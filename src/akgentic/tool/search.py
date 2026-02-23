@@ -4,6 +4,9 @@ from pydantic import BaseModel
 from tavily import TavilyClient
 
 from akgentic.tool.core import BaseTool
+from akgentic.tool.event import ToolCallEvent, ToolObserver
+
+ToolObsOrNone = ToolObserver | None
 
 
 class WebSearch(BaseModel):
@@ -26,21 +29,20 @@ class WebCrawl(BaseModel):
 
 
 class SearchTool(BaseTool):
-    def get_tools(self) -> list[Callable]:
+    def get_tools(self, observer: ToolObsOrNone) -> list[Callable]:
 
         tools = []
-
         for params in self.tool_card.params or []:
             if isinstance(params, WebSearch):
-                tools.append(self.web_search_factory(params))
+                tools.append(self.web_search_factory(params, observer))
             if isinstance(params, WebFetch):
-                tools.append(self.web_fetch_factory(params))
+                tools.append(self.web_fetch_factory(params, observer))
             if isinstance(params, WebCrawl):
-                tools.append(self.web_crawl_factory(params))
+                tools.append(self.web_crawl_factory(params, observer))
 
         return tools
 
-    def web_search_factory(self, params: WebSearch) -> Callable:
+    def web_search_factory(self, params: WebSearch, observer: ToolObsOrNone) -> Callable:
 
         def web_search_tool(
             query: str,
@@ -68,6 +70,15 @@ class SearchTool(BaseTool):
             if search_depth is not None:
                 search_kwargs["search_depth"] = search_depth
 
+            if observer is not None:
+                observer.notify_event(
+                    ToolCallEvent(
+                        tool_name="Web Search",
+                        args=[query],
+                        kwargs={"max_results": max_results, **search_kwargs},
+                    )
+                )
+
             return tavily_client.search(
                 query,
                 max_results=max_results,
@@ -76,7 +87,7 @@ class SearchTool(BaseTool):
 
         return web_search_tool
 
-    def web_fetch_factory(self, params: WebFetch) -> Callable:
+    def web_fetch_factory(self, params: WebFetch, observer: ToolObsOrNone) -> Callable:
 
         def web_fetch_tool(
             urls: list[str],
@@ -105,6 +116,15 @@ class SearchTool(BaseTool):
             if extract_depth is not None:
                 fetch_kwargs["extract_depth"] = extract_depth
 
+            if observer is not None:
+                observer.notify_event(
+                    ToolCallEvent(
+                        tool_name="Web Fetch",
+                        args=[urls],
+                        kwargs={"timeout": timeout, **fetch_kwargs},
+                    )
+                )
+
             return tavily_client.extract(
                 urls,
                 timeout=timeout,
@@ -113,7 +133,7 @@ class SearchTool(BaseTool):
 
         return web_fetch_tool
 
-    def web_crawl_factory(self, params: WebCrawl) -> Callable:
+    def web_crawl_factory(self, params: WebCrawl, observer: ToolObsOrNone) -> Callable:
 
         def web_crawl_tool(
             url: str,
@@ -160,6 +180,15 @@ class SearchTool(BaseTool):
                 crawl_kwargs["instructions"] = instructions
             if extract_depth is not None:
                 crawl_kwargs["extract_depth"] = extract_depth
+
+            if observer is not None:
+                observer.notify_event(
+                    ToolCallEvent(
+                        tool_name="Web Crawl",
+                        args=[url],
+                        kwargs={"timeout": timeout, **crawl_kwargs},
+                    )
+                )
 
             return tavily_client.crawl(
                 url,
