@@ -8,11 +8,11 @@ This module contains protocol-level concerns only:
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, Field
 
-from akgentic.tool.core import BaseTool, ToolCard
+from akgentic.tool.core import ToolCard
 
 MCPHTTPTransport = Literal["streamable-http", "sse"]
 
@@ -143,60 +143,20 @@ def _load_mcp_server_classes() -> tuple[type[Any], type[Any], type[Any]]:
     return MCPServerSSE, MCPServerStreamableHTTP, MCPServerStdio
 
 
-class MCPTool(BaseTool):
-    """Base tool provider for MCP-based toolsets.
+class MCPTool(ToolCard):
+    """MCP protocol integration — exposes tools via toolsets, not callables.
 
-    This class intentionally exposes no callable tools by default.
-    It contributes an MCP toolset object through ``get_toolset()``.
+    Attributes:
+        connection: MCP transport configuration (HTTP/SSE or stdio).
     """
 
-    def __init__(self, tool_card: ToolCard) -> None:
-        """Initialize MCP tool with connection configuration.
+    connection: MCPConnectionConfig
 
-        Args:
-            tool_card: Tool card containing MCP connection configuration in params.
-
-        Raises:
-            ValueError: If tool_card does not contain valid MCP connection config.
-        """
-        super().__init__(tool_card)
-        self.connection = self._extract_connection(tool_card)
-
-    def _extract_connection(self, tool_card: ToolCard) -> MCPConnectionConfig:
-        """Extract MCP connection configuration from tool card parameters.
-
-        Args:
-            tool_card: Tool card to search for connection config.
-
-        Returns:
-            The first MCP connection configuration found in tool_card.params.
-
-        Raises:
-            ValueError: If no MCP connection configuration is found.
-        """
-        for params in tool_card.params or []:
-            if isinstance(params, MCPHTTPConnectionConfig | MCPStdioConnectionConfig):
-                return params
-
-        raise ValueError(
-            f"ToolCard '{tool_card.name}' must include one MCPHTTPConnectionConfig "
-            f"or MCPStdioConnectionConfig in params"
-        )
-
-    def get_tools(self, observer: Any | None) -> list[Any]:
-        """Return list of callable tools.
-
-        MCP tools expose their functionality through toolsets, not individual tools.
-
-        Args:
-            observer: Optional observer for tool execution events (unused).
-
-        Returns:
-            Empty list - MCP tools are accessed via get_toolset().
-        """
+    def get_tools(self) -> list[Callable]:
+        """MCP tools come via toolsets, not individual callables."""
         return []
 
-    def get_toolset(self) -> Any:
+    def get_toolsets(self) -> list[Any]:
         """Create and return an MCP server toolset for pydantic-ai agents.
 
         Creates the appropriate MCP server instance based on connection configuration:
@@ -205,17 +165,12 @@ class MCPTool(BaseTool):
         - MCPServerStreamableHTTP for streamable-http transport
 
         Returns:
-            Configured MCP server instance (MCPServerStdio, MCPServerSSE, or
-            MCPServerStreamableHTTP) ready to be used as a toolset in pydantic-ai agents.
+            List containing a single configured MCP server instance ready to be
+            used as a toolset in pydantic-ai agents.
 
         Raises:
             ValueError: If stdio_command is missing for stdio transport.
             ImportError: If pydantic-ai MCP extras are not installed.
-
-        Example:
-            >>> from pydantic_ai import Agent
-            >>> toolset = mcp_tool.get_toolset()
-            >>> agent = Agent(model='openai:gpt-4', toolsets=[toolset])
         """
         mcp_server_sse, mcp_server_streamable_http, mcp_server_stdio = _load_mcp_server_classes()
         headers = _mcp_auth_headers(self.connection.bearer_token)
@@ -228,39 +183,42 @@ class MCPTool(BaseTool):
             if self.connection.stdio_token_env_var and self.connection.bearer_token:
                 env[self.connection.stdio_token_env_var] = self.connection.bearer_token
 
-            return mcp_server_stdio(
-                command=self.connection.stdio_command,
-                args=self.connection.stdio_args,
-                env=env or None,
-                cwd=self.connection.stdio_cwd,
-                tool_prefix=self.connection.tool_prefix,
-                timeout=self.connection.timeout,
-                read_timeout=self.connection.read_timeout,
-            )
+            return [
+                mcp_server_stdio(
+                    command=self.connection.stdio_command,
+                    args=self.connection.stdio_args,
+                    env=env or None,
+                    cwd=self.connection.stdio_cwd,
+                    tool_prefix=self.connection.tool_prefix,
+                    timeout=self.connection.timeout,
+                    read_timeout=self.connection.read_timeout,
+                )
+            ]
 
         if self.connection.transport == "sse":
-            return mcp_server_sse(
+            return [
+                mcp_server_sse(
+                    url=self.connection.url,
+                    headers=headers,
+                    tool_prefix=self.connection.tool_prefix,
+                    timeout=self.connection.timeout,
+                    read_timeout=self.connection.read_timeout,
+                )
+            ]
+
+        return [
+            mcp_server_streamable_http(
                 url=self.connection.url,
                 headers=headers,
                 tool_prefix=self.connection.tool_prefix,
                 timeout=self.connection.timeout,
                 read_timeout=self.connection.read_timeout,
             )
-
-        return mcp_server_streamable_http(
-            url=self.connection.url,
-            headers=headers,
-            tool_prefix=self.connection.tool_prefix,
-            timeout=self.connection.timeout,
-            read_timeout=self.connection.read_timeout,
-        )
+        ]
 
 
 async def list_mcp_tools(connection: MCPConnectionConfig) -> list[str]:
     """Connect to an MCP server and return exposed tool names.
-
-    Establishes a connection to the MCP server and retrieves the list of
-    available tools. Prints diagnostic messages during connection process.
 
     Args:
         connection: MCP connection configuration (HTTP/SSE or stdio).
@@ -271,21 +229,17 @@ async def list_mcp_tools(connection: MCPConnectionConfig) -> list[str]:
     Raises:
         ImportError: If pydantic-ai MCP extras are not installed.
         Exception: If connection fails or server is unreachable.
-
-    Example:
-        >>> config = MCPHTTPConnectionConfig(url="http://localhost:8080")
-        >>> tools = await list_mcp_tools(config)
-        >>> print(f"Found {len(tools)} tools: {tools}")
     """
-    probe_card = ToolCard(
+    tool = MCPTool(
         name="mcp-probe",
-        module=MCPTool,
         description="Probe MCP endpoint",
-        params=[connection],
+        connection=connection,
     )
-    tool = MCPTool(probe_card)
     print("## Creating MCP toolset for diagnostics...")
-    server = tool.get_toolset()
+    toolsets = tool.get_toolsets()
+    if not toolsets:
+        raise ValueError("MCPTool.get_toolsets() returned empty list")
+    server = toolsets[0]
     print("## Server toolset created, connecting and listing tools...")
     async with server:
         print("## Connected to MCP server, fetching tool list...")
@@ -300,32 +254,12 @@ async def probe_mcp_connection(
 ) -> dict[str, Any]:
     """Probe an MCP server and return a compact feasibility summary.
 
-    Tests connectivity to an MCP server and returns basic information about
-    available tools. Useful for diagnostics and validation before full integration.
-
     Args:
         connection: MCP connection configuration to probe.
         max_tools_to_print: Maximum number of tool names to include in result.
-            Defaults to 20.
 
     Returns:
-        Dictionary with keys:
-            - tool_count (int): Total number of tools available
-            - tools (list[str]): Tool names (truncated to max_tools_to_print)
-            - feasible (bool): True if at least one tool is available
-
-    Raises:
-        ImportError: If pydantic-ai MCP extras are not installed.
-        Exception: If connection fails or server is unreachable.
-
-    Example:
-        >>> config = MCPStdioConnectionConfig(
-        ...     stdio_command="npx",
-        ...     stdio_args=["-y", "@modelcontextprotocol/server-filesystem"]
-        ... )
-        >>> result = await probe_mcp_connection(config)
-        >>> if result["feasible"]:
-        ...     print(f"Server has {result['tool_count']} tools")
+        Dictionary with tool_count, tools (list), and feasible (bool).
     """
     tool_names = await list_mcp_tools(connection)
     return {
