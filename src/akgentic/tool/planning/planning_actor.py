@@ -75,7 +75,7 @@ class PlanActor(Akgent[BaseConfig, PlanManagerState]):
         state: Current state of the plan execution.
     """
 
-    def init(self):
+    def on_start(self):
         self.state = PlanManagerState()
         self.state.observer(self)
 

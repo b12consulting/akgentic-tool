@@ -61,7 +61,7 @@ class MockActorAddress(ActorAddress):
 def test_update_item_success() -> None:
     """Test successful item update returns None."""
     actor = PlanActor()
-    actor.init()
+    actor.on_start()
 
     # Create an item
     create_req = PlanItemCreate(
@@ -87,7 +87,7 @@ def test_update_item_success() -> None:
 def test_update_item_not_found() -> None:
     """Test updating non-existent item returns error message."""
     actor = PlanActor()
-    actor.init()
+    actor.on_start()
 
     # Try to update non-existent item
     update_req = PlanItemUpdate(id=999, status="started")
@@ -103,7 +103,7 @@ def test_update_item_not_found() -> None:
 def test_update_planning_with_update_errors() -> None:
     """Test update_planning collects errors from failed updates."""
     actor = PlanActor()
-    actor.init()
+    actor.on_start()
     actor_addr = MockActorAddress("test-agent")
 
     # Create one item
@@ -133,7 +133,7 @@ def test_update_planning_with_update_errors() -> None:
 def test_update_planning_delete_not_found() -> None:
     """Test deleting non-existent item returns error."""
     actor = PlanActor()
-    actor.init()
+    actor.on_start()
     actor_addr = MockActorAddress("test-agent")
 
     # Try to delete non-existent item
@@ -155,7 +155,7 @@ def test_update_planning_delete_not_found() -> None:
 def test_update_planning_delete_success() -> None:
     """Test successful deletion."""
     actor = PlanActor()
-    actor.init()
+    actor.on_start()
     actor_addr = MockActorAddress("test-agent")
 
     # Create an item
@@ -181,7 +181,7 @@ def test_update_planning_delete_success() -> None:
 def test_update_planning_mixed_operations_with_errors() -> None:
     """Test mixed create/update/delete operations with some errors."""
     actor = PlanActor()
-    actor.init()
+    actor.on_start()
     actor_addr = MockActorAddress("test-agent")
 
     # Create initial item
@@ -220,7 +220,7 @@ def test_update_planning_mixed_operations_with_errors() -> None:
 def test_update_planning_all_success() -> None:
     """Test update_planning returns 'Done' when no errors."""
     actor = PlanActor()
-    actor.init()
+    actor.on_start()
     actor_addr = MockActorAddress("test-agent")
 
     # Create initial item
