@@ -1,7 +1,7 @@
 import logging
-from typing import Callable, cast
+from typing import Callable
 
-from pydantic import Field, PrivateAttr
+from pydantic import Field
 
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.orchestrator import Orchestrator
@@ -47,12 +47,9 @@ class PlanningTool(ToolCard):
     get_planning_item: GetPlanningItem | bool = True
     update_planning: UpdatePlanning | bool = True
 
-    _planning_proxy: PlanActor | None = PrivateAttr(default=None)
-
-    def observer(self, observer: ToolObserver | None = None) -> "PlanningTool":
+    def observer(self, observer: ToolObserver):
         """Attach observer and set up the planning actor proxy."""
-        super().observer(observer)
-        assert observer is not None, "PlanningTool requires an observer to function."
+        self._observer = observer
         orchestrator = observer.orchestrator
         assert orchestrator is not None, "PlanningTool requires access to the orchestrator."
 
@@ -68,12 +65,11 @@ class PlanningTool(ToolCard):
             )
 
         self._planning_proxy = observer.proxy_ask(planning_tool_addr, PlanActor)
-        return self
 
     def get_system_prompts(self) -> list[Callable]:
         gp = _resolve(self.get_planning, GetPlanning)
         if gp and gp.system_prompt:
-            planning_proxy = cast(PlanActor, self._planning_proxy)
+            planning_proxy = self._planning_proxy
 
             def team_planning() -> str:
                 planning = planning_proxy.get_planning()
@@ -111,7 +107,7 @@ class PlanningTool(ToolCard):
         return tools
 
     def _get_planning_factory(self, params: GetPlanning) -> Callable:
-        planning_proxy = cast(PlanActor, self._planning_proxy)
+        planning_proxy = self._planning_proxy
         observer = self._observer
 
         def get_planning() -> list[PlanItem]:
@@ -125,7 +121,7 @@ class PlanningTool(ToolCard):
         return get_planning
 
     def _get_planning_item_factory(self, params: GetPlanningItem) -> Callable:
-        planning_proxy = cast(PlanActor, self._planning_proxy)
+        planning_proxy = self._planning_proxy
         observer = self._observer
 
         def get_planning_item(item_id: int) -> PlanItem | str:
@@ -141,8 +137,8 @@ class PlanningTool(ToolCard):
         return get_planning_item
 
     def _update_planning_factory(self, params: UpdatePlanning) -> Callable:
-        planning_proxy = cast(PlanActor, self._planning_proxy)
-        observer = cast(ToolObserver, self._observer)
+        planning_proxy = self._planning_proxy
+        observer = self._observer
 
         def update_planning(update: UpdatePlan):
             """Update team planning items (create, update, delete).

@@ -83,14 +83,14 @@ class PlanActor(Akgent[BaseConfig, PlanManagerState]):
         new_item = PlanItem(**item_create.__dict__, creator=actor_address.name)
         self.state.item_list.append(new_item)
 
-    def _update_item(self, item_update: PlanItemUpdate) -> None:
+    def _update_item(self, item_update: PlanItemUpdate) -> None | str:
         # Use __dict__ to get raw values, filter out None to only apply explicitly set fields
         updates = {k: v for k, v in item_update.__dict__.items() if v is not None}
         for idx, item in enumerate(self.state.item_list):
             if item.id == item_update.id:
                 self.state.item_list[idx] = item.model_copy(update=updates)
                 return
-        # FIXME - handle case where item to update doesn't exist
+        return f"Update error - no item with ID {item_update.id} found."
 
     ##
     ## Tools to expose to agents:
@@ -107,18 +107,24 @@ class PlanActor(Akgent[BaseConfig, PlanManagerState]):
     def update_planning(self, update: UpdatePlan, actor_address: ActorAddress) -> str:
         """Update the plan with new, updated, or deleted items."""
 
+        errors = []
+
         # Handle item creation
         for item_create in update.create_items:
             self._create_item(item_create, actor_address)
 
         # Handle item updates
         for item_update in update.update_items:
-            self._update_item(item_update)
+            error = self._update_item(item_update)
+            if error is not None:
+                errors.append(error)
 
         # Handle item deletions
-        item_list = self.state.item_list
         for item_id in update.delete_items:
-            self.state.item_list = [item for item in item_list if item.id != item_id]
+            if not any(item.id == item_id for item in self.state.item_list):
+                errors.append(f"Delete error - no item with ID {item_id} found.")
+            else:
+                self.state.item_list = [item for item in self.state.item_list if item.id != item_id]
 
         self.state.notify_state_change()
-        return "Done"
+        return "Done" if not errors else "Done with errors: " + "; ".join(errors)
