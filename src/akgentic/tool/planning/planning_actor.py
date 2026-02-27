@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import Akgent, BaseConfig, BaseState
 from akgentic.core.utils.serializer import SerializableBaseModel
+from akgentic.tool.errors import ToolError
 
 PlanStatus = Literal["pending", "started", "completed", "abort"]
 
@@ -127,4 +128,7 @@ class PlanActor(Akgent[BaseConfig, PlanManagerState]):
                 self.state.item_list = [item for item in self.state.item_list if item.id != item_id]
 
         self.state.notify_state_change()
-        return "Done" if not errors else "Done with errors: " + "; ".join(errors)
+
+        if errors:
+            raise ToolError("Update errors: " + "; ".join(errors))
+        return "Done"
