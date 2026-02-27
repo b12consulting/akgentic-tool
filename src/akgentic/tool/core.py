@@ -6,11 +6,13 @@ Defines the core contracts:
 - ``ToolFactory``: resolves ``ToolCard`` instances into callable tools, prompts, and toolsets.
 """
 
+import functools
 from abc import ABC, abstractmethod
 from typing import Any, Callable, TypeVar
 
-from pydantic import BaseModel, PrivateAttr
+from pydantic import BaseModel
 
+from akgentic.tool.errors import ToolError
 from akgentic.tool.event import ToolObserver
 
 T = TypeVar("T", bound="BaseToolParam")
@@ -41,11 +43,11 @@ class BaseToolParam(BaseModel):
     to the LLM and how its description can be customized.
     """
 
-    description: str | None = None
-    """Override the default LLM-facing docstring for this tool.
+    instructions: str | None = None
+    """Additional instructions appended to the default tool docstring.
 
-    When set, the factory uses this text instead of the hardcoded docstring
-    in the closure. When ``None``, the built-in default docstring is used.
+    When set, the factory appends these instructions to the built-in docstring
+    under a structured header. When ``None``, only the default docstring is used.
     """
 
     system_prompt: bool = False
@@ -53,6 +55,21 @@ class BaseToolParam(BaseModel):
 
     llm_tool: bool = True
     """Whether this capability is exposed as a callable tool for the LLM."""
+
+    def format_docstring(self, original: str | None) -> str | None:
+        """Format the tool docstring with optional additional instructions.
+
+        Args:
+            original: The original docstring from the tool callable.
+
+        Returns:
+            The formatted docstring, or the original if no instructions are set.
+        """
+        if not self.instructions:
+            return original
+
+        base_doc = original or ""
+        return f"{base_doc}\n\nAdditional Instructions:\n{self.instructions}"
 
 
 class ToolCard(BaseModel, ABC):
@@ -112,6 +129,7 @@ class ToolFactory:
         self,
         tool_cards: list[ToolCard],
         observer: ToolObserver | None = None,
+        retry_exception: type[Exception] | None = None,
     ) -> None:
         """Create a factory for one or more tool cards.
 
@@ -122,17 +140,38 @@ class ToolFactory:
             tool_cards: Tool cards to resolve into callable tools.
             observer: Optional observer notified by tool implementations during
                 tool calls.
+            retry_exception: Optional exception class to raise when a tool raises
+                ``ToolError``. Injected by the integration layer (e.g., ModelRetry
+                from pydantic-ai) to keep the tool module framework-agnostic.
         """
         self.tool_cards = tool_cards
         self.observer = observer
+        self._retry_exception = retry_exception
 
         if self.observer is not None:
             for card in self.tool_cards:
                 card.observer(self.observer)
 
+    def _wrap_with_retry(self, fn: Callable) -> Callable:
+        """Wrap a tool callable to convert ``ToolError`` into retry_exception."""
+        assert self._retry_exception is not None
+        retry_exc = self._retry_exception
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except ToolError as e:
+                raise retry_exc(str(e)) from e
+
+        return wrapper
+
     def get_tools(self) -> list[Callable]:
         """Return tool callables aggregated from all tool cards."""
-        return [t for card in self.tool_cards for t in card.get_tools()]
+        tools = [t for card in self.tool_cards for t in card.get_tools()]
+        if self._retry_exception is not None:
+            tools = [self._wrap_with_retry(t) for t in tools]
+        return tools
 
     def get_system_prompts(self) -> list[Callable]:
         """Return system prompt callables aggregated from all tool cards."""
