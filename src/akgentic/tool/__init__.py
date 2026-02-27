@@ -3,7 +3,7 @@
 # Submodules with their own __init__ files
 from . import mcp, planning, search
 from .core import BaseToolParam, ToolCard, ToolFactory
-from .event import ToolCallEvent, ToolObserver
+from .event import ActorToolObserver, ToolCallEvent, ToolObserver
 
 __all__ = [
     # Core abstractions
@@ -13,6 +13,7 @@ __all__ = [
     # Events and observers
     "ToolCallEvent",
     "ToolObserver",
+    "ActorToolObserver",
     # Submodules
     "mcp",
     "planning",

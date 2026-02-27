@@ -1,10 +1,5 @@
-from dataclasses import dataclass
+"""Planning module events.
 
-
-@dataclass(frozen=True)
-class PlanningEvent:
-    """Event emitted when the llm make a tool call."""
-
-    tool_name: str
-    args: list
-    kwargs: dict
+This module is intentionally empty. Planning tools use ToolCallEvent
+from the parent event module instead of defining custom event types.
+"""

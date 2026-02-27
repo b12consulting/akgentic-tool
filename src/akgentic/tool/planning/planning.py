@@ -6,7 +6,7 @@ from pydantic import Field, PrivateAttr
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.tool.core import BaseToolParam, ToolCard, _resolve
-from akgentic.tool.event import ToolCallEvent, ToolObserver
+from akgentic.tool.event import ActorToolObserver, ToolCallEvent
 from akgentic.tool.planning.planning_actor import PlanActor, PlanItem, UpdatePlan
 
 logger = logging.getLogger(__name__)
@@ -49,14 +49,18 @@ class PlanningTool(ToolCard):
 
     _planning_proxy: PlanActor | None = PrivateAttr(default=None)
 
-    def observer(self, observer: ToolObserver | None = None) -> "PlanningTool":
-        """Attach observer and set up the planning actor proxy."""
-        super().observer(observer)
-        assert observer is not None, "PlanningTool requires an observer to function."
-        orchestrator = observer.orchestrator
-        assert orchestrator is not None, "PlanningTool requires access to the orchestrator."
+    def observer(self, observer: ActorToolObserver | None = None) -> "PlanningTool":
+        """Attach observer and set up the planning actor proxy.
 
-        orchestrator_proxy_ask = observer.proxy_ask(orchestrator, Orchestrator)
+        Requires an ActorToolObserver for actor system access.
+        """
+        super().observer(observer)
+        if observer is None:
+            raise ValueError("PlanningTool requires an ActorToolObserver to function.")
+        if observer.orchestrator is None:
+            raise ValueError("PlanningTool requires access to the orchestrator.")
+
+        orchestrator_proxy_ask = observer.proxy_ask(observer.orchestrator, Orchestrator)
         planning_tool_addr = orchestrator_proxy_ask.get_team_member(PLANNING_ACTOR_NAME)
 
         if planning_tool_addr is None:
@@ -142,9 +146,9 @@ class PlanningTool(ToolCard):
 
     def _update_planning_factory(self, params: UpdatePlanning) -> Callable:
         planning_proxy = cast(PlanActor, self._planning_proxy)
-        observer = cast(ToolObserver, self._observer)
+        observer = cast(ActorToolObserver, self._observer)
 
-        def update_planning(update: UpdatePlan):
+        def update_planning(update: UpdatePlan) -> str:
             """Update team planning items (create, update, delete).
 
             When you start or complete a task from the planning,

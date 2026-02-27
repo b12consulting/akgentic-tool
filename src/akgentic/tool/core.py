@@ -11,7 +11,6 @@ from typing import Any, Callable, TypeVar
 
 from pydantic import BaseModel, PrivateAttr
 
-from akgentic.core.agent import Akgent
 from akgentic.tool.event import ToolObserver
 
 T = TypeVar("T", bound="BaseToolParam")
@@ -114,7 +113,7 @@ class ToolFactory:
     def __init__(
         self,
         tool_cards: list[ToolCard],
-        observer: Akgent | None = None,
+        observer: ToolObserver | None = None,
     ) -> None:
         """Create a factory for one or more tool cards.
 
