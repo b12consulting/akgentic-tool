@@ -68,3 +68,74 @@ class ActorToolObserver(ToolObserver, Protocol):
         """
         ...
 
+
+@runtime_checkable
+class TeamManagementToolObserver(ActorToolObserver, Protocol):
+    """Observer protocol for team management tools.
+
+    Extends ActorToolObserver with team-specific capabilities needed by
+    TeamTool for hiring, firing, and managing team members within the
+    actor system.
+    """
+
+    def createActor(
+        self,
+        actor_class: type[AkgentType],
+        *,
+        config: object,
+    ) -> ActorAddress:
+        """Create a child actor with the given config.
+
+        Args:
+            actor_class: The actor class to instantiate
+            config: Configuration object for the actor
+
+        Returns:
+            Address of the newly created actor
+        """
+        ...
+
+    def send(self, target: ActorAddress, message: object) -> None:
+        """Send a message to another actor.
+
+        Args:
+            target: Address of the target actor
+            message: Message to send
+        """
+        ...
+
+    def stop(self, target: ActorAddress) -> None:
+        """Stop an actor and its children recursively.
+
+        Args:
+            target: Address of the actor to stop
+        """
+        ...
+
+    def on_hire(self, name: str, address: ActorAddress) -> None:
+        """Hook called after hiring a team member.
+
+        Handles agent-specific concerns such as:
+        - Tracking child in agent's children list
+        - Updating local caches
+        - Any agent-specific bookkeeping
+
+        Args:
+            name: Name of hired agent (e.g., '@Developer123')
+            address: ActorAddress of hired agent
+        """
+        ...
+
+    def on_fire(self, name: str, address: ActorAddress) -> None:
+        """Hook called after firing a team member.
+
+        Handles agent-specific concerns such as:
+        - Removing from children tracking
+        - Clearing from local caches
+        - Any agent-specific cleanup
+
+        Args:
+            name: Name of fired agent (e.g., '@Developer123')
+            address: ActorAddress of fired agent
+        """
+        ...

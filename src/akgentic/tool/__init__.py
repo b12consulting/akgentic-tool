@@ -1,10 +1,15 @@
 """akgentic-tool public API."""
 
 # Submodules with their own __init__ files
-from . import mcp, planning, search
+from . import mcp, planning, search, team
 from .core import BaseToolParam, ToolCard, ToolFactory
 from .errors import ToolError
-from .event import ActorToolObserver, ToolCallEvent, ToolObserver
+from .event import (
+    ActorToolObserver,
+    TeamManagementToolObserver,
+    ToolCallEvent,
+    ToolObserver,
+)
 
 __all__ = [
     # Core abstractions
@@ -17,8 +22,10 @@ __all__ = [
     "ToolCallEvent",
     "ToolObserver",
     "ActorToolObserver",
+    "TeamManagementToolObserver",
     # Submodules
     "mcp",
     "planning",
     "search",
+    "team",
 ]

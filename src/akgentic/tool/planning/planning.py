@@ -87,7 +87,6 @@ class PlanningTool(ToolCard):
                     ]
                 )
 
-            team_planning.__doc__ = gp.format_docstring(team_planning.__doc__)
             return [team_planning]
         return []
 
