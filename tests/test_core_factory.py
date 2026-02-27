@@ -73,3 +73,27 @@ def test_base_tool_param_defaults() -> None:
     assert p.description is None
     assert p.system_prompt is False
     assert p.llm_tool is True
+
+
+def test_tool_factory_with_null_observer() -> None:
+    """Test that ToolFactory handles None observer gracefully without calling card.observer()."""
+    observer_called = False
+
+    class _ObserverCheckTool(ToolCard):
+        name: str = "observer_check"
+        description: str = "checks observer calls"
+
+        def observer(self, observer):
+            nonlocal observer_called
+            observer_called = True
+            return super().observer(observer)
+
+        def get_tools(self) -> list[Callable]:
+            return []
+
+    card = _ObserverCheckTool()
+    factory = ToolFactory(tool_cards=[card], observer=None)
+    
+    # Observer should NOT be called when observer is None
+    assert not observer_called
+    assert factory.observer is None

@@ -69,9 +69,7 @@ class ToolCard(BaseModel, ABC):
     name: str
     description: str
 
-    _observer: ToolObserver | None = PrivateAttr(default=None)
-
-    def observer(self, observer: ToolObserver | None = None) -> "ToolCard":
+    def observer(self, observer: ToolObserver) -> "ToolCard":
         """Attach an observer and perform runtime setup.
 
         Follows the same pattern as ``BaseState.observer()``.
@@ -128,8 +126,9 @@ class ToolFactory:
         self.tool_cards = tool_cards
         self.observer = observer
 
-        for card in self.tool_cards:
-            card.observer(self.observer)
+        if self.observer is not None:
+            for card in self.tool_cards:
+                card.observer(self.observer)
 
     def get_tools(self) -> list[Callable]:
         """Return tool callables aggregated from all tool cards."""
