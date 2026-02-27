@@ -41,7 +41,7 @@ class PlanItem(PlanItemCreate):
     output: str = Field(default="", description="Output or result of the task.")
     creator: str = Field(default="", description="Team member name who creates the plan item.")
     updated_at: datetime.datetime = Field(
-        default_factory=datetime.datetime.now,
+        default_factory=lambda: datetime.datetime.now(datetime.UTC),
         description="ISO timestamp of the last update.",
     )
 

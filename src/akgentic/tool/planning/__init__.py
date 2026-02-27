@@ -1,6 +1,5 @@
 """Planning support for akgentic-tool."""
 
-from .event import PlanningEvent
 from .planning import (
     GetPlanning,
     GetPlanningItem,
@@ -13,7 +12,6 @@ __all__ = [
     "GetPlanning",
     "GetPlanningItem",
     "PlanManagerState",
-    "PlanningEvent",
     "PlanningTool",
     "UpdatePlanning",
 ]

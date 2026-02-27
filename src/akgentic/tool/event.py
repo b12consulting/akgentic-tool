@@ -16,7 +16,12 @@ class ToolCallEvent:
 
 @runtime_checkable
 class ToolObserver(Protocol):
-    """Observer protocol for tool interactions."""
+    """Basic observer protocol for tool interactions.
+
+    This protocol defines the minimal interface required for tools that only
+    need to emit events. Tools requiring actor-aware features should use
+    ActorToolObserver instead.
+    """
 
     def notify_event(self, event: object) -> None:
         """Called when a tool domain event is emitted.
@@ -26,8 +31,17 @@ class ToolObserver(Protocol):
         """
         ...
 
+
+@runtime_checkable
+class ActorToolObserver(ToolObserver, Protocol):
+    """Actor-aware observer protocol for tool interactions.
+
+    Extends ToolObserver with actor-specific capabilities needed by tools
+    that interact with the actor system (e.g., PlanningTool).
+    """
+
     @property
-    def myAddress(self) -> ActorAddress:
+    def myAddress(self) -> ActorAddress:  # noqa: N802
         """Get the current actor's address."""
         ...
 
@@ -53,3 +67,4 @@ class ToolObserver(Protocol):
             Proxy object to interact with the target actor
         """
         ...
+

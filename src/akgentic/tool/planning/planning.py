@@ -6,7 +6,7 @@ from pydantic import Field
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.tool.core import BaseToolParam, ToolCard, _resolve
-from akgentic.tool.event import ToolCallEvent, ToolObserver
+from akgentic.tool.event import ActorToolObserver, ToolCallEvent
 from akgentic.tool.planning.planning_actor import PlanActor, PlanItem, UpdatePlan
 
 logger = logging.getLogger(__name__)
@@ -47,13 +47,19 @@ class PlanningTool(ToolCard):
     get_planning_item: GetPlanningItem | bool = True
     update_planning: UpdatePlanning | bool = True
 
-    def observer(self, observer: ToolObserver):
-        """Attach observer and set up the planning actor proxy."""
-        self._observer = observer
-        orchestrator = observer.orchestrator
-        assert orchestrator is not None, "PlanningTool requires access to the orchestrator."
 
-        orchestrator_proxy_ask = observer.proxy_ask(orchestrator, Orchestrator)
+    def observer(self, observer: ActorToolObserver) -> "PlanningTool":
+        """Attach observer and set up the planning actor proxy.
+
+        Requires an ActorToolObserver for actor system access.
+        """
+        super().observer(observer)
+        if observer is None:
+            raise ValueError("PlanningTool requires an ActorToolObserver to function.")
+        if observer.orchestrator is None:
+            raise ValueError("PlanningTool requires access to the orchestrator.")
+
+        orchestrator_proxy_ask = observer.proxy_ask(observer.orchestrator, Orchestrator)
         planning_tool_addr = orchestrator_proxy_ask.get_team_member(PLANNING_ACTOR_NAME)
 
         if planning_tool_addr is None:
@@ -138,9 +144,9 @@ class PlanningTool(ToolCard):
 
     def _update_planning_factory(self, params: UpdatePlanning) -> Callable:
         planning_proxy = self._planning_proxy
-        observer = self._observer
+        observer = self._observe
 
-        def update_planning(update: UpdatePlan):
+        def update_planning(update: UpdatePlan) -> str:
             """Update team planning items (create, update, delete).
 
             When you start or complete a task from the planning,
