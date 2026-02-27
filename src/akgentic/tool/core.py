@@ -1,114 +1,114 @@
-"""Tool abstractions and factory for dynamic tool instantiation.
+"""Tool abstractions and factory for the akgentic tool package.
 
-Defines the core contracts used by the tool package:
-- ``ToolCard``: metadata/configuration for a tool provider.
-- ``BaseTool``: abstract interface implemented by concrete tool modules.
-- ``ToolFactory``: resolver that loads tool classes and materializes callable tools.
+Defines the core contracts:
+- ``BaseToolParam``: base for capability parameter models.
+- ``ToolCard``: abstract base — tool configuration + callable factory in one class.
+- ``ToolFactory``: resolves ``ToolCard`` instances into callable tools, prompts, and toolsets.
 """
 
-from abc import ABC
-from typing import Any, Callable
+from abc import ABC, abstractmethod
+from typing import Any, Callable, TypeVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, PrivateAttr
 
 from akgentic.tool.event import ToolObserver
-from akgentic.tool.utils import import_class
+
+T = TypeVar("T", bound="BaseToolParam")
 
 
-class ToolCard(BaseModel):
-    """Metadata and configuration for a tool provider.
+def _resolve(value: "T | bool", cls: "type[T]") -> "T | None":
+    """Resolve a ``ParamModel | bool`` field to a ``ParamModel`` or ``None``.
 
-    A ``ToolCard`` describes how a tool implementation should be resolved and
-    what parameter presets should be passed to it.
+    Args:
+        value: ``True`` (enable with defaults), ``False`` (disable), or a
+            ``BaseToolParam`` instance (enable with custom parameters).
+        cls: The param model class to instantiate when *value* is ``True``.
+
+    Returns:
+        A param model instance, or ``None`` if the capability is disabled.
+    """
+    if value is True:
+        return cls()
+    if value is False:
+        return None
+    return value  # already a ParamModel instance
+
+
+class BaseToolParam(BaseModel):
+    """Base for capability parameter models.
+
+    Provides common fields that control how a capability is exposed
+    to the LLM and how its description can be customized.
+    """
+
+    description: str | None = None
+    """Override the default LLM-facing docstring for this tool.
+
+    When set, the factory uses this text instead of the hardcoded docstring
+    in the closure. When ``None``, the built-in default docstring is used.
+    """
+
+    system_prompt: bool = False
+    """Whether this capability injects a system prompt into the LLM context."""
+
+    llm_tool: bool = True
+    """Whether this capability is exposed as a callable tool for the LLM."""
+
+
+class ToolCard(BaseModel, ABC):
+    """Abstract base: tool configuration + callable factory in one class.
+
+    Subclasses define typed fields for their capabilities and implement
+    the factory methods that produce LLM-callable functions.
 
     Attributes:
         name: Human-readable tool provider name.
-        module: Fully qualified class path (``str``) or class type implementing
-            ``BaseTool``.
         description: Natural-language description of tool capabilities.
-        params: Optional list of parameter model instances used by the concrete
-            tool implementation to build callable tools.
     """
 
     name: str
-    module: str | type
     description: str
-    params: list[Any] | None = None
 
+    _observer: ToolObserver | None = PrivateAttr(default=None)
 
-class BaseTool(ABC):
-    """Abstract base class for tool providers.
+    def observer(self, observer: ToolObserver | None = None) -> "ToolCard":
+        """Attach an observer and perform runtime setup.
 
-    Concrete subclasses wrap one logical tool module and expose one or more
-    executable callables via ``get_tools``.
-    """
-
-    def __init__(self, tool_card: ToolCard) -> None:
-        """Initialize the tool provider.
+        Follows the same pattern as ``BaseState.observer()``.
+        Override for setup that requires the observer (e.g., actor proxies).
+        All methods can then access the observer via ``self._observer``.
 
         Args:
-            tool_card: Tool metadata and parameter presets for this provider.
-        """
-        self.tool_card = tool_card
-
-    def get_tools(self, observer: ToolObserver | None) -> list[Callable]:
-        """Return a list of callables that implement the tools defined in the tool card.
-
-        Args:
-            observer: Optional observer for monitoring tool execution events.
+            observer: Optional observer for tool call events.
 
         Returns:
-            List of callable functions that implement the tool functionality.
-
-        Raises:
-            NotImplementedError: Must be implemented by concrete subclasses.
+            Self, enabling method chaining.
         """
-        raise NotImplementedError("Must be implemented by subclasses")
+        self._observer = observer
+        return self
 
-    def get_toolset(self) -> Any | None:
-        """Return a toolset object for LLM runtimes that support native toolsets.
+    @abstractmethod
+    def get_tools(self) -> list[Callable]:
+        """Return callable tool functions for LLM agents.
 
-        Toolsets are runtime-specific objects that expose multiple tools through
-        a single interface. The primary use case is MCP (Model Context Protocol)
-        servers, which provide dynamic tool discovery and execution.
-
-        Most tool implementations expose individual callable functions via
-        ``get_tools()`` and should return ``None`` from this method. Only
-        specialized tools that integrate with protocols like MCP need to
-        implement this method.
-
-        Returns:
-            Toolset object (e.g., MCPServer instance from pydantic-ai) if the tool
-            uses a native toolset protocol, or ``None`` for standard callable-based
-            tools.
-
-        Example:
-            Standard tool (returns None):
-
-            >>> class MyTool(BaseTool):
-            ...     def get_tools(self, observer):
-            ...         return [my_function]
-            ...     def get_toolset(self):
-            ...         return None  # Uses individual callables
-
-            MCP-based tool (returns toolset):
-
-            >>> class MCPTool(BaseTool):
-            ...     def get_tools(self, observer):
-            ...         return []  # No individual callables
-            ...     def get_toolset(self):
-            ...         return MCPServerStdio(...)  # Returns MCP server instance
+        Use ``self._observer`` when tool callables need to emit events.
         """
-        return None
+        ...
+
+    def get_system_prompts(self) -> list[Callable]:
+        """Return system prompt callables injected into LLM context.
+
+        Use ``self._observer`` when prompts need runtime data.
+        """
+        return []
+
+    def get_toolsets(self) -> list[Any]:
+        """Return runtime toolset objects (e.g., MCP servers)."""
+        return []
 
 
 class ToolFactory:
-    """Factory responsible for resolving and instantiating tool callables.
-
-    Supports two usage patterns:
-    - Build callables for a specific ``ToolCard``.
-    - Build callables for all cards provided at factory construction.
-    """
+    """Resolves ``ToolCard`` instances into callable tools, prompts, and toolsets."""
 
     def __init__(
         self,
@@ -117,60 +117,28 @@ class ToolFactory:
     ) -> None:
         """Create a factory for one or more tool cards.
 
+        Attaches the observer to every card (triggers runtime setup in
+        ``ToolCard.observer()``).
+
         Args:
             tool_cards: Tool cards to resolve into callable tools.
             observer: Optional observer notified by tool implementations during
                 tool calls.
         """
-
         self.tool_cards = tool_cards
         self.observer = observer
 
-    def get_tools(self, tool_card: ToolCard | None = None) -> list[Callable]:
-        """Resolve and return tool callables.
-
-        Args:
-            tool_card: Optional single tool card to resolve. When ``None``, all
-                cards from ``self.tool_cards`` are resolved and flattened.
-
-        Returns:
-            List of executable callables produced by the resolved tool classes.
-        """
-        if tool_card is not None:
-            tool_class = (
-                import_class(tool_card.module)
-                if isinstance(tool_card.module, str)
-                else tool_card.module
-            )
-            tool: BaseTool = tool_class(tool_card)
-            return tool.get_tools(self.observer)
-
-        tools = []
         for card in self.tool_cards:
-            tools.extend(self.get_tools(tool_card=card))
-        return tools
+            card.observer(self.observer)
 
-    def get_toolsets(self, tool_card: ToolCard | None = None) -> list[Any]:
-        """Resolve and return toolset instances.
+    def get_tools(self) -> list[Callable]:
+        """Return tool callables aggregated from all tool cards."""
+        return [t for card in self.tool_cards for t in card.get_tools()]
 
-        Args:
-            tool_card: Optional single tool card to resolve. When ``None``, all
-                cards from ``self.tool_cards`` are resolved and flattened.
+    def get_system_prompts(self) -> list[Callable]:
+        """Return system prompt callables aggregated from all tool cards."""
+        return [p for card in self.tool_cards for p in card.get_system_prompts()]
 
-        Returns:
-            List of non-None toolset objects exposed by tool implementations.
-        """
-        if tool_card is not None:
-            tool_class = (
-                import_class(tool_card.module)
-                if isinstance(tool_card.module, str)
-                else tool_card.module
-            )
-            tool: BaseTool = tool_class(tool_card)
-            toolset = tool.get_toolset()
-            return [toolset] if toolset is not None else []
-
-        toolsets: list[Any] = []
-        for card in self.tool_cards:
-            toolsets.extend(self.get_toolsets(tool_card=card))
-        return toolsets
+    def get_toolsets(self) -> list[Any]:
+        """Return toolset instances aggregated from all tool cards."""
+        return [ts for card in self.tool_cards for ts in card.get_toolsets()]

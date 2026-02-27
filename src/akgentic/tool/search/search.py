@@ -1,25 +1,28 @@
 from typing import Any, Callable, Literal
 
-from pydantic import BaseModel
 from tavily import TavilyClient
 
-from akgentic.tool.core import BaseTool
-from akgentic.tool.event import ToolCallEvent, ToolObserver
-
-ToolObsOrNone = ToolObserver | None
+from akgentic.tool.core import BaseToolParam, ToolCard, _resolve
+from akgentic.tool.event import ToolCallEvent
 
 
-class WebSearch(BaseModel):
+class WebSearch(BaseToolParam):
+    """Parameters for the web search capability."""
+
     max_results: int = 5
     search_depth: Literal["basic", "advanced"] | None = None
 
 
-class WebFetch(BaseModel):
+class WebFetch(BaseToolParam):
+    """Parameters for the web fetch (extract) capability."""
+
     timeout: float = 30
     extract_depth: Literal["basic", "advanced"] | None = None
 
 
-class WebCrawl(BaseModel):
+class WebCrawl(BaseToolParam):
+    """Parameters for the web crawl capability."""
+
     timeout: float = 150
     max_depth: int | None = None
     max_breadth: int | None = None
@@ -28,21 +31,31 @@ class WebCrawl(BaseModel):
     extract_depth: Literal["basic", "advanced"] | None = None
 
 
-class SearchTool(BaseTool):
-    def get_tools(self, observer: ToolObsOrNone) -> list[Callable]:
+class SearchTool(ToolCard):
+    """Web search, fetch, and crawl capabilities via Tavily."""
 
-        tools = []
-        for params in self.tool_card.params or []:
-            if isinstance(params, WebSearch):
-                tools.append(self.web_search_factory(params, observer))
-            if isinstance(params, WebFetch):
-                tools.append(self.web_fetch_factory(params, observer))
-            if isinstance(params, WebCrawl):
-                tools.append(self.web_crawl_factory(params, observer))
+    name: str = "Web Search"
+    description: str = "Search the web for current information"
 
+    web_search: WebSearch | bool = True
+    web_crawl: WebCrawl | bool = True
+    web_fetch: WebFetch | bool = True
+
+    def get_tools(self) -> list[Callable]:
+        tools: list[Callable] = []
+        ws = _resolve(self.web_search, WebSearch)
+        if ws and ws.llm_tool:
+            tools.append(self._web_search_factory(ws))
+        wc = _resolve(self.web_crawl, WebCrawl)
+        if wc and wc.llm_tool:
+            tools.append(self._web_crawl_factory(wc))
+        wf = _resolve(self.web_fetch, WebFetch)
+        if wf and wf.llm_tool:
+            tools.append(self._web_fetch_factory(wf))
         return tools
 
-    def web_search_factory(self, params: WebSearch, observer: ToolObsOrNone) -> Callable:
+    def _web_search_factory(self, params: WebSearch) -> Callable:
+        observer = self._observer
 
         def web_search_tool(
             query: str,
@@ -85,9 +98,12 @@ class SearchTool(BaseTool):
                 **search_kwargs,
             )
 
+        if params.description:
+            web_search_tool.__doc__ = params.description
         return web_search_tool
 
-    def web_fetch_factory(self, params: WebFetch, observer: ToolObsOrNone) -> Callable:
+    def _web_fetch_factory(self, params: WebFetch) -> Callable:
+        observer = self._observer
 
         def web_fetch_tool(
             urls: list[str],
@@ -131,9 +147,12 @@ class SearchTool(BaseTool):
                 **fetch_kwargs,
             )
 
+        if params.description:
+            web_fetch_tool.__doc__ = params.description
         return web_fetch_tool
 
-    def web_crawl_factory(self, params: WebCrawl, observer: ToolObsOrNone) -> Callable:
+    def _web_crawl_factory(self, params: WebCrawl) -> Callable:
+        observer = self._observer
 
         def web_crawl_tool(
             url: str,
@@ -196,4 +215,6 @@ class SearchTool(BaseTool):
                 **crawl_kwargs,
             )
 
+        if params.description:
+            web_crawl_tool.__doc__ = params.description
         return web_crawl_tool
