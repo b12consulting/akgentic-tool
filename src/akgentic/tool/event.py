@@ -78,7 +78,7 @@ class TeamManagementToolObserver(ActorToolObserver, Protocol):
     actor system.
     """
 
-    def createActor(
+    def createActor(  # noqa: N802
         self,
         actor_class: type[AkgentType],
         *,
@@ -92,23 +92,6 @@ class TeamManagementToolObserver(ActorToolObserver, Protocol):
 
         Returns:
             Address of the newly created actor
-        """
-        ...
-
-    def send(self, target: ActorAddress, message: object) -> None:
-        """Send a message to another actor.
-
-        Args:
-            target: Address of the target actor
-            message: Message to send
-        """
-        ...
-
-    def stop(self, target: ActorAddress) -> None:
-        """Stop an actor and its children recursively.
-
-        Args:
-            target: Address of the actor to stop
         """
         ...
 

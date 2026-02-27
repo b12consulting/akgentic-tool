@@ -12,7 +12,7 @@ from typing import Any, Callable, TypeVar
 
 from pydantic import BaseModel
 
-from akgentic.tool.errors import ToolError
+from akgentic.tool.errors import RetriableError
 from akgentic.tool.event import ToolObserver
 
 T = TypeVar("T", bound="BaseToolParam")
@@ -161,7 +161,7 @@ class ToolFactory:
         def wrapper(*args, **kwargs):
             try:
                 return fn(*args, **kwargs)
-            except ToolError as e:
+            except RetriableError as e:
                 raise retry_exc(str(e)) from e
 
         return wrapper

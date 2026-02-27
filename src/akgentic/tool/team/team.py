@@ -6,14 +6,13 @@ that can be attached to any agent.
 
 import logging
 import random
-import re
 from typing import Callable
 
 from pydantic import Field
 
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.tool.core import BaseToolParam, ToolCard, _resolve
-from akgentic.tool.errors import ToolError
+from akgentic.tool.errors import RetriableError
 from akgentic.tool.event import TeamManagementToolObserver, ToolCallEvent
 
 logger = logging.getLogger(__name__)
@@ -47,7 +46,7 @@ class TeamTool(ToolCard):
     """Team management tool for hiring, firing, and team awareness.
 
     Provides:
-    - hire_members(roles: list[str]) -> list[str]: Hire team members
+    - hire_members(roles: list[str]) -> str: Hire team members
     - fire_members(names: list[str]) -> str: Fire team members
     - Team roster system prompt: Current team composition
     - Role profiles system prompt: Available roles and descriptions
@@ -62,11 +61,11 @@ class TeamTool(ToolCard):
     fire_team_members: FireTeamMembers | bool = Field(
         default=True, description="Enable firing team members (default: True)"
     )
-    get_team_roster: GetTeamRoster | bool = Field(
-        default=True, description="Include team roster in system prompt (default: True)"
-    )
     get_role_profiles: GetRoleProfiles | bool = Field(
         default=True, description="Include role profiles in system prompt (default: True)"
+    )
+    get_team_roster: GetTeamRoster | bool = Field(
+        default=True, description="Include team roster in system prompt (default: True)"
     )
 
     def observer(self, observer: TeamManagementToolObserver) -> "TeamTool":
@@ -153,6 +152,9 @@ class TeamTool(ToolCard):
             Returns:
                 Confirmation message with hired member names (e.g., 'Members hired: [@Developer123, @Tester456]')
             """
+            if not roles:
+                raise RetriableError("No roles provided. Specify at least one role to hire.")
+
             observer.notify_event(
                 ToolCallEvent(tool_name="hire_members", args=[], kwargs={"roles": roles})
             )
@@ -160,6 +162,7 @@ class TeamTool(ToolCard):
             hired_members = []
             errors = []
             agent_catalog = orchestrator_proxy.get_agent_catalog()
+            existing_names = {member.name for member in orchestrator_proxy.get_team()}
 
             for role in roles:
                 # Get agent card for role from catalog
@@ -170,14 +173,20 @@ class TeamTool(ToolCard):
 
                 # Create child agent using agent primitive
                 # agent_class can be str | type, but in production it should be a type
-                actor_class = agent_card.agent_class
+                actor_class = agent_card.get_agent_class()
                 if isinstance(actor_class, str):
+                    ## The llm cannot retry, so raise a ValueError
                     raise ValueError(
                         f"Hire error - agent class for role {role} is a string, not a type. "
                     )
 
-                # Generate name
-                child_name = f"@{role.replace(' ', '')}{random.randint(100, 999)}"
+                # Generate unique name: random, increment on collision
+                role_prefix = f"@{role.replace(' ', '')}"
+                suffix = random.randint(100, 999)
+                child_name = f"{role_prefix}{suffix}"
+                while child_name in existing_names:
+                    suffix += 1
+                    child_name = f"{role_prefix}{suffix}"
 
                 # Create config
                 agent_card_config = agent_card.get_config_copy()
@@ -189,6 +198,7 @@ class TeamTool(ToolCard):
                 # Call agent hook
                 observer.on_hire(child_name, child_address)
 
+                existing_names.add(child_name)
                 hired_members.append(child_name)
                 logger.info(f"Hired {role} agent: {child_name} at {child_address}")
 
@@ -201,7 +211,7 @@ class TeamTool(ToolCard):
                     error_message = (
                         f"Partial success - Members hired: {hired_members}. " + error_message
                     )
-                raise ToolError(error_message)
+                raise RetriableError(error_message)
 
             return f"Members hired: {hired_members}"
 
@@ -235,6 +245,9 @@ class TeamTool(ToolCard):
             Returns:
                 Combined confirmation messages (e.g., "Member @Developer123 has been fired. - ...")
             """
+            if not names:
+                raise RetriableError("No names provided. Specify at least one member name to fire.")
+
             observer.notify_event(
                 ToolCallEvent(tool_name="fire_members", args=[], kwargs={"names": names})
             )
@@ -250,7 +263,7 @@ class TeamTool(ToolCard):
                     continue
 
                 # Stop actor using agent primitive
-                observer.stop(address)
+                address.stop()
 
                 # Call agent hook
                 observer.on_fire(name, address)
@@ -267,7 +280,7 @@ class TeamTool(ToolCard):
                     error_message = (
                         f"Partial success - Members fired: {fired_members}. " + error_message
                     )
-                raise ToolError(error_message)
+                raise RetriableError(error_message)
 
             return f"Members fired: {', '.join(fired_members)}"
 
@@ -312,6 +325,7 @@ class TeamTool(ToolCard):
 
                 return "Team members:\n" + "\n".join(team_members_names)
             except Exception:
+                logger.error("Failed to get team roster", exc_info=True)
                 return "Cannot get team roster..."
 
         return team_roster_prompt
@@ -351,6 +365,7 @@ class TeamTool(ToolCard):
 
                 return "Available team roles:\n" + "\n".join(profiles)
             except Exception:
+                logger.error("Failed to get role profiles", exc_info=True)
                 return "Cannot get role profiles..."
 
         return role_profiles_prompt

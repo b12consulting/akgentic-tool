@@ -60,9 +60,7 @@ class PlanningTool(ToolCard):
         planning_tool_addr = orchestrator_proxy_ask.get_team_member(PLANNING_ACTOR_NAME)
 
         if planning_tool_addr is None:
-            logger.info(
-                f"PlanningTool actor not found in team, creating new one at {PLANNING_ACTOR_NAME}."
-            )
+            logger.info(f"PlanningTool: create {PLANNING_ACTOR_NAME}.")
             planning_tool_addr = orchestrator_proxy_ask.createActor(
                 PlanActor, config=BaseConfig(name=PLANNING_ACTOR_NAME, role=PLANNING_ACTOR_ROLE)
             )

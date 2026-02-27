@@ -3,7 +3,7 @@
 # Submodules with their own __init__ files
 from . import mcp, planning, search, team
 from .core import BaseToolParam, ToolCard, ToolFactory
-from .errors import ToolError
+from .errors import RetriableError
 from .event import (
     ActorToolObserver,
     TeamManagementToolObserver,
@@ -17,7 +17,7 @@ __all__ = [
     "ToolCard",
     "ToolFactory",
     # Errors
-    "ToolError",
+    "RetriableError",
     # Events and observers
     "ToolCallEvent",
     "ToolObserver",

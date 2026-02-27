@@ -11,7 +11,7 @@ from akgentic.core.agent_card import AgentCard
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.orchestrator import Orchestrator
 
-from akgentic.tool.errors import ToolError
+from akgentic.tool.errors import RetriableError
 from akgentic.tool.event import TeamManagementToolObserver
 from akgentic.tool.team import (
     FireTeamMembers,
@@ -46,6 +46,7 @@ def mock_observer() -> Mock:
 
     # Mock orchestrator proxy
     orchestrator_mock = Mock(spec=Orchestrator)
+    orchestrator_mock.get_team.return_value = []
     observer.proxy_ask.return_value = orchestrator_mock
 
     return observer
@@ -116,6 +117,7 @@ def test_hire_members_tool_execution():
     orchestrator_mock = Mock(spec=Orchestrator)
     orchestrator_mock.get_available_roles.return_value = ["Developer"]
     orchestrator_mock.get_agent_catalog.return_value = [agent_card]
+    orchestrator_mock.get_team.return_value = []
 
     observer_mock = Mock(spec=TeamManagementToolObserver)
     observer_mock.orchestrator = create_test_address("@Orchestrator", "Orchestrator")
@@ -137,11 +139,32 @@ def test_hire_members_tool_execution():
     observer_mock.notify_event.assert_called()
 
 
+def test_hire_members_empty_list():
+    """hire_members raises ToolError for empty roles list."""
+    tool = TeamTool()
+    tool.observer(mock_observer())
+    hire_members = tool.get_tools()[0]
+
+    with pytest.raises(RetriableError, match="No roles provided"):
+        hire_members([])
+
+
+def test_fire_members_empty_list():
+    """fire_members raises ToolError for empty names list."""
+    tool = TeamTool()
+    tool.observer(mock_observer())
+    fire_members = tool.get_tools()[1]
+
+    with pytest.raises(RetriableError, match="No names provided"):
+        fire_members([])
+
+
 def test_hire_members_invalid_role():
     """hire_members raises ToolError for invalid role."""
     orchestrator_mock = Mock(spec=Orchestrator)
     orchestrator_mock.get_available_roles.return_value = ["Developer"]
     orchestrator_mock.get_agent_catalog.return_value = []  # Empty catalog
+    orchestrator_mock.get_team.return_value = []
 
     observer_mock = Mock(spec=TeamManagementToolObserver)
     observer_mock.orchestrator = create_test_address("@Orchestrator", "Orchestrator")
@@ -151,20 +174,21 @@ def test_hire_members_invalid_role():
     tool.observer(observer_mock)
     hire_members = tool.get_tools()[0]
 
-    with pytest.raises(ToolError, match="cannot find agent card"):
+    with pytest.raises(RetriableError, match="cannot find agent card"):
         hire_members(["InvalidRole"])
 
 
 def test_hire_members_string_agent_class():
-    """hire_members raises ValueError if agent_class is a string (non-recoverable config error)."""
-    # Mock AgentCard with string agent_class
+    """hire_members raises ValueError if get_agent_class() returns a string (non-recoverable config error)."""
+    # Mock AgentCard with get_agent_class returning a string
     agent_card = Mock(spec=AgentCard)
     agent_card.role = "Developer"
-    agent_card.agent_class = "some.module.Agent"  # String instead of type
+    agent_card.get_agent_class.return_value = "some.module.Agent"  # String instead of type
 
     orchestrator_mock = Mock(spec=Orchestrator)
     orchestrator_mock.get_available_roles.return_value = ["Developer"]
     orchestrator_mock.get_agent_catalog.return_value = [agent_card]
+    orchestrator_mock.get_team.return_value = []
 
     observer_mock = Mock(spec=TeamManagementToolObserver)
     observer_mock.orchestrator = create_test_address("@Orchestrator", "Orchestrator")
@@ -180,11 +204,13 @@ def test_hire_members_string_agent_class():
 
 
 def test_fire_members_tool_execution():
-    """fire_members looks up address, calls observer.stop(), calls on_fire hook."""
+    """fire_members looks up address, calls address.stop(), calls on_fire hook."""
+    member_address = Mock()
+    member_address.name = "@Developer123"
+    member_address.role = "Developer"
+
     orchestrator_mock = Mock(spec=Orchestrator)
-    orchestrator_mock.get_team_member.return_value = create_test_address(
-        "@Developer123", "Developer"
-    )
+    orchestrator_mock.get_team_member.return_value = member_address
 
     observer_mock = Mock(spec=TeamManagementToolObserver)
     observer_mock.orchestrator = create_test_address("@Orchestrator", "Orchestrator")
@@ -199,7 +225,7 @@ def test_fire_members_tool_execution():
     assert "Developer123" in result
     assert "fired" in result.lower()
     orchestrator_mock.get_team_member.assert_called_once_with("@Developer123")
-    observer_mock.stop.assert_called_once()  # Agent primitive called
+    member_address.stop.assert_called_once()  # address.stop() called
     observer_mock.on_fire.assert_called_once()  # Hook called
     observer_mock.notify_event.assert_called()
 
@@ -218,7 +244,7 @@ def test_fire_members_not_found():
     tool.observer(observer_mock)
     fire_members = tool.get_tools()[1]
 
-    with pytest.raises(ToolError, match="Fire errors"):
+    with pytest.raises(RetriableError, match="Fire errors"):
         fire_members(["@Developer123"])
 
 
@@ -367,6 +393,7 @@ def test_hire_members_batch_with_multiple_errors():
     orchestrator_mock = Mock(spec=Orchestrator)
     orchestrator_mock.get_available_roles.return_value = ["Developer"]
     orchestrator_mock.get_agent_catalog.return_value = []  # Empty catalog - no cards found
+    orchestrator_mock.get_team.return_value = []
 
     observer_mock = Mock(spec=TeamManagementToolObserver)
     observer_mock.orchestrator = create_test_address("@Orchestrator", "Orchestrator")
@@ -377,7 +404,7 @@ def test_hire_members_batch_with_multiple_errors():
     hire_members = tool.get_tools()[0]
 
     # Try to hire multiple invalid roles
-    with pytest.raises(ToolError) as exc_info:
+    with pytest.raises(RetriableError) as exc_info:
         hire_members(["InvalidRole1", "InvalidRole2"])
 
     # Should contain both errors
@@ -397,6 +424,7 @@ def test_hire_members_batch_partial_success():
     orchestrator_mock = Mock(spec=Orchestrator)
     orchestrator_mock.get_available_roles.return_value = ["Developer"]
     orchestrator_mock.get_agent_catalog.return_value = [agent_card]
+    orchestrator_mock.get_team.return_value = []
 
     observer_mock = Mock(spec=TeamManagementToolObserver)
     observer_mock.orchestrator = create_test_address("@Orchestrator", "Orchestrator")
@@ -409,7 +437,7 @@ def test_hire_members_batch_partial_success():
     hire_members = tool.get_tools()[0]
 
     # Mix valid and invalid roles
-    with pytest.raises(ToolError) as exc_info:
+    with pytest.raises(RetriableError) as exc_info:
         hire_members(["Developer", "InvalidRole"])
 
     # Should have hired the valid one before failing
@@ -434,7 +462,7 @@ def test_fire_members_batch_with_multiple_errors():
     fire_members = tool.get_tools()[1]
 
     # Try to fire multiple non-existent members
-    with pytest.raises(ToolError) as exc_info:
+    with pytest.raises(RetriableError) as exc_info:
         fire_members(["@NonExistent1", "@NonExistent2"])
 
     # Should contain both errors
@@ -446,11 +474,15 @@ def test_fire_members_batch_with_multiple_errors():
 
 def test_fire_members_batch_partial_success():
     """fire_members continues on errors and fires valid members."""
+    valid_address = Mock()
+    valid_address.name = "@Valid123"
+    valid_address.role = "Developer"
+
     orchestrator_mock = Mock(spec=Orchestrator)
 
     def get_member_side_effect(name):
         if name == "@Valid123":
-            return create_test_address("@Valid123", "Developer")
+            return valid_address
         return None
 
     orchestrator_mock.get_team_member.side_effect = get_member_side_effect
@@ -465,11 +497,11 @@ def test_fire_members_batch_partial_success():
     fire_members = tool.get_tools()[1]
 
     # Mix valid and invalid members
-    with pytest.raises(ToolError) as exc_info:
+    with pytest.raises(RetriableError) as exc_info:
         fire_members(["@Valid123", "@NonExistent"])
 
     # Should have stopped the valid one before failing
-    assert observer_mock.stop.call_count == 1
+    valid_address.stop.assert_called_once()
     # Error should mention partial success and the invalid member
     assert "Partial success" in str(exc_info.value)
     assert "NonExistent" in str(exc_info.value)
