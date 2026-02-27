@@ -1,7 +1,7 @@
 import logging
 from typing import Callable
 
-from pydantic import Field, PrivateAttr
+from pydantic import Field
 
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.orchestrator import Orchestrator
@@ -23,7 +23,7 @@ class GetPlanning(BaseToolParam):
     llm_tool: bool = False
 
 
-class GetPlanningItem(BaseToolParam):
+class GetPlanningTask(BaseToolParam):
     """Get a single task by ID."""
 
     pass
@@ -44,7 +44,7 @@ class PlanningTool(ToolCard):
     get_planning: GetPlanning | bool = Field(
         default=True, description="By default the plan in included in the system prompt"
     )
-    get_planning_task: GetPlanningItem | bool = True
+    get_planning_task: GetPlanningTask | bool = True
     update_planning: UpdatePlanning | bool = True
 
     def observer(self, observer: ActorToolObserver):
@@ -98,7 +98,7 @@ class PlanningTool(ToolCard):
         if gp and gp.llm_tool:
             tools.append(self._get_planning_factory(gp))
 
-        gpi = _resolve(self.get_planning_task, GetPlanningItem)
+        gpi = _resolve(self.get_planning_task, GetPlanningTask)
         if gpi and gpi.llm_tool:
             tools.append(self._get_planning_task_factory(gpi))
 
@@ -121,7 +121,7 @@ class PlanningTool(ToolCard):
         get_planning.__doc__ = params.format_docstring(get_planning.__doc__)
         return get_planning
 
-    def _get_planning_task_factory(self, params: GetPlanningItem) -> Callable:
+    def _get_planning_task_factory(self, params: GetPlanningTask) -> Callable:
         planning_proxy = self._planning_proxy
         observer = self._observer
 
