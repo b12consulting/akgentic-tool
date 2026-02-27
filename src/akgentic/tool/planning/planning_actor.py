@@ -8,23 +8,23 @@ from akgentic.core.agent import Akgent, BaseConfig, BaseState
 from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.errors import ToolError
 
-PlanStatus = Literal["pending", "started", "completed", "abort"]
+TaskStatus = Literal["pending", "started", "completed", "abort"]
 
 
-class PlanItemCreate(SerializableBaseModel):
-    id: int = Field(..., description="Unique identifier of the plan item.")
-    status: PlanStatus = Field(..., description="Status of the task.")
+class TaskCreate(SerializableBaseModel):
+    id: int = Field(..., description="Unique identifier of the task.")
+    status: TaskStatus = Field(..., description="Status of the task.")
     description: str = Field(..., max_length=300, description="Short description of the task.")
     owner: str = Field(..., description="Assigned team member name; empty if not yet assigned.")
     dependencies: list[int] = Field(
         default_factory=list,
-        description="List of plan item IDs that must be completed before this one.",
+        description="List of task IDs that must be completed before this one.",
     )
 
 
-class PlanItemUpdate(SerializableBaseModel):
-    id: int = Field(..., description="Unique identifier of the plan item.")
-    status: PlanStatus | None = Field(default=None, description="New status of the task.")
+class TaskUpdate(SerializableBaseModel):
+    id: int = Field(..., description="Unique identifier of the task.")
+    status: TaskStatus | None = Field(default=None, description="New status of the task.")
     description: str | None = Field(
         default=None, max_length=300, description="New description of the task."
     )
@@ -34,13 +34,13 @@ class PlanItemUpdate(SerializableBaseModel):
     owner: str | None = Field(default=None, description="New assigned team member name;")
     dependencies: list[int] | None = Field(
         default=None,
-        description="New list of plan item IDs that must be completed first.",
+        description="New list of task IDs that must be completed first.",
     )
 
 
-class PlanItem(PlanItemCreate):
+class Task(TaskCreate):
     output: str = Field(default="", description="Output or result of the task.")
-    creator: str = Field(default="", description="Team member name who creates the plan item.")
+    creator: str = Field(default="", description="Team member name who creates the task.")
     updated_at: datetime.datetime = Field(
         default_factory=lambda: datetime.datetime.now(datetime.UTC),
         description="ISO timestamp of the last update.",
@@ -48,19 +48,19 @@ class PlanItem(PlanItemCreate):
 
 
 class UpdatePlan(BaseModel):
-    create_items: list[PlanItemCreate] = Field(
-        default_factory=list, description="Items to add to the plan."
+    create_tasks: list[TaskCreate] = Field(
+        default_factory=list, description="Tasks to add to the plan."
     )
-    update_items: list[PlanItemUpdate] = Field(
-        default_factory=list, description="Items to update in the plan."
+    update_tasks: list[TaskUpdate] = Field(
+        default_factory=list, description="Tasks to update in the plan."
     )
-    delete_items: list[int] = Field(
-        default_factory=list, description="Items to remove from the plan."
+    delete_tasks: list[int] = Field(
+        default_factory=list, description="Tasks to remove from the plan."
     )
 
 
 class PlanManagerState(BaseState):
-    item_list: list[PlanItem] = Field(default_factory=list)
+    task_list: list[Task] = Field(default_factory=list)
 
 
 class PlanActor(Akgent[BaseConfig, PlanManagerState]):
@@ -80,52 +80,52 @@ class PlanActor(Akgent[BaseConfig, PlanManagerState]):
         self.state = PlanManagerState()
         self.state.observer(self)
 
-    def _create_item(self, item_create: PlanItemCreate, actor_address: ActorAddress) -> None:
-        new_item = PlanItem(**item_create.__dict__, creator=actor_address.name)
-        self.state.item_list.append(new_item)
+    def _create_task(self, task: TaskCreate, actor_address: ActorAddress) -> None:
+        new_task = Task(**task.__dict__, creator=actor_address.name)
+        self.state.task_list.append(new_task)
 
-    def _update_item(self, item_update: PlanItemUpdate) -> None | str:
+    def _update_task(self, task_update: TaskUpdate) -> None | str:
         # Use __dict__ to get raw values, filter out None to only apply explicitly set fields
-        updates = {k: v for k, v in item_update.__dict__.items() if v is not None}
-        for idx, item in enumerate(self.state.item_list):
-            if item.id == item_update.id:
-                self.state.item_list[idx] = item.model_copy(update=updates)
+        updates = {k: v for k, v in task_update.__dict__.items() if v is not None}
+        for idx, task in enumerate(self.state.task_list):
+            if task.id == task_update.id:
+                self.state.task_list[idx] = task.model_copy(update=updates)
                 return
-        return f"Update error - no item with ID {item_update.id} found."
+        return f"Update error - no task with ID {task_update.id} found."
 
     ##
     ## Tools to expose to agents:
     ##
-    def get_planning(self) -> list[PlanItem]:
-        """Get the current plan items."""
-        return self.state.item_list
+    def get_planning(self) -> list[Task]:
+        """Get the current plan tasks."""
+        return self.state.task_list
 
-    def get_planning_item(self, item_id: int) -> PlanItem | str:
-        """Get a specific plan item by ID."""
-        item_list = self.state.item_list
-        return next((item for item in item_list if item.id == item_id), "No item with that ID.")
+    def get_planning_task(self, task_id: int) -> Task | str:
+        """Get a specific plan task by ID."""
+        task_list = self.state.task_list
+        return next((task for task in task_list if task.id == task_id), "No task with that ID.")
 
     def update_planning(self, update: UpdatePlan, actor_address: ActorAddress) -> str:
-        """Update the plan with new, updated, or deleted items."""
+        """Update the plan with new, updated, or deleted task."""
 
         errors = []
 
-        # Handle item creation
-        for item_create in update.create_items:
-            self._create_item(item_create, actor_address)
+        # Handle task creation
+        for task_create in update.create_tasks:
+            self._create_task(task_create, actor_address)
 
-        # Handle item updates
-        for item_update in update.update_items:
-            error = self._update_item(item_update)
+        # Handle task updates
+        for task_update in update.update_tasks:
+            error = self._update_task(task_update)
             if error is not None:
                 errors.append(error)
 
-        # Handle item deletions
-        for item_id in update.delete_items:
-            if not any(item.id == item_id for item in self.state.item_list):
-                errors.append(f"Delete error - no item with ID {item_id} found.")
+        # Handle task deletions
+        for task_id in update.delete_tasks:
+            if not any(task.id == task_id for task in self.state.task_list):
+                errors.append(f"Delete error - no task with ID {task_id} found.")
             else:
-                self.state.item_list = [item for item in self.state.item_list if item.id != item_id]
+                self.state.task_list = [task for task in self.state.task_list if task.id != task_id]
 
         self.state.notify_state_change()
 

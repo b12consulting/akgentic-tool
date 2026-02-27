@@ -1,13 +1,13 @@
 import logging
 from typing import Callable
 
-from pydantic import Field
+from pydantic import Field, PrivateAttr
 
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.tool.core import BaseToolParam, ToolCard, _resolve
 from akgentic.tool.event import ActorToolObserver, ToolCallEvent
-from akgentic.tool.planning.planning_actor import PlanActor, PlanItem, UpdatePlan
+from akgentic.tool.planning.planning_actor import PlanActor, Task, UpdatePlan
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -24,13 +24,13 @@ class GetPlanning(BaseToolParam):
 
 
 class GetPlanningItem(BaseToolParam):
-    """Get a single planning item by ID."""
+    """Get a single task by ID."""
 
     pass
 
 
 class UpdatePlanning(BaseToolParam):
-    """Update planning items."""
+    """Update tasks."""
 
     pass
 
@@ -44,18 +44,15 @@ class PlanningTool(ToolCard):
     get_planning: GetPlanning | bool = Field(
         default=True, description="By default the plan in included in the system prompt"
     )
-    get_planning_item: GetPlanningItem | bool = True
+    get_planning_task: GetPlanningItem | bool = True
     update_planning: UpdatePlanning | bool = True
 
-
-    def observer(self, observer: ActorToolObserver) -> "PlanningTool":
+    def observer(self, observer: ActorToolObserver):
         """Attach observer and set up the planning actor proxy.
 
         Requires an ActorToolObserver for actor system access.
         """
-        super().observer(observer)
-        if observer is None:
-            raise ValueError("PlanningTool requires an ActorToolObserver to function.")
+        self._observer = observer
         if observer.orchestrator is None:
             raise ValueError("PlanningTool requires access to the orchestrator.")
 
@@ -83,10 +80,10 @@ class PlanningTool(ToolCard):
                     return "No current Team planning."
                 return "Team planning:\n" + "\n".join(
                     [
-                        f"- ID {item.id} [{item.status}] {item.description} "
-                        f"{item.output and f'— Output: {item.output} '}"
-                        f"(Owner: {item.owner}, Creator: {item.creator})"
-                        for item in planning
+                        f"- ID {task.id} [{task.status}] {task.description} "
+                        f"{task.output and f'— Output: {task.output} '}"
+                        f"(Owner: {task.owner}, Creator: {task.creator})"
+                        for task in planning
                     ]
                 )
 
@@ -102,9 +99,9 @@ class PlanningTool(ToolCard):
         if gp and gp.llm_tool:
             tools.append(self._get_planning_factory(gp))
 
-        gpi = _resolve(self.get_planning_item, GetPlanningItem)
+        gpi = _resolve(self.get_planning_task, GetPlanningItem)
         if gpi and gpi.llm_tool:
-            tools.append(self._get_planning_item_factory(gpi))
+            tools.append(self._get_planning_task_factory(gpi))
 
         up = _resolve(self.update_planning, UpdatePlanning)
         if up and up.llm_tool:
@@ -116,7 +113,7 @@ class PlanningTool(ToolCard):
         planning_proxy = self._planning_proxy
         observer = self._observer
 
-        def get_planning() -> list[PlanItem]:
+        def get_planning() -> list[Task]:
             """Get the full team planning."""
             if observer is not None:
                 observer.notify_event(ToolCallEvent(tool_name="Get planning", args=[], kwargs={}))
@@ -126,28 +123,28 @@ class PlanningTool(ToolCard):
             get_planning.__doc__ = params.description
         return get_planning
 
-    def _get_planning_item_factory(self, params: GetPlanningItem) -> Callable:
+    def _get_planning_task_factory(self, params: GetPlanningItem) -> Callable:
         planning_proxy = self._planning_proxy
         observer = self._observer
 
-        def get_planning_item(item_id: int) -> PlanItem | str:
-            """Get a single team planning item by its ID."""
+        def get_planning_task(task_id: int) -> Task | str:
+            """Get a single team task by its ID."""
             if observer is not None:
                 observer.notify_event(
-                    ToolCallEvent(tool_name="Get planning item", args=[item_id], kwargs={})
+                    ToolCallEvent(tool_name="Get task", args=[task_id], kwargs={})
                 )
-            return planning_proxy.get_planning_item(item_id)
+            return planning_proxy.get_planning_task(task_id)
 
         if params.description:
-            get_planning_item.__doc__ = params.description
-        return get_planning_item
+            get_planning_task.__doc__ = params.description
+        return get_planning_task
 
     def _update_planning_factory(self, params: UpdatePlanning) -> Callable:
         planning_proxy = self._planning_proxy
         observer = self._observer
 
         def update_planning(update: UpdatePlan) -> str:
-            """Update team planning items (create, update, delete).
+            """Update team tasks (create, update, delete).
 
             When you start or complete a task from the planning,
             do not forget to update the plan with the new status
@@ -157,7 +154,7 @@ class PlanningTool(ToolCard):
                 observer.notify_event(
                     ToolCallEvent(tool_name="Update planning", args=[update], kwargs={})
                 )
-            ## Then observer.myAddress is used to set the creator of any new items in the plan.
+            ## Then observer.myAddress is used to set the creator of any new tasks in the plan.
             return planning_proxy.update_planning(update, observer.myAddress)
 
         if params.description:
