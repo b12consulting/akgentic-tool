@@ -144,7 +144,7 @@ class PlanningTool(ToolCard):
 
     def _update_planning_factory(self, params: UpdatePlanning) -> Callable:
         planning_proxy = self._planning_proxy
-        observer = self._observe
+        observer = self._observer
 
         def update_planning(update: UpdatePlan) -> str:
             """Update team planning items (create, update, delete).
