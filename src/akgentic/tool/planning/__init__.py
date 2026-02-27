@@ -2,7 +2,7 @@
 
 from .planning import (
     GetPlanning,
-    GetPlanningItem,
+    GetPlanningTask,
     PlanningTool,
     UpdatePlanning,
 )
@@ -10,7 +10,7 @@ from .planning_actor import PlanManagerState
 
 __all__ = [
     "GetPlanning",
-    "GetPlanningItem",
+    "GetPlanningTask",
     "PlanManagerState",
     "PlanningTool",
     "UpdatePlanning",
