@@ -120,11 +120,12 @@ class PlanActor(Akgent[BaseConfig, PlanManagerState]):
                 errors.append(error)
 
         # Handle item deletions
-        for item_id in update.delete_items:
-            if not any(item.id == item_id for item in self.state.item_list):
-                errors.append(f"Delete error - no item with ID {item_id} found.")
-            else:
-                self.state.item_list = [item for item in self.state.item_list if item.id != item_id]
+        items_to_delete = set(update.delete_items)
+        existing_ids = {item.id for item in self.state.item_list}
+        for item_id in items_to_delete - existing_ids:
+            errors.append(f"Delete error - no item with ID {item_id} found.")
+        valid_deletes = items_to_delete & existing_ids
+        self.state.item_list = [item for item in self.state.item_list if item.id not in valid_deletes]
 
         self.state.notify_state_change()
         return "Done" if not errors else "Done with errors: " + "; ".join(errors)
