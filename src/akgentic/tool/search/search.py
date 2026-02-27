@@ -98,8 +98,7 @@ class SearchTool(ToolCard):
                 **search_kwargs,
             )
 
-        if params.description:
-            web_search_tool.__doc__ = params.description
+        web_search_tool.__doc__ = params.format_docstring(web_search_tool.__doc__)
         return web_search_tool
 
     def _web_fetch_factory(self, params: WebFetch) -> Callable:
@@ -147,8 +146,7 @@ class SearchTool(ToolCard):
                 **fetch_kwargs,
             )
 
-        if params.description:
-            web_fetch_tool.__doc__ = params.description
+        web_fetch_tool.__doc__ = params.format_docstring(web_fetch_tool.__doc__)
         return web_fetch_tool
 
     def _web_crawl_factory(self, params: WebCrawl) -> Callable:
@@ -215,6 +213,5 @@ class SearchTool(ToolCard):
                 **crawl_kwargs,
             )
 
-        if params.description:
-            web_crawl_tool.__doc__ = params.description
+        web_crawl_tool.__doc__ = params.format_docstring(web_crawl_tool.__doc__)
         return web_crawl_tool

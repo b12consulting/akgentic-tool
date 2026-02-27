@@ -87,8 +87,7 @@ class PlanningTool(ToolCard):
                     ]
                 )
 
-            if gp.description:
-                team_planning.__doc__ = gp.description
+            team_planning.__doc__ = gp.format_docstring(team_planning.__doc__)
             return [team_planning]
         return []
 
@@ -119,8 +118,7 @@ class PlanningTool(ToolCard):
                 observer.notify_event(ToolCallEvent(tool_name="Get planning", args=[], kwargs={}))
             return planning_proxy.get_planning()
 
-        if params.description:
-            get_planning.__doc__ = params.description
+        get_planning.__doc__ = params.format_docstring(get_planning.__doc__)
         return get_planning
 
     def _get_planning_task_factory(self, params: GetPlanningItem) -> Callable:
@@ -135,8 +133,7 @@ class PlanningTool(ToolCard):
                 )
             return planning_proxy.get_planning_task(task_id)
 
-        if params.description:
-            get_planning_task.__doc__ = params.description
+        get_planning_task.__doc__ = params.format_docstring(get_planning_task.__doc__)
         return get_planning_task
 
     def _update_planning_factory(self, params: UpdatePlanning) -> Callable:
@@ -150,13 +147,11 @@ class PlanningTool(ToolCard):
             do not forget to update the plan with the new status
             and output of the task.
             """
-            if observer is not None:
-                observer.notify_event(
-                    ToolCallEvent(tool_name="Update planning", args=[update], kwargs={})
-                )
+            observer.notify_event(
+                ToolCallEvent(tool_name="Update planning", args=[update], kwargs={})
+            )
             ## Then observer.myAddress is used to set the creator of any new tasks in the plan.
             return planning_proxy.update_planning(update, observer.myAddress)
 
-        if params.description:
-            update_planning.__doc__ = params.description
+        update_planning.__doc__ = params.format_docstring(update_planning.__doc__)
         return update_planning

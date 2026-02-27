@@ -43,11 +43,11 @@ class BaseToolParam(BaseModel):
     to the LLM and how its description can be customized.
     """
 
-    description: str | None = None
-    """Override the default LLM-facing docstring for this tool.
+    instructions: str | None = None
+    """Additional instructions appended to the default tool docstring.
 
-    When set, the factory uses this text instead of the hardcoded docstring
-    in the closure. When ``None``, the built-in default docstring is used.
+    When set, the factory appends these instructions to the built-in docstring
+    under a structured header. When ``None``, only the default docstring is used.
     """
 
     system_prompt: bool = False
@@ -55,6 +55,21 @@ class BaseToolParam(BaseModel):
 
     llm_tool: bool = True
     """Whether this capability is exposed as a callable tool for the LLM."""
+
+    def format_docstring(self, original: str | None) -> str | None:
+        """Format the tool docstring with optional additional instructions.
+
+        Args:
+            original: The original docstring from the tool callable.
+
+        Returns:
+            The formatted docstring, or the original if no instructions are set.
+        """
+        if not self.instructions:
+            return original
+
+        base_doc = original or ""
+        return f"{base_doc}\n\nAdditional Instructions:\n{self.instructions}"
 
 
 class ToolCard(BaseModel, ABC):

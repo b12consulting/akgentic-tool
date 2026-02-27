@@ -70,7 +70,7 @@ def test_resolve_instance() -> None:
 
 def test_base_tool_param_defaults() -> None:
     p = BaseToolParam()
-    assert p.description is None
+    assert p.instructions is None
     assert p.system_prompt is False
     assert p.llm_tool is True
 
@@ -93,7 +93,7 @@ def test_tool_factory_with_null_observer() -> None:
 
     card = _ObserverCheckTool()
     factory = ToolFactory(tool_cards=[card], observer=None)
-    
+
     # Observer should NOT be called when observer is None
     assert not observer_called
     assert factory.observer is None
