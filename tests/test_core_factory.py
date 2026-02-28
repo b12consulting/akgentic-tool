@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from akgentic.tool.core import BaseToolParam, ToolCard, ToolFactory, _resolve
+from akgentic.tool.core import (
+    COMMAND,
+    TOOL_CALL,
+    BaseToolParam,
+    ToolCard,
+    ToolFactory,
+    _resolve,
+)
 
 
 class _DummyParam(BaseToolParam):
@@ -16,7 +23,7 @@ class _DummyTool(ToolCard):
 
     def get_tools(self) -> list[Callable]:
         p = _resolve(self.cap, _DummyParam)
-        if p and p.llm_tool:
+        if p and TOOL_CALL in p.expose:
             return [lambda: f"ok-{p.value}"]
         return []
 
@@ -69,10 +76,57 @@ def test_resolve_instance() -> None:
 
 
 def test_base_tool_param_defaults() -> None:
+    """BaseToolParam defaults: expose={TOOL_CALL}, instructions=None."""
     p = BaseToolParam()
     assert p.instructions is None
-    assert p.system_prompt is False
-    assert p.llm_tool is True
+    assert p.expose == {TOOL_CALL}
+
+
+def test_base_tool_param_subclass_defaults() -> None:
+    """Subclass inherits expose default from BaseToolParam."""
+    p = _DummyParam()
+    assert p.instructions is None
+    assert p.expose == {TOOL_CALL}
+
+
+def test_tool_factory_get_commands() -> None:
+    """ToolFactory.get_commands() aggregates from all tool cards."""
+
+    class _CommandParam(BaseToolParam):
+        expose: set[str] = {COMMAND}
+
+    class _CommandTool(ToolCard):
+        name: str = "cmd_tool"
+        description: str = "command tool"
+        cmd: _CommandParam | bool = True
+
+        def get_tools(self) -> list[Callable]:
+            return []
+
+        def get_commands(self) -> dict[type[BaseToolParam], Callable]:
+            p = _resolve(self.cmd, _CommandParam)
+            if p and COMMAND in p.expose:
+
+                def my_cmd() -> str:
+                    return "cmd-result"
+
+                return {_CommandParam: my_cmd}
+            return {}
+
+    card = _CommandTool()
+    factory = ToolFactory(tool_cards=[card])
+    commands = factory.get_commands()
+    assert len(commands) == 1
+    assert _CommandParam in commands
+    assert commands[_CommandParam]() == "cmd-result"
+
+
+def test_tool_factory_get_commands_empty() -> None:
+    """ToolFactory.get_commands() returns empty dict when no cards have commands."""
+    card = _DummyTool()
+    factory = ToolFactory(tool_cards=[card])
+    commands = factory.get_commands()
+    assert commands == {}
 
 
 def test_tool_factory_with_null_observer() -> None:

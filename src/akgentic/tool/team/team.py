@@ -10,36 +10,138 @@ from typing import Callable
 
 from pydantic import Field
 
+from akgentic.core.actor_address import ActorAddress
+from akgentic.core.agent_card import AgentCard
 from akgentic.core.orchestrator import Orchestrator
-from akgentic.tool.core import BaseToolParam, ToolCard, _resolve
+from akgentic.tool.core import (
+    COMMAND,
+    SYSTEM_PROMPT,
+    TOOL_CALL,
+    BaseToolParam,
+    Channels,
+    ToolCard,
+    _resolve,
+)
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.event import TeamManagementToolObserver, ToolCallEvent
 
 logger = logging.getLogger(__name__)
 
 
-class HireTeamMembers(BaseToolParam):
+class HireTeamMember(BaseToolParam):
     """Hire new team members by role."""
 
-    pass
+    expose: set[Channels] = {TOOL_CALL, COMMAND}
 
 
-class FireTeamMembers(BaseToolParam):
+class FireTeamMember(BaseToolParam):
     """Fire existing team members by name."""
 
-    pass
+    expose: set[Channels] = {TOOL_CALL, COMMAND}
 
 
 class GetTeamRoster(BaseToolParam):
     """Get current team roster as system prompt."""
 
-    system_prompt: bool = True
+    expose: set[Channels] = {SYSTEM_PROMPT, COMMAND}
 
 
 class GetRoleProfiles(BaseToolParam):
     """Get available role profiles as system prompt."""
 
-    system_prompt: bool = True
+    expose: set[Channels] = {SYSTEM_PROMPT, COMMAND}
+
+
+def _hire_single_member(
+    orchestrator_proxy: Orchestrator,
+    observer: TeamManagementToolObserver,
+    role: str,
+    name: str | None,
+    existing_names: set[str],
+    agent_catalog: list[AgentCard] | None = None,
+) -> tuple[str, ActorAddress]:
+    """Core hire logic for a single member.
+
+    Args:
+        orchestrator_proxy: Proxy to the orchestrator actor.
+        observer: TeamManagementToolObserver for actor creation and hooks.
+        role: Role to hire.
+        name: Optional specific name. If None, auto-generated.
+        existing_names: Set of existing member names (for uniqueness).
+        agent_catalog: Pre-fetched catalog. If None, fetched from orchestrator.
+
+    Returns:
+        Tuple of (child_name, child_address).
+
+    Raises:
+        RetriableError: If no agent card found for the role.
+        ValueError: If agent class is a string (configuration error).
+    """
+    if agent_catalog is None:
+        agent_catalog = orchestrator_proxy.get_agent_catalog()
+    agent_card = next((card for card in agent_catalog if card.role == role), None)
+    if agent_card is None:
+        available_roles = orchestrator_proxy.get_available_roles()
+        raise RetriableError(
+            f"Hire error - cannot find agent card for role '{role}'. "
+            f"Available roles: {available_roles}"
+        )
+
+    actor_class = agent_card.get_agent_class()
+    if isinstance(actor_class, str):
+        raise ValueError(f"Hire error - agent class for role {role} is a string, not a type. ")
+
+    if name is None:
+        role_prefix = f"@{role.replace(' ', '')}"
+        suffix = random.randint(100, 999)
+        child_name = f"{role_prefix}{suffix}"
+        while child_name in existing_names:
+            suffix += 1
+            child_name = f"{role_prefix}{suffix}"
+    else:
+        child_name = name
+
+    agent_card_config = agent_card.get_config_copy()
+    agent_card_config.name = child_name
+    agent_card_config.role = role
+
+    child_address = observer.createActor(actor_class, config=agent_card_config)
+    observer.on_hire(child_name, child_address)
+
+    logger.info(f"Hired {role} agent: {child_name} at {child_address}")
+    return child_name, child_address
+
+
+def _fire_single_member(
+    orchestrator_proxy: Orchestrator,
+    observer: TeamManagementToolObserver,
+    name: str,
+) -> str:
+    """Core fire logic for a single member.
+
+    Args:
+        orchestrator_proxy: Proxy to the orchestrator actor.
+        observer: TeamManagementToolObserver for hooks.
+        name: Name of the member to fire.
+
+    Returns:
+        The fired member's name.
+
+    Raises:
+        RetriableError: If member not found in team.
+    """
+    address = orchestrator_proxy.get_team_member(name)
+    if address is None:
+        team_members = [member.name for member in orchestrator_proxy.get_team()]
+        raise RetriableError(
+            f"Fire error - member '{name}' not part of the team. "
+            f"Current team members: {team_members}"
+        )
+
+    address.stop()
+    observer.on_fire(name, address)
+    logger.info(f"Fired team member: {name}")
+    return name
 
 
 class TeamTool(ToolCard):
@@ -55,10 +157,10 @@ class TeamTool(ToolCard):
     name: str = "Team"
     description: str = "Team management tool for hiring, firing, and team awareness"
 
-    hire_team_members: HireTeamMembers | bool = Field(
+    hire_team_members: HireTeamMember | bool = Field(
         default=True, description="Enable hiring team members (default: True)"
     )
-    fire_team_members: FireTeamMembers | bool = Field(
+    fire_team_members: FireTeamMember | bool = Field(
         default=True, description="Enable firing team members (default: True)"
     )
     get_role_profiles: GetRoleProfiles | bool = Field(
@@ -98,11 +200,11 @@ class TeamTool(ToolCard):
         prompts: list[Callable] = []
 
         gtr = _resolve(self.get_team_roster, GetTeamRoster)
-        if gtr and gtr.system_prompt:
+        if gtr and SYSTEM_PROMPT in gtr.expose:
             prompts.append(self._team_roster_prompt_factory(gtr))
 
         grp = _resolve(self.get_role_profiles, GetRoleProfiles)
-        if grp and grp.system_prompt:
+        if grp and SYSTEM_PROMPT in grp.expose:
             prompts.append(self._role_profiles_prompt_factory(grp))
 
         return prompts
@@ -115,17 +217,43 @@ class TeamTool(ToolCard):
         """
         tools: list[Callable] = []
 
-        htm = _resolve(self.hire_team_members, HireTeamMembers)
-        if htm and htm.llm_tool:
+        htm = _resolve(self.hire_team_members, HireTeamMember)
+        if htm and TOOL_CALL in htm.expose:
             tools.append(self._hire_members_factory(htm))
 
-        ftm = _resolve(self.fire_team_members, FireTeamMembers)
-        if ftm and ftm.llm_tool:
+        ftm = _resolve(self.fire_team_members, FireTeamMember)
+        if ftm and TOOL_CALL in ftm.expose:
             tools.append(self._fire_members_factory(ftm))
 
         return tools
 
-    def _hire_members_factory(self, params: HireTeamMembers) -> Callable:
+    def get_commands(self) -> dict[type[BaseToolParam], Callable]:
+        """Get programmatic commands for inter-agent orchestration.
+
+        Returns:
+            Dict mapping param class to callable.
+        """
+        commands: dict[type[BaseToolParam], Callable] = {}
+
+        htm = _resolve(self.hire_team_members, HireTeamMember)
+        if htm and COMMAND in htm.expose:
+            commands[HireTeamMember] = self._hire_member_command_factory(htm)
+
+        ftm = _resolve(self.fire_team_members, FireTeamMember)
+        if ftm and COMMAND in ftm.expose:
+            commands[FireTeamMember] = self._fire_member_command_factory(ftm)
+
+        gtr = _resolve(self.get_team_roster, GetTeamRoster)
+        if gtr and COMMAND in gtr.expose:
+            commands[GetTeamRoster] = self._team_roster_prompt_factory(gtr)
+
+        grp = _resolve(self.get_role_profiles, GetRoleProfiles)
+        if grp and COMMAND in grp.expose:
+            commands[GetRoleProfiles] = self._role_profiles_prompt_factory(grp)
+
+        return commands
+
+    def _hire_members_factory(self, params: HireTeamMember) -> Callable:
         """Create hire_members tool callable.
 
         Args:
@@ -161,46 +289,23 @@ class TeamTool(ToolCard):
 
             hired_members = []
             errors = []
-            agent_catalog = orchestrator_proxy.get_agent_catalog()
             existing_names = {member.name for member in orchestrator_proxy.get_team()}
+            agent_catalog = orchestrator_proxy.get_agent_catalog()
 
             for role in roles:
-                # Get agent card for role from catalog
-                agent_card = next((card for card in agent_catalog if card.role == role), None)
-                if agent_card is None:
-                    errors.append(role)
-                    continue
-
-                # Create child agent using agent primitive
-                # agent_class can be str | type, but in production it should be a type
-                actor_class = agent_card.get_agent_class()
-                if isinstance(actor_class, str):
-                    ## The llm cannot retry, so raise a ValueError
-                    raise ValueError(
-                        f"Hire error - agent class for role {role} is a string, not a type. "
+                try:
+                    child_name, _ = _hire_single_member(
+                        orchestrator_proxy,
+                        observer,
+                        role,
+                        None,
+                        existing_names,
+                        agent_catalog=agent_catalog,
                     )
-
-                # Generate unique name: random, increment on collision
-                role_prefix = f"@{role.replace(' ', '')}"
-                suffix = random.randint(100, 999)
-                child_name = f"{role_prefix}{suffix}"
-                while child_name in existing_names:
-                    suffix += 1
-                    child_name = f"{role_prefix}{suffix}"
-
-                # Create config
-                agent_card_config = agent_card.get_config_copy()
-                agent_card_config.name = child_name
-                agent_card_config.role = role
-
-                child_address = observer.createActor(actor_class, config=agent_card_config)
-
-                # Call agent hook
-                observer.on_hire(child_name, child_address)
-
-                existing_names.add(child_name)
-                hired_members.append(child_name)
-                logger.info(f"Hired {role} agent: {child_name} at {child_address}")
+                    existing_names.add(child_name)
+                    hired_members.append(child_name)
+                except RetriableError:
+                    errors.append(role)
 
             if errors:
                 available_roles = orchestrator_proxy.get_available_roles()
@@ -218,7 +323,40 @@ class TeamTool(ToolCard):
         hire_members.__doc__ = params.format_docstring(hire_members.__doc__)
         return hire_members
 
-    def _fire_members_factory(self, params: FireTeamMembers) -> Callable:
+    def _hire_member_command_factory(self, params: HireTeamMember) -> Callable:
+        """Create hire_member command callable.
+
+        Args:
+            params: Configuration for hire capability
+
+        Returns:
+            Callable that hires a single team member
+        """
+        orchestrator_proxy = self._orchestrator_proxy
+        observer = self._observer
+
+        def hire_member(role: str, name: str | None = None):
+            """Hire a single new team member with the given role.
+
+            Creates a new agent actor with the specified role. If no name is
+            provided, one is auto-generated as @<Role><RandomNumber>.
+
+            Args:
+                role: Role to hire (must be in available_roles)
+                name: Optional specific name for the member
+
+            Returns:
+                Tuple of (member_name, member_address)
+            """
+            observer.notify_event(
+                ToolCallEvent(tool_name="hire_member", args=[], kwargs={"role": role, "name": name})
+            )
+            existing_names = {member.name for member in orchestrator_proxy.get_team()}
+            return _hire_single_member(orchestrator_proxy, observer, role, name, existing_names)
+
+        return hire_member
+
+    def _fire_members_factory(self, params: FireTeamMember) -> Callable:
         """Create fire_members tool callable.
 
         Args:
@@ -243,7 +381,7 @@ class TeamTool(ToolCard):
                 names: List of member names to fire (e.g., ['@Developer123', '@Tester456'])
 
             Returns:
-                Combined confirmation messages (e.g., "Member @Developer123 has been fired. - ...")
+                Combined confirmation messages (e.g., "Members fired: @Developer123, @Tester456")
             """
             if not names:
                 raise RetriableError("No names provided. Specify at least one member name to fire.")
@@ -255,21 +393,12 @@ class TeamTool(ToolCard):
             fired_members = []
             errors = []
             for name in names:
-                # Lookup member
-                address = orchestrator_proxy.get_team_member(name)
-                if address is None:
+                try:
+                    _fire_single_member(orchestrator_proxy, observer, name)
+                    fired_members.append(name)
+                except RetriableError:
                     errors.append(name)
                     logger.error(f"Fire error, team member not part of the team: {name}")
-                    continue
-
-                # Stop actor using agent primitive
-                address.stop()
-
-                # Call agent hook
-                observer.on_fire(name, address)
-
-                fired_members.append(name)
-                logger.info(f"Fired team member: {name}")
 
             if errors:
                 team_members = [member.name for member in orchestrator_proxy.get_team()]
@@ -286,6 +415,37 @@ class TeamTool(ToolCard):
 
         fire_members.__doc__ = params.format_docstring(fire_members.__doc__)
         return fire_members
+
+    def _fire_member_command_factory(self, params: FireTeamMember) -> Callable:
+        """Create fire_member command callable.
+
+        Args:
+            params: Configuration for fire capability
+
+        Returns:
+            Callable that fires a single team member
+        """
+        orchestrator_proxy = self._orchestrator_proxy
+        observer = self._observer
+
+        def fire_member(name: str) -> str:
+            """Fire a team member with the given name.
+
+            Stops the member actor and removes them from the team.
+
+            Args:
+                name: Member name to fire (e.g., '@Developer123')
+
+            Returns:
+                Confirmation message (e.g., "Member @Developer123 has been fired.")
+            """
+            observer.notify_event(
+                ToolCallEvent(tool_name="fire_member", args=[], kwargs={"name": name})
+            )
+            _fire_single_member(orchestrator_proxy, observer, name)
+            return f"Member {name} has been fired."
+
+        return fire_member
 
     def _team_roster_prompt_factory(self, params: GetTeamRoster) -> Callable:
         """Create team roster system prompt callable.

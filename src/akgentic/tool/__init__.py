@@ -2,7 +2,15 @@
 
 # Submodules with their own __init__ files
 from . import mcp, planning, search, team
-from .core import BaseToolParam, ToolCard, ToolFactory
+from .core import (
+    COMMAND,
+    SYSTEM_PROMPT,
+    TOOL_CALL,
+    BaseToolParam,
+    Channels,
+    ToolCard,
+    ToolFactory,
+)
 from .errors import RetriableError
 from .event import (
     ActorToolObserver,
@@ -16,6 +24,11 @@ __all__ = [
     "BaseToolParam",
     "ToolCard",
     "ToolFactory",
+    # Expose channel constants
+    "COMMAND",
+    "SYSTEM_PROMPT",
+    "TOOL_CALL",
+    "Channels",
     # Errors
     "RetriableError",
     # Events and observers

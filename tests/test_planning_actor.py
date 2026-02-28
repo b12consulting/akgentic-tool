@@ -50,6 +50,9 @@ class MockActorAddress(ActorAddress):
     def is_alive(self) -> bool:
         return True
 
+    def stop(self) -> None:
+        pass
+
     def handle_user_message(self) -> bool:
         return False
 

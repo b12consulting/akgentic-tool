@@ -11,13 +11,14 @@ from akgentic.core.agent_card import AgentCard
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.orchestrator import Orchestrator
 
+from akgentic.tool.core import TOOL_CALL
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.event import TeamManagementToolObserver
 from akgentic.tool.team import (
-    FireTeamMembers,
+    FireTeamMember,
     GetRoleProfiles,
     GetTeamRoster,
-    HireTeamMembers,
+    HireTeamMember,
     TeamTool,
 )
 
@@ -262,8 +263,8 @@ def test_team_tool_get_system_prompts_default():
 def test_team_tool_get_system_prompts_disabled():
     """TeamTool.get_system_prompts() excludes disabled prompts."""
     tool = TeamTool(
-        get_team_roster=GetTeamRoster(system_prompt=False),
-        get_role_profiles=GetRoleProfiles(system_prompt=False),
+        get_team_roster=GetTeamRoster(expose=set()),
+        get_role_profiles=GetRoleProfiles(expose=set()),
     )
     tool.observer(mock_observer())
 
@@ -369,7 +370,7 @@ def test_role_profiles_prompt_empty():
 def test_hire_members_custom_instructions():
     """HireTeamMembers.instructions appended to docstring."""
     tool = TeamTool(
-        hire_team_members=HireTeamMembers(instructions="Only hire when explicitly requested.")
+        hire_team_members=HireTeamMember(instructions="Only hire when explicitly requested.")
     )
     tool.observer(mock_observer())
 
@@ -380,7 +381,7 @@ def test_hire_members_custom_instructions():
 def test_fire_members_custom_instructions():
     """FireTeamMembers.instructions appended to docstring."""
     tool = TeamTool(
-        fire_team_members=FireTeamMembers(instructions="Only fire when explicitly requested.")
+        fire_team_members=FireTeamMember(instructions="Only fire when explicitly requested.")
     )
     tool.observer(mock_observer())
 
@@ -505,3 +506,178 @@ def test_fire_members_batch_partial_success():
     # Error should mention partial success and the invalid member
     assert "Partial success" in str(exc_info.value)
     assert "NonExistent" in str(exc_info.value)
+
+
+# ── Command tests ──────────────────────────────────────────────────────────
+
+
+def test_team_tool_get_commands_default():
+    """TeamTool.get_commands() returns dict keyed by param class with 4 commands."""
+    tool = TeamTool()
+    tool.observer(mock_observer())
+
+    commands = tool.get_commands()
+    assert len(commands) == 4
+    assert HireTeamMember in commands
+    assert FireTeamMember in commands
+    assert GetTeamRoster in commands
+    assert GetRoleProfiles in commands
+    assert all(callable(c) for c in commands.values())
+
+
+def test_team_tool_get_commands_disabled():
+    """TeamTool.get_commands() excludes fully disabled capabilities."""
+    tool = TeamTool(
+        hire_team_members=False,
+        fire_team_members=False,
+        get_team_roster=False,
+        get_role_profiles=False,
+    )
+    tool.observer(mock_observer())
+
+    commands = tool.get_commands()
+    assert commands == {}
+
+
+def test_team_tool_get_commands_partial():
+    """TeamTool.get_commands() respects per-capability expose sets."""
+    tool = TeamTool(
+        hire_team_members=HireTeamMember(expose={TOOL_CALL}),  # no command
+        fire_team_members=True,  # default includes command
+    )
+    tool.observer(mock_observer())
+
+    commands = tool.get_commands()
+    # hire excluded (no command in expose), fire + roster + profiles = 3
+    assert len(commands) == 3
+    assert HireTeamMember not in commands
+    assert FireTeamMember in commands
+
+
+def test_hire_member_command_execution():
+    """hire_member command hires a single member and returns (name, address)."""
+    agent_card = Mock(spec=AgentCard)
+    agent_card.role = "Developer"
+    agent_card.agent_class = Mock
+
+    config_mock = Mock(spec=BaseConfig)
+    agent_card.get_config_copy.return_value = config_mock
+
+    orchestrator_mock = Mock(spec=Orchestrator)
+    orchestrator_mock.get_agent_catalog.return_value = [agent_card]
+    orchestrator_mock.get_team.return_value = []
+
+    address = create_test_address("@Developer123", "Developer")
+
+    observer_mock = Mock(spec=TeamManagementToolObserver)
+    observer_mock.orchestrator = create_test_address("@Orchestrator", "Orchestrator")
+    observer_mock.myAddress = create_test_address("@Manager", "Manager")
+    observer_mock.proxy_ask.return_value = orchestrator_mock
+    observer_mock.createActor.return_value = address
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_member = tool.get_commands()[HireTeamMember]
+
+    result = hire_member("Developer")
+
+    assert isinstance(result, tuple)
+    assert len(result) == 2
+    assert "@Developer" in result[0]
+    observer_mock.createActor.assert_called_once()
+    observer_mock.on_hire.assert_called_once()
+    observer_mock.notify_event.assert_called()
+
+
+def test_hire_member_command_with_name():
+    """hire_member command uses provided name."""
+    agent_card = Mock(spec=AgentCard)
+    agent_card.role = "Developer"
+    agent_card.agent_class = Mock
+
+    config_mock = Mock(spec=BaseConfig)
+    agent_card.get_config_copy.return_value = config_mock
+
+    orchestrator_mock = Mock(spec=Orchestrator)
+    orchestrator_mock.get_agent_catalog.return_value = [agent_card]
+    orchestrator_mock.get_team.return_value = []
+
+    address = create_test_address("@MyDev", "Developer")
+
+    observer_mock = Mock(spec=TeamManagementToolObserver)
+    observer_mock.orchestrator = create_test_address("@Orchestrator", "Orchestrator")
+    observer_mock.myAddress = create_test_address("@Manager", "Manager")
+    observer_mock.proxy_ask.return_value = orchestrator_mock
+    observer_mock.createActor.return_value = address
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_member = tool.get_commands()[HireTeamMember]
+
+    result = hire_member("Developer", "@MyDev")
+
+    assert result[0] == "@MyDev"
+    observer_mock.createActor.assert_called_once()
+
+
+def test_hire_member_command_invalid_role():
+    """hire_member command raises RetriableError for invalid role."""
+    orchestrator_mock = Mock(spec=Orchestrator)
+    orchestrator_mock.get_available_roles.return_value = ["Developer"]
+    orchestrator_mock.get_agent_catalog.return_value = []
+    orchestrator_mock.get_team.return_value = []
+
+    observer_mock = Mock(spec=TeamManagementToolObserver)
+    observer_mock.orchestrator = create_test_address("@Orchestrator", "Orchestrator")
+    observer_mock.proxy_ask.return_value = orchestrator_mock
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_member = tool.get_commands()[HireTeamMember]
+
+    with pytest.raises(RetriableError, match="cannot find agent card"):
+        hire_member("InvalidRole")
+
+
+def test_fire_member_command_execution():
+    """fire_member command fires a single member."""
+    member_address = Mock()
+    member_address.name = "@Developer123"
+    member_address.role = "Developer"
+
+    orchestrator_mock = Mock(spec=Orchestrator)
+    orchestrator_mock.get_team_member.return_value = member_address
+
+    observer_mock = Mock(spec=TeamManagementToolObserver)
+    observer_mock.orchestrator = create_test_address("@Orchestrator", "Orchestrator")
+    observer_mock.proxy_ask.return_value = orchestrator_mock
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    fire_member = tool.get_commands()[FireTeamMember]
+
+    result = fire_member("@Developer123")
+
+    assert "Developer123" in result
+    assert "fired" in result.lower()
+    member_address.stop.assert_called_once()
+    observer_mock.on_fire.assert_called_once()
+    observer_mock.notify_event.assert_called()
+
+
+def test_fire_member_command_not_found():
+    """fire_member command raises RetriableError if member not found."""
+    orchestrator_mock = Mock(spec=Orchestrator)
+    orchestrator_mock.get_team_member.return_value = None
+    orchestrator_mock.get_team.return_value = [create_test_address("@Developer456", "Developer")]
+
+    observer_mock = Mock(spec=TeamManagementToolObserver)
+    observer_mock.orchestrator = create_test_address("@Orchestrator", "Orchestrator")
+    observer_mock.proxy_ask.return_value = orchestrator_mock
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    fire_member = tool.get_commands()[FireTeamMember]
+
+    with pytest.raises(RetriableError, match="Fire error"):
+        fire_member("@Developer123")

@@ -1,17 +1,17 @@
 """Team management tool for akgentic framework."""
 
 from .team import (
-    FireTeamMembers,
+    FireTeamMember,
     GetRoleProfiles,
     GetTeamRoster,
-    HireTeamMembers,
+    HireTeamMember,
     TeamTool,
 )
 
 __all__ = [
     "TeamTool",
-    "HireTeamMembers",
-    "FireTeamMembers",
+    "HireTeamMember",
+    "FireTeamMember",
     "GetTeamRoster",
     "GetRoleProfiles",
 ]

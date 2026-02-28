@@ -8,6 +8,7 @@ Defines the core contracts:
 
 import functools
 from abc import ABC, abstractmethod
+from enum import StrEnum
 from typing import Any, Callable, TypeVar
 
 from pydantic import BaseModel
@@ -36,11 +37,37 @@ def _resolve(value: "T | bool", cls: "type[T]") -> "T | None":
     return value  # already a ParamModel instance
 
 
+class Channels(StrEnum):
+    """Valid channel names for capability exposure."""
+
+    SYSTEM_PROMPT = "system_prompt"
+    """Expose as a system prompt injected into the LLM context."""
+
+    TOOL_CALL = "tool_call"
+    """Expose as a callable tool for the LLM."""
+
+    COMMAND = "command"
+    """Expose as a programmatic command for inter-agent orchestration."""
+
+
+# Backward-compatible module-level aliases
+SYSTEM_PROMPT = Channels.SYSTEM_PROMPT
+TOOL_CALL = Channels.TOOL_CALL
+COMMAND = Channels.COMMAND
+
+
 class BaseToolParam(BaseModel):
     """Base for capability parameter models.
 
     Provides common fields that control how a capability is exposed
-    to the LLM and how its description can be customized.
+    and how its description can be customized.
+
+    Each subclass can override the default ``expose`` set to declare the channels
+    it participates in. Use the module-level channel constants:
+
+    - ``TOOL_CALL``: callable tool invoked by the LLM (default).
+    - ``SYSTEM_PROMPT``: prompt injected into the LLM context.
+    - ``COMMAND``: programmatic call for inter-agent orchestration.
     """
 
     instructions: str | None = None
@@ -50,11 +77,12 @@ class BaseToolParam(BaseModel):
     under a structured header. When ``None``, only the default docstring is used.
     """
 
-    system_prompt: bool = False
-    """Whether this capability injects a system prompt into the LLM context."""
+    expose: set[Channels] = {TOOL_CALL}
+    """Set of channels this capability is exposed through.
 
-    llm_tool: bool = True
-    """Whether this capability is exposed as a callable tool for the LLM."""
+    Defaults to ``{Channel.TOOL_CALL}``. Override in subclasses or at instantiation.
+    Use ``Channel`` enum members or module-level aliases: ``TOOL_CALL``, ``SYSTEM_PROMPT``, ``COMMAND``.
+    """
 
     def format_docstring(self, original: str | None) -> str | None:
         """Format the tool docstring with optional additional instructions.
@@ -117,6 +145,19 @@ class ToolCard(BaseModel, ABC):
         """
         return []
 
+    def get_commands(self) -> dict[type["BaseToolParam"], Callable]:
+        """Return callable commands for programmatic invocation.
+
+        Commands are methods exposed for inter-agent orchestration
+        (e.g., ``hire_member``, ``fire_member``). Unlike tools (invoked by
+        the LLM), commands are called programmatically by other agents
+        or system components via ``proxy_call`` or similar mechanisms.
+
+        Returns:
+            Dict mapping param class (e.g., ``HireTeamMember``) to callable.
+        """
+        return {}
+
     def get_toolsets(self) -> list[Any]:
         """Return runtime toolset objects (e.g., MCP servers)."""
         return []
@@ -176,6 +217,20 @@ class ToolFactory:
     def get_system_prompts(self) -> list[Callable]:
         """Return system prompt callables aggregated from all tool cards."""
         return [p for card in self.tool_cards for p in card.get_system_prompts()]
+
+    def get_commands(self) -> dict[type[BaseToolParam], Callable]:
+        """Return command callables aggregated from all tool cards.
+
+        Returns:
+            Dict mapping param class to callable, merged from all tool cards.
+        """
+        commands: dict[type[BaseToolParam], Callable] = {}
+        for card in self.tool_cards:
+            commands.update(card.get_commands())
+
+        if self._retry_exception is not None:
+            commands = {k: self._wrap_with_retry(v) for k, v in commands.items()}
+        return commands
 
     def get_toolsets(self) -> list[Any]:
         """Return toolset instances aggregated from all tool cards."""
