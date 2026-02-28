@@ -80,8 +80,8 @@ class BaseToolParam(BaseModel):
     expose: set[Channels] = {TOOL_CALL}
     """Set of channels this capability is exposed through.
 
-    Defaults to ``{Channel.TOOL_CALL}``. Override in subclasses or at instantiation.
-    Use ``Channel`` enum members or module-level aliases: ``TOOL_CALL``, ``SYSTEM_PROMPT``, ``COMMAND``.
+    Defaults to ``{TOOL_CALL}``. Override in subclasses or at instantiation.
+    Use ``Channels`` enum members or module-level aliases: ``TOOL_CALL``, ``SYSTEM_PROMPT``, ``COMMAND``.
     """
 
     def format_docstring(self, original: str | None) -> str | None:
