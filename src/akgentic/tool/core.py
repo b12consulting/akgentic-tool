@@ -182,7 +182,7 @@ class ToolFactory:
             observer: Optional observer notified by tool implementations during
                 tool calls.
             retry_exception: Optional exception class to raise when a tool raises
-                ``ToolError``. Injected by the integration layer (e.g., ModelRetry
+                ``RetriableError``. Injected by the integration layer (e.g., ModelRetry
                 from pydantic-ai) to keep the tool module framework-agnostic.
         """
         self.tool_cards = tool_cards
@@ -194,7 +194,7 @@ class ToolFactory:
                 card.observer(self.observer)
 
     def _wrap_with_retry(self, fn: Callable) -> Callable:
-        """Wrap a tool callable to convert ``ToolError`` into retry_exception."""
+        """Wrap a tool callable to convert ``RetriableError`` into retry_exception."""
         assert self._retry_exception is not None
         retry_exc = self._retry_exception
 

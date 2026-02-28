@@ -141,7 +141,7 @@ def test_hire_members_tool_execution():
 
 
 def test_hire_members_empty_list():
-    """hire_members raises ToolError for empty roles list."""
+    """hire_members raises RetriableError for empty roles list."""
     tool = TeamTool()
     tool.observer(mock_observer())
     hire_members = tool.get_tools()[0]
@@ -151,7 +151,7 @@ def test_hire_members_empty_list():
 
 
 def test_fire_members_empty_list():
-    """fire_members raises ToolError for empty names list."""
+    """fire_members raises RetriableError for empty names list."""
     tool = TeamTool()
     tool.observer(mock_observer())
     fire_members = tool.get_tools()[1]
@@ -161,7 +161,7 @@ def test_fire_members_empty_list():
 
 
 def test_hire_members_invalid_role():
-    """hire_members raises ToolError for invalid role."""
+    """hire_members raises RetriableError for invalid role."""
     orchestrator_mock = Mock(spec=Orchestrator)
     orchestrator_mock.get_available_roles.return_value = ["Developer"]
     orchestrator_mock.get_agent_catalog.return_value = []  # Empty catalog
@@ -199,7 +199,7 @@ def test_hire_members_string_agent_class():
     tool.observer(observer_mock)
     hire_members = tool.get_tools()[0]
 
-    # ValueError (not ToolError) because LLM cannot fix configuration errors
+    # ValueError (not RetriableError) because LLM cannot fix configuration errors
     with pytest.raises(ValueError, match="is a string, not a type"):
         hire_members(["Developer"])
 
@@ -232,7 +232,7 @@ def test_fire_members_tool_execution():
 
 
 def test_fire_members_not_found():
-    """fire_members raises ToolError if member not found."""
+    """fire_members raises RetriableError if member not found."""
     orchestrator_mock = Mock(spec=Orchestrator)
     orchestrator_mock.get_team_member.return_value = None
     orchestrator_mock.get_team.return_value = [create_test_address("@Developer456", "Developer")]

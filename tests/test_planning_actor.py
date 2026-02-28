@@ -132,7 +132,7 @@ def test_update_planning_with_update_errors() -> None:
 
 
 def test_update_planning_delete_not_found() -> None:
-    """Test deleting non-existent item raises ToolError."""
+    """Test deleting non-existent item raises RetriableError."""
     actor = PlanActor()
     actor.on_start()
     actor_addr = MockActorAddress("test-agent")
