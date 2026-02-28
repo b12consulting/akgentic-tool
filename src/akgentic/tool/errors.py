@@ -5,7 +5,7 @@ translates them into the appropriate retry mechanism (e.g., pydantic-ai ModelRet
 """
 
 
-class ToolError(Exception):
+class RetriableError(Exception):
     """Raised by tool implementations when the LLM should retry with corrected input.
 
     Tools raise this to signal a recoverable error. The consuming framework

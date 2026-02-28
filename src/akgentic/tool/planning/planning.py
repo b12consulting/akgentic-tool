@@ -1,11 +1,19 @@
 import logging
 from typing import Callable
 
-from pydantic import Field, PrivateAttr
+from pydantic import Field
 
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.orchestrator import Orchestrator
-from akgentic.tool.core import BaseToolParam, ToolCard, _resolve
+from akgentic.tool.core import (
+    COMMAND,
+    SYSTEM_PROMPT,
+    TOOL_CALL,
+    BaseToolParam,
+    Channels,
+    ToolCard,
+    _resolve,
+)
 from akgentic.tool.event import ActorToolObserver, ToolCallEvent
 from akgentic.tool.planning.planning_actor import PlanActor, Task, UpdatePlan
 
@@ -19,20 +27,17 @@ PLANNING_ACTOR_ROLE = "ToolActor"
 class GetPlanning(BaseToolParam):
     """Get the full team plan — as system prompt and/or tool."""
 
-    system_prompt: bool = True
-    llm_tool: bool = False
+    expose: set[Channels] = {SYSTEM_PROMPT, COMMAND}
 
 
-class GetPlanningItem(BaseToolParam):
+class GetPlanningTask(BaseToolParam):
     """Get a single task by ID."""
 
-    pass
+    expose: set[Channels] = {TOOL_CALL, COMMAND}
 
 
 class UpdatePlanning(BaseToolParam):
     """Update tasks."""
-
-    pass
 
 
 class PlanningTool(ToolCard):
@@ -44,7 +49,7 @@ class PlanningTool(ToolCard):
     get_planning: GetPlanning | bool = Field(
         default=True, description="By default the plan in included in the system prompt"
     )
-    get_planning_task: GetPlanningItem | bool = True
+    get_planning_task: GetPlanningTask | bool = True
     update_planning: UpdatePlanning | bool = True
 
     def observer(self, observer: ActorToolObserver):
@@ -60,9 +65,7 @@ class PlanningTool(ToolCard):
         planning_tool_addr = orchestrator_proxy_ask.get_team_member(PLANNING_ACTOR_NAME)
 
         if planning_tool_addr is None:
-            logger.info(
-                f"PlanningTool actor not found in team, creating new one at {PLANNING_ACTOR_NAME}."
-            )
+            logger.info(f"PlanningTool: create {PLANNING_ACTOR_NAME}.")
             planning_tool_addr = orchestrator_proxy_ask.createActor(
                 PlanActor, config=BaseConfig(name=PLANNING_ACTOR_NAME, role=PLANNING_ACTOR_ROLE)
             )
@@ -71,57 +74,60 @@ class PlanningTool(ToolCard):
 
     def get_system_prompts(self) -> list[Callable]:
         gp = _resolve(self.get_planning, GetPlanning)
-        if gp and gp.system_prompt:
-            planning_proxy = self._planning_proxy
-
-            def team_planning() -> str:
-                planning = planning_proxy.get_planning()
-                if not planning:
-                    return "No current Team planning."
-                return "Team planning:\n" + "\n".join(
-                    [
-                        f"- ID {task.id} [{task.status}] {task.description} "
-                        f"{task.output and f'— Output: {task.output} '}"
-                        f"(Owner: {task.owner}, Creator: {task.creator})"
-                        for task in planning
-                    ]
-                )
-
-            team_planning.__doc__ = gp.format_docstring(team_planning.__doc__)
-            return [team_planning]
+        if gp and SYSTEM_PROMPT in gp.expose:
+            return [self._planning_prompt_factory(gp)]
         return []
 
     def get_tools(self) -> list[Callable]:
         tools: list[Callable] = []
 
         gp = _resolve(self.get_planning, GetPlanning)
-        if gp and gp.llm_tool:
-            tools.append(self._get_planning_factory(gp))
+        if gp and TOOL_CALL in gp.expose:
+            tools.append(self._planning_prompt_factory(gp))
 
-        gpi = _resolve(self.get_planning_task, GetPlanningItem)
-        if gpi and gpi.llm_tool:
+        gpi = _resolve(self.get_planning_task, GetPlanningTask)
+        if gpi and TOOL_CALL in gpi.expose:
             tools.append(self._get_planning_task_factory(gpi))
 
         up = _resolve(self.update_planning, UpdatePlanning)
-        if up and up.llm_tool:
+        if up and TOOL_CALL in up.expose:
             tools.append(self._update_planning_factory(up))
 
         return tools
 
-    def _get_planning_factory(self, params: GetPlanning) -> Callable:
+    def get_commands(self) -> dict[type[BaseToolParam], Callable]:
+        commands: dict[type[BaseToolParam], Callable] = {}
+
+        gp = _resolve(self.get_planning, GetPlanning)
+        if gp and COMMAND in gp.expose:
+            commands[GetPlanning] = self._planning_prompt_factory(gp)
+
+        gpi = _resolve(self.get_planning_task, GetPlanningTask)
+        if gpi and COMMAND in gpi.expose:
+            commands[GetPlanningTask] = self._get_planning_task_factory(gpi)
+
+        return commands
+
+    def _planning_prompt_factory(self, params: GetPlanning) -> Callable:
         planning_proxy = self._planning_proxy
-        observer = self._observer
 
-        def get_planning() -> list[Task]:
+        def planning_prompt() -> str:
             """Get the full team planning."""
-            if observer is not None:
-                observer.notify_event(ToolCallEvent(tool_name="Get planning", args=[], kwargs={}))
-            return planning_proxy.get_planning()
+            planning = planning_proxy.get_planning()
+            if not planning:
+                return "No current Team planning."
+            return "Team planning:\n" + "\n".join(
+                [
+                    f"- ID {task.id} [{task.status}] {task.description} "
+                    f"{task.output and f'\u2014 Output: {task.output} '}"
+                    f"(Owner: {task.owner}, Creator: {task.creator})"
+                    for task in planning
+                ]
+            )
 
-        get_planning.__doc__ = params.format_docstring(get_planning.__doc__)
-        return get_planning
+        return planning_prompt
 
-    def _get_planning_task_factory(self, params: GetPlanningItem) -> Callable:
+    def _get_planning_task_factory(self, params: GetPlanningTask) -> Callable:
         planning_proxy = self._planning_proxy
         observer = self._observer
 

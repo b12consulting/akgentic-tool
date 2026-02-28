@@ -7,7 +7,7 @@ import uuid
 import pytest
 from akgentic.core.actor_address import ActorAddress
 
-from akgentic.tool.errors import ToolError
+from akgentic.tool.errors import RetriableError
 from akgentic.tool.planning.planning_actor import (
     PlanActor,
     TaskCreate,
@@ -49,6 +49,9 @@ class MockActorAddress(ActorAddress):
 
     def is_alive(self) -> bool:
         return True
+
+    def stop(self) -> None:
+        pass
 
     def handle_user_message(self) -> bool:
         return False
@@ -124,12 +127,12 @@ def test_update_planning_with_update_errors() -> None:
         delete_tasks=[],
     )
 
-    with pytest.raises(ToolError, match="Update error.*999"):
+    with pytest.raises(RetriableError, match="Update error.*999"):
         actor.update_planning(update_plan, actor_addr)
 
 
 def test_update_planning_delete_not_found() -> None:
-    """Test deleting non-existent item raises ToolError."""
+    """Test deleting non-existent item raises RetriableError."""
     actor = PlanActor()
     actor.on_start()
     actor_addr = MockActorAddress("test-agent")
@@ -141,7 +144,7 @@ def test_update_planning_delete_not_found() -> None:
         delete_tasks=[999],
     )
 
-    with pytest.raises(ToolError, match="Delete error.*999"):
+    with pytest.raises(RetriableError, match="Delete error.*999"):
         actor.update_planning(update_plan, actor_addr)
 
 
@@ -195,7 +198,7 @@ def test_update_planning_mixed_operations_with_errors() -> None:
         delete_tasks=[1, 888],  # First succeeds, second fails
     )
 
-    with pytest.raises(ToolError) as exc_info:
+    with pytest.raises(RetriableError) as exc_info:
         actor.update_planning(update_plan, actor_addr)
 
     # Should report multiple errors

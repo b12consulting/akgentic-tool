@@ -2,7 +2,7 @@ from typing import Any, Callable, Literal
 
 from tavily import TavilyClient
 
-from akgentic.tool.core import BaseToolParam, ToolCard, _resolve
+from akgentic.tool.core import TOOL_CALL, BaseToolParam, ToolCard, _resolve
 from akgentic.tool.event import ToolCallEvent
 
 
@@ -44,13 +44,13 @@ class SearchTool(ToolCard):
     def get_tools(self) -> list[Callable]:
         tools: list[Callable] = []
         ws = _resolve(self.web_search, WebSearch)
-        if ws and ws.llm_tool:
+        if ws and TOOL_CALL in ws.expose:
             tools.append(self._web_search_factory(ws))
         wc = _resolve(self.web_crawl, WebCrawl)
-        if wc and wc.llm_tool:
+        if wc and TOOL_CALL in wc.expose:
             tools.append(self._web_crawl_factory(wc))
         wf = _resolve(self.web_fetch, WebFetch)
-        if wf and wf.llm_tool:
+        if wf and TOOL_CALL in wf.expose:
             tools.append(self._web_fetch_factory(wf))
         return tools
 
