@@ -100,6 +100,15 @@ def _hire_single_member(
             child_name = f"{role_prefix}{suffix}"
     else:
         child_name = name
+        if not isinstance(child_name, str):
+            raise RetriableError("Hire error - member name must be a string.")
+        child_name = child_name.strip()
+        if not child_name:
+            raise RetriableError("Hire error - member name cannot be empty.")
+        if child_name in existing_names:
+            raise RetriableError(
+                f"Hire error - member name '{child_name}' already exists. Please choose a unique name."
+            )
 
     agent_card_config = agent_card.get_config_copy()
     agent_card_config.name = child_name
