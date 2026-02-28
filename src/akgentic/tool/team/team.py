@@ -89,7 +89,7 @@ def _hire_single_member(
 
     actor_class = agent_card.get_agent_class()
     if isinstance(actor_class, str):
-        raise ValueError(f"Hire error - agent class for role {role} is a string, not a type. ")
+        raise ValueError(f"Hire error - agent class for role {role} is a string, not a type.")
 
     if name is None:
         role_prefix = f"@{role.replace(' ', '')}"
