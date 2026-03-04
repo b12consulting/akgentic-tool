@@ -303,7 +303,7 @@ class TeamTool(ToolCard):
 
             for role in roles:
                 try:
-                    child = _hire_single_member(
+                    child_address = _hire_single_member(
                         orchestrator_proxy,
                         observer,
                         role,
@@ -311,8 +311,8 @@ class TeamTool(ToolCard):
                         existing_names,
                         agent_catalog=agent_catalog,
                     )
-                    existing_names.add(child.name)
-                    hired_members.append(child.name)
+                    existing_names.add(child_address.name)
+                    hired_members.append(child_address.name)
                 except RetriableError:
                     errors.append(role)
 
