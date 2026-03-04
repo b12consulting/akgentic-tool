@@ -1,0 +1,246 @@
+"""Data models for the Knowledge Graph subsystem.
+
+Defines entity, relation, CRUD request models, query/search models,
+and state containers for the KnowledgeGraphActor. All models extend
+SerializableBaseModel for proper actor message serialization.
+
+Source: V2 redesign of akgentic-framework/libs/tools/tools/knowledge_graph.py
+"""
+
+from __future__ import annotations
+
+import uuid
+from typing import Literal
+
+from pydantic import Field
+
+from akgentic.core.agent_state import BaseState
+from akgentic.core.utils.serializer import SerializableBaseModel
+
+# ---------------------------------------------------------------------------
+# Core domain models
+# ---------------------------------------------------------------------------
+
+
+class Entity(SerializableBaseModel):
+    """An entity node in the knowledge graph.
+
+    Attributes:
+        id: Auto-generated UUID for stable vector index referencing.
+        name: Human-facing unique key (deduplication key).
+        entity_type: Classification label (e.g. "Person", "Concept").
+        description: Free-text or Markdown description.
+        observations: Incremental observations attached to the entity.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, description="Stable unique identifier.")
+    name: str = Field(..., description="Human-facing unique name (deduplication key).")
+    entity_type: str = Field(..., description="Classification label for the entity.")
+    description: str = Field(..., description="Free-text or Markdown description.")
+    observations: list[str] = Field(
+        default_factory=list, description="Incremental observations attached to the entity."
+    )
+
+
+class Relation(SerializableBaseModel):
+    """A directed edge between two entities in the knowledge graph.
+
+    Attributes:
+        id: Auto-generated UUID for stable vector index referencing.
+        from_entity: Source entity name.
+        to_entity: Target entity name.
+        relation_type: Label describing the relationship.
+        description: Optional free-text description (enables embedding in Epic 2).
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, description="Stable unique identifier.")
+    from_entity: str = Field(..., description="Source entity name.")
+    to_entity: str = Field(..., description="Target entity name.")
+    relation_type: str = Field(..., description="Label describing the relationship.")
+    description: str = Field(default="", description="Optional description of the relation.")
+
+
+# ---------------------------------------------------------------------------
+# CRUD request models
+# ---------------------------------------------------------------------------
+
+
+class EntityCreate(SerializableBaseModel):
+    """Request to create a new entity.
+
+    Mirrors Entity fields minus ``id`` (auto-generated on creation).
+    """
+
+    name: str = Field(..., description="Unique entity name.")
+    entity_type: str = Field(..., description="Classification label.")
+    description: str = Field(..., description="Free-text description.")
+    observations: list[str] = Field(default_factory=list, description="Initial observations.")
+
+
+class EntityUpdate(SerializableBaseModel):
+    """Partial update for an existing entity.
+
+    Only ``name`` is required (lookup key). All other fields are optional;
+    only non-None values are applied.
+    """
+
+    name: str = Field(..., description="Entity name to update (lookup key).")
+    description: str | None = Field(default=None, description="New description.")
+    entity_type: str | None = Field(default=None, description="New entity type.")
+    add_observations: list[str] | None = Field(default=None, description="Observations to append.")
+    remove_observations: list[str] | None = Field(
+        default=None, description="Observations to remove."
+    )
+
+
+class RelationCreate(SerializableBaseModel):
+    """Request to create a new relation."""
+
+    from_entity: str = Field(..., description="Source entity name.")
+    to_entity: str = Field(..., description="Target entity name.")
+    relation_type: str = Field(..., description="Relation label.")
+    description: str = Field(default="", description="Optional relation description.")
+
+
+class RelationDelete(SerializableBaseModel):
+    """Request to delete a relation by its unique triple."""
+
+    from_entity: str = Field(..., description="Source entity name.")
+    to_entity: str = Field(..., description="Target entity name.")
+    relation_type: str = Field(..., description="Relation label.")
+
+
+# ---------------------------------------------------------------------------
+# Batch mutation model
+# ---------------------------------------------------------------------------
+
+
+class ManageGraph(SerializableBaseModel):
+    """Batch mutation request processed by ``KnowledgeGraphActor.update_graph``.
+
+    Operation order: create_entities → create_relations → update_entities
+    → delete_relations → delete_entities.
+    """
+
+    create_entities: list[EntityCreate] = Field(
+        default_factory=list, description="Entities to add."
+    )
+    update_entities: list[EntityUpdate] = Field(
+        default_factory=list, description="Partial entity updates."
+    )
+    delete_entities: list[str] = Field(
+        default_factory=list, description="Entity names to remove (cascade deletes relations)."
+    )
+    create_relations: list[RelationCreate] = Field(
+        default_factory=list, description="Relations to add."
+    )
+    delete_relations: list[RelationDelete] = Field(
+        default_factory=list, description="Relations to remove by triple."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Container & state models
+# ---------------------------------------------------------------------------
+
+
+class KnowledgeGraph(SerializableBaseModel):
+    """In-memory container for the full knowledge graph."""
+
+    entities: list[Entity] = Field(default_factory=list, description="All entities.")
+    relations: list[Relation] = Field(default_factory=list, description="All relations.")
+
+
+class KnowledgeGraphState(BaseState):
+    """Actor state wrapping a ``KnowledgeGraph`` instance.
+
+    Inherits observer pattern from ``BaseState`` for automatic
+    ``StateChangedMessage`` propagation to the orchestrator.
+    """
+
+    knowledge_graph: KnowledgeGraph = Field(default_factory=KnowledgeGraph)
+
+
+# ---------------------------------------------------------------------------
+# Query & search models (Story 1.2)
+# ---------------------------------------------------------------------------
+
+
+class GetGraphQuery(SerializableBaseModel):
+    """Parameters for subgraph retrieval via ``KnowledgeGraphActor.get_graph``.
+
+    When ``entity_names`` is empty the full graph is returned.
+    ``depth`` controls BFS expansion hops from root entities.
+    ``relation_types`` limits which edges are traversed during expansion.
+
+    Note: ``path: list[PathStep]`` is planned for Epic 3, Story 3.1 —
+    do NOT add it here.
+    """
+
+    entity_names: list[str] = Field(
+        default_factory=list,
+        description="Root entity names to start subgraph from (empty = full graph).",
+    )
+    relation_types: list[str] = Field(
+        default_factory=list,
+        description="Only traverse these relation types during BFS (empty = all).",
+    )
+    depth: int = Field(default=1, description="Max BFS hops from root entities.")
+
+
+class GraphView(SerializableBaseModel):
+    """Read-only snapshot of a (sub)graph returned by ``get_graph``.
+
+    Attributes:
+        entities: Entities in the view.
+        relations: Relations connecting entities in the view.
+    """
+
+    entities: list[Entity] = Field(default_factory=list, description="Entities in the view.")
+    relations: list[Relation] = Field(default_factory=list, description="Relations in the view.")
+
+
+class SearchQuery(SerializableBaseModel):
+    """Parameters for ``KnowledgeGraphActor.search``.
+
+    Note: ``include_neighbors``, ``include_edges``, ``find_paths`` are
+    planned for Epic 3 — do NOT add them here.
+    """
+
+    query: str = Field(..., description="Search query string.")
+    top_k: int = Field(default=10, description="Maximum number of hits to return.")
+    mode: Literal["hybrid", "vector", "keyword"] = Field(
+        default="hybrid", description="Search mode: hybrid, vector, or keyword."
+    )
+
+
+class SearchHit(SerializableBaseModel):
+    """A single search result entry.
+
+    Attributes:
+        ref_type: Whether the hit is an entity or relation.
+        ref_id: UUID string of the matched entity/relation.
+        score: Match score (1.0 for keyword binary match).
+        entity: Populated when ref_type is "entity".
+        relation: Populated when ref_type is "relation".
+    """
+
+    ref_type: Literal["entity", "relation"] = Field(
+        ..., description="Type of the referenced object."
+    )
+    ref_id: str = Field(..., description="UUID string of the matched object.")
+    score: float = Field(..., description="Match score.")
+    entity: Entity | None = Field(default=None, description="Matched entity (if ref_type=entity).")
+    relation: Relation | None = Field(
+        default=None, description="Matched relation (if ref_type=relation)."
+    )
+
+
+class SearchResult(SerializableBaseModel):
+    """Container for search results.
+
+    Note: ``neighbors``, ``connected_relations``, ``paths`` fields are
+    planned for Epic 3 — do NOT add them here.
+    """
+
+    hits: list[SearchHit] = Field(default_factory=list, description="Ranked search hits.")
