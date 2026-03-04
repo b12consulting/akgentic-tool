@@ -59,7 +59,7 @@ def _hire_single_member(
     name: str | None,
     existing_names: set[str],
     agent_catalog: list[AgentCard] | None = None,
-) -> tuple[str, ActorAddress]:
+) -> ActorAddress:
     """Core hire logic for a single member.
 
     Args:
@@ -71,7 +71,7 @@ def _hire_single_member(
         agent_catalog: Pre-fetched catalog. If None, fetched from orchestrator.
 
     Returns:
-        Tuple of (child_name, child_address).
+        ActorAddress: Address of the newly hired child actor.
 
     Raises:
         RetriableError: If no agent card found for the role.
@@ -115,10 +115,10 @@ def _hire_single_member(
     agent_card_config.role = role
 
     child_address = observer.createActor(actor_class, config=agent_card_config)
-    observer.on_hire(child_name, child_address)
+    observer.on_hire(child_address)
 
     logger.info(f"Hired {role} agent: {child_name} at {child_address}")
-    return child_name, child_address
+    return child_address
 
 
 def _fire_single_member(
@@ -148,7 +148,7 @@ def _fire_single_member(
         )
 
     address.stop()
-    observer.on_fire(name, address)
+    observer.on_fire(address)
     logger.info(f"Fired team member: {name}")
     return name
 
@@ -303,7 +303,7 @@ class TeamTool(ToolCard):
 
             for role in roles:
                 try:
-                    child_name, _ = _hire_single_member(
+                    child_address = _hire_single_member(
                         orchestrator_proxy,
                         observer,
                         role,
@@ -311,8 +311,8 @@ class TeamTool(ToolCard):
                         existing_names,
                         agent_catalog=agent_catalog,
                     )
-                    existing_names.add(child_name)
-                    hired_members.append(child_name)
+                    existing_names.add(child_address.name)
+                    hired_members.append(child_address.name)
                 except RetriableError:
                     errors.append(role)
 

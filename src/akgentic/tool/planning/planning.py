@@ -113,6 +113,7 @@ class PlanningTool(ToolCard):
 
         def planning_prompt() -> str:
             """Get the full team planning."""
+
             planning = planning_proxy.get_planning()
             if not planning:
                 return "No current Team planning."
@@ -149,10 +150,7 @@ class PlanningTool(ToolCard):
         def update_planning(update: UpdatePlan) -> str:
             """Update team tasks (create, update, delete).
 
-            When you start or complete a task from the planning,
-            do not forget to update the plan with the new status
-            and output of the task.
-            """
+            Keep the plan up to date: update task status when you make progress, record outputs when you complete work, and create sub-tasks when you delegate."""
             observer.notify_event(
                 ToolCallEvent(tool_name="Update planning", args=[update], kwargs={})
             )

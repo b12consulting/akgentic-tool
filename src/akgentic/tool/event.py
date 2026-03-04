@@ -95,7 +95,7 @@ class TeamManagementToolObserver(ActorToolObserver, Protocol):
         """
         ...
 
-    def on_hire(self, name: str, address: ActorAddress) -> None:
+    def on_hire(self, address: ActorAddress) -> None:
         """Hook called after hiring a team member.
 
         Handles agent-specific concerns such as:
@@ -104,12 +104,11 @@ class TeamManagementToolObserver(ActorToolObserver, Protocol):
         - Any agent-specific bookkeeping
 
         Args:
-            name: Name of hired agent (e.g., '@Developer123')
             address: ActorAddress of hired agent
         """
         ...
 
-    def on_fire(self, name: str, address: ActorAddress) -> None:
+    def on_fire(self, address: ActorAddress) -> None:
         """Hook called after firing a team member.
 
         Handles agent-specific concerns such as:
@@ -118,7 +117,6 @@ class TeamManagementToolObserver(ActorToolObserver, Protocol):
         - Any agent-specific cleanup
 
         Args:
-            name: Name of fired agent (e.g., '@Developer123')
             address: ActorAddress of fired agent
         """
         ...
