@@ -71,7 +71,7 @@ def _hire_single_member(
         agent_catalog: Pre-fetched catalog. If None, fetched from orchestrator.
 
     Returns:
-        child_address.
+        ActorAddress: Address of the newly hired child actor.
 
     Raises:
         RetriableError: If no agent card found for the role.
