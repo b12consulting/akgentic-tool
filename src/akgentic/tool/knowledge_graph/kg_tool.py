@@ -33,8 +33,10 @@ from akgentic.tool.knowledge_graph.kg_actor import (
 )
 from akgentic.tool.knowledge_graph.models import (
     GetGraphQuery,
+    GraphView,
     ManageGraph,
     SearchQuery,
+    SearchResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -128,6 +130,45 @@ class KnowledgeGraphTool(ToolCard):
         self._kg_proxy = observer.proxy_ask(kg_addr, KnowledgeGraphActor)
 
     # ------------------------------------------------------------------
+    # Formatting helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _format_graph_view(view: GraphView) -> str:
+        """Format a ``GraphView`` as a human-readable string."""
+        if not view.entities:
+            return "Knowledge graph is empty."
+        lines = ["Knowledge Graph:"]
+        lines.append("Entities:")
+        for e in view.entities:
+            lines.append(f"  - {e.name} ({e.entity_type}): {e.description}")
+        lines.append("Relations:")
+        for r in view.relations:
+            desc = f" — {r.description}" if r.description else ""
+            lines.append(f"  - {r.from_entity} --[{r.relation_type}]--> {r.to_entity}{desc}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_search_result(result: SearchResult) -> str:
+        """Format a ``SearchResult`` as a human-readable string."""
+        if not result.hits:
+            return "No results found."
+        lines = ["Search Results:"]
+        for hit in result.hits:
+            if hit.entity:
+                lines.append(
+                    f"  - [entity] {hit.entity.name} ({hit.entity.entity_type}): "
+                    f"{hit.entity.description} (score: {hit.score:.2f})"
+                )
+            elif hit.relation:
+                r = hit.relation
+                lines.append(
+                    f"  - [relation] {r.from_entity} --[{r.relation_type}]--> "
+                    f"{r.to_entity} (score: {hit.score:.2f})"
+                )
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
     # System prompts (2.3)
     # ------------------------------------------------------------------
 
@@ -141,21 +182,12 @@ class KnowledgeGraphTool(ToolCard):
     def _get_graph_prompt_factory(self) -> Callable:
         """Create a closure that returns the current graph as a prompt string."""
         kg_proxy = self._kg_proxy
+        format_view = self._format_graph_view
 
         def graph_prompt() -> str:
             """Get the current knowledge graph state."""
             view = kg_proxy.get_graph(GetGraphQuery())
-            if not view.entities:
-                return "Knowledge graph is empty."
-            lines = ["Knowledge Graph:"]
-            lines.append("Entities:")
-            for e in view.entities:
-                lines.append(f"  - {e.name} ({e.entity_type}): {e.description}")
-            lines.append("Relations:")
-            for r in view.relations:
-                desc = f" — {r.description}" if r.description else ""
-                lines.append(f"  - {r.from_entity} --[{r.relation_type}]--> {r.to_entity}{desc}")
-            return "\n".join(lines)
+            return format_view(view)
 
         return graph_prompt
 
@@ -208,22 +240,13 @@ class KnowledgeGraphTool(ToolCard):
         """Return a closure that fetches and formats the graph."""
         kg_proxy = self._kg_proxy
         observer = self._observer
+        format_view = self._format_graph_view
 
         def get_graph() -> str:
             """Get the current knowledge graph."""
             observer.notify_event(ToolCallEvent(tool_name="Get graph", args=[], kwargs={}))
             view = kg_proxy.get_graph(GetGraphQuery())
-            if not view.entities:
-                return "Knowledge graph is empty."
-            lines = ["Knowledge Graph:"]
-            lines.append("Entities:")
-            for e in view.entities:
-                lines.append(f"  - {e.name} ({e.entity_type}): {e.description}")
-            lines.append("Relations:")
-            for r in view.relations:
-                desc = f" — {r.description}" if r.description else ""
-                lines.append(f"  - {r.from_entity} --[{r.relation_type}]--> {r.to_entity}{desc}")
-            return "\n".join(lines)
+            return format_view(view)
 
         get_graph.__doc__ = params.format_docstring(get_graph.__doc__)
         return get_graph
@@ -248,27 +271,13 @@ class KnowledgeGraphTool(ToolCard):
         """Return a closure that searches the graph."""
         kg_proxy = self._kg_proxy
         observer = self._observer
+        format_result = self._format_search_result
 
         def search_graph(query: SearchQuery) -> str:
             """Search the knowledge graph by keyword, vector, or hybrid mode."""
             observer.notify_event(ToolCallEvent(tool_name="Search graph", args=[query], kwargs={}))
             result = kg_proxy.search(query)
-            if not result.hits:
-                return "No results found."
-            lines = ["Search Results:"]
-            for hit in result.hits:
-                if hit.entity:
-                    lines.append(
-                        f"  - [entity] {hit.entity.name} ({hit.entity.entity_type}): "
-                        f"{hit.entity.description} (score: {hit.score:.2f})"
-                    )
-                elif hit.relation:
-                    r = hit.relation
-                    lines.append(
-                        f"  - [relation] {r.from_entity} --[{r.relation_type}]--> "
-                        f"{r.to_entity} (score: {hit.score:.2f})"
-                    )
-            return "\n".join(lines)
+            return format_result(result)
 
         search_graph.__doc__ = params.format_docstring(search_graph.__doc__)
         return search_graph

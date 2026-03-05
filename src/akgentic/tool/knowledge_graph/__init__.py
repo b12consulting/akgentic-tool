@@ -58,16 +58,23 @@ def _check_kg_dependencies() -> None:
     """Validate that ``[kg]`` optional dependencies are installed.
 
     Raises:
-        ImportError: With install instructions when ``numpy`` is missing.
+        ImportError: With install instructions when ``numpy`` or ``openai`` is missing.
     """
+    missing: list[str] = []
     try:
         import numpy as _  # noqa: F811, F401
-    except ImportError as exc:
+    except ImportError:
+        missing.append("numpy")
+    try:
+        import openai as _  # noqa: F811, F401
+    except ImportError:
+        missing.append("openai")
+    if missing:
         msg = (
-            "The knowledge_graph module requires extra dependencies. "
+            f"The knowledge_graph module requires extra dependencies ({', '.join(missing)}). "
             "Install them with: pip install akgentic-tool[kg]"
         )
-        raise ImportError(msg) from exc
+        raise ImportError(msg)
 
 
 __all__ = [
