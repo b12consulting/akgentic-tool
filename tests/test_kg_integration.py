@@ -174,13 +174,15 @@ class TestEndToEndUpdateGetSearch:
             )
         )
 
-        # Get via system prompt
+        # Get via system prompt — compact summary shows counts + types
         prompts = tool.get_system_prompts()
         result = prompts[0]()
-        assert "Python" in result
-        assert "FastAPI" in result
+        assert "Knowledge Graph Summary:" in result
+        assert "Entities: 2" in result
+        assert "Relations: 1" in result
         assert "BUILT_WITH" in result
         assert "Language" in result
+        assert "Framework" in result
 
     def test_update_then_search(self) -> None:
         tool, observer = self._make_tool()
@@ -300,10 +302,11 @@ class TestEndToEndUpdateGetSearch:
             )
         )
 
-        # Read
+        # Read — compact summary shows counts + types
         prompts = tool.get_system_prompts()
         prompt_result = prompts[0]()
-        assert "Go" in prompt_result
+        assert "Entities: 1" in prompt_result
+        assert "Language" in prompt_result
 
         # Search
         search_result = search_fn(SearchQuery(query="Go"))

@@ -136,7 +136,8 @@ class TestGetGraphQuery:
         q = GetGraphQuery()
         assert q.entity_names == []
         assert q.relation_types == []
-        assert q.depth == 1
+        assert q.depth is None
+        assert q.roots_only is False
 
     def test_explicit_values(self) -> None:
         q = GetGraphQuery(entity_names=["A"], relation_types=["R"], depth=3)
@@ -524,3 +525,179 @@ class TestSearchModeRouting:
         result = actor.search(SearchQuery(query="test", mode="vector"))
         assert isinstance(result, SearchResult)
         assert result.hits == []
+
+
+# ===========================================================================
+# Task 4 — roots_only query tests (Story 1.4, subtask 3.4)
+# ===========================================================================
+
+
+def _seed_graph_with_roots(actor: KnowledgeGraphActor) -> None:
+    """Populate a test graph with root entities for roots_only tests.
+
+    Root entities: Product, AuthService
+    Non-root: Library, Algorithm, Team
+    Relations:
+        Product --DEPENDS_ON--> Library
+        Product --CONNECTS_TO--> AuthService  (inter-root)
+        Library --USES--> Algorithm
+        AuthService --MAINTAINED_BY--> Team
+    """
+    actor.update_graph(
+        ManageGraph(
+            create_entities=[
+                EntityCreate(
+                    name="Product",
+                    entity_type="Software",
+                    description="Main product",
+                    is_root=True,
+                ),
+                EntityCreate(
+                    name="AuthService",
+                    entity_type="Service",
+                    description="Authentication service",
+                    is_root=True,
+                ),
+                EntityCreate(
+                    name="Library",
+                    entity_type="Software",
+                    description="Math utility library",
+                ),
+                EntityCreate(
+                    name="Algorithm",
+                    entity_type="Concept",
+                    description="FFT algorithm",
+                ),
+                EntityCreate(
+                    name="Team",
+                    entity_type="Organization",
+                    description="Engineering team",
+                ),
+            ],
+            create_relations=[
+                RelationCreate(
+                    from_entity="Product",
+                    to_entity="Library",
+                    relation_type="DEPENDS_ON",
+                ),
+                RelationCreate(
+                    from_entity="Product",
+                    to_entity="AuthService",
+                    relation_type="CONNECTS_TO",
+                ),
+                RelationCreate(
+                    from_entity="Library",
+                    to_entity="Algorithm",
+                    relation_type="USES",
+                ),
+                RelationCreate(
+                    from_entity="AuthService",
+                    to_entity="Team",
+                    relation_type="MAINTAINED_BY",
+                ),
+            ],
+        )
+    )
+
+
+class TestRootsOnly:
+    """Story 1.4, AC-4: roots_only=True returns root entities + inter-root relations."""
+
+    def test_roots_only_returns_root_entities(self) -> None:
+        actor = _actor()
+        _seed_graph_with_roots(actor)
+        result = actor.get_graph(GetGraphQuery(roots_only=True))
+        entity_names = {e.name for e in result.entities}
+        assert entity_names == {"Product", "AuthService"}
+
+    def test_roots_only_returns_inter_root_relations(self) -> None:
+        actor = _actor()
+        _seed_graph_with_roots(actor)
+        result = actor.get_graph(GetGraphQuery(roots_only=True))
+        # Only Product→AuthService (inter-root) should be included
+        assert len(result.relations) == 1
+        assert result.relations[0].from_entity == "Product"
+        assert result.relations[0].to_entity == "AuthService"
+
+    def test_roots_only_depth_1_expands_neighbors(self) -> None:
+        """AC-5: roots_only + depth=1 expands from roots to direct neighbors."""
+        actor = _actor()
+        _seed_graph_with_roots(actor)
+        result = actor.get_graph(GetGraphQuery(roots_only=True, depth=1))
+        entity_names = {e.name for e in result.entities}
+        # Product→Library, Product→AuthService, AuthService→Team
+        assert "Product" in entity_names
+        assert "AuthService" in entity_names
+        assert "Library" in entity_names
+        assert "Team" in entity_names
+        # Algorithm is 2 hops from roots
+        assert "Algorithm" not in entity_names
+
+    def test_roots_only_ignores_entity_names(self) -> None:
+        """AC-6: entity_names ignored when roots_only=True."""
+        actor = _actor()
+        _seed_graph_with_roots(actor)
+        result = actor.get_graph(
+            GetGraphQuery(roots_only=True, entity_names=["Library"])
+        )
+        entity_names = {e.name for e in result.entities}
+        # Should return root entities, not Library
+        assert "Product" in entity_names
+        assert "AuthService" in entity_names
+        # Library is NOT returned because entity_names is ignored
+        assert "Library" not in entity_names
+
+    def test_roots_only_empty_graph(self) -> None:
+        actor = _actor()
+        result = actor.get_graph(GetGraphQuery(roots_only=True))
+        assert result.entities == []
+        assert result.relations == []
+
+    def test_roots_only_no_root_entities(self) -> None:
+        """Graph with entities but none marked is_root → empty result."""
+        actor = _actor()
+        _seed_graph(actor)  # Uses original seed without is_root
+        result = actor.get_graph(GetGraphQuery(roots_only=True))
+        assert result.entities == []
+        assert result.relations == []
+
+    def test_roots_only_with_relation_types_filter(self) -> None:
+        """roots_only + relation_types limits BFS edge traversal."""
+        actor = _actor()
+        _seed_graph_with_roots(actor)
+        result = actor.get_graph(
+            GetGraphQuery(roots_only=True, depth=1, relation_types=["DEPENDS_ON"])
+        )
+        entity_names = {e.name for e in result.entities}
+        # Only DEPENDS_ON edges traversed: Product→Library
+        assert "Product" in entity_names
+        assert "AuthService" in entity_names  # Root entity itself
+        assert "Library" in entity_names
+        # Team not reached (MAINTAINED_BY not in filter)
+        assert "Team" not in entity_names
+
+    def test_roots_only_explicit_depth_0(self) -> None:
+        """AC-4: roots_only + explicit depth=0 returns only roots + inter-root relations."""
+        actor = _actor()
+        _seed_graph_with_roots(actor)
+        result = actor.get_graph(GetGraphQuery(roots_only=True, depth=0))
+        entity_names = {e.name for e in result.entities}
+        assert entity_names == {"Product", "AuthService"}
+        # Only inter-root relation
+        assert len(result.relations) == 1
+        assert result.relations[0].relation_type == "CONNECTS_TO"
+
+    def test_roots_only_depth_2_full_expansion(self) -> None:
+        """roots_only + depth=2 reaches 2-hop neighbors from roots."""
+        actor = _actor()
+        _seed_graph_with_roots(actor)
+        result = actor.get_graph(GetGraphQuery(roots_only=True, depth=2))
+        entity_names = {e.name for e in result.entities}
+        # All entities reachable within 2 hops from roots
+        assert entity_names == {"Product", "AuthService", "Library", "Algorithm", "Team"}
+
+    def test_negative_depth_rejected(self) -> None:
+        """L-1: Negative depth values are rejected by validation."""
+        import pytest
+        with pytest.raises(Exception):  # noqa: B017
+            GetGraphQuery(depth=-1)

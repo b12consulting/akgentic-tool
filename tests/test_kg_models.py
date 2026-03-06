@@ -80,6 +80,19 @@ class TestEntity:
         # UUID survives round-trip (as string in dump, parsed back)
         assert str(restored.id) == str(e.id)
 
+    def test_is_root_defaults_false(self) -> None:
+        e = Entity(name="Alice", entity_type="Person", description="A person")
+        assert e.is_root is False
+
+    def test_is_root_set_true(self) -> None:
+        e = Entity(name="Alice", entity_type="Person", description="A person", is_root=True)
+        assert e.is_root is True
+
+    def test_is_root_survives_serialization(self) -> None:
+        e = Entity(name="R", entity_type="T", description="d", is_root=True)
+        restored = Entity.model_validate(e.model_dump())
+        assert restored.is_root is True
+
 
 # ---------------------------------------------------------------------------
 # Relation model (AC-3, Task 1.2)
@@ -132,6 +145,14 @@ class TestEntityCreate:
         ec = EntityCreate(name="X", entity_type="Concept", description="desc", observations=["a"])
         assert ec.observations == ["a"]
 
+    def test_is_root_defaults_false(self) -> None:
+        ec = EntityCreate(name="X", entity_type="Concept", description="desc")
+        assert ec.is_root is False
+
+    def test_is_root_set_true(self) -> None:
+        ec = EntityCreate(name="X", entity_type="Concept", description="desc", is_root=True)
+        assert ec.is_root is True
+
 
 class TestEntityUpdate:
     def test_all_optional_fields_default_none(self) -> None:
@@ -140,11 +161,24 @@ class TestEntityUpdate:
         assert eu.entity_type is None
         assert eu.add_observations is None
         assert eu.remove_observations is None
+        assert eu.is_root is None
 
     def test_partial_fields(self) -> None:
         eu = EntityUpdate(name="X", description="new desc")
         assert eu.description == "new desc"
         assert eu.entity_type is None
+
+    def test_is_root_none_is_noop(self) -> None:
+        eu = EntityUpdate(name="X")
+        assert eu.is_root is None
+
+    def test_is_root_set_true(self) -> None:
+        eu = EntityUpdate(name="X", is_root=True)
+        assert eu.is_root is True
+
+    def test_is_root_set_false(self) -> None:
+        eu = EntityUpdate(name="X", is_root=False)
+        assert eu.is_root is False
 
 
 class TestRelationCreate:

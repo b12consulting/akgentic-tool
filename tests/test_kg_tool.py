@@ -33,6 +33,7 @@ from akgentic.tool.knowledge_graph.kg_tool import (
 )
 from akgentic.tool.knowledge_graph.models import (
     EntityCreate,
+    GraphView,
     ManageGraph,
     RelationCreate,
     SearchQuery,
@@ -336,17 +337,21 @@ class TestGetSystemPrompts:
 
         prompts = tool.get_system_prompts()
         result = prompts[0]()
-        assert "empty" in result.lower()
+        assert result == "Knowledge graph is empty."
 
-    def test_prompt_contains_entities(self) -> None:
+    def test_prompt_contains_compact_summary(self) -> None:
         tool = KnowledgeGraphTool()
         observer = MockActorToolObserver()
         actor = observer.setup_kg_actor()
-        # Seed data
         actor.update_graph(
             ManageGraph(
                 create_entities=[
-                    EntityCreate(name="Alice", entity_type="Person", description="Engineer"),
+                    EntityCreate(
+                        name="Alice",
+                        entity_type="Person",
+                        description="Engineer",
+                        is_root=True,
+                    ),
                 ]
             )
         )
@@ -354,9 +359,12 @@ class TestGetSystemPrompts:
 
         prompts = tool.get_system_prompts()
         result = prompts[0]()
-        assert "Alice" in result
-        assert "Person" in result
-        assert "Engineer" in result
+        assert "Knowledge Graph Summary:" in result
+        assert "Entities: 1" in result
+        assert "Entity types: Person" in result
+        assert "Root entities:" in result
+        assert "Alice (Person): Engineer" in result
+        assert "Use the get_graph tool" in result
 
 
 class TestGetTools:
@@ -536,3 +544,183 @@ class TestSearchFactory:
 
         assert len(observer.events) == 1
         assert observer.events[0].tool_name == "Search graph"
+
+
+# ===========================================================================
+# Story 1.4 — _format_graph_summary and prompt config tests
+# ===========================================================================
+
+
+def _build_summary_view() -> GraphView:
+    """Build a GraphView with varied types and root entities for summary tests."""
+    from akgentic.tool.knowledge_graph.models import Entity, Relation
+
+    entities = [
+        Entity(
+            name="Product", entity_type="Component", description="Main product platform",
+            is_root=True,
+        ),
+        Entity(
+            name="AuthService", entity_type="Service",
+            description="Central authentication service", is_root=True,
+        ),
+        Entity(
+            name="UserDB", entity_type="Database",
+            description="Primary user data store", is_root=True,
+        ),
+        Entity(name="Cache", entity_type="Component", description="Redis cache layer"),
+        Entity(name="Logger", entity_type="Service", description="Logging service"),
+    ]
+    relations = [
+        Relation(
+            from_entity="Product", to_entity="AuthService", relation_type="DEPENDS_ON",
+        ),
+        Relation(
+            from_entity="AuthService", to_entity="UserDB", relation_type="STORES_IN",
+        ),
+        Relation(
+            from_entity="Product", to_entity="Cache", relation_type="CONNECTS_TO",
+        ),
+    ]
+    return GraphView(entities=entities, relations=relations)
+
+
+class TestFormatGraphSummary:
+    """Story 1.4 Task 4.2: _format_graph_summary static method."""
+
+    def test_both_schema_and_roots_enabled(self) -> None:
+        view = _build_summary_view()
+        result = KnowledgeGraphTool._format_graph_summary(view)
+        assert "Knowledge Graph Summary:" in result
+        assert "Entities: 5 | Relations: 3" in result
+        assert "Entity types:" in result
+        assert "Component" in result
+        assert "Service" in result
+        assert "Database" in result
+        assert "Relation types:" in result
+        assert "DEPENDS_ON" in result
+        assert "Root entities:" in result
+        assert "Product (Component): Main product platform" in result
+        assert "AuthService (Service): Central authentication service" in result
+        assert "UserDB (Database): Primary user data store" in result
+        assert "Use the get_graph tool" in result
+
+    def test_schema_disabled(self) -> None:
+        view = _build_summary_view()
+        result = KnowledgeGraphTool._format_graph_summary(
+            view, include_schema=False
+        )
+        assert "Entity types:" not in result
+        assert "Relation types:" not in result
+        # Counts and roots still present
+        assert "Entities: 5" in result
+        assert "Root entities:" in result
+
+    def test_roots_disabled(self) -> None:
+        view = _build_summary_view()
+        result = KnowledgeGraphTool._format_graph_summary(
+            view, include_roots=False
+        )
+        assert "Root entities:" not in result
+        assert "Product (Component)" not in result
+        # Counts and schema still present
+        assert "Entities: 5" in result
+        assert "Entity types:" in result
+
+    def test_both_disabled_counts_and_footer_only(self) -> None:
+        view = _build_summary_view()
+        result = KnowledgeGraphTool._format_graph_summary(
+            view, include_schema=False, include_roots=False
+        )
+        assert "Entities: 5 | Relations: 3" in result
+        assert "Entity types:" not in result
+        assert "Root entities:" not in result
+        assert "Use the get_graph tool" in result
+
+    def test_empty_graph(self) -> None:
+        result = KnowledgeGraphTool._format_graph_summary(GraphView())
+        assert result == "Knowledge graph is empty."
+
+    def test_scales_by_types_not_entities(self) -> None:
+        """AC-12: Summary length depends on distinct types + roots, not total count."""
+        from akgentic.tool.knowledge_graph.models import Entity, Relation
+
+        # Build graph with many entities but few types
+        entities = [
+            Entity(
+                name=f"E{i}", entity_type="TypeA" if i % 2 == 0 else "TypeB",
+                description=f"Entity {i}",
+            )
+            for i in range(50)
+        ]
+        entities[0].is_root = True
+        relations = [
+            Relation(
+                from_entity=f"E{i}", to_entity=f"E{i+1}", relation_type="REL",
+            )
+            for i in range(49)
+        ]
+        view = GraphView(entities=entities, relations=relations)
+        result = KnowledgeGraphTool._format_graph_summary(view)
+        # Summary should have lines for: header, counts, 2 entity types,
+        # 1 relation type, root header + 1 root, blank, footer = ~8 lines
+        lines = result.strip().split("\n")
+        assert len(lines) < 15  # NOT 50+ lines
+
+    def test_format_graph_view_still_returns_full_details(self) -> None:
+        """Task 4.4: _format_graph_view unchanged — still returns full entity/relation details."""
+        view = _build_summary_view()
+        result = KnowledgeGraphTool._format_graph_view(view)
+        assert "Knowledge Graph:" in result
+        assert "Entities:" in result
+        assert "Relations:" in result
+        # Full details — every entity listed
+        assert "Product" in result
+        assert "Cache" in result
+        assert "Logger" in result
+
+
+class TestSystemPromptConfig:
+    """Story 1.4 Task 4.3/4.5: prompt config passed through to summary."""
+
+    def test_prompt_schema_disabled(self) -> None:
+        tool = KnowledgeGraphTool(
+            get_graph=GetGraph(prompt_include_schema=False)
+        )
+        observer = MockActorToolObserver()
+        actor = observer.setup_kg_actor()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(
+                        name="X", entity_type="T", description="d", is_root=True
+                    ),
+                ]
+            )
+        )
+        tool.observer(observer)
+
+        result = tool.get_system_prompts()[0]()
+        assert "Entity types:" not in result
+        assert "Entities: 1" in result
+
+    def test_prompt_roots_disabled(self) -> None:
+        tool = KnowledgeGraphTool(
+            get_graph=GetGraph(prompt_include_roots=False)
+        )
+        observer = MockActorToolObserver()
+        actor = observer.setup_kg_actor()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(
+                        name="X", entity_type="T", description="d", is_root=True
+                    ),
+                ]
+            )
+        )
+        tool.observer(observer)
+
+        result = tool.get_system_prompts()[0]()
+        assert "Root entities:" not in result
+        assert "Entity types:" in result

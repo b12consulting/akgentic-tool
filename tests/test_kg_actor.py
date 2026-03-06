@@ -516,3 +516,92 @@ class TestOperationOrder:
         assert entities[0].name == "Bob"
         # Both relations (original + new) should be cascade-deleted
         assert len(relations) == 0
+
+
+# ---------------------------------------------------------------------------
+# is_root wiring (Story 1.4, AC-2, AC-3)
+# ---------------------------------------------------------------------------
+
+
+class TestIsRootWiring:
+    """Verify is_root flows through create and update operations."""
+
+    def test_create_entity_with_is_root_true(self) -> None:
+        actor = _actor()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(
+                        name="Root", entity_type="Concept", description="entry point", is_root=True
+                    )
+                ]
+            )
+        )
+        entities = actor.get_graph().entities
+        assert len(entities) == 1
+        assert entities[0].is_root is True
+
+    def test_create_entity_without_is_root_defaults_false(self) -> None:
+        actor = _actor()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="Leaf", entity_type="Concept", description="not root")
+                ]
+            )
+        )
+        entities = actor.get_graph().entities
+        assert entities[0].is_root is False
+
+    def test_update_entity_toggle_is_root_true(self) -> None:
+        actor = _actor()
+        _seed_entities(actor)
+        actor.update_graph(ManageGraph(update_entities=[EntityUpdate(name="Alice", is_root=True)]))
+        alice = next(e for e in actor.get_graph().entities if e.name == "Alice")
+        assert alice.is_root is True
+
+    def test_update_entity_toggle_is_root_false(self) -> None:
+        actor = _actor()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="Root", entity_type="T", description="d", is_root=True)
+                ]
+            )
+        )
+        actor.update_graph(ManageGraph(update_entities=[EntityUpdate(name="Root", is_root=False)]))
+        root = actor.get_graph().entities[0]
+        assert root.is_root is False
+
+    def test_is_root_survives_other_partial_updates(self) -> None:
+        actor = _actor()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="Root", entity_type="T", description="d", is_root=True)
+                ]
+            )
+        )
+        # Update description only — is_root should remain True
+        actor.update_graph(
+            ManageGraph(update_entities=[EntityUpdate(name="Root", description="updated")])
+        )
+        root = actor.get_graph().entities[0]
+        assert root.is_root is True
+        assert root.description == "updated"
+
+    def test_update_is_root_none_is_noop(self) -> None:
+        actor = _actor()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="Root", entity_type="T", description="d", is_root=True)
+                ]
+            )
+        )
+        # is_root=None (default) means no change
+        actor.update_graph(
+            ManageGraph(update_entities=[EntityUpdate(name="Root", description="x")])
+        )
+        root = actor.get_graph().entities[0]
+        assert root.is_root is True

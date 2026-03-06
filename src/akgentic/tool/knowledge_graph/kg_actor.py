@@ -95,6 +95,7 @@ class KnowledgeGraphActor(Akgent[BaseConfig, KnowledgeGraphState]):
                 entity_type=ec.entity_type,
                 description=ec.description,
                 observations=list(ec.observations),
+                is_root=ec.is_root,
             )
             self.state.knowledge_graph.entities.append(entity)
             existing_names.add(ec.name)
@@ -163,6 +164,8 @@ class KnowledgeGraphActor(Akgent[BaseConfig, KnowledgeGraphState]):
                 entity.description = eu.description
             if eu.entity_type is not None:
                 entity.entity_type = eu.entity_type
+            if eu.is_root is not None:
+                entity.is_root = eu.is_root
             if eu.add_observations is not None:
                 entity.observations.extend(eu.add_observations)
             if eu.remove_observations is not None:
@@ -304,10 +307,14 @@ class KnowledgeGraphActor(Akgent[BaseConfig, KnowledgeGraphState]):
     def get_graph(self, query: GetGraphQuery | None = None) -> GraphView:
         """Return a full or filtered subgraph view.
 
-        When ``query`` is None or has empty ``entity_names``, the full
-        graph is returned.  Otherwise BFS expansion is performed from
-        the root entities up to ``depth`` hops, optionally filtered by
-        ``relation_types``.
+        When ``query`` is None or has empty ``entity_names`` (and
+        ``roots_only`` is False), the full graph is returned.  Otherwise
+        BFS expansion is performed from the seed entities up to
+        ``depth`` hops, optionally filtered by ``relation_types``.
+
+        When ``roots_only`` is True, entities with ``is_root=True`` are
+        used as BFS seeds and ``entity_names`` is ignored.  Depth
+        defaults to 0 (no expansion) for ``roots_only`` mode.
 
         Args:
             query: Subgraph query parameters.  Defaults to full graph.
@@ -318,15 +325,30 @@ class KnowledgeGraphActor(Akgent[BaseConfig, KnowledgeGraphState]):
         if query is None:
             query = GetGraphQuery()
 
+        # roots_only takes precedence over entity_names (AC-6)
+        if query.roots_only:
+            root_names = [e.name for e in self.state.knowledge_graph.entities if e.is_root]
+            if not root_names:
+                return GraphView()
+            # depth=None → 0 for roots_only (AC-4); explicit depth used as-is (AC-5)
+            effective_depth = query.depth if query.depth is not None else 0
+            return self._get_subgraph(
+                entity_names=root_names,
+                depth=effective_depth,
+                relation_types=query.relation_types,
+            )
+
         if not query.entity_names:
             return GraphView(
                 entities=list(self.state.knowledge_graph.entities),
                 relations=list(self.state.knowledge_graph.relations),
             )
 
+        # depth=None → 1 for entity_names mode (backward compat)
+        effective_depth = query.depth if query.depth is not None else 1
         return self._get_subgraph(
             entity_names=query.entity_names,
-            depth=query.depth,
+            depth=effective_depth,
             relation_types=query.relation_types,
         )
 

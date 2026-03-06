@@ -40,6 +40,10 @@ class Entity(SerializableBaseModel):
     observations: list[str] = Field(
         default_factory=list, description="Incremental observations attached to the entity."
     )
+    is_root: bool = Field(
+        default=False,
+        description="Marks entry-point/anchor entities for system prompt and roots_only queries.",
+    )
 
 
 class Relation(SerializableBaseModel):
@@ -75,6 +79,7 @@ class EntityCreate(SerializableBaseModel):
     entity_type: str = Field(..., description="Classification label.")
     description: str = Field(..., description="Free-text description.")
     observations: list[str] = Field(default_factory=list, description="Initial observations.")
+    is_root: bool = Field(default=False, description="Mark as root/entry-point entity.")
 
 
 class EntityUpdate(SerializableBaseModel):
@@ -91,6 +96,7 @@ class EntityUpdate(SerializableBaseModel):
     remove_observations: list[str] | None = Field(
         default=None, description="Observations to remove."
     )
+    is_root: bool | None = Field(default=None, description="Toggle root status.")
 
 
 class RelationCreate(SerializableBaseModel):
@@ -169,9 +175,14 @@ class KnowledgeGraphState(BaseState):
 class GetGraphQuery(SerializableBaseModel):
     """Parameters for subgraph retrieval via ``KnowledgeGraphActor.get_graph``.
 
-    When ``entity_names`` is empty the full graph is returned.
-    ``depth`` controls BFS expansion hops from root entities.
-    ``relation_types`` limits which edges are traversed during expansion.
+    When ``entity_names`` is empty and ``roots_only`` is False the full
+    graph is returned.  ``depth`` controls BFS expansion hops from root
+    entities.  ``relation_types`` limits which edges are traversed.
+
+    When ``roots_only`` is True, only entities with ``is_root=True`` are
+    used as BFS seeds (``entity_names`` is ignored).  ``depth`` defaults
+    to None which means: 0 for roots_only mode (no expansion), 1 for
+    entity_names mode (1-hop expansion).  Explicit depth always wins.
 
     Note: ``path: list[PathStep]`` is planned for Epic 3, Story 3.1 —
     do NOT add it here.
@@ -185,7 +196,15 @@ class GetGraphQuery(SerializableBaseModel):
         default_factory=list,
         description="Only traverse these relation types during BFS (empty = all).",
     )
-    depth: int = Field(default=1, description="Max BFS hops from root entities.")
+    depth: int | None = Field(
+        default=None,
+        ge=0,
+        description="Max BFS hops. None = context default (0 for roots_only, 1 for entity_names).",
+    )
+    roots_only: bool = Field(
+        default=False,
+        description="Return only is_root=True entities + inter-root relations.",
+    )
 
 
 class GraphView(SerializableBaseModel):

@@ -52,6 +52,14 @@ class GetGraph(BaseToolParam):
     """Get the full knowledge graph — as system prompt and/or command."""
 
     expose: set[Channels] = {SYSTEM_PROMPT, COMMAND}
+    prompt_include_schema: bool = Field(
+        default=True,
+        description="Include entity/relation type schema in system prompt.",
+    )
+    prompt_include_roots: bool = Field(
+        default=True,
+        description="Include root entities listing in system prompt.",
+    )
 
 
 class UpdateGraph(BaseToolParam):
@@ -149,6 +157,40 @@ class KnowledgeGraphTool(ToolCard):
         return "\n".join(lines)
 
     @staticmethod
+    def _format_graph_summary(
+        view: GraphView,
+        include_schema: bool = True,
+        include_roots: bool = True,
+    ) -> str:
+        """Format a compact system prompt summary of the graph.
+
+        Output scales as O(types + roots), not O(entities + relations).
+        """
+        if not view.entities:
+            return "Knowledge graph is empty."
+
+        lines = ["**Knowledge Graph Summary:**"]
+        lines.append(f"Entities: {len(view.entities)} | Relations: {len(view.relations)}")
+
+        if include_schema:
+            entity_types = sorted({e.entity_type for e in view.entities})
+            relation_types = sorted({r.relation_type for r in view.relations})
+            lines.append(f"Entity types: {', '.join(entity_types)}")
+            if relation_types:
+                lines.append(f"Relation types: {', '.join(relation_types)}")
+
+        if include_roots:
+            root_entities = sorted((e for e in view.entities if e.is_root), key=lambda e: e.name)
+            if root_entities:
+                lines.append("Root entities:")
+                for e in root_entities:
+                    lines.append(f"- {e.name} ({e.entity_type}): {e.description}")
+
+        lines.append("")
+        lines.append("Use the get_graph tool to explore the full graph or subgraphs.")
+        return "\n".join(lines)
+
+    @staticmethod
     def _format_search_result(result: SearchResult) -> str:
         """Format a ``SearchResult`` as a human-readable string."""
         if not result.hits:
@@ -180,14 +222,17 @@ class KnowledgeGraphTool(ToolCard):
         return []
 
     def _get_graph_prompt_factory(self) -> Callable:
-        """Create a closure that returns the current graph as a prompt string."""
+        """Create a closure that returns a compact graph summary as a prompt string."""
         kg_proxy = self._kg_proxy
-        format_view = self._format_graph_view
+        format_summary = self._format_graph_summary
+        gp = _resolve(self.get_graph, GetGraph)
+        include_schema = gp.prompt_include_schema if gp else True
+        include_roots = gp.prompt_include_roots if gp else True
 
         def graph_prompt() -> str:
             """Get the current knowledge graph state."""
             view = kg_proxy.get_graph(GetGraphQuery())
-            return format_view(view)
+            return format_summary(view, include_schema=include_schema, include_roots=include_roots)
 
         return graph_prompt
 
