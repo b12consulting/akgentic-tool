@@ -13,7 +13,7 @@ test methods. Same pattern as test_planning_actor.py.
 from __future__ import annotations
 
 import uuid
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 from akgentic.core.actor_address import ActorAddress
@@ -23,6 +23,7 @@ from akgentic.tool.knowledge_graph.kg_actor import (
     KG_ACTOR_NAME,
     KG_ACTOR_ROLE,
     KnowledgeGraphActor,
+    KnowledgeGraphConfig,
 )
 from akgentic.tool.knowledge_graph.models import (
     EntityCreate,
@@ -117,6 +118,33 @@ def _seed_with_relation(actor: KnowledgeGraphActor) -> None:
             ],
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# KnowledgeGraphConfig (AC-1)
+# ---------------------------------------------------------------------------
+
+
+class TestKnowledgeGraphConfig:
+    """AC-1: KnowledgeGraphConfig extends BaseConfig with embedding settings."""
+
+    def test_default_embedding_model(self) -> None:
+        cfg = KnowledgeGraphConfig(name="test", role="ToolActor")
+        assert cfg.embedding_model == "text-embedding-3-small"
+
+    def test_default_embedding_provider(self) -> None:
+        cfg = KnowledgeGraphConfig(name="test", role="ToolActor")
+        assert cfg.embedding_provider == "openai"
+
+    def test_custom_embedding_model(self) -> None:
+        cfg = KnowledgeGraphConfig(
+            name="test", role="ToolActor", embedding_model="text-embedding-ada-002"
+        )
+        assert cfg.embedding_model == "text-embedding-ada-002"
+
+    def test_azure_provider(self) -> None:
+        cfg = KnowledgeGraphConfig(name="test", role="ToolActor", embedding_provider="azure")
+        assert cfg.embedding_provider == "azure"
 
 
 # ---------------------------------------------------------------------------
@@ -635,7 +663,9 @@ class TestEmbeddingOnCreate:
         actor, mock_svc = _actor_with_mock_embed()
         actor.update_graph(
             ManageGraph(
-                create_entities=[EntityCreate(name="Alice", entity_type="Person", description="Eng")]
+                create_entities=[
+                    EntityCreate(name="Alice", entity_type="Person", description="Eng")
+                ]
             )
         )
         mock_svc.embed.assert_called_once()
@@ -684,7 +714,9 @@ class TestEmbeddingOnUpdate:
         actor, mock_svc = _actor_with_mock_embed()
         actor.update_graph(
             ManageGraph(
-                create_entities=[EntityCreate(name="Alice", entity_type="Person", description="Eng")]
+                create_entities=[
+                    EntityCreate(name="Alice", entity_type="Person", description="Eng")
+                ]
             )
         )
         embed_count_before = mock_svc.embed.call_count
@@ -700,7 +732,9 @@ class TestEmbeddingOnUpdate:
         actor, mock_svc = _actor_with_mock_embed()
         actor.update_graph(
             ManageGraph(
-                create_entities=[EntityCreate(name="Alice", entity_type="Person", description="Eng")]
+                create_entities=[
+                    EntityCreate(name="Alice", entity_type="Person", description="Eng")
+                ]
             )
         )
         embed_count_before = mock_svc.embed.call_count
@@ -718,7 +752,9 @@ class TestEmbeddingOnDelete:
         actor, mock_svc = _actor_with_mock_embed()
         actor.update_graph(
             ManageGraph(
-                create_entities=[EntityCreate(name="Alice", entity_type="Person", description="Eng")]
+                create_entities=[
+                    EntityCreate(name="Alice", entity_type="Person", description="Eng")
+                ]
             )
         )
         # Check an embedding was stored
@@ -763,7 +799,9 @@ class TestEmbeddingGracefulDegradation:
         mock_svc.embed.side_effect = RuntimeError("API key invalid")
         result = actor.update_graph(
             ManageGraph(
-                create_entities=[EntityCreate(name="Alice", entity_type="Person", description="Eng")]
+                create_entities=[
+                    EntityCreate(name="Alice", entity_type="Person", description="Eng")
+                ]
             )
         )
         assert result == "Done"

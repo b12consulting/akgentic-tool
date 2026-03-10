@@ -10,7 +10,6 @@ Covers:
 from __future__ import annotations
 
 import time
-import unittest.mock as mock
 from typing import Literal
 from unittest.mock import MagicMock, patch
 
@@ -153,7 +152,9 @@ class TestEmbeddingService:
 # ---------------------------------------------------------------------------
 
 
-def _make_entry(ref_id: str, vector: list[float], ref_type: Literal["entity", "relation"] = "entity") -> VectorEntry:
+def _make_entry(
+    ref_id: str, vector: list[float], ref_type: Literal["entity", "relation"] = "entity"
+) -> VectorEntry:
     """Factory for VectorEntry instances in tests."""
     return VectorEntry(ref_type=ref_type, ref_id=ref_id, text=f"text-{ref_id}", vector=vector)
 
@@ -224,7 +225,6 @@ class TestVectorIndexCosineSearch:
     def test_results_sorted_descending_by_score(self) -> None:
         idx = VectorIndex()
         # e1 is aligned, e2 is 45°, e3 is orthogonal
-        import math
         idx.add(_make_entry("e1", [1.0, 0.0]))
         idx.add(_make_entry("e2", [1.0, 1.0]))  # normalized scores 1/sqrt(2)
         idx.add(_make_entry("e3", [0.0, 1.0]))

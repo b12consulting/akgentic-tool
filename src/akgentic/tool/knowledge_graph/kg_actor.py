@@ -295,7 +295,7 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
     def _delete_entities(self, names: list[str]) -> list[str]:
         """Remove entities by name with cascade deletion of relations.
 
-        Also removes any associated VectorEntry embeddings (no-op until Epic 2).
+        Also removes any associated VectorEntry embeddings from the vector index.
 
         Returns:
             List of error strings for entities not found.
@@ -310,7 +310,7 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         names_set = set(names) & existing_names
 
         if names_set:
-            # Collect UUIDs of deleted entities for future embedding removal
+            # Collect UUIDs of deleted entities for embedding removal
             _deleted_ids = [
                 e.id for e in self.state.knowledge_graph.entities if e.name in names_set
             ]
@@ -343,7 +343,7 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
     def _delete_relations(self, deletions: list[RelationDelete]) -> list[str]:
         """Remove relations by ``(from_entity, to_entity, relation_type)`` triple.
 
-        Also removes any associated VectorEntry embeddings (no-op until Epic 2).
+        Also removes any associated VectorEntry embeddings from the vector index.
 
         Returns:
             List of error strings for relations not found.
@@ -365,7 +365,7 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
                 triples_to_delete.add(triple)
 
         if triples_to_delete:
-            # Collect UUIDs for future embedding removal
+            # Collect UUIDs for embedding removal
             _deleted_rel_ids = [
                 r.id
                 for r in self.state.knowledge_graph.relations

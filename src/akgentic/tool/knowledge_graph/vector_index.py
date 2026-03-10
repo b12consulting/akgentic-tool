@@ -102,11 +102,18 @@ class VectorIndex:
         self._norms_buf: np.ndarray = np.empty(0, dtype=np.float64)
 
     def _ensure_capacity(self, dim: int) -> None:
-        """Grow the backing buffers if the current row count equals capacity."""
+        """Grow the backing buffers if the current row count equals capacity.
+
+        Uses ``self._dim`` (the index's established dimensionality) for the new
+        buffer shape.  The ``dim`` parameter is used only when initializing the
+        first buffer (``self._dim == 0``), ensuring consistent column counts
+        across resizes regardless of the caller's argument.
+        """
         if self._count < self._capacity:
             return
+        effective_dim = self._dim if self._dim > 0 else dim
         new_cap = max(self._INITIAL_CAPACITY, self._capacity * self._GROWTH_FACTOR)
-        new_buf = np.empty((new_cap, dim), dtype=np.float64)
+        new_buf = np.empty((new_cap, effective_dim), dtype=np.float64)
         new_norms = np.empty(new_cap, dtype=np.float64)
         if self._count > 0:
             new_buf[: self._count] = self._buf[: self._count]
