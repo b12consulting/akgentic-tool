@@ -516,16 +516,18 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         return GraphView(entities=result_entities, relations=result_relations)
 
     # ------------------------------------------------------------------
-    # Keyword search
+    # Search (keyword / vector / hybrid)
     # ------------------------------------------------------------------
 
     def search(self, query: SearchQuery) -> SearchResult:
         """Search the knowledge graph by keyword, vector, or hybrid mode.
 
         ``mode="keyword"``: case-insensitive substring matching across
-        entity and relation fields.  ``mode="vector"``: placeholder
-        returning empty results (Epic 2).  ``mode="hybrid"``: keyword
-        only for now (vector component added in Epic 2).
+        entity and relation fields.  ``mode="vector"``: embeds the query
+        and returns top-k results by cosine similarity; returns empty when
+        no embeddings exist or the embedding service is unavailable.
+        ``mode="hybrid"``: merges keyword and vector results with weighted
+        scoring; falls back to keyword-only when embeddings are unavailable.
 
         Args:
             query: Search parameters.
@@ -534,9 +536,109 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
             SearchResult with ranked hits.
         """
         if query.mode == "vector":
-            return SearchResult(hits=[])
-        # hybrid and keyword both use keyword-only search for now
+            return self._vector_search(query.query, query.top_k)
+        if query.mode == "hybrid":
+            return self._hybrid_search(query.query, query.top_k)
         return self._keyword_search(query.query, query.top_k)
+
+    def _resolve_ref(self, ref_id: str) -> Entity | Relation | None:
+        """Resolve a ``ref_id`` UUID string to the corresponding Entity or Relation.
+
+        Scans entities first, then relations.  Returns ``None`` when the
+        ref_id is not found (stale index entry).
+
+        Args:
+            ref_id: UUID string from a ``VectorEntry``.
+
+        Returns:
+            The matching ``Entity`` or ``Relation``, or ``None``.
+        """
+        for entity in self.state.knowledge_graph.entities:
+            if str(entity.id) == ref_id:
+                return entity
+        for relation in self.state.knowledge_graph.relations:
+            if str(relation.id) == ref_id:
+                return relation
+        return None
+
+    def _vector_search(self, query_text: str, top_k: int) -> SearchResult:
+        """Embed ``query_text`` and return top-k results by cosine similarity.
+
+        Returns an empty ``SearchResult`` when the embedding service is
+        unavailable, the index is empty, or the embedding call fails.
+
+        Args:
+            query_text: The natural-language query to embed and search.
+            top_k: Maximum number of results to return.
+
+        Returns:
+            ``SearchResult`` with hits ranked by cosine similarity score.
+        """
+        svc = self._get_or_create_embedding_svc()
+        if svc is None or not self._vector_index._entries:  # noqa: SLF001
+            return SearchResult(hits=[])
+        try:
+            vectors = svc.embed([query_text])
+            query_vector = vectors[0]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] Vector search embedding failed: %s", self.config.name, exc)
+            return SearchResult(hits=[])
+
+        pairs = self._vector_index.search_cosine(query_vector, top_k)
+        hits: list[SearchHit] = []
+        for ref_id, score in pairs:
+            obj = self._resolve_ref(ref_id)
+            if obj is None:
+                continue
+            if isinstance(obj, Entity):
+                hits.append(SearchHit(ref_type="entity", ref_id=ref_id, score=score, entity=obj))
+            else:
+                hits.append(
+                    SearchHit(ref_type="relation", ref_id=ref_id, score=score, relation=obj)
+                )
+        return SearchResult(hits=hits)
+
+    def _hybrid_search(self, query_text: str, top_k: int) -> SearchResult:
+        """Merge keyword and vector search results with weighted scoring.
+
+        Scoring rules:
+        - Keyword-only hit: ``score = 1.0``
+        - Vector-only hit: ``score = cosine_similarity``
+        - Hit in both: ``score = cosine_similarity + 0.5`` (keyword boost)
+
+        Falls back to keyword-only when the vector search returns no hits
+        (embedding service unavailable or index empty — AC-4).
+
+        Args:
+            query_text: The query string.
+            top_k: Maximum number of results to return.
+
+        Returns:
+            ``SearchResult`` with merged hits ranked by combined score.
+        """
+        keyword_result = self._keyword_search(query_text, top_k * 2)
+        vector_result = self._vector_search(query_text, top_k * 2)
+
+        if not vector_result.hits:
+            # Graceful fallback: no embeddings → keyword only (AC-4)
+            return SearchResult(hits=keyword_result.hits[:top_k])
+
+        merged: dict[str, SearchHit] = {}
+
+        for hit in vector_result.hits:
+            merged[hit.ref_id] = hit  # start with vector score
+
+        for kw_hit in keyword_result.hits:
+            if kw_hit.ref_id in merged:
+                existing = merged[kw_hit.ref_id]
+                merged[kw_hit.ref_id] = existing.model_copy(
+                    update={"score": existing.score + 0.5}
+                )
+            else:
+                merged[kw_hit.ref_id] = kw_hit  # keyword-only hit (score = 1.0)
+
+        ranked = sorted(merged.values(), key=lambda h: h.score, reverse=True)
+        return SearchResult(hits=ranked[:top_k])
 
     def _keyword_search(self, query: str, top_k: int) -> SearchResult:
         """Case-insensitive substring search across entity and relation fields."""

@@ -5,6 +5,7 @@ state change notification, deduplication logic, singleton constants (Task 2.9).
 Also covers embedding wiring: entity/relation embedding on create, re-embedding
 on description update, removal on delete, graceful degradation on API failure
 (Task 5.11, Story 2.1 ACs 3-7).
+Also covers vector search and hybrid search (Story 2.2 ACs 1-5).
 
 Pattern: Instantiate KnowledgeGraphActor() directly, call on_start(),
 test methods. Same pattern as test_planning_actor.py.
@@ -825,3 +826,206 @@ class TestEmbeddingGracefulDegradation:
         )
         assert result == "Done"
         assert len(actor.get_graph().relations) == 1
+
+
+# ---------------------------------------------------------------------------
+# Vector search (Story 2.2 Task 1, ACs 1, 3, 5)
+# ---------------------------------------------------------------------------
+
+
+def _actor_with_vector_entries() -> tuple[KnowledgeGraphActor, list[str]]:
+    """Return actor with 3 seeded entities whose vectors are pre-populated."""
+    actor, mock_svc = _actor_with_mock_embed()
+    actor.update_graph(
+        ManageGraph(
+            create_entities=[
+                EntityCreate(name="Alice", entity_type="Person", description="Engineer"),
+                EntityCreate(name="Bob", entity_type="Person", description="Designer"),
+                EntityCreate(name="Charlie", entity_type="Person", description="Manager"),
+            ]
+        )
+    )
+    # Return the ref_ids of the three entities
+    ref_ids = [str(e.id) for e in actor.get_graph().entities]
+    return actor, ref_ids
+
+
+class TestVectorSearch:
+    """AC-1, AC-5: vector search returns ranked results or empty on no embeddings."""
+
+    def test_vector_search_returns_top_k_ranked_by_score(self) -> None:
+        actor, mock_svc = _actor_with_mock_embed()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="Alice", entity_type="Person", description="Engineer"),
+                    EntityCreate(name="Bob", entity_type="Person", description="Designer"),
+                ]
+            )
+        )
+        # Assign distinct scores: first entity scores 0.9, second 0.5
+        entity_ids = [str(e.id) for e in actor.get_graph().entities]
+        actor._vector_index._entries[0]  # noqa: SLF001 (exists: added by _actor_with_mock_embed)
+        # Override search_cosine to return predictable scores
+        from unittest.mock import patch
+
+        with patch.object(
+            actor._vector_index,  # noqa: SLF001
+            "search_cosine",
+            return_value=[(entity_ids[0], 0.9), (entity_ids[1], 0.5)],
+        ):
+            mock_svc.embed.return_value = [_FAKE_VECTOR]
+            result = actor.search(
+                __import__(
+                    "akgentic.tool.knowledge_graph.models", fromlist=["SearchQuery"]
+                ).SearchQuery(query="engineer", top_k=2, mode="vector")
+            )
+        assert len(result.hits) == 2
+        assert result.hits[0].score == 0.9
+        assert result.hits[1].score == 0.5
+        assert result.hits[0].entity is not None
+
+    def test_vector_search_returns_empty_when_no_entries_in_index(self) -> None:
+        actor = _actor()
+        # Empty graph, no vectors
+        from akgentic.tool.knowledge_graph.models import SearchQuery
+
+        result = actor.search(SearchQuery(query="anything", top_k=5, mode="vector"))
+        assert result.hits == []
+
+    def test_vector_search_returns_empty_when_service_unavailable(self) -> None:
+        actor = _actor()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="Alice", entity_type="Person", description="Eng")
+                ]
+            )
+        )
+        # _embedding_svc is None (never set) and openai would fail → graceful empty
+        from akgentic.tool.knowledge_graph.models import SearchQuery
+
+        result = actor.search(SearchQuery(query="Alice", top_k=5, mode="vector"))
+        assert result.hits == []
+
+
+# ---------------------------------------------------------------------------
+# Hybrid search (Story 2.2 Task 2, ACs 2, 4)
+# ---------------------------------------------------------------------------
+
+
+class TestHybridSearch:
+    """AC-2, AC-4: hybrid merges keyword+vector, falls back to keyword when no embeddings."""
+
+    def _setup_actor_with_known_vectors(
+        self,
+    ) -> tuple[KnowledgeGraphActor, MagicMock]:
+        """Actor with Alice + Bob; mock embed returns fixed vectors."""
+        actor, mock_svc = _actor_with_mock_embed()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(
+                        name="Alice", entity_type="Person", description="Engineer login"
+                    ),
+                    EntityCreate(
+                        name="Bob", entity_type="Person", description="Designer security"
+                    ),
+                ]
+            )
+        )
+        return actor, mock_svc
+
+    def test_hybrid_falls_back_to_keyword_when_no_embeddings(self) -> None:
+        actor = _actor()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(
+                        name="Alice", entity_type="Person", description="Engineer"
+                    )
+                ]
+            )
+        )
+        # No embedding service → vector search returns empty → hybrid falls back
+        from akgentic.tool.knowledge_graph.models import SearchQuery
+
+        result = actor.search(SearchQuery(query="Alice", top_k=5, mode="hybrid"))
+        # Keyword should find Alice
+        assert len(result.hits) == 1
+        assert result.hits[0].entity is not None
+        assert result.hits[0].entity.name == "Alice"
+
+    def test_hybrid_deduplicates_by_ref_id(self) -> None:
+        actor, mock_svc = self._setup_actor_with_known_vectors()
+        alice_id = str(
+            next(e for e in actor.get_graph().entities if e.name == "Alice").id
+        )
+
+        from unittest.mock import patch
+
+        from akgentic.tool.knowledge_graph.models import SearchQuery
+
+        # Vector search also returns Alice → should appear once in merged result
+        with patch.object(
+            actor._vector_index,  # noqa: SLF001
+            "search_cosine",
+            return_value=[(alice_id, 0.8)],
+        ):
+            mock_svc.embed.return_value = [_FAKE_VECTOR]
+            result = actor.search(
+                SearchQuery(query="Alice", top_k=10, mode="hybrid")
+            )
+        alice_hits = [h for h in result.hits if h.ref_id == alice_id]
+        assert len(alice_hits) == 1, "Alice should appear exactly once (deduplication)"
+
+    def test_hybrid_combined_hits_rank_higher_than_vector_only(self) -> None:
+        actor, mock_svc = self._setup_actor_with_known_vectors()
+        entities = actor.get_graph().entities
+        alice_id = str(next(e for e in entities if e.name == "Alice").id)
+        bob_id = str(next(e for e in entities if e.name == "Bob").id)
+
+        from unittest.mock import patch
+
+        from akgentic.tool.knowledge_graph.models import SearchQuery
+
+        # Alice matches keyword "login" AND vector; Bob matches vector only
+        with patch.object(
+            actor._vector_index,  # noqa: SLF001
+            "search_cosine",
+            return_value=[(alice_id, 0.8), (bob_id, 0.9)],
+        ):
+            mock_svc.embed.return_value = [_FAKE_VECTOR]
+            result = actor.search(
+                SearchQuery(query="login", top_k=5, mode="hybrid")
+            )
+        # Alice: vector(0.8) + keyword_boost(0.5) = 1.3; Bob: vector only = 0.9
+        ref_ids = [h.ref_id for h in result.hits]
+        assert ref_ids[0] == alice_id, "Alice (vector+keyword) should rank above Bob (vector-only)"
+
+    def test_hybrid_top_k_limits_results(self) -> None:
+        actor, mock_svc = _actor_with_mock_embed()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name=f"Entity{i}", entity_type="T", description=f"desc {i}")
+                    for i in range(10)
+                ]
+            )
+        )
+        entity_ids = [str(e.id) for e in actor.get_graph().entities]
+
+        from unittest.mock import patch
+
+        from akgentic.tool.knowledge_graph.models import SearchQuery
+
+        with patch.object(
+            actor._vector_index,  # noqa: SLF001
+            "search_cosine",
+            return_value=[(eid, 0.5) for eid in entity_ids],
+        ):
+            mock_svc.embed.return_value = [_FAKE_VECTOR]
+            result = actor.search(
+                SearchQuery(query="desc", top_k=3, mode="hybrid")
+            )
+        assert len(result.hits) <= 3
