@@ -575,7 +575,7 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
             ``SearchResult`` with hits ranked by cosine similarity score.
         """
         svc = self._get_or_create_embedding_svc()
-        if svc is None or not self._vector_index._entries:  # noqa: SLF001
+        if svc is None or len(self._vector_index) == 0:
             return SearchResult(hits=[])
         try:
             vectors = svc.embed([query_text])
