@@ -11,7 +11,8 @@ Public API
 ----------
 Models:
     Entity, Relation, KnowledgeGraph, KnowledgeGraphState,
-    EntityCreate, EntityUpdate, RelationCreate, RelationDelete, ManageGraph
+    EntityCreate, EntityUpdate, RelationCreate, RelationDelete, ManageGraph,
+    PathStep, GetGraphQuery, GraphView, SearchQuery, SearchHit, SearchResult
 
 ToolCard:
     KnowledgeGraphTool, GetGraph, UpdateGraph, SearchGraph

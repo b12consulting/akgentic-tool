@@ -837,3 +837,28 @@ class TestDirectedPathTraversal:
         # ComponentA → ServiceB (DEPENDS_ON) → DatabaseC (DEPENDS_ON)
         assert "ServiceB" in entity_names
         assert "DatabaseC" in entity_names
+
+    def test_multi_step_path_traversal(self) -> None:
+        """AC-1: Multi-step path (2 waypoints) navigates correctly through the graph."""
+        actor = _actor()
+        _seed_path_graph(actor)
+        # Device → HAS_COMPONENT → ComponentA → DEPENDS_ON → ServiceB, then depth=1
+        result = actor.get_graph(
+            GetGraphQuery(
+                entity_names=["Device"],
+                path=[
+                    PathStep(relation_type="HAS_COMPONENT", to_entity="ComponentA"),
+                    PathStep(relation_type="DEPENDS_ON", to_entity="ServiceB"),
+                ],
+                depth=1,
+            )
+        )
+        entity_names = {e.name for e in result.entities}
+        # All waypoint entities present
+        assert "Device" in entity_names
+        assert "ComponentA" in entity_names
+        assert "ServiceB" in entity_names
+        # depth=1 from ServiceB includes DatabaseC
+        assert "DatabaseC" in entity_names
+        # ComponentX is off Device (sibling branch), not reachable from ServiceB
+        assert "ComponentX" not in entity_names

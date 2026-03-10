@@ -395,6 +395,24 @@ class TestSearchResultEpic3Fields:
         assert len(restored.neighbors) == 1
         assert restored.neighbors[0].name == "N"
 
+    def test_paths_serialization_round_trip(self) -> None:
+        """Serialization round-trip for paths: list[list[Entity | Relation]]."""
+        e1 = Entity(name="A", entity_type="T", description="d1")
+        r = Relation(from_entity="A", to_entity="B", relation_type="LINKS")
+        e2 = Entity(name="B", entity_type="T", description="d2")
+        sr = SearchResult(paths=[[e1, r, e2]])
+        dumped = sr.model_dump()
+        restored = SearchResult.model_validate(dumped)
+        assert len(restored.paths) == 1
+        path = restored.paths[0]
+        assert len(path) == 3
+        assert isinstance(path[0], Entity)
+        assert isinstance(path[1], Relation)
+        assert isinstance(path[2], Entity)
+        assert path[0].name == "A"
+        assert path[1].relation_type == "LINKS"
+        assert path[2].name == "B"
+
 
 class TestKnowledgeGraphState:
     def test_default_knowledge_graph(self) -> None:

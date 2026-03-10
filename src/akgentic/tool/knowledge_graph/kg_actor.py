@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections import deque
 from typing import Literal
 
 from pydantic import Field
@@ -813,9 +814,10 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         Returns:
             ``SearchResult`` with hits plus expanded context.
         """
-        # Extract entity hits for expansion
+        # Extract entity hits for expansion; filter gives Entity (not Entity | None)
         entity_hits = [h for h in hits if h.entity is not None]
-        hit_entity_names = {h.entity.name for h in entity_hits if h.entity}
+        hit_entities = [h.entity for h in entity_hits if h.entity is not None]
+        hit_entity_names = {e.name for e in hit_entities}
 
         neighbors: list[Entity] = []
         connected_relations: list[Relation] = []
@@ -882,8 +884,6 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         Returns:
             Alternating entity/relation path list, or ``None`` if unreachable.
         """
-        from collections import deque
-
         graph = self.state.knowledge_graph
         entity_map = {e.name: e for e in graph.entities}
 
@@ -899,7 +899,10 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         while queue:
             path = queue.popleft()
             current_entity = path[-1]
-            assert isinstance(current_entity, Entity)
+            if not isinstance(current_entity, Entity):  # pragma: no cover
+                raise TypeError(
+                    f"Expected Entity at path tail, got {type(current_entity).__name__}"
+                )
 
             for rel in graph.relations:
                 neighbor_name: str | None = None
