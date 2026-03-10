@@ -492,7 +492,7 @@ class TeamTool(ToolCard):
                 if not team_members_names:
                     return ""
 
-                return "Team members:\n" + "\n".join(team_members_names)
+                return "**Team members:**\n" + "\n".join(team_members_names)
             except Exception:
                 logger.error("Failed to get team roster", exc_info=True)
                 return "Cannot get team roster..."
@@ -527,12 +527,12 @@ class TeamTool(ToolCard):
                 profiles = []
                 for card in agent_catalog:
                     skills_str = ", ".join(card.skills) if card.skills else "none"
-                    profiles.append(f"**{card.role}**: {card.description} (Skills: {skills_str})")
+                    profiles.append(f"{card.role}: {card.description} (Skills: {skills_str})")
 
                 if not profiles:
                     return ""
 
-                return "Available team roles:\n" + "\n".join(profiles)
+                return "**Available team roles:**\n" + "\n".join(profiles)
             except Exception:
                 logger.error("Failed to get role profiles", exc_info=True)
                 return "Cannot get role profiles..."

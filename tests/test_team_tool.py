@@ -345,8 +345,8 @@ def test_role_profiles_prompt():
     result = profiles_prompt()
 
     assert "Available team roles:" in result
-    assert "**Developer**: Writes code (Skills: python, testing)" in result
-    assert "**Tester**: Tests code (Skills: selenium, pytest)" in result
+    assert "Developer: Writes code (Skills: python, testing)" in result
+    assert "Tester: Tests code (Skills: selenium, pytest)" in result
 
 
 def test_role_profiles_prompt_empty():

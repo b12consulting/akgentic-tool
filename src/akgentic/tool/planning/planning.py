@@ -117,7 +117,7 @@ class PlanningTool(ToolCard):
             planning = planning_proxy.get_planning()
             if not planning:
                 return "No current Team planning."
-            return "Team planning:\n" + "\n".join(
+            return "**Team planning:**\n" + "\n".join(
                 [
                     f"- ID {task.id} [{task.status}] {task.description} "
                     f"{task.output and f'\u2014 Output: {task.output} '}"
@@ -148,9 +148,7 @@ class PlanningTool(ToolCard):
         observer = self._observer
 
         def update_planning(update: UpdatePlan) -> str:
-            """Update team tasks (create, update, delete).
-
-            Keep the plan up to date: update task status when you make progress, record outputs when you complete work, and create sub-tasks when you delegate."""
+            """Update team tasks (create, update, delete)."""
             observer.notify_event(
                 ToolCallEvent(tool_name="Update planning", args=[update], kwargs={})
             )
