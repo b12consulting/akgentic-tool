@@ -18,6 +18,7 @@ from akgentic.tool.knowledge_graph.models import (
     GetGraphQuery,
     GraphView,
     ManageGraph,
+    PathStep,
     Relation,
     RelationCreate,
     SearchHit,
@@ -701,3 +702,138 @@ class TestRootsOnly:
         import pytest
         with pytest.raises(Exception):  # noqa: B017
             GetGraphQuery(depth=-1)
+
+
+# ===========================================================================
+# Task 5 — Path traversal tests (Story 3.1, AC-1)
+# ===========================================================================
+
+
+def _seed_path_graph(actor: KnowledgeGraphActor) -> None:
+    """Populate a linear + branching test graph for path traversal tests.
+
+    Graph topology:
+        Device --HAS_COMPONENT--> ComponentA
+        ComponentA --DEPENDS_ON--> ServiceB
+        ServiceB --DEPENDS_ON--> DatabaseC
+        Device --ALSO_HAS--> ComponentX  (side branch)
+
+    5 entities, 4 relations.
+    """
+    actor.update_graph(
+        ManageGraph(
+            create_entities=[
+                EntityCreate(name="Device", entity_type="Hardware", description="Main device"),
+                EntityCreate(name="ComponentA", entity_type="Component", description="Primary component"),
+                EntityCreate(name="ServiceB", entity_type="Service", description="Backend service"),
+                EntityCreate(name="DatabaseC", entity_type="Database", description="Persistent store"),
+                EntityCreate(name="ComponentX", entity_type="Component", description="Secondary component"),
+            ],
+            create_relations=[
+                RelationCreate(from_entity="Device", to_entity="ComponentA", relation_type="HAS_COMPONENT"),
+                RelationCreate(from_entity="ComponentA", to_entity="ServiceB", relation_type="DEPENDS_ON"),
+                RelationCreate(from_entity="ServiceB", to_entity="DatabaseC", relation_type="DEPENDS_ON"),
+                RelationCreate(from_entity="Device", to_entity="ComponentX", relation_type="ALSO_HAS"),
+            ],
+        )
+    )
+
+
+class TestDirectedPathTraversal:
+    """AC-1: Directed path traversal via PathStep waypoints."""
+
+    def test_single_waypoint_depth_2(self) -> None:
+        """Device → HAS_COMPONENT → ComponentA, then depth=2 expands from ComponentA."""
+        actor = _actor()
+        _seed_path_graph(actor)
+        result = actor.get_graph(
+            GetGraphQuery(
+                entity_names=["Device"],
+                path=[PathStep(relation_type="HAS_COMPONENT", to_entity="ComponentA")],
+                depth=2,
+            )
+        )
+        entity_names = {e.name for e in result.entities}
+        # Device and ComponentA collected during waypoint walk
+        assert "Device" in entity_names
+        assert "ComponentA" in entity_names
+        # Depth=2 from ComponentA: ServiceB (1 hop), DatabaseC (2 hops)
+        assert "ServiceB" in entity_names
+        assert "DatabaseC" in entity_names
+        # ComponentX is a sibling of ComponentA (off Device), NOT from ComponentA
+        assert "ComponentX" not in entity_names
+
+    def test_missing_waypoint_returns_empty(self) -> None:
+        """Path traversal with wrong relation type returns empty GraphView."""
+        actor = _actor()
+        _seed_path_graph(actor)
+        result = actor.get_graph(
+            GetGraphQuery(
+                entity_names=["Device"],
+                path=[PathStep(relation_type="NONEXISTENT_REL", to_entity="ComponentA")],
+                depth=1,
+            )
+        )
+        assert result.entities == []
+        assert result.relations == []
+
+    def test_missing_target_entity_returns_empty(self) -> None:
+        """Path traversal targeting a non-existent entity returns empty."""
+        actor = _actor()
+        _seed_path_graph(actor)
+        result = actor.get_graph(
+            GetGraphQuery(
+                entity_names=["Device"],
+                path=[PathStep(relation_type="HAS_COMPONENT", to_entity="NoSuchEntity")],
+                depth=1,
+            )
+        )
+        assert result.entities == []
+        assert result.relations == []
+
+    def test_empty_entity_names_returns_empty(self) -> None:
+        """Path traversal with empty entity_names returns empty GraphView."""
+        actor = _actor()
+        _seed_path_graph(actor)
+        result = actor.get_graph(
+            GetGraphQuery(
+                entity_names=[],
+                path=[PathStep(relation_type="HAS_COMPONENT", to_entity="ComponentA")],
+                depth=1,
+            )
+        )
+        assert result.entities == []
+        assert result.relations == []
+
+    def test_depth_0_returns_only_terminal_entity(self) -> None:
+        """Path traversal with depth=0 returns only the terminal entity (no BFS expansion)."""
+        actor = _actor()
+        _seed_path_graph(actor)
+        result = actor.get_graph(
+            GetGraphQuery(
+                entity_names=["Device"],
+                path=[PathStep(relation_type="HAS_COMPONENT", to_entity="ComponentA")],
+                depth=0,
+            )
+        )
+        entity_names = {e.name for e in result.entities}
+        # Terminal is ComponentA; with depth=0 no expansion, but path entities are collected
+        assert "ComponentA" in entity_names
+        assert "ServiceB" not in entity_names
+
+    def test_relation_types_filter_applies_during_expansion(self) -> None:
+        """relation_types filter applies during BFS expansion phase, not waypoint phase."""
+        actor = _actor()
+        _seed_path_graph(actor)
+        result = actor.get_graph(
+            GetGraphQuery(
+                entity_names=["Device"],
+                path=[PathStep(relation_type="HAS_COMPONENT", to_entity="ComponentA")],
+                depth=2,
+                relation_types=["DEPENDS_ON"],  # filter during expansion
+            )
+        )
+        entity_names = {e.name for e in result.entities}
+        # ComponentA → ServiceB (DEPENDS_ON) → DatabaseC (DEPENDS_ON)
+        assert "ServiceB" in entity_names
+        assert "DatabaseC" in entity_names

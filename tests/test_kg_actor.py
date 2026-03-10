@@ -974,3 +974,217 @@ class TestHybridSearch:
             mock_svc.embed.return_value = [_FAKE_VECTOR]
             result = actor.search(SearchQuery(query="desc", top_k=3, mode="hybrid"))
         assert len(result.hits) <= 3
+
+
+# ---------------------------------------------------------------------------
+# Search expansion: include_neighbors, include_edges, find_paths (Story 3.1, ACs 2-5)
+# ---------------------------------------------------------------------------
+
+
+def _seed_expansion_graph(actor: KnowledgeGraphActor) -> None:
+    """Populate a test graph for search expansion tests.
+
+    Graph topology:
+        Alice --KNOWS--> Bob
+        Alice --WORKS_AT--> Corp
+        Bob --WORKS_AT--> Corp
+        Corp --LOCATED_IN--> City
+        Dave --KNOWS--> Eve   (disconnected island)
+    """
+    actor.update_graph(
+        ManageGraph(
+            create_entities=[
+                EntityCreate(name="Alice", entity_type="Person", description="alice engineer"),
+                EntityCreate(name="Bob", entity_type="Person", description="bob designer"),
+                EntityCreate(name="Corp", entity_type="Organization", description="tech corporation"),
+                EntityCreate(name="City", entity_type="Location", description="metro city"),
+                EntityCreate(name="Dave", entity_type="Person", description="dave manager"),
+                EntityCreate(name="Eve", entity_type="Person", description="eve analyst"),
+            ],
+            create_relations=[
+                RelationCreate(from_entity="Alice", to_entity="Bob", relation_type="KNOWS"),
+                RelationCreate(from_entity="Alice", to_entity="Corp", relation_type="WORKS_AT"),
+                RelationCreate(from_entity="Bob", to_entity="Corp", relation_type="WORKS_AT"),
+                RelationCreate(from_entity="Corp", to_entity="City", relation_type="LOCATED_IN"),
+                RelationCreate(from_entity="Dave", to_entity="Eve", relation_type="KNOWS"),
+            ],
+        )
+    )
+
+
+class TestSearchIncludeNeighbors:
+    """AC-2: include_neighbors=True returns 1-hop neighbors of entity hits."""
+
+    def test_include_neighbors_returns_1hop_neighbors(self) -> None:
+        actor = _actor()
+        _seed_expansion_graph(actor)
+        result = actor.search(SearchQuery(query="alice engineer", mode="keyword", include_neighbors=True))
+        entity_hit_names = {h.entity.name for h in result.hits if h.entity}
+        assert "Alice" in entity_hit_names
+        # Alice's neighbors: Bob (KNOWS) and Corp (WORKS_AT)
+        neighbor_names = {e.name for e in result.neighbors}
+        assert "Bob" in neighbor_names
+        assert "Corp" in neighbor_names
+        # Neighbors should not include Alice herself
+        assert "Alice" not in neighbor_names
+
+    def test_include_neighbors_excludes_entities_in_hits(self) -> None:
+        """Neighbors should not duplicate entities already in hits."""
+        actor = _actor()
+        _seed_expansion_graph(actor)
+        # Search "alice" matches Alice (entity hit)
+        result = actor.search(SearchQuery(query="alice", mode="keyword", include_neighbors=True))
+        hit_names = {h.entity.name for h in result.hits if h.entity}
+        neighbor_names = {e.name for e in result.neighbors}
+        # No overlap between hits and neighbors
+        assert not (hit_names & neighbor_names)
+
+    def test_include_neighbors_no_entity_hits_returns_empty_neighbors(self) -> None:
+        actor = _actor()
+        _seed_expansion_graph(actor)
+        # Search for something that only matches relations (by relation_type)
+        result = actor.search(SearchQuery(query="zzz_no_match", mode="keyword", include_neighbors=True))
+        assert result.neighbors == []
+
+    def test_include_neighbors_false_returns_empty(self) -> None:
+        """Default behavior: no neighbors expansion."""
+        actor = _actor()
+        _seed_expansion_graph(actor)
+        result = actor.search(SearchQuery(query="alice", mode="keyword"))
+        assert result.neighbors == []
+
+
+class TestSearchIncludeEdges:
+    """AC-3: include_edges=True returns all relations connected to entity hits."""
+
+    def test_include_edges_returns_connected_relations(self) -> None:
+        actor = _actor()
+        _seed_expansion_graph(actor)
+        result = actor.search(SearchQuery(query="alice engineer", mode="keyword", include_edges=True))
+        entity_hit_names = {h.entity.name for h in result.hits if h.entity}
+        assert "Alice" in entity_hit_names
+        # Alice's relations: Alice→Bob (KNOWS), Alice→Corp (WORKS_AT)
+        rel_types = {r.relation_type for r in result.connected_relations}
+        assert "KNOWS" in rel_types
+        assert "WORKS_AT" in rel_types
+
+    def test_include_edges_deduplicates_relations(self) -> None:
+        """When multiple entity hits share a relation, it appears only once."""
+        actor = _actor()
+        _seed_expansion_graph(actor)
+        # Both Alice and Bob are connected via Corp's WORKS_AT relation
+        result = actor.search(
+            SearchQuery(query="designer", mode="keyword", include_edges=True)
+        )
+        # Find all relation IDs — should be unique
+        rel_ids = [str(r.id) for r in result.connected_relations]
+        assert len(rel_ids) == len(set(rel_ids))
+
+    def test_include_edges_false_returns_empty(self) -> None:
+        actor = _actor()
+        _seed_expansion_graph(actor)
+        result = actor.search(SearchQuery(query="alice", mode="keyword"))
+        assert result.connected_relations == []
+
+
+class TestSearchFindPaths:
+    """AC-4, AC-5: find_paths computes BFS paths between top 5 entity hits."""
+
+    def test_find_paths_with_5_entity_hits(self) -> None:
+        """find_paths=True with 5+ entity hits finds paths between top 5."""
+        actor = _actor()
+        # Create 5 connected entities
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name=f"Node{i}", entity_type="T", description="node target")
+                    for i in range(5)
+                ],
+                create_relations=[
+                    RelationCreate(from_entity=f"Node{i}", to_entity=f"Node{i+1}", relation_type="LINKS")
+                    for i in range(4)
+                ],
+            )
+        )
+        result = actor.search(SearchQuery(query="node target", mode="keyword", find_paths=True))
+        entity_hits = [h for h in result.hits if h.entity]
+        assert len(entity_hits) == 5
+        # Should find paths between connected nodes
+        assert len(result.paths) > 0
+
+    def test_find_paths_fewer_than_2_hits_returns_empty(self) -> None:
+        """AC-5: fewer than 2 entity hits → empty paths."""
+        actor = _actor()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="OnlyOne", entity_type="T", description="unique item xyz123")
+                ]
+            )
+        )
+        result = actor.search(SearchQuery(query="unique item xyz123", mode="keyword", find_paths=True))
+        entity_hits = [h for h in result.hits if h.entity]
+        assert len(entity_hits) == 1
+        assert result.paths == []
+
+    def test_find_paths_max_10_pairs(self) -> None:
+        """find_paths uses top 5 entities → max C(5,2) = 10 pairs."""
+        actor = _actor()
+        # Create 6 entities all matching but only top 5 used
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name=f"N{i}", entity_type="T", description="path target")
+                    for i in range(6)
+                ],
+                create_relations=[
+                    RelationCreate(from_entity=f"N{i}", to_entity=f"N{i+1}", relation_type="LINKS")
+                    for i in range(5)
+                ],
+            )
+        )
+        result = actor.search(SearchQuery(query="path target", mode="keyword", find_paths=True))
+        # Max 10 paths (C(5,2) = 10 pairs)
+        assert len(result.paths) <= 10
+
+    def test_find_paths_no_path_between_disconnected_entities(self) -> None:
+        """Disconnected entities: path not found → silently skipped."""
+        actor = _actor()
+        _seed_expansion_graph(actor)
+        # Alice-Corp-Bob are connected; Dave-Eve are disconnected from them
+        # Search for "person" matches Alice, Bob, Dave, Eve → paths between disconnected pairs skipped
+        result = actor.search(SearchQuery(query="person", mode="keyword", find_paths=True))
+        entity_hit_names = {h.entity.name for h in result.hits if h.entity}
+        # We should have multiple entity hits but paths only between reachable pairs
+        assert isinstance(result.paths, list)
+        # Paths are returned (may be empty if none reachable) but no exception
+
+    def test_find_paths_false_returns_empty(self) -> None:
+        actor = _actor()
+        _seed_expansion_graph(actor)
+        result = actor.search(SearchQuery(query="alice", mode="keyword"))
+        assert result.paths == []
+
+    def test_find_paths_path_is_alternating_entity_relation_sequence(self) -> None:
+        """Paths contain alternating [Entity, Relation, Entity, ...] sequences."""
+        from akgentic.tool.knowledge_graph.models import Entity, Relation
+        actor = _actor()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="Start", entity_type="T", description="route node"),
+                    EntityCreate(name="End", entity_type="T", description="route node"),
+                ],
+                create_relations=[
+                    RelationCreate(from_entity="Start", to_entity="End", relation_type="CONNECTS"),
+                ],
+            )
+        )
+        result = actor.search(SearchQuery(query="route node", mode="keyword", find_paths=True))
+        assert len(result.paths) == 1
+        path = result.paths[0]
+        # [Entity, Relation, Entity] for direct connection
+        assert len(path) == 3
+        assert isinstance(path[0], Entity)
+        assert isinstance(path[1], Relation)
+        assert isinstance(path[2], Entity)

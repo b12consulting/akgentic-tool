@@ -193,6 +193,18 @@ class KnowledgeGraphState(BaseState):
 # ---------------------------------------------------------------------------
 
 
+class PathStep(SerializableBaseModel):
+    """One directed hop in a path traversal query.
+
+    Used in ``GetGraphQuery.path`` to specify directed graph navigation
+    waypoints. Each step identifies the relation type to follow and the
+    target entity name to navigate to.
+    """
+
+    relation_type: str = Field(..., description="Relation type to follow.")
+    to_entity: str = Field(..., description="Target entity name to navigate to.")
+
+
 class GetGraphQuery(SerializableBaseModel):
     """Parameters for subgraph retrieval via ``KnowledgeGraphActor.get_graph``.
 
@@ -205,8 +217,10 @@ class GetGraphQuery(SerializableBaseModel):
     to None which means: 0 for roots_only mode (no expansion), 1 for
     entity_names mode (1-hop expansion).  Explicit depth always wins.
 
-    Note: ``path: list[PathStep]`` is planned for Epic 3, Story 3.1 —
-    do NOT add it here.
+    When ``path`` is non-empty, directed traversal is performed: the actor
+    navigates from ``entity_names[0]`` through each ``PathStep`` waypoint,
+    then applies BFS with ``depth`` hops from the terminal entity.  Path
+    traversal takes precedence over ``roots_only`` and BFS modes.
     """
 
     entity_names: list[str] = Field(
@@ -226,6 +240,12 @@ class GetGraphQuery(SerializableBaseModel):
         default=False,
         description="Return only is_root=True entities + inter-root relations.",
     )
+    path: list[PathStep] = Field(
+        default_factory=list,
+        description=(
+            "Directed traversal waypoints. When non-empty, used instead of BFS from entity_names."
+        ),
+    )
 
 
 class GraphView(SerializableBaseModel):
@@ -243,14 +263,27 @@ class GraphView(SerializableBaseModel):
 class SearchQuery(SerializableBaseModel):
     """Parameters for ``KnowledgeGraphActor.search``.
 
-    Note: ``include_neighbors``, ``include_edges``, ``find_paths`` are
-    planned for Epic 3 — do NOT add them here.
+    Epic 3 expansion options (all default False for zero behavior change):
+    ``include_neighbors`` adds 1-hop neighbors of entity hits to the result.
+    ``include_edges`` adds all relations connected to entity hits.
+    ``find_paths`` computes BFS shortest paths between the top 5 entity hits
+    (max 10 pairs).
     """
 
     query: str = Field(..., description="Search query string.")
     top_k: int = Field(default=10, description="Maximum number of hits to return.")
     mode: Literal["hybrid", "vector", "keyword"] = Field(
         default="hybrid", description="Search mode: hybrid, vector, or keyword."
+    )
+    include_neighbors: bool = Field(
+        default=False, description="Include 1-hop neighbors of entity hits."
+    )
+    include_edges: bool = Field(
+        default=False, description="Include all relations connected to entity hits."
+    )
+    find_paths: bool = Field(
+        default=False,
+        description="Find shortest BFS paths between top 5 entity hits (max 10 pairs).",
     )
 
 
@@ -279,8 +312,25 @@ class SearchHit(SerializableBaseModel):
 class SearchResult(SerializableBaseModel):
     """Container for search results.
 
-    Note: ``neighbors``, ``connected_relations``, ``paths`` fields are
-    planned for Epic 3 — do NOT add them here.
+    Epic 3 expansion fields (all default to empty for zero behavior change):
+    ``neighbors`` contains 1-hop neighbors of found entities (when
+    ``include_neighbors=True`` in the query).  ``connected_relations``
+    contains all relations connected to found entities (when
+    ``include_edges=True``).  ``paths`` contains BFS shortest-path sequences
+    between top entity hits (when ``find_paths=True``), each as an alternating
+    ``[Entity, Relation, Entity, ...]`` list.
     """
 
     hits: list[SearchHit] = Field(default_factory=list, description="Ranked search hits.")
+    neighbors: list[Entity] = Field(
+        default_factory=list,
+        description="1-hop neighbors of found entities (when include_neighbors=True).",
+    )
+    connected_relations: list[Relation] = Field(
+        default_factory=list,
+        description="All relations connected to found entities (when include_edges=True).",
+    )
+    paths: list[list[Entity | Relation]] = Field(
+        default_factory=list,
+        description="Shortest BFS paths between top entity hits (when find_paths=True).",
+    )

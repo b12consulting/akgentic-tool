@@ -26,6 +26,7 @@ from akgentic.tool.knowledge_graph.models import (
     GraphView,
     KnowledgeGraphState,
     ManageGraph,
+    PathStep,
     Relation,
     RelationCreate,
     RelationDelete,
@@ -431,6 +432,11 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         used as BFS seeds and ``entity_names`` is ignored.  Depth
         defaults to 0 (no expansion) for ``roots_only`` mode.
 
+        When ``path`` is non-empty, directed path traversal is performed
+        (takes highest precedence): the actor navigates from
+        ``entity_names[0]`` through each ``PathStep`` waypoint, then
+        applies BFS with ``depth`` hops from the terminal entity.
+
         Args:
             query: Subgraph query parameters.  Defaults to full graph.
 
@@ -439,6 +445,19 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         """
         if query is None:
             query = GetGraphQuery()
+
+        # Directed path traversal takes precedence over all other modes (AC-1)
+        if query.path:
+            if not query.entity_names:
+                return GraphView()
+            start_entity = query.entity_names[0]
+            effective_depth = query.depth if query.depth is not None else 1
+            return self._get_path_subgraph(
+                start_entity=start_entity,
+                path=query.path,
+                depth=effective_depth,
+                relation_types=query.relation_types,
+            )
 
         # roots_only takes precedence over entity_names (AC-6)
         if query.roots_only:
@@ -476,6 +495,7 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         entity_names: list[str],
         depth: int,
         relation_types: list[str],
+        pre_visited: set[str] | None = None,
     ) -> GraphView:
         """BFS expansion from root entities.
 
@@ -484,11 +504,14 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         edge types are followed.  After expansion completes, only
         relations whose **both** endpoints are in the visited set are
         included in the result.
+
+        ``pre_visited`` optionally seeds the visited set before BFS starts,
+        preventing backtracking into already-collected path entities.
         """
         graph = self.state.knowledge_graph
         entity_map = {e.name: e for e in graph.entities}
 
-        visited: set[str] = set()
+        visited: set[str] = set(pre_visited) if pre_visited else set()
         frontier: set[str] = set()
         for name in entity_names:
             if name in entity_map:
@@ -515,6 +538,95 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         ]
         return GraphView(entities=result_entities, relations=result_relations)
 
+    def _get_path_subgraph(
+        self,
+        start_entity: str,
+        path: list[PathStep],
+        depth: int,
+        relation_types: list[str],
+    ) -> GraphView:
+        """Navigate directed waypoints, then BFS-expand from the terminal entity.
+
+        Algorithm:
+        1. Start at ``start_entity`` (seed = {start_entity}).
+        2. For each ``PathStep(relation_type, to_entity)``:
+           a. Find a relation from the current seed matching the specified
+              ``relation_type`` leading to ``to_entity``.
+           b. If found, ``to_entity`` becomes the new seed.
+           c. If NOT found, return empty ``GraphView`` (invalid path).
+        3. Collect all entities and relations visited during the waypoint walk.
+        4. Apply ``_get_subgraph()`` BFS with ``depth`` from the terminal entity.
+        5. Merge and deduplicate path entities/relations with BFS result.
+
+        ``relation_types`` is applied only during the BFS expansion phase
+        (step 4), not during the waypoint navigation phase (step 2).
+
+        Args:
+            start_entity: Name of the entity to start traversal from.
+            path: Ordered list of directed waypoints.
+            depth: BFS expansion hops from the terminal entity.
+            relation_types: Edge type filter for the BFS expansion phase.
+
+        Returns:
+            ``GraphView`` with path entities/relations plus BFS expansion,
+            or empty ``GraphView`` if any waypoint cannot be resolved.
+        """
+        graph = self.state.knowledge_graph
+        entity_map = {e.name: e for e in graph.entities}
+
+        if start_entity not in entity_map:
+            return GraphView()
+
+        # Collect path entities and relations during waypoint walk
+        path_entities: dict[str, Entity] = {}
+        path_relations: dict[str, Relation] = {}
+
+        current_name = start_entity
+        path_entities[current_name] = entity_map[current_name]
+
+        for step in path:
+            # Find matching relation: from current → to_entity via relation_type
+            matching_rel: Relation | None = None
+            for rel in graph.relations:
+                if (
+                    rel.from_entity == current_name
+                    and rel.relation_type == step.relation_type
+                    and rel.to_entity == step.to_entity
+                ):
+                    matching_rel = rel
+                    break
+
+            if matching_rel is None or step.to_entity not in entity_map:
+                return GraphView()
+
+            path_relations[str(matching_rel.id)] = matching_rel
+            current_name = step.to_entity
+            path_entities[current_name] = entity_map[current_name]
+
+        # BFS expansion from terminal entity; pre_visited prevents backtracking
+        # into path entities already collected during waypoint navigation.
+        pre_visited = {name for name in path_entities if name != current_name}
+        bfs_result = self._get_subgraph(
+            entity_names=[current_name],
+            depth=depth,
+            relation_types=relation_types,
+            pre_visited=pre_visited,
+        )
+
+        # Merge: path entities/relations + BFS result (deduplicate by id/name)
+        merged_entities: dict[str, Entity] = {**path_entities}
+        for e in bfs_result.entities:
+            merged_entities[e.name] = e
+
+        merged_relations: dict[str, Relation] = {**path_relations}
+        for r in bfs_result.relations:
+            merged_relations[str(r.id)] = r
+
+        return GraphView(
+            entities=list(merged_entities.values()),
+            relations=list(merged_relations.values()),
+        )
+
     # ------------------------------------------------------------------
     # Search (keyword / vector / hybrid)
     # ------------------------------------------------------------------
@@ -529,17 +641,25 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         ``mode="hybrid"``: merges keyword and vector results with weighted
         scoring; falls back to keyword-only when embeddings are unavailable.
 
+        Epic 3 expansion options (``include_neighbors``, ``include_edges``,
+        ``find_paths``) are applied as post-processing after the core search.
+
         Args:
             query: Search parameters.
 
         Returns:
-            SearchResult with ranked hits.
+            SearchResult with ranked hits and optional expansion data.
         """
         if query.mode == "vector":
-            return self._vector_search(query.query, query.top_k)
-        if query.mode == "hybrid":
-            return self._hybrid_search(query.query, query.top_k)
-        return self._keyword_search(query.query, query.top_k)
+            base_result = self._vector_search(query.query, query.top_k)
+        elif query.mode == "hybrid":
+            base_result = self._hybrid_search(query.query, query.top_k)
+        else:
+            base_result = self._keyword_search(query.query, query.top_k)
+
+        if query.include_neighbors or query.include_edges or query.find_paths:
+            return self._expand_search_result(base_result.hits, query)
+        return base_result
 
     def _resolve_ref(self, ref_id: str) -> Entity | Relation | None:
         """Resolve a ``ref_id`` UUID string to the corresponding Entity or Relation.
@@ -677,3 +797,129 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
                 )
 
         return SearchResult(hits=sorted(hits, key=lambda h: h.score, reverse=True)[:top_k])
+
+    def _expand_search_result(
+        self, hits: list[SearchHit], query: SearchQuery
+    ) -> SearchResult:
+        """Post-process search hits with Epic 3 expansion options.
+
+        Applies ``include_neighbors``, ``include_edges``, and ``find_paths``
+        expansions to the given hits and returns an enriched ``SearchResult``.
+
+        Args:
+            hits: Raw search hits from the core search.
+            query: Original search query with expansion flags.
+
+        Returns:
+            ``SearchResult`` with hits plus expanded context.
+        """
+        # Extract entity hits for expansion
+        entity_hits = [h for h in hits if h.entity is not None]
+        hit_entity_names = {h.entity.name for h in entity_hits if h.entity}
+
+        neighbors: list[Entity] = []
+        connected_relations: list[Relation] = []
+        paths: list[list[Entity | Relation]] = []
+
+        if query.include_neighbors and entity_hits:
+            seen_neighbor_names: set[str] = set(hit_entity_names)
+            for hit in entity_hits:
+                if hit.entity is None:
+                    continue
+                # 1-hop BFS from the entity
+                subgraph = self._get_subgraph(
+                    entity_names=[hit.entity.name], depth=1, relation_types=[]
+                )
+                for e in subgraph.entities:
+                    if e.name not in seen_neighbor_names:
+                        neighbors.append(e)
+                        seen_neighbor_names.add(e.name)
+
+        if query.include_edges and entity_hits:
+            seen_rel_ids: set[str] = set()
+            for rel in self.state.knowledge_graph.relations:
+                if (
+                    rel.from_entity in hit_entity_names or rel.to_entity in hit_entity_names
+                ) and str(rel.id) not in seen_rel_ids:
+                    connected_relations.append(rel)
+                    seen_rel_ids.add(str(rel.id))
+
+        if query.find_paths:
+            top_entity_hits = entity_hits[:5]  # top 5 entity hits by score
+            pairs = [
+                (i, j)
+                for i in range(len(top_entity_hits))
+                for j in range(i + 1, len(top_entity_hits))
+            ]
+            for i, j in pairs[:10]:
+                e_i = top_entity_hits[i].entity
+                e_j = top_entity_hits[j].entity
+                if e_i is None or e_j is None:
+                    continue
+                path = self._find_shortest_path(e_i.name, e_j.name)
+                if path is not None:
+                    paths.append(path)
+
+        return SearchResult(
+            hits=hits,
+            neighbors=neighbors,
+            connected_relations=connected_relations,
+            paths=paths,
+        )
+
+    def _find_shortest_path(
+        self, from_entity: str, to_entity: str
+    ) -> list[Entity | Relation] | None:
+        """BFS to find the shortest path between two entity names.
+
+        Returns an alternating ``[Entity, Relation, Entity, ...]`` sequence,
+        or ``None`` if no path exists.
+
+        Args:
+            from_entity: Name of the source entity.
+            to_entity: Name of the target entity.
+
+        Returns:
+            Alternating entity/relation path list, or ``None`` if unreachable.
+        """
+        from collections import deque
+
+        graph = self.state.knowledge_graph
+        entity_map = {e.name: e for e in graph.entities}
+
+        if from_entity not in entity_map or to_entity not in entity_map:
+            return None
+        if from_entity == to_entity:
+            return [entity_map[from_entity]]
+
+        # BFS tracking full path (list of Entity | Relation)
+        queue: deque[list[Entity | Relation]] = deque([[entity_map[from_entity]]])
+        visited: set[str] = {from_entity}
+
+        while queue:
+            path = queue.popleft()
+            current_entity = path[-1]
+            assert isinstance(current_entity, Entity)
+
+            for rel in graph.relations:
+                neighbor_name: str | None = None
+                if rel.from_entity == current_entity.name:
+                    neighbor_name = rel.to_entity
+                elif rel.to_entity == current_entity.name:
+                    neighbor_name = rel.from_entity
+                else:
+                    continue
+
+                if neighbor_name in visited:
+                    continue
+                neighbor = entity_map.get(neighbor_name)
+                if neighbor is None:
+                    continue
+
+                new_path: list[Entity | Relation] = [*path, rel, neighbor]
+                if neighbor_name == to_entity:
+                    return new_path
+                visited.add(neighbor_name)
+                queue.append(new_path)
+
+        return None
