@@ -9,7 +9,11 @@ Source: V2 redesign of akgentic-framework KnowledgeGraphManager.
 
 from __future__ import annotations
 
+import logging
 import uuid
+from typing import Literal
+
+from pydantic import Field
 
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
@@ -28,7 +32,11 @@ from akgentic.tool.knowledge_graph.models import (
     SearchHit,
     SearchQuery,
     SearchResult,
+    VectorEntry,
 )
+from akgentic.tool.knowledge_graph.vector_index import EmbeddingService, VectorIndex
+
+logger = logging.getLogger(__name__)
 
 KG_ACTOR_NAME: str = "#KnowledgeGraphTool"
 """Singleton actor name registered with the orchestrator."""
@@ -37,7 +45,24 @@ KG_ACTOR_ROLE: str = "ToolActor"
 """Actor role constant for ToolCard integration."""
 
 
-class KnowledgeGraphActor(Akgent[BaseConfig, KnowledgeGraphState]):
+class KnowledgeGraphConfig(BaseConfig):
+    """Configuration for ``KnowledgeGraphActor`` with embedding provider settings.
+
+    Extends ``BaseConfig`` with the embedding model and provider fields so
+    the actor can initialize ``EmbeddingService`` from its config object.
+    """
+
+    embedding_model: str = Field(
+        default="text-embedding-3-small",
+        description="OpenAI embedding model identifier",
+    )
+    embedding_provider: Literal["openai", "azure"] = Field(
+        default="openai",
+        description="Which OpenAI SDK variant to use for embeddings",
+    )
+
+
+class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
     """Centralized, thread-safe knowledge graph with batch CRUD.
 
     All mutations flow through ``update_graph(ManageGraph)`` which
@@ -55,9 +80,93 @@ class KnowledgeGraphActor(Akgent[BaseConfig, KnowledgeGraphState]):
     # ------------------------------------------------------------------
 
     def on_start(self) -> None:  # noqa: ANN201
-        """Initialize state and attach observer for orchestrator notifications."""
+        """Initialize state, attach observer, and set up the vector index."""
         self.state = KnowledgeGraphState()
         self.state.observer(self)
+        self._vector_index = VectorIndex()
+        self._embedding_svc: EmbeddingService | None = None
+
+    # ------------------------------------------------------------------
+    # Embedding helpers
+    # ------------------------------------------------------------------
+
+    def _get_or_create_embedding_svc(self) -> EmbeddingService | None:
+        """Return the ``EmbeddingService``, creating it lazily on first call.
+
+        Returns:
+            The service instance, or ``None`` if creation fails (e.g. missing deps).
+        """
+        if self._embedding_svc is None:
+            try:
+                self._embedding_svc = EmbeddingService(
+                    model=self.config.embedding_model,
+                    provider=self.config.embedding_provider,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[%s] Failed to initialize EmbeddingService: %s", self.config.name, exc
+                )
+                return None
+        return self._embedding_svc
+
+    def _embed_entity(self, entity: Entity) -> None:
+        """Embed an entity and store the result in the vector index.
+
+        Silently logs a WARNING and returns if the embedding service is
+        unavailable or if the API call fails (AC-7).
+        """
+        svc = self._get_or_create_embedding_svc()
+        if svc is None:
+            return
+        try:
+            text = f"{entity.name}: {entity.description}"
+            vectors = svc.embed([text])
+            self._vector_index.add(
+                VectorEntry(
+                    ref_type="entity",
+                    ref_id=str(entity.id),
+                    text=text,
+                    vector=vectors[0],
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[%s] Failed to embed entity '%s': %s", self.config.name, entity.name, exc
+            )
+
+    def _embed_relation(self, relation: Relation) -> None:
+        """Embed a relation if it has a non-empty description.
+
+        Relations without descriptions are not embedded (no meaningful text).
+        Silently logs WARNING on embedding failure (AC-7).
+        """
+        if not relation.description:
+            return
+        svc = self._get_or_create_embedding_svc()
+        if svc is None:
+            return
+        try:
+            text = (
+                f"{relation.from_entity} {relation.relation_type} "
+                f"{relation.to_entity}: {relation.description}"
+            )
+            vectors = svc.embed([text])
+            self._vector_index.add(
+                VectorEntry(
+                    ref_type="relation",
+                    ref_id=str(relation.id),
+                    text=text,
+                    vector=vectors[0],
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[%s] Failed to embed relation '%s→%s': %s",
+                self.config.name,
+                relation.from_entity,
+                relation.to_entity,
+                exc,
+            )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -99,6 +208,7 @@ class KnowledgeGraphActor(Akgent[BaseConfig, KnowledgeGraphState]):
             )
             self.state.knowledge_graph.entities.append(entity)
             existing_names.add(ec.name)
+            self._embed_entity(entity)
         return errors
 
     def _create_relations(self, relations: list[RelationCreate]) -> list[str]:
@@ -136,6 +246,7 @@ class KnowledgeGraphActor(Akgent[BaseConfig, KnowledgeGraphState]):
             )
             self.state.knowledge_graph.relations.append(relation)
             existing_triples.add(triple)
+            self._embed_relation(relation)
         return errors
 
     # ------------------------------------------------------------------
@@ -160,7 +271,11 @@ class KnowledgeGraphActor(Akgent[BaseConfig, KnowledgeGraphState]):
                 errors.append(f"Entity '{eu.name}' not found for update")
                 continue
 
-            if eu.description is not None:
+            if eu.description is not None and eu.description != entity.description:
+                self._vector_index.remove({str(entity.id)})
+                entity.description = eu.description
+                self._embed_entity(entity)
+            elif eu.description is not None:
                 entity.description = eu.description
             if eu.entity_type is not None:
                 entity.entity_type = eu.entity_type
@@ -219,8 +334,9 @@ class KnowledgeGraphActor(Akgent[BaseConfig, KnowledgeGraphState]):
                 if r.from_entity not in names_set and r.to_entity not in names_set
             ]
 
-            # TODO(Epic 2): Remove associated VectorEntry embeddings by ref_id
-            # self._remove_embeddings(_deleted_ids + _deleted_rel_ids)
+            self._vector_index.remove(
+                {str(eid) for eid in _deleted_ids} | {str(rid) for rid in _deleted_rel_ids}
+            )
 
         return errors
 
@@ -262,8 +378,7 @@ class KnowledgeGraphActor(Akgent[BaseConfig, KnowledgeGraphState]):
                 if (r.from_entity, r.to_entity, r.relation_type) not in triples_to_delete
             ]
 
-            # TODO(Epic 2): Remove associated VectorEntry embeddings by ref_id
-            # self._remove_embeddings(_deleted_rel_ids)
+            self._vector_index.remove({str(rid) for rid in _deleted_rel_ids})
 
         return errors
 

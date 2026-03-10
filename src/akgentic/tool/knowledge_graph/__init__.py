@@ -29,6 +29,7 @@ from akgentic.tool.knowledge_graph.kg_actor import (
     KG_ACTOR_NAME,
     KG_ACTOR_ROLE,
     KnowledgeGraphActor,
+    KnowledgeGraphConfig,
 )
 from akgentic.tool.knowledge_graph.kg_tool import (
     GetGraph,
@@ -51,7 +52,9 @@ from akgentic.tool.knowledge_graph.models import (
     SearchHit,
     SearchQuery,
     SearchResult,
+    VectorEntry,
 )
+from akgentic.tool.knowledge_graph.vector_index import EmbeddingService, VectorIndex
 
 
 def _check_kg_dependencies() -> None:
@@ -95,15 +98,21 @@ __all__ = [
     "SearchQuery",
     "SearchHit",
     "SearchResult",
+    # Vector index models (Story 2.1)
+    "VectorEntry",
     # ToolCard (Story 1.3)
     "KnowledgeGraphTool",
     "GetGraph",
     "UpdateGraph",
     "SearchGraph",
-    # Actor
+    # Actor (Story 2.1: KnowledgeGraphConfig added)
     "KnowledgeGraphActor",
+    "KnowledgeGraphConfig",
     "KG_ACTOR_NAME",
     "KG_ACTOR_ROLE",
+    # Vector index services (Story 2.1)
+    "EmbeddingService",
+    "VectorIndex",
     # Utilities
     "_check_kg_dependencies",
 ]

@@ -2,6 +2,9 @@
 
 Covers: all CRUD ops, cascade deletion, error collection, partial updates,
 state change notification, deduplication logic, singleton constants (Task 2.9).
+Also covers embedding wiring: entity/relation embedding on create, re-embedding
+on description update, removal on delete, graceful degradation on API failure
+(Task 5.11, Story 2.1 ACs 3-7).
 
 Pattern: Instantiate KnowledgeGraphActor() directly, call on_start(),
 test methods. Same pattern as test_planning_actor.py.
@@ -10,6 +13,7 @@ test methods. Same pattern as test_planning_actor.py.
 from __future__ import annotations
 
 import uuid
+from unittest.mock import MagicMock, patch
 
 import pytest
 from akgentic.core.actor_address import ActorAddress
@@ -605,3 +609,181 @@ class TestIsRootWiring:
         )
         root = actor.get_graph().entities[0]
         assert root.is_root is True
+
+
+# ---------------------------------------------------------------------------
+# Embedding wiring (Task 5.11, Story 2.1 ACs 3-7)
+# ---------------------------------------------------------------------------
+
+_FAKE_VECTOR = [0.1, 0.2, 0.3]
+_EMBED_MODULE = "akgentic.tool.knowledge_graph.kg_actor.EmbeddingService"
+
+
+def _actor_with_mock_embed() -> tuple[KnowledgeGraphActor, MagicMock]:
+    """Return (actor, mock_embed_method) with a pre-wired mock EmbeddingService."""
+    actor = _actor()
+    mock_svc = MagicMock()
+    mock_svc.embed.return_value = [_FAKE_VECTOR]
+    actor._embedding_svc = mock_svc  # inject mock directly, bypassing lazy init
+    return actor, mock_svc
+
+
+class TestEmbeddingOnCreate:
+    """AC-3, AC-4: embedding called when entities/relations are created."""
+
+    def test_embedding_called_on_entity_create(self) -> None:
+        actor, mock_svc = _actor_with_mock_embed()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[EntityCreate(name="Alice", entity_type="Person", description="Eng")]
+            )
+        )
+        mock_svc.embed.assert_called_once()
+        call_args = mock_svc.embed.call_args[0][0]
+        assert "Alice" in call_args[0]
+        assert "Eng" in call_args[0]
+
+    def test_embedding_called_on_relation_create_with_description(self) -> None:
+        actor, mock_svc = _actor_with_mock_embed()
+        _seed_entities(actor)
+        mock_svc.reset_mock()
+        actor.update_graph(
+            ManageGraph(
+                create_relations=[
+                    RelationCreate(
+                        from_entity="Alice",
+                        to_entity="Bob",
+                        relation_type="knows",
+                        description="long colleagues",
+                    )
+                ]
+            )
+        )
+        mock_svc.embed.assert_called_once()
+        call_args = mock_svc.embed.call_args[0][0]
+        assert "long colleagues" in call_args[0]
+
+    def test_embedding_skipped_on_relation_create_empty_description(self) -> None:
+        actor, mock_svc = _actor_with_mock_embed()
+        _seed_entities(actor)
+        mock_svc.reset_mock()
+        actor.update_graph(
+            ManageGraph(
+                create_relations=[
+                    RelationCreate(from_entity="Alice", to_entity="Bob", relation_type="knows")
+                ]
+            )
+        )
+        mock_svc.embed.assert_not_called()
+
+
+class TestEmbeddingOnUpdate:
+    """AC-5: re-embedding on description change."""
+
+    def test_embedding_updated_on_description_change(self) -> None:
+        actor, mock_svc = _actor_with_mock_embed()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[EntityCreate(name="Alice", entity_type="Person", description="Eng")]
+            )
+        )
+        embed_count_before = mock_svc.embed.call_count
+        actor.update_graph(
+            ManageGraph(update_entities=[EntityUpdate(name="Alice", description="Senior Eng")])
+        )
+        assert mock_svc.embed.call_count == embed_count_before + 1
+        # Verify the new description is embedded, not the old one
+        last_call = mock_svc.embed.call_args[0][0]
+        assert "Senior Eng" in last_call[0]
+
+    def test_no_re_embedding_when_description_unchanged(self) -> None:
+        actor, mock_svc = _actor_with_mock_embed()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[EntityCreate(name="Alice", entity_type="Person", description="Eng")]
+            )
+        )
+        embed_count_before = mock_svc.embed.call_count
+        # Update entity_type only — no description change
+        actor.update_graph(
+            ManageGraph(update_entities=[EntityUpdate(name="Alice", entity_type="Engineer")])
+        )
+        assert mock_svc.embed.call_count == embed_count_before
+
+
+class TestEmbeddingOnDelete:
+    """AC-6: embedding removed when entities/relations are deleted."""
+
+    def test_entity_embedding_removed_on_delete(self) -> None:
+        actor, mock_svc = _actor_with_mock_embed()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[EntityCreate(name="Alice", entity_type="Person", description="Eng")]
+            )
+        )
+        # Check an embedding was stored
+        assert len(actor._vector_index._entries) == 1
+
+        actor.update_graph(ManageGraph(delete_entities=["Alice"]))
+        assert len(actor._vector_index._entries) == 0
+
+    def test_relation_embedding_removed_on_delete(self) -> None:
+        actor, mock_svc = _actor_with_mock_embed()
+        _seed_entities(actor)
+        actor.update_graph(
+            ManageGraph(
+                create_relations=[
+                    RelationCreate(
+                        from_entity="Alice",
+                        to_entity="Bob",
+                        relation_type="knows",
+                        description="old friends",
+                    )
+                ]
+            )
+        )
+        # 2 entity embeddings + 1 relation embedding
+        assert len(actor._vector_index._entries) == 3
+
+        actor.update_graph(
+            ManageGraph(
+                delete_relations=[
+                    RelationDelete(from_entity="Alice", to_entity="Bob", relation_type="knows")
+                ]
+            )
+        )
+        assert len(actor._vector_index._entries) == 2
+
+
+class TestEmbeddingGracefulDegradation:
+    """AC-7: embedding failures do not block CRUD operations."""
+
+    def test_embedding_failure_does_not_block_entity_create(self) -> None:
+        actor, mock_svc = _actor_with_mock_embed()
+        mock_svc.embed.side_effect = RuntimeError("API key invalid")
+        result = actor.update_graph(
+            ManageGraph(
+                create_entities=[EntityCreate(name="Alice", entity_type="Person", description="Eng")]
+            )
+        )
+        assert result == "Done"
+        assert len(actor.get_graph().entities) == 1
+
+    def test_embedding_failure_does_not_block_relation_create(self) -> None:
+        actor, mock_svc = _actor_with_mock_embed()
+        _seed_entities(actor)
+        mock_svc.embed.side_effect = RuntimeError("API timeout")
+        result = actor.update_graph(
+            ManageGraph(
+                create_relations=[
+                    RelationCreate(
+                        from_entity="Alice",
+                        to_entity="Bob",
+                        relation_type="knows",
+                        description="desc",
+                    )
+                ]
+            )
+        )
+        assert result == "Done"
+        assert len(actor.get_graph().relations) == 1
