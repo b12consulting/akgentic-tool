@@ -72,7 +72,7 @@ class _MockAddress(ActorAddress):
     def squad_id(self) -> uuid.UUID | None:
         return None
 
-    def send(self, recipient: Any, message: Any) -> None:  # noqa: ANN401
+    def send(self, recipient: Any, message: Any) -> None:  # noqa: ANN401 — ActorAddress protocol allows Any for generic message passing
         pass
 
     def is_alive(self) -> bool:
@@ -111,7 +111,7 @@ class _OrchestratorStub:
             return self._kg_addr
         return None
 
-    def createActor(self, *args: Any, **kwargs: Any) -> ActorAddress:  # noqa: N802, ANN401
+    def createActor(self, *args: Any, **kwargs: Any) -> ActorAddress:  # noqa: N802, ANN401 — N802: Pykka actor convention; ANN401: generic stub accepting any actor args
         return self._kg_addr
 
 
@@ -292,11 +292,10 @@ def demonstrate_queries(kg_actor: KnowledgeGraphActor, tool: KnowledgeGraphTool)
         print(summary)
 
 
-def demonstrate_search(kg_actor: KnowledgeGraphActor, tool: KnowledgeGraphTool) -> None:
+def demonstrate_search(tool: KnowledgeGraphTool) -> None:
     """Show keyword and (optional) hybrid search patterns.
 
     Args:
-        kg_actor: Direct actor access for search.
         tool: The configured ToolCard providing search callables.
     """
     print("\n--- Step 4: Searching the knowledge graph ---")
@@ -361,7 +360,7 @@ def main() -> None:
     demonstrate_queries(kg_actor, tool)
 
     # --- Search the graph ---
-    demonstrate_search(kg_actor, tool)
+    demonstrate_search(tool)
 
     # --- Summary of tool call events ---
     print("\n--- Tool call event log ---")

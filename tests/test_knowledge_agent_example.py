@@ -16,19 +16,21 @@ from unittest.mock import patch
 def _load_example_module() -> types.ModuleType:
     """Load knowledge_agent.py as a module via importlib.
 
-    Adds the examples directory to the module spec so it can be
-    imported without modifying sys.path permanently.
+    Uses a unique module name per call to avoid sys.modules caching
+    between tests, ensuring each call gets a fresh module with clean state.
 
     Returns:
         The loaded knowledge_agent module.
     """
     examples_dir = Path(__file__).parent.parent / "examples"
     example_path = examples_dir / "knowledge_agent.py"
-    spec = importlib.util.spec_from_file_location("knowledge_agent", example_path)
+    # Use a unique key each load to prevent cross-test sys.modules caching
+    module_key = f"knowledge_agent_{id(object())}"
+    spec = importlib.util.spec_from_file_location(module_key, example_path)
     assert spec is not None and spec.loader is not None, "Could not load example module spec"
     module = importlib.util.module_from_spec(spec)
-    sys.modules["knowledge_agent"] = module
-    spec.loader.exec_module(module)  # type: ignore[union-attr]
+    sys.modules[module_key] = module
+    spec.loader.exec_module(module)  # type: ignore[union-attr]  # loader type narrowed by assert above
     return module
 
 
@@ -53,14 +55,13 @@ class TestKnowledgeAgentExample:
         with patch.dict("os.environ", {"OPENAI_API_KEY": ""}, clear=False):
             module = _load_example_module()
 
-            # Create a fresh observer for introspection
+            # Create a fresh observer for introspection; wire tool to register the KG actor
             observer = module._ExampleObserver()
-            tool = module.KnowledgeGraphTool(
+            module.KnowledgeGraphTool(
                 get_graph=module.GetGraph(prompt_include_schema=True, prompt_include_roots=True),
                 update_graph=True,
                 search=True,
-            )
-            tool.observer(observer)
+            ).observer(observer)
 
             # Build the graph via the helper function
             module.build_tech_stack_graph(observer._kg_actor)
