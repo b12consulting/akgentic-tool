@@ -166,6 +166,10 @@ class VectorIndex:
         self._entries = [self._entries[i] for i in keep]
         self._count = new_count
 
+    def __len__(self) -> int:
+        """Return the number of entries currently stored in the index."""
+        return self._count
+
     def search_cosine(self, query_vector: list[float], top_k: int) -> list[tuple[str, float]]:
         """Return the top-k most similar entries by cosine similarity.
 

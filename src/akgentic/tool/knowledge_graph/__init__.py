@@ -11,7 +11,8 @@ Public API
 ----------
 Models:
     Entity, Relation, KnowledgeGraph, KnowledgeGraphState,
-    EntityCreate, EntityUpdate, RelationCreate, RelationDelete, ManageGraph
+    EntityCreate, EntityUpdate, RelationCreate, RelationDelete, ManageGraph,
+    PathStep, GetGraphQuery, GraphView, SearchQuery, SearchHit, SearchResult
 
 ToolCard:
     KnowledgeGraphTool, GetGraph, UpdateGraph, SearchGraph
@@ -46,6 +47,7 @@ from akgentic.tool.knowledge_graph.models import (
     KnowledgeGraph,
     KnowledgeGraphState,
     ManageGraph,
+    PathStep,
     Relation,
     RelationCreate,
     RelationDelete,
@@ -92,9 +94,10 @@ __all__ = [
     "RelationCreate",
     "RelationDelete",
     "ManageGraph",
-    # Query & search models (Story 1.2)
+    # Query & search models (Story 1.2 + 3.1)
     "GetGraphQuery",
     "GraphView",
+    "PathStep",
     "SearchQuery",
     "SearchHit",
     "SearchResult",
