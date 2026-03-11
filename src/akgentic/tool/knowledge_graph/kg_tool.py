@@ -14,7 +14,6 @@ from typing import Callable, Literal
 
 from pydantic import Field
 
-from akgentic.core.agent_config import BaseConfig
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.tool.core import (
     COMMAND,
@@ -30,6 +29,7 @@ from akgentic.tool.knowledge_graph.kg_actor import (
     KG_ACTOR_NAME,
     KG_ACTOR_ROLE,
     KnowledgeGraphActor,
+    KnowledgeGraphConfig,
 )
 from akgentic.tool.knowledge_graph.models import (
     GetGraphQuery,
@@ -132,7 +132,12 @@ class KnowledgeGraphTool(ToolCard):
             logger.info("KnowledgeGraphTool: creating singleton %s.", KG_ACTOR_NAME)
             kg_addr = orchestrator_proxy.createActor(
                 KnowledgeGraphActor,
-                config=BaseConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE),
+                config=KnowledgeGraphConfig(
+                    name=KG_ACTOR_NAME,
+                    role=KG_ACTOR_ROLE,
+                    embedding_model=self.embedding_model,
+                    embedding_provider=self.embedding_provider,
+                ),
             )
 
         self._kg_proxy = observer.proxy_ask(kg_addr, KnowledgeGraphActor)
