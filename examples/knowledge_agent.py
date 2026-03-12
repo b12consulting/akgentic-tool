@@ -26,6 +26,7 @@ from akgentic.tool.knowledge_graph.kg_actor import (
     KG_ACTOR_NAME,
     KG_ACTOR_ROLE,
     KnowledgeGraphActor,
+    KnowledgeGraphConfig,
 )
 from akgentic.tool.knowledge_graph.kg_tool import (
     GetGraph,
@@ -126,7 +127,7 @@ class _ExampleObserver:
         self.events: list[ToolCallEvent] = []
         self._address = _MockAddress("knowledge-agent")
         self._orchestrator_addr = _MockAddress("orchestrator")
-        self._kg_actor = KnowledgeGraphActor()
+        self._kg_actor = KnowledgeGraphActor(config=KnowledgeGraphConfig())
         self._kg_actor.on_start()
         self._kg_addr = _MockAddress(KG_ACTOR_NAME, KG_ACTOR_ROLE)
 
@@ -316,11 +317,19 @@ def demonstrate_search(tool: KnowledgeGraphTool) -> None:
     kw_result2 = search_fn(SearchQuery(query="deploy", mode="keyword"))
     print(kw_result2)
 
-    # Hybrid/vector search — graceful degradation when no API key
+    # Hybrid/vector search — queries with no keyword match test real semantic value
     if os.environ.get("OPENAI_API_KEY"):
-        print("\nHybrid search for 'deploy' (semantic + keyword):")
-        hybrid_result = search_fn(SearchQuery(query="deploy", mode="hybrid"))
+        # "containerization" has zero substring overlap → keyword returns nothing,
+        # but a good embedding model should rank Docker highly.
+        print("\nHybrid search for 'containerization' (semantic-only signal):")
+        hybrid_result = search_fn(SearchQuery(query="containerization", mode="hybrid"))
         print(hybrid_result)
+
+        # "RDBMS" has zero substring overlap → keyword returns nothing,
+        # but semantic search should surface PostgreSQL.
+        print("\nHybrid search for 'RDBMS' (semantic-only signal):")
+        hybrid_result2 = search_fn(SearchQuery(query="RDBMS", mode="hybrid"))
+        print(hybrid_result2)
     else:
         print("\nOPENAI_API_KEY not set — using keyword search only")
         print("  Hybrid mode falls back gracefully to keyword search when embeddings unavailable")
