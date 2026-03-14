@@ -18,6 +18,7 @@ from .event import (
     ToolCallEvent,
     ToolObserver,
 )
+from .vector import EmbeddingService, VectorEntry, VectorIndex
 
 __all__ = [
     # Core abstractions
@@ -41,4 +42,8 @@ __all__ = [
     "planning",
     "search",
     "team",
+    # Vector infrastructure
+    "VectorEntry",
+    "EmbeddingService",
+    "VectorIndex",
 ]
