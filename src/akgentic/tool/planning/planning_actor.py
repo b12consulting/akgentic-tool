@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import datetime
 import logging
 from typing import TYPE_CHECKING, Literal
@@ -110,14 +112,14 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
         # Only instantiate VectorIndex (which imports numpy) when semantic_search is enabled.
         # This preserves the graceful fallback behaviour: if numpy is absent and
         # semantic_search=False, on_start must not crash (AC#7, AC#8).
-        self._vector_index: "VectorIndex | None" = None
+        self._vector_index: VectorIndex | None = None
         if self.config.semantic_search:
             from akgentic.tool.vector import VectorIndex
 
             self._vector_index = VectorIndex()
         self._embedding_svc: EmbeddingService | None = None
 
-    def _get_or_create_embedding_svc(self) -> "EmbeddingService | None":
+    def _get_or_create_embedding_svc(self) -> EmbeddingService | None:
         """Return (or lazily create) the EmbeddingService.
 
         Returns None when semantic_search is disabled or [vector_search]
@@ -185,15 +187,14 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
                     task_update.description is not None
                     and task_update.description != task.description
                 )
-                should_reindex = (
+                if (
                     self.config.semantic_search
                     and description_changed
                     and self._vector_index is not None
-                )
-                if should_reindex:
+                ):
                     self._vector_index.remove({str(task.id)})
                     self._embed_task(updated_task)
-                return
+                return None
         return f"Update error - no task with ID {task_update.id} found."
 
     ##
@@ -203,10 +204,36 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
         """Get the current plan tasks."""
         return self.state.task_list
 
-    def get_planning_task(self, task_id: int) -> Task | str:
-        """Get a specific plan task by ID."""
-        task_list = self.state.task_list
-        return next((task for task in task_list if task.id == task_id), "No task with that ID.")
+    def get_planning_task(self, task_id: int | str) -> Task | str:
+        """Look up a task by exact ID (int) or semantic query (str).
+
+        Args:
+            task_id: An integer for exact ID lookup, or a string for semantic search.
+
+        Returns:
+            The matching ``Task`` if found, or a plain string message when no match
+            is found or semantic search is unavailable.
+        """
+        if isinstance(task_id, int):
+            return next(
+                (t for t in self.state.task_list if t.id == task_id), "No task with that ID."
+            )
+
+        # Semantic search path
+        svc = self._get_or_create_embedding_svc()
+        if svc is None or self._vector_index is None or len(self._vector_index) == 0:
+            return "Semantic search unavailable."
+
+        query_vector = svc.embed([task_id])[0]
+        pairs = self._vector_index.search_cosine(query_vector, top_k=1)
+        if not pairs:
+            return "Semantic search unavailable."
+
+        ref_id, _ = pairs[0]
+        return next(
+            (t for t in self.state.task_list if str(t.id) == ref_id),
+            "No task with that ID.",
+        )
 
     def update_planning(self, update: UpdatePlan, actor_address: ActorAddress) -> str:
         """Update the plan with new, updated, or deleted task."""
