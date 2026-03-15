@@ -1,9 +1,10 @@
+from __future__ import annotations
+
 import logging
-from typing import Callable
+from typing import Callable, Literal
 
 from pydantic import Field
 
-from akgentic.core.agent_config import BaseConfig
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.tool.core import (
     COMMAND,
@@ -15,7 +16,7 @@ from akgentic.tool.core import (
     _resolve,
 )
 from akgentic.tool.event import ActorToolObserver, ToolCallEvent
-from akgentic.tool.planning.planning_actor import PlanActor, Task, UpdatePlan
+from akgentic.tool.planning.planning_actor import PlanActor, PlanConfig, Task, UpdatePlan
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -51,8 +52,16 @@ class PlanningTool(ToolCard):
     )
     get_planning_task: GetPlanningTask | bool = True
     update_planning: UpdatePlanning | bool = True
+    embedding_model: str = Field(
+        default="text-embedding-3-small",
+        description="Embedding model passed through to PlanConfig for semantic task search",
+    )
+    embedding_provider: Literal["openai", "azure"] = Field(
+        default="openai",
+        description="Embedding provider passed through to PlanConfig for semantic task search",
+    )
 
-    def observer(self, observer: ActorToolObserver):
+    def observer(self, observer: ActorToolObserver) -> None:  # type: ignore[override]
         """Attach observer and set up the planning actor proxy.
 
         Requires an ActorToolObserver for actor system access.
@@ -66,9 +75,13 @@ class PlanningTool(ToolCard):
 
         if planning_tool_addr is None:
             logger.info(f"PlanningTool: create {PLANNING_ACTOR_NAME}.")
-            planning_tool_addr = orchestrator_proxy_ask.createActor(
-                PlanActor, config=BaseConfig(name=PLANNING_ACTOR_NAME, role=PLANNING_ACTOR_ROLE)
+            config = PlanConfig(
+                name=PLANNING_ACTOR_NAME,
+                role=PLANNING_ACTOR_ROLE,
+                embedding_model=self.embedding_model,
+                embedding_provider=self.embedding_provider,
             )
+            planning_tool_addr = orchestrator_proxy_ask.createActor(PlanActor, config=config)
 
         self._planning_proxy = observer.proxy_ask(planning_tool_addr, PlanActor)
 
@@ -132,8 +145,8 @@ class PlanningTool(ToolCard):
         planning_proxy = self._planning_proxy
         observer = self._observer
 
-        def get_planning_task(task_id: int) -> Task | str:
-            """Get a single team task by its ID."""
+        def get_planning_task(task_id: int | str) -> Task | str:
+            """Get a single team task by its integer ID or semantic query string."""
             if observer is not None:
                 observer.notify_event(
                     ToolCallEvent(tool_name="Get task", args=[task_id], kwargs={})
