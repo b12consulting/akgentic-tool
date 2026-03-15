@@ -16,27 +16,7 @@ from pydantic import Field
 
 from akgentic.core.agent_state import BaseState
 from akgentic.core.utils.serializer import SerializableBaseModel
-
-# ---------------------------------------------------------------------------
-# Vector index models (Epic 2)
-# ---------------------------------------------------------------------------
-
-
-class VectorEntry(SerializableBaseModel):
-    """A single embedding record stored in the VectorIndex.
-
-    Links an embedding vector back to its source entity or relation via
-    ``ref_type`` and ``ref_id``. Used by ``VectorIndex`` for cosine
-    similarity search.
-    """
-
-    ref_type: Literal["entity", "relation"] = Field(
-        ..., description="Whether this entry is for an entity or a relation."
-    )
-    ref_id: str = Field(..., description="UUID string of the referenced entity or relation.")
-    text: str = Field(..., description="The text that was embedded.")
-    vector: list[float] = Field(..., description="Embedding values (one float per dimension).")
-
+from akgentic.tool.vector import VectorEntry as VectorEntry  # re-exported for KG consumers
 
 # ---------------------------------------------------------------------------
 # Core domain models
