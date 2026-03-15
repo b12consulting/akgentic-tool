@@ -34,9 +34,8 @@ from akgentic.tool.knowledge_graph.models import (
     SearchHit,
     SearchQuery,
     SearchResult,
-    VectorEntry,
 )
-from akgentic.tool.knowledge_graph.vector_index import EmbeddingService, VectorIndex
+from akgentic.tool.vector import EmbeddingService, VectorEntry, VectorIndex
 
 logger = logging.getLogger(__name__)
 

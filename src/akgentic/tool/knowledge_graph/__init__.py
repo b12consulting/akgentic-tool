@@ -54,33 +54,15 @@ from akgentic.tool.knowledge_graph.models import (
     SearchHit,
     SearchQuery,
     SearchResult,
-    VectorEntry,
 )
-from akgentic.tool.knowledge_graph.vector_index import EmbeddingService, VectorIndex
-
-
-def _check_kg_dependencies() -> None:
-    """Validate that ``[vector_search]`` optional dependencies are installed.
-
-    Raises:
-        ImportError: With install instructions when ``numpy`` or ``openai`` is missing.
-    """
-    missing: list[str] = []
-    try:
-        import numpy as _np  # noqa: F401
-    except ImportError:
-        missing.append("numpy")
-    try:
-        import openai as _openai  # noqa: F401
-    except ImportError:
-        missing.append("openai")
-    if missing:
-        msg = (
-            f"The knowledge_graph module requires extra dependencies ({', '.join(missing)}). "
-            "Install them with: pip install akgentic-tool[vector_search]"
-        )
-        raise ImportError(msg)
-
+from akgentic.tool.vector import (
+    EmbeddingService,  # noqa: F401
+    VectorEntry,  # noqa: F401
+    VectorIndex,  # noqa: F401
+)
+from akgentic.tool.vector import (
+    _check_vector_search_dependencies as _check_kg_dependencies,
+)
 
 __all__ = [
     # Core domain models
