@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 from akgentic.core import ActorAddressProxy
+from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent_card import AgentCard
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.orchestrator import Orchestrator
@@ -581,9 +582,8 @@ def test_hire_member_command_execution():
 
     result = hire_member("Developer")
 
-    assert isinstance(result, tuple)
-    assert len(result) == 2
-    assert "@Developer" in result[0]
+    assert isinstance(result, ActorAddress)
+    assert result.name == "@Developer123"
     observer_mock.createActor.assert_called_once()
     observer_mock.on_hire.assert_called_once()
     observer_mock.notify_event.assert_called()
@@ -616,7 +616,7 @@ def test_hire_member_command_with_name():
 
     result = hire_member("Developer", "@MyDev")
 
-    assert result[0] == "@MyDev"
+    assert result.name == "@MyDev"
     observer_mock.createActor.assert_called_once()
 
 
