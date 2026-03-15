@@ -306,6 +306,26 @@ class TestOutputFieldRendering:
         result = fn()
         assert "— Output:" not in result
 
+    def test_output_and_created_by_tag_combined(self) -> None:
+        """AC4+AC10: A delegated task with both output and [created by you] renders both."""
+        tasks = [
+            make_task(
+                id=7,
+                owner="@ArchAgent",
+                creator="@DevAgent",
+                description="Review PR #42",
+                output="comments posted",
+            ),
+        ]
+        fn = make_prompt_fn(tasks, agent_name="@DevAgent")
+        result = fn()
+        assert "Review PR #42" in result
+        assert "— Output: comments posted" in result
+        assert "[created by you]" in result
+        # Verify ordering: output before tag
+        task_line = next(line for line in result.splitlines() if "Review PR #42" in line)
+        assert task_line.index("— Output:") < task_line.index("[created by you]")
+
 
 # --- Tests: navigation hint (AC#3, #8) ---
 

@@ -154,7 +154,7 @@ class PlanningTool(ToolCard):
             breakdown_parts = [f"{name}: {count}" for name, count in named]
             if unassigned_count:
                 breakdown_parts.append(f"unassigned: {unassigned_count}")
-            breakdown = " | ".join(breakdown_parts) if breakdown_parts else "all unassigned"
+            breakdown = " | ".join(breakdown_parts)
 
             lines = [f"**Team planning:** {total} task{'s' if total != 1 else ''} total"]
             lines.append(f"Owners: {breakdown}")
