@@ -29,6 +29,14 @@ class GetPlanning(BaseToolParam):
     """Get the full team plan — as system prompt and/or tool."""
 
     expose: set[Channels] = {SYSTEM_PROMPT, COMMAND}
+    filter_by_agent: bool = Field(
+        default=True,
+        description=(
+            "When True (default), the system prompt shows only tasks owned or created by the "
+            "calling agent. The team summary (totals + owner breakdown) is always shown. "
+            "Set False to list all tasks."
+        ),
+    )
 
 
 class GetPlanningTask(BaseToolParam):
@@ -123,21 +131,72 @@ class PlanningTool(ToolCard):
 
     def _planning_prompt_factory(self, params: GetPlanning) -> Callable:
         planning_proxy = self._planning_proxy
+        # Capture agent identity and filter setting at bind time — stable for actor's lifetime.
+        agent_name = self._observer.myAddress.name
+        filter_by_agent = params.filter_by_agent
 
         def planning_prompt() -> str:
             """Get the full team planning."""
+            tasks = planning_proxy.get_planning()
+            if not tasks:
+                return "No current team planning."
 
-            planning = planning_proxy.get_planning()
-            if not planning:
-                return "No current Team planning."
-            return "**Team planning:**\n" + "\n".join(
-                [
-                    f"- ID {task.id} [{task.status}] {task.description} "
-                    f"{task.output and f'\u2014 Output: {task.output} '}"
-                    f"(Owner: {task.owner}, Creator: {task.creator})"
-                    for task in planning
+            total = len(tasks)
+
+            # --- Build per-owner breakdown ---
+            owner_counts: dict[str, int] = {}
+            for task in tasks:
+                key = task.owner if task.owner else "unassigned"
+                owner_counts[key] = owner_counts.get(key, 0) + 1
+
+            named = sorted((k, v) for k, v in owner_counts.items() if k != "unassigned")
+            unassigned_count = owner_counts.get("unassigned", 0)
+            breakdown_parts = [f"{name}: {count}" for name, count in named]
+            if unassigned_count:
+                breakdown_parts.append(f"unassigned: {unassigned_count}")
+            breakdown = " | ".join(breakdown_parts)
+
+            lines = [f"**Team planning:** {total} task{'s' if total != 1 else ''} total"]
+            lines.append(f"Owners: {breakdown}")
+
+            if filter_by_agent:
+                # Only include tasks where the calling agent is owner or creator.
+                # Unassigned tasks (empty owner) never appear here even if creator matches.
+                own_tasks = [
+                    t
+                    for t in tasks
+                    if t.owner == agent_name or (t.owner and t.creator == agent_name)
                 ]
+                if own_tasks:
+                    lines.append(f"\n**Your tasks** (owner or creator: {agent_name}):")
+                    for task in own_tasks:
+                        role_tag = ""
+                        if task.owner != agent_name and task.creator == agent_name:
+                            role_tag = " [created by you]"
+                        output_part = f" — Output: {task.output}" if task.output else ""
+                        lines.append(
+                            f"- ID {task.id} [{task.status}] {task.description}"
+                            f"{output_part}{role_tag}"
+                        )
+                else:
+                    lines.append(
+                        f"\nNo tasks assigned to or created by {agent_name} yet."
+                    )
+            else:
+                lines.append("\n**All tasks:**")
+                for task in tasks:
+                    output_part = f" — Output: {task.output}" if task.output else ""
+                    owner_label = task.owner or "unassigned"
+                    lines.append(
+                        f"- ID {task.id} [{task.status}] {task.description}"
+                        f"{output_part} (Owner: {owner_label}, Creator: {task.creator})"
+                    )
+
+            lines.append(
+                "\nUse get_planning_task(id) for exact lookup or "
+                "get_planning_task(query) for semantic search."
             )
+            return "\n".join(lines)
 
         return planning_prompt
 
