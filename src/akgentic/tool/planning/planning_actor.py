@@ -10,7 +10,7 @@ from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.errors import RetriableError
 
 if TYPE_CHECKING:
-    from akgentic.tool.vector import EmbeddingService
+    from akgentic.tool.vector import EmbeddingService, VectorIndex
 
 logger = logging.getLogger(__name__)
 
@@ -97,8 +97,6 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
     """
 
     def on_start(self) -> None:
-        from akgentic.tool.vector import VectorIndex
-
         self.state = PlanManagerState()
         self.state.observer(self)
         # Coerce BaseConfig → PlanConfig if the actor was started with a plain BaseConfig
@@ -109,7 +107,14 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
                 name=self.config.name,
                 role=self.config.role,
             )
-        self._vector_index: VectorIndex = VectorIndex()
+        # Only instantiate VectorIndex (which imports numpy) when semantic_search is enabled.
+        # This preserves the graceful fallback behaviour: if numpy is absent and
+        # semantic_search=False, on_start must not crash (AC#7, AC#8).
+        self._vector_index: "VectorIndex | None" = None
+        if self.config.semantic_search:
+            from akgentic.tool.vector import VectorIndex
+
+            self._vector_index = VectorIndex()
         self._embedding_svc: EmbeddingService | None = None
 
     def _get_or_create_embedding_svc(self) -> "EmbeddingService | None":
@@ -137,11 +142,13 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
         """Embed a task's description and store the resulting VectorEntry.
 
         Called after task create or update. Does nothing when embedding service
-        is unavailable (semantic_search=False or missing deps).
+        is unavailable (semantic_search=False or missing deps). Any embedding
+        error (import, network, auth) is logged and swallowed so that task CRUD
+        is never interrupted by a transient embedding failure.
         """
         try:
             svc = self._get_or_create_embedding_svc()
-            if svc is None:
+            if svc is None or self._vector_index is None:
                 return
             from akgentic.tool.vector import VectorEntry
 
@@ -155,6 +162,10 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
             self._vector_index.add(entry)
         except ImportError:
             logger.warning("Vector search deps missing — skipping embedding for task %s", task.id)
+        except Exception:
+            logger.warning(
+                "Embedding failed for task %s — semantic index not updated", task.id, exc_info=True
+            )
 
     def _create_task(self, task: TaskCreate, actor_address: ActorAddress) -> None:
         new_task = Task(**task.__dict__, creator=actor_address.name)
@@ -169,7 +180,17 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
             if task.id == task_update.id:
                 updated_task = task.model_copy(update=updates)
                 self.state.task_list[idx] = updated_task
-                if self.config.semantic_search and task_update.description is not None:
+                # Re-index only when the description actually changed (AC#5).
+                description_changed = (
+                    task_update.description is not None
+                    and task_update.description != task.description
+                )
+                should_reindex = (
+                    self.config.semantic_search
+                    and description_changed
+                    and self._vector_index is not None
+                )
+                if should_reindex:
                     self._vector_index.remove({str(task.id)})
                     self._embed_task(updated_task)
                 return
@@ -207,7 +228,7 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
             if not any(task.id == task_id for task in self.state.task_list):
                 errors.append(f"Delete error - no task with ID {task_id} found.")
             else:
-                if self.config.semantic_search:
+                if self.config.semantic_search and self._vector_index is not None:
                     self._vector_index.remove({str(task_id)})
                 self.state.task_list = [task for task in self.state.task_list if task.id != task_id]
 
