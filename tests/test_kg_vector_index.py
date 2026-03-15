@@ -12,8 +12,7 @@ from __future__ import annotations
 import time
 from unittest.mock import MagicMock, patch
 
-from akgentic.tool.knowledge_graph.models import VectorEntry
-from akgentic.tool.knowledge_graph.vector_index import EmbeddingService, VectorIndex
+from akgentic.tool.vector import EmbeddingService, VectorEntry, VectorIndex
 
 # ---------------------------------------------------------------------------
 # VectorEntry (Task 1.3)
@@ -59,51 +58,50 @@ class TestVectorEntry:
 # ---------------------------------------------------------------------------
 
 
+def _make_mock_embedding_response(n: int = 2, dim: int = 3) -> MagicMock:
+    """Build a mock embeddings.create() response with n embeddings of dim dims."""
+    items = [MagicMock(embedding=[float(i)] * dim) for i in range(n)]
+    response = MagicMock()
+    response.data = items
+    return response
+
+
 class TestEmbeddingService:
     """AC-1, AC-2: EmbeddingService correct client selection and return shape."""
 
-    def _make_mock_response(self, n: int = 2, dim: int = 3) -> MagicMock:
-        """Build a mock embeddings.create() response with n embeddings of dim dims."""
-        items = [MagicMock(embedding=[float(i)] * dim) for i in range(n)]
-        response = MagicMock()
-        response.data = items
-        return response
-
     def test_openai_client_used_for_openai_provider(self) -> None:
-        with patch("akgentic.tool.knowledge_graph.vector_index.openai") as mock_openai:
-            mock_client = MagicMock()
-            mock_openai.OpenAI.return_value = mock_client
-            response = self._make_mock_response(1, 3)
-            mock_client.embeddings.create.return_value = response
+        mock_client = MagicMock()
+        mock_client.embeddings.create.return_value = _make_mock_embedding_response(1, 3)
 
+        with patch("openai.OpenAI", return_value=mock_client) as mock_cls:
             svc = EmbeddingService(model="text-embedding-3-small", provider="openai")
             result = svc.embed(["hello"])
 
-        mock_openai.OpenAI.assert_called_once()
+        mock_cls.assert_called_once()
         assert len(result) == 1
         assert len(result[0]) == 3
 
     def test_azure_client_used_for_azure_provider(self) -> None:
-        with patch("akgentic.tool.knowledge_graph.vector_index.openai") as mock_openai:
-            mock_client = MagicMock()
-            mock_openai.AzureOpenAI.return_value = mock_client
-            response = self._make_mock_response(1, 4)
-            mock_client.embeddings.create.return_value = response
+        mock_client = MagicMock()
+        mock_client.embeddings.create.return_value = _make_mock_embedding_response(1, 4)
 
+        with (
+            patch("openai.OpenAI") as mock_oai,
+            patch("openai.AzureOpenAI", return_value=mock_client) as mock_azure,
+        ):
             svc = EmbeddingService(model="text-embedding-3-small", provider="azure")
             result = svc.embed(["hello"])
 
-        mock_openai.AzureOpenAI.assert_called_once()
-        mock_openai.OpenAI.assert_not_called()
+        mock_azure.assert_called_once()
+        mock_oai.assert_not_called()
         assert len(result) == 1
         assert len(result[0]) == 4
 
     def test_embed_multiple_texts_returns_one_vector_per_text(self) -> None:
-        with patch("akgentic.tool.knowledge_graph.vector_index.openai") as mock_openai:
-            mock_client = MagicMock()
-            mock_openai.OpenAI.return_value = mock_client
-            mock_client.embeddings.create.return_value = self._make_mock_response(3, 5)
+        mock_client = MagicMock()
+        mock_client.embeddings.create.return_value = _make_mock_embedding_response(3, 5)
 
+        with patch("openai.OpenAI", return_value=mock_client):
             svc = EmbeddingService(model="text-embedding-3-small", provider="openai")
             result = svc.embed(["a", "b", "c"])
 
@@ -113,31 +111,29 @@ class TestEmbeddingService:
 
     def test_client_created_lazily_on_first_embed(self) -> None:
         """Client must not be created at __init__ time, only on first embed()."""
-        with patch("akgentic.tool.knowledge_graph.vector_index.openai") as mock_openai:
-            mock_client = MagicMock()
-            mock_openai.OpenAI.return_value = mock_client
-            mock_client.embeddings.create.return_value = self._make_mock_response(1)
+        mock_client = MagicMock()
+        mock_client.embeddings.create.return_value = _make_mock_embedding_response(1)
 
+        with patch("openai.OpenAI", return_value=mock_client) as mock_cls:
             svc = EmbeddingService(model="m", provider="openai")
             # Client NOT created yet
-            mock_openai.OpenAI.assert_not_called()
+            mock_cls.assert_not_called()
 
             svc.embed(["x"])
             # Now it is created
-            mock_openai.OpenAI.assert_called_once()
+            mock_cls.assert_called_once()
 
     def test_client_cached_across_embed_calls(self) -> None:
         """Second embed() must reuse the same client, not create a new one."""
-        with patch("akgentic.tool.knowledge_graph.vector_index.openai") as mock_openai:
-            mock_client = MagicMock()
-            mock_openai.OpenAI.return_value = mock_client
-            mock_client.embeddings.create.return_value = self._make_mock_response(1)
+        mock_client = MagicMock()
+        mock_client.embeddings.create.return_value = _make_mock_embedding_response(1)
 
+        with patch("openai.OpenAI", return_value=mock_client) as mock_cls:
             svc = EmbeddingService(model="m", provider="openai")
             svc.embed(["x"])
             svc.embed(["y"])
 
-            assert mock_openai.OpenAI.call_count == 1
+            assert mock_cls.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -261,3 +257,29 @@ class TestVectorIndexPerformance:
 
         assert len(results) == 10
         assert elapsed_ms < 1.0, f"Cosine search took {elapsed_ms:.3f}ms (> 1ms)"
+
+
+# ---------------------------------------------------------------------------
+# Backward-compat shim (AC-5: old import paths must still work)
+# ---------------------------------------------------------------------------
+
+
+class TestBackwardCompatImports:
+    """Verify that importing from deprecated paths still works."""
+
+    def test_vector_index_shim_exports_embedding_service(self) -> None:
+        from akgentic.tool.knowledge_graph.vector_index import (
+            EmbeddingService as ShimEmbeddingService,
+        )
+
+        assert ShimEmbeddingService is EmbeddingService
+
+    def test_vector_index_shim_exports_vector_index(self) -> None:
+        from akgentic.tool.knowledge_graph.vector_index import VectorIndex as ShimVectorIndex
+
+        assert ShimVectorIndex is VectorIndex
+
+    def test_knowledge_graph_package_exports_vector_entry(self) -> None:
+        from akgentic.tool.knowledge_graph import VectorEntry as KgVectorEntry
+
+        assert KgVectorEntry is VectorEntry
