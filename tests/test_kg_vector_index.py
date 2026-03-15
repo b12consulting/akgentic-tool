@@ -257,3 +257,29 @@ class TestVectorIndexPerformance:
 
         assert len(results) == 10
         assert elapsed_ms < 1.0, f"Cosine search took {elapsed_ms:.3f}ms (> 1ms)"
+
+
+# ---------------------------------------------------------------------------
+# Backward-compat shim (AC-5: old import paths must still work)
+# ---------------------------------------------------------------------------
+
+
+class TestBackwardCompatImports:
+    """Verify that importing from deprecated paths still works."""
+
+    def test_vector_index_shim_exports_embedding_service(self) -> None:
+        from akgentic.tool.knowledge_graph.vector_index import (
+            EmbeddingService as ShimEmbeddingService,
+        )
+
+        assert ShimEmbeddingService is EmbeddingService
+
+    def test_vector_index_shim_exports_vector_index(self) -> None:
+        from akgentic.tool.knowledge_graph.vector_index import VectorIndex as ShimVectorIndex
+
+        assert ShimVectorIndex is VectorIndex
+
+    def test_knowledge_graph_package_exports_vector_entry(self) -> None:
+        from akgentic.tool.knowledge_graph import VectorEntry as KgVectorEntry
+
+        assert KgVectorEntry is VectorEntry

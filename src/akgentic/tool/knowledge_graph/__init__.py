@@ -56,9 +56,9 @@ from akgentic.tool.knowledge_graph.models import (
     SearchResult,
 )
 from akgentic.tool.vector import (
-    EmbeddingService,  # noqa: F401
-    VectorEntry,  # noqa: F401
-    VectorIndex,  # noqa: F401
+    EmbeddingService,
+    VectorEntry,
+    VectorIndex,
 )
 from akgentic.tool.vector import (
     _check_vector_search_dependencies as _check_kg_dependencies,
