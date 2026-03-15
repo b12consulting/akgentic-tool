@@ -14,6 +14,7 @@ import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from akgentic.tool.vector import (
     EmbeddingService,
@@ -86,15 +87,15 @@ class TestVectorEntry:
         assert entry.vector == vec
 
     def test_missing_ref_id_raises(self) -> None:
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             VectorEntry(ref_type="entity", text="foo", vector=[])  # type: ignore[call-arg]
 
     def test_missing_text_raises(self) -> None:
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             VectorEntry(ref_type="entity", ref_id="x", vector=[0.1])  # type: ignore[call-arg]
 
     def test_missing_vector_raises(self) -> None:
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             VectorEntry(ref_type="entity", ref_id="x", text="t")  # type: ignore[call-arg]
 
 
@@ -214,6 +215,17 @@ class TestVectorIndex:
             index.add(VectorEntry(ref_type="task", ref_id=str(i), text="t", vector=[float(i), 1.0]))
         results = index.search_cosine([1.0, 0.0], top_k=2)
         assert len(results) == 2
+
+    def test_remove_nonexistent_id_is_noop(self) -> None:
+        index = VectorIndex()
+        index.add(VectorEntry(ref_type="task", ref_id="1", text="foo", vector=[1.0, 0.0]))
+        index.remove({"nonexistent"})
+        assert len(index) == 1
+
+    def test_remove_on_empty_index_is_noop(self) -> None:
+        index = VectorIndex()
+        index.remove({"any-id"})  # Must not raise
+        assert len(index) == 0
 
     def test_search_cosine_returns_ref_id_and_score_tuples(self) -> None:
         index = VectorIndex()
