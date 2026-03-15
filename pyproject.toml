@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-semantic = [
+vector_search = [
     "openai>=1.0.0",
     "numpy>=1.26.0",
 ]

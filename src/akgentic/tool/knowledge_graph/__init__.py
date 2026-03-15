@@ -3,9 +3,9 @@
 Provides in-memory knowledge graph with entity/relation CRUD,
 backed by a Pykka actor (KnowledgeGraphActor) for thread safety.
 
-Requires the ``[semantic]`` optional dependency group::
+Requires the ``[vector_search]`` optional dependency group::
 
-    pip install akgentic-tool[semantic]
+    pip install akgentic-tool[vector_search]
 
 Public API
 ----------
@@ -60,7 +60,7 @@ from akgentic.tool.knowledge_graph.vector_index import EmbeddingService, VectorI
 
 
 def _check_kg_dependencies() -> None:
-    """Validate that ``[semantic]`` optional dependencies are installed.
+    """Validate that ``[vector_search]`` optional dependencies are installed.
 
     Raises:
         ImportError: With install instructions when ``numpy`` or ``openai`` is missing.
@@ -77,7 +77,7 @@ def _check_kg_dependencies() -> None:
     if missing:
         msg = (
             f"The knowledge_graph module requires extra dependencies ({', '.join(missing)}). "
-            "Install them with: pip install akgentic-tool[semantic]"
+            "Install them with: pip install akgentic-tool[vector_search]"
         )
         raise ImportError(msg)
 

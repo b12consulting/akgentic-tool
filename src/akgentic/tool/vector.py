@@ -1,19 +1,21 @@
 """Shared vector embedding infrastructure for akgentic-tool.
 
 Zero domain coupling — no imports from knowledge_graph or planning.
-Install akgentic-tool[semantic] to use embedding functionality.
+Install akgentic-tool[vector_search] to use embedding functionality.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
-import numpy as np
-import openai
 from pydantic import Field
 
 from akgentic.core.utils.serializer import SerializableBaseModel
+
+if TYPE_CHECKING:
+    import numpy as np
+    import openai as _openai_typing
 
 logger = logging.getLogger(__name__)
 
@@ -60,21 +62,23 @@ class EmbeddingService:
     def __init__(self, model: str, provider: Literal["openai", "azure"]) -> None:
         self._model = model
         self._provider = provider
-        self._client: openai.OpenAI | openai.AzureOpenAI | None = None
+        self._client: _openai_typing.OpenAI | _openai_typing.AzureOpenAI | None = None
 
     # --- Internal ---
 
-    def _get_client(self) -> openai.OpenAI | openai.AzureOpenAI:
+    def _get_client(self) -> _openai_typing.OpenAI | _openai_typing.AzureOpenAI:
         """Return (or lazily create) the openai client.
 
         Returns:
             Configured OpenAI or AzureOpenAI client instance.
         """
+        import openai as _openai
+
         if self._client is None:
             if self._provider == "azure":
-                self._client = openai.AzureOpenAI()
+                self._client = _openai.AzureOpenAI()
             else:
-                self._client = openai.OpenAI()
+                self._client = _openai.OpenAI()
         return self._client
 
     # --- Public API ---
@@ -114,6 +118,8 @@ class VectorIndex:
     _GROWTH_FACTOR: int = 2
 
     def __init__(self) -> None:
+        import numpy as np
+
         self._entries: list[VectorEntry] = []
         self._count: int = 0
         self._dim: int = 0
@@ -131,6 +137,8 @@ class VectorIndex:
         first buffer (``self._dim == 0``), ensuring consistent column counts
         across resizes regardless of the caller's argument.
         """
+        import numpy as np
+
         if self._count < self._capacity:
             return
         effective_dim = self._dim if self._dim > 0 else dim
@@ -154,6 +162,8 @@ class VectorIndex:
         Args:
             entry: The embedding record to store.
         """
+        import numpy as np
+
         dim = len(entry.vector)
         if self._dim == 0:
             self._dim = dim
@@ -171,6 +181,8 @@ class VectorIndex:
         Args:
             ref_ids: Set of UUID strings to remove. Unknown IDs are silently ignored.
         """
+        import numpy as np
+
         keep = [i for i, e in enumerate(self._entries) if e.ref_id not in ref_ids]
         if len(keep) == self._count:
             return  # Nothing removed — fast path
@@ -207,6 +219,8 @@ class VectorIndex:
             List of ``(ref_id, score)`` tuples sorted by score descending,
             limited to ``top_k`` entries.
         """
+        import numpy as np
+
         if not self._entries:
             return []
 
@@ -228,8 +242,8 @@ class VectorIndex:
 # ---------------------------------------------------------------------------
 
 
-def _check_semantic_dependencies() -> None:
-    """Validate that [semantic] optional dependencies are installed.
+def _check_vector_search_dependencies() -> None:
+    """Validate that [vector_search] optional dependencies are installed.
 
     Raises:
         ImportError: With install instructions when ``numpy`` or ``openai`` is missing.
@@ -245,9 +259,9 @@ def _check_semantic_dependencies() -> None:
         missing.append("openai")
     if missing:
         raise ImportError(
-            f"Semantic search requires extra dependencies ({', '.join(missing)}). "
-            "Install with: pip install akgentic-tool[semantic]"
+            f"Vector search requires extra dependencies ({', '.join(missing)}). "
+            "Install with: pip install akgentic-tool[vector_search]"
         )
 
 
-__all__ = ["VectorEntry", "EmbeddingService", "VectorIndex", "_check_semantic_dependencies"]
+__all__ = ["VectorEntry", "EmbeddingService", "VectorIndex", "_check_vector_search_dependencies"]

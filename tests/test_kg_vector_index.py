@@ -10,10 +10,7 @@ Covers:
 from __future__ import annotations
 
 import time
-from typing import Literal
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 from akgentic.tool.knowledge_graph.models import VectorEntry
 from akgentic.tool.knowledge_graph.vector_index import EmbeddingService, VectorIndex
@@ -47,14 +44,10 @@ class TestVectorEntry:
         )
         assert entry.ref_type == "relation"
 
-    def test_invalid_ref_type_rejected(self) -> None:
-        with pytest.raises(Exception):
-            VectorEntry(
-                ref_type="unknown",  # type: ignore[arg-type]
-                ref_id="id",
-                text="text",
-                vector=[0.1],
-            )
+    def test_ref_type_accepts_any_string(self) -> None:
+        # VectorEntry is domain-agnostic; ref_type is a free-form string.
+        entry = VectorEntry(ref_type="custom_type", ref_id="id", text="text", vector=[0.1])
+        assert entry.ref_type == "custom_type"
 
     def test_vector_field_accepts_empty_list(self) -> None:
         entry = VectorEntry(ref_type="entity", ref_id="id", text="t", vector=[])
@@ -153,7 +146,7 @@ class TestEmbeddingService:
 
 
 def _make_entry(
-    ref_id: str, vector: list[float], ref_type: Literal["entity", "relation"] = "entity"
+    ref_id: str, vector: list[float], ref_type: str = "entity"
 ) -> VectorEntry:
     """Factory for VectorEntry instances in tests."""
     return VectorEntry(ref_type=ref_type, ref_id=ref_id, text=f"text-{ref_id}", vector=vector)

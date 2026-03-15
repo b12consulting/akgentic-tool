@@ -1,5 +1,7 @@
 """akgentic-tool public API."""
 
+from __future__ import annotations
+
 # Submodules with their own __init__ files
 from . import mcp, planning, search, team
 from .core import (
@@ -18,7 +20,13 @@ from .event import (
     ToolCallEvent,
     ToolObserver,
 )
-from .vector import EmbeddingService, VectorEntry, VectorIndex
+
+try:
+    from .vector import EmbeddingService, VectorEntry, VectorIndex
+
+    _VECTOR_SEARCH_AVAILABLE = True
+except ImportError:
+    _VECTOR_SEARCH_AVAILABLE = False
 
 __all__ = [
     # Core abstractions
@@ -42,7 +50,7 @@ __all__ = [
     "planning",
     "search",
     "team",
-    # Vector infrastructure
+    # Vector infrastructure (requires akgentic-tool[vector_search])
     "VectorEntry",
     "EmbeddingService",
     "VectorIndex",
