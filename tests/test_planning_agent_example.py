@@ -33,7 +33,11 @@ def _load_example_module() -> types.ModuleType:
     assert spec is not None and spec.loader is not None, "Could not load example module spec"
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_key] = module
-    spec.loader.exec_module(module)  # type: ignore[union-attr]  # loader type narrowed by assert above
+    try:
+        spec.loader.exec_module(module)  # type: ignore[union-attr]  # loader type narrowed by assert above
+    except Exception:
+        sys.modules.pop(module_key, None)
+        raise
     return module
 
 

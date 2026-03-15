@@ -226,7 +226,9 @@ def demonstrate_exact_lookup(plan_actor: PlanActor) -> None:
     """
     print("\n--- Step 2: Exact-ID lookup ---")
     result = plan_actor.get_planning_task(2)
-    assert isinstance(result, Task)
+    if not isinstance(result, Task):
+        msg = f"Expected Task from exact-ID lookup, got {type(result).__name__}: {result}"
+        raise TypeError(msg)
     print(
         f"Task {result.id} (int lookup): {result.description}"
         f" [{result.status}] owner={result.owner}"
@@ -311,7 +313,8 @@ def main() -> None:
     for event in observer.events:
         print(f"  [{event.tool_name}]")
 
-    # --- Shutdown ---
+    # --- Shutdown: proper actor lifecycle (start was called in observer init) ---
+    plan_actor.on_stop()
     print("\n--- Shutdown complete ---")
     print("Planning agent example finished successfully.")
     print("=" * 60)
