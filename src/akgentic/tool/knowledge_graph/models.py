@@ -16,7 +16,7 @@ from pydantic import Field
 
 from akgentic.core.agent_state import BaseState
 from akgentic.core.utils.serializer import SerializableBaseModel
-from akgentic.tool.vector import VectorEntry  # noqa: F401 — re-exported for KG consumers
+from akgentic.tool.vector import VectorEntry as VectorEntry  # re-exported for KG consumers
 
 # ---------------------------------------------------------------------------
 # Core domain models

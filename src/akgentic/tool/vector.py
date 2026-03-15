@@ -125,9 +125,9 @@ class VectorIndex:
         self._dim: int = 0
         self._capacity: int = 0
         # Pre-allocated backing stores resized geometrically.
-        self._buf: np.ndarray = np.empty((0, 0), dtype=np.float64)
+        self._buf: np.ndarray = np.empty((0, 0), dtype=np.float64)  # type: ignore[type-arg]
         # Row norms pre-computed at add() time to avoid re-reading matrix during search.
-        self._norms_buf: np.ndarray = np.empty(0, dtype=np.float64)
+        self._norms_buf: np.ndarray = np.empty(0, dtype=np.float64)  # type: ignore[type-arg]
 
     def _ensure_capacity(self, dim: int) -> None:
         """Grow the backing buffers if the current row count equals capacity.

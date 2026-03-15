@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 # Submodules with their own __init__ files
-from . import mcp, planning, search, team
-from .core import (
+from . import mcp, planning, search, team  # noqa: F401
+from .core import (  # noqa: F401
     COMMAND,
     SYSTEM_PROMPT,
     TOOL_CALL,
@@ -13,8 +13,8 @@ from .core import (
     ToolCard,
     ToolFactory,
 )
-from .errors import RetriableError
-from .event import (
+from .errors import RetriableError  # noqa: F401
+from .event import (  # noqa: F401
     ActorToolObserver,
     TeamManagementToolObserver,
     ToolCallEvent,
@@ -22,7 +22,7 @@ from .event import (
 )
 
 try:
-    from .vector import EmbeddingService, VectorEntry, VectorIndex
+    from .vector import EmbeddingService, VectorEntry, VectorIndex  # noqa: F401
 
     _VECTOR_SEARCH_AVAILABLE = True
 except ImportError:
@@ -50,8 +50,7 @@ __all__ = [
     "planning",
     "search",
     "team",
-    # Vector infrastructure (requires akgentic-tool[vector_search])
-    "VectorEntry",
-    "EmbeddingService",
-    "VectorIndex",
 ]
+
+if _VECTOR_SEARCH_AVAILABLE:
+    __all__ += ["VectorEntry", "EmbeddingService", "VectorIndex"]

@@ -67,11 +67,11 @@ def _check_kg_dependencies() -> None:
     """
     missing: list[str] = []
     try:
-        import numpy as _  # noqa: F811, F401
+        import numpy as _np  # noqa: F401
     except ImportError:
         missing.append("numpy")
     try:
-        import openai as _  # noqa: F811, F401
+        import openai as _openai  # noqa: F401
     except ImportError:
         missing.append("openai")
     if missing:
