@@ -1,71 +1,19 @@
 """Tests for PlanActor.get_planning_task — int and semantic (str) lookup paths.
 
-Covers AC#1–#7 (get_planning_task method) and AC#10 (test file completeness).
+Covers AC#1–#7 (get_planning_task method) and AC#8–#9 (PlanningTool wiring),
+satisfying AC#10 (test file completeness).
 """
 
 from __future__ import annotations
 
-import uuid
 from unittest.mock import MagicMock, patch
-
-from akgentic.core.actor_address import ActorAddress
 
 from akgentic.tool.planning.planning_actor import (
     PlanActor,
     PlanConfig,
     Task,
 )
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-class MockActorAddress(ActorAddress):
-    """Minimal ActorAddress stub for tests that need a creator identity."""
-
-    def __init__(self, name: str = "test-agent", role: str = "test-role") -> None:
-        self._name = name
-        self._role = role
-        self._agent_id = uuid.uuid4()
-
-    @property
-    def agent_id(self) -> uuid.UUID:
-        return self._agent_id
-
-    @property
-    def name(self) -> str:
-        return self._name
-
-    @property
-    def role(self) -> str:
-        return self._role
-
-    @property
-    def team_id(self) -> uuid.UUID | None:
-        return None
-
-    @property
-    def squad_id(self) -> uuid.UUID | None:
-        return None
-
-    def send(self, recipient: object, message: object) -> None:
-        pass
-
-    def is_alive(self) -> bool:
-        return True
-
-    def stop(self) -> None:
-        pass
-
-    def handle_user_message(self) -> bool:
-        return False
-
-    def serialize(self) -> dict:  # type: ignore[type-arg]
-        return {"name": self._name, "role": self._role, "agent_id": str(self._agent_id)}
-
-    def __repr__(self) -> str:
-        return f"MockActorAddress(name={self._name})"
+from tests.conftest import MockActorAddress
 
 
 def _make_actor(semantic_search: bool = True) -> PlanActor:
@@ -272,3 +220,81 @@ class TestGetPlanningTaskStrOrphanedRefId:
             result = actor.get_planning_task("deleted task description")
 
         assert result == "No task with that ID."
+
+
+# ---------------------------------------------------------------------------
+# AC#8 — PlanningTool has embedding_model and embedding_provider fields
+# ---------------------------------------------------------------------------
+
+
+class TestPlanningToolFields:
+    """AC8: PlanningTool exposes embedding_model and embedding_provider Pydantic fields."""
+
+    def test_default_embedding_model(self) -> None:
+        from akgentic.tool.planning.planning import PlanningTool
+
+        tool = PlanningTool()
+        assert tool.embedding_model == "text-embedding-3-small"
+
+    def test_default_embedding_provider(self) -> None:
+        from akgentic.tool.planning.planning import PlanningTool
+
+        tool = PlanningTool()
+        assert tool.embedding_provider == "openai"
+
+    def test_custom_embedding_model(self) -> None:
+        from akgentic.tool.planning.planning import PlanningTool
+
+        tool = PlanningTool(embedding_model="text-embedding-ada-002")
+        assert tool.embedding_model == "text-embedding-ada-002"
+
+    def test_custom_embedding_provider_azure(self) -> None:
+        from akgentic.tool.planning.planning import PlanningTool
+
+        tool = PlanningTool(embedding_provider="azure")
+        assert tool.embedding_provider == "azure"
+
+
+# ---------------------------------------------------------------------------
+# AC#9 — PlanningTool.observer() passes PlanConfig with embedding fields
+# ---------------------------------------------------------------------------
+
+
+class TestPlanningToolObserverWiring:
+    """AC9: observer() wires PlanConfig(embedding_model, embedding_provider) to PlanActor."""
+
+    def test_observer_creates_plan_actor_with_plan_config(self) -> None:
+        """observer() must pass PlanConfig (not BaseConfig) with embedding fields to PlanActor."""
+        from akgentic.tool.planning.planning import PlanningTool
+
+        tool = PlanningTool(
+            embedding_model="text-embedding-ada-002",
+            embedding_provider="azure",
+        )
+
+        # Capture the config passed to createActor
+        captured_config: list[PlanConfig] = []
+
+        mock_proxy_ask = MagicMock()
+        mock_proxy_ask.get_team_member.return_value = None  # Force actor creation path
+
+        def capture_create_actor(actor_cls: type, config: PlanConfig) -> MagicMock:
+            captured_config.append(config)
+            return MagicMock()
+
+        mock_proxy_ask.createActor.side_effect = capture_create_actor
+
+        mock_observer = MagicMock()
+        mock_observer.orchestrator = MagicMock()
+        mock_observer.proxy_ask.return_value = mock_proxy_ask
+
+        tool.observer(mock_observer)
+
+        assert len(captured_config) == 1
+        config = captured_config[0]
+        assert isinstance(config, PlanConfig), (
+            f"Expected PlanConfig, got {type(config).__name__}. "
+            "observer() must not pass a plain BaseConfig."
+        )
+        assert config.embedding_model == "text-embedding-ada-002"
+        assert config.embedding_provider == "azure"

@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import uuid
-
 import pytest
-from akgentic.core.actor_address import ActorAddress
 
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.planning.planning_actor import (
@@ -14,53 +11,7 @@ from akgentic.tool.planning.planning_actor import (
     TaskUpdate,
     UpdatePlan,
 )
-
-
-class MockActorAddress(ActorAddress):
-    """Mock ActorAddress for testing."""
-
-    def __init__(self, name: str = "test-agent", role: str = "test-role"):
-        self._name = name
-        self._role = role
-        self._agent_id = uuid.uuid4()
-
-    @property
-    def agent_id(self) -> uuid.UUID:
-        return self._agent_id
-
-    @property
-    def name(self) -> str:
-        return self._name
-
-    @property
-    def role(self) -> str:
-        return self._role
-
-    @property
-    def team_id(self) -> uuid.UUID | None:
-        return None
-
-    @property
-    def squad_id(self) -> uuid.UUID | None:
-        return None
-
-    def send(self, recipient, message):
-        pass
-
-    def is_alive(self) -> bool:
-        return True
-
-    def stop(self) -> None:
-        pass
-
-    def handle_user_message(self) -> bool:
-        return False
-
-    def serialize(self):
-        return {"name": self._name, "role": self._role, "agent_id": str(self._agent_id)}
-
-    def __repr__(self) -> str:
-        return f"MockActorAddress(name={self._name}, role={self._role}, agent_id={self._agent_id})"
+from tests.conftest import MockActorAddress
 
 
 def test_update_item_success() -> None:

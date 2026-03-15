@@ -187,15 +187,14 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
                     task_update.description is not None
                     and task_update.description != task.description
                 )
-                should_reindex = (
+                if (
                     self.config.semantic_search
                     and description_changed
                     and self._vector_index is not None
-                )
-                if should_reindex:
+                ):
                     self._vector_index.remove({str(task.id)})
                     self._embed_task(updated_task)
-                return
+                return None
         return f"Update error - no task with ID {task_update.id} found."
 
     ##
