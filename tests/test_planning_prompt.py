@@ -164,6 +164,7 @@ class TestFilterByAgentTrue:
         result = fn()
         assert "Delegated" in result
         assert "[created by you]" in result
+        assert "[created by you] (Owner: @ArchAgent, Creator: @DevAgent)" in result
 
     def test_owned_task_has_no_created_by_tag(self) -> None:
         """AC4 inverse: When owner==agent, no [created by you] tag."""
@@ -174,6 +175,7 @@ class TestFilterByAgentTrue:
         result = fn()
         assert "Own task" in result
         assert "[created by you]" not in result
+        assert "(Owner: @DevAgent, Creator: @DevAgent)" in result
 
     def test_unassigned_tasks_excluded_from_own_list(self) -> None:
         """AC5: Tasks with empty owner not in own-task section even if creator matches."""
@@ -325,14 +327,12 @@ class TestOutputFieldRendering:
         # Verify ordering: output before tag
         task_line = next(line for line in result.splitlines() if "Review PR #42" in line)
         assert task_line.index("— Output:") < task_line.index("[created by you]")
+        assert "[created by you] (Owner: @ArchAgent, Creator: @DevAgent)" in task_line
 
 
 # --- Tests: navigation hint (AC#3, #8) ---
 
-_NAV_HINT = (
-    "Use get_planning_task(id) for exact lookup or "
-    "get_planning_task(query) for semantic search."
-)
+_NAV_HINT = "Use get_planning_task(id) for exact ID lookup or search_planning(...) to filter tasks."
 
 
 class TestNavigationHint:
@@ -457,3 +457,51 @@ class TestPlanningToolRoutingMethods:
         tools = tool.get_tools()
         # Default GetPlanningTask has TOOL_CALL in expose -> one entry
         assert any(callable(t) for t in tools)
+
+
+# --- Tests: owner/creator suffix in scoped view (AC#1, #2, #3) ---
+
+
+class TestScopedViewOwnerCreatorDisplay:
+    """AC1-AC3: Owner/creator suffix on task lines in filter_by_agent=True mode."""
+
+    def test_owned_task_shows_owner_creator_suffix(self) -> None:
+        """AC1: Task where owner==agent shows (Owner: ..., Creator: ...)."""
+        tasks = [
+            make_task(id=1, owner="@DevAgent", creator="@DevAgent", description="My task"),
+        ]
+        fn = make_prompt_fn(tasks, agent_name="@DevAgent")
+        result = fn()
+        assert "(Owner: @DevAgent, Creator: @DevAgent)" in result
+
+    def test_delegated_task_shows_created_by_before_owner_creator(self) -> None:
+        """AC2: Delegated task has [created by you] then (Owner:..., Creator:...)."""
+        tasks = [
+            make_task(id=1, owner="@ArchAgent", creator="@DevAgent", description="Delegated"),
+        ]
+        fn = make_prompt_fn(tasks, agent_name="@DevAgent")
+        result = fn()
+        task_line = next(line for line in result.splitlines() if "Delegated" in line)
+        assert "[created by you] (Owner: @ArchAgent, Creator: @DevAgent)" in task_line
+
+    def test_scoped_view_unassigned_owner_shown_as_unassigned(self) -> None:
+        """AC3: Task with empty owner in full-view renders 'unassigned'."""
+        # Edge case: unassigned tasks don't appear in scoped view (filter excludes them),
+        # so we verify via filter_by_agent=False that the label renders correctly.
+        tasks = [
+            make_task(id=1, owner="", creator="@DevAgent"),
+        ]
+        fn = make_prompt_fn(tasks, agent_name="@DevAgent", filter_by_agent=False)
+        result = fn()
+        assert "(Owner: unassigned, Creator: @DevAgent)" in result
+
+    def test_scoped_view_owner_label_unassigned_not_reachable_but_guarded(self) -> None:
+        """Guard: If a task with named owner enters own_tasks, suffix shows correct owner."""
+        # Confirms owner_label = task.owner or "unassigned" guard renders correctly
+        # for a task created by another agent but owned by the scoped agent.
+        tasks = [
+            make_task(id=2, owner="@DevAgent", creator="@OtherAgent", description="Assigned"),
+        ]
+        fn = make_prompt_fn(tasks, agent_name="@DevAgent")
+        result = fn()
+        assert "(Owner: @DevAgent, Creator: @OtherAgent)" in result

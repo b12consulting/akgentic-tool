@@ -174,9 +174,11 @@ class PlanningTool(ToolCard):
                         if task.owner != agent_name and task.creator == agent_name:
                             role_tag = " [created by you]"
                         output_part = f" — Output: {task.output}" if task.output else ""
+                        owner_label = task.owner or "unassigned"
+                        suffix = f" (Owner: {owner_label}, Creator: {task.creator})"
                         lines.append(
                             f"- ID {task.id} [{task.status}] {task.description}"
-                            f"{output_part}{role_tag}"
+                            f"{output_part}{role_tag}{suffix}"
                         )
                 else:
                     lines.append(
@@ -193,8 +195,8 @@ class PlanningTool(ToolCard):
                     )
 
             lines.append(
-                "\nUse get_planning_task(id) for exact lookup or "
-                "get_planning_task(query) for semantic search."
+                "\nUse get_planning_task(id) for exact ID lookup or "
+                "search_planning(...) to filter tasks."
             )
             return "\n".join(lines)
 
