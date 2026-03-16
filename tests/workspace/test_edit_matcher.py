@@ -130,10 +130,10 @@ def test_escape_normalised_double_escaped_newline() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_fuzzy_above_threshold_matches() -> None:
+def test_fuzzy_identical_strings_exact_wins() -> None:
+    """Verify that identical strings are caught by exact strategy before fuzzy."""
     m = EditMatcher()
     content = "def calculate_sum(a, b):\n    return a + b\n"
-    # Slightly different spelling, should still be >= 0.85
     old = "def calculate_sum(a, b):\n    return a + b\n"  # identical → exact wins
     result = m.find(content, old)
     assert result is not None
@@ -246,3 +246,76 @@ def test_normalise_endings_no_double_conversion() -> None:
     result = normalise_endings(content, "\r\n")
     assert "\r\r\n" not in result
     assert result == "line1\r\nline2\r\n"
+
+
+# ---------------------------------------------------------------------------
+# Additional coverage: uncovered branches
+# ---------------------------------------------------------------------------
+
+
+def test_dedented_fallback_dedents_content() -> None:
+    """Cover the _dedented fallback path where content itself is dedented."""
+    m = EditMatcher()
+    # Both content and old are indented the same → dedented_old == textwrap.dedent(old)
+    # Force the second branch: dedented_old not found verbatim in content,
+    # but found after dedenting both.
+    content = "    def foo():\n        return 1\n"
+    old = "        def foo():\n            return 1\n"
+    result = m._dedented(content, old)
+    assert result is not None
+    assert result.strategy == "dedented"
+
+
+def test_trimmed_boundary_stripped_not_in_content_returns_none() -> None:
+    """Cover _trimmed_boundary when the stripped old is not found in content."""
+    m = EditMatcher()
+    # old has blank edges but stripped version is not in content
+    result = m._trimmed_boundary("hello world", "\ncompletely_different\n")
+    assert result is None
+
+
+def test_escape_normalised_inverse_path() -> None:
+    """Cover _escape_normalised inverse path: decoded content contains old.
+
+    Setup:
+    - old = 'line1\\nline2'   (single backslash-n: two chars)
+    - norm_old = decode(old) = 'line1<newline>line2'  (actual newline) → norm_old != old
+    - content = 'line1\\\\nline2'  (two backslashes + n: four chars)
+    - norm_old ('line1<newline>line2') NOT in content → forward branch fails
+    - decoded_content = decode(content) = 'line1\\nline2' = old → inverse match found
+    """
+    m = EditMatcher()
+    old = "line1\\nline2"      # contains literal backslash + n (two chars \n)
+    content = "line1\\\\nline2"  # contains literal \\ + n (decodes to \n → matches old)
+    result = m._escape_normalised(content, old)
+    assert result is not None
+    assert result.strategy == "escape_normalised"
+
+
+def test_fuzzy_old_longer_than_content_returns_none() -> None:
+    """Cover _fuzzy when old has more lines than content."""
+    m = EditMatcher()
+    content = "line1\nline2\n"
+    old = "line1\nline2\nline3\nline4\nline5\n"
+    result = m._fuzzy(content, old)
+    assert result is None
+
+
+def test_fuzzy_empty_old_returns_none() -> None:
+    """Cover _fuzzy guard for zero-line old_string."""
+    m = EditMatcher()
+    result = m._fuzzy("some content\n", "")
+    assert result is None
+
+
+def test_remap_returns_none_when_lines_before_exceeds_original() -> None:
+    """Cover _remap guard: lines_before >= len(orig_lines) → None."""
+    m = EditMatcher()
+    # original has 1 line; norm_content has 'a' on line 4 (index 3).
+    # lines_before=3 >= len(orig_lines)=1 → _remap returns None.
+    original = "a\n"             # 1 line
+    old = "a\n"
+    norm_content2 = "x\ny\nz\na\n"
+    idx = norm_content2.find("a")  # at position 6 (after 3 newlines)
+    result = m._remap(original, old, idx, norm_content2, strategy="dedented")
+    assert result is None

@@ -145,6 +145,25 @@ def test_parse_patch_multi_hunk() -> None:
     assert patches[0].hunks[1].old_start == 5
 
 
+def test_parse_patch_hunk_header_missing_count_defaults_to_one() -> None:
+    """Cover the branch where hunk header omits count (e.g. @@ -1 +1 @@)."""
+    # Unified diff spec: "@@ -start +start @@" without count means count=1
+    diff_no_count = """\
+--- a/src/foo.py
++++ b/src/foo.py
+@@ -1 +1 @@
+-old_line
++new_line
+"""
+    patches = parse_patch(diff_no_count)
+    assert len(patches) == 1
+    hunk = patches[0].hunks[0]
+    assert hunk.old_start == 1
+    assert hunk.old_count == 1   # defaulted from missing count
+    assert hunk.new_start == 1
+    assert hunk.new_count == 1   # defaulted from missing count
+
+
 # ---------------------------------------------------------------------------
 # apply_file_patch — update operation
 # ---------------------------------------------------------------------------
@@ -216,6 +235,21 @@ def test_apply_file_patch_add_new_file(tmp_path: Path) -> None:
     result = fs.read("new_file.py").decode()
     assert "first_line" in result
     assert "second_line" in result
+    # New files must end with a trailing newline (Unix convention)
+    assert result.endswith("\n")
+
+
+def test_apply_file_patch_empty_hunks_does_not_create_file(tmp_path: Path) -> None:
+    """Guard against empty hunk list being treated as new-file (all() bug)."""
+    fs = Filesystem(str(tmp_path), "ws")
+    # Write an existing file first
+    fs.write("existing.py", b"content\n")
+    patch = FilePatch(path="existing.py", hunks=[])
+    # Empty hunk list → is_new_file must be False, update path is taken,
+    # splitlines on existing content with no hunks → file written back unchanged
+    apply_file_patch(fs, patch)
+    result = fs.read("existing.py").decode()
+    assert "content" in result
 
 
 # ---------------------------------------------------------------------------

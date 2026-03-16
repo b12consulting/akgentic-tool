@@ -340,8 +340,10 @@ def apply_file_patch(workspace: "Workspace", file_patch: FilePatch) -> None:
         FileNotFoundError: If file does not exist and patch is not a pure add.
         PermissionError: If path escapes the workspace root.
     """
-    # Determine if this is a new-file creation (all lines are additions)
-    is_new_file = all(
+    # Determine if this is a new-file creation (all lines are additions).
+    # Note: `all()` on an empty sequence returns True, so we guard against
+    # empty hunk lists explicitly to avoid treating an empty patch as new-file.
+    is_new_file = bool(file_patch.hunks) and all(
         all(patch_line.startswith("+") for patch_line in hunk.lines if patch_line)
         for hunk in file_patch.hunks
     )
@@ -350,7 +352,7 @@ def apply_file_patch(workspace: "Workspace", file_patch: FilePatch) -> None:
         new_content = "\n".join(
             line[1:] for hunk in file_patch.hunks for line in hunk.lines if line.startswith("+")
         )
-        workspace.write(file_patch.path, new_content.encode("utf-8"))
+        workspace.write(file_patch.path, (new_content + "\n").encode("utf-8"))
         return
 
     raw = workspace.read(file_patch.path)
