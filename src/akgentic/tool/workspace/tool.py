@@ -20,6 +20,7 @@ from typing import Any, Callable
 from pydantic import PrivateAttr
 
 from akgentic.tool.core import TOOL_CALL, BaseToolParam, Channels, ToolCard, _resolve
+from akgentic.tool.errors import RetriableError
 from akgentic.tool.event import ActorToolObserver
 from akgentic.tool.workspace.edit import (
     EditItem,
@@ -30,6 +31,8 @@ from akgentic.tool.workspace.edit import (
     parse_patch,
 )
 from akgentic.tool.workspace.workspace import Filesystem, get_workspace
+
+_PERM_ERR_MSG = "Path escapes workspace root — use a path relative to the workspace"
 
 
 class WorkspaceRead(BaseToolParam):
@@ -292,22 +295,26 @@ class WorkspaceReadTool(ToolCard):
                 Truncated files include a trailing notice.
 
             Raises:
-                FileNotFoundError: If the path does not exist.
-                PermissionError: If the path escapes the workspace root.
+                RetriableError: If the path does not exist or escapes the workspace root.
             """
-            raw = backend.read(path).decode("utf-8")
-            lines = raw.splitlines()
-            total = len(lines)
-            start = max(0, offset - 1)
-            end = min(start + limit, total)
-            numbered = "\n".join(
-                f"{start + i + 1:<6}{line}" for i, line in enumerate(lines[start:end])
-            )
-            if end < total:
-                numbered += (
-                    f"\n[... truncated: {total} lines total, showing {start + 1}-{end} ...]"
+            try:
+                raw = backend.read(path).decode("utf-8")
+                lines = raw.splitlines()
+                total = len(lines)
+                start = max(0, offset - 1)
+                end = min(start + limit, total)
+                numbered = "\n".join(
+                    f"{start + i + 1:<6}{line}" for i, line in enumerate(lines[start:end])
                 )
-            return numbered
+                if end < total:
+                    numbered += (
+                        f"\n[... truncated: {total} lines total, showing {start + 1}-{end} ...]"
+                    )
+                return numbered
+            except FileNotFoundError:
+                raise RetriableError(f"File not found: {path}")
+            except PermissionError:
+                raise RetriableError(_PERM_ERR_MSG)
 
         workspace_read.__doc__ = params.format_docstring(workspace_read.__doc__)
         return workspace_read
@@ -336,30 +343,33 @@ class WorkspaceReadTool(ToolCard):
                 files as ``name (N bytes)``. Returns "Empty directory." if no entries.
 
             Raises:
-                PermissionError: If path escapes the workspace root.
+                RetriableError: If path escapes the workspace root.
             """
-            if path:
-                resolved = backend._validate_path(path)
-            else:
-                resolved = backend._root
+            try:
+                if path:
+                    resolved = backend._validate_path(path)
+                else:
+                    resolved = backend._root
 
-            entries = backend.list(path)
-            if not entries:
-                return "Empty directory."
+                entries = backend.list(path)
+                if not entries:
+                    return "Empty directory."
 
-            if depth == 1:
-                # Flat list — no tree connectors
-                lines: list[str] = []
-                for entry in entries:
-                    if entry.is_dir:
-                        lines.append(f"{entry.name}/")
-                    else:
-                        lines.append(f"{entry.name} ({entry.size} bytes)")
-                return "\n".join(lines)
-            else:
-                # ASCII tree — depth=0 means unlimited, depth>1 means N levels
-                tree_lines = _build_tree(resolved, max_depth=depth)
-                return ".\n" + "\n".join(tree_lines) if tree_lines else "Empty directory."
+                if depth == 1:
+                    # Flat list — no tree connectors
+                    lines: list[str] = []
+                    for entry in entries:
+                        if entry.is_dir:
+                            lines.append(f"{entry.name}/")
+                        else:
+                            lines.append(f"{entry.name} ({entry.size} bytes)")
+                    return "\n".join(lines)
+                else:
+                    # ASCII tree — depth=0 means unlimited, depth>1 means N levels
+                    tree_lines = _build_tree(resolved, max_depth=depth)
+                    return ".\n" + "\n".join(tree_lines) if tree_lines else "Empty directory."
+            except PermissionError:
+                raise RetriableError(_PERM_ERR_MSG)
 
         workspace_list.__doc__ = params.format_docstring(workspace_list.__doc__)
         return workspace_list
@@ -388,30 +398,33 @@ class WorkspaceReadTool(ToolCard):
                 Includes truncation notice if more than max_results files matched.
 
             Raises:
-                PermissionError: If path escapes the workspace root.
+                RetriableError: If path escapes the workspace root.
             """
-            if path:
-                search_root = (backend._root / path).resolve()
-                if not search_root.is_relative_to(backend._root.resolve()):
-                    raise PermissionError(f"Path '{path}' escapes workspace root")
-            else:
-                search_root = backend._root
-            all_matches = sorted(
-                (match for match in search_root.glob(pattern) if match.is_file()),
-                key=lambda match: match.stat().st_mtime,
-                reverse=True,
-            )
-            truncated = len(all_matches) > max_results
-            shown = [str(m.relative_to(backend._root)) for m in all_matches[:max_results]]
-            if not shown:
-                return "No files found."
-            result = "\n".join(shown)
-            if truncated:
-                result += (
-                    f"\n[... truncated: {len(all_matches)} total,"
-                    f" showing first {max_results} ...]"
+            try:
+                if path:
+                    search_root = (backend._root / path).resolve()
+                    if not search_root.is_relative_to(backend._root.resolve()):
+                        raise PermissionError(f"Path '{path}' escapes workspace root")
+                else:
+                    search_root = backend._root
+                all_matches = sorted(
+                    (match for match in search_root.glob(pattern) if match.is_file()),
+                    key=lambda match: match.stat().st_mtime,
+                    reverse=True,
                 )
-            return result
+                truncated = len(all_matches) > max_results
+                shown = [str(m.relative_to(backend._root)) for m in all_matches[:max_results]]
+                if not shown:
+                    return "No files found."
+                result = "\n".join(shown)
+                if truncated:
+                    result += (
+                        f"\n[... truncated: {len(all_matches)} total,"
+                        f" showing first {max_results} ...]"
+                    )
+                return result
+            except PermissionError:
+                raise RetriableError(_PERM_ERR_MSG)
 
         workspace_glob.__doc__ = params.format_docstring(workspace_glob.__doc__)
         return workspace_glob
@@ -442,30 +455,34 @@ class WorkspaceReadTool(ToolCard):
                 Formatted results grouped by file, or "No matches found."
 
             Raises:
-                re.error: If pattern is not a valid regex.
-                PermissionError: If path escapes the workspace root.
+                RetriableError: If pattern is not a valid regex or path escapes workspace root.
             """
-            if path:
-                search_root = (backend._root / path).resolve()
-                if not search_root.is_relative_to(backend._root.resolve()):
-                    raise PermissionError(f"Path '{path}' escapes workspace root")
-            else:
-                search_root = backend._root
+            try:
+                if path:
+                    search_root = (backend._root / path).resolve()
+                    if not search_root.is_relative_to(backend._root.resolve()):
+                        raise PermissionError(f"Path '{path}' escapes workspace root")
+                else:
+                    search_root = backend._root
 
-            raw_matches = _grep_rg(search_root, pattern, include, max_results)
-            if raw_matches is None:
-                raw_matches = _grep_python(
-                    search_root, pattern, include, max_results, max_line_len
-                )
+                raw_matches = _grep_rg(search_root, pattern, include, max_results)
+                if raw_matches is None:
+                    raw_matches = _grep_python(
+                        search_root, pattern, include, max_results, max_line_len
+                    )
 
-            if not raw_matches:
-                return "No matches found."
+                if not raw_matches:
+                    return "No matches found."
 
-            result_lines = [
-                f"{fpath.relative_to(backend._root)}:{lineno}: {line}"
-                for fpath, lineno, line in raw_matches
-            ]
-            return "\n".join(result_lines)
+                result_lines = [
+                    f"{fpath.relative_to(backend._root)}:{lineno}: {line}"
+                    for fpath, lineno, line in raw_matches
+                ]
+                return "\n".join(result_lines)
+            except PermissionError:
+                raise RetriableError(_PERM_ERR_MSG)
+            except _re.error as e:
+                raise RetriableError(f"Invalid regex pattern: {e}")
 
         workspace_grep.__doc__ = params.format_docstring(workspace_grep.__doc__)
         return workspace_grep
@@ -587,16 +604,19 @@ class WorkspaceTool(WorkspaceReadTool):
                 Confirmation string "Written: <path>".
 
             Raises:
-                PermissionError: If the path escapes the workspace root.
+                RetriableError: If the path escapes the workspace root.
             """
             try:
-                existing = backend.read(path).decode("utf-8")
-                line_ending = detect_line_ending(existing)
-                normalised = normalise_endings(content, line_ending)
-            except (FileNotFoundError, UnicodeDecodeError):
-                normalised = content  # new file or non-UTF-8 — use content as-is
-            backend.write(path, normalised.encode("utf-8"))
-            return f"Written: {path}"
+                try:
+                    existing = backend.read(path).decode("utf-8")
+                    line_ending = detect_line_ending(existing)
+                    normalised = normalise_endings(content, line_ending)
+                except (FileNotFoundError, UnicodeDecodeError):
+                    normalised = content  # new file or non-UTF-8 — use content as-is
+                backend.write(path, normalised.encode("utf-8"))
+                return f"Written: {path}"
+            except PermissionError:
+                raise RetriableError(_PERM_ERR_MSG)
 
         workspace_write.__doc__ = params.format_docstring(workspace_write.__doc__)
         return workspace_write
@@ -622,11 +642,15 @@ class WorkspaceTool(WorkspaceReadTool):
                 Confirmation string "Deleted: <path>".
 
             Raises:
-                FileNotFoundError: If the path does not exist.
-                PermissionError: If the path escapes the workspace root.
+                RetriableError: If the path does not exist or escapes the workspace root.
             """
-            backend.delete(path)
-            return f"Deleted: {path}"
+            try:
+                backend.delete(path)
+                return f"Deleted: {path}"
+            except FileNotFoundError:
+                raise RetriableError(f"File not found: {path}")
+            except PermissionError:
+                raise RetriableError(_PERM_ERR_MSG)
 
         workspace_delete.__doc__ = params.format_docstring(workspace_delete.__doc__)
         return workspace_delete
@@ -661,44 +685,50 @@ class WorkspaceTool(WorkspaceReadTool):
                 Unified diff string of the change, or "[ERROR] ..." on failure.
 
             Raises:
-                FileNotFoundError: If path does not exist.
-                PermissionError: If path escapes the workspace root.
+                RetriableError: If path does not exist or escapes the workspace root.
             """
-            raw = backend.read(path).decode("utf-8")
-            line_ending = detect_line_ending(raw)
-            content = raw
+            try:
+                raw = backend.read(path).decode("utf-8")
+                line_ending = detect_line_ending(raw)
+                content = raw
 
-            if replace_all:
-                new_content = content
-                found_any = False
-                while True:
-                    match = matcher.find(new_content, old_string)
+                if replace_all:
+                    new_content = content
+                    found_any = False
+                    while True:
+                        match = matcher.find(new_content, old_string)
+                        if match is None:
+                            break
+                        found_any = True
+                        new_content = (
+                            new_content[: match.start] + new_string + new_content[match.end :]
+                        )
+                    if not found_any:
+                        return f"[ERROR] old_string not found in {path}"
+                    content = new_content
+                else:
+                    match = matcher.find(content, old_string)
                     if match is None:
-                        break
-                    found_any = True
-                    new_content = new_content[: match.start] + new_string + new_content[match.end :]
-                if not found_any:
-                    return f"[ERROR] old_string not found in {path}"
-                content = new_content
-            else:
-                match = matcher.find(content, old_string)
-                if match is None:
-                    return f"[ERROR] old_string not found in {path}"
-                content = content[: match.start] + new_string + content[match.end :]
+                        return f"[ERROR] old_string not found in {path}"
+                    content = content[: match.start] + new_string + content[match.end :]
 
-            normalised = normalise_endings(content, line_ending)
-            backend.write(path, normalised.encode("utf-8"))
+                normalised = normalise_endings(content, line_ending)
+                backend.write(path, normalised.encode("utf-8"))
 
-            diff_lines = list(
-                difflib.unified_diff(
-                    raw.splitlines(),
-                    normalised.splitlines(),
-                    fromfile=f"a/{path}",
-                    tofile=f"b/{path}",
-                    lineterm="",
+                diff_lines = list(
+                    difflib.unified_diff(
+                        raw.splitlines(),
+                        normalised.splitlines(),
+                        fromfile=f"a/{path}",
+                        tofile=f"b/{path}",
+                        lineterm="",
+                    )
                 )
-            )
-            return "\n".join(diff_lines) if diff_lines else f"(no change) {path}"
+                return "\n".join(diff_lines) if diff_lines else f"(no change) {path}"
+            except FileNotFoundError:
+                raise RetriableError(f"File not found: {path}")
+            except PermissionError:
+                raise RetriableError(_PERM_ERR_MSG)
 
         workspace_edit.__doc__ = params.format_docstring(workspace_edit.__doc__)
         return workspace_edit
@@ -727,54 +757,60 @@ class WorkspaceTool(WorkspaceReadTool):
                 Combined unified diff of all applied edits, or "[ERROR] ..." on failure.
 
             Raises:
-                FileNotFoundError: If a target file does not exist.
-                PermissionError: If a path escapes the workspace root.
+                RetriableError: If a target file does not exist or a path escapes
+                    the workspace root.
             """
-            all_diffs: list[str] = []
-            for item in edits:
-                raw = backend.read(item.path).decode("utf-8")
-                line_ending = detect_line_ending(raw)
-                content = raw
+            try:
+                all_diffs: list[str] = []
+                for item in edits:
+                    try:
+                        raw = backend.read(item.path).decode("utf-8")
+                    except FileNotFoundError:
+                        raise RetriableError(f"File not found: {item.path}")
+                    line_ending = detect_line_ending(raw)
+                    content = raw
 
-                if item.replace_all:
-                    new_content = content
-                    found_any = False
-                    while True:
-                        match = matcher.find(new_content, item.old_string)
+                    if item.replace_all:
+                        new_content = content
+                        found_any = False
+                        while True:
+                            match = matcher.find(new_content, item.old_string)
+                            if match is None:
+                                break
+                            found_any = True
+                            new_content = (
+                                new_content[: match.start]
+                                + item.new_string
+                                + new_content[match.end :]
+                            )
+                        if not found_any:
+                            return f"[ERROR] old_string not found in {item.path}"
+                        content = new_content
+                    else:
+                        match = matcher.find(content, item.old_string)
                         if match is None:
-                            break
-                        found_any = True
-                        new_content = (
-                            new_content[: match.start]
-                            + item.new_string
-                            + new_content[match.end :]
+                            return f"[ERROR] old_string not found in {item.path}"
+                        content = (
+                            content[: match.start] + item.new_string + content[match.end :]
                         )
-                    if not found_any:
-                        return f"[ERROR] old_string not found in {item.path}"
-                    content = new_content
-                else:
-                    match = matcher.find(content, item.old_string)
-                    if match is None:
-                        return f"[ERROR] old_string not found in {item.path}"
-                    content = (
-                        content[: match.start] + item.new_string + content[match.end :]
-                    )
 
-                normalised = normalise_endings(content, line_ending)
-                backend.write(item.path, normalised.encode("utf-8"))
-                diff_lines = list(
-                    difflib.unified_diff(
-                        raw.splitlines(),
-                        normalised.splitlines(),
-                        fromfile=f"a/{item.path}",
-                        tofile=f"b/{item.path}",
-                        lineterm="",
+                    normalised = normalise_endings(content, line_ending)
+                    backend.write(item.path, normalised.encode("utf-8"))
+                    diff_lines = list(
+                        difflib.unified_diff(
+                            raw.splitlines(),
+                            normalised.splitlines(),
+                            fromfile=f"a/{item.path}",
+                            tofile=f"b/{item.path}",
+                            lineterm="",
+                        )
                     )
-                )
-                if diff_lines:
-                    all_diffs.append("\n".join(diff_lines))
+                    if diff_lines:
+                        all_diffs.append("\n".join(diff_lines))
 
-            return "\n".join(all_diffs) if all_diffs else "(no changes applied)"
+                return "\n".join(all_diffs) if all_diffs else "(no changes applied)"
+            except PermissionError:
+                raise RetriableError(_PERM_ERR_MSG)
 
         workspace_multi_edit.__doc__ = params.format_docstring(workspace_multi_edit.__doc__)
         return workspace_multi_edit
@@ -803,45 +839,48 @@ class WorkspaceTool(WorkspaceReadTool):
                 "deleted: ...". Returns "[ERROR] ..." on failure.
 
             Raises:
-                PermissionError: If any path escapes the workspace root.
+                RetriableError: If any path escapes the workspace root.
             """
-            file_patches = parse_patch(patch_text)
-            results: list[str] = []
+            try:
+                file_patches = parse_patch(patch_text)
+                results: list[str] = []
 
-            # parse_patch derives path from +++ line; for delete patches (+++ /dev/null)
-            # we must extract the real path from the --- a/<path> line in the raw text.
-            delete_paths: set[str] = set()
-            lines = patch_text.splitlines()
-            for i, line in enumerate(lines):
-                if line.startswith("+++ /dev/null") or line.startswith("+++ b//dev/null"):
-                    for j in range(i - 1, max(i - 5, -1), -1):
-                        if lines[j].startswith("--- "):
-                            raw_del = lines[j][4:].strip()
-                            del_path = raw_del[2:] if raw_del.startswith("a/") else raw_del
-                            if del_path != "/dev/null":
-                                delete_paths.add(del_path)
-                            break
+                # parse_patch derives path from +++ line; for delete patches (+++ /dev/null)
+                # we must extract the real path from the --- a/<path> line in the raw text.
+                delete_paths: set[str] = set()
+                lines = patch_text.splitlines()
+                for i, line in enumerate(lines):
+                    if line.startswith("+++ /dev/null") or line.startswith("+++ b//dev/null"):
+                        for j in range(i - 1, max(i - 5, -1), -1):
+                            if lines[j].startswith("--- "):
+                                raw_del = lines[j][4:].strip()
+                                del_path = raw_del[2:] if raw_del.startswith("a/") else raw_del
+                                if del_path != "/dev/null":
+                                    delete_paths.add(del_path)
+                                break
 
-            for fp in file_patches:
-                try:
-                    if fp.path == "/dev/null":
-                        for del_path in delete_paths:
-                            backend.delete(del_path)
-                            results.append(f"deleted: {del_path}")
-                    else:
-                        apply_file_patch(backend, fp)
-                        is_add = bool(fp.hunks) and all(
-                            all(pl.startswith("+") for pl in h.lines if pl)
-                            for h in fp.hunks
-                        )
-                        if is_add:
-                            results.append(f"created: {fp.path}")
+                for fp in file_patches:
+                    try:
+                        if fp.path == "/dev/null":
+                            for del_path in delete_paths:
+                                backend.delete(del_path)
+                                results.append(f"deleted: {del_path}")
                         else:
-                            results.append(f"updated: {fp.path}")
-                except Exception as exc:
-                    return f"[ERROR] {fp.path}: {exc}"
+                            apply_file_patch(backend, fp)
+                            is_add = bool(fp.hunks) and all(
+                                all(pl.startswith("+") for pl in h.lines if pl)
+                                for h in fp.hunks
+                            )
+                            if is_add:
+                                results.append(f"created: {fp.path}")
+                            else:
+                                results.append(f"updated: {fp.path}")
+                    except Exception as exc:
+                        return f"[ERROR] {fp.path}: {exc}"
 
-            return "\n".join(results) if results else "(no patches applied)"
+                return "\n".join(results) if results else "(no patches applied)"
+            except PermissionError:
+                raise RetriableError(_PERM_ERR_MSG)
 
         workspace_patch.__doc__ = params.format_docstring(workspace_patch.__doc__)
         return workspace_patch
@@ -867,10 +906,13 @@ class WorkspaceTool(WorkspaceReadTool):
                 Confirmation string "Created: <path>".
 
             Raises:
-                PermissionError: If the path escapes the workspace root.
+                RetriableError: If the path escapes the workspace root.
             """
-            backend.mkdir(path)
-            return f"Created: {path}"
+            try:
+                backend.mkdir(path)
+                return f"Created: {path}"
+            except PermissionError:
+                raise RetriableError(_PERM_ERR_MSG)
 
         workspace_mkdir.__doc__ = params.format_docstring(workspace_mkdir.__doc__)
         return workspace_mkdir

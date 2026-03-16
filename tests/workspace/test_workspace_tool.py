@@ -8,6 +8,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from akgentic.tool.errors import RetriableError
+from akgentic.tool.workspace.edit import EditItem
 from akgentic.tool.workspace.tool import WorkspaceTool
 from akgentic.tool.workspace.workspace import Filesystem
 
@@ -74,7 +76,7 @@ class TestObserverDelegation:
 
 class TestGetToolsDefault:
     def test_default_count_is_ten(self, tmp_path: Path) -> None:
-        """By default get_tools() returns 10: 4 read + write + delete + edit + multi_edit + patch + mkdir."""
+        """By default, get_tools() returns all 10 tool callables."""
         tool, _ = make_wired_tool(tmp_path)
         tools = tool.get_tools()
         assert len(tools) == 10
@@ -187,10 +189,10 @@ class TestWorkspaceDelete:
         assert not (fs._root / "to_delete.py").exists()
 
     def test_delete_nonexistent_file_raises(self, tmp_path: Path) -> None:
-        """workspace_delete raises FileNotFoundError for missing files."""
+        """workspace_delete raises RetriableError for missing files."""
         tool, fs = make_wired_tool(tmp_path)
         delete_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_delete")
-        with pytest.raises(FileNotFoundError):
+        with pytest.raises(RetriableError, match="File not found: nonexistent.py"):
             delete_fn("nonexistent.py")
 
     def test_delete_returns_deleted_path(self, tmp_path: Path) -> None:
@@ -263,17 +265,17 @@ class TestCapabilityToggling:
 
 class TestPathSecurity:
     def test_write_path_traversal_raises(self, tmp_path: Path) -> None:
-        """workspace_write raises PermissionError for paths escaping workspace root."""
+        """workspace_write raises RetriableError for paths escaping workspace root."""
         tool, fs = make_wired_tool(tmp_path)
         write_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_write")
-        with pytest.raises(PermissionError):
+        with pytest.raises(RetriableError, match="Path escapes workspace root"):
             write_fn("../escape.py", "malicious content\n")
 
     def test_delete_path_traversal_raises(self, tmp_path: Path) -> None:
-        """workspace_delete raises PermissionError for paths escaping workspace root."""
+        """workspace_delete raises RetriableError for paths escaping workspace root."""
         tool, fs = make_wired_tool(tmp_path)
         delete_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_delete")
-        with pytest.raises(PermissionError):
+        with pytest.raises(RetriableError, match="Path escapes workspace root"):
             delete_fn("../escape.py")
 
 
@@ -536,7 +538,7 @@ class TestWorkspacePatch:
 
 class TestCapabilityTogglingStory55:
     def test_default_count_is_ten(self, tmp_path: Path) -> None:
-        """By default get_tools() returns 10: 4 read + write + delete + edit + multi_edit + patch + mkdir."""
+        """By default, get_tools() returns all 10 tool callables."""
         tool, _ = make_wired_tool(tmp_path)
         assert len(tool.get_tools()) == 10
 
@@ -612,7 +614,7 @@ class TestWorkspaceMkdir:
     def test_mkdir_traversal_raises(self, tmp_path: Path) -> None:
         tool, fs = make_wired_tool(tmp_path)
         mkdir_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_mkdir")
-        with pytest.raises(PermissionError):
+        with pytest.raises(RetriableError, match="Path escapes workspace root"):
             mkdir_fn("../../escape")
 
     def test_mkdir_disabled_not_in_get_tools(self, tmp_path: Path) -> None:
@@ -625,6 +627,86 @@ class TestWorkspaceMkdir:
         assert len(tool.get_tools()) == 9
 
     def test_default_count_is_ten(self, tmp_path: Path) -> None:
-        """By default get_tools() returns 10: 4 read + write + delete + edit + multi_edit + patch + mkdir."""
+        """By default, get_tools() returns all 10 tool callables."""
         tool, _ = make_wired_tool(tmp_path)
         assert len(tool.get_tools()) == 10
+
+
+# ---------------------------------------------------------------------------
+# Story 5.7: RetriableError wrapping in write tools
+# ---------------------------------------------------------------------------
+
+
+class TestRetriableErrorWorkspaceTool:
+    def test_write_permission_error_raises_retriable_error(self, tmp_path: Path) -> None:
+        """workspace_write raises RetriableError when backend.write raises PermissionError."""
+        tool, fs = make_wired_tool(tmp_path)
+        write_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_write")
+        with patch.object(fs, "write", side_effect=PermissionError("escaped")):
+            with pytest.raises(RetriableError, match="Path escapes workspace root"):
+                write_fn("src/file.py", "content")
+
+    def test_delete_file_not_found_raises_retriable_error(self, tmp_path: Path) -> None:
+        """workspace_delete raises RetriableError for non-existent files."""
+        tool, fs = make_wired_tool(tmp_path)
+        delete_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_delete")
+        with pytest.raises(RetriableError, match="File not found: nonexistent.txt"):
+            delete_fn("nonexistent.txt")
+
+    def test_delete_permission_error_raises_retriable_error(self, tmp_path: Path) -> None:
+        """workspace_delete raises RetriableError for path escaping workspace."""
+        tool, fs = make_wired_tool(tmp_path)
+        delete_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_delete")
+        with pytest.raises(RetriableError, match="Path escapes workspace root"):
+            delete_fn("../../escape")
+
+    def test_edit_file_not_found_raises_retriable_error(self, tmp_path: Path) -> None:
+        """workspace_edit raises RetriableError for non-existent files."""
+        tool, fs = make_wired_tool(tmp_path)
+        edit_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_edit")
+        with pytest.raises(RetriableError, match="File not found: nonexistent.txt"):
+            edit_fn("nonexistent.txt", "x", "y")
+
+    def test_edit_permission_error_raises_retriable_error(self, tmp_path: Path) -> None:
+        """workspace_edit raises RetriableError when backend raises PermissionError."""
+        tool, fs = make_wired_tool(tmp_path)
+        edit_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_edit")
+        with patch.object(fs, "read", side_effect=PermissionError("escaped")):
+            with pytest.raises(RetriableError, match="Path escapes workspace root"):
+                edit_fn("src/file.py", "old", "new")
+
+    def test_multi_edit_file_not_found_raises_retriable_error(self, tmp_path: Path) -> None:
+        """workspace_multi_edit raises RetriableError for non-existent files."""
+        tool, fs = make_wired_tool(tmp_path)
+        multi_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_multi_edit")
+        with pytest.raises(RetriableError, match="File not found: nonexistent.txt"):
+            multi_fn([EditItem(path="nonexistent.txt", old_string="x", new_string="y")])
+
+    def test_patch_permission_error_raises_retriable_error(self, tmp_path: Path) -> None:
+        """workspace_patch raises RetriableError when PermissionError escapes inner handler."""
+        tool, fs = make_wired_tool(tmp_path)
+        patch_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_patch")
+        # parse_patch is called before any per-patch try/except, so a PermissionError
+        # raised there will be caught by the outer except PermissionError handler.
+        with patch(
+            "akgentic.tool.workspace.tool.parse_patch",
+            side_effect=PermissionError("path escapes workspace root"),
+        ):
+            with pytest.raises(RetriableError, match="Path escapes workspace root"):
+                patch_fn("--- a/file.py\n+++ b/file.py\n@@ -1 +1 @@\n-old\n+new\n")
+
+    def test_multi_edit_permission_error_raises_retriable_error(self, tmp_path: Path) -> None:
+        """workspace_multi_edit raises RetriableError when backend raises PermissionError."""
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("src/file.py", b"old\n")
+        multi_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_multi_edit")
+        with patch.object(fs, "write", side_effect=PermissionError("escaped")):
+            with pytest.raises(RetriableError, match="Path escapes workspace root"):
+                multi_fn([EditItem(path="src/file.py", old_string="old", new_string="new")])
+
+    def test_mkdir_permission_error_raises_retriable_error(self, tmp_path: Path) -> None:
+        """workspace_mkdir raises RetriableError for path escaping workspace."""
+        tool, fs = make_wired_tool(tmp_path)
+        mkdir_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_mkdir")
+        with pytest.raises(RetriableError, match="Path escapes workspace root"):
+            mkdir_fn("../../escape")
