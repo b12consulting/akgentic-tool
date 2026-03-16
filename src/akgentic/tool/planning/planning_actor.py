@@ -243,7 +243,7 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
             Tasks matching ALL provided filters. When all parameters are None,
             returns the full task list.
         """
-        tasks = self.state.task_list
+        tasks: list[Task] = list(self.state.task_list)
 
         # Query phase: build candidate set (keyword UNION semantic), then intersect with rest
         if query is not None:

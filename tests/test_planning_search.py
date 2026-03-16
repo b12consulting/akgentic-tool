@@ -258,15 +258,15 @@ class TestSearchPlanningQueryKeyword:
         assert result == []
 
     def test_keyword_with_semantic_search_disabled(self) -> None:
-        """Keyword-only mode when semantic_search=False."""
+        """Keyword-only mode when semantic_search=False — embedding svc returns None."""
         actor = _make_actor(semantic_search=False)
         _add_task(actor, 1, "auth flow")
         _add_task(actor, 2, "payment gateway")
 
-        with patch.object(actor, "_get_or_create_embedding_svc") as mock_svc:
+        # Patch returns None to simulate the svc-unavailable path explicitly.
+        # _vector_index is also None because semantic_search=False.
+        with patch.object(actor, "_get_or_create_embedding_svc", return_value=None):
             result = actor.search_planning(query="auth")
-            # _get_or_create_embedding_svc is still called but returns None for semantic_search=False
-            # The actual behaviour is that it returns None from the real method
 
         assert len(result) == 1
         assert result[0].id == 1
