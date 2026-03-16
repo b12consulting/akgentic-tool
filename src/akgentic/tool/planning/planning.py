@@ -16,7 +16,13 @@ from akgentic.tool.core import (
     _resolve,
 )
 from akgentic.tool.event import ActorToolObserver, ToolCallEvent
-from akgentic.tool.planning.planning_actor import PlanActor, PlanConfig, Task, UpdatePlan
+from akgentic.tool.planning.planning_actor import (
+    PlanActor,
+    PlanConfig,
+    Task,
+    TaskStatus,
+    UpdatePlan,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -49,6 +55,24 @@ class UpdatePlanning(BaseToolParam):
     """Update tasks."""
 
 
+class SearchPlanning(BaseToolParam):
+    """Search tasks by status, owner, creator, and/or natural-language description."""
+
+    expose: set[Channels] = {TOOL_CALL, COMMAND}
+    status: TaskStatus | None = Field(default=None, description="Filter by exact task status.")
+    owner: str | None = Field(
+        default=None, description="Filter by exact owner name. Empty string matches unassigned."
+    )
+    creator: str | None = Field(default=None, description="Filter by exact creator name.")
+    query: str | None = Field(
+        default=None,
+        description=(
+            "Case-insensitive keyword search on task description. When vector deps are available, "
+            "also runs semantic similarity search (cosine ≥ 0.5, top_k=20) and unions results."
+        ),
+    )
+
+
 class PlanningTool(ToolCard):
     """Team planning management via actor-based plan store."""
 
@@ -60,6 +84,7 @@ class PlanningTool(ToolCard):
     )
     get_planning_task: GetPlanningTask | bool = True
     update_planning: UpdatePlanning | bool = True
+    search_planning: SearchPlanning | bool = True
     embedding_model: str = Field(
         default="text-embedding-3-small",
         description="Embedding model passed through to PlanConfig for semantic task search",
@@ -114,6 +139,10 @@ class PlanningTool(ToolCard):
         if up and TOOL_CALL in up.expose:
             tools.append(self._update_planning_factory(up))
 
+        sp = _resolve(self.search_planning, SearchPlanning)
+        if sp and TOOL_CALL in sp.expose:
+            tools.append(self._search_planning_factory(sp))
+
         return tools
 
     def get_commands(self) -> dict[type[BaseToolParam], Callable]:
@@ -126,6 +155,10 @@ class PlanningTool(ToolCard):
         gpi = _resolve(self.get_planning_task, GetPlanningTask)
         if gpi and COMMAND in gpi.expose:
             commands[GetPlanningTask] = self._get_planning_task_factory(gpi)
+
+        sp = _resolve(self.search_planning, SearchPlanning)
+        if sp and COMMAND in sp.expose:
+            commands[SearchPlanning] = self._search_planning_factory(sp)
 
         return commands
 
@@ -231,3 +264,40 @@ class PlanningTool(ToolCard):
 
         update_planning.__doc__ = params.format_docstring(update_planning.__doc__)
         return update_planning
+
+    def _search_planning_factory(self, params: SearchPlanning) -> Callable:
+        planning_proxy = self._planning_proxy
+        observer = self._observer
+
+        def search_planning(
+            status: TaskStatus | None = None,
+            owner: str | None = None,
+            creator: str | None = None,
+            query: str | None = None,
+        ) -> list[Task]:
+            """Search tasks by status, owner, creator, and/or natural-language description.
+
+            All parameters are optional. Provided parameters are combined as AND conditions.
+            When all are None, returns the full task list.
+            query applies case-insensitive substring match on description; when vector deps
+            are available, also uses semantic similarity (cosine ≥ 0.5, top_k=20).
+            """
+            if observer is not None:
+                observer.notify_event(
+                    ToolCallEvent(
+                        tool_name="Search planning",
+                        args=[],
+                        kwargs={
+                            "status": status,
+                            "owner": owner,
+                            "creator": creator,
+                            "query": query,
+                        },
+                    )
+                )
+            return planning_proxy.search_planning(
+                status=status, owner=owner, creator=creator, query=query
+            )
+
+        search_planning.__doc__ = params.format_docstring(search_planning.__doc__)
+        return search_planning
