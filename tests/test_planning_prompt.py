@@ -156,15 +156,15 @@ class TestFilterByAgentTrue:
         assert "**Your tasks** (owner or creator: @DevAgent):" in result
 
     def test_created_by_you_tag_on_delegated_task(self) -> None:
-        """AC4: Task where creator==agent but owner!=agent gets [created by you] tag."""
+        """AC1 (4.4): Delegated task (creator==agent, owner!=agent) shows no [created by you] tag."""
         tasks = [
             make_task(id=1, owner="@ArchAgent", creator="@DevAgent", description="Delegated"),
         ]
         fn = make_prompt_fn(tasks, agent_name="@DevAgent")
         result = fn()
         assert "Delegated" in result
-        assert "[created by you]" in result
-        assert "[created by you] (Owner: @ArchAgent, Creator: @DevAgent)" in result
+        assert "[created by you]" not in result
+        assert "(Owner: @ArchAgent, Creator: @DevAgent)" in result
 
     def test_owned_task_has_no_created_by_tag(self) -> None:
         """AC4 inverse: When owner==agent, no [created by you] tag."""
@@ -309,7 +309,7 @@ class TestOutputFieldRendering:
         assert "— Output:" not in result
 
     def test_output_and_created_by_tag_combined(self) -> None:
-        """AC4+AC10: A delegated task with both output and [created by you] renders both."""
+        """AC1+AC10 (4.4): Delegated task with output — output rendered, no [created by you] tag."""
         tasks = [
             make_task(
                 id=7,
@@ -323,11 +323,10 @@ class TestOutputFieldRendering:
         result = fn()
         assert "Review PR #42" in result
         assert "— Output: comments posted" in result
-        assert "[created by you]" in result
-        # Verify ordering: output before tag
+        assert "[created by you]" not in result
         task_line = next(line for line in result.splitlines() if "Review PR #42" in line)
-        assert task_line.index("— Output:") < task_line.index("[created by you]")
-        assert "[created by you] (Owner: @ArchAgent, Creator: @DevAgent)" in task_line
+        assert "— Output:" in task_line
+        assert "(Owner: @ArchAgent, Creator: @DevAgent)" in task_line
 
 
 # --- Tests: navigation hint (AC#3, #8) ---
@@ -474,15 +473,16 @@ class TestScopedViewOwnerCreatorDisplay:
         result = fn()
         assert "(Owner: @DevAgent, Creator: @DevAgent)" in result
 
-    def test_delegated_task_shows_created_by_before_owner_creator(self) -> None:
-        """AC2: Delegated task has [created by you] then (Owner:..., Creator:...)."""
+    def test_delegated_task_shows_owner_creator_no_tag(self) -> None:
+        """AC1 (4.4): Delegated task shows (Owner:..., Creator:...) with no [created by you] tag."""
         tasks = [
             make_task(id=1, owner="@ArchAgent", creator="@DevAgent", description="Delegated"),
         ]
         fn = make_prompt_fn(tasks, agent_name="@DevAgent")
         result = fn()
         task_line = next(line for line in result.splitlines() if "Delegated" in line)
-        assert "[created by you] (Owner: @ArchAgent, Creator: @DevAgent)" in task_line
+        assert "[created by you]" not in task_line
+        assert "(Owner: @ArchAgent, Creator: @DevAgent)" in task_line
 
     def test_full_view_unassigned_owner_shown_as_unassigned(self) -> None:
         """AC3: Task with empty owner in full-view (filter_by_agent=False) renders 'unassigned'.
