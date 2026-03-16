@@ -76,7 +76,7 @@ class TestObserverDelegation:
 
 class TestGetToolsDefault:
     def test_default_count_is_ten(self, tmp_path: Path) -> None:
-        """By default get_tools() returns 10: 4 read + write + delete + edit + multi_edit + patch + mkdir."""
+        """By default, get_tools() returns all 10 tool callables."""
         tool, _ = make_wired_tool(tmp_path)
         tools = tool.get_tools()
         assert len(tools) == 10
@@ -538,7 +538,7 @@ class TestWorkspacePatch:
 
 class TestCapabilityTogglingStory55:
     def test_default_count_is_ten(self, tmp_path: Path) -> None:
-        """By default get_tools() returns 10: 4 read + write + delete + edit + multi_edit + patch + mkdir."""
+        """By default, get_tools() returns all 10 tool callables."""
         tool, _ = make_wired_tool(tmp_path)
         assert len(tool.get_tools()) == 10
 
@@ -627,7 +627,7 @@ class TestWorkspaceMkdir:
         assert len(tool.get_tools()) == 9
 
     def test_default_count_is_ten(self, tmp_path: Path) -> None:
-        """By default get_tools() returns 10: 4 read + write + delete + edit + multi_edit + patch + mkdir."""
+        """By default, get_tools() returns all 10 tool callables."""
         tool, _ = make_wired_tool(tmp_path)
         assert len(tool.get_tools()) == 10
 
@@ -694,6 +694,15 @@ class TestRetriableErrorWorkspaceTool:
         ):
             with pytest.raises(RetriableError, match="Path escapes workspace root"):
                 patch_fn("--- a/file.py\n+++ b/file.py\n@@ -1 +1 @@\n-old\n+new\n")
+
+    def test_multi_edit_permission_error_raises_retriable_error(self, tmp_path: Path) -> None:
+        """workspace_multi_edit raises RetriableError when backend raises PermissionError."""
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("src/file.py", b"old\n")
+        multi_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_multi_edit")
+        with patch.object(fs, "write", side_effect=PermissionError("escaped")):
+            with pytest.raises(RetriableError, match="Path escapes workspace root"):
+                multi_fn([EditItem(path="src/file.py", old_string="old", new_string="new")])
 
     def test_mkdir_permission_error_raises_retriable_error(self, tmp_path: Path) -> None:
         """workspace_mkdir raises RetriableError for path escaping workspace."""

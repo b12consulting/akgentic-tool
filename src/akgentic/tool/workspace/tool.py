@@ -763,7 +763,10 @@ class WorkspaceTool(WorkspaceReadTool):
             try:
                 all_diffs: list[str] = []
                 for item in edits:
-                    raw = backend.read(item.path).decode("utf-8")
+                    try:
+                        raw = backend.read(item.path).decode("utf-8")
+                    except FileNotFoundError:
+                        raise RetriableError(f"File not found: {item.path}")
                     line_ending = detect_line_ending(raw)
                     content = raw
 
@@ -806,8 +809,6 @@ class WorkspaceTool(WorkspaceReadTool):
                         all_diffs.append("\n".join(diff_lines))
 
                 return "\n".join(all_diffs) if all_diffs else "(no changes applied)"
-            except FileNotFoundError:
-                raise RetriableError(f"File not found: {item.path}")
             except PermissionError:
                 raise RetriableError(_PERM_ERR_MSG)
 
