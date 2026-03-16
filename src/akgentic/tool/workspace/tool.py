@@ -1,9 +1,10 @@
-"""WorkspaceReadTool — read-only workspace access: read, list, glob, grep.
+"""Workspace ToolCards — read-only and full read/write/delete access.
 
-Provides a ToolCard that exposes four read-only workspace operations as
-LLM-callable tools.  All operations are anchored to a team-scoped
-:class:`~akgentic.tool.workspace.workspace.Filesystem` backend obtained via
-:func:`~akgentic.tool.workspace.workspace.get_workspace`.
+:class:`WorkspaceReadTool` exposes four read-only workspace operations as
+LLM-callable tools.  :class:`WorkspaceTool` extends it with ``workspace_write``
+and ``workspace_delete`` capabilities.  All operations are anchored to a
+team-scoped :class:`~akgentic.tool.workspace.workspace.Filesystem` backend
+obtained via :func:`~akgentic.tool.workspace.workspace.get_workspace`.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from pydantic import PrivateAttr
 
 from akgentic.tool.core import TOOL_CALL, BaseToolParam, Channels, ToolCard, _resolve
 from akgentic.tool.event import ActorToolObserver
+from akgentic.tool.workspace.edit import detect_line_ending, normalise_endings
 from akgentic.tool.workspace.workspace import Filesystem, get_workspace
 
 
@@ -399,3 +401,123 @@ class WorkspaceReadTool(ToolCard):
 
         workspace_grep.__doc__ = params.format_docstring(workspace_grep.__doc__)
         return workspace_grep
+
+
+class WorkspaceWrite(BaseToolParam):
+    """Write content to a file in the team workspace."""
+
+    expose: set[Channels] = {TOOL_CALL}
+
+
+class WorkspaceDelete(BaseToolParam):
+    """Delete a file from the team workspace."""
+
+    expose: set[Channels] = {TOOL_CALL}
+
+
+class WorkspaceTool(WorkspaceReadTool):
+    """Full workspace access: read + write + delete."""
+
+    name: str = "Workspace"
+    description: str = (
+        "Read, write, and delete files in the team workspace. "
+        "For SWE agents with full file I/O access."
+    )
+
+    workspace_write: WorkspaceWrite | bool = True
+    workspace_delete: WorkspaceDelete | bool = True
+
+    def observer(  # type: ignore[override]
+        self, observer: ActorToolObserver
+    ) -> "WorkspaceTool":
+        """Delegate to WorkspaceReadTool.observer(), return self typed as WorkspaceTool.
+
+        Args:
+            observer: Actor tool observer; must have a non-None orchestrator.
+
+        Returns:
+            Self, enabling method chaining.
+        """
+        super().observer(observer)
+        return self
+
+    def get_tools(self) -> list[Callable[..., Any]]:
+        """Return read tools from super() plus write and delete tools.
+
+        Returns:
+            List of callables for all enabled capabilities.
+        """
+        tools = super().get_tools()
+        pw = _resolve(self.workspace_write, WorkspaceWrite)
+        if pw is not None and TOOL_CALL in pw.expose:
+            tools.append(self._write_factory(pw))
+        pd = _resolve(self.workspace_delete, WorkspaceDelete)
+        if pd is not None and TOOL_CALL in pd.expose:
+            tools.append(self._delete_factory(pd))
+        return tools
+
+    def _write_factory(self, params: WorkspaceWrite) -> Callable[..., Any]:
+        """Create the ``workspace_write`` tool callable.
+
+        Args:
+            params: Write capability configuration.
+
+        Returns:
+            Callable that writes content to a workspace file.
+        """
+        backend = self.workspace
+
+        def workspace_write(path: str, content: str) -> str:
+            """Write content to a file in the team workspace.
+
+            Args:
+                path: Relative path from workspace root (e.g. "src/main.py").
+                content: Text content to write.
+
+            Returns:
+                Confirmation string "Written: <path>".
+
+            Raises:
+                PermissionError: If the path escapes the workspace root.
+            """
+            try:
+                existing = backend.read(path).decode("utf-8")
+                line_ending = detect_line_ending(existing)
+                normalised = normalise_endings(content, line_ending)
+            except (FileNotFoundError, UnicodeDecodeError):
+                normalised = content  # new file or non-UTF-8 — use content as-is
+            backend.write(path, normalised.encode("utf-8"))
+            return f"Written: {path}"
+
+        workspace_write.__doc__ = params.format_docstring(workspace_write.__doc__)
+        return workspace_write
+
+    def _delete_factory(self, params: WorkspaceDelete) -> Callable[..., Any]:
+        """Create the ``workspace_delete`` tool callable.
+
+        Args:
+            params: Delete capability configuration.
+
+        Returns:
+            Callable that deletes a file from the workspace.
+        """
+        backend = self.workspace
+
+        def workspace_delete(path: str) -> str:
+            """Delete a file from the team workspace.
+
+            Args:
+                path: Relative path from workspace root (e.g. "src/old.py").
+
+            Returns:
+                Confirmation string "Deleted: <path>".
+
+            Raises:
+                FileNotFoundError: If the path does not exist.
+                PermissionError: If the path escapes the workspace root.
+            """
+            backend.delete(path)
+            return f"Deleted: {path}"
+
+        workspace_delete.__doc__ = params.format_docstring(workspace_delete.__doc__)
+        return workspace_delete
