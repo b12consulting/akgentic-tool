@@ -13,9 +13,12 @@ from akgentic.tool.workspace.edit import (
 )
 from akgentic.tool.workspace.tool import (
     WorkspaceDelete,
+    WorkspaceEdit,
     WorkspaceGlob,
     WorkspaceGrep,
     WorkspaceList,
+    WorkspaceMultiEdit,
+    WorkspacePatch,
     WorkspaceRead,
     WorkspaceReadTool,
     WorkspaceTool,
@@ -49,5 +52,8 @@ __all__ = [
     "WorkspaceReadTool",
     "WorkspaceWrite",
     "WorkspaceDelete",
+    "WorkspaceEdit",
+    "WorkspaceMultiEdit",
+    "WorkspacePatch",
     "WorkspaceTool",
 ]
