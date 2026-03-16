@@ -17,6 +17,7 @@ from akgentic.tool.workspace.tool import (
     WorkspaceGlob,
     WorkspaceGrep,
     WorkspaceList,
+    WorkspaceMkdir,
     WorkspaceMultiEdit,
     WorkspacePatch,
     WorkspaceRead,
@@ -55,5 +56,6 @@ __all__ = [
     "WorkspaceEdit",
     "WorkspaceMultiEdit",
     "WorkspacePatch",
+    "WorkspaceMkdir",
     "WorkspaceTool",
 ]

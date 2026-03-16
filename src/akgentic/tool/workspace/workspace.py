@@ -36,6 +36,8 @@ class Workspace(Protocol):
 
     def list(self, path: str = "") -> list[FileEntry]: ...
 
+    def mkdir(self, path: str) -> None: ...
+
 
 class Filesystem:
     """Local filesystem backend for a single team workspace.
@@ -118,6 +120,17 @@ class Filesystem:
         files.sort(key=lambda e: e.name)
         entries = dirs + files
         return entries
+
+    def mkdir(self, path: str) -> None:
+        """Create directory *path* and all missing parents within the workspace.
+
+        Idempotent — calling on an existing directory is a no-op.
+
+        Raises:
+            PermissionError: if *path* escapes the workspace root.
+        """
+        resolved = self._validate_path(path)
+        resolved.mkdir(parents=True, exist_ok=True)
 
 
 def get_workspace(workspace_name: str) -> Filesystem:

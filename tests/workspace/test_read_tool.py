@@ -225,8 +225,8 @@ class TestWorkspaceList:
         (root / "README.md").write_bytes(b"hello")
         fn = tool.get_tools()[1]  # workspace_list
         result = fn()
-        assert "[dir]  src" in result
-        assert "[file] README.md  (5 bytes)" in result
+        assert "src/" in result
+        assert "README.md (5 bytes)" in result
 
     def test_list_empty_directory(self, tmp_path: Path) -> None:
         tool = make_tool(tmp_path)
@@ -241,7 +241,7 @@ class TestWorkspaceList:
         (sub / "mod.py").write_bytes(b"pass")
         fn = tool.get_tools()[1]
         result = fn("pkg")
-        assert "[file] mod.py  (4 bytes)" in result
+        assert "mod.py (4 bytes)" in result
 
     def test_list_format_bytes(self, tmp_path: Path) -> None:
         tool = make_tool(tmp_path)
@@ -555,3 +555,70 @@ class TestCapabilityToggling:
         tools = tool.get_tools()
         assert len(tools) == 1
         assert tools[0].__name__ == "workspace_glob"
+
+
+# ---------------------------------------------------------------------------
+# Story 5.6: workspace_list depth variants
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceListDepth:
+    def test_depth_1_returns_flat_list_format(self, tmp_path: Path) -> None:
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        (root / "src").mkdir()
+        (root / "README.md").write_bytes(b"hello")
+        fn = tool.get_tools()[1]  # workspace_list
+        result = fn()  # default depth=1
+        # Flat format: no tree connectors
+        assert "src/" in result
+        assert "README.md (5 bytes)" in result
+        assert "├──" not in result
+        assert "└──" not in result
+
+    def test_depth_2_returns_ascii_tree(self, tmp_path: Path) -> None:
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        src = root / "src"
+        src.mkdir()
+        (src / "main.py").write_bytes(b"pass")
+        fn = tool.get_tools()[1]
+        result = fn(depth=2)
+        assert result.startswith(".")
+        assert "src/" in result
+        assert "main.py" in result
+        # Tree connectors present
+        assert "├──" in result or "└──" in result
+
+    def test_depth_0_returns_unlimited_tree(self, tmp_path: Path) -> None:
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        deep = root / "a" / "b" / "c"
+        deep.mkdir(parents=True)
+        (deep / "file.txt").write_bytes(b"x")
+        fn = tool.get_tools()[1]
+        result = fn(depth=0)
+        assert result.startswith(".")
+        assert "file.txt" in result
+        assert "a/" in result
+        assert "b/" in result
+        assert "c/" in result
+
+    def test_depth_tree_ordering_dirs_before_files(self, tmp_path: Path) -> None:
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        (root / "zfile.txt").write_bytes(b"z")
+        (root / "adir").mkdir()
+        fn = tool.get_tools()[1]
+        result = fn(depth=2)
+        lines = result.split("\n")
+        # First non-root entry should be the directory
+        entry_lines = [line for line in lines if "├──" in line or "└──" in line]
+        assert "adir/" in entry_lines[0]
+        assert "zfile.txt" in entry_lines[1]
+
+    def test_empty_directory_any_depth_returns_empty(self, tmp_path: Path) -> None:
+        tool = make_tool(tmp_path)
+        fn = tool.get_tools()[1]
+        assert fn(depth=2) == "Empty directory."
+        assert fn(depth=0) == "Empty directory."

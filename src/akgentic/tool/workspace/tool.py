@@ -43,6 +43,7 @@ class WorkspaceList(BaseToolParam):
     """List immediate children of a directory in the team workspace."""
 
     expose: set[Channels] = {TOOL_CALL}
+    max_depth: int = 1  # 1 = flat list (default), 0 = unlimited, N = N levels deep
 
 
 class WorkspaceGlob(BaseToolParam):
@@ -148,6 +149,51 @@ def _grep_rg(
             except ValueError:
                 continue
     return matches
+
+
+def _build_tree(
+    root: Path,
+    prefix: str = "",
+    current_depth: int = 0,
+    max_depth: int = 0,
+) -> list[str]:
+    """Render directory entries as an ASCII tree recursively.
+
+    Args:
+        root: Filesystem path of the directory to render.
+        prefix: Current indentation prefix string for rendering.
+        current_depth: Current recursion depth (0 = top level).
+        max_depth: Max depth to recurse (0 = unlimited, N = stop at N).
+
+    Returns:
+        List of rendered lines (one per entry, no trailing newline).
+    """
+    try:
+        children = list(root.iterdir())
+    except PermissionError:
+        return []
+
+    dirs = sorted([c for c in children if c.is_dir()], key=lambda c: c.name)
+    files = sorted([c for c in children if c.is_file()], key=lambda c: c.name)
+    entries = dirs + files
+
+    lines: list[str] = []
+    for i, entry in enumerate(entries):
+        is_last = i == len(entries) - 1
+        connector = "└── " if is_last else "├── "
+        if entry.is_dir():
+            lines.append(f"{prefix}{connector}{entry.name}/")
+            # Recurse if max_depth is unlimited (0) or we haven't reached the limit
+            if max_depth == 0 or current_depth + 1 < max_depth:
+                extension = "    " if is_last else "│   "
+                lines.extend(
+                    _build_tree(entry, prefix + extension, current_depth + 1, max_depth)
+                )
+        else:
+            size = entry.stat().st_size
+            lines.append(f"{prefix}{connector}{entry.name} ({size} bytes)")
+
+    return lines
 
 
 class WorkspaceReadTool(ToolCard):
@@ -273,34 +319,47 @@ class WorkspaceReadTool(ToolCard):
             params: List capability configuration.
 
         Returns:
-            Callable that lists workspace directory contents.
+            Callable that lists workspace directory contents (flat or tree).
         """
         backend = self.workspace
 
-        def workspace_list(path: str = "") -> str:
+        def workspace_list(path: str = "", depth: int = params.max_depth) -> str:
             """List the contents of a directory in the team workspace.
 
             Args:
                 path: Relative directory path. Defaults to workspace root.
+                depth: Tree depth. 1 = flat list (default), 0 = unlimited tree,
+                    N > 1 = tree N levels deep.
 
             Returns:
-                Newline-separated entries with ``[dir]`` / ``[file]`` prefixes
-                and byte sizes for files.  Returns "Empty directory." if the
-                directory contains no entries.
+                Flat list or ASCII tree of entries. Directories shown as ``name/``,
+                files as ``name (N bytes)``. Returns "Empty directory." if no entries.
 
             Raises:
                 PermissionError: If path escapes the workspace root.
             """
+            if path:
+                resolved = backend._validate_path(path)
+            else:
+                resolved = backend._root
+
             entries = backend.list(path)
             if not entries:
                 return "Empty directory."
-            entry_lines: list[str] = []
-            for entry in entries:
-                if entry.is_dir:
-                    entry_lines.append(f"[dir]  {entry.name}")
-                else:
-                    entry_lines.append(f"[file] {entry.name}  ({entry.size} bytes)")
-            return "\n".join(entry_lines)
+
+            if depth == 1:
+                # Flat list — no tree connectors
+                lines: list[str] = []
+                for entry in entries:
+                    if entry.is_dir:
+                        lines.append(f"{entry.name}/")
+                    else:
+                        lines.append(f"{entry.name} ({entry.size} bytes)")
+                return "\n".join(lines)
+            else:
+                # ASCII tree — depth=0 means unlimited, depth>1 means N levels
+                tree_lines = _build_tree(resolved, max_depth=depth)
+                return ".\n" + "\n".join(tree_lines) if tree_lines else "Empty directory."
 
         workspace_list.__doc__ = params.format_docstring(workspace_list.__doc__)
         return workspace_list
@@ -442,6 +501,12 @@ class WorkspacePatch(BaseToolParam):
     expose: set[Channels] = {TOOL_CALL}
 
 
+class WorkspaceMkdir(BaseToolParam):
+    """Create a directory (and parents) in the team workspace."""
+
+    expose: set[Channels] = {TOOL_CALL}
+
+
 class WorkspaceTool(WorkspaceReadTool):
     """Full workspace access: read + write + delete + edit + multi_edit + patch."""
 
@@ -457,6 +522,7 @@ class WorkspaceTool(WorkspaceReadTool):
     workspace_edit: WorkspaceEdit | bool = True
     workspace_multi_edit: WorkspaceMultiEdit | bool = True
     workspace_patch: WorkspacePatch | bool = True
+    workspace_mkdir: WorkspaceMkdir | bool = True
 
     def observer(  # type: ignore[override]
         self, observer: ActorToolObserver
@@ -473,7 +539,7 @@ class WorkspaceTool(WorkspaceReadTool):
         return self
 
     def get_tools(self) -> list[Callable[..., Any]]:
-        """Return read tools from super() plus write, delete, edit, multi_edit, and patch tools.
+        """Return read tools plus write, delete, edit, multi_edit, patch, and mkdir tools.
 
         Returns:
             List of callables for all enabled capabilities.
@@ -494,6 +560,9 @@ class WorkspaceTool(WorkspaceReadTool):
         pp = _resolve(self.workspace_patch, WorkspacePatch)
         if pp is not None and TOOL_CALL in pp.expose:
             tools.append(self._patch_factory(pp))
+        pm = _resolve(self.workspace_mkdir, WorkspaceMkdir)
+        if pm is not None and TOOL_CALL in pm.expose:
+            tools.append(self._mkdir_factory(pm))
         return tools
 
     def _write_factory(self, params: WorkspaceWrite) -> Callable[..., Any]:
@@ -776,3 +845,32 @@ class WorkspaceTool(WorkspaceReadTool):
 
         workspace_patch.__doc__ = params.format_docstring(workspace_patch.__doc__)
         return workspace_patch
+
+    def _mkdir_factory(self, params: WorkspaceMkdir) -> Callable[..., Any]:
+        """Create the ``workspace_mkdir`` tool callable.
+
+        Args:
+            params: Mkdir capability configuration.
+
+        Returns:
+            Callable that creates a directory in the workspace.
+        """
+        backend = self.workspace
+
+        def workspace_mkdir(path: str) -> str:
+            """Create a directory and all missing parents in the team workspace.
+
+            Args:
+                path: Relative directory path from workspace root (e.g. "src/utils").
+
+            Returns:
+                Confirmation string "Created: <path>".
+
+            Raises:
+                PermissionError: If the path escapes the workspace root.
+            """
+            backend.mkdir(path)
+            return f"Created: {path}"
+
+        workspace_mkdir.__doc__ = params.format_docstring(workspace_mkdir.__doc__)
+        return workspace_mkdir
