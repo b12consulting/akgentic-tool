@@ -376,6 +376,7 @@ def test_hire_members_custom_instructions():
     tool.observer(mock_observer())
 
     hire_members = tool.get_tools()[0]
+    assert hire_members.__doc__ is not None
     assert "Only hire when explicitly requested" in hire_members.__doc__
 
 
@@ -387,6 +388,7 @@ def test_fire_members_custom_instructions():
     tool.observer(mock_observer())
 
     fire_members = tool.get_tools()[1]
+    assert fire_members.__doc__ is not None
     assert "Only fire when explicitly requested" in fire_members.__doc__
 
 
