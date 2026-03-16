@@ -203,15 +203,12 @@ class PlanningTool(ToolCard):
                 if own_tasks:
                     lines.append(f"\n**Your tasks** (owner or creator: {agent_name}):")
                     for task in own_tasks:
-                        role_tag = ""
-                        if task.owner != agent_name and task.creator == agent_name:
-                            role_tag = " [created by you]"
                         output_part = f" — Output: {task.output}" if task.output else ""
                         owner_label = task.owner or "unassigned"
                         suffix = f" (Owner: {owner_label}, Creator: {task.creator})"
                         lines.append(
                             f"- ID {task.id} [{task.status}] {task.description}"
-                            f"{output_part}{role_tag}{suffix}"
+                            f"{output_part}{suffix}"
                         )
                 else:
                     lines.append(
