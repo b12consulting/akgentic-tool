@@ -12,11 +12,14 @@ from akgentic.tool.workspace.edit import (
     parse_patch,
 )
 from akgentic.tool.workspace.tool import (
+    WorkspaceDelete,
     WorkspaceGlob,
     WorkspaceGrep,
     WorkspaceList,
     WorkspaceRead,
     WorkspaceReadTool,
+    WorkspaceTool,
+    WorkspaceWrite,
 )
 from akgentic.tool.workspace.workspace import (
     FileEntry,
@@ -44,4 +47,7 @@ __all__ = [
     "WorkspaceGlob",
     "WorkspaceGrep",
     "WorkspaceReadTool",
+    "WorkspaceWrite",
+    "WorkspaceDelete",
+    "WorkspaceTool",
 ]
