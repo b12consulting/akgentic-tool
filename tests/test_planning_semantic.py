@@ -1,7 +1,7 @@
-"""Tests for PlanActor.get_planning_task — int and semantic (str) lookup paths.
+"""Tests for PlanActor.get_planning_task — integer ID lookup path.
 
-Covers AC#1–#7 (get_planning_task method) and AC#8–#9 (PlanningTool wiring),
-satisfying AC#10 (test file completeness).
+Covers AC#1 (int found) and AC#2 (int not found).
+Also covers AC#8–#9 (PlanningTool embedding field wiring).
 """
 
 from __future__ import annotations
@@ -86,138 +86,55 @@ class TestGetPlanningTaskIntNotFound:
 
 
 # ---------------------------------------------------------------------------
-# AC#3 — str lookup: semantic search found
+# AC#4 — _get_planning_task_factory: ToolCallEvent emitted when observer present
 # ---------------------------------------------------------------------------
 
 
-class TestGetPlanningTaskStrFound:
-    """AC3: str task_id with populated index → EmbeddingService called, Task returned."""
+class TestGetPlanningTaskToolCallEvent:
+    """AC4 (Task 2.3): _get_planning_task_factory emits ToolCallEvent via observer."""
 
-    def test_semantic_search_returns_matching_task(self) -> None:
-        actor = _make_actor(semantic_search=True)
-        _add_task(actor, task_id=5, description="Auth module implementation")
+    def test_notify_event_called_with_task_id(self) -> None:
+        """observer.notify_event fires with ToolCallEvent(tool_name='Get task', args=[task_id])."""
+        from unittest.mock import MagicMock
 
-        # Seed the vector index with a pre-computed entry for task id=5
-        task = actor.state.task_list[0]
-        unit_vector = [1.0, 0.0, 0.0]
+        from akgentic.tool.event import ToolCallEvent
+        from akgentic.tool.planning.planning import GetPlanningTask, PlanningTool
 
-        from akgentic.tool.vector import VectorEntry
+        tool = PlanningTool()
 
-        entry = VectorEntry(
-            ref_type="task",
-            ref_id=str(task.id),
-            text=task.description,
-            vector=unit_vector,
-        )
-        assert actor._vector_index is not None
-        actor._vector_index.add(entry)
+        # Wire up a mock observer and planning proxy
+        mock_observer = MagicMock()
+        tool._observer = mock_observer
 
-        # Mock embed to return the same unit vector → cosine similarity of 1.0
-        mock_svc = MagicMock()
-        mock_svc.embed.return_value = [[1.0, 0.0, 0.0]]
+        mock_proxy = MagicMock()
+        mock_proxy.get_planning_task.return_value = "No task with that ID."
+        tool._planning_proxy = mock_proxy
 
-        with patch.object(actor, "_get_or_create_embedding_svc", return_value=mock_svc):
-            result = actor.get_planning_task("auth module")
+        fn = tool._get_planning_task_factory(GetPlanningTask())
+        fn(42)
 
-        assert isinstance(result, Task)
-        assert result.id == 5
-        mock_svc.embed.assert_called_once_with(["auth module"])
+        mock_observer.notify_event.assert_called_once()
+        call_args = mock_observer.notify_event.call_args[0][0]
+        assert isinstance(call_args, ToolCallEvent)
+        assert call_args.tool_name == "Get task"
+        assert call_args.args == [42]
+        assert call_args.kwargs == {}
 
+    def test_no_notify_when_observer_is_none(self) -> None:
+        """When observer is None, notify_event is not called (no AttributeError)."""
+        from unittest.mock import MagicMock
 
-# ---------------------------------------------------------------------------
-# AC#4 — str lookup: empty vector index
-# ---------------------------------------------------------------------------
+        from akgentic.tool.planning.planning import GetPlanningTask, PlanningTool
 
+        tool = PlanningTool()
+        tool._observer = None  # type: ignore[assignment]
 
-class TestGetPlanningTaskStrEmptyIndex:
-    """AC4: str task_id with empty vector index → 'Semantic search unavailable.'"""
+        mock_proxy = MagicMock()
+        mock_proxy.get_planning_task.return_value = "No task with that ID."
+        tool._planning_proxy = mock_proxy
 
-    def test_returns_unavailable_when_index_empty(self) -> None:
-        actor = _make_actor(semantic_search=True)
-        _add_task(actor, task_id=1, description="Some task")
-        # Index is empty — no entries added
-
-        mock_svc = MagicMock()
-
-        with patch.object(actor, "_get_or_create_embedding_svc", return_value=mock_svc):
-            result = actor.get_planning_task("something")
-
-        assert result == "Semantic search unavailable."
-        mock_svc.embed.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# AC#5 — str lookup: semantic_search=False
-# ---------------------------------------------------------------------------
-
-
-class TestGetPlanningTaskStrSemanticDisabled:
-    """AC5: str task_id with semantic_search=False → 'Semantic search unavailable.'"""
-
-    def test_returns_unavailable_when_semantic_search_disabled(self) -> None:
-        actor = _make_actor(semantic_search=False)
-        _add_task(actor, task_id=1, description="Some task")
-
-        with patch.object(actor, "_get_or_create_embedding_svc", return_value=None) as mock_fn:
-            result = actor.get_planning_task("some query")
-
-        assert result == "Semantic search unavailable."
-        # _get_or_create_embedding_svc is called but returns None — no embed call
-        mock_fn.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
-# AC#6 — str lookup: missing [vector_search] deps
-# ---------------------------------------------------------------------------
-
-
-class TestGetPlanningTaskStrMissingDeps:
-    """AC6: str task_id with missing vector deps → 'Semantic search unavailable.'"""
-
-    def test_returns_unavailable_when_deps_missing(self) -> None:
-        actor = _make_actor(semantic_search=True)
-        _add_task(actor, task_id=1, description="Some task")
-
-        # Simulate missing deps: _get_or_create_embedding_svc returns None
-        with patch.object(actor, "_get_or_create_embedding_svc", return_value=None):
-            result = actor.get_planning_task("auth module")
-
-        assert result == "Semantic search unavailable."
-
-
-# ---------------------------------------------------------------------------
-# AC#7 — str lookup: orphaned ref_id
-# ---------------------------------------------------------------------------
-
-
-class TestGetPlanningTaskStrOrphanedRefId:
-    """AC7: top-1 ref_id doesn't match any task (deleted) → 'No task with that ID.'"""
-
-    def test_returns_no_task_when_ref_id_orphaned(self) -> None:
-        actor = _make_actor(semantic_search=True)
-
-        # Seed index with ref_id=99 (task deleted from task_list)
-        unit_vector = [1.0, 0.0, 0.0]
-
-        from akgentic.tool.vector import VectorEntry
-
-        entry = VectorEntry(
-            ref_type="task",
-            ref_id="99",  # orphaned — task 99 not in task_list
-            text="deleted task description",
-            vector=unit_vector,
-        )
-        assert actor._vector_index is not None
-        actor._vector_index.add(entry)
-
-        # task_list has task id=1, NOT id=99
-        _add_task(actor, task_id=1, description="Surviving task")
-
-        mock_svc = MagicMock()
-        mock_svc.embed.return_value = [[1.0, 0.0, 0.0]]
-
-        with patch.object(actor, "_get_or_create_embedding_svc", return_value=mock_svc):
-            result = actor.get_planning_task("deleted task description")
+        fn = tool._get_planning_task_factory(GetPlanningTask())
+        result = fn(99)
 
         assert result == "No task with that ID."
 

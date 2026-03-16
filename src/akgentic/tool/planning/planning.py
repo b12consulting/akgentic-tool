@@ -206,8 +206,8 @@ class PlanningTool(ToolCard):
         planning_proxy = self._planning_proxy
         observer = self._observer
 
-        def get_planning_task(task_id: int | str) -> Task | str:
-            """Get a single team task by its integer ID or semantic query string."""
+        def get_planning_task(task_id: int) -> Task | str:
+            """Get a single team task by its integer ID."""
             if observer is not None:
                 observer.notify_event(
                     ToolCallEvent(tool_name="Get task", args=[task_id], kwargs={})
