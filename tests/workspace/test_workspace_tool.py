@@ -394,6 +394,42 @@ class TestWorkspaceMultiEdit:
         assert b"z = 3" in fs.read("c.py")    # third never reached
         assert result.startswith("[ERROR]")
 
+    def test_multi_edit_replace_all_in_item(self, tmp_path: Path) -> None:
+        """workspace_multi_edit applies replace_all=True on a single EditItem."""
+        from akgentic.tool.workspace.edit import EditItem
+
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("a.py", b"foo\nfoo\nfoo\n")
+        multi_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_multi_edit")
+        result = multi_fn([
+            EditItem(path="a.py", old_string="foo", new_string="bar", replace_all=True),
+        ])
+        content = fs.read("a.py").decode("utf-8")
+        assert content.count("bar") == 3
+        assert "foo" not in content
+        assert isinstance(result, str)
+        assert not result.startswith("[ERROR]")
+
+    def test_multi_edit_replace_all_not_found_returns_error(self, tmp_path: Path) -> None:
+        """workspace_multi_edit with replace_all=True returns [ERROR] when not found."""
+        from akgentic.tool.workspace.edit import EditItem
+
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("a.py", b"hello world\n")
+        multi_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_multi_edit")
+        result = multi_fn([
+            EditItem(path="a.py", old_string="xyz not here", new_string="anything", replace_all=True),  # noqa: E501
+        ])
+        assert result.startswith("[ERROR]")
+        assert "a.py" in result
+
+    def test_multi_edit_empty_list_returns_no_changes(self, tmp_path: Path) -> None:
+        """workspace_multi_edit with empty edits list returns '(no changes applied)'."""
+        tool, _ = make_wired_tool(tmp_path)
+        multi_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_multi_edit")
+        result = multi_fn([])
+        assert result == "(no changes applied)"
+
     def test_multi_edit_disabled_not_in_get_tools(self, tmp_path: Path) -> None:
         """WorkspaceTool(workspace_multi_edit=False) excludes workspace_multi_edit."""
         observer, fs = make_observer(tmp_path)
@@ -458,6 +494,29 @@ class TestWorkspacePatch:
         result = patch_fn(patch_text)
         assert "deleted: old_file.py" in result
         assert not (fs._root / "old_file.py").exists()
+
+    def test_patch_apply_error_returns_error_string(self, tmp_path: Path) -> None:
+        """workspace_patch returns [ERROR] when apply_file_patch raises an exception."""
+        tool, fs = make_wired_tool(tmp_path)
+        # Patch references a non-existent file — apply_file_patch will raise FileNotFoundError
+        patch_text = (
+            "--- a/missing.py\n"
+            "+++ b/missing.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old line\n"
+            "+new line\n"
+        )
+        patch_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_patch")
+        result = patch_fn(patch_text)
+        assert result.startswith("[ERROR]")
+        assert "missing.py" in result
+
+    def test_patch_empty_patch_text_returns_no_patches_applied(self, tmp_path: Path) -> None:
+        """workspace_patch with empty/whitespace patch text returns '(no patches applied)'."""
+        tool, _ = make_wired_tool(tmp_path)
+        patch_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_patch")
+        result = patch_fn("")
+        assert result == "(no patches applied)"
 
     def test_patch_disabled_not_in_get_tools(self, tmp_path: Path) -> None:
         """WorkspaceTool(workspace_patch=False) excludes workspace_patch from get_tools()."""
