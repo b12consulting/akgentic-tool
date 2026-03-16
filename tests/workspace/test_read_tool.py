@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.tool import (
     WorkspaceGlob,
     WorkspaceGrep,
@@ -309,7 +310,7 @@ class TestWorkspaceGlob:
     def test_glob_path_escape_raises_permission_error(self, tmp_path: Path) -> None:
         tool = make_tool(tmp_path)
         fn = tool.get_tools()[2]
-        with pytest.raises(PermissionError, match="escapes workspace root"):
+        with pytest.raises(RetriableError, match="Path escapes workspace root"):
             fn("**/*.py", path="../../etc")
 
     def test_glob_no_truncation_when_under_cap(self, tmp_path: Path) -> None:
@@ -483,7 +484,7 @@ class TestWorkspaceGrep:
     def test_grep_path_escape_raises_permission_error(self, tmp_path: Path) -> None:
         tool = make_tool(tmp_path)
         fn = tool.get_tools()[3]
-        with pytest.raises(PermissionError, match="escapes workspace root"):
+        with pytest.raises(RetriableError, match="Path escapes workspace root"):
             fn("pattern", path="../../etc")
 
     def test_grep_uses_rg_when_available(self, tmp_path: Path) -> None:
@@ -622,3 +623,57 @@ class TestWorkspaceListDepth:
         fn = tool.get_tools()[1]
         assert fn(depth=2) == "Empty directory."
         assert fn(depth=0) == "Empty directory."
+
+
+# ---------------------------------------------------------------------------
+# Story 5.7: RetriableError wrapping in read-only tools
+# ---------------------------------------------------------------------------
+
+
+class TestRetriableErrorReadTool:
+    def test_read_file_not_found_raises_retriable_error(self, tmp_path: Path) -> None:
+        """workspace_read raises RetriableError for non-existent files."""
+        tool = make_tool(tmp_path)
+        read_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_read")
+        with pytest.raises(RetriableError, match="File not found: nonexistent.txt"):
+            read_fn("nonexistent.txt")
+
+    def test_read_permission_error_raises_retriable_error(self, tmp_path: Path) -> None:
+        """workspace_read raises RetriableError when backend raises PermissionError."""
+        tool = make_tool(tmp_path)
+        read_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_read")
+        with patch.object(tool.workspace, "read", side_effect=PermissionError("escaped")):
+            with pytest.raises(RetriableError, match="Path escapes workspace root"):
+                read_fn("src/file.py")
+
+    def test_list_permission_error_raises_retriable_error(self, tmp_path: Path) -> None:
+        """workspace_list raises RetriableError when path escapes workspace root."""
+        tool = make_tool(tmp_path)
+        list_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_list")
+        with patch.object(tool.workspace, "_validate_path", side_effect=PermissionError("escaped")):
+            with pytest.raises(RetriableError, match="Path escapes workspace root"):
+                list_fn("some/path")
+
+    def test_glob_permission_error_raises_retriable_error(self, tmp_path: Path) -> None:
+        """workspace_glob raises RetriableError for path escaping workspace."""
+        tool = make_tool(tmp_path)
+        glob_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_glob")
+        with pytest.raises(RetriableError, match="Path escapes workspace root"):
+            glob_fn("**/*.py", path="../../escape")
+
+    def test_grep_invalid_regex_raises_retriable_error(self, tmp_path: Path) -> None:
+        """workspace_grep raises RetriableError for invalid regex patterns."""
+        tool = make_tool(tmp_path)
+        # Write a file so grep actually tries to match
+        (tool.workspace._root / "test.txt").write_text("hello", encoding="utf-8")
+        grep_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_grep")
+        with patch("akgentic.tool.workspace.tool._grep_rg", return_value=None):
+            with pytest.raises(RetriableError, match="Invalid regex pattern"):
+                grep_fn("[invalid")  # unclosed bracket — invalid regex
+
+    def test_grep_permission_error_raises_retriable_error(self, tmp_path: Path) -> None:
+        """workspace_grep raises RetriableError for path escaping workspace root."""
+        tool = make_tool(tmp_path)
+        grep_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_grep")
+        with pytest.raises(RetriableError, match="Path escapes workspace root"):
+            grep_fn("pattern", path="../../escape")
