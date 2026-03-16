@@ -151,8 +151,10 @@ class WorkspaceReadTool(ToolCard):
     workspace_glob: WorkspaceGlob | bool = True
     workspace_grep: WorkspaceGrep | bool = True
 
-    # Private runtime state — not part of the serialised config
-    _workspace: Filesystem = PrivateAttr()
+    # Private runtime state — not part of the serialised config.
+    # Default None sentinel lets the workspace property detect uninitialized state
+    # reliably under both normal execution and coverage instrumentation.
+    _workspace: Filesystem | None = PrivateAttr(default=None)
 
     def observer(  # type: ignore[override]
         self, observer: ActorToolObserver
@@ -168,16 +170,24 @@ class WorkspaceReadTool(ToolCard):
         Raises:
             ValueError: If ``observer.orchestrator`` is None.
         """
-        self._observer = observer
         if observer.orchestrator is None:
             raise ValueError("WorkspaceReadTool requires access to the orchestrator.")
+        self._observer = observer
         ws_name = self.workspace_id or str(observer._team_id)  # type: ignore[attr-defined]
         self._workspace = get_workspace(ws_name)
         return self
 
     @property
     def workspace(self) -> Filesystem:
-        """Return the workspace backend (set after :meth:`observer` is called)."""
+        """Return the workspace backend (set after :meth:`observer` is called).
+
+        Raises:
+            RuntimeError: If :meth:`observer` has not been called yet.
+        """
+        if not isinstance(self._workspace, Filesystem):
+            raise RuntimeError(
+                "WorkspaceReadTool.workspace accessed before observer() was called."
+            )
         return self._workspace
 
     def get_tools(self) -> list[Callable[..., Any]]:

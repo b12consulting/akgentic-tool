@@ -121,6 +121,23 @@ class TestObserverWiring:
             result = tool.observer(observer)
         assert result is tool
 
+    def test_observer_failed_call_does_not_set_internal_observer(self) -> None:
+        """When observer() raises, _observer must NOT be set (no partial init)."""
+        observer = make_observer(orchestrator_is_none=True)
+        tool = WorkspaceReadTool()
+        with pytest.raises(ValueError):
+            tool.observer(observer)
+        # _observer must remain unset — check via __pydantic_private__
+        assert tool.__pydantic_private__ is None or "_observer" not in (
+            tool.__pydantic_private__ or {}
+        )
+
+    def test_get_tools_raises_before_observer_called(self) -> None:
+        """Calling get_tools() before observer() raises RuntimeError from workspace property."""
+        tool = WorkspaceReadTool()
+        with pytest.raises(RuntimeError, match="observer\\(\\) was called"):
+            tool.get_tools()
+
 
 # ---------------------------------------------------------------------------
 # Task 2: workspace_read pagination (AC 4, 5)
@@ -343,6 +360,34 @@ class TestGrepPython:
         results = _grep_python(tmp_path, "xxx", "", 100, 10)
         assert len(results[0][2]) <= 10
 
+    def test_skips_directories_from_rglob(self, tmp_path: Path) -> None:
+        """rglob may yield directories; they must be skipped gracefully."""
+        sub = tmp_path / "subdir"
+        sub.mkdir()
+        (tmp_path / "a.py").write_text("match\n", encoding="utf-8")
+        results = _grep_python(tmp_path, "match", "", 100, 2000)
+        # Only the file should produce results, not the directory
+        assert all(r[0].is_file() for r in results)
+
+    def test_skips_unreadable_files(self, tmp_path: Path) -> None:
+        """OSError during read_text must be swallowed and the file skipped."""
+        good = tmp_path / "good.py"
+        bad = tmp_path / "bad.py"
+        good.write_text("match\n", encoding="utf-8")
+        bad.write_text("match\n", encoding="utf-8")
+        original_read_text = Path.read_text
+
+        def patched_read_text(self: Path, **kwargs: object) -> str:  # type: ignore[misc]
+            if self.name == "bad.py":
+                raise OSError("permission denied")
+            return original_read_text(self, **kwargs)  # type: ignore[arg-type]
+
+        with patch.object(Path, "read_text", patched_read_text):
+            results = _grep_python(tmp_path, "match", "", 100, 2000)
+        result_names = [r[0].name for r in results]
+        assert "good.py" in result_names
+        assert "bad.py" not in result_names
+
 
 # ---------------------------------------------------------------------------
 # Task 5: _grep_rg helper
@@ -361,6 +406,42 @@ class TestGrepRg:
         ):
             result = _grep_rg(tmp_path, "pattern", "", 100)
         assert result is None
+
+    def test_returns_none_on_timeout(self, tmp_path: Path) -> None:
+        import subprocess as _subprocess
+
+        with patch("shutil.which", return_value="/usr/bin/rg"), patch(
+            "subprocess.run",
+            side_effect=_subprocess.TimeoutExpired(cmd=["rg"], timeout=15),
+        ):
+            result = _grep_rg(tmp_path, "pattern", "", 100)
+        assert result is None
+
+    def test_returns_none_on_nonzero_returncode(self, tmp_path: Path) -> None:
+        mock_result = MagicMock()
+        mock_result.returncode = 2
+        mock_result.stdout = ""
+        with patch("shutil.which", return_value="/usr/bin/rg"), patch(
+            "subprocess.run", return_value=mock_result
+        ):
+            result = _grep_rg(tmp_path, "pattern", "", 100)
+        assert result is None
+
+    def test_parses_rg_output_into_tuples(self, tmp_path: Path) -> None:
+        fake_file = tmp_path / "x.py"
+        fake_file.write_bytes(b"")
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = f"{fake_file}:3:import os\n"
+        with patch("shutil.which", return_value="/usr/bin/rg"), patch(
+            "subprocess.run", return_value=mock_result
+        ):
+            result = _grep_rg(tmp_path, "import", "", 100)
+        assert result is not None
+        assert len(result) == 1
+        path, lineno, line = result[0]
+        assert lineno == 3
+        assert line == "import os"
 
 
 # ---------------------------------------------------------------------------
