@@ -66,8 +66,8 @@ class _MockAddress(ActorAddress):
         return self._role
 
     @property
-    def team_id(self) -> uuid.UUID | None:
-        return None
+    def team_id(self) -> uuid.UUID:
+        return self._agent_id
 
     @property
     def squad_id(self) -> uuid.UUID | None:
