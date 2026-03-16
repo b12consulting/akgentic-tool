@@ -204,35 +204,18 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
         """Get the current plan tasks."""
         return self.state.task_list
 
-    def get_planning_task(self, task_id: int | str) -> Task | str:
-        """Look up a task by exact ID (int) or semantic query (str).
+    def get_planning_task(self, task_id: int) -> Task | str:
+        """Look up a task by exact integer ID.
 
         Args:
-            task_id: An integer for exact ID lookup, or a string for semantic search.
+            task_id: The integer ID of the task to retrieve.
 
         Returns:
-            The matching ``Task`` if found, or a plain string message when no match
-            is found or semantic search is unavailable.
+            The matching ``Task`` if found, or ``"No task with that ID."`` if no
+            task with that ID exists.
         """
-        if isinstance(task_id, int):
-            return next(
-                (t for t in self.state.task_list if t.id == task_id), "No task with that ID."
-            )
-
-        # Semantic search path
-        svc = self._get_or_create_embedding_svc()
-        if svc is None or self._vector_index is None or len(self._vector_index) == 0:
-            return "Semantic search unavailable."
-
-        query_vector = svc.embed([task_id])[0]
-        pairs = self._vector_index.search_cosine(query_vector, top_k=1)
-        if not pairs:
-            return "Semantic search unavailable."
-
-        ref_id, _ = pairs[0]
         return next(
-            (t for t in self.state.task_list if str(t.id) == ref_id),
-            "No task with that ID.",
+            (t for t in self.state.task_list if t.id == task_id), "No task with that ID."
         )
 
     def update_planning(self, update: UpdatePlan, actor_address: ActorAddress) -> str:
