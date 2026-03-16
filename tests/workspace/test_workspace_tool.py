@@ -73,7 +73,7 @@ class TestObserverDelegation:
 
 
 class TestGetToolsDefault:
-    def test_default_count_is_nine(self, tmp_path: Path) -> None:
+    def test_default_count_is_ten(self, tmp_path: Path) -> None:
         """By default get_tools() returns 10: 4 read + write + delete + edit + multi_edit + patch + mkdir."""
         tool, _ = make_wired_tool(tmp_path)
         tools = tool.get_tools()
@@ -208,7 +208,7 @@ class TestWorkspaceDelete:
 
 
 class TestCapabilityToggling:
-    def test_workspace_delete_disabled_returns_eight_tools(self, tmp_path: Path) -> None:
+    def test_workspace_delete_disabled_returns_nine_tools(self, tmp_path: Path) -> None:
         """WorkspaceTool(workspace_delete=False) exposes 9 tools."""
         observer, fs = make_observer(tmp_path)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
@@ -220,7 +220,7 @@ class TestCapabilityToggling:
         assert "workspace_write" in names
         assert len(tools) == 9
 
-    def test_workspace_write_disabled_returns_eight_tools(self, tmp_path: Path) -> None:
+    def test_workspace_write_disabled_returns_nine_tools(self, tmp_path: Path) -> None:
         """WorkspaceTool(workspace_write=False) exposes 9 tools."""
         observer, fs = make_observer(tmp_path)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
@@ -232,7 +232,7 @@ class TestCapabilityToggling:
         assert "workspace_delete" in names
         assert len(tools) == 9
 
-    def test_both_write_and_delete_disabled_returns_seven_tools(
+    def test_both_write_and_delete_disabled_returns_eight_tools(
         self, tmp_path: Path
     ) -> None:
         """WorkspaceTool(workspace_write=False, workspace_delete=False) returns 8 tools."""
@@ -535,12 +535,12 @@ class TestWorkspacePatch:
 
 
 class TestCapabilityTogglingStory55:
-    def test_default_count_is_nine(self, tmp_path: Path) -> None:
+    def test_default_count_is_ten(self, tmp_path: Path) -> None:
         """By default get_tools() returns 10: 4 read + write + delete + edit + multi_edit + patch + mkdir."""
         tool, _ = make_wired_tool(tmp_path)
         assert len(tool.get_tools()) == 10
 
-    def test_edit_disabled_count_is_eight(self, tmp_path: Path) -> None:
+    def test_edit_disabled_count_is_nine(self, tmp_path: Path) -> None:
         """WorkspaceTool(workspace_edit=False) returns 9 tools."""
         observer, fs = make_observer(tmp_path)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
@@ -548,7 +548,7 @@ class TestCapabilityTogglingStory55:
             tool.observer(observer)
         assert len(tool.get_tools()) == 9
 
-    def test_multi_edit_disabled_count_is_eight(self, tmp_path: Path) -> None:
+    def test_multi_edit_disabled_count_is_nine(self, tmp_path: Path) -> None:
         """WorkspaceTool(workspace_multi_edit=False) returns 9 tools."""
         observer, fs = make_observer(tmp_path)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
@@ -556,7 +556,7 @@ class TestCapabilityTogglingStory55:
             tool.observer(observer)
         assert len(tool.get_tools()) == 9
 
-    def test_patch_disabled_count_is_eight(self, tmp_path: Path) -> None:
+    def test_patch_disabled_count_is_nine(self, tmp_path: Path) -> None:
         """WorkspaceTool(workspace_patch=False) returns 9 tools."""
         observer, fs = make_observer(tmp_path)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):

@@ -153,7 +153,6 @@ def _grep_rg(
 
 def _build_tree(
     root: Path,
-    ws_root: Path,
     prefix: str = "",
     current_depth: int = 0,
     max_depth: int = 0,
@@ -162,7 +161,6 @@ def _build_tree(
 
     Args:
         root: Filesystem path of the directory to render.
-        ws_root: Workspace root (unused in recursion but available for relative paths).
         prefix: Current indentation prefix string for rendering.
         current_depth: Current recursion depth (0 = top level).
         max_depth: Max depth to recurse (0 = unlimited, N = stop at N).
@@ -189,7 +187,7 @@ def _build_tree(
             if max_depth == 0 or current_depth + 1 < max_depth:
                 extension = "    " if is_last else "│   "
                 lines.extend(
-                    _build_tree(entry, ws_root, prefix + extension, current_depth + 1, max_depth)
+                    _build_tree(entry, prefix + extension, current_depth + 1, max_depth)
                 )
         else:
             size = entry.stat().st_size
@@ -360,7 +358,7 @@ class WorkspaceReadTool(ToolCard):
                 return "\n".join(lines)
             else:
                 # ASCII tree — depth=0 means unlimited, depth>1 means N levels
-                tree_lines = _build_tree(resolved, backend._root, max_depth=depth)
+                tree_lines = _build_tree(resolved, max_depth=depth)
                 return ".\n" + "\n".join(tree_lines) if tree_lines else "Empty directory."
 
         workspace_list.__doc__ = params.format_docstring(workspace_list.__doc__)
@@ -541,7 +539,7 @@ class WorkspaceTool(WorkspaceReadTool):
         return self
 
     def get_tools(self) -> list[Callable[..., Any]]:
-        """Return read tools from super() plus write, delete, edit, multi_edit, and patch tools.
+        """Return read tools plus write, delete, edit, multi_edit, patch, and mkdir tools.
 
         Returns:
             List of callables for all enabled capabilities.
