@@ -160,6 +160,16 @@ class TestWorkspaceWriteLineEndingPreservation:
         assert result == "Written: same.py"
         assert b"updated" in fs.read("same.py")
 
+    def test_write_non_utf8_existing_file_does_not_raise(self, tmp_path: Path) -> None:
+        """Overwriting a non-UTF-8 binary file writes content as-is without raising."""
+        tool, fs = make_wired_tool(tmp_path)
+        # Write a file with non-UTF-8 bytes (Windows-1252 / Latin-1 encoded)
+        fs.write("binary.dat", b"\xff\xfe binary garbage \x80\x81")
+        write_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_write")
+        result = write_fn("binary.dat", "replacement\n")
+        assert result == "Written: binary.dat"
+        assert b"replacement" in fs.read("binary.dat")
+
 
 # ---------------------------------------------------------------------------
 # Task 4: workspace_delete — success and not-found (AC 5, 6)
@@ -244,3 +254,24 @@ class TestCapabilityToggling:
             tool = WorkspaceTool(workspace_delete=False)
             tool.observer(observer)
         assert len(tool.get_tools()) == 5
+
+
+# ---------------------------------------------------------------------------
+# Security: path traversal raises PermissionError
+# ---------------------------------------------------------------------------
+
+
+class TestPathSecurity:
+    def test_write_path_traversal_raises(self, tmp_path: Path) -> None:
+        """workspace_write raises PermissionError for paths escaping workspace root."""
+        tool, fs = make_wired_tool(tmp_path)
+        write_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_write")
+        with pytest.raises(PermissionError):
+            write_fn("../escape.py", "malicious content\n")
+
+    def test_delete_path_traversal_raises(self, tmp_path: Path) -> None:
+        """workspace_delete raises PermissionError for paths escaping workspace root."""
+        tool, fs = make_wired_tool(tmp_path)
+        delete_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_delete")
+        with pytest.raises(PermissionError):
+            delete_fn("../escape.py")

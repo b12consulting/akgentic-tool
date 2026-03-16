@@ -1,9 +1,10 @@
-"""WorkspaceReadTool — read-only workspace access: read, list, glob, grep.
+"""Workspace ToolCards — read-only and full read/write/delete access.
 
-Provides a ToolCard that exposes four read-only workspace operations as
-LLM-callable tools.  All operations are anchored to a team-scoped
-:class:`~akgentic.tool.workspace.workspace.Filesystem` backend obtained via
-:func:`~akgentic.tool.workspace.workspace.get_workspace`.
+:class:`WorkspaceReadTool` exposes four read-only workspace operations as
+LLM-callable tools.  :class:`WorkspaceTool` extends it with ``workspace_write``
+and ``workspace_delete`` capabilities.  All operations are anchored to a
+team-scoped :class:`~akgentic.tool.workspace.workspace.Filesystem` backend
+obtained via :func:`~akgentic.tool.workspace.workspace.get_workspace`.
 """
 
 from __future__ import annotations
@@ -483,8 +484,8 @@ class WorkspaceTool(WorkspaceReadTool):
                 existing = backend.read(path).decode("utf-8")
                 line_ending = detect_line_ending(existing)
                 normalised = normalise_endings(content, line_ending)
-            except FileNotFoundError:
-                normalised = content  # new file — use content as-is
+            except (FileNotFoundError, UnicodeDecodeError):
+                normalised = content  # new file or non-UTF-8 — use content as-is
             backend.write(path, normalised.encode("utf-8"))
             return f"Written: {path}"
 
