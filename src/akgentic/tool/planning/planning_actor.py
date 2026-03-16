@@ -218,6 +218,66 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
             (t for t in self.state.task_list if t.id == task_id), "No task with that ID."
         )
 
+    def search_planning(
+        self,
+        status: TaskStatus | None = None,
+        owner: str | None = None,
+        creator: str | None = None,
+        query: str | None = None,
+    ) -> list[Task]:
+        """Search tasks with optional multi-criteria filters (AND logic).
+
+        Args:
+            status: Exact match on task.status. None means no filter.
+            owner: Exact match on task.owner. Empty string matches unassigned tasks.
+                   None means no filter.
+            creator: Exact match on task.creator. None means no filter.
+            query: Case-insensitive substring match on task.description (keyword phase).
+                   When [vector_search] deps are available and the index is non-empty,
+                   also runs a semantic phase (cosine ≥ 0.5, top_k=20). Keyword and
+                   semantic hits are unioned before other filters apply.
+                   Degrades to keyword-only without raising when vector deps absent.
+                   None means no filter.
+
+        Returns:
+            Tasks matching ALL provided filters. When all parameters are None,
+            returns the full task list.
+        """
+        tasks: list[Task] = list(self.state.task_list)
+
+        # Query phase: build candidate set (keyword UNION semantic), then intersect with rest
+        if query is not None:
+            q_lower = query.lower()
+            keyword_ids = {t.id for t in tasks if q_lower in t.description.lower()}
+
+            semantic_ids: set[int] = set()
+            svc = self._get_or_create_embedding_svc()
+            if svc is not None and self._vector_index is not None and len(self._vector_index) > 0:
+                try:
+                    query_vector = svc.embed([query])[0]
+                    pairs = self._vector_index.search_cosine(query_vector, top_k=20)
+                    for ref_id, score in pairs:
+                        if score >= 0.5:
+                            semantic_ids.add(int(ref_id))
+                except Exception:
+                    logger.warning(
+                        "Semantic search failed for query — falling back to keyword only",
+                        exc_info=True,
+                    )
+
+            candidate_ids = keyword_ids | semantic_ids
+            tasks = [t for t in tasks if t.id in candidate_ids]
+
+        # Apply remaining AND filters
+        if status is not None:
+            tasks = [t for t in tasks if t.status == status]
+        if owner is not None:
+            tasks = [t for t in tasks if t.owner == owner]
+        if creator is not None:
+            tasks = [t for t in tasks if t.creator == creator]
+
+        return tasks
+
     def update_planning(self, update: UpdatePlan, actor_address: ActorAddress) -> str:
         """Update the plan with new, updated, or deleted task."""
 
