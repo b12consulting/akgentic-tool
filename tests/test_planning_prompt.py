@@ -484,10 +484,14 @@ class TestScopedViewOwnerCreatorDisplay:
         task_line = next(line for line in result.splitlines() if "Delegated" in line)
         assert "[created by you] (Owner: @ArchAgent, Creator: @DevAgent)" in task_line
 
-    def test_scoped_view_unassigned_owner_shown_as_unassigned(self) -> None:
-        """AC3: Task with empty owner in full-view renders 'unassigned'."""
-        # Edge case: unassigned tasks don't appear in scoped view (filter excludes them),
-        # so we verify via filter_by_agent=False that the label renders correctly.
+    def test_full_view_unassigned_owner_shown_as_unassigned(self) -> None:
+        """AC3: Task with empty owner in full-view (filter_by_agent=False) renders 'unassigned'.
+
+        Note: unassigned tasks are excluded from the scoped view (filter_by_agent=True) because
+        the filter requires task.owner == agent_name or (task.owner and task.creator == agent_name).
+        The owner_label guard in the scoped-view loop is defensive; this test covers the label via
+        the full-view branch where unassigned tasks are always rendered.
+        """
         tasks = [
             make_task(id=1, owner="", creator="@DevAgent"),
         ]
@@ -495,10 +499,8 @@ class TestScopedViewOwnerCreatorDisplay:
         result = fn()
         assert "(Owner: unassigned, Creator: @DevAgent)" in result
 
-    def test_scoped_view_owner_label_unassigned_not_reachable_but_guarded(self) -> None:
-        """Guard: If a task with named owner enters own_tasks, suffix shows correct owner."""
-        # Confirms owner_label = task.owner or "unassigned" guard renders correctly
-        # for a task created by another agent but owned by the scoped agent.
+    def test_scoped_view_owner_created_by_other_shows_correct_suffix(self) -> None:
+        """AC1 variant: Task created by a different agent but owned by the calling agent shows correct suffix."""
         tasks = [
             make_task(id=2, owner="@DevAgent", creator="@OtherAgent", description="Assigned"),
         ]
