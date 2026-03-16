@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 # Submodules with their own __init__ files
-from . import mcp, planning, search, team  # noqa: F401
+from . import mcp, planning, search, team, workspace  # noqa: F401
+from .workspace.tool import WorkspaceReadTool  # noqa: F401
 from .core import (  # noqa: F401
     COMMAND,
     SYSTEM_PROMPT,
@@ -50,6 +51,8 @@ __all__ = [
     "planning",
     "search",
     "team",
+    "workspace",
+    "WorkspaceReadTool",
 ]
 
 if _VECTOR_SEARCH_AVAILABLE:
