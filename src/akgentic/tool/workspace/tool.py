@@ -1,14 +1,16 @@
-"""Workspace ToolCards — read-only and full read/write/delete access.
+"""Workspace ToolCards — read-only and full read/write/delete/edit access.
 
 :class:`WorkspaceReadTool` exposes four read-only workspace operations as
-LLM-callable tools.  :class:`WorkspaceTool` extends it with ``workspace_write``
-and ``workspace_delete`` capabilities.  All operations are anchored to a
+LLM-callable tools.  :class:`WorkspaceTool` extends it with ``workspace_write``,
+``workspace_delete``, ``workspace_edit``, ``workspace_multi_edit``, and
+``workspace_patch`` capabilities.  All operations are anchored to a
 team-scoped :class:`~akgentic.tool.workspace.workspace.Filesystem` backend
 obtained via :func:`~akgentic.tool.workspace.workspace.get_workspace`.
 """
 
 from __future__ import annotations
 
+import difflib
 import re as _re
 import shutil
 import subprocess
@@ -19,7 +21,14 @@ from pydantic import PrivateAttr
 
 from akgentic.tool.core import TOOL_CALL, BaseToolParam, Channels, ToolCard, _resolve
 from akgentic.tool.event import ActorToolObserver
-from akgentic.tool.workspace.edit import detect_line_ending, normalise_endings
+from akgentic.tool.workspace.edit import (
+    EditItem,
+    EditMatcher,
+    apply_file_patch,
+    detect_line_ending,
+    normalise_endings,
+    parse_patch,
+)
 from akgentic.tool.workspace.workspace import Filesystem, get_workspace
 
 
@@ -415,17 +424,39 @@ class WorkspaceDelete(BaseToolParam):
     expose: set[Channels] = {TOOL_CALL}
 
 
+class WorkspaceEdit(BaseToolParam):
+    """Apply a surgical find-and-replace edit to a workspace file."""
+
+    expose: set[Channels] = {TOOL_CALL}
+
+
+class WorkspaceMultiEdit(BaseToolParam):
+    """Apply a sequence of find-and-replace edits to workspace files."""
+
+    expose: set[Channels] = {TOOL_CALL}
+
+
+class WorkspacePatch(BaseToolParam):
+    """Apply a unified diff patch to the team workspace."""
+
+    expose: set[Channels] = {TOOL_CALL}
+
+
 class WorkspaceTool(WorkspaceReadTool):
-    """Full workspace access: read + write + delete."""
+    """Full workspace access: read + write + delete + edit + multi_edit + patch."""
 
     name: str = "Workspace"
     description: str = (
-        "Read, write, and delete files in the team workspace. "
+        "Read, write, edit, and delete files in the team workspace. "
+        "Supports surgical find-and-replace, batch multi-edit, and unified diff patch. "
         "For SWE agents with full file I/O access."
     )
 
     workspace_write: WorkspaceWrite | bool = True
     workspace_delete: WorkspaceDelete | bool = True
+    workspace_edit: WorkspaceEdit | bool = True
+    workspace_multi_edit: WorkspaceMultiEdit | bool = True
+    workspace_patch: WorkspacePatch | bool = True
 
     def observer(  # type: ignore[override]
         self, observer: ActorToolObserver
@@ -442,7 +473,7 @@ class WorkspaceTool(WorkspaceReadTool):
         return self
 
     def get_tools(self) -> list[Callable[..., Any]]:
-        """Return read tools from super() plus write and delete tools.
+        """Return read tools from super() plus write, delete, edit, multi_edit, and patch tools.
 
         Returns:
             List of callables for all enabled capabilities.
@@ -454,6 +485,15 @@ class WorkspaceTool(WorkspaceReadTool):
         pd = _resolve(self.workspace_delete, WorkspaceDelete)
         if pd is not None and TOOL_CALL in pd.expose:
             tools.append(self._delete_factory(pd))
+        pe = _resolve(self.workspace_edit, WorkspaceEdit)
+        if pe is not None and TOOL_CALL in pe.expose:
+            tools.append(self._edit_factory(pe))
+        pme = _resolve(self.workspace_multi_edit, WorkspaceMultiEdit)
+        if pme is not None and TOOL_CALL in pme.expose:
+            tools.append(self._multi_edit_factory(pme))
+        pp = _resolve(self.workspace_patch, WorkspacePatch)
+        if pp is not None and TOOL_CALL in pp.expose:
+            tools.append(self._patch_factory(pp))
         return tools
 
     def _write_factory(self, params: WorkspaceWrite) -> Callable[..., Any]:
@@ -521,3 +561,218 @@ class WorkspaceTool(WorkspaceReadTool):
 
         workspace_delete.__doc__ = params.format_docstring(workspace_delete.__doc__)
         return workspace_delete
+
+    def _edit_factory(self, params: WorkspaceEdit) -> Callable[..., Any]:
+        """Create the ``workspace_edit`` tool callable.
+
+        Args:
+            params: Edit capability configuration.
+
+        Returns:
+            Callable that applies a surgical find-and-replace edit to a workspace file.
+        """
+        backend = self.workspace
+        matcher = EditMatcher()
+
+        def workspace_edit(
+            path: str,
+            old_string: str,
+            new_string: str,
+            replace_all: bool = False,
+        ) -> str:
+            """Apply a surgical find-and-replace edit to a workspace file.
+
+            Args:
+                path: Relative path from workspace root.
+                old_string: Exact (or approximately matching) text to replace.
+                new_string: Replacement text.
+                replace_all: If True, replace all occurrences (default False).
+
+            Returns:
+                Unified diff string of the change, or "[ERROR] ..." on failure.
+
+            Raises:
+                FileNotFoundError: If path does not exist.
+                PermissionError: If path escapes the workspace root.
+            """
+            raw = backend.read(path).decode("utf-8")
+            line_ending = detect_line_ending(raw)
+            content = raw
+
+            if replace_all:
+                new_content = content
+                found_any = False
+                while True:
+                    match = matcher.find(new_content, old_string)
+                    if match is None:
+                        break
+                    found_any = True
+                    new_content = new_content[: match.start] + new_string + new_content[match.end :]
+                if not found_any:
+                    return f"[ERROR] old_string not found in {path}"
+                content = new_content
+            else:
+                match = matcher.find(content, old_string)
+                if match is None:
+                    return f"[ERROR] old_string not found in {path}"
+                content = content[: match.start] + new_string + content[match.end :]
+
+            normalised = normalise_endings(content, line_ending)
+            backend.write(path, normalised.encode("utf-8"))
+
+            diff_lines = list(
+                difflib.unified_diff(
+                    raw.splitlines(),
+                    normalised.splitlines(),
+                    fromfile=f"a/{path}",
+                    tofile=f"b/{path}",
+                    lineterm="",
+                )
+            )
+            return "\n".join(diff_lines) if diff_lines else f"(no change) {path}"
+
+        workspace_edit.__doc__ = params.format_docstring(workspace_edit.__doc__)
+        return workspace_edit
+
+    def _multi_edit_factory(self, params: WorkspaceMultiEdit) -> Callable[..., Any]:
+        """Create the ``workspace_multi_edit`` tool callable.
+
+        Args:
+            params: Multi-edit capability configuration.
+
+        Returns:
+            Callable that applies a sequence of find-and-replace edits to workspace files.
+        """
+        backend = self.workspace
+        matcher = EditMatcher()
+
+        def workspace_multi_edit(edits: list[EditItem]) -> str:
+            """Apply a sequence of find-and-replace edits to workspace files.
+
+            Args:
+                edits: Ordered list of EditItem objects. Each edit is applied
+                    sequentially; each sees the result of the previous one.
+                    Stops on first failure — no rollback.
+
+            Returns:
+                Combined unified diff of all applied edits, or "[ERROR] ..." on failure.
+
+            Raises:
+                FileNotFoundError: If a target file does not exist.
+                PermissionError: If a path escapes the workspace root.
+            """
+            all_diffs: list[str] = []
+            for item in edits:
+                raw = backend.read(item.path).decode("utf-8")
+                line_ending = detect_line_ending(raw)
+                content = raw
+
+                if item.replace_all:
+                    new_content = content
+                    found_any = False
+                    while True:
+                        match = matcher.find(new_content, item.old_string)
+                        if match is None:
+                            break
+                        found_any = True
+                        new_content = (
+                            new_content[: match.start]
+                            + item.new_string
+                            + new_content[match.end :]
+                        )
+                    if not found_any:
+                        return f"[ERROR] old_string not found in {item.path}"
+                    content = new_content
+                else:
+                    match = matcher.find(content, item.old_string)
+                    if match is None:
+                        return f"[ERROR] old_string not found in {item.path}"
+                    content = (
+                        content[: match.start] + item.new_string + content[match.end :]
+                    )
+
+                normalised = normalise_endings(content, line_ending)
+                backend.write(item.path, normalised.encode("utf-8"))
+                diff_lines = list(
+                    difflib.unified_diff(
+                        raw.splitlines(),
+                        normalised.splitlines(),
+                        fromfile=f"a/{item.path}",
+                        tofile=f"b/{item.path}",
+                        lineterm="",
+                    )
+                )
+                if diff_lines:
+                    all_diffs.append("\n".join(diff_lines))
+
+            return "\n".join(all_diffs) if all_diffs else "(no changes applied)"
+
+        workspace_multi_edit.__doc__ = params.format_docstring(workspace_multi_edit.__doc__)
+        return workspace_multi_edit
+
+    def _patch_factory(self, params: WorkspacePatch) -> Callable[..., Any]:
+        """Create the ``workspace_patch`` tool callable.
+
+        Args:
+            params: Patch capability configuration.
+
+        Returns:
+            Callable that applies a unified diff patch to the team workspace.
+        """
+        backend = self.workspace
+
+        def workspace_patch(patch_text: str) -> str:
+            """Apply a unified diff patch to the team workspace.
+
+            Supports add (--- /dev/null), update, and delete (+++ /dev/null).
+
+            Args:
+                patch_text: GNU unified diff string.
+
+            Returns:
+                Newline-joined summary: "created: ...", "updated: ...", or
+                "deleted: ...". Returns "[ERROR] ..." on failure.
+
+            Raises:
+                PermissionError: If any path escapes the workspace root.
+            """
+            file_patches = parse_patch(patch_text)
+            results: list[str] = []
+
+            # parse_patch derives path from +++ line; for delete patches (+++ /dev/null)
+            # we must extract the real path from the --- a/<path> line in the raw text.
+            delete_paths: set[str] = set()
+            lines = patch_text.splitlines()
+            for i, line in enumerate(lines):
+                if line.startswith("+++ /dev/null") or line.startswith("+++ b//dev/null"):
+                    for j in range(i - 1, max(i - 5, -1), -1):
+                        if lines[j].startswith("--- "):
+                            raw_del = lines[j][4:].strip()
+                            del_path = raw_del[2:] if raw_del.startswith("a/") else raw_del
+                            if del_path != "/dev/null":
+                                delete_paths.add(del_path)
+                            break
+
+            for fp in file_patches:
+                try:
+                    if fp.path == "/dev/null":
+                        for del_path in delete_paths:
+                            backend.delete(del_path)
+                            results.append(f"deleted: {del_path}")
+                    else:
+                        apply_file_patch(backend, fp)
+                        is_add = bool(fp.hunks) and all(
+                            all(pl.startswith("+") for pl in h.lines if pl)
+                            for h in fp.hunks
+                        )
+                        if is_add:
+                            results.append(f"created: {fp.path}")
+                        else:
+                            results.append(f"updated: {fp.path}")
+                except Exception as exc:
+                    return f"[ERROR] {fp.path}: {exc}"
+
+            return "\n".join(results) if results else "(no patches applied)"
+
+        workspace_patch.__doc__ = params.format_docstring(workspace_patch.__doc__)
+        return workspace_patch

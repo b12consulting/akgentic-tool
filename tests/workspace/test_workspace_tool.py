@@ -73,11 +73,11 @@ class TestObserverDelegation:
 
 
 class TestGetToolsDefault:
-    def test_default_count_is_six(self, tmp_path: Path) -> None:
-        """By default get_tools() returns 6 tools: 4 read + write + delete."""
+    def test_default_count_is_nine(self, tmp_path: Path) -> None:
+        """By default get_tools() returns 9: 4 read + write + delete + edit + multi_edit + patch."""
         tool, _ = make_wired_tool(tmp_path)
         tools = tool.get_tools()
-        assert len(tools) == 6
+        assert len(tools) == 9
 
     def test_default_includes_all_read_tools(self, tmp_path: Path) -> None:
         tool, _ = make_wired_tool(tmp_path)
@@ -208,8 +208,8 @@ class TestWorkspaceDelete:
 
 
 class TestCapabilityToggling:
-    def test_workspace_delete_disabled_returns_five_tools(self, tmp_path: Path) -> None:
-        """WorkspaceTool(workspace_delete=False) exposes 5 tools."""
+    def test_workspace_delete_disabled_returns_eight_tools(self, tmp_path: Path) -> None:
+        """WorkspaceTool(workspace_delete=False) exposes 8 tools."""
         observer, fs = make_observer(tmp_path)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             tool = WorkspaceTool(workspace_delete=False)
@@ -218,10 +218,10 @@ class TestCapabilityToggling:
         names = [t.__name__ for t in tools]
         assert "workspace_delete" not in names
         assert "workspace_write" in names
-        assert len(tools) == 5
+        assert len(tools) == 8
 
-    def test_workspace_write_disabled_returns_five_tools(self, tmp_path: Path) -> None:
-        """WorkspaceTool(workspace_write=False) exposes 5 tools."""
+    def test_workspace_write_disabled_returns_eight_tools(self, tmp_path: Path) -> None:
+        """WorkspaceTool(workspace_write=False) exposes 8 tools."""
         observer, fs = make_observer(tmp_path)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             tool = WorkspaceTool(workspace_write=False)
@@ -230,12 +230,12 @@ class TestCapabilityToggling:
         names = [t.__name__ for t in tools]
         assert "workspace_write" not in names
         assert "workspace_delete" in names
-        assert len(tools) == 5
+        assert len(tools) == 8
 
-    def test_both_write_and_delete_disabled_returns_four_read_tools(
+    def test_both_write_and_delete_disabled_returns_seven_tools(
         self, tmp_path: Path
     ) -> None:
-        """WorkspaceTool(workspace_write=False, workspace_delete=False) returns 4 read tools."""
+        """WorkspaceTool(workspace_write=False, workspace_delete=False) returns 7 tools."""
         observer, fs = make_observer(tmp_path)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             tool = WorkspaceTool(workspace_write=False, workspace_delete=False)
@@ -245,7 +245,7 @@ class TestCapabilityToggling:
         assert "workspace_write" not in names
         assert "workspace_delete" not in names
         assert "workspace_read" in names
-        assert len(tools) == 4
+        assert len(tools) == 7
 
     def test_workspace_delete_false_count(self, tmp_path: Path) -> None:
         """Repeated get_tools() call count is stable."""
@@ -253,7 +253,7 @@ class TestCapabilityToggling:
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             tool = WorkspaceTool(workspace_delete=False)
             tool.observer(observer)
-        assert len(tool.get_tools()) == 5
+        assert len(tool.get_tools()) == 8
 
 
 # ---------------------------------------------------------------------------
@@ -275,3 +275,299 @@ class TestPathSecurity:
         delete_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_delete")
         with pytest.raises(PermissionError):
             delete_fn("../escape.py")
+
+
+# ---------------------------------------------------------------------------
+# Story 5.5: workspace_edit
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceEdit:
+    def test_edit_exact_match_returns_diff(self, tmp_path: Path) -> None:
+        """workspace_edit finds exact match, applies replacement, returns unified diff."""
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("main.py", b"old code\nmore code\n")
+        edit_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_edit")
+        result = edit_fn("main.py", "old code", "new code")
+        assert "-old code" in result or "old code" in result
+        assert b"new code" in fs.read("main.py")
+
+    def test_edit_fuzzy_match_exercises_matcher(self, tmp_path: Path) -> None:
+        """workspace_edit uses EditMatcher cascade — near-match is accepted."""
+        tool, fs = make_wired_tool(tmp_path)
+        # Write content with slight whitespace variation
+        fs.write("main.py", b"def  foo():\n    pass\n")
+        edit_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_edit")
+        # EditMatcher should handle the double-space via normalisation strategies
+        result = edit_fn("main.py", "def foo():\n    pass", "def bar():\n    pass")
+        assert not result.startswith("[ERROR]"), f"Expected match but got: {result}"
+        assert b"bar" in fs.read("main.py")
+
+    def test_edit_not_found_returns_error(self, tmp_path: Path) -> None:
+        """workspace_edit returns [ERROR] when old_string is not found."""
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("main.py", b"some content\n")
+        edit_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_edit")
+        result = edit_fn("main.py", "nonexistent string xyz", "replacement")
+        assert result.startswith("[ERROR]")
+        assert "main.py" in result
+
+    def test_edit_replace_all_replaces_all_occurrences(self, tmp_path: Path) -> None:
+        """workspace_edit with replace_all=True replaces all occurrences."""
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("main.py", b"foo\nfoo\nfoo\n")
+        edit_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_edit")
+        result = edit_fn("main.py", "foo", "bar", replace_all=True)
+        content = fs.read("main.py").decode("utf-8")
+        assert content.count("bar") == 3
+        assert "foo" not in content
+        assert isinstance(result, str)
+
+    def test_edit_replace_all_not_found_returns_error(self, tmp_path: Path) -> None:
+        """workspace_edit with replace_all=True returns [ERROR] when not found."""
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("main.py", b"hello world\n")
+        edit_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_edit")
+        result = edit_fn("main.py", "xyz not here", "replacement", replace_all=True)
+        assert result.startswith("[ERROR]")
+
+    def test_edit_preserves_crlf_line_endings(self, tmp_path: Path) -> None:
+        """workspace_edit preserves CRLF line endings after replacement."""
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("main.py", b"old code\r\nmore code\r\n")
+        edit_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_edit")
+        edit_fn("main.py", "old code", "new code")
+        content = fs.read("main.py")
+        assert b"\r\n" in content
+        assert b"new code" in content
+
+    def test_edit_disabled_not_in_get_tools(self, tmp_path: Path) -> None:
+        """WorkspaceTool(workspace_edit=False) excludes workspace_edit from get_tools()."""
+        observer, fs = make_observer(tmp_path)
+        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+            tool = WorkspaceTool(workspace_edit=False)
+            tool.observer(observer)
+        names = [t.__name__ for t in tool.get_tools()]
+        assert "workspace_edit" not in names
+        assert len(tool.get_tools()) == 8
+
+
+# ---------------------------------------------------------------------------
+# Story 5.5: workspace_multi_edit
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceMultiEdit:
+    def test_multi_edit_sequential_success(self, tmp_path: Path) -> None:
+        """workspace_multi_edit applies edits sequentially and returns combined diff."""
+        from akgentic.tool.workspace.edit import EditItem
+
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("a.py", b"x = 1\n")
+        fs.write("b.py", b"y = 2\n")
+        multi_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_multi_edit")
+        result = multi_fn([
+            EditItem(path="a.py", old_string="x = 1", new_string="x = 10"),
+            EditItem(path="b.py", old_string="y = 2", new_string="y = 20"),
+        ])
+        assert b"x = 10" in fs.read("a.py")
+        assert b"y = 20" in fs.read("b.py")
+        assert isinstance(result, str)
+        assert not result.startswith("[ERROR]")
+
+    def test_multi_edit_stops_on_failure(self, tmp_path: Path) -> None:
+        """workspace_multi_edit stops on first failure; prior edits persist, later ones skipped."""
+        from akgentic.tool.workspace.edit import EditItem
+
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("a.py", b"x = 1\n")
+        fs.write("b.py", b"y = 2\n")
+        fs.write("c.py", b"z = 3\n")
+        multi_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_multi_edit")
+        result = multi_fn([
+            EditItem(path="a.py", old_string="x = 1", new_string="x = 10"),
+            EditItem(path="b.py", old_string="DOES NOT EXIST", new_string="whatever"),
+            EditItem(path="c.py", old_string="z = 3", new_string="z = 30"),
+        ])
+        assert b"x = 10" in fs.read("a.py")   # first edit applied
+        assert b"y = 2" in fs.read("b.py")    # second not changed (just the error)
+        assert b"z = 3" in fs.read("c.py")    # third never reached
+        assert result.startswith("[ERROR]")
+
+    def test_multi_edit_replace_all_in_item(self, tmp_path: Path) -> None:
+        """workspace_multi_edit applies replace_all=True on a single EditItem."""
+        from akgentic.tool.workspace.edit import EditItem
+
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("a.py", b"foo\nfoo\nfoo\n")
+        multi_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_multi_edit")
+        result = multi_fn([
+            EditItem(path="a.py", old_string="foo", new_string="bar", replace_all=True),
+        ])
+        content = fs.read("a.py").decode("utf-8")
+        assert content.count("bar") == 3
+        assert "foo" not in content
+        assert isinstance(result, str)
+        assert not result.startswith("[ERROR]")
+
+    def test_multi_edit_replace_all_not_found_returns_error(self, tmp_path: Path) -> None:
+        """workspace_multi_edit with replace_all=True returns [ERROR] when not found."""
+        from akgentic.tool.workspace.edit import EditItem
+
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("a.py", b"hello world\n")
+        multi_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_multi_edit")
+        result = multi_fn([
+            EditItem(path="a.py", old_string="xyz not here", new_string="anything", replace_all=True),  # noqa: E501
+        ])
+        assert result.startswith("[ERROR]")
+        assert "a.py" in result
+
+    def test_multi_edit_empty_list_returns_no_changes(self, tmp_path: Path) -> None:
+        """workspace_multi_edit with empty edits list returns '(no changes applied)'."""
+        tool, _ = make_wired_tool(tmp_path)
+        multi_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_multi_edit")
+        result = multi_fn([])
+        assert result == "(no changes applied)"
+
+    def test_multi_edit_disabled_not_in_get_tools(self, tmp_path: Path) -> None:
+        """WorkspaceTool(workspace_multi_edit=False) excludes workspace_multi_edit."""
+        observer, fs = make_observer(tmp_path)
+        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+            tool = WorkspaceTool(workspace_multi_edit=False)
+            tool.observer(observer)
+        names = [t.__name__ for t in tool.get_tools()]
+        assert "workspace_multi_edit" not in names
+        assert len(tool.get_tools()) == 8
+
+
+# ---------------------------------------------------------------------------
+# Story 5.5: workspace_patch
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspacePatch:
+    def test_patch_add_new_file(self, tmp_path: Path) -> None:
+        """workspace_patch creates a new file from --- /dev/null patch."""
+        tool, fs = make_wired_tool(tmp_path)
+        patch_text = (
+            "--- /dev/null\n"
+            "+++ b/new_file.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+line1\n"
+            "+line2\n"
+        )
+        patch_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_patch")
+        result = patch_fn(patch_text)
+        assert "created: new_file.py" in result
+        assert (fs._root / "new_file.py").exists()
+
+    def test_patch_update_existing_file(self, tmp_path: Path) -> None:
+        """workspace_patch applies hunks to an existing file and returns updated:."""
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("existing.py", b"line1\nold_line\nline3\n")
+        patch_text = (
+            "--- a/existing.py\n"
+            "+++ b/existing.py\n"
+            "@@ -1,3 +1,3 @@\n"
+            " line1\n"
+            "-old_line\n"
+            "+new_line\n"
+            " line3\n"
+        )
+        patch_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_patch")
+        result = patch_fn(patch_text)
+        assert "updated: existing.py" in result
+        assert b"new_line" in fs.read("existing.py")
+
+    def test_patch_delete_file(self, tmp_path: Path) -> None:
+        """workspace_patch deletes a file from +++ /dev/null patch."""
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("old_file.py", b"to be deleted\n")
+        patch_text = (
+            "--- a/old_file.py\n"
+            "+++ /dev/null\n"
+            "@@ -1 +0,0 @@\n"
+            "-to be deleted\n"
+        )
+        patch_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_patch")
+        result = patch_fn(patch_text)
+        assert "deleted: old_file.py" in result
+        assert not (fs._root / "old_file.py").exists()
+
+    def test_patch_apply_error_returns_error_string(self, tmp_path: Path) -> None:
+        """workspace_patch returns [ERROR] when apply_file_patch raises an exception."""
+        tool, fs = make_wired_tool(tmp_path)
+        # Patch references a non-existent file — apply_file_patch will raise FileNotFoundError
+        patch_text = (
+            "--- a/missing.py\n"
+            "+++ b/missing.py\n"
+            "@@ -1,1 +1,1 @@\n"
+            "-old line\n"
+            "+new line\n"
+        )
+        patch_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_patch")
+        result = patch_fn(patch_text)
+        assert result.startswith("[ERROR]")
+        assert "missing.py" in result
+
+    def test_patch_empty_patch_text_returns_no_patches_applied(self, tmp_path: Path) -> None:
+        """workspace_patch with empty/whitespace patch text returns '(no patches applied)'."""
+        tool, _ = make_wired_tool(tmp_path)
+        patch_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_patch")
+        result = patch_fn("")
+        assert result == "(no patches applied)"
+
+    def test_patch_disabled_not_in_get_tools(self, tmp_path: Path) -> None:
+        """WorkspaceTool(workspace_patch=False) excludes workspace_patch from get_tools()."""
+        observer, fs = make_observer(tmp_path)
+        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+            tool = WorkspaceTool(workspace_patch=False)
+            tool.observer(observer)
+        names = [t.__name__ for t in tool.get_tools()]
+        assert "workspace_patch" not in names
+        assert len(tool.get_tools()) == 8
+
+
+# ---------------------------------------------------------------------------
+# Story 5.5: Capability toggling — default count and individual disabling
+# ---------------------------------------------------------------------------
+
+
+class TestCapabilityTogglingStory55:
+    def test_default_count_is_nine(self, tmp_path: Path) -> None:
+        """By default get_tools() returns 9: 4 read + write + delete + edit + multi_edit + patch."""
+        tool, _ = make_wired_tool(tmp_path)
+        assert len(tool.get_tools()) == 9
+
+    def test_edit_disabled_count_is_eight(self, tmp_path: Path) -> None:
+        """WorkspaceTool(workspace_edit=False) returns 8 tools."""
+        observer, fs = make_observer(tmp_path)
+        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+            tool = WorkspaceTool(workspace_edit=False)
+            tool.observer(observer)
+        assert len(tool.get_tools()) == 8
+
+    def test_multi_edit_disabled_count_is_eight(self, tmp_path: Path) -> None:
+        """WorkspaceTool(workspace_multi_edit=False) returns 8 tools."""
+        observer, fs = make_observer(tmp_path)
+        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+            tool = WorkspaceTool(workspace_multi_edit=False)
+            tool.observer(observer)
+        assert len(tool.get_tools()) == 8
+
+    def test_patch_disabled_count_is_eight(self, tmp_path: Path) -> None:
+        """WorkspaceTool(workspace_patch=False) returns 8 tools."""
+        observer, fs = make_observer(tmp_path)
+        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+            tool = WorkspaceTool(workspace_patch=False)
+            tool.observer(observer)
+        assert len(tool.get_tools()) == 8
+
+    def test_all_new_tools_present_by_default(self, tmp_path: Path) -> None:
+        """workspace_edit, workspace_multi_edit, workspace_patch all in default get_tools()."""
+        tool, _ = make_wired_tool(tmp_path)
+        names = [t.__name__ for t in tool.get_tools()]
+        assert "workspace_edit" in names
+        assert "workspace_multi_edit" in names
+        assert "workspace_patch" in names
