@@ -52,11 +52,15 @@ class Filesystem:
     def _validate_path(self, path: str) -> Path:
         """Resolve *path* relative to the workspace root and validate it.
 
+        Uses :meth:`Path.is_relative_to` (Python 3.9+) for component-level
+        comparison, which prevents false positives when a sibling workspace name
+        begins with the same characters (e.g. ``team-1`` vs ``team-11``).
+
         Raises:
             PermissionError: if the resolved path escapes the workspace root.
         """
         resolved = (self._root / path).resolve()
-        if not str(resolved).startswith(str(self._root.resolve())):
+        if not resolved.is_relative_to(self._root.resolve()):
             raise PermissionError(f"Path '{path}' escapes workspace root")
         return resolved
 

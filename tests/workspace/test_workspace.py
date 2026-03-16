@@ -86,6 +86,27 @@ class TestValidatePath:
         with pytest.raises(PermissionError):
             fs._validate_path("src/../../../../../../etc/hosts")
 
+    def test_sibling_workspace_name_prefix_raises(self, tmp_path: Path) -> None:
+        """Sibling workspace 'team-11' must not pass validation for workspace 'team-1'.
+
+        A naive ``str.startswith`` check would incorrectly allow this because
+        ``str('/workspaces/team-11').startswith('/workspaces/team-1')`` is True.
+        """
+        sibling = tmp_path / "team-11"
+        sibling.mkdir()
+        (sibling / "secret.txt").write_bytes(b"secret")
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        # Construct a path that resolves to the sibling workspace
+        sibling_relative = "../team-11/secret.txt"
+        with pytest.raises(PermissionError, match="escapes workspace root"):
+            fs._validate_path(sibling_relative)
+
+    def test_absolute_path_injection_raises(self, tmp_path: Path) -> None:
+        """An absolute path supplied as the path argument must be rejected."""
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        with pytest.raises(PermissionError, match="escapes workspace root"):
+            fs._validate_path("/etc/passwd")
+
 
 # ---------------------------------------------------------------------------
 # Filesystem.read
