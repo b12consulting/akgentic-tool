@@ -19,9 +19,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from akgentic.tool.sandbox.actor import ExecResult, SandboxConfig, SandboxState
+from akgentic.tool.sandbox.actor import (
+    ExecResult,
+    SandboxConfig,
+    SandboxState,
+)
 from akgentic.tool.sandbox.local import LocalSandboxActor
-
 
 # ---------------------------------------------------------------------------
 # Helper factory
@@ -42,7 +45,9 @@ def make_actor(team_id: str = "team-test") -> LocalSandboxActor:
 # ---------------------------------------------------------------------------
 
 
-def test_start_sandbox_creates_workspace_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_start_sandbox_creates_workspace_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """AC1: _start_sandbox() creates ./workspaces/team-1/ relative to CWD."""
     monkeypatch.chdir(tmp_path)
     actor = make_actor(team_id="team-1")
@@ -54,7 +59,9 @@ def test_start_sandbox_creates_workspace_directory(tmp_path: Path, monkeypatch: 
     assert expected.is_dir()
 
 
-def test_start_sandbox_stores_absolute_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_start_sandbox_stores_absolute_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """AC1: _start_sandbox() stores resolved absolute path in state.workspace_path."""
     monkeypatch.chdir(tmp_path)
     actor = make_actor(team_id="team-1")
@@ -66,7 +73,9 @@ def test_start_sandbox_stores_absolute_path(tmp_path: Path, monkeypatch: pytest.
     assert actor.state.workspace_path == (tmp_path / "workspaces" / "team-1").resolve()
 
 
-def test_start_sandbox_calls_notify_state_change(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_start_sandbox_calls_notify_state_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """AC1: _start_sandbox() calls state.notify_state_change() — verified via class-level patch."""
     monkeypatch.chdir(tmp_path)
     actor = make_actor(team_id="team-1")
@@ -109,7 +118,9 @@ def test_stop_sandbox_is_noop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     assert result is None
 
 
-def test_stop_sandbox_does_not_remove_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_stop_sandbox_does_not_remove_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """AC3: _stop_sandbox() leaves the workspace directory intact."""
     monkeypatch.chdir(tmp_path)
     actor = make_actor(team_id="team-1")
@@ -127,7 +138,9 @@ def test_stop_sandbox_does_not_remove_workspace(tmp_path: Path, monkeypatch: pyt
 
 
 @patch("akgentic.tool.sandbox.local.subprocess.run")
-def test_exec_no_cwd_uses_workspace_path(mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_exec_no_cwd_uses_workspace_path(
+    mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """AC4: _exec(cmd, cwd='') passes state.workspace_path as cwd to subprocess.run."""
     monkeypatch.chdir(tmp_path)
     actor = make_actor(team_id="team-1")
@@ -152,7 +165,9 @@ def test_exec_no_cwd_uses_workspace_path(mock_run: MagicMock, tmp_path: Path, mo
 
 
 @patch("akgentic.tool.sandbox.local.subprocess.run")
-def test_exec_with_cwd_appends_to_workspace_path(mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_exec_with_cwd_appends_to_workspace_path(
+    mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """AC5: _exec(cmd, cwd='src') passes state.workspace_path / 'src' as cwd."""
     monkeypatch.chdir(tmp_path)
     actor = make_actor(team_id="team-1")
@@ -178,7 +193,9 @@ def test_exec_with_cwd_appends_to_workspace_path(mock_run: MagicMock, tmp_path: 
 
 
 @patch("akgentic.tool.sandbox.local.subprocess.run")
-def test_exec_returns_exec_result(mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_exec_returns_exec_result(
+    mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """_exec() returns ExecResult with stdout, stderr, exit_code from subprocess.run."""
     monkeypatch.chdir(tmp_path)
     actor = make_actor(team_id="team-1")
@@ -195,7 +212,9 @@ def test_exec_returns_exec_result(mock_run: MagicMock, tmp_path: Path, monkeypat
 
 
 @patch("akgentic.tool.sandbox.local.subprocess.run")
-def test_exec_captures_non_zero_exit_code(mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_exec_captures_non_zero_exit_code(
+    mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """_exec() correctly captures non-zero exit codes from subprocess.run."""
     monkeypatch.chdir(tmp_path)
     actor = make_actor(team_id="team-1")
@@ -215,7 +234,9 @@ def test_exec_captures_non_zero_exit_code(mock_run: MagicMock, tmp_path: Path, m
 
 
 @patch("akgentic.tool.sandbox.local.subprocess.run")
-def test_exec_timeout_propagates(mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_exec_timeout_propagates(
+    mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """AC6: subprocess.TimeoutExpired from subprocess.run propagates out of _exec()."""
     monkeypatch.chdir(tmp_path)
     actor = make_actor(team_id="team-1")
@@ -233,7 +254,9 @@ def test_exec_timeout_propagates(mock_run: MagicMock, tmp_path: Path, monkeypatc
 
 
 @patch("akgentic.tool.sandbox.local.subprocess.run")
-def test_public_exec_method_end_to_end(mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_public_exec_method_end_to_end(
+    mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """AC7: actor.exec() through inherited SandboxActor.exec() delegates to _exec()."""
     monkeypatch.chdir(tmp_path)
     actor = make_actor(team_id="team-1")
