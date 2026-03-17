@@ -39,7 +39,7 @@ class DockerSandboxActor(SandboxActor):
             capture_output=True,
             text=True,
         )
-        if container_name in check.stdout:
+        if container_name in check.stdout.splitlines():
             subprocess.run(
                 ["docker", "start", container_name],
                 capture_output=True,

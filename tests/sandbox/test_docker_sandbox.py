@@ -17,7 +17,7 @@ Covers AC1 through AC11 for Story 6.3:
 from __future__ import annotations
 
 import subprocess
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -180,6 +180,30 @@ def test_start_sandbox_docker_start_uses_correct_args(
 
     start_call_args = mock_run.call_args_list[1][0][0]
     assert start_call_args == ["docker", "start", "sandbox-team-1"]
+
+
+@patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
+@patch("akgentic.tool.sandbox.docker.subprocess.run")
+def test_start_sandbox_no_false_positive_on_prefix_container_name(
+    mock_run: MagicMock, mock_which: MagicMock
+) -> None:
+    """AC1: container name prefix in stdout does not trigger false reuse.
+
+    If 'sandbox-team-10' appears in stdout, checking for 'sandbox-team-1'
+    must NOT match — exact line matching is required.
+    """
+    # docker ps -a stdout contains a prefix-matching name, not exact match
+    mock_run.side_effect = [
+        MagicMock(stdout="sandbox-team-10\n", returncode=0),  # docker ps -a
+        MagicMock(stdout="abc123", returncode=0),  # docker run (not docker start)
+    ]
+    actor = make_actor(team_id="team-1")
+    actor._start_sandbox()
+
+    # Must run docker run, NOT docker start
+    second_call_args = mock_run.call_args_list[1][0][0]
+    assert second_call_args[1] == "run"
+    assert actor.state.container_name == "sandbox-team-1"
 
 
 # ---------------------------------------------------------------------------
@@ -391,7 +415,7 @@ def test_exec_timeout_propagates(mock_run: MagicMock) -> None:
 def test_integration_container_name_set_after_start(
     mock_run: MagicMock, mock_which: MagicMock
 ) -> None:
-    """AC8: After _start_sandbox(), state.container_name is set — volume mount ensures file sharing."""
+    """AC8: After _start_sandbox(), state.container_name is set — volume mount ensures sharing."""
     mock_run.side_effect = [
         MagicMock(stdout="", returncode=0),  # docker ps -a
         MagicMock(stdout="abc123", returncode=0),  # docker run
