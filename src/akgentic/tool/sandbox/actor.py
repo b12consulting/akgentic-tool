@@ -169,7 +169,12 @@ class SandboxActor(Akgent[SandboxConfig, SandboxState], ABC):
         Raises:
             CommandNotAllowedError: If the command binary is not in ALLOWED_COMMANDS.
         """
-        binary = cmd.split()[0]
+        tokens = cmd.split()
+        if not tokens:
+            raise CommandNotAllowedError(
+                "Command string is empty — no binary to validate against the allowlist."
+            )
+        binary = tokens[0]
         if binary not in ALLOWED_COMMANDS:
             raise CommandNotAllowedError(
                 f"Command '{binary}' is not in the allowed commands list. "

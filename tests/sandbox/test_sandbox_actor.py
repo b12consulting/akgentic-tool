@@ -9,9 +9,9 @@ Covers AC1 through AC9 for Story 6.1:
 
 from __future__ import annotations
 
-import pytest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+
+import pytest
 
 from akgentic.tool.sandbox.actor import (
     ALLOWED_COMMANDS,
@@ -23,7 +23,6 @@ from akgentic.tool.sandbox.actor import (
     SandboxConfig,
     SandboxState,
 )
-
 
 # ---------------------------------------------------------------------------
 # Minimal concrete stub — required because SandboxActor is abstract
@@ -238,6 +237,15 @@ def test_exec_disallowed_command_error_message_contains_binary() -> None:
         actor.exec("malware --install")
 
 
+def test_exec_empty_command_raises_error() -> None:
+    """exec('') raises CommandNotAllowedError — empty string has no binary token."""
+    actor = ConcreteSandboxActor()
+    actor.on_start()
+
+    with pytest.raises(CommandNotAllowedError, match="empty"):
+        actor.exec("")
+
+
 # ---------------------------------------------------------------------------
 # exec() allowlist edge case (AC6)
 # ---------------------------------------------------------------------------
@@ -320,13 +328,8 @@ def test_on_stop_calls_super_on_stop() -> None:
     actor = FailingStopSandboxActor()
     actor.on_start()
 
-    super_called = False
-
-    import akgentic.tool.sandbox.actor as actor_module
-    original_super = super
-
-    # Patch super() inside on_stop to track the call
-    # Instead, we verify indirectly: on_stop() must not raise
-    # and state observer is still intact (super().on_stop() is a Pykka hook, no-op in unit tests)
+    # Verify indirectly: on_stop() must not raise.
+    # super().on_stop() is a Pykka hook (no-op in unit tests without a running actor system).
+    # If we reach the end of this call without exception, super().on_stop() was not blocked
+    # by the _stop_sandbox() failure.
     actor.on_stop()  # Should not raise
-    # If we reach here, super().on_stop() was not blocked by _stop_sandbox exception
