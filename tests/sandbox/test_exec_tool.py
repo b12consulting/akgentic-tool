@@ -18,10 +18,9 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
-
 from akgentic.core.actor_address import ActorAddress
+
 from akgentic.tool.sandbox.actor import (
-    ALLOWED_COMMANDS,
     SANDBOX_ACTOR_NAME,
     CommandNotAllowedError,
     ExecResult,
@@ -31,7 +30,6 @@ from akgentic.tool.sandbox.actor import (
 from akgentic.tool.sandbox.docker import DockerSandboxActor
 from akgentic.tool.sandbox.local import LocalSandboxActor
 from akgentic.tool.sandbox.tool import SANDBOX_ACTOR_CLASSES, ExecTool
-
 
 # ---------------------------------------------------------------------------
 # Mock observer infrastructure

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 # Submodules with their own __init__ files
 from . import mcp, planning, sandbox, search, team, workspace  # noqa: F401
-from .sandbox.tool import ExecTool  # noqa: F401
-from .workspace.tool import WorkspaceReadTool, WorkspaceTool  # noqa: F401
 from .core import (  # noqa: F401
     COMMAND,
     SYSTEM_PROMPT,
@@ -22,6 +20,8 @@ from .event import (  # noqa: F401
     ToolCallEvent,
     ToolObserver,
 )
+from .sandbox.tool import ExecTool  # noqa: F401
+from .workspace.tool import WorkspaceReadTool, WorkspaceTool  # noqa: F401
 
 try:
     from .vector import EmbeddingService, VectorEntry, VectorIndex  # noqa: F401
