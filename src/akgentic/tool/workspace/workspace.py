@@ -4,7 +4,8 @@ Provides a secure, team-scoped filesystem backend for workspace tools.
 All path operations validate that the resolved path stays within the workspace root
 to prevent directory traversal attacks.
 
-Unknown WORKSPACE_MODE values raise KeyError intentionally (fail-fast behaviour).
+The workspace root is derived from the ``AKGENTIC_WORKSPACES_ROOT`` environment
+variable (default: ``./workspaces``).
 """
 
 from __future__ import annotations
@@ -134,19 +135,16 @@ class Filesystem:
 
 
 def get_workspace(workspace_name: str) -> Filesystem:
-    """Return a :class:`Filesystem` for *workspace_name* using the current mode.
+    """Return a :class:`Filesystem` for *workspace_name* rooted at the configured base.
 
-    The base path is selected from ``WORKSPACE_MODE`` environment variable:
+    The base path is read from the ``AKGENTIC_WORKSPACES_ROOT`` environment
+    variable.  When the variable is unset the default ``./workspaces`` is used.
 
-    - ``local`` (default, or unset): ``./workspaces``
-    - ``docker``: ``/workspaces``
+    Args:
+        workspace_name: Team-scoped workspace directory name (e.g. ``"team-1"``).
 
-    Raises:
-        KeyError: if ``WORKSPACE_MODE`` is set to an unknown value (fail-fast).
+    Returns:
+        A :class:`Filesystem` anchored at ``<AKGENTIC_WORKSPACES_ROOT>/<workspace_name>``.
     """
-    mode = os.environ.get("WORKSPACE_MODE", "local")
-    base_path = {
-        "local": "./workspaces",
-        "docker": "/workspaces",
-    }[mode]
+    base_path = os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
     return Filesystem(base_path=base_path, workspace_name=workspace_name)

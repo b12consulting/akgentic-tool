@@ -1,6 +1,6 @@
 """Tests for DockerSandboxActor — persistent Docker container execution.
 
-Covers AC1 through AC11 for Story 6.3:
+Covers AC1 through AC11 for Story 6.3 (updated for Story 6.5):
 - AC1: _start_sandbox() runs docker run when container does not exist
 - AC2: _start_sandbox() runs docker start when container already exists
 - AC3: _start_sandbox() raises RuntimeError when docker CLI not on PATH
@@ -12,6 +12,7 @@ Covers AC1 through AC11 for Story 6.3:
 - AC9: SANDBOX_IMAGE == "akgentic-sandbox:latest"
 - AC10: DOCKER_EXEC_TIMEOUT == 60
 - AC11: 80%+ branch coverage
+- Story 6.5: volume mount host path derived from AKGENTIC_WORKSPACES_ROOT
 """
 
 from __future__ import annotations
@@ -95,9 +96,10 @@ def test_start_sandbox_creates_container_when_absent(
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
 @patch("akgentic.tool.sandbox.docker.subprocess.run")
 def test_start_sandbox_docker_run_uses_correct_flags(
-    mock_run: MagicMock, mock_which: MagicMock
+    mock_run: MagicMock, mock_which: MagicMock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """AC1: docker run uses -d, --name, --network none, -v, -w, sleep infinity."""
+    """AC1: docker run uses -d, --name, --network none, -v, -w, sleep infinity (default root)."""
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
     mock_run.side_effect = [
         MagicMock(stdout="", returncode=0),  # docker ps -a
         MagicMock(stdout="abc123", returncode=0),  # docker run
@@ -115,13 +117,32 @@ def test_start_sandbox_docker_run_uses_correct_flags(
         "--network",
         "none",
         "-v",
-        "workspaces/team-1:/workspace",
+        "./workspaces/team-1:/workspace",
         "-w",
         "/workspace",
         SANDBOX_IMAGE,
         "sleep",
         "infinity",
     ]
+
+
+@patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
+@patch("akgentic.tool.sandbox.docker.subprocess.run")
+def test_start_sandbox_docker_run_uses_custom_workspaces_root(
+    mock_run: MagicMock, mock_which: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Story 6.5: docker run -v uses AKGENTIC_WORKSPACES_ROOT when set."""
+    monkeypatch.setenv("AKGENTIC_WORKSPACES_ROOT", "/workspaces")
+    mock_run.side_effect = [
+        MagicMock(stdout="", returncode=0),  # docker ps -a
+        MagicMock(stdout="abc123", returncode=0),  # docker run
+    ]
+    actor = make_actor(team_id="team-1")
+    actor._start_sandbox()
+
+    run_call_args = mock_run.call_args_list[1][0][0]
+    volume_arg_idx = run_call_args.index("-v") + 1
+    assert run_call_args[volume_arg_idx] == "/workspaces/team-1:/workspace"
 
 
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")

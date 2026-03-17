@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 
@@ -16,7 +17,8 @@ class DockerSandboxActor(SandboxActor):
 
     Manages a single Docker container named sandbox-{team_id}.
     Container is started (or reused) on on_start(), stopped (not removed)
-    on on_stop(). Used when SANDBOX_MODE=docker.
+    on on_stop(). The host-side volume mount root is derived from the
+    ``AKGENTIC_WORKSPACES_ROOT`` environment variable (default: ``./workspaces``).
     """
 
     def _start_sandbox(self) -> None:
@@ -25,6 +27,8 @@ class DockerSandboxActor(SandboxActor):
             raise RuntimeError(
                 "docker CLI not found on PATH — cannot start DockerSandboxActor"
             )
+        base = os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
+        volume = f"{base}/{self.config.team_id}:/workspace"
         # Check if container already exists (any state)
         check = subprocess.run(
             [
@@ -57,7 +61,7 @@ class DockerSandboxActor(SandboxActor):
                     "--network",
                     "none",
                     "-v",
-                    f"workspaces/{self.config.team_id}:/workspace",
+                    volume,
                     "-w",
                     "/workspace",
                     SANDBOX_IMAGE,

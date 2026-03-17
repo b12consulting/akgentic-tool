@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -11,12 +12,14 @@ from akgentic.tool.sandbox.actor import ExecResult, SandboxActor
 class LocalSandboxActor(SandboxActor):
     """Subprocess-based sandbox actor for local filesystem execution.
 
-    Creates and manages a workspace directory under ./workspaces/{team_id}/.
-    No Docker daemon required. Used when SANDBOX_MODE=local (default).
+    Creates and manages a workspace directory under
+    ``<AKGENTIC_WORKSPACES_ROOT>/{team_id}/`` (default root: ``./workspaces``).
+    No Docker daemon required.
     """
 
     def _start_sandbox(self) -> None:
-        workspace_path = Path(f"./workspaces/{self.config.team_id}")
+        base = os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
+        workspace_path = Path(base) / self.config.team_id
         workspace_path.mkdir(parents=True, exist_ok=True)
         self.state.workspace_path = workspace_path.resolve()
         self.state.notify_state_change()

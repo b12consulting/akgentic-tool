@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import os
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from pydantic import PrivateAttr
 
@@ -53,13 +52,14 @@ class ExecTool(ToolCard):
     name: str = "Exec"
     description: str = "Execute sandboxed shell commands in the team workspace"
     exec_command: ExecCommand | bool = True
+    mode: Literal["local", "docker"] = "local"
 
     _sandbox_proxy: SandboxActor | None = PrivateAttr(default=None)
 
     def observer(self, observer: ActorToolObserver) -> "ExecTool":  # type: ignore[override]
         """Attach observer and set up the sandbox actor proxy.
 
-        Resolves SANDBOX_ACTOR_CLASSES[SANDBOX_MODE] at call time (not import
+        Resolves ``SANDBOX_ACTOR_CLASSES[self.mode]`` at call time (not import
         time) so that akgentic-infra can inject additional actor classes before
         any ExecTool is constructed (NFR-SB-7).
 
@@ -71,7 +71,7 @@ class ExecTool(ToolCard):
 
         Raises:
             ValueError: If observer.orchestrator is None.
-            KeyError: If SANDBOX_MODE env var names an unregistered backend.
+            KeyError: If ``self.mode`` names an unregistered backend.
         """
         self._observer = observer
         if observer.orchestrator is None:
@@ -81,15 +81,15 @@ class ExecTool(ToolCard):
         sandbox_addr = orchestrator_proxy.get_team_member(SANDBOX_ACTOR_NAME)
 
         if sandbox_addr is None:
-            sandbox_mode = os.environ.get("SANDBOX_MODE", "local")
             # KeyError on unknown mode — intentional (fail-fast, NFR-SB-7)
-            actor_class = SANDBOX_ACTOR_CLASSES[sandbox_mode]
+            actor_class = SANDBOX_ACTOR_CLASSES[self.mode]
             sandbox_addr = orchestrator_proxy.createActor(
                 actor_class,
                 config=SandboxConfig(
                     name=SANDBOX_ACTOR_NAME,
                     role="ToolActor",
                     team_id=str(observer._team_id),  # type: ignore[attr-defined]
+                    mode=self.mode,
                 ),
             )
 
