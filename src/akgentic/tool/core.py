@@ -11,8 +11,7 @@ from abc import ABC, abstractmethod
 from enum import StrEnum
 from typing import Any, Callable, TypeVar
 
-from pydantic import BaseModel
-
+from akgentic.core.utils import SerializableBaseModel
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.event import ToolObserver
 
@@ -56,7 +55,7 @@ TOOL_CALL = Channels.TOOL_CALL
 COMMAND = Channels.COMMAND
 
 
-class BaseToolParam(BaseModel):
+class BaseToolParam(SerializableBaseModel):
     """Base for capability parameter models.
 
     Provides common fields that control how a capability is exposed
@@ -100,7 +99,7 @@ class BaseToolParam(BaseModel):
         return f"{base_doc}\n\nAdditional Instructions:\n{self.instructions}"
 
 
-class ToolCard(BaseModel, ABC):
+class ToolCard(SerializableBaseModel, ABC):
     """Abstract base: tool configuration + callable factory in one class.
 
     Subclasses define typed fields for their capabilities and implement

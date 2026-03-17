@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from pathlib import Path
 
 from akgentic.tool.sandbox.actor import ExecResult, SandboxActor
 
@@ -28,7 +29,7 @@ class DockerSandboxActor(SandboxActor):
                 "docker CLI not found on PATH — cannot start DockerSandboxActor"
             )
         base = os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
-        volume = f"{base}/{self.config.team_id}:/workspace"
+        volume = f"{Path(base) / self.config.team_id}:/workspace"
         # Check if container already exists (any state)
         check = subprocess.run(
             [

@@ -299,3 +299,64 @@ def test_public_exec_method_end_to_end(
     assert result.stdout == "passed"
     assert result.exit_code == 0
     mock_run.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Story 6.5: shared-filesystem invariant — WorkspaceTool and LocalSandboxActor
+# resolve to the same absolute path for the same team_id
+# ---------------------------------------------------------------------------
+
+
+def test_workspace_tool_and_local_sandbox_actor_resolve_same_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Story 6.5 AC: WorkspaceTool (via get_workspace) and LocalSandboxActor share the same
+    workspace root when AKGENTIC_WORKSPACES_ROOT is unset.
+
+    Both tools must resolve to the same absolute path for team-1 to guarantee
+    the shared-filesystem invariant (ADR-006).
+    """
+    from akgentic.tool.workspace.workspace import get_workspace
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
+
+    # WorkspaceTool path (via get_workspace factory)
+    workspace = get_workspace("team-1")
+    workspace_tool_root = workspace._root.resolve()
+
+    # LocalSandboxActor path (via _start_sandbox())
+    actor = make_actor(team_id="team-1")
+    actor._start_sandbox()
+    sandbox_root = actor.state.workspace_path
+
+    assert sandbox_root is not None
+    assert workspace_tool_root == sandbox_root, (
+        f"WorkspaceTool root ({workspace_tool_root}) != "
+        f"LocalSandboxActor root ({sandbox_root})"
+    )
+
+
+def test_workspace_tool_and_local_sandbox_actor_resolve_same_path_custom_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Story 6.5 AC: Both tools use custom AKGENTIC_WORKSPACES_ROOT and resolve to same path."""
+    from akgentic.tool.workspace.workspace import get_workspace
+
+    custom_root = tmp_path / "shared-workspaces"
+    monkeypatch.setenv("AKGENTIC_WORKSPACES_ROOT", str(custom_root))
+
+    # WorkspaceTool path
+    workspace = get_workspace("team-1")
+    workspace_tool_root = workspace._root.resolve()
+
+    # LocalSandboxActor path
+    actor = make_actor(team_id="team-1")
+    actor._start_sandbox()
+    sandbox_root = actor.state.workspace_path
+
+    assert sandbox_root is not None
+    assert workspace_tool_root == sandbox_root, (
+        f"WorkspaceTool root ({workspace_tool_root}) != "
+        f"LocalSandboxActor root ({sandbox_root})"
+    )

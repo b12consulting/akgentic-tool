@@ -117,7 +117,7 @@ def test_start_sandbox_docker_run_uses_correct_flags(
         "--network",
         "none",
         "-v",
-        "./workspaces/team-1:/workspace",
+        "workspaces/team-1:/workspace",
         "-w",
         "/workspace",
         SANDBOX_IMAGE,
@@ -143,6 +143,32 @@ def test_start_sandbox_docker_run_uses_custom_workspaces_root(
     run_call_args = mock_run.call_args_list[1][0][0]
     volume_arg_idx = run_call_args.index("-v") + 1
     assert run_call_args[volume_arg_idx] == "/workspaces/team-1:/workspace"
+
+
+@patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
+@patch("akgentic.tool.sandbox.docker.subprocess.run")
+def test_start_sandbox_docker_run_normalizes_trailing_slash_in_root(
+    mock_run: MagicMock, mock_which: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Story 6.5: AKGENTIC_WORKSPACES_ROOT with trailing slash must NOT produce double-slash volume.
+
+    e.g. '/workspaces/' must yield '/workspaces/team-1:/workspace', not '/workspaces//team-1:/workspace'.
+    Path() normalizes this automatically.
+    """
+    monkeypatch.setenv("AKGENTIC_WORKSPACES_ROOT", "/workspaces/")
+    mock_run.side_effect = [
+        MagicMock(stdout="", returncode=0),  # docker ps -a
+        MagicMock(stdout="abc123", returncode=0),  # docker run
+    ]
+    actor = make_actor(team_id="team-1")
+    actor._start_sandbox()
+
+    run_call_args = mock_run.call_args_list[1][0][0]
+    volume_arg_idx = run_call_args.index("-v") + 1
+    volume = run_call_args[volume_arg_idx]
+    assert volume == "/workspaces/team-1:/workspace", (
+        f"Volume mount must not contain double slash: got '{volume}'"
+    )
 
 
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
