@@ -19,7 +19,7 @@ from typing import Any, Callable
 
 from pydantic import PrivateAttr
 
-from akgentic.tool.core import TOOL_CALL, BaseToolParam, Channels, ToolCard, _resolve
+from akgentic.tool.core import COMMAND, TOOL_CALL, BaseToolParam, Channels, ToolCard, _resolve
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.event import ActorToolObserver
 from akgentic.tool.workspace.edit import (
@@ -30,10 +30,11 @@ from akgentic.tool.workspace.edit import (
     normalise_endings,
     parse_patch,
 )
-from akgentic.tool.workspace.readers import DocumentReader
+from akgentic.tool.workspace.readers import _MIME_MAP, DocumentReader, MediaContent
 from akgentic.tool.workspace.workspace import Filesystem, get_workspace
 
 _PERM_ERR_MSG = "Path escapes workspace root — use a path relative to the workspace"
+_REF_RE = _re.compile(r"!!(\S+)")
 
 
 class WorkspaceRead(BaseToolParam):
@@ -64,6 +65,15 @@ class WorkspaceGrep(BaseToolParam):
     expose: set[Channels] = {TOOL_CALL}
     max_results: int = 100
     max_line_length: int = 2000
+
+
+class ExpandMediaRefs(BaseToolParam):
+    """Expand ``!!glob_pattern`` tokens in a prompt into binary image content.
+
+    COMMAND channel only — never exposed as an LLM tool.
+    """
+
+    expose: set[Channels] = {COMMAND}
 
 
 def _grep_python(
@@ -244,6 +254,7 @@ class WorkspaceReadTool(ToolCard):
     workspace_glob: WorkspaceGlob | bool = True
     workspace_grep: WorkspaceGrep | bool = True
     document_reader: DocumentReader | bool = True
+    workspace_expand_media_refs: ExpandMediaRefs | bool = True
 
     # Private runtime state — not part of the serialised config.
     # Default None sentinel lets the workspace property detect uninitialized state
@@ -302,6 +313,86 @@ class WorkspaceReadTool(ToolCard):
         if pgr is not None and TOOL_CALL in pgr.expose:
             tools.append(self._grep_factory(pgr))
         return tools
+
+    def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
+        """Return COMMAND-channel capabilities for this tool.
+
+        Returns:
+            Dict mapping ``ExpandMediaRefs`` to ``_expand_media_refs`` when enabled.
+        """
+        commands: dict[type[BaseToolParam], Callable[..., Any]] = {}
+        pr = _resolve(self.workspace_expand_media_refs, ExpandMediaRefs)
+        if pr is not None:
+            commands[ExpandMediaRefs] = self._expand_media_refs
+        return commands
+
+    def _expand_media_refs(self, prompt: str) -> list[str | MediaContent]:
+        """Expand ``!!glob_pattern`` tokens in a prompt into binary image content.
+
+        For each ``!!pattern`` token:
+        - Image matches (extension in ``_MIME_MAP``) → ``MediaContent`` objects (sorted by path)
+        - Document-only matches (extension in ``DocumentReader.extensions`` but NOT in
+          ``_MIME_MAP``) → ``"!!name[=> Use workspace_read tool]"`` hint strings
+        - No matches at all → ``"!!_pattern_[Error: no image found]"``
+
+        Pure-text prompts (no ``!!`` tokens) return ``[prompt]``.
+
+        .. note::
+            The returned list may contain trailing empty strings (``""``) when the
+            prompt ends with a ``!!token`` with no text following it.  Consumers
+            that only care about non-empty parts should filter out empty strings::
+
+                parts = [p for p in result if p != ""]
+
+        Args:
+            prompt: Input prompt string potentially containing ``!!glob_pattern`` tokens.
+
+        Returns:
+            Mixed list of plain strings and ``MediaContent`` objects.  May include
+            trailing ``""`` entries when the last character of *prompt* is part of
+            an expanded token.
+
+        Raises:
+            RuntimeError: If :meth:`observer` has not been called yet (workspace
+                not initialised).
+        """
+        parts: list[str | MediaContent] = []
+        last = 0
+        for m in _REF_RE.finditer(prompt):
+            if m.start() > last:
+                parts.append(prompt[last : m.start()])
+            pattern = m.group(1)
+            all_matches = sorted(
+                p for p in self.workspace._root.glob(pattern) if p.is_file()
+            )
+            image_matches = [p for p in all_matches if p.suffix.lower() in _MIME_MAP]
+            doc_matches = [
+                p
+                for p in all_matches
+                if p.suffix.lower() in DocumentReader.extensions
+                and p.suffix.lower() not in _MIME_MAP
+            ]
+            if image_matches:
+                for path in image_matches:
+                    try:
+                        data = path.read_bytes()
+                    except OSError:
+                        parts.append(f"!!_{path.name}_[Error: file unreadable]")
+                        continue
+                    parts.append(
+                        MediaContent(
+                            data=data,
+                            media_type=_MIME_MAP[path.suffix.lower()],
+                        )
+                    )
+            elif doc_matches:
+                for path in doc_matches:
+                    parts.append(f"!!{path.name}[=> Use workspace_read tool]")
+            else:
+                parts.append(f"!!_{pattern}_[Error: no image found]")
+            last = m.end()
+        parts.append(prompt[last:])
+        return parts
 
     def _read_factory(self, params: WorkspaceRead) -> Callable[..., Any]:
         """Create the ``workspace_read`` tool callable.
