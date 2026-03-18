@@ -32,10 +32,12 @@ from akgentic.tool.sandbox.local import LocalSandboxActor
 # ---------------------------------------------------------------------------
 
 
-def make_actor(team_id: str = "team-test") -> LocalSandboxActor:
+def make_actor(team_id: str = "team-test", workspace_id: str | None = None) -> LocalSandboxActor:
     """Create a LocalSandboxActor with config and state pre-initialized (no Pykka runtime)."""
     actor = LocalSandboxActor()
-    actor.config = SandboxConfig(name="sandbox", role="ToolActor", team_id=team_id)
+    actor.config = SandboxConfig(
+        name="sandbox", role="ToolActor", team_id=team_id, workspace_id=workspace_id
+    )
     actor.state = SandboxState()
     actor.state.observer(actor)
     return actor
@@ -352,6 +354,68 @@ def test_workspace_tool_and_local_sandbox_actor_resolve_same_path_custom_root(
 
     # LocalSandboxActor path
     actor = make_actor(team_id="team-1")
+    actor._start_sandbox()
+    sandbox_root = actor.state.workspace_path
+
+    assert sandbox_root is not None
+    assert workspace_tool_root == sandbox_root, (
+        f"WorkspaceTool root ({workspace_tool_root}) != "
+        f"LocalSandboxActor root ({sandbox_root})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Story 6.6: workspace_id overrides team_id for workspace directory name
+# ---------------------------------------------------------------------------
+
+
+def test_start_sandbox_workspace_id_overrides_team_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FR-SB-33: When workspace_id is set, workspace path uses workspace_id, not team_id."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
+    actor = make_actor(team_id="team-1", workspace_id="test")
+
+    actor._start_sandbox()
+
+    expected = tmp_path / "workspaces" / "test"
+    assert expected.exists()
+    assert expected.is_dir()
+    assert actor.state.workspace_path == expected.resolve()
+
+
+def test_start_sandbox_workspace_id_none_falls_back_to_team_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FR-SB-33: When workspace_id is None, workspace path uses team_id (unchanged default)."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
+    actor = make_actor(team_id="team-1", workspace_id=None)
+
+    actor._start_sandbox()
+
+    expected = tmp_path / "workspaces" / "team-1"
+    assert expected.exists()
+    assert actor.state.workspace_path == expected.resolve()
+
+
+def test_exec_tool_and_workspace_tool_resolve_same_path_via_workspace_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FR-SB-35: ExecTool(workspace_id='test') and WorkspaceTool(workspace_id='test')
+    resolve to the same absolute directory when AKGENTIC_WORKSPACES_ROOT is set.
+    """
+    from akgentic.tool.workspace.workspace import get_workspace
+
+    monkeypatch.setenv("AKGENTIC_WORKSPACES_ROOT", str(tmp_path / "workspaces"))
+
+    # WorkspaceTool path via get_workspace (mirrors WorkspaceReadTool.observer logic)
+    workspace = get_workspace("test")
+    workspace_tool_root = workspace._root.resolve()
+
+    # LocalSandboxActor path with workspace_id="test"
+    actor = make_actor(team_id="team-1", workspace_id="test")
     actor._start_sandbox()
     sandbox_root = actor.state.workspace_path
 

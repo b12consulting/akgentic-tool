@@ -38,10 +38,14 @@ from akgentic.tool.sandbox.docker import (
 # ---------------------------------------------------------------------------
 
 
-def make_actor(team_id: str = "team-test") -> DockerSandboxActor:
+def make_actor(
+    team_id: str = "team-test", workspace_id: str | None = None
+) -> DockerSandboxActor:
     """Create a DockerSandboxActor with config and state pre-initialized (no Pykka runtime)."""
     actor = DockerSandboxActor()
-    actor.config = SandboxConfig(name="sandbox", role="ToolActor", team_id=team_id)
+    actor.config = SandboxConfig(
+        name="sandbox", role="ToolActor", team_id=team_id, workspace_id=workspace_id
+    )
     actor.state = SandboxState()
     actor.state.observer(actor)
     return actor
@@ -495,3 +499,66 @@ def test_start_sandbox_calls_notify_state_change(
     with patch("akgentic.tool.sandbox.actor.SandboxState.notify_state_change") as mock_notify:
         actor._start_sandbox()
         mock_notify.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Story 6.6: workspace_id overrides team_id for volume mount; container name unchanged
+# ---------------------------------------------------------------------------
+
+
+@patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
+@patch("akgentic.tool.sandbox.docker.subprocess.run")
+def test_start_sandbox_workspace_id_overrides_volume_mount(
+    mock_run: MagicMock, mock_which: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FR-SB-34: workspace_id='test' makes volume mount use 'test', not team_id."""
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
+    mock_run.side_effect = [
+        MagicMock(stdout="", returncode=0),  # docker ps -a
+        MagicMock(stdout="abc123", returncode=0),  # docker run
+    ]
+    actor = make_actor(team_id="t1", workspace_id="test")
+    actor._start_sandbox()
+
+    run_call_args = mock_run.call_args_list[1][0][0]
+    volume_arg_idx = run_call_args.index("-v") + 1
+    assert run_call_args[volume_arg_idx] == "workspaces/test:/workspace"
+
+
+@patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
+@patch("akgentic.tool.sandbox.docker.subprocess.run")
+def test_start_sandbox_container_name_uses_team_id_not_workspace_id(
+    mock_run: MagicMock, mock_which: MagicMock
+) -> None:
+    """FR-SB-34: container name is sandbox-{team_id}, NOT sandbox-{workspace_id}."""
+    mock_run.side_effect = [
+        MagicMock(stdout="", returncode=0),  # docker ps -a
+        MagicMock(stdout="abc123", returncode=0),  # docker run
+    ]
+    actor = make_actor(team_id="t1", workspace_id="test")
+    actor._start_sandbox()
+
+    # Container name must be based on team_id, not workspace_id
+    assert actor.state.container_name == "sandbox-t1"
+    run_call_args = mock_run.call_args_list[1][0][0]
+    name_idx = run_call_args.index("--name") + 1
+    assert run_call_args[name_idx] == "sandbox-t1"
+
+
+@patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
+@patch("akgentic.tool.sandbox.docker.subprocess.run")
+def test_start_sandbox_workspace_id_none_uses_team_id_for_volume(
+    mock_run: MagicMock, mock_which: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FR-SB-34: workspace_id=None falls back to team_id for volume mount (unchanged default)."""
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
+    mock_run.side_effect = [
+        MagicMock(stdout="", returncode=0),  # docker ps -a
+        MagicMock(stdout="abc123", returncode=0),  # docker run
+    ]
+    actor = make_actor(team_id="team-1", workspace_id=None)
+    actor._start_sandbox()
+
+    run_call_args = mock_run.call_args_list[1][0][0]
+    volume_arg_idx = run_call_args.index("-v") + 1
+    assert run_call_args[volume_arg_idx] == "workspaces/team-1:/workspace"

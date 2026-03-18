@@ -103,6 +103,29 @@ def test_sandbox_config_mode_local_explicit() -> None:
     assert config.mode == "local"
 
 
+def test_sandbox_config_workspace_id_defaults_to_none() -> None:
+    """FR-SB-31: SandboxConfig.workspace_id defaults to None."""
+    config = SandboxConfig(name="sandbox", role="ToolActor", team_id="team-1")
+    assert config.workspace_id is None
+
+
+def test_sandbox_config_workspace_id_can_be_set() -> None:
+    """FR-SB-31: SandboxConfig.workspace_id can be set to a string value."""
+    config = SandboxConfig(
+        name="sandbox", role="ToolActor", team_id="team-1", workspace_id="my-workspace"
+    )
+    assert config.workspace_id == "my-workspace"
+
+
+def test_sandbox_config_has_both_team_id_and_workspace_id() -> None:
+    """FR-SB-31: SandboxConfig stores both team_id and workspace_id independently."""
+    config = SandboxConfig(
+        name="sandbox", role="ToolActor", team_id="t1", workspace_id="test"
+    )
+    assert config.team_id == "t1"
+    assert config.workspace_id == "test"
+
+
 # ---------------------------------------------------------------------------
 # SandboxState model validation (AC1)
 # ---------------------------------------------------------------------------

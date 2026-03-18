@@ -67,11 +67,16 @@ class SandboxConfig(BaseConfig):
 
     Attributes:
         team_id: Identifier of the team that owns this sandbox.
+        workspace_id: Optional workspace directory name override.  When ``None``
+            (default), the workspace directory is named after ``team_id``.  When
+            set, the named directory is used instead.  Docker container name
+            always uses ``team_id`` — containers are per-team, not per-workspace.
         mode: Execution backend — ``"local"`` (subprocess) or ``"docker"``
             (persistent container).  Defaults to ``"local"``.
     """
 
     team_id: str
+    workspace_id: str | None = None
     mode: Literal["local", "docker"] = "local"
 
 

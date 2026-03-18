@@ -404,3 +404,58 @@ def test_exec_tool_mode_not_affected_by_sandbox_mode_env(
     call_args = observer._orch_proxy.createActor.call_args
     # Despite env var, LocalSandboxActor must be chosen (mode="local")
     assert call_args[0][0] is LocalSandboxActor
+
+
+# ---------------------------------------------------------------------------
+# Story 6.6: workspace_id field on ExecTool and pass-through to SandboxConfig
+# ---------------------------------------------------------------------------
+
+
+def test_exec_tool_workspace_id_defaults_to_none() -> None:
+    """FR-SB-32: ExecTool.workspace_id defaults to None."""
+    tool = ExecTool()
+    assert tool.workspace_id is None
+
+
+def test_exec_tool_workspace_id_can_be_set() -> None:
+    """FR-SB-32: ExecTool(workspace_id='test') stores workspace_id='test'."""
+    tool = ExecTool(workspace_id="test")
+    assert tool.workspace_id == "test"
+
+
+def test_observer_passes_workspace_id_to_sandbox_config() -> None:
+    """FR-SB-32: ExecTool.observer() passes workspace_id through to SandboxConfig."""
+    observer = MockObserver(existing_actor=None)
+    tool = ExecTool(workspace_id="test")
+
+    tool.observer(observer)  # type: ignore[arg-type]
+
+    call_kwargs = observer._orch_proxy.createActor.call_args[1]
+    config: SandboxConfig = call_kwargs["config"]
+    assert config.workspace_id == "test"
+
+
+def test_observer_passes_workspace_id_none_to_sandbox_config() -> None:
+    """FR-SB-32: ExecTool() (no workspace_id) passes workspace_id=None to SandboxConfig."""
+    observer = MockObserver(existing_actor=None)
+    tool = ExecTool()
+
+    tool.observer(observer)  # type: ignore[arg-type]
+
+    call_kwargs = observer._orch_proxy.createActor.call_args[1]
+    config: SandboxConfig = call_kwargs["config"]
+    assert config.workspace_id is None
+
+
+def test_observer_config_has_team_id_and_workspace_id_independently() -> None:
+    """FR-SB-32: SandboxConfig gets both team_id and workspace_id, independently set."""
+    observer = MockObserver(existing_actor=None)
+    observer._team_id = "t1"
+    tool = ExecTool(workspace_id="my-ws")
+
+    tool.observer(observer)  # type: ignore[arg-type]
+
+    call_kwargs = observer._orch_proxy.createActor.call_args[1]
+    config: SandboxConfig = call_kwargs["config"]
+    assert config.team_id == "t1"
+    assert config.workspace_id == "my-ws"
