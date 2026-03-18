@@ -160,7 +160,7 @@ _BRACE_RE = _re.compile(r"\{([^{}]+)\}")
 
 
 def _expand_braces(pattern: str) -> list[str]:
-    """Expand a single brace group in a glob pattern into multiple patterns.
+    """Expand brace groups in a glob pattern into multiple patterns.
 
     Handles multiple non-nested brace groups via recursion.
     Patterns without braces are returned as-is (passthrough).

@@ -1028,6 +1028,10 @@ class TestExpandBraces:
         result = _expand_braces("**/*.{py, js, ts}")
         assert result == ["**/*.py", "**/*.js", "**/*.ts"]
 
+    def test_expand_braces_single_alternative(self) -> None:
+        """Single alternative in braces degenerates to one pattern."""
+        assert _expand_braces("**/*.{py}") == ["**/*.py"]
+
 
 # ---------------------------------------------------------------------------
 # Story 5.9: workspace_glob brace expansion integration tests
@@ -1043,8 +1047,9 @@ class TestWorkspaceGlobBraceExpansion:
         (root / "b.js").write_bytes(b"b")
         glob_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_glob")
         result = glob_fn("**/*.{py,js}")
-        assert "a.py" in result
-        assert "b.js" in result
+        lines = result.splitlines()
+        assert "a.py" in lines
+        assert "b.js" in lines
 
     def test_no_brace_passthrough(self, tmp_path: Path) -> None:
         """AC 5: No-brace pattern behaves identically to pre-brace implementation."""
@@ -1077,8 +1082,9 @@ class TestWorkspaceGlobBraceExpansion:
         (lib / "b.js").write_bytes(b"b")
         glob_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_glob")
         result = glob_fn("{src,lib}/**/*.{py,js}")
-        assert "a.py" in result
-        assert "b.js" in result
+        lines = result.splitlines()
+        assert "src/a.py" in lines
+        assert "lib/b.js" in lines
 
     def test_mtime_sort_preserved(self, tmp_path: Path) -> None:
         """AC 1: Results are sorted newest-first by mtime."""
