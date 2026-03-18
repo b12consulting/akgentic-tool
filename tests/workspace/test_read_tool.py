@@ -10,8 +10,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.workspace.readers import DocumentReader
+from akgentic.tool.workspace.readers import DocumentReader, MediaContent
 from akgentic.tool.workspace.tool import (
+    ExpandMediaRefs,
     WorkspaceGlob,
     WorkspaceGrep,
     WorkspaceList,
@@ -1203,3 +1204,162 @@ class TestDocumentReaderLazyInit:
         second = reader._get_openai_client()
         # Same object identity — no second construction
         assert first is second
+
+
+# ---------------------------------------------------------------------------
+# Story 3-1: ExpandMediaRefs command (AC-1 through AC-8)
+# ---------------------------------------------------------------------------
+
+
+class TestExpandMediaRefs:
+    """Tests for WorkspaceReadTool._expand_media_refs (story 3-1)."""
+
+    def test_single_image_match(self, tmp_path: Path) -> None:
+        """AC-1: Single image match → MediaContent with correct bytes and media_type."""
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        (root / "photo.png").write_bytes(b"fake-png")
+        result = tool._expand_media_refs("look at !!photo.png please")
+        assert result == [
+            "look at ",
+            MediaContent(data=b"fake-png", media_type="image/png"),
+            " please",
+        ]
+
+    def test_multi_image_match_glob(self, tmp_path: Path) -> None:
+        """AC-2: Glob pattern !!*.png → sorted list of MediaContent objects."""
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        (root / "a.png").write_bytes(b"aaa")
+        (root / "b.png").write_bytes(b"bbb")
+        result = tool._expand_media_refs("check !!*.png")
+        # sorted by path → a.png before b.png
+        assert result == [
+            "check ",
+            MediaContent(data=b"aaa", media_type="image/png"),
+            MediaContent(data=b"bbb", media_type="image/png"),
+            "",
+        ]
+
+    def test_document_match_hint(self, tmp_path: Path) -> None:
+        """AC-3: Document match (.pdf) → hint string with workspace_read instruction."""
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        (root / "report.pdf").write_bytes(b"%PDF-fake")
+        result = tool._expand_media_refs("show !!report.pdf")
+        assert result == ["show ", "!!report.pdf[=> Use workspace_read tool]", ""]
+
+    def test_no_match_error(self, tmp_path: Path) -> None:
+        """AC-4: No match → error string with pattern name."""
+        tool = make_tool(tmp_path)
+        result = tool._expand_media_refs("show !!missing.png")
+        assert result == ["show ", "!!_missing.png_[Error: no image found]", ""]
+
+    def test_pure_text_passthrough(self, tmp_path: Path) -> None:
+        """AC-5: Pure text prompt with no !! tokens → single-element list."""
+        tool = make_tool(tmp_path)
+        result = tool._expand_media_refs("no tokens here")
+        assert result == ["no tokens here"]
+
+    def test_disabled_field_excludes_from_commands(self, tmp_path: Path) -> None:
+        """AC-6: workspace_expand_media_refs=False → ExpandMediaRefs not in get_commands()."""
+        import uuid
+        from unittest.mock import patch
+
+        tid = uuid.uuid4()
+        fs = Filesystem(str(tmp_path), str(tid))
+        observer = make_observer(team_id=tid)
+        tool = WorkspaceReadTool(workspace_expand_media_refs=False)
+        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+            tool.observer(observer)
+        commands = tool.get_commands()
+        assert ExpandMediaRefs not in commands
+
+    def test_enabled_field_includes_in_commands(self, tmp_path: Path) -> None:
+        """AC-6 inverse: workspace_expand_media_refs=True → ExpandMediaRefs in get_commands()."""
+        tool = make_tool(tmp_path)
+        commands = tool.get_commands()
+        assert ExpandMediaRefs in commands
+        assert commands[ExpandMediaRefs] == tool._expand_media_refs
+
+    def test_media_content_model_dump(self) -> None:
+        """AC-7: MediaContent.model_dump() returns correct dict."""
+        mc = MediaContent(data=b"abc", media_type="image/png")
+        result = mc.model_dump()
+        assert result == {"data": b"abc", "media_type": "image/png"}
+
+    def test_mixed_prompt_text_and_image(self, tmp_path: Path) -> None:
+        """AC-8: Mixed prompt — text segments interleaved with image tokens."""
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        (root / "cat.jpg").write_bytes(b"jpg-bytes")
+        result = tool._expand_media_refs("hello !!cat.jpg world")
+        assert result == [
+            "hello ",
+            MediaContent(data=b"jpg-bytes", media_type="image/jpeg"),
+            " world",
+        ]
+
+    def test_expand_media_refs_not_in_get_tools(self, tmp_path: Path) -> None:
+        """AC-8 / Task 6.9: ExpandMediaRefs must NOT appear in get_tools() — COMMAND channel only."""
+        tool = make_tool(tmp_path)
+        tools = tool.get_tools()
+        tool_names = [fn.__name__ for fn in tools]
+        assert "expand_media_refs" not in tool_names
+
+    def test_jpg_mime_type(self, tmp_path: Path) -> None:
+        """Image with .jpg extension → media_type image/jpeg."""
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        (root / "img.jpg").write_bytes(b"jpegdata")
+        result = tool._expand_media_refs("!!img.jpg")
+        assert result == [MediaContent(data=b"jpegdata", media_type="image/jpeg"), ""]
+
+    def test_webp_mime_type(self, tmp_path: Path) -> None:
+        """Image with .webp extension → media_type image/webp."""
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        (root / "anim.webp").write_bytes(b"webpdata")
+        result = tool._expand_media_refs("!!anim.webp")
+        assert result == [MediaContent(data=b"webpdata", media_type="image/webp"), ""]
+
+    def test_gif_mime_type(self, tmp_path: Path) -> None:
+        """Image with .gif extension → media_type image/gif."""
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        (root / "anim.gif").write_bytes(b"gifdata")
+        result = tool._expand_media_refs("!!anim.gif")
+        assert result == [MediaContent(data=b"gifdata", media_type="image/gif"), ""]
+
+    def test_bmp_mime_type(self, tmp_path: Path) -> None:
+        """Image with .bmp extension → media_type image/bmp."""
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        (root / "icon.bmp").write_bytes(b"bmpdata")
+        result = tool._expand_media_refs("!!icon.bmp")
+        assert result == [MediaContent(data=b"bmpdata", media_type="image/bmp"), ""]
+
+    def test_image_takes_priority_over_doc_extension(self, tmp_path: Path) -> None:
+        """Image extensions shared with DocumentReader (e.g. .png) → MediaContent, not hint."""
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        # .png is in both _MIME_MAP and DocumentReader.extensions
+        assert ".png" in DocumentReader.extensions
+        (root / "photo.png").write_bytes(b"imgdata")
+        result = tool._expand_media_refs("!!photo.png")
+        assert result == [MediaContent(data=b"imgdata", media_type="image/png"), ""]
+
+    def test_multiple_tokens_in_prompt(self, tmp_path: Path) -> None:
+        """Multiple !! tokens in one prompt → each expands independently."""
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        (root / "a.png").write_bytes(b"adata")
+        (root / "b.png").write_bytes(b"bdata")
+        result = tool._expand_media_refs("first !!a.png middle !!b.png end")
+        assert result == [
+            "first ",
+            MediaContent(data=b"adata", media_type="image/png"),
+            " middle ",
+            MediaContent(data=b"bdata", media_type="image/png"),
+            " end",
+        ]

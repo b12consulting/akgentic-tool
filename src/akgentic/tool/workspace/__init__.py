@@ -15,8 +15,10 @@ from akgentic.tool.workspace.readers import (
     TEXT_EXTENSIONS,
     DocumentReader,
     FileTypeReader,
+    MediaContent,
 )
 from akgentic.tool.workspace.tool import (
+    ExpandMediaRefs,
     WorkspaceDelete,
     WorkspaceEdit,
     WorkspaceGlob,
@@ -40,6 +42,7 @@ from akgentic.tool.workspace.workspace import (
 __all__ = [
     "DocumentReader",
     "FileTypeReader",
+    "MediaContent",
     "TEXT_EXTENSIONS",
     "EditItem",
     "EditMatcher",
@@ -54,6 +57,7 @@ __all__ = [
     "Filesystem",
     "Workspace",
     "get_workspace",
+    "ExpandMediaRefs",
     "WorkspaceRead",
     "WorkspaceList",
     "WorkspaceGlob",

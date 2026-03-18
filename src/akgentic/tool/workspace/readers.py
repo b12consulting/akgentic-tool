@@ -12,6 +12,27 @@ from pydantic import BaseModel, PrivateAttr
 if TYPE_CHECKING:
     from openai import OpenAI
 
+_MIME_MAP: dict[str, str] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+}
+
+
+class MediaContent(BaseModel):
+    """In-memory binary image content with MIME type.
+
+    Plain ``BaseModel`` (NOT ``SerializableBaseModel``) — in-memory only,
+    never wire-serialized.  No pydantic-ai imports — framework-agnostic by design.
+    """
+
+    data: bytes
+    media_type: str
+
+
 TEXT_EXTENSIONS: frozenset[str] = frozenset(
     {
         ".txt",
