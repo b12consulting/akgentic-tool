@@ -156,6 +156,33 @@ def _grep_rg(
     return matches
 
 
+_BRACE_RE = _re.compile(r"\{([^{}]+)\}")
+
+
+def _expand_braces(pattern: str) -> list[str]:
+    """Expand a single brace group in a glob pattern into multiple patterns.
+
+    Handles multiple non-nested brace groups via recursion.
+    Patterns without braces are returned as-is (passthrough).
+
+    Args:
+        pattern: Glob pattern, potentially containing brace groups like ``{py,js}``.
+
+    Returns:
+        List of fully expanded patterns (one entry if no braces found).
+    """
+    match = _BRACE_RE.search(pattern)
+    if not match:
+        return [pattern]
+    prefix = pattern[: match.start()]
+    suffix = pattern[match.end() :]
+    alternatives = match.group(1).split(",")
+    expanded: list[str] = []
+    for alt in alternatives:
+        expanded.extend(_expand_braces(f"{prefix}{alt.strip()}{suffix}"))
+    return expanded
+
+
 def _build_tree(
     root: Path,
     prefix: str = "",
@@ -458,8 +485,15 @@ class WorkspaceReadTool(ToolCard):
                         raise PermissionError(f"Path '{path}' escapes workspace root")
                 else:
                     search_root = backend._root
+                seen: set[Path] = set()
+                raw_matches: list[Path] = []
+                for expanded_pattern in _expand_braces(pattern):
+                    for m in search_root.glob(expanded_pattern):
+                        if m.is_file() and m not in seen:
+                            seen.add(m)
+                            raw_matches.append(m)
                 all_matches = sorted(
-                    (match for match in search_root.glob(pattern) if match.is_file()),
+                    raw_matches,
                     key=lambda match: match.stat().st_mtime,
                     reverse=True,
                 )
