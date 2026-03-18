@@ -33,7 +33,7 @@ class DockerSandboxActor(SandboxActor):
             )
         base = os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
         ws_name = self.config.workspace_id or self.config.team_id
-        volume = f"{Path(base) / ws_name}:/workspace"
+        volume = f"{(Path(base) / ws_name).resolve()}:/workspace"
         # Check if container already exists (any state)
         check = subprocess.run(
             [
@@ -56,15 +56,13 @@ class DockerSandboxActor(SandboxActor):
                 check=True,
             )
         else:
-            subprocess.run(
+            result = subprocess.run(
                 [
                     "docker",
                     "run",
                     "-d",
                     "--name",
                     container_name,
-                    "--network",
-                    "none",
                     "-v",
                     volume,
                     "-w",
@@ -75,8 +73,11 @@ class DockerSandboxActor(SandboxActor):
                 ],
                 capture_output=True,
                 text=True,
-                check=True,
             )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"docker run failed (exit {result.returncode}): {result.stderr.strip()}"
+                )
         self.state.container_name = container_name
         self.state.notify_state_change()
 
