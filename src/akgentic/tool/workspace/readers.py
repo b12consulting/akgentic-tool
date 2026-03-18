@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from openai import OpenAI
@@ -85,6 +86,31 @@ class DocumentReader:
         self._llm_client = llm_client
         self._llm_model = llm_model
 
+    @staticmethod
+    def _convert_via_tempfile(md: Any, content: bytes, suffix: str) -> str:
+        """Write content to a temp file, convert via MarkItDown, and clean up.
+
+        Uses ``delete=False`` to avoid Windows file-locking issues when
+        MarkItDown re-opens the file by name.
+
+        Args:
+            md: A ``MarkItDown`` instance (plain or LLM-enabled).
+            content: Raw bytes to write.
+            suffix: File suffix for the temp file (e.g. ".pdf").
+
+        Returns:
+            Extracted text content, or empty string if None.
+        """
+        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        try:
+            tmp.write(content)
+            tmp.flush()
+            tmp.close()
+            result = md.convert(tmp.name)
+            return result.text_content or ""
+        finally:
+            os.unlink(tmp.name)
+
     def extract_text(self, content: bytes, path: str) -> str:
         """Extract text from binary file content using MarkItDown.
 
@@ -109,23 +135,14 @@ class DocumentReader:
         suffix = Path(path).suffix or ".bin"
 
         # Pass 1: plain MarkItDown (no LLM)
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
-            tmp.write(content)
-            tmp.flush()
-            md = MarkItDown()
-            result = md.convert(tmp.name)
-            text = result.text_content or ""
+        text = self._convert_via_tempfile(MarkItDown(), content, suffix)
 
         # Pass 2: LLM vision fallback if Pass 1 yielded insufficient content
         if len("".join(text.split())) < 50 and self._llm_client is not None:
-            with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp2:
-                tmp2.write(content)
-                tmp2.flush()
-                md_vision = MarkItDown(
-                    llm_client=self._llm_client, llm_model=self._llm_model
-                )
-                result2 = md_vision.convert(tmp2.name)
-                text = result2.text_content or ""
+            md_vision = MarkItDown(
+                llm_client=self._llm_client, llm_model=self._llm_model
+            )
+            text = self._convert_via_tempfile(md_vision, content, suffix)
 
         if len("".join(text.split())) < 50:
             return "<!-- markitdown: no text extracted -->"

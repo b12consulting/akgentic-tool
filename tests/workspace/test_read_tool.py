@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.workspace.readers import DocumentReader, TEXT_EXTENSIONS
+from akgentic.tool.workspace.readers import DocumentReader
 from akgentic.tool.workspace.tool import (
     WorkspaceGlob,
     WorkspaceGrep,
@@ -892,6 +892,15 @@ class TestBinaryFileReading:
         )
         result = read_fn("data.custom")
         assert "custom format data" in result
+
+    def test_binary_file_not_found_raises_retriable_error(self, tmp_path: Path) -> None:
+        """Binary file that doesn't exist -> RetriableError (not ValueError)."""
+        reader = DocumentReader()
+        tool, _fs = make_wired_tool(tmp_path, document_reader=reader)
+
+        read_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_read")
+        with pytest.raises(RetriableError, match="File not found: missing.pdf"):
+            read_fn("missing.pdf")
 
 
 # ---------------------------------------------------------------------------
