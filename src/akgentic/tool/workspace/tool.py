@@ -337,11 +337,24 @@ class WorkspaceReadTool(ToolCard):
 
         Pure-text prompts (no ``!!`` tokens) return ``[prompt]``.
 
+        .. note::
+            The returned list may contain trailing empty strings (``""``) when the
+            prompt ends with a ``!!token`` with no text following it.  Consumers
+            that only care about non-empty parts should filter out empty strings::
+
+                parts = [p for p in result if p != ""]
+
         Args:
             prompt: Input prompt string potentially containing ``!!glob_pattern`` tokens.
 
         Returns:
-            Mixed list of plain strings and ``MediaContent`` objects.
+            Mixed list of plain strings and ``MediaContent`` objects.  May include
+            trailing ``""`` entries when the last character of *prompt* is part of
+            an expanded token.
+
+        Raises:
+            RuntimeError: If :meth:`observer` has not been called yet (workspace
+                not initialised).
         """
         parts: list[str | MediaContent] = []
         last = 0
@@ -361,9 +374,14 @@ class WorkspaceReadTool(ToolCard):
             ]
             if image_matches:
                 for path in image_matches:
+                    try:
+                        data = path.read_bytes()
+                    except OSError:
+                        parts.append(f"!!_{path.name}_[Error: file unreadable]")
+                        continue
                     parts.append(
                         MediaContent(
-                            data=path.read_bytes(),
+                            data=data,
                             media_type=_MIME_MAP[path.suffix.lower()],
                         )
                     )

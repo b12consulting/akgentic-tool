@@ -1363,3 +1363,9 @@ class TestExpandMediaRefs:
             MediaContent(data=b"bdata", media_type="image/png"),
             " end",
         ]
+
+    def test_expand_media_refs_raises_before_observer_called(self) -> None:
+        """M2: Calling _expand_media_refs before observer() raises RuntimeError."""
+        tool = WorkspaceReadTool()
+        with pytest.raises(RuntimeError):
+            tool._expand_media_refs("!!photo.png")
