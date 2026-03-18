@@ -17,7 +17,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable
 
-from pydantic import ConfigDict, PrivateAttr
+from pydantic import PrivateAttr
 
 from akgentic.tool.core import TOOL_CALL, BaseToolParam, Channels, ToolCard, _resolve
 from akgentic.tool.errors import RetriableError
@@ -218,9 +218,7 @@ def _build_tree(
             # Recurse if max_depth is unlimited (0) or we haven't reached the limit
             if max_depth == 0 or current_depth + 1 < max_depth:
                 extension = "    " if is_last else "│   "
-                lines.extend(
-                    _build_tree(entry, prefix + extension, current_depth + 1, max_depth)
-                )
+                lines.extend(_build_tree(entry, prefix + extension, current_depth + 1, max_depth))
         else:
             size = entry.stat().st_size
             lines.append(f"{prefix}{connector}{entry.name} ({size} bytes)")
@@ -229,9 +227,13 @@ def _build_tree(
 
 
 class WorkspaceReadTool(ToolCard):
-    """Read-only workspace access: read, list, glob, grep."""
+    """Read-only workspace access: read, list, glob, grep.
 
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    ``document_reader`` controls binary file extraction:
+    - ``True`` (default): uses a default ``DocumentReader()`` (Pass 1 only, no LLM).
+    - ``False``: binary reads raise ``ValueError`` with install hint.
+    - ``DocumentReader(...)`` instance: custom extraction config (e.g. with LLM).
+    """
 
     name: str = "WorkspaceRead"
     description: str = "Read files, list directories, and search the team workspace"
@@ -241,7 +243,7 @@ class WorkspaceReadTool(ToolCard):
     workspace_list: WorkspaceList | bool = True
     workspace_glob: WorkspaceGlob | bool = True
     workspace_grep: WorkspaceGrep | bool = True
-    document_reader: DocumentReader | None = None
+    document_reader: DocumentReader | bool = True
 
     # Private runtime state — not part of the serialised config.
     # Default None sentinel lets the workspace property detect uninitialized state
@@ -277,9 +279,7 @@ class WorkspaceReadTool(ToolCard):
             RuntimeError: If :meth:`observer` has not been called yet.
         """
         if not isinstance(self._workspace, Filesystem):
-            raise RuntimeError(
-                "WorkspaceReadTool.workspace accessed before observer() was called."
-            )
+            raise RuntimeError("WorkspaceReadTool.workspace accessed before observer() was called.")
         return self._workspace
 
     def get_tools(self) -> list[Callable[..., Any]]:
@@ -313,7 +313,13 @@ class WorkspaceReadTool(ToolCard):
             Callable that reads a workspace file with pagination.
         """
         backend = self.workspace
-        document_reader = self.document_reader
+        _dr_cfg = self.document_reader
+        if _dr_cfg is True:
+            document_reader: DocumentReader | None = DocumentReader()
+        elif _dr_cfg is False:
+            document_reader = None
+        else:
+            document_reader = _dr_cfg
 
         def workspace_read(
             path: str,
@@ -347,11 +353,7 @@ class WorkspaceReadTool(ToolCard):
             is_sidecar = p.name.startswith(".") and p.name.endswith(".md")
 
             # ValueError check outside try -- configuration error, not retryable
-            if (
-                not is_sidecar
-                and document_reader is None
-                and ext in DocumentReader.extensions
-            ):
+            if not is_sidecar and document_reader is None and ext in DocumentReader.extensions:
                 raise ValueError(
                     "Binary file reading requires document_reader. "
                     'Install: pip install "akgentic-tool[docs]"'
@@ -380,13 +382,11 @@ class WorkspaceReadTool(ToolCard):
                 start = max(0, offset - 1)
                 end = min(start + limit, total)
                 numbered = "\n".join(
-                    f"{start + i + 1:<6}{line}"
-                    for i, line in enumerate(lines[start:end])
+                    f"{start + i + 1:<6}{line}" for i, line in enumerate(lines[start:end])
                 )
                 if end < total:
                     numbered += (
-                        f"\n[... truncated: {total} lines total,"
-                        f" showing {start + 1}-{end} ...]"
+                        f"\n[... truncated: {total} lines total, showing {start + 1}-{end} ...]"
                     )
                 return numbered
             except FileNotFoundError:
@@ -875,9 +875,7 @@ class WorkspaceTool(WorkspaceReadTool):
                         match = matcher.find(content, item.old_string)
                         if match is None:
                             return f"[ERROR] old_string not found in {item.path}"
-                        content = (
-                            content[: match.start] + item.new_string + content[match.end :]
-                        )
+                        content = content[: match.start] + item.new_string + content[match.end :]
 
                     normalised = normalise_endings(content, line_ending)
                     backend.write(item.path, normalised.encode("utf-8"))
@@ -953,8 +951,7 @@ class WorkspaceTool(WorkspaceReadTool):
                         else:
                             apply_file_patch(backend, fp)
                             is_add = bool(fp.hunks) and all(
-                                all(pl.startswith("+") for pl in h.lines if pl)
-                                for h in fp.hunks
+                                all(pl.startswith("+") for pl in h.lines if pl) for h in fp.hunks
                             )
                             if is_add:
                                 results.append(f"created: {fp.path}")
