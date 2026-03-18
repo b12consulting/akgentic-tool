@@ -11,6 +11,11 @@ from akgentic.tool.workspace.edit import (
     normalise_endings,
     parse_patch,
 )
+from akgentic.tool.workspace.readers import (
+    TEXT_EXTENSIONS,
+    DocumentReader,
+    FileTypeReader,
+)
 from akgentic.tool.workspace.tool import (
     WorkspaceDelete,
     WorkspaceEdit,
@@ -33,6 +38,9 @@ from akgentic.tool.workspace.workspace import (
 )
 
 __all__ = [
+    "DocumentReader",
+    "FileTypeReader",
+    "TEXT_EXTENSIONS",
     "EditItem",
     "EditMatcher",
     "FilePatch",

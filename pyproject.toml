@@ -22,6 +22,7 @@ vector_search = [
     "openai>=1.0.0",
     "numpy>=1.26.0",
 ]
+docs = ["markitdown[pdf,docx,xlsx,xls,pptx,outlook]>=0.1"]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
