@@ -17,7 +17,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable
 
-from pydantic import PrivateAttr
+from pydantic import ConfigDict, PrivateAttr
 
 from akgentic.tool.core import TOOL_CALL, BaseToolParam, Channels, ToolCard, _resolve
 from akgentic.tool.errors import RetriableError
@@ -30,6 +30,7 @@ from akgentic.tool.workspace.edit import (
     normalise_endings,
     parse_patch,
 )
+from akgentic.tool.workspace.readers import DocumentReader
 from akgentic.tool.workspace.workspace import Filesystem, get_workspace
 
 _PERM_ERR_MSG = "Path escapes workspace root — use a path relative to the workspace"
@@ -40,6 +41,7 @@ class WorkspaceRead(BaseToolParam):
 
     expose: set[Channels] = {TOOL_CALL}
     default_limit: int = 2000
+    force_document_regeneration: bool = False
 
 
 class WorkspaceList(BaseToolParam):
@@ -202,6 +204,8 @@ def _build_tree(
 class WorkspaceReadTool(ToolCard):
     """Read-only workspace access: read, list, glob, grep."""
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     name: str = "WorkspaceRead"
     description: str = "Read files, list directories, and search the team workspace"
 
@@ -210,6 +214,7 @@ class WorkspaceReadTool(ToolCard):
     workspace_list: WorkspaceList | bool = True
     workspace_glob: WorkspaceGlob | bool = True
     workspace_grep: WorkspaceGrep | bool = True
+    document_reader: DocumentReader | None = None
 
     # Private runtime state — not part of the serialised config.
     # Default None sentinel lets the workspace property detect uninitialized state
@@ -281,34 +286,80 @@ class WorkspaceReadTool(ToolCard):
             Callable that reads a workspace file with pagination.
         """
         backend = self.workspace
+        document_reader = self.document_reader
 
-        def workspace_read(path: str, offset: int = 1, limit: int = params.default_limit) -> str:
+        def workspace_read(
+            path: str,
+            offset: int = 1,
+            limit: int = params.default_limit,
+            force_document_regeneration: bool = params.force_document_regeneration,
+        ) -> str:
             """Read a file from the team workspace.
 
             Args:
                 path: Relative path from workspace root (e.g. "src/main.py").
                 offset: First line to return, 1-indexed. Defaults to 1.
                 limit: Maximum lines to return. Defaults to 2000.
+                force_document_regeneration: If True, re-extract binary files
+                    even if a cached sidecar exists. Defaults to False.
 
             Returns:
                 File contents with 1-indexed line numbers prefixed.
                 Truncated files include a trailing notice.
 
             Raises:
-                RetriableError: If the path does not exist or escapes the workspace root.
+                RetriableError: If the path does not exist or escapes the
+                    workspace root.
+                ValueError: If the file is a binary format and
+                    ``document_reader`` is not configured.
             """
+            ext = Path(path).suffix.lower()
+            p = Path(path)
+
+            # Sidecar self-read guard: .report.pdf.md -> plain text
+            is_sidecar = p.name.startswith(".") and p.name.endswith(".md")
+
+            # ValueError check outside try -- configuration error, not retryable
+            if (
+                not is_sidecar
+                and document_reader is None
+                and ext in DocumentReader.extensions
+            ):
+                raise ValueError(
+                    "Binary file reading requires document_reader. "
+                    'Install: pip install "akgentic-tool[docs]"'
+                )
+
             try:
-                raw = backend.read(path).decode("utf-8")
+                if (
+                    not is_sidecar
+                    and document_reader is not None
+                    and ext in document_reader.extensions
+                ):
+                    # Binary path: sidecar cache or extraction
+                    sidecar = backend._root / p.parent / f".{p.name}.md"
+                    if sidecar.exists() and not force_document_regeneration:
+                        raw = sidecar.read_text(encoding="utf-8")
+                    else:
+                        content_bytes = backend.read(path)
+                        raw = document_reader.extract_text(content_bytes, path)
+                        sidecar.write_text(raw, encoding="utf-8")
+                else:
+                    # Text path (existing logic)
+                    raw = backend.read(path).decode("utf-8")
+
                 lines = raw.splitlines()
                 total = len(lines)
                 start = max(0, offset - 1)
                 end = min(start + limit, total)
                 numbered = "\n".join(
-                    f"{start + i + 1:<6}{line}" for i, line in enumerate(lines[start:end])
+                    f"{start + i + 1:<6}{line}"
+                    for i, line in enumerate(lines[start:end])
                 )
                 if end < total:
                     numbered += (
-                        f"\n[... truncated: {total} lines total, showing {start + 1}-{end} ...]"
+                        f"\n[... truncated: {total} lines total,"
+                        f" showing {start + 1}-{end} ...]"
                     )
                 return numbered
             except FileNotFoundError:

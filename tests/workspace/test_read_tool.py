@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from akgentic.tool.errors import RetriableError
+from akgentic.tool.workspace.readers import DocumentReader
 from akgentic.tool.workspace.tool import (
     WorkspaceGlob,
     WorkspaceGrep,
@@ -677,3 +678,329 @@ class TestRetriableErrorReadTool:
         grep_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_grep")
         with pytest.raises(RetriableError, match="Path escapes workspace root"):
             grep_fn("pattern", path="../../escape")
+
+
+# ---------------------------------------------------------------------------
+# Helpers for binary reading tests
+# ---------------------------------------------------------------------------
+
+
+def make_wired_tool(
+    tmp_path: Path,
+    document_reader: DocumentReader | None = None,
+) -> tuple[WorkspaceReadTool, Filesystem]:
+    """Build a WorkspaceReadTool wired to a Filesystem, returning both."""
+    tid = uuid.uuid4()
+    fs = Filesystem(str(tmp_path), str(tid))
+    observer = make_observer(team_id=tid)
+    tool = WorkspaceReadTool(document_reader=document_reader)
+    with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        tool.observer(observer)
+    return tool, fs
+
+
+# ---------------------------------------------------------------------------
+# Story 5.8: Binary file reading — DocumentReader and sidecar cache
+# ---------------------------------------------------------------------------
+
+
+class TestBinaryFileReading:
+    """Tests for binary file reading dispatch in workspace_read (AC 1-10)."""
+
+    def test_document_reader_none_raises_value_error(self, tmp_path: Path) -> None:
+        """AC 1: workspace_read on binary ext with document_reader=None -> ValueError."""
+        tool, fs = make_wired_tool(tmp_path, document_reader=None)
+        pdf_path = fs._root / "report.pdf"
+        pdf_path.write_bytes(b"%PDF fake")
+
+        read_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_read")
+        with pytest.raises(ValueError, match='pip install "akgentic-tool\\[docs\\]"'):
+            read_fn("report.pdf")
+
+    def test_pass1_success_extracts_and_writes_sidecar(self, tmp_path: Path) -> None:
+        """AC 2: Pass 1 success -> sidecar written, content returned paginated."""
+        reader = DocumentReader()
+        tool, fs = make_wired_tool(tmp_path, document_reader=reader)
+        pdf_path = fs._root / "report.pdf"
+        pdf_path.write_bytes(b"%PDF fake content")
+
+        extracted = "# Report\n" + "x" * 60
+        with patch.object(reader, "extract_text", return_value=extracted):
+            read_fn = next(
+                t for t in tool.get_tools() if t.__name__ == "workspace_read"
+            )
+            result = read_fn("report.pdf")
+
+        assert "# Report" in result
+        sidecar = fs._root / ".report.pdf.md"
+        assert sidecar.exists()
+        assert "# Report" in sidecar.read_text(encoding="utf-8")
+
+    def test_sidecar_cache_hit(self, tmp_path: Path) -> None:
+        """AC 3: Sidecar exists + force_document_regeneration=False -> no extraction."""
+        reader = DocumentReader()
+        tool, fs = make_wired_tool(tmp_path, document_reader=reader)
+        pdf_path = fs._root / "report.pdf"
+        pdf_path.write_bytes(b"%PDF fake")
+        sidecar = fs._root / ".report.pdf.md"
+        sidecar.write_text("# Cached Content\nline two", encoding="utf-8")
+
+        with patch.object(reader, "extract_text") as mock_extract:
+            read_fn = next(
+                t for t in tool.get_tools() if t.__name__ == "workspace_read"
+            )
+            result = read_fn("report.pdf")
+            mock_extract.assert_not_called()
+
+        assert "# Cached Content" in result
+
+    def test_force_regeneration_bypasses_cache(self, tmp_path: Path) -> None:
+        """AC 4: force_document_regeneration=True -> re-extracts even if sidecar exists."""
+        reader = DocumentReader()
+        tool, fs = make_wired_tool(tmp_path, document_reader=reader)
+        pdf_path = fs._root / "report.pdf"
+        pdf_path.write_bytes(b"%PDF fake")
+        sidecar = fs._root / ".report.pdf.md"
+        sidecar.write_text("# Old Cache", encoding="utf-8")
+
+        extracted = "# Fresh Extract\n" + "y" * 60
+        with patch.object(reader, "extract_text", return_value=extracted):
+            read_fn = next(
+                t for t in tool.get_tools() if t.__name__ == "workspace_read"
+            )
+            result = read_fn("report.pdf", force_document_regeneration=True)
+
+        assert "# Fresh Extract" in result
+        assert "# Old Cache" not in sidecar.read_text(encoding="utf-8")
+
+    def test_pass1_empty_no_llm_returns_placeholder(self, tmp_path: Path) -> None:
+        """AC 5: Pass 1 empty + no LLM -> placeholder written and returned."""
+        reader = DocumentReader(llm_client=None)
+        tool, fs = make_wired_tool(tmp_path, document_reader=reader)
+        pdf_path = fs._root / "scan.pdf"
+        pdf_path.write_bytes(b"%PDF image only")
+
+        placeholder = "<!-- markitdown: no text extracted -->"
+        with patch.object(reader, "extract_text", return_value=placeholder):
+            read_fn = next(
+                t for t in tool.get_tools() if t.__name__ == "workspace_read"
+            )
+            result = read_fn("scan.pdf")
+
+        assert "markitdown: no text extracted" in result
+        sidecar = fs._root / ".scan.pdf.md"
+        assert sidecar.exists()
+        assert "markitdown: no text extracted" in sidecar.read_text(encoding="utf-8")
+
+    def test_pass1_empty_pass2_with_llm_returns_content(self, tmp_path: Path) -> None:
+        """AC 6: Pass 1 empty + LLM configured -> Pass 2 invoked, content returned."""
+        mock_llm_client = MagicMock()
+        reader = DocumentReader(llm_client=mock_llm_client, llm_model="gpt-4o")
+        tool, fs = make_wired_tool(tmp_path, document_reader=reader)
+        pdf_path = fs._root / "scan.pdf"
+        pdf_path.write_bytes(b"%PDF image only")
+
+        extracted = "# OCR Result\n" + "z" * 60
+        with patch.object(reader, "extract_text", return_value=extracted):
+            read_fn = next(
+                t for t in tool.get_tools() if t.__name__ == "workspace_read"
+            )
+            result = read_fn("scan.pdf")
+
+        assert "# OCR Result" in result
+
+    def test_both_passes_empty_returns_placeholder(self, tmp_path: Path) -> None:
+        """AC 7: Both passes return empty -> placeholder written and returned."""
+        mock_llm_client = MagicMock()
+        reader = DocumentReader(llm_client=mock_llm_client)
+        tool, fs = make_wired_tool(tmp_path, document_reader=reader)
+        img_path = fs._root / "photo.png"
+        img_path.write_bytes(b"\x89PNG fake")
+
+        placeholder = "<!-- markitdown: no text extracted -->"
+        with patch.object(reader, "extract_text", return_value=placeholder):
+            read_fn = next(
+                t for t in tool.get_tools() if t.__name__ == "workspace_read"
+            )
+            result = read_fn("photo.png")
+
+        assert "markitdown: no text extracted" in result
+        sidecar = fs._root / ".photo.png.md"
+        assert sidecar.exists()
+
+    def test_text_extension_uses_text_path(self, tmp_path: Path) -> None:
+        """AC 8: Text extension -> DocumentReader never invoked."""
+        reader = DocumentReader()
+        tool, fs = make_wired_tool(tmp_path, document_reader=reader)
+        txt_path = fs._root / "notes.txt"
+        txt_path.write_text("Hello, world!", encoding="utf-8")
+
+        with patch.object(reader, "extract_text") as mock_extract:
+            read_fn = next(
+                t for t in tool.get_tools() if t.__name__ == "workspace_read"
+            )
+            result = read_fn("notes.txt")
+            mock_extract.assert_not_called()
+
+        assert "Hello, world!" in result
+
+    def test_sidecar_self_read_guard(self, tmp_path: Path) -> None:
+        """AC 9: .report.pdf.md reads as plain text, no extraction."""
+        reader = DocumentReader()
+        tool, fs = make_wired_tool(tmp_path, document_reader=reader)
+        sidecar = fs._root / ".report.pdf.md"
+        sidecar.write_text("# Sidecar Content", encoding="utf-8")
+
+        with patch.object(reader, "extract_text") as mock_extract:
+            read_fn = next(
+                t for t in tool.get_tools() if t.__name__ == "workspace_read"
+            )
+            result = read_fn(".report.pdf.md")
+            mock_extract.assert_not_called()
+
+        assert "# Sidecar Content" in result
+
+    def test_subdirectory_binary_file_sidecar_path(self, tmp_path: Path) -> None:
+        """Sidecar for binary file in subdirectory is placed in same directory."""
+        reader = DocumentReader()
+        tool, fs = make_wired_tool(tmp_path, document_reader=reader)
+        docs_dir = fs._root / "docs"
+        docs_dir.mkdir()
+        pdf_path = docs_dir / "slides.pptx"
+        pdf_path.write_bytes(b"PK fake pptx")
+
+        extracted = "# Slides\n" + "a" * 60
+        with patch.object(reader, "extract_text", return_value=extracted):
+            read_fn = next(
+                t for t in tool.get_tools() if t.__name__ == "workspace_read"
+            )
+            result = read_fn("docs/slides.pptx")
+
+        assert "# Slides" in result
+        sidecar = docs_dir / ".slides.pptx.md"
+        assert sidecar.exists()
+
+    def test_unknown_extension_uses_text_path(self, tmp_path: Path) -> None:
+        """Unknown extension falls through to UTF-8 decode path."""
+        reader = DocumentReader()
+        tool, fs = make_wired_tool(tmp_path, document_reader=reader)
+        file_path = fs._root / "data.custom"
+        file_path.write_text("custom format data", encoding="utf-8")
+
+        read_fn = next(
+            t for t in tool.get_tools() if t.__name__ == "workspace_read"
+        )
+        result = read_fn("data.custom")
+        assert "custom format data" in result
+
+    def test_binary_file_not_found_raises_retriable_error(self, tmp_path: Path) -> None:
+        """Binary file that doesn't exist -> RetriableError (not ValueError)."""
+        reader = DocumentReader()
+        tool, _fs = make_wired_tool(tmp_path, document_reader=reader)
+
+        read_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_read")
+        with pytest.raises(RetriableError, match="File not found: missing.pdf"):
+            read_fn("missing.pdf")
+
+
+# ---------------------------------------------------------------------------
+# Story 5.8: DocumentReader.extract_text unit tests (mocked markitdown)
+# ---------------------------------------------------------------------------
+
+
+class TestDocumentReaderExtractText:
+    """Unit tests for DocumentReader.extract_text with mocked markitdown module."""
+
+    def _make_mock_markitdown_module(self) -> MagicMock:
+        """Create a mock markitdown module with MarkItDown class."""
+        mock_module = MagicMock()
+        return mock_module
+
+    def test_pass1_success_returns_content(self) -> None:
+        """Pass 1 yields >= 50 non-ws chars -> returns content directly."""
+        reader = DocumentReader()
+        mock_md_module = self._make_mock_markitdown_module()
+        mock_result = MagicMock()
+        mock_result.text_content = "# Report\n" + "x" * 60
+        mock_md_module.MarkItDown.return_value.convert.return_value = mock_result
+
+        import sys
+
+        with patch.dict(sys.modules, {"markitdown": mock_md_module}):
+            result = reader.extract_text(b"%PDF fake", "report.pdf")
+
+        assert result == "# Report\n" + "x" * 60
+
+    def test_pass1_empty_no_llm_returns_placeholder(self) -> None:
+        """Pass 1 empty + no LLM -> placeholder returned."""
+        reader = DocumentReader(llm_client=None)
+        mock_md_module = self._make_mock_markitdown_module()
+        mock_result = MagicMock()
+        mock_result.text_content = ""
+        mock_md_module.MarkItDown.return_value.convert.return_value = mock_result
+
+        import sys
+
+        with patch.dict(sys.modules, {"markitdown": mock_md_module}):
+            result = reader.extract_text(b"%PDF fake", "scan.pdf")
+
+        assert result == "<!-- markitdown: no text extracted -->"
+
+    def test_pass1_empty_pass2_with_llm(self) -> None:
+        """Pass 1 empty + LLM -> Pass 2 invoked with llm_client."""
+        mock_llm = MagicMock()
+        reader = DocumentReader(llm_client=mock_llm, llm_model="gpt-4o")
+        mock_md_module = self._make_mock_markitdown_module()
+
+        empty_result = MagicMock()
+        empty_result.text_content = ""
+        vision_result = MagicMock()
+        vision_result.text_content = "# OCR\n" + "z" * 60
+
+        call_count = 0
+
+        def mock_md_class(*args: object, **kwargs: object) -> MagicMock:
+            nonlocal call_count
+            call_count += 1
+            instance = MagicMock()
+            if call_count == 1:
+                instance.convert.return_value = empty_result
+            else:
+                instance.convert.return_value = vision_result
+            return instance
+
+        mock_md_module.MarkItDown = mock_md_class
+
+        import sys
+
+        with patch.dict(sys.modules, {"markitdown": mock_md_module}):
+            result = reader.extract_text(b"%PDF image", "scan.pdf")
+
+        assert result == "# OCR\n" + "z" * 60
+        assert call_count == 2
+
+    def test_both_passes_empty_returns_placeholder(self) -> None:
+        """Both passes empty -> placeholder."""
+        mock_llm = MagicMock()
+        reader = DocumentReader(llm_client=mock_llm)
+        mock_md_module = self._make_mock_markitdown_module()
+        empty_result = MagicMock()
+        empty_result.text_content = ""
+        mock_md_module.MarkItDown.return_value.convert.return_value = empty_result
+
+        import sys
+
+        with patch.dict(sys.modules, {"markitdown": mock_md_module}):
+            result = reader.extract_text(b"\x89PNG", "photo.png")
+
+        assert result == "<!-- markitdown: no text extracted -->"
+
+    def test_markitdown_not_installed_raises_import_error(self) -> None:
+        """When markitdown is not installed, raises ImportError with hint."""
+        reader = DocumentReader()
+        import sys
+
+        # Ensure markitdown is not available
+        with patch.dict(sys.modules, {"markitdown": None}):
+            with pytest.raises(ImportError, match='pip install "akgentic-tool\\[docs\\]"'):
+                reader.extract_text(b"fake", "file.pdf")
