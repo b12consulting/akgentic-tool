@@ -5,7 +5,9 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol
+
+from pydantic import BaseModel, PrivateAttr
 
 if TYPE_CHECKING:
     from openai import OpenAI
@@ -50,17 +52,17 @@ class FileTypeReader(Protocol):
         ...
 
 
-class DocumentReader:
-    """MarkItDown-based document reader with optional LLM vision fallback.
+class DocumentReader(BaseModel):
+    """MarkItDown-based document reader, fully Pydantic-serializable.
 
     Pass 1: Extract text via ``MarkItDown()`` (no LLM).
     Pass 2 (optional): If Pass 1 yields fewer than 50 non-whitespace characters
-    and ``llm_client`` is configured, retry with ``MarkItDown(llm_client=...)``.
+    and ``llm_client="openai"`` is set, lazily constructs ``OpenAI()`` and retries.
     If both passes yield fewer than 50 non-whitespace characters, returns a
     placeholder comment.
     """
 
-    extensions: frozenset[str] = frozenset(
+    extensions: ClassVar[frozenset[str]] = frozenset(
         {
             ".pdf",
             ".docx",
@@ -78,13 +80,23 @@ class DocumentReader:
         }
     )
 
-    def __init__(
-        self,
-        llm_client: OpenAI | None = None,
-        llm_model: str = "gpt-4o",
-    ) -> None:
-        self._llm_client = llm_client
-        self._llm_model = llm_model
+    llm_client: Literal["openai"] | None = None
+    llm_model: str = "gpt-4o"
+
+    _openai_client: OpenAI | None = PrivateAttr(default=None)
+
+    def _get_openai_client(self) -> OpenAI | None:
+        """Lazily create and cache an OpenAI client.
+
+        Returns None if ``llm_client`` is not set.
+        """
+        if self.llm_client is None:
+            return None
+        if self._openai_client is None:
+            from openai import OpenAI as _OpenAI  # noqa: PLC0415
+
+            self._openai_client = _OpenAI()
+        return self._openai_client
 
     @staticmethod
     def _convert_via_tempfile(md: Any, content: bytes, suffix: str) -> str:
@@ -138,10 +150,9 @@ class DocumentReader:
         text = self._convert_via_tempfile(MarkItDown(), content, suffix)
 
         # Pass 2: LLM vision fallback if Pass 1 yielded insufficient content
-        if len("".join(text.split())) < 50 and self._llm_client is not None:
-            md_vision = MarkItDown(
-                llm_client=self._llm_client, llm_model=self._llm_model
-            )
+        openai_client = self._get_openai_client()
+        if len("".join(text.split())) < 50 and openai_client is not None:
+            md_vision = MarkItDown(llm_client=openai_client, llm_model=self.llm_model)
             text = self._convert_via_tempfile(md_vision, content, suffix)
 
         if len("".join(text.split())) < 50:

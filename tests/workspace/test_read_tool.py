@@ -97,9 +97,7 @@ class TestObserverWiring:
         observer = make_observer(team_id=team_id)
         fs = Filesystem(str(tmp_path), str(team_id))
         tool = WorkspaceReadTool()
-        with patch(
-            "akgentic.tool.workspace.tool.get_workspace", return_value=fs
-        ) as mock_gw:
+        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs) as mock_gw:
             result = tool.observer(observer)
             mock_gw.assert_called_once_with(str(team_id))
             assert tool.workspace is fs
@@ -109,9 +107,7 @@ class TestObserverWiring:
         observer = make_observer()
         fs = Filesystem(str(tmp_path), "explicit-ws")
         tool = WorkspaceReadTool(workspace_id="explicit-ws")
-        with patch(
-            "akgentic.tool.workspace.tool.get_workspace", return_value=fs
-        ) as mock_gw:
+        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs) as mock_gw:
             tool.observer(observer)
             mock_gw.assert_called_once_with("explicit-ws")
 
@@ -404,8 +400,9 @@ class TestGrepRg:
         assert result is None
 
     def test_returns_none_on_subprocess_error(self, tmp_path: Path) -> None:
-        with patch("shutil.which", return_value="/usr/bin/rg"), patch(
-            "subprocess.run", side_effect=OSError("no rg")
+        with (
+            patch("shutil.which", return_value="/usr/bin/rg"),
+            patch("subprocess.run", side_effect=OSError("no rg")),
         ):
             result = _grep_rg(tmp_path, "pattern", "", 100)
         assert result is None
@@ -413,9 +410,12 @@ class TestGrepRg:
     def test_returns_none_on_timeout(self, tmp_path: Path) -> None:
         import subprocess as _subprocess
 
-        with patch("shutil.which", return_value="/usr/bin/rg"), patch(
-            "subprocess.run",
-            side_effect=_subprocess.TimeoutExpired(cmd=["rg"], timeout=15),
+        with (
+            patch("shutil.which", return_value="/usr/bin/rg"),
+            patch(
+                "subprocess.run",
+                side_effect=_subprocess.TimeoutExpired(cmd=["rg"], timeout=15),
+            ),
         ):
             result = _grep_rg(tmp_path, "pattern", "", 100)
         assert result is None
@@ -424,8 +424,9 @@ class TestGrepRg:
         mock_result = MagicMock()
         mock_result.returncode = 2
         mock_result.stdout = ""
-        with patch("shutil.which", return_value="/usr/bin/rg"), patch(
-            "subprocess.run", return_value=mock_result
+        with (
+            patch("shutil.which", return_value="/usr/bin/rg"),
+            patch("subprocess.run", return_value=mock_result),
         ):
             result = _grep_rg(tmp_path, "pattern", "", 100)
         assert result is None
@@ -436,8 +437,9 @@ class TestGrepRg:
         mock_result = MagicMock()
         mock_result.returncode = 0
         mock_result.stdout = f"{fake_file}:3:import os\n"
-        with patch("shutil.which", return_value="/usr/bin/rg"), patch(
-            "subprocess.run", return_value=mock_result
+        with (
+            patch("shutil.which", return_value="/usr/bin/rg"),
+            patch("subprocess.run", return_value=mock_result),
         ):
             result = _grep_rg(tmp_path, "import", "", 100)
         assert result is not None
@@ -495,11 +497,10 @@ class TestWorkspaceGrep:
         root = tool.workspace._root
         fake_match = (root / "x.py", 1, "import os")
         fn = tool.get_tools()[3]
-        with patch(
-            "akgentic.tool.workspace.tool._grep_rg", return_value=[fake_match]
-        ) as mock_rg, patch(
-            "akgentic.tool.workspace.tool._grep_python"
-        ) as mock_py:
+        with (
+            patch("akgentic.tool.workspace.tool._grep_rg", return_value=[fake_match]) as mock_rg,
+            patch("akgentic.tool.workspace.tool._grep_python") as mock_py,
+        ):
             result = fn("import os")
         mock_rg.assert_called_once()
         mock_py.assert_not_called()
@@ -688,7 +689,7 @@ class TestRetriableErrorReadTool:
 
 def make_wired_tool(
     tmp_path: Path,
-    document_reader: DocumentReader | None = None,
+    document_reader: DocumentReader | bool = True,
 ) -> tuple[WorkspaceReadTool, Filesystem]:
     """Build a WorkspaceReadTool wired to a Filesystem, returning both."""
     tid = uuid.uuid4()
@@ -709,8 +710,8 @@ class TestBinaryFileReading:
     """Tests for binary file reading dispatch in workspace_read (AC 1-10)."""
 
     def test_document_reader_none_raises_value_error(self, tmp_path: Path) -> None:
-        """AC 1: workspace_read on binary ext with document_reader=None -> ValueError."""
-        tool, fs = make_wired_tool(tmp_path, document_reader=None)
+        """AC 1: workspace_read on binary ext with document_reader=False -> ValueError."""
+        tool, fs = make_wired_tool(tmp_path, document_reader=False)
         pdf_path = fs._root / "report.pdf"
         pdf_path.write_bytes(b"%PDF fake")
 
@@ -726,10 +727,8 @@ class TestBinaryFileReading:
         pdf_path.write_bytes(b"%PDF fake content")
 
         extracted = "# Report\n" + "x" * 60
-        with patch.object(reader, "extract_text", return_value=extracted):
-            read_fn = next(
-                t for t in tool.get_tools() if t.__name__ == "workspace_read"
-            )
+        with patch.object(DocumentReader, "extract_text", return_value=extracted):
+            read_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_read")
             result = read_fn("report.pdf")
 
         assert "# Report" in result
@@ -746,10 +745,8 @@ class TestBinaryFileReading:
         sidecar = fs._root / ".report.pdf.md"
         sidecar.write_text("# Cached Content\nline two", encoding="utf-8")
 
-        with patch.object(reader, "extract_text") as mock_extract:
-            read_fn = next(
-                t for t in tool.get_tools() if t.__name__ == "workspace_read"
-            )
+        with patch.object(DocumentReader, "extract_text") as mock_extract:
+            read_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_read")
             result = read_fn("report.pdf")
             mock_extract.assert_not_called()
 
@@ -765,10 +762,8 @@ class TestBinaryFileReading:
         sidecar.write_text("# Old Cache", encoding="utf-8")
 
         extracted = "# Fresh Extract\n" + "y" * 60
-        with patch.object(reader, "extract_text", return_value=extracted):
-            read_fn = next(
-                t for t in tool.get_tools() if t.__name__ == "workspace_read"
-            )
+        with patch.object(DocumentReader, "extract_text", return_value=extracted):
+            read_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_read")
             result = read_fn("report.pdf", force_document_regeneration=True)
 
         assert "# Fresh Extract" in result
@@ -782,10 +777,8 @@ class TestBinaryFileReading:
         pdf_path.write_bytes(b"%PDF image only")
 
         placeholder = "<!-- markitdown: no text extracted -->"
-        with patch.object(reader, "extract_text", return_value=placeholder):
-            read_fn = next(
-                t for t in tool.get_tools() if t.__name__ == "workspace_read"
-            )
+        with patch.object(DocumentReader, "extract_text", return_value=placeholder):
+            read_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_read")
             result = read_fn("scan.pdf")
 
         assert "markitdown: no text extracted" in result
@@ -795,34 +788,28 @@ class TestBinaryFileReading:
 
     def test_pass1_empty_pass2_with_llm_returns_content(self, tmp_path: Path) -> None:
         """AC 6: Pass 1 empty + LLM configured -> Pass 2 invoked, content returned."""
-        mock_llm_client = MagicMock()
-        reader = DocumentReader(llm_client=mock_llm_client, llm_model="gpt-4o")
+        reader = DocumentReader(llm_client="openai", llm_model="gpt-4o")
         tool, fs = make_wired_tool(tmp_path, document_reader=reader)
         pdf_path = fs._root / "scan.pdf"
         pdf_path.write_bytes(b"%PDF image only")
 
         extracted = "# OCR Result\n" + "z" * 60
-        with patch.object(reader, "extract_text", return_value=extracted):
-            read_fn = next(
-                t for t in tool.get_tools() if t.__name__ == "workspace_read"
-            )
+        with patch.object(DocumentReader, "extract_text", return_value=extracted):
+            read_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_read")
             result = read_fn("scan.pdf")
 
         assert "# OCR Result" in result
 
     def test_both_passes_empty_returns_placeholder(self, tmp_path: Path) -> None:
         """AC 7: Both passes return empty -> placeholder written and returned."""
-        mock_llm_client = MagicMock()
-        reader = DocumentReader(llm_client=mock_llm_client)
+        reader = DocumentReader(llm_client="openai")
         tool, fs = make_wired_tool(tmp_path, document_reader=reader)
         img_path = fs._root / "photo.png"
         img_path.write_bytes(b"\x89PNG fake")
 
         placeholder = "<!-- markitdown: no text extracted -->"
-        with patch.object(reader, "extract_text", return_value=placeholder):
-            read_fn = next(
-                t for t in tool.get_tools() if t.__name__ == "workspace_read"
-            )
+        with patch.object(DocumentReader, "extract_text", return_value=placeholder):
+            read_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_read")
             result = read_fn("photo.png")
 
         assert "markitdown: no text extracted" in result
@@ -836,10 +823,8 @@ class TestBinaryFileReading:
         txt_path = fs._root / "notes.txt"
         txt_path.write_text("Hello, world!", encoding="utf-8")
 
-        with patch.object(reader, "extract_text") as mock_extract:
-            read_fn = next(
-                t for t in tool.get_tools() if t.__name__ == "workspace_read"
-            )
+        with patch.object(DocumentReader, "extract_text") as mock_extract:
+            read_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_read")
             result = read_fn("notes.txt")
             mock_extract.assert_not_called()
 
@@ -852,10 +837,8 @@ class TestBinaryFileReading:
         sidecar = fs._root / ".report.pdf.md"
         sidecar.write_text("# Sidecar Content", encoding="utf-8")
 
-        with patch.object(reader, "extract_text") as mock_extract:
-            read_fn = next(
-                t for t in tool.get_tools() if t.__name__ == "workspace_read"
-            )
+        with patch.object(DocumentReader, "extract_text") as mock_extract:
+            read_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_read")
             result = read_fn(".report.pdf.md")
             mock_extract.assert_not_called()
 
@@ -871,10 +854,8 @@ class TestBinaryFileReading:
         pdf_path.write_bytes(b"PK fake pptx")
 
         extracted = "# Slides\n" + "a" * 60
-        with patch.object(reader, "extract_text", return_value=extracted):
-            read_fn = next(
-                t for t in tool.get_tools() if t.__name__ == "workspace_read"
-            )
+        with patch.object(DocumentReader, "extract_text", return_value=extracted):
+            read_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_read")
             result = read_fn("docs/slides.pptx")
 
         assert "# Slides" in result
@@ -888,9 +869,7 @@ class TestBinaryFileReading:
         file_path = fs._root / "data.custom"
         file_path.write_text("custom format data", encoding="utf-8")
 
-        read_fn = next(
-            t for t in tool.get_tools() if t.__name__ == "workspace_read"
-        )
+        read_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_read")
         result = read_fn("data.custom")
         assert "custom format data" in result
 
@@ -948,9 +927,8 @@ class TestDocumentReaderExtractText:
         assert result == "<!-- markitdown: no text extracted -->"
 
     def test_pass1_empty_pass2_with_llm(self) -> None:
-        """Pass 1 empty + LLM -> Pass 2 invoked with llm_client."""
-        mock_llm = MagicMock()
-        reader = DocumentReader(llm_client=mock_llm, llm_model="gpt-4o")
+        """Pass 1 empty + LLM -> Pass 2 invoked with lazily-created OpenAI client."""
+        reader = DocumentReader(llm_client="openai", llm_model="gpt-4o")
         mock_md_module = self._make_mock_markitdown_module()
 
         empty_result = MagicMock()
@@ -974,7 +952,10 @@ class TestDocumentReaderExtractText:
 
         import sys
 
-        with patch.dict(sys.modules, {"markitdown": mock_md_module}):
+        mock_openai_instance = MagicMock()
+        mock_openai_module = MagicMock()
+        mock_openai_module.OpenAI = MagicMock(return_value=mock_openai_instance)
+        with patch.dict(sys.modules, {"markitdown": mock_md_module, "openai": mock_openai_module}):
             result = reader.extract_text(b"%PDF image", "scan.pdf")
 
         assert result == "# OCR\n" + "z" * 60
@@ -982,8 +963,7 @@ class TestDocumentReaderExtractText:
 
     def test_both_passes_empty_returns_placeholder(self) -> None:
         """Both passes empty -> placeholder."""
-        mock_llm = MagicMock()
-        reader = DocumentReader(llm_client=mock_llm)
+        reader = DocumentReader(llm_client="openai")
         mock_md_module = self._make_mock_markitdown_module()
         empty_result = MagicMock()
         empty_result.text_content = ""
@@ -991,7 +971,10 @@ class TestDocumentReaderExtractText:
 
         import sys
 
-        with patch.dict(sys.modules, {"markitdown": mock_md_module}):
+        mock_openai_instance = MagicMock()
+        mock_openai_module = MagicMock()
+        mock_openai_module.OpenAI = MagicMock(return_value=mock_openai_instance)
+        with patch.dict(sys.modules, {"markitdown": mock_md_module, "openai": mock_openai_module}):
             result = reader.extract_text(b"\x89PNG", "photo.png")
 
         assert result == "<!-- markitdown: no text extracted -->"
@@ -1117,3 +1100,106 @@ class TestWorkspaceGlobBraceExpansion:
         lines = [ln for ln in result.split("\n") if not ln.startswith("[")]
         assert len(lines) <= 100
         assert "truncated" in result
+
+
+# ---------------------------------------------------------------------------
+# Story 5.10: DocumentReader serialization tests
+# ---------------------------------------------------------------------------
+
+
+class TestDocumentReaderSerialization:
+    """Verify DocumentReader.model_dump() round-trips cleanly (AC: 2)."""
+
+    def test_model_dump_default(self) -> None:
+        """Default DocumentReader dumps to expected dict."""
+        assert DocumentReader().model_dump() == {"llm_client": None, "llm_model": "gpt-4o"}
+
+    def test_model_dump_with_openai(self) -> None:
+        """DocumentReader with llm_client='openai' dumps correctly."""
+        assert DocumentReader(llm_client="openai").model_dump() == {
+            "llm_client": "openai",
+            "llm_model": "gpt-4o",
+        }
+
+    def test_no_openai_client_in_dump(self) -> None:
+        """Private _openai_client must not appear in model_dump()."""
+        assert "_openai_client" not in DocumentReader().model_dump()
+
+    def test_extensions_not_in_dump(self) -> None:
+        """ClassVar extensions must not appear in model_dump()."""
+        assert "extensions" not in DocumentReader().model_dump()
+
+    def test_model_validate_roundtrip_default(self) -> None:
+        """model_dump() -> model_validate() round-trips for default DocumentReader."""
+        original = DocumentReader()
+        restored = DocumentReader.model_validate(original.model_dump())
+        assert restored.llm_client == original.llm_client
+        assert restored.llm_model == original.llm_model
+
+    def test_model_validate_roundtrip_with_openai(self) -> None:
+        """model_dump() -> model_validate() round-trips for llm_client='openai'."""
+        original = DocumentReader(llm_client="openai")
+        restored = DocumentReader.model_validate(original.model_dump())
+        assert restored.llm_client == "openai"
+        assert restored.llm_model == "gpt-4o"
+
+
+class TestWorkspaceReadToolSerialization:
+    """Verify WorkspaceReadTool.model_dump() succeeds without ConfigDict (AC: 5)."""
+
+    def test_default_tool_model_dump_succeeds(self) -> None:
+        """model_dump() does not raise on default WorkspaceReadTool."""
+        result = WorkspaceReadTool().model_dump()
+        assert isinstance(result, dict)
+
+    def test_document_reader_true_in_dump(self) -> None:
+        """Default document_reader=True serializes as True."""
+        assert WorkspaceReadTool().model_dump()["document_reader"] is True
+
+    def test_document_reader_false_in_dump(self) -> None:
+        """document_reader=False serializes as False."""
+        assert WorkspaceReadTool(document_reader=False).model_dump()["document_reader"] is False
+
+    def test_document_reader_instance_in_dump(self) -> None:
+        """DocumentReader instance serializes to its model_dump() dict."""
+        tool = WorkspaceReadTool(document_reader=DocumentReader(llm_client="openai"))
+        assert tool.model_dump()["document_reader"] == {
+            "llm_client": "openai",
+            "llm_model": "gpt-4o",
+        }
+
+    def test_model_validate_roundtrip_with_document_reader(self) -> None:
+        """model_dump -> model_validate round-trips with DocumentReader."""
+        original = WorkspaceReadTool(document_reader=DocumentReader(llm_client="openai"))
+        restored = WorkspaceReadTool.model_validate(original.model_dump())
+        assert isinstance(restored.document_reader, DocumentReader)
+        assert restored.document_reader.llm_client == "openai"
+
+
+class TestDocumentReaderLazyInit:
+    """Verify lazy OpenAI client creation via _get_openai_client() (AC: 3)."""
+
+    def test_get_openai_client_returns_none_when_disabled(self) -> None:
+        """No llm_client -> _get_openai_client() returns None."""
+        assert DocumentReader()._get_openai_client() is None
+
+    def test_get_openai_client_lazy_creation(self) -> None:
+        """llm_client='openai' -> lazily constructs OpenAI() on first call."""
+        reader = DocumentReader(llm_client="openai")
+        # Ensure private attrs are initialised (coverage hooks can interfere)
+        if reader.__pydantic_private__ is None:
+            reader.__pydantic_private__ = {"_openai_client": None}
+        result = reader._get_openai_client()
+        # After call, a real OpenAI client is returned and cached
+        assert result is not None
+        assert reader._openai_client is result
+
+    def test_get_openai_client_cached(self) -> None:
+        """Second _get_openai_client() call reuses cached client."""
+        reader = DocumentReader(llm_client="openai")
+        if reader.__pydantic_private__ is None:
+            reader.__pydantic_private__ = {"_openai_client": None}
+        first = reader._get_openai_client()
+        second = reader._get_openai_client()
+        # Same object identity — no second construction
+        assert first is second
