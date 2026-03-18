@@ -17,6 +17,7 @@ from akgentic.tool.workspace.tool import (
     WorkspaceList,
     WorkspaceRead,
     WorkspaceReadTool,
+    _expand_braces,
     _grep_python,
     _grep_rg,
 )
@@ -1004,3 +1005,115 @@ class TestDocumentReaderExtractText:
         with patch.dict(sys.modules, {"markitdown": None}):
             with pytest.raises(ImportError, match='pip install "akgentic-tool\\[docs\\]"'):
                 reader.extract_text(b"fake", "file.pdf")
+
+
+# ---------------------------------------------------------------------------
+# Story 5.9: _expand_braces unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestExpandBraces:
+    def test_expand_braces_no_braces(self) -> None:
+        assert _expand_braces("**/*.py") == ["**/*.py"]
+
+    def test_expand_braces_single_group(self) -> None:
+        result = _expand_braces("**/*.{py,js}")
+        assert result == ["**/*.py", "**/*.js"]
+
+    def test_expand_braces_multiple_groups(self) -> None:
+        result = _expand_braces("{src,lib}/**/*.{py,js}")
+        assert result == ["src/**/*.py", "src/**/*.js", "lib/**/*.py", "lib/**/*.js"]
+
+    def test_expand_braces_strips_whitespace(self) -> None:
+        result = _expand_braces("**/*.{py, js, ts}")
+        assert result == ["**/*.py", "**/*.js", "**/*.ts"]
+
+    def test_expand_braces_single_alternative(self) -> None:
+        """Single alternative in braces degenerates to one pattern."""
+        assert _expand_braces("**/*.{py}") == ["**/*.py"]
+
+
+# ---------------------------------------------------------------------------
+# Story 5.9: workspace_glob brace expansion integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceGlobBraceExpansion:
+    def test_single_brace_group_multi_extension(self, tmp_path: Path) -> None:
+        """AC 1: workspace_glob("**/*.{py,js}") returns both .py and .js files."""
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        (root / "a.py").write_bytes(b"a")
+        (root / "b.js").write_bytes(b"b")
+        glob_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_glob")
+        result = glob_fn("**/*.{py,js}")
+        lines = result.splitlines()
+        assert "a.py" in lines
+        assert "b.js" in lines
+
+    def test_no_brace_passthrough(self, tmp_path: Path) -> None:
+        """AC 5: No-brace pattern behaves identically to pre-brace implementation."""
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        (root / "c.py").write_bytes(b"c")
+        glob_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_glob")
+        result = glob_fn("**/*.py")
+        assert "c.py" in result
+
+    def test_deduplication(self, tmp_path: Path) -> None:
+        """AC 2: Duplicate expansions produce deduplicated results."""
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        (root / "x.py").write_bytes(b"x")
+        glob_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_glob")
+        result = glob_fn("**/*.{py,py}")
+        lines = [ln for ln in result.split("\n") if not ln.startswith("[")]
+        assert lines.count("x.py") == 1
+
+    def test_multiple_brace_groups_combinatorial(self, tmp_path: Path) -> None:
+        """AC 3, 4: Multiple brace groups expand combinatorially and merge results."""
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        src = root / "src"
+        src.mkdir()
+        lib = root / "lib"
+        lib.mkdir()
+        (src / "a.py").write_bytes(b"a")
+        (lib / "b.js").write_bytes(b"b")
+        glob_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_glob")
+        result = glob_fn("{src,lib}/**/*.{py,js}")
+        lines = result.splitlines()
+        assert "src/a.py" in lines
+        assert "lib/b.js" in lines
+
+    def test_mtime_sort_preserved(self, tmp_path: Path) -> None:
+        """AC 1: Results are sorted newest-first by mtime."""
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        old_file = root / "old.py"
+        new_file = root / "new.py"
+        old_file.write_bytes(b"old")
+        time.sleep(0.05)
+        new_file.write_bytes(b"new")
+        glob_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_glob")
+        result = glob_fn("**/*.{py,ts}")
+        lines = [ln for ln in result.split("\n") if not ln.startswith("[")]
+        assert lines[0] == "new.py"
+        assert lines[1] == "old.py"
+
+    def test_max_results_cap_preserved(self, tmp_path: Path) -> None:
+        """AC 6: max_results cap and truncation notice still work with brace expansion."""
+        tool = WorkspaceReadTool(workspace_glob=WorkspaceGlob(max_results=100))
+        team_id = uuid.uuid4()
+        fs = Filesystem(str(tmp_path), str(team_id))
+        root = fs._root
+        for i in range(110):
+            (root / f"f{i:03d}.py").write_bytes(b"x")
+        observer = make_observer(team_id=team_id)
+        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+            tool.observer(observer)
+        glob_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_glob")
+        result = glob_fn("**/*.{py,js}")
+        lines = [ln for ln in result.split("\n") if not ln.startswith("[")]
+        assert len(lines) <= 100
+        assert "truncated" in result
