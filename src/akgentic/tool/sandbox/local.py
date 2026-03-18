@@ -13,8 +13,10 @@ class LocalSandboxActor(SandboxActor):
     """Subprocess-based sandbox actor for local filesystem execution.
 
     Creates and manages a workspace directory under
-    ``<AKGENTIC_WORKSPACES_ROOT>/{team_id}/`` (default root: ``./workspaces``).
-    No Docker daemon required.
+    ``<AKGENTIC_WORKSPACES_ROOT>/{workspace_id or team_id}/`` (default root:
+    ``./workspaces``). When ``SandboxConfig.workspace_id`` is set, that value is
+    used as the directory name instead of ``team_id``, enabling directory sharing
+    with ``WorkspaceTool(workspace_id=...)``. No Docker daemon required.
     """
 
     def _start_sandbox(self) -> None:

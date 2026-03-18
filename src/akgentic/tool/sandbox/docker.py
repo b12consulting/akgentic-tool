@@ -16,10 +16,13 @@ DOCKER_EXEC_TIMEOUT: int = 60
 class DockerSandboxActor(SandboxActor):
     """Persistent Docker container sandbox per team.
 
-    Manages a single Docker container named sandbox-{team_id}.
+    Manages a single Docker container named ``sandbox-{team_id}``.
     Container is started (or reused) on on_start(), stopped (not removed)
-    on on_stop(). The host-side volume mount root is derived from the
-    ``AKGENTIC_WORKSPACES_ROOT`` environment variable (default: ``./workspaces``).
+    on on_stop(). The host-side volume mount path uses
+    ``{AKGENTIC_WORKSPACES_ROOT}/{workspace_id or team_id}`` so that when
+    ``SandboxConfig.workspace_id`` is set, the mounted directory matches the
+    one used by ``WorkspaceTool(workspace_id=...)``. The container name always
+    uses ``team_id`` — containers are per-team execution resources.
     """
 
     def _start_sandbox(self) -> None:
