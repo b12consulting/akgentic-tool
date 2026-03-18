@@ -85,6 +85,24 @@ def test_sandbox_config_valid() -> None:
     assert config.role == "ToolActor"
 
 
+def test_sandbox_config_mode_defaults_to_local() -> None:
+    """SandboxConfig.mode defaults to 'local' when not provided."""
+    config = SandboxConfig(name="sandbox", role="ToolActor", team_id="team-1")
+    assert config.mode == "local"
+
+
+def test_sandbox_config_mode_docker() -> None:
+    """SandboxConfig accepts mode='docker'."""
+    config = SandboxConfig(name="sandbox", role="ToolActor", team_id="team-1", mode="docker")
+    assert config.mode == "docker"
+
+
+def test_sandbox_config_mode_local_explicit() -> None:
+    """SandboxConfig accepts mode='local' explicitly."""
+    config = SandboxConfig(name="sandbox", role="ToolActor", team_id="team-1", mode="local")
+    assert config.mode == "local"
+
+
 # ---------------------------------------------------------------------------
 # SandboxState model validation (AC1)
 # ---------------------------------------------------------------------------

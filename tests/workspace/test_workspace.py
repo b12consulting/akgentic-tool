@@ -278,8 +278,11 @@ class TestFilesystemList:
 
 
 class TestGetWorkspace:
-    def test_get_workspace_local_mode_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("WORKSPACE_MODE", raising=False)
+    def test_get_workspace_default_root_when_env_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """get_workspace() uses ./workspaces when AKGENTIC_WORKSPACES_ROOT is not set."""
+        monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
         with patch("akgentic.tool.workspace.workspace.Filesystem") as mock_fs_cls:
             mock_instance = MagicMock()
             mock_fs_cls.return_value = mock_instance
@@ -287,27 +290,37 @@ class TestGetWorkspace:
             mock_fs_cls.assert_called_once_with(base_path="./workspaces", workspace_name="team-1")
             assert result is mock_instance
 
-    def test_get_workspace_local_mode_explicit(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("WORKSPACE_MODE", "local")
+    def test_get_workspace_custom_root_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """get_workspace() uses AKGENTIC_WORKSPACES_ROOT value when set."""
+        monkeypatch.setenv("AKGENTIC_WORKSPACES_ROOT", "/workspaces")
+        with patch("akgentic.tool.workspace.workspace.Filesystem") as mock_fs_cls:
+            mock_instance = MagicMock()
+            mock_fs_cls.return_value = mock_instance
+            result = get_workspace("team-1")
+            mock_fs_cls.assert_called_once_with(base_path="/workspaces", workspace_name="team-1")
+            assert result is mock_instance
+
+    def test_get_workspace_custom_tmp_root(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """get_workspace() passes any arbitrary AKGENTIC_WORKSPACES_ROOT value through."""
+        monkeypatch.setenv("AKGENTIC_WORKSPACES_ROOT", "/tmp/test-workspaces")
         with patch("akgentic.tool.workspace.workspace.Filesystem") as mock_fs_cls:
             mock_instance = MagicMock()
             mock_fs_cls.return_value = mock_instance
             result = get_workspace("team-2")
-            mock_fs_cls.assert_called_once_with(base_path="./workspaces", workspace_name="team-2")
+            mock_fs_cls.assert_called_once_with(
+                base_path="/tmp/test-workspaces", workspace_name="team-2"
+            )
             assert result is mock_instance
 
-    def test_get_workspace_docker_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("WORKSPACE_MODE", "docker")
+    def test_get_workspace_workspace_name_passed_through(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """get_workspace() passes workspace_name verbatim to Filesystem."""
+        monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
         with patch("akgentic.tool.workspace.workspace.Filesystem") as mock_fs_cls:
             mock_instance = MagicMock()
             mock_fs_cls.return_value = mock_instance
-            result = get_workspace("team-3")
-            mock_fs_cls.assert_called_once_with(base_path="/workspaces", workspace_name="team-3")
-            assert result is mock_instance
-
-    def test_get_workspace_unknown_mode_raises_key_error(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("WORKSPACE_MODE", "s3")
-        with pytest.raises(KeyError):
-            get_workspace("team-1")
+            get_workspace("my-special-team")
+            mock_fs_cls.assert_called_once_with(
+                base_path="./workspaces", workspace_name="my-special-team"
+            )

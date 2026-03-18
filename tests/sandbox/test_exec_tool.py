@@ -1,16 +1,17 @@
-"""Tests for ExecTool — observer wiring, SANDBOX_MODE resolution, tool behaviour.
+"""Tests for ExecTool — observer wiring, mode field, tool behaviour.
 
-Covers AC1–AC13 for Story 6.4:
+Covers AC1–AC13 for Story 6.4 (updated for Story 6.5):
 - SANDBOX_ACTOR_CLASSES dict (AC1)
-- ExecTool fields (AC2)
+- ExecTool fields including mode (AC2)
 - observer() raises ValueError when orchestrator is None (AC3)
-- observer() creates LocalSandboxActor with SANDBOX_MODE=local (AC4)
-- observer() creates DockerSandboxActor with SANDBOX_MODE=docker (AC5)
+- observer() creates LocalSandboxActor with mode="local" (AC4)
+- observer() creates DockerSandboxActor with mode="docker" (AC5)
 - observer() reuses existing actor — no second createActor call (AC6)
-- observer() raises KeyError on unknown SANDBOX_MODE (AC7)
+- observer() raises KeyError on unknown mode (AC7)
 - exec_command returns formatted stdout/stderr/exit_code (AC8)
 - exec_command catches CommandNotAllowedError → error string (AC9)
 - get_tools() returns [] when exec_command=False (AC10)
+- Story 6.5: mode comes from ExecTool.mode field, not SANDBOX_MODE env var
 """
 
 from __future__ import annotations
@@ -92,7 +93,7 @@ def test_sandbox_actor_classes_is_mutable_dict() -> None:
 
 
 # ---------------------------------------------------------------------------
-# AC2 — ExecTool field defaults
+# AC2 — ExecTool field defaults (including mode)
 # ---------------------------------------------------------------------------
 
 
@@ -114,6 +115,18 @@ def test_exec_tool_exec_command_default_is_true() -> None:
     assert tool.exec_command is True
 
 
+def test_exec_tool_mode_defaults_to_local() -> None:
+    """Story 6.5: ExecTool.mode defaults to 'local'."""
+    tool = ExecTool()
+    assert tool.mode == "local"
+
+
+def test_exec_tool_mode_can_be_set_to_docker() -> None:
+    """Story 6.5: ExecTool(mode='docker') stores mode='docker'."""
+    tool = ExecTool(mode="docker")
+    assert tool.mode == "docker"
+
+
 # ---------------------------------------------------------------------------
 # AC3 — observer() raises ValueError when orchestrator is None
 # ---------------------------------------------------------------------------
@@ -129,15 +142,14 @@ def test_observer_raises_value_error_when_orchestrator_is_none() -> None:
 
 
 # ---------------------------------------------------------------------------
-# AC4 — observer() creates LocalSandboxActor when SANDBOX_MODE=local
+# AC4 — observer() creates LocalSandboxActor when mode="local"
 # ---------------------------------------------------------------------------
 
 
-def test_observer_creates_local_sandbox_actor(monkeypatch: pytest.MonkeyPatch) -> None:
-    """AC4: observer() with SANDBOX_MODE=local creates LocalSandboxActor."""
-    monkeypatch.setenv("SANDBOX_MODE", "local")
+def test_observer_creates_local_sandbox_actor() -> None:
+    """AC4: ExecTool(mode='local').observer() creates LocalSandboxActor."""
     observer = MockObserver(existing_actor=None)
-    tool = ExecTool()
+    tool = ExecTool(mode="local")
 
     tool.observer(observer)  # type: ignore[arg-type]
 
@@ -146,11 +158,10 @@ def test_observer_creates_local_sandbox_actor(monkeypatch: pytest.MonkeyPatch) -
     assert call_args[0][0] is LocalSandboxActor
 
 
-def test_observer_creates_actor_with_correct_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    """AC4: SandboxConfig passed to createActor has name, role, and team_id."""
-    monkeypatch.setenv("SANDBOX_MODE", "local")
+def test_observer_creates_actor_with_correct_config() -> None:
+    """AC4: SandboxConfig passed to createActor has name, role, team_id, and mode."""
     observer = MockObserver(existing_actor=None)
-    tool = ExecTool()
+    tool = ExecTool(mode="local")
 
     tool.observer(observer)  # type: ignore[arg-type]
 
@@ -159,13 +170,13 @@ def test_observer_creates_actor_with_correct_config(monkeypatch: pytest.MonkeyPa
     assert config.name == SANDBOX_ACTOR_NAME
     assert config.role == "ToolActor"
     assert config.team_id == "team-test"
+    assert config.mode == "local"
 
 
-def test_observer_stores_sandbox_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_observer_stores_sandbox_proxy() -> None:
     """AC4: observer() stores a non-None _sandbox_proxy after wiring."""
-    monkeypatch.setenv("SANDBOX_MODE", "local")
     observer = MockObserver(existing_actor=None)
-    tool = ExecTool()
+    tool = ExecTool(mode="local")
 
     tool.observer(observer)  # type: ignore[arg-type]
 
@@ -173,15 +184,14 @@ def test_observer_stores_sandbox_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# AC5 — observer() creates DockerSandboxActor when SANDBOX_MODE=docker
+# AC5 — observer() creates DockerSandboxActor when mode="docker"
 # ---------------------------------------------------------------------------
 
 
-def test_observer_creates_docker_sandbox_actor(monkeypatch: pytest.MonkeyPatch) -> None:
-    """AC5: observer() with SANDBOX_MODE=docker creates DockerSandboxActor."""
-    monkeypatch.setenv("SANDBOX_MODE", "docker")
+def test_observer_creates_docker_sandbox_actor() -> None:
+    """AC5: ExecTool(mode='docker').observer() creates DockerSandboxActor."""
     observer = MockObserver(existing_actor=None)
-    tool = ExecTool()
+    tool = ExecTool(mode="docker")
 
     tool.observer(observer)  # type: ignore[arg-type]
 
@@ -190,14 +200,25 @@ def test_observer_creates_docker_sandbox_actor(monkeypatch: pytest.MonkeyPatch) 
     assert call_args[0][0] is DockerSandboxActor
 
 
+def test_observer_creates_docker_actor_config_has_mode_docker() -> None:
+    """Story 6.5: SandboxConfig for docker mode has mode='docker'."""
+    observer = MockObserver(existing_actor=None)
+    tool = ExecTool(mode="docker")
+
+    tool.observer(observer)  # type: ignore[arg-type]
+
+    call_kwargs = observer._orch_proxy.createActor.call_args[1]
+    config: SandboxConfig = call_kwargs["config"]
+    assert config.mode == "docker"
+
+
 # ---------------------------------------------------------------------------
 # AC6 — observer() reuses existing actor — does NOT call createActor again
 # ---------------------------------------------------------------------------
 
 
-def test_observer_reuses_existing_actor(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_observer_reuses_existing_actor() -> None:
     """AC6: when #SandboxActor already exists, createActor is NOT called."""
-    monkeypatch.setenv("SANDBOX_MODE", "local")
     existing_addr = MagicMock(spec=ActorAddress)
     observer = MockObserver(existing_actor=existing_addr)
     tool = ExecTool()
@@ -207,10 +228,8 @@ def test_observer_reuses_existing_actor(monkeypatch: pytest.MonkeyPatch) -> None
     observer._orch_proxy.createActor.assert_not_called()
 
 
-def test_observer_second_call_reuses_actor(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_observer_second_call_reuses_actor() -> None:
     """AC6: calling observer() a second time (actor already exists) does not create a new one."""
-    monkeypatch.setenv("SANDBOX_MODE", "local")
-
     # First call: no existing actor → creates one
     observer1 = MockObserver(existing_actor=None)
     tool = ExecTool()
@@ -226,17 +245,16 @@ def test_observer_second_call_reuses_actor(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 # ---------------------------------------------------------------------------
-# AC7 — observer() raises KeyError on unknown SANDBOX_MODE
+# AC7 — observer() raises KeyError on unknown mode value
 # ---------------------------------------------------------------------------
 
 
-def test_observer_raises_key_error_on_unknown_sandbox_mode(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """AC7: SANDBOX_MODE=unknown → KeyError (fail-fast, no error handling added)."""
-    monkeypatch.setenv("SANDBOX_MODE", "unknown-backend")
+def test_observer_raises_key_error_on_unknown_mode() -> None:
+    """AC7: ExecTool(mode=...) with an unregistered mode → KeyError (fail-fast)."""
     observer = MockObserver(existing_actor=None)
+    # Bypass Literal validation by using object.__setattr__
     tool = ExecTool()
+    object.__setattr__(tool, "mode", "unknown-backend")
 
     with pytest.raises(KeyError):
         tool.observer(observer)  # type: ignore[arg-type]
@@ -247,11 +265,10 @@ def test_observer_raises_key_error_on_unknown_sandbox_mode(
 # ---------------------------------------------------------------------------
 
 
-def test_exec_command_returns_formatted_output(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_exec_command_returns_formatted_output() -> None:
     """AC8: exec_command returns 'stdout:\\n...\\nstderr:\\n...\\nexit_code: 0'."""
-    monkeypatch.setenv("SANDBOX_MODE", "local")
     observer = MockObserver(existing_actor=None)
-    tool = ExecTool()
+    tool = ExecTool(mode="local")
     tool.observer(observer)  # type: ignore[arg-type]
 
     # Replace proxy with a controlled mock
@@ -271,11 +288,10 @@ def test_exec_command_returns_formatted_output(monkeypatch: pytest.MonkeyPatch) 
     assert "stderr:" in result
 
 
-def test_exec_command_includes_stderr_in_output(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_exec_command_includes_stderr_in_output() -> None:
     """AC8: exec_command includes stderr in the returned string."""
-    monkeypatch.setenv("SANDBOX_MODE", "local")
     observer = MockObserver(existing_actor=None)
-    tool = ExecTool()
+    tool = ExecTool(mode="local")
     tool.observer(observer)  # type: ignore[arg-type]
 
     mock_proxy = MagicMock(spec=SandboxActor)
@@ -294,13 +310,10 @@ def test_exec_command_includes_stderr_in_output(monkeypatch: pytest.MonkeyPatch)
 # ---------------------------------------------------------------------------
 
 
-def test_exec_command_catches_command_not_allowed_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_exec_command_catches_command_not_allowed_error() -> None:
     """AC9: CommandNotAllowedError is caught and returned as an error string — not raised."""
-    monkeypatch.setenv("SANDBOX_MODE", "local")
     observer = MockObserver(existing_actor=None)
-    tool = ExecTool()
+    tool = ExecTool(mode="local")
     tool.observer(observer)  # type: ignore[arg-type]
 
     mock_proxy = MagicMock(spec=SandboxActor)
@@ -314,13 +327,10 @@ def test_exec_command_catches_command_not_allowed_error(
     assert not result.startswith("Traceback")  # must not have raised
 
 
-def test_exec_command_error_string_lists_allowed_commands(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_exec_command_error_string_lists_allowed_commands() -> None:
     """AC9: error string contains the sorted list of ALLOWED_COMMANDS."""
-    monkeypatch.setenv("SANDBOX_MODE", "local")
     observer = MockObserver(existing_actor=None)
-    tool = ExecTool()
+    tool = ExecTool(mode="local")
     tool.observer(observer)  # type: ignore[arg-type]
 
     mock_proxy = MagicMock(spec=SandboxActor)
@@ -346,11 +356,10 @@ def test_get_tools_returns_empty_list_when_exec_command_disabled() -> None:
     assert tool.get_tools() == []
 
 
-def test_get_tools_returns_one_callable_when_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_get_tools_returns_one_callable_when_enabled() -> None:
     """get_tools() returns exactly one callable when exec_command=True."""
-    monkeypatch.setenv("SANDBOX_MODE", "local")
     observer = MockObserver(existing_actor=None)
-    tool = ExecTool()
+    tool = ExecTool(mode="local")
     tool.observer(observer)  # type: ignore[arg-type]
 
     mock_proxy = MagicMock(spec=SandboxActor)
@@ -366,12 +375,32 @@ def test_get_tools_returns_one_callable_when_enabled(monkeypatch: pytest.MonkeyP
 # ---------------------------------------------------------------------------
 
 
-def test_observer_returns_self(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_observer_returns_self() -> None:
     """observer() returns the ExecTool instance for method chaining."""
-    monkeypatch.setenv("SANDBOX_MODE", "local")
     observer = MockObserver(existing_actor=None)
     tool = ExecTool()
 
     result = tool.observer(observer)  # type: ignore[arg-type]
 
     assert result is tool
+
+
+# ---------------------------------------------------------------------------
+# Story 6.5: no SANDBOX_MODE env var dependency
+# ---------------------------------------------------------------------------
+
+
+def test_exec_tool_mode_not_affected_by_sandbox_mode_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Story 6.5: SANDBOX_MODE env var has no effect — mode is read from ExecTool.mode."""
+    # Even if SANDBOX_MODE is set, ExecTool must use self.mode exclusively
+    monkeypatch.setenv("SANDBOX_MODE", "docker")
+    observer = MockObserver(existing_actor=None)
+    tool = ExecTool(mode="local")  # explicit local
+
+    tool.observer(observer)  # type: ignore[arg-type]
+
+    call_args = observer._orch_proxy.createActor.call_args
+    # Despite env var, LocalSandboxActor must be chosen (mode="local")
+    assert call_args[0][0] is LocalSandboxActor

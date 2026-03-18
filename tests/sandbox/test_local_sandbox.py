@@ -1,7 +1,8 @@
 """Tests for LocalSandboxActor — subprocess-based sandbox execution.
 
-Covers AC1 through AC7 for Story 6.2:
+Covers AC1 through AC7 for Story 6.2 (updated for Story 6.5):
 - _start_sandbox() creates workspace directory and stores absolute path
+- _start_sandbox() uses AKGENTIC_WORKSPACES_ROOT (default ./workspaces)
 - _start_sandbox() is idempotent (calling twice does not raise)
 - _stop_sandbox() is a no-op
 - _exec() with empty cwd uses state.workspace_path directly
@@ -48,8 +49,9 @@ def make_actor(team_id: str = "team-test") -> LocalSandboxActor:
 def test_start_sandbox_creates_workspace_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """AC1: _start_sandbox() creates ./workspaces/team-1/ relative to CWD."""
+    """AC1: _start_sandbox() creates ./workspaces/team-1/ relative to CWD (default root)."""
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
     actor = make_actor(team_id="team-1")
 
     actor._start_sandbox()
@@ -64,6 +66,7 @@ def test_start_sandbox_stores_absolute_path(
 ) -> None:
     """AC1: _start_sandbox() stores resolved absolute path in state.workspace_path."""
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
     actor = make_actor(team_id="team-1")
 
     actor._start_sandbox()
@@ -73,11 +76,28 @@ def test_start_sandbox_stores_absolute_path(
     assert actor.state.workspace_path == (tmp_path / "workspaces" / "team-1").resolve()
 
 
+def test_start_sandbox_uses_custom_workspaces_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Story 6.5: _start_sandbox() uses AKGENTIC_WORKSPACES_ROOT when set."""
+    custom_root = tmp_path / "my-custom-root"
+    monkeypatch.setenv("AKGENTIC_WORKSPACES_ROOT", str(custom_root))
+    actor = make_actor(team_id="team-1")
+
+    actor._start_sandbox()
+
+    expected = custom_root / "team-1"
+    assert expected.exists()
+    assert expected.is_dir()
+    assert actor.state.workspace_path == expected.resolve()
+
+
 def test_start_sandbox_calls_notify_state_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC1: _start_sandbox() calls state.notify_state_change() — verified via class-level patch."""
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
     actor = make_actor(team_id="team-1")
 
     with patch("akgentic.tool.sandbox.actor.SandboxState.notify_state_change") as mock_notify:
@@ -93,6 +113,7 @@ def test_start_sandbox_calls_notify_state_change(
 def test_start_sandbox_is_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """AC2: Calling _start_sandbox() twice does not raise."""
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
     actor = make_actor(team_id="team-1")
 
     actor._start_sandbox()
@@ -110,6 +131,7 @@ def test_start_sandbox_is_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyP
 def test_stop_sandbox_is_noop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """AC3: _stop_sandbox() returns None and has no side effects."""
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
     actor = make_actor(team_id="team-1")
     actor._start_sandbox()
 
@@ -123,6 +145,7 @@ def test_stop_sandbox_does_not_remove_workspace(
 ) -> None:
     """AC3: _stop_sandbox() leaves the workspace directory intact."""
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
     actor = make_actor(team_id="team-1")
     actor._start_sandbox()
 
@@ -143,6 +166,7 @@ def test_exec_no_cwd_uses_workspace_path(
 ) -> None:
     """AC4: _exec(cmd, cwd='') passes state.workspace_path as cwd to subprocess.run."""
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
     actor = make_actor(team_id="team-1")
     actor._start_sandbox()
 
@@ -170,6 +194,7 @@ def test_exec_with_cwd_appends_to_workspace_path(
 ) -> None:
     """AC5: _exec(cmd, cwd='src') passes state.workspace_path / 'src' as cwd."""
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
     actor = make_actor(team_id="team-1")
     actor._start_sandbox()
 
@@ -198,6 +223,7 @@ def test_exec_returns_exec_result(
 ) -> None:
     """_exec() returns ExecResult with stdout, stderr, exit_code from subprocess.run."""
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
     actor = make_actor(team_id="team-1")
     actor._start_sandbox()
 
@@ -217,6 +243,7 @@ def test_exec_captures_non_zero_exit_code(
 ) -> None:
     """_exec() correctly captures non-zero exit codes from subprocess.run."""
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
     actor = make_actor(team_id="team-1")
     actor._start_sandbox()
 
@@ -239,6 +266,7 @@ def test_exec_timeout_propagates(
 ) -> None:
     """AC6: subprocess.TimeoutExpired from subprocess.run propagates out of _exec()."""
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
     actor = make_actor(team_id="team-1")
     actor._start_sandbox()
 
@@ -259,6 +287,7 @@ def test_public_exec_method_end_to_end(
 ) -> None:
     """AC7: actor.exec() through inherited SandboxActor.exec() delegates to _exec()."""
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
     actor = make_actor(team_id="team-1")
     actor.on_start()  # Use the full lifecycle (sets state via SandboxActor.on_start)
 
@@ -270,3 +299,64 @@ def test_public_exec_method_end_to_end(
     assert result.stdout == "passed"
     assert result.exit_code == 0
     mock_run.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Story 6.5: shared-filesystem invariant — WorkspaceTool and LocalSandboxActor
+# resolve to the same absolute path for the same team_id
+# ---------------------------------------------------------------------------
+
+
+def test_workspace_tool_and_local_sandbox_actor_resolve_same_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Story 6.5 AC: WorkspaceTool (via get_workspace) and LocalSandboxActor share the same
+    workspace root when AKGENTIC_WORKSPACES_ROOT is unset.
+
+    Both tools must resolve to the same absolute path for team-1 to guarantee
+    the shared-filesystem invariant (ADR-006).
+    """
+    from akgentic.tool.workspace.workspace import get_workspace
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
+
+    # WorkspaceTool path (via get_workspace factory)
+    workspace = get_workspace("team-1")
+    workspace_tool_root = workspace._root.resolve()
+
+    # LocalSandboxActor path (via _start_sandbox())
+    actor = make_actor(team_id="team-1")
+    actor._start_sandbox()
+    sandbox_root = actor.state.workspace_path
+
+    assert sandbox_root is not None
+    assert workspace_tool_root == sandbox_root, (
+        f"WorkspaceTool root ({workspace_tool_root}) != "
+        f"LocalSandboxActor root ({sandbox_root})"
+    )
+
+
+def test_workspace_tool_and_local_sandbox_actor_resolve_same_path_custom_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Story 6.5 AC: Both tools use custom AKGENTIC_WORKSPACES_ROOT and resolve to same path."""
+    from akgentic.tool.workspace.workspace import get_workspace
+
+    custom_root = tmp_path / "shared-workspaces"
+    monkeypatch.setenv("AKGENTIC_WORKSPACES_ROOT", str(custom_root))
+
+    # WorkspaceTool path
+    workspace = get_workspace("team-1")
+    workspace_tool_root = workspace._root.resolve()
+
+    # LocalSandboxActor path
+    actor = make_actor(team_id="team-1")
+    actor._start_sandbox()
+    sandbox_root = actor.state.workspace_path
+
+    assert sandbox_root is not None
+    assert workspace_tool_root == sandbox_root, (
+        f"WorkspaceTool root ({workspace_tool_root}) != "
+        f"LocalSandboxActor root ({sandbox_root})"
+    )

@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -66,9 +67,12 @@ class SandboxConfig(BaseConfig):
 
     Attributes:
         team_id: Identifier of the team that owns this sandbox.
+        mode: Execution backend — ``"local"`` (subprocess) or ``"docker"``
+            (persistent container).  Defaults to ``"local"``.
     """
 
     team_id: str
+    mode: Literal["local", "docker"] = "local"
 
 
 class SandboxState(BaseState):
