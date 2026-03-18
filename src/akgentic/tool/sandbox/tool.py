@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, Literal
 
 from pydantic import PrivateAttr
@@ -18,6 +19,9 @@ from akgentic.tool.sandbox.actor import (
 )
 from akgentic.tool.sandbox.docker import DockerSandboxActor
 from akgentic.tool.sandbox.local import LocalSandboxActor
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 # ---------------------------------------------------------------------------
 # SANDBOX_ACTOR_CLASSES — mutable injection window for runtime registration
@@ -53,6 +57,7 @@ class ExecTool(ToolCard):
     description: str = "Execute sandboxed shell commands in the team workspace"
     exec_command: ExecCommand | bool = True
     mode: Literal["local", "docker"] = "local"
+    workspace_id: str | None = None
 
     _sandbox_proxy: SandboxActor | None = PrivateAttr(default=None)
 
@@ -61,7 +66,9 @@ class ExecTool(ToolCard):
 
         Resolves ``SANDBOX_ACTOR_CLASSES[self.mode]`` at call time (not import
         time) so that akgentic-infra can inject additional actor classes before
-        any ExecTool is constructed (NFR-SB-7).
+        any ExecTool is constructed (NFR-SB-7).  ``self.workspace_id`` is
+        forwarded to ``SandboxConfig`` so the sandbox backend uses the same
+        workspace directory as ``WorkspaceTool(workspace_id=...)``.
 
         Args:
             observer: Actor-aware observer providing orchestrator access.
@@ -81,6 +88,7 @@ class ExecTool(ToolCard):
         sandbox_addr = orchestrator_proxy.get_team_member(SANDBOX_ACTOR_NAME)
 
         if sandbox_addr is None:
+            logger.info(f"ExecTool: create {SANDBOX_ACTOR_NAME}.")
             # KeyError on unknown mode — intentional (fail-fast, NFR-SB-7)
             actor_class = SANDBOX_ACTOR_CLASSES[self.mode]
             sandbox_addr = orchestrator_proxy.createActor(
@@ -89,6 +97,7 @@ class ExecTool(ToolCard):
                     name=SANDBOX_ACTOR_NAME,
                     role="ToolActor",
                     team_id=str(observer._team_id),  # type: ignore[attr-defined]
+                    workspace_id=self.workspace_id,
                     mode=self.mode,
                 ),
             )

@@ -29,7 +29,8 @@ class DockerSandboxActor(SandboxActor):
                 "docker CLI not found on PATH — cannot start DockerSandboxActor"
             )
         base = os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
-        volume = f"{Path(base) / self.config.team_id}:/workspace"
+        ws_name = self.config.workspace_id or self.config.team_id
+        volume = f"{Path(base) / ws_name}:/workspace"
         # Check if container already exists (any state)
         check = subprocess.run(
             [

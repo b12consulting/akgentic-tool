@@ -19,7 +19,8 @@ class LocalSandboxActor(SandboxActor):
 
     def _start_sandbox(self) -> None:
         base = os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
-        workspace_path = Path(base) / self.config.team_id
+        ws_name = self.config.workspace_id or self.config.team_id
+        workspace_path = Path(base) / ws_name
         workspace_path.mkdir(parents=True, exist_ok=True)
         self.state.workspace_path = workspace_path.resolve()
         self.state.notify_state_change()
