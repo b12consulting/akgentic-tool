@@ -1129,6 +1129,20 @@ class TestDocumentReaderSerialization:
         """ClassVar extensions must not appear in model_dump()."""
         assert "extensions" not in DocumentReader().model_dump()
 
+    def test_model_validate_roundtrip_default(self) -> None:
+        """model_dump() -> model_validate() round-trips for default DocumentReader."""
+        original = DocumentReader()
+        restored = DocumentReader.model_validate(original.model_dump())
+        assert restored.llm_client == original.llm_client
+        assert restored.llm_model == original.llm_model
+
+    def test_model_validate_roundtrip_with_openai(self) -> None:
+        """model_dump() -> model_validate() round-trips for llm_client='openai'."""
+        original = DocumentReader(llm_client="openai")
+        restored = DocumentReader.model_validate(original.model_dump())
+        assert restored.llm_client == "openai"
+        assert restored.llm_model == "gpt-4o"
+
 
 class TestWorkspaceReadToolSerialization:
     """Verify WorkspaceReadTool.model_dump() succeeds without ConfigDict (AC: 5)."""
@@ -1153,6 +1167,13 @@ class TestWorkspaceReadToolSerialization:
             "llm_client": "openai",
             "llm_model": "gpt-4o",
         }
+
+    def test_model_validate_roundtrip_with_document_reader(self) -> None:
+        """model_dump -> model_validate round-trips with DocumentReader."""
+        original = WorkspaceReadTool(document_reader=DocumentReader(llm_client="openai"))
+        restored = WorkspaceReadTool.model_validate(original.model_dump())
+        assert isinstance(restored.document_reader, DocumentReader)
+        assert restored.document_reader.llm_client == "openai"
 
 
 class TestDocumentReaderLazyInit:
