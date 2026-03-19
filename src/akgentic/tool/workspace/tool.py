@@ -367,7 +367,7 @@ class WorkspaceTool(ToolCard):
     workspace_glob: WorkspaceGlob | bool = True
     workspace_grep: WorkspaceGrep | bool = True
     document_reader: DocumentReader | bool = True
-    workspace_expand_media_refs: ExpandMediaRefs | bool = True
+    expand_media_refs: ExpandMediaRefs | bool = True
 
     # Read-only gate (NEW)
     read_only: bool = False
@@ -472,7 +472,7 @@ class WorkspaceTool(ToolCard):
             Dict mapping ``ExpandMediaRefs`` to ``_expand_media_refs`` when enabled.
         """
         commands: dict[type[BaseToolParam], Callable[..., Any]] = {}
-        pr = _resolve(self.workspace_expand_media_refs, ExpandMediaRefs)
+        pr = _resolve(self.expand_media_refs, ExpandMediaRefs)
         if pr is not None:
             commands[ExpandMediaRefs] = self._expand_media_refs
         return commands

@@ -1267,21 +1267,21 @@ class TestExpandMediaRefs:
         assert result == ["no tokens here"]
 
     def test_disabled_field_excludes_from_commands(self, tmp_path: Path) -> None:
-        """AC-6: workspace_expand_media_refs=False → ExpandMediaRefs not in get_commands()."""
+        """AC-6: expand_media_refs=False → ExpandMediaRefs not in get_commands()."""
         import uuid
         from unittest.mock import patch
 
         tid = uuid.uuid4()
         fs = Filesystem(str(tmp_path), str(tid))
         observer = make_observer(team_id=tid)
-        tool = WorkspaceTool(read_only=True, workspace_expand_media_refs=False)
+        tool = WorkspaceTool(read_only=True, expand_media_refs=False)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             tool.observer(observer)
         commands = tool.get_commands()
         assert ExpandMediaRefs not in commands
 
     def test_enabled_field_includes_in_commands(self, tmp_path: Path) -> None:
-        """AC-6 inverse: workspace_expand_media_refs=True → ExpandMediaRefs in get_commands()."""
+        """AC-6 inverse: expand_media_refs=True → ExpandMediaRefs in get_commands()."""
         tool = make_tool(tmp_path)
         commands = tool.get_commands()
         assert ExpandMediaRefs in commands
