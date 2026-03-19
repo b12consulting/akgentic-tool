@@ -11,13 +11,15 @@ obtained via :func:`~akgentic.tool.workspace.workspace.get_workspace`.
 from __future__ import annotations
 
 import difflib
+import io
 import re as _re
 import shutil
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 from pydantic import PrivateAttr
+from pydantic_ai.messages import BinaryContent
 
 from akgentic.tool.core import COMMAND, TOOL_CALL, BaseToolParam, Channels, ToolCard, _resolve
 from akgentic.tool.errors import RetriableError
@@ -35,6 +37,15 @@ from akgentic.tool.workspace.workspace import Filesystem, get_workspace
 
 _PERM_ERR_MSG = "Path escapes workspace root — use a path relative to the workspace"
 _REF_RE = _re.compile(r'!!"([^"]+)"|!!(\S+)')
+_PILLOW_FMT: dict[str, str] = {
+    ".png": "PNG",
+    ".jpg": "JPEG",
+    ".jpeg": "JPEG",
+    ".webp": "WEBP",
+    ".gif": "GIF",
+    ".bmp": "BMP",
+}
+_PILLOW_WARN_EMITTED: bool = False  # guards the one-time Pillow-absent warning
 
 
 class WorkspaceRead(BaseToolParam):
@@ -74,6 +85,60 @@ class ExpandMediaRefs(BaseToolParam):
     """
 
     expose: set[Channels] = {COMMAND}
+
+
+class WorkspaceView(BaseToolParam):
+    """View an image file from the team workspace as binary content for LLM vision."""
+
+    expose: set[Channels] = {TOOL_CALL}
+    max_dimension: int = 1568
+    """Longest-side pixel cap. Images exceeding this are resized (aspect-ratio preserved, LANCZOS).
+    Set to 0 to disable resizing and return raw bytes."""
+
+
+def _maybe_resize(data: bytes, suffix: str, max_dim: int, root: Path, path: str) -> bytes:
+    """Resize *data* if longest side exceeds *max_dim*, with sidecar cache.
+
+    When *max_dim* is 0, returns *data* unchanged and writes no sidecar.
+    When Pillow is not installed, logs a one-time warning and returns *data* unchanged.
+
+    Sidecar naming: ``.{stem}.{ext}.{max_dim}.{ext}`` colocated with the source file.
+    """
+    if max_dim == 0:
+        return data
+
+    try:
+        from PIL import Image  # noqa: PLC0415
+    except ImportError:
+        global _PILLOW_WARN_EMITTED  # noqa: PLW0603
+        if not _PILLOW_WARN_EMITTED:
+            import logging  # noqa: PLC0415
+
+            logging.getLogger(__name__).warning(
+                "Pillow not installed — sending raw image without resizing. "
+                'Install with: pip install "akgentic-tool[vision]"'
+            )
+            _PILLOW_WARN_EMITTED = True
+        return data
+
+    p = Path(path)
+    sidecar_name = f".{p.stem}{p.suffix}.{max_dim}{p.suffix}"
+    sidecar_path = root / p.parent / sidecar_name
+
+    if sidecar_path.exists():
+        return sidecar_path.read_bytes()
+
+    img = Image.open(io.BytesIO(data))
+    if max(img.size) <= max_dim:
+        return data  # already within limit — no resize, no sidecar
+
+    img.thumbnail((max_dim, max_dim), Image.LANCZOS)  # type: ignore[attr-defined]
+    buf = io.BytesIO()
+    fmt = _PILLOW_FMT.get(suffix, "JPEG")
+    img.save(buf, format=fmt)
+    resized = buf.getvalue()
+    sidecar_path.write_bytes(resized)
+    return resized
 
 
 def _grep_python(
@@ -255,6 +320,7 @@ class WorkspaceReadTool(ToolCard):
     workspace_grep: WorkspaceGrep | bool = True
     document_reader: DocumentReader | bool = True
     workspace_expand_media_refs: ExpandMediaRefs | bool = True
+    workspace_view: WorkspaceView | bool = True
 
     # Private runtime state — not part of the serialised config.
     # Default None sentinel lets the workspace property detect uninitialized state
@@ -312,6 +378,9 @@ class WorkspaceReadTool(ToolCard):
         pgr = _resolve(self.workspace_grep, WorkspaceGrep)
         if pgr is not None and TOOL_CALL in pgr.expose:
             tools.append(self._grep_factory(pgr))
+        vw = _resolve(self.workspace_view, WorkspaceView)
+        if vw is not None and TOOL_CALL in vw.expose:
+            tools.append(self._view_factory(vw))
         return tools
 
     def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
@@ -364,9 +433,7 @@ class WorkspaceReadTool(ToolCard):
             if m.start() > last:
                 parts.append(prompt[last : m.start()])
             pattern = m.group(1) or m.group(2)
-            all_matches = sorted(
-                p for p in self.workspace._root.glob(pattern) if p.is_file()
-            )
+            all_matches = sorted(p for p in self.workspace._root.glob(pattern) if p.is_file())
             image_matches = [p for p in all_matches if p.suffix.lower() in _MIME_MAP]
             doc_matches = [
                 p
@@ -664,6 +731,59 @@ class WorkspaceReadTool(ToolCard):
 
         workspace_grep.__doc__ = params.format_docstring(workspace_grep.__doc__)
         return workspace_grep
+
+    def _view_factory(self, params: WorkspaceView) -> Callable[..., Any]:
+        """Create the ``workspace_view`` tool callable.
+
+        Args:
+            params: View capability configuration.
+
+        Returns:
+            Callable that reads an image from the workspace as BinaryContent.
+        """
+        backend = self.workspace
+        max_dim = params.max_dimension
+
+        def workspace_view(path: str) -> BinaryContent:
+            """View an image file from the workspace. Returns the image for vision analysis.
+
+            Use this when you need to visually inspect an image (screenshot, diagram, photo).
+            For text extraction from documents (PDF, DOCX), use workspace_read instead.
+
+            Supported formats: PNG, JPEG, GIF, WebP, BMP.
+
+            Args:
+                path: Relative path to the image file within the workspace.
+
+            Returns:
+                BinaryContent with the image bytes and MIME type.
+
+            Raises:
+                RetriableError: If the path does not exist, escapes the workspace root,
+                    or the file extension is not a supported image format.
+            """
+            try:
+                data = backend.read_bytes(path)
+            except FileNotFoundError:
+                raise RetriableError(f"File not found: {path}")
+            except PermissionError:
+                raise RetriableError(_PERM_ERR_MSG)
+            try:
+                suffix = PurePosixPath(path).suffix.lower()
+                mime = _MIME_MAP.get(suffix)
+                if mime is None:
+                    raise RetriableError(
+                        f"Unsupported image format '{suffix}'. "
+                        f"Supported: {', '.join(sorted(_MIME_MAP))}. "
+                        f"For documents, use workspace_read instead."
+                    )
+                data = _maybe_resize(data, suffix, max_dim, backend._root, path)
+                return BinaryContent(data=data, media_type=mime)
+            except RetriableError:
+                raise
+
+        workspace_view.__doc__ = params.format_docstring(workspace_view.__doc__)
+        return workspace_view
 
 
 class WorkspaceWrite(BaseToolParam):
