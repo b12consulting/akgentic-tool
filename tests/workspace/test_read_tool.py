@@ -17,7 +17,7 @@ from akgentic.tool.workspace.tool import (
     WorkspaceGrep,
     WorkspaceList,
     WorkspaceRead,
-    WorkspaceReadTool,
+    WorkspaceTool,
     _expand_braces,
     _grep_python,
     _grep_rg,
@@ -40,12 +40,12 @@ def make_observer(
     return observer
 
 
-def make_tool(tmp_path: Path, team_id: uuid.UUID | None = None) -> WorkspaceReadTool:
-    """Build a WorkspaceReadTool wired to a Filesystem rooted at tmp_path."""
+def make_tool(tmp_path: Path, team_id: uuid.UUID | None = None) -> WorkspaceTool:
+    """Build a WorkspaceTool(read_only=True) wired to a Filesystem rooted at tmp_path."""
     tid = team_id or uuid.uuid4()
     fs = Filesystem(str(tmp_path), str(tid))
     observer = make_observer(team_id=tid)
-    tool = WorkspaceReadTool()
+    tool = WorkspaceTool(read_only=True)
     with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
         tool.observer(observer)
     return tool
@@ -58,8 +58,8 @@ def make_tool(tmp_path: Path, team_id: uuid.UUID | None = None) -> WorkspaceRead
 
 class TestWorkspaceReadToolFields:
     def test_default_fields(self) -> None:
-        tool = WorkspaceReadTool()
-        assert tool.name == "WorkspaceRead"
+        tool = WorkspaceTool(read_only=True)
+        assert tool.name == "Workspace"
         assert tool.workspace_id is None
         assert tool.workspace_read is True
         assert tool.workspace_list is True
@@ -67,11 +67,12 @@ class TestWorkspaceReadToolFields:
         assert tool.workspace_grep is True
 
     def test_workspace_id_set(self) -> None:
-        tool = WorkspaceReadTool(workspace_id="my-workspace")
+        tool = WorkspaceTool(read_only=True, workspace_id="my-workspace")
         assert tool.workspace_id == "my-workspace"
 
     def test_capabilities_accept_param_models(self) -> None:
-        tool = WorkspaceReadTool(
+        tool = WorkspaceTool(
+            read_only=True,
             workspace_read=WorkspaceRead(default_limit=500),
             workspace_list=WorkspaceList(),
             workspace_glob=WorkspaceGlob(max_results=50),
@@ -89,7 +90,7 @@ class TestWorkspaceReadToolFields:
 class TestObserverWiring:
     def test_observer_raises_when_orchestrator_is_none(self, tmp_path: Path) -> None:
         observer = make_observer(orchestrator_is_none=True)
-        tool = WorkspaceReadTool()
+        tool = WorkspaceTool(read_only=True)
         with pytest.raises(ValueError, match="orchestrator"):
             tool.observer(observer)
 
@@ -97,7 +98,7 @@ class TestObserverWiring:
         team_id = uuid.uuid4()
         observer = make_observer(team_id=team_id)
         fs = Filesystem(str(tmp_path), str(team_id))
-        tool = WorkspaceReadTool()
+        tool = WorkspaceTool(read_only=True)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs) as mock_gw:
             result = tool.observer(observer)
             mock_gw.assert_called_once_with(str(team_id))
@@ -107,7 +108,7 @@ class TestObserverWiring:
     def test_observer_uses_explicit_workspace_id(self, tmp_path: Path) -> None:
         observer = make_observer()
         fs = Filesystem(str(tmp_path), "explicit-ws")
-        tool = WorkspaceReadTool(workspace_id="explicit-ws")
+        tool = WorkspaceTool(read_only=True, workspace_id="explicit-ws")
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs) as mock_gw:
             tool.observer(observer)
             mock_gw.assert_called_once_with("explicit-ws")
@@ -116,7 +117,7 @@ class TestObserverWiring:
         team_id = uuid.uuid4()
         observer = make_observer(team_id=team_id)
         fs = Filesystem(str(tmp_path), str(team_id))
-        tool = WorkspaceReadTool()
+        tool = WorkspaceTool(read_only=True)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             result = tool.observer(observer)
         assert result is tool
@@ -124,7 +125,7 @@ class TestObserverWiring:
     def test_observer_failed_call_does_not_set_internal_observer(self) -> None:
         """When observer() raises, _observer must NOT be set (no partial init)."""
         observer = make_observer(orchestrator_is_none=True)
-        tool = WorkspaceReadTool()
+        tool = WorkspaceTool(read_only=True)
         with pytest.raises(ValueError):
             tool.observer(observer)
         # _observer must remain unset — check via __pydantic_private__
@@ -134,7 +135,7 @@ class TestObserverWiring:
 
     def test_get_tools_raises_before_observer_called(self) -> None:
         """Calling get_tools() before observer() raises RuntimeError from workspace property."""
-        tool = WorkspaceReadTool()
+        tool = WorkspaceTool(read_only=True)
         with pytest.raises(RuntimeError, match="observer\\(\\) was called"):
             tool.get_tools()
 
@@ -154,7 +155,7 @@ class TestWorkspaceRead:
         fs = Filesystem(str(tmp_path), str(team_id))
         root = fs._root
         self._make_file(root, "big.txt", 3500)
-        tool = WorkspaceReadTool()
+        tool = WorkspaceTool(read_only=True)
         observer = make_observer(team_id=team_id)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             tool.observer(observer)
@@ -172,7 +173,7 @@ class TestWorkspaceRead:
         fs = Filesystem(str(tmp_path), str(team_id))
         root = fs._root
         self._make_file(root, "file.txt", 200)
-        tool = WorkspaceReadTool()
+        tool = WorkspaceTool(read_only=True)
         observer = make_observer(team_id=team_id)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             tool.observer(observer)
@@ -188,7 +189,7 @@ class TestWorkspaceRead:
         fs = Filesystem(str(tmp_path), str(team_id))
         root = fs._root
         self._make_file(root, "small.txt", 10)
-        tool = WorkspaceReadTool()
+        tool = WorkspaceTool(read_only=True)
         observer = make_observer(team_id=team_id)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             tool.observer(observer)
@@ -201,7 +202,7 @@ class TestWorkspaceRead:
         team_id = uuid.uuid4()
         fs = Filesystem(str(tmp_path), str(team_id))
         (fs._root / "abc.txt").write_text("alpha\nbeta\ngamma", encoding="utf-8")
-        tool = WorkspaceReadTool()
+        tool = WorkspaceTool(read_only=True)
         observer = make_observer(team_id=team_id)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             tool.observer(observer)
@@ -285,7 +286,7 @@ class TestWorkspaceGlob:
         assert lines[1] == "old.py"
 
     def test_glob_cap_at_max_results_with_truncation(self, tmp_path: Path) -> None:
-        tool = WorkspaceReadTool(workspace_glob=WorkspaceGlob(max_results=3))
+        tool = WorkspaceTool(read_only=True, workspace_glob=WorkspaceGlob(max_results=3))
         team_id = uuid.uuid4()
         fs = Filesystem(str(tmp_path), str(team_id))
         root = fs._root
@@ -522,7 +523,7 @@ class TestCapabilityToggling:
         team_id = uuid.uuid4()
         fs = Filesystem(str(tmp_path), str(team_id))
         observer = make_observer(team_id=team_id)
-        tool = WorkspaceReadTool(workspace_glob=False, workspace_grep=False)
+        tool = WorkspaceTool(read_only=True, workspace_glob=False, workspace_grep=False)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             tool.observer(observer)
         tools = tool.get_tools()
@@ -535,7 +536,8 @@ class TestCapabilityToggling:
         team_id = uuid.uuid4()
         fs = Filesystem(str(tmp_path), str(team_id))
         observer = make_observer(team_id=team_id)
-        tool = WorkspaceReadTool(
+        tool = WorkspaceTool(
+            read_only=True,
             workspace_read=False,
             workspace_list=False,
             workspace_glob=False,
@@ -550,7 +552,8 @@ class TestCapabilityToggling:
         team_id = uuid.uuid4()
         fs = Filesystem(str(tmp_path), str(team_id))
         observer = make_observer(team_id=team_id)
-        tool = WorkspaceReadTool(
+        tool = WorkspaceTool(
+            read_only=True,
             workspace_read=False,
             workspace_list=False,
             workspace_glob=WorkspaceGlob(),
@@ -693,12 +696,12 @@ class TestRetriableErrorReadTool:
 def make_wired_tool(
     tmp_path: Path,
     document_reader: DocumentReader | bool = True,
-) -> tuple[WorkspaceReadTool, Filesystem]:
-    """Build a WorkspaceReadTool wired to a Filesystem, returning both."""
+) -> tuple[WorkspaceTool, Filesystem]:
+    """Build a WorkspaceTool(read_only=True) wired to a Filesystem, returning both."""
     tid = uuid.uuid4()
     fs = Filesystem(str(tmp_path), str(tid))
     observer = make_observer(team_id=tid)
-    tool = WorkspaceReadTool(document_reader=document_reader)
+    tool = WorkspaceTool(read_only=True, document_reader=document_reader)
     with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
         tool.observer(observer)
     return tool, fs
@@ -1089,7 +1092,7 @@ class TestWorkspaceGlobBraceExpansion:
 
     def test_max_results_cap_preserved(self, tmp_path: Path) -> None:
         """AC 6: max_results cap and truncation notice still work with brace expansion."""
-        tool = WorkspaceReadTool(workspace_glob=WorkspaceGlob(max_results=100))
+        tool = WorkspaceTool(read_only=True, workspace_glob=WorkspaceGlob(max_results=100))
         team_id = uuid.uuid4()
         fs = Filesystem(str(tmp_path), str(team_id))
         root = fs._root
@@ -1148,24 +1151,24 @@ class TestDocumentReaderSerialization:
 
 
 class TestWorkspaceReadToolSerialization:
-    """Verify WorkspaceReadTool.model_dump() succeeds without ConfigDict (AC: 5)."""
+    """Verify WorkspaceTool(read_only=True).model_dump() succeeds without ConfigDict (AC: 5)."""
 
     def test_default_tool_model_dump_succeeds(self) -> None:
-        """model_dump() does not raise on default WorkspaceReadTool."""
-        result = WorkspaceReadTool().model_dump()
+        """model_dump() does not raise on WorkspaceTool(read_only=True)."""
+        result = WorkspaceTool(read_only=True).model_dump()
         assert isinstance(result, dict)
 
     def test_document_reader_true_in_dump(self) -> None:
         """Default document_reader=True serializes as True."""
-        assert WorkspaceReadTool().model_dump()["document_reader"] is True
+        assert WorkspaceTool(read_only=True).model_dump()["document_reader"] is True
 
     def test_document_reader_false_in_dump(self) -> None:
         """document_reader=False serializes as False."""
-        assert WorkspaceReadTool(document_reader=False).model_dump()["document_reader"] is False
+        assert WorkspaceTool(read_only=True, document_reader=False).model_dump()["document_reader"] is False
 
     def test_document_reader_instance_in_dump(self) -> None:
         """DocumentReader instance serializes to its model_dump() dict."""
-        tool = WorkspaceReadTool(document_reader=DocumentReader(llm_client="openai"))
+        tool = WorkspaceTool(read_only=True, document_reader=DocumentReader(llm_client="openai"))
         assert tool.model_dump()["document_reader"] == {
             "llm_client": "openai",
             "llm_model": "gpt-4o",
@@ -1173,8 +1176,8 @@ class TestWorkspaceReadToolSerialization:
 
     def test_model_validate_roundtrip_with_document_reader(self) -> None:
         """model_dump -> model_validate round-trips with DocumentReader."""
-        original = WorkspaceReadTool(document_reader=DocumentReader(llm_client="openai"))
-        restored = WorkspaceReadTool.model_validate(original.model_dump())
+        original = WorkspaceTool(read_only=True, document_reader=DocumentReader(llm_client="openai"))
+        restored = WorkspaceTool.model_validate(original.model_dump())
         assert isinstance(restored.document_reader, DocumentReader)
         assert restored.document_reader.llm_client == "openai"
 
@@ -1271,7 +1274,7 @@ class TestExpandMediaRefs:
         tid = uuid.uuid4()
         fs = Filesystem(str(tmp_path), str(tid))
         observer = make_observer(team_id=tid)
-        tool = WorkspaceReadTool(workspace_expand_media_refs=False)
+        tool = WorkspaceTool(read_only=True, workspace_expand_media_refs=False)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             tool.observer(observer)
         commands = tool.get_commands()
@@ -1436,6 +1439,6 @@ class TestExpandMediaRefs:
 
     def test_expand_media_refs_raises_before_observer_called(self) -> None:
         """M2: Calling _expand_media_refs before observer() raises RuntimeError."""
-        tool = WorkspaceReadTool()
+        tool = WorkspaceTool(read_only=True)
         with pytest.raises(RuntimeError):
             tool._expand_media_refs("!!photo.png")

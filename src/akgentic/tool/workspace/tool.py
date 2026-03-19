@@ -1,11 +1,13 @@
-"""Workspace ToolCards — read-only and full read/write/delete/edit access.
+"""Workspace ToolCards — configurable read-only or full read/write/delete/edit access.
 
-:class:`WorkspaceReadTool` exposes four read-only workspace operations as
-LLM-callable tools.  :class:`WorkspaceTool` extends it with ``workspace_write``,
-``workspace_delete``, ``workspace_edit``, ``workspace_multi_edit``, and
-``workspace_patch`` capabilities.  All operations are anchored to a
-team-scoped :class:`~akgentic.tool.workspace.workspace.Filesystem` backend
-obtained via :func:`~akgentic.tool.workspace.workspace.get_workspace`.
+:class:`WorkspaceTool` exposes workspace operations as LLM-callable tools.
+Pass ``read_only=True`` to restrict to read-side callables only (``workspace_read``,
+``workspace_list``, ``workspace_glob``, ``workspace_grep``, ``workspace_view``).
+The default ``read_only=False`` also includes write-side callables (``workspace_write``,
+``workspace_delete``, ``workspace_edit``, ``workspace_multi_edit``, ``workspace_patch``,
+``workspace_mkdir``).  All operations are anchored to a team-scoped
+:class:`~akgentic.tool.workspace.workspace.Filesystem` backend obtained via
+:func:`~akgentic.tool.workspace.workspace.get_workspace`.
 """
 
 from __future__ import annotations
@@ -301,8 +303,48 @@ def _build_tree(
     return lines
 
 
-class WorkspaceReadTool(ToolCard):
-    """Read-only workspace access: read, list, glob, grep.
+class WorkspaceWrite(BaseToolParam):
+    """Write content to a file in the team workspace."""
+
+    expose: set[Channels] = {TOOL_CALL}
+
+
+class WorkspaceDelete(BaseToolParam):
+    """Delete a file from the team workspace."""
+
+    expose: set[Channels] = {TOOL_CALL}
+
+
+class WorkspaceEdit(BaseToolParam):
+    """Apply a surgical find-and-replace edit to a workspace file."""
+
+    expose: set[Channels] = {TOOL_CALL}
+
+
+class WorkspaceMultiEdit(BaseToolParam):
+    """Apply a sequence of find-and-replace edits to workspace files."""
+
+    expose: set[Channels] = {TOOL_CALL}
+
+
+class WorkspacePatch(BaseToolParam):
+    """Apply a unified diff patch to the team workspace."""
+
+    expose: set[Channels] = {TOOL_CALL}
+
+
+class WorkspaceMkdir(BaseToolParam):
+    """Create a directory (and parents) in the team workspace."""
+
+    expose: set[Channels] = {TOOL_CALL}
+
+
+class WorkspaceTool(ToolCard):
+    """Workspace access with configurable read-only or full read/write/delete/edit mode.
+
+    Pass ``read_only=True`` to restrict to read-side tools only.  The default
+    ``read_only=False`` also exposes write-side tools (write, delete, edit,
+    multi_edit, patch, mkdir).
 
     ``document_reader`` controls binary file extraction:
     - ``True`` (default): uses a default ``DocumentReader()`` (Pass 1 only, no LLM).
@@ -310,9 +352,14 @@ class WorkspaceReadTool(ToolCard):
     - ``DocumentReader(...)`` instance: custom extraction config (e.g. with LLM).
     """
 
-    name: str = "WorkspaceRead"
-    description: str = "Read files, list directories, and search the team workspace"
+    name: str = "Workspace"
+    description: str = (
+        "Read, write, edit, and delete files in the team workspace. "
+        "Supports surgical find-and-replace, batch multi-edit, and unified diff patch. "
+        "For SWE agents with full file I/O access."
+    )
 
+    # Read capability fields (formerly in WorkspaceReadTool)
     workspace_id: str | None = None
     workspace_read: WorkspaceRead | bool = True
     workspace_list: WorkspaceList | bool = True
@@ -322,6 +369,17 @@ class WorkspaceReadTool(ToolCard):
     workspace_expand_media_refs: ExpandMediaRefs | bool = True
     workspace_view: WorkspaceView | bool = True
 
+    # Read-only gate (NEW)
+    read_only: bool = False
+
+    # Write capability fields
+    workspace_write: WorkspaceWrite | bool = True
+    workspace_delete: WorkspaceDelete | bool = True
+    workspace_edit: WorkspaceEdit | bool = True
+    workspace_multi_edit: WorkspaceMultiEdit | bool = True
+    workspace_patch: WorkspacePatch | bool = True
+    workspace_mkdir: WorkspaceMkdir | bool = True
+
     # Private runtime state — not part of the serialised config.
     # Default None sentinel lets the workspace property detect uninitialized state
     # reliably under both normal execution and coverage instrumentation.
@@ -329,7 +387,7 @@ class WorkspaceReadTool(ToolCard):
 
     def observer(  # type: ignore[override]
         self, observer: ActorToolObserver
-    ) -> "WorkspaceReadTool":
+    ) -> "WorkspaceTool":
         """Attach observer and initialise the workspace backend.
 
         Args:
@@ -342,7 +400,7 @@ class WorkspaceReadTool(ToolCard):
             ValueError: If ``observer.orchestrator`` is None.
         """
         if observer.orchestrator is None:
-            raise ValueError("WorkspaceReadTool requires access to the orchestrator.")
+            raise ValueError("WorkspaceTool requires access to the orchestrator.")
         self._observer = observer
         ws_name = self.workspace_id or str(observer._team_id)  # type: ignore[attr-defined]
         self._workspace = get_workspace(ws_name)
@@ -356,16 +414,20 @@ class WorkspaceReadTool(ToolCard):
             RuntimeError: If :meth:`observer` has not been called yet.
         """
         if not isinstance(self._workspace, Filesystem):
-            raise RuntimeError("WorkspaceReadTool.workspace accessed before observer() was called.")
+            raise RuntimeError("WorkspaceTool.workspace accessed before observer() was called.")
         return self._workspace
 
     def get_tools(self) -> list[Callable[..., Any]]:
-        """Return enabled read-only workspace tool callables.
+        """Return enabled workspace tool callables.
+
+        Read tools are always included (when their capability field is enabled).
+        Write tools are only included when ``read_only=False`` (the default).
 
         Returns:
-            List of callables for the capabilities not disabled via ``False``.
+            List of callables for all enabled capabilities.
         """
         tools: list[Callable[..., Any]] = []
+        # Read tools — always included (regardless of read_only)
         pr = _resolve(self.workspace_read, WorkspaceRead)
         if pr is not None and TOOL_CALL in pr.expose:
             tools.append(self._read_factory(pr))
@@ -381,6 +443,26 @@ class WorkspaceReadTool(ToolCard):
         vw = _resolve(self.workspace_view, WorkspaceView)
         if vw is not None and TOOL_CALL in vw.expose:
             tools.append(self._view_factory(vw))
+        # Write tools — only when not read_only
+        if not self.read_only:
+            pw = _resolve(self.workspace_write, WorkspaceWrite)
+            if pw is not None and TOOL_CALL in pw.expose:
+                tools.append(self._write_factory(pw))
+            pd = _resolve(self.workspace_delete, WorkspaceDelete)
+            if pd is not None and TOOL_CALL in pd.expose:
+                tools.append(self._delete_factory(pd))
+            pe = _resolve(self.workspace_edit, WorkspaceEdit)
+            if pe is not None and TOOL_CALL in pe.expose:
+                tools.append(self._edit_factory(pe))
+            pme = _resolve(self.workspace_multi_edit, WorkspaceMultiEdit)
+            if pme is not None and TOOL_CALL in pme.expose:
+                tools.append(self._multi_edit_factory(pme))
+            pp = _resolve(self.workspace_patch, WorkspacePatch)
+            if pp is not None and TOOL_CALL in pp.expose:
+                tools.append(self._patch_factory(pp))
+            pm = _resolve(self.workspace_mkdir, WorkspaceMkdir)
+            if pm is not None and TOOL_CALL in pm.expose:
+                tools.append(self._mkdir_factory(pm))
         return tools
 
     def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
@@ -784,101 +866,6 @@ class WorkspaceReadTool(ToolCard):
 
         workspace_view.__doc__ = params.format_docstring(workspace_view.__doc__)
         return workspace_view
-
-
-class WorkspaceWrite(BaseToolParam):
-    """Write content to a file in the team workspace."""
-
-    expose: set[Channels] = {TOOL_CALL}
-
-
-class WorkspaceDelete(BaseToolParam):
-    """Delete a file from the team workspace."""
-
-    expose: set[Channels] = {TOOL_CALL}
-
-
-class WorkspaceEdit(BaseToolParam):
-    """Apply a surgical find-and-replace edit to a workspace file."""
-
-    expose: set[Channels] = {TOOL_CALL}
-
-
-class WorkspaceMultiEdit(BaseToolParam):
-    """Apply a sequence of find-and-replace edits to workspace files."""
-
-    expose: set[Channels] = {TOOL_CALL}
-
-
-class WorkspacePatch(BaseToolParam):
-    """Apply a unified diff patch to the team workspace."""
-
-    expose: set[Channels] = {TOOL_CALL}
-
-
-class WorkspaceMkdir(BaseToolParam):
-    """Create a directory (and parents) in the team workspace."""
-
-    expose: set[Channels] = {TOOL_CALL}
-
-
-class WorkspaceTool(WorkspaceReadTool):
-    """Full workspace access: read + write + delete + edit + multi_edit + patch."""
-
-    name: str = "Workspace"
-    description: str = (
-        "Read, write, edit, and delete files in the team workspace. "
-        "Supports surgical find-and-replace, batch multi-edit, and unified diff patch. "
-        "For SWE agents with full file I/O access."
-    )
-
-    workspace_write: WorkspaceWrite | bool = True
-    workspace_delete: WorkspaceDelete | bool = True
-    workspace_edit: WorkspaceEdit | bool = True
-    workspace_multi_edit: WorkspaceMultiEdit | bool = True
-    workspace_patch: WorkspacePatch | bool = True
-    workspace_mkdir: WorkspaceMkdir | bool = True
-
-    def observer(  # type: ignore[override]
-        self, observer: ActorToolObserver
-    ) -> "WorkspaceTool":
-        """Delegate to WorkspaceReadTool.observer(), return self typed as WorkspaceTool.
-
-        Args:
-            observer: Actor tool observer; must have a non-None orchestrator.
-
-        Returns:
-            Self, enabling method chaining.
-        """
-        super().observer(observer)
-        return self
-
-    def get_tools(self) -> list[Callable[..., Any]]:
-        """Return read tools plus write, delete, edit, multi_edit, patch, and mkdir tools.
-
-        Returns:
-            List of callables for all enabled capabilities.
-        """
-        tools = super().get_tools()
-        pw = _resolve(self.workspace_write, WorkspaceWrite)
-        if pw is not None and TOOL_CALL in pw.expose:
-            tools.append(self._write_factory(pw))
-        pd = _resolve(self.workspace_delete, WorkspaceDelete)
-        if pd is not None and TOOL_CALL in pd.expose:
-            tools.append(self._delete_factory(pd))
-        pe = _resolve(self.workspace_edit, WorkspaceEdit)
-        if pe is not None and TOOL_CALL in pe.expose:
-            tools.append(self._edit_factory(pe))
-        pme = _resolve(self.workspace_multi_edit, WorkspaceMultiEdit)
-        if pme is not None and TOOL_CALL in pme.expose:
-            tools.append(self._multi_edit_factory(pme))
-        pp = _resolve(self.workspace_patch, WorkspacePatch)
-        if pp is not None and TOOL_CALL in pp.expose:
-            tools.append(self._patch_factory(pp))
-        pm = _resolve(self.workspace_mkdir, WorkspaceMkdir)
-        if pm is not None and TOOL_CALL in pm.expose:
-            tools.append(self._mkdir_factory(pm))
-        return tools
 
     def _write_factory(self, params: WorkspaceWrite) -> Callable[..., Any]:
         """Create the ``workspace_write`` tool callable.
