@@ -23,6 +23,7 @@ vector_search = [
     "numpy>=1.26.0",
 ]
 docs = ["markitdown[pdf,docx,xlsx,xls,pptx,outlook]>=0.1"]
+vision = ["Pillow>=10.0"]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",

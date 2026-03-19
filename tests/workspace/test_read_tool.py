@@ -516,9 +516,9 @@ class TestWorkspaceGrep:
 class TestCapabilityToggling:
     def test_all_enabled_returns_four_tools(self, tmp_path: Path) -> None:
         tool = make_tool(tmp_path)
-        assert len(tool.get_tools()) == 4
+        assert len(tool.get_tools()) == 5  # read, list, glob, grep, view
 
-    def test_glob_and_grep_disabled_returns_two_tools(self, tmp_path: Path) -> None:
+    def test_glob_and_grep_disabled_returns_three_tools(self, tmp_path: Path) -> None:
         team_id = uuid.uuid4()
         fs = Filesystem(str(tmp_path), str(team_id))
         observer = make_observer(team_id=team_id)
@@ -526,7 +526,7 @@ class TestCapabilityToggling:
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             tool.observer(observer)
         tools = tool.get_tools()
-        assert len(tools) == 2
+        assert len(tools) == 3  # read, list, view
         names = [t.__name__ for t in tools]
         assert "workspace_read" in names
         assert "workspace_list" in names
@@ -540,6 +540,7 @@ class TestCapabilityToggling:
             workspace_list=False,
             workspace_glob=False,
             workspace_grep=False,
+            workspace_view=False,
         )
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             tool.observer(observer)
@@ -554,6 +555,7 @@ class TestCapabilityToggling:
             workspace_list=False,
             workspace_glob=WorkspaceGlob(),
             workspace_grep=False,
+            workspace_view=False,
         )
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             tool.observer(observer)

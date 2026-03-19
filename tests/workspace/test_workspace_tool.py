@@ -76,10 +76,10 @@ class TestObserverDelegation:
 
 class TestGetToolsDefault:
     def test_default_count_is_ten(self, tmp_path: Path) -> None:
-        """By default, get_tools() returns all 10 tool callables."""
+        """By default, get_tools() returns all 11 tool callables."""
         tool, _ = make_wired_tool(tmp_path)
         tools = tool.get_tools()
-        assert len(tools) == 10
+        assert len(tools) == 11  # read, list, glob, grep, view, write, delete, edit, multi_edit, patch, mkdir
 
     def test_default_includes_all_read_tools(self, tmp_path: Path) -> None:
         tool, _ = make_wired_tool(tmp_path)
@@ -210,8 +210,8 @@ class TestWorkspaceDelete:
 
 
 class TestCapabilityToggling:
-    def test_workspace_delete_disabled_returns_nine_tools(self, tmp_path: Path) -> None:
-        """WorkspaceTool(workspace_delete=False) exposes 9 tools."""
+    def test_workspace_delete_disabled_returns_ten_tools(self, tmp_path: Path) -> None:
+        """WorkspaceTool(workspace_delete=False) exposes 10 tools."""
         observer, fs = make_observer(tmp_path)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             tool = WorkspaceTool(workspace_delete=False)
@@ -220,10 +220,10 @@ class TestCapabilityToggling:
         names = [t.__name__ for t in tools]
         assert "workspace_delete" not in names
         assert "workspace_write" in names
-        assert len(tools) == 9
+        assert len(tools) == 10
 
-    def test_workspace_write_disabled_returns_nine_tools(self, tmp_path: Path) -> None:
-        """WorkspaceTool(workspace_write=False) exposes 9 tools."""
+    def test_workspace_write_disabled_returns_ten_tools(self, tmp_path: Path) -> None:
+        """WorkspaceTool(workspace_write=False) exposes 10 tools."""
         observer, fs = make_observer(tmp_path)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             tool = WorkspaceTool(workspace_write=False)
@@ -232,12 +232,12 @@ class TestCapabilityToggling:
         names = [t.__name__ for t in tools]
         assert "workspace_write" not in names
         assert "workspace_delete" in names
-        assert len(tools) == 9
+        assert len(tools) == 10
 
-    def test_both_write_and_delete_disabled_returns_eight_tools(
+    def test_both_write_and_delete_disabled_returns_nine_tools(
         self, tmp_path: Path
     ) -> None:
-        """WorkspaceTool(workspace_write=False, workspace_delete=False) returns 8 tools."""
+        """WorkspaceTool(workspace_write=False, workspace_delete=False) returns 9 tools."""
         observer, fs = make_observer(tmp_path)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             tool = WorkspaceTool(workspace_write=False, workspace_delete=False)
@@ -247,7 +247,7 @@ class TestCapabilityToggling:
         assert "workspace_write" not in names
         assert "workspace_delete" not in names
         assert "workspace_read" in names
-        assert len(tools) == 8
+        assert len(tools) == 9
 
     def test_workspace_delete_false_count(self, tmp_path: Path) -> None:
         """Repeated get_tools() call count is stable."""
@@ -255,7 +255,7 @@ class TestCapabilityToggling:
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             tool = WorkspaceTool(workspace_delete=False)
             tool.observer(observer)
-        assert len(tool.get_tools()) == 9
+        assert len(tool.get_tools()) == 10
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +351,7 @@ class TestWorkspaceEdit:
             tool.observer(observer)
         names = [t.__name__ for t in tool.get_tools()]
         assert "workspace_edit" not in names
-        assert len(tool.get_tools()) == 9
+        assert len(tool.get_tools()) == 10
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +440,7 @@ class TestWorkspaceMultiEdit:
             tool.observer(observer)
         names = [t.__name__ for t in tool.get_tools()]
         assert "workspace_multi_edit" not in names
-        assert len(tool.get_tools()) == 9
+        assert len(tool.get_tools()) == 10
 
 
 # ---------------------------------------------------------------------------
@@ -528,7 +528,7 @@ class TestWorkspacePatch:
             tool.observer(observer)
         names = [t.__name__ for t in tool.get_tools()]
         assert "workspace_patch" not in names
-        assert len(tool.get_tools()) == 9
+        assert len(tool.get_tools()) == 10
 
 
 # ---------------------------------------------------------------------------
@@ -537,34 +537,34 @@ class TestWorkspacePatch:
 
 
 class TestCapabilityTogglingStory55:
-    def test_default_count_is_ten(self, tmp_path: Path) -> None:
-        """By default, get_tools() returns all 10 tool callables."""
+    def test_default_count_is_eleven(self, tmp_path: Path) -> None:
+        """By default, get_tools() returns all 11 tool callables."""
         tool, _ = make_wired_tool(tmp_path)
-        assert len(tool.get_tools()) == 10
+        assert len(tool.get_tools()) == 11
 
-    def test_edit_disabled_count_is_nine(self, tmp_path: Path) -> None:
-        """WorkspaceTool(workspace_edit=False) returns 9 tools."""
+    def test_edit_disabled_count_is_ten(self, tmp_path: Path) -> None:
+        """WorkspaceTool(workspace_edit=False) returns 10 tools."""
         observer, fs = make_observer(tmp_path)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             tool = WorkspaceTool(workspace_edit=False)
             tool.observer(observer)
-        assert len(tool.get_tools()) == 9
+        assert len(tool.get_tools()) == 10
 
-    def test_multi_edit_disabled_count_is_nine(self, tmp_path: Path) -> None:
-        """WorkspaceTool(workspace_multi_edit=False) returns 9 tools."""
+    def test_multi_edit_disabled_count_is_ten(self, tmp_path: Path) -> None:
+        """WorkspaceTool(workspace_multi_edit=False) returns 10 tools."""
         observer, fs = make_observer(tmp_path)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             tool = WorkspaceTool(workspace_multi_edit=False)
             tool.observer(observer)
-        assert len(tool.get_tools()) == 9
+        assert len(tool.get_tools()) == 10
 
-    def test_patch_disabled_count_is_nine(self, tmp_path: Path) -> None:
-        """WorkspaceTool(workspace_patch=False) returns 9 tools."""
+    def test_patch_disabled_count_is_ten(self, tmp_path: Path) -> None:
+        """WorkspaceTool(workspace_patch=False) returns 10 tools."""
         observer, fs = make_observer(tmp_path)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             tool = WorkspaceTool(workspace_patch=False)
             tool.observer(observer)
-        assert len(tool.get_tools()) == 9
+        assert len(tool.get_tools()) == 10
 
     def test_all_new_tools_present_by_default(self, tmp_path: Path) -> None:
         """workspace_edit, workspace_multi_edit, workspace_patch all in default get_tools()."""
@@ -624,12 +624,12 @@ class TestWorkspaceMkdir:
             tool.observer(observer)
         names = [t.__name__ for t in tool.get_tools()]
         assert "workspace_mkdir" not in names
-        assert len(tool.get_tools()) == 9
-
-    def test_default_count_is_ten(self, tmp_path: Path) -> None:
-        """By default, get_tools() returns all 10 tool callables."""
-        tool, _ = make_wired_tool(tmp_path)
         assert len(tool.get_tools()) == 10
+
+    def test_default_count_is_eleven(self, tmp_path: Path) -> None:
+        """By default, get_tools() returns all 11 tool callables."""
+        tool, _ = make_wired_tool(tmp_path)
+        assert len(tool.get_tools()) == 11
 
 
 # ---------------------------------------------------------------------------

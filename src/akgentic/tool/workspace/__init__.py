@@ -30,6 +30,7 @@ from akgentic.tool.workspace.tool import (
     WorkspaceRead,
     WorkspaceReadTool,
     WorkspaceTool,
+    WorkspaceView,
     WorkspaceWrite,
 )
 from akgentic.tool.workspace.workspace import (
@@ -58,6 +59,7 @@ __all__ = [
     "Workspace",
     "get_workspace",
     "ExpandMediaRefs",
+    "WorkspaceView",
     "WorkspaceRead",
     "WorkspaceList",
     "WorkspaceGlob",

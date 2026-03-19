@@ -31,6 +31,8 @@ class Workspace(Protocol):
 
     def read(self, path: str) -> bytes: ...
 
+    def read_bytes(self, path: str) -> bytes: ...
+
     def write(self, path: str, data: bytes) -> None: ...
 
     def delete(self, path: str) -> None: ...
@@ -77,6 +79,16 @@ class Filesystem:
         resolved = self._validate_path(path)
         return resolved.read_bytes()
 
+    def read_bytes(self, path: str) -> bytes:
+        """Return the raw bytes of *path* with no decoding or pagination.
+
+        Raises:
+            FileNotFoundError: if the file does not exist.
+            PermissionError: if *path* escapes the workspace root.
+        """
+        resolved = self._validate_path(path)
+        return resolved.read_bytes()
+
     def write(self, path: str, data: bytes) -> None:
         """Write *data* to *path*, creating missing parent directories.
 
@@ -114,9 +126,7 @@ class Filesystem:
             if child.is_dir():
                 dirs.append(FileEntry(name=child.name, is_dir=True, size=0))
             else:
-                files.append(
-                    FileEntry(name=child.name, is_dir=False, size=child.stat().st_size)
-                )
+                files.append(FileEntry(name=child.name, is_dir=False, size=child.stat().st_size))
         dirs.sort(key=lambda e: e.name)
         files.sort(key=lambda e: e.name)
         entries = dirs + files
