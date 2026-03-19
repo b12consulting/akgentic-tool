@@ -763,6 +763,12 @@ class WorkspaceReadTool(ToolCard):
                     or the file extension is not a supported image format.
             """
             try:
+                data = backend.read_bytes(path)
+            except FileNotFoundError:
+                raise RetriableError(f"File not found: {path}")
+            except PermissionError:
+                raise RetriableError(_PERM_ERR_MSG)
+            try:
                 suffix = PurePosixPath(path).suffix.lower()
                 mime = _MIME_MAP.get(suffix)
                 if mime is None:
@@ -771,13 +777,10 @@ class WorkspaceReadTool(ToolCard):
                         f"Supported: {', '.join(sorted(_MIME_MAP))}. "
                         f"For documents, use workspace_read instead."
                     )
-                data = backend.read_bytes(path)
                 data = _maybe_resize(data, suffix, max_dim, backend._root, path)
                 return BinaryContent(data=data, media_type=mime)
-            except FileNotFoundError:
-                raise RetriableError(f"File not found: {path}")
-            except PermissionError:
-                raise RetriableError(_PERM_ERR_MSG)
+            except RetriableError:
+                raise
 
         workspace_view.__doc__ = params.format_docstring(workspace_view.__doc__)
         return workspace_view
