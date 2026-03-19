@@ -52,7 +52,7 @@ def make_tool(tmp_path: Path, team_id: uuid.UUID | None = None) -> WorkspaceTool
 
 
 # ---------------------------------------------------------------------------
-# Task 1: WorkspaceReadTool fields (AC 1)
+# Task 1: WorkspaceTool(read_only=True) fields (AC 1)
 # ---------------------------------------------------------------------------
 
 
@@ -1150,7 +1150,7 @@ class TestDocumentReaderSerialization:
         assert restored.llm_model == "gpt-4o"
 
 
-class TestWorkspaceReadToolSerialization:
+class TestWorkspaceToolSerialization:
     """Verify WorkspaceTool(read_only=True).model_dump() succeeds without ConfigDict (AC: 5)."""
 
     def test_default_tool_model_dump_succeeds(self) -> None:
@@ -1217,7 +1217,7 @@ class TestDocumentReaderLazyInit:
 
 
 class TestExpandMediaRefs:
-    """Tests for WorkspaceReadTool._expand_media_refs (story 3-1)."""
+    """Tests for WorkspaceTool._expand_media_refs (story 3-1)."""
 
     def test_single_image_match(self, tmp_path: Path) -> None:
         """AC-1: Single image match → MediaContent with correct bytes and media_type."""

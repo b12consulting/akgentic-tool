@@ -811,3 +811,23 @@ class TestReadOnlyParameter:
         tool = WorkspaceTool(read_only=True)
         with pytest.raises(RuntimeError, match="WorkspaceTool"):
             _ = tool.workspace
+
+    def test_read_only_true_overrides_write_capability_fields(self, tmp_path: Path) -> None:
+        """read_only=True excludes write tools even when their capability fields are True."""
+        observer, fs = make_observer(tmp_path)
+        tool = WorkspaceTool(
+            read_only=True,
+            workspace_write=True,   # explicitly enabled
+            workspace_delete=True,  # explicitly enabled
+            workspace_edit=True,    # explicitly enabled
+        )
+        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+            tool.observer(observer)
+        names = [t.__name__ for t in tool.get_tools()]
+        # read_only gate must override individual capability fields
+        assert "workspace_write" not in names
+        assert "workspace_delete" not in names
+        assert "workspace_edit" not in names
+        # Read tools still present
+        assert "workspace_read" in names
+        assert len(tool.get_tools()) == 5
