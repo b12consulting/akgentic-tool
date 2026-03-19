@@ -37,6 +37,15 @@ from akgentic.tool.workspace.workspace import Filesystem, get_workspace
 
 _PERM_ERR_MSG = "Path escapes workspace root — use a path relative to the workspace"
 _REF_RE = _re.compile(r'!!"([^"]+)"|!!(\S+)')
+_PILLOW_FMT: dict[str, str] = {
+    ".png": "PNG",
+    ".jpg": "JPEG",
+    ".jpeg": "JPEG",
+    ".webp": "WEBP",
+    ".gif": "GIF",
+    ".bmp": "BMP",
+}
+_PILLOW_WARN_EMITTED: bool = False  # guards the one-time Pillow-absent warning
 
 
 class WorkspaceRead(BaseToolParam):
@@ -101,12 +110,15 @@ def _maybe_resize(data: bytes, suffix: str, max_dim: int, root: Path, path: str)
     try:
         from PIL import Image  # noqa: PLC0415
     except ImportError:
-        import logging  # noqa: PLC0415
+        global _PILLOW_WARN_EMITTED  # noqa: PLW0603
+        if not _PILLOW_WARN_EMITTED:
+            import logging  # noqa: PLC0415
 
-        logging.getLogger(__name__).warning(
-            "Pillow not installed — sending raw image without resizing. "
-            'Install with: pip install "akgentic-tool[vision]"'
-        )
+            logging.getLogger(__name__).warning(
+                "Pillow not installed — sending raw image without resizing. "
+                'Install with: pip install "akgentic-tool[vision]"'
+            )
+            _PILLOW_WARN_EMITTED = True
         return data
 
     p = Path(path)
@@ -122,7 +134,7 @@ def _maybe_resize(data: bytes, suffix: str, max_dim: int, root: Path, path: str)
 
     img.thumbnail((max_dim, max_dim), Image.LANCZOS)  # type: ignore[attr-defined]
     buf = io.BytesIO()
-    fmt = "PNG" if suffix == ".png" else "JPEG"
+    fmt = _PILLOW_FMT.get(suffix, "JPEG")
     img.save(buf, format=fmt)
     resized = buf.getvalue()
     sidecar_path.write_bytes(resized)

@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import akgentic.tool.workspace.tool as _tool_mod
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.tool import WorkspaceReadTool, WorkspaceView
 from akgentic.tool.workspace.workspace import Filesystem
@@ -185,8 +186,9 @@ PIL = pytest.importorskip("PIL", reason="Pillow not installed")
 
 def _make_png_bytes(width: int, height: int) -> bytes:
     """Create a real minimal PNG image of given dimensions."""
-    from PIL import Image
     import io
+
+    from PIL import Image
 
     img = Image.new("RGB", (width, height), color=(128, 64, 32))
     buf = io.BytesIO()
@@ -231,7 +233,7 @@ class TestWorkspaceViewResize:
         tool.workspace_view = WorkspaceView(max_dimension=1568)
         fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_view")
         # First call — creates sidecar
-        result1 = fn("big.png")
+        fn("big.png")
         sidecar = fs._root / ".big.png.1568.png"
         assert sidecar.exists()
         sidecar_bytes = sidecar.read_bytes()
@@ -298,6 +300,55 @@ class TestWorkspaceViewResize:
         sidecar = fs._root / ".small.png.1568.png"
         assert not sidecar.exists()
 
+    def test_webp_resize_uses_webp_format(self, tmp_path: Path) -> None:
+        """WebP image resized and sidecar contains valid WebP bytes (not JPEG)."""
+        import io
+
+        from PIL import Image
+
+        # Build a minimal WebP image larger than 1568px
+        img = Image.new("RGB", (2000, 2000), color=(10, 20, 30))
+        buf = io.BytesIO()
+        img.save(buf, format="WEBP")
+        raw_webp = buf.getvalue()
+
+        tool, fs = make_wired_read_tool(tmp_path)
+        (fs._root / "anim.webp").write_bytes(raw_webp)
+        tool.workspace_view = WorkspaceView(max_dimension=1568)
+        fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_view")
+        result = fn("anim.webp")
+
+        assert result.media_type == "image/webp"
+        # Verify sidecar bytes are valid WebP (starts with RIFF...WEBP signature)
+        sidecar = fs._root / ".anim.webp.1568.webp"
+        assert sidecar.exists()
+        sidecar_bytes = sidecar.read_bytes()
+        assert sidecar_bytes[:4] == b"RIFF", "Sidecar must be WebP (RIFF), not JPEG (FFD8)"
+        assert result.data == sidecar_bytes
+
+    def test_jpeg_resize_uses_jpeg_format(self, tmp_path: Path) -> None:
+        """JPEG image resized and sidecar contains valid JPEG bytes."""
+        import io
+
+        from PIL import Image
+
+        img = Image.new("RGB", (2000, 2000), color=(50, 100, 150))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG")
+        raw_jpeg = buf.getvalue()
+
+        tool, fs = make_wired_read_tool(tmp_path)
+        (fs._root / "photo.jpg").write_bytes(raw_jpeg)
+        tool.workspace_view = WorkspaceView(max_dimension=1568)
+        fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_view")
+        result = fn("photo.jpg")
+
+        assert result.media_type == "image/jpeg"
+        sidecar = fs._root / ".photo.jpg.1568.jpg"
+        assert sidecar.exists()
+        # JPEG files start with FFD8
+        assert sidecar.read_bytes()[:2] == b"\xff\xd8", "Sidecar must be JPEG"
+
 
 # ---------------------------------------------------------------------------
 # TestWorkspaceViewPillowAbsent
@@ -309,6 +360,7 @@ class TestWorkspaceViewPillowAbsent:
 
     def test_pillow_absent_returns_raw_bytes_no_error(self, tmp_path: Path) -> None:
         """When Pillow is not installed, raw bytes returned with no ImportError raised."""
+        _tool_mod._PILLOW_WARN_EMITTED = False  # reset one-time flag for test isolation
         tool, fs = make_wired_read_tool(tmp_path)
         raw = b"fake-png-data"
         (fs._root / "image.png").write_bytes(raw)
@@ -325,6 +377,7 @@ class TestWorkspaceViewPillowAbsent:
 
     def test_pillow_absent_no_sidecar_written(self, tmp_path: Path) -> None:
         """When Pillow absent, no sidecar file is created."""
+        _tool_mod._PILLOW_WARN_EMITTED = False  # reset one-time flag for test isolation
         tool, fs = make_wired_read_tool(tmp_path)
         (fs._root / "image.png").write_bytes(b"fake-png-data")
         tool.workspace_view = WorkspaceView(max_dimension=1568)
@@ -339,10 +392,11 @@ class TestWorkspaceViewPillowAbsent:
         assert sidecars == []
 
     def test_pillow_absent_logs_warning(self, tmp_path: Path) -> None:
-        """When Pillow absent, a warning is logged."""
+        """When Pillow absent, a warning is logged once (one-time flag)."""
         import logging
         import sys
 
+        _tool_mod._PILLOW_WARN_EMITTED = False  # reset one-time flag for test isolation
         tool, fs = make_wired_read_tool(tmp_path)
         (fs._root / "image.png").write_bytes(b"fake-png-data")
         tool.workspace_view = WorkspaceView(max_dimension=1568)
@@ -353,6 +407,7 @@ class TestWorkspaceViewPillowAbsent:
             patch.object(logging.getLogger("akgentic.tool.workspace.tool"), "warning") as mock_warn,
         ):
             fn("image.png")
+            fn("image.png")  # second call — warning must NOT be repeated
 
-        mock_warn.assert_called_once()
+        mock_warn.assert_called_once()  # only one warning total across both calls
         assert "Pillow" in mock_warn.call_args[0][0]
