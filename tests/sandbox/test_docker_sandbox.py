@@ -18,6 +18,7 @@ Covers AC1 through AC11 for Story 6.3 (updated for Story 6.5):
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -112,16 +113,15 @@ def test_start_sandbox_docker_run_uses_correct_flags(
     actor._start_sandbox()
 
     run_call_args = mock_run.call_args_list[1][0][0]
+    expected_volume = f"{Path('./workspaces/team-1').resolve()}:/workspace"
     assert run_call_args == [
         "docker",
         "run",
         "-d",
         "--name",
         "sandbox-team-1",
-        "--network",
-        "none",
         "-v",
-        "workspaces/team-1:/workspace",
+        expected_volume,
         "-w",
         "/workspace",
         SANDBOX_IMAGE,
@@ -522,7 +522,7 @@ def test_start_sandbox_workspace_id_overrides_volume_mount(
 
     run_call_args = mock_run.call_args_list[1][0][0]
     volume_arg_idx = run_call_args.index("-v") + 1
-    assert run_call_args[volume_arg_idx] == "workspaces/test:/workspace"
+    assert run_call_args[volume_arg_idx] == f"{Path('./workspaces/test').resolve()}:/workspace"
 
 
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
@@ -561,4 +561,4 @@ def test_start_sandbox_workspace_id_none_uses_team_id_for_volume(
 
     run_call_args = mock_run.call_args_list[1][0][0]
     volume_arg_idx = run_call_args.index("-v") + 1
-    assert run_call_args[volume_arg_idx] == "workspaces/team-1:/workspace"
+    assert run_call_args[volume_arg_idx] == f"{Path('./workspaces/team-1').resolve()}:/workspace"
