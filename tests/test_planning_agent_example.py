@@ -79,7 +79,13 @@ class TestPlanningAgentExample:
             assert result.description == "Implement authentication middleware"
 
     def test_semantic_search_graceful_without_api_key(self) -> None:
-        """AC-3: Semantic search returns graceful message without API key."""
+        """AC-3: Semantic search degrades gracefully without API key.
+
+        Without OPENAI_API_KEY, embeddings fail silently and search_planning
+        falls back to keyword-only. "login security" has no substring overlap
+        with any task description, so the result is an empty list — proving
+        the semantic path is unavailable but the system does not crash.
+        """
         env = os.environ.copy()
         env.pop("OPENAI_API_KEY", None)
         with patch.dict("os.environ", env, clear=True):
@@ -91,6 +97,8 @@ class TestPlanningAgentExample:
 
             module.create_sprint_tasks(plan_actor, address)
 
-            result = plan_actor.get_planning_task("login security")
-            assert isinstance(result, str)
-            assert "unavailable" in result.lower()
+            # "login security" has no substring match — without semantic search
+            # this returns an empty list (graceful degradation, no crash)
+            result = plan_actor.search_planning(query="login security")
+            assert isinstance(result, list)
+            assert len(result) == 0
