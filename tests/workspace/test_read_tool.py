@@ -1253,7 +1253,7 @@ class TestExpandMediaRefs:
         """AC-4: No match → error string with pattern name."""
         tool = make_tool(tmp_path)
         result = tool._expand_media_refs("show !!missing.png")
-        assert result == ["show ", "!!_missing.png_[Error: no image found]", ""]
+        assert result == ["show ", "!!missing.png[Error: no image found in the workspace]", ""]
 
     def test_pure_text_passthrough(self, tmp_path: Path) -> None:
         """AC-5: Pure text prompt with no !! tokens → single-element list."""
@@ -1362,6 +1362,74 @@ class TestExpandMediaRefs:
             " middle ",
             MediaContent(data=b"bdata", media_type="image/png"),
             " end",
+        ]
+
+    # ------------------------------------------------------------------
+    # Quoted glob syntax: !!"pattern with spaces"
+    # ------------------------------------------------------------------
+
+    def test_quoted_image_with_spaces(self, tmp_path: Path) -> None:
+        """Quoted syntax !!"file name.png" matches files with spaces."""
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        (root / "my photo.png").write_bytes(b"spaced-png")
+        result = tool._expand_media_refs('look at !!"my photo.png" please')
+        assert result == [
+            "look at ",
+            MediaContent(data=b"spaced-png", media_type="image/png"),
+            " please",
+        ]
+
+    def test_quoted_glob_with_spaces(self, tmp_path: Path) -> None:
+        """Quoted glob !!"sub dir/*.png" expands files in spaced directories."""
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        (root / "sub dir").mkdir()
+        (root / "sub dir" / "a.png").write_bytes(b"aaa")
+        (root / "sub dir" / "b.png").write_bytes(b"bbb")
+        result = tool._expand_media_refs('check !!"sub dir/*.png"')
+        assert result == [
+            "check ",
+            MediaContent(data=b"aaa", media_type="image/png"),
+            MediaContent(data=b"bbb", media_type="image/png"),
+            "",
+        ]
+
+    def test_quoted_no_match_error(self, tmp_path: Path) -> None:
+        """Quoted syntax with no match → error string."""
+        tool = make_tool(tmp_path)
+        result = tool._expand_media_refs('show !!"no such file.png"')
+        assert result == [
+            "show ",
+            "!!no such file.png[Error: no image found in the workspace]",
+            "",
+        ]
+
+    def test_quoted_and_unquoted_mixed(self, tmp_path: Path) -> None:
+        """Mix of quoted and unquoted refs in the same prompt."""
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        (root / "simple.png").write_bytes(b"s")
+        (root / "has space.png").write_bytes(b"sp")
+        result = tool._expand_media_refs('first !!simple.png then !!"has space.png" end')
+        assert result == [
+            "first ",
+            MediaContent(data=b"s", media_type="image/png"),
+            " then ",
+            MediaContent(data=b"sp", media_type="image/png"),
+            " end",
+        ]
+
+    def test_quoted_document_hint(self, tmp_path: Path) -> None:
+        """Quoted syntax with document match → hint string."""
+        tool = make_tool(tmp_path)
+        root = tool.workspace._root
+        (root / "my report.pdf").write_bytes(b"%PDF-fake")
+        result = tool._expand_media_refs('read !!"my report.pdf"')
+        assert result == [
+            "read ",
+            "!!my report.pdf[=> Use workspace_read tool]",
+            "",
         ]
 
     def test_expand_media_refs_raises_before_observer_called(self) -> None:

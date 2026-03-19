@@ -34,7 +34,7 @@ from akgentic.tool.workspace.readers import _MIME_MAP, DocumentReader, MediaCont
 from akgentic.tool.workspace.workspace import Filesystem, get_workspace
 
 _PERM_ERR_MSG = "Path escapes workspace root — use a path relative to the workspace"
-_REF_RE = _re.compile(r"!!(\S+)")
+_REF_RE = _re.compile(r'!!"([^"]+)"|!!(\S+)')
 
 
 class WorkspaceRead(BaseToolParam):
@@ -329,7 +329,9 @@ class WorkspaceReadTool(ToolCard):
     def _expand_media_refs(self, prompt: str) -> list[str | MediaContent]:
         """Expand ``!!glob_pattern`` tokens in a prompt into binary image content.
 
-        For each ``!!pattern`` token:
+        Supports both ``!!pattern`` (no spaces) and ``!!"pattern with spaces"`` (quoted).
+
+        For each ``!!pattern`` or ``!!"pattern"`` token:
         - Image matches (extension in ``_MIME_MAP``) → ``MediaContent`` objects (sorted by path)
         - Document-only matches (extension in ``DocumentReader.extensions`` but NOT in
           ``_MIME_MAP``) → ``"!!name[=> Use workspace_read tool]"`` hint strings
@@ -361,7 +363,7 @@ class WorkspaceReadTool(ToolCard):
         for m in _REF_RE.finditer(prompt):
             if m.start() > last:
                 parts.append(prompt[last : m.start()])
-            pattern = m.group(1)
+            pattern = m.group(1) or m.group(2)
             all_matches = sorted(
                 p for p in self.workspace._root.glob(pattern) if p.is_file()
             )
@@ -377,7 +379,7 @@ class WorkspaceReadTool(ToolCard):
                     try:
                         data = path.read_bytes()
                     except OSError:
-                        parts.append(f"!!_{path.name}_[Error: file unreadable]")
+                        parts.append(f"!!{path.name}[Error: file unreadable]")
                         continue
                     parts.append(
                         MediaContent(
@@ -389,7 +391,7 @@ class WorkspaceReadTool(ToolCard):
                 for path in doc_matches:
                     parts.append(f"!!{path.name}[=> Use workspace_read tool]")
             else:
-                parts.append(f"!!_{pattern}_[Error: no image found]")
+                parts.append(f"!!{pattern}[Error: no image found in the workspace]")
             last = m.end()
         parts.append(prompt[last:])
         return parts
