@@ -362,12 +362,12 @@ class WorkspaceTool(ToolCard):
     # Read capability fields (formerly in WorkspaceReadTool)
     workspace_id: str | None = None
     workspace_read: WorkspaceRead | bool = True
+    workspace_view: WorkspaceView | bool = True
     workspace_list: WorkspaceList | bool = True
     workspace_glob: WorkspaceGlob | bool = True
     workspace_grep: WorkspaceGrep | bool = True
     document_reader: DocumentReader | bool = True
     workspace_expand_media_refs: ExpandMediaRefs | bool = True
-    workspace_view: WorkspaceView | bool = True
 
     # Read-only gate (NEW)
     read_only: bool = False
