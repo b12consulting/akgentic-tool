@@ -21,7 +21,7 @@ from .event import (  # noqa: F401
     ToolObserver,
 )
 from .sandbox.tool import ExecTool  # noqa: F401
-from .workspace.tool import WorkspaceReadTool, WorkspaceTool  # noqa: F401
+from .workspace.tool import WorkspaceTool  # noqa: F401
 
 try:
     from .vector import EmbeddingService, VectorEntry, VectorIndex  # noqa: F401
@@ -55,7 +55,6 @@ __all__ = [
     "team",
     "workspace",
     "ExecTool",
-    "WorkspaceReadTool",
     "WorkspaceTool",
 ]
 

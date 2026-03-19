@@ -10,7 +10,7 @@ import pytest
 
 import akgentic.tool.workspace.tool as _tool_mod
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.workspace.tool import WorkspaceReadTool, WorkspaceView
+from akgentic.tool.workspace.tool import WorkspaceTool, WorkspaceView
 from akgentic.tool.workspace.workspace import Filesystem
 
 try:
@@ -34,12 +34,12 @@ def make_observer(
     return observer
 
 
-def make_wired_read_tool(tmp_path: Path) -> tuple[WorkspaceReadTool, Filesystem]:
-    """Build a WorkspaceReadTool wired to a Filesystem rooted at tmp_path."""
+def make_wired_read_tool(tmp_path: Path) -> tuple[WorkspaceTool, Filesystem]:
+    """Build a WorkspaceTool(read_only=True) wired to a Filesystem rooted at tmp_path."""
     tid = uuid.uuid4()
     fs = Filesystem(str(tmp_path), str(tid))
     observer = make_observer(team_id=tid)
-    tool = WorkspaceReadTool()
+    tool = WorkspaceTool(read_only=True)
     with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
         tool.observer(observer)
     return tool, fs
@@ -81,7 +81,7 @@ class TestWorkspaceReadBytes:
 class TestWorkspaceViewTool:
     """Tests for workspace_view tool callable (AC: 4, 10, 11)."""
 
-    def _view_fn(self, tool: WorkspaceReadTool) -> object:
+    def _view_fn(self, tool: WorkspaceTool) -> object:
         """Extract workspace_view callable from tool."""
         return next(t for t in tool.get_tools() if t.__name__ == "workspace_view")
 
@@ -163,7 +163,7 @@ class TestWorkspaceViewTool:
         tid = uuid.uuid4()
         fs = Filesystem(str(tmp_path), str(tid))
         observer = make_observer(team_id=tid)
-        tool = WorkspaceReadTool(workspace_view=False)
+        tool = WorkspaceTool(read_only=True, workspace_view=False)
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
             tool.observer(observer)
         names = [t.__name__ for t in tool.get_tools()]
@@ -263,7 +263,7 @@ class TestWorkspaceViewResize:
         tid = uuid.uuid4()
         fs2 = Filesystem(str(tmp_path), str(tid))
         obs2 = make_observer(team_id=tid)
-        tool2 = WorkspaceReadTool(workspace_view=WorkspaceView(max_dimension=1568))
+        tool2 = WorkspaceTool(read_only=True, workspace_view=WorkspaceView(max_dimension=1568))
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs2):
             tool2.observer(obs2)
         (fs2._root / "big.png").write_bytes(raw)
@@ -274,7 +274,7 @@ class TestWorkspaceViewResize:
         tid3 = uuid.uuid4()
         fs3 = Filesystem(str(tmp_path), str(tid3))
         obs3 = make_observer(team_id=tid3)
-        tool3 = WorkspaceReadTool(workspace_view=WorkspaceView(max_dimension=800))
+        tool3 = WorkspaceTool(read_only=True, workspace_view=WorkspaceView(max_dimension=800))
         with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs3):
             tool3.observer(obs3)
         (fs3._root / "big.png").write_bytes(raw)

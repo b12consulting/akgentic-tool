@@ -710,3 +710,124 @@ class TestRetriableErrorWorkspaceTool:
         mkdir_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_mkdir")
         with pytest.raises(RetriableError, match="Path escapes workspace root"):
             mkdir_fn("../../escape")
+
+
+# ---------------------------------------------------------------------------
+# Story 7.1: read_only parameter — AC 1, 3, 4, 5, 6, 7
+# ---------------------------------------------------------------------------
+
+
+class TestReadOnlyParameter:
+    """Tests for WorkspaceTool.read_only field (story 7.1 ACs 3, 4, 5, 6, 7)."""
+
+    def test_name_is_workspace(self) -> None:
+        """AC 6: WorkspaceTool(read_only=True).name == 'Workspace'."""
+        assert WorkspaceTool(read_only=True).name == "Workspace"
+
+    def test_name_default_is_workspace(self) -> None:
+        """AC 6: WorkspaceTool().name == 'Workspace'."""
+        assert WorkspaceTool().name == "Workspace"
+
+    def test_read_only_default_is_false(self) -> None:
+        """AC 1: Default read_only is False."""
+        assert WorkspaceTool().read_only is False
+
+    def test_read_only_true_get_tools_returns_five_tools(self, tmp_path: Path) -> None:
+        """AC 3: read_only=True → 5 read tools: read, list, glob, grep, view."""
+        observer, fs = make_observer(tmp_path)
+        tool = WorkspaceTool(read_only=True)
+        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+            tool.observer(observer)
+        tools = tool.get_tools()
+        assert len(tools) == 5
+        names = [t.__name__ for t in tools]
+        assert "workspace_read" in names
+        assert "workspace_list" in names
+        assert "workspace_glob" in names
+        assert "workspace_grep" in names
+        assert "workspace_view" in names
+        # No write tools
+        assert "workspace_write" not in names
+        assert "workspace_delete" not in names
+        assert "workspace_edit" not in names
+        assert "workspace_multi_edit" not in names
+        assert "workspace_patch" not in names
+        assert "workspace_mkdir" not in names
+
+    def test_read_only_false_get_tools_returns_eleven_tools(self, tmp_path: Path) -> None:
+        """AC 4: read_only=False (default) → 11 tools: 5 read + 6 write."""
+        tool, fs = make_wired_tool(tmp_path)
+        tools = tool.get_tools()
+        assert len(tools) == 11
+        names = [t.__name__ for t in tools]
+        # Read tools
+        assert "workspace_read" in names
+        assert "workspace_list" in names
+        assert "workspace_glob" in names
+        assert "workspace_grep" in names
+        assert "workspace_view" in names
+        # Write tools
+        assert "workspace_write" in names
+        assert "workspace_delete" in names
+        assert "workspace_edit" in names
+        assert "workspace_multi_edit" in names
+        assert "workspace_patch" in names
+        assert "workspace_mkdir" in names
+
+    def test_model_dump_roundtrip_read_only_true(self) -> None:
+        """AC 5: WorkspaceTool(read_only=True).model_dump() round-trips."""
+        original = WorkspaceTool(read_only=True)
+        dumped = original.model_dump()
+        restored = WorkspaceTool.model_validate(dumped)
+        assert restored.read_only is True
+        assert restored.name == "Workspace"
+
+    def test_model_dump_roundtrip_read_only_false(self) -> None:
+        """AC 5: WorkspaceTool(read_only=False).model_dump() round-trips."""
+        original = WorkspaceTool(read_only=False)
+        dumped = original.model_dump()
+        restored = WorkspaceTool.model_validate(dumped)
+        assert restored.read_only is False
+        assert restored.name == "Workspace"
+
+    def test_read_only_in_model_dump(self) -> None:
+        """AC 5: read_only field appears in model_dump() output."""
+        dumped = WorkspaceTool(read_only=True).model_dump()
+        assert "read_only" in dumped
+        assert dumped["read_only"] is True
+
+    def test_observer_raises_when_orchestrator_none_references_workspacetool(
+        self, tmp_path: Path
+    ) -> None:
+        """AC 7: observer() raises ValueError referencing WorkspaceTool (not WorkspaceReadTool)."""
+        observer = MagicMock()
+        observer.orchestrator = None
+        tool = WorkspaceTool(read_only=True)
+        with pytest.raises(ValueError, match="WorkspaceTool"):
+            tool.observer(observer)
+
+    def test_workspace_property_raises_references_workspacetool(self) -> None:
+        """AC 7: workspace property RuntimeError references WorkspaceTool."""
+        tool = WorkspaceTool(read_only=True)
+        with pytest.raises(RuntimeError, match="WorkspaceTool"):
+            _ = tool.workspace
+
+    def test_read_only_true_overrides_write_capability_fields(self, tmp_path: Path) -> None:
+        """read_only=True excludes write tools even when their capability fields are True."""
+        observer, fs = make_observer(tmp_path)
+        tool = WorkspaceTool(
+            read_only=True,
+            workspace_write=True,   # explicitly enabled
+            workspace_delete=True,  # explicitly enabled
+            workspace_edit=True,    # explicitly enabled
+        )
+        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+            tool.observer(observer)
+        names = [t.__name__ for t in tool.get_tools()]
+        # read_only gate must override individual capability fields
+        assert "workspace_write" not in names
+        assert "workspace_delete" not in names
+        assert "workspace_edit" not in names
+        # Read tools still present
+        assert "workspace_read" in names
+        assert len(tool.get_tools()) == 5
