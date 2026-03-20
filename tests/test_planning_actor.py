@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.planning.planning_actor import (
@@ -194,3 +195,73 @@ def test_update_planning_all_success() -> None:
     assert len(items) == 2
     assert items[0].status == "completed"
     assert items[1].id == 2
+
+
+# ---------------------------------------------------------------------------
+# Field length constraints
+# ---------------------------------------------------------------------------
+
+
+class TestFieldLengthConstraints:
+    """Tests for max_length constraints on TaskCreate and TaskUpdate."""
+
+    def test_task_create_description_at_limit_accepted(self) -> None:
+        """description of exactly 300 chars is valid."""
+        t = TaskCreate(id=1, status="pending", description="x" * 300, owner="Alice")
+        assert len(t.description) == 300
+
+    def test_task_create_description_over_limit_raises(self) -> None:
+        """description > 300 chars raises ValidationError."""
+        with pytest.raises(ValidationError, match="300"):
+            TaskCreate(id=1, status="pending", description="x" * 301, owner="Alice")
+
+    def test_task_update_description_at_limit_accepted(self) -> None:
+        """TaskUpdate description of exactly 300 chars is valid."""
+        t = TaskUpdate(id=1, description="y" * 300)
+        assert t.description is not None
+        assert len(t.description) == 300
+
+    def test_task_update_description_over_limit_raises(self) -> None:
+        """TaskUpdate description > 300 chars raises ValidationError."""
+        with pytest.raises(ValidationError, match="300"):
+            TaskUpdate(id=1, description="y" * 301)
+
+    def test_task_update_output_at_limit_accepted(self) -> None:
+        """output of exactly 150 chars is stored as-is."""
+        t = TaskUpdate(id=1, output="z" * 150)
+        assert t.output == "z" * 150
+
+    def test_task_update_output_truncated_at_151(self) -> None:
+        """output of 151 chars is truncated to 150 chars (147 + '...')."""
+        t = TaskUpdate(id=1, output="a" * 151)
+        assert t.output is not None
+        assert len(t.output) == 150
+        assert t.output.endswith("...")
+
+    def test_task_update_output_long_string_truncated(self) -> None:
+        """output of 500 chars is truncated to 150 chars ending with '...'."""
+        t = TaskUpdate(id=1, output="b" * 500)
+        assert t.output is not None
+        assert len(t.output) == 150
+        assert t.output.endswith("...")
+        assert t.output.startswith("b" * 147)
+
+    def test_task_update_output_none_unchanged(self) -> None:
+        """None output passes through the validator unchanged."""
+        t = TaskUpdate(id=1, output=None)
+        assert t.output is None
+
+    def test_task_update_output_short_string_unchanged(self) -> None:
+        """output shorter than 150 chars is not modified."""
+        t = TaskUpdate(id=1, output="short result")
+        assert t.output == "short result"
+
+    def test_field_descriptions_mention_max_length(self) -> None:
+        """Field descriptions must state the char limit so LLMs see it in the schema."""
+        schema = TaskCreate.model_json_schema()
+        desc_field = schema["properties"]["description"]
+        assert "300" in desc_field.get("description", "")
+
+        update_schema = TaskUpdate.model_json_schema()
+        assert "300" in update_schema["properties"]["description"].get("description", "")
+        assert "150" in update_schema["properties"]["output"].get("description", "")
