@@ -10,7 +10,7 @@ import pytest
 
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.edit import EditItem
-from akgentic.tool.workspace.tool import WorkspaceTool
+from akgentic.tool.workspace.tool import WorkspaceTool, _normalize_glob_pattern
 from akgentic.tool.workspace.workspace import Filesystem
 
 # ---------------------------------------------------------------------------
@@ -831,3 +831,105 @@ class TestReadOnlyParameter:
         # Read tools still present
         assert "workspace_read" in names
         assert len(tool.get_tools()) == 5
+
+
+# ---------------------------------------------------------------------------
+# _normalize_glob_pattern — unit tests
+# ---------------------------------------------------------------------------
+
+
+class TestNormalizeGlobPattern:
+    """Unit tests for _normalize_glob_pattern."""
+
+    def test_valid_recursive_pattern_unchanged(self) -> None:
+        """'**/*.py' is already valid — must not be modified."""
+        assert _normalize_glob_pattern("**/*.py") == "**/*.py"
+
+    def test_valid_prefixed_recursive_pattern_unchanged(self) -> None:
+        """'src/**/*.ts' is already valid — must not be modified."""
+        assert _normalize_glob_pattern("src/**/*.ts") == "src/**/*.ts"
+
+    def test_bare_star_pattern_unchanged(self) -> None:
+        """'*.py' has no '**' — must pass through unchanged."""
+        assert _normalize_glob_pattern("*.py") == "*.py"
+
+    def test_double_star_alone_unchanged(self) -> None:
+        """'**' by itself is valid — must not be modified."""
+        assert _normalize_glob_pattern("**") == "**"
+
+    def test_embedded_double_star_no_slash_fixed(self) -> None:
+        """'**.py' → '**/*.py': common LLM mistake that Python 3.12 rejects."""
+        assert _normalize_glob_pattern("**.py") == "**/*.py"
+
+    def test_embedded_double_star_in_subdir_fixed(self) -> None:
+        """'src/**.py' → 'src/**/*.py'."""
+        assert _normalize_glob_pattern("src/**.py") == "src/**/*.py"
+
+    def test_embedded_double_star_mid_path_fixed(self) -> None:
+        """'src/**.ts' → 'src/**/*.ts'."""
+        assert _normalize_glob_pattern("src/**.ts") == "src/**/*.ts"
+
+    def test_result_accepted_by_pathlib(self, tmp_path: Path) -> None:
+        """Normalized pattern must not raise ValueError in pathlib.glob()."""
+        (tmp_path / "sub").mkdir()
+        (tmp_path / "sub" / "file.py").write_text("x")
+        pattern = _normalize_glob_pattern("**.py")
+        # Must not raise
+        matches = list(tmp_path.glob(pattern))
+        assert any(m.name == "file.py" for m in matches)
+
+
+# ---------------------------------------------------------------------------
+# workspace_glob — integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceGlob:
+    """Integration tests for the workspace_glob tool callable."""
+
+    def _glob_fn(self, tool: WorkspaceTool) -> object:
+        return next(t for t in tool.get_tools() if t.__name__ == "workspace_glob")
+
+    def test_valid_pattern_finds_files(self, tmp_path: Path) -> None:
+        """workspace_glob returns matching files for a well-formed pattern."""
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("src/foo.py", b"x")
+        fs.write("src/bar.py", b"y")
+        glob_fn = self._glob_fn(tool)
+        result = glob_fn("**/*.py")
+        assert "src/foo.py" in result
+        assert "src/bar.py" in result
+
+    def test_invalid_pattern_double_star_no_slash_does_not_raise(
+        self, tmp_path: Path
+    ) -> None:
+        """workspace_glob normalizes '**.py' instead of crashing with ValueError."""
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("src/foo.py", b"x")
+        glob_fn = self._glob_fn(tool)
+        # Must not raise ValueError: '**' can only be an entire path component
+        result = glob_fn("**.py")
+        assert "src/foo.py" in result
+
+    def test_no_match_returns_sentinel(self, tmp_path: Path) -> None:
+        """workspace_glob returns 'No files found.' when nothing matches."""
+        tool, _ = make_wired_tool(tmp_path)
+        glob_fn = self._glob_fn(tool)
+        assert glob_fn("**/*.nonexistent") == "No files found."
+
+    def test_path_escape_raises_retriable_error(self, tmp_path: Path) -> None:
+        """workspace_glob raises RetriableError when path escapes workspace root."""
+        tool, _ = make_wired_tool(tmp_path)
+        glob_fn = self._glob_fn(tool)
+        with pytest.raises(RetriableError, match="Path escapes workspace root"):
+            glob_fn("**/*.py", path="../../escape")
+
+    def test_brace_expansion_with_embedded_double_star(self, tmp_path: Path) -> None:
+        """workspace_glob handles '**.{py,ts}' — brace expand then normalize."""
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("src/foo.py", b"x")
+        fs.write("src/bar.ts", b"y")
+        glob_fn = self._glob_fn(tool)
+        result = glob_fn("**.{py,ts}")
+        assert "src/foo.py" in result
+        assert "src/bar.ts" in result

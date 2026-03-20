@@ -236,6 +236,25 @@ def _grep_rg(
 _BRACE_RE = _re.compile(r"\{([^{}]+)\}")
 
 
+def _normalize_glob_pattern(pattern: str) -> str:
+    """Ensure '**' only appears as a standalone path component.
+
+    Fixes patterns like '**.py' → '**/*.py' that are rejected by Python 3.12
+    pathlib.glob() with: ValueError: '**' can only be an entire path component.
+    """
+    parts = pattern.split("/")
+    result: list[str] = []
+    for part in parts:
+        if "**" in part and part != "**":
+            result.append("**")
+            remainder = part.replace("**", "*")
+            if remainder not in ("", "*"):
+                result.append(remainder)
+        else:
+            result.append(part)
+    return "/".join(result)
+
+
 def _expand_braces(pattern: str) -> list[str]:
     """Expand brace groups in a glob pattern into multiple patterns.
 
@@ -730,7 +749,8 @@ class WorkspaceTool(ToolCard):
                 seen: set[Path] = set()
                 raw_matches: list[Path] = []
                 for expanded_pattern in _expand_braces(pattern):
-                    for m in search_root.glob(expanded_pattern):
+                    safe_pattern = _normalize_glob_pattern(expanded_pattern)
+                    for m in search_root.glob(safe_pattern):
                         if m.is_file() and m not in seen:
                             seen.add(m)
                             raw_matches.append(m)
