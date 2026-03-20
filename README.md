@@ -459,7 +459,7 @@ Every pull request runs the full quality gate via GitHub Actions
 |---|---|---|
 | Type check | `mypy packages/akgentic-tool/src/` (strict, Python 3.12) | Zero errors |
 | Lint | `ruff check packages/akgentic-tool/src/` | Zero errors |
-| Tests | `pytest packages/akgentic-tool/tests/ --cov=akgentic.tool --cov-fail-under=80` | All pass, ≥ 80 % branch coverage |
+| Tests | `pytest packages/akgentic-tool/tests/ --cov=akgentic.tool --cov-fail-under=80` | All pass, ≥ 80% coverage |
 
 The CI badge at the top of this README reflects the current state of `master`. PRs are
 blocked from merging until all four steps are green.
