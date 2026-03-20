@@ -4,7 +4,7 @@ import datetime
 import logging
 from typing import TYPE_CHECKING, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import Akgent, BaseConfig, BaseState
@@ -22,7 +22,9 @@ TaskStatus = Literal["pending", "started", "completed", "abort"]
 class TaskCreate(SerializableBaseModel):
     id: int = Field(..., description="Unique identifier of the task.")
     status: TaskStatus = Field(..., description="Status of the task.")
-    description: str = Field(..., max_length=300, description="Short description of the task.")
+    description: str = Field(
+        ..., max_length=300, description="Short description of the task (max 300 chars)."
+    )
     owner: str = Field(..., description="Assigned team member name; empty if not yet assigned.")
     dependencies: list[int] = Field(
         default_factory=list,
@@ -34,16 +36,26 @@ class TaskUpdate(SerializableBaseModel):
     id: int = Field(..., description="Unique identifier of the task.")
     status: TaskStatus | None = Field(default=None, description="New status of the task.")
     description: str | None = Field(
-        default=None, max_length=300, description="New description of the task."
+        default=None, max_length=300, description="New description of the task (max 300 chars)."
     )
     output: str | None = Field(
-        default=None, max_length=150, description="New output or result of the task."
+        default=None,
+        max_length=150,
+        description="New output or result of the task (max 150 chars; truncated automatically).",
     )
     owner: str | None = Field(default=None, description="New assigned team member name;")
     dependencies: list[int] | None = Field(
         default=None,
         description="New list of task IDs that must be completed first.",
     )
+
+    @field_validator("output", mode="before")
+    @classmethod
+    def truncate_output(cls, v: object) -> object:
+        """Silently truncate output to 150 chars to avoid validation errors."""
+        if isinstance(v, str) and len(v) > 150:
+            return v[:147] + "..."
+        return v
 
 
 class Task(TaskCreate):

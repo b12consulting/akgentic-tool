@@ -254,7 +254,12 @@ class PlanningTool(ToolCard):
         observer = self._observer
 
         def update_planning(update: UpdatePlan) -> str:
-            """Update team tasks (create, update, delete)."""
+            """Update team tasks (create, update, delete).
+
+            Field constraints (violating them causes a validation error):
+            - description: max 300 characters — keep it concise.
+            - output: max 150 characters — will be truncated automatically if exceeded.
+            """
             observer.notify_event(
                 ToolCallEvent(tool_name="Update planning", args=[update], kwargs={})
             )
