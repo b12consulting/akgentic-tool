@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from pathlib import Path
@@ -1189,6 +1190,9 @@ class TestDocumentReaderLazyInit:
         """No llm_client -> _get_openai_client() returns None."""
         assert DocumentReader()._get_openai_client() is None
 
+    @pytest.mark.skipif(
+        not os.environ.get("OPENAI_API_KEY"), reason="requires OPENAI_API_KEY"
+    )
     def test_get_openai_client_lazy_creation(self) -> None:
         """llm_client='openai' -> lazily constructs OpenAI() on first call."""
         reader = DocumentReader(llm_client="openai")
@@ -1200,6 +1204,9 @@ class TestDocumentReaderLazyInit:
         assert result is not None
         assert reader._openai_client is result
 
+    @pytest.mark.skipif(
+        not os.environ.get("OPENAI_API_KEY"), reason="requires OPENAI_API_KEY"
+    )
     def test_get_openai_client_cached(self) -> None:
         """Second _get_openai_client() call reuses cached client."""
         reader = DocumentReader(llm_client="openai")
