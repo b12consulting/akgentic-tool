@@ -107,7 +107,8 @@ def _hire_single_member(
             raise RetriableError("Hire error - member name cannot be empty.")
         if child_name in existing_names:
             raise RetriableError(
-                f"Hire error - member name '{child_name}' already exists. Please choose a unique name."
+                f"Hire error - member name '{child_name}' already exists. "
+                "Please choose a unique name."
             )
 
     agent_card_config = agent_card.get_config_copy()
@@ -287,7 +288,8 @@ class TeamTool(ToolCard):
                 roles: List of roles to hire (each must be in available_roles)
 
             Returns:
-                Confirmation message with hired member names (e.g., 'Members hired: [@Developer123, @Tester456]')
+                Confirmation message with hired member names
+                (e.g., 'Members hired: [@Developer123, @Tester456]')
             """
             if not roles:
                 raise RetriableError("No roles provided. Specify at least one role to hire.")
