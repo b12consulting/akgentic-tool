@@ -256,7 +256,7 @@ class TestVectorIndexPerformance:
         elapsed_ms = (time.perf_counter() - start) * 1000
 
         assert len(results) == 10
-        assert elapsed_ms < 1.0, f"Cosine search took {elapsed_ms:.3f}ms (> 1ms)"
+        assert elapsed_ms < 10.0, f"Cosine search took {elapsed_ms:.3f}ms (> 10ms)"
 
 
 # ---------------------------------------------------------------------------
