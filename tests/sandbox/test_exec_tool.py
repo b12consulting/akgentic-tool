@@ -709,3 +709,34 @@ def test_observer_auto_mode_config_uses_resolved_mode() -> None:
     call_kwargs = observer._orch_proxy.createActor.call_args[1]
     config: SandboxConfig = call_kwargs["config"]
     assert config.mode == "bwrap"  # resolved mode stored, not "auto"
+
+
+def test_observer_auto_mode_creates_docker_actor() -> None:
+    """AC (8.4): mode='auto' → _resolve_auto_mode='docker' → DockerSandboxActor created."""
+    observer = MockObserver(existing_actor=None)
+    tool = ExecTool(mode="auto")
+
+    with patch("akgentic.tool.sandbox.tool._resolve_auto_mode", return_value="docker"):
+        tool.observer(observer)  # type: ignore[arg-type]
+
+    call_args = observer._orch_proxy.createActor.call_args
+    assert call_args[0][0] is DockerSandboxActor
+
+
+def test_observer_local_mode_explicit_does_not_emit_deprecation_warning() -> None:
+    """AC8/AC9 (8.4): ExecTool(mode='local') explicit — no DeprecationWarning emitted.
+
+    DeprecationWarning must ONLY fire when mode='auto' falls back to 'local',
+    not when mode='local' is explicitly requested by the caller.
+    """
+    import warnings
+
+    observer = MockObserver(existing_actor=None)
+    tool = ExecTool(mode="local")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        tool.observer(observer)  # type: ignore[arg-type]  # must not raise
+
+    call_args = observer._orch_proxy.createActor.call_args
+    assert call_args[0][0] is LocalSandboxActor
