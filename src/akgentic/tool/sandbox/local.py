@@ -17,7 +17,8 @@ def _make_preexec(cpu_s: int = 30, mem_mb: int = 512, fsize_mb: int = 100) -> Ca
 
     Sets hard caps for:
     - ``RLIMIT_CPU``: CPU time in seconds
-    - ``RLIMIT_AS``: Virtual address space in bytes
+    - ``RLIMIT_AS``: Virtual address space in bytes (skipped on macOS/Darwin
+      where it is not reliably enforceable)
     - ``RLIMIT_FSIZE``: Maximum file size in bytes
 
     Also calls ``os.setpgrp()`` to put the child process into a new process group,
