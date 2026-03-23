@@ -55,7 +55,7 @@ def actor(tmp_path: Path) -> SeatbeltSandboxActor:
 
 
 def test_start_sandbox_sandbox_exec_not_on_path_raises_runtime_error() -> None:
-    """AC2: _start_sandbox() raises RuntimeError before DeprecationWarning when sandbox-exec missing."""
+    """AC2: RuntimeError raised before DeprecationWarning when sandbox-exec is missing."""
     a: SeatbeltSandboxActor = SeatbeltSandboxActor.__new__(SeatbeltSandboxActor)
     a.config = SandboxConfig(name="sandbox", role="ToolActor", team_id="test-team")
     a.state = SandboxState()
@@ -149,11 +149,10 @@ def test_start_sandbox_idempotent_existing_workspace(
 
 
 def test_stop_sandbox_is_noop(actor: SeatbeltSandboxActor) -> None:
-    """AC3: _stop_sandbox() returns None and makes no subprocess calls."""
+    """AC3: _stop_sandbox() completes without error and makes no subprocess calls."""
     with patch("akgentic.tool.sandbox.seatbelt.subprocess.run") as mock_run:
-        result = actor._stop_sandbox()
+        actor._stop_sandbox()
 
-    assert result is None
     mock_run.assert_not_called()
 
 
@@ -177,24 +176,27 @@ def test_exec_writes_policy_and_calls_sandbox_exec(actor: SeatbeltSandboxActor) 
 
 
 # ---------------------------------------------------------------------------
-# AC5: Policy content — (deny default)
+# Shared helper: capture policy content written to NamedTemporaryFile
 # ---------------------------------------------------------------------------
 
 
-def test_exec_policy_contains_deny_default(actor: SeatbeltSandboxActor, tmp_path: Path) -> None:
-    """AC5: SBPL policy written by _exec() contains '(deny default)'."""
-    captured_policy: list[str] = []
+def _capture_policy(actor: SeatbeltSandboxActor) -> str:
+    """Execute actor._exec() under mocks and return the SBPL policy string written to disk.
+
+    Uses a real NamedTemporaryFile so file I/O is faithful, patches subprocess.run
+    and os.unlink to avoid side-effects.  The written policy text is read back from
+    the temp file before os.unlink would remove it.
+    """
+    policy_path_holder: list[str] = []
     original_ntf = tempfile.NamedTemporaryFile
 
-    def fake_ntf(**kwargs: object) -> object:
-        f = original_ntf(**kwargs)  # type: ignore[arg-type]
-        original_write = f.write
-
-        def capturing_write(data: str) -> int:
-            captured_policy.append(data)
-            return original_write(data)
-
-        f.write = capturing_write  # type: ignore[method-assign]
+    def fake_ntf(
+        mode: str = "w",
+        suffix: str | None = None,
+        delete: bool = True,
+    ) -> object:
+        f = original_ntf(mode=mode, suffix=suffix, delete=delete)
+        policy_path_holder.append(f.name)
         return f
 
     with (
@@ -205,7 +207,22 @@ def test_exec_policy_contains_deny_default(actor: SeatbeltSandboxActor, tmp_path
         mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
         actor._exec("ls .", "")
 
-    assert "(deny default)" in "".join(captured_policy)
+    policy_path = policy_path_holder[0]
+    with open(policy_path) as fh:
+        content = fh.read()
+    os.unlink(policy_path)
+    return content
+
+
+# ---------------------------------------------------------------------------
+# AC5: Policy content — (deny default)
+# ---------------------------------------------------------------------------
+
+
+def test_exec_policy_contains_deny_default(actor: SeatbeltSandboxActor) -> None:
+    """AC5: SBPL policy written by _exec() contains '(deny default)'."""
+    policy = _capture_policy(actor)
+    assert "(deny default)" in policy
 
 
 # ---------------------------------------------------------------------------
@@ -217,29 +234,8 @@ def test_exec_policy_substitutes_workspace_path(
     actor: SeatbeltSandboxActor, tmp_path: Path
 ) -> None:
     """AC4: _exec() substitutes actual workspace path into the SBPL policy."""
-    captured_policy: list[str] = []
-    original_ntf = tempfile.NamedTemporaryFile
-
-    def fake_ntf(**kwargs: object) -> object:
-        f = original_ntf(**kwargs)  # type: ignore[arg-type]
-        original_write = f.write
-
-        def capturing_write(data: str) -> int:
-            captured_policy.append(data)
-            return original_write(data)
-
-        f.write = capturing_write  # type: ignore[method-assign]
-        return f
-
-    with (
-        patch("akgentic.tool.sandbox.seatbelt.tempfile.NamedTemporaryFile", side_effect=fake_ntf),
-        patch("akgentic.tool.sandbox.seatbelt.subprocess.run") as mock_run,
-        patch("akgentic.tool.sandbox.seatbelt.os.unlink"),
-    ):
-        mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
-        actor._exec("ls .", "")
-
-    assert str(tmp_path) in "".join(captured_policy)
+    policy = _capture_policy(actor)
+    assert str(tmp_path) in policy
 
 
 # ---------------------------------------------------------------------------
@@ -247,31 +243,10 @@ def test_exec_policy_substitutes_workspace_path(
 # ---------------------------------------------------------------------------
 
 
-def test_exec_policy_denies_network(actor: SeatbeltSandboxActor, tmp_path: Path) -> None:
+def test_exec_policy_denies_network(actor: SeatbeltSandboxActor) -> None:
     """AC5: SBPL policy written by _exec() contains '(deny network*)'."""
-    captured_policy: list[str] = []
-    original_ntf = tempfile.NamedTemporaryFile
-
-    def fake_ntf(**kwargs: object) -> object:
-        f = original_ntf(**kwargs)  # type: ignore[arg-type]
-        original_write = f.write
-
-        def capturing_write(data: str) -> int:
-            captured_policy.append(data)
-            return original_write(data)
-
-        f.write = capturing_write  # type: ignore[method-assign]
-        return f
-
-    with (
-        patch("akgentic.tool.sandbox.seatbelt.tempfile.NamedTemporaryFile", side_effect=fake_ntf),
-        patch("akgentic.tool.sandbox.seatbelt.subprocess.run") as mock_run,
-        patch("akgentic.tool.sandbox.seatbelt.os.unlink"),
-    ):
-        mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
-        actor._exec("ls .", "")
-
-    assert "(deny network*)" in "".join(captured_policy)
+    policy = _capture_policy(actor)
+    assert "(deny network*)" in policy
 
 
 # ---------------------------------------------------------------------------
@@ -283,32 +258,10 @@ def test_exec_policy_allows_workspace_read_write(
     actor: SeatbeltSandboxActor, tmp_path: Path
 ) -> None:
     """AC5: SBPL policy contains file-read* and file-write* subpath entries for workspace."""
-    captured_policy: list[str] = []
-    original_ntf = tempfile.NamedTemporaryFile
-
-    def fake_ntf(**kwargs: object) -> object:
-        f = original_ntf(**kwargs)  # type: ignore[arg-type]
-        original_write = f.write
-
-        def capturing_write(data: str) -> int:
-            captured_policy.append(data)
-            return original_write(data)
-
-        f.write = capturing_write  # type: ignore[method-assign]
-        return f
-
-    with (
-        patch("akgentic.tool.sandbox.seatbelt.tempfile.NamedTemporaryFile", side_effect=fake_ntf),
-        patch("akgentic.tool.sandbox.seatbelt.subprocess.run") as mock_run,
-        patch("akgentic.tool.sandbox.seatbelt.os.unlink"),
-    ):
-        mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
-        actor._exec("ls .", "")
-
-    full_policy = "".join(captured_policy)
+    policy = _capture_policy(actor)
     ws = str(tmp_path)
-    assert f'(allow file-read*  (subpath "{ws}"))' in full_policy
-    assert f'(allow file-write* (subpath "{ws}"))' in full_policy
+    assert f'(allow file-read*  (subpath "{ws}"))' in policy
+    assert f'(allow file-write* (subpath "{ws}"))' in policy
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +269,7 @@ def test_exec_policy_allows_workspace_read_write(
 # ---------------------------------------------------------------------------
 
 
-def test_exec_deletes_tempfile_in_finally(actor: SeatbeltSandboxActor, tmp_path: Path) -> None:
+def test_exec_deletes_tempfile_in_finally(actor: SeatbeltSandboxActor) -> None:
     """AC4: _exec() deletes the temp .sb policy file in a finally block."""
     with patch("akgentic.tool.sandbox.seatbelt.subprocess.run") as mock_run:
         mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
