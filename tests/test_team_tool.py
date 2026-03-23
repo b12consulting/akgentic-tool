@@ -138,7 +138,6 @@ def test_hire_members_tool_execution():
     assert "@Developer" in result
     observer_mock.createActor.assert_called_once()  # Agent primitive called
     observer_mock.on_hire.assert_called_once()  # Hook called
-    observer_mock.notify_event.assert_called()
 
 
 def test_hire_members_empty_list():
@@ -229,7 +228,6 @@ def test_fire_members_tool_execution():
     orchestrator_mock.get_team_member.assert_called_once_with("@Developer123")
     member_address.stop.assert_called_once()  # address.stop() called
     observer_mock.on_fire.assert_called_once()  # Hook called
-    observer_mock.notify_event.assert_called()
 
 
 def test_fire_members_not_found():
@@ -588,7 +586,6 @@ def test_hire_member_command_execution():
     assert result.name == "@Developer123"
     observer_mock.createActor.assert_called_once()
     observer_mock.on_hire.assert_called_once()
-    observer_mock.notify_event.assert_called()
 
 
 def test_hire_member_command_with_name():
@@ -664,7 +661,6 @@ def test_fire_member_command_execution():
     assert "fired" in result.lower()
     member_address.stop.assert_called_once()
     observer_mock.on_fire.assert_called_once()
-    observer_mock.notify_event.assert_called()
 
 
 def test_fire_member_command_not_found():

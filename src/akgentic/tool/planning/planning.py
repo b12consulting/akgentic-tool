@@ -15,7 +15,7 @@ from akgentic.tool.core import (
     ToolCard,
     _resolve,
 )
-from akgentic.tool.event import ActorToolObserver, ToolCallEvent
+from akgentic.tool.event import ActorToolObserver
 from akgentic.tool.planning.planning_actor import (
     PlanActor,
     PlanConfig,
@@ -236,14 +236,9 @@ class PlanningTool(ToolCard):
 
     def _get_planning_task_factory(self, params: GetPlanningTask) -> Callable:
         planning_proxy = self._planning_proxy
-        observer = self._observer
 
         def get_planning_task(task_id: int) -> Task | str:
             """Get a single team task by its integer ID."""
-            if observer is not None:
-                observer.notify_event(
-                    ToolCallEvent(tool_name="Get task", args=[task_id], kwargs={})
-                )
             return planning_proxy.get_planning_task(task_id)
 
         get_planning_task.__doc__ = params.format_docstring(get_planning_task.__doc__)
@@ -260,10 +255,7 @@ class PlanningTool(ToolCard):
             - description: max 300 characters — keep it concise.
             - output: max 150 characters — will be truncated automatically if exceeded.
             """
-            observer.notify_event(
-                ToolCallEvent(tool_name="Update planning", args=[update], kwargs={})
-            )
-            ## Then observer.myAddress is used to set the creator of any new tasks in the plan.
+            ## observer.myAddress is used to set the creator of any new tasks in the plan.
             return planning_proxy.update_planning(update, observer.myAddress)
 
         update_planning.__doc__ = params.format_docstring(update_planning.__doc__)
@@ -271,7 +263,6 @@ class PlanningTool(ToolCard):
 
     def _search_planning_factory(self, params: SearchPlanning) -> Callable:
         planning_proxy = self._planning_proxy
-        observer = self._observer
 
         def search_planning(
             status: TaskStatus | None = None,
@@ -286,19 +277,6 @@ class PlanningTool(ToolCard):
             query applies case-insensitive substring match on description; when vector deps
             are available, also uses semantic similarity (cosine ≥ 0.5, top_k=20).
             """
-            if observer is not None:
-                observer.notify_event(
-                    ToolCallEvent(
-                        tool_name="Search planning",
-                        args=[],
-                        kwargs={
-                            "status": status,
-                            "owner": owner,
-                            "creator": creator,
-                            "query": query,
-                        },
-                    )
-                )
             return planning_proxy.search_planning(
                 status=status, owner=owner, creator=creator, query=query
             )

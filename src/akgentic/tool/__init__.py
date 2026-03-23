@@ -17,7 +17,6 @@ from .errors import RetriableError  # noqa: F401
 from .event import (  # noqa: F401
     ActorToolObserver,
     TeamManagementToolObserver,
-    ToolCallEvent,
     ToolObserver,
 )
 from .sandbox.bwrap import BwrapSandboxActor  # noqa: F401
@@ -45,7 +44,6 @@ __all__ = [
     # Errors
     "RetriableError",
     # Events and observers
-    "ToolCallEvent",
     "ToolObserver",
     "ActorToolObserver",
     "TeamManagementToolObserver",

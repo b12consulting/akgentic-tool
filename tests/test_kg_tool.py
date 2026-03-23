@@ -19,7 +19,6 @@ from akgentic.core.agent import AkgentType
 from akgentic.core.orchestrator import Orchestrator
 
 from akgentic.tool.core import COMMAND, SYSTEM_PROMPT, TOOL_CALL, BaseToolParam, _resolve
-from akgentic.tool.event import ToolCallEvent
 from akgentic.tool.knowledge_graph.kg_actor import (
     KG_ACTOR_NAME,
     KG_ACTOR_ROLE,
@@ -95,7 +94,7 @@ class MockActorToolObserver:
     """Mock implementing ActorToolObserver protocol for ToolCard tests."""
 
     def __init__(self) -> None:
-        self.events: list[ToolCallEvent] = []
+        self.events: list[object] = []
         self._address = MockActorAddress("test-agent")
         self._orchestrator = MockActorAddress("orchestrator")
         self._kg_actor: KnowledgeGraphActor | None = None
@@ -110,8 +109,7 @@ class MockActorToolObserver:
         return self._orchestrator
 
     def notify_event(self, event: object) -> None:
-        if isinstance(event, ToolCallEvent):
-            self.events.append(event)
+        self.events.append(event)
 
     def proxy_ask(
         self,
@@ -456,19 +454,6 @@ class TestGetGraphFactory:
         assert "Bob" in result
         assert "KNOWS" in result
 
-    def test_get_graph_emits_tool_call_event(self) -> None:
-        tool = KnowledgeGraphTool(get_graph=GetGraph(expose={TOOL_CALL}))
-        observer = MockActorToolObserver()
-        observer.setup_kg_actor()
-        tool.observer(observer)
-
-        tools = tool.get_tools()
-        get_graph_fn = [t for t in tools if t.__name__ == "get_graph"][0]
-        get_graph_fn()
-
-        assert len(observer.events) == 1
-        assert observer.events[0].tool_name == "Get graph"
-
 
 class TestUpdateGraphFactory:
     """_update_graph_factory closure behavior (2.7)."""
@@ -490,25 +475,6 @@ class TestUpdateGraphFactory:
         )
         assert result == "Done"
         assert len(actor.state.knowledge_graph.entities) == 1
-
-    def test_update_graph_emits_tool_call_event(self) -> None:
-        tool = KnowledgeGraphTool()
-        observer = MockActorToolObserver()
-        observer.setup_kg_actor()
-        tool.observer(observer)
-
-        tools = tool.get_tools()
-        update_fn = [t for t in tools if t.__name__ == "update_graph"][0]
-        update_fn(
-            ManageGraph(
-                create_entities=[
-                    EntityCreate(name="X", entity_type="T", description="D"),
-                ]
-            )
-        )
-
-        assert len(observer.events) == 1
-        assert observer.events[0].tool_name == "Update graph"
 
 
 class TestSearchFactory:
@@ -532,18 +498,6 @@ class TestSearchFactory:
         result = search_fn(SearchQuery(query="Alice"))
         assert "Alice" in result
 
-    def test_search_emits_tool_call_event(self) -> None:
-        tool = KnowledgeGraphTool()
-        observer = MockActorToolObserver()
-        observer.setup_kg_actor()
-        tool.observer(observer)
-
-        tools = tool.get_tools()
-        search_fn = [t for t in tools if t.__name__ == "search_graph"][0]
-        search_fn(SearchQuery(query="nonexistent"))
-
-        assert len(observer.events) == 1
-        assert observer.events[0].tool_name == "Search graph"
 
 
 # ===========================================================================

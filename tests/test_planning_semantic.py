@@ -86,60 +86,6 @@ class TestGetPlanningTaskIntNotFound:
 
 
 # ---------------------------------------------------------------------------
-# AC#4 — _get_planning_task_factory: ToolCallEvent emitted when observer present
-# ---------------------------------------------------------------------------
-
-
-class TestGetPlanningTaskToolCallEvent:
-    """AC4 (Task 2.3): _get_planning_task_factory emits ToolCallEvent via observer."""
-
-    def test_notify_event_called_with_task_id(self) -> None:
-        """observer.notify_event fires with ToolCallEvent(tool_name='Get task', args=[task_id])."""
-        from unittest.mock import MagicMock
-
-        from akgentic.tool.event import ToolCallEvent
-        from akgentic.tool.planning.planning import GetPlanningTask, PlanningTool
-
-        tool = PlanningTool()
-
-        # Wire up a mock observer and planning proxy
-        mock_observer = MagicMock()
-        tool._observer = mock_observer
-
-        mock_proxy = MagicMock()
-        mock_proxy.get_planning_task.return_value = "No task with that ID."
-        tool._planning_proxy = mock_proxy
-
-        fn = tool._get_planning_task_factory(GetPlanningTask())
-        fn(42)
-
-        mock_observer.notify_event.assert_called_once()
-        call_args = mock_observer.notify_event.call_args[0][0]
-        assert isinstance(call_args, ToolCallEvent)
-        assert call_args.tool_name == "Get task"
-        assert call_args.args == [42]
-        assert call_args.kwargs == {}
-
-    def test_no_notify_when_observer_is_none(self) -> None:
-        """When observer is None, notify_event is not called (no AttributeError)."""
-        from unittest.mock import MagicMock
-
-        from akgentic.tool.planning.planning import GetPlanningTask, PlanningTool
-
-        tool = PlanningTool()
-        tool._observer = None  # type: ignore[assignment]
-
-        mock_proxy = MagicMock()
-        mock_proxy.get_planning_task.return_value = "No task with that ID."
-        tool._planning_proxy = mock_proxy
-
-        fn = tool._get_planning_task_factory(GetPlanningTask())
-        result = fn(99)
-
-        assert result == "No task with that ID."
-
-
-# ---------------------------------------------------------------------------
 # AC#8 — PlanningTool has embedding_model and embedding_provider fields
 # ---------------------------------------------------------------------------
 

@@ -18,7 +18,7 @@ system integration.
 
 - **planning.py**: `PlanningTool` - the main tool card that exposes planning capabilities
 - **planning_actor.py**: `PlanActor` - the actor that manages plan state
-- **event.py**: Empty module (planning uses `ToolCallEvent` from parent)
+- **event.py**: Empty module
 
 ## Dependencies
 
