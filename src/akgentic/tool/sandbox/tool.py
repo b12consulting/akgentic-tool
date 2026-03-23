@@ -137,6 +137,8 @@ class ExecTool(ToolCard):
                 )
             except CommandNotAllowedError as e:
                 return f"CommandNotAllowedError: {e}. Allowed commands: {sorted(ALLOWED_COMMANDS)}"
+            except Exception as e:
+                return f"SandboxError: {type(e).__name__}: {e}"
 
         exec_command.__doc__ = params.format_docstring(exec_command.__doc__)
         return exec_command
