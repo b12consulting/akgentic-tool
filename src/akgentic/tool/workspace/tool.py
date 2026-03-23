@@ -421,7 +421,7 @@ class WorkspaceTool(ToolCard):
         if observer.orchestrator is None:
             raise ValueError("WorkspaceTool requires access to the orchestrator.")
         self._observer = observer
-        ws_name = self.workspace_id or str(observer._team_id)  # type: ignore[attr-defined]
+        ws_name = self.workspace_id or str(observer.team_id)
         self._workspace = get_workspace(ws_name)
         return self
 

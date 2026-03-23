@@ -26,7 +26,7 @@ def make_observer(
     tid = team_id or uuid.uuid4()
     observer = MagicMock()
     observer.orchestrator = MagicMock()
-    observer._team_id = tid
+    observer.team_id = tid
     fs = Filesystem(str(tmp_path), str(tid))
     return observer, fs
 

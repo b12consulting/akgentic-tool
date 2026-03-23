@@ -96,7 +96,7 @@ class ExecTool(ToolCard):
                 config=SandboxConfig(
                     name=SANDBOX_ACTOR_NAME,
                     role="ToolActor",
-                    team_id=str(observer._team_id),  # type: ignore[attr-defined]
+                    team_id=str(observer.team_id),
                     workspace_id=self.workspace_id,
                     mode=self.mode,
                 ),

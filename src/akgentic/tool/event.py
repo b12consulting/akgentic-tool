@@ -1,3 +1,4 @@
+import uuid
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -48,6 +49,11 @@ class ActorToolObserver(ToolObserver, Protocol):
     @property
     def orchestrator(self) -> ActorAddress | None:
         """Get the orchestrator address."""
+        ...
+
+    @property
+    def team_id(self) -> uuid.UUID:
+        """Get the team id."""
         ...
 
     def proxy_ask(
