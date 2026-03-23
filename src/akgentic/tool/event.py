@@ -1,6 +1,6 @@
+import uuid
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
-import uuid
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import AkgentType
