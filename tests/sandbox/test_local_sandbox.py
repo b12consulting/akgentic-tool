@@ -551,7 +551,9 @@ def test_make_preexec_fn_sets_resource_limits() -> None:
     with (
         patch.object(resource_module, "setrlimit") as mock_setrlimit,
         patch("os.setpgrp") as mock_setpgrp,
+        patch("akgentic.tool.sandbox.local.sys") as mock_sys,
     ):
+        mock_sys.platform = "linux"
         fn()
 
     mb = 1024**2
@@ -561,4 +563,70 @@ def test_make_preexec_fn_sets_resource_limits() -> None:
         call(resource_module.RLIMIT_FSIZE, (100 * mb, 100 * mb)),
     ]
     mock_setrlimit.assert_has_calls(expected_calls, any_order=False)
+    mock_setpgrp.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Story 8.5: Darwin platform guard for RLIMIT_AS (AC: 1, 2)
+# ---------------------------------------------------------------------------
+
+
+def test_make_preexec_skips_rlimit_as_on_darwin() -> None:
+    """AC1 (Story 8.5): On macOS (Darwin), RLIMIT_AS is NOT set,
+    while RLIMIT_CPU and RLIMIT_FSIZE are still applied.
+    """
+    import resource as resource_module
+    from unittest.mock import call, patch
+
+    from akgentic.tool.sandbox.local import _make_preexec
+
+    fn = _make_preexec(cpu_s=30, mem_mb=512, fsize_mb=100)
+
+    with (
+        patch.object(resource_module, "setrlimit") as mock_setrlimit,
+        patch("os.setpgrp") as mock_setpgrp,
+        patch("akgentic.tool.sandbox.local.sys") as mock_sys,
+    ):
+        mock_sys.platform = "darwin"
+        fn()
+
+    mb = 1024**2
+    expected_calls = [
+        call(resource_module.RLIMIT_CPU, (30, 30)),
+        call(resource_module.RLIMIT_FSIZE, (100 * mb, 100 * mb)),
+    ]
+    mock_setrlimit.assert_has_calls(expected_calls, any_order=False)
+    # Verify RLIMIT_AS was NOT set
+    for c in mock_setrlimit.call_args_list:
+        assert c[0][0] != resource_module.RLIMIT_AS, "RLIMIT_AS should not be set on Darwin"
+    mock_setpgrp.assert_called_once()
+
+
+def test_make_preexec_sets_rlimit_as_on_linux() -> None:
+    """AC2 (Story 8.5): On Linux, all three limits (RLIMIT_CPU, RLIMIT_AS,
+    RLIMIT_FSIZE) are set as before.
+    """
+    import resource as resource_module
+    from unittest.mock import call, patch
+
+    from akgentic.tool.sandbox.local import _make_preexec
+
+    fn = _make_preexec(cpu_s=30, mem_mb=512, fsize_mb=100)
+
+    with (
+        patch.object(resource_module, "setrlimit") as mock_setrlimit,
+        patch("os.setpgrp") as mock_setpgrp,
+        patch("akgentic.tool.sandbox.local.sys") as mock_sys,
+    ):
+        mock_sys.platform = "linux"
+        fn()
+
+    mb = 1024**2
+    expected_calls = [
+        call(resource_module.RLIMIT_CPU, (30, 30)),
+        call(resource_module.RLIMIT_AS, (512 * mb, 512 * mb)),
+        call(resource_module.RLIMIT_FSIZE, (100 * mb, 100 * mb)),
+    ]
+    mock_setrlimit.assert_has_calls(expected_calls, any_order=False)
+    assert mock_setrlimit.call_count == 3
     mock_setpgrp.assert_called_once()

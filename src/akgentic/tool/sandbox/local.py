@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import resource
 import subprocess
+import sys
 from pathlib import Path
 from typing import Callable
 
@@ -16,7 +17,8 @@ def _make_preexec(cpu_s: int = 30, mem_mb: int = 512, fsize_mb: int = 100) -> Ca
 
     Sets hard caps for:
     - ``RLIMIT_CPU``: CPU time in seconds
-    - ``RLIMIT_AS``: Virtual address space in bytes
+    - ``RLIMIT_AS``: Virtual address space in bytes (skipped on macOS/Darwin
+      where it is not reliably enforceable)
     - ``RLIMIT_FSIZE``: Maximum file size in bytes
 
     Also calls ``os.setpgrp()`` to put the child process into a new process group,
@@ -25,7 +27,8 @@ def _make_preexec(cpu_s: int = 30, mem_mb: int = 512, fsize_mb: int = 100) -> Ca
 
     def preexec() -> None:
         resource.setrlimit(resource.RLIMIT_CPU, (cpu_s, cpu_s))
-        resource.setrlimit(resource.RLIMIT_AS, (mem_mb * 1024**2, mem_mb * 1024**2))
+        if sys.platform != "darwin":
+            resource.setrlimit(resource.RLIMIT_AS, (mem_mb * 1024**2, mem_mb * 1024**2))
         resource.setrlimit(resource.RLIMIT_FSIZE, (fsize_mb * 1024**2, fsize_mb * 1024**2))
         os.setpgrp()  # new process group → timeout kills entire subtree
 

@@ -327,6 +327,48 @@ def test_exec_command_catches_command_not_allowed_error() -> None:
     assert not result.startswith("Traceback")  # must not have raised
 
 
+def test_exec_command_catches_subprocess_error() -> None:
+    """AC3 (Story 8.5): When sandbox proxy raises SubprocessError, exec_command
+    returns an error string instead of crashing.
+    """
+    import subprocess
+
+    observer = MockObserver(existing_actor=None)
+    tool = ExecTool(mode="local")
+    tool.observer(observer)  # type: ignore[arg-type]
+
+    mock_proxy = MagicMock(spec=SandboxActor)
+    mock_proxy.exec.side_effect = subprocess.SubprocessError("Exception occurred in preexec_fn.")
+    tool._sandbox_proxy = mock_proxy
+
+    tools = tool.get_tools()
+    result = tools[0](cmd="echo hello")
+
+    assert "SandboxError" in result
+    assert "SubprocessError" in result
+    assert "preexec_fn" in result
+
+
+def test_exec_command_catches_generic_exception() -> None:
+    """AC3 (Story 8.5): When sandbox proxy raises any Exception, exec_command
+    returns an error string instead of raising.
+    """
+    observer = MockObserver(existing_actor=None)
+    tool = ExecTool(mode="local")
+    tool.observer(observer)  # type: ignore[arg-type]
+
+    mock_proxy = MagicMock(spec=SandboxActor)
+    mock_proxy.exec.side_effect = RuntimeError("sandbox crashed")
+    tool._sandbox_proxy = mock_proxy
+
+    tools = tool.get_tools()
+    result = tools[0](cmd="echo hello")
+
+    assert "SandboxError" in result
+    assert "RuntimeError" in result
+    assert "sandbox crashed" in result
+
+
 def test_exec_command_error_string_lists_allowed_commands() -> None:
     """AC9: error string contains the sorted list of ALLOWED_COMMANDS."""
     observer = MockObserver(existing_actor=None)
