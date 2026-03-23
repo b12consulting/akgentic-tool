@@ -10,6 +10,11 @@ Covers AC1 through AC7 for Story 6.2 (updated for Story 6.5):
 - _exec() returns ExecResult with correct stdout, stderr, exit_code
 - subprocess.TimeoutExpired propagates from _exec()
 - exec() public method works end-to-end through _exec()
+
+Story 8.1: Resource limits and environment stripping:
+- preexec_fn is passed to subprocess.run (mock assert)
+- env is stripped to minimal PATH (mock assert)
+- docstring contains isolation disclaimer
 """
 
 from __future__ import annotations
@@ -176,13 +181,16 @@ def test_exec_no_cwd_uses_workspace_path(
 
     actor._exec("pytest tests/", "")
 
-    mock_run.assert_called_once_with(
-        ["pytest", "tests/"],
-        cwd=str(actor.state.workspace_path),
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    call_kwargs = mock_run.call_args
+    assert call_kwargs is not None
+    assert call_kwargs.args[0] == ["pytest", "tests/"]
+    assert call_kwargs.kwargs["cwd"] == str(actor.state.workspace_path)
+    assert call_kwargs.kwargs["capture_output"] is True
+    assert call_kwargs.kwargs["text"] is True
+    assert call_kwargs.kwargs["timeout"] == 30
+    assert call_kwargs.kwargs["preexec_fn"] is not None
+    assert callable(call_kwargs.kwargs["preexec_fn"])
+    assert call_kwargs.kwargs["env"] == {"PATH": "/usr/bin:/bin:/usr/local/bin"}
 
 
 # ---------------------------------------------------------------------------
@@ -205,13 +213,16 @@ def test_exec_with_cwd_appends_to_workspace_path(
     actor._exec("pytest tests/", "src")
 
     expected_cwd = str(actor.state.workspace_path / "src")
-    mock_run.assert_called_once_with(
-        ["pytest", "tests/"],
-        cwd=expected_cwd,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+    call_kwargs = mock_run.call_args
+    assert call_kwargs is not None
+    assert call_kwargs.args[0] == ["pytest", "tests/"]
+    assert call_kwargs.kwargs["cwd"] == expected_cwd
+    assert call_kwargs.kwargs["capture_output"] is True
+    assert call_kwargs.kwargs["text"] is True
+    assert call_kwargs.kwargs["timeout"] == 30
+    assert call_kwargs.kwargs["preexec_fn"] is not None
+    assert callable(call_kwargs.kwargs["preexec_fn"])
+    assert call_kwargs.kwargs["env"] == {"PATH": "/usr/bin:/bin:/usr/local/bin"}
 
 
 # ---------------------------------------------------------------------------
@@ -424,3 +435,77 @@ def test_exec_tool_and_workspace_tool_resolve_same_path_via_workspace_id(
         f"WorkspaceTool root ({workspace_tool_root}) != "
         f"LocalSandboxActor root ({sandbox_root})"
     )
+
+
+# ---------------------------------------------------------------------------
+# Story 8.1: Resource limits and environment stripping (AC: 1, 2, 5)
+# ---------------------------------------------------------------------------
+
+
+@patch("akgentic.tool.sandbox.local.subprocess.run")
+def test_exec_passes_preexec_fn_to_subprocess(
+    mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC5 (Story 8.1): _exec() passes a non-None callable preexec_fn to subprocess.run."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
+    actor = make_actor(team_id="team-1")
+    actor._start_sandbox()
+
+    mock_run.return_value = MagicMock(stdout="output", stderr="", returncode=0)
+
+    actor._exec("echo hello", "")
+
+    call_kwargs = mock_run.call_args
+    assert call_kwargs is not None
+    preexec_fn = call_kwargs.kwargs.get("preexec_fn")
+    assert preexec_fn is not None
+    assert callable(preexec_fn)
+
+
+@patch("akgentic.tool.sandbox.local.subprocess.run")
+def test_exec_strips_env_to_minimal_path(
+    mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC5 (Story 8.1): _exec() passes env={'PATH': '/usr/bin:/bin:/usr/local/bin'} to subprocess.run."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
+    actor = make_actor(team_id="team-1")
+    actor._start_sandbox()
+
+    mock_run.return_value = MagicMock(stdout="output", stderr="", returncode=0)
+
+    actor._exec("echo hello", "")
+
+    call_kwargs = mock_run.call_args
+    assert call_kwargs is not None
+    env = call_kwargs.kwargs.get("env")
+    assert env == {"PATH": "/usr/bin:/bin:/usr/local/bin"}
+
+
+@patch("akgentic.tool.sandbox.local.subprocess.run")
+def test_exec_no_env_kwargs_other_than_path(
+    mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC5 (Story 8.1): env dict passed to subprocess.run has exactly one key ('PATH')."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
+    actor = make_actor(team_id="team-1")
+    actor._start_sandbox()
+
+    mock_run.return_value = MagicMock(stdout="output", stderr="", returncode=0)
+
+    actor._exec("echo hello", "")
+
+    call_kwargs = mock_run.call_args
+    assert call_kwargs is not None
+    env = call_kwargs.kwargs.get("env")
+    assert isinstance(env, dict)
+    assert len(env) == 1
+    assert "PATH" in env
+
+
+def test_docstring_contains_isolation_disclaimer() -> None:
+    """AC5 (Story 8.1): LocalSandboxActor docstring contains isolation disclaimer."""
+    assert LocalSandboxActor.__doc__ is not None
+    assert "does NOT provide filesystem isolation" in LocalSandboxActor.__doc__
