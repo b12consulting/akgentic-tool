@@ -410,10 +410,21 @@ ExecTool(workspace_id="shared")   # share workspace directory with WorkspaceTool
 `grep`, `mkdir`, `cp`, `mv`, `rm`, `echo`, `touch`, `curl`, `wget`, `make`, `bash`, `sh`,
 `node`, `npm`, `npx`
 
-**Platform note (RLIMIT_AS on Darwin):** The `local` mode sets `RLIMIT_AS` (virtual address
-space limit) to 512 MB on Linux but skips this resource limit on macOS/Darwin, where
-`RLIMIT_AS` is not reliably enforceable. CPU time and file size limits are applied on all
-platforms.
+**Auto-mode probe order (`_resolve_auto_mode()`):** When `mode="auto"`, the function probes
+the host at `ExecTool.observer()` call time in the following order: `bwrap` (Linux bubblewrap)
+→ `seatbelt` (macOS `sandbox-exec`) → `docker` → `local` (fallback, no isolation). If `local`
+is selected as the fallback, a `DeprecationWarning` is emitted to alert that no isolation
+backend was found.
+
+**Platform notes:**
+
+- **RLIMIT_AS on Darwin:** The `local` mode sets `RLIMIT_AS` (virtual address space limit) to
+  512 MB on Linux but skips this resource limit on macOS/Darwin, where `RLIMIT_AS` is not
+  reliably enforceable. CPU time and file size limits are applied on all platforms.
+- **Seatbelt DeprecationWarning:** `SeatbeltSandboxActor._start_sandbox()` emits a
+  `DeprecationWarning` because `sandbox-exec` is deprecated since macOS 10.15 Catalina and
+  may be removed in a future macOS release. The seatbelt mode is intended for macOS developer
+  workstations only.
 
 **Error handling:** All errors from the sandbox backend surface as a `SandboxError` string
 returned to the LLM (never raised). Disallowed commands return a `CommandNotAllowedError`
@@ -559,12 +570,14 @@ src/akgentic/tool/
         readers.py            # DocumentReader (Pydantic BaseModel), TEXT_EXTENSIONS
         └── tool.py           # WorkspaceTool ToolCard
     sandbox/
+        __init__.py           # Public exports: ExecTool, SandboxActor subclasses, models
         actor.py              # SandboxActor (abstract), SandboxConfig, ALLOWED_COMMANDS
         local.py              # LocalSandboxActor (subprocess, resource limits)
         docker.py             # DockerSandboxActor (persistent container per team)
         seatbelt.py           # SeatbeltSandboxActor (macOS Apple Seatbelt)
         bwrap.py              # BwrapSandboxActor (Linux bubblewrap)
-        └── tool.py           # ExecTool ToolCard, SANDBOX_ACTOR_CLASSES registry
+        tool.py               # ExecTool ToolCard, SANDBOX_ACTOR_CLASSES registry
+        └── Dockerfile        # Bundled image definition for akgentic-sandbox:latest
 tests/                        # Tests organised by domain
 ```
 
