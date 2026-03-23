@@ -11,12 +11,15 @@ from .actor import (
     SandboxConfig,
     SandboxState,
 )
+from .bwrap import BwrapSandboxActor
 from .docker import DockerSandboxActor
 from .local import LocalSandboxActor
+from .seatbelt import SeatbeltSandboxActor
 from .tool import ExecTool
 
 __all__ = [
     "ALLOWED_COMMANDS",
+    "BwrapSandboxActor",
     "CommandNotAllowedError",
     "DockerSandboxActor",
     "ExecResult",
@@ -26,4 +29,5 @@ __all__ = [
     "SandboxActor",
     "SandboxConfig",
     "SandboxState",
+    "SeatbeltSandboxActor",
 ]

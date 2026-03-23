@@ -1,6 +1,6 @@
 """Tests for ExecTool — observer wiring, mode field, tool behaviour.
 
-Covers AC1–AC13 for Story 6.4 (updated for Story 6.5):
+Covers AC1–AC13 for Story 6.4 (updated for Story 6.5, Story 8.4):
 - SANDBOX_ACTOR_CLASSES dict (AC1)
 - ExecTool fields including mode (AC2)
 - observer() raises ValueError when orchestrator is None (AC3)
@@ -12,11 +12,12 @@ Covers AC1–AC13 for Story 6.4 (updated for Story 6.5):
 - exec_command catches CommandNotAllowedError → error string (AC9)
 - get_tools() returns [] when exec_command=False (AC10)
 - Story 6.5: mode comes from ExecTool.mode field, not SANDBOX_MODE env var
+- Story 8.4: bwrap/seatbelt keys in registry, auto-mode resolution, DeprecationWarning
 """
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from akgentic.core.actor_address import ActorAddress
@@ -28,9 +29,11 @@ from akgentic.tool.sandbox.actor import (
     SandboxActor,
     SandboxConfig,
 )
+from akgentic.tool.sandbox.bwrap import BwrapSandboxActor
 from akgentic.tool.sandbox.docker import DockerSandboxActor
 from akgentic.tool.sandbox.local import LocalSandboxActor
-from akgentic.tool.sandbox.tool import SANDBOX_ACTOR_CLASSES, ExecTool
+from akgentic.tool.sandbox.seatbelt import SeatbeltSandboxActor
+from akgentic.tool.sandbox.tool import SANDBOX_ACTOR_CLASSES, ExecTool, _resolve_auto_mode
 
 # ---------------------------------------------------------------------------
 # Mock observer infrastructure
@@ -501,3 +504,208 @@ def test_observer_config_has_team_id_and_workspace_id_independently() -> None:
     config: SandboxConfig = call_kwargs["config"]
     assert config.team_id == "t1"
     assert config.workspace_id == "my-ws"
+
+
+# ---------------------------------------------------------------------------
+# Story 8.4 — registry extension: bwrap and seatbelt keys
+# ---------------------------------------------------------------------------
+
+
+def test_sandbox_actor_classes_has_bwrap_key() -> None:
+    """AC1 (8.4): SANDBOX_ACTOR_CLASSES['bwrap'] maps to BwrapSandboxActor."""
+    assert "bwrap" in SANDBOX_ACTOR_CLASSES
+    assert SANDBOX_ACTOR_CLASSES["bwrap"] is BwrapSandboxActor
+
+
+def test_sandbox_actor_classes_has_seatbelt_key() -> None:
+    """AC1 (8.4): SANDBOX_ACTOR_CLASSES['seatbelt'] maps to SeatbeltSandboxActor."""
+    assert "seatbelt" in SANDBOX_ACTOR_CLASSES
+    assert SANDBOX_ACTOR_CLASSES["seatbelt"] is SeatbeltSandboxActor
+
+
+# ---------------------------------------------------------------------------
+# Story 8.4 — ExecTool mode field accepts new values
+# ---------------------------------------------------------------------------
+
+
+def test_exec_tool_mode_can_be_set_to_bwrap() -> None:
+    """AC2 (8.4): ExecTool(mode='bwrap').mode == 'bwrap'."""
+    tool = ExecTool(mode="bwrap")
+    assert tool.mode == "bwrap"
+
+
+def test_exec_tool_mode_can_be_set_to_seatbelt() -> None:
+    """AC2 (8.4): ExecTool(mode='seatbelt').mode == 'seatbelt'."""
+    tool = ExecTool(mode="seatbelt")
+    assert tool.mode == "seatbelt"
+
+
+def test_exec_tool_mode_can_be_set_to_auto() -> None:
+    """AC3 (8.4): ExecTool(mode='auto').mode == 'auto'."""
+    tool = ExecTool(mode="auto")
+    assert tool.mode == "auto"
+
+
+# ---------------------------------------------------------------------------
+# Story 8.4 — SandboxConfig accepts new mode values
+# ---------------------------------------------------------------------------
+
+
+def test_sandbox_config_mode_accepts_bwrap() -> None:
+    """AC2 (8.4): SandboxConfig(team_id='t', mode='bwrap') validates without error."""
+    config = SandboxConfig(team_id="t", mode="bwrap")
+    assert config.mode == "bwrap"
+
+
+def test_sandbox_config_mode_accepts_seatbelt() -> None:
+    """AC2 (8.4): SandboxConfig(team_id='t', mode='seatbelt') validates without error."""
+    config = SandboxConfig(team_id="t", mode="seatbelt")
+    assert config.mode == "seatbelt"
+
+
+def test_sandbox_config_mode_accepts_auto() -> None:
+    """AC3 (8.4): SandboxConfig(team_id='t', mode='auto') validates without error."""
+    config = SandboxConfig(team_id="t", mode="auto")
+    assert config.mode == "auto"
+
+
+# ---------------------------------------------------------------------------
+# Story 8.4 — observer() creates correct actor for bwrap and seatbelt modes
+# ---------------------------------------------------------------------------
+
+
+def test_observer_creates_bwrap_sandbox_actor() -> None:
+    """AC4 (8.4): ExecTool(mode='bwrap').observer() creates BwrapSandboxActor."""
+    observer = MockObserver(existing_actor=None)
+    tool = ExecTool(mode="bwrap")
+
+    tool.observer(observer)  # type: ignore[arg-type]
+
+    call_args = observer._orch_proxy.createActor.call_args
+    assert call_args[0][0] is BwrapSandboxActor
+
+
+def test_observer_creates_seatbelt_sandbox_actor() -> None:
+    """AC5 (8.4): ExecTool(mode='seatbelt').observer() creates SeatbeltSandboxActor."""
+    observer = MockObserver(existing_actor=None)
+    tool = ExecTool(mode="seatbelt")
+
+    tool.observer(observer)  # type: ignore[arg-type]
+
+    call_args = observer._orch_proxy.createActor.call_args
+    assert call_args[0][0] is SeatbeltSandboxActor
+
+
+# ---------------------------------------------------------------------------
+# Story 8.4 — _resolve_auto_mode() probe order
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_auto_mode_returns_bwrap_when_bwrap_on_path() -> None:
+    """AC6 (8.4): _resolve_auto_mode() returns 'bwrap' when bwrap is on PATH."""
+    with patch("akgentic.tool.sandbox.tool.shutil.which", return_value="/usr/bin/bwrap"):
+        result = _resolve_auto_mode()
+    assert result == "bwrap"
+
+
+def test_resolve_auto_mode_returns_seatbelt_on_darwin_without_bwrap() -> None:
+    """AC7 (8.4): _resolve_auto_mode() returns 'seatbelt' on Darwin when sandbox-exec found."""
+
+    def which_side_effect(cmd: str) -> str | None:
+        return {
+            "bwrap": None,
+            "sandbox-exec": "/usr/bin/sandbox-exec",
+            "docker": None,
+        }.get(cmd)
+
+    with (
+        patch("akgentic.tool.sandbox.tool.shutil.which", side_effect=which_side_effect),
+        patch("akgentic.tool.sandbox.tool.platform.system", return_value="Darwin"),
+    ):
+        result = _resolve_auto_mode()
+    assert result == "seatbelt"
+
+
+def test_resolve_auto_mode_returns_docker_when_docker_on_path() -> None:
+    """AC (8.4): _resolve_auto_mode() returns 'docker' when docker on PATH, no bwrap/seatbelt."""
+
+    def which_side_effect(cmd: str) -> str | None:
+        return {
+            "bwrap": None,
+            "sandbox-exec": None,
+            "docker": "/usr/bin/docker",
+        }.get(cmd)
+
+    with (
+        patch("akgentic.tool.sandbox.tool.shutil.which", side_effect=which_side_effect),
+        patch("akgentic.tool.sandbox.tool.platform.system", return_value="Linux"),
+    ):
+        result = _resolve_auto_mode()
+    assert result == "docker"
+
+
+def test_resolve_auto_mode_returns_local_when_nothing_found() -> None:
+    """AC8 (8.4): _resolve_auto_mode() returns 'local' when no backends found."""
+    with (
+        patch("akgentic.tool.sandbox.tool.shutil.which", return_value=None),
+        patch("akgentic.tool.sandbox.tool.platform.system", return_value="Linux"),
+    ):
+        result = _resolve_auto_mode()
+    assert result == "local"
+
+
+# ---------------------------------------------------------------------------
+# Story 8.4 — observer() auto-mode creates correct actor
+# ---------------------------------------------------------------------------
+
+
+def test_observer_auto_mode_creates_bwrap_actor() -> None:
+    """AC6 (8.4): mode='auto' → _resolve_auto_mode='bwrap' → BwrapSandboxActor created."""
+    observer = MockObserver(existing_actor=None)
+    tool = ExecTool(mode="auto")
+
+    with patch("akgentic.tool.sandbox.tool._resolve_auto_mode", return_value="bwrap"):
+        tool.observer(observer)  # type: ignore[arg-type]
+
+    call_args = observer._orch_proxy.createActor.call_args
+    assert call_args[0][0] is BwrapSandboxActor
+
+
+def test_observer_auto_mode_creates_seatbelt_actor() -> None:
+    """AC7 (8.4): mode='auto' → _resolve_auto_mode='seatbelt' → SeatbeltSandboxActor created."""
+    observer = MockObserver(existing_actor=None)
+    tool = ExecTool(mode="auto")
+
+    with patch("akgentic.tool.sandbox.tool._resolve_auto_mode", return_value="seatbelt"):
+        tool.observer(observer)  # type: ignore[arg-type]
+
+    call_args = observer._orch_proxy.createActor.call_args
+    assert call_args[0][0] is SeatbeltSandboxActor
+
+
+def test_observer_auto_mode_fallback_to_local_emits_deprecation_warning() -> None:
+    """AC8 (8.4): mode='auto' fallback to 'local' emits DeprecationWarning."""
+    observer = MockObserver(existing_actor=None)
+    tool = ExecTool(mode="auto")
+
+    with (
+        patch("akgentic.tool.sandbox.tool._resolve_auto_mode", return_value="local"),
+        pytest.warns(DeprecationWarning, match="no isolation backend found"),
+    ):
+        tool.observer(observer)  # type: ignore[arg-type]
+
+    call_args = observer._orch_proxy.createActor.call_args
+    assert call_args[0][0] is LocalSandboxActor
+
+
+def test_observer_auto_mode_config_uses_resolved_mode() -> None:
+    """AC6 (8.4): SandboxConfig.mode stores resolved mode, not 'auto'."""
+    observer = MockObserver(existing_actor=None)
+    tool = ExecTool(mode="auto")
+
+    with patch("akgentic.tool.sandbox.tool._resolve_auto_mode", return_value="bwrap"):
+        tool.observer(observer)  # type: ignore[arg-type]
+
+    call_kwargs = observer._orch_proxy.createActor.call_args[1]
+    config: SandboxConfig = call_kwargs["config"]
+    assert config.mode == "bwrap"  # resolved mode stored, not "auto"

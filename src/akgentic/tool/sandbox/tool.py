@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import logging
+import platform
+import shutil
+import warnings
 from typing import Any, Callable, Literal
 
 from pydantic import PrivateAttr
@@ -17,8 +20,10 @@ from akgentic.tool.sandbox.actor import (
     SandboxActor,
     SandboxConfig,
 )
+from akgentic.tool.sandbox.bwrap import BwrapSandboxActor
 from akgentic.tool.sandbox.docker import DockerSandboxActor
 from akgentic.tool.sandbox.local import LocalSandboxActor
+from akgentic.tool.sandbox.seatbelt import SeatbeltSandboxActor
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -29,9 +34,41 @@ logger.setLevel(logging.INFO)
 
 SANDBOX_ACTOR_CLASSES: dict[str, type[SandboxActor]] = {
     "local": LocalSandboxActor,
+    "bwrap": BwrapSandboxActor,
+    "seatbelt": SeatbeltSandboxActor,
     "docker": DockerSandboxActor,
     # "e2b": E2BSandboxActor  ← injected by akgentic-infra at runtime
 }
+
+
+# ---------------------------------------------------------------------------
+# Auto-mode resolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_auto_mode() -> Literal["local", "bwrap", "seatbelt", "docker"]:
+    """Probe the host and return the best available sandbox backend.
+
+    Probe order:
+    1. ``bwrap`` on PATH → ``"bwrap"`` (Linux bubblewrap)
+    2. ``sandbox-exec`` on PATH + Darwin → ``"seatbelt"`` (macOS)
+    3. ``docker`` on PATH → ``"docker"``
+    4. fallback → ``"local"`` (no filesystem isolation)
+
+    Returns:
+        String key matching an entry in SANDBOX_ACTOR_CLASSES.
+    """
+    if shutil.which("bwrap") is not None:
+        logger.info("_resolve_auto_mode: selected bwrap")
+        return "bwrap"
+    if shutil.which("sandbox-exec") is not None and platform.system() == "Darwin":
+        logger.info("_resolve_auto_mode: selected seatbelt")
+        return "seatbelt"
+    if shutil.which("docker") is not None:
+        logger.info("_resolve_auto_mode: selected docker")
+        return "docker"
+    logger.info("_resolve_auto_mode: fallback to local (no isolation backend found)")
+    return "local"
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +93,7 @@ class ExecTool(ToolCard):
     name: str = "Exec"
     description: str = "Execute sandboxed shell commands in the team workspace"
     exec_command: ExecCommand | bool = True
-    mode: Literal["local", "docker"] = "local"
+    mode: Literal["local", "bwrap", "seatbelt", "docker", "auto"] = "local"
     workspace_id: str | None = None
 
     _sandbox_proxy: SandboxActor | None = PrivateAttr(default=None)
@@ -89,8 +126,16 @@ class ExecTool(ToolCard):
 
         if sandbox_addr is None:
             logger.info(f"ExecTool: create {SANDBOX_ACTOR_NAME}.")
+            effective_mode = _resolve_auto_mode() if self.mode == "auto" else self.mode
+            if self.mode == "auto" and effective_mode == "local":
+                warnings.warn(
+                    "ExecTool mode='auto': no isolation backend found (bwrap, sandbox-exec, "
+                    "docker). Falling back to LocalSandboxActor — no filesystem isolation.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
             # KeyError on unknown mode — intentional (fail-fast, NFR-SB-7)
-            actor_class = SANDBOX_ACTOR_CLASSES[self.mode]
+            actor_class = SANDBOX_ACTOR_CLASSES[effective_mode]
             sandbox_addr = orchestrator_proxy.createActor(
                 actor_class,
                 config=SandboxConfig(
@@ -98,7 +143,7 @@ class ExecTool(ToolCard):
                     role="ToolActor",
                     team_id=str(observer.team_id),
                     workspace_id=self.workspace_id,
-                    mode=self.mode,
+                    mode=effective_mode,
                 ),
             )
 
