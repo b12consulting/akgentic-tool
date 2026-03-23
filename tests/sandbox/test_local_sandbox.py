@@ -11,10 +11,12 @@ Covers AC1 through AC7 for Story 6.2 (updated for Story 6.5):
 - subprocess.TimeoutExpired propagates from _exec()
 - exec() public method works end-to-end through _exec()
 
-Story 8.1: Resource limits and environment stripping:
-- preexec_fn is passed to subprocess.run (mock assert)
-- env is stripped to minimal PATH (mock assert)
-- docstring contains isolation disclaimer
+Story 8.1: Resource limits and environment stripping (AC: 1, 2, 3, 4, 5):
+- preexec_fn is passed to subprocess.run (mock assert) — AC5
+- env is stripped to minimal PATH (mock assert) — AC5
+- env dict has exactly one key — AC5
+- docstring contains isolation disclaimer — AC4 / AC5
+- _make_preexec() callable sets RLIMIT_CPU, RLIMIT_AS, RLIMIT_FSIZE and calls setpgrp — AC1 / AC3
 """
 
 from __future__ import annotations
@@ -467,7 +469,7 @@ def test_exec_passes_preexec_fn_to_subprocess(
 def test_exec_strips_env_to_minimal_path(
     mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """AC5 (Story 8.1): _exec() passes env={'PATH': '/usr/bin:/bin:/usr/local/bin'} to subprocess.run."""
+    """AC5 (Story 8.1): _exec() passes minimal PATH-only env dict to subprocess.run."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
     actor = make_actor(team_id="team-1")
@@ -506,6 +508,57 @@ def test_exec_no_env_kwargs_other_than_path(
 
 
 def test_docstring_contains_isolation_disclaimer() -> None:
-    """AC5 (Story 8.1): LocalSandboxActor docstring contains isolation disclaimer."""
+    """AC4 / AC5 (Story 8.1): LocalSandboxActor docstring contains isolation disclaimer."""
     assert LocalSandboxActor.__doc__ is not None
     assert "does NOT provide filesystem isolation" in LocalSandboxActor.__doc__
+
+
+# ---------------------------------------------------------------------------
+# Story 8.1: _make_preexec() unit tests — verify actual resource-limit logic
+# ---------------------------------------------------------------------------
+
+
+def test_make_preexec_returns_callable() -> None:
+    """AC1 (Story 8.1): _make_preexec() returns a callable (not None)."""
+    from akgentic.tool.sandbox.local import _make_preexec
+
+    fn = _make_preexec()
+    assert callable(fn)
+
+
+def test_make_preexec_custom_defaults_returns_callable() -> None:
+    """AC1 (Story 8.1): _make_preexec() with custom args returns a callable."""
+    from akgentic.tool.sandbox.local import _make_preexec
+
+    fn = _make_preexec(cpu_s=10, mem_mb=256, fsize_mb=50)
+    assert callable(fn)
+
+
+def test_make_preexec_fn_sets_resource_limits() -> None:
+    """AC1 / AC3 (Story 8.1): The callable returned by _make_preexec() sets RLIMIT_CPU,
+    RLIMIT_AS, and RLIMIT_FSIZE to the expected values, and calls os.setpgrp().
+
+    We mock resource.setrlimit and os.setpgrp to avoid altering the test process's
+    resource limits.
+    """
+    import resource as resource_module
+    from unittest.mock import call, patch
+
+    from akgentic.tool.sandbox.local import _make_preexec
+
+    fn = _make_preexec(cpu_s=30, mem_mb=512, fsize_mb=100)
+
+    with (
+        patch.object(resource_module, "setrlimit") as mock_setrlimit,
+        patch("os.setpgrp") as mock_setpgrp,
+    ):
+        fn()
+
+    mb = 1024**2
+    expected_calls = [
+        call(resource_module.RLIMIT_CPU, (30, 30)),
+        call(resource_module.RLIMIT_AS, (512 * mb, 512 * mb)),
+        call(resource_module.RLIMIT_FSIZE, (100 * mb, 100 * mb)),
+    ]
+    mock_setrlimit.assert_has_calls(expected_calls, any_order=False)
+    mock_setpgrp.assert_called_once()
