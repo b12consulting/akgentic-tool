@@ -24,7 +24,7 @@ from akgentic.tool.core import (
     ToolCard,
     _resolve,
 )
-from akgentic.tool.event import ActorToolObserver, ToolCallEvent
+from akgentic.tool.event import ActorToolObserver
 from akgentic.tool.knowledge_graph.kg_actor import (
     KG_ACTOR_NAME,
     KG_ACTOR_ROLE,
@@ -289,12 +289,10 @@ class KnowledgeGraphTool(ToolCard):
     def _get_graph_factory(self, params: GetGraph) -> Callable:
         """Return a closure that fetches and formats the graph."""
         kg_proxy = self._kg_proxy
-        observer = self._observer
         format_view = self._format_graph_view
 
         def get_graph() -> str:
             """Get the current knowledge graph."""
-            observer.notify_event(ToolCallEvent(tool_name="Get graph", args=[], kwargs={}))
             view = kg_proxy.get_graph(GetGraphQuery())
             return format_view(view)
 
@@ -304,14 +302,12 @@ class KnowledgeGraphTool(ToolCard):
     def _update_graph_factory(self, params: UpdateGraph) -> Callable:
         """Return a closure that applies graph mutations."""
         kg_proxy = self._kg_proxy
-        observer = self._observer
 
         def update_graph(update: ManageGraph) -> str:
             """Update the knowledge graph (create/update/delete entities & relations).
 
             Use this tool to add new entities, update existing ones, create or
             remove relations, and delete entities from the knowledge graph."""
-            observer.notify_event(ToolCallEvent(tool_name="Update graph", args=[update], kwargs={}))
             return kg_proxy.update_graph(update)
 
         update_graph.__doc__ = params.format_docstring(update_graph.__doc__)
@@ -320,12 +316,10 @@ class KnowledgeGraphTool(ToolCard):
     def _search_factory(self, params: SearchGraph) -> Callable:
         """Return a closure that searches the graph."""
         kg_proxy = self._kg_proxy
-        observer = self._observer
         format_result = self._format_search_result
 
         def search_graph(query: SearchQuery) -> str:
             """Search the knowledge graph by keyword, vector, or hybrid mode."""
-            observer.notify_event(ToolCallEvent(tool_name="Search graph", args=[query], kwargs={}))
             result = kg_proxy.search(query)
             return format_result(result)
 

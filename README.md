@@ -38,7 +38,10 @@ running inside it. It provides:
   invokes it), a `SYSTEM_PROMPT` (injected into context before each LLM call), or a `COMMAND`
   (programmatic call from another agent or the orchestrator)
 - **Observer protocols** — `ToolObserver`, `ActorToolObserver`, and `TeamManagementToolObserver`
-  give tools access to the actor system, event emission, and team lifecycle hooks
+  give tools access to the actor system, event emission, and team lifecycle hooks.
+  > **Migration note (ADR-018):** `ToolCallEvent` has been removed from `akgentic-tool`. Tool call
+  > observability is now handled by `akgentic-llm`. Import `ToolCallEvent` and `ToolReturnEvent`
+  > from `akgentic.llm.event` instead.
 - **RetriableError** — tools signal recoverable failures; `ToolFactory` translates them to the
   framework-specific retry exception without coupling tool logic to pydantic-ai
 - **Domain tools** — seven production-ready tool implementations covering workspace I/O, task
@@ -149,7 +152,7 @@ tool composition happens at the agent level.
 │  workspace  │  planning  │  knowledge_graph  │  search  │  team  │  mcp  │  sandbox  │
 ├──────────────────────────────────────────────────────────────────┤
 │  Core Layer: ToolCard, BaseToolParam, ToolFactory, Channels      │
-│              RetriableError, ToolCallEvent, Observer protocols   │
+│              RetriableError, Observer protocols                   │
 ├──────────────────────────────────────────────────────────────────┤
 │  Vector infrastructure (optional): VectorIndex, EmbeddingService │
 ├──────────────────────────────────────────────────────────────────┤
@@ -546,7 +549,7 @@ src/akgentic/tool/
     __init__.py               # Public API
     core.py                   # ToolCard, BaseToolParam, ToolFactory, Channels
     errors.py                 # RetriableError
-    event.py                  # ToolCallEvent, ToolObserver, ActorToolObserver,
+    event.py                  # ToolObserver, ActorToolObserver,
     │                         #   TeamManagementToolObserver
     vector.py                 # VectorEntry, EmbeddingService, VectorIndex
     │                         #   [optional: vector_search extra]

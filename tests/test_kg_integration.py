@@ -12,7 +12,6 @@ from typing import Any
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import AkgentType
 from akgentic.core.orchestrator import Orchestrator
-from akgentic.tool.event import ActorToolObserver, ToolCallEvent
 from akgentic.tool.knowledge_graph.kg_actor import (
     KG_ACTOR_NAME,
     KG_ACTOR_ROLE,
@@ -89,7 +88,7 @@ class IntegrationObserver:
     """Mock observer wiring a real KnowledgeGraphActor for integration testing."""
 
     def __init__(self) -> None:
-        self.events: list[ToolCallEvent] = []
+        self.events: list[object] = []
         self._address = MockActorAddress("test-agent")
         self._orchestrator_addr = MockActorAddress("orchestrator")
         self._kg_actor = KnowledgeGraphActor()
@@ -105,8 +104,7 @@ class IntegrationObserver:
         return self._orchestrator_addr
 
     def notify_event(self, event: object) -> None:
-        if isinstance(event, ToolCallEvent):
-            self.events.append(event)
+        self.events.append(event)
 
     def proxy_ask(
         self,
@@ -204,26 +202,6 @@ class TestEndToEndUpdateGetSearch:
         result = search_fn(SearchQuery(query="Django"))
         assert "Django" in result
         assert "Framework" in result
-
-    def test_event_emission_across_operations(self) -> None:
-        tool, observer = self._make_tool()
-
-        tools = tool.get_tools()
-        update_fn = [t for t in tools if t.__name__ == "update_graph"][0]
-        search_fn = [t for t in tools if t.__name__ == "search_graph"][0]
-
-        update_fn(
-            ManageGraph(
-                create_entities=[
-                    EntityCreate(name="Rust", entity_type="Language", description="Systems lang"),
-                ]
-            )
-        )
-        search_fn(SearchQuery(query="Rust"))
-
-        assert len(observer.events) == 2
-        assert observer.events[0].tool_name == "Update graph"
-        assert observer.events[1].tool_name == "Search graph"
 
     def test_read_only_blocks_update(self) -> None:
         observer = IntegrationObserver()

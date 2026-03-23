@@ -23,7 +23,7 @@ from akgentic.tool.core import (
     _resolve,
 )
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.event import TeamManagementToolObserver, ToolCallEvent
+from akgentic.tool.event import TeamManagementToolObserver
 
 logger = logging.getLogger(__name__)
 
@@ -294,10 +294,6 @@ class TeamTool(ToolCard):
             if not roles:
                 raise RetriableError("No roles provided. Specify at least one role to hire.")
 
-            observer.notify_event(
-                ToolCallEvent(tool_name="hire_members", args=[], kwargs={"roles": roles})
-            )
-
             hired_members = []
             errors = []
             existing_names = {member.name for member in orchestrator_proxy.get_team()}
@@ -359,9 +355,6 @@ class TeamTool(ToolCard):
             Returns:
                 Tuple of (member_name, member_address)
             """
-            observer.notify_event(
-                ToolCallEvent(tool_name="hire_member", args=[], kwargs={"role": role, "name": name})
-            )
             existing_names = {member.name for member in orchestrator_proxy.get_team()}
             return _hire_single_member(orchestrator_proxy, observer, role, name, existing_names)
 
@@ -396,10 +389,6 @@ class TeamTool(ToolCard):
             """
             if not names:
                 raise RetriableError("No names provided. Specify at least one member name to fire.")
-
-            observer.notify_event(
-                ToolCallEvent(tool_name="fire_members", args=[], kwargs={"names": names})
-            )
 
             fired_members = []
             errors = []
@@ -450,9 +439,6 @@ class TeamTool(ToolCard):
             Returns:
                 Confirmation message (e.g., "Member @Developer123 has been fired.")
             """
-            observer.notify_event(
-                ToolCallEvent(tool_name="fire_member", args=[], kwargs={"name": name})
-            )
             _fire_single_member(orchestrator_proxy, observer, name)
             return f"Member {name} has been fired."
 

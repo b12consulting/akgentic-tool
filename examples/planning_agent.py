@@ -21,7 +21,6 @@ from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import AkgentType
 from akgentic.core.utils.deserializer import ActorAddressDict
 
-from akgentic.tool.event import ToolCallEvent
 from akgentic.tool.planning.planning import (
     PLANNING_ACTOR_NAME,
     PLANNING_ACTOR_ROLE,
@@ -122,7 +121,7 @@ class _ExampleObserver:
     """
 
     def __init__(self) -> None:
-        self.events: list[ToolCallEvent] = []
+        self.events: list[object] = []
         self._address = _MockAddress("planning-agent")
         self._orchestrator_addr = _MockAddress("orchestrator")
         self._plan_actor = PlanActor(config=PlanConfig(
@@ -143,9 +142,8 @@ class _ExampleObserver:
         return self._orchestrator_addr
 
     def notify_event(self, event: object) -> None:
-        """Record ToolCallEvents for introspection."""
-        if isinstance(event, ToolCallEvent):
-            self.events.append(event)
+        """Record events for introspection."""
+        self.events.append(event)
 
     def proxy_ask(
         self,

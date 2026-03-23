@@ -1,18 +1,8 @@
 import uuid
-from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import AkgentType
-
-
-@dataclass(frozen=True)
-class ToolCallEvent:
-    """Event emitted when the llm make a tool call."""
-
-    tool_name: str
-    args: list
-    kwargs: dict
 
 
 @runtime_checkable
