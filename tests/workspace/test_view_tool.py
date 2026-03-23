@@ -92,7 +92,7 @@ class TestWorkspaceViewTool:
         # Disable resize to avoid Pillow dependency in basic test
         tool.workspace_view = WorkspaceView(max_dimension=0)
         fn = self._view_fn(tool)
-        result = fn("screenshot.png")
+        result = fn("screenshot.png") # type: ignore[assignment]
         assert result.media_type == "image/png"
         assert result.data == b"fake-png-bytes"
 
@@ -102,7 +102,7 @@ class TestWorkspaceViewTool:
         (fs._root / "photo.jpg").write_bytes(b"fake-jpeg-bytes")
         tool.workspace_view = WorkspaceView(max_dimension=0)
         fn = self._view_fn(tool)
-        result = fn("photo.jpg")
+        result = fn("photo.jpg")  # type: ignore[assignment]
         assert result.media_type == "image/jpeg"
         assert result.data == b"fake-jpeg-bytes"
 
@@ -112,7 +112,7 @@ class TestWorkspaceViewTool:
         (fs._root / "anim.webp").write_bytes(b"fake-webp-bytes")
         tool.workspace_view = WorkspaceView(max_dimension=0)
         fn = self._view_fn(tool)
-        result = fn("anim.webp")
+        result = fn("anim.webp")  # type: ignore[assignment]
         assert result.media_type == "image/webp"
 
     def test_gif_success(self, tmp_path: Path) -> None:
@@ -121,7 +121,7 @@ class TestWorkspaceViewTool:
         (fs._root / "anim.gif").write_bytes(b"fake-gif-bytes")
         tool.workspace_view = WorkspaceView(max_dimension=0)
         fn = self._view_fn(tool)
-        result = fn("anim.gif")
+        result = fn("anim.gif")  # type: ignore[assignment]
         assert result.media_type == "image/gif"
 
     def test_unsupported_format_raises_retriable_error(self, tmp_path: Path) -> None:
@@ -131,7 +131,7 @@ class TestWorkspaceViewTool:
         tool.workspace_view = WorkspaceView(max_dimension=0)
         fn = self._view_fn(tool)
         with pytest.raises(RetriableError):
-            fn("report.pdf")
+            fn("report.pdf")  # type: ignore[assignment]
 
     def test_unsupported_format_error_message_hint(self, tmp_path: Path) -> None:
         """RetriableError message for unsupported format includes workspace_read hint."""
@@ -140,7 +140,7 @@ class TestWorkspaceViewTool:
         tool.workspace_view = WorkspaceView(max_dimension=0)
         fn = self._view_fn(tool)
         with pytest.raises(RetriableError, match="workspace_read"):
-            fn("report.pdf")
+            fn("report.pdf")  # type: ignore[assignment]
 
     def test_file_not_found_raises_retriable_error(self, tmp_path: Path) -> None:
         """Non-existent file → RetriableError."""
@@ -148,7 +148,7 @@ class TestWorkspaceViewTool:
         tool.workspace_view = WorkspaceView(max_dimension=0)
         fn = self._view_fn(tool)
         with pytest.raises(RetriableError, match="File not found"):
-            fn("ghost.png")
+            fn("ghost.png")  # type: ignore[assignment]
 
     def test_traversal_raises_retriable_error(self, tmp_path: Path) -> None:
         """Path traversal → RetriableError."""
@@ -156,7 +156,7 @@ class TestWorkspaceViewTool:
         tool.workspace_view = WorkspaceView(max_dimension=0)
         fn = self._view_fn(tool)
         with pytest.raises(RetriableError):
-            fn("../../secret.png")
+            fn("../../secret.png")  # type: ignore[assignment]
 
     def test_workspace_view_false_not_in_tools(self, tmp_path: Path) -> None:
         """workspace_view=False → workspace_view not in get_tools() (AC: 11)."""

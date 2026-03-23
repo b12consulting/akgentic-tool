@@ -389,11 +389,11 @@ per team and reused across all `ExecTool` calls. The backend is selected via the
 ```python
 from akgentic.tool.sandbox.tool import ExecTool
 
-ExecTool()                        # local mode (subprocess, no filesystem isolation)
+ExecTool()                        # auto mode (default — probe: bwrap → seatbelt → docker → local)
+ExecTool(mode="local")            # local mode (subprocess, no filesystem isolation)
 ExecTool(mode="bwrap")            # Linux bubblewrap (filesystem namespace isolation)
 ExecTool(mode="seatbelt")         # macOS Apple Seatbelt (sandbox-exec profile)
 ExecTool(mode="docker")           # persistent Docker container per team
-ExecTool(mode="auto")             # probe host: bwrap → seatbelt → docker → local
 ExecTool(workspace_id="shared")   # share workspace directory with WorkspaceTool
 ```
 

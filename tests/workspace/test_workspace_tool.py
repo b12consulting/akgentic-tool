@@ -896,7 +896,7 @@ class TestWorkspaceGlob:
         fs.write("src/foo.py", b"x")
         fs.write("src/bar.py", b"y")
         glob_fn = self._glob_fn(tool)
-        result = glob_fn("**/*.py")
+        result = glob_fn("**/*.py")  # type: ignore[assignment]
         assert "src/foo.py" in result
         assert "src/bar.py" in result
 
@@ -908,21 +908,21 @@ class TestWorkspaceGlob:
         fs.write("src/foo.py", b"x")
         glob_fn = self._glob_fn(tool)
         # Must not raise ValueError: '**' can only be an entire path component
-        result = glob_fn("**.py")
+        result = glob_fn("**.py")  # type: ignore[assignment]
         assert "src/foo.py" in result
 
     def test_no_match_returns_sentinel(self, tmp_path: Path) -> None:
         """workspace_glob returns 'No files found.' when nothing matches."""
         tool, _ = make_wired_tool(tmp_path)
         glob_fn = self._glob_fn(tool)
-        assert glob_fn("**/*.nonexistent") == "No files found."
+        assert glob_fn("**/*.nonexistent") == "No files found."  # type: ignore[assignment]
 
     def test_path_escape_raises_retriable_error(self, tmp_path: Path) -> None:
         """workspace_glob raises RetriableError when path escapes workspace root."""
         tool, _ = make_wired_tool(tmp_path)
         glob_fn = self._glob_fn(tool)
         with pytest.raises(RetriableError, match="Path escapes workspace root"):
-            glob_fn("**/*.py", path="../../escape")
+            glob_fn("**/*.py", path="../../escape")  # type: ignore[assignment]
 
     def test_brace_expansion_with_embedded_double_star(self, tmp_path: Path) -> None:
         """workspace_glob handles '**.{py,ts}' — brace expand then normalize."""
@@ -930,6 +930,6 @@ class TestWorkspaceGlob:
         fs.write("src/foo.py", b"x")
         fs.write("src/bar.ts", b"y")
         glob_fn = self._glob_fn(tool)
-        result = glob_fn("**.{py,ts}")
+        result = glob_fn("**.{py,ts}")  # type: ignore[assignment]
         assert "src/foo.py" in result
         assert "src/bar.ts" in result
