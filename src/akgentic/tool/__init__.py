@@ -20,6 +20,8 @@ from .event import (  # noqa: F401
     ToolCallEvent,
     ToolObserver,
 )
+from .sandbox.bwrap import BwrapSandboxActor  # noqa: F401
+from .sandbox.seatbelt import SeatbeltSandboxActor  # noqa: F401
 from .sandbox.tool import ExecTool  # noqa: F401
 from .workspace.tool import WorkspaceTool  # noqa: F401
 
@@ -54,7 +56,9 @@ __all__ = [
     "search",
     "team",
     "workspace",
+    "BwrapSandboxActor",
     "ExecTool",
+    "SeatbeltSandboxActor",
     "WorkspaceTool",
 ]
 

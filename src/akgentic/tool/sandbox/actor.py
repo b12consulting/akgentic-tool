@@ -71,13 +71,15 @@ class SandboxConfig(BaseConfig):
             (default), the workspace directory is named after ``team_id``.  When
             set, the named directory is used instead.  Docker container name
             always uses ``team_id`` — containers are per-team, not per-workspace.
-        mode: Execution backend — ``"local"`` (subprocess) or ``"docker"``
-            (persistent container).  Defaults to ``"local"``.
+        mode: Execution backend — ``"local"`` (subprocess), ``"bwrap"``
+            (Linux bubblewrap), ``"seatbelt"`` (macOS Apple Seatbelt),
+            ``"docker"`` (persistent container), or ``"auto"`` (automatic
+            selection of the best available backend).  Defaults to ``"local"``.
     """
 
     team_id: str
     workspace_id: str | None = None
-    mode: Literal["local", "docker"] = "local"
+    mode: Literal["local", "bwrap", "seatbelt", "docker", "auto"] = "local"
 
 
 class SandboxState(BaseState):
