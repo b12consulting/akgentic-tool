@@ -30,7 +30,7 @@ def make_observer(
     """Build a minimal mock ActorToolObserver."""
     observer = MagicMock()
     observer.orchestrator = None if orchestrator_is_none else MagicMock()
-    observer._team_id = team_id or uuid.uuid4()
+    observer.team_id = team_id or uuid.uuid4()
     return observer
 
 

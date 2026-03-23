@@ -15,7 +15,6 @@ Covers Story 8.2 (AC: 1–8):
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -23,8 +22,6 @@ import pytest
 
 from akgentic.tool.sandbox.actor import ExecResult, SandboxConfig, SandboxState
 from akgentic.tool.sandbox.bwrap import BwrapSandboxActor
-from akgentic.tool.sandbox.local import _make_preexec  # noqa: F401  (imported for availability check)
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

@@ -45,7 +45,7 @@ class MockObserver:
         has_orchestrator: bool = True,
         existing_actor: ActorAddress | None = None,
     ) -> None:
-        self._team_id = "team-test"
+        self.team_id = "team-test"
         self.myAddress = MagicMock(spec=ActorAddress)
         self.orchestrator = MagicMock(spec=ActorAddress) if has_orchestrator else None
 
@@ -450,7 +450,7 @@ def test_observer_passes_workspace_id_none_to_sandbox_config() -> None:
 def test_observer_config_has_team_id_and_workspace_id_independently() -> None:
     """FR-SB-32: SandboxConfig gets both team_id and workspace_id, independently set."""
     observer = MockObserver(existing_actor=None)
-    observer._team_id = "t1"
+    observer.team_id = "t1"
     tool = ExecTool(workspace_id="my-ws")
 
     tool.observer(observer)  # type: ignore[arg-type]

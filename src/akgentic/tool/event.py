@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
+import uuid
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import AkgentType
@@ -48,6 +49,11 @@ class ActorToolObserver(ToolObserver, Protocol):
     @property
     def orchestrator(self) -> ActorAddress | None:
         """Get the orchestrator address."""
+        ...
+
+    @property
+    def team_id(self) -> uuid.UUID:
+        """Get the team id."""
         ...
 
     def proxy_ask(
