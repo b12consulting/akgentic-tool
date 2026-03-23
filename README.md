@@ -21,6 +21,7 @@ channel system — as tool calls, system prompt injections, or programmatic comm
   - [SearchTool](#searchtool)
   - [TeamTool](#teamtool)
   - [MCPTool](#mcptool)
+  - [ExecTool](#exectool)
 - [Error Handling](#error-handling)
 - [Optional Extras](#optional-extras)
 - [Development](#development)
@@ -40,8 +41,9 @@ running inside it. It provides:
   give tools access to the actor system, event emission, and team lifecycle hooks
 - **RetriableError** — tools signal recoverable failures; `ToolFactory` translates them to the
   framework-specific retry exception without coupling tool logic to pydantic-ai
-- **Domain tools** — six production-ready tool implementations covering workspace I/O, task
-  planning, knowledge graph, web search, team management, and MCP server integration
+- **Domain tools** — seven production-ready tool implementations covering workspace I/O, task
+  planning, knowledge graph, web search, team management, MCP server integration, and sandboxed
+  shell execution
 
 ```
 ToolCard(s)
@@ -144,7 +146,7 @@ tool composition happens at the agent level.
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │  Domain Tools                                                    │
-│  workspace  │  planning  │  knowledge_graph  │  search  │  team │  mcp  │
+│  workspace  │  planning  │  knowledge_graph  │  search  │  team  │  mcp  │  sandbox  │
 ├──────────────────────────────────────────────────────────────────┤
 │  Core Layer: ToolCard, BaseToolParam, ToolFactory, Channels      │
 │              RetriableError, ToolCallEvent, Observer protocols   │
@@ -376,6 +378,68 @@ Returns registered MCP tools via `get_toolsets()` — pydantic-ai handles schema
 dispatch. OAuth 2.0 flows are supported for MCP servers requiring authentication (see
 `mcp/oauth_handler.py`).
 
+### ExecTool
+
+Sandboxed shell command execution inside the team workspace. A single `SandboxActor` is spawned
+per team and reused across all `ExecTool` calls. The backend is selected via the `mode` field.
+
+```python
+from akgentic.tool.sandbox.tool import ExecTool
+
+ExecTool()                        # local mode (subprocess, no filesystem isolation)
+ExecTool(mode="bwrap")            # Linux bubblewrap (filesystem namespace isolation)
+ExecTool(mode="seatbelt")         # macOS Apple Seatbelt (sandbox-exec profile)
+ExecTool(mode="docker")           # persistent Docker container per team
+ExecTool(mode="auto")             # probe host: bwrap → seatbelt → docker → local
+ExecTool(workspace_id="shared")   # share workspace directory with WorkspaceTool
+```
+
+**Sandbox modes:**
+
+| Mode | Platform | Isolation | Requirement |
+|---|---|---|---|
+| `local` | Any | None — subprocess only | No extra tools needed |
+| `bwrap` | Linux | Filesystem namespace (bubblewrap) | `bwrap` on PATH |
+| `seatbelt` | macOS | Apple Seatbelt profile (`sandbox-exec`) | `sandbox-exec` on PATH |
+| `docker` | Any | Persistent container per team | Docker daemon on PATH |
+| `auto` | Any | Best available (probe order: bwrap → seatbelt → docker → local) | Automatic |
+
+**Allowed commands** (enforced by `ALLOWED_COMMANDS` allowlist — first token only):
+
+`python`, `python3`, `pytest`, `ruff`, `mypy`, `git`, `uv`, `pip`, `cat`, `ls`, `find`,
+`grep`, `mkdir`, `cp`, `mv`, `rm`, `echo`, `touch`, `curl`, `wget`, `make`, `bash`, `sh`,
+`node`, `npm`, `npx`
+
+**Platform note (RLIMIT_AS on Darwin):** The `local` mode sets `RLIMIT_AS` (virtual address
+space limit) to 512 MB on Linux but skips this resource limit on macOS/Darwin, where
+`RLIMIT_AS` is not reliably enforceable. CPU time and file size limits are applied on all
+platforms.
+
+**Error handling:** All errors from the sandbox backend surface as a `SandboxError` string
+returned to the LLM (never raised). Disallowed commands return a `CommandNotAllowedError`
+string listing the allowed commands.
+
+```python
+# Example tool response for a disallowed command:
+# "CommandNotAllowedError: Command 'curl' is not in the allowed commands list.
+#  Allowed: ['bash', 'cat', 'cp', ...]"
+
+# Example tool response for a backend failure:
+# "SandboxError: TimeoutExpired: Command 'python main.py' timed out after 30s"
+```
+
+**`SANDBOX_ACTOR_CLASSES` registry:** The backend registry is a mutable `dict[str, type[SandboxActor]]`
+exposed at `akgentic.tool.sandbox.tool.SANDBOX_ACTOR_CLASSES`. Infrastructure packages (e.g.,
+`akgentic-infra`) can inject additional backends at import time before any `ExecTool` is
+constructed:
+
+```python
+from akgentic.tool.sandbox.tool import SANDBOX_ACTOR_CLASSES
+from my_infra.e2b_actor import E2BSandboxActor
+
+SANDBOX_ACTOR_CLASSES["e2b"] = E2BSandboxActor  # now available as ExecTool(mode="e2b")
+```
+
 ## Error Handling
 
 `RetriableError` (defined in `akgentic.tool.errors`) is the single signal for recoverable
@@ -494,6 +558,13 @@ src/akgentic/tool/
         edit.py               # EditMatcher (7-strategy), FilePatch, parse_patch
         readers.py            # DocumentReader (Pydantic BaseModel), TEXT_EXTENSIONS
         └── tool.py           # WorkspaceTool ToolCard
+    sandbox/
+        actor.py              # SandboxActor (abstract), SandboxConfig, ALLOWED_COMMANDS
+        local.py              # LocalSandboxActor (subprocess, resource limits)
+        docker.py             # DockerSandboxActor (persistent container per team)
+        seatbelt.py           # SeatbeltSandboxActor (macOS Apple Seatbelt)
+        bwrap.py              # BwrapSandboxActor (Linux bubblewrap)
+        └── tool.py           # ExecTool ToolCard, SANDBOX_ACTOR_CLASSES registry
 tests/                        # Tests organised by domain
 ```
 
