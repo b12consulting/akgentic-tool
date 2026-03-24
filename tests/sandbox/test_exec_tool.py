@@ -118,10 +118,10 @@ def test_exec_tool_exec_command_default_is_true() -> None:
     assert tool.exec_command is True
 
 
-def test_exec_tool_mode_defaults_to_local() -> None:
-    """Story 6.5: ExecTool.mode defaults to 'local'."""
+def test_exec_tool_mode_defaults_to_auto() -> None:
+    """Story 6.5: ExecTool.mode defaults to 'auto'."""
     tool = ExecTool()
-    assert tool.mode == "local"
+    assert tool.mode == "auto"
 
 
 def test_exec_tool_mode_can_be_set_to_docker() -> None:
