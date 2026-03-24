@@ -32,7 +32,7 @@ from akgentic.tool.sandbox.actor import (
     SandboxConfig,
     SandboxState,
 )
-from akgentic.tool.sandbox.local import LocalSandboxActor
+from akgentic.tool.sandbox.local import _SAFE_ENV_KEYS, LocalSandboxActor
 
 # ---------------------------------------------------------------------------
 # Helper factory
@@ -192,7 +192,10 @@ def test_exec_no_cwd_uses_workspace_path(
     assert call_kwargs.kwargs["timeout"] == 30
     assert call_kwargs.kwargs["preexec_fn"] is not None
     assert callable(call_kwargs.kwargs["preexec_fn"])
-    assert call_kwargs.kwargs["env"] == {"PATH": "/usr/bin:/bin:/usr/local/bin"}
+    env = call_kwargs.kwargs["env"]
+    assert "PATH" in env
+    unexpected = set(env) - _SAFE_ENV_KEYS
+    assert not unexpected, f"Unexpected keys in env: {unexpected}"
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +227,10 @@ def test_exec_with_cwd_appends_to_workspace_path(
     assert call_kwargs.kwargs["timeout"] == 30
     assert call_kwargs.kwargs["preexec_fn"] is not None
     assert callable(call_kwargs.kwargs["preexec_fn"])
-    assert call_kwargs.kwargs["env"] == {"PATH": "/usr/bin:/bin:/usr/local/bin"}
+    env = call_kwargs.kwargs["env"]
+    assert "PATH" in env
+    unexpected = set(env) - _SAFE_ENV_KEYS
+    assert not unexpected, f"Unexpected keys in env: {unexpected}"
 
 
 # ---------------------------------------------------------------------------
@@ -466,30 +472,10 @@ def test_exec_passes_preexec_fn_to_subprocess(
 
 
 @patch("akgentic.tool.sandbox.local.subprocess.run")
-def test_exec_strips_env_to_minimal_path(
+def test_exec_strips_env_to_safe_keys(
     mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """AC5 (Story 8.1): _exec() passes minimal PATH-only env dict to subprocess.run."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
-    actor = make_actor(team_id="team-1")
-    actor._start_sandbox()
-
-    mock_run.return_value = MagicMock(stdout="output", stderr="", returncode=0)
-
-    actor._exec("echo hello", "")
-
-    call_kwargs = mock_run.call_args
-    assert call_kwargs is not None
-    env = call_kwargs.kwargs.get("env")
-    assert env == {"PATH": "/usr/bin:/bin:/usr/local/bin"}
-
-
-@patch("akgentic.tool.sandbox.local.subprocess.run")
-def test_exec_no_env_kwargs_other_than_path(
-    mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """AC5 (Story 8.1): env dict passed to subprocess.run has exactly one key ('PATH')."""
+    """AC5 (Story 8.1): _exec() passes env with only safe keys to subprocess.run."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
     actor = make_actor(team_id="team-1")
@@ -503,8 +489,32 @@ def test_exec_no_env_kwargs_other_than_path(
     assert call_kwargs is not None
     env = call_kwargs.kwargs.get("env")
     assert isinstance(env, dict)
-    assert len(env) == 1
     assert "PATH" in env
+    assert all(k in _SAFE_ENV_KEYS for k in env), f"Unexpected keys: {set(env) - _SAFE_ENV_KEYS}"
+
+
+@patch("akgentic.tool.sandbox.local.subprocess.run")
+def test_exec_env_excludes_secrets(
+    mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC5 (Story 8.1): env dict does not contain API keys or secrets."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
+    actor = make_actor(team_id="team-1")
+    actor._start_sandbox()
+
+    mock_run.return_value = MagicMock(stdout="output", stderr="", returncode=0)
+
+    actor._exec("echo hello", "")
+
+    call_kwargs = mock_run.call_args
+    assert call_kwargs is not None
+    env = call_kwargs.kwargs.get("env")
+    assert isinstance(env, dict)
+    assert "OPENAI_API_KEY" not in env
+    assert "AWS_SECRET_ACCESS_KEY" not in env
 
 
 def test_docstring_contains_isolation_disclaimer() -> None:

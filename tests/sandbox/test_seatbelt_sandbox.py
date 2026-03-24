@@ -70,14 +70,33 @@ def test_start_sandbox_sandbox_exec_not_on_path_raises_runtime_error() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_start_sandbox_raises_runtime_error_when_probe_fails() -> None:
+    """_start_sandbox() raises RuntimeError when sandbox_apply is blocked (macOS 15+)."""
+    a: SeatbeltSandboxActor = SeatbeltSandboxActor.__new__(SeatbeltSandboxActor)
+    a.config = SandboxConfig(name="sandbox", role="ToolActor", team_id="test-team")
+    a.state = SandboxState()
+
+    mock_probe = MagicMock(returncode=71)
+    with (
+        patch("akgentic.tool.sandbox.seatbelt.shutil.which", return_value="/usr/bin/sandbox-exec"),
+        patch("akgentic.tool.sandbox.seatbelt.platform.system", return_value="Darwin"),
+        patch("akgentic.tool.sandbox.seatbelt.subprocess.run", return_value=mock_probe),
+    ):
+        with pytest.raises(RuntimeError, match="sandbox_apply is blocked"):
+            a._start_sandbox()
+
+
 def test_start_sandbox_emits_deprecation_warning() -> None:
     """AC1: _start_sandbox() emits DeprecationWarning with correct message."""
     a: SeatbeltSandboxActor = SeatbeltSandboxActor.__new__(SeatbeltSandboxActor)
     a.config = SandboxConfig(name="sandbox", role="ToolActor", team_id="test-team")
     a.state = SandboxState()
 
+    mock_probe = MagicMock(returncode=0)
     with (
         patch("akgentic.tool.sandbox.seatbelt.shutil.which", return_value="/usr/bin/sandbox-exec"),
+        patch("akgentic.tool.sandbox.seatbelt.platform.system", return_value="Darwin"),
+        patch("akgentic.tool.sandbox.seatbelt.subprocess.run", return_value=mock_probe),
         patch("pathlib.Path.mkdir"),
         patch("akgentic.tool.sandbox.actor.SandboxState.notify_state_change"),
         pytest.warns(DeprecationWarning, match="sandbox-exec is deprecated"),
@@ -101,8 +120,11 @@ def test_start_sandbox_creates_workspace_directory(
     a.config = SandboxConfig(name="sandbox", role="ToolActor", team_id="test-team")
     a.state = SandboxState()
 
+    mock_probe = MagicMock(returncode=0)
     with (
         patch("akgentic.tool.sandbox.seatbelt.shutil.which", return_value="/usr/bin/sandbox-exec"),
+        patch("akgentic.tool.sandbox.seatbelt.platform.system", return_value="Darwin"),
+        patch("akgentic.tool.sandbox.seatbelt.subprocess.run", return_value=mock_probe),
         patch("akgentic.tool.sandbox.actor.SandboxState.notify_state_change"),
         warnings.catch_warnings(),
     ):
@@ -130,8 +152,11 @@ def test_start_sandbox_idempotent_existing_workspace(
     a.config = SandboxConfig(name="sandbox", role="ToolActor", team_id="test-team")
     a.state = SandboxState()
 
+    mock_probe = MagicMock(returncode=0)
     with (
         patch("akgentic.tool.sandbox.seatbelt.shutil.which", return_value="/usr/bin/sandbox-exec"),
+        patch("akgentic.tool.sandbox.seatbelt.platform.system", return_value="Darwin"),
+        patch("akgentic.tool.sandbox.seatbelt.subprocess.run", return_value=mock_probe),
         patch("akgentic.tool.sandbox.actor.SandboxState.notify_state_change"),
         warnings.catch_warnings(),
     ):
@@ -173,6 +198,50 @@ def test_exec_writes_policy_and_calls_sandbox_exec(actor: SeatbeltSandboxActor) 
         assert cmd_list[2].endswith(".sb")
         assert "ls" in cmd_list
         assert "." in cmd_list
+
+
+# ---------------------------------------------------------------------------
+# cwd forwarding — empty cwd defaults to workspace, explicit cwd is used
+# ---------------------------------------------------------------------------
+
+
+def test_exec_empty_cwd_defaults_to_workspace(
+    actor: SeatbeltSandboxActor, tmp_path: Path
+) -> None:
+    """_exec() passes workspace_path as cwd when cwd is empty string."""
+    with patch("akgentic.tool.sandbox.seatbelt.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+        with patch("akgentic.tool.sandbox.seatbelt.os.unlink"):
+            actor._exec("ls .", "")
+    assert mock_run.call_args.kwargs["cwd"] == str(tmp_path)
+
+
+def test_exec_explicit_cwd_is_resolved_relative_to_workspace(
+    actor: SeatbeltSandboxActor, tmp_path: Path
+) -> None:
+    """_exec() resolves cwd as a subdirectory of the workspace path."""
+    with patch("akgentic.tool.sandbox.seatbelt.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+        with patch("akgentic.tool.sandbox.seatbelt.os.unlink"):
+            actor._exec("ls .", "subdir")
+    assert mock_run.call_args.kwargs["cwd"] == str(tmp_path / "subdir")
+
+
+def test_exec_missing_cwd_returns_error_result(
+    actor: SeatbeltSandboxActor, tmp_path: Path
+) -> None:
+    """_exec() returns ExecResult with exit_code=1 when cwd does not exist."""
+    with patch("akgentic.tool.sandbox.seatbelt.subprocess.run") as mock_run:
+        mock_run.side_effect = FileNotFoundError(
+            2, "No such file or directory", str(tmp_path / "nope")
+        )
+        with patch("akgentic.tool.sandbox.seatbelt.os.unlink"):
+            result = actor._exec("ls .", "nope")
+    assert result.exit_code == 1
+    assert "not found" in result.stderr.lower()
+    assert "nope" in result.stderr
+    # Must NOT leak the absolute host path
+    assert str(tmp_path) not in result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -243,24 +312,29 @@ def test_exec_policy_substitutes_workspace_path(
 # ---------------------------------------------------------------------------
 
 
-def test_exec_policy_denies_network(actor: SeatbeltSandboxActor) -> None:
-    """AC5: SBPL policy written by _exec() contains '(deny network*)'."""
+def test_exec_policy_allows_network(actor: SeatbeltSandboxActor) -> None:
+    """SBPL policy allows network access (needed for git clone, curl, wget, pip)."""
     policy = _capture_policy(actor)
-    assert "(deny network*)" in policy
+    assert "(allow network*)" in policy
+
+
+def test_exec_policy_allows_all_reads(actor: SeatbeltSandboxActor) -> None:
+    """Policy uses blanket (allow file-read*) for broad read access on macOS."""
+    policy = _capture_policy(actor)
+    assert "(allow file-read*)" in policy
 
 
 # ---------------------------------------------------------------------------
-# AC5: Policy contains file-read* and file-write* for workspace
+# AC5: Policy contains file-write* for workspace
 # ---------------------------------------------------------------------------
 
 
-def test_exec_policy_allows_workspace_read_write(
+def test_exec_policy_allows_workspace_write(
     actor: SeatbeltSandboxActor, tmp_path: Path
 ) -> None:
-    """AC5: SBPL policy contains file-read* and file-write* subpath entries for workspace."""
+    """AC5: SBPL policy contains file-write* subpath entry for workspace."""
     policy = _capture_policy(actor)
     ws = str(tmp_path)
-    assert f'(allow file-read*  (subpath "{ws}"))' in policy
     assert f'(allow file-write* (subpath "{ws}"))' in policy
 
 

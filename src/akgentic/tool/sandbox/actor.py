@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from akgentic.core.agent import Akgent, BaseConfig, BaseState
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 # ---------------------------------------------------------------------------
 # Module-level constants
