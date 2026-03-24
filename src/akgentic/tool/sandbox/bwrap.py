@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -9,6 +10,8 @@ from pathlib import Path
 
 from akgentic.tool.sandbox.actor import ExecResult, SandboxActor
 from akgentic.tool.sandbox.local import _make_preexec
+
+logger = logging.getLogger(__name__)
 
 
 class BwrapSandboxActor(SandboxActor):
@@ -47,6 +50,10 @@ class BwrapSandboxActor(SandboxActor):
         workspace_path.mkdir(parents=True, exist_ok=True)
         self.state.workspace_path = workspace_path.resolve()
         self.state.notify_state_change()
+        logger.debug(
+            "BwrapSandboxActor started: workspace=%s",
+            self.state.workspace_path,
+        )
 
     def _stop_sandbox(self) -> None:
         """Stop the bubblewrap sandbox.
@@ -54,7 +61,7 @@ class BwrapSandboxActor(SandboxActor):
         No-op: bubblewrap processes do not persist between ``_exec()`` calls —
         each invocation spawns and terminates its own namespace.
         """
-        pass  # bwrap processes do not persist between calls
+        logger.debug("BwrapSandboxActor stopped.")
 
     def _exec(self, cmd: str, cwd: str) -> ExecResult:
         """Execute a command inside a bubblewrap namespace.

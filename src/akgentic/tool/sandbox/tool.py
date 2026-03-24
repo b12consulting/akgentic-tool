@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import platform
 import shutil
+import subprocess
 import warnings
 from typing import Any, Callable, Literal
 
@@ -46,6 +47,25 @@ SANDBOX_ACTOR_CLASSES: dict[str, type[SandboxActor]] = {
 # ---------------------------------------------------------------------------
 
 
+def _seatbelt_available() -> bool:
+    """Return True if sandbox-exec is on PATH and actually works at runtime.
+
+    macOS 15+ may block ``sandbox_apply`` even when ``sandbox-exec`` is present.
+    A quick probe with ``(allow default)`` detects this at negligible cost.
+    """
+    if shutil.which("sandbox-exec") is None or platform.system() != "Darwin":
+        return False
+    try:
+        result = subprocess.run(
+            ["sandbox-exec", "-p", "(version 1)(allow default)", "/usr/bin/true"],
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
 def _resolve_auto_mode() -> Literal["local", "bwrap", "seatbelt", "docker"]:
     """Probe the host and return the best available sandbox backend.
 
@@ -59,15 +79,15 @@ def _resolve_auto_mode() -> Literal["local", "bwrap", "seatbelt", "docker"]:
         String key matching an entry in SANDBOX_ACTOR_CLASSES.
     """
     if shutil.which("bwrap") is not None:
-        logger.info("_resolve_auto_mode: selected bwrap")
+        logger.debug("_resolve_auto_mode: selected bwrap")
         return "bwrap"
-    if shutil.which("sandbox-exec") is not None and platform.system() == "Darwin":
-        logger.info("_resolve_auto_mode: selected seatbelt")
+    if _seatbelt_available():
+        logger.debug("_resolve_auto_mode: selected seatbelt")
         return "seatbelt"
     if shutil.which("docker") is not None:
-        logger.info("_resolve_auto_mode: selected docker")
+        logger.debug("_resolve_auto_mode: selected docker")
         return "docker"
-    logger.info("_resolve_auto_mode: fallback to local (no isolation backend found)")
+    logger.debug("_resolve_auto_mode: fallback to local (no isolation backend found)")
     return "local"
 
 
@@ -125,7 +145,6 @@ class ExecTool(ToolCard):
         sandbox_addr = orchestrator_proxy.get_team_member(SANDBOX_ACTOR_NAME)
 
         if sandbox_addr is None:
-            logger.info(f"ExecTool: create {SANDBOX_ACTOR_NAME}.")
             effective_mode = _resolve_auto_mode() if self.mode == "auto" else self.mode
             if self.mode == "auto" and effective_mode == "local":
                 warnings.warn(
@@ -136,6 +155,7 @@ class ExecTool(ToolCard):
                 )
             # KeyError on unknown mode — intentional (fail-fast, NFR-SB-7)
             actor_class = SANDBOX_ACTOR_CLASSES[effective_mode]
+            logger.info("ExecTool: create %s (%s).", SANDBOX_ACTOR_NAME, actor_class.__name__)
             sandbox_addr = orchestrator_proxy.createActor(
                 actor_class,
                 config=SandboxConfig(
@@ -176,9 +196,12 @@ class ExecTool(ToolCard):
             """
             try:
                 result = sandbox_proxy.exec(cmd, cwd)
+                status = "OK" if result.exit_code == 0 else "FAILED"
                 return (
-                    f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-                    f"\nexit_code: {result.exit_code}"
+                    f"exit_code: {result.exit_code} ({status})"
+                    f"\nstdout:\n{result.stdout}"
+                    f"\nstderr (note: many tools write progress to stderr"
+                    f" even on success):\n{result.stderr}"
                 )
             except CommandNotAllowedError as e:
                 return f"CommandNotAllowedError: {e}. Allowed commands: {sorted(ALLOWED_COMMANDS)}"
@@ -186,5 +209,7 @@ class ExecTool(ToolCard):
                 logger.warning("Sandbox exec failed: %s: %s", type(e).__name__, e)
                 return f"SandboxError: {type(e).__name__}: {e}"
 
-        exec_command.__doc__ = params.format_docstring(exec_command.__doc__)
+        allowed_str = ", ".join(sorted(ALLOWED_COMMANDS))
+        base_doc = (exec_command.__doc__ or "") + f"\n\n            Allowed binaries: {allowed_str}"
+        exec_command.__doc__ = params.format_docstring(base_doc)
         return exec_command

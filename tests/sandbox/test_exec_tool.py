@@ -285,10 +285,10 @@ def test_exec_command_returns_formatted_output() -> None:
     assert len(tools) == 1
     result = tools[0](cmd="pytest tests/ -v")
 
-    assert "exit_code: 0" in result
+    assert "exit_code: 0 (OK)" in result
     assert "5 passed" in result
     assert "stdout:" in result
-    assert "stderr:" in result
+    assert "stderr" in result
 
 
 def test_exec_command_includes_stderr_in_output() -> None:
@@ -609,7 +609,7 @@ def test_resolve_auto_mode_returns_bwrap_when_bwrap_on_path() -> None:
 
 
 def test_resolve_auto_mode_returns_seatbelt_on_darwin_without_bwrap() -> None:
-    """AC7 (8.4): _resolve_auto_mode() returns 'seatbelt' on Darwin when sandbox-exec found."""
+    """AC7 (8.4): _resolve_auto_mode() returns 'seatbelt' on Darwin when sandbox-exec works."""
 
     def which_side_effect(cmd: str) -> str | None:
         return {
@@ -618,12 +618,34 @@ def test_resolve_auto_mode_returns_seatbelt_on_darwin_without_bwrap() -> None:
             "docker": None,
         }.get(cmd)
 
+    mock_probe = MagicMock(returncode=0)
     with (
         patch("akgentic.tool.sandbox.tool.shutil.which", side_effect=which_side_effect),
         patch("akgentic.tool.sandbox.tool.platform.system", return_value="Darwin"),
+        patch("akgentic.tool.sandbox.tool.subprocess.run", return_value=mock_probe),
     ):
         result = _resolve_auto_mode()
     assert result == "seatbelt"
+
+
+def test_resolve_auto_mode_skips_seatbelt_when_probe_fails() -> None:
+    """_resolve_auto_mode() falls through to docker/local when sandbox-exec probe fails."""
+
+    def which_side_effect(cmd: str) -> str | None:
+        return {
+            "bwrap": None,
+            "sandbox-exec": "/usr/bin/sandbox-exec",
+            "docker": "/usr/bin/docker",
+        }.get(cmd)
+
+    mock_probe = MagicMock(returncode=71)  # Operation not permitted
+    with (
+        patch("akgentic.tool.sandbox.tool.shutil.which", side_effect=which_side_effect),
+        patch("akgentic.tool.sandbox.tool.platform.system", return_value="Darwin"),
+        patch("akgentic.tool.sandbox.tool.subprocess.run", return_value=mock_probe),
+    ):
+        result = _resolve_auto_mode()
+    assert result == "docker"
 
 
 def test_resolve_auto_mode_returns_docker_when_docker_on_path() -> None:
@@ -638,7 +660,7 @@ def test_resolve_auto_mode_returns_docker_when_docker_on_path() -> None:
 
     with (
         patch("akgentic.tool.sandbox.tool.shutil.which", side_effect=which_side_effect),
-        patch("akgentic.tool.sandbox.tool.platform.system", return_value="Linux"),
+        patch("akgentic.tool.sandbox.tool._seatbelt_available", return_value=False),
     ):
         result = _resolve_auto_mode()
     assert result == "docker"
@@ -648,7 +670,7 @@ def test_resolve_auto_mode_returns_local_when_nothing_found() -> None:
     """AC8 (8.4): _resolve_auto_mode() returns 'local' when no backends found."""
     with (
         patch("akgentic.tool.sandbox.tool.shutil.which", return_value=None),
-        patch("akgentic.tool.sandbox.tool.platform.system", return_value="Linux"),
+        patch("akgentic.tool.sandbox.tool._seatbelt_available", return_value=False),
     ):
         result = _resolve_auto_mode()
     assert result == "local"

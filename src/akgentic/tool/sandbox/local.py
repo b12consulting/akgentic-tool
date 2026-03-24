@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import resource
 import subprocess
@@ -10,6 +11,62 @@ from pathlib import Path
 from typing import Callable
 
 from akgentic.tool.sandbox.actor import ExecResult, SandboxActor
+
+logger = logging.getLogger(__name__)
+
+# Environment variables safe to pass through to sandboxed subprocesses.
+# Keeps tools like git/xcode-select functional on macOS while stripping
+# secrets, API keys, and shell customisation that could leak or interfere.
+_SAFE_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TERM",
+        "DEVELOPER_DIR",
+        "TMPDIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "GIT_EXEC_PATH",
+        "GIT_TEMPLATE_DIR",
+    }
+)
+
+
+_MACOS_DEVELOPER_DIRS: tuple[str, ...] = (
+    "/Library/Developer/CommandLineTools",
+    "/Applications/Xcode.app/Contents/Developer",
+)
+
+
+def _make_sandbox_env() -> dict[str, str]:
+    """Build a minimal env dict from the host, keeping only safe keys.
+
+    Falls back to a hardcoded PATH if the host PATH is missing.
+    On macOS, sets ``DEVELOPER_DIR`` when absent — this avoids the
+    ``xcode-select`` symlink lookup at ``/var/select/developer_dir`` which
+    is blocked when the calling process is already sandboxed (e.g. Claude Code).
+    """
+    env: dict[str, str] = {}
+    for key in _SAFE_ENV_KEYS:
+        val = os.environ.get(key)
+        if val is not None:
+            env[key] = val
+    env.setdefault("PATH", "/usr/bin:/bin:/usr/local/bin")
+    if sys.platform == "darwin" and "DEVELOPER_DIR" not in env:
+        for candidate in _MACOS_DEVELOPER_DIRS:
+            if Path(candidate).is_dir():
+                env["DEVELOPER_DIR"] = candidate
+                break
+    return env
 
 
 def _make_preexec(cpu_s: int = 30, mem_mb: int = 512, fsize_mb: int = 100) -> Callable[[], None]:
@@ -56,24 +113,36 @@ class LocalSandboxActor(SandboxActor):
         workspace_path.mkdir(parents=True, exist_ok=True)
         self.state.workspace_path = workspace_path.resolve()
         self.state.notify_state_change()
+        logger.debug(
+            "LocalSandboxActor started: workspace=%s (no filesystem isolation)",
+            self.state.workspace_path,
+        )
 
     def _stop_sandbox(self) -> None:
-        pass  # no persistent resource to tear down
+        logger.debug("LocalSandboxActor stopped.")
 
     def _exec(self, cmd: str, cwd: str) -> ExecResult:
         assert self.state.workspace_path is not None
         effective_cwd = self.state.workspace_path / cwd if cwd else self.state.workspace_path
-        result = subprocess.run(
-            cmd.split(),
-            cwd=str(effective_cwd),
-            capture_output=True,
-            text=True,
-            timeout=30,
-            preexec_fn=_make_preexec(),
-            env={"PATH": "/usr/bin:/bin:/usr/local/bin"},
-        )
-        return ExecResult(
-            stdout=result.stdout,
-            stderr=result.stderr,
-            exit_code=result.returncode,
-        )
+        logger.debug("LocalSandboxActor exec: cmd=%r cwd=%s", cmd, effective_cwd)
+        try:
+            result = subprocess.run(
+                cmd.split(),
+                cwd=str(effective_cwd),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                preexec_fn=_make_preexec(),
+                env=_make_sandbox_env(),
+            )
+            return ExecResult(
+                stdout=result.stdout,
+                stderr=result.stderr,
+                exit_code=result.returncode,
+            )
+        except FileNotFoundError:
+            return ExecResult(
+                stdout="",
+                stderr=f"Working directory not found: {cwd or '.'}",
+                exit_code=1,
+            )
