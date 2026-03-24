@@ -47,10 +47,10 @@ class SeatbeltSandboxActor(SandboxActor):
     macOS release. This actor is intended for macOS developer workstations
     only.
 
-    Each ``_exec()`` invocation writes a deny-by-default SBPL policy to a
-    temporary ``.sb`` file that restricts filesystem access to the workspace
-    directory and denies all network access. The temp file is deleted in a
-    ``finally`` block after the subprocess completes.
+    Each ``_exec()`` invocation writes a write-restricted SBPL policy to a
+    temporary ``.sb`` file that allows all reads but restricts writes to the
+    workspace directory and tmpdir. Network access is allowed. The temp file
+    is deleted in a ``finally`` block after the subprocess completes.
 
     Unlike ``BwrapSandboxActor`` and ``LocalSandboxActor``, no ``preexec_fn``
     or env-stripping is applied: ``resource.setrlimit`` behaves differently on
