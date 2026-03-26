@@ -479,6 +479,25 @@ class TestReceiveEmbeddingResult:
             actor.receiveMsg_EmbeddingResult(self._make_result())
             assert mock_notify.call_count >= 1
 
+    def test_backend_add_failure_transitions_to_error(self) -> None:
+        """When backend.add() fails, collection moves to ERROR (not stuck in INDEXING)."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        backend.add.side_effect = RuntimeError("disk full")
+        actor._backend = backend
+        actor.state.collection_statuses["col1"] = CollectionStatus.INDEXING
+        actor.state.indexing_pending["col1"] = 2
+        actor.state.pending_entries["col1"] = [
+            {"ref_type": "entity", "ref_id": "e1", "text": "hi"},
+            {"ref_type": "entity", "ref_id": "e2", "text": "bye"},
+        ]
+
+        actor.receiveMsg_EmbeddingResult(self._make_result())
+
+        assert actor.state.collection_statuses["col1"] == CollectionStatus.ERROR
+        assert actor.state.indexing_pending["col1"] == 0
+        assert "col1" not in actor.state.pending_entries
+
 
 # ---------------------------------------------------------------------------
 # receiveMsg_EmbeddingError (AC7)

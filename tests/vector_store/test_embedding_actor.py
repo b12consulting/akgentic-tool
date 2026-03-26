@@ -228,6 +228,36 @@ class TestEmbeddingActorStopsSelf:
 
 
 # ---------------------------------------------------------------------------
+# No-parent guard (null safety)
+# ---------------------------------------------------------------------------
+
+
+class TestNoParentGuard:
+    """Verify EmbeddingActor handles missing parent gracefully."""
+
+    def test_no_parent_on_success_path(self) -> None:
+        """When _parent is None, result delivery is skipped without error."""
+        actor = _make_actor()
+        actor._parent = None
+        mock_svc = MagicMock()
+        mock_svc.embed.return_value = [[0.1], [0.2]]
+        actor._embedding_svc = mock_svc
+
+        with patch.object(actor, "stop"):
+            # Should not raise
+            actor.receiveMsg_EmbeddingRequest(_make_request())
+
+    def test_no_parent_on_error_path(self) -> None:
+        """When _parent is None, _send_error logs and returns without error."""
+        actor = _make_actor()
+        actor._parent = None
+
+        with patch.object(actor, "stop"):
+            # _send_error should not raise
+            actor._send_error(_make_request(), "test error")
+
+
+# ---------------------------------------------------------------------------
 # Message model construction
 # ---------------------------------------------------------------------------
 

@@ -368,6 +368,11 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
                 self.config.name,
                 exc,
             )
+            # Transition to ERROR so the collection does not stay stuck in INDEXING
+            self.state.collection_statuses[msg.collection] = CollectionStatus.ERROR
+            self.state.pending_entries.pop(msg.collection, None)
+            self.state.indexing_pending[msg.collection] = 0
+            self.state.notify_state_change()
 
     def receiveMsg_EmbeddingError(self, msg: EmbeddingError) -> None:  # noqa: N802
         """Handle embedding failure from EmbeddingActor.

@@ -153,7 +153,9 @@ class EmbeddingActor(Akgent[BaseConfig, BaseState]):
                 entries=vector_entries,
                 request_id=msg.request_id,
             )
-            assert self._parent is not None  # always set by createActor
+            if self._parent is None:
+                logger.warning("[%s] No parent address, cannot deliver result", self.config.name)
+                return
             parent_proxy = self.proxy_tell(self._parent, VectorStoreActor)
             parent_proxy.receiveMsg_EmbeddingResult(result)
 
@@ -177,7 +179,9 @@ class EmbeddingActor(Akgent[BaseConfig, BaseState]):
             request_id=msg.request_id,
         )
         try:
-            assert self._parent is not None  # always set by createActor
+            if self._parent is None:
+                logger.warning("[%s] No parent address, cannot deliver error", self.config.name)
+                return
             parent_proxy = self.proxy_tell(self._parent, VectorStoreActor)
             parent_proxy.receiveMsg_EmbeddingError(err)
         except Exception as send_exc:  # noqa: BLE001
