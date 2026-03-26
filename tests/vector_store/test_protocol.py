@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from akgentic.tool.vector_store.protocol import (
     CollectionConfig,
     CollectionStatus,
@@ -11,7 +14,6 @@ from akgentic.tool.vector_store.protocol import (
     VectorStoreConfig,
     VectorStoreService,
 )
-
 
 # ---------------------------------------------------------------------------
 # CollectionStatus enum tests (AC3)
@@ -85,6 +87,14 @@ class TestCollectionConfig:
         restored = CollectionConfig.model_validate(data)
         assert restored == cfg
 
+    def test_dimension_must_be_positive(self) -> None:
+        with pytest.raises(ValidationError):
+            CollectionConfig(dimension=0)
+
+    def test_dimension_rejects_negative(self) -> None:
+        with pytest.raises(ValidationError):
+            CollectionConfig(dimension=-1)
+
 
 # ---------------------------------------------------------------------------
 # SearchHit tests (AC4, AC8)
@@ -134,6 +144,18 @@ class TestSearchResult:
         result = SearchResult(
             hits=[hit], status=CollectionStatus.INDEXING, indexing_pending=3
         )
+        data = result.model_dump()
+        restored = SearchResult.model_validate(data)
+        assert restored == result
+
+    def test_indexing_pending_rejects_negative(self) -> None:
+        with pytest.raises(ValidationError):
+            SearchResult(hits=[], status=CollectionStatus.READY, indexing_pending=-1)
+
+    def test_empty_hits_with_error_status(self) -> None:
+        result = SearchResult(hits=[], status=CollectionStatus.ERROR)
+        assert result.hits == []
+        assert result.status == CollectionStatus.ERROR
         data = result.model_dump()
         restored = SearchResult.model_validate(data)
         assert restored == result

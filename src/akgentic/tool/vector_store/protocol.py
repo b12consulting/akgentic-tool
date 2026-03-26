@@ -44,7 +44,7 @@ class CollectionConfig(SerializableBaseModel):
     strategy for the collection.
     """
 
-    dimension: int = Field(default=1536, description="Embedding vector dimensionality")
+    dimension: int = Field(default=1536, ge=1, description="Embedding vector dimensionality")
     backend: Literal["inmemory", "weaviate"] = Field(
         default="inmemory", description="Storage backend for this collection"
     )
@@ -89,7 +89,7 @@ class SearchResult(SerializableBaseModel):
     hits: list[SearchHit] = Field(description="Ranked search results")
     status: CollectionStatus = Field(description="Current collection lifecycle state")
     indexing_pending: int = Field(
-        default=0, description="Number of entries still being indexed"
+        default=0, ge=0, description="Number of entries still being indexed"
     )
 
 
@@ -196,14 +196,3 @@ class VectorStoreConfig(BaseConfig):
     weaviate_api_key: str | None = Field(
         default=None, description="Weaviate API key"
     )
-
-
-__all__ = [
-    "CollectionConfig",
-    "CollectionStatus",
-    "EmbeddingProvider",
-    "SearchHit",
-    "SearchResult",
-    "VectorStoreConfig",
-    "VectorStoreService",
-]
