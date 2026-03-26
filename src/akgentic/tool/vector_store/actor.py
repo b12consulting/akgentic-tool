@@ -32,6 +32,7 @@ if TYPE_CHECKING:
         EmbeddingResult,
     )
     from akgentic.tool.vector_store.inmemory import InMemoryBackend
+    from akgentic.tool.vector_store.weaviate import WeaviateBackend
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +99,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         self.state = VectorStoreState()
         self.state.observer(self)
         self._backend: InMemoryBackend | None = None
+        self._weaviate_backend: WeaviateBackend | None = None
         self._embedding_svc: EmbeddingService | None = None
 
     # ------------------------------------------------------------------
@@ -151,6 +153,58 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
             return None
         return self._embedding_svc
 
+    def _get_or_create_weaviate_backend(self) -> WeaviateBackend | None:
+        """Return the ``WeaviateBackend``, creating it lazily on first call.
+
+        Uses ``self.config.weaviate_url`` and ``self.config.weaviate_api_key``
+        for connection. Returns ``None`` when ``weaviate-client`` is missing
+        or connection fails.
+        """
+        if self._weaviate_backend is not None:
+            return self._weaviate_backend
+        try:
+            from akgentic.tool.vector_store.weaviate import WeaviateBackend
+
+            url = self.config.weaviate_url
+            if not url:
+                logger.warning(
+                    "[%s] weaviate_url not configured, cannot create WeaviateBackend",
+                    self.config.name,
+                )
+                return None
+            self._weaviate_backend = WeaviateBackend(
+                url=url,
+                api_key=self.config.weaviate_api_key,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[%s] Failed to initialize WeaviateBackend: %s",
+                self.config.name,
+                exc,
+            )
+            return None
+        return self._weaviate_backend
+
+    def _get_backend_for_collection(
+        self, collection: str,
+    ) -> InMemoryBackend | WeaviateBackend | None:
+        """Return the correct backend for the given collection.
+
+        Checks ``self.state.collection_configs`` to determine whether the
+        collection uses the inmemory or weaviate backend.
+
+        Args:
+            collection: Collection name to look up.
+
+        Returns:
+            The appropriate backend, or ``None`` if unavailable.
+        """
+        cfg_data = self.state.collection_configs.get(collection, {})
+        backend_type = cfg_data.get("backend", "inmemory")
+        if backend_type == "weaviate":
+            return self._get_or_create_weaviate_backend()
+        return self._get_or_create_backend()
+
     # ------------------------------------------------------------------
     # State synchronisation
     # ------------------------------------------------------------------
@@ -191,34 +245,51 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
     def create_collection(self, name: str, config: CollectionConfig) -> None:
         """Create or reconfigure a named collection.
 
-        For ``persistence="workspace"`` collections, delegates to
+        Routes to the appropriate backend based on ``config.backend``:
+        - ``"inmemory"``: delegates to ``InMemoryBackend``
+        - ``"weaviate"``: delegates to ``WeaviateBackend``
+
+        For inmemory ``persistence="workspace"`` collections, delegates to
         ``InMemoryBackend.load_collection()`` which restores from disk
-        or starts empty. Otherwise delegates to ``create_collection()``.
+        or starts empty.
 
         Args:
             name: Unique collection identifier.
             config: Collection configuration.
         """
-        backend = self._get_or_create_backend()
-        if backend is None:
-            logger.warning(
-                "[%s] Backend unavailable, skipping create_collection",
-                self.config.name,
-            )
-            return
         try:
-            if config.persistence == "workspace" and config.workspace_path:
-                backend.load_collection(name, config, config.workspace_path)
+            if config.backend == "weaviate":
+                wb = self._get_or_create_weaviate_backend()
+                if wb is None:
+                    logger.warning(
+                        "[%s] Weaviate backend unavailable, skipping create_collection",
+                        self.config.name,
+                    )
+                    return
+                wb.create_collection(name, config)
             else:
-                backend.create_collection(name, config)
+                backend = self._get_or_create_backend()
+                if backend is None:
+                    logger.warning(
+                        "[%s] Backend unavailable, skipping create_collection",
+                        self.config.name,
+                    )
+                    return
+                if config.persistence == "workspace" and config.workspace_path:
+                    backend.load_collection(name, config, config.workspace_path)
+                else:
+                    backend.create_collection(name, config)
+
             self.state.collection_configs[name] = {
                 "dimension": config.dimension,
                 "backend": config.backend,
                 "persistence": config.persistence,
                 "workspace_path": config.workspace_path,
+                "tenant": config.tenant,
             }
             self.state.collection_statuses[name] = CollectionStatus.READY
-            self._sync_backend_state()
+            if config.backend != "weaviate":
+                self._sync_backend_state()
             self.state.notify_state_change()
         except Exception as exc:  # noqa: BLE001
             logger.warning("[%s] create_collection failed: %s", self.config.name, exc)
@@ -237,7 +308,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
             collection: Target collection name.
             entries: List of ``VectorEntry`` to store.
         """
-        backend = self._get_or_create_backend()
+        backend = self._get_backend_for_collection(collection)
         if backend is None:
             logger.warning("[%s] Backend unavailable, skipping add", self.config.name)
             return
@@ -258,13 +329,15 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
             collection: Target collection name.
             entries: Entries with non-empty vector fields.
         """
-        backend = self._get_or_create_backend()
+        backend = self._get_backend_for_collection(collection)
         if backend is None:
             return
         try:
             backend.add(collection, entries)
-            self._sync_backend_state()
-            self._save_workspace_collection(collection)
+            cfg_data = self.state.collection_configs.get(collection, {})
+            if cfg_data.get("backend", "inmemory") != "weaviate":
+                self._sync_backend_state()
+                self._save_workspace_collection(collection)
             self.state.notify_state_change()
         except ValueError as exc:
             raise RetriableError(str(exc)) from exc
@@ -321,21 +394,23 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
     def remove(self, collection: str, ref_ids: list[str]) -> None:
         """Remove entries from a collection by reference ID.
 
-        Delegates to ``InMemoryBackend.remove()``. ``ValueError`` (non-existent
+        Delegates to the appropriate backend. ``ValueError`` (non-existent
         collection) is re-raised as ``RetriableError``.
 
         Args:
             collection: Target collection name.
             ref_ids: List of reference IDs to remove.
         """
-        backend = self._get_or_create_backend()
+        backend = self._get_backend_for_collection(collection)
         if backend is None:
             logger.warning("[%s] Backend unavailable, skipping remove", self.config.name)
             return
         try:
             backend.remove(collection, ref_ids)
-            self._sync_backend_state()
-            self._save_workspace_collection(collection)
+            cfg_data = self.state.collection_configs.get(collection, {})
+            if cfg_data.get("backend", "inmemory") != "weaviate":
+                self._sync_backend_state()
+                self._save_workspace_collection(collection)
             self.state.notify_state_change()
         except ValueError as exc:
             raise RetriableError(str(exc)) from exc
@@ -356,7 +431,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         Returns:
             Search results with hits and collection status.
         """
-        backend = self._get_or_create_backend()
+        backend = self._get_backend_for_collection(collection)
         if backend is None:
             logger.warning("[%s] Backend unavailable, returning empty search", self.config.name)
             return SearchResult(hits=[], status=CollectionStatus.READY, indexing_pending=0)

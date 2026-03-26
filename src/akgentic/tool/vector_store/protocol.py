@@ -54,6 +54,10 @@ class CollectionConfig(SerializableBaseModel):
     workspace_path: str | None = Field(
         default=None, description="Filesystem path when persistence is workspace"
     )
+    tenant: str | None = Field(
+        default=None,
+        description="Weaviate tenant ID for multi-tenancy (maps to workspace/team ID)",
+    )
 
 
 # ---------------------------------------------------------------------------
