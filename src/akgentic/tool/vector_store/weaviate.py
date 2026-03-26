@@ -128,20 +128,19 @@ class WeaviateBackend:
                     pass  # Tenant may already exist
             return
 
-        kwargs: dict[str, object] = {
-            "name": name,
-            "vectorizer_config": Configure.Vectorizer.none(),
-            "properties": [
-                Property(name="ref_type", data_type=DataType.TEXT),
-                Property(name="ref_id", data_type=DataType.TEXT),
-                Property(name="text", data_type=DataType.TEXT),
-            ],
-        }
+        properties = [
+            Property(name="ref_type", data_type=DataType.TEXT),
+            Property(name="ref_id", data_type=DataType.TEXT),
+            Property(name="text", data_type=DataType.TEXT),
+        ]
+        mt_config = Configure.multi_tenancy(enabled=True) if tenant else None
 
-        if tenant:
-            kwargs["multi_tenancy_config"] = Configure.multi_tenancy(enabled=True)
-
-        self._client.collections.create(**kwargs)
+        self._client.collections.create(
+            name=name,
+            vectorizer_config=Configure.Vectorizer.none(),
+            properties=properties,
+            multi_tenancy_config=mt_config,
+        )
         self._collections_created.add(name)
 
         # Create the tenant after multi-tenant collection is created
