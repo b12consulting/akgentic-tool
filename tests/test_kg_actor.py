@@ -950,6 +950,14 @@ class TestVectorSearch:
         result = actor.search(SearchQuery(query="Alice", top_k=5, mode="vector"))
         assert result.hits == []
 
+    def test_vector_search_returns_empty_when_search_call_fails(self) -> None:
+        """Graceful empty result when vs_proxy.search() raises during vector search."""
+        actor, mock_proxy = _actor_with_mock_embed()
+        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        mock_proxy.search.side_effect = RuntimeError("Connection refused")
+        result = actor.search(SearchQuery(query="Alice", top_k=5, mode="vector"))
+        assert result.hits == []
+
 
 # ---------------------------------------------------------------------------
 # Hybrid search (Story 2.2 Task 2, ACs 2, 4)

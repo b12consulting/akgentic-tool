@@ -291,8 +291,6 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
                     self._vs_proxy.remove(KG_COLLECTION, [str(entity.id)])
                 entity.description = eu.description
                 self._embed_entity(entity)
-            elif eu.description is not None:
-                entity.description = eu.description
             if eu.entity_type is not None:
                 entity.entity_type = eu.entity_type
             if eu.is_root is not None:
@@ -311,7 +309,7 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
     def _delete_entities(self, names: list[str]) -> list[str]:
         """Remove entities by name with cascade deletion of relations.
 
-        Also removes any associated VectorEntry embeddings from the vector index.
+        Also removes any associated VectorEntry embeddings from VectorStoreActor.
 
         Returns:
             List of error strings for entities not found.
@@ -361,7 +359,7 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
     def _delete_relations(self, deletions: list[RelationDelete]) -> list[str]:
         """Remove relations by ``(from_entity, to_entity, relation_type)`` triple.
 
-        Also removes any associated VectorEntry embeddings from the vector index.
+        Also removes any associated VectorEntry embeddings from VectorStoreActor.
 
         Returns:
             List of error strings for relations not found.
