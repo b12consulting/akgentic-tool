@@ -302,6 +302,30 @@ class TestSearch:
         assert result.hits[0].score == pytest.approx(0.8)
         mock_collection.query.near_vector.assert_called_once()
 
+    def test_search_clamps_negative_scores(self) -> None:
+        """Scores are clamped to [0, 1] when distance > 1.0."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+
+        mock_collection = MagicMock()
+        mock_client.collections.get.return_value = mock_collection
+
+        mock_obj = MagicMock()
+        mock_obj.properties = {"ref_type": "entity", "ref_id": "r1", "text": "hello"}
+        mock_obj.metadata.distance = 1.5  # distance > 1 => would produce negative score
+        mock_result = MagicMock()
+        mock_result.objects = [mock_obj]
+        mock_collection.query.near_vector.return_value = mock_result
+
+        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+
+        backend = WeaviateBackend(url="http://localhost:8080")
+        backend.create_collection("col1", CollectionConfig())
+        result = backend.search("col1", [0.1, 0.2], top_k=5)
+
+        assert result.hits[0].score == 0.0
+
     def test_search_raises_on_unknown_collection(self) -> None:
         """search raises ValueError for non-existent collection."""
         _install_mock_weaviate()
@@ -382,6 +406,35 @@ class TestMultiTenancy:
 
         create_kwargs = mock_client.collections.create.call_args[1]
         assert "multi_tenancy_config" in create_kwargs
+        mock_col.tenants.create.assert_called_once()
+
+    def test_config_tenant_scoped_on_operations(self) -> None:
+        """Operations use per-collection tenant from CollectionConfig, not backend."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+
+        mock_col = MagicMock()
+        mock_tenant_col = MagicMock()
+        mock_col.with_tenant.return_value = mock_tenant_col
+        mock_client.collections.get.return_value = mock_col
+
+        # Set up batch mock on tenant collection
+        mock_batch = MagicMock()
+        mock_tenant_col.batch.dynamic.return_value.__enter__ = MagicMock(return_value=mock_batch)
+        mock_tenant_col.batch.dynamic.return_value.__exit__ = MagicMock(return_value=False)
+
+        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+
+        backend = WeaviateBackend(url="http://localhost:8080")  # no backend tenant
+        config = CollectionConfig(tenant="workspace-99")
+        backend.create_collection("col1", config)
+
+        entry = _make_entry()
+        backend.add("col1", [entry])
+
+        mock_col.with_tenant.assert_called_with("workspace-99")
+        mock_batch.add_object.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

@@ -96,6 +96,7 @@ class WeaviateBackend:
             auth_credentials=auth,
         )
         self._collections_created: set[str] = set()
+        self._collection_tenants: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # VectorStoreService protocol methods
@@ -119,13 +120,17 @@ class WeaviateBackend:
 
         if self._client.collections.exists(name):
             self._collections_created.add(name)
-            # Ensure tenant exists if multi-tenancy is enabled
             if tenant:
+                self._collection_tenants[name] = tenant
                 try:
                     collection = self._client.collections.get(name)
                     collection.tenants.create([Tenant(name=tenant)])
                 except Exception:  # noqa: BLE001
-                    pass  # Tenant may already exist
+                    logger.debug(
+                        "Tenant '%s' may already exist on collection '%s'",
+                        tenant,
+                        name,
+                    )
             return
 
         properties = [
@@ -145,6 +150,7 @@ class WeaviateBackend:
 
         # Create the tenant after multi-tenant collection is created
         if tenant:
+            self._collection_tenants[name] = tenant
             collection = self._client.collections.get(name)
             collection.tenants.create([Tenant(name=tenant)])
 
@@ -225,7 +231,7 @@ class WeaviateBackend:
         for obj in result.objects:
             props = obj.properties
             distance = obj.metadata.distance if obj.metadata and obj.metadata.distance else 0.0
-            score = 1.0 - distance
+            score = max(0.0, 1.0 - distance)
             hits.append(
                 SearchHit(
                     ref_type=str(props.get("ref_type", "")),
@@ -265,6 +271,9 @@ class WeaviateBackend:
     def _get_collection(self, name: str) -> weaviate.collections.Collection:
         """Return the Weaviate collection handle, with tenant if applicable.
 
+        Resolves the effective tenant from the per-collection mapping first,
+        falling back to the backend-level default tenant.
+
         Args:
             name: Collection name.
 
@@ -272,6 +281,7 @@ class WeaviateBackend:
             Weaviate collection object (optionally scoped to tenant).
         """
         col = self._client.collections.get(name)
-        if self._tenant:
-            col = col.with_tenant(self._tenant)
+        tenant = self._collection_tenants.get(name) or self._tenant
+        if tenant:
+            col = col.with_tenant(tenant)
         return col
