@@ -9,11 +9,13 @@ initialisation and catch/log/swallow error handling.
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import TYPE_CHECKING, Any
 
 from pydantic import Field
 
 from akgentic.core.agent import Akgent
+from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.vector_store.protocol import (
@@ -25,6 +27,10 @@ from akgentic.tool.vector_store.protocol import (
 
 if TYPE_CHECKING:
     from akgentic.tool.vector import EmbeddingService, VectorEntry
+    from akgentic.tool.vector_store.embedding_actor import (
+        EmbeddingError,
+        EmbeddingResult,
+    )
     from akgentic.tool.vector_store.inmemory import InMemoryBackend
 
 logger = logging.getLogger(__name__)
@@ -55,6 +61,14 @@ class VectorStoreState(BaseState):
     collection_statuses: dict[str, CollectionStatus] = Field(
         default_factory=dict,
         description="Per-collection lifecycle status",
+    )
+    pending_entries: dict[str, list[dict[str, str]]] = Field(
+        default_factory=dict,
+        description="Raw entry metadata awaiting embedding, keyed by collection",
+    )
+    indexing_pending: dict[str, int] = Field(
+        default_factory=dict,
+        description="Count of entries pending embedding per collection",
     )
 
 
@@ -174,8 +188,12 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
     def add(self, collection: str, entries: list[VectorEntry]) -> None:
         """Ingest embedding entries into a collection.
 
-        Delegates to ``InMemoryBackend.add()``. ``ValueError`` (non-existent
-        collection) is re-raised as ``RetriableError``.
+        Entries with pre-populated vectors go through the synchronous path
+        directly to the backend.  Entries without vectors are sent to a
+        spawned ``EmbeddingActor`` for asynchronous embedding (AC2, AC9).
+
+        If the collection is in ``ERROR`` status, a new ``add()`` resets
+        it to ``INDEXING`` (AC8 -- retry after failure).
 
         Args:
             collection: Target collection name.
@@ -185,6 +203,26 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         if backend is None:
             logger.warning("[%s] Backend unavailable, skipping add", self.config.name)
             return
+
+        pre_embedded = [e for e in entries if len(e.vector) > 0]
+        needs_embedding = [e for e in entries if len(e.vector) == 0]
+
+        if pre_embedded:
+            self._add_pre_embedded(collection, pre_embedded)
+
+        if needs_embedding:
+            self._add_needs_embedding(collection, needs_embedding)
+
+    def _add_pre_embedded(self, collection: str, entries: list[VectorEntry]) -> None:
+        """Add entries with pre-populated vectors directly to backend.
+
+        Args:
+            collection: Target collection name.
+            entries: Entries with non-empty vector fields.
+        """
+        backend = self._get_or_create_backend()
+        if backend is None:
+            return
         try:
             backend.add(collection, entries)
             self._sync_backend_state()
@@ -192,7 +230,54 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         except ValueError as exc:
             raise RetriableError(str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
-            logger.warning("[%s] add failed: %s", self.config.name, exc)
+            logger.warning("[%s] _add_pre_embedded failed: %s", self.config.name, exc)
+
+    def _add_needs_embedding(self, collection: str, entries: list[VectorEntry]) -> None:
+        """Spawn an EmbeddingActor for entries that need embedding.
+
+        Stores raw metadata in pending state, sets collection to INDEXING,
+        and fires the request asynchronously (AC2, AC3, AC8).
+
+        Args:
+            collection: Target collection name.
+            entries: Entries with empty vector fields.
+        """
+        from akgentic.tool.vector_store.embedding_actor import (
+            EmbeddingActor,
+            EmbeddingRequest,
+        )
+
+        request_id = str(uuid.uuid4())
+        raw_entries = [
+            {"ref_type": e.ref_type, "ref_id": e.ref_id, "text": e.text} for e in entries
+        ]
+
+        # Track pending entries in state
+        pending = self.state.pending_entries.get(collection, [])
+        pending.extend(raw_entries)
+        self.state.pending_entries[collection] = pending
+
+        count = self.state.indexing_pending.get(collection, 0)
+        self.state.indexing_pending[collection] = count + len(entries)
+
+        # Transition status (READY/ERROR -> INDEXING)
+        self.state.collection_statuses[collection] = CollectionStatus.INDEXING
+
+        # Spawn EmbeddingActor child
+        embed_config = BaseConfig(name=f"embed-{collection}-{request_id}")
+        embed_addr = self.createActor(EmbeddingActor, config=embed_config)
+
+        request = EmbeddingRequest(
+            collection=collection,
+            entries=raw_entries,
+            request_id=request_id,
+            embedding_model=self.config.embedding_model,
+            embedding_provider=self.config.embedding_provider,
+        )
+        embed_proxy = self.proxy_tell(embed_addr, EmbeddingActor)
+        embed_proxy.receiveMsg_EmbeddingRequest(request)
+
+        self.state.notify_state_change()
 
     def remove(self, collection: str, ref_ids: list[str]) -> None:
         """Remove entries from a collection by reference ID.
@@ -217,9 +302,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         except Exception as exc:  # noqa: BLE001
             logger.warning("[%s] remove failed: %s", self.config.name, exc)
 
-    def search(
-        self, collection: str, query_vector: list[float], top_k: int
-    ) -> SearchResult:
+    def search(self, collection: str, query_vector: list[float], top_k: int) -> SearchResult:
         """Search a collection by cosine similarity.
 
         Read-only operation — does not call ``state.notify_state_change()``.
@@ -236,19 +319,94 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         backend = self._get_or_create_backend()
         if backend is None:
             logger.warning("[%s] Backend unavailable, returning empty search", self.config.name)
-            return SearchResult(
-                hits=[], status=CollectionStatus.READY, indexing_pending=0
-            )
+            return SearchResult(hits=[], status=CollectionStatus.READY, indexing_pending=0)
         try:
             result: SearchResult = backend.search(collection, query_vector, top_k)
+            # Override status/pending from actor state (AC6)
+            actor_status = self.state.collection_statuses.get(collection)
+            if actor_status is not None:
+                result = SearchResult(
+                    hits=result.hits,
+                    status=actor_status,
+                    indexing_pending=self.state.indexing_pending.get(collection, 0),
+                )
             return result
         except ValueError as exc:
             raise RetriableError(str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
             logger.warning("[%s] search failed: %s", self.config.name, exc)
-            return SearchResult(
-                hits=[], status=CollectionStatus.READY, indexing_pending=0
+            return SearchResult(hits=[], status=CollectionStatus.READY, indexing_pending=0)
+
+    # ------------------------------------------------------------------
+    # Embedding result/error handlers
+    # ------------------------------------------------------------------
+
+    def receiveMsg_EmbeddingResult(self, msg: EmbeddingResult) -> None:  # noqa: N802
+        """Handle successful embedding delivery from EmbeddingActor.
+
+        Inserts fully-vectorised entries into the backend and updates
+        collection status (AC5).
+
+        Args:
+            msg: Result containing entries with populated vectors.
+        """
+        backend = self._get_or_create_backend()
+        if backend is None:
+            logger.warning(
+                "[%s] Backend unavailable, cannot insert embedding results",
+                self.config.name,
             )
+            return
+        try:
+            backend.add(msg.collection, msg.entries)
+            self._remove_pending(msg.collection, len(msg.entries))
+            self._sync_backend_state()
+            self.state.notify_state_change()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[%s] receiveMsg_EmbeddingResult failed: %s",
+                self.config.name,
+                exc,
+            )
+
+    def receiveMsg_EmbeddingError(self, msg: EmbeddingError) -> None:  # noqa: N802
+        """Handle embedding failure from EmbeddingActor.
+
+        Sets collection to ERROR and discards pending entries (AC7).
+
+        Args:
+            msg: Error details from the failed embedding batch.
+        """
+        logger.warning(
+            "[%s] Embedding failed for collection '%s': %s",
+            self.config.name,
+            msg.collection,
+            msg.error,
+        )
+        self.state.collection_statuses[msg.collection] = CollectionStatus.ERROR
+        self.state.pending_entries.pop(msg.collection, None)
+        self.state.indexing_pending[msg.collection] = 0
+        self.state.notify_state_change()
+
+    def _remove_pending(self, collection: str, count: int) -> None:
+        """Decrement pending count and clean up on completion.
+
+        Args:
+            collection: Collection name.
+            count: Number of entries that were successfully embedded.
+        """
+        pending = self.state.indexing_pending.get(collection, 0)
+        pending = max(0, pending - count)
+        self.state.indexing_pending[collection] = pending
+
+        # Remove corresponding raw entries from pending list
+        pending_list = self.state.pending_entries.get(collection, [])
+        self.state.pending_entries[collection] = pending_list[count:]
+
+        if pending <= 0:
+            self.state.collection_statuses[collection] = CollectionStatus.READY
+            self.state.pending_entries.pop(collection, None)
+            self.state.indexing_pending.pop(collection, None)
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         """Embed texts via ``EmbeddingService``.

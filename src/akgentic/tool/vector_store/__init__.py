@@ -12,6 +12,12 @@ from akgentic.tool.vector_store.actor import (
     VectorStoreActor,
     VectorStoreState,
 )
+from akgentic.tool.vector_store.embedding_actor import (
+    EmbeddingActor,
+    EmbeddingError,
+    EmbeddingRequest,
+    EmbeddingResult,
+)
 from akgentic.tool.vector_store.inmemory import InMemoryBackend
 from akgentic.tool.vector_store.protocol import (
     CollectionConfig,
@@ -26,7 +32,11 @@ from akgentic.tool.vector_store.protocol import (
 __all__ = [
     "CollectionConfig",
     "CollectionStatus",
+    "EmbeddingActor",
+    "EmbeddingError",
     "EmbeddingProvider",
+    "EmbeddingRequest",
+    "EmbeddingResult",
     "InMemoryBackend",
     "SearchHit",
     "SearchResult",

@@ -23,6 +23,10 @@ from akgentic.tool.vector_store.actor import (
     VectorStoreActor,
     VectorStoreState,
 )
+from akgentic.tool.vector_store.embedding_actor import (
+    EmbeddingError,
+    EmbeddingResult,
+)
 from akgentic.tool.vector_store.protocol import (
     CollectionConfig,
     CollectionStatus,
@@ -48,6 +52,28 @@ def _mock_backend() -> MagicMock:
     backend = MagicMock()
     backend.get_state.return_value = {"collections": {}}
     return backend
+
+
+def _mock_entry(
+    ref_id: str = "e1",
+    ref_type: str = "entity",
+    text: str = "hello",
+    vector: list[float] | None = None,
+) -> MagicMock:
+    """Return a MagicMock that mimics VectorEntry.
+
+    Args:
+        ref_id: Entry reference ID.
+        ref_type: Entry reference type.
+        text: Entry text.
+        vector: Embedding vector; empty list means needs-embedding.
+    """
+    entry = MagicMock()
+    entry.ref_id = ref_id
+    entry.ref_type = ref_type
+    entry.text = text
+    entry.vector = vector if vector is not None else []
+    return entry
 
 
 # ---------------------------------------------------------------------------
@@ -183,45 +209,389 @@ class TestCreateCollection:
 class TestAdd:
     """AC5: add delegates to backend with state notification."""
 
-    def test_delegates_to_backend(self) -> None:
-        """AC5: Delegation to InMemoryBackend.add."""
+    def test_pre_embedded_delegates_to_backend(self) -> None:
+        """AC9: Pre-embedded entries go directly to backend.add()."""
         actor = _make_actor()
         backend = _mock_backend()
         actor._backend = backend
-        entries = [MagicMock()]
+        entry = _mock_entry(vector=[0.1, 0.2])
 
-        actor.add("col1", entries)
-        backend.add.assert_called_once_with("col1", entries)
+        actor.add("col1", [entry])
+        backend.add.assert_called_once_with("col1", [entry])
 
-    def test_notifies_state_change(self) -> None:
-        """AC12: state.notify_state_change() called after add."""
+    def test_pre_embedded_notifies_state_change(self) -> None:
+        """AC12: state.notify_state_change() called after pre-embedded add."""
         actor = _make_actor()
         backend = _mock_backend()
         actor._backend = backend
+        entry = _mock_entry(vector=[0.1])
 
         with patch.object(VectorStoreState, "notify_state_change") as mock_notify:
-            actor.add("col1", [])
+            actor.add("col1", [entry])
             mock_notify.assert_called_once()
 
-    def test_nonexistent_collection_raises_retriable(self) -> None:
+    def test_pre_embedded_nonexistent_collection_raises_retriable(self) -> None:
         """AC9: ValueError from backend becomes RetriableError."""
         actor = _make_actor()
         backend = _mock_backend()
         backend.add.side_effect = ValueError("Collection 'col1' does not exist")
         actor._backend = backend
+        entry = _mock_entry(vector=[0.1])
 
         with pytest.raises(RetriableError, match="does not exist"):
-            actor.add("col1", [])
+            actor.add("col1", [entry])
 
-    def test_unexpected_error_swallowed(self) -> None:
+    def test_pre_embedded_unexpected_error_swallowed(self) -> None:
         """AC9: Unexpected errors caught/logged/swallowed."""
         actor = _make_actor()
         backend = _mock_backend()
         backend.add.side_effect = RuntimeError("unexpected")
         actor._backend = backend
+        entry = _mock_entry(vector=[0.1])
 
         # Should not raise
+        actor.add("col1", [entry])
+
+    def test_empty_entries_no_op(self) -> None:
+        """Empty entries list is a no-op."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+
         actor.add("col1", [])
+        backend.add.assert_not_called()
+
+    def test_backend_unavailable_skips(self) -> None:
+        """When backend is None, add() logs and returns."""
+        actor = _make_actor()
+        with patch.object(actor, "_get_or_create_backend", return_value=None):
+            actor.add("col1", [_mock_entry(vector=[0.1])])
+
+
+# ---------------------------------------------------------------------------
+# Non-blocking add — needs embedding (AC2, AC3, AC8)
+# ---------------------------------------------------------------------------
+
+
+class TestAddNeedsEmbedding:
+    """AC2/AC3: Entries without vectors spawn EmbeddingActor."""
+
+    def test_spawns_embedding_actor(self) -> None:
+        """AC2: add() with vectorless entries spawns EmbeddingActor."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+        entry = _mock_entry(vector=[])
+
+        mock_addr = MagicMock()
+        mock_proxy = MagicMock()
+        with (
+            patch.object(actor, "createActor", return_value=mock_addr) as mock_create,
+            patch.object(actor, "proxy_tell", return_value=mock_proxy),
+        ):
+            actor.add("col1", [entry])
+            mock_create.assert_called_once()
+            mock_proxy.receiveMsg_EmbeddingRequest.assert_called_once()
+
+    def test_sets_status_indexing(self) -> None:
+        """AC3: Collection status transitions to INDEXING on add."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+        entry = _mock_entry(vector=[])
+
+        with (
+            patch.object(actor, "createActor", return_value=MagicMock()),
+            patch.object(actor, "proxy_tell", return_value=MagicMock()),
+        ):
+            actor.add("col1", [entry])
+
+        assert actor.state.collection_statuses["col1"] == CollectionStatus.INDEXING
+
+    def test_tracks_indexing_pending_count(self) -> None:
+        """AC3: indexing_pending incremented by number of entries."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+        entries = [_mock_entry(ref_id="e1"), _mock_entry(ref_id="e2")]
+
+        with (
+            patch.object(actor, "createActor", return_value=MagicMock()),
+            patch.object(actor, "proxy_tell", return_value=MagicMock()),
+        ):
+            actor.add("col1", entries)
+
+        assert actor.state.indexing_pending["col1"] == 2
+
+    def test_stores_pending_entries(self) -> None:
+        """Pending entry metadata stored in state."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+        entry = _mock_entry(ref_id="e1", text="hello")
+
+        with (
+            patch.object(actor, "createActor", return_value=MagicMock()),
+            patch.object(actor, "proxy_tell", return_value=MagicMock()),
+        ):
+            actor.add("col1", [entry])
+
+        assert len(actor.state.pending_entries["col1"]) == 1
+        assert actor.state.pending_entries["col1"][0]["ref_id"] == "e1"
+
+    def test_does_not_call_backend_add(self) -> None:
+        """AC2: Vectorless entries do NOT call backend.add() directly."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+        entry = _mock_entry(vector=[])
+
+        with (
+            patch.object(actor, "createActor", return_value=MagicMock()),
+            patch.object(actor, "proxy_tell", return_value=MagicMock()),
+        ):
+            actor.add("col1", [entry])
+
+        backend.add.assert_not_called()
+
+    def test_retry_from_error_resets_to_indexing(self) -> None:
+        """AC8: add() on ERROR collection transitions to INDEXING."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+        actor.state.collection_statuses["col1"] = CollectionStatus.ERROR
+
+        entry = _mock_entry(vector=[])
+        with (
+            patch.object(actor, "createActor", return_value=MagicMock()),
+            patch.object(actor, "proxy_tell", return_value=MagicMock()),
+        ):
+            actor.add("col1", [entry])
+
+        assert actor.state.collection_statuses["col1"] == CollectionStatus.INDEXING
+
+    def test_mixed_entries_partitioned(self) -> None:
+        """AC9: Mixed entries: pre-embedded go to backend, vectorless to actor."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+
+        pre = _mock_entry(ref_id="pre1", vector=[0.1, 0.2])
+        needs = _mock_entry(ref_id="needs1", vector=[])
+
+        with (
+            patch.object(actor, "createActor", return_value=MagicMock()),
+            patch.object(actor, "proxy_tell", return_value=MagicMock()),
+        ):
+            actor.add("col1", [pre, needs])
+
+        # Pre-embedded goes to backend
+        backend.add.assert_called_once_with("col1", [pre])
+        # Needs-embedding tracked in pending
+        assert actor.state.indexing_pending["col1"] == 1
+
+
+# ---------------------------------------------------------------------------
+# receiveMsg_EmbeddingResult (AC5)
+# ---------------------------------------------------------------------------
+
+
+class TestReceiveEmbeddingResult:
+    """AC5: VectorStoreActor handles embedding results."""
+
+    def _make_result(self, collection: str = "col1") -> EmbeddingResult:
+        """Create a mock EmbeddingResult with VectorEntry objects."""
+        from akgentic.tool.vector import VectorEntry
+
+        entries = [
+            VectorEntry(ref_type="entity", ref_id="e1", text="hi", vector=[0.1]),
+            VectorEntry(ref_type="entity", ref_id="e2", text="bye", vector=[0.2]),
+        ]
+        return EmbeddingResult(
+            collection=collection, entries=entries, request_id="req-1"
+        )
+
+    def test_inserts_into_backend(self) -> None:
+        """AC5: Entries are inserted into backend on result delivery."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+        actor.state.collection_statuses["col1"] = CollectionStatus.INDEXING
+        actor.state.indexing_pending["col1"] = 2
+        actor.state.pending_entries["col1"] = [
+            {"ref_type": "entity", "ref_id": "e1", "text": "hi"},
+            {"ref_type": "entity", "ref_id": "e2", "text": "bye"},
+        ]
+
+        result = self._make_result()
+        actor.receiveMsg_EmbeddingResult(result)
+
+        backend.add.assert_called_once_with("col1", result.entries)
+
+    def test_transitions_to_ready(self) -> None:
+        """AC5: Status returns to READY when all pending complete."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+        actor.state.collection_statuses["col1"] = CollectionStatus.INDEXING
+        actor.state.indexing_pending["col1"] = 2
+        actor.state.pending_entries["col1"] = [
+            {"ref_type": "entity", "ref_id": "e1", "text": "hi"},
+            {"ref_type": "entity", "ref_id": "e2", "text": "bye"},
+        ]
+
+        actor.receiveMsg_EmbeddingResult(self._make_result())
+
+        assert actor.state.collection_statuses["col1"] == CollectionStatus.READY
+        assert actor.state.indexing_pending.get("col1") is None
+
+    def test_decrements_pending_count(self) -> None:
+        """AC5: indexing_pending decremented by result entry count."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+        # Simulate 4 pending, result delivers 2
+        actor.state.collection_statuses["col1"] = CollectionStatus.INDEXING
+        actor.state.indexing_pending["col1"] = 4
+        actor.state.pending_entries["col1"] = [
+            {"ref_type": "entity", "ref_id": f"e{i}", "text": f"t{i}"}
+            for i in range(4)
+        ]
+
+        actor.receiveMsg_EmbeddingResult(self._make_result())
+
+        assert actor.state.indexing_pending["col1"] == 2
+        assert actor.state.collection_statuses["col1"] == CollectionStatus.INDEXING
+
+    def test_notifies_state_change(self) -> None:
+        """state.notify_state_change() called after result delivery."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+        actor.state.collection_statuses["col1"] = CollectionStatus.INDEXING
+        actor.state.indexing_pending["col1"] = 2
+        actor.state.pending_entries["col1"] = [
+            {"ref_type": "entity", "ref_id": "e1", "text": "hi"},
+            {"ref_type": "entity", "ref_id": "e2", "text": "bye"},
+        ]
+
+        with patch.object(VectorStoreState, "notify_state_change") as mock_notify:
+            actor.receiveMsg_EmbeddingResult(self._make_result())
+            assert mock_notify.call_count >= 1
+
+
+# ---------------------------------------------------------------------------
+# receiveMsg_EmbeddingError (AC7)
+# ---------------------------------------------------------------------------
+
+
+class TestReceiveEmbeddingError:
+    """AC7: VectorStoreActor handles embedding errors."""
+
+    def test_sets_error_status(self) -> None:
+        """AC7: Collection status set to ERROR."""
+        actor = _make_actor()
+        actor.state.collection_statuses["col1"] = CollectionStatus.INDEXING
+        actor.state.indexing_pending["col1"] = 2
+        actor.state.pending_entries["col1"] = [
+            {"ref_type": "entity", "ref_id": "e1", "text": "hi"},
+        ]
+
+        err = EmbeddingError(collection="col1", error="API failed", request_id="r1")
+        actor.receiveMsg_EmbeddingError(err)
+
+        assert actor.state.collection_statuses["col1"] == CollectionStatus.ERROR
+
+    def test_discards_pending_entries(self) -> None:
+        """AC7: Pending entries discarded on error."""
+        actor = _make_actor()
+        actor.state.collection_statuses["col1"] = CollectionStatus.INDEXING
+        actor.state.indexing_pending["col1"] = 2
+        actor.state.pending_entries["col1"] = [
+            {"ref_type": "entity", "ref_id": "e1", "text": "hi"},
+        ]
+
+        err = EmbeddingError(collection="col1", error="API failed", request_id="r1")
+        actor.receiveMsg_EmbeddingError(err)
+
+        assert actor.state.indexing_pending["col1"] == 0
+        assert "col1" not in actor.state.pending_entries
+
+    def test_notifies_state_change(self) -> None:
+        """state.notify_state_change() called after error."""
+        actor = _make_actor()
+        actor.state.collection_statuses["col1"] = CollectionStatus.INDEXING
+
+        with patch.object(VectorStoreState, "notify_state_change") as mock_notify:
+            err = EmbeddingError(
+                collection="col1", error="fail", request_id="r1"
+            )
+            actor.receiveMsg_EmbeddingError(err)
+            assert mock_notify.call_count >= 1
+
+
+# ---------------------------------------------------------------------------
+# Search during INDEXING (AC6)
+# ---------------------------------------------------------------------------
+
+
+class TestSearchDuringIndexing:
+    """AC6: search() returns partial results with INDEXING status."""
+
+    def test_returns_indexing_status(self) -> None:
+        """AC6: Search returns status=INDEXING when collection is indexing."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        backend.search.return_value = SearchResult(
+            hits=[], status=CollectionStatus.READY, indexing_pending=0
+        )
+        actor._backend = backend
+        actor.state.collection_statuses["col1"] = CollectionStatus.INDEXING
+        actor.state.indexing_pending["col1"] = 3
+
+        result = actor.search("col1", [0.1], 5)
+        assert result.status == CollectionStatus.INDEXING
+        assert result.indexing_pending == 3
+
+    def test_returns_ready_when_not_indexing(self) -> None:
+        """Search returns READY status when no indexing."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        backend.search.return_value = SearchResult(
+            hits=[], status=CollectionStatus.READY, indexing_pending=0
+        )
+        actor._backend = backend
+        actor.state.collection_statuses["col1"] = CollectionStatus.READY
+
+        result = actor.search("col1", [0.1], 5)
+        assert result.status == CollectionStatus.READY
+        assert result.indexing_pending == 0
+
+
+# ---------------------------------------------------------------------------
+# State serialisation with new fields
+# ---------------------------------------------------------------------------
+
+
+class TestVectorStoreStateNewFields:
+    """Pending entries and indexing_pending serialise correctly."""
+
+    def test_pending_entries_round_trip(self) -> None:
+        """pending_entries survives serialisation."""
+        state = VectorStoreState(
+            pending_entries={"c1": [{"ref_type": "t", "ref_id": "1", "text": "hi"}]},
+            indexing_pending={"c1": 1},
+        )
+        data = state.model_dump()
+        restored = VectorStoreState.model_validate(data)
+        assert restored.pending_entries == state.pending_entries
+        assert restored.indexing_pending == state.indexing_pending
+
+    def test_defaults_empty(self) -> None:
+        """New fields default to empty dicts."""
+        state = VectorStoreState()
+        assert state.pending_entries == {}
+        assert state.indexing_pending == {}
 
 
 # ---------------------------------------------------------------------------
@@ -535,3 +905,16 @@ class TestPublicApiExports:
         assert "VS_ACTOR_ROLE" in vs.__all__
         assert vs.VS_ACTOR_NAME == "#VectorStore"
         assert vs.VS_ACTOR_ROLE == "ToolActor"
+
+    def test_embedding_actor_exported(self) -> None:
+        """EmbeddingActor and message models in __all__."""
+        import akgentic.tool.vector_store as vs
+
+        assert "EmbeddingActor" in vs.__all__
+        assert "EmbeddingRequest" in vs.__all__
+        assert "EmbeddingResult" in vs.__all__
+        assert "EmbeddingError" in vs.__all__
+        assert hasattr(vs, "EmbeddingActor")
+        assert hasattr(vs, "EmbeddingRequest")
+        assert hasattr(vs, "EmbeddingResult")
+        assert hasattr(vs, "EmbeddingError")
