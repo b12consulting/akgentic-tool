@@ -165,4 +165,4 @@ class TestPlanningToolObserverWiring:
         # Second: PlanConfig without embedding fields
         plan_config = captured_configs[1]
         assert isinstance(plan_config, PlanConfig)
-        assert not hasattr(plan_config, "embedding_model") or "embedding_model" not in PlanConfig.model_fields
+        assert "embedding_model" not in PlanConfig.model_fields
