@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import pytest
 
 from akgentic.tool.vector import VectorEntry
 from akgentic.tool.vector_store.inmemory import InMemoryBackend
 from akgentic.tool.vector_store.protocol import CollectionConfig, CollectionStatus
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -236,7 +236,7 @@ class TestWorkspacePersistence:
     """Tests for save_collection / load_collection."""
 
     def test_round_trip(
-        self, backend: InMemoryBackend, config: CollectionConfig, tmp_path: str
+        self, backend: InMemoryBackend, config: CollectionConfig, tmp_path: Path
     ) -> None:
         """AC9: save_collection / load_collection round-trip."""
         backend.create_collection("col1", config)
@@ -255,21 +255,19 @@ class TestWorkspacePersistence:
         assert result.hits[0].text == "saved"
 
     def test_creates_vector_store_directory(
-        self, backend: InMemoryBackend, config: CollectionConfig, tmp_path: str
+        self, backend: InMemoryBackend, config: CollectionConfig, tmp_path: Path
     ) -> None:
         """AC9: save_collection creates .vector_store/ directory."""
-        from pathlib import Path
-
         backend.create_collection("col1", config)
         backend.add("col1", [_make_entry("e1", [1.0, 0.0])])
         backend.save_collection("col1", str(tmp_path))
 
-        assert (Path(str(tmp_path)) / ".vector_store").is_dir()
-        assert (Path(str(tmp_path)) / ".vector_store" / "col1.npz").exists()
-        assert (Path(str(tmp_path)) / ".vector_store" / "col1.json").exists()
+        assert (tmp_path / ".vector_store").is_dir()
+        assert (tmp_path / ".vector_store" / "col1.npz").exists()
+        assert (tmp_path / ".vector_store" / "col1.json").exists()
 
     def test_missing_file_starts_empty(
-        self, config: CollectionConfig, tmp_path: str
+        self, config: CollectionConfig, tmp_path: Path
     ) -> None:
         """AC9: loading from missing file starts empty collection."""
         backend = InMemoryBackend()
@@ -280,7 +278,7 @@ class TestWorkspacePersistence:
         assert result.status == CollectionStatus.READY
 
     def test_save_nonexistent_collection_raises(
-        self, backend: InMemoryBackend, tmp_path: str
+        self, backend: InMemoryBackend, tmp_path: Path
     ) -> None:
         """save_collection on non-existent collection raises ValueError."""
         with pytest.raises(ValueError, match="does not exist"):
@@ -317,6 +315,42 @@ class TestMultipleCollections:
 # ---------------------------------------------------------------------------
 # Cosine similarity correctness
 # ---------------------------------------------------------------------------
+
+
+class TestProtocolConformance:
+    """Verify InMemoryBackend satisfies VectorStoreService structurally."""
+
+    def test_satisfies_vector_store_service_protocol(self) -> None:
+        """AC1: InMemoryBackend structurally implements VectorStoreService."""
+        from akgentic.tool.vector_store.protocol import VectorStoreService
+
+        backend = InMemoryBackend()
+        # Structural subtyping check: assign to protocol-typed variable
+        svc: VectorStoreService = backend
+        assert svc is backend
+
+
+class TestRestoreStateEdgeCases:
+    """Edge case tests for restore_state."""
+
+    def test_restore_empty_state(self, backend: InMemoryBackend) -> None:
+        """restore_state with empty collections dict clears existing data."""
+        config = CollectionConfig()
+        backend.create_collection("col1", config)
+        backend.add("col1", [_make_entry("e1", [1.0, 0.0])])
+
+        backend.restore_state({"collections": {}})
+
+        with pytest.raises(ValueError, match="does not exist"):
+            backend.search("col1", [1.0, 0.0], top_k=5)
+
+    def test_restore_state_missing_collections_key(self) -> None:
+        """restore_state with empty dict treats it as no collections."""
+        backend = InMemoryBackend()
+        backend.restore_state({})
+        # Backend should be empty — no collections at all
+        with pytest.raises(ValueError, match="does not exist"):
+            backend.search("anything", [1.0], top_k=1)
 
 
 class TestCosineCorrectness:
