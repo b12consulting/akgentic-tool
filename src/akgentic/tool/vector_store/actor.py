@@ -236,7 +236,8 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
                 hits=[], status=CollectionStatus.READY, indexing_pending=0
             )
         try:
-            return backend.search(collection, query_vector, top_k)
+            result: SearchResult = backend.search(collection, query_vector, top_k)
+            return result
         except ValueError as exc:
             raise RetriableError(str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
