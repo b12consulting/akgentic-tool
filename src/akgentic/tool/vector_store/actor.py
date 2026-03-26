@@ -9,7 +9,7 @@ initialisation and catch/log/swallow error handling.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import Field
 
@@ -22,6 +22,10 @@ from akgentic.tool.vector_store.protocol import (
     SearchResult,
     VectorStoreConfig,
 )
+
+if TYPE_CHECKING:
+    from akgentic.tool.vector import EmbeddingService, VectorEntry
+    from akgentic.tool.vector_store.inmemory import InMemoryBackend
 
 logger = logging.getLogger(__name__)
 
@@ -75,14 +79,14 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         """Initialise state, attach observer, and prepare lazy runtime slots."""
         self.state = VectorStoreState()
         self.state.observer(self)
-        self._backend: Any = None  # InMemoryBackend | None — lazy
-        self._embedding_svc: Any = None  # EmbeddingService | None — lazy
+        self._backend: InMemoryBackend | None = None
+        self._embedding_svc: EmbeddingService | None = None
 
     # ------------------------------------------------------------------
     # Lazy initialisation
     # ------------------------------------------------------------------
 
-    def _get_or_create_backend(self) -> Any:
+    def _get_or_create_backend(self) -> InMemoryBackend | None:
         """Return the ``InMemoryBackend``, creating it lazily on first call.
 
         If ``self.state.backend_state`` contains data the backend is restored
@@ -106,7 +110,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
             return None
         return self._backend
 
-    def _get_or_create_embedding_svc(self) -> Any:
+    def _get_or_create_embedding_svc(self) -> EmbeddingService | None:
         """Return the ``EmbeddingService``, creating it lazily on first call.
 
         Returns ``None`` when creation fails (e.g. missing deps or bad config).
@@ -167,7 +171,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         except Exception as exc:  # noqa: BLE001
             logger.warning("[%s] create_collection failed: %s", self.config.name, exc)
 
-    def add(self, collection: str, entries: list[Any]) -> None:
+    def add(self, collection: str, entries: list[VectorEntry]) -> None:
         """Ingest embedding entries into a collection.
 
         Delegates to ``InMemoryBackend.add()``. ``ValueError`` (non-existent
