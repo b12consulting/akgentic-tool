@@ -12,12 +12,10 @@ from __future__ import annotations
 import logging
 import uuid
 from collections import deque
-from typing import Literal
-
-from pydantic import Field
 
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
+from akgentic.core.orchestrator import Orchestrator
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.knowledge_graph.models import (
     Entity,
@@ -35,7 +33,10 @@ from akgentic.tool.knowledge_graph.models import (
     SearchQuery,
     SearchResult,
 )
-from akgentic.tool.vector import EmbeddingService, VectorEntry, VectorIndex
+from akgentic.tool.vector import VectorEntry
+from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
+from akgentic.tool.vector_store.protocol import CollectionConfig
+from akgentic.tool.vector_store.protocol import SearchResult as VsSearchResult
 
 logger = logging.getLogger(__name__)
 
@@ -45,22 +46,16 @@ KG_ACTOR_NAME: str = "#KnowledgeGraphTool"
 KG_ACTOR_ROLE: str = "ToolActor"
 """Actor role constant for ToolCard integration."""
 
+KG_COLLECTION: str = "knowledge_graph"
+"""Collection name used in VectorStoreActor."""
+
 
 class KnowledgeGraphConfig(BaseConfig):
-    """Configuration for ``KnowledgeGraphActor`` with embedding provider settings.
+    """Configuration for ``KnowledgeGraphActor``.
 
-    Extends ``BaseConfig`` with the embedding model and provider fields so
-    the actor can initialize ``EmbeddingService`` from its config object.
+    An empty ``BaseConfig`` subclass retained for type stability
+    (the actor generic parameter still references it).
     """
-
-    embedding_model: str = Field(
-        default="text-embedding-3-small",
-        description="OpenAI embedding model identifier",
-    )
-    embedding_provider: Literal["openai", "azure"] = Field(
-        default="openai",
-        description="Which OpenAI SDK variant to use for embeddings",
-    )
 
 
 class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
@@ -81,54 +76,69 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
     # ------------------------------------------------------------------
 
     def on_start(self) -> None:  # noqa: ANN201
-        """Initialize state, attach observer, and set up the vector index."""
+        """Initialize state, attach observer, and acquire VectorStoreActor proxy."""
         self.state = KnowledgeGraphState()
         self.state.observer(self)
-        self._vector_index = VectorIndex()
-        self._embedding_svc: EmbeddingService | None = None
+        self._vs_proxy: VectorStoreActor | None = None
+        self._acquire_vs_proxy()
 
-    # ------------------------------------------------------------------
-    # Embedding helpers
-    # ------------------------------------------------------------------
+    def _acquire_vs_proxy(self) -> None:
+        """Acquire the VectorStoreActor proxy and create the KG collection.
 
-    def _get_or_create_embedding_svc(self) -> EmbeddingService | None:
-        """Return the ``EmbeddingService``, creating it lazily on first call.
-
-        Returns:
-            The service instance, or ``None`` if creation fails (e.g. missing deps).
+        Operates in degraded mode (no vector search) if the proxy cannot
+        be acquired.
         """
-        if self._embedding_svc is None:
-            try:
-                self._embedding_svc = EmbeddingService(
-                    model=self.config.embedding_model,
-                    provider=self.config.embedding_provider,
-                )
-            except Exception as exc:  # noqa: BLE001
+        try:
+            if self.orchestrator is None:
                 logger.warning(
-                    "[%s] Failed to initialize EmbeddingService: %s", self.config.name, exc
+                    "[%s] No orchestrator; operating in degraded mode",
+                    self.config.name,
                 )
-                return None
-        return self._embedding_svc
+                return
+            orch_proxy = self.proxy_ask(self.orchestrator, Orchestrator)
+            vs_addr = orch_proxy.get_team_member(VS_ACTOR_NAME)
+            if vs_addr is None:
+                logger.warning(
+                    "[%s] VectorStoreActor not found; operating in degraded mode",
+                    self.config.name,
+                )
+                return
+            self._vs_proxy = self.proxy_ask(vs_addr, VectorStoreActor)
+            self._vs_proxy.create_collection(KG_COLLECTION, CollectionConfig())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[%s] Failed to acquire VectorStoreActor proxy: %s",
+                self.config.name,
+                exc,
+            )
+
+    # ------------------------------------------------------------------
+    # Embedding helpers (via VectorStoreActor proxy)
+    # ------------------------------------------------------------------
 
     def _embed_entity(self, entity: Entity) -> None:
-        """Embed an entity and store the result in the vector index.
+        """Embed an entity and store the result via VectorStoreActor proxy.
 
-        Silently logs a WARNING and returns if the embedding service is
-        unavailable or if the API call fails (AC-7).
+        Silently logs a WARNING and returns if the proxy is unavailable
+        or if the embedding call fails.
         """
-        svc = self._get_or_create_embedding_svc()
-        if svc is None:
+        if self._vs_proxy is None:
             return
         try:
             text = f"{entity.name}: {entity.description}"
-            vectors = svc.embed([text])
-            self._vector_index.add(
-                VectorEntry(
-                    ref_type="entity",
-                    ref_id=str(entity.id),
-                    text=text,
-                    vector=vectors[0],
-                )
+            vectors = self._vs_proxy.embed([text])
+            if not vectors:
+                return
+            self._vs_proxy.add(
+                KG_COLLECTION,
+                [
+                    VectorEntry(
+                        ref_type="entity",
+                        ref_id=str(entity.id),
+                        text=text,
+                        vector=vectors[0],
+                    )
+                ],
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -139,30 +149,34 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         """Embed a relation if it has a non-empty description.
 
         Relations without descriptions are not embedded (no meaningful text).
-        Silently logs WARNING on embedding failure (AC-7).
+        Silently logs WARNING on embedding failure.
         """
         if not relation.description:
             return
-        svc = self._get_or_create_embedding_svc()
-        if svc is None:
+        if self._vs_proxy is None:
             return
         try:
             text = (
                 f"{relation.from_entity} {relation.relation_type} "
                 f"{relation.to_entity}: {relation.description}"
             )
-            vectors = svc.embed([text])
-            self._vector_index.add(
-                VectorEntry(
-                    ref_type="relation",
-                    ref_id=str(relation.id),
-                    text=text,
-                    vector=vectors[0],
-                )
+            vectors = self._vs_proxy.embed([text])
+            if not vectors:
+                return
+            self._vs_proxy.add(
+                KG_COLLECTION,
+                [
+                    VectorEntry(
+                        ref_type="relation",
+                        ref_id=str(relation.id),
+                        text=text,
+                        vector=vectors[0],
+                    )
+                ],
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "[%s] Failed to embed relation '%s→%s': %s",
+                "[%s] Failed to embed relation '%s->%s': %s",
                 self.config.name,
                 relation.from_entity,
                 relation.to_entity,
@@ -273,7 +287,8 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
                 continue
 
             if eu.description is not None and eu.description != entity.description:
-                self._vector_index.remove({str(entity.id)})
+                if self._vs_proxy is not None:
+                    self._vs_proxy.remove(KG_COLLECTION, [str(entity.id)])
                 entity.description = eu.description
                 self._embed_entity(entity)
             elif eu.description is not None:
@@ -335,9 +350,11 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
                 if r.from_entity not in names_set and r.to_entity not in names_set
             ]
 
-            self._vector_index.remove(
-                {str(eid) for eid in _deleted_ids} | {str(rid) for rid in _deleted_rel_ids}
-            )
+            if self._vs_proxy is not None:
+                ref_ids = [str(eid) for eid in _deleted_ids] + [
+                    str(rid) for rid in _deleted_rel_ids
+                ]
+                self._vs_proxy.remove(KG_COLLECTION, ref_ids)
 
         return errors
 
@@ -379,7 +396,8 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
                 if (r.from_entity, r.to_entity, r.relation_type) not in triples_to_delete
             ]
 
-            self._vector_index.remove({str(rid) for rid in _deleted_rel_ids})
+            if self._vs_proxy is not None:
+                self._vs_proxy.remove(KG_COLLECTION, [str(rid) for rid in _deleted_rel_ids])
 
         return errors
 
@@ -684,8 +702,8 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
     def _vector_search(self, query_text: str, top_k: int) -> SearchResult:
         """Embed ``query_text`` and return top-k results by cosine similarity.
 
-        Returns an empty ``SearchResult`` when the embedding service is
-        unavailable, the index is empty, or the embedding call fails.
+        Returns an empty ``SearchResult`` when the VectorStoreActor proxy is
+        unavailable or the embedding call fails.
 
         Args:
             query_text: The natural-language query to embed and search.
@@ -694,17 +712,26 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         Returns:
             ``SearchResult`` with hits ranked by cosine similarity score.
         """
-        svc = self._get_or_create_embedding_svc()
-        if svc is None or len(self._vector_index) == 0:
+        if self._vs_proxy is None:
             return SearchResult(hits=[])
         try:
-            vectors = svc.embed([query_text])
+            vectors = self._vs_proxy.embed([query_text])
+            if not vectors:
+                return SearchResult(hits=[])
             query_vector = vectors[0]
         except Exception as exc:  # noqa: BLE001
             logger.warning("[%s] Vector search embedding failed: %s", self.config.name, exc)
             return SearchResult(hits=[])
 
-        pairs = self._vector_index.search_cosine(query_vector, top_k)
+        try:
+            vs_result: VsSearchResult = self._vs_proxy.search(
+                KG_COLLECTION, query_vector, top_k
+            )
+            pairs = [(hit.ref_id, hit.score) for hit in vs_result.hits]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] Vector search failed: %s", self.config.name, exc)
+            return SearchResult(hits=[])
+
         hits: list[SearchHit] = []
         for ref_id, score in pairs:
             obj = self._resolve_ref(ref_id)

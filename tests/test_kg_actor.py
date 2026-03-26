@@ -2,13 +2,13 @@
 
 Covers: all CRUD ops, cascade deletion, error collection, partial updates,
 state change notification, deduplication logic, singleton constants (Task 2.9).
-Also covers embedding wiring: entity/relation embedding on create, re-embedding
-on description update, removal on delete, graceful degradation on API failure
-(Task 5.11, Story 2.1 ACs 3-7).
-Also covers vector search and hybrid search (Story 2.2 ACs 1-5).
+Also covers embedding wiring via VectorStoreActor proxy: entity/relation
+embedding on create, re-embedding on description update, removal on delete,
+graceful degradation on API failure.
+Also covers vector search and hybrid search.
 
 Pattern: Instantiate KnowledgeGraphActor() directly, call on_start(),
-test methods. Same pattern as test_planning_actor.py.
+test methods.  The VectorStoreActor proxy is mocked.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from akgentic.tool.errors import RetriableError
 from akgentic.tool.knowledge_graph.kg_actor import (
     KG_ACTOR_NAME,
     KG_ACTOR_ROLE,
+    KG_COLLECTION,
     KnowledgeGraphActor,
     KnowledgeGraphConfig,
 )
@@ -35,6 +36,9 @@ from akgentic.tool.knowledge_graph.models import (
     RelationDelete,
     SearchQuery,
 )
+from akgentic.tool.vector_store.protocol import CollectionStatus
+from akgentic.tool.vector_store.protocol import SearchHit as VsSearchHit
+from akgentic.tool.vector_store.protocol import SearchResult as VsSearchResult
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -89,9 +93,18 @@ class MockActorAddress(ActorAddress):
 
 
 def _actor() -> KnowledgeGraphActor:
-    """Create and initialize a KnowledgeGraphActor for testing."""
+    """Create and initialize a KnowledgeGraphActor for testing.
+
+    The VectorStoreActor proxy is not available (degraded mode) -- suitable
+    for pure CRUD tests that do not need embedding.
+    """
+    from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
+
     actor = KnowledgeGraphActor()
-    actor.on_start()
+    # Bypass _acquire_vs_proxy (no orchestrator in unit tests)
+    actor.state = KnowledgeGraphState()
+    actor.state.observer(actor)
+    actor._vs_proxy = None
     return actor
 
 
@@ -128,25 +141,22 @@ def _seed_with_relation(actor: KnowledgeGraphActor) -> None:
 
 
 class TestKnowledgeGraphConfig:
-    """AC-1: KnowledgeGraphConfig extends BaseConfig with embedding settings."""
+    """AC-8: KnowledgeGraphConfig is an empty BaseConfig subclass."""
 
-    def test_default_embedding_model(self) -> None:
+    def test_config_is_base_config_subclass(self) -> None:
+        from akgentic.core.agent_config import BaseConfig
+
+        assert issubclass(KnowledgeGraphConfig, BaseConfig)
+
+    def test_config_creates_with_name_and_role(self) -> None:
         cfg = KnowledgeGraphConfig(name="test", role="ToolActor")
-        assert cfg.embedding_model == "text-embedding-3-small"
+        assert cfg.name == "test"
+        assert cfg.role == "ToolActor"
 
-    def test_default_embedding_provider(self) -> None:
+    def test_config_has_no_embedding_fields(self) -> None:
         cfg = KnowledgeGraphConfig(name="test", role="ToolActor")
-        assert cfg.embedding_provider == "openai"
-
-    def test_custom_embedding_model(self) -> None:
-        cfg = KnowledgeGraphConfig(
-            name="test", role="ToolActor", embedding_model="text-embedding-ada-002"
-        )
-        assert cfg.embedding_model == "text-embedding-ada-002"
-
-    def test_azure_provider(self) -> None:
-        cfg = KnowledgeGraphConfig(name="test", role="ToolActor", embedding_provider="azure")
-        assert cfg.embedding_provider == "azure"
+        assert not hasattr(cfg, "embedding_model")
+        assert not hasattr(cfg, "embedding_provider")
 
 
 # ---------------------------------------------------------------------------
@@ -646,23 +656,34 @@ class TestIsRootWiring:
 # ---------------------------------------------------------------------------
 
 _FAKE_VECTOR = [0.1, 0.2, 0.3]
-_EMBED_MODULE = "akgentic.tool.knowledge_graph.kg_actor.EmbeddingService"
+
+
+def _make_mock_vs_proxy() -> MagicMock:
+    """Create a mock VectorStoreActor proxy with default return values."""
+    proxy = MagicMock()
+    proxy.embed.return_value = [_FAKE_VECTOR]
+    proxy.add.return_value = None
+    proxy.remove.return_value = None
+    proxy.create_collection.return_value = None
+    proxy.search.return_value = VsSearchResult(
+        hits=[], status=CollectionStatus.READY, indexing_pending=0
+    )
+    return proxy
 
 
 def _actor_with_mock_embed() -> tuple[KnowledgeGraphActor, MagicMock]:
-    """Return (actor, mock_embed_method) with a pre-wired mock EmbeddingService."""
+    """Return (actor, mock_vs_proxy) with a pre-wired mock VectorStoreActor proxy."""
     actor = _actor()
-    mock_svc = MagicMock()
-    mock_svc.embed.return_value = [_FAKE_VECTOR]
-    actor._embedding_svc = mock_svc  # inject mock directly, bypassing lazy init
-    return actor, mock_svc
+    mock_proxy = _make_mock_vs_proxy()
+    actor._vs_proxy = mock_proxy
+    return actor, mock_proxy
 
 
 class TestEmbeddingOnCreate:
-    """AC-3, AC-4: embedding called when entities/relations are created."""
+    """AC-4, AC-6: embedding called when entities/relations are created via vs_proxy."""
 
     def test_embedding_called_on_entity_create(self) -> None:
-        actor, mock_svc = _actor_with_mock_embed()
+        actor, mock_proxy = _actor_with_mock_embed()
         actor.update_graph(
             ManageGraph(
                 create_entities=[
@@ -670,15 +691,29 @@ class TestEmbeddingOnCreate:
                 ]
             )
         )
-        mock_svc.embed.assert_called_once()
-        call_args = mock_svc.embed.call_args[0][0]
+        mock_proxy.embed.assert_called_once()
+        call_args = mock_proxy.embed.call_args[0][0]
         assert "Alice" in call_args[0]
         assert "Eng" in call_args[0]
 
+    def test_add_called_on_entity_create(self) -> None:
+        actor, mock_proxy = _actor_with_mock_embed()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="Alice", entity_type="Person", description="Eng")
+                ]
+            )
+        )
+        mock_proxy.add.assert_called_once()
+        call_args = mock_proxy.add.call_args
+        assert call_args[0][0] == KG_COLLECTION
+
     def test_embedding_called_on_relation_create_with_description(self) -> None:
-        actor, mock_svc = _actor_with_mock_embed()
+        actor, mock_proxy = _actor_with_mock_embed()
         _seed_entities(actor)
-        mock_svc.reset_mock()
+        mock_proxy.reset_mock()
+        mock_proxy.embed.return_value = [_FAKE_VECTOR]
         actor.update_graph(
             ManageGraph(
                 create_relations=[
@@ -691,14 +726,14 @@ class TestEmbeddingOnCreate:
                 ]
             )
         )
-        mock_svc.embed.assert_called_once()
-        call_args = mock_svc.embed.call_args[0][0]
+        mock_proxy.embed.assert_called_once()
+        call_args = mock_proxy.embed.call_args[0][0]
         assert "long colleagues" in call_args[0]
 
     def test_embedding_skipped_on_relation_create_empty_description(self) -> None:
-        actor, mock_svc = _actor_with_mock_embed()
+        actor, mock_proxy = _actor_with_mock_embed()
         _seed_entities(actor)
-        mock_svc.reset_mock()
+        mock_proxy.reset_mock()
         actor.update_graph(
             ManageGraph(
                 create_relations=[
@@ -706,14 +741,14 @@ class TestEmbeddingOnCreate:
                 ]
             )
         )
-        mock_svc.embed.assert_not_called()
+        mock_proxy.embed.assert_not_called()
 
 
 class TestEmbeddingOnUpdate:
-    """AC-5: re-embedding on description change."""
+    """AC-5: re-embedding on description change via vs_proxy."""
 
     def test_embedding_updated_on_description_change(self) -> None:
-        actor, mock_svc = _actor_with_mock_embed()
+        actor, mock_proxy = _actor_with_mock_embed()
         actor.update_graph(
             ManageGraph(
                 create_entities=[
@@ -721,17 +756,17 @@ class TestEmbeddingOnUpdate:
                 ]
             )
         )
-        embed_count_before = mock_svc.embed.call_count
+        embed_count_before = mock_proxy.embed.call_count
         actor.update_graph(
             ManageGraph(update_entities=[EntityUpdate(name="Alice", description="Senior Eng")])
         )
-        assert mock_svc.embed.call_count == embed_count_before + 1
+        assert mock_proxy.embed.call_count == embed_count_before + 1
         # Verify the new description is embedded, not the old one
-        last_call = mock_svc.embed.call_args[0][0]
+        last_call = mock_proxy.embed.call_args[0][0]
         assert "Senior Eng" in last_call[0]
 
-    def test_no_re_embedding_when_description_unchanged(self) -> None:
-        actor, mock_svc = _actor_with_mock_embed()
+    def test_remove_called_before_re_embedding(self) -> None:
+        actor, mock_proxy = _actor_with_mock_embed()
         actor.update_graph(
             ManageGraph(
                 create_entities=[
@@ -739,19 +774,36 @@ class TestEmbeddingOnUpdate:
                 ]
             )
         )
-        embed_count_before = mock_svc.embed.call_count
+        mock_proxy.remove.reset_mock()
+        actor.update_graph(
+            ManageGraph(update_entities=[EntityUpdate(name="Alice", description="Senior Eng")])
+        )
+        mock_proxy.remove.assert_called_once()
+        call_args = mock_proxy.remove.call_args
+        assert call_args[0][0] == KG_COLLECTION
+
+    def test_no_re_embedding_when_description_unchanged(self) -> None:
+        actor, mock_proxy = _actor_with_mock_embed()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="Alice", entity_type="Person", description="Eng")
+                ]
+            )
+        )
+        embed_count_before = mock_proxy.embed.call_count
         # Update entity_type only — no description change
         actor.update_graph(
             ManageGraph(update_entities=[EntityUpdate(name="Alice", entity_type="Engineer")])
         )
-        assert mock_svc.embed.call_count == embed_count_before
+        assert mock_proxy.embed.call_count == embed_count_before
 
 
 class TestEmbeddingOnDelete:
-    """AC-6: embedding removed when entities/relations are deleted."""
+    """AC-7: embedding removed when entities/relations are deleted via vs_proxy."""
 
     def test_entity_embedding_removed_on_delete(self) -> None:
-        actor, mock_svc = _actor_with_mock_embed()
+        actor, mock_proxy = _actor_with_mock_embed()
         actor.update_graph(
             ManageGraph(
                 create_entities=[
@@ -759,15 +811,17 @@ class TestEmbeddingOnDelete:
                 ]
             )
         )
-        # Check an embedding was stored
-        assert len(actor._vector_index._entries) == 1
-
+        mock_proxy.remove.reset_mock()
         actor.update_graph(ManageGraph(delete_entities=["Alice"]))
-        assert len(actor._vector_index._entries) == 0
+        mock_proxy.remove.assert_called_once()
+        call_args = mock_proxy.remove.call_args
+        assert call_args[0][0] == KG_COLLECTION
+        assert len(call_args[0][1]) == 1  # 1 entity ref_id
 
     def test_relation_embedding_removed_on_delete(self) -> None:
-        actor, mock_svc = _actor_with_mock_embed()
+        actor, mock_proxy = _actor_with_mock_embed()
         _seed_entities(actor)
+        mock_proxy.remove.reset_mock()
         actor.update_graph(
             ManageGraph(
                 create_relations=[
@@ -780,9 +834,7 @@ class TestEmbeddingOnDelete:
                 ]
             )
         )
-        # 2 entity embeddings + 1 relation embedding
-        assert len(actor._vector_index._entries) == 3
-
+        mock_proxy.remove.reset_mock()
         actor.update_graph(
             ManageGraph(
                 delete_relations=[
@@ -790,15 +842,18 @@ class TestEmbeddingOnDelete:
                 ]
             )
         )
-        assert len(actor._vector_index._entries) == 2
+        mock_proxy.remove.assert_called_once()
+        call_args = mock_proxy.remove.call_args
+        assert call_args[0][0] == KG_COLLECTION
+        assert len(call_args[0][1]) == 1  # 1 relation ref_id
 
 
 class TestEmbeddingGracefulDegradation:
-    """AC-7: embedding failures do not block CRUD operations."""
+    """Embedding failures do not block CRUD operations."""
 
     def test_embedding_failure_does_not_block_entity_create(self) -> None:
-        actor, mock_svc = _actor_with_mock_embed()
-        mock_svc.embed.side_effect = RuntimeError("API key invalid")
+        actor, mock_proxy = _actor_with_mock_embed()
+        mock_proxy.embed.side_effect = RuntimeError("API key invalid")
         result = actor.update_graph(
             ManageGraph(
                 create_entities=[
@@ -810,9 +865,9 @@ class TestEmbeddingGracefulDegradation:
         assert len(actor.get_graph().entities) == 1
 
     def test_embedding_failure_does_not_block_relation_create(self) -> None:
-        actor, mock_svc = _actor_with_mock_embed()
+        actor, mock_proxy = _actor_with_mock_embed()
         _seed_entities(actor)
-        mock_svc.embed.side_effect = RuntimeError("API timeout")
+        mock_proxy.embed.side_effect = RuntimeError("API timeout")
         result = actor.update_graph(
             ManageGraph(
                 create_relations=[
@@ -828,6 +883,19 @@ class TestEmbeddingGracefulDegradation:
         assert result == "Done"
         assert len(actor.get_graph().relations) == 1
 
+    def test_degraded_mode_when_no_proxy(self) -> None:
+        """When _vs_proxy is None, CRUD works but no embedding calls are made."""
+        actor = _actor()  # _vs_proxy is None
+        result = actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="Alice", entity_type="Person", description="Eng")
+                ]
+            )
+        )
+        assert result == "Done"
+        assert len(actor.get_graph().entities) == 1
+
 
 # ---------------------------------------------------------------------------
 # Vector search (Story 2.2 Task 1, ACs 1, 3, 5)
@@ -835,10 +903,10 @@ class TestEmbeddingGracefulDegradation:
 
 
 class TestVectorSearch:
-    """AC-1, AC-5: vector search returns ranked results or empty on no embeddings."""
+    """AC-5: vector search returns ranked results or empty on no embeddings."""
 
     def test_vector_search_returns_top_k_ranked_by_score(self) -> None:
-        actor, mock_svc = _actor_with_mock_embed()
+        actor, mock_proxy = _actor_with_mock_embed()
         actor.update_graph(
             ManageGraph(
                 create_entities=[
@@ -848,35 +916,37 @@ class TestVectorSearch:
             )
         )
         entity_ids = [str(e.id) for e in actor.get_graph().entities]
-        with patch.object(
-            actor._vector_index,  # noqa: SLF001
-            "search_cosine",
-            return_value=[(entity_ids[0], 0.9), (entity_ids[1], 0.5)],
-        ):
-            mock_svc.embed.return_value = [_FAKE_VECTOR]
-            result = actor.search(SearchQuery(query="engineer", top_k=2, mode="vector"))
+        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        mock_proxy.search.return_value = VsSearchResult(
+            hits=[
+                VsSearchHit(ref_type="entity", ref_id=entity_ids[0], text="", score=0.9),
+                VsSearchHit(ref_type="entity", ref_id=entity_ids[1], text="", score=0.5),
+            ],
+            status=CollectionStatus.READY,
+            indexing_pending=0,
+        )
+        result = actor.search(SearchQuery(query="engineer", top_k=2, mode="vector"))
         assert len(result.hits) == 2
         assert result.hits[0].score == 0.9
         assert result.hits[1].score == 0.5
         assert result.hits[0].entity is not None
 
-    def test_vector_search_returns_empty_when_no_entries_in_index(self) -> None:
-        actor = _actor()
+    def test_vector_search_returns_empty_when_no_proxy(self) -> None:
+        actor = _actor()  # _vs_proxy is None
         result = actor.search(SearchQuery(query="anything", top_k=5, mode="vector"))
         assert result.hits == []
 
     def test_vector_search_returns_empty_when_embed_call_fails(self) -> None:
-        """Verify graceful empty result when embed() raises during vector search (AC-5)."""
-        actor, mock_svc = _actor_with_mock_embed()
-        actor.update_graph(
-            ManageGraph(
-                create_entities=[
-                    EntityCreate(name="Alice", entity_type="Person", description="Eng")
-                ]
-            )
-        )
-        # Index has 1 entry; make embed raise during the search query
-        mock_svc.embed.side_effect = RuntimeError("API quota exceeded")
+        """Verify graceful empty result when embed() raises during vector search."""
+        actor, mock_proxy = _actor_with_mock_embed()
+        mock_proxy.embed.side_effect = RuntimeError("API quota exceeded")
+        result = actor.search(SearchQuery(query="Alice", top_k=5, mode="vector"))
+        assert result.hits == []
+
+    def test_vector_search_returns_empty_when_embed_returns_empty(self) -> None:
+        """VectorStoreActor returns [] on embed failure -- should result in empty search."""
+        actor, mock_proxy = _actor_with_mock_embed()
+        mock_proxy.embed.return_value = []
         result = actor.search(SearchQuery(query="Alice", top_k=5, mode="vector"))
         assert result.hits == []
 
@@ -887,13 +957,13 @@ class TestVectorSearch:
 
 
 class TestHybridSearch:
-    """AC-2, AC-4: hybrid merges keyword+vector, falls back to keyword when no embeddings."""
+    """Hybrid merges keyword+vector, falls back to keyword when no embeddings."""
 
     def _setup_actor_with_known_vectors(
         self,
     ) -> tuple[KnowledgeGraphActor, MagicMock]:
-        """Actor with Alice + Bob; mock embed returns fixed vectors."""
-        actor, mock_svc = _actor_with_mock_embed()
+        """Actor with Alice + Bob; mock vs_proxy."""
+        actor, mock_proxy = _actor_with_mock_embed()
         actor.update_graph(
             ManageGraph(
                 create_entities=[
@@ -906,10 +976,10 @@ class TestHybridSearch:
                 ]
             )
         )
-        return actor, mock_svc
+        return actor, mock_proxy
 
-    def test_hybrid_falls_back_to_keyword_when_no_embeddings(self) -> None:
-        actor = _actor()
+    def test_hybrid_falls_back_to_keyword_when_no_proxy(self) -> None:
+        actor = _actor()  # _vs_proxy is None
         actor.update_graph(
             ManageGraph(
                 create_entities=[
@@ -917,46 +987,46 @@ class TestHybridSearch:
                 ]
             )
         )
-        # No embedding service → vector search returns empty → hybrid falls back
         result = actor.search(SearchQuery(query="Alice", top_k=5, mode="hybrid"))
         assert len(result.hits) == 1
         assert result.hits[0].entity is not None
         assert result.hits[0].entity.name == "Alice"
 
     def test_hybrid_deduplicates_by_ref_id(self) -> None:
-        actor, mock_svc = self._setup_actor_with_known_vectors()
+        actor, mock_proxy = self._setup_actor_with_known_vectors()
         alice_id = str(
             next(e for e in actor.get_graph().entities if e.name == "Alice").id
         )
-        with patch.object(
-            actor._vector_index,  # noqa: SLF001
-            "search_cosine",
-            return_value=[(alice_id, 0.8)],
-        ):
-            mock_svc.embed.return_value = [_FAKE_VECTOR]
-            result = actor.search(SearchQuery(query="Alice", top_k=10, mode="hybrid"))
+        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        mock_proxy.search.return_value = VsSearchResult(
+            hits=[VsSearchHit(ref_type="entity", ref_id=alice_id, text="", score=0.8)],
+            status=CollectionStatus.READY,
+            indexing_pending=0,
+        )
+        result = actor.search(SearchQuery(query="Alice", top_k=10, mode="hybrid"))
         alice_hits = [h for h in result.hits if h.ref_id == alice_id]
         assert len(alice_hits) == 1, "Alice should appear exactly once (deduplication)"
 
     def test_hybrid_combined_hits_rank_higher_than_vector_only(self) -> None:
-        actor, mock_svc = self._setup_actor_with_known_vectors()
+        actor, mock_proxy = self._setup_actor_with_known_vectors()
         entities = actor.get_graph().entities
         alice_id = str(next(e for e in entities if e.name == "Alice").id)
         bob_id = str(next(e for e in entities if e.name == "Bob").id)
-        # Alice matches keyword "login" AND vector; Bob matches vector only
-        with patch.object(
-            actor._vector_index,  # noqa: SLF001
-            "search_cosine",
-            return_value=[(alice_id, 0.8), (bob_id, 0.9)],
-        ):
-            mock_svc.embed.return_value = [_FAKE_VECTOR]
-            result = actor.search(SearchQuery(query="login", top_k=5, mode="hybrid"))
-        # Alice: vector(0.8) + keyword_boost(0.5) = 1.3; Bob: vector only = 0.9
+        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        mock_proxy.search.return_value = VsSearchResult(
+            hits=[
+                VsSearchHit(ref_type="entity", ref_id=alice_id, text="", score=0.8),
+                VsSearchHit(ref_type="entity", ref_id=bob_id, text="", score=0.9),
+            ],
+            status=CollectionStatus.READY,
+            indexing_pending=0,
+        )
+        result = actor.search(SearchQuery(query="login", top_k=5, mode="hybrid"))
         ref_ids = [h.ref_id for h in result.hits]
         assert ref_ids[0] == alice_id, "Alice (vector+keyword) should rank above Bob (vector-only)"
 
     def test_hybrid_top_k_limits_results(self) -> None:
-        actor, mock_svc = _actor_with_mock_embed()
+        actor, mock_proxy = _actor_with_mock_embed()
         actor.update_graph(
             ManageGraph(
                 create_entities=[
@@ -966,13 +1036,16 @@ class TestHybridSearch:
             )
         )
         entity_ids = [str(e.id) for e in actor.get_graph().entities]
-        with patch.object(
-            actor._vector_index,  # noqa: SLF001
-            "search_cosine",
-            return_value=[(eid, 0.5) for eid in entity_ids],
-        ):
-            mock_svc.embed.return_value = [_FAKE_VECTOR]
-            result = actor.search(SearchQuery(query="desc", top_k=3, mode="hybrid"))
+        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        mock_proxy.search.return_value = VsSearchResult(
+            hits=[
+                VsSearchHit(ref_type="entity", ref_id=eid, text="", score=0.5)
+                for eid in entity_ids
+            ],
+            status=CollectionStatus.READY,
+            indexing_pending=0,
+        )
+        result = actor.search(SearchQuery(query="desc", top_k=3, mode="hybrid"))
         assert len(result.hits) <= 3
 
 
