@@ -6,6 +6,12 @@ directly from ``akgentic.tool.vector_store``.
 
 from __future__ import annotations
 
+from akgentic.tool.vector_store.actor import (
+    VS_ACTOR_NAME,
+    VS_ACTOR_ROLE,
+    VectorStoreActor,
+    VectorStoreState,
+)
 from akgentic.tool.vector_store.inmemory import InMemoryBackend
 from akgentic.tool.vector_store.protocol import (
     CollectionConfig,
@@ -24,6 +30,10 @@ __all__ = [
     "InMemoryBackend",
     "SearchHit",
     "SearchResult",
+    "VS_ACTOR_NAME",
+    "VS_ACTOR_ROLE",
+    "VectorStoreActor",
     "VectorStoreConfig",
     "VectorStoreService",
+    "VectorStoreState",
 ]

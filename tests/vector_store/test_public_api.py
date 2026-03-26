@@ -22,7 +22,11 @@ class TestPublicApi:
             "InMemoryBackend",
             "SearchHit",
             "SearchResult",
+            "VS_ACTOR_NAME",
+            "VS_ACTOR_ROLE",
+            "VectorStoreActor",
             "VectorStoreConfig",
             "VectorStoreService",
+            "VectorStoreState",
         }
         assert set(vs.__all__) == expected
