@@ -6,6 +6,7 @@ directly from ``akgentic.tool.vector_store``.
 
 from __future__ import annotations
 
+from akgentic.tool.vector_store.inmemory import InMemoryBackend
 from akgentic.tool.vector_store.protocol import (
     CollectionConfig,
     CollectionStatus,
@@ -20,6 +21,7 @@ __all__ = [
     "CollectionConfig",
     "CollectionStatus",
     "EmbeddingProvider",
+    "InMemoryBackend",
     "SearchHit",
     "SearchResult",
     "VectorStoreConfig",

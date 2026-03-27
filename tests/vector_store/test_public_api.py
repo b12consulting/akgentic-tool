@@ -19,6 +19,7 @@ class TestPublicApi:
             "CollectionConfig",
             "CollectionStatus",
             "EmbeddingProvider",
+            "InMemoryBackend",
             "SearchHit",
             "SearchResult",
             "VectorStoreConfig",
