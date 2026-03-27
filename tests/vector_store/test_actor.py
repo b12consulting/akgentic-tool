@@ -101,6 +101,28 @@ class TestVectorStoreState:
         assert restored.backend_state == state.backend_state
         assert restored.collection_statuses == state.collection_statuses
 
+    def test_collection_configs_round_trip(self) -> None:
+        """collection_configs survives Pydantic serialisation."""
+        state = VectorStoreState(
+            collection_configs={
+                "c1": {
+                    "dimension": 128,
+                    "backend": "inmemory",
+                    "persistence": "workspace",
+                    "workspace_path": "/tmp/ws",
+                }
+            },
+        )
+        data = state.model_dump()
+        restored = VectorStoreState.model_validate(data)
+        assert restored.collection_configs == state.collection_configs
+        assert restored.collection_configs["c1"]["persistence"] == "workspace"
+
+    def test_collection_configs_defaults_empty(self) -> None:
+        """collection_configs defaults to empty dict."""
+        state = VectorStoreState()
+        assert state.collection_configs == {}
+
 
 # ---------------------------------------------------------------------------
 # Actor lifecycle (AC1, AC2, AC3, AC10)
@@ -160,6 +182,21 @@ class TestCreateCollection:
 
         actor.create_collection("test_col", CollectionConfig())
         assert actor.state.collection_statuses["test_col"] == CollectionStatus.READY
+
+    def test_populates_collection_configs(self) -> None:
+        """create_collection stores config dict in state.collection_configs."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+
+        config = CollectionConfig(dimension=128, persistence="workspace", workspace_path="/ws")
+        actor.create_collection("test_col", config)
+        assert "test_col" in actor.state.collection_configs
+        cfg = actor.state.collection_configs["test_col"]
+        assert cfg["dimension"] == 128
+        assert cfg["persistence"] == "workspace"
+        assert cfg["workspace_path"] == "/ws"
+        assert cfg["backend"] == "inmemory"
 
     def test_notifies_state_change(self) -> None:
         """AC12: state.notify_state_change() called after creation."""
@@ -892,6 +929,54 @@ class TestLazyBackend:
             assert result is None
         finally:
             vector_mod.EmbeddingService = original_cls  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# _save_workspace_collection error handling
+# ---------------------------------------------------------------------------
+
+
+class TestSaveWorkspaceCollection:
+    """Workspace save error handling: logs warning and does not raise."""
+
+    def test_save_logs_warning_on_backend_error(self) -> None:
+        """_save_workspace_collection catches and logs backend save failure."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        backend.save_collection.side_effect = OSError("disk full")
+        actor._backend = backend
+        actor.state.collection_configs["col1"] = {
+            "dimension": 3,
+            "backend": "inmemory",
+            "persistence": "workspace",
+            "workspace_path": "/tmp/ws",
+        }
+        # Should not raise
+        actor._save_workspace_collection("col1")
+        backend.save_collection.assert_called_once_with("col1", "/tmp/ws")
+
+    def test_save_skipped_for_actor_state_persistence(self) -> None:
+        """_save_workspace_collection is a no-op for actor_state persistence."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+        actor.state.collection_configs["col1"] = {
+            "dimension": 3,
+            "backend": "inmemory",
+            "persistence": "actor_state",
+            "workspace_path": None,
+        }
+        actor._save_workspace_collection("col1")
+        backend.save_collection.assert_not_called()
+
+    def test_save_skipped_for_unknown_collection(self) -> None:
+        """_save_workspace_collection is a no-op for unknown collection."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+        # No collection_configs entry
+        actor._save_workspace_collection("unknown_col")
+        backend.save_collection.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

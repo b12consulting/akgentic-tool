@@ -70,6 +70,10 @@ class VectorStoreState(BaseState):
         default_factory=dict,
         description="Count of entries pending embedding per collection",
     )
+    collection_configs: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        description="Serialised CollectionConfig per collection (for persistence lookups)",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +160,30 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         if self._backend is not None:
             self.state.backend_state = self._backend.get_state()
 
+    def _save_workspace_collection(self, collection: str) -> None:
+        """Persist a workspace collection to disk if applicable.
+
+        Checks the stored ``CollectionConfig`` for the collection. If
+        ``persistence == "workspace"`` and a ``workspace_path`` is set,
+        delegates to ``InMemoryBackend.save_collection()``.
+
+        Args:
+            collection: Collection name to potentially persist.
+        """
+        cfg_data = self.state.collection_configs.get(collection, {})
+        persistence = cfg_data.get("persistence", "actor_state")
+        workspace_path = cfg_data.get("workspace_path")
+        if persistence == "workspace" and workspace_path and self._backend is not None:
+            try:
+                self._backend.save_collection(collection, workspace_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[%s] _save_workspace_collection failed for '%s': %s",
+                    self.config.name,
+                    collection,
+                    exc,
+                )
+
     # ------------------------------------------------------------------
     # Proxy methods
     # ------------------------------------------------------------------
@@ -163,8 +191,9 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
     def create_collection(self, name: str, config: CollectionConfig) -> None:
         """Create or reconfigure a named collection.
 
-        Delegates to ``InMemoryBackend.create_collection()``, marks the
-        collection as ``READY``, and notifies the orchestrator.
+        For ``persistence="workspace"`` collections, delegates to
+        ``InMemoryBackend.load_collection()`` which restores from disk
+        or starts empty. Otherwise delegates to ``create_collection()``.
 
         Args:
             name: Unique collection identifier.
@@ -178,7 +207,16 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
             )
             return
         try:
-            backend.create_collection(name, config)
+            if config.persistence == "workspace" and config.workspace_path:
+                backend.load_collection(name, config, config.workspace_path)
+            else:
+                backend.create_collection(name, config)
+            self.state.collection_configs[name] = {
+                "dimension": config.dimension,
+                "backend": config.backend,
+                "persistence": config.persistence,
+                "workspace_path": config.workspace_path,
+            }
             self.state.collection_statuses[name] = CollectionStatus.READY
             self._sync_backend_state()
             self.state.notify_state_change()
@@ -226,6 +264,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         try:
             backend.add(collection, entries)
             self._sync_backend_state()
+            self._save_workspace_collection(collection)
             self.state.notify_state_change()
         except ValueError as exc:
             raise RetriableError(str(exc)) from exc
@@ -296,6 +335,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         try:
             backend.remove(collection, ref_ids)
             self._sync_backend_state()
+            self._save_workspace_collection(collection)
             self.state.notify_state_change()
         except ValueError as exc:
             raise RetriableError(str(exc)) from exc
@@ -361,6 +401,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
             backend.add(msg.collection, msg.entries)
             self._remove_pending(msg.collection, len(msg.entries))
             self._sync_backend_state()
+            self._save_workspace_collection(msg.collection)
             self.state.notify_state_change()
         except Exception as exc:  # noqa: BLE001
             logger.warning(
