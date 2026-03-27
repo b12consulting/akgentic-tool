@@ -18,7 +18,11 @@ class TestPublicApi:
         expected = {
             "CollectionConfig",
             "CollectionStatus",
+            "EmbeddingActor",
+            "EmbeddingError",
             "EmbeddingProvider",
+            "EmbeddingRequest",
+            "EmbeddingResult",
             "InMemoryBackend",
             "SearchHit",
             "SearchResult",
