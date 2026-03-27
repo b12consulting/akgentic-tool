@@ -19,6 +19,11 @@ from akgentic.tool.vector_store.embedding_actor import (
     EmbeddingResult,
 )
 from akgentic.tool.vector_store.inmemory import InMemoryBackend
+
+try:
+    from akgentic.tool.vector_store.weaviate import WeaviateBackend
+except ImportError:
+    WeaviateBackend = None  # type: ignore[assignment,misc]
 from akgentic.tool.vector_store.protocol import (
     CollectionConfig,
     CollectionStatus,
@@ -38,6 +43,7 @@ __all__ = [
     "EmbeddingRequest",
     "EmbeddingResult",
     "InMemoryBackend",
+    "WeaviateBackend",
     "SearchHit",
     "SearchResult",
     "VS_ACTOR_NAME",

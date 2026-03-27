@@ -1022,3 +1022,132 @@ class TestPublicApiExports:
         assert hasattr(vs, "EmbeddingRequest")
         assert hasattr(vs, "EmbeddingResult")
         assert hasattr(vs, "EmbeddingError")
+
+
+# ---------------------------------------------------------------------------
+# Weaviate backend routing (AC11 — Story 12.1)
+# ---------------------------------------------------------------------------
+
+
+class TestWeaviateRouting:
+    """AC11: VectorStoreActor routes weaviate collections to WeaviateBackend."""
+
+    def test_create_collection_routes_to_weaviate(self) -> None:
+        """create_collection with backend='weaviate' uses WeaviateBackend."""
+        actor = _make_actor()
+        actor.config = VectorStoreConfig(
+            name=VS_ACTOR_NAME,
+            role=VS_ACTOR_ROLE,
+            weaviate_url="http://localhost:8080",
+        )
+        mock_wb = MagicMock()
+        actor._weaviate_backend = mock_wb
+
+        config = CollectionConfig(backend="weaviate", dimension=384)
+        actor.create_collection("wv_col", config)
+
+        mock_wb.create_collection.assert_called_once_with("wv_col", config)
+        assert actor.state.collection_configs["wv_col"]["backend"] == "weaviate"
+        assert actor.state.collection_statuses["wv_col"] == CollectionStatus.READY
+
+    def test_create_collection_inmemory_still_works(self) -> None:
+        """create_collection with backend='inmemory' still routes to InMemoryBackend."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+
+        config = CollectionConfig(backend="inmemory")
+        actor.create_collection("im_col", config)
+
+        backend.create_collection.assert_called_once_with("im_col", config)
+        assert actor.state.collection_configs["im_col"]["backend"] == "inmemory"
+
+    def test_add_routes_to_weaviate_backend(self) -> None:
+        """add() for a weaviate collection routes to WeaviateBackend."""
+        actor = _make_actor()
+        mock_wb = MagicMock()
+        actor._weaviate_backend = mock_wb
+        actor.state.collection_configs["wv_col"] = {"backend": "weaviate"}
+
+        entry = _mock_entry(vector=[0.1, 0.2])
+        actor.add("wv_col", [entry])
+
+        mock_wb.add.assert_called_once_with("wv_col", [entry])
+
+    def test_remove_routes_to_weaviate_backend(self) -> None:
+        """remove() for a weaviate collection routes to WeaviateBackend."""
+        actor = _make_actor()
+        mock_wb = MagicMock()
+        actor._weaviate_backend = mock_wb
+        actor.state.collection_configs["wv_col"] = {"backend": "weaviate"}
+
+        actor.remove("wv_col", ["id1"])
+
+        mock_wb.remove.assert_called_once_with("wv_col", ["id1"])
+
+    def test_search_routes_to_weaviate_backend(self) -> None:
+        """search() for a weaviate collection routes to WeaviateBackend."""
+        actor = _make_actor()
+        mock_wb = MagicMock()
+        expected = SearchResult(hits=[], status=CollectionStatus.READY, indexing_pending=0)
+        mock_wb.search.return_value = expected
+        actor._weaviate_backend = mock_wb
+        actor.state.collection_configs["wv_col"] = {"backend": "weaviate"}
+
+        result = actor.search("wv_col", [0.1], 5)
+
+        mock_wb.search.assert_called_once_with("wv_col", [0.1], 5)
+        assert result == expected
+
+    def test_inmemory_collection_not_routed_to_weaviate(self) -> None:
+        """inmemory collections still go to InMemoryBackend even when weaviate is available."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+        mock_wb = MagicMock()
+        actor._weaviate_backend = mock_wb
+        actor.state.collection_configs["im_col"] = {"backend": "inmemory"}
+
+        entry = _mock_entry(vector=[0.1])
+        actor.add("im_col", [entry])
+
+        backend.add.assert_called_once()
+        mock_wb.add.assert_not_called()
+
+    def test_weaviate_backend_unavailable_logs_warning(self) -> None:
+        """create_collection logs warning when weaviate backend is unavailable."""
+        actor = _make_actor()
+        actor.config = VectorStoreConfig(name=VS_ACTOR_NAME, role=VS_ACTOR_ROLE)
+        # No weaviate_url => _get_or_create_weaviate_backend returns None
+
+        config = CollectionConfig(backend="weaviate")
+        actor.create_collection("wv_col", config)
+
+        # Should not crash, just skip
+        assert "wv_col" not in actor.state.collection_statuses
+
+    def test_weaviate_no_sync_backend_state(self) -> None:
+        """Weaviate collections should NOT call _sync_backend_state."""
+        actor = _make_actor()
+        mock_wb = MagicMock()
+        actor._weaviate_backend = mock_wb
+        actor.config = VectorStoreConfig(
+            name=VS_ACTOR_NAME,
+            role=VS_ACTOR_ROLE,
+            weaviate_url="http://localhost:8080",
+        )
+
+        config = CollectionConfig(backend="weaviate")
+        actor.create_collection("wv_col", config)
+
+        # backend_state should still be empty (not synced for weaviate)
+        assert actor.state.backend_state == {}
+
+    def test_get_backend_for_collection_defaults_to_inmemory(self) -> None:
+        """Unknown collections default to inmemory backend."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+
+        result = actor._get_backend_for_collection("unknown")
+        assert result is backend
