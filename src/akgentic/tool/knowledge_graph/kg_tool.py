@@ -38,6 +38,8 @@ from akgentic.tool.knowledge_graph.models import (
     SearchQuery,
     SearchResult,
 )
+from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
+from akgentic.tool.vector_store.protocol import VectorStoreConfig
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -114,8 +116,8 @@ class KnowledgeGraphTool(ToolCard):
     def observer(self, observer: ActorToolObserver) -> None:  # type: ignore[override]
         """Attach observer and set up the KG actor proxy.
 
-        Creates/retrieves the singleton ``KnowledgeGraphActor`` via the
-        orchestrator, identical to PlanningTool's observer pattern.
+        Ensures the ``VectorStoreActor`` singleton exists (AC10) before
+        creating/retrieving the ``KnowledgeGraphActor`` singleton.
         """
         from akgentic.tool.knowledge_graph import _check_kg_dependencies
 
@@ -126,8 +128,23 @@ class KnowledgeGraphTool(ToolCard):
             raise ValueError("KnowledgeGraphTool requires access to the orchestrator.")
 
         orchestrator_proxy = observer.proxy_ask(observer.orchestrator, Orchestrator)
-        kg_addr = orchestrator_proxy.get_team_member(KG_ACTOR_NAME)
 
+        # Ensure VectorStoreActor singleton exists (AC10)
+        vs_addr = orchestrator_proxy.get_team_member(VS_ACTOR_NAME)
+        if vs_addr is None:
+            logger.info("KnowledgeGraphTool: creating singleton %s.", VS_ACTOR_NAME)
+            vs_addr = orchestrator_proxy.createActor(
+                VectorStoreActor,
+                config=VectorStoreConfig(
+                    name=VS_ACTOR_NAME,
+                    role="ToolActor",
+                    embedding_model=self.embedding_model,
+                    embedding_provider=self.embedding_provider,
+                ),
+            )
+
+        # Create/retrieve KnowledgeGraphActor singleton
+        kg_addr = orchestrator_proxy.get_team_member(KG_ACTOR_NAME)
         if kg_addr is None:
             logger.info("KnowledgeGraphTool: creating singleton %s.", KG_ACTOR_NAME)
             kg_addr = orchestrator_proxy.createActor(
@@ -135,8 +152,6 @@ class KnowledgeGraphTool(ToolCard):
                 config=KnowledgeGraphConfig(
                     name=KG_ACTOR_NAME,
                     role=KG_ACTOR_ROLE,
-                    embedding_model=self.embedding_model,
-                    embedding_provider=self.embedding_provider,
                 ),
             )
 

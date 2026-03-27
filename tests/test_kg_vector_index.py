@@ -260,26 +260,7 @@ class TestVectorIndexPerformance:
 
 
 # ---------------------------------------------------------------------------
-# Backward-compat shim (AC-5: old import paths must still work)
+# Backward-compat shim removed (Story 11.1 AC-9)
+# vector_index.py shim and KG re-exports of VectorEntry/EmbeddingService are deleted.
+# VectorEntry and EmbeddingService should be imported from akgentic.tool.vector directly.
 # ---------------------------------------------------------------------------
-
-
-class TestBackwardCompatImports:
-    """Verify that importing from deprecated paths still works."""
-
-    def test_vector_index_shim_exports_embedding_service(self) -> None:
-        from akgentic.tool.knowledge_graph.vector_index import (
-            EmbeddingService as ShimEmbeddingService,
-        )
-
-        assert ShimEmbeddingService is EmbeddingService
-
-    def test_vector_index_shim_exports_vector_index(self) -> None:
-        from akgentic.tool.knowledge_graph.vector_index import VectorIndex as ShimVectorIndex
-
-        assert ShimVectorIndex is VectorIndex
-
-    def test_knowledge_graph_package_exports_vector_entry(self) -> None:
-        from akgentic.tool.knowledge_graph import VectorEntry as KgVectorEntry
-
-        assert KgVectorEntry is VectorEntry
