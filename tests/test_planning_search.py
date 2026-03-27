@@ -491,7 +491,7 @@ class TestSearchPlanningVectorFallback:
 
 
 class TestSearchPlanningParamClass:
-    """AC1: SearchPlanning has correct expose and field types."""
+    """AC1: SearchPlanning has correct expose and only inherited fields."""
 
     def test_expose_contains_tool_call_and_command(self) -> None:
         from akgentic.tool.core import COMMAND, TOOL_CALL
@@ -504,7 +504,6 @@ class TestSearchPlanningParamClass:
     def test_only_inherited_fields(self) -> None:
         from akgentic.tool.planning.planning import SearchPlanning
 
-        SearchPlanning()
         # SearchPlanning should only have inherited fields from BaseToolParam
         field_names = set(SearchPlanning.model_fields.keys())
         assert field_names == {"expose", "instructions"}
