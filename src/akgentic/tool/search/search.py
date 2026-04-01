@@ -11,18 +11,23 @@ from akgentic.tool.core import TOOL_CALL, BaseToolParam, ToolCard, _resolve
 logger = logging.getLogger(__name__)
 
 
+def _has_tavily_api_key() -> bool:
+    """Return ``True`` when ``TAVILY_API_KEY`` is present and non-empty."""
+    return bool(os.environ.get("TAVILY_API_KEY", "").strip())
+
+
 def _check_tavily_api_key() -> bool:
-    """Check whether ``TAVILY_API_KEY`` is configured in the environment.
+    """Check whether ``TAVILY_API_KEY`` is configured and log a warning if not.
 
     Returns:
         ``True`` when the key is present and non-empty, ``False`` otherwise.
         A warning is logged when the key is missing.
     """
-    if os.environ.get("TAVILY_API_KEY", "").strip():
+    if _has_tavily_api_key():
         return True
     logger.warning(
         "TAVILY_API_KEY is not set in the environment. "
-        "Tavily search tools will be non-functional until the key is configured."
+        "Tavily search tools will be registered but non-functional until the key is configured."
     )
     return False
 
@@ -63,11 +68,7 @@ class SearchTool(ToolCard):
     web_fetch: WebFetch | bool = True
 
     def get_tools(self) -> list[Callable]:
-        if not _check_tavily_api_key():
-            logger.warning(
-                "SearchTool: Tavily tools registered but will be non-functional "
-                "— TAVILY_API_KEY is not set."
-            )
+        _check_tavily_api_key()
         tools: list[Callable] = []
         ws = _resolve(self.web_search, WebSearch)
         if ws and TOOL_CALL in ws.expose:
@@ -100,7 +101,7 @@ class SearchTool(ToolCard):
                     - ``advanced``: higher relevance, potentially slower and more expensive.
                     If ``None``, Tavily default behavior is used.
             """
-            if not os.environ.get("TAVILY_API_KEY", "").strip():
+            if not _has_tavily_api_key():
                 return (
                     "Web search is unavailable: TAVILY_API_KEY is not set. "
                     "Ask the user to configure it and restart."
@@ -150,7 +151,7 @@ class SearchTool(ToolCard):
                       potentially slower and more expensive.
                     If ``None``, Tavily default behavior is used.
             """
-            if not os.environ.get("TAVILY_API_KEY", "").strip():
+            if not _has_tavily_api_key():
                 return (
                     "Web fetch is unavailable: TAVILY_API_KEY is not set. "
                     "Ask the user to configure it and restart."
@@ -211,7 +212,7 @@ class SearchTool(ToolCard):
                     - ``advanced``: richer extraction with higher latency/cost.
                     If ``None``, Tavily default behavior is used.
             """
-            if not os.environ.get("TAVILY_API_KEY", "").strip():
+            if not _has_tavily_api_key():
                 return (
                     "Web crawl is unavailable: TAVILY_API_KEY is not set. "
                     "Ask the user to configure it and restart."

@@ -8,8 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from akgentic.tool.search.search import SearchTool
-
+from akgentic.tool.search.search import SearchTool, _check_tavily_api_key, _has_tavily_api_key
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -41,6 +40,57 @@ def _get_tool_by_name(tools: list, name: str) -> Any:
             return tool
     msg = f"Tool {name!r} not found in {[t.__name__ for t in tools]}"
     raise ValueError(msg)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests for _has_tavily_api_key / _check_tavily_api_key helpers
+# ---------------------------------------------------------------------------
+
+
+class TestHasTavilyApiKey:
+    """Direct unit tests for the _has_tavily_api_key helper."""
+
+    def test_returns_true_when_key_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TAVILY_API_KEY", "sk-test-123")
+        assert _has_tavily_api_key() is True
+
+    def test_returns_false_when_key_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+        assert _has_tavily_api_key() is False
+
+    def test_returns_false_when_key_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TAVILY_API_KEY", "")
+        assert _has_tavily_api_key() is False
+
+    def test_returns_false_when_key_whitespace_only(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("TAVILY_API_KEY", "   ")
+        assert _has_tavily_api_key() is False
+
+
+class TestCheckTavilyApiKey:
+    """Direct unit tests for _check_tavily_api_key (logs warning on missing key)."""
+
+    def test_returns_true_no_log_when_key_set(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.setenv("TAVILY_API_KEY", "sk-test-123")
+        with caplog.at_level(logging.WARNING, logger="akgentic.tool.search.search"):
+            assert _check_tavily_api_key() is True
+        assert len(caplog.records) == 0
+
+    def test_returns_false_and_logs_when_key_unset(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+        with caplog.at_level(logging.WARNING, logger="akgentic.tool.search.search"):
+            assert _check_tavily_api_key() is False
+        assert any("non-functional" in rec.message for rec in caplog.records)
 
 
 # ---------------------------------------------------------------------------
