@@ -51,7 +51,7 @@ class Filesystem:
     """
 
     def __init__(self, base_path: str, workspace_name: str) -> None:
-        self._root = Path(base_path) / workspace_name
+        self._root = (Path(base_path) / workspace_name).resolve()
         self._root.mkdir(parents=True, exist_ok=True)
 
     def _validate_path(self, path: str) -> Path:
@@ -65,7 +65,7 @@ class Filesystem:
             PermissionError: if the resolved path escapes the workspace root.
         """
         resolved = (self._root / path).resolve()
-        if not resolved.is_relative_to(self._root.resolve()):
+        if not resolved.is_relative_to(self._root):
             raise PermissionError(f"Path '{path}' escapes workspace root")
         return resolved
 

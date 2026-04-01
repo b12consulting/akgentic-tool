@@ -742,7 +742,7 @@ class WorkspaceTool(ToolCard):
             try:
                 if path:
                     search_root = (backend._root / path).resolve()
-                    if not search_root.is_relative_to(backend._root.resolve()):
+                    if not search_root.is_relative_to(backend._root):
                         raise PermissionError(f"Path '{path}' escapes workspace root")
                 else:
                     search_root = backend._root
@@ -807,7 +807,7 @@ class WorkspaceTool(ToolCard):
             try:
                 if path:
                     search_root = (backend._root / path).resolve()
-                    if not search_root.is_relative_to(backend._root.resolve()):
+                    if not search_root.is_relative_to(backend._root):
                         raise PermissionError(f"Path '{path}' escapes workspace root")
                 else:
                     search_root = backend._root
