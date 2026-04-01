@@ -1,8 +1,30 @@
+from __future__ import annotations
+
+import logging
+import os
 from typing import Any, Callable, Literal
 
 from tavily import TavilyClient
 
 from akgentic.tool.core import TOOL_CALL, BaseToolParam, ToolCard, _resolve
+
+logger = logging.getLogger(__name__)
+
+
+def _check_tavily_api_key() -> bool:
+    """Check whether ``TAVILY_API_KEY`` is configured in the environment.
+
+    Returns:
+        ``True`` when the key is present and non-empty, ``False`` otherwise.
+        A warning is logged when the key is missing.
+    """
+    if os.environ.get("TAVILY_API_KEY", "").strip():
+        return True
+    logger.warning(
+        "TAVILY_API_KEY is not set in the environment. "
+        "Tavily search tools will be non-functional until the key is configured."
+    )
+    return False
 
 
 class WebSearch(BaseToolParam):
@@ -41,6 +63,11 @@ class SearchTool(ToolCard):
     web_fetch: WebFetch | bool = True
 
     def get_tools(self) -> list[Callable]:
+        if not _check_tavily_api_key():
+            logger.warning(
+                "SearchTool: Tavily tools registered but will be non-functional "
+                "— TAVILY_API_KEY is not set."
+            )
         tools: list[Callable] = []
         ws = _resolve(self.web_search, WebSearch)
         if ws and TOOL_CALL in ws.expose:
@@ -73,18 +100,31 @@ class SearchTool(ToolCard):
                     - ``advanced``: higher relevance, potentially slower and more expensive.
                     If ``None``, Tavily default behavior is used.
             """
+            if not os.environ.get("TAVILY_API_KEY", "").strip():
+                return (
+                    "Web search is unavailable: TAVILY_API_KEY is not set. "
+                    "Ask the user to configure it and restart."
+                )
 
-            tavily_client = TavilyClient()
+            try:
+                tavily_client = TavilyClient()
 
-            search_kwargs: dict[str, Any] = {}
-            if search_depth is not None:
-                search_kwargs["search_depth"] = search_depth
+                search_kwargs: dict[str, Any] = {}
+                if search_depth is not None:
+                    search_kwargs["search_depth"] = search_depth
 
-            return tavily_client.search(
-                query,
-                max_results=max_results,
-                **search_kwargs,
-            )
+                return tavily_client.search(
+                    query,
+                    max_results=max_results,
+                    **search_kwargs,
+                )
+            except Exception as exc:
+                logger.warning("web_search failed: %s", exc)
+                return (
+                    f"Web search failed: {exc}. "
+                    "The TAVILY_API_KEY may be invalid or the service may be "
+                    "temporarily unavailable."
+                )
 
         web_search_tool.__doc__ = params.format_docstring(web_search_tool.__doc__)
         return web_search_tool
@@ -110,18 +150,31 @@ class SearchTool(ToolCard):
                       potentially slower and more expensive.
                     If ``None``, Tavily default behavior is used.
             """
+            if not os.environ.get("TAVILY_API_KEY", "").strip():
+                return (
+                    "Web fetch is unavailable: TAVILY_API_KEY is not set. "
+                    "Ask the user to configure it and restart."
+                )
 
-            tavily_client = TavilyClient()
+            try:
+                tavily_client = TavilyClient()
 
-            fetch_kwargs: dict[str, Any] = {}
-            if extract_depth is not None:
-                fetch_kwargs["extract_depth"] = extract_depth
+                fetch_kwargs: dict[str, Any] = {}
+                if extract_depth is not None:
+                    fetch_kwargs["extract_depth"] = extract_depth
 
-            return tavily_client.extract(
-                urls,
-                timeout=timeout,
-                **fetch_kwargs,
-            )
+                return tavily_client.extract(
+                    urls,
+                    timeout=timeout,
+                    **fetch_kwargs,
+                )
+            except Exception as exc:
+                logger.warning("web_fetch failed: %s", exc)
+                return (
+                    f"Web fetch failed: {exc}. "
+                    "The TAVILY_API_KEY may be invalid or the service may be "
+                    "temporarily unavailable."
+                )
 
         web_fetch_tool.__doc__ = params.format_docstring(web_fetch_tool.__doc__)
         return web_fetch_tool
@@ -158,26 +211,39 @@ class SearchTool(ToolCard):
                     - ``advanced``: richer extraction with higher latency/cost.
                     If ``None``, Tavily default behavior is used.
             """
+            if not os.environ.get("TAVILY_API_KEY", "").strip():
+                return (
+                    "Web crawl is unavailable: TAVILY_API_KEY is not set. "
+                    "Ask the user to configure it and restart."
+                )
 
-            tavily_client = TavilyClient()
+            try:
+                tavily_client = TavilyClient()
 
-            crawl_kwargs: dict[str, Any] = {}
-            if max_depth is not None:
-                crawl_kwargs["max_depth"] = max_depth
-            if max_breadth is not None:
-                crawl_kwargs["max_breadth"] = max_breadth
-            if limit is not None:
-                crawl_kwargs["limit"] = limit
-            if instructions is not None:
-                crawl_kwargs["instructions"] = instructions
-            if extract_depth is not None:
-                crawl_kwargs["extract_depth"] = extract_depth
+                crawl_kwargs: dict[str, Any] = {}
+                if max_depth is not None:
+                    crawl_kwargs["max_depth"] = max_depth
+                if max_breadth is not None:
+                    crawl_kwargs["max_breadth"] = max_breadth
+                if limit is not None:
+                    crawl_kwargs["limit"] = limit
+                if instructions is not None:
+                    crawl_kwargs["instructions"] = instructions
+                if extract_depth is not None:
+                    crawl_kwargs["extract_depth"] = extract_depth
 
-            return tavily_client.crawl(
-                url,
-                timeout=timeout,
-                **crawl_kwargs,
-            )
+                return tavily_client.crawl(
+                    url,
+                    timeout=timeout,
+                    **crawl_kwargs,
+                )
+            except Exception as exc:
+                logger.warning("web_crawl failed: %s", exc)
+                return (
+                    f"Web crawl failed: {exc}. "
+                    "The TAVILY_API_KEY may be invalid or the service may be "
+                    "temporarily unavailable."
+                )
 
         web_crawl_tool.__doc__ = params.format_docstring(web_crawl_tool.__doc__)
         return web_crawl_tool
