@@ -944,6 +944,14 @@ class TestWorkspaceGlob:
         assert "subdir/file.py" in result
         assert "other/ignore.py" not in result
 
+    def test_glob_with_path_traversal_rejected(self, tmp_path: Path) -> None:
+        """workspace_glob rejects path arguments that escape the workspace root."""
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("legit/file.py", b"ok")
+        glob_fn = self._glob_fn(tool)
+        with pytest.raises(RetriableError):
+            glob_fn("**/*.py", path="../escape")  # type: ignore[assignment]
+
 
 # ---------------------------------------------------------------------------
 # Regression: workspace_grep with path argument (Story 14.1, AC #3)
@@ -967,6 +975,14 @@ class TestWorkspaceGrepRegression:
         assert "search_term_here" in result
         assert "other/ignore.py" not in result
 
+    def test_grep_with_path_traversal_rejected(self, tmp_path: Path) -> None:
+        """workspace_grep rejects path arguments that escape the workspace root."""
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("legit/file.py", b"ok\n")
+        grep_fn = self._grep_fn(tool)
+        with pytest.raises(RetriableError):
+            grep_fn("ok", path="../escape")  # type: ignore[assignment]
+
 
 # ---------------------------------------------------------------------------
 # Regression: Filesystem._root is absolute after construction (Story 14.1, AC #1)
@@ -978,11 +994,7 @@ class TestFilesystemRootAbsolute:
 
     def test_filesystem_root_is_absolute_after_construction(self, tmp_path: Path) -> None:
         """Filesystem constructed with relative base_path has absolute _root."""
-        fs = Filesystem("relative/path", "workspace")
+        # Use tmp_path to avoid creating directories in CWD
+        relative_base = str(tmp_path / "rel")
+        fs = Filesystem(relative_base, "workspace")
         assert fs._root.is_absolute()
-        # Clean up the created directory
-        import shutil
-
-        resolved = Path("relative").resolve()
-        if resolved.exists():
-            shutil.rmtree(resolved)
