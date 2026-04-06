@@ -205,7 +205,7 @@ def test_hire_members_string_agent_class():
 
 
 def test_fire_members_tool_execution():
-    """fire_members looks up address, calls address.stop(), calls on_fire hook."""
+    """fire_members looks up address, calls observer.proxy_ask(address, Akgent).stop(), calls on_fire hook."""
     member_address = Mock()
     member_address.name = "@Developer123"
     member_address.role = "Developer"
@@ -213,9 +213,21 @@ def test_fire_members_tool_execution():
     orchestrator_mock = Mock(spec=Orchestrator)
     orchestrator_mock.get_team_member.return_value = member_address
 
+    stop_proxy_mock = Mock()
+
     observer_mock = Mock(spec=TeamManagementToolObserver)
     observer_mock.orchestrator = create_test_address("@Orchestrator", "Orchestrator")
-    observer_mock.proxy_ask.return_value = orchestrator_mock
+
+    def proxy_ask_side_effect(target, actor_type):
+        from akgentic.core.agent import Akgent
+
+        if actor_type is Orchestrator:
+            return orchestrator_mock
+        if actor_type is Akgent:
+            return stop_proxy_mock
+        return Mock()
+
+    observer_mock.proxy_ask.side_effect = proxy_ask_side_effect
 
     tool = TeamTool()
     tool.observer(observer_mock)
@@ -226,7 +238,7 @@ def test_fire_members_tool_execution():
     assert "Developer123" in result
     assert "fired" in result.lower()
     orchestrator_mock.get_team_member.assert_called_once_with("@Developer123")
-    member_address.stop.assert_called_once()  # address.stop() called
+    stop_proxy_mock.stop.assert_called_once()  # proxy-based stop called
     observer_mock.on_fire.assert_called_once()  # Hook called
 
 
@@ -475,7 +487,7 @@ def test_fire_members_batch_with_multiple_errors():
 
 
 def test_fire_members_batch_partial_success():
-    """fire_members continues on errors and fires valid members."""
+    """fire_members continues on errors and fires valid members via proxy-based stop."""
     valid_address = Mock()
     valid_address.name = "@Valid123"
     valid_address.role = "Developer"
@@ -490,9 +502,21 @@ def test_fire_members_batch_partial_success():
     orchestrator_mock.get_team_member.side_effect = get_member_side_effect
     orchestrator_mock.get_team.return_value = []
 
+    stop_proxy_mock = Mock()
+
     observer_mock = Mock(spec=TeamManagementToolObserver)
     observer_mock.orchestrator = create_test_address("@Orchestrator", "Orchestrator")
-    observer_mock.proxy_ask.return_value = orchestrator_mock
+
+    def proxy_ask_side_effect(target, actor_type):
+        from akgentic.core.agent import Akgent
+
+        if actor_type is Orchestrator:
+            return orchestrator_mock
+        if actor_type is Akgent:
+            return stop_proxy_mock
+        return Mock()
+
+    observer_mock.proxy_ask.side_effect = proxy_ask_side_effect
 
     tool = TeamTool()
     tool.observer(observer_mock)
@@ -502,8 +526,8 @@ def test_fire_members_batch_partial_success():
     with pytest.raises(RetriableError) as exc_info:
         fire_members(["@Valid123", "@NonExistent"])
 
-    # Should have stopped the valid one before failing
-    valid_address.stop.assert_called_once()
+    # Should have stopped the valid one via proxy-based stop
+    stop_proxy_mock.stop.assert_called_once()
     # Error should mention partial success and the invalid member
     assert "Partial success" in str(exc_info.value)
     assert "NonExistent" in str(exc_info.value)
@@ -639,7 +663,7 @@ def test_hire_member_command_invalid_role():
 
 
 def test_fire_member_command_execution():
-    """fire_member command fires a single member."""
+    """fire_member command fires a single member via proxy-based stop."""
     member_address = Mock()
     member_address.name = "@Developer123"
     member_address.role = "Developer"
@@ -647,9 +671,21 @@ def test_fire_member_command_execution():
     orchestrator_mock = Mock(spec=Orchestrator)
     orchestrator_mock.get_team_member.return_value = member_address
 
+    stop_proxy_mock = Mock()
+
     observer_mock = Mock(spec=TeamManagementToolObserver)
     observer_mock.orchestrator = create_test_address("@Orchestrator", "Orchestrator")
-    observer_mock.proxy_ask.return_value = orchestrator_mock
+
+    def proxy_ask_side_effect(target, actor_type):
+        from akgentic.core.agent import Akgent
+
+        if actor_type is Orchestrator:
+            return orchestrator_mock
+        if actor_type is Akgent:
+            return stop_proxy_mock
+        return Mock()
+
+    observer_mock.proxy_ask.side_effect = proxy_ask_side_effect
 
     tool = TeamTool()
     tool.observer(observer_mock)
@@ -659,7 +695,7 @@ def test_fire_member_command_execution():
 
     assert "Developer123" in result
     assert "fired" in result.lower()
-    member_address.stop.assert_called_once()
+    stop_proxy_mock.stop.assert_called_once()  # proxy-based stop called
     observer_mock.on_fire.assert_called_once()
 
 
