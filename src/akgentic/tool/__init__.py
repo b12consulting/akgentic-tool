@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-# Submodules with their own __init__ files
-from . import mcp, planning, sandbox, search, team, workspace  # noqa: F401
+from importlib import import_module
+
 from .core import (  # noqa: F401
     COMMAND,
     SYSTEM_PROMPT,
@@ -19,9 +19,6 @@ from .event import (  # noqa: F401
     TeamManagementToolObserver,
     ToolObserver,
 )
-from .sandbox.bwrap import BwrapSandboxActor  # noqa: F401
-from .sandbox.seatbelt import SeatbeltSandboxActor  # noqa: F401
-from .sandbox.tool import ExecTool  # noqa: F401
 from .workspace.tool import WorkspaceTool  # noqa: F401
 
 try:
@@ -50,6 +47,12 @@ __all__ = [
     # Submodules
     "mcp",
     "planning",
+    "search",
+    "team",
+    "workspace",
+    "WorkspaceTool",
+    "mcp",
+    "planning",
     "sandbox",
     "search",
     "team",
@@ -57,8 +60,30 @@ __all__ = [
     "BwrapSandboxActor",
     "ExecTool",
     "SeatbeltSandboxActor",
-    "WorkspaceTool",
 ]
 
 if _VECTOR_SEARCH_AVAILABLE:
     __all__ += ["VectorEntry", "EmbeddingService", "VectorIndex"]
+
+
+_LAZY_SUBMODULES = {"mcp", "planning", "sandbox", "search", "team", "workspace"}
+_LAZY_ATTRS = {
+    "BwrapSandboxActor": (".sandbox.bwrap", "BwrapSandboxActor"),
+    "ExecTool": (".sandbox.tool", "ExecTool"),
+    "SeatbeltSandboxActor": (".sandbox.seatbelt", "SeatbeltSandboxActor"),
+}
+
+
+def __getattr__(name: str) -> object:
+    if name in _LAZY_SUBMODULES:
+        module = import_module(f".{name}", __name__)
+        globals()[name] = module
+        return module
+
+    if name in _LAZY_ATTRS:
+        module_name, attr_name = _LAZY_ATTRS[name]
+        value = getattr(import_module(module_name, __name__), attr_name)
+        globals()[name] = value
+        return value
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

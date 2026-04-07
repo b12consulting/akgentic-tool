@@ -1,8 +1,22 @@
 import uuid
-from typing import Protocol, runtime_checkable
+from dataclasses import dataclass
+from typing import Any, Protocol, runtime_checkable
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import AkgentType
+
+
+@dataclass
+class ToolCallEvent:
+    """Event emitted when a tool is called.
+
+    Used by MCP server factory and tool observers to track tool invocations
+    for telemetry and monitoring purposes (ADR-023, Epic 16).
+    """
+
+    tool_name: str
+    args: list[Any]
+    kwargs: dict[str, Any]
 
 
 @runtime_checkable
