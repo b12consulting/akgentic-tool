@@ -19,6 +19,7 @@ from pydantic import Field
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
 from akgentic.tool.errors import RetriableError
+from akgentic.tool.event import ToolStateEvent
 from akgentic.tool.knowledge_graph.models import (
     Entity,
     EntityCreate,
@@ -26,6 +27,7 @@ from akgentic.tool.knowledge_graph.models import (
     GetGraphQuery,
     GraphView,
     KnowledgeGraphState,
+    KnowledgeGraphStateEvent,
     ManageGraph,
     PathStep,
     Relation,
@@ -86,6 +88,7 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         self.state.observer(self)
         self._vector_index = VectorIndex()
         self._embedding_svc: EmbeddingService | None = None
+        self._state_event_seq: int = 0
 
     # ------------------------------------------------------------------
     # Embedding helpers
@@ -186,13 +189,14 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
     # CRUD: Create
     # ------------------------------------------------------------------
 
-    def _create_entities(self, entities: list[EntityCreate]) -> list[str]:
+    def _create_entities(self, entities: list[EntityCreate]) -> tuple[list[Entity], list[str]]:
         """Add new entities, skipping duplicates by name.
 
         Returns:
-            List of error strings for duplicate names already in graph.
+            Tuple of (applied entities, error strings for duplicate names).
         """
         errors: list[str] = []
+        applied: list[Entity] = []
         existing_names = {e.name for e in self.state.knowledge_graph.entities}
 
         for ec in entities:
@@ -210,15 +214,20 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
             self.state.knowledge_graph.entities.append(entity)
             existing_names.add(ec.name)
             self._embed_entity(entity)
-        return errors
+            applied.append(entity)
+        return applied, errors
 
-    def _create_relations(self, relations: list[RelationCreate]) -> list[str]:
+    def _create_relations(
+        self, relations: list[RelationCreate]
+    ) -> tuple[list[Relation], list[str]]:
         """Add new relations, validating entity references and deduplicating.
 
         Returns:
-            List of error strings for missing entity references or duplicates.
+            Tuple of (applied relations, error strings for missing refs).
+            Duplicate triples are silently skipped and NOT included in applied.
         """
         errors: list[str] = []
+        applied: list[Relation] = []
         existing_names = {e.name for e in self.state.knowledge_graph.entities}
         existing_triples = {
             (r.from_entity, r.to_entity, r.relation_type)
@@ -248,22 +257,26 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
             self.state.knowledge_graph.relations.append(relation)
             existing_triples.add(triple)
             self._embed_relation(relation)
-        return errors
+            applied.append(relation)
+        return applied, errors
 
     # ------------------------------------------------------------------
     # CRUD: Update
     # ------------------------------------------------------------------
 
-    def _update_entities(self, updates: list[EntityUpdate]) -> list[str]:
+    def _update_entities(self, updates: list[EntityUpdate]) -> tuple[list[Entity], list[str]]:
         """Apply partial updates to existing entities.
 
         Only non-None fields are applied. ``add_observations`` appends,
-        ``remove_observations`` removes from the existing list.
+        ``remove_observations`` removes from the existing list. An entity
+        appears in the applied list only if at least one mutation
+        effectively changed it.
 
         Returns:
-            List of error strings for entities not found.
+            Tuple of (post-update snapshots of changed entities, errors).
         """
         errors: list[str] = []
+        applied: list[Entity] = []
         entity_map = self._entity_map()
 
         for eu in updates:
@@ -272,34 +285,50 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
                 errors.append(f"Entity '{eu.name}' not found for update")
                 continue
 
+            changed: bool = False
+
             if eu.description is not None and eu.description != entity.description:
                 self._vector_index.remove({str(entity.id)})
                 entity.description = eu.description
                 self._embed_entity(entity)
+                changed = True
             elif eu.description is not None:
+                # Same value -> no-op
                 entity.description = eu.description
-            if eu.entity_type is not None:
+            if eu.entity_type is not None and eu.entity_type != entity.entity_type:
                 entity.entity_type = eu.entity_type
-            if eu.is_root is not None:
+                changed = True
+            if eu.is_root is not None and eu.is_root != entity.is_root:
                 entity.is_root = eu.is_root
-            if eu.add_observations is not None:
+                changed = True
+            if eu.add_observations:
                 entity.observations.extend(eu.add_observations)
+                changed = True
             if eu.remove_observations is not None:
                 to_remove = set(eu.remove_observations)
-                entity.observations = [o for o in entity.observations if o not in to_remove]
-        return errors
+                before = entity.observations
+                after = [o for o in before if o not in to_remove]
+                if len(after) != len(before):
+                    changed = True
+                entity.observations = after
+
+            if changed:
+                applied.append(entity)
+        return applied, errors
 
     # ------------------------------------------------------------------
     # CRUD: Delete
     # ------------------------------------------------------------------
 
-    def _delete_entities(self, names: list[str]) -> list[str]:
+    def _delete_entities(
+        self, names: list[str]
+    ) -> tuple[list[uuid.UUID], list[uuid.UUID], list[str]]:
         """Remove entities by name with cascade deletion of relations.
 
         Also removes any associated VectorEntry embeddings from the vector index.
 
         Returns:
-            List of error strings for entities not found.
+            Tuple of (deleted entity ids, cascaded relation ids, errors).
         """
         errors: list[str] = []
         existing_names = {e.name for e in self.state.knowledge_graph.entities}
@@ -310,44 +339,48 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
 
         names_set = set(names) & existing_names
 
-        if names_set:
-            # Collect UUIDs of deleted entities for embedding removal
-            _deleted_ids = [
-                e.id for e in self.state.knowledge_graph.entities if e.name in names_set
-            ]
+        if not names_set:
+            return [], [], errors
 
-            # Collect UUIDs of cascade-deleted relations
-            _deleted_rel_ids = [
-                r.id
-                for r in self.state.knowledge_graph.relations
-                if r.from_entity in names_set or r.to_entity in names_set
-            ]
+        # Collect UUIDs of deleted entities for embedding removal
+        deleted_entity_ids: list[uuid.UUID] = [
+            e.id for e in self.state.knowledge_graph.entities if e.name in names_set
+        ]
 
-            # Remove entities
-            self.state.knowledge_graph.entities = [
-                e for e in self.state.knowledge_graph.entities if e.name not in names_set
-            ]
+        # Collect UUIDs of cascade-deleted relations
+        cascaded_rel_ids: list[uuid.UUID] = [
+            r.id
+            for r in self.state.knowledge_graph.relations
+            if r.from_entity in names_set or r.to_entity in names_set
+        ]
 
-            # Cascade-delete relations referencing deleted entities
-            self.state.knowledge_graph.relations = [
-                r
-                for r in self.state.knowledge_graph.relations
-                if r.from_entity not in names_set and r.to_entity not in names_set
-            ]
+        # Remove entities
+        self.state.knowledge_graph.entities = [
+            e for e in self.state.knowledge_graph.entities if e.name not in names_set
+        ]
 
-            self._vector_index.remove(
-                {str(eid) for eid in _deleted_ids} | {str(rid) for rid in _deleted_rel_ids}
-            )
+        # Cascade-delete relations referencing deleted entities
+        self.state.knowledge_graph.relations = [
+            r
+            for r in self.state.knowledge_graph.relations
+            if r.from_entity not in names_set and r.to_entity not in names_set
+        ]
 
-        return errors
+        self._vector_index.remove(
+            {str(eid) for eid in deleted_entity_ids} | {str(rid) for rid in cascaded_rel_ids}
+        )
 
-    def _delete_relations(self, deletions: list[RelationDelete]) -> list[str]:
+        return deleted_entity_ids, cascaded_rel_ids, errors
+
+    def _delete_relations(
+        self, deletions: list[RelationDelete]
+    ) -> tuple[list[uuid.UUID], list[str]]:
         """Remove relations by ``(from_entity, to_entity, relation_type)`` triple.
 
         Also removes any associated VectorEntry embeddings from the vector index.
 
         Returns:
-            List of error strings for relations not found.
+            Tuple of (ids of relations actually removed, errors).
         """
         errors: list[str] = []
         existing_triples = {
@@ -365,9 +398,9 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
             else:
                 triples_to_delete.add(triple)
 
+        deleted_rel_ids: list[uuid.UUID] = []
         if triples_to_delete:
-            # Collect UUIDs for embedding removal
-            _deleted_rel_ids = [
+            deleted_rel_ids = [
                 r.id
                 for r in self.state.knowledge_graph.relations
                 if (r.from_entity, r.to_entity, r.relation_type) in triples_to_delete
@@ -379,9 +412,9 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
                 if (r.from_entity, r.to_entity, r.relation_type) not in triples_to_delete
             ]
 
-            self._vector_index.remove({str(rid) for rid in _deleted_rel_ids})
+            self._vector_index.remove({str(rid) for rid in deleted_rel_ids})
 
-        return errors
+        return deleted_rel_ids, errors
 
     # ------------------------------------------------------------------
     # Public API
@@ -408,17 +441,66 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         """
         errors: list[str] = []
 
-        errors.extend(self._create_entities(update.create_entities))
-        errors.extend(self._create_relations(update.create_relations))
-        errors.extend(self._update_entities(update.update_entities))
-        errors.extend(self._delete_relations(update.delete_relations))
-        errors.extend(self._delete_entities(update.delete_entities))
+        created_entities, errs = self._create_entities(update.create_entities)
+        errors.extend(errs)
+
+        created_relations, errs = self._create_relations(update.create_relations)
+        errors.extend(errs)
+
+        modified_entities, errs = self._update_entities(update.update_entities)
+        errors.extend(errs)
+
+        deleted_relation_ids, errs = self._delete_relations(update.delete_relations)
+        errors.extend(errs)
+
+        deleted_entity_ids, cascaded_relation_ids, errs = self._delete_entities(
+            update.delete_entities
+        )
+        errors.extend(errs)
+
+        # Merge explicit + cascaded relation deletions, preserving order and deduping.
+        merged_relations_removed: list[uuid.UUID] = list(deleted_relation_ids)
+        seen_rel_ids: set[uuid.UUID] = set(deleted_relation_ids)
+        for rid in cascaded_relation_ids:
+            if rid not in seen_rel_ids:
+                merged_relations_removed.append(rid)
+                seen_rel_ids.add(rid)
+
+        delta = KnowledgeGraphStateEvent(
+            entities_added=created_entities,
+            entities_modified=modified_entities,
+            entities_removed=deleted_entity_ids,
+            relations_added=created_relations,
+            relations_removed=merged_relations_removed,
+        )
 
         self.state.notify_state_change()
+
+        if self._delta_is_non_empty(delta):
+            self._state_event_seq += 1
+            self.notify_event(
+                ToolStateEvent(
+                    tool_id=KG_ACTOR_NAME,
+                    seq=self._state_event_seq,
+                    payload=delta,
+                )
+            )
 
         if errors:
             raise RetriableError("Update errors: " + "; ".join(errors))
         return "Done"
+
+    @staticmethod
+    def _delta_is_non_empty(delta: KnowledgeGraphStateEvent) -> bool:
+        """Return ``True`` iff any collection on the delta is non-empty."""
+        return bool(
+            delta.entities_added
+            or delta.entities_modified
+            or delta.entities_removed
+            or delta.relations_added
+            or delta.relations_modified
+            or delta.relations_removed
+        )
 
     def get_graph(self, query: GetGraphQuery | None = None) -> GraphView:
         """Return a full or filtered subgraph view.
@@ -751,9 +833,7 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         for kw_hit in keyword_result.hits:
             if kw_hit.ref_id in merged:
                 existing = merged[kw_hit.ref_id]
-                merged[kw_hit.ref_id] = existing.model_copy(
-                    update={"score": existing.score + 0.5}
-                )
+                merged[kw_hit.ref_id] = existing.model_copy(update={"score": existing.score + 0.5})
             else:
                 merged[kw_hit.ref_id] = kw_hit  # keyword-only hit (score = 1.0)
 
@@ -798,9 +878,7 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
 
         return SearchResult(hits=sorted(hits, key=lambda h: h.score, reverse=True)[:top_k])
 
-    def _expand_search_result(
-        self, hits: list[SearchHit], query: SearchQuery
-    ) -> SearchResult:
+    def _expand_search_result(self, hits: list[SearchHit], query: SearchQuery) -> SearchResult:
         """Post-process search hits with Epic 3 expansion options.
 
         Applies ``include_neighbors``, ``include_edges``, and ``find_paths``
