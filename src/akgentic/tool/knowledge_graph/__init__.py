@@ -46,6 +46,7 @@ from akgentic.tool.knowledge_graph.models import (
     GraphView,
     KnowledgeGraph,
     KnowledgeGraphState,
+    KnowledgeGraphStateEvent,
     ManageGraph,
     PathStep,
     Relation,
@@ -85,6 +86,8 @@ __all__ = [
     "SearchResult",
     # Vector index models (Story 2.1)
     "VectorEntry",
+    # State delta models (Story 17.1)
+    "KnowledgeGraphStateEvent",
     # ToolCard (Story 1.3)
     "KnowledgeGraphTool",
     "GetGraph",
