@@ -1,8 +1,39 @@
+from __future__ import annotations
+
 import uuid
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, TypeAlias, runtime_checkable
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import AkgentType
+from akgentic.core.messages import Message
+
+if TYPE_CHECKING:
+    from akgentic.tool.knowledge_graph.models import KnowledgeGraphStateEvent
+
+# Union of tool-specific delta payloads carried by ``ToolStateEvent`` (ADR-024).
+# Defined as a ``TypeAlias`` so future stateful tools (e.g. ``VectorStoreStateEvent``)
+# can extend the union without touching ``ToolStateEvent``. Uses a string forward
+# reference to avoid the ``event.py → knowledge_graph.models`` import cycle.
+ToolStatePayload: TypeAlias = "KnowledgeGraphStateEvent"
+
+
+class ToolStateEvent(Message):
+    """Generic tool-state event envelope (ADR-024, Story 17.1).
+
+    Wraps a tool-specific delta payload so any stateful tool actor can broadcast
+    typed state changes on the existing orchestrator event stream. Inherits
+    ``team_id``, ``timestamp``, ``id``, ``sender``, and ``display_type`` from
+    :class:`akgentic.core.messages.Message` without override.
+
+    Attributes:
+        tool_id: Tool-actor name emitting the event (e.g. ``"#KnowledgeGraphTool"``).
+        seq: Per-tool monotonic sequence number (starts at 1, enforced in Story 17.2).
+        payload: Tool-specific delta payload (see :data:`ToolStatePayload`).
+    """
+
+    tool_id: str
+    seq: int
+    payload: ToolStatePayload
 
 
 @runtime_checkable
