@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from importlib import import_module
+from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    from .knowledge_graph.models import KnowledgeGraphStateEvent as KnowledgeGraphStateEvent
 from .core import (  # noqa: F401
     COMMAND,
     SYSTEM_PROMPT,
@@ -18,6 +21,8 @@ from .event import (  # noqa: F401
     ActorToolObserver,
     TeamManagementToolObserver,
     ToolObserver,
+    ToolStateEvent,
+    ToolStatePayload,
 )
 from .workspace.tool import WorkspaceTool  # noqa: F401
 
@@ -44,19 +49,17 @@ __all__ = [
     "ToolObserver",
     "ActorToolObserver",
     "TeamManagementToolObserver",
+    "ToolStateEvent",
+    "ToolStatePayload",
+    "KnowledgeGraphStateEvent",
     # Submodules
-    "mcp",
-    "planning",
-    "search",
-    "team",
-    "workspace",
-    "WorkspaceTool",
     "mcp",
     "planning",
     "sandbox",
     "search",
     "team",
     "workspace",
+    "WorkspaceTool",
     "BwrapSandboxActor",
     "ExecTool",
     "SeatbeltSandboxActor",
@@ -74,7 +77,7 @@ _LAZY_ATTRS = {
 }
 
 
-def __getattr__(name: str) -> object:
+def __getattr__(name: str) -> Any:
     if name in _LAZY_SUBMODULES:
         module = import_module(f".{name}", __name__)
         globals()[name] = module
@@ -86,4 +89,8 @@ def __getattr__(name: str) -> object:
         globals()[name] = value
         return value
 
+    if name == "KnowledgeGraphStateEvent":
+        from .knowledge_graph.models import KnowledgeGraphStateEvent
+
+        return KnowledgeGraphStateEvent
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

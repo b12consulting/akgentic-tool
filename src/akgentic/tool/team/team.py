@@ -11,6 +11,7 @@ from typing import Callable
 from pydantic import Field
 
 from akgentic.core.actor_address import ActorAddress
+from akgentic.core.agent import Akgent
 from akgentic.core.agent_card import AgentCard
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.tool.core import (
@@ -148,7 +149,7 @@ def _fire_single_member(
             f"Current team members: {team_members}"
         )
 
-    address.stop()
+    observer.proxy_ask(address, Akgent).stop()
     observer.on_fire(address)
     logger.info(f"Fired team member: {name}")
     return name
