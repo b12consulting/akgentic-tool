@@ -4,22 +4,17 @@ This module contains protocol-level concerns only:
 - MCP transport configuration
 - MCP server toolset creation
 - MCP diagnostics (tool listing)
-- Tool filtering and policy enforcement (ADR-023)
-- MCPServerFactory for observer and hook management
 """
 
 from __future__ import annotations
 
-import fnmatch
-from collections.abc import Awaitable, Callable
-from typing import Any, Literal, TypeAlias
+from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, Field
 
 from akgentic.tool.core import ToolCard
-from akgentic.tool.event import ToolCallEvent, ToolObserver
 
-MCPHTTPTransport: TypeAlias = Literal["streamable-http", "sse"]
+MCPHTTPTransport = Literal["streamable-http", "sse"]
 
 
 class MCPHTTPConnectionConfig(BaseModel):
@@ -97,7 +92,11 @@ class MCPStdioConnectionConfig(BaseModel):
     )
 
 
-MCPConnectionConfig: TypeAlias = MCPHTTPConnectionConfig | MCPStdioConnectionConfig
+MCPConnectionConfig = MCPHTTPConnectionConfig | MCPStdioConnectionConfig
+"""Union type for MCP connection configurations.
+
+Supports both HTTP/SSE and stdio transport types.
+"""
 
 
 class MCPDiagnosticsConfig(BaseModel):
@@ -107,14 +106,28 @@ class MCPDiagnosticsConfig(BaseModel):
 
 
 def _mcp_auth_headers(bearer_token: str | None) -> dict[str, str] | None:
-    """Build HTTP authorization headers from a bearer token."""
+    """Build HTTP authorization headers from a bearer token.
+
+    Args:
+        bearer_token: Optional bearer token for authentication.
+
+    Returns:
+        Dictionary with Authorization header if token provided, None otherwise.
+    """
     if not bearer_token:
         return None
     return {"Authorization": f"Bearer {bearer_token}"}
 
 
 def _load_mcp_server_classes() -> tuple[type[Any], type[Any], type[Any]]:
-    """Lazy-load MCP server classes from pydantic-ai."""
+    """Lazy-load MCP server classes from pydantic-ai.
+
+    Returns:
+        Tuple of (MCPServerSSE, MCPServerStreamableHTTP, MCPServerStdio) classes.
+
+    Raises:
+        ImportError: If pydantic-ai MCP extras are not installed.
+    """
     try:
         from pydantic_ai.mcp import (  # noqa: PLC0415
             MCPServerSSE,
@@ -130,195 +143,108 @@ def _load_mcp_server_classes() -> tuple[type[Any], type[Any], type[Any]]:
     return MCPServerSSE, MCPServerStreamableHTTP, MCPServerStdio
 
 
-def _matches_any_pattern(tool_name: str, patterns: set[str] | None) -> bool:
-    """Check if a tool name matches any pattern in the set using fnmatch."""
-    if patterns is None:
-        return True
-    return any(fnmatch.fnmatch(tool_name, pattern) for pattern in patterns)
-
-
-def _extract_tool_metadata(tool_def: Any) -> tuple[str, dict[str, Any]]:
-    """Extract a tool name and annotations from a tool definition."""
-    if isinstance(tool_def, str):
-        return tool_def, {}
-
-    if isinstance(tool_def, dict):
-        name = str(tool_def.get("name", ""))
-        annotations = tool_def.get("annotations", {})
-        return name, annotations if isinstance(annotations, dict) else {}
-
-    name = str(getattr(tool_def, "name", ""))
-    metadata = getattr(tool_def, "metadata", None)
-    if not isinstance(metadata, dict):
-        return name, {}
-
-    annotations = metadata.get("annotations", {})
-    return name, annotations if isinstance(annotations, dict) else {}
-
-
-def _load_filtered_toolset_class() -> type[Any]:
-    """Lazy-load the pydantic-ai filtered toolset wrapper."""
-    try:
-        from pydantic_ai.toolsets.filtered import FilteredToolset  # noqa: PLC0415
-    except ImportError as error:  # pragma: no cover - environment-specific
-        raise ImportError(
-            "MCP filtering requires pydantic-ai MCP extras. "
-            'Install with: pip install "pydantic-ai-slim[mcp]"'
-        ) from error
-
-    return FilteredToolset
-
-
-def _apply_tool_filters(
-    server: Any,
-    allowed_tools: set[str] | None,
-    blocked_tools: set[str] | None,
-    read_only_tools: bool,
-    tool_prefix: str | None = None,
-) -> Any:
-    """Apply filtering policy to an MCP toolset wrapper."""
-    if not allowed_tools and not blocked_tools and not read_only_tools:
-        return server
-
-    filtered_toolset_class = _load_filtered_toolset_class()
-
-    def filter_fn(_ctx: Any, tool_def: Any) -> bool:
-        tool_name, annotations = _extract_tool_metadata(tool_def)
-        normalized_name = tool_name
-        if tool_prefix and tool_name.startswith(f"{tool_prefix}_"):
-            normalized_name = tool_name[len(tool_prefix) + 1 :]
-
-        if allowed_tools and not _matches_any_pattern(normalized_name, allowed_tools):
-            return False
-
-        if read_only_tools and not (
-            annotations.get("readOnly") or annotations.get("readOnlyHint")
-        ):
-            return False
-
-        if blocked_tools and _matches_any_pattern(normalized_name, blocked_tools):
-            return False
-
-        return True
-
-    return filtered_toolset_class(server, filter_fn)
-
-
-class MCPServerFactory:
-    """Factory for MCP servers with observer-backed process hooks."""
-
-    def __init__(self, get_observer: Callable[[], ToolObserver | None] | None = None) -> None:
-        self._get_observer = get_observer or (lambda: None)
-
-    def _build_process_tool_call(self) -> Callable[..., Awaitable[Any]]:
-        async def process_tool_call(
-            _ctx: Any,
-            call_next: Callable[[str, dict[str, Any]], Awaitable[Any]],
-            tool_name: str,
-            tool_args: dict[str, Any],
-        ) -> Any:
-            observer = self._get_observer()
-            if observer is not None:
-                observer.notify_event(
-                    ToolCallEvent(tool_name=tool_name, args=[], kwargs=tool_args)
-                )
-            return await call_next(tool_name, tool_args)
-
-        return process_tool_call
-
-    def create(self, connection: MCPConnectionConfig) -> Any:
-        """Create a transport-specific MCP server."""
-        if isinstance(connection, MCPStdioConnectionConfig) and not connection.stdio_command:
-            raise ValueError("stdio_command is required for MCPStdioConnectionConfig")
-
-        mcp_server_sse, mcp_server_streamable_http, mcp_server_stdio = (
-            _load_mcp_server_classes()
-        )
-        process_tool_call = self._build_process_tool_call()
-        headers = _mcp_auth_headers(connection.bearer_token)
-
-        if isinstance(connection, MCPStdioConnectionConfig):
-            env = dict(connection.stdio_env or {})
-            if connection.stdio_token_env_var and connection.bearer_token:
-                env[connection.stdio_token_env_var] = connection.bearer_token
-
-            return mcp_server_stdio(
-                command=connection.stdio_command,
-                args=connection.stdio_args,
-                env=env or None,
-                cwd=connection.stdio_cwd,
-                tool_prefix=connection.tool_prefix,
-                timeout=connection.timeout,
-                read_timeout=connection.read_timeout,
-                process_tool_call=process_tool_call,
-            )
-
-        if connection.transport == "sse":
-            return mcp_server_sse(
-                url=connection.url,
-                headers=headers,
-                tool_prefix=connection.tool_prefix,
-                timeout=connection.timeout,
-                read_timeout=connection.read_timeout,
-                process_tool_call=process_tool_call,
-            )
-
-        return mcp_server_streamable_http(
-            url=connection.url,
-            headers=headers,
-            tool_prefix=connection.tool_prefix,
-            timeout=connection.timeout,
-            read_timeout=connection.read_timeout,
-            process_tool_call=process_tool_call,
-        )
-
-
 class MCPTool(ToolCard):
-    """MCP protocol integration — exposes tools via toolsets, not callables."""
+    """MCP protocol integration — exposes tools via toolsets, not callables.
+
+    Attributes:
+        connection: MCP transport configuration (HTTP/SSE or stdio).
+    """
 
     connection: MCPConnectionConfig
-    allowed_tools: set[str] | None = Field(
-        default=None,
-        description="Allowlist tool patterns (fnmatch); None means all allowed.",
-    )
-    blocked_tools: set[str] | None = Field(
-        default=None,
-        description="Blocklist tool patterns (fnmatch); takes precedence.",
-    )
-    read_only_tools: bool = Field(
-        default=False,
-        description="If True, only expose tools with readOnly/readOnlyHint.",
-    )
 
-    def get_tools(self) -> list[Callable[..., Any]]:
+    def get_tools(self) -> list[Callable]:
         """MCP tools come via toolsets, not individual callables."""
         return []
 
     def get_toolsets(self) -> list[Any]:
-        factory = MCPServerFactory()
-        created_server = factory.create(self.connection)
-        filtered_server = _apply_tool_filters(
-            created_server,
-            self.allowed_tools,
-            self.blocked_tools,
-            read_only_tools=self.read_only_tools,
-            tool_prefix=self.connection.tool_prefix,
-        )
-        return [filtered_server]
+        """Create and return an MCP server toolset for pydantic-ai agents.
+
+        Creates the appropriate MCP server instance based on connection configuration:
+        - MCPServerStdio for stdio transport
+        - MCPServerSSE for SSE transport
+        - MCPServerStreamableHTTP for streamable-http transport
+
+        Returns:
+            List containing a single configured MCP server instance ready to be
+            used as a toolset in pydantic-ai agents.
+
+        Raises:
+            ValueError: If stdio_command is missing for stdio transport.
+            ImportError: If pydantic-ai MCP extras are not installed.
+        """
+        mcp_server_sse, mcp_server_streamable_http, mcp_server_stdio = _load_mcp_server_classes()
+        headers = _mcp_auth_headers(self.connection.bearer_token)
+
+        if isinstance(self.connection, MCPStdioConnectionConfig):
+            if not self.connection.stdio_command:
+                raise ValueError("stdio_command is required for MCPStdioConnectionConfig")
+
+            env = dict(self.connection.stdio_env or {})
+            if self.connection.stdio_token_env_var and self.connection.bearer_token:
+                env[self.connection.stdio_token_env_var] = self.connection.bearer_token
+
+            return [
+                mcp_server_stdio(
+                    command=self.connection.stdio_command,
+                    args=self.connection.stdio_args,
+                    env=env or None,
+                    cwd=self.connection.stdio_cwd,
+                    tool_prefix=self.connection.tool_prefix,
+                    timeout=self.connection.timeout,
+                    read_timeout=self.connection.read_timeout,
+                )
+            ]
+
+        if self.connection.transport == "sse":
+            return [
+                mcp_server_sse(
+                    url=self.connection.url,
+                    headers=headers,
+                    tool_prefix=self.connection.tool_prefix,
+                    timeout=self.connection.timeout,
+                    read_timeout=self.connection.read_timeout,
+                )
+            ]
+
+        return [
+            mcp_server_streamable_http(
+                url=self.connection.url,
+                headers=headers,
+                tool_prefix=self.connection.tool_prefix,
+                timeout=self.connection.timeout,
+                read_timeout=self.connection.read_timeout,
+            )
+        ]
 
 
 async def list_mcp_tools(connection: MCPConnectionConfig) -> list[str]:
-    """Connect to an MCP server and return exposed tool names."""
-    tool = MCPTool(name="mcp-probe", description="Probe MCP endpoint", connection=connection)
+    """Connect to an MCP server and return exposed tool names.
+
+    Args:
+        connection: MCP connection configuration (HTTP/SSE or stdio).
+
+    Returns:
+        List of tool names exposed by the MCP server.
+
+    Raises:
+        ImportError: If pydantic-ai MCP extras are not installed.
+        Exception: If connection fails or server is unreachable.
+    """
+    tool = MCPTool(
+        name="mcp-probe",
+        description="Probe MCP endpoint",
+        connection=connection,
+    )
+    print("## Creating MCP toolset for diagnostics...")
     toolsets = tool.get_toolsets()
     if not toolsets:
         raise ValueError("MCPTool.get_toolsets() returned empty list")
-
     server = toolsets[0]
+    print("## Server toolset created, connecting and listing tools...")
     async with server:
+        print("## Connected to MCP server, fetching tool list...")
         tools = await server.list_tools()
-
-    return [_extract_tool_metadata(tool_def)[0] for tool_def in tools]
+    return [tool_def.name for tool_def in tools]
 
 
 async def probe_mcp_connection(
@@ -326,19 +252,18 @@ async def probe_mcp_connection(
     *,
     max_tools_to_print: int = 20,
 ) -> dict[str, Any]:
-    """Probe an MCP server and return a compact feasibility summary."""
-    tool_defs = await list_mcp_tools(connection)
+    """Probe an MCP server and return a compact feasibility summary.
 
-    tool_names: list[str] = []
-    tool_annotations: list[dict[str, Any]] = []
-    for tool_def in tool_defs[:max_tools_to_print]:
-        tool_name, annotations = _extract_tool_metadata(tool_def)
-        tool_names.append(tool_name)
-        tool_annotations.append({"name": tool_name, "annotations": annotations})
+    Args:
+        connection: MCP connection configuration to probe.
+        max_tools_to_print: Maximum number of tool names to include in result.
 
+    Returns:
+        Dictionary with tool_count, tools (list), and feasible (bool).
+    """
+    tool_names = await list_mcp_tools(connection)
     return {
-        "tool_count": len(tool_defs),
-        "tools": tool_names,
-        "tool_annotations": tool_annotations,
-        "feasible": len(tool_defs) > 0,
+        "tool_count": len(tool_names),
+        "tools": tool_names[:max_tools_to_print],
+        "feasible": len(tool_names) > 0,
     }
