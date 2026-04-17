@@ -131,7 +131,6 @@ class MockActorToolObserver:
     def setup_kg_actor(self) -> KnowledgeGraphActor:
         """Create a real KG actor and wire it for proxy_ask."""
         from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
-        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
 
         actor = KnowledgeGraphActor()
         # Manually init without orchestrator dependency
@@ -265,7 +264,7 @@ class TestKnowledgeGraphToolObserver:
         with pytest.raises(ValueError, match="orchestrator"):
             tool.observer(observer)
 
-    def test_observer_creates_actors_via_getChildrenOrCreate(self) -> None:
+    def test_observer_creates_actors_via_get_children_or_create(self) -> None:
         tool = KnowledgeGraphTool()
         observer = MockActorToolObserver()
         addr = MockActorAddress(KG_ACTOR_NAME, KG_ACTOR_ROLE)
@@ -276,7 +275,7 @@ class TestKnowledgeGraphToolObserver:
         # getChildrenOrCreate called for both VectorStore and KG
         assert observer._orchestrator_proxy.getChildrenOrCreate.call_count == 2
 
-    def test_observer_uses_getChildrenOrCreate_for_both(self) -> None:
+    def test_observer_uses_get_children_or_create_for_both(self) -> None:
         """getChildrenOrCreate is always called (it handles both create and reuse)."""
         tool = KnowledgeGraphTool()
         observer = MockActorToolObserver()

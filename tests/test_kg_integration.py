@@ -11,7 +11,8 @@ from typing import Any
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import AkgentType
-from akgentic.core.orchestrator import Orchestrator
+
+from akgentic.tool.core import TOOL_CALL
 from akgentic.tool.knowledge_graph.kg_actor import (
     KG_ACTOR_NAME,
     KG_ACTOR_ROLE,
@@ -21,7 +22,6 @@ from akgentic.tool.knowledge_graph.kg_tool import (
     GetGraph,
     KnowledgeGraphTool,
     SearchGraph,
-    UpdateGraph,
 )
 from akgentic.tool.knowledge_graph.models import (
     EntityCreate,
@@ -29,8 +29,6 @@ from akgentic.tool.knowledge_graph.models import (
     RelationCreate,
     SearchQuery,
 )
-from akgentic.tool.core import TOOL_CALL
-
 
 # ---------------------------------------------------------------------------
 # Shared mock infrastructure

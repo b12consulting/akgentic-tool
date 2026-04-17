@@ -127,7 +127,6 @@ class TestPlanningToolObserverWiring:
     def test_observer_creates_vectorstore_and_plan_actors(self) -> None:
         """observer() must create VectorStoreActor with embedding fields, then PlanActor."""
         from akgentic.tool.planning.planning import PlanningTool
-        from akgentic.tool.vector_store.actor import VectorStoreActor
         from akgentic.tool.vector_store.protocol import VectorStoreConfig
 
         tool = PlanningTool(
