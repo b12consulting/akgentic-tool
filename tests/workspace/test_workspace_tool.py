@@ -933,3 +933,68 @@ class TestWorkspaceGlob:
         result = glob_fn("**.{py,ts}")  # type: ignore[assignment]
         assert "src/foo.py" in result
         assert "src/bar.ts" in result
+
+    def test_glob_with_path_argument_returns_relative_paths(self, tmp_path: Path) -> None:
+        """workspace_glob with path='subdir' returns relative paths without ValueError."""
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("subdir/file.py", b"content")
+        fs.write("other/ignore.py", b"other")
+        glob_fn = self._glob_fn(tool)
+        result = glob_fn("**/*.py", path="subdir")  # type: ignore[assignment]
+        assert "subdir/file.py" in result
+        assert "other/ignore.py" not in result
+
+    def test_glob_with_path_traversal_rejected(self, tmp_path: Path) -> None:
+        """workspace_glob rejects path arguments that escape the workspace root."""
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("legit/file.py", b"ok")
+        glob_fn = self._glob_fn(tool)
+        with pytest.raises(RetriableError):
+            glob_fn("**/*.py", path="../escape")  # type: ignore[assignment]
+
+
+# ---------------------------------------------------------------------------
+# Regression: workspace_grep with path argument (Story 14.1, AC #3)
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceGrepRegression:
+    """Regression tests for workspace_grep with path argument (ADR-021)."""
+
+    def _grep_fn(self, tool: WorkspaceTool) -> object:
+        return next(t for t in tool.get_tools() if t.__name__ == "workspace_grep")
+
+    def test_grep_with_path_argument_returns_relative_paths(self, tmp_path: Path) -> None:
+        """workspace_grep with path='subdir' returns relative paths without ValueError."""
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("subdir/file.py", b"search_term_here\n")
+        fs.write("other/ignore.py", b"no match\n")
+        grep_fn = self._grep_fn(tool)
+        result = grep_fn("search_term_here", path="subdir")  # type: ignore[assignment]
+        assert "subdir/file.py" in result
+        assert "search_term_here" in result
+        assert "other/ignore.py" not in result
+
+    def test_grep_with_path_traversal_rejected(self, tmp_path: Path) -> None:
+        """workspace_grep rejects path arguments that escape the workspace root."""
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("legit/file.py", b"ok\n")
+        grep_fn = self._grep_fn(tool)
+        with pytest.raises(RetriableError):
+            grep_fn("ok", path="../escape")  # type: ignore[assignment]
+
+
+# ---------------------------------------------------------------------------
+# Regression: Filesystem._root is absolute after construction (Story 14.1, AC #1)
+# ---------------------------------------------------------------------------
+
+
+class TestFilesystemRootAbsolute:
+    """Regression test ensuring _root is always absolute after construction."""
+
+    def test_filesystem_root_is_absolute_after_construction(self, tmp_path: Path) -> None:
+        """Filesystem constructed with relative base_path has absolute _root."""
+        # Use tmp_path to avoid creating directories in CWD
+        relative_base = str(tmp_path / "rel")
+        fs = Filesystem(relative_base, "workspace")
+        assert fs._root.is_absolute()

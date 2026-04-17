@@ -313,3 +313,58 @@ class SearchResult(SerializableBaseModel):
         default_factory=list,
         description="Shortest BFS paths between top entity hits (when find_paths=True).",
     )
+
+
+# ---------------------------------------------------------------------------
+# State delta models (Story 17.1, ADR-024)
+# ---------------------------------------------------------------------------
+
+
+class KnowledgeGraphStateEvent(SerializableBaseModel):
+    """Delta payload describing changes to the knowledge graph (Story 17.1, ADR-024).
+
+    Carried inside a ``ToolStateEvent`` envelope and broadcast on the orchestrator
+    event stream by the ``KnowledgeGraphActor`` (emission lands in Story 17.2).
+    All collections default to empty so that a single mutation category can be
+    reported without populating the others.
+
+    Attributes:
+        entities_added: Entities newly created in this delta.
+        entities_modified: Entities whose fields were updated.
+        entities_removed: UUIDs of entities removed in this delta.
+        relations_added: Relations newly created in this delta.
+        relations_modified: Relations whose fields were updated.
+        relations_removed: UUIDs of relations removed in this delta.
+    """
+
+    entities_added: list[Entity] = Field(
+        default_factory=list, description="Entities newly created in this delta."
+    )
+    entities_modified: list[Entity] = Field(
+        default_factory=list, description="Entities whose fields were updated."
+    )
+    entities_removed: list[uuid.UUID] = Field(
+        default_factory=list, description="UUIDs of entities removed in this delta."
+    )
+    relations_added: list[Relation] = Field(
+        default_factory=list, description="Relations newly created in this delta."
+    )
+    relations_modified: list[Relation] = Field(
+        default_factory=list, description="Relations whose fields were updated."
+    )
+    relations_removed: list[uuid.UUID] = Field(
+        default_factory=list, description="UUIDs of relations removed in this delta."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Resolve the forward-referenced ``ToolStatePayload`` alias on ``ToolStateEvent``
+# now that ``KnowledgeGraphStateEvent`` is defined. ``event.py`` cannot import
+# this module directly without creating a cycle, so the rebuild lives here
+# (Story 17.1, ADR-024).
+# ---------------------------------------------------------------------------
+from akgentic.tool.event import ToolStateEvent as _ToolStateEvent  # noqa: E402
+
+_ToolStateEvent.model_rebuild(
+    _types_namespace={"KnowledgeGraphStateEvent": KnowledgeGraphStateEvent}
+)

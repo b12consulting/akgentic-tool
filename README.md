@@ -207,6 +207,30 @@ ToolFactory(
 )
 ```
 
+### BaseToolParam: Configuration, Not Schema
+
+Every custom field on a `BaseToolParam` subclass must be read at factory bind time and influence
+the tool's runtime behavior — as a closure variable, function default, or observer setup value.
+Fields that merely mirror the LLM-facing function signature are dead code: they look configurable
+but have no effect.
+
+**Rule:** if a developer writes `MyParam(field=value)`, that value must influence runtime behavior.
+LLM-facing parameters belong exclusively on the factory-produced function signature.
+
+```python
+# CORRECT — field captured at bind time, controls behavior
+class GetPlanning(BaseToolParam):
+    filter_by_agent: bool = True  # read by factory, stored in closure
+
+# CORRECT — no custom fields, search params live on the function signature
+class SearchGraph(BaseToolParam):
+    expose: set[Channels] = {TOOL_CALL, COMMAND}
+
+# WRONG — fields duplicate function signature but are never read
+class BadParam(BaseToolParam):
+    status: str | None = None  # never consumed by factory
+```
+
 ## Channel System
 
 The `Channels` enum (`TOOL_CALL`, `SYSTEM_PROMPT`, `COMMAND`) controls how a capability is

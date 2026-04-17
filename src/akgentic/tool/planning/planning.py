@@ -61,18 +61,6 @@ class SearchPlanning(BaseToolParam):
     """Search tasks by status, owner, creator, and/or natural-language description."""
 
     expose: set[Channels] = {TOOL_CALL, COMMAND}
-    status: TaskStatus | None = Field(default=None, description="Filter by exact task status.")
-    owner: str | None = Field(
-        default=None, description="Filter by exact owner name. Empty string matches unassigned."
-    )
-    creator: str | None = Field(default=None, description="Filter by exact creator name.")
-    query: str | None = Field(
-        default=None,
-        description=(
-            "Case-insensitive keyword search on task description. When vector deps are available, "
-            "also runs semantic similarity search (cosine ≥ 0.5, top_k=20) and unions results."
-        ),
-    )
 
 
 class PlanningTool(ToolCard):
@@ -231,9 +219,7 @@ class PlanningTool(ToolCard):
                             f"{output_part}{suffix}"
                         )
                 else:
-                    lines.append(
-                        f"\nNo tasks assigned to or created by {agent_name} yet."
-                    )
+                    lines.append(f"\nNo tasks assigned to or created by {agent_name} yet.")
             else:
                 lines.append("\n**All tasks:**")
                 for task in tasks:
@@ -241,8 +227,7 @@ class PlanningTool(ToolCard):
                     owner_label = task.owner or "unassigned"
                     suffix = f" (Owner: {owner_label}, Creator: {task.creator})"
                     lines.append(
-                        f"- ID {task.id} [{task.status}] {task.description}"
-                        f"{output_part}{suffix}"
+                        f"- ID {task.id} [{task.status}] {task.description}{output_part}{suffix}"
                     )
 
             lines.append(
