@@ -99,6 +99,7 @@ class MockActorToolObserver:
         self._orchestrator = MockActorAddress("orchestrator")
         self._kg_actor: KnowledgeGraphActor | None = None
         self._orchestrator_proxy = MagicMock(spec=Orchestrator)
+        self._vs_addr = MockActorAddress("#VectorStore", "ToolActor")
 
     @property
     def myAddress(self) -> ActorAddress:  # noqa: N802
@@ -119,6 +120,9 @@ class MockActorToolObserver:
     ) -> Any:
         if actor == self._orchestrator:
             return self._orchestrator_proxy
+        # Return mock VectorStoreActor proxy for VS address
+        if actor == self._vs_addr:
+            return MagicMock()
         # Return the real KG actor for KG actor address
         if self._kg_actor is not None:
             return self._kg_actor
@@ -126,11 +130,26 @@ class MockActorToolObserver:
 
     def setup_kg_actor(self) -> KnowledgeGraphActor:
         """Create a real KG actor and wire it for proxy_ask."""
+        from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
+
         actor = KnowledgeGraphActor()
-        actor.on_start()
+        # Manually init without orchestrator dependency
+        actor.state = KnowledgeGraphState()
+        actor.state.observer(actor)
+        actor._vs_proxy = None
         self._kg_actor = actor
         kg_addr = MockActorAddress(KG_ACTOR_NAME, KG_ACTOR_ROLE)
-        self._orchestrator_proxy.get_team_member.return_value = kg_addr
+
+        # get_team_member returns VS addr for #VectorStore, KG addr for #KnowledgeGraphTool
+        def _get_team_member(name: str) -> MockActorAddress | None:
+            if name == VS_ACTOR_NAME:
+                return self._vs_addr
+            if name == KG_ACTOR_NAME:
+                return kg_addr
+            return None
+
+        self._orchestrator_proxy.get_team_member.side_effect = _get_team_member
         return actor
 
 
@@ -243,28 +262,45 @@ class TestKnowledgeGraphToolObserver:
         with pytest.raises(ValueError, match="orchestrator"):
             tool.observer(observer)
 
-    def test_observer_creates_actor_when_none(self) -> None:
+    def test_observer_creates_actors_when_none(self) -> None:
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
+
         tool = KnowledgeGraphTool()
         observer = MockActorToolObserver()
-        # get_team_member returns None → must createActor
+        # get_team_member returns None → must createActor for both VS and KG
         observer._orchestrator_proxy.get_team_member.return_value = None
-        kg_addr = MockActorAddress(KG_ACTOR_NAME, KG_ACTOR_ROLE)
-        observer._orchestrator_proxy.createActor.return_value = kg_addr
+        addr = MockActorAddress(KG_ACTOR_NAME, KG_ACTOR_ROLE)
+        observer._orchestrator_proxy.createActor.return_value = addr
 
         tool.observer(observer)
 
-        observer._orchestrator_proxy.get_team_member.assert_called_once_with(KG_ACTOR_NAME)
-        observer._orchestrator_proxy.createActor.assert_called_once()
+        # Should check for both VectorStore and KG actors
+        calls = observer._orchestrator_proxy.get_team_member.call_args_list
+        called_names = [c[0][0] for c in calls]
+        assert VS_ACTOR_NAME in called_names
+        assert KG_ACTOR_NAME in called_names
+        # createActor called for both
+        assert observer._orchestrator_proxy.createActor.call_count == 2
 
-    def test_observer_reuses_existing_actor(self) -> None:
+    def test_observer_reuses_existing_actors(self) -> None:
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
+
         tool = KnowledgeGraphTool()
         observer = MockActorToolObserver()
-        existing_addr = MockActorAddress(KG_ACTOR_NAME, KG_ACTOR_ROLE)
-        observer._orchestrator_proxy.get_team_member.return_value = existing_addr
+        vs_addr = MockActorAddress("#VectorStore", "ToolActor")
+        kg_addr = MockActorAddress(KG_ACTOR_NAME, KG_ACTOR_ROLE)
+
+        def _get_team_member(name: str) -> MockActorAddress | None:
+            if name == VS_ACTOR_NAME:
+                return vs_addr
+            if name == KG_ACTOR_NAME:
+                return kg_addr
+            return None
+
+        observer._orchestrator_proxy.get_team_member.side_effect = _get_team_member
 
         tool.observer(observer)
 
-        observer._orchestrator_proxy.get_team_member.assert_called_once_with(KG_ACTOR_NAME)
         observer._orchestrator_proxy.createActor.assert_not_called()
 
 

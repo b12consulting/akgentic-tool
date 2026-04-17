@@ -18,10 +18,20 @@ class TestPublicApi:
         expected = {
             "CollectionConfig",
             "CollectionStatus",
+            "EmbeddingActor",
+            "EmbeddingError",
             "EmbeddingProvider",
+            "EmbeddingRequest",
+            "EmbeddingResult",
+            "InMemoryBackend",
             "SearchHit",
             "SearchResult",
+            "VS_ACTOR_NAME",
+            "VS_ACTOR_ROLE",
+            "VectorStoreActor",
             "VectorStoreConfig",
             "VectorStoreService",
+            "VectorStoreState",
+            "WeaviateBackend",
         }
         assert set(vs.__all__) == expected

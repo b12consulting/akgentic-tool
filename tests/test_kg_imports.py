@@ -42,6 +42,14 @@ class TestPackageImports:
         for name in expected:
             assert hasattr(knowledge_graph, name), f"Missing export: {name}"
 
+    def test_removed_exports_not_in_all(self) -> None:
+        """EmbeddingService, VectorIndex, VectorEntry no longer exported from KG."""
+        from akgentic.tool import knowledge_graph
+
+        removed = ["EmbeddingService", "VectorIndex", "VectorEntry"]
+        for name in removed:
+            assert name not in knowledge_graph.__all__, f"{name} should not be in __all__"
+
     def test_tool_import_does_not_trigger_kg_import(self) -> None:
         """Importing akgentic.tool does NOT eagerly import knowledge_graph."""
         # Remove knowledge_graph from cache if present

@@ -88,12 +88,19 @@ class IntegrationObserver:
     """Mock observer wiring a real KnowledgeGraphActor for integration testing."""
 
     def __init__(self) -> None:
+        from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
+
         self.events: list[object] = []
         self._address = MockActorAddress("test-agent")
         self._orchestrator_addr = MockActorAddress("orchestrator")
         self._kg_actor = KnowledgeGraphActor()
-        self._kg_actor.on_start()
+        # Manually init without orchestrator dependency
+        self._kg_actor.state = KnowledgeGraphState()
+        self._kg_actor.state.observer(self._kg_actor)
+        self._kg_actor._vs_proxy = None
         self._kg_addr = MockActorAddress(KG_ACTOR_NAME, KG_ACTOR_ROLE)
+        self._vs_addr = MockActorAddress(VS_ACTOR_NAME, "ToolActor")
 
     @property
     def myAddress(self) -> ActorAddress:  # noqa: N802
@@ -112,20 +119,29 @@ class IntegrationObserver:
         actor_type: type[AkgentType] | None = None,
         timeout: int | None = None,
     ) -> Any:
+        from unittest.mock import MagicMock
+
         if actor == self._orchestrator_addr:
-            return _OrchestratorStub(self._kg_addr)
+            return _OrchestratorStub(self._kg_addr, self._vs_addr)
+        if actor == self._vs_addr:
+            return MagicMock()  # mock VectorStoreActor proxy
         return self._kg_actor
 
 
 class _OrchestratorStub:
-    """Minimal orchestrator stub that returns a known KG address."""
+    """Minimal orchestrator stub that returns known actor addresses."""
 
-    def __init__(self, kg_addr: MockActorAddress) -> None:
+    def __init__(self, kg_addr: MockActorAddress, vs_addr: MockActorAddress) -> None:
         self._kg_addr = kg_addr
+        self._vs_addr = vs_addr
 
     def get_team_member(self, name: str) -> ActorAddress | None:
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
+
         if name == KG_ACTOR_NAME:
             return self._kg_addr
+        if name == VS_ACTOR_NAME:
+            return self._vs_addr
         return None
 
     def createActor(self, *args: Any, **kwargs: Any) -> ActorAddress:  # noqa: N802
