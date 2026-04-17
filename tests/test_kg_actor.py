@@ -20,6 +20,7 @@ import pytest
 from akgentic.core.actor_address import ActorAddress
 
 from akgentic.tool.errors import RetriableError
+from akgentic.tool.event import ToolStateEvent
 from akgentic.tool.knowledge_graph.kg_actor import (
     KG_ACTOR_NAME,
     KG_ACTOR_ROLE,
@@ -31,6 +32,7 @@ from akgentic.tool.knowledge_graph.models import (
     EntityCreate,
     EntityUpdate,
     GraphView,
+    KnowledgeGraphStateEvent,
     ManageGraph,
     RelationCreate,
     RelationDelete,
@@ -105,6 +107,7 @@ def _actor() -> KnowledgeGraphActor:
     actor.state = KnowledgeGraphState()
     actor.state.observer(actor)
     actor._vs_proxy = None
+    actor._state_event_seq = 0
     return actor
 
 
@@ -1269,3 +1272,56 @@ class TestSearchFindPaths:
         assert isinstance(path[0], Entity)
         assert isinstance(path[1], Relation)
         assert isinstance(path[2], Entity)
+
+
+# ---------------------------------------------------------------------------
+# ToolStateEvent emission (AC-3)
+# ---------------------------------------------------------------------------
+
+
+class TestToolStateEventEmission:
+    """Verify update_graph emits ToolStateEvent with KnowledgeGraphStateEvent payload."""
+
+    def test_notify_event_called_on_non_empty_mutation(self) -> None:
+        actor = _actor()
+        with patch.object(actor, "notify_event") as mock_notify:
+            actor.update_graph(
+                ManageGraph(
+                    create_entities=[
+                        EntityCreate(name="Eve", entity_type="Person", description="Tester")
+                    ]
+                )
+            )
+            mock_notify.assert_called_once()
+            event = mock_notify.call_args[0][0]
+            assert isinstance(event, ToolStateEvent)
+            assert isinstance(event.payload, KnowledgeGraphStateEvent)
+            assert event.seq == 1
+            assert len(event.payload.entities_added) == 1
+            assert event.payload.entities_added[0].name == "Eve"
+
+    def test_notify_event_not_called_on_empty_mutation(self) -> None:
+        actor = _actor()
+        with patch.object(actor, "notify_event") as mock_notify:
+            actor.update_graph(ManageGraph())
+            mock_notify.assert_not_called()
+
+    def test_state_event_seq_increments(self) -> None:
+        actor = _actor()
+        with patch.object(actor, "notify_event"):
+            actor.update_graph(
+                ManageGraph(
+                    create_entities=[
+                        EntityCreate(name="A", entity_type="T", description="d1")
+                    ]
+                )
+            )
+            assert actor._state_event_seq == 1
+            actor.update_graph(
+                ManageGraph(
+                    create_entities=[
+                        EntityCreate(name="B", entity_type="T", description="d2")
+                    ]
+                )
+            )
+            assert actor._state_event_seq == 2

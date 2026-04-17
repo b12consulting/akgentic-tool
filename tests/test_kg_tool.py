@@ -138,6 +138,7 @@ class MockActorToolObserver:
         actor.state = KnowledgeGraphState()
         actor.state.observer(actor)
         actor._vs_proxy = None
+        actor._state_event_seq = 0
         self._kg_actor = actor
         kg_addr = MockActorAddress(KG_ACTOR_NAME, KG_ACTOR_ROLE)
 
