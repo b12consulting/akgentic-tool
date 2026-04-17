@@ -36,8 +36,8 @@ from akgentic.tool.knowledge_graph.models import (
     SearchResult,
 )
 from akgentic.tool.vector import VectorEntry
-from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
-from akgentic.tool.vector_store.protocol import CollectionConfig
+from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE, VectorStoreActor
+from akgentic.tool.vector_store.protocol import CollectionConfig, VectorStoreConfig
 from akgentic.tool.vector_store.protocol import SearchResult as VsSearchResult
 
 logger = logging.getLogger(__name__)
@@ -99,13 +99,10 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
                 )
                 return
             orch_proxy = self.proxy_ask(self.orchestrator, Orchestrator)
-            vs_addr = orch_proxy.get_team_member(VS_ACTOR_NAME)
-            if vs_addr is None:
-                logger.warning(
-                    "[%s] VectorStoreActor not found; operating in degraded mode",
-                    self.config.name,
-                )
-                return
+            vs_addr = orch_proxy.getChildrenOrCreate(
+                VectorStoreActor,
+                config=VectorStoreConfig(name=VS_ACTOR_NAME, role=VS_ACTOR_ROLE),
+            )
             self._vs_proxy = self.proxy_ask(vs_addr, VectorStoreActor)
             self._vs_proxy.create_collection(KG_COLLECTION, CollectionConfig())
         except Exception as exc:  # noqa: BLE001

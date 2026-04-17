@@ -141,31 +141,29 @@ class ExecTool(ToolCard):
         if observer.orchestrator is None:
             raise ValueError("ExecTool requires access to the orchestrator.")
 
-        orchestrator_proxy = observer.proxy_ask(observer.orchestrator, Orchestrator)
-        sandbox_addr = orchestrator_proxy.get_team_member(SANDBOX_ACTOR_NAME)
-
-        if sandbox_addr is None:
-            effective_mode = _resolve_auto_mode() if self.mode == "auto" else self.mode
-            if self.mode == "auto" and effective_mode == "local":
-                warnings.warn(
-                    "ExecTool mode='auto': no isolation backend found (bwrap, sandbox-exec, "
-                    "docker). Falling back to LocalSandboxActor — no filesystem isolation.",
-                    DeprecationWarning,
-                    stacklevel=2,
-                )
-            # KeyError on unknown mode — intentional (fail-fast, NFR-SB-7)
-            actor_class = SANDBOX_ACTOR_CLASSES[effective_mode]
-            logger.info("ExecTool: create %s (%s).", SANDBOX_ACTOR_NAME, actor_class.__name__)
-            sandbox_addr = orchestrator_proxy.createActor(
-                actor_class,
-                config=SandboxConfig(
-                    name=SANDBOX_ACTOR_NAME,
-                    role="ToolActor",
-                    team_id=str(observer.team_id),
-                    workspace_id=self.workspace_id,
-                    mode=effective_mode,
-                ),
+        # Resolve mode and emit warnings before getChildrenOrCreate
+        effective_mode = _resolve_auto_mode() if self.mode == "auto" else self.mode
+        if self.mode == "auto" and effective_mode == "local":
+            warnings.warn(
+                "ExecTool mode='auto': no isolation backend found (bwrap, sandbox-exec, "
+                "docker). Falling back to LocalSandboxActor — no filesystem isolation.",
+                DeprecationWarning,
+                stacklevel=2,
             )
+        # KeyError on unknown mode — intentional (fail-fast, NFR-SB-7)
+        actor_class = SANDBOX_ACTOR_CLASSES[effective_mode]
+
+        orchestrator_proxy = observer.proxy_ask(observer.orchestrator, Orchestrator)
+        sandbox_addr = orchestrator_proxy.getChildrenOrCreate(
+            actor_class,
+            config=SandboxConfig(
+                name=SANDBOX_ACTOR_NAME,
+                role="ToolActor",
+                team_id=str(observer.team_id),
+                workspace_id=self.workspace_id,
+                mode=effective_mode,
+            ),
+        )
 
         self._sandbox_proxy = observer.proxy_ask(sandbox_addr, SandboxActor)
         return self

@@ -103,13 +103,16 @@ class _OrchestratorStub:
 
     def __init__(self, plan_addr: _MockAddress) -> None:
         self._plan_addr = plan_addr
+        self._vs_addr = _MockAddress("#VectorStore", "ToolActor")
 
-    def get_team_member(self, name: str) -> ActorAddress | None:
-        if name == PLANNING_ACTOR_NAME:
-            return self._plan_addr
-        return None
+    def getChildrenOrCreate(  # noqa: N802
+        self, actor_class: type, config: object = None,
+    ) -> ActorAddress:
+        """Return plan addr for PlanActor, VS addr for VectorStore actors."""
+        from akgentic.tool.vector_store.actor import VectorStoreActor
 
-    def createActor(self, *args: Any, **kwargs: Any) -> ActorAddress:  # noqa: N802, ANN401 — N802: Pykka actor convention; ANN401: generic stub accepting any actor args
+        if actor_class is VectorStoreActor:
+            return self._vs_addr
         return self._plan_addr
 
 
@@ -154,6 +157,11 @@ class _ExampleObserver:
         """Return the appropriate stub based on which actor is being asked."""
         if actor == self._orchestrator_addr:
             return _OrchestratorStub(self._plan_addr)
+        # Return mock for VectorStoreActor proxy
+        if hasattr(actor, 'name') and actor.name == "#VectorStore":
+            from unittest.mock import MagicMock
+
+            return MagicMock()
         return self._plan_actor
 
 

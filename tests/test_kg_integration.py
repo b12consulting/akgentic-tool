@@ -136,6 +136,18 @@ class _OrchestratorStub:
         self._kg_addr = kg_addr
         self._vs_addr = vs_addr
 
+    def getChildrenOrCreate(  # noqa: N802
+        self, actor_class: type, config: object = None,
+    ) -> ActorAddress:
+        from akgentic.tool.knowledge_graph.kg_actor import KnowledgeGraphActor
+        from akgentic.tool.vector_store.actor import VectorStoreActor
+
+        if actor_class is VectorStoreActor:
+            return self._vs_addr
+        if actor_class is KnowledgeGraphActor:
+            return self._kg_addr
+        return self._kg_addr
+
     def get_team_member(self, name: str) -> ActorAddress | None:
         from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
 
