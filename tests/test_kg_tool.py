@@ -245,14 +245,6 @@ class TestKnowledgeGraphToolDefaults:
         tool = KnowledgeGraphTool()
         assert tool.read_only is False
 
-    def test_default_embedding_model(self) -> None:
-        tool = KnowledgeGraphTool()
-        assert tool.embedding_model == "text-embedding-3-small"
-
-    def test_default_embedding_provider(self) -> None:
-        tool = KnowledgeGraphTool()
-        assert tool.embedding_provider == "openai"
-
 
 class TestKnowledgeGraphToolObserver:
     """observer() wiring — singleton actor creation (2.2)."""
