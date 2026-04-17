@@ -20,6 +20,7 @@ import pytest
 from akgentic.core.actor_address import ActorAddress
 
 from akgentic.tool.errors import RetriableError
+from akgentic.tool.event import ToolStateEvent
 from akgentic.tool.knowledge_graph.kg_actor import (
     KG_ACTOR_NAME,
     KG_ACTOR_ROLE,
@@ -31,6 +32,7 @@ from akgentic.tool.knowledge_graph.models import (
     EntityCreate,
     EntityUpdate,
     GraphView,
+    KnowledgeGraphStateEvent,
     ManageGraph,
     RelationCreate,
     RelationDelete,
@@ -1292,9 +1294,6 @@ class TestToolStateEventEmission:
             )
             mock_notify.assert_called_once()
             event = mock_notify.call_args[0][0]
-            from akgentic.tool.event import ToolStateEvent
-            from akgentic.tool.knowledge_graph.models import KnowledgeGraphStateEvent
-
             assert isinstance(event, ToolStateEvent)
             assert isinstance(event.payload, KnowledgeGraphStateEvent)
             assert event.seq == 1
