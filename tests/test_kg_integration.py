@@ -99,6 +99,7 @@ class IntegrationObserver:
         self._kg_actor.state = KnowledgeGraphState()
         self._kg_actor.state.observer(self._kg_actor)
         self._kg_actor._vs_proxy = None
+        self._kg_actor._state_event_seq = 0
         self._kg_addr = MockActorAddress(KG_ACTOR_NAME, KG_ACTOR_ROLE)
         self._vs_addr = MockActorAddress(VS_ACTOR_NAME, "ToolActor")
 
