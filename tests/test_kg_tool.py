@@ -291,6 +291,39 @@ class TestKnowledgeGraphToolObserver:
 
         assert observer._orchestrator_proxy.getChildrenOrCreate.call_count == 2
 
+    def test_observer_passes_default_vectorstore_config(self) -> None:
+        """VectorStoreConfig uses centralized defaults (no embedding fields on KG tool)."""
+        from unittest.mock import MagicMock
+
+        from akgentic.tool.vector_store.protocol import VectorStoreConfig
+
+        tool = KnowledgeGraphTool()
+
+        captured_configs: list[object] = []
+
+        mock_proxy_ask = MagicMock()
+
+        def capture_get_children_or_create(
+            actor_cls: type, config: object = None,
+        ) -> MagicMock:
+            captured_configs.append(config)
+            return MagicMock()
+
+        mock_proxy_ask.getChildrenOrCreate.side_effect = capture_get_children_or_create
+
+        mock_observer = MagicMock()
+        mock_observer.orchestrator = MagicMock()
+        mock_observer.proxy_ask.return_value = mock_proxy_ask
+
+        tool.observer(mock_observer)
+
+        assert len(captured_configs) == 2
+
+        vs_config = captured_configs[0]
+        assert isinstance(vs_config, VectorStoreConfig)
+        assert vs_config.embedding_model == "text-embedding-3-small"
+        assert vs_config.embedding_provider == "openai"
+
 
 class TestKnowledgeGraphToolReadOnly:
     """read_only=True disables update_graph (2.9)."""
