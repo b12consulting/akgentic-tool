@@ -131,7 +131,6 @@ class MockActorToolObserver:
     def setup_kg_actor(self) -> KnowledgeGraphActor:
         """Create a real KG actor and wire it for proxy_ask."""
         from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
-        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
 
         actor = KnowledgeGraphActor()
         # Manually init without orchestrator dependency
@@ -142,15 +141,17 @@ class MockActorToolObserver:
         self._kg_actor = actor
         kg_addr = MockActorAddress(KG_ACTOR_NAME, KG_ACTOR_ROLE)
 
-        # get_team_member returns VS addr for #VectorStore, KG addr for #KnowledgeGraphTool
-        def _get_team_member(name: str) -> MockActorAddress | None:
-            if name == VS_ACTOR_NAME:
-                return self._vs_addr
-            if name == KG_ACTOR_NAME:
-                return kg_addr
-            return None
+        # getChildrenOrCreate returns VS addr for #VectorStore, KG addr for #KnowledgeGraphTool
+        def _get_children_or_create(
+            actor_class: type, config: object = None,
+        ) -> MockActorAddress:
+            from akgentic.tool.vector_store.actor import VectorStoreActor as _VSActor
 
-        self._orchestrator_proxy.get_team_member.side_effect = _get_team_member
+            if actor_class is _VSActor:
+                return self._vs_addr
+            return kg_addr
+
+        self._orchestrator_proxy.getChildrenOrCreate.side_effect = _get_children_or_create
         return actor
 
 
@@ -263,46 +264,40 @@ class TestKnowledgeGraphToolObserver:
         with pytest.raises(ValueError, match="orchestrator"):
             tool.observer(observer)
 
-    def test_observer_creates_actors_when_none(self) -> None:
-        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
-
+    def test_observer_creates_actors_via_get_children_or_create(self) -> None:
         tool = KnowledgeGraphTool()
         observer = MockActorToolObserver()
-        # get_team_member returns None → must createActor for both VS and KG
-        observer._orchestrator_proxy.get_team_member.return_value = None
         addr = MockActorAddress(KG_ACTOR_NAME, KG_ACTOR_ROLE)
-        observer._orchestrator_proxy.createActor.return_value = addr
+        observer._orchestrator_proxy.getChildrenOrCreate.return_value = addr
 
         tool.observer(observer)
 
-        # Should check for both VectorStore and KG actors
-        calls = observer._orchestrator_proxy.get_team_member.call_args_list
-        called_names = [c[0][0] for c in calls]
-        assert VS_ACTOR_NAME in called_names
-        assert KG_ACTOR_NAME in called_names
-        # createActor called for both
-        assert observer._orchestrator_proxy.createActor.call_count == 2
+        # getChildrenOrCreate called for both VectorStore and KG
+        assert observer._orchestrator_proxy.getChildrenOrCreate.call_count == 2
 
-    def test_observer_reuses_existing_actors(self) -> None:
-        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
-
+    def test_observer_uses_get_children_or_create_for_both(self) -> None:
+        """getChildrenOrCreate is always called (it handles both create and reuse)."""
         tool = KnowledgeGraphTool()
         observer = MockActorToolObserver()
         vs_addr = MockActorAddress("#VectorStore", "ToolActor")
         kg_addr = MockActorAddress(KG_ACTOR_NAME, KG_ACTOR_ROLE)
 
-        def _get_team_member(name: str) -> MockActorAddress | None:
-            if name == VS_ACTOR_NAME:
-                return vs_addr
-            if name == KG_ACTOR_NAME:
-                return kg_addr
-            return None
+        from akgentic.tool.vector_store.actor import VectorStoreActor as _VSActor
 
-        observer._orchestrator_proxy.get_team_member.side_effect = _get_team_member
+        def _get_children_or_create(
+            actor_class: type, config: object = None,
+        ) -> MockActorAddress:
+            if actor_class is _VSActor:
+                return vs_addr
+            return kg_addr
+
+        observer._orchestrator_proxy.getChildrenOrCreate.side_effect = (
+            _get_children_or_create
+        )
 
         tool.observer(observer)
 
-        observer._orchestrator_proxy.createActor.assert_not_called()
+        assert observer._orchestrator_proxy.getChildrenOrCreate.call_count == 2
 
 
 class TestKnowledgeGraphToolReadOnly:

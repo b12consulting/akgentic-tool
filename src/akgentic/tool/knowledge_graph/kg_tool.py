@@ -38,7 +38,7 @@ from akgentic.tool.knowledge_graph.models import (
     SearchQuery,
     SearchResult,
 )
-from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
+from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE, VectorStoreActor
 from akgentic.tool.vector_store.protocol import VectorStoreConfig
 
 logger = logging.getLogger(__name__)
@@ -129,31 +129,25 @@ class KnowledgeGraphTool(ToolCard):
 
         orchestrator_proxy = observer.proxy_ask(observer.orchestrator, Orchestrator)
 
-        # Ensure VectorStoreActor singleton exists (AC10)
-        vs_addr = orchestrator_proxy.get_team_member(VS_ACTOR_NAME)
-        if vs_addr is None:
-            logger.info("KnowledgeGraphTool: creating singleton %s.", VS_ACTOR_NAME)
-            vs_addr = orchestrator_proxy.createActor(
-                VectorStoreActor,
-                config=VectorStoreConfig(
-                    name=VS_ACTOR_NAME,
-                    role="ToolActor",
-                    embedding_model=self.embedding_model,
-                    embedding_provider=self.embedding_provider,
-                ),
-            )
+        # Ensure VectorStoreActor singleton exists
+        orchestrator_proxy.getChildrenOrCreate(
+            VectorStoreActor,
+            config=VectorStoreConfig(
+                name=VS_ACTOR_NAME,
+                role=VS_ACTOR_ROLE,
+                embedding_model=self.embedding_model,
+                embedding_provider=self.embedding_provider,
+            ),
+        )
 
         # Create/retrieve KnowledgeGraphActor singleton
-        kg_addr = orchestrator_proxy.get_team_member(KG_ACTOR_NAME)
-        if kg_addr is None:
-            logger.info("KnowledgeGraphTool: creating singleton %s.", KG_ACTOR_NAME)
-            kg_addr = orchestrator_proxy.createActor(
-                KnowledgeGraphActor,
-                config=KnowledgeGraphConfig(
-                    name=KG_ACTOR_NAME,
-                    role=KG_ACTOR_ROLE,
-                ),
-            )
+        kg_addr = orchestrator_proxy.getChildrenOrCreate(
+            KnowledgeGraphActor,
+            config=KnowledgeGraphConfig(
+                name=KG_ACTOR_NAME,
+                role=KG_ACTOR_ROLE,
+            ),
+        )
 
         self._kg_proxy = observer.proxy_ask(kg_addr, KnowledgeGraphActor)
 

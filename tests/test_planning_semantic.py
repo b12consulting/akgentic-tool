@@ -127,7 +127,6 @@ class TestPlanningToolObserverWiring:
     def test_observer_creates_vectorstore_and_plan_actors(self) -> None:
         """observer() must create VectorStoreActor with embedding fields, then PlanActor."""
         from akgentic.tool.planning.planning import PlanningTool
-        from akgentic.tool.vector_store.actor import VectorStoreActor
         from akgentic.tool.vector_store.protocol import VectorStoreConfig
 
         tool = PlanningTool(
@@ -139,13 +138,14 @@ class TestPlanningToolObserverWiring:
         captured_configs: list[object] = []
 
         mock_proxy_ask = MagicMock()
-        mock_proxy_ask.get_team_member.return_value = None  # Force actor creation path
 
-        def capture_create_actor(actor_cls: type, config: object) -> MagicMock:
+        def capture_get_children_or_create(
+            actor_cls: type, config: object = None,
+        ) -> MagicMock:
             captured_configs.append(config)
             return MagicMock()
 
-        mock_proxy_ask.createActor.side_effect = capture_create_actor
+        mock_proxy_ask.getChildrenOrCreate.side_effect = capture_get_children_or_create
 
         mock_observer = MagicMock()
         mock_observer.orchestrator = MagicMock()

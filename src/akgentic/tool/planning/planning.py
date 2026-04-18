@@ -96,32 +96,27 @@ class PlanningTool(ToolCard):
         if observer.orchestrator is None:
             raise ValueError("PlanningTool requires access to the orchestrator.")
 
-        orchestrator_proxy_ask = observer.proxy_ask(observer.orchestrator, Orchestrator)
+        orchestrator_proxy = observer.proxy_ask(observer.orchestrator, Orchestrator)
 
-        # Ensure VectorStoreActor singleton exists (AC10)
-        vs_addr = orchestrator_proxy_ask.get_team_member(VS_ACTOR_NAME)
-        if vs_addr is None:
-            logger.info("PlanningTool: creating singleton %s.", VS_ACTOR_NAME)
-            vs_addr = orchestrator_proxy_ask.createActor(
-                VectorStoreActor,
-                config=VectorStoreConfig(
-                    name=VS_ACTOR_NAME,
-                    role=VS_ACTOR_ROLE,
-                    embedding_model=self.embedding_model,
-                    embedding_provider=self.embedding_provider,
-                ),
-            )
+        # Ensure VectorStoreActor singleton exists
+        orchestrator_proxy.getChildrenOrCreate(
+            VectorStoreActor,
+            config=VectorStoreConfig(
+                name=VS_ACTOR_NAME,
+                role=VS_ACTOR_ROLE,
+                embedding_model=self.embedding_model,
+                embedding_provider=self.embedding_provider,
+            ),
+        )
 
         # Create/retrieve PlanActor singleton
-        planning_tool_addr = orchestrator_proxy_ask.get_team_member(PLANNING_ACTOR_NAME)
-
-        if planning_tool_addr is None:
-            logger.info("PlanningTool: creating %s.", PLANNING_ACTOR_NAME)
-            config = PlanConfig(
+        planning_tool_addr = orchestrator_proxy.getChildrenOrCreate(
+            PlanActor,
+            config=PlanConfig(
                 name=PLANNING_ACTOR_NAME,
                 role=PLANNING_ACTOR_ROLE,
-            )
-            planning_tool_addr = orchestrator_proxy_ask.createActor(PlanActor, config=config)
+            ),
+        )
 
         self._planning_proxy = observer.proxy_ask(planning_tool_addr, PlanActor)
 
