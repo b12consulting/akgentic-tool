@@ -134,8 +134,6 @@ Custom planning configuration with semantic search:
 
 ```python
 PlanningTool(
-    embedding_model="text-embedding-3-small",
-    embedding_provider="openai",
     get_planning=GetPlanning(filter_by_agent=False),  # show all tasks, not just own
 )
 ```

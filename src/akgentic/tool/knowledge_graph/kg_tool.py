@@ -10,7 +10,7 @@ Follows the same pattern as ``PlanningTool`` in akgentic.tool.planning.
 from __future__ import annotations
 
 import logging
-from typing import Callable, Literal
+from typing import Callable
 
 from pydantic import Field
 
@@ -105,8 +105,6 @@ class KnowledgeGraphTool(ToolCard):
         description="Search graph — TOOL_CALL + COMMAND by default",
     )
 
-    embedding_model: str = "text-embedding-3-small"
-    embedding_provider: Literal["openai", "azure"] = "openai"
     read_only: bool = False
 
     # ------------------------------------------------------------------
@@ -135,8 +133,6 @@ class KnowledgeGraphTool(ToolCard):
             config=VectorStoreConfig(
                 name=VS_ACTOR_NAME,
                 role=VS_ACTOR_ROLE,
-                embedding_model=self.embedding_model,
-                embedding_provider=self.embedding_provider,
             ),
         )
 

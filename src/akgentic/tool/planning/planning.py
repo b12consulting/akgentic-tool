@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable, Literal
+from typing import Callable
 
 from pydantic import Field
 
@@ -75,14 +75,6 @@ class PlanningTool(ToolCard):
     get_planning_task: GetPlanningTask | bool = True
     update_planning: UpdatePlanning | bool = True
     search_planning: SearchPlanning | bool = True
-    embedding_model: str = Field(
-        default="text-embedding-3-small",
-        description="Embedding model passed through to PlanConfig for semantic task search",
-    )
-    embedding_provider: Literal["openai", "azure"] = Field(
-        default="openai",
-        description="Embedding provider passed through to PlanConfig for semantic task search",
-    )
 
     def observer(self, observer: ActorToolObserver) -> None:  # type: ignore[override]
         """Attach observer and set up the planning actor proxy.
@@ -104,8 +96,6 @@ class PlanningTool(ToolCard):
             config=VectorStoreConfig(
                 name=VS_ACTOR_NAME,
                 role=VS_ACTOR_ROLE,
-                embedding_model=self.embedding_model,
-                embedding_provider=self.embedding_provider,
             ),
         )
 

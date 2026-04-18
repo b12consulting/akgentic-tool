@@ -291,8 +291,6 @@ def main() -> None:
         get_planning=GetPlanning(filter_by_agent=True),
         get_planning_task=GetPlanningTask(),
         update_planning=UpdatePlanning(),
-        embedding_model="text-embedding-3-small",
-        embedding_provider="openai",
     )
     tool.observer(observer)
     print(f"Tool: {tool.name} — {tool.description}")

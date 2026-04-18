@@ -84,40 +84,7 @@ class TestGetPlanningTaskIntNotFound:
 
 
 # ---------------------------------------------------------------------------
-# AC#8 — PlanningTool has embedding_model and embedding_provider fields
-# ---------------------------------------------------------------------------
-
-
-class TestPlanningToolFields:
-    """AC8: PlanningTool exposes embedding_model and embedding_provider Pydantic fields."""
-
-    def test_default_embedding_model(self) -> None:
-        from akgentic.tool.planning.planning import PlanningTool
-
-        tool = PlanningTool()
-        assert tool.embedding_model == "text-embedding-3-small"
-
-    def test_default_embedding_provider(self) -> None:
-        from akgentic.tool.planning.planning import PlanningTool
-
-        tool = PlanningTool()
-        assert tool.embedding_provider == "openai"
-
-    def test_custom_embedding_model(self) -> None:
-        from akgentic.tool.planning.planning import PlanningTool
-
-        tool = PlanningTool(embedding_model="text-embedding-ada-002")
-        assert tool.embedding_model == "text-embedding-ada-002"
-
-    def test_custom_embedding_provider_azure(self) -> None:
-        from akgentic.tool.planning.planning import PlanningTool
-
-        tool = PlanningTool(embedding_provider="azure")
-        assert tool.embedding_provider == "azure"
-
-
-# ---------------------------------------------------------------------------
-# AC#9 — PlanningTool.observer() passes PlanConfig with embedding fields
+# AC#9 — PlanningTool.observer() creates VectorStoreActor with default config
 # ---------------------------------------------------------------------------
 
 
@@ -125,16 +92,13 @@ class TestPlanningToolObserverWiring:
     """AC9/AC10: observer() creates VectorStoreActor and PlanActor with correct configs."""
 
     def test_observer_creates_vectorstore_and_plan_actors(self) -> None:
-        """observer() must create VectorStoreActor with embedding fields, then PlanActor."""
+        """observer() must create VectorStoreActor with defaults, then PlanActor."""
         from akgentic.tool.planning.planning import PlanningTool
         from akgentic.tool.vector_store.protocol import VectorStoreConfig
 
-        tool = PlanningTool(
-            embedding_model="text-embedding-ada-002",
-            embedding_provider="azure",
-        )
+        tool = PlanningTool()
 
-        # Capture configs passed to createActor calls
+        # Capture configs passed to getChildrenOrCreate calls
         captured_configs: list[object] = []
 
         mock_proxy_ask = MagicMock()
@@ -156,11 +120,11 @@ class TestPlanningToolObserverWiring:
         # Two actors created: VectorStoreActor first, PlanActor second
         assert len(captured_configs) == 2
 
-        # First: VectorStoreConfig with embedding fields
+        # First: VectorStoreConfig with defaults (embedding config centralized here)
         vs_config = captured_configs[0]
         assert isinstance(vs_config, VectorStoreConfig)
-        assert vs_config.embedding_model == "text-embedding-ada-002"
-        assert vs_config.embedding_provider == "azure"
+        assert vs_config.embedding_model == "text-embedding-3-small"
+        assert vs_config.embedding_provider == "openai"
 
         # Second: PlanConfig without embedding fields
         plan_config = captured_configs[1]
