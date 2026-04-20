@@ -31,7 +31,7 @@ def _extract_ids(results: list[str]) -> set[int]:
 
 def _make_actor(
     vector_store: bool = False,
-    search_top_k: int = 20,
+    search_top_k: int = 10,
     search_score_threshold: float = 0.5,
 ) -> PlanActor:
     """Construct a bare PlanActor with configurable search defaults."""
@@ -101,7 +101,7 @@ class TestPlanningToolSearchFields:
         from akgentic.tool.planning.planning import PlanningTool
 
         tool = PlanningTool()
-        assert tool.search_top_k == 20
+        assert tool.search_top_k == 10
 
     def test_default_search_score_threshold(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
@@ -135,7 +135,7 @@ class TestPlanningToolSearchFields:
 
         tool = PlanningTool()
         reloaded = PlanningTool.model_validate(tool.model_dump())
-        assert reloaded.search_top_k == 20
+        assert reloaded.search_top_k == 10
         assert reloaded.search_score_threshold == 0.5
 
     def test_fields_in_model_dump(self) -> None:
@@ -174,7 +174,7 @@ class TestConfigPropagation:
         from akgentic.tool.planning.planning import PlanningTool
 
         configs = self._run_observer(PlanningTool())
-        assert configs[0].search_top_k == 20
+        assert configs[0].search_top_k == 10
 
     def test_propagates_default_search_score_threshold(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
@@ -456,9 +456,9 @@ class TestCatalogYAMLConfiguration:
 class TestBackwardCompatibility:
     """AC-8: Without new fields, defaults match hardcoded behavior."""
 
-    def test_default_top_k_is_20(self) -> None:
+    def test_default_top_k_is_10(self) -> None:
         actor = _make_actor(vector_store=False)
-        assert actor.config.search_top_k == 20
+        assert actor.config.search_top_k == 10
 
     def test_default_score_threshold_is_05(self) -> None:
         actor = _make_actor(vector_store=False)
@@ -472,11 +472,11 @@ class TestBackwardCompatibility:
         actor.config = BaseConfig(name="test", role="ToolActor")
         actor.on_start()
 
-        assert actor.config.search_top_k == 20
+        assert actor.config.search_top_k == 10
         assert actor.config.search_score_threshold == 0.5
 
-    def test_search_with_default_config_uses_20_and_05(self) -> None:
-        """Default config: search uses top_k=20, threshold=0.5."""
+    def test_search_with_default_config_uses_10_and_05(self) -> None:
+        """Default config: search uses top_k=10, threshold=0.5."""
         actor = _make_actor(vector_store=True)
         _add_task(actor, 1, "auth service")
 
@@ -490,7 +490,7 @@ class TestBackwardCompatibility:
         assert result == []
 
     def test_search_with_default_config_top_k_passed(self) -> None:
-        """Default config: search passes top_k=20 to vector store."""
+        """Default config: search passes top_k=10 to vector store."""
         actor = _make_actor(vector_store=True)
         _add_task(actor, 1, "auth service")
 
@@ -501,7 +501,7 @@ class TestBackwardCompatibility:
         actor.search_planning(query="auth")
 
         call_args = actor._vs_proxy.search.call_args
-        assert call_args[0][2] == 20
+        assert call_args[0][2] == 10
 
     def test_default_mode_is_hybrid(self) -> None:
         """Default mode is hybrid — same as current implicit behavior."""

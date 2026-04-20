@@ -811,17 +811,22 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         Returns:
             SearchResult with ranked hits and optional expansion data.
         """
+        effective_top_k = (
+            query.top_k
+            if query.top_k is not None
+            else self.config.search_top_k
+        )
         effective_threshold = (
             query.score_threshold
             if query.score_threshold is not None
             else self.config.search_score_threshold
         )
         if query.mode == "vector":
-            base_result = self._vector_search(query.query, query.top_k, effective_threshold)
+            base_result = self._vector_search(query.query, effective_top_k, effective_threshold)
         elif query.mode == "hybrid":
-            base_result = self._hybrid_search(query.query, query.top_k, effective_threshold)
+            base_result = self._hybrid_search(query.query, effective_top_k, effective_threshold)
         else:
-            base_result = self._keyword_search(query.query, query.top_k)
+            base_result = self._keyword_search(query.query, effective_top_k)
 
         if query.include_neighbors or query.include_edges or query.find_paths:
             return self._expand_search_result(base_result.hits, query)

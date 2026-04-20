@@ -91,7 +91,7 @@ class PlanningTool(ToolCard):
     )
 
     search_top_k: int = Field(
-        default=20,
+        default=10,
         description="Default top-k for semantic search in search_planning.",
     )
     search_score_threshold: float = Field(
@@ -302,19 +302,19 @@ class PlanningTool(ToolCard):
             top_k: int | None = None,
             score_threshold: float | None = None,
         ) -> list[str]:
-            """Search tasks by status, owner, creator, and/or natural-language description.
+            """Search tasks. All filters are AND-combined; omit all for full list.
 
-            All parameters are optional. Provided parameters are combined as AND conditions.
-            When all are None, returns the full task list.
-            query applies case-insensitive substring match on description; when vector deps
-            are available, also uses semantic similarity.
-            mode controls the search strategy: "hybrid" (default) runs both keyword and
-            semantic phases; "keyword" skips embedding/vector search; "vector" skips keyword
-            substring matching. When vector deps are unavailable, "vector" returns empty
-            results and "hybrid" falls back to keyword-only.
-            top_k overrides the default maximum number of semantic search hits (config default).
-            score_threshold overrides the default minimum cosine similarity score (config default).
-            Results include score labels and are ordered by score (highest first).
+            Args:
+                status: Filter by status.
+                owner: Filter by owner.
+                creator: Filter by creator.
+                query: Search text for keyword and/or semantic matching.
+                mode: "hybrid" (default) = keyword + semantic,
+                    "keyword" = substring only, "vector" = semantic only.
+                top_k: Max semantic hits (default 10).
+                score_threshold: Min cosine similarity (default 0.5).
+
+            Returns scored results: "(semantic: 0.85)", "(keyword match)", "(hybrid: 0.90)".
             """
             return planning_proxy.search_planning(
                 status=status,

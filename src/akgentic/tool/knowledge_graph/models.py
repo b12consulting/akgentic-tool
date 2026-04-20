@@ -250,23 +250,28 @@ class SearchQuery(SerializableBaseModel):
     """
 
     query: str = Field(..., description="Search query string.")
-    top_k: int = Field(default=10, description="Maximum number of hits to return.")
+    top_k: int | None = Field(
+        default=None,
+        description="Max hits. Overrides ToolCard default (10) when set.",
+    )
     mode: Literal["hybrid", "vector", "keyword"] = Field(
-        default="hybrid", description="Search mode: hybrid, vector, or keyword."
+        default="hybrid",
+        description="hybrid (default) = keyword + vector, "
+        "keyword = substring only, vector = semantic only.",
     )
     include_neighbors: bool = Field(
-        default=False, description="Include 1-hop neighbors of entity hits."
+        default=False, description="Add 1-hop neighbors of entity hits."
     )
     include_edges: bool = Field(
-        default=False, description="Include all relations connected to entity hits."
+        default=False, description="Add relations connected to entity hits."
     )
     find_paths: bool = Field(
         default=False,
-        description="Find shortest BFS paths between top 5 entity hits (max 10 pairs).",
+        description="BFS shortest paths between top 5 entity hits (max 10 pairs).",
     )
     score_threshold: float | None = Field(
         default=None,
-        description="Minimum cosine similarity score. Overrides the ToolCard default when set.",
+        description="Min cosine similarity. Overrides ToolCard default (0.3) when set.",
     )
 
 

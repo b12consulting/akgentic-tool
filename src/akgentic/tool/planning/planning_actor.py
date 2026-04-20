@@ -106,7 +106,7 @@ class PlanConfig(BaseConfig):
         ),
     )
     search_top_k: int = Field(
-        default=20,
+        default=10,
         description="Default top-k for semantic search in search_planning.",
     )
     search_score_threshold: float = Field(
@@ -295,7 +295,7 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
                    results; ``mode="hybrid"`` falls back to keyword-only with
                    a warning.
             top_k: Maximum number of semantic search hits. When None, uses
-                   ``config.search_top_k`` (default 20).
+                   ``config.search_top_k`` (default 10).
             score_threshold: Minimum cosine similarity score for semantic results.
                    When None, uses ``config.search_score_threshold`` (default 0.5).
 
