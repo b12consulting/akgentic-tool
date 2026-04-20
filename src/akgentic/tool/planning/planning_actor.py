@@ -12,8 +12,8 @@ from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.vector import VectorEntry
-from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE, VectorStoreActor
-from akgentic.tool.vector_store.protocol import CollectionConfig, VectorStoreConfig
+from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
+from akgentic.tool.vector_store.protocol import CollectionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +98,13 @@ class PlanConfig(BaseConfig):
             "for semantic search. Falls back gracefully if VectorStoreActor is unavailable."
         ),
     )
+    vector_store: bool | str = Field(
+        default=True,
+        description=(
+            "Binding to a VectorStoreActor: True=default #VectorStore, "
+            "str=named instance, False=degraded mode (no vector search)."
+        ),
+    )
 
 
 class PlanActor(Akgent[PlanConfig, PlanManagerState]):
@@ -129,31 +136,56 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
             self._acquire_vs_proxy()
 
     def _acquire_vs_proxy(self) -> None:
-        """Acquire the VectorStoreActor proxy and create the planning collection.
+        """Look up the VectorStoreActor proxy and create the planning collection.
 
-        Operates in degraded mode (no vector search) if the proxy cannot
-        be acquired.
+        The VectorStoreActor is owned by ``VectorStoreTool``; this actor
+        only resolves it by name. Behaviour:
+
+        - ``config.vector_store is False`` → stay in degraded mode (no
+          lookup, ``_vs_proxy`` remains ``None``).
+        - ``self.orchestrator is None`` (test harness) → log WARNING and
+          return — existing behaviour preserved.
+        - Otherwise look up the target actor name (``config.vector_store``
+          when a ``str``, else ``VS_ACTOR_NAME``) via
+          ``orch_proxy.get_team_member``. Raise ``RuntimeError`` when it
+          is missing — a missing VectorStoreTool is a **configuration**
+          error, not a runtime degradation.
+        - A transient backend error during ``create_collection`` drops
+          back to degraded mode with a WARNING (matches existing
+          behaviour for embedding failures).
         """
-        try:
-            if self.orchestrator is None:
-                logger.warning(
-                    "[%s] No orchestrator; operating in degraded mode",
-                    self.config.name,
-                )
-                return
-            orch_proxy = self.proxy_ask(self.orchestrator, Orchestrator)
-            vs_addr = orch_proxy.getChildrenOrCreate(
-                VectorStoreActor,
-                config=VectorStoreConfig(name=VS_ACTOR_NAME, role=VS_ACTOR_ROLE),
+        if self.config.vector_store is False:
+            return  # degraded mode by design
+
+        if self.orchestrator is None:
+            logger.warning(
+                "[%s] No orchestrator; operating in degraded mode",
+                self.config.name,
             )
-            self._vs_proxy = self.proxy_ask(vs_addr, VectorStoreActor)
+            return
+
+        vs_name = (
+            self.config.vector_store
+            if isinstance(self.config.vector_store, str)
+            else VS_ACTOR_NAME
+        )
+        orch_proxy = self.proxy_ask(self.orchestrator, Orchestrator)
+        vs_addr = orch_proxy.get_team_member(vs_name)
+        if vs_addr is None:
+            raise RuntimeError(
+                f"{self.config.name} requires VectorStoreActor '{vs_name}' "
+                f"but it was not found. Ensure VectorStoreTool is in the team config."
+            )
+        self._vs_proxy = self.proxy_ask(vs_addr, VectorStoreActor)
+        try:
             self._vs_proxy.create_collection(PLAN_COLLECTION, CollectionConfig())
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "[%s] Failed to acquire VectorStoreActor proxy: %s",
+                "[%s] create_collection on VectorStoreActor failed: %s — degraded mode",
                 self.config.name,
                 exc,
             )
+            self._vs_proxy = None
 
     def _embed_task(self, task: Task) -> None:
         """Embed a task's description and store the resulting VectorEntry.

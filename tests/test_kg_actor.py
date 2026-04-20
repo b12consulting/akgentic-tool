@@ -1325,3 +1325,173 @@ class TestToolStateEventEmission:
                 )
             )
             assert actor._state_event_seq == 2
+
+
+# ---------------------------------------------------------------------------
+# Story 10-9 — KnowledgeGraphConfig.vector_store + _acquire_vs_proxy()
+# ---------------------------------------------------------------------------
+
+
+class TestKnowledgeGraphConfigVectorStoreField:
+    """AC-3: KnowledgeGraphConfig carries a fully-serialisable vector_store field."""
+
+    def test_vector_store_default_true(self) -> None:
+        cfg = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
+        assert cfg.vector_store is True
+
+    def test_vector_store_accepts_false(self) -> None:
+        cfg = KnowledgeGraphConfig(
+            name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store=False
+        )
+        assert cfg.vector_store is False
+
+    def test_vector_store_accepts_string(self) -> None:
+        cfg = KnowledgeGraphConfig(
+            name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store="#VectorStore-RAG"
+        )
+        assert cfg.vector_store == "#VectorStore-RAG"
+
+    def test_vector_store_roundtrip(self) -> None:
+        for value in (True, False, "#VectorStore-RAG"):
+            cfg = KnowledgeGraphConfig(
+                name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store=value
+            )
+            reloaded = KnowledgeGraphConfig.model_validate(cfg.model_dump())
+            assert reloaded.vector_store == value
+
+
+def _actor_with_orchestrator(
+    vector_store_value: object = True,
+) -> tuple[KnowledgeGraphActor, MagicMock, MockActorAddress | None]:
+    """Build a KG actor with a stubbed orchestrator + proxy_ask recorder.
+
+    Returns (actor, orch_proxy_mock, orch_addr). Does NOT call on_start.
+    Caller invokes ``_acquire_vs_proxy`` directly and asserts on
+    ``orch_proxy_mock.get_team_member`` / ``orch_proxy_mock.getChildrenOrCreate``.
+    """
+    from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
+
+    actor = KnowledgeGraphActor()
+    actor.config = KnowledgeGraphConfig(
+        name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store=vector_store_value  # type: ignore[arg-type]
+    )
+    actor.state = KnowledgeGraphState()
+    actor.state.observer(actor)
+    actor._vs_proxy = None
+    actor._state_event_seq = 0
+
+    orch_addr = MockActorAddress("orchestrator", "Orchestrator")
+    actor._orchestrator = orch_addr  # type: ignore[assignment]
+
+    orch_proxy = MagicMock()
+
+    # Patch Akgent.proxy_ask on this instance: route orchestrator to orch_proxy,
+    # everything else to a fresh MagicMock (covers VectorStoreActor proxy).
+    def _proxy_ask(target: object, actor_type: type | None = None,
+                   timeout: int | None = None) -> object:
+        if target is orch_addr:
+            return orch_proxy
+        return MagicMock()
+
+    actor.proxy_ask = _proxy_ask  # type: ignore[method-assign,assignment]
+    return actor, orch_proxy, orch_addr
+
+
+class TestKnowledgeGraphActorAcquireVsProxy:
+    """AC-6 / AC-7 / AC-10: _acquire_vs_proxy looks up (never creates) VectorStoreActor."""
+
+    def test_acquire_vs_proxy_uses_get_team_member_not_get_children_or_create(self) -> None:
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
+
+        actor, orch_proxy, _ = _actor_with_orchestrator(vector_store_value=True)
+        orch_proxy.get_team_member.return_value = MockActorAddress(VS_ACTOR_NAME, "ToolActor")
+
+        actor._acquire_vs_proxy()
+
+        orch_proxy.get_team_member.assert_called_once_with(VS_ACTOR_NAME)
+        orch_proxy.getChildrenOrCreate.assert_not_called()
+        assert actor._vs_proxy is not None
+
+    def test_acquire_vs_proxy_named_instance(self) -> None:
+        """AC-10: when vector_store is a string, the named actor is looked up."""
+        named = "#VectorStore-RAG"
+        actor, orch_proxy, _ = _actor_with_orchestrator(vector_store_value=named)
+        orch_proxy.get_team_member.return_value = MockActorAddress(named, "ToolActor")
+
+        actor._acquire_vs_proxy()
+
+        orch_proxy.get_team_member.assert_called_once_with(named)
+        assert actor._vs_proxy is not None
+
+    def test_acquire_vs_proxy_false_skips_all_wiring(self) -> None:
+        """AC-7: vector_store=False → no orchestrator lookup, degraded mode."""
+        actor, orch_proxy, _ = _actor_with_orchestrator(vector_store_value=False)
+
+        actor._acquire_vs_proxy()
+
+        assert actor._vs_proxy is None
+        orch_proxy.get_team_member.assert_not_called()
+        orch_proxy.getChildrenOrCreate.assert_not_called()
+
+    def test_acquire_vs_proxy_missing_raises_runtime_error(self) -> None:
+        """AC-7: missing VectorStoreActor → RuntimeError naming actor + VS + VectorStoreTool."""
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
+
+        actor, orch_proxy, _ = _actor_with_orchestrator(vector_store_value=True)
+        orch_proxy.get_team_member.return_value = None
+
+        with pytest.raises(RuntimeError) as exc_info:
+            actor._acquire_vs_proxy()
+
+        msg = str(exc_info.value)
+        assert KG_ACTOR_NAME in msg
+        assert VS_ACTOR_NAME in msg
+        assert "VectorStoreTool" in msg
+        # No silent fallback — proxy remains None
+        assert actor._vs_proxy is None
+
+    def test_acquire_vs_proxy_no_orchestrator_degraded_mode(self) -> None:
+        """AC-7: orchestrator is None → WARNING, no raise, stays in degraded mode."""
+        from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
+
+        actor = KnowledgeGraphActor()
+        actor.config = KnowledgeGraphConfig(
+            name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store=True
+        )
+        actor.state = KnowledgeGraphState()
+        actor.state.observer(actor)
+        actor._vs_proxy = None
+        actor._state_event_seq = 0
+        actor._orchestrator = None  # type: ignore[assignment]
+
+        # Must NOT raise
+        actor._acquire_vs_proxy()
+
+        assert actor._vs_proxy is None
+
+    def test_acquire_vs_proxy_create_collection_failure_degrades(self) -> None:
+        """Transient create_collection failure → degraded mode (not raised)."""
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
+
+        actor, orch_proxy, orch_addr = _actor_with_orchestrator(vector_store_value=True)
+        orch_proxy.get_team_member.return_value = MockActorAddress(
+            VS_ACTOR_NAME, "ToolActor"
+        )
+
+        # Replace proxy_ask: orchestrator → orch_proxy; anything else → a proxy whose
+        # create_collection raises.
+        vs_proxy = MagicMock()
+        vs_proxy.create_collection.side_effect = RuntimeError("backend down")
+
+        def _proxy_ask(target: object, actor_type: type | None = None,
+                       timeout: int | None = None) -> object:
+            if target is orch_addr:
+                return orch_proxy
+            return vs_proxy
+
+        actor.proxy_ask = _proxy_ask  # type: ignore[method-assign,assignment]
+
+        # Must NOT raise — degraded mode
+        actor._acquire_vs_proxy()
+
+        assert actor._vs_proxy is None  # degraded

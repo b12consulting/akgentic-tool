@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 from pydantic import ValidationError
 
@@ -265,3 +267,165 @@ class TestFieldLengthConstraints:
         update_schema = TaskUpdate.model_json_schema()
         assert "300" in update_schema["properties"]["description"].get("description", "")
         assert "150" in update_schema["properties"]["output"].get("description", "")
+
+
+# ---------------------------------------------------------------------------
+# Story 10-9 — PlanConfig.vector_store + PlanActor._acquire_vs_proxy
+# ---------------------------------------------------------------------------
+
+
+class TestPlanConfigVectorStoreField:
+    """AC-3: PlanConfig carries a fully-serialisable vector_store field."""
+
+    def test_vector_store_default_true(self) -> None:
+        from akgentic.tool.planning.planning_actor import PlanConfig
+
+        cfg = PlanConfig(name="#PlanningTool", role="ToolActor")
+        assert cfg.vector_store is True
+
+    def test_vector_store_accepts_false(self) -> None:
+        from akgentic.tool.planning.planning_actor import PlanConfig
+
+        cfg = PlanConfig(name="#PlanningTool", role="ToolActor", vector_store=False)
+        assert cfg.vector_store is False
+
+    def test_vector_store_accepts_string(self) -> None:
+        from akgentic.tool.planning.planning_actor import PlanConfig
+
+        cfg = PlanConfig(
+            name="#PlanningTool", role="ToolActor", vector_store="#VectorStore-RAG"
+        )
+        assert cfg.vector_store == "#VectorStore-RAG"
+
+    def test_vector_store_roundtrip(self) -> None:
+        from akgentic.tool.planning.planning_actor import PlanConfig
+
+        for value in (True, False, "#VectorStore-RAG"):
+            cfg = PlanConfig(
+                name="#PlanningTool", role="ToolActor", vector_store=value
+            )
+            reloaded = PlanConfig.model_validate(cfg.model_dump())
+            assert reloaded.vector_store == value
+
+
+def _plan_actor_with_orchestrator(
+    vector_store_value: object = True,
+    semantic_search: bool = True,
+) -> tuple[PlanActor, MagicMock, MockActorAddress]:
+    """Build a PlanActor with a stubbed orchestrator + proxy_ask recorder.
+
+    Does NOT call on_start (which would run _acquire_vs_proxy). Caller
+    invokes ``_acquire_vs_proxy`` directly.
+    """
+    from akgentic.tool.planning.planning_actor import PlanConfig, PlanManagerState
+
+    actor = PlanActor()
+    actor.config = PlanConfig(
+        name="#PlanningTool",
+        role="ToolActor",
+        semantic_search=semantic_search,
+        vector_store=vector_store_value,  # type: ignore[arg-type]
+    )
+    actor.state = PlanManagerState()
+    actor.state.observer(actor)
+    actor._vs_proxy = None
+
+    orch_addr = MockActorAddress("orchestrator", "Orchestrator")
+    actor._orchestrator = orch_addr  # type: ignore[assignment]
+
+    orch_proxy = MagicMock()
+
+    def _proxy_ask(target: object, actor_type: type | None = None,
+                   timeout: int | None = None) -> object:
+        if target is orch_addr:
+            return orch_proxy
+        return MagicMock()
+
+    actor.proxy_ask = _proxy_ask  # type: ignore[method-assign,assignment]
+    return actor, orch_proxy, orch_addr
+
+
+class TestPlanActorAcquireVsProxy:
+    """AC-8: PlanActor._acquire_vs_proxy mirrors the KG actor behaviour."""
+
+    def test_uses_get_team_member_not_get_children_or_create(self) -> None:
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
+
+        actor, orch_proxy, _ = _plan_actor_with_orchestrator(vector_store_value=True)
+        orch_proxy.get_team_member.return_value = MockActorAddress(VS_ACTOR_NAME, "ToolActor")
+
+        actor._acquire_vs_proxy()
+
+        orch_proxy.get_team_member.assert_called_once_with(VS_ACTOR_NAME)
+        orch_proxy.getChildrenOrCreate.assert_not_called()
+        assert actor._vs_proxy is not None
+
+    def test_named_instance(self) -> None:
+        named = "#VectorStore-RAG"
+        actor, orch_proxy, _ = _plan_actor_with_orchestrator(vector_store_value=named)
+        orch_proxy.get_team_member.return_value = MockActorAddress(named, "ToolActor")
+
+        actor._acquire_vs_proxy()
+
+        orch_proxy.get_team_member.assert_called_once_with(named)
+        assert actor._vs_proxy is not None
+
+    def test_false_skips_all_wiring(self) -> None:
+        actor, orch_proxy, _ = _plan_actor_with_orchestrator(vector_store_value=False)
+
+        actor._acquire_vs_proxy()
+
+        assert actor._vs_proxy is None
+        orch_proxy.get_team_member.assert_not_called()
+        orch_proxy.getChildrenOrCreate.assert_not_called()
+
+    def test_missing_raises_runtime_error(self) -> None:
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
+
+        actor, orch_proxy, _ = _plan_actor_with_orchestrator(vector_store_value=True)
+        orch_proxy.get_team_member.return_value = None
+
+        with pytest.raises(RuntimeError) as exc_info:
+            actor._acquire_vs_proxy()
+
+        msg = str(exc_info.value)
+        assert "#PlanningTool" in msg
+        assert VS_ACTOR_NAME in msg
+        assert "VectorStoreTool" in msg
+        assert actor._vs_proxy is None
+
+    def test_no_orchestrator_degraded_mode(self) -> None:
+        from akgentic.tool.planning.planning_actor import PlanConfig, PlanManagerState
+
+        actor = PlanActor()
+        actor.config = PlanConfig(
+            name="#PlanningTool", role="ToolActor", vector_store=True
+        )
+        actor.state = PlanManagerState()
+        actor.state.observer(actor)
+        actor._vs_proxy = None
+        actor._orchestrator = None  # type: ignore[assignment]
+
+        actor._acquire_vs_proxy()
+
+        assert actor._vs_proxy is None
+
+    def test_semantic_search_false_short_circuits_vector_store(self) -> None:
+        """AC-8: semantic_search=False short-circuits BEFORE vector_store is examined.
+
+        Even if ``vector_store`` is truthy and the orchestrator is missing, the
+        ``semantic_search=False`` guard in ``on_start`` must prevent
+        ``_acquire_vs_proxy`` from running and raising.
+        """
+        from akgentic.tool.planning.planning_actor import PlanConfig
+
+        actor = PlanActor()
+        actor.config = PlanConfig(
+            name="#PlanningTool",
+            role="ToolActor",
+            semantic_search=False,
+            vector_store=True,  # would otherwise be examined
+        )
+        actor.on_start()
+        # _acquire_vs_proxy not invoked → _vs_proxy stays None, no RuntimeError
+        assert actor._vs_proxy is None

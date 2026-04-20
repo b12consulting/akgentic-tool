@@ -13,6 +13,8 @@ import logging
 import uuid
 from collections import deque
 
+from pydantic import Field
+
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.orchestrator import Orchestrator
@@ -36,8 +38,8 @@ from akgentic.tool.knowledge_graph.models import (
     SearchResult,
 )
 from akgentic.tool.vector import VectorEntry
-from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE, VectorStoreActor
-from akgentic.tool.vector_store.protocol import CollectionConfig, VectorStoreConfig
+from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
+from akgentic.tool.vector_store.protocol import CollectionConfig
 from akgentic.tool.vector_store.protocol import SearchResult as VsSearchResult
 
 logger = logging.getLogger(__name__)
@@ -55,9 +57,19 @@ KG_COLLECTION: str = "knowledge_graph"
 class KnowledgeGraphConfig(BaseConfig):
     """Configuration for ``KnowledgeGraphActor``.
 
-    An empty ``BaseConfig`` subclass retained for type stability
-    (the actor generic parameter still references it).
+    Carries the actor-level binding to a ``VectorStoreActor`` so the
+    knowledge graph can resolve its vector store by name (or operate in
+    degraded mode without one). The actor itself is created by
+    ``VectorStoreTool``; this config only points at it.
     """
+
+    vector_store: bool | str = Field(
+        default=True,
+        description=(
+            "Binding to a VectorStoreActor: True=default #VectorStore, "
+            "str=named instance, False=degraded mode (no vector search)."
+        ),
+    )
 
 
 class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
@@ -81,36 +93,70 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         """Initialize state, attach observer, and acquire VectorStoreActor proxy."""
         self.state = KnowledgeGraphState()
         self.state.observer(self)
+        # Coerce BaseConfig → KnowledgeGraphConfig when the actor was started with
+        # a plain BaseConfig (e.g., test harnesses that construct the actor
+        # directly). This preserves backward compatibility while giving the actor
+        # typed access to the vector_store field introduced in story 10-9.
+        if not isinstance(self.config, KnowledgeGraphConfig):
+            self.config = KnowledgeGraphConfig(
+                name=self.config.name,
+                role=self.config.role,
+            )
         self._vs_proxy: VectorStoreActor | None = None
         self._acquire_vs_proxy()
         self._state_event_seq: int = 0
 
     def _acquire_vs_proxy(self) -> None:
-        """Acquire the VectorStoreActor proxy and create the KG collection.
+        """Look up the VectorStoreActor proxy and create the KG collection.
 
-        Operates in degraded mode (no vector search) if the proxy cannot
-        be acquired.
+        The VectorStoreActor is owned by ``VectorStoreTool``; this actor
+        only resolves it by name. Behaviour:
+
+        - ``config.vector_store is False`` → stay in degraded mode (no
+          lookup, ``_vs_proxy`` remains ``None``).
+        - ``self.orchestrator is None`` (test harness) → log WARNING and
+          return — existing behaviour preserved.
+        - Otherwise look up the target actor name (``config.vector_store``
+          when a ``str``, else ``VS_ACTOR_NAME``) via
+          ``orch_proxy.get_team_member``. Raise ``RuntimeError`` when it
+          is missing — a missing VectorStoreTool is a **configuration**
+          error, not a runtime degradation.
+        - A transient backend error during ``create_collection`` drops
+          back to degraded mode with a WARNING (matches existing
+          behaviour for embedding failures).
         """
-        try:
-            if self.orchestrator is None:
-                logger.warning(
-                    "[%s] No orchestrator; operating in degraded mode",
-                    self.config.name,
-                )
-                return
-            orch_proxy = self.proxy_ask(self.orchestrator, Orchestrator)
-            vs_addr = orch_proxy.getChildrenOrCreate(
-                VectorStoreActor,
-                config=VectorStoreConfig(name=VS_ACTOR_NAME, role=VS_ACTOR_ROLE),
+        if self.config.vector_store is False:
+            return  # degraded mode by design
+
+        if self.orchestrator is None:
+            logger.warning(
+                "[%s] No orchestrator; operating in degraded mode",
+                self.config.name,
             )
-            self._vs_proxy = self.proxy_ask(vs_addr, VectorStoreActor)
+            return
+
+        vs_name = (
+            self.config.vector_store
+            if isinstance(self.config.vector_store, str)
+            else VS_ACTOR_NAME
+        )
+        orch_proxy = self.proxy_ask(self.orchestrator, Orchestrator)
+        vs_addr = orch_proxy.get_team_member(vs_name)
+        if vs_addr is None:
+            raise RuntimeError(
+                f"{self.config.name} requires VectorStoreActor '{vs_name}' "
+                f"but it was not found. Ensure VectorStoreTool is in the team config."
+            )
+        self._vs_proxy = self.proxy_ask(vs_addr, VectorStoreActor)
+        try:
             self._vs_proxy.create_collection(KG_COLLECTION, CollectionConfig())
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "[%s] Failed to acquire VectorStoreActor proxy: %s",
+                "[%s] create_collection on VectorStoreActor failed: %s — degraded mode",
                 self.config.name,
                 exc,
             )
+            self._vs_proxy = None
 
     # ------------------------------------------------------------------
     # Embedding helpers (via VectorStoreActor proxy)

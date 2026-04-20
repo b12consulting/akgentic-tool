@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from typing import Callable, ClassVar
 
 from pydantic import Field
 
@@ -23,8 +23,6 @@ from akgentic.tool.planning.planning_actor import (
     TaskStatus,
     UpdatePlan,
 )
-from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE, VectorStoreActor
-from akgentic.tool.vector_store.protocol import VectorStoreConfig
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -64,10 +62,28 @@ class SearchPlanning(BaseToolParam):
 
 
 class PlanningTool(ToolCard):
-    """Team planning management via actor-based plan store."""
+    """Team planning management via actor-based plan store.
+
+    The ``VectorStoreActor`` singleton is owned by ``VectorStoreTool`` and
+    declared as a dependency here; this tool only looks it up at actor-start
+    time.
+    """
 
     name: str = "Planning"
     description: str = "Planning tool to manage team plans and tasks"
+
+    # Declared dependency on VectorStoreTool — ToolFactory's topological sort
+    # (story 10-8) guarantees VectorStoreTool.observer() runs first so that the
+    # VectorStoreActor singleton exists before this tool's actor starts.
+    depends_on: ClassVar[list[str]] = ["VectorStoreTool"]
+
+    vector_store: bool | str = Field(
+        default=True,
+        description=(
+            "False disables vector store wiring; True uses the default VectorStoreActor; "
+            "str names a specific VectorStoreActor to look up."
+        ),
+    )
 
     get_planning: GetPlanning | bool = Field(
         default=True, description="By default the plan in included in the system prompt"
@@ -79,8 +95,10 @@ class PlanningTool(ToolCard):
     def observer(self, observer: ActorToolObserver) -> None:  # type: ignore[override]
         """Attach observer and set up the planning actor proxy.
 
-        Ensures the ``VectorStoreActor`` singleton exists before
-        creating/retrieving the ``PlanActor`` singleton.
+        Assumes ``VectorStoreTool.observer()`` has already created the
+        ``VectorStoreActor`` singleton (ordering enforced by
+        ``ToolFactory`` topological sort via ``depends_on``). The
+        ``PlanActor`` looks that actor up by name during its own ``on_start``.
 
         Requires an ActorToolObserver for actor system access.
         """
@@ -90,21 +108,14 @@ class PlanningTool(ToolCard):
 
         orchestrator_proxy = observer.proxy_ask(observer.orchestrator, Orchestrator)
 
-        # Ensure VectorStoreActor singleton exists
-        orchestrator_proxy.getChildrenOrCreate(
-            VectorStoreActor,
-            config=VectorStoreConfig(
-                name=VS_ACTOR_NAME,
-                role=VS_ACTOR_ROLE,
-            ),
-        )
-
-        # Create/retrieve PlanActor singleton
+        # Create/retrieve PlanActor singleton. VectorStoreActor creation is owned
+        # by VectorStoreTool (depends_on enforces ordering).
         planning_tool_addr = orchestrator_proxy.getChildrenOrCreate(
             PlanActor,
             config=PlanConfig(
                 name=PLANNING_ACTOR_NAME,
                 role=PLANNING_ACTOR_ROLE,
+                vector_store=self.vector_store,
             ),
         )
 

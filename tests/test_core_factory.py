@@ -599,3 +599,115 @@ def test_topological_sort_duplicate_class_allowed() -> None:
     assert len(ordered) == 2
     assert ordered[0] is d1
     assert ordered[1] is d2
+
+
+# ---------------------------------------------------------------------------
+# Story 10-9 — end-to-end VectorStoreTool + consumer ToolCards
+# ---------------------------------------------------------------------------
+
+
+def _build_recording_observer() -> tuple[Any, list[tuple[str, Any]]]:
+    """Build a MagicMock observer whose orchestrator proxy records every
+    getChildrenOrCreate call as ``(actor_class_name, config)``.
+    """
+    from unittest.mock import MagicMock
+
+    calls: list[tuple[str, Any]] = []
+
+    orch_proxy = MagicMock()
+
+    def capture(actor_cls: type, config: Any = None) -> Any:
+        calls.append((actor_cls.__name__, config))
+        return MagicMock()
+
+    orch_proxy.getChildrenOrCreate.side_effect = capture
+
+    observer = MagicMock()
+    observer.orchestrator = MagicMock()
+    observer.proxy_ask.return_value = orch_proxy
+    return observer, calls
+
+
+def test_factory_wires_vector_store_tool_before_consumers() -> None:
+    """AC-9: VectorStoreTool runs first; consumers never create VectorStoreActor."""
+    from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
+    from akgentic.tool.planning.planning import PlanningTool
+    from akgentic.tool.vector_store.tool import VectorStoreTool
+
+    observer, calls = _build_recording_observer()
+
+    # Deliberately mis-order input: KG + Planning first, VS last.
+    ToolFactory(
+        tool_cards=[KnowledgeGraphTool(), PlanningTool(), VectorStoreTool()],
+        observer=observer,
+    )
+
+    # Every actor-class name recorded, in creation order.
+    names = [n for n, _ in calls]
+    # Expect exactly one VectorStoreActor creation, one KnowledgeGraphActor, one PlanActor.
+    assert names.count("VectorStoreActor") == 1
+    assert names.count("KnowledgeGraphActor") == 1
+    assert names.count("PlanActor") == 1
+
+    # Order: VS before both consumers.
+    vs_idx = names.index("VectorStoreActor")
+    kg_idx = names.index("KnowledgeGraphActor")
+    plan_idx = names.index("PlanActor")
+    assert vs_idx < kg_idx
+    assert vs_idx < plan_idx
+
+
+def test_factory_consumers_do_not_create_vector_store_actor() -> None:
+    """AC-9: consumer observers never call getChildrenOrCreate(VectorStoreActor, ...).
+
+    We verify that *after* VectorStoreTool runs (first creation), subsequent
+    creations are all consumer-owned actors — NOT VectorStoreActor.
+    """
+    from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
+    from akgentic.tool.planning.planning import PlanningTool
+    from akgentic.tool.vector_store.tool import VectorStoreTool
+
+    observer, calls = _build_recording_observer()
+    ToolFactory(
+        tool_cards=[KnowledgeGraphTool(), PlanningTool(), VectorStoreTool()],
+        observer=observer,
+    )
+
+    names = [n for n, _ in calls]
+    vs_idx = names.index("VectorStoreActor")
+    # No further VectorStoreActor creation after the first one.
+    assert "VectorStoreActor" not in names[vs_idx + 1 :]
+
+
+def test_factory_consumer_configs_propagate_vector_store_true() -> None:
+    """AC-9: KnowledgeGraphConfig and PlanConfig both carry vector_store=True."""
+    from akgentic.tool.knowledge_graph.kg_actor import KnowledgeGraphConfig
+    from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
+    from akgentic.tool.planning.planning import PlanningTool
+    from akgentic.tool.planning.planning_actor import PlanConfig
+    from akgentic.tool.vector_store.tool import VectorStoreTool
+
+    observer, calls = _build_recording_observer()
+    ToolFactory(
+        tool_cards=[KnowledgeGraphTool(), PlanningTool(), VectorStoreTool()],
+        observer=observer,
+    )
+
+    configs_by_class = {name: cfg for name, cfg in calls}
+    kg_cfg = configs_by_class["KnowledgeGraphActor"]
+    plan_cfg = configs_by_class["PlanActor"]
+    assert isinstance(kg_cfg, KnowledgeGraphConfig)
+    assert isinstance(plan_cfg, PlanConfig)
+    assert kg_cfg.vector_store is True
+    assert plan_cfg.vector_store is True
+
+
+def test_factory_missing_vector_store_tool_raises_missing_dependency_error() -> None:
+    """AC-9 (negative path): a consumer without its VectorStoreTool fails at factory-init."""
+    from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
+
+    with pytest.raises(ValueError) as exc:
+        ToolFactory(tool_cards=[KnowledgeGraphTool()])
+    msg = str(exc.value)
+    assert "KnowledgeGraphTool" in msg
+    assert "VectorStoreTool" in msg

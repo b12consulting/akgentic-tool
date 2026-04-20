@@ -5,6 +5,8 @@ Covers:
 - KnowledgeGraphTool config, read_only, get_graph=False (Task 2)
 - Observer wiring, singleton actor proxy (Task 2)
 - Factory closures: get_graph, update_graph, search (Task 2)
+- Story 10-9: depends_on + vector_store field, observer no longer creates
+  VectorStoreActor, vector_store propagates into KnowledgeGraphConfig.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from akgentic.tool.knowledge_graph.kg_actor import (
     KG_ACTOR_NAME,
     KG_ACTOR_ROLE,
     KnowledgeGraphActor,
+    KnowledgeGraphConfig,
 )
 from akgentic.tool.knowledge_graph.kg_tool import (
     GetGraph,
@@ -37,6 +40,7 @@ from akgentic.tool.knowledge_graph.models import (
     RelationCreate,
     SearchQuery,
 )
+from akgentic.tool.vector_store.actor import VectorStoreActor
 
 # ---------------------------------------------------------------------------
 # Mock helpers
@@ -247,7 +251,7 @@ class TestKnowledgeGraphToolDefaults:
 
 
 class TestKnowledgeGraphToolObserver:
-    """observer() wiring — singleton actor creation (2.2)."""
+    """observer() wiring — singleton actor creation (2.2, story 10-9)."""
 
     def test_observer_requires_orchestrator(self) -> None:
         tool = KnowledgeGraphTool()
@@ -256,7 +260,8 @@ class TestKnowledgeGraphToolObserver:
         with pytest.raises(ValueError, match="orchestrator"):
             tool.observer(observer)
 
-    def test_observer_creates_actors_via_get_children_or_create(self) -> None:
+    def test_observer_creates_only_kg_actor_via_get_children_or_create(self) -> None:
+        """Story 10-9: observer() creates ONLY KnowledgeGraphActor, not VectorStoreActor."""
         tool = KnowledgeGraphTool()
         observer = MockActorToolObserver()
         addr = MockActorAddress(KG_ACTOR_NAME, KG_ACTOR_ROLE)
@@ -264,65 +269,131 @@ class TestKnowledgeGraphToolObserver:
 
         tool.observer(observer)
 
-        # getChildrenOrCreate called for both VectorStore and KG
-        assert observer._orchestrator_proxy.getChildrenOrCreate.call_count == 2
+        # Only KnowledgeGraphActor is created here; VectorStoreTool owns VectorStoreActor.
+        assert observer._orchestrator_proxy.getChildrenOrCreate.call_count == 1
 
-    def test_observer_uses_get_children_or_create_for_both(self) -> None:
-        """getChildrenOrCreate is always called (it handles both create and reuse)."""
+    def test_observer_does_not_create_vector_store_actor(self) -> None:
+        """Story 10-9 AC-4: VectorStoreActor is never the class arg to getChildrenOrCreate."""
         tool = KnowledgeGraphTool()
         observer = MockActorToolObserver()
-        vs_addr = MockActorAddress("#VectorStore", "ToolActor")
         kg_addr = MockActorAddress(KG_ACTOR_NAME, KG_ACTOR_ROLE)
-
-        from akgentic.tool.vector_store.actor import VectorStoreActor as _VSActor
-
-        def _get_children_or_create(
-            actor_class: type, config: object = None,
-        ) -> MockActorAddress:
-            if actor_class is _VSActor:
-                return vs_addr
-            return kg_addr
-
-        observer._orchestrator_proxy.getChildrenOrCreate.side_effect = (
-            _get_children_or_create
-        )
+        observer._orchestrator_proxy.getChildrenOrCreate.return_value = kg_addr
 
         tool.observer(observer)
 
-        assert observer._orchestrator_proxy.getChildrenOrCreate.call_count == 2
+        for call in observer._orchestrator_proxy.getChildrenOrCreate.call_args_list:
+            actor_cls = call.args[0] if call.args else call.kwargs.get("actor_class")
+            assert actor_cls is not VectorStoreActor, (
+                "KnowledgeGraphTool.observer() must not create VectorStoreActor"
+            )
+        # And the only remaining call is for KnowledgeGraphActor.
+        last_cls = observer._orchestrator_proxy.getChildrenOrCreate.call_args.args[0]
+        assert last_cls is KnowledgeGraphActor
 
-    def test_observer_passes_default_vectorstore_config(self) -> None:
-        """VectorStoreConfig uses centralized defaults (no embedding fields on KG tool)."""
-        from unittest.mock import MagicMock
+    def test_observer_passes_kg_config_with_default_vector_store(self) -> None:
+        """AC-4: vector_store=True (default) is propagated into KnowledgeGraphConfig."""
+        tool = KnowledgeGraphTool()  # default vector_store=True
+        captured: list[KnowledgeGraphConfig] = []
 
-        from akgentic.tool.vector_store.protocol import VectorStoreConfig
+        mock_proxy = MagicMock()
 
-        tool = KnowledgeGraphTool()
-
-        captured_configs: list[object] = []
-
-        mock_proxy_ask = MagicMock()
-
-        def capture_get_children_or_create(
-            actor_cls: type, config: object = None,
-        ) -> MagicMock:
-            captured_configs.append(config)
+        def capture(actor_cls: type, config: object = None) -> MagicMock:
+            assert isinstance(config, KnowledgeGraphConfig)
+            captured.append(config)
             return MagicMock()
 
-        mock_proxy_ask.getChildrenOrCreate.side_effect = capture_get_children_or_create
-
+        mock_proxy.getChildrenOrCreate.side_effect = capture
         mock_observer = MagicMock()
         mock_observer.orchestrator = MagicMock()
-        mock_observer.proxy_ask.return_value = mock_proxy_ask
+        mock_observer.proxy_ask.return_value = mock_proxy
 
         tool.observer(mock_observer)
 
-        assert len(captured_configs) == 2
+        assert len(captured) == 1
+        assert captured[0].vector_store is True
 
-        vs_config = captured_configs[0]
-        assert isinstance(vs_config, VectorStoreConfig)
-        assert vs_config.embedding_model == "text-embedding-3-small"
-        assert vs_config.embedding_provider == "openai"
+    def test_observer_propagates_vector_store_false(self) -> None:
+        """AC-4: vector_store=False flows into KnowledgeGraphConfig."""
+        tool = KnowledgeGraphTool(vector_store=False)
+        captured: list[KnowledgeGraphConfig] = []
+
+        mock_proxy = MagicMock()
+
+        def capture(actor_cls: type, config: object = None) -> MagicMock:
+            assert isinstance(config, KnowledgeGraphConfig)
+            captured.append(config)
+            return MagicMock()
+
+        mock_proxy.getChildrenOrCreate.side_effect = capture
+        mock_observer = MagicMock()
+        mock_observer.orchestrator = MagicMock()
+        mock_observer.proxy_ask.return_value = mock_proxy
+
+        tool.observer(mock_observer)
+
+        assert len(captured) == 1
+        assert captured[0].vector_store is False
+
+    def test_observer_propagates_vector_store_named_string(self) -> None:
+        """AC-4 / AC-10: vector_store="<name>" flows into KnowledgeGraphConfig."""
+        tool = KnowledgeGraphTool(vector_store="#VectorStore-RAG")
+        captured: list[KnowledgeGraphConfig] = []
+
+        mock_proxy = MagicMock()
+
+        def capture(actor_cls: type, config: object = None) -> MagicMock:
+            assert isinstance(config, KnowledgeGraphConfig)
+            captured.append(config)
+            return MagicMock()
+
+        mock_proxy.getChildrenOrCreate.side_effect = capture
+        mock_observer = MagicMock()
+        mock_observer.orchestrator = MagicMock()
+        mock_observer.proxy_ask.return_value = mock_proxy
+
+        tool.observer(mock_observer)
+
+        assert len(captured) == 1
+        assert captured[0].vector_store == "#VectorStore-RAG"
+
+
+class TestKnowledgeGraphToolDependsOn:
+    """Story 10-9 AC-1: depends_on declaration + vector_store field."""
+
+    def test_depends_on_is_vector_store_tool(self) -> None:
+        assert KnowledgeGraphTool.depends_on == ["VectorStoreTool"]
+
+    def test_depends_on_not_a_pydantic_field(self) -> None:
+        assert "depends_on" not in KnowledgeGraphTool.model_fields
+
+    def test_depends_on_not_in_model_dump(self) -> None:
+        dump = KnowledgeGraphTool().model_dump()
+        assert "depends_on" not in dump
+
+    def test_vector_store_field_default_true(self) -> None:
+        tool = KnowledgeGraphTool()
+        assert tool.vector_store is True
+        assert "vector_store" in KnowledgeGraphTool.model_fields
+
+    def test_vector_store_appears_in_model_dump(self) -> None:
+        dump = KnowledgeGraphTool().model_dump()
+        assert "vector_store" in dump
+        assert dump["vector_store"] is True
+
+    def test_vector_store_roundtrip_true(self) -> None:
+        tool = KnowledgeGraphTool(vector_store=True)
+        reloaded = KnowledgeGraphTool.model_validate(tool.model_dump())
+        assert reloaded.vector_store is True
+
+    def test_vector_store_roundtrip_false(self) -> None:
+        tool = KnowledgeGraphTool(vector_store=False)
+        reloaded = KnowledgeGraphTool.model_validate(tool.model_dump())
+        assert reloaded.vector_store is False
+
+    def test_vector_store_roundtrip_string(self) -> None:
+        tool = KnowledgeGraphTool(vector_store="#VectorStore-RAG")
+        reloaded = KnowledgeGraphTool.model_validate(tool.model_dump())
+        assert reloaded.vector_store == "#VectorStore-RAG"
 
 
 class TestKnowledgeGraphToolReadOnly:
