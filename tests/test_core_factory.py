@@ -292,8 +292,11 @@ class _DependsOnXTool(ToolCard):
 
 
 def test_tool_card_depends_on_default_is_empty() -> None:
-    """Default depends_on is [] and is not a Pydantic field."""
-    assert _NoDepsTool.depends_on == []
+    """Default depends_on is [] via @property and is not a Pydantic field."""
+    # Class-level access returns the property descriptor (AC-1).
+    assert isinstance(ToolCard.__dict__["depends_on"], property)
+    # Instance-level access returns the default empty list.
+    assert _NoDepsTool().depends_on == []
     assert "depends_on" not in _NoDepsTool.model_fields
     assert "depends_on" not in ToolCard.model_fields
 
@@ -330,9 +333,9 @@ def test_tool_card_subclass_can_override_depends_on() -> None:
             return []
 
     assert _A.depends_on == ["B"]
-    assert _C.depends_on == []
-    # Base class unaffected by either subclass.
-    assert ToolCard.depends_on == []
+    assert _C().depends_on == []
+    # Base class property unaffected by either subclass.
+    assert _NoDepsTool().depends_on == []
 
 
 # --- Stubs used by the factory-level tests below ----------------------------
@@ -795,3 +798,75 @@ def test_factory_default_tools_propagate_default_collection() -> None:
     assert plan_cfg.collection == CollectionConfig()
     # Fresh per-instance — no aliasing between siblings.
     assert kg_cfg.collection is not plan_cfg.collection
+
+
+# ---------------------------------------------------------------------------
+# Story 10-11 — conditional depends_on for vector_store opt-out
+# ---------------------------------------------------------------------------
+
+
+class TestConditionalDependsOn:
+    """AC-5, AC-6, AC-7: factory accepts opted-out consumers, rejects opted-in without VS."""
+
+    def test_planning_tool_vector_store_false_constructs_successfully(self) -> None:
+        """AC-5: PlanningTool(vector_store=False) alone succeeds."""
+        from akgentic.tool.planning.planning import PlanningTool
+
+        card = PlanningTool(vector_store=False)
+        factory = ToolFactory(tool_cards=[card])
+        assert len(factory.tool_cards) == 1
+        assert factory.tool_cards[0] is card
+
+    def test_planning_tool_vector_store_true_raises_missing_dep(self) -> None:
+        """AC-6: PlanningTool(vector_store=True) alone raises ValueError."""
+        from akgentic.tool.planning.planning import PlanningTool
+
+        with pytest.raises(ValueError) as exc:
+            ToolFactory(tool_cards=[PlanningTool(vector_store=True)])
+        msg = str(exc.value)
+        assert "PlanningTool depends on VectorStoreTool but it was not found in the tool list" in msg
+
+    def test_planning_tool_vector_store_str_raises_missing_dep(self) -> None:
+        """AC-6: PlanningTool(vector_store=str) alone raises ValueError."""
+        from akgentic.tool.planning.planning import PlanningTool
+
+        with pytest.raises(ValueError) as exc:
+            ToolFactory(tool_cards=[PlanningTool(vector_store="#VectorStore-RAG")])
+        msg = str(exc.value)
+        assert "PlanningTool depends on VectorStoreTool but it was not found in the tool list" in msg
+
+    def test_kg_tool_vector_store_false_constructs_successfully(self) -> None:
+        """AC-7: KnowledgeGraphTool(vector_store=False) alone succeeds."""
+        from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
+
+        card = KnowledgeGraphTool(vector_store=False)
+        factory = ToolFactory(tool_cards=[card])
+        assert len(factory.tool_cards) == 1
+        assert factory.tool_cards[0] is card
+
+    def test_kg_tool_vector_store_true_raises_missing_dep(self) -> None:
+        """AC-7: KnowledgeGraphTool(vector_store=True) alone raises ValueError."""
+        from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
+
+        with pytest.raises(ValueError) as exc:
+            ToolFactory(tool_cards=[KnowledgeGraphTool(vector_store=True)])
+        msg = str(exc.value)
+        assert (
+            "KnowledgeGraphTool depends on VectorStoreTool but it was not found in the tool list"
+            in msg
+        )
+
+    def test_mixed_opted_out_and_opted_in_raises_for_opted_in(self) -> None:
+        """Mixed: Planning opts out (False), KG opts in (True) with no VS -> KG error."""
+        from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
+        from akgentic.tool.planning.planning import PlanningTool
+
+        with pytest.raises(ValueError) as exc:
+            ToolFactory(
+                tool_cards=[
+                    PlanningTool(vector_store=False),
+                    KnowledgeGraphTool(vector_store=True),
+                ]
+            )
+        msg = str(exc.value)
+        assert "KnowledgeGraphTool depends on VectorStoreTool" in msg

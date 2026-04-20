@@ -10,7 +10,7 @@ import functools
 from abc import ABC, abstractmethod
 from collections import deque
 from enum import StrEnum
-from typing import Any, Callable, ClassVar, TypeVar
+from typing import Any, Callable, TypeVar
 
 from akgentic.core.utils import SerializableBaseModel
 from akgentic.tool.errors import RetriableError
@@ -110,18 +110,23 @@ class ToolCard(SerializableBaseModel, ABC):
     Attributes:
         name: Human-readable tool provider name.
         description: Natural-language description of tool capabilities.
-        depends_on: Class-level list of ToolCard subclass names that MUST be
-            wired before this ToolCard. The string is matched against
-            ``type(card).__name__``. Default ``[]`` (no dependencies). Not
-            serialised — this is a class attribute, not a Pydantic field.
-            ``ToolFactory`` uses this to topologically sort tool cards before
-            calling ``observer()`` so that dependent cards can look up actors
-            or resources created by their prerequisites.
     """
 
     name: str
     description: str
-    depends_on: ClassVar[list[str]] = []
+
+    @property
+    def depends_on(self) -> list[str]:
+        """Class-name list of ToolCards that MUST be wired before this one.
+
+        Default: no dependencies. Subclasses may override as a property
+        whose return value depends on instance fields (e.g. the value of
+        a ``vector_store`` field on consumer tools). The string is matched
+        against ``type(card).__name__`` by ``ToolFactory``'s topological
+        sort. Not a Pydantic field — does not appear in ``model_dump`` and
+        cannot be set via ``model_validate``.
+        """
+        return []
 
     def observer(self, observer: ToolObserver) -> "ToolCard":
         """Attach an observer and perform runtime setup.
@@ -204,7 +209,7 @@ def _topological_sort(cards: list[ToolCard]) -> list[ToolCard]:
 
     # Validate every declared dependency is present.
     for card in cards:
-        for dep in type(card).depends_on:
+        for dep in card.depends_on:
             if dep not in by_name:
                 raise ValueError(
                     f"{type(card).__name__} depends on {dep} but it was not "
@@ -216,7 +221,7 @@ def _topological_sort(cards: list[ToolCard]) -> list[ToolCard]:
     # Reverse adjacency: dep_name → list of class names that depend on it.
     dependents: dict[str, list[str]] = {name: [] for name in by_name}
     for name, card in by_name.items():
-        for dep in type(card).depends_on:
+        for dep in card.depends_on:
             in_degree[name] += 1
             dependents[dep].append(name)
 

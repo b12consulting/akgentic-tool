@@ -10,7 +10,7 @@ Follows the same pattern as ``PlanningTool`` in akgentic.tool.planning.
 from __future__ import annotations
 
 import logging
-from typing import Callable, ClassVar
+from typing import Callable
 
 from pydantic import Field
 
@@ -93,11 +93,6 @@ class KnowledgeGraphTool(ToolCard):
     name: str = "KnowledgeGraph"
     description: str = "Knowledge graph tool for structured knowledge with semantic search"
 
-    # Declared dependency on VectorStoreTool — ToolFactory's topological sort
-    # (story 10-8) guarantees VectorStoreTool.observer() runs first so that the
-    # VectorStoreActor singleton exists before this tool's actor starts.
-    depends_on: ClassVar[list[str]] = ["VectorStoreTool"]
-
     vector_store: bool | str = Field(
         default=True,
         description=(
@@ -115,6 +110,18 @@ class KnowledgeGraphTool(ToolCard):
             "VectorStoreActor."
         ),
     )
+
+    @property
+    def depends_on(self) -> list[str]:
+        """Runtime dependency on VectorStoreTool, conditional on vector_store.
+
+        When ``vector_store`` is ``False`` this tool is in degraded mode and
+        does not need VectorStoreActor — the factory must not require a
+        ``VectorStoreTool`` in the team config. Any other value (``True`` or a
+        name ``str``) requires VectorStoreTool to be wired first so the
+        KG actor can look up the VectorStoreActor during ``on_start``.
+        """
+        return ["VectorStoreTool"] if self.vector_store is not False else []
 
     get_graph: GetGraph | bool = Field(
         default=True,

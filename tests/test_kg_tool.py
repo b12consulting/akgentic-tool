@@ -362,7 +362,7 @@ class TestKnowledgeGraphToolDependsOn:
     """Story 10-9 AC-1: depends_on declaration + vector_store field."""
 
     def test_depends_on_is_vector_store_tool(self) -> None:
-        assert KnowledgeGraphTool.depends_on == ["VectorStoreTool"]
+        assert KnowledgeGraphTool().depends_on == ["VectorStoreTool"]
 
     def test_depends_on_not_a_pydantic_field(self) -> None:
         assert "depends_on" not in KnowledgeGraphTool.model_fields
@@ -923,5 +923,53 @@ class TestKnowledgeGraphToolObserverCollection:
         self._run_observer(tool)
 
         assert tool.collection.model_dump() == before_dump
+
+
+# ---------------------------------------------------------------------------
+# Story 10-11 — conditional depends_on property
+# ---------------------------------------------------------------------------
+
+
+class TestKnowledgeGraphToolDependsOnProperty:
+    """AC-3, AC-8: depends_on is a conditional @property, not serialised."""
+
+    def test_default_depends_on_vector_store_tool(self) -> None:
+        """Default (vector_store=True) depends on VectorStoreTool."""
+        assert KnowledgeGraphTool().depends_on == ["VectorStoreTool"]
+
+    def test_vector_store_true_depends_on_vector_store_tool(self) -> None:
+        assert KnowledgeGraphTool(vector_store=True).depends_on == ["VectorStoreTool"]
+
+    def test_vector_store_str_depends_on_vector_store_tool(self) -> None:
+        assert KnowledgeGraphTool(vector_store="#VectorStore-RAG").depends_on == ["VectorStoreTool"]
+
+    def test_vector_store_false_no_dependency(self) -> None:
+        assert KnowledgeGraphTool(vector_store=False).depends_on == []
+
+    def test_depends_on_not_in_model_fields(self) -> None:
+        """depends_on is a @property, not a Pydantic field."""
+        assert "depends_on" not in KnowledgeGraphTool.model_fields
+
+    def test_depends_on_not_in_model_dump(self) -> None:
+        """depends_on never appears in serialised output."""
+        tool_false = KnowledgeGraphTool(vector_store=False)
+        tool_true = KnowledgeGraphTool(vector_store=True)
+        assert "depends_on" not in tool_false.model_dump()
+        assert "depends_on" not in tool_true.model_dump()
+        assert "depends_on" not in tool_false.model_dump(mode="json")
+        assert "depends_on" not in tool_true.model_dump(mode="json")
+
+    def test_round_trip_preserves_depends_on_semantics(self) -> None:
+        """Round-trip via model_validate reconstructs conditional depends_on."""
+        tool = KnowledgeGraphTool(vector_store=False)
+        dump = tool.model_dump()
+        reconstructed = KnowledgeGraphTool.model_validate(dump)
+        assert reconstructed.depends_on == []
+        assert reconstructed.vector_store is False
+
+        tool_true = KnowledgeGraphTool(vector_store=True)
+        dump_true = tool_true.model_dump()
+        reconstructed_true = KnowledgeGraphTool.model_validate(dump_true)
+        assert reconstructed_true.depends_on == ["VectorStoreTool"]
 
 

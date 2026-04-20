@@ -145,7 +145,7 @@ class TestPlanningToolDependsOn:
     def test_depends_on_is_vector_store_tool(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
 
-        assert PlanningTool.depends_on == ["VectorStoreTool"]
+        assert PlanningTool().depends_on == ["VectorStoreTool"]
 
     def test_depends_on_not_a_pydantic_field(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
@@ -391,5 +391,67 @@ class TestPlanningToolObserverCollection:
         self._run_observer(tool)
 
         assert tool.collection.model_dump() == before_dump
+
+
+# ---------------------------------------------------------------------------
+# Story 10-11 — conditional depends_on property
+# ---------------------------------------------------------------------------
+
+
+class TestPlanningToolDependsOnProperty:
+    """AC-4, AC-8: depends_on is a conditional @property, not serialised."""
+
+    def test_default_depends_on_vector_store_tool(self) -> None:
+        """Default (vector_store=True) depends on VectorStoreTool."""
+        from akgentic.tool.planning.planning import PlanningTool
+
+        assert PlanningTool().depends_on == ["VectorStoreTool"]
+
+    def test_vector_store_true_depends_on_vector_store_tool(self) -> None:
+        from akgentic.tool.planning.planning import PlanningTool
+
+        assert PlanningTool(vector_store=True).depends_on == ["VectorStoreTool"]
+
+    def test_vector_store_str_depends_on_vector_store_tool(self) -> None:
+        from akgentic.tool.planning.planning import PlanningTool
+
+        assert PlanningTool(vector_store="#VectorStore-RAG").depends_on == ["VectorStoreTool"]
+
+    def test_vector_store_false_no_dependency(self) -> None:
+        from akgentic.tool.planning.planning import PlanningTool
+
+        assert PlanningTool(vector_store=False).depends_on == []
+
+    def test_depends_on_not_in_model_fields(self) -> None:
+        """depends_on is a @property, not a Pydantic field."""
+        from akgentic.tool.planning.planning import PlanningTool
+
+        assert "depends_on" not in PlanningTool.model_fields
+
+    def test_depends_on_not_in_model_dump(self) -> None:
+        """depends_on never appears in serialised output."""
+        from akgentic.tool.planning.planning import PlanningTool
+
+        tool_false = PlanningTool(vector_store=False)
+        tool_true = PlanningTool(vector_store=True)
+        assert "depends_on" not in tool_false.model_dump()
+        assert "depends_on" not in tool_true.model_dump()
+        assert "depends_on" not in tool_false.model_dump(mode="json")
+        assert "depends_on" not in tool_true.model_dump(mode="json")
+
+    def test_round_trip_preserves_depends_on_semantics(self) -> None:
+        """Round-trip via model_validate reconstructs conditional depends_on."""
+        from akgentic.tool.planning.planning import PlanningTool
+
+        tool = PlanningTool(vector_store=False)
+        dump = tool.model_dump()
+        reconstructed = PlanningTool.model_validate(dump)
+        assert reconstructed.depends_on == []
+        assert reconstructed.vector_store is False
+
+        tool_true = PlanningTool(vector_store=True)
+        dump_true = tool_true.model_dump()
+        reconstructed_true = PlanningTool.model_validate(dump_true)
+        assert reconstructed_true.depends_on == ["VectorStoreTool"]
 
 

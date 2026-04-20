@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable, ClassVar
+from typing import Callable
 
 from pydantic import Field
 
@@ -73,11 +73,6 @@ class PlanningTool(ToolCard):
     name: str = "Planning"
     description: str = "Planning tool to manage team plans and tasks"
 
-    # Declared dependency on VectorStoreTool — ToolFactory's topological sort
-    # (story 10-8) guarantees VectorStoreTool.observer() runs first so that the
-    # VectorStoreActor singleton exists before this tool's actor starts.
-    depends_on: ClassVar[list[str]] = ["VectorStoreTool"]
-
     vector_store: bool | str = Field(
         default=True,
         description=(
@@ -94,6 +89,18 @@ class PlanningTool(ToolCard):
             "create_collection on the VectorStoreActor."
         ),
     )
+
+    @property
+    def depends_on(self) -> list[str]:
+        """Runtime dependency on VectorStoreTool, conditional on vector_store.
+
+        When ``vector_store`` is ``False`` this tool is in degraded mode and
+        does not need VectorStoreActor — the factory must not require a
+        ``VectorStoreTool`` in the team config. Any other value (``True`` or a
+        name ``str``) requires VectorStoreTool to be wired first so the
+        PlanActor can look up the VectorStoreActor during ``on_start``.
+        """
+        return ["VectorStoreTool"] if self.vector_store is not False else []
 
     get_planning: GetPlanning | bool = Field(
         default=True, description="By default the plan in included in the system prompt"
