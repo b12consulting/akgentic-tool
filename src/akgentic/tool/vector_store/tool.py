@@ -14,7 +14,6 @@ surface).
 
 from __future__ import annotations
 
-import logging
 from typing import Any, Callable, Literal
 
 from pydantic import Field
@@ -24,8 +23,6 @@ from akgentic.tool.core import ToolCard
 from akgentic.tool.event import ActorToolObserver
 from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE, VectorStoreActor
 from akgentic.tool.vector_store.protocol import VectorStoreConfig
-
-logger = logging.getLogger(__name__)
 
 
 class VectorStoreTool(ToolCard):
