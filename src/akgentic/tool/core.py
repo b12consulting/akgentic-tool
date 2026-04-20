@@ -8,8 +8,9 @@ Defines the core contracts:
 
 import functools
 from abc import ABC, abstractmethod
+from collections import deque
 from enum import StrEnum
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, ClassVar, TypeVar
 
 from akgentic.core.utils import SerializableBaseModel
 from akgentic.tool.errors import RetriableError
@@ -109,10 +110,18 @@ class ToolCard(SerializableBaseModel, ABC):
     Attributes:
         name: Human-readable tool provider name.
         description: Natural-language description of tool capabilities.
+        depends_on: Class-level list of ToolCard subclass names that MUST be
+            wired before this ToolCard. The string is matched against
+            ``type(card).__name__``. Default ``[]`` (no dependencies). Not
+            serialised — this is a class attribute, not a Pydantic field.
+            ``ToolFactory`` uses this to topologically sort tool cards before
+            calling ``observer()`` so that dependent cards can look up actors
+            or resources created by their prerequisites.
     """
 
     name: str
     description: str
+    depends_on: ClassVar[list[str]] = []
 
     def observer(self, observer: ToolObserver) -> "ToolCard":
         """Attach an observer and perform runtime setup.
@@ -163,6 +172,94 @@ class ToolCard(SerializableBaseModel, ABC):
         return []
 
 
+def _topological_sort(cards: list[ToolCard]) -> list[ToolCard]:
+    """Return ``cards`` topologically sorted by ``ToolCard.depends_on``.
+
+    Dependency keys are matched against ``type(card).__name__``. The sort uses
+    Kahn's algorithm with a FIFO queue seeded in input order, which produces a
+    deterministic ordering: independent nodes retain their relative input order.
+
+    Duplicate class names in ``cards`` (e.g. two ``VectorStoreTool`` instances
+    with different configuration) are permitted — later entries overwrite
+    earlier entries in the internal name→card map. Dependency relationships
+    are at the class level, not per-instance.
+
+    Args:
+        cards: Tool cards to sort. Input order is preserved for independent
+            nodes.
+
+    Returns:
+        A new list containing the same cards in dependency-respecting order
+        (prerequisites before dependents).
+
+    Raises:
+        ValueError: If a declared dependency is not present in ``cards``
+            (message names both the dependent and the missing class), or if
+            the dependency graph contains a cycle (message contains ``"cycle"``
+            and lists the class names involved).
+    """
+    # Name → card map. Later duplicates overwrite earlier entries — dependency
+    # relationships are at the class level, not per-instance.
+    by_name: dict[str, ToolCard] = {type(card).__name__: card for card in cards}
+
+    # Validate every declared dependency is present.
+    for card in cards:
+        for dep in type(card).depends_on:
+            if dep not in by_name:
+                raise ValueError(
+                    f"{type(card).__name__} depends on {dep} but it was not "
+                    f"found in the tool list"
+                )
+
+    # Build in-degree map keyed by class name (not instance — duplicates collapse).
+    in_degree: dict[str, int] = {name: 0 for name in by_name}
+    # Reverse adjacency: dep_name → list of class names that depend on it.
+    dependents: dict[str, list[str]] = {name: [] for name in by_name}
+    for name, card in by_name.items():
+        for dep in type(card).depends_on:
+            in_degree[name] += 1
+            dependents[dep].append(name)
+
+    # Seed the queue with zero-in-degree names in the order they appeared in
+    # the input (FIFO → deterministic for the same input). We iterate cards to
+    # preserve input order, skipping duplicates.
+    queue: deque[str] = deque()
+    seen: set[str] = set()
+    for card in cards:
+        name = type(card).__name__
+        if name in seen:
+            continue
+        seen.add(name)
+        if in_degree[name] == 0:
+            queue.append(name)
+
+    ordered_names: list[str] = []
+    while queue:
+        name = queue.popleft()
+        ordered_names.append(name)
+        for dependent in dependents[name]:
+            in_degree[dependent] -= 1
+            if in_degree[dependent] == 0:
+                queue.append(dependent)
+
+    if len(ordered_names) < len(by_name):
+        remaining = sorted(set(by_name) - set(ordered_names))
+        raise ValueError(
+            f"ToolCard dependency cycle detected: {remaining}"
+        )
+
+    # Map sorted names back to ToolCard instances. Preserve input order for
+    # duplicate class names: emit instances in the order they appeared in the
+    # input, grouped by their class's position in the sorted name order.
+    by_name_instances: dict[str, list[ToolCard]] = {name: [] for name in by_name}
+    for card in cards:
+        by_name_instances[type(card).__name__].append(card)
+    ordered: list[ToolCard] = []
+    for name in ordered_names:
+        ordered.extend(by_name_instances[name])
+    return ordered
+
+
 class ToolFactory:
     """Resolves ``ToolCard`` instances into callable tools, prompts, and toolsets."""
 
@@ -174,18 +271,30 @@ class ToolFactory:
     ) -> None:
         """Create a factory for one or more tool cards.
 
-        Attaches the observer to every card (triggers runtime setup in
-        ``ToolCard.observer()``).
+        Topologically sorts ``tool_cards`` by their ``depends_on`` class
+        attribute, then attaches the observer to every card in dependency order
+        (triggers runtime setup in ``ToolCard.observer()``). Prerequisites are
+        wired before dependents, so a consumer card's ``observer()`` can safely
+        look up actors or resources created by its prerequisites.
 
         Args:
-            tool_cards: Tool cards to resolve into callable tools.
+            tool_cards: Tool cards to resolve into callable tools. Reordered
+                in-place to reflect dependency order; aggregators
+                (``get_tools``, ``get_system_prompts``, ``get_commands``,
+                ``get_toolsets``) also iterate in this order.
             observer: Optional observer notified by tool implementations during
                 tool calls.
             retry_exception: Optional exception class to raise when a tool raises
                 ``RetriableError``. Injected by the integration layer (e.g., ModelRetry
                 from pydantic-ai) to keep the tool module framework-agnostic.
+
+        Raises:
+            ValueError: If the dependency graph is invalid — either a card
+                declares ``depends_on`` for a class not present in
+                ``tool_cards``, or a cycle exists. Raised before any observer
+                is attached (fail fast at team creation).
         """
-        self.tool_cards = tool_cards
+        self.tool_cards = _topological_sort(tool_cards)
         self.observer = observer
         self._retry_exception = retry_exception
 

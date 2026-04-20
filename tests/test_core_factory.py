@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any, Callable, ClassVar
+
+import pytest
 
 from akgentic.tool.core import (
     COMMAND,
@@ -9,6 +11,7 @@ from akgentic.tool.core import (
     ToolCard,
     ToolFactory,
     _resolve,
+    _topological_sort,
 )
 
 
@@ -260,3 +263,339 @@ def test_tool_factory_retry_exception_wraps_retriable_error() -> None:
 
     with _pytest.raises(_MyRetryError):
         tools[0]()
+
+
+# ---------------------------------------------------------------------------
+# depends_on / topological-sort tests (story 10-8)
+# ---------------------------------------------------------------------------
+
+
+class _NoDepsTool(ToolCard):
+    """ToolCard subclass with no depends_on override (default empty)."""
+
+    name: str = "no-deps"
+    description: str = "no dependency"
+
+    def get_tools(self) -> list[Callable]:
+        return []
+
+
+class _DependsOnXTool(ToolCard):
+    """ToolCard subclass declaring depends_on = ['X']."""
+
+    name: str = "depends-x"
+    description: str = "declares a class-level dependency on X"
+    depends_on: ClassVar[list[str]] = ["X"]
+
+    def get_tools(self) -> list[Callable]:
+        return []
+
+
+def test_tool_card_depends_on_default_is_empty() -> None:
+    """Default depends_on is [] and is not a Pydantic field."""
+    assert _NoDepsTool.depends_on == []
+    assert "depends_on" not in _NoDepsTool.model_fields
+    assert "depends_on" not in ToolCard.model_fields
+
+
+def test_tool_card_depends_on_is_not_a_pydantic_field() -> None:
+    """depends_on must never leak into model_dump() output."""
+    # Default-empty subclass.
+    no_deps = _NoDepsTool()
+    dump = no_deps.model_dump()
+    assert "depends_on" not in dump
+
+    # Subclass that overrides depends_on — still must not appear in the dump.
+    depends = _DependsOnXTool()
+    dump_with_deps = depends.model_dump()
+    assert "depends_on" not in dump_with_deps
+
+
+def test_tool_card_subclass_can_override_depends_on() -> None:
+    """Overriding depends_on on one subclass does not contaminate siblings."""
+
+    class _A(ToolCard):
+        name: str = "a"
+        description: str = "a"
+        depends_on: ClassVar[list[str]] = ["B"]
+
+        def get_tools(self) -> list[Callable]:
+            return []
+
+    class _C(ToolCard):
+        name: str = "c"
+        description: str = "c"
+
+        def get_tools(self) -> list[Callable]:
+            return []
+
+    assert _A.depends_on == ["B"]
+    assert _C.depends_on == []
+    # Base class unaffected by either subclass.
+    assert ToolCard.depends_on == []
+
+
+# --- Stubs used by the factory-level tests below ----------------------------
+
+
+class StubVectorStoreTool(ToolCard):
+    """Stub prerequisite — no dependencies."""
+
+    name: str = "stub-vector-store"
+    description: str = "stub VS"
+
+    def get_tools(self) -> list[Callable]:
+        return []
+
+
+class StubKnowledgeGraphTool(ToolCard):
+    """Stub consumer — depends on StubVectorStoreTool."""
+
+    name: str = "stub-kg"
+    description: str = "stub KG"
+    depends_on: ClassVar[list[str]] = ["StubVectorStoreTool"]
+
+    def get_tools(self) -> list[Callable]:
+        return []
+
+
+class StubPlanningTool(ToolCard):
+    """Stub consumer — depends on StubVectorStoreTool."""
+
+    name: str = "stub-planning"
+    description: str = "stub planning"
+    depends_on: ClassVar[list[str]] = ["StubVectorStoreTool"]
+
+    def get_tools(self) -> list[Callable]:
+        return []
+
+
+def test_tool_factory_topological_sort_happy_path() -> None:
+    """VectorStore is wired before KG and Planning regardless of input order."""
+    calls: list[str] = []
+
+    class _RecordingVS(StubVectorStoreTool):
+        def observer(self, obs):  # type: ignore[override,no-untyped-def]
+            calls.append(type(self).__name__)
+            return super().observer(obs)
+
+    class _RecordingKG(StubKnowledgeGraphTool):
+        depends_on: ClassVar[list[str]] = ["_RecordingVS"]
+
+        def observer(self, obs):  # type: ignore[override,no-untyped-def]
+            calls.append(type(self).__name__)
+            return super().observer(obs)
+
+    class _RecordingPlan(StubPlanningTool):
+        depends_on: ClassVar[list[str]] = ["_RecordingVS"]
+
+        def observer(self, obs):  # type: ignore[override,no-untyped-def]
+            calls.append(type(self).__name__)
+            return super().observer(obs)
+
+    kg = _RecordingKG()
+    plan = _RecordingPlan()
+    vs = _RecordingVS()
+
+    factory = ToolFactory(tool_cards=[kg, plan, vs], observer=object())
+    # VS must be first; KG and Planning preserve their relative input order (kg before plan).
+    assert calls == ["_RecordingVS", "_RecordingKG", "_RecordingPlan"]
+    assert [type(c).__name__ for c in factory.tool_cards] == [
+        "_RecordingVS",
+        "_RecordingKG",
+        "_RecordingPlan",
+    ]
+
+
+def test_tool_factory_deterministic_stable_sort() -> None:
+    """Sorting the same input twice produces the same ordering (AC-3)."""
+    kg = StubKnowledgeGraphTool()
+    plan = StubPlanningTool()
+    vs = StubVectorStoreTool()
+    cards = [kg, plan, vs]
+
+    f1 = ToolFactory(tool_cards=list(cards))
+    f2 = ToolFactory(tool_cards=list(cards))
+    names1 = [type(c).__name__ for c in f1.tool_cards]
+    names2 = [type(c).__name__ for c in f2.tool_cards]
+    assert names1 == names2
+    assert names1 == ["StubVectorStoreTool", "StubKnowledgeGraphTool", "StubPlanningTool"]
+
+
+def test_tool_factory_missing_dependency_raises_value_error() -> None:
+    """Missing dependency raises ValueError with both class names in the message."""
+    with pytest.raises(ValueError) as exc:
+        ToolFactory(tool_cards=[StubKnowledgeGraphTool()])
+    msg = str(exc.value)
+    assert "StubKnowledgeGraphTool" in msg
+    assert "StubVectorStoreTool" in msg
+
+
+def test_tool_factory_cycle_detection_raises_value_error() -> None:
+    """A 2-node cycle is detected and named in the error message."""
+
+    class CyclicA(ToolCard):
+        name: str = "a"
+        description: str = "cycle a"
+        depends_on: ClassVar[list[str]] = ["CyclicB"]
+
+        def get_tools(self) -> list[Callable]:
+            return []
+
+    class CyclicB(ToolCard):
+        name: str = "b"
+        description: str = "cycle b"
+        depends_on: ClassVar[list[str]] = ["CyclicA"]
+
+        def get_tools(self) -> list[Callable]:
+            return []
+
+    with pytest.raises(ValueError) as exc:
+        ToolFactory(tool_cards=[CyclicA(), CyclicB()])
+    msg = str(exc.value)
+    assert "cycle" in msg.lower()
+    assert "CyclicA" in msg
+    assert "CyclicB" in msg
+
+
+def test_tool_factory_cycle_detection_three_node_cycle() -> None:
+    """A 3-node cycle (A → B → C → A) is detected and named."""
+
+    class CycA(ToolCard):
+        name: str = "a3"
+        description: str = "cycle a3"
+        depends_on: ClassVar[list[str]] = ["CycB"]
+
+        def get_tools(self) -> list[Callable]:
+            return []
+
+    class CycB(ToolCard):
+        name: str = "b3"
+        description: str = "cycle b3"
+        depends_on: ClassVar[list[str]] = ["CycC"]
+
+        def get_tools(self) -> list[Callable]:
+            return []
+
+    class CycC(ToolCard):
+        name: str = "c3"
+        description: str = "cycle c3"
+        depends_on: ClassVar[list[str]] = ["CycA"]
+
+        def get_tools(self) -> list[Callable]:
+            return []
+
+    with pytest.raises(ValueError) as exc:
+        ToolFactory(tool_cards=[CycA(), CycB(), CycC()])
+    msg = str(exc.value)
+    assert "cycle" in msg.lower()
+    for name in ("CycA", "CycB", "CycC"):
+        assert name in msg
+
+
+def test_tool_factory_no_dependencies_preserves_input_order() -> None:
+    """With no declared dependencies, input order is preserved (AC-6)."""
+
+    class CardAlpha(ToolCard):
+        name: str = "alpha"
+        description: str = "alpha"
+
+        def get_tools(self) -> list[Callable]:
+            return []
+
+    class CardBeta(ToolCard):
+        name: str = "beta"
+        description: str = "beta"
+
+        def get_tools(self) -> list[Callable]:
+            return []
+
+    class CardGamma(ToolCard):
+        name: str = "gamma"
+        description: str = "gamma"
+
+        def get_tools(self) -> list[Callable]:
+            return []
+
+    a = CardAlpha()
+    b = CardBeta()
+    c = CardGamma()
+    factory = ToolFactory(tool_cards=[a, b, c])
+    assert [type(card).__name__ for card in factory.tool_cards] == [
+        "CardAlpha",
+        "CardBeta",
+        "CardGamma",
+    ]
+
+
+def test_topological_sort_helper_directly() -> None:
+    """Direct coverage for _topological_sort on a small 4-node DAG."""
+
+    class NodeD(ToolCard):
+        name: str = "d"
+        description: str = "d"
+
+        def get_tools(self) -> list[Callable]:
+            return []
+
+    class NodeB(ToolCard):
+        name: str = "b"
+        description: str = "b"
+        depends_on: ClassVar[list[str]] = ["NodeD"]
+
+        def get_tools(self) -> list[Callable]:
+            return []
+
+    class NodeC(ToolCard):
+        name: str = "c"
+        description: str = "c"
+        depends_on: ClassVar[list[str]] = ["NodeD"]
+
+        def get_tools(self) -> list[Callable]:
+            return []
+
+    class NodeA(ToolCard):
+        name: str = "a"
+        description: str = "a"
+        depends_on: ClassVar[list[str]] = ["NodeB", "NodeC", "NodeD"]
+
+        def get_tools(self) -> list[Callable]:
+            return []
+
+    a = NodeA()
+    b = NodeB()
+    c = NodeC()
+    d = NodeD()
+    # Input order is [A, B, C, D] — A has three unresolved deps, so it lands last.
+    ordered = _topological_sort([a, b, c, d])
+    names = [type(card).__name__ for card in ordered]
+    # D must precede B, C, A; B must precede A; C must precede A.
+    assert names.index("NodeD") < names.index("NodeB")
+    assert names.index("NodeD") < names.index("NodeC")
+    assert names.index("NodeD") < names.index("NodeA")
+    assert names.index("NodeB") < names.index("NodeA")
+    assert names.index("NodeC") < names.index("NodeA")
+    # Determinism: B appears before C (input order for independent nodes).
+    assert names.index("NodeB") < names.index("NodeC")
+    # Exactly one instance per node returned.
+    assert len(ordered) == 4
+    assert set(id(x) for x in ordered) == {id(a), id(b), id(c), id(d)}
+
+
+def test_topological_sort_duplicate_class_allowed() -> None:
+    """Two instances of the same ToolCard subclass are permitted."""
+
+    class DupTool(ToolCard):
+        name: str = "dup"
+        description: str = "dup"
+
+        def get_tools(self) -> list[Callable]:
+            return []
+
+    d1 = DupTool()
+    d2 = DupTool()
+    ordered = _topological_sort([d1, d2])
+    # Both instances must survive the sort, preserving input order.
+    assert len(ordered) == 2
+    assert ordered[0] is d1
+    assert ordered[1] is d2
