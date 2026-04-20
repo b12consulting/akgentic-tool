@@ -54,10 +54,12 @@ class MockObserver:
 
         # Set up orchestrator proxy mock
         self._orch_proxy = MagicMock()
-        self._orch_proxy.get_team_member.return_value = existing_actor  # None = not found
-        new_addr = MagicMock(spec=ActorAddress)
-        self._orch_proxy.createActor.return_value = new_addr
-        self._new_actor_addr = new_addr
+        if existing_actor is not None:
+            self._orch_proxy.getChildrenOrCreate.return_value = existing_actor
+        else:
+            new_addr = MagicMock(spec=ActorAddress)
+            self._orch_proxy.getChildrenOrCreate.return_value = new_addr
+            self._new_actor_addr = new_addr
 
     def proxy_ask(
         self,
@@ -156,8 +158,8 @@ def test_observer_creates_local_sandbox_actor() -> None:
 
     tool.observer(observer)  # type: ignore[arg-type]
 
-    observer._orch_proxy.createActor.assert_called_once()
-    call_args = observer._orch_proxy.createActor.call_args
+    observer._orch_proxy.getChildrenOrCreate.assert_called_once()
+    call_args = observer._orch_proxy.getChildrenOrCreate.call_args
     assert call_args[0][0] is LocalSandboxActor
 
 
@@ -168,7 +170,7 @@ def test_observer_creates_actor_with_correct_config() -> None:
 
     tool.observer(observer)  # type: ignore[arg-type]
 
-    call_kwargs = observer._orch_proxy.createActor.call_args[1]
+    call_kwargs = observer._orch_proxy.getChildrenOrCreate.call_args[1]
     config: SandboxConfig = call_kwargs["config"]
     assert config.name == SANDBOX_ACTOR_NAME
     assert config.role == "ToolActor"
@@ -198,8 +200,8 @@ def test_observer_creates_docker_sandbox_actor() -> None:
 
     tool.observer(observer)  # type: ignore[arg-type]
 
-    observer._orch_proxy.createActor.assert_called_once()
-    call_args = observer._orch_proxy.createActor.call_args
+    observer._orch_proxy.getChildrenOrCreate.assert_called_once()
+    call_args = observer._orch_proxy.getChildrenOrCreate.call_args
     assert call_args[0][0] is DockerSandboxActor
 
 
@@ -210,7 +212,7 @@ def test_observer_creates_docker_actor_config_has_mode_docker() -> None:
 
     tool.observer(observer)  # type: ignore[arg-type]
 
-    call_kwargs = observer._orch_proxy.createActor.call_args[1]
+    call_kwargs = observer._orch_proxy.getChildrenOrCreate.call_args[1]
     config: SandboxConfig = call_kwargs["config"]
     assert config.mode == "docker"
 
@@ -221,30 +223,30 @@ def test_observer_creates_docker_actor_config_has_mode_docker() -> None:
 
 
 def test_observer_reuses_existing_actor() -> None:
-    """AC6: when #SandboxActor already exists, createActor is NOT called."""
+    """AC6: getChildrenOrCreate is called and returns the existing actor."""
     existing_addr = MagicMock(spec=ActorAddress)
     observer = MockObserver(existing_actor=existing_addr)
     tool = ExecTool()
 
     tool.observer(observer)  # type: ignore[arg-type]
 
-    observer._orch_proxy.createActor.assert_not_called()
+    observer._orch_proxy.getChildrenOrCreate.assert_called_once()
 
 
 def test_observer_second_call_reuses_actor() -> None:
-    """AC6: calling observer() a second time (actor already exists) does not create a new one."""
-    # First call: no existing actor → creates one
+    """AC6: calling observer() a second time still calls getChildrenOrCreate."""
+    # First call: no existing actor → getChildrenOrCreate creates one
     observer1 = MockObserver(existing_actor=None)
     tool = ExecTool()
     tool.observer(observer1)  # type: ignore[arg-type]
-    assert observer1._orch_proxy.createActor.call_count == 1
+    assert observer1._orch_proxy.getChildrenOrCreate.call_count == 1
 
-    # Second call: actor now exists
+    # Second call: actor now exists — getChildrenOrCreate returns existing
     existing_addr = MagicMock(spec=ActorAddress)
     observer2 = MockObserver(existing_actor=existing_addr)
     tool.observer(observer2)  # type: ignore[arg-type]
 
-    observer2._orch_proxy.createActor.assert_not_called()
+    observer2._orch_proxy.getChildrenOrCreate.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +448,7 @@ def test_exec_tool_mode_not_affected_by_sandbox_mode_env(
 
     tool.observer(observer)  # type: ignore[arg-type]
 
-    call_args = observer._orch_proxy.createActor.call_args
+    call_args = observer._orch_proxy.getChildrenOrCreate.call_args
     # Despite env var, LocalSandboxActor must be chosen (mode="local")
     assert call_args[0][0] is LocalSandboxActor
 
@@ -475,7 +477,7 @@ def test_observer_passes_workspace_id_to_sandbox_config() -> None:
 
     tool.observer(observer)  # type: ignore[arg-type]
 
-    call_kwargs = observer._orch_proxy.createActor.call_args[1]
+    call_kwargs = observer._orch_proxy.getChildrenOrCreate.call_args[1]
     config: SandboxConfig = call_kwargs["config"]
     assert config.workspace_id == "test"
 
@@ -487,7 +489,7 @@ def test_observer_passes_workspace_id_none_to_sandbox_config() -> None:
 
     tool.observer(observer)  # type: ignore[arg-type]
 
-    call_kwargs = observer._orch_proxy.createActor.call_args[1]
+    call_kwargs = observer._orch_proxy.getChildrenOrCreate.call_args[1]
     config: SandboxConfig = call_kwargs["config"]
     assert config.workspace_id is None
 
@@ -500,7 +502,7 @@ def test_observer_config_has_team_id_and_workspace_id_independently() -> None:
 
     tool.observer(observer)  # type: ignore[arg-type]
 
-    call_kwargs = observer._orch_proxy.createActor.call_args[1]
+    call_kwargs = observer._orch_proxy.getChildrenOrCreate.call_args[1]
     config: SandboxConfig = call_kwargs["config"]
     assert config.team_id == "t1"
     assert config.workspace_id == "my-ws"
@@ -581,7 +583,7 @@ def test_observer_creates_bwrap_sandbox_actor() -> None:
 
     tool.observer(observer)  # type: ignore[arg-type]
 
-    call_args = observer._orch_proxy.createActor.call_args
+    call_args = observer._orch_proxy.getChildrenOrCreate.call_args
     assert call_args[0][0] is BwrapSandboxActor
 
 
@@ -592,7 +594,7 @@ def test_observer_creates_seatbelt_sandbox_actor() -> None:
 
     tool.observer(observer)  # type: ignore[arg-type]
 
-    call_args = observer._orch_proxy.createActor.call_args
+    call_args = observer._orch_proxy.getChildrenOrCreate.call_args
     assert call_args[0][0] is SeatbeltSandboxActor
 
 
@@ -689,7 +691,7 @@ def test_observer_auto_mode_creates_bwrap_actor() -> None:
     with patch("akgentic.tool.sandbox.tool._resolve_auto_mode", return_value="bwrap"):
         tool.observer(observer)  # type: ignore[arg-type]
 
-    call_args = observer._orch_proxy.createActor.call_args
+    call_args = observer._orch_proxy.getChildrenOrCreate.call_args
     assert call_args[0][0] is BwrapSandboxActor
 
 
@@ -701,7 +703,7 @@ def test_observer_auto_mode_creates_seatbelt_actor() -> None:
     with patch("akgentic.tool.sandbox.tool._resolve_auto_mode", return_value="seatbelt"):
         tool.observer(observer)  # type: ignore[arg-type]
 
-    call_args = observer._orch_proxy.createActor.call_args
+    call_args = observer._orch_proxy.getChildrenOrCreate.call_args
     assert call_args[0][0] is SeatbeltSandboxActor
 
 
@@ -716,7 +718,7 @@ def test_observer_auto_mode_fallback_to_local_emits_deprecation_warning() -> Non
     ):
         tool.observer(observer)  # type: ignore[arg-type]
 
-    call_args = observer._orch_proxy.createActor.call_args
+    call_args = observer._orch_proxy.getChildrenOrCreate.call_args
     assert call_args[0][0] is LocalSandboxActor
 
 
@@ -728,7 +730,7 @@ def test_observer_auto_mode_config_uses_resolved_mode() -> None:
     with patch("akgentic.tool.sandbox.tool._resolve_auto_mode", return_value="bwrap"):
         tool.observer(observer)  # type: ignore[arg-type]
 
-    call_kwargs = observer._orch_proxy.createActor.call_args[1]
+    call_kwargs = observer._orch_proxy.getChildrenOrCreate.call_args[1]
     config: SandboxConfig = call_kwargs["config"]
     assert config.mode == "bwrap"  # resolved mode stored, not "auto"
 
@@ -741,7 +743,7 @@ def test_observer_auto_mode_creates_docker_actor() -> None:
     with patch("akgentic.tool.sandbox.tool._resolve_auto_mode", return_value="docker"):
         tool.observer(observer)  # type: ignore[arg-type]
 
-    call_args = observer._orch_proxy.createActor.call_args
+    call_args = observer._orch_proxy.getChildrenOrCreate.call_args
     assert call_args[0][0] is DockerSandboxActor
 
 
@@ -760,5 +762,5 @@ def test_observer_local_mode_explicit_does_not_emit_deprecation_warning() -> Non
         warnings.simplefilter("error", DeprecationWarning)
         tool.observer(observer)  # type: ignore[arg-type]  # must not raise
 
-    call_args = observer._orch_proxy.createActor.call_args
+    call_args = observer._orch_proxy.getChildrenOrCreate.call_args
     assert call_args[0][0] is LocalSandboxActor

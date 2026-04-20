@@ -2,17 +2,18 @@ from __future__ import annotations
 
 import datetime
 import logging
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import Akgent, BaseConfig, BaseState
+from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.errors import RetriableError
-
-if TYPE_CHECKING:
-    from akgentic.tool.vector import EmbeddingService, VectorIndex
+from akgentic.tool.vector import VectorEntry
+from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE, VectorStoreActor
+from akgentic.tool.vector_store.protocol import CollectionConfig, VectorStoreConfig
 
 logger = logging.getLogger(__name__)
 
@@ -83,16 +84,18 @@ class PlanManagerState(BaseState):
     task_list: list[Task] = Field(default_factory=list)
 
 
+PLAN_COLLECTION: str = "planning"
+"""Collection name used in VectorStoreActor."""
+
+
 class PlanConfig(BaseConfig):
     """Configuration for PlanActor with optional semantic search support."""
 
-    embedding_model: str = Field(default="text-embedding-3-small")
-    embedding_provider: Literal["openai", "azure"] = Field(default="openai")
     semantic_search: bool = Field(
         default=True,
         description=(
             "When True, task descriptions are embedded on create/update/delete "
-            "for semantic search. Falls back gracefully if [vector_search] deps are not installed."
+            "for semantic search. Falls back gracefully if VectorStoreActor is unavailable."
         ),
     )
 
@@ -121,62 +124,59 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
                 name=self.config.name,
                 role=self.config.role,
             )
-        # Only instantiate VectorIndex (which imports numpy) when semantic_search is enabled.
-        # This preserves the graceful fallback behaviour: if numpy is absent and
-        # semantic_search=False, on_start must not crash (AC#7, AC#8).
-        self._vector_index: VectorIndex | None = None
+        self._vs_proxy: VectorStoreActor | None = None
         if self.config.semantic_search:
-            from akgentic.tool.vector import VectorIndex
+            self._acquire_vs_proxy()
 
-            self._vector_index = VectorIndex()
-        self._embedding_svc: EmbeddingService | None = None
+    def _acquire_vs_proxy(self) -> None:
+        """Acquire the VectorStoreActor proxy and create the planning collection.
 
-    def _get_or_create_embedding_svc(self) -> EmbeddingService | None:
-        """Return (or lazily create) the EmbeddingService.
-
-        Returns None when semantic_search is disabled or [vector_search]
-        optional dependencies are not installed.
+        Operates in degraded mode (no vector search) if the proxy cannot
+        be acquired.
         """
-        if not self.config.semantic_search:
-            return None
-        if self._embedding_svc is None:
-            try:
-                from akgentic.tool.vector import EmbeddingService, _check_vector_search_dependencies
-
-                _check_vector_search_dependencies()
-            except ImportError:
-                return None
-            self._embedding_svc = EmbeddingService(
-                model=self.config.embedding_model,
-                provider=self.config.embedding_provider,
+        try:
+            if self.orchestrator is None:
+                logger.warning(
+                    "[%s] No orchestrator; operating in degraded mode",
+                    self.config.name,
+                )
+                return
+            orch_proxy = self.proxy_ask(self.orchestrator, Orchestrator)
+            vs_addr = orch_proxy.getChildrenOrCreate(
+                VectorStoreActor,
+                config=VectorStoreConfig(name=VS_ACTOR_NAME, role=VS_ACTOR_ROLE),
             )
-        return self._embedding_svc
+            self._vs_proxy = self.proxy_ask(vs_addr, VectorStoreActor)
+            self._vs_proxy.create_collection(PLAN_COLLECTION, CollectionConfig())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[%s] Failed to acquire VectorStoreActor proxy: %s",
+                self.config.name,
+                exc,
+            )
 
     def _embed_task(self, task: Task) -> None:
         """Embed a task's description and store the resulting VectorEntry.
 
-        Called after task create or update. Does nothing when embedding service
-        is unavailable (semantic_search=False or missing deps). Any embedding
-        error (import, network, auth) is logged and swallowed so that task CRUD
+        Called after task create or update. Does nothing when VectorStoreActor
+        proxy is unavailable (semantic_search=False or proxy not acquired).
+        Any embedding error is logged and swallowed so that task CRUD
         is never interrupted by a transient embedding failure.
         """
+        if self._vs_proxy is None:
+            return
         try:
-            svc = self._get_or_create_embedding_svc()
-            if svc is None or self._vector_index is None:
+            vectors = self._vs_proxy.embed([task.description])
+            if not vectors:
                 return
-            from akgentic.tool.vector import VectorEntry
-
-            vector = svc.embed([task.description])[0]
             entry = VectorEntry(
                 ref_type="task",
                 ref_id=str(task.id),
                 text=task.description,
-                vector=vector,
+                vector=vectors[0],
             )
-            self._vector_index.add(entry)
-        except ImportError:
-            logger.warning("Vector search deps missing — skipping embedding for task %s", task.id)
-        except Exception:
+            self._vs_proxy.add(PLAN_COLLECTION, [entry])
+        except Exception:  # noqa: BLE001
             logger.warning(
                 "Embedding failed for task %s — semantic index not updated", task.id, exc_info=True
             )
@@ -202,9 +202,9 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
                 if (
                     self.config.semantic_search
                     and description_changed
-                    and self._vector_index is not None
+                    and self._vs_proxy is not None
                 ):
-                    self._vector_index.remove({str(task.id)})
+                    self._vs_proxy.remove(PLAN_COLLECTION, [str(task.id)])
                     self._embed_task(updated_task)
                 return None
         return f"Update error - no task with ID {task_update.id} found."
@@ -263,15 +263,16 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
             keyword_ids = {t.id for t in tasks if q_lower in t.description.lower()}
 
             semantic_ids: set[int] = set()
-            svc = self._get_or_create_embedding_svc()
-            if svc is not None and self._vector_index is not None and len(self._vector_index) > 0:
+            if self._vs_proxy is not None:
                 try:
-                    query_vector = svc.embed([query])[0]
-                    pairs = self._vector_index.search_cosine(query_vector, top_k=20)
-                    for ref_id, score in pairs:
-                        if score >= 0.5:
-                            semantic_ids.add(int(ref_id))
-                except Exception:
+                    vectors = self._vs_proxy.embed([query])
+                    if vectors:
+                        query_vector = vectors[0]
+                        result = self._vs_proxy.search(PLAN_COLLECTION, query_vector, 20)
+                        for hit in result.hits:
+                            if hit.score >= 0.5:
+                                semantic_ids.add(int(hit.ref_id))
+                except Exception:  # noqa: BLE001
                     logger.warning(
                         "Semantic search failed for query — falling back to keyword only",
                         exc_info=True,
@@ -310,8 +311,8 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
             if not any(task.id == task_id for task in self.state.task_list):
                 errors.append(f"Delete error - no task with ID {task_id} found.")
             else:
-                if self.config.semantic_search and self._vector_index is not None:
-                    self._vector_index.remove({str(task_id)})
+                if self.config.semantic_search and self._vs_proxy is not None:
+                    self._vs_proxy.remove(PLAN_COLLECTION, [str(task_id)])
                 self.state.task_list = [task for task in self.state.task_list if task.id != task_id]
 
         self.state.notify_state_change()

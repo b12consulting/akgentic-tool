@@ -5,7 +5,7 @@ Covers AC#2–#12 from Story 4.3: search_planning Filtered Search Capability.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -258,15 +258,13 @@ class TestSearchPlanningQueryKeyword:
         assert result == []
 
     def test_keyword_with_semantic_search_disabled(self) -> None:
-        """Keyword-only mode when semantic_search=False — embedding svc returns None."""
+        """Keyword-only mode when semantic_search=False — _vs_proxy is None."""
         actor = _make_actor(semantic_search=False)
         _add_task(actor, 1, "auth flow")
         _add_task(actor, 2, "payment gateway")
 
-        # Patch returns None to simulate the svc-unavailable path explicitly.
-        # _vector_index is also None because semantic_search=False.
-        with patch.object(actor, "_get_or_create_embedding_svc", return_value=None):
-            result = actor.search_planning(query="auth")
+        # _vs_proxy is None because semantic_search=False — keyword-only path.
+        result = actor.search_planning(query="auth")
 
         assert len(result) == 1
         assert result[0].id == 1
@@ -278,7 +276,28 @@ class TestSearchPlanningQueryKeyword:
 
 
 class TestSearchPlanningQuerySemantic:
-    """AC6: query with mocked vector deps — union of keyword + semantic, dedup, cosine ≥ 0.5."""
+    """AC6: query with mocked VectorStoreActor proxy — union of keyword + semantic, dedup, cosine ≥ 0.5."""
+
+    def _make_vs_proxy_mock(
+        self, embed_return: list[list[float]], search_hits: list[tuple[str, float]]
+    ) -> MagicMock:
+        """Build a mock VectorStoreActor proxy with embed and search stubs."""
+        from akgentic.tool.vector_store.protocol import (
+            CollectionStatus,
+            SearchHit,
+            SearchResult,
+        )
+
+        mock = MagicMock()
+        mock.embed.return_value = embed_return
+        mock.search.return_value = SearchResult(
+            hits=[
+                SearchHit(ref_type="task", ref_id=ref_id, text="", score=score)
+                for ref_id, score in search_hits
+            ],
+            status=CollectionStatus.READY,
+        )
+        return mock
 
     def test_semantic_union_with_keyword(self) -> None:
         """Semantic hits union with keyword hits; tasks with score ≥ 0.5 included."""
@@ -287,19 +306,13 @@ class TestSearchPlanningQuerySemantic:
         _add_task(actor, 2, "database schema")  # semantic match only
         _add_task(actor, 3, "deployment pipeline")  # no match
 
-        # Mock embedding service
-        mock_svc = MagicMock()
-        mock_svc.embed.return_value = [[0.1, 0.2, 0.3]]
-
-        # Mock vector index with non-zero size
-        mock_index = MagicMock()
-        mock_index.__len__ = MagicMock(return_value=3)
         # Task 2 has cosine score ≥ 0.5, task 3 has score < 0.5
-        mock_index.search_cosine.return_value = [("2", 0.75), ("3", 0.3)]
-        actor._vector_index = mock_index
+        actor._vs_proxy = self._make_vs_proxy_mock(
+            embed_return=[[0.1, 0.2, 0.3]],
+            search_hits=[("2", 0.75), ("3", 0.3)],
+        )
 
-        with patch.object(actor, "_get_or_create_embedding_svc", return_value=mock_svc):
-            result = actor.search_planning(query="auth flow")
+        result = actor.search_planning(query="auth flow")
 
         # task 1 via keyword, task 2 via semantic (score 0.75 ≥ 0.5)
         # task 3 excluded (score 0.3 < 0.5)
@@ -310,17 +323,13 @@ class TestSearchPlanningQuerySemantic:
         actor = _make_actor(semantic_search=True)
         _add_task(actor, 1, "auth module")
 
-        mock_svc = MagicMock()
-        mock_svc.embed.return_value = [[0.1, 0.2, 0.3]]
-
-        mock_index = MagicMock()
-        mock_index.__len__ = MagicMock(return_value=1)
         # Task 1 is both a keyword match AND semantic match
-        mock_index.search_cosine.return_value = [("1", 0.9)]
-        actor._vector_index = mock_index
+        actor._vs_proxy = self._make_vs_proxy_mock(
+            embed_return=[[0.1, 0.2, 0.3]],
+            search_hits=[("1", 0.9)],
+        )
 
-        with patch.object(actor, "_get_or_create_embedding_svc", return_value=mock_svc):
-            result = actor.search_planning(query="auth")
+        result = actor.search_planning(query="auth")
 
         # Deduplicated: only one entry for task 1
         assert len(result) == 1
@@ -331,16 +340,12 @@ class TestSearchPlanningQuerySemantic:
         actor = _make_actor(semantic_search=True)
         _add_task(actor, 1, "database task")
 
-        mock_svc = MagicMock()
-        mock_svc.embed.return_value = [[0.1, 0.2]]
+        actor._vs_proxy = self._make_vs_proxy_mock(
+            embed_return=[[0.1, 0.2]],
+            search_hits=[("1", 0.5)],
+        )
 
-        mock_index = MagicMock()
-        mock_index.__len__ = MagicMock(return_value=1)
-        mock_index.search_cosine.return_value = [("1", 0.5)]
-        actor._vector_index = mock_index
-
-        with patch.object(actor, "_get_or_create_embedding_svc", return_value=mock_svc):
-            result = actor.search_planning(query="db")
+        result = actor.search_planning(query="db")
 
         assert len(result) == 1
         assert result[0].id == 1
@@ -350,36 +355,31 @@ class TestSearchPlanningQuerySemantic:
         actor = _make_actor(semantic_search=True)
         _add_task(actor, 1, "database task")
 
-        mock_svc = MagicMock()
-        mock_svc.embed.return_value = [[0.1, 0.2]]
+        actor._vs_proxy = self._make_vs_proxy_mock(
+            embed_return=[[0.1, 0.2]],
+            search_hits=[("1", 0.49)],
+        )
 
-        mock_index = MagicMock()
-        mock_index.__len__ = MagicMock(return_value=1)
-        mock_index.search_cosine.return_value = [("1", 0.49)]
-        actor._vector_index = mock_index
-
-        with patch.object(actor, "_get_or_create_embedding_svc", return_value=mock_svc):
-            result = actor.search_planning(query="completely different topic")
+        result = actor.search_planning(query="completely different topic")
 
         # Not a keyword match AND cosine < 0.5 → excluded
         assert result == []
 
-    def test_empty_vector_index_falls_back_to_keyword(self) -> None:
-        """When vector index is empty (len=0), semantic phase is skipped."""
+    def test_empty_embed_result_falls_back_to_keyword(self) -> None:
+        """When embed returns empty list, semantic phase is skipped."""
         actor = _make_actor(semantic_search=True)
         _add_task(actor, 1, "auth flow setup")
 
-        mock_svc = MagicMock()
+        # Embed returns empty list (no vectors) — semantic skipped
+        actor._vs_proxy = self._make_vs_proxy_mock(
+            embed_return=[],
+            search_hits=[],
+        )
 
-        mock_index = MagicMock()
-        mock_index.__len__ = MagicMock(return_value=0)
-        actor._vector_index = mock_index
+        result = actor.search_planning(query="auth")
 
-        with patch.object(actor, "_get_or_create_embedding_svc", return_value=mock_svc):
-            result = actor.search_planning(query="auth")
-
-        # Keyword match only; search_cosine should not be called (index is empty)
-        mock_index.search_cosine.assert_not_called()
+        # Keyword match only; search should not be called (embed returned empty)
+        actor._vs_proxy.search.assert_not_called()
         assert len(result) == 1
         assert result[0].id == 1
 
@@ -436,50 +436,45 @@ class TestSearchPlanningCombinedFilters:
 
 
 class TestSearchPlanningVectorFallback:
-    """AC5/AC6: when _get_or_create_embedding_svc returns None, degrades to keyword-only."""
+    """AC5/AC6: when _vs_proxy is None or raises, degrades to keyword-only."""
 
-    def test_no_exception_when_svc_returns_none(self) -> None:
-        """When embedding svc unavailable, search_planning works via keyword only."""
+    def test_no_exception_when_vs_proxy_is_none(self) -> None:
+        """When VectorStoreActor proxy unavailable, search_planning works via keyword only."""
         actor = _make_actor(semantic_search=True)
         _add_task(actor, 1, "auth service")
         _add_task(actor, 2, "payment service")
 
-        with patch.object(actor, "_get_or_create_embedding_svc", return_value=None):
-            result = actor.search_planning(query="auth")
+        # _vs_proxy is None (degraded mode) — keyword-only
+        assert actor._vs_proxy is None
+        result = actor.search_planning(query="auth")
 
         # Falls back to keyword-only, no exception raised
         assert len(result) == 1
         assert result[0].id == 1
 
-    def test_no_exception_when_vector_index_is_none(self) -> None:
-        """When _vector_index is None (semantic_search=False), keyword fallback works."""
+    def test_no_exception_when_semantic_search_disabled(self) -> None:
+        """When semantic_search=False, _vs_proxy is None and keyword fallback works."""
         actor = _make_actor(semantic_search=False)
         _add_task(actor, 1, "auth service")
 
-        mock_svc = MagicMock()
-        # Even if svc somehow returned non-None, _vector_index being None skips semantic
-        with patch.object(actor, "_get_or_create_embedding_svc", return_value=mock_svc):
-            # _vector_index is None because semantic_search=False
-            result = actor.search_planning(query="auth")
+        # _vs_proxy is None because semantic_search=False
+        assert actor._vs_proxy is None
+        result = actor.search_planning(query="auth")
 
         assert len(result) == 1
         assert result[0].id == 1
 
     def test_semantic_exception_falls_back_to_keyword(self) -> None:
-        """When semantic search raises an exception, keyword results still returned."""
+        """When VectorStoreActor proxy raises an exception, keyword results still returned."""
         actor = _make_actor(semantic_search=True)
         _add_task(actor, 1, "auth service")
 
-        mock_svc = MagicMock()
-        mock_svc.embed.side_effect = RuntimeError("embedding API error")
+        mock_proxy = MagicMock()
+        mock_proxy.embed.side_effect = RuntimeError("embedding API error")
+        actor._vs_proxy = mock_proxy
 
-        mock_index = MagicMock()
-        mock_index.__len__ = MagicMock(return_value=1)
-        actor._vector_index = mock_index
-
-        with patch.object(actor, "_get_or_create_embedding_svc", return_value=mock_svc):
-            # Should not raise; falls back to keyword
-            result = actor.search_planning(query="auth")
+        # Should not raise; falls back to keyword
+        result = actor.search_planning(query="auth")
 
         assert len(result) == 1
         assert result[0].id == 1

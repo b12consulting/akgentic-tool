@@ -56,14 +56,7 @@ from akgentic.tool.knowledge_graph.models import (
     SearchQuery,
     SearchResult,
 )
-from akgentic.tool.vector import (
-    EmbeddingService,
-    VectorEntry,
-    VectorIndex,
-)
-from akgentic.tool.vector import (
-    _check_vector_search_dependencies as _check_kg_dependencies,
-)
+from akgentic.tool.vector import _check_vector_search_dependencies as _check_kg_dependencies
 
 __all__ = [
     # Core domain models
@@ -84,8 +77,6 @@ __all__ = [
     "SearchQuery",
     "SearchHit",
     "SearchResult",
-    # Vector index models (Story 2.1)
-    "VectorEntry",
     # State delta models (Story 17.1)
     "KnowledgeGraphStateEvent",
     # ToolCard (Story 1.3)
@@ -98,9 +89,6 @@ __all__ = [
     "KnowledgeGraphConfig",
     "KG_ACTOR_NAME",
     "KG_ACTOR_ROLE",
-    # Vector index services (Story 2.1)
-    "EmbeddingService",
-    "VectorIndex",
     # Utilities
     "_check_kg_dependencies",
 ]

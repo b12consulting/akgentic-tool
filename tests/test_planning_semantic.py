@@ -6,7 +6,7 @@ Also covers AC#8–#9 (PlanningTool embedding field wiring).
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from akgentic.tool.planning.planning_actor import (
     PlanActor,
@@ -59,13 +59,11 @@ class TestGetPlanningTaskIntFound:
         actor = _make_actor()
         _add_task(actor, task_id=3, description="Auth module")
 
-        with patch.object(actor, "_get_or_create_embedding_svc") as mock_svc:
-            result = actor.get_planning_task(3)
+        result = actor.get_planning_task(3)
 
         assert isinstance(result, Task)
         assert result.id == 3
         assert result.description == "Auth module"
-        mock_svc.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -86,66 +84,32 @@ class TestGetPlanningTaskIntNotFound:
 
 
 # ---------------------------------------------------------------------------
-# AC#8 — PlanningTool has embedding_model and embedding_provider fields
-# ---------------------------------------------------------------------------
-
-
-class TestPlanningToolFields:
-    """AC8: PlanningTool exposes embedding_model and embedding_provider Pydantic fields."""
-
-    def test_default_embedding_model(self) -> None:
-        from akgentic.tool.planning.planning import PlanningTool
-
-        tool = PlanningTool()
-        assert tool.embedding_model == "text-embedding-3-small"
-
-    def test_default_embedding_provider(self) -> None:
-        from akgentic.tool.planning.planning import PlanningTool
-
-        tool = PlanningTool()
-        assert tool.embedding_provider == "openai"
-
-    def test_custom_embedding_model(self) -> None:
-        from akgentic.tool.planning.planning import PlanningTool
-
-        tool = PlanningTool(embedding_model="text-embedding-ada-002")
-        assert tool.embedding_model == "text-embedding-ada-002"
-
-    def test_custom_embedding_provider_azure(self) -> None:
-        from akgentic.tool.planning.planning import PlanningTool
-
-        tool = PlanningTool(embedding_provider="azure")
-        assert tool.embedding_provider == "azure"
-
-
-# ---------------------------------------------------------------------------
-# AC#9 — PlanningTool.observer() passes PlanConfig with embedding fields
+# AC#9 — PlanningTool.observer() creates VectorStoreActor with default config
 # ---------------------------------------------------------------------------
 
 
 class TestPlanningToolObserverWiring:
-    """AC9: observer() wires PlanConfig(embedding_model, embedding_provider) to PlanActor."""
+    """AC9/AC10: observer() creates VectorStoreActor and PlanActor with correct configs."""
 
-    def test_observer_creates_plan_actor_with_plan_config(self) -> None:
-        """observer() must pass PlanConfig (not BaseConfig) with embedding fields to PlanActor."""
+    def test_observer_creates_vectorstore_and_plan_actors(self) -> None:
+        """observer() must create VectorStoreActor with defaults, then PlanActor."""
         from akgentic.tool.planning.planning import PlanningTool
+        from akgentic.tool.vector_store.protocol import VectorStoreConfig
 
-        tool = PlanningTool(
-            embedding_model="text-embedding-ada-002",
-            embedding_provider="azure",
-        )
+        tool = PlanningTool()
 
-        # Capture the config passed to createActor
-        captured_config: list[PlanConfig] = []
+        # Capture configs passed to getChildrenOrCreate calls
+        captured_configs: list[object] = []
 
         mock_proxy_ask = MagicMock()
-        mock_proxy_ask.get_team_member.return_value = None  # Force actor creation path
 
-        def capture_create_actor(actor_cls: type, config: PlanConfig) -> MagicMock:
-            captured_config.append(config)
+        def capture_get_children_or_create(
+            actor_cls: type, config: object = None,
+        ) -> MagicMock:
+            captured_configs.append(config)
             return MagicMock()
 
-        mock_proxy_ask.createActor.side_effect = capture_create_actor
+        mock_proxy_ask.getChildrenOrCreate.side_effect = capture_get_children_or_create
 
         mock_observer = MagicMock()
         mock_observer.orchestrator = MagicMock()
@@ -153,11 +117,16 @@ class TestPlanningToolObserverWiring:
 
         tool.observer(mock_observer)
 
-        assert len(captured_config) == 1
-        config = captured_config[0]
-        assert isinstance(config, PlanConfig), (
-            f"Expected PlanConfig, got {type(config).__name__}. "
-            "observer() must not pass a plain BaseConfig."
-        )
-        assert config.embedding_model == "text-embedding-ada-002"
-        assert config.embedding_provider == "azure"
+        # Two actors created: VectorStoreActor first, PlanActor second
+        assert len(captured_configs) == 2
+
+        # First: VectorStoreConfig with defaults (embedding config centralized here)
+        vs_config = captured_configs[0]
+        assert isinstance(vs_config, VectorStoreConfig)
+        assert vs_config.embedding_model == "text-embedding-3-small"
+        assert vs_config.embedding_provider == "openai"
+
+        # Second: PlanConfig without embedding fields
+        plan_config = captured_configs[1]
+        assert isinstance(plan_config, PlanConfig)
+        assert "embedding_model" not in PlanConfig.model_fields

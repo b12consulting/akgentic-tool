@@ -10,7 +10,7 @@ Follows the same pattern as ``PlanningTool`` in akgentic.tool.planning.
 from __future__ import annotations
 
 import logging
-from typing import Callable, Literal
+from typing import Callable
 
 from pydantic import Field
 
@@ -38,6 +38,8 @@ from akgentic.tool.knowledge_graph.models import (
     SearchQuery,
     SearchResult,
 )
+from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE, VectorStoreActor
+from akgentic.tool.vector_store.protocol import VectorStoreConfig
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -103,8 +105,6 @@ class KnowledgeGraphTool(ToolCard):
         description="Search graph — TOOL_CALL + COMMAND by default",
     )
 
-    embedding_model: str = "text-embedding-3-small"
-    embedding_provider: Literal["openai", "azure"] = "openai"
     read_only: bool = False
 
     # ------------------------------------------------------------------
@@ -114,8 +114,8 @@ class KnowledgeGraphTool(ToolCard):
     def observer(self, observer: ActorToolObserver) -> None:  # type: ignore[override]
         """Attach observer and set up the KG actor proxy.
 
-        Creates/retrieves the singleton ``KnowledgeGraphActor`` via the
-        orchestrator, identical to PlanningTool's observer pattern.
+        Ensures the ``VectorStoreActor`` singleton exists (AC10) before
+        creating/retrieving the ``KnowledgeGraphActor`` singleton.
         """
         from akgentic.tool.knowledge_graph import _check_kg_dependencies
 
@@ -126,19 +126,24 @@ class KnowledgeGraphTool(ToolCard):
             raise ValueError("KnowledgeGraphTool requires access to the orchestrator.")
 
         orchestrator_proxy = observer.proxy_ask(observer.orchestrator, Orchestrator)
-        kg_addr = orchestrator_proxy.get_team_member(KG_ACTOR_NAME)
 
-        if kg_addr is None:
-            logger.info("KnowledgeGraphTool: creating singleton %s.", KG_ACTOR_NAME)
-            kg_addr = orchestrator_proxy.createActor(
-                KnowledgeGraphActor,
-                config=KnowledgeGraphConfig(
-                    name=KG_ACTOR_NAME,
-                    role=KG_ACTOR_ROLE,
-                    embedding_model=self.embedding_model,
-                    embedding_provider=self.embedding_provider,
-                ),
-            )
+        # Ensure VectorStoreActor singleton exists
+        orchestrator_proxy.getChildrenOrCreate(
+            VectorStoreActor,
+            config=VectorStoreConfig(
+                name=VS_ACTOR_NAME,
+                role=VS_ACTOR_ROLE,
+            ),
+        )
+
+        # Create/retrieve KnowledgeGraphActor singleton
+        kg_addr = orchestrator_proxy.getChildrenOrCreate(
+            KnowledgeGraphActor,
+            config=KnowledgeGraphConfig(
+                name=KG_ACTOR_NAME,
+                role=KG_ACTOR_ROLE,
+            ),
+        )
 
         self._kg_proxy = observer.proxy_ask(kg_addr, KnowledgeGraphActor)
 

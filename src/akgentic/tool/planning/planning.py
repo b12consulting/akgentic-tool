@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable, Literal
+from typing import Callable
 
 from pydantic import Field
 
@@ -23,6 +23,8 @@ from akgentic.tool.planning.planning_actor import (
     TaskStatus,
     UpdatePlan,
 )
+from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE, VectorStoreActor
+from akgentic.tool.vector_store.protocol import VectorStoreConfig
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -73,17 +75,12 @@ class PlanningTool(ToolCard):
     get_planning_task: GetPlanningTask | bool = True
     update_planning: UpdatePlanning | bool = True
     search_planning: SearchPlanning | bool = True
-    embedding_model: str = Field(
-        default="text-embedding-3-small",
-        description="Embedding model passed through to PlanConfig for semantic task search",
-    )
-    embedding_provider: Literal["openai", "azure"] = Field(
-        default="openai",
-        description="Embedding provider passed through to PlanConfig for semantic task search",
-    )
 
     def observer(self, observer: ActorToolObserver) -> None:  # type: ignore[override]
         """Attach observer and set up the planning actor proxy.
+
+        Ensures the ``VectorStoreActor`` singleton exists before
+        creating/retrieving the ``PlanActor`` singleton.
 
         Requires an ActorToolObserver for actor system access.
         """
@@ -91,18 +88,25 @@ class PlanningTool(ToolCard):
         if observer.orchestrator is None:
             raise ValueError("PlanningTool requires access to the orchestrator.")
 
-        orchestrator_proxy_ask = observer.proxy_ask(observer.orchestrator, Orchestrator)
-        planning_tool_addr = orchestrator_proxy_ask.get_team_member(PLANNING_ACTOR_NAME)
+        orchestrator_proxy = observer.proxy_ask(observer.orchestrator, Orchestrator)
 
-        if planning_tool_addr is None:
-            logger.info(f"PlanningTool: create {PLANNING_ACTOR_NAME}.")
-            config = PlanConfig(
+        # Ensure VectorStoreActor singleton exists
+        orchestrator_proxy.getChildrenOrCreate(
+            VectorStoreActor,
+            config=VectorStoreConfig(
+                name=VS_ACTOR_NAME,
+                role=VS_ACTOR_ROLE,
+            ),
+        )
+
+        # Create/retrieve PlanActor singleton
+        planning_tool_addr = orchestrator_proxy.getChildrenOrCreate(
+            PlanActor,
+            config=PlanConfig(
                 name=PLANNING_ACTOR_NAME,
                 role=PLANNING_ACTOR_ROLE,
-                embedding_model=self.embedding_model,
-                embedding_provider=self.embedding_provider,
-            )
-            planning_tool_addr = orchestrator_proxy_ask.createActor(PlanActor, config=config)
+            ),
+        )
 
         self._planning_proxy = observer.proxy_ask(planning_tool_addr, PlanActor)
 
