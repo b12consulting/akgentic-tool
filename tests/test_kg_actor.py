@@ -38,7 +38,7 @@ from akgentic.tool.knowledge_graph.models import (
     RelationDelete,
     SearchQuery,
 )
-from akgentic.tool.vector_store.protocol import CollectionStatus
+from akgentic.tool.vector_store.protocol import CollectionConfig, CollectionStatus
 from akgentic.tool.vector_store.protocol import SearchHit as VsSearchHit
 from akgentic.tool.vector_store.protocol import SearchResult as VsSearchResult
 
@@ -1495,3 +1495,153 @@ class TestKnowledgeGraphActorAcquireVsProxy:
         actor._acquire_vs_proxy()
 
         assert actor._vs_proxy is None  # degraded
+
+
+# ---------------------------------------------------------------------------
+# Story 10-10 — KnowledgeGraphConfig.collection + _acquire_vs_proxy identity
+# ---------------------------------------------------------------------------
+
+
+class TestKnowledgeGraphConfigCollectionField:
+    """AC-3: KnowledgeGraphConfig carries a fully-serialisable collection field."""
+
+    def test_collection_default_is_default_collection_config(self) -> None:
+        cfg = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
+        assert cfg.collection == CollectionConfig()
+        # Structural defaults — AC-11 backward-compat guard.
+        assert cfg.collection.dimension == 1536
+        assert cfg.collection.backend == "inmemory"
+        assert cfg.collection.persistence == "actor_state"
+        assert cfg.collection.workspace_path is None
+        assert cfg.collection.tenant is None
+
+    def test_collection_accepts_custom_value(self) -> None:
+        cfg = KnowledgeGraphConfig(
+            name=KG_ACTOR_NAME,
+            role=KG_ACTOR_ROLE,
+            collection=CollectionConfig(backend="weaviate", tenant="t1"),
+        )
+        assert cfg.collection.backend == "weaviate"
+        assert cfg.collection.tenant == "t1"
+
+    def test_collection_roundtrip_default(self) -> None:
+        cfg = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
+        reloaded = KnowledgeGraphConfig.model_validate(cfg.model_dump())
+        assert reloaded.collection == CollectionConfig()
+
+    def test_collection_roundtrip_custom(self) -> None:
+        cfg = KnowledgeGraphConfig(
+            name=KG_ACTOR_NAME,
+            role=KG_ACTOR_ROLE,
+            collection=CollectionConfig(backend="weaviate", tenant="team-abc"),
+        )
+        reloaded = KnowledgeGraphConfig.model_validate(cfg.model_dump())
+        assert reloaded.collection.backend == "weaviate"
+        assert reloaded.collection.tenant == "team-abc"
+        assert reloaded.collection.dimension == 1536  # default preserved
+
+    def test_base_config_coercion_yields_default_collection(self) -> None:
+        """AC-8: BaseConfig → KnowledgeGraphConfig coercion keeps default collection."""
+        from akgentic.core.agent_config import BaseConfig
+
+        from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
+
+        # Simulate the coercion path inside on_start()
+        actor = KnowledgeGraphActor()
+        actor.config = BaseConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)  # type: ignore[assignment]
+        actor.state = KnowledgeGraphState()
+        actor.state.observer(actor)
+        actor._vs_proxy = None
+        actor._state_event_seq = 0
+        actor._orchestrator = None  # type: ignore[assignment]
+
+        # Exercise the coercion block from on_start.
+        if not isinstance(actor.config, KnowledgeGraphConfig):
+            actor.config = KnowledgeGraphConfig(
+                name=actor.config.name,
+                role=actor.config.role,
+            )
+        assert isinstance(actor.config, KnowledgeGraphConfig)
+        assert actor.config.collection == CollectionConfig()
+        assert actor.config.vector_store is True  # 10-9 invariant
+
+
+class TestKnowledgeGraphActorAcquireVsProxyCollectionPropagation:
+    """AC-6 / AC-11: _acquire_vs_proxy forwards config.collection to create_collection."""
+
+    def _build_actor_with_vs_proxy(
+        self,
+        collection: CollectionConfig,
+        vector_store_value: object = True,
+    ) -> tuple[KnowledgeGraphActor, MagicMock]:
+        """Return (actor, vs_proxy_mock) with everything wired so _acquire_vs_proxy
+        reaches the create_collection branch without raising.
+        """
+        from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
+
+        actor = KnowledgeGraphActor()
+        actor.config = KnowledgeGraphConfig(
+            name=KG_ACTOR_NAME,
+            role=KG_ACTOR_ROLE,
+            vector_store=vector_store_value,  # type: ignore[arg-type]
+            collection=collection,
+        )
+        actor.state = KnowledgeGraphState()
+        actor.state.observer(actor)
+        actor._vs_proxy = None
+        actor._state_event_seq = 0
+
+        orch_addr = MockActorAddress("orchestrator", "Orchestrator")
+        actor._orchestrator = orch_addr  # type: ignore[assignment]
+
+        orch_proxy = MagicMock()
+        orch_proxy.get_team_member.return_value = MockActorAddress(
+            VS_ACTOR_NAME, "ToolActor"
+        )
+
+        vs_proxy = MagicMock()
+        vs_proxy.create_collection.return_value = None
+
+        def _proxy_ask(target: object, actor_type: type | None = None,
+                       timeout: int | None = None) -> object:
+            if target is orch_addr:
+                return orch_proxy
+            return vs_proxy
+
+        actor.proxy_ask = _proxy_ask  # type: ignore[method-assign,assignment]
+        return actor, vs_proxy
+
+    def test_create_collection_receives_same_instance_as_config_collection(self) -> None:
+        """AC-6: the CollectionConfig passed to create_collection is the config's instance."""
+        custom = CollectionConfig(backend="weaviate", tenant="t1")
+        actor, vs_proxy = self._build_actor_with_vs_proxy(collection=custom)
+
+        actor._acquire_vs_proxy()
+
+        vs_proxy.create_collection.assert_called_once()
+        args, _ = vs_proxy.create_collection.call_args
+        assert args[0] == KG_COLLECTION
+        # Identity assertion — proves the same object is threaded through,
+        # rather than a freshly-constructed CollectionConfig().
+        assert args[1] is actor.config.collection
+        assert args[1] is custom
+        assert args[1].backend == "weaviate"
+        assert args[1].tenant == "t1"
+
+    def test_default_config_collection_is_structurally_default(self) -> None:
+        """AC-11: default `KnowledgeGraphConfig()` → create_collection gets a CollectionConfig()
+        structurally equal to the pre-10-10 hardcoded default.
+        """
+        default_collection = CollectionConfig()
+        actor, vs_proxy = self._build_actor_with_vs_proxy(collection=default_collection)
+
+        actor._acquire_vs_proxy()
+
+        args, _ = vs_proxy.create_collection.call_args
+        assert args[1] == CollectionConfig()
+        assert args[1].dimension == 1536
+        assert args[1].backend == "inmemory"
+        assert args[1].persistence == "actor_state"
+        assert args[1].workspace_path is None
+        assert args[1].tenant is None

@@ -105,6 +105,13 @@ class PlanConfig(BaseConfig):
             "str=named instance, False=degraded mode (no vector search)."
         ),
     )
+    collection: CollectionConfig = Field(
+        default_factory=CollectionConfig,
+        description=(
+            "Vector collection configuration forwarded to "
+            "VectorStoreActor.create_collection."
+        ),
+    )
 
 
 class PlanActor(Akgent[PlanConfig, PlanManagerState]):
@@ -178,7 +185,7 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
             )
         self._vs_proxy = self.proxy_ask(vs_addr, VectorStoreActor)
         try:
-            self._vs_proxy.create_collection(PLAN_COLLECTION, CollectionConfig())
+            self._vs_proxy.create_collection(PLAN_COLLECTION, self.config.collection)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "[%s] create_collection on VectorStoreActor failed: %s — degraded mode",

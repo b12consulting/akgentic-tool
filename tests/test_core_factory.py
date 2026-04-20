@@ -711,3 +711,87 @@ def test_factory_missing_vector_store_tool_raises_missing_dependency_error() -> 
     msg = str(exc.value)
     assert "KnowledgeGraphTool" in msg
     assert "VectorStoreTool" in msg
+
+
+# ---------------------------------------------------------------------------
+# Story 10-10 — per-consumer CollectionConfig propagation through ToolFactory
+# ---------------------------------------------------------------------------
+
+
+def test_factory_propagates_per_consumer_collection_config() -> None:
+    """AC-10: KG and Planning each get their own CollectionConfig through the factory.
+
+    Constructs KnowledgeGraphTool and PlanningTool with distinct non-default
+    CollectionConfig values and verifies the factory's topological-sort + observer
+    loop threads each consumer's collection into its actor config. Also verifies
+    10-9 invariants (vector_store=True) continue to propagate.
+    """
+    from akgentic.tool.knowledge_graph.kg_actor import KnowledgeGraphConfig
+    from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
+    from akgentic.tool.planning.planning import PlanningTool
+    from akgentic.tool.planning.planning_actor import PlanConfig
+    from akgentic.tool.vector_store.protocol import CollectionConfig
+    from akgentic.tool.vector_store.tool import VectorStoreTool
+
+    kg_collection = CollectionConfig(backend="weaviate", tenant="team-42")
+    plan_collection = CollectionConfig(
+        backend="inmemory", persistence="workspace", workspace_path="/tmp/plan"
+    )
+
+    observer, calls = _build_recording_observer()
+    ToolFactory(
+        tool_cards=[
+            KnowledgeGraphTool(collection=kg_collection),
+            PlanningTool(collection=plan_collection),
+            VectorStoreTool(),
+        ],
+        observer=observer,
+    )
+
+    configs_by_class = {name: cfg for name, cfg in calls}
+    kg_cfg = configs_by_class["KnowledgeGraphActor"]
+    plan_cfg = configs_by_class["PlanActor"]
+    assert isinstance(kg_cfg, KnowledgeGraphConfig)
+    assert isinstance(plan_cfg, PlanConfig)
+
+    # Each consumer received ITS OWN CollectionConfig (not aliased).
+    assert kg_cfg.collection is kg_collection
+    assert plan_cfg.collection is plan_collection
+    assert kg_cfg.collection.backend == "weaviate"
+    assert kg_cfg.collection.tenant == "team-42"
+    assert plan_cfg.collection.backend == "inmemory"
+    assert plan_cfg.collection.persistence == "workspace"
+    assert plan_cfg.collection.workspace_path == "/tmp/plan"
+
+    # The two collections are distinct — per-consumer backend divergence.
+    assert kg_cfg.collection != plan_cfg.collection
+
+    # 10-9 invariant: vector_store=True still propagates.
+    assert kg_cfg.vector_store is True
+    assert plan_cfg.vector_store is True
+
+
+def test_factory_default_tools_propagate_default_collection() -> None:
+    """AC-11 regression guard at the factory level.
+
+    With no explicit ``collection`` argument, both consumers should propagate a
+    ``CollectionConfig()`` structurally equal to the historical hardcoded value.
+    """
+    from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
+    from akgentic.tool.planning.planning import PlanningTool
+    from akgentic.tool.vector_store.protocol import CollectionConfig
+    from akgentic.tool.vector_store.tool import VectorStoreTool
+
+    observer, calls = _build_recording_observer()
+    ToolFactory(
+        tool_cards=[KnowledgeGraphTool(), PlanningTool(), VectorStoreTool()],
+        observer=observer,
+    )
+
+    configs_by_class = {name: cfg for name, cfg in calls}
+    kg_cfg = configs_by_class["KnowledgeGraphActor"]
+    plan_cfg = configs_by_class["PlanActor"]
+    assert kg_cfg.collection == CollectionConfig()
+    assert plan_cfg.collection == CollectionConfig()
+    # Fresh per-instance — no aliasing between siblings.
+    assert kg_cfg.collection is not plan_cfg.collection

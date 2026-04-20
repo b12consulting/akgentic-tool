@@ -38,6 +38,7 @@ from akgentic.tool.knowledge_graph.models import (
     SearchQuery,
     SearchResult,
 )
+from akgentic.tool.vector_store.protocol import CollectionConfig
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -105,6 +106,16 @@ class KnowledgeGraphTool(ToolCard):
         ),
     )
 
+    collection: CollectionConfig = Field(
+        default_factory=CollectionConfig,
+        description=(
+            "Vector collection configuration (backend, persistence, dimension, tenant). "
+            "Propagated to KnowledgeGraphConfig and used by "
+            "KnowledgeGraphActor._acquire_vs_proxy when calling create_collection on the "
+            "VectorStoreActor."
+        ),
+    )
+
     get_graph: GetGraph | bool = Field(
         default=True,
         description="Get the full graph — SYSTEM_PROMPT + COMMAND by default",
@@ -151,6 +162,7 @@ class KnowledgeGraphTool(ToolCard):
                 name=KG_ACTOR_NAME,
                 role=KG_ACTOR_ROLE,
                 vector_store=self.vector_store,
+                collection=self.collection,
             ),
         )
 

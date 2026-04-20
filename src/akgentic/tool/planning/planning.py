@@ -23,6 +23,7 @@ from akgentic.tool.planning.planning_actor import (
     TaskStatus,
     UpdatePlan,
 )
+from akgentic.tool.vector_store.protocol import CollectionConfig
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -85,6 +86,15 @@ class PlanningTool(ToolCard):
         ),
     )
 
+    collection: CollectionConfig = Field(
+        default_factory=CollectionConfig,
+        description=(
+            "Vector collection configuration (backend, persistence, dimension, tenant). "
+            "Propagated to PlanConfig and used by PlanActor._acquire_vs_proxy when calling "
+            "create_collection on the VectorStoreActor."
+        ),
+    )
+
     get_planning: GetPlanning | bool = Field(
         default=True, description="By default the plan in included in the system prompt"
     )
@@ -116,6 +126,7 @@ class PlanningTool(ToolCard):
                 name=PLANNING_ACTOR_NAME,
                 role=PLANNING_ACTOR_ROLE,
                 vector_store=self.vector_store,
+                collection=self.collection,
             ),
         )
 

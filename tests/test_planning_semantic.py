@@ -249,3 +249,147 @@ class TestPlanningToolObserverNoVsCreation:
         mock_observer.orchestrator = None
         with pytest.raises(ValueError, match="orchestrator"):
             tool.observer(mock_observer)
+
+
+# ---------------------------------------------------------------------------
+# Story 10-10 — PlanningTool.collection field + observer propagation
+# ---------------------------------------------------------------------------
+
+
+class TestPlanningToolCollectionField:
+    """AC-2: PlanningTool.collection is a CollectionConfig field."""
+
+    def test_default_collection_is_default_collection_config(self) -> None:
+        from akgentic.tool.planning.planning import PlanningTool
+        from akgentic.tool.vector_store.protocol import CollectionConfig
+
+        tool = PlanningTool()
+        assert isinstance(tool.collection, CollectionConfig)
+        assert tool.collection == CollectionConfig()
+        assert tool.collection.dimension == 1536
+        assert tool.collection.backend == "inmemory"
+        assert tool.collection.persistence == "actor_state"
+        assert tool.collection.workspace_path is None
+        assert tool.collection.tenant is None
+
+    def test_collection_field_present_in_model_fields(self) -> None:
+        from akgentic.tool.planning.planning import PlanningTool
+
+        assert "collection" in PlanningTool.model_fields
+
+    def test_collection_appears_in_model_dump(self) -> None:
+        from akgentic.tool.planning.planning import PlanningTool
+
+        dump = PlanningTool().model_dump()
+        assert "collection" in dump
+
+    def test_custom_collection_stored_on_instance(self) -> None:
+        from akgentic.tool.planning.planning import PlanningTool
+        from akgentic.tool.vector_store.protocol import CollectionConfig
+
+        custom = CollectionConfig(
+            backend="inmemory", persistence="workspace", workspace_path="/tmp/plan"
+        )
+        tool = PlanningTool(collection=custom)
+        assert tool.collection is custom
+        assert tool.collection.persistence == "workspace"
+        assert tool.collection.workspace_path == "/tmp/plan"
+
+    def test_collection_roundtrip_default(self) -> None:
+        from akgentic.tool.planning.planning import PlanningTool
+        from akgentic.tool.vector_store.protocol import CollectionConfig
+
+        tool = PlanningTool()
+        reloaded = PlanningTool.model_validate(tool.model_dump())
+        assert reloaded.collection == CollectionConfig()
+
+    def test_collection_roundtrip_custom(self) -> None:
+        from akgentic.tool.planning.planning import PlanningTool
+        from akgentic.tool.vector_store.protocol import CollectionConfig
+
+        tool = PlanningTool(
+            collection=CollectionConfig(
+                backend="inmemory",
+                persistence="workspace",
+                workspace_path="/tmp/plan",
+            )
+        )
+        reloaded = PlanningTool.model_validate(tool.model_dump())
+        assert reloaded.collection.backend == "inmemory"
+        assert reloaded.collection.persistence == "workspace"
+        assert reloaded.collection.workspace_path == "/tmp/plan"
+        assert reloaded.collection.dimension == 1536  # default preserved
+        assert reloaded.collection.tenant is None  # default preserved
+
+    def test_independent_tools_do_not_alias_collection(self) -> None:
+        """`default_factory=CollectionConfig` gives each instance a fresh object."""
+        from akgentic.tool.planning.planning import PlanningTool
+
+        a = PlanningTool()
+        b = PlanningTool()
+        assert a.collection is not b.collection
+
+
+class TestPlanningToolObserverCollection:
+    """AC-5: observer() propagates ``collection`` identity into ``PlanConfig``."""
+
+    def _run_observer(self, tool: object) -> list[PlanConfig]:
+        captured: list[PlanConfig] = []
+        mock_proxy = MagicMock()
+
+        def capture(actor_cls: type, config: object = None) -> MagicMock:
+            assert isinstance(config, PlanConfig)
+            captured.append(config)
+            return MagicMock()
+
+        mock_proxy.getChildrenOrCreate.side_effect = capture
+        mock_observer = MagicMock()
+        mock_observer.orchestrator = MagicMock()
+        mock_observer.proxy_ask.return_value = mock_proxy
+        tool.observer(mock_observer)  # type: ignore[attr-defined]
+        return captured
+
+    def test_observer_propagates_custom_collection_identity(self) -> None:
+        """The exact CollectionConfig object on the ToolCard reaches the config."""
+        from akgentic.tool.planning.planning import PlanningTool
+        from akgentic.tool.vector_store.protocol import CollectionConfig
+
+        custom = CollectionConfig(
+            backend="inmemory", persistence="workspace", workspace_path="/tmp/plan"
+        )
+        tool = PlanningTool(collection=custom)
+
+        captured = self._run_observer(tool)
+
+        assert len(captured) == 1
+        assert captured[0].collection is custom
+        # 10-9 invariant preserved.
+        assert captured[0].vector_store is True
+
+    def test_observer_propagates_default_collection_structurally_equal(self) -> None:
+        """AC-11 backward-compat: default tool → config.collection == CollectionConfig()."""
+        from akgentic.tool.planning.planning import PlanningTool
+        from akgentic.tool.vector_store.protocol import CollectionConfig
+
+        tool = PlanningTool()
+
+        captured = self._run_observer(tool)
+
+        assert len(captured) == 1
+        assert captured[0].collection == CollectionConfig()
+
+    def test_observer_does_not_mutate_tool_collection(self) -> None:
+        from akgentic.tool.planning.planning import PlanningTool
+        from akgentic.tool.vector_store.protocol import CollectionConfig
+
+        custom = CollectionConfig(
+            backend="inmemory", persistence="workspace", workspace_path="/tmp/x"
+        )
+        tool = PlanningTool(collection=custom)
+        before_dump = tool.collection.model_dump()
+
+        self._run_observer(tool)
+
+        assert tool.collection.model_dump() == before_dump
+
+
