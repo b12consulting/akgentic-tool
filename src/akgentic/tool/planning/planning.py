@@ -90,6 +90,15 @@ class PlanningTool(ToolCard):
         ),
     )
 
+    search_top_k: int = Field(
+        default=20,
+        description="Default top-k for semantic search in search_planning.",
+    )
+    search_score_threshold: float = Field(
+        default=0.5,
+        description="Default minimum cosine similarity score for semantic results.",
+    )
+
     @property
     def depends_on(self) -> list[str]:
         """Runtime dependency on VectorStoreTool, conditional on vector_store.
@@ -134,6 +143,8 @@ class PlanningTool(ToolCard):
                 role=PLANNING_ACTOR_ROLE,
                 vector_store=self.vector_store,
                 collection=self.collection,
+                search_top_k=self.search_top_k,
+                search_score_threshold=self.search_score_threshold,
             ),
         )
 
@@ -287,16 +298,26 @@ class PlanningTool(ToolCard):
             owner: str | None = None,
             creator: str | None = None,
             query: str | None = None,
-        ) -> list[Task]:
+            top_k: int | None = None,
+            score_threshold: float | None = None,
+        ) -> list[str]:
             """Search tasks by status, owner, creator, and/or natural-language description.
 
             All parameters are optional. Provided parameters are combined as AND conditions.
             When all are None, returns the full task list.
             query applies case-insensitive substring match on description; when vector deps
-            are available, also uses semantic similarity (cosine ≥ 0.5, top_k=20).
+            are available, also uses semantic similarity.
+            top_k overrides the default maximum number of semantic search hits (config default).
+            score_threshold overrides the default minimum cosine similarity score (config default).
+            Results include score labels and are ordered by score (highest first).
             """
             return planning_proxy.search_planning(
-                status=status, owner=owner, creator=creator, query=query
+                status=status,
+                owner=owner,
+                creator=creator,
+                query=query,
+                top_k=top_k,
+                score_threshold=score_threshold,
             )
 
         search_planning.__doc__ = params.format_docstring(search_planning.__doc__)

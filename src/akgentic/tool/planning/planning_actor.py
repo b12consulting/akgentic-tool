@@ -105,6 +105,14 @@ class PlanConfig(BaseConfig):
             "VectorStoreActor.create_collection."
         ),
     )
+    search_top_k: int = Field(
+        default=20,
+        description="Default top-k for semantic search in search_planning.",
+    )
+    search_score_threshold: float = Field(
+        default=0.5,
+        description="Default minimum cosine similarity score for semantic results.",
+    )
 
 
 class PlanActor(Akgent[PlanConfig, PlanManagerState]):
@@ -264,7 +272,9 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
         owner: str | None = None,
         creator: str | None = None,
         query: str | None = None,
-    ) -> list[Task]:
+        top_k: int | None = None,
+        score_threshold: float | None = None,
+    ) -> list[str]:
         """Search tasks with optional multi-criteria filters (AND logic).
 
         Args:
@@ -273,40 +283,59 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
                    None means no filter.
             creator: Exact match on task.creator. None means no filter.
             query: Case-insensitive substring match on task.description (keyword phase).
-                   When [vector_search] deps are available and the index is non-empty,
-                   also runs a semantic phase (cosine ≥ 0.5, top_k=20). Keyword and
-                   semantic hits are unioned before other filters apply.
+                   When vector deps are available, also runs a semantic phase.
+                   Keyword and semantic hits are unioned before other filters apply.
                    Degrades to keyword-only without raising when vector deps absent.
                    None means no filter.
+            top_k: Maximum number of semantic search hits. When None, uses
+                   ``config.search_top_k`` (default 20).
+            score_threshold: Minimum cosine similarity score for semantic results.
+                   When None, uses ``config.search_score_threshold`` (default 0.5).
 
         Returns:
-            Tasks matching ALL provided filters. When all parameters are None,
-            returns the full task list.
+            Formatted strings for each matching task, ordered by score (highest
+            first). Each string includes the task ID, description, status, owner,
+            and a score label: ``(semantic: 0.85)`` for vector hits or
+            ``(keyword match)`` for keyword-only hits.
+            When all parameters are None, returns the full task list (unscored).
         """
+        effective_top_k = top_k if top_k is not None else self.config.search_top_k
+        effective_threshold = (
+            score_threshold if score_threshold is not None else self.config.search_score_threshold
+        )
+
         tasks: list[Task] = list(self.state.task_list)
+
+        # Track scores: {task_id: (score, label)}
+        scores: dict[int, tuple[float, str]] = {}
 
         # Query phase: build candidate set (keyword UNION semantic), then intersect with rest
         if query is not None:
             q_lower = query.lower()
-            keyword_ids = {t.id for t in tasks if q_lower in t.description.lower()}
+            for t in tasks:
+                if q_lower in t.description.lower():
+                    scores[t.id] = (1.0, "keyword match")
 
-            semantic_ids: set[int] = set()
             if self._vs_proxy is not None:
                 try:
                     vectors = self._vs_proxy.embed([query])
                     if vectors:
                         query_vector = vectors[0]
-                        result = self._vs_proxy.search(PLAN_COLLECTION, query_vector, 20)
+                        result = self._vs_proxy.search(
+                            PLAN_COLLECTION, query_vector, effective_top_k
+                        )
                         for hit in result.hits:
-                            if hit.score >= 0.5:
-                                semantic_ids.add(int(hit.ref_id))
+                            if hit.score >= effective_threshold:
+                                tid = int(hit.ref_id)
+                                if tid not in scores:  # keyword match takes precedence
+                                    scores[tid] = (hit.score, f"semantic: {hit.score:.2f}")
                 except Exception:  # noqa: BLE001
                     logger.warning(
                         "Semantic search failed for query — falling back to keyword only",
                         exc_info=True,
                     )
 
-            candidate_ids = keyword_ids | semantic_ids
+            candidate_ids = set(scores.keys())
             tasks = [t for t in tasks if t.id in candidate_ids]
 
         # Apply remaining AND filters
@@ -317,7 +346,24 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
         if creator is not None:
             tasks = [t for t in tasks if t.creator == creator]
 
-        return tasks
+        # Sort by score descending when query was provided
+        if query is not None:
+            tasks.sort(key=lambda t: scores.get(t.id, (0.0, ""))[0], reverse=True)
+
+        # Format output
+        lines: list[str] = []
+        for t in tasks:
+            owner_label = t.owner or "unassigned"
+            base = (
+                f"Task {t.id}: {t.description} [{t.status}] "
+                f"(Owner: {owner_label}, Creator: {t.creator})"
+            )
+            if t.id in scores:
+                _, label = scores[t.id]
+                base += f" ({label})"
+            lines.append(base)
+
+        return lines
 
     def update_planning(self, update: UpdatePlan, actor_address: ActorAddress) -> str:
         """Update the plan with new, updated, or deleted task."""
