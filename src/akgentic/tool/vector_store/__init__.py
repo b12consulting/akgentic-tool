@@ -33,6 +33,7 @@ from akgentic.tool.vector_store.protocol import (
     VectorStoreConfig,
     VectorStoreService,
 )
+from akgentic.tool.vector_store.tool import VectorStoreTool
 
 __all__ = [
     "CollectionConfig",
@@ -52,4 +53,5 @@ __all__ = [
     "VectorStoreConfig",
     "VectorStoreService",
     "VectorStoreState",
+    "VectorStoreTool",
 ]
