@@ -278,10 +278,11 @@ class ToolFactory:
         look up actors or resources created by its prerequisites.
 
         Args:
-            tool_cards: Tool cards to resolve into callable tools. Reordered
-                in-place to reflect dependency order; aggregators
-                (``get_tools``, ``get_system_prompts``, ``get_commands``,
-                ``get_toolsets``) also iterate in this order.
+            tool_cards: Tool cards to resolve into callable tools. The caller's
+                list is not mutated; a new dependency-ordered list is stored on
+                ``self.tool_cards``. Aggregators (``get_tools``,
+                ``get_system_prompts``, ``get_commands``, ``get_toolsets``)
+                iterate in this dependency order.
             observer: Optional observer notified by tool implementations during
                 tool calls.
             retry_exception: Optional exception class to raise when a tool raises
