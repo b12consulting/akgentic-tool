@@ -89,15 +89,8 @@ PLAN_COLLECTION: str = "planning"
 
 
 class PlanConfig(BaseConfig):
-    """Configuration for PlanActor with optional semantic search support."""
+    """Configuration for PlanActor with optional vector-backed semantic search."""
 
-    semantic_search: bool = Field(
-        default=True,
-        description=(
-            "When True, task descriptions are embedded on create/update/delete "
-            "for semantic search. Falls back gracefully if VectorStoreActor is unavailable."
-        ),
-    )
     vector_store: bool | str = Field(
         default=True,
         description=(
@@ -139,7 +132,7 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
                 role=self.config.role,
             )
         self._vs_proxy: VectorStoreActor | None = None
-        if self.config.semantic_search:
+        if self.config.vector_store is not False:
             self._acquire_vs_proxy()
 
     def _acquire_vs_proxy(self) -> None:
@@ -198,7 +191,7 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
         """Embed a task's description and store the resulting VectorEntry.
 
         Called after task create or update. Does nothing when VectorStoreActor
-        proxy is unavailable (semantic_search=False or proxy not acquired).
+        proxy is unavailable (vector_store=False or proxy not acquired).
         Any embedding error is logged and swallowed so that task CRUD
         is never interrupted by a transient embedding failure.
         """
@@ -223,7 +216,7 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
     def _create_task(self, task: TaskCreate, actor_address: ActorAddress) -> None:
         new_task = Task(**task.__dict__, creator=actor_address.name)
         self.state.task_list.append(new_task)
-        if self.config.semantic_search:
+        if self._vs_proxy is not None:
             self._embed_task(new_task)
 
     def _update_task(self, task_update: TaskUpdate) -> None | str:
@@ -238,11 +231,7 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
                     task_update.description is not None
                     and task_update.description != task.description
                 )
-                if (
-                    self.config.semantic_search
-                    and description_changed
-                    and self._vs_proxy is not None
-                ):
+                if description_changed and self._vs_proxy is not None:
                     self._vs_proxy.remove(PLAN_COLLECTION, [str(task.id)])
                     self._embed_task(updated_task)
                 return None
@@ -350,7 +339,7 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
             if not any(task.id == task_id for task in self.state.task_list):
                 errors.append(f"Delete error - no task with ID {task_id} found.")
             else:
-                if self.config.semantic_search and self._vs_proxy is not None:
+                if self._vs_proxy is not None:
                     self._vs_proxy.remove(PLAN_COLLECTION, [str(task_id)])
                 self.state.task_list = [task for task in self.state.task_list if task.id != task_id]
 

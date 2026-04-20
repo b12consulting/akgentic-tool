@@ -19,13 +19,13 @@ from akgentic.tool.planning.planning_actor import (
 from tests.conftest import MockActorAddress
 
 
-def _make_actor(semantic_search: bool = True) -> PlanActor:
+def _make_actor(vector_store: bool = False) -> PlanActor:
     """Construct a bare PlanActor with no Pykka runtime — calls on_start directly."""
     actor = PlanActor()
     actor.config = PlanConfig(
         name="test-plan",
         role="ToolActor",
-        semantic_search=semantic_search,
+        vector_store=vector_store,
     )
     actor.on_start()
     return actor

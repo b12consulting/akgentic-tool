@@ -310,7 +310,6 @@ class TestPlanConfigVectorStoreField:
 
 def _plan_actor_with_orchestrator(
     vector_store_value: object = True,
-    semantic_search: bool = True,
 ) -> tuple[PlanActor, MagicMock, MockActorAddress]:
     """Build a PlanActor with a stubbed orchestrator + proxy_ask recorder.
 
@@ -323,7 +322,6 @@ def _plan_actor_with_orchestrator(
     actor.config = PlanConfig(
         name="#PlanningTool",
         role="ToolActor",
-        semantic_search=semantic_search,
         vector_store=vector_store_value,  # type: ignore[arg-type]
     )
     actor.state = PlanManagerState()
@@ -410,12 +408,11 @@ class TestPlanActorAcquireVsProxy:
 
         assert actor._vs_proxy is None
 
-    def test_semantic_search_false_short_circuits_vector_store(self) -> None:
-        """AC-8: semantic_search=False short-circuits BEFORE vector_store is examined.
+    def test_vector_store_false_short_circuits_acquire(self) -> None:
+        """vector_store=False short-circuits _acquire_vs_proxy in on_start.
 
-        Even if ``vector_store`` is truthy and the orchestrator is missing, the
-        ``semantic_search=False`` guard in ``on_start`` must prevent
-        ``_acquire_vs_proxy`` from running and raising.
+        When ``vector_store=False`` the ``on_start`` guard must prevent
+        ``_acquire_vs_proxy`` from running, so no orchestrator lookup occurs.
         """
         from akgentic.tool.planning.planning_actor import PlanConfig
 
@@ -423,8 +420,7 @@ class TestPlanActorAcquireVsProxy:
         actor.config = PlanConfig(
             name="#PlanningTool",
             role="ToolActor",
-            semantic_search=False,
-            vector_store=True,  # would otherwise be examined
+            vector_store=False,
         )
         actor.on_start()
         # _acquire_vs_proxy not invoked → _vs_proxy stays None, no RuntimeError
@@ -529,7 +525,6 @@ class TestPlanConfigCollectionField:
 def _plan_actor_with_vs_proxy(
     collection: object,
     vector_store_value: object = True,
-    semantic_search: bool = True,
 ) -> tuple[PlanActor, MagicMock]:
     """Build a PlanActor wired so _acquire_vs_proxy can reach create_collection.
 
@@ -542,7 +537,6 @@ def _plan_actor_with_vs_proxy(
     actor.config = PlanConfig(
         name="#PlanningTool",
         role="ToolActor",
-        semantic_search=semantic_search,
         vector_store=vector_store_value,  # type: ignore[arg-type]
         collection=collection,  # type: ignore[arg-type]
     )
@@ -610,20 +604,18 @@ class TestPlanActorAcquireVsProxyCollectionPropagation:
         assert args[1].workspace_path is None
         assert args[1].tenant is None
 
-    def test_semantic_search_false_short_circuits_before_collection_examined(self) -> None:
-        """AC-7: semantic_search=False → _acquire_vs_proxy never runs, even with custom coll."""
+    def test_vector_store_false_short_circuits_before_collection_examined(self) -> None:
+        """vector_store=False → _acquire_vs_proxy never runs, even with custom coll."""
         from akgentic.tool.planning.planning_actor import PlanConfig
-
-        # Non-default collection, orchestrator absent (would otherwise warn+return).
-        # semantic_search=False must short-circuit in on_start before we touch it.
-        actor = PlanActor()
         from akgentic.tool.vector_store.protocol import CollectionConfig
 
+        # Non-default collection, orchestrator absent (would otherwise warn+return).
+        # vector_store=False must short-circuit in on_start before we touch it.
+        actor = PlanActor()
         actor.config = PlanConfig(
             name="#PlanningTool",
             role="ToolActor",
-            semantic_search=False,
-            vector_store=True,
+            vector_store=False,
             collection=CollectionConfig(backend="weaviate", tenant="t1"),
         )
         actor.on_start()
