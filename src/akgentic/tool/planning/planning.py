@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from typing import Callable, Literal
 
 from pydantic import Field
 
@@ -298,6 +298,7 @@ class PlanningTool(ToolCard):
             owner: str | None = None,
             creator: str | None = None,
             query: str | None = None,
+            mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
             top_k: int | None = None,
             score_threshold: float | None = None,
         ) -> list[str]:
@@ -307,6 +308,10 @@ class PlanningTool(ToolCard):
             When all are None, returns the full task list.
             query applies case-insensitive substring match on description; when vector deps
             are available, also uses semantic similarity.
+            mode controls the search strategy: "hybrid" (default) runs both keyword and
+            semantic phases; "keyword" skips embedding/vector search; "vector" skips keyword
+            substring matching. When vector deps are unavailable, "vector" returns empty
+            results and "hybrid" falls back to keyword-only.
             top_k overrides the default maximum number of semantic search hits (config default).
             score_threshold overrides the default minimum cosine similarity score (config default).
             Results include score labels and are ordered by score (highest first).
@@ -316,6 +321,7 @@ class PlanningTool(ToolCard):
                 owner=owner,
                 creator=creator,
                 query=query,
+                mode=mode,
                 top_k=top_k,
                 score_threshold=score_threshold,
             )

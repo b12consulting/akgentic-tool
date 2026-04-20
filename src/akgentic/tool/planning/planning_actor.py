@@ -272,6 +272,7 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
         owner: str | None = None,
         creator: str | None = None,
         query: str | None = None,
+        mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
         top_k: int | None = None,
         score_threshold: float | None = None,
     ) -> list[str]:
@@ -287,6 +288,12 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
                    Keyword and semantic hits are unioned before other filters apply.
                    Degrades to keyword-only without raising when vector deps absent.
                    None means no filter.
+            mode: Search mode — ``"hybrid"`` (default) runs both keyword and
+                   semantic phases; ``"keyword"`` skips embedding/vector search;
+                   ``"vector"`` skips keyword substring matching. When
+                   ``_vs_proxy is None`` and ``mode="vector"``, returns empty
+                   results; ``mode="hybrid"`` falls back to keyword-only with
+                   a warning.
             top_k: Maximum number of semantic search hits. When None, uses
                    ``config.search_top_k`` (default 20).
             score_threshold: Minimum cosine similarity score for semantic results.
@@ -295,8 +302,9 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
         Returns:
             Formatted strings for each matching task, ordered by score (highest
             first). Each string includes the task ID, description, status, owner,
-            and a score label: ``(semantic: 0.85)`` for vector hits or
-            ``(keyword match)`` for keyword-only hits.
+            and a score label: ``(semantic: 0.85)`` for vector hits,
+            ``(keyword match)`` for keyword-only hits, or ``(hybrid: 0.90)``
+            for hits found by both keyword and semantic.
             When all parameters are None, returns the full task list (unscored).
         """
         effective_top_k = top_k if top_k is not None else self.config.search_top_k
@@ -309,14 +317,20 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
         # Track scores: {task_id: (score, label)}
         scores: dict[int, tuple[float, str]] = {}
 
-        # Query phase: build candidate set (keyword UNION semantic), then intersect with rest
+        # Query phase: build candidate set based on mode, then intersect with rest
         if query is not None:
-            q_lower = query.lower()
-            for t in tasks:
-                if q_lower in t.description.lower():
-                    scores[t.id] = (1.0, "keyword match")
+            run_keyword = mode in ("hybrid", "keyword")
+            run_semantic = mode in ("hybrid", "vector")
 
-            if self._vs_proxy is not None:
+            # Keyword phase
+            if run_keyword:
+                q_lower = query.lower()
+                for t in tasks:
+                    if q_lower in t.description.lower():
+                        scores[t.id] = (1.0, "keyword match")
+
+            # Semantic phase
+            if run_semantic and self._vs_proxy is not None:
                 try:
                     vectors = self._vs_proxy.embed([query])
                     if vectors:
@@ -327,12 +341,27 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
                         for hit in result.hits:
                             if hit.score >= effective_threshold:
                                 tid = int(hit.ref_id)
-                                if tid not in scores:  # keyword match takes precedence
+                                if tid in scores:
+                                    # Found by both keyword and semantic — hybrid label
+                                    scores[tid] = (
+                                        max(scores[tid][0], hit.score),
+                                        f"hybrid: {hit.score:.2f}",
+                                    )
+                                else:
                                     scores[tid] = (hit.score, f"semantic: {hit.score:.2f}")
                 except Exception:  # noqa: BLE001
                     logger.warning(
                         "Semantic search failed for query — falling back to keyword only",
                         exc_info=True,
+                    )
+            elif run_semantic and self._vs_proxy is None:
+                if mode == "vector":
+                    logger.warning(
+                        "mode='vector' but _vs_proxy is None — returning empty results"
+                    )
+                elif mode == "hybrid":
+                    logger.warning(
+                        "mode='hybrid' but _vs_proxy is None — falling back to keyword-only"
                     )
 
             candidate_ids = set(scores.keys())
