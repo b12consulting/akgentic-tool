@@ -103,6 +103,8 @@ def _actor() -> KnowledgeGraphActor:
     from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
 
     actor = KnowledgeGraphActor()
+    # Set typed config so search methods can access search_score_threshold.
+    actor.config = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
     # Bypass _acquire_vs_proxy (no orchestrator in unit tests)
     actor.state = KnowledgeGraphState()
     actor.state.observer(actor)
@@ -1645,3 +1647,267 @@ class TestKnowledgeGraphActorAcquireVsProxyCollectionPropagation:
         assert args[1].persistence == "actor_state"
         assert args[1].workspace_path is None
         assert args[1].tenant is None
+
+
+# ---------------------------------------------------------------------------
+# Story 10-13 — search_score_threshold + search_top_k on KnowledgeGraphConfig
+# ---------------------------------------------------------------------------
+
+
+class TestKnowledgeGraphConfigSearchFields:
+    """AC-1/AC-2: KnowledgeGraphConfig carries search_top_k and search_score_threshold."""
+
+    def test_default_search_top_k(self) -> None:
+        cfg = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
+        assert cfg.search_top_k == 10
+
+    def test_default_search_score_threshold(self) -> None:
+        cfg = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
+        assert cfg.search_score_threshold == 0.3
+
+    def test_custom_values(self) -> None:
+        cfg = KnowledgeGraphConfig(
+            name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE,
+            search_top_k=15, search_score_threshold=0.5,
+        )
+        assert cfg.search_top_k == 15
+        assert cfg.search_score_threshold == 0.5
+
+    def test_roundtrip(self) -> None:
+        for top_k, threshold in [(10, 0.3), (15, 0.4), (5, 0.8)]:
+            cfg = KnowledgeGraphConfig(
+                name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE,
+                search_top_k=top_k, search_score_threshold=threshold,
+            )
+            reloaded = KnowledgeGraphConfig.model_validate(cfg.model_dump())
+            assert reloaded.search_top_k == top_k
+            assert reloaded.search_score_threshold == threshold
+
+    def test_base_config_coercion_yields_default_search_fields(self) -> None:
+        """BaseConfig -> KnowledgeGraphConfig coercion keeps default search fields."""
+        from akgentic.core.agent_config import BaseConfig
+
+        from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
+
+        actor = KnowledgeGraphActor()
+        actor.config = BaseConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)  # type: ignore[assignment]
+        actor.state = KnowledgeGraphState()
+        actor.state.observer(actor)
+        actor._vs_proxy = None
+        actor._state_event_seq = 0
+        actor._orchestrator = None  # type: ignore[assignment]
+
+        if not isinstance(actor.config, KnowledgeGraphConfig):
+            actor.config = KnowledgeGraphConfig(
+                name=actor.config.name,
+                role=actor.config.role,
+            )
+        assert actor.config.search_top_k == 10
+        assert actor.config.search_score_threshold == 0.3
+
+
+# ---------------------------------------------------------------------------
+# Story 10-13 — SearchQuery.score_threshold
+# ---------------------------------------------------------------------------
+
+
+class TestSearchQueryScoreThreshold:
+    """AC-3: SearchQuery has score_threshold field."""
+
+    def test_default_is_none(self) -> None:
+        q = SearchQuery(query="test")
+        assert q.score_threshold is None
+
+    def test_explicit_threshold(self) -> None:
+        q = SearchQuery(query="test", score_threshold=0.5)
+        assert q.score_threshold == 0.5
+
+    def test_roundtrip_none(self) -> None:
+        q = SearchQuery(query="test")
+        reloaded = SearchQuery.model_validate(q.model_dump())
+        assert reloaded.score_threshold is None
+
+    def test_roundtrip_explicit(self) -> None:
+        q = SearchQuery(query="test", score_threshold=0.7)
+        reloaded = SearchQuery.model_validate(q.model_dump())
+        assert reloaded.score_threshold == 0.7
+
+
+# ---------------------------------------------------------------------------
+# Story 10-13 — threshold filtering in _vector_search and _hybrid_search
+# ---------------------------------------------------------------------------
+
+
+class TestVectorSearchThresholdFiltering:
+    """AC-4: _vector_search filters hits below threshold."""
+
+    def test_filters_below_threshold(self) -> None:
+        actor, mock_proxy = _actor_with_mock_embed()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="High", entity_type="T", description="high score"),
+                    EntityCreate(name="Low", entity_type="T", description="low score"),
+                ]
+            )
+        )
+        entities = actor.get_graph().entities
+        high_id = str(next(e for e in entities if e.name == "High").id)
+        low_id = str(next(e for e in entities if e.name == "Low").id)
+        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        mock_proxy.search.return_value = VsSearchResult(
+            hits=[
+                VsSearchHit(ref_type="entity", ref_id=high_id, text="", score=0.8),
+                VsSearchHit(ref_type="entity", ref_id=low_id, text="", score=0.2),
+            ],
+            status=CollectionStatus.READY,
+            indexing_pending=0,
+        )
+        result = actor.search(SearchQuery(query="test", mode="vector"))
+        # Default threshold is 0.3, so the 0.2-score hit should be filtered
+        assert len(result.hits) == 1
+        assert result.hits[0].ref_id == high_id
+
+    def test_query_score_threshold_overrides_config(self) -> None:
+        actor, mock_proxy = _actor_with_mock_embed()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="Med", entity_type="T", description="medium"),
+                ]
+            )
+        )
+        entity_id = str(actor.get_graph().entities[0].id)
+        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        mock_proxy.search.return_value = VsSearchResult(
+            hits=[
+                VsSearchHit(ref_type="entity", ref_id=entity_id, text="", score=0.4),
+            ],
+            status=CollectionStatus.READY,
+            indexing_pending=0,
+        )
+        # Config default is 0.3, query override is 0.5 -> should filter
+        result = actor.search(
+            SearchQuery(query="test", mode="vector", score_threshold=0.5)
+        )
+        assert len(result.hits) == 0
+
+    def test_query_score_threshold_none_uses_config_default(self) -> None:
+        actor, mock_proxy = _actor_with_mock_embed()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="A", entity_type="T", description="d"),
+                ]
+            )
+        )
+        entity_id = str(actor.get_graph().entities[0].id)
+        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        mock_proxy.search.return_value = VsSearchResult(
+            hits=[
+                VsSearchHit(ref_type="entity", ref_id=entity_id, text="", score=0.35),
+            ],
+            status=CollectionStatus.READY,
+            indexing_pending=0,
+        )
+        # Default threshold is 0.3, 0.35 >= 0.3 -> included
+        result = actor.search(
+            SearchQuery(query="test", mode="vector", score_threshold=None)
+        )
+        assert len(result.hits) == 1
+
+
+class TestHybridSearchThresholdFiltering:
+    """AC-4: _hybrid_search filters hits below threshold."""
+
+    def test_filters_vector_only_hits_below_threshold(self) -> None:
+        actor, mock_proxy = _actor_with_mock_embed()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="GoodVec", entity_type="T", description="unique_xyz_no_kw"),
+                    EntityCreate(name="BadVec", entity_type="T", description="unique_abc_no_kw"),
+                ]
+            )
+        )
+        entities = actor.get_graph().entities
+        good_id = str(next(e for e in entities if e.name == "GoodVec").id)
+        bad_id = str(next(e for e in entities if e.name == "BadVec").id)
+        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        mock_proxy.search.return_value = VsSearchResult(
+            hits=[
+                VsSearchHit(ref_type="entity", ref_id=good_id, text="", score=0.6),
+                VsSearchHit(ref_type="entity", ref_id=bad_id, text="", score=0.1),
+            ],
+            status=CollectionStatus.READY,
+            indexing_pending=0,
+        )
+        # Threshold 0.3 (default): vector-only hits at 0.1 should be filtered
+        result = actor.search(
+            SearchQuery(query="zzz_nomatch", mode="hybrid")
+        )
+        ref_ids = {h.ref_id for h in result.hits}
+        assert good_id in ref_ids
+        assert bad_id not in ref_ids
+
+    def test_keyword_hits_above_threshold_survive(self) -> None:
+        """Keyword-only hits have score 1.0, always above threshold."""
+        actor = _actor()  # no vector proxy
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="Alice", entity_type="Person", description="engineer"),
+                ]
+            )
+        )
+        result = actor.search(SearchQuery(query="Alice", mode="hybrid"))
+        # Keyword fallback: score 1.0, threshold 0.3 -> included
+        assert len(result.hits) == 1
+        assert result.hits[0].score == 1.0
+
+    def test_hybrid_query_override_threshold(self) -> None:
+        actor, mock_proxy = _actor_with_mock_embed()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="X", entity_type="T", description="zz_unique"),
+                ]
+            )
+        )
+        entity_id = str(actor.get_graph().entities[0].id)
+        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        mock_proxy.search.return_value = VsSearchResult(
+            hits=[
+                VsSearchHit(ref_type="entity", ref_id=entity_id, text="", score=0.4),
+            ],
+            status=CollectionStatus.READY,
+            indexing_pending=0,
+        )
+        # Override threshold to 0.5 -> vector-only hit at 0.4 should be filtered
+        result = actor.search(
+            SearchQuery(query="zz_nomatch", mode="hybrid", score_threshold=0.5)
+        )
+        assert len(result.hits) == 0
+
+
+class TestBackwardCompatibility:
+    """AC-6: no new fields specified uses defaults."""
+
+    def test_no_config_changes_defaults(self) -> None:
+        cfg = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
+        assert cfg.search_top_k == 10
+        assert cfg.search_score_threshold == 0.3
+
+    def test_keyword_search_unaffected(self) -> None:
+        """Keyword search does not apply threshold filtering."""
+        actor = _actor()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="Alice", entity_type="Person", description="eng"),
+                ]
+            )
+        )
+        result = actor.search(SearchQuery(query="Alice", mode="keyword"))
+        assert len(result.hits) == 1
+        assert result.hits[0].score == 1.0

@@ -111,6 +111,22 @@ class KnowledgeGraphTool(ToolCard):
         ),
     )
 
+    search_top_k: int = Field(
+        default=10,
+        description=(
+            "Default maximum number of search hits to return. "
+            "Can be overridden per-call via SearchQuery.top_k."
+        ),
+    )
+    search_score_threshold: float = Field(
+        default=0.3,
+        description=(
+            "Default minimum cosine similarity score for vector/hybrid search results. "
+            "Hits below this threshold are filtered out. "
+            "Can be overridden per-call via SearchQuery.score_threshold."
+        ),
+    )
+
     @property
     def depends_on(self) -> list[str]:
         """Runtime dependency on VectorStoreTool, conditional on vector_store.
@@ -170,6 +186,8 @@ class KnowledgeGraphTool(ToolCard):
                 role=KG_ACTOR_ROLE,
                 vector_store=self.vector_store,
                 collection=self.collection,
+                search_top_k=self.search_top_k,
+                search_score_threshold=self.search_score_threshold,
             ),
         )
 

@@ -264,6 +264,10 @@ class SearchQuery(SerializableBaseModel):
         default=False,
         description="Find shortest BFS paths between top 5 entity hits (max 10 pairs).",
     )
+    score_threshold: float | None = Field(
+        default=None,
+        description="Minimum cosine similarity score. Overrides the ToolCard default when set.",
+    )
 
 
 class SearchHit(SerializableBaseModel):

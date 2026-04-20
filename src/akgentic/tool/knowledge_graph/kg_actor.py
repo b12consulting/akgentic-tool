@@ -77,6 +77,17 @@ class KnowledgeGraphConfig(BaseConfig):
             "VectorStoreActor.create_collection."
         ),
     )
+    search_top_k: int = Field(
+        default=10,
+        description="Default maximum number of search hits to return.",
+    )
+    search_score_threshold: float = Field(
+        default=0.3,
+        description=(
+            "Default minimum cosine similarity score for vector/hybrid search. "
+            "Hits below this threshold are filtered out."
+        ),
+    )
 
 
 class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
@@ -800,10 +811,15 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         Returns:
             SearchResult with ranked hits and optional expansion data.
         """
+        effective_threshold = (
+            query.score_threshold
+            if query.score_threshold is not None
+            else self.config.search_score_threshold
+        )
         if query.mode == "vector":
-            base_result = self._vector_search(query.query, query.top_k)
+            base_result = self._vector_search(query.query, query.top_k, effective_threshold)
         elif query.mode == "hybrid":
-            base_result = self._hybrid_search(query.query, query.top_k)
+            base_result = self._hybrid_search(query.query, query.top_k, effective_threshold)
         else:
             base_result = self._keyword_search(query.query, query.top_k)
 
@@ -831,15 +847,19 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
                 return relation
         return None
 
-    def _vector_search(self, query_text: str, top_k: int) -> SearchResult:
+    def _vector_search(
+        self, query_text: str, top_k: int, score_threshold: float = 0.0
+    ) -> SearchResult:
         """Embed ``query_text`` and return top-k results by cosine similarity.
 
         Returns an empty ``SearchResult`` when the VectorStoreActor proxy is
-        unavailable or the embedding call fails.
+        unavailable or the embedding call fails.  Hits with score below
+        ``score_threshold`` are filtered out before returning.
 
         Args:
             query_text: The natural-language query to embed and search.
             top_k: Maximum number of results to return.
+            score_threshold: Minimum cosine similarity score to include a hit.
 
         Returns:
             ``SearchResult`` with hits ranked by cosine similarity score.
@@ -875,9 +895,12 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
                 hits.append(
                     SearchHit(ref_type="relation", ref_id=ref_id, score=score, relation=obj)
                 )
+        hits = [h for h in hits if h.score >= score_threshold]
         return SearchResult(hits=hits)
 
-    def _hybrid_search(self, query_text: str, top_k: int) -> SearchResult:
+    def _hybrid_search(
+        self, query_text: str, top_k: int, score_threshold: float = 0.0
+    ) -> SearchResult:
         """Merge keyword and vector search results with weighted scoring.
 
         Scoring rules:
@@ -887,10 +910,13 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
 
         Falls back to keyword-only when the vector search returns no hits
         (embedding service unavailable or index empty — AC-4).
+        Hits with score below ``score_threshold`` are filtered out after
+        merging and before the ``top_k`` slice.
 
         Args:
             query_text: The query string.
             top_k: Maximum number of results to return.
+            score_threshold: Minimum score to include a hit.
 
         Returns:
             ``SearchResult`` with merged hits ranked by combined score.
@@ -915,6 +941,7 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
                 merged[kw_hit.ref_id] = kw_hit  # keyword-only hit (score = 1.0)
 
         ranked = sorted(merged.values(), key=lambda h: h.score, reverse=True)
+        ranked = [h for h in ranked if h.score >= score_threshold]
         return SearchResult(hits=ranked[:top_k])
 
     def _keyword_search(self, query: str, top_k: int) -> SearchResult:

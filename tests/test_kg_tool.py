@@ -138,6 +138,8 @@ class MockActorToolObserver:
         from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
 
         actor = KnowledgeGraphActor()
+        # Set typed config so search methods can access search_score_threshold.
+        actor.config = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
         # Manually init without orchestrator dependency
         actor.state = KnowledgeGraphState()
         actor.state.observer(actor)
@@ -971,5 +973,95 @@ class TestKnowledgeGraphToolDependsOnProperty:
         dump_true = tool_true.model_dump()
         reconstructed_true = KnowledgeGraphTool.model_validate(dump_true)
         assert reconstructed_true.depends_on == ["VectorStoreTool"]
+
+
+# ===========================================================================
+# Story 10-13 — search_top_k, search_score_threshold fields + propagation
+# ===========================================================================
+
+
+class TestKnowledgeGraphToolSearchFields:
+    """AC-1: KnowledgeGraphTool has search_top_k and search_score_threshold fields."""
+
+    def test_default_search_top_k(self) -> None:
+        tool = KnowledgeGraphTool()
+        assert tool.search_top_k == 10
+
+    def test_default_search_score_threshold(self) -> None:
+        tool = KnowledgeGraphTool()
+        assert tool.search_score_threshold == 0.3
+
+    def test_search_top_k_field_in_model_fields(self) -> None:
+        assert "search_top_k" in KnowledgeGraphTool.model_fields
+
+    def test_search_score_threshold_field_in_model_fields(self) -> None:
+        assert "search_score_threshold" in KnowledgeGraphTool.model_fields
+
+    def test_custom_search_top_k(self) -> None:
+        tool = KnowledgeGraphTool(search_top_k=15)
+        assert tool.search_top_k == 15
+
+    def test_custom_search_score_threshold(self) -> None:
+        tool = KnowledgeGraphTool(search_score_threshold=0.4)
+        assert tool.search_score_threshold == 0.4
+
+    def test_roundtrip_with_defaults(self) -> None:
+        """AC-6: default values round-trip cleanly."""
+        tool = KnowledgeGraphTool()
+        reloaded = KnowledgeGraphTool.model_validate(tool.model_dump())
+        assert reloaded.search_top_k == 10
+        assert reloaded.search_score_threshold == 0.3
+
+    def test_roundtrip_with_custom_values(self) -> None:
+        """AC-5: catalog YAML config values round-trip cleanly."""
+        tool = KnowledgeGraphTool(search_top_k=15, search_score_threshold=0.4)
+        reloaded = KnowledgeGraphTool.model_validate(tool.model_dump())
+        assert reloaded.search_top_k == 15
+        assert reloaded.search_score_threshold == 0.4
+
+    def test_appears_in_model_dump(self) -> None:
+        dump = KnowledgeGraphTool().model_dump()
+        assert "search_top_k" in dump
+        assert "search_score_threshold" in dump
+        assert dump["search_top_k"] == 10
+        assert dump["search_score_threshold"] == 0.3
+
+
+class TestKnowledgeGraphToolObserverSearchFields:
+    """AC-2: observer() propagates search_top_k and search_score_threshold."""
+
+    def _run_observer(
+        self, tool: KnowledgeGraphTool,
+    ) -> list[KnowledgeGraphConfig]:
+        from unittest.mock import MagicMock
+
+        captured: list[KnowledgeGraphConfig] = []
+        mock_proxy = MagicMock()
+
+        def capture(actor_cls: type, config: object = None) -> MagicMock:
+            assert isinstance(config, KnowledgeGraphConfig)
+            captured.append(config)
+            return MagicMock()
+
+        mock_proxy.getChildrenOrCreate.side_effect = capture
+        mock_observer = MagicMock()
+        mock_observer.orchestrator = MagicMock()
+        mock_observer.proxy_ask.return_value = mock_proxy
+        tool.observer(mock_observer)
+        return captured
+
+    def test_observer_propagates_default_search_fields(self) -> None:
+        tool = KnowledgeGraphTool()
+        captured = self._run_observer(tool)
+        assert len(captured) == 1
+        assert captured[0].search_top_k == 10
+        assert captured[0].search_score_threshold == 0.3
+
+    def test_observer_propagates_custom_search_fields(self) -> None:
+        tool = KnowledgeGraphTool(search_top_k=15, search_score_threshold=0.4)
+        captured = self._run_observer(tool)
+        assert len(captured) == 1
+        assert captured[0].search_top_k == 15
+        assert captured[0].search_score_threshold == 0.4
 
 
