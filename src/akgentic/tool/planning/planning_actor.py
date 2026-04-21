@@ -12,8 +12,8 @@ from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.vector import VectorEntry
-from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE, VectorStoreActor
-from akgentic.tool.vector_store.protocol import CollectionConfig, VectorStoreConfig
+from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
+from akgentic.tool.vector_store.protocol import CollectionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -89,14 +89,29 @@ PLAN_COLLECTION: str = "planning"
 
 
 class PlanConfig(BaseConfig):
-    """Configuration for PlanActor with optional semantic search support."""
+    """Configuration for PlanActor with optional vector-backed semantic search."""
 
-    semantic_search: bool = Field(
+    vector_store: bool | str = Field(
         default=True,
         description=(
-            "When True, task descriptions are embedded on create/update/delete "
-            "for semantic search. Falls back gracefully if VectorStoreActor is unavailable."
+            "Binding to a VectorStoreActor: True=default #VectorStore, "
+            "str=named instance, False=degraded mode (no vector search)."
         ),
+    )
+    collection: CollectionConfig = Field(
+        default_factory=CollectionConfig,
+        description=(
+            "Vector collection configuration forwarded to "
+            "VectorStoreActor.create_collection."
+        ),
+    )
+    search_top_k: int = Field(
+        default=10,
+        description="Default top-k for semantic search in search_planning.",
+    )
+    search_score_threshold: float = Field(
+        default=0.5,
+        description="Default minimum cosine similarity score for semantic results.",
     )
 
 
@@ -125,41 +140,66 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
                 role=self.config.role,
             )
         self._vs_proxy: VectorStoreActor | None = None
-        if self.config.semantic_search:
+        if self.config.vector_store is not False:
             self._acquire_vs_proxy()
 
     def _acquire_vs_proxy(self) -> None:
-        """Acquire the VectorStoreActor proxy and create the planning collection.
+        """Look up the VectorStoreActor proxy and create the planning collection.
 
-        Operates in degraded mode (no vector search) if the proxy cannot
-        be acquired.
+        The VectorStoreActor is owned by ``VectorStoreTool``; this actor
+        only resolves it by name. Behaviour:
+
+        - ``config.vector_store is False`` → stay in degraded mode (no
+          lookup, ``_vs_proxy`` remains ``None``).
+        - ``self.orchestrator is None`` (test harness) → log WARNING and
+          return — existing behaviour preserved.
+        - Otherwise look up the target actor name (``config.vector_store``
+          when a ``str``, else ``VS_ACTOR_NAME``) via
+          ``orch_proxy.get_team_member``. Raise ``RuntimeError`` when it
+          is missing — a missing VectorStoreTool is a **configuration**
+          error, not a runtime degradation.
+        - A transient backend error during ``create_collection`` drops
+          back to degraded mode with a WARNING (matches existing
+          behaviour for embedding failures).
         """
-        try:
-            if self.orchestrator is None:
-                logger.warning(
-                    "[%s] No orchestrator; operating in degraded mode",
-                    self.config.name,
-                )
-                return
-            orch_proxy = self.proxy_ask(self.orchestrator, Orchestrator)
-            vs_addr = orch_proxy.getChildrenOrCreate(
-                VectorStoreActor,
-                config=VectorStoreConfig(name=VS_ACTOR_NAME, role=VS_ACTOR_ROLE),
+        if self.config.vector_store is False:
+            return  # degraded mode by design
+
+        if self.orchestrator is None:
+            logger.warning(
+                "[%s] No orchestrator; operating in degraded mode",
+                self.config.name,
             )
-            self._vs_proxy = self.proxy_ask(vs_addr, VectorStoreActor)
-            self._vs_proxy.create_collection(PLAN_COLLECTION, CollectionConfig())
+            return
+
+        vs_name = (
+            self.config.vector_store
+            if isinstance(self.config.vector_store, str)
+            else VS_ACTOR_NAME
+        )
+        orch_proxy = self.proxy_ask(self.orchestrator, Orchestrator)
+        vs_addr = orch_proxy.get_team_member(vs_name)
+        if vs_addr is None:
+            raise RuntimeError(
+                f"{self.config.name} requires VectorStoreActor '{vs_name}' "
+                f"but it was not found. Ensure VectorStoreTool is in the team config."
+            )
+        self._vs_proxy = self.proxy_ask(vs_addr, VectorStoreActor)
+        try:
+            self._vs_proxy.create_collection(PLAN_COLLECTION, self.config.collection)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "[%s] Failed to acquire VectorStoreActor proxy: %s",
+                "[%s] create_collection on VectorStoreActor failed: %s — degraded mode",
                 self.config.name,
                 exc,
             )
+            self._vs_proxy = None
 
     def _embed_task(self, task: Task) -> None:
         """Embed a task's description and store the resulting VectorEntry.
 
         Called after task create or update. Does nothing when VectorStoreActor
-        proxy is unavailable (semantic_search=False or proxy not acquired).
+        proxy is unavailable (vector_store=False or proxy not acquired).
         Any embedding error is logged and swallowed so that task CRUD
         is never interrupted by a transient embedding failure.
         """
@@ -184,7 +224,7 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
     def _create_task(self, task: TaskCreate, actor_address: ActorAddress) -> None:
         new_task = Task(**task.__dict__, creator=actor_address.name)
         self.state.task_list.append(new_task)
-        if self.config.semantic_search:
+        if self._vs_proxy is not None:
             self._embed_task(new_task)
 
     def _update_task(self, task_update: TaskUpdate) -> None | str:
@@ -199,11 +239,7 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
                     task_update.description is not None
                     and task_update.description != task.description
                 )
-                if (
-                    self.config.semantic_search
-                    and description_changed
-                    and self._vs_proxy is not None
-                ):
+                if description_changed and self._vs_proxy is not None:
                     self._vs_proxy.remove(PLAN_COLLECTION, [str(task.id)])
                     self._embed_task(updated_task)
                 return None
@@ -236,7 +272,10 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
         owner: str | None = None,
         creator: str | None = None,
         query: str | None = None,
-    ) -> list[Task]:
+        mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
+        top_k: int | None = None,
+        score_threshold: float | None = None,
+    ) -> list[str]:
         """Search tasks with optional multi-criteria filters (AND logic).
 
         Args:
@@ -245,40 +284,87 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
                    None means no filter.
             creator: Exact match on task.creator. None means no filter.
             query: Case-insensitive substring match on task.description (keyword phase).
-                   When [vector_search] deps are available and the index is non-empty,
-                   also runs a semantic phase (cosine ≥ 0.5, top_k=20). Keyword and
-                   semantic hits are unioned before other filters apply.
+                   When vector deps are available, also runs a semantic phase.
+                   Keyword and semantic hits are unioned before other filters apply.
                    Degrades to keyword-only without raising when vector deps absent.
                    None means no filter.
+            mode: Search mode — ``"hybrid"`` (default) runs both keyword and
+                   semantic phases; ``"keyword"`` skips embedding/vector search;
+                   ``"vector"`` skips keyword substring matching. When
+                   ``_vs_proxy is None`` and ``mode="vector"``, returns empty
+                   results; ``mode="hybrid"`` falls back to keyword-only with
+                   a warning.
+            top_k: Maximum number of semantic search hits. When None, uses
+                   ``config.search_top_k`` (default 10).
+            score_threshold: Minimum cosine similarity score for semantic results.
+                   When None, uses ``config.search_score_threshold`` (default 0.5).
 
         Returns:
-            Tasks matching ALL provided filters. When all parameters are None,
-            returns the full task list.
+            Formatted strings for each matching task, ordered by score (highest
+            first). Each string includes the task ID, description, status, owner,
+            and a score label: ``(semantic: 0.85)`` for vector hits,
+            ``(keyword match)`` for keyword-only hits, or ``(hybrid: 0.90)``
+            for hits found by both keyword and semantic.
+            When all parameters are None, returns the full task list (unscored).
         """
+        effective_top_k = top_k if top_k is not None else self.config.search_top_k
+        effective_threshold = (
+            score_threshold if score_threshold is not None else self.config.search_score_threshold
+        )
+
         tasks: list[Task] = list(self.state.task_list)
 
-        # Query phase: build candidate set (keyword UNION semantic), then intersect with rest
-        if query is not None:
-            q_lower = query.lower()
-            keyword_ids = {t.id for t in tasks if q_lower in t.description.lower()}
+        # Track scores: {task_id: (score, label)}
+        scores: dict[int, tuple[float, str]] = {}
 
-            semantic_ids: set[int] = set()
-            if self._vs_proxy is not None:
+        # Query phase: build candidate set based on mode, then intersect with rest
+        if query is not None:
+            run_keyword = mode in ("hybrid", "keyword")
+            run_semantic = mode in ("hybrid", "vector")
+
+            # Keyword phase
+            if run_keyword:
+                q_lower = query.lower()
+                for t in tasks:
+                    if q_lower in t.description.lower():
+                        scores[t.id] = (1.0, "keyword match")
+
+            # Semantic phase
+            if run_semantic and self._vs_proxy is not None:
                 try:
                     vectors = self._vs_proxy.embed([query])
                     if vectors:
                         query_vector = vectors[0]
-                        result = self._vs_proxy.search(PLAN_COLLECTION, query_vector, 20)
+                        result = self._vs_proxy.search(
+                            PLAN_COLLECTION, query_vector, effective_top_k
+                        )
                         for hit in result.hits:
-                            if hit.score >= 0.5:
-                                semantic_ids.add(int(hit.ref_id))
+                            if hit.score >= effective_threshold:
+                                tid = int(hit.ref_id)
+                                if tid in scores:
+                                    # Found by both keyword and semantic — hybrid label
+                                    scores[tid] = (
+                                        max(scores[tid][0], hit.score),
+                                        f"hybrid: {hit.score:.2f}",
+                                    )
+                                else:
+                                    scores[tid] = (hit.score, f"semantic: {hit.score:.2f}")
                 except Exception:  # noqa: BLE001
                     logger.warning(
                         "Semantic search failed for query — falling back to keyword only",
                         exc_info=True,
                     )
+            elif run_semantic and self._vs_proxy is None:
+                if mode == "vector":
+                    logger.warning(
+                        "mode='vector' but _vs_proxy is None — returning empty results"
+                    )
+                elif mode == "hybrid":
+                    logger.warning(
+                        "mode='hybrid' but _vs_proxy is None — falling back to keyword-only"
+                    )
 
-            candidate_ids = keyword_ids | semantic_ids
+            candidate_ids = set(scores.keys())
             tasks = [t for t in tasks if t.id in candidate_ids]
 
         # Apply remaining AND filters
@@ -289,7 +375,24 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
         if creator is not None:
             tasks = [t for t in tasks if t.creator == creator]
 
-        return tasks
+        # Sort by score descending when query was provided
+        if query is not None:
+            tasks.sort(key=lambda t: scores.get(t.id, (0.0, ""))[0], reverse=True)
+
+        # Format output
+        lines: list[str] = []
+        for t in tasks:
+            owner_label = t.owner or "unassigned"
+            base = (
+                f"Task {t.id}: {t.description} [{t.status}] "
+                f"(Owner: {owner_label}, Creator: {t.creator})"
+            )
+            if t.id in scores:
+                _, label = scores[t.id]
+                base += f" ({label})"
+            lines.append(base)
+
+        return lines
 
     def update_planning(self, update: UpdatePlan, actor_address: ActorAddress) -> str:
         """Update the plan with new, updated, or deleted task."""
@@ -311,7 +414,7 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
             if not any(task.id == task_id for task in self.state.task_list):
                 errors.append(f"Delete error - no task with ID {task_id} found.")
             else:
-                if self.config.semantic_search and self._vs_proxy is not None:
+                if self._vs_proxy is not None:
                     self._vs_proxy.remove(PLAN_COLLECTION, [str(task_id)])
                 self.state.task_list = [task for task in self.state.task_list if task.id != task_id]
 

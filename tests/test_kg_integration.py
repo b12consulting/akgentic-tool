@@ -17,6 +17,7 @@ from akgentic.tool.knowledge_graph.kg_actor import (
     KG_ACTOR_NAME,
     KG_ACTOR_ROLE,
     KnowledgeGraphActor,
+    KnowledgeGraphConfig,
 )
 from akgentic.tool.knowledge_graph.kg_tool import (
     GetGraph,
@@ -93,6 +94,8 @@ class IntegrationObserver:
         self._address = MockActorAddress("test-agent")
         self._orchestrator_addr = MockActorAddress("orchestrator")
         self._kg_actor = KnowledgeGraphActor()
+        # Set typed config so search methods can access search_score_threshold.
+        self._kg_actor.config = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
         # Manually init without orchestrator dependency
         self._kg_actor.state = KnowledgeGraphState()
         self._kg_actor.state.observer(self._kg_actor)

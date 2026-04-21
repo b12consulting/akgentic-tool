@@ -13,6 +13,8 @@ import logging
 import uuid
 from collections import deque
 
+from pydantic import Field
+
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.orchestrator import Orchestrator
@@ -36,8 +38,8 @@ from akgentic.tool.knowledge_graph.models import (
     SearchResult,
 )
 from akgentic.tool.vector import VectorEntry
-from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE, VectorStoreActor
-from akgentic.tool.vector_store.protocol import CollectionConfig, VectorStoreConfig
+from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
+from akgentic.tool.vector_store.protocol import CollectionConfig
 from akgentic.tool.vector_store.protocol import SearchResult as VsSearchResult
 
 logger = logging.getLogger(__name__)
@@ -55,9 +57,37 @@ KG_COLLECTION: str = "knowledge_graph"
 class KnowledgeGraphConfig(BaseConfig):
     """Configuration for ``KnowledgeGraphActor``.
 
-    An empty ``BaseConfig`` subclass retained for type stability
-    (the actor generic parameter still references it).
+    Carries the actor-level binding to a ``VectorStoreActor`` so the
+    knowledge graph can resolve its vector store by name (or operate in
+    degraded mode without one). The actor itself is created by
+    ``VectorStoreTool``; this config only points at it.
     """
+
+    vector_store: bool | str = Field(
+        default=True,
+        description=(
+            "Binding to a VectorStoreActor: True=default #VectorStore, "
+            "str=named instance, False=degraded mode (no vector search)."
+        ),
+    )
+    collection: CollectionConfig = Field(
+        default_factory=CollectionConfig,
+        description=(
+            "Vector collection configuration forwarded to "
+            "VectorStoreActor.create_collection."
+        ),
+    )
+    search_top_k: int = Field(
+        default=10,
+        description="Default maximum number of search hits to return.",
+    )
+    search_score_threshold: float = Field(
+        default=0.3,
+        description=(
+            "Default minimum cosine similarity score for vector/hybrid search. "
+            "Hits below this threshold are filtered out."
+        ),
+    )
 
 
 class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
@@ -81,36 +111,70 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         """Initialize state, attach observer, and acquire VectorStoreActor proxy."""
         self.state = KnowledgeGraphState()
         self.state.observer(self)
+        # Coerce BaseConfig → KnowledgeGraphConfig when the actor was started with
+        # a plain BaseConfig (e.g., test harnesses that construct the actor
+        # directly). This preserves backward compatibility while giving the actor
+        # typed access to the vector_store field introduced in story 10-9.
+        if not isinstance(self.config, KnowledgeGraphConfig):
+            self.config = KnowledgeGraphConfig(
+                name=self.config.name,
+                role=self.config.role,
+            )
         self._vs_proxy: VectorStoreActor | None = None
         self._acquire_vs_proxy()
         self._state_event_seq: int = 0
 
     def _acquire_vs_proxy(self) -> None:
-        """Acquire the VectorStoreActor proxy and create the KG collection.
+        """Look up the VectorStoreActor proxy and create the KG collection.
 
-        Operates in degraded mode (no vector search) if the proxy cannot
-        be acquired.
+        The VectorStoreActor is owned by ``VectorStoreTool``; this actor
+        only resolves it by name. Behaviour:
+
+        - ``config.vector_store is False`` → stay in degraded mode (no
+          lookup, ``_vs_proxy`` remains ``None``).
+        - ``self.orchestrator is None`` (test harness) → log WARNING and
+          return — existing behaviour preserved.
+        - Otherwise look up the target actor name (``config.vector_store``
+          when a ``str``, else ``VS_ACTOR_NAME``) via
+          ``orch_proxy.get_team_member``. Raise ``RuntimeError`` when it
+          is missing — a missing VectorStoreTool is a **configuration**
+          error, not a runtime degradation.
+        - A transient backend error during ``create_collection`` drops
+          back to degraded mode with a WARNING (matches existing
+          behaviour for embedding failures).
         """
-        try:
-            if self.orchestrator is None:
-                logger.warning(
-                    "[%s] No orchestrator; operating in degraded mode",
-                    self.config.name,
-                )
-                return
-            orch_proxy = self.proxy_ask(self.orchestrator, Orchestrator)
-            vs_addr = orch_proxy.getChildrenOrCreate(
-                VectorStoreActor,
-                config=VectorStoreConfig(name=VS_ACTOR_NAME, role=VS_ACTOR_ROLE),
+        if self.config.vector_store is False:
+            return  # degraded mode by design
+
+        if self.orchestrator is None:
+            logger.warning(
+                "[%s] No orchestrator; operating in degraded mode",
+                self.config.name,
             )
-            self._vs_proxy = self.proxy_ask(vs_addr, VectorStoreActor)
-            self._vs_proxy.create_collection(KG_COLLECTION, CollectionConfig())
+            return
+
+        vs_name = (
+            self.config.vector_store
+            if isinstance(self.config.vector_store, str)
+            else VS_ACTOR_NAME
+        )
+        orch_proxy = self.proxy_ask(self.orchestrator, Orchestrator)
+        vs_addr = orch_proxy.get_team_member(vs_name)
+        if vs_addr is None:
+            raise RuntimeError(
+                f"{self.config.name} requires VectorStoreActor '{vs_name}' "
+                f"but it was not found. Ensure VectorStoreTool is in the team config."
+            )
+        self._vs_proxy = self.proxy_ask(vs_addr, VectorStoreActor)
+        try:
+            self._vs_proxy.create_collection(KG_COLLECTION, self.config.collection)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "[%s] Failed to acquire VectorStoreActor proxy: %s",
+                "[%s] create_collection on VectorStoreActor failed: %s — degraded mode",
                 self.config.name,
                 exc,
             )
+            self._vs_proxy = None
 
     # ------------------------------------------------------------------
     # Embedding helpers (via VectorStoreActor proxy)
@@ -747,12 +811,22 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         Returns:
             SearchResult with ranked hits and optional expansion data.
         """
+        effective_top_k = (
+            query.top_k
+            if query.top_k is not None
+            else self.config.search_top_k
+        )
+        effective_threshold = (
+            query.score_threshold
+            if query.score_threshold is not None
+            else self.config.search_score_threshold
+        )
         if query.mode == "vector":
-            base_result = self._vector_search(query.query, query.top_k)
+            base_result = self._vector_search(query.query, effective_top_k, effective_threshold)
         elif query.mode == "hybrid":
-            base_result = self._hybrid_search(query.query, query.top_k)
+            base_result = self._hybrid_search(query.query, effective_top_k, effective_threshold)
         else:
-            base_result = self._keyword_search(query.query, query.top_k)
+            base_result = self._keyword_search(query.query, effective_top_k)
 
         if query.include_neighbors or query.include_edges or query.find_paths:
             return self._expand_search_result(base_result.hits, query)
@@ -778,15 +852,19 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
                 return relation
         return None
 
-    def _vector_search(self, query_text: str, top_k: int) -> SearchResult:
+    def _vector_search(
+        self, query_text: str, top_k: int, score_threshold: float = 0.0
+    ) -> SearchResult:
         """Embed ``query_text`` and return top-k results by cosine similarity.
 
         Returns an empty ``SearchResult`` when the VectorStoreActor proxy is
-        unavailable or the embedding call fails.
+        unavailable or the embedding call fails.  Hits with score below
+        ``score_threshold`` are filtered out before returning.
 
         Args:
             query_text: The natural-language query to embed and search.
             top_k: Maximum number of results to return.
+            score_threshold: Minimum cosine similarity score to include a hit.
 
         Returns:
             ``SearchResult`` with hits ranked by cosine similarity score.
@@ -822,9 +900,12 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
                 hits.append(
                     SearchHit(ref_type="relation", ref_id=ref_id, score=score, relation=obj)
                 )
+        hits = [h for h in hits if h.score >= score_threshold]
         return SearchResult(hits=hits)
 
-    def _hybrid_search(self, query_text: str, top_k: int) -> SearchResult:
+    def _hybrid_search(
+        self, query_text: str, top_k: int, score_threshold: float = 0.0
+    ) -> SearchResult:
         """Merge keyword and vector search results with weighted scoring.
 
         Scoring rules:
@@ -834,10 +915,13 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
 
         Falls back to keyword-only when the vector search returns no hits
         (embedding service unavailable or index empty — AC-4).
+        Hits with score below ``score_threshold`` are filtered out after
+        merging and before the ``top_k`` slice.
 
         Args:
             query_text: The query string.
             top_k: Maximum number of results to return.
+            score_threshold: Minimum score to include a hit.
 
         Returns:
             ``SearchResult`` with merged hits ranked by combined score.
@@ -862,6 +946,7 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
                 merged[kw_hit.ref_id] = kw_hit  # keyword-only hit (score = 1.0)
 
         ranked = sorted(merged.values(), key=lambda h: h.score, reverse=True)
+        ranked = [h for h in ranked if h.score >= score_threshold]
         return SearchResult(hits=ranked[:top_k])
 
     def _keyword_search(self, query: str, top_k: int) -> SearchResult:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from typing import Callable, Literal
 
 from pydantic import Field
 
@@ -23,8 +23,7 @@ from akgentic.tool.planning.planning_actor import (
     TaskStatus,
     UpdatePlan,
 )
-from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE, VectorStoreActor
-from akgentic.tool.vector_store.protocol import VectorStoreConfig
+from akgentic.tool.vector_store.protocol import CollectionConfig
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -64,10 +63,53 @@ class SearchPlanning(BaseToolParam):
 
 
 class PlanningTool(ToolCard):
-    """Team planning management via actor-based plan store."""
+    """Team planning management via actor-based plan store.
+
+    The ``VectorStoreActor`` singleton is owned by ``VectorStoreTool`` and
+    declared as a dependency here; this tool only looks it up at actor-start
+    time.
+    """
 
     name: str = "Planning"
     description: str = "Planning tool to manage team plans and tasks"
+
+    vector_store: bool | str = Field(
+        default=True,
+        description=(
+            "False disables vector store wiring; True uses the default VectorStoreActor; "
+            "str names a specific VectorStoreActor to look up."
+        ),
+    )
+
+    collection: CollectionConfig = Field(
+        default_factory=CollectionConfig,
+        description=(
+            "Vector collection configuration (backend, persistence, dimension, tenant). "
+            "Propagated to PlanConfig and used by PlanActor._acquire_vs_proxy when calling "
+            "create_collection on the VectorStoreActor."
+        ),
+    )
+
+    search_top_k: int = Field(
+        default=10,
+        description="Default top-k for semantic search in search_planning.",
+    )
+    search_score_threshold: float = Field(
+        default=0.5,
+        description="Default minimum cosine similarity score for semantic results.",
+    )
+
+    @property
+    def depends_on(self) -> list[str]:
+        """Runtime dependency on VectorStoreTool, conditional on vector_store.
+
+        When ``vector_store`` is ``False`` this tool is in degraded mode and
+        does not need VectorStoreActor — the factory must not require a
+        ``VectorStoreTool`` in the team config. Any other value (``True`` or a
+        name ``str``) requires VectorStoreTool to be wired first so the
+        PlanActor can look up the VectorStoreActor during ``on_start``.
+        """
+        return ["VectorStoreTool"] if self.vector_store is not False else []
 
     get_planning: GetPlanning | bool = Field(
         default=True, description="By default the plan in included in the system prompt"
@@ -79,8 +121,10 @@ class PlanningTool(ToolCard):
     def observer(self, observer: ActorToolObserver) -> None:  # type: ignore[override]
         """Attach observer and set up the planning actor proxy.
 
-        Ensures the ``VectorStoreActor`` singleton exists before
-        creating/retrieving the ``PlanActor`` singleton.
+        Assumes ``VectorStoreTool.observer()`` has already created the
+        ``VectorStoreActor`` singleton (ordering enforced by
+        ``ToolFactory`` topological sort via ``depends_on``). The
+        ``PlanActor`` looks that actor up by name during its own ``on_start``.
 
         Requires an ActorToolObserver for actor system access.
         """
@@ -90,21 +134,17 @@ class PlanningTool(ToolCard):
 
         orchestrator_proxy = observer.proxy_ask(observer.orchestrator, Orchestrator)
 
-        # Ensure VectorStoreActor singleton exists
-        orchestrator_proxy.getChildrenOrCreate(
-            VectorStoreActor,
-            config=VectorStoreConfig(
-                name=VS_ACTOR_NAME,
-                role=VS_ACTOR_ROLE,
-            ),
-        )
-
-        # Create/retrieve PlanActor singleton
+        # Create/retrieve PlanActor singleton. VectorStoreActor creation is owned
+        # by VectorStoreTool (depends_on enforces ordering).
         planning_tool_addr = orchestrator_proxy.getChildrenOrCreate(
             PlanActor,
             config=PlanConfig(
                 name=PLANNING_ACTOR_NAME,
                 role=PLANNING_ACTOR_ROLE,
+                vector_store=self.vector_store,
+                collection=self.collection,
+                search_top_k=self.search_top_k,
+                search_score_threshold=self.search_score_threshold,
             ),
         )
 
@@ -258,16 +298,32 @@ class PlanningTool(ToolCard):
             owner: str | None = None,
             creator: str | None = None,
             query: str | None = None,
-        ) -> list[Task]:
-            """Search tasks by status, owner, creator, and/or natural-language description.
+            mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
+            top_k: int | None = None,
+            score_threshold: float | None = None,
+        ) -> list[str]:
+            """Search tasks. All filters are AND-combined; omit all for full list.
 
-            All parameters are optional. Provided parameters are combined as AND conditions.
-            When all are None, returns the full task list.
-            query applies case-insensitive substring match on description; when vector deps
-            are available, also uses semantic similarity (cosine ≥ 0.5, top_k=20).
+            Args:
+                status: Filter by status.
+                owner: Filter by owner.
+                creator: Filter by creator.
+                query: Search text for keyword and/or semantic matching.
+                mode: "hybrid" (default) = keyword + semantic,
+                    "keyword" = substring only, "vector" = semantic only.
+                top_k: Max semantic hits (default 10).
+                score_threshold: Min cosine similarity (default 0.5).
+
+            Returns scored results: "(semantic: 0.85)", "(keyword match)", "(hybrid: 0.90)".
             """
             return planning_proxy.search_planning(
-                status=status, owner=owner, creator=creator, query=query
+                status=status,
+                owner=owner,
+                creator=creator,
+                query=query,
+                mode=mode,
+                top_k=top_k,
+                score_threshold=score_threshold,
             )
 
         search_planning.__doc__ = params.format_docstring(search_planning.__doc__)

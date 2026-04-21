@@ -32,6 +32,7 @@ class TestPublicApi:
             "VectorStoreConfig",
             "VectorStoreService",
             "VectorStoreState",
+            "VectorStoreTool",
             "WeaviateBackend",
         }
         assert set(vs.__all__) == expected

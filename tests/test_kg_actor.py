@@ -38,7 +38,7 @@ from akgentic.tool.knowledge_graph.models import (
     RelationDelete,
     SearchQuery,
 )
-from akgentic.tool.vector_store.protocol import CollectionStatus
+from akgentic.tool.vector_store.protocol import CollectionConfig, CollectionStatus
 from akgentic.tool.vector_store.protocol import SearchHit as VsSearchHit
 from akgentic.tool.vector_store.protocol import SearchResult as VsSearchResult
 
@@ -103,6 +103,8 @@ def _actor() -> KnowledgeGraphActor:
     from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
 
     actor = KnowledgeGraphActor()
+    # Set typed config so search methods can access search_score_threshold.
+    actor.config = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
     # Bypass _acquire_vs_proxy (no orchestrator in unit tests)
     actor.state = KnowledgeGraphState()
     actor.state.observer(actor)
@@ -1325,3 +1327,587 @@ class TestToolStateEventEmission:
                 )
             )
             assert actor._state_event_seq == 2
+
+
+# ---------------------------------------------------------------------------
+# Story 10-9 — KnowledgeGraphConfig.vector_store + _acquire_vs_proxy()
+# ---------------------------------------------------------------------------
+
+
+class TestKnowledgeGraphConfigVectorStoreField:
+    """AC-3: KnowledgeGraphConfig carries a fully-serialisable vector_store field."""
+
+    def test_vector_store_default_true(self) -> None:
+        cfg = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
+        assert cfg.vector_store is True
+
+    def test_vector_store_accepts_false(self) -> None:
+        cfg = KnowledgeGraphConfig(
+            name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store=False
+        )
+        assert cfg.vector_store is False
+
+    def test_vector_store_accepts_string(self) -> None:
+        cfg = KnowledgeGraphConfig(
+            name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store="#VectorStore-RAG"
+        )
+        assert cfg.vector_store == "#VectorStore-RAG"
+
+    def test_vector_store_roundtrip(self) -> None:
+        for value in (True, False, "#VectorStore-RAG"):
+            cfg = KnowledgeGraphConfig(
+                name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store=value
+            )
+            reloaded = KnowledgeGraphConfig.model_validate(cfg.model_dump())
+            assert reloaded.vector_store == value
+
+
+def _actor_with_orchestrator(
+    vector_store_value: object = True,
+) -> tuple[KnowledgeGraphActor, MagicMock, MockActorAddress | None]:
+    """Build a KG actor with a stubbed orchestrator + proxy_ask recorder.
+
+    Returns (actor, orch_proxy_mock, orch_addr). Does NOT call on_start.
+    Caller invokes ``_acquire_vs_proxy`` directly and asserts on
+    ``orch_proxy_mock.get_team_member`` / ``orch_proxy_mock.getChildrenOrCreate``.
+    """
+    from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
+
+    actor = KnowledgeGraphActor()
+    actor.config = KnowledgeGraphConfig(
+        name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store=vector_store_value  # type: ignore[arg-type]
+    )
+    actor.state = KnowledgeGraphState()
+    actor.state.observer(actor)
+    actor._vs_proxy = None
+    actor._state_event_seq = 0
+
+    orch_addr = MockActorAddress("orchestrator", "Orchestrator")
+    actor._orchestrator = orch_addr  # type: ignore[assignment]
+
+    orch_proxy = MagicMock()
+
+    # Patch Akgent.proxy_ask on this instance: route orchestrator to orch_proxy,
+    # everything else to a fresh MagicMock (covers VectorStoreActor proxy).
+    def _proxy_ask(target: object, actor_type: type | None = None,
+                   timeout: int | None = None) -> object:
+        if target is orch_addr:
+            return orch_proxy
+        return MagicMock()
+
+    actor.proxy_ask = _proxy_ask  # type: ignore[method-assign,assignment]
+    return actor, orch_proxy, orch_addr
+
+
+class TestKnowledgeGraphActorAcquireVsProxy:
+    """AC-6 / AC-7 / AC-10: _acquire_vs_proxy looks up (never creates) VectorStoreActor."""
+
+    def test_acquire_vs_proxy_uses_get_team_member_not_get_children_or_create(self) -> None:
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
+
+        actor, orch_proxy, _ = _actor_with_orchestrator(vector_store_value=True)
+        orch_proxy.get_team_member.return_value = MockActorAddress(VS_ACTOR_NAME, "ToolActor")
+
+        actor._acquire_vs_proxy()
+
+        orch_proxy.get_team_member.assert_called_once_with(VS_ACTOR_NAME)
+        orch_proxy.getChildrenOrCreate.assert_not_called()
+        assert actor._vs_proxy is not None
+
+    def test_acquire_vs_proxy_named_instance(self) -> None:
+        """AC-10: when vector_store is a string, the named actor is looked up."""
+        named = "#VectorStore-RAG"
+        actor, orch_proxy, _ = _actor_with_orchestrator(vector_store_value=named)
+        orch_proxy.get_team_member.return_value = MockActorAddress(named, "ToolActor")
+
+        actor._acquire_vs_proxy()
+
+        orch_proxy.get_team_member.assert_called_once_with(named)
+        assert actor._vs_proxy is not None
+
+    def test_acquire_vs_proxy_false_skips_all_wiring(self) -> None:
+        """AC-7: vector_store=False → no orchestrator lookup, degraded mode."""
+        actor, orch_proxy, _ = _actor_with_orchestrator(vector_store_value=False)
+
+        actor._acquire_vs_proxy()
+
+        assert actor._vs_proxy is None
+        orch_proxy.get_team_member.assert_not_called()
+        orch_proxy.getChildrenOrCreate.assert_not_called()
+
+    def test_acquire_vs_proxy_missing_raises_runtime_error(self) -> None:
+        """AC-7: missing VectorStoreActor → RuntimeError naming actor + VS + VectorStoreTool."""
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
+
+        actor, orch_proxy, _ = _actor_with_orchestrator(vector_store_value=True)
+        orch_proxy.get_team_member.return_value = None
+
+        with pytest.raises(RuntimeError) as exc_info:
+            actor._acquire_vs_proxy()
+
+        msg = str(exc_info.value)
+        assert KG_ACTOR_NAME in msg
+        assert VS_ACTOR_NAME in msg
+        assert "VectorStoreTool" in msg
+        # No silent fallback — proxy remains None
+        assert actor._vs_proxy is None
+
+    def test_acquire_vs_proxy_no_orchestrator_degraded_mode(self) -> None:
+        """AC-7: orchestrator is None → WARNING, no raise, stays in degraded mode."""
+        from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
+
+        actor = KnowledgeGraphActor()
+        actor.config = KnowledgeGraphConfig(
+            name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store=True
+        )
+        actor.state = KnowledgeGraphState()
+        actor.state.observer(actor)
+        actor._vs_proxy = None
+        actor._state_event_seq = 0
+        actor._orchestrator = None  # type: ignore[assignment]
+
+        # Must NOT raise
+        actor._acquire_vs_proxy()
+
+        assert actor._vs_proxy is None
+
+    def test_acquire_vs_proxy_create_collection_failure_degrades(self) -> None:
+        """Transient create_collection failure → degraded mode (not raised)."""
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
+
+        actor, orch_proxy, orch_addr = _actor_with_orchestrator(vector_store_value=True)
+        orch_proxy.get_team_member.return_value = MockActorAddress(
+            VS_ACTOR_NAME, "ToolActor"
+        )
+
+        # Replace proxy_ask: orchestrator → orch_proxy; anything else → a proxy whose
+        # create_collection raises.
+        vs_proxy = MagicMock()
+        vs_proxy.create_collection.side_effect = RuntimeError("backend down")
+
+        def _proxy_ask(target: object, actor_type: type | None = None,
+                       timeout: int | None = None) -> object:
+            if target is orch_addr:
+                return orch_proxy
+            return vs_proxy
+
+        actor.proxy_ask = _proxy_ask  # type: ignore[method-assign,assignment]
+
+        # Must NOT raise — degraded mode
+        actor._acquire_vs_proxy()
+
+        assert actor._vs_proxy is None  # degraded
+
+
+# ---------------------------------------------------------------------------
+# Story 10-10 — KnowledgeGraphConfig.collection + _acquire_vs_proxy identity
+# ---------------------------------------------------------------------------
+
+
+class TestKnowledgeGraphConfigCollectionField:
+    """AC-3: KnowledgeGraphConfig carries a fully-serialisable collection field."""
+
+    def test_collection_default_is_default_collection_config(self) -> None:
+        cfg = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
+        assert cfg.collection == CollectionConfig()
+        # Structural defaults — AC-11 backward-compat guard.
+        assert cfg.collection.dimension == 1536
+        assert cfg.collection.backend == "inmemory"
+        assert cfg.collection.persistence == "actor_state"
+        assert cfg.collection.workspace_path is None
+        assert cfg.collection.tenant is None
+
+    def test_collection_accepts_custom_value(self) -> None:
+        cfg = KnowledgeGraphConfig(
+            name=KG_ACTOR_NAME,
+            role=KG_ACTOR_ROLE,
+            collection=CollectionConfig(backend="weaviate", tenant="t1"),
+        )
+        assert cfg.collection.backend == "weaviate"
+        assert cfg.collection.tenant == "t1"
+
+    def test_collection_roundtrip_default(self) -> None:
+        cfg = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
+        reloaded = KnowledgeGraphConfig.model_validate(cfg.model_dump())
+        assert reloaded.collection == CollectionConfig()
+
+    def test_collection_roundtrip_custom(self) -> None:
+        cfg = KnowledgeGraphConfig(
+            name=KG_ACTOR_NAME,
+            role=KG_ACTOR_ROLE,
+            collection=CollectionConfig(backend="weaviate", tenant="team-abc"),
+        )
+        reloaded = KnowledgeGraphConfig.model_validate(cfg.model_dump())
+        assert reloaded.collection.backend == "weaviate"
+        assert reloaded.collection.tenant == "team-abc"
+        assert reloaded.collection.dimension == 1536  # default preserved
+
+    def test_base_config_coercion_yields_default_collection(self) -> None:
+        """AC-8: BaseConfig → KnowledgeGraphConfig coercion keeps default collection."""
+        from akgentic.core.agent_config import BaseConfig
+
+        from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
+
+        # Simulate the coercion path inside on_start()
+        actor = KnowledgeGraphActor()
+        actor.config = BaseConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)  # type: ignore[assignment]
+        actor.state = KnowledgeGraphState()
+        actor.state.observer(actor)
+        actor._vs_proxy = None
+        actor._state_event_seq = 0
+        actor._orchestrator = None  # type: ignore[assignment]
+
+        # Exercise the coercion block from on_start.
+        if not isinstance(actor.config, KnowledgeGraphConfig):
+            actor.config = KnowledgeGraphConfig(
+                name=actor.config.name,
+                role=actor.config.role,
+            )
+        assert isinstance(actor.config, KnowledgeGraphConfig)
+        assert actor.config.collection == CollectionConfig()
+        assert actor.config.vector_store is True  # 10-9 invariant
+
+
+class TestKnowledgeGraphActorAcquireVsProxyCollectionPropagation:
+    """AC-6 / AC-11: _acquire_vs_proxy forwards config.collection to create_collection."""
+
+    def _build_actor_with_vs_proxy(
+        self,
+        collection: CollectionConfig,
+        vector_store_value: object = True,
+    ) -> tuple[KnowledgeGraphActor, MagicMock]:
+        """Return (actor, vs_proxy_mock) with everything wired so _acquire_vs_proxy
+        reaches the create_collection branch without raising.
+        """
+        from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
+
+        actor = KnowledgeGraphActor()
+        actor.config = KnowledgeGraphConfig(
+            name=KG_ACTOR_NAME,
+            role=KG_ACTOR_ROLE,
+            vector_store=vector_store_value,  # type: ignore[arg-type]
+            collection=collection,
+        )
+        actor.state = KnowledgeGraphState()
+        actor.state.observer(actor)
+        actor._vs_proxy = None
+        actor._state_event_seq = 0
+
+        orch_addr = MockActorAddress("orchestrator", "Orchestrator")
+        actor._orchestrator = orch_addr  # type: ignore[assignment]
+
+        orch_proxy = MagicMock()
+        orch_proxy.get_team_member.return_value = MockActorAddress(
+            VS_ACTOR_NAME, "ToolActor"
+        )
+
+        vs_proxy = MagicMock()
+        vs_proxy.create_collection.return_value = None
+
+        def _proxy_ask(target: object, actor_type: type | None = None,
+                       timeout: int | None = None) -> object:
+            if target is orch_addr:
+                return orch_proxy
+            return vs_proxy
+
+        actor.proxy_ask = _proxy_ask  # type: ignore[method-assign,assignment]
+        return actor, vs_proxy
+
+    def test_create_collection_receives_same_instance_as_config_collection(self) -> None:
+        """AC-6: the CollectionConfig passed to create_collection is the config's instance."""
+        custom = CollectionConfig(backend="weaviate", tenant="t1")
+        actor, vs_proxy = self._build_actor_with_vs_proxy(collection=custom)
+
+        actor._acquire_vs_proxy()
+
+        vs_proxy.create_collection.assert_called_once()
+        args, _ = vs_proxy.create_collection.call_args
+        assert args[0] == KG_COLLECTION
+        # Identity assertion — proves the same object is threaded through,
+        # rather than a freshly-constructed CollectionConfig().
+        assert args[1] is actor.config.collection
+        assert args[1] is custom
+        assert args[1].backend == "weaviate"
+        assert args[1].tenant == "t1"
+
+    def test_default_config_collection_is_structurally_default(self) -> None:
+        """AC-11: default `KnowledgeGraphConfig()` → create_collection gets a CollectionConfig()
+        structurally equal to the pre-10-10 hardcoded default.
+        """
+        default_collection = CollectionConfig()
+        actor, vs_proxy = self._build_actor_with_vs_proxy(collection=default_collection)
+
+        actor._acquire_vs_proxy()
+
+        args, _ = vs_proxy.create_collection.call_args
+        assert args[1] == CollectionConfig()
+        assert args[1].dimension == 1536
+        assert args[1].backend == "inmemory"
+        assert args[1].persistence == "actor_state"
+        assert args[1].workspace_path is None
+        assert args[1].tenant is None
+
+
+# ---------------------------------------------------------------------------
+# Story 10-13 — search_score_threshold + search_top_k on KnowledgeGraphConfig
+# ---------------------------------------------------------------------------
+
+
+class TestKnowledgeGraphConfigSearchFields:
+    """AC-1/AC-2: KnowledgeGraphConfig carries search_top_k and search_score_threshold."""
+
+    def test_default_search_top_k(self) -> None:
+        cfg = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
+        assert cfg.search_top_k == 10
+
+    def test_default_search_score_threshold(self) -> None:
+        cfg = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
+        assert cfg.search_score_threshold == 0.3
+
+    def test_custom_values(self) -> None:
+        cfg = KnowledgeGraphConfig(
+            name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE,
+            search_top_k=15, search_score_threshold=0.5,
+        )
+        assert cfg.search_top_k == 15
+        assert cfg.search_score_threshold == 0.5
+
+    def test_roundtrip(self) -> None:
+        for top_k, threshold in [(10, 0.3), (15, 0.4), (5, 0.8)]:
+            cfg = KnowledgeGraphConfig(
+                name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE,
+                search_top_k=top_k, search_score_threshold=threshold,
+            )
+            reloaded = KnowledgeGraphConfig.model_validate(cfg.model_dump())
+            assert reloaded.search_top_k == top_k
+            assert reloaded.search_score_threshold == threshold
+
+    def test_base_config_coercion_yields_default_search_fields(self) -> None:
+        """BaseConfig -> KnowledgeGraphConfig coercion keeps default search fields."""
+        from akgentic.core.agent_config import BaseConfig
+
+        from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
+
+        actor = KnowledgeGraphActor()
+        actor.config = BaseConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)  # type: ignore[assignment]
+        actor.state = KnowledgeGraphState()
+        actor.state.observer(actor)
+        actor._vs_proxy = None
+        actor._state_event_seq = 0
+        actor._orchestrator = None  # type: ignore[assignment]
+
+        if not isinstance(actor.config, KnowledgeGraphConfig):
+            actor.config = KnowledgeGraphConfig(
+                name=actor.config.name,
+                role=actor.config.role,
+            )
+        assert actor.config.search_top_k == 10
+        assert actor.config.search_score_threshold == 0.3
+
+
+# ---------------------------------------------------------------------------
+# Story 10-13 — SearchQuery.score_threshold
+# ---------------------------------------------------------------------------
+
+
+class TestSearchQueryScoreThreshold:
+    """AC-3: SearchQuery has score_threshold field."""
+
+    def test_default_is_none(self) -> None:
+        q = SearchQuery(query="test")
+        assert q.score_threshold is None
+
+    def test_explicit_threshold(self) -> None:
+        q = SearchQuery(query="test", score_threshold=0.5)
+        assert q.score_threshold == 0.5
+
+    def test_roundtrip_none(self) -> None:
+        q = SearchQuery(query="test")
+        reloaded = SearchQuery.model_validate(q.model_dump())
+        assert reloaded.score_threshold is None
+
+    def test_roundtrip_explicit(self) -> None:
+        q = SearchQuery(query="test", score_threshold=0.7)
+        reloaded = SearchQuery.model_validate(q.model_dump())
+        assert reloaded.score_threshold == 0.7
+
+
+# ---------------------------------------------------------------------------
+# Story 10-13 — threshold filtering in _vector_search and _hybrid_search
+# ---------------------------------------------------------------------------
+
+
+class TestVectorSearchThresholdFiltering:
+    """AC-4: _vector_search filters hits below threshold."""
+
+    def test_filters_below_threshold(self) -> None:
+        actor, mock_proxy = _actor_with_mock_embed()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="High", entity_type="T", description="high score"),
+                    EntityCreate(name="Low", entity_type="T", description="low score"),
+                ]
+            )
+        )
+        entities = actor.get_graph().entities
+        high_id = str(next(e for e in entities if e.name == "High").id)
+        low_id = str(next(e for e in entities if e.name == "Low").id)
+        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        mock_proxy.search.return_value = VsSearchResult(
+            hits=[
+                VsSearchHit(ref_type="entity", ref_id=high_id, text="", score=0.8),
+                VsSearchHit(ref_type="entity", ref_id=low_id, text="", score=0.2),
+            ],
+            status=CollectionStatus.READY,
+            indexing_pending=0,
+        )
+        result = actor.search(SearchQuery(query="test", mode="vector"))
+        # Default threshold is 0.3, so the 0.2-score hit should be filtered
+        assert len(result.hits) == 1
+        assert result.hits[0].ref_id == high_id
+
+    def test_query_score_threshold_overrides_config(self) -> None:
+        actor, mock_proxy = _actor_with_mock_embed()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="Med", entity_type="T", description="medium"),
+                ]
+            )
+        )
+        entity_id = str(actor.get_graph().entities[0].id)
+        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        mock_proxy.search.return_value = VsSearchResult(
+            hits=[
+                VsSearchHit(ref_type="entity", ref_id=entity_id, text="", score=0.4),
+            ],
+            status=CollectionStatus.READY,
+            indexing_pending=0,
+        )
+        # Config default is 0.3, query override is 0.5 -> should filter
+        result = actor.search(
+            SearchQuery(query="test", mode="vector", score_threshold=0.5)
+        )
+        assert len(result.hits) == 0
+
+    def test_query_score_threshold_none_uses_config_default(self) -> None:
+        actor, mock_proxy = _actor_with_mock_embed()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="A", entity_type="T", description="d"),
+                ]
+            )
+        )
+        entity_id = str(actor.get_graph().entities[0].id)
+        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        mock_proxy.search.return_value = VsSearchResult(
+            hits=[
+                VsSearchHit(ref_type="entity", ref_id=entity_id, text="", score=0.35),
+            ],
+            status=CollectionStatus.READY,
+            indexing_pending=0,
+        )
+        # Default threshold is 0.3, 0.35 >= 0.3 -> included
+        result = actor.search(
+            SearchQuery(query="test", mode="vector", score_threshold=None)
+        )
+        assert len(result.hits) == 1
+
+
+class TestHybridSearchThresholdFiltering:
+    """AC-4: _hybrid_search filters hits below threshold."""
+
+    def test_filters_vector_only_hits_below_threshold(self) -> None:
+        actor, mock_proxy = _actor_with_mock_embed()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="GoodVec", entity_type="T", description="unique_xyz_no_kw"),
+                    EntityCreate(name="BadVec", entity_type="T", description="unique_abc_no_kw"),
+                ]
+            )
+        )
+        entities = actor.get_graph().entities
+        good_id = str(next(e for e in entities if e.name == "GoodVec").id)
+        bad_id = str(next(e for e in entities if e.name == "BadVec").id)
+        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        mock_proxy.search.return_value = VsSearchResult(
+            hits=[
+                VsSearchHit(ref_type="entity", ref_id=good_id, text="", score=0.6),
+                VsSearchHit(ref_type="entity", ref_id=bad_id, text="", score=0.1),
+            ],
+            status=CollectionStatus.READY,
+            indexing_pending=0,
+        )
+        # Threshold 0.3 (default): vector-only hits at 0.1 should be filtered
+        result = actor.search(
+            SearchQuery(query="zzz_nomatch", mode="hybrid")
+        )
+        ref_ids = {h.ref_id for h in result.hits}
+        assert good_id in ref_ids
+        assert bad_id not in ref_ids
+
+    def test_keyword_hits_above_threshold_survive(self) -> None:
+        """Keyword-only hits have score 1.0, always above threshold."""
+        actor = _actor()  # no vector proxy
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="Alice", entity_type="Person", description="engineer"),
+                ]
+            )
+        )
+        result = actor.search(SearchQuery(query="Alice", mode="hybrid"))
+        # Keyword fallback: score 1.0, threshold 0.3 -> included
+        assert len(result.hits) == 1
+        assert result.hits[0].score == 1.0
+
+    def test_hybrid_query_override_threshold(self) -> None:
+        actor, mock_proxy = _actor_with_mock_embed()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="X", entity_type="T", description="zz_unique"),
+                ]
+            )
+        )
+        entity_id = str(actor.get_graph().entities[0].id)
+        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        mock_proxy.search.return_value = VsSearchResult(
+            hits=[
+                VsSearchHit(ref_type="entity", ref_id=entity_id, text="", score=0.4),
+            ],
+            status=CollectionStatus.READY,
+            indexing_pending=0,
+        )
+        # Override threshold to 0.5 -> vector-only hit at 0.4 should be filtered
+        result = actor.search(
+            SearchQuery(query="zz_nomatch", mode="hybrid", score_threshold=0.5)
+        )
+        assert len(result.hits) == 0
+
+
+class TestBackwardCompatibility:
+    """AC-6: no new fields specified uses defaults."""
+
+    def test_no_config_changes_defaults(self) -> None:
+        cfg = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
+        assert cfg.search_top_k == 10
+        assert cfg.search_score_threshold == 0.3
+
+    def test_keyword_search_unaffected(self) -> None:
+        """Keyword search does not apply threshold filtering."""
+        actor = _actor()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="Alice", entity_type="Person", description="eng"),
+                ]
+            )
+        )
+        result = actor.search(SearchQuery(query="Alice", mode="keyword"))
+        assert len(result.hits) == 1
+        assert result.hits[0].score == 1.0

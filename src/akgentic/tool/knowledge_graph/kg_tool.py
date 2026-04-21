@@ -38,8 +38,7 @@ from akgentic.tool.knowledge_graph.models import (
     SearchQuery,
     SearchResult,
 )
-from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE, VectorStoreActor
-from akgentic.tool.vector_store.protocol import VectorStoreConfig
+from akgentic.tool.vector_store.protocol import CollectionConfig
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -86,11 +85,59 @@ class KnowledgeGraphTool(ToolCard):
 
     Follows the same actor-based pattern as ``PlanningTool``: a singleton
     ``KnowledgeGraphActor`` is created/retrieved via the orchestrator,
-    and tool factories delegate to the actor proxy.
+    and tool factories delegate to the actor proxy. The ``VectorStoreActor``
+    singleton is owned by ``VectorStoreTool`` (declared via ``depends_on``);
+    this tool only looks it up at actor-start time.
     """
 
     name: str = "KnowledgeGraph"
     description: str = "Knowledge graph tool for structured knowledge with semantic search"
+
+    vector_store: bool | str = Field(
+        default=True,
+        description=(
+            "False disables vector store wiring; True uses the default VectorStoreActor; "
+            "str names a specific VectorStoreActor to look up."
+        ),
+    )
+
+    collection: CollectionConfig = Field(
+        default_factory=CollectionConfig,
+        description=(
+            "Vector collection configuration (backend, persistence, dimension, tenant). "
+            "Propagated to KnowledgeGraphConfig and used by "
+            "KnowledgeGraphActor._acquire_vs_proxy when calling create_collection on the "
+            "VectorStoreActor."
+        ),
+    )
+
+    search_top_k: int = Field(
+        default=10,
+        description=(
+            "Default maximum number of search hits to return. "
+            "Can be overridden per-call via SearchQuery.top_k."
+        ),
+    )
+    search_score_threshold: float = Field(
+        default=0.3,
+        description=(
+            "Default minimum cosine similarity score for vector/hybrid search results. "
+            "Hits below this threshold are filtered out. "
+            "Can be overridden per-call via SearchQuery.score_threshold."
+        ),
+    )
+
+    @property
+    def depends_on(self) -> list[str]:
+        """Runtime dependency on VectorStoreTool, conditional on vector_store.
+
+        When ``vector_store`` is ``False`` this tool is in degraded mode and
+        does not need VectorStoreActor — the factory must not require a
+        ``VectorStoreTool`` in the team config. Any other value (``True`` or a
+        name ``str``) requires VectorStoreTool to be wired first so the
+        KG actor can look up the VectorStoreActor during ``on_start``.
+        """
+        return ["VectorStoreTool"] if self.vector_store is not False else []
 
     get_graph: GetGraph | bool = Field(
         default=True,
@@ -114,8 +161,11 @@ class KnowledgeGraphTool(ToolCard):
     def observer(self, observer: ActorToolObserver) -> None:  # type: ignore[override]
         """Attach observer and set up the KG actor proxy.
 
-        Ensures the ``VectorStoreActor`` singleton exists (AC10) before
-        creating/retrieving the ``KnowledgeGraphActor`` singleton.
+        Assumes ``VectorStoreTool.observer()`` has already created the
+        ``VectorStoreActor`` singleton (ordering enforced by
+        ``ToolFactory`` topological sort via ``depends_on``). The
+        ``KnowledgeGraphActor`` looks that actor up by name during its own
+        ``on_start``.
         """
         from akgentic.tool.knowledge_graph import _check_kg_dependencies
 
@@ -127,21 +177,17 @@ class KnowledgeGraphTool(ToolCard):
 
         orchestrator_proxy = observer.proxy_ask(observer.orchestrator, Orchestrator)
 
-        # Ensure VectorStoreActor singleton exists
-        orchestrator_proxy.getChildrenOrCreate(
-            VectorStoreActor,
-            config=VectorStoreConfig(
-                name=VS_ACTOR_NAME,
-                role=VS_ACTOR_ROLE,
-            ),
-        )
-
-        # Create/retrieve KnowledgeGraphActor singleton
+        # Create/retrieve KnowledgeGraphActor singleton. VectorStoreActor creation
+        # is owned by VectorStoreTool (depends_on enforces ordering).
         kg_addr = orchestrator_proxy.getChildrenOrCreate(
             KnowledgeGraphActor,
             config=KnowledgeGraphConfig(
                 name=KG_ACTOR_NAME,
                 role=KG_ACTOR_ROLE,
+                vector_store=self.vector_store,
+                collection=self.collection,
+                search_top_k=self.search_top_k,
+                search_score_threshold=self.search_score_threshold,
             ),
         )
 

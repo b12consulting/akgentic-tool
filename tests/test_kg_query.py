@@ -181,7 +181,7 @@ class TestSearchQuery:
     def test_defaults(self) -> None:
         sq = SearchQuery(query="test")
         assert sq.query == "test"
-        assert sq.top_k == 10
+        assert sq.top_k is None
         assert sq.mode == "hybrid"
 
     def test_keyword_mode(self) -> None:
