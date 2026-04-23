@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
+from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .knowledge_graph.models import KnowledgeGraphStateEvent as KnowledgeGraphStateEvent
-
-# Submodules with their own __init__ files
-from . import mcp, planning, sandbox, search, team, workspace  # noqa: F401
 from .core import (  # noqa: F401
     COMMAND,
     SYSTEM_PROMPT,
@@ -26,9 +24,6 @@ from .event import (  # noqa: F401
     ToolStateEvent,
     ToolStatePayload,
 )
-from .sandbox.bwrap import BwrapSandboxActor  # noqa: F401
-from .sandbox.seatbelt import SeatbeltSandboxActor  # noqa: F401
-from .sandbox.tool import ExecTool  # noqa: F401
 from .workspace.tool import WorkspaceTool  # noqa: F401
 
 try:
@@ -64,25 +59,36 @@ __all__ = [
     "search",
     "team",
     "workspace",
+    "WorkspaceTool",
     "BwrapSandboxActor",
     "ExecTool",
     "SeatbeltSandboxActor",
-    "WorkspaceTool",
 ]
 
 if _VECTOR_SEARCH_AVAILABLE:
     __all__ += ["VectorEntry", "EmbeddingService", "VectorIndex"]
 
 
-def __getattr__(name: str) -> Any:
-    """Lazy re-export of the KG delta payload (Story 17.1).
+_LAZY_SUBMODULES = {"mcp", "planning", "sandbox", "search", "team", "workspace"}
+_LAZY_ATTRS = {
+    "BwrapSandboxActor": (".sandbox.bwrap", "BwrapSandboxActor"),
+    "ExecTool": (".sandbox.tool", "ExecTool"),
+    "SeatbeltSandboxActor": (".sandbox.seatbelt", "SeatbeltSandboxActor"),
+}
 
-    ``KnowledgeGraphStateEvent`` lives in ``akgentic.tool.knowledge_graph.models``
-    and pulls the ``[vector_search]`` optional dependency chain when imported.
-    Exposing it via module ``__getattr__`` keeps the bare ``akgentic.tool``
-    import cheap (see ``test_tool_import_does_not_trigger_kg_import``) while
-    still honoring AC #5 of Story 17.1.
-    """
+
+def __getattr__(name: str) -> Any:
+    if name in _LAZY_SUBMODULES:
+        module = import_module(f".{name}", __name__)
+        globals()[name] = module
+        return module
+
+    if name in _LAZY_ATTRS:
+        module_name, attr_name = _LAZY_ATTRS[name]
+        value = getattr(import_module(module_name, __name__), attr_name)
+        globals()[name] = value
+        return value
+
     if name == "KnowledgeGraphStateEvent":
         from .knowledge_graph.models import KnowledgeGraphStateEvent
 

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import uuid
-from typing import TYPE_CHECKING, Protocol, TypeAlias, runtime_checkable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, runtime_checkable
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import AkgentType
@@ -34,6 +35,19 @@ class ToolStateEvent(Message):
     tool_id: str
     seq: int
     payload: ToolStatePayload
+
+
+@dataclass
+class ToolCallEvent:
+    """Event emitted when a tool is called.
+
+    Used by MCP server factory and tool observers to track tool invocations
+    for telemetry and monitoring purposes (ADR-023, Epic 16).
+    """
+
+    tool_name: str
+    args: list[Any]
+    kwargs: dict[str, Any]
 
 
 @runtime_checkable
