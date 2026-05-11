@@ -371,13 +371,6 @@ class WorkspaceTool(ToolCard):
     - ``DocumentReader(...)`` instance: custom extraction config (e.g. with LLM).
     """
 
-    name: str = "Workspace"
-    description: str = (
-        "Read, write, edit, and delete files in the team workspace. "
-        "Supports surgical find-and-replace, batch multi-edit, and unified diff patch. "
-        "For SWE agents with full file I/O access."
-    )
-
     # Read capability fields (formerly in WorkspaceReadTool)
     workspace_id: str | None = None
     workspace_read: WorkspaceRead | bool = True
