@@ -20,7 +20,7 @@ from akgentic.tool.workspace.tool import (
     WorkspaceTool,
     _normalize_glob_pattern,
 )
-from akgentic.tool.workspace.workspace import Filesystem
+from akgentic.tool.workspace.workspace import Filesystem, Workspace
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -605,6 +605,41 @@ class TestFilesystemMkdir:
         tool, fs = make_wired_tool(tmp_path)
         with pytest.raises(PermissionError):
             fs.mkdir("../../escape")
+
+
+# ---------------------------------------------------------------------------
+# Story 19.2: Filesystem.exists()
+# ---------------------------------------------------------------------------
+
+
+class TestFilesystemExists:
+    def test_exists_true_for_existing_file(self, tmp_path: Path) -> None:
+        """exists() returns True for a file that was written (AC #2)."""
+        tool, fs = make_wired_tool(tmp_path)
+        fs.write("notes/todo.txt", b"hello")
+        assert fs.exists("notes/todo.txt") is True
+
+    def test_exists_false_for_absent_path(self, tmp_path: Path) -> None:
+        """exists() returns False for a path that was never created (AC #3)."""
+        tool, fs = make_wired_tool(tmp_path)
+        assert fs.exists("missing.txt") is False
+
+    def test_exists_true_for_existing_directory(self, tmp_path: Path) -> None:
+        """exists() returns True for an existing directory (AC #4)."""
+        tool, fs = make_wired_tool(tmp_path)
+        fs.mkdir("src/utils")
+        assert fs.exists("src/utils") is True
+
+    def test_exists_traversal_raises(self, tmp_path: Path) -> None:
+        """exists() raises PermissionError for a root-escaping path (AC #5)."""
+        tool, fs = make_wired_tool(tmp_path)
+        with pytest.raises(PermissionError):
+            fs.exists("../escape")
+
+    def test_filesystem_satisfies_workspace_protocol(self, tmp_path: Path) -> None:
+        """Filesystem satisfies the runtime-checkable Workspace Protocol (AC #1)."""
+        tool, fs = make_wired_tool(tmp_path)
+        assert isinstance(fs, Workspace)
 
 
 # ---------------------------------------------------------------------------
