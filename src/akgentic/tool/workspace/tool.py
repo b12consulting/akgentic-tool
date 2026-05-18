@@ -444,6 +444,11 @@ class WorkspaceTool(ToolCard):
     workspace_patch: WorkspacePatch | bool = True
     workspace_mkdir: WorkspaceMkdir | bool = True
 
+    resources: list[Resource] = []
+    """Files seeded into the team workspace at observer() time, before the
+    agent's first turn. Each resource is written only if its path does not
+    already exist — restoring a team never clobbers edited files."""
+
     # Private runtime state — not part of the serialised config.
     # Default None sentinel lets the workspace property detect uninitialized state
     # reliably under both normal execution and coverage instrumentation.
@@ -468,7 +473,20 @@ class WorkspaceTool(ToolCard):
         self._observer = observer
         ws_name = self.workspace_id or str(observer.team_id)
         self._workspace = get_workspace(ws_name)
+        self._seed_resources()
         return self
+
+    def _seed_resources(self) -> None:
+        """Write each configured resource that is not already present.
+
+        Idempotent: an existing file is never overwritten, so a team restore
+        cannot clobber edits made to a seeded file since team creation.
+        """
+        assert self._workspace is not None
+        for resource in self.resources:
+            if self._workspace.exists(resource.file_name):
+                continue
+            self._workspace.write(resource.file_name, resource.to_bytes())
 
     @property
     def workspace(self) -> Filesystem:
