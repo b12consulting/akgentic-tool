@@ -12,17 +12,20 @@ The default ``read_only=False`` also includes write-side callables (``workspace_
 
 from __future__ import annotations
 
+import base64
 import difflib
 import io
 import re as _re
 import shutil
 import subprocess
+from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 from pydantic import PrivateAttr
 from pydantic_ai.messages import BinaryContent
 
+from akgentic.core.utils import SerializableBaseModel
 from akgentic.tool.core import COMMAND, TOOL_CALL, BaseToolParam, Channels, ToolCard, _resolve
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.event import ActorToolObserver
@@ -356,6 +359,48 @@ class WorkspaceMkdir(BaseToolParam):
     """Create a directory (and parents) in the team workspace."""
 
     expose: set[Channels] = {TOOL_CALL}
+
+
+class ResourceType(StrEnum):
+    """Encoding of a seeded resource's ``content`` field.
+
+    Acts as the explicit encoding discriminator for a :class:`Resource`: it
+    decides how ``content`` is decoded into bytes (see :meth:`Resource.to_bytes`).
+    Encoding is always explicit — never inferred from the filename extension.
+    """
+
+    TEXT = "text"  # content is UTF-8 text, written verbatim
+    IMAGE = "image"  # content is base64-encoded binary, decoded before write
+
+
+class Resource(SerializableBaseModel):
+    """A file seeded into the team workspace at team-creation time.
+
+    Fully Pydantic-serializable: primitive fields plus a :class:`ResourceType`
+    ``StrEnum`` only, so it round-trips cleanly through ``model_dump`` /
+    ``model_validate``. The file extension lives in ``file_name`` (e.g.
+    ``logo.png``); ``file_type`` carries the encoding discriminator, not a MIME
+    type.
+    """
+
+    file_name: str
+    file_type: ResourceType = ResourceType.TEXT
+    content: str
+
+    def to_bytes(self) -> bytes:
+        """Decode ``content`` into the bytes to write to the workspace.
+
+        Returns:
+            ``base64.b64decode(content)`` when ``file_type`` is
+            :attr:`ResourceType.IMAGE`, else ``content.encode("utf-8")``.
+
+        Raises:
+            binascii.Error: If ``file_type`` is :attr:`ResourceType.IMAGE` and
+                ``content`` is not valid base64.
+        """
+        if self.file_type is ResourceType.IMAGE:
+            return base64.b64decode(self.content)
+        return self.content.encode("utf-8")
 
 
 class WorkspaceTool(ToolCard):
