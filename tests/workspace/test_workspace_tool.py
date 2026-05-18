@@ -2,15 +2,24 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import uuid
+from enum import StrEnum
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from akgentic.core.utils import SerializableBaseModel
 
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.edit import EditItem
-from akgentic.tool.workspace.tool import WorkspaceTool, _normalize_glob_pattern
+from akgentic.tool.workspace.tool import (
+    Resource,
+    ResourceType,
+    WorkspaceTool,
+    _normalize_glob_pattern,
+)
 from akgentic.tool.workspace.workspace import Filesystem
 
 # ---------------------------------------------------------------------------
@@ -998,3 +1007,84 @@ class TestFilesystemRootAbsolute:
         relative_base = str(tmp_path / "rel")
         fs = Filesystem(relative_base, "workspace")
         assert fs._root.is_absolute()
+
+
+# ---------------------------------------------------------------------------
+# Resource model and ResourceType encoding (Story 19.1, AC #1-#6)
+# ---------------------------------------------------------------------------
+
+
+class TestResourceType:
+    """ResourceType is a StrEnum with TEXT and IMAGE string members (AC #1)."""
+
+    def test_resourcetype_is_strenum(self) -> None:
+        """ResourceType members are str instances (StrEnum contract)."""
+        assert issubclass(ResourceType, StrEnum)
+        assert isinstance(ResourceType.TEXT, str)
+        assert isinstance(ResourceType.IMAGE, str)
+
+    def test_resourcetype_member_values(self) -> None:
+        """TEXT == 'text' and IMAGE == 'image'."""
+        assert ResourceType.TEXT.value == "text"
+        assert ResourceType.IMAGE.value == "image"
+
+
+class TestResourceModel:
+    """Resource construction, defaults, to_bytes, and serialization (AC #2-#5)."""
+
+    def test_construct_with_all_fields(self) -> None:
+        """Resource constructs with file_name, file_type, and content (AC #2)."""
+        res = Resource(file_name="logo.png", file_type=ResourceType.IMAGE, content="QUJD")
+        assert res.file_name == "logo.png"
+        assert res.file_type is ResourceType.IMAGE
+        assert res.content == "QUJD"
+
+    def test_file_type_defaults_to_text(self) -> None:
+        """file_type defaults to ResourceType.TEXT when omitted (AC #2)."""
+        res = Resource(file_name="notes.md", content="hello")
+        assert res.file_type is ResourceType.TEXT
+
+    def test_resource_is_serializable_base_model(self) -> None:
+        """Resource subclasses SerializableBaseModel (AC #2)."""
+        assert issubclass(Resource, SerializableBaseModel)
+
+    def test_to_bytes_text_returns_utf8(self) -> None:
+        """to_bytes() on a TEXT resource returns UTF-8 bytes of content (AC #3)."""
+        res = Resource(file_name="notes.md", file_type=ResourceType.TEXT, content="héllo")
+        assert res.to_bytes() == "héllo".encode("utf-8")
+
+    def test_to_bytes_image_returns_decoded_bytes(self) -> None:
+        """to_bytes() on an IMAGE resource returns base64-decoded bytes (AC #4)."""
+        raw = b"\x89PNG\r\n\x1a\n"
+        encoded = base64.b64encode(raw).decode("ascii")
+        res = Resource(file_name="logo.png", file_type=ResourceType.IMAGE, content=encoded)
+        assert res.to_bytes() == raw
+
+    def test_to_bytes_image_malformed_base64_raises(self) -> None:
+        """Malformed base64 content for an IMAGE resource raises binascii.Error (AC #4)."""
+        res = Resource(file_name="logo.png", file_type=ResourceType.IMAGE, content="not!base64!")
+        with pytest.raises(binascii.Error):
+            res.to_bytes()
+
+    def test_round_trip_text(self) -> None:
+        """A TEXT Resource round-trips through model_dump / model_validate (AC #5)."""
+        res = Resource(file_name="notes.md", file_type=ResourceType.TEXT, content="hello")
+        restored = Resource.model_validate(res.model_dump())
+        assert restored == res
+        assert restored.file_type is ResourceType.TEXT
+
+    def test_round_trip_image(self) -> None:
+        """An IMAGE Resource round-trips through model_dump / model_validate (AC #5)."""
+        res = Resource(file_name="logo.png", file_type=ResourceType.IMAGE, content="QUJD")
+        restored = Resource.model_validate(res.model_dump())
+        assert restored == res
+        assert restored.file_type is ResourceType.IMAGE
+
+
+def test_resource_and_resourcetype_importable_from_public_api() -> None:
+    """Resource and ResourceType import cleanly from akgentic.tool.workspace (AC #6)."""
+    from akgentic.tool.workspace import Resource as PublicResource
+    from akgentic.tool.workspace import ResourceType as PublicResourceType
+
+    assert PublicResource is Resource
+    assert PublicResourceType is ResourceType
