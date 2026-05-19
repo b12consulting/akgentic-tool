@@ -8,6 +8,10 @@ on:
 
 env:
   NO_COLOR: "1"
+  # Release channel for akgentic-* dependencies. On a release branch set this
+  # to that branch (e.g. version-1.x); the rewrite step below pins every
+  # akgentic-* dependency to it.
+  RELEASE_BRANCH: master
 
 jobs:
   quality:
@@ -24,9 +28,16 @@ jobs:
       - name: Set up Python 3.12
         run: uv python install 3.12
 
-      # akgentic-* dependencies are resolved from GitHub via the git sources in
-      # pyproject.toml ([tool.uv.sources]); their `branch` field selects the
-      # release channel. uv follows the transitive tree itself.
+      # In the akgentic-quick-start workspace, akgentic-* deps use
+      # `workspace = true`. Standalone CI has no workspace, so rewrite each
+      # akgentic-* source to a GitHub git source at RELEASE_BRANCH. uv then
+      # resolves the transitive tree itself.
+      - name: Rewrite akgentic-* sources to git at RELEASE_BRANCH
+        run: |
+          sed -i -E "s#^(akgentic-[a-z-]+) = \{ workspace = true \}#\1 = { git = \"https://github.com/b12consulting/\1.git\", branch = \"${RELEASE_BRANCH}\" }#" pyproject.toml
+          echo "--- rewritten [tool.uv.sources] ---"
+          grep -E '^akgentic-' pyproject.toml
+
       # --all-extras installs optional deps (weaviate, vision/PIL, docs) so mypy
       # can analyze their imports.
       - name: Install dependencies
