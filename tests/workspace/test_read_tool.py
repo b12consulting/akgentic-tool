@@ -701,7 +701,9 @@ def make_wired_tool(
     tid = uuid.uuid4()
     fs = Filesystem(str(tmp_path), str(tid))
     observer = make_observer(team_id=tid)
-    tool = WorkspaceTool(read_only=True, document_reader=document_reader)
+    tool = WorkspaceTool(
+        read_only=True, workspace_read=WorkspaceRead(document_reader=document_reader)
+    )
     with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
         tool.observer(observer)
     return tool, fs
@@ -1159,32 +1161,36 @@ class TestWorkspaceToolSerialization:
         assert isinstance(result, dict)
 
     def test_document_reader_true_in_dump(self) -> None:
-        """Default document_reader=True serializes as True."""
-        assert WorkspaceTool(read_only=True).model_dump()["document_reader"] is True
+        """Default nested document_reader=True serializes as True under workspace_read."""
+        tool = WorkspaceTool(read_only=True, workspace_read=WorkspaceRead())
+        assert tool.model_dump()["workspace_read"]["document_reader"] is True
 
     def test_document_reader_false_in_dump(self) -> None:
-        """document_reader=False serializes as False."""
-        assert (
-            WorkspaceTool(read_only=True, document_reader=False).model_dump()["document_reader"]
-            is False
-        )
+        """Nested document_reader=False serializes as False under workspace_read."""
+        tool = WorkspaceTool(read_only=True, workspace_read=WorkspaceRead(document_reader=False))
+        assert tool.model_dump()["workspace_read"]["document_reader"] is False
 
     def test_document_reader_instance_in_dump(self) -> None:
-        """DocumentReader instance serializes to its model_dump() dict."""
-        tool = WorkspaceTool(read_only=True, document_reader=DocumentReader(llm_client="openai"))
-        assert tool.model_dump()["document_reader"] == {
+        """Nested DocumentReader instance serializes to its model_dump() dict."""
+        tool = WorkspaceTool(
+            read_only=True,
+            workspace_read=WorkspaceRead(document_reader=DocumentReader(llm_client="openai")),
+        )
+        assert tool.model_dump()["workspace_read"]["document_reader"] == {
             "llm_client": "openai",
             "llm_model": "gpt-4o",
         }
 
     def test_model_validate_roundtrip_with_document_reader(self) -> None:
-        """model_dump -> model_validate round-trips with DocumentReader."""
+        """model_dump -> model_validate round-trips with nested DocumentReader."""
         original = WorkspaceTool(
-            read_only=True, document_reader=DocumentReader(llm_client="openai")
+            read_only=True,
+            workspace_read=WorkspaceRead(document_reader=DocumentReader(llm_client="openai")),
         )
         restored = WorkspaceTool.model_validate(original.model_dump())
-        assert isinstance(restored.document_reader, DocumentReader)
-        assert restored.document_reader.llm_client == "openai"
+        assert isinstance(restored.workspace_read, WorkspaceRead)
+        assert isinstance(restored.workspace_read.document_reader, DocumentReader)
+        assert restored.workspace_read.document_reader.llm_client == "openai"
 
 
 class TestDocumentReaderLazyInit:
