@@ -1120,13 +1120,16 @@ class TestDocumentReaderSerialization:
 
     def test_model_dump_default(self) -> None:
         """Default DocumentReader dumps to expected dict."""
-        assert DocumentReader().model_dump() == {"llm_client": None, "llm_model": "gpt-4o"}
+        assert DocumentReader().model_dump() == {
+            "llm_client": "openai",
+            "llm_model": "gpt-5.4-mini",
+        }
 
     def test_model_dump_with_openai(self) -> None:
         """DocumentReader with llm_client='openai' dumps correctly."""
         assert DocumentReader(llm_client="openai").model_dump() == {
             "llm_client": "openai",
-            "llm_model": "gpt-4o",
+            "llm_model": "gpt-5.4-mini",
         }
 
     def test_no_openai_client_in_dump(self) -> None:
@@ -1149,7 +1152,7 @@ class TestDocumentReaderSerialization:
         original = DocumentReader(llm_client="openai")
         restored = DocumentReader.model_validate(original.model_dump())
         assert restored.llm_client == "openai"
-        assert restored.llm_model == "gpt-4o"
+        assert restored.llm_model == "gpt-5.4-mini"
 
 
 class TestWorkspaceToolSerialization:
@@ -1178,7 +1181,7 @@ class TestWorkspaceToolSerialization:
         )
         assert tool.model_dump()["workspace_read"]["document_reader"] == {
             "llm_client": "openai",
-            "llm_model": "gpt-4o",
+            "llm_model": "gpt-5.4-mini",
         }
 
     def test_model_validate_roundtrip_with_document_reader(self) -> None:
@@ -1198,7 +1201,7 @@ class TestDocumentReaderLazyInit:
 
     def test_get_openai_client_returns_none_when_disabled(self) -> None:
         """No llm_client -> _get_openai_client() returns None."""
-        assert DocumentReader()._get_openai_client() is None
+        assert DocumentReader(llm_client=None)._get_openai_client() is None
 
     @pytest.mark.skipif(not os.environ.get("OPENAI_API_KEY"), reason="requires OPENAI_API_KEY")
     def test_get_openai_client_lazy_creation(self) -> None:
