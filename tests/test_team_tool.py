@@ -304,7 +304,7 @@ def test_team_roster_prompt():
 
     result = roster_prompt()
 
-    assert "Team members:" in result
+    assert "Here is the team member list by name (and role):" in result
     assert "@Manager (role: Manager)" in result
     assert "[you]" in result  # Current agent marked
     assert "@Developer (role: Developer)" in result
@@ -355,7 +355,7 @@ def test_role_profiles_prompt():
 
     result = profiles_prompt()
 
-    assert "Available team roles:" in result
+    assert "Here is the available team role list (for hiring):" in result
     assert "Developer: Writes code (Skills: python, testing)" in result
     assert "Tester: Tests code (Skills: selenium, pytest)" in result
 

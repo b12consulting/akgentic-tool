@@ -478,7 +478,9 @@ class TeamTool(ToolCard):
                 if not team_members_names:
                     return ""
 
-                return "**Team members:**\n" + "\n".join(team_members_names)
+                return "**Here is the team member list by name (and role):**\n" + "\n".join(
+                    team_members_names
+                )
             except Exception:
                 logger.error("Failed to get team roster", exc_info=True)
                 return "Cannot get team roster..."
@@ -518,7 +520,9 @@ class TeamTool(ToolCard):
                 if not profiles:
                     return ""
 
-                return "**Available team roles:**\n" + "\n".join(profiles)
+                return "**Here is the available team role list (for hiring):**\n" + "\n".join(
+                    profiles
+                )
             except Exception:
                 logger.error("Failed to get role profiles", exc_info=True)
                 return "Cannot get role profiles..."
