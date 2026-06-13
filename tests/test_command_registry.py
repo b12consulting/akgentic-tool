@@ -10,7 +10,7 @@ assertion checks for an ADR-reference string (Golden Rule #8 / NFR3).
 from __future__ import annotations
 
 import warnings
-from typing import Callable
+from typing import Callable, Literal
 
 import pytest
 
@@ -444,3 +444,227 @@ def test_retry_exception_wrapping_preserves_name_and_translates() -> None:
     # catches and returns as a string (identified-command failure semantics).
     result = registry.dispatch("/needy x")
     assert "needy" in result
+
+
+# ===========================================================================
+# Story 21.4 — keyword (key=value) arguments in command dispatch
+# ===========================================================================
+
+_Status = Literal["pending", "started", "completed", "abort"]
+
+
+class _SearchCard(ToolCard):
+    """``search_planning``-shaped all-optional, multi-parameter command.
+
+    Mirrors the motivating signature (status, owner, creator, query, mode) whose
+    all-optional shape positional-only dispatch cannot serve for later params.
+    """
+
+    name: str = "search-card"
+    description: str = "search card"
+
+    def get_tools(self) -> list[Callable]:
+        return []
+
+    def get_commands(self) -> dict[type[BaseToolParam], Callable]:
+        def search_planning(
+            status: _Status | None = None,
+            owner: str | None = None,
+            creator: str | None = None,
+            query: str | None = None,
+            mode: str = "hybrid",
+        ) -> dict[str, object]:
+            """Search planning tasks by optional filters."""
+            return {
+                "status": status,
+                "owner": owner,
+                "creator": creator,
+                "query": query,
+                "mode": mode,
+            }
+
+        return {_HireParam: search_planning}
+
+
+class _RequiredPairCard(ToolCard):
+    """``f(a: str, b: str)`` with both required, for merged-arity tests."""
+
+    name: str = "pair-card"
+    description: str = "pair card"
+
+    def get_tools(self) -> list[Callable]:
+        return []
+
+    def get_commands(self) -> dict[type[BaseToolParam], Callable]:
+        def f(a: str, b: str) -> str:
+            """Concatenate a and b."""
+            return f"{a}|{b}"
+
+        return {_HireParam: f}
+
+
+# --- AC1: positional dispatch unchanged (backward compatibility) ------------
+
+
+def test_kw_positional_dispatch_unchanged() -> None:
+    registry = _registry(_HireCard())
+    result = registry.dispatch('/hire_member Developer "Alice Smith"')
+    assert "Developer" in result
+    assert "Alice Smith" in result
+
+
+# --- AC2: a name=value token binds by parameter name ------------------------
+
+
+def test_kw_binds_by_name_with_coercion() -> None:
+    registry = _registry(_SearchCard())
+    result = registry.dispatch("/search_planning status=pending")
+    assert "'status': 'pending'" in result
+    # Every other parameter falls back to its own default.
+    assert "'owner': None" in result
+    assert "'mode': 'hybrid'" in result
+
+
+# --- AC3: keyword reaches a later optional without filling earlier ones ------
+
+
+def test_kw_reaches_later_optional_only() -> None:
+    registry = _registry(_SearchCard())
+    result = registry.dispatch('/search_planning query="deploy the service"')
+    assert "'query': 'deploy the service'" in result
+    assert "'status': None" in result
+    assert "'owner': None" in result
+    assert "'creator': None" in result
+
+
+# --- AC4: mixed positional + keyword; positional-after-keyword errors --------
+
+
+def test_kw_mixed_positional_and_keyword() -> None:
+    registry = _registry(_SearchCard())
+    result = registry.dispatch("/search_planning pending owner=@Manager")
+    assert "'status': 'pending'" in result
+    assert "'owner': '@Manager'" in result
+
+
+def test_kw_positional_after_keyword_is_result_string() -> None:
+    registry = _registry(_SearchCard())
+    result = registry.dispatch("/search_planning status=pending @Manager")
+    assert isinstance(result, str)
+    # Post-identification failure: names the offending positional, not CommandNotRecognized.
+    assert "search_planning" in result
+    assert "@Manager" in result
+
+
+def test_kw_positional_after_keyword_does_not_raise() -> None:
+    registry = _registry(_SearchCard())
+    # Must NOT raise CommandNotRecognized — command was identified.
+    result = registry.dispatch("/search_planning status=pending @Manager")
+    assert isinstance(result, str)
+
+
+# --- AC5: keyword only when LHS is a real parameter name; first-= split ------
+
+
+def test_kw_value_containing_equals_via_keyword() -> None:
+    registry = _registry(_SearchCard())
+    result = registry.dispatch('/search_planning query="a=b"')
+    # Split on the FIRST '=' only -> query value is "a=b".
+    assert "'query': 'a=b'" in result
+
+
+def test_kw_unknown_lhs_is_positional_value() -> None:
+    registry = _registry(_HireCard())
+    # 'x' is NOT a parameter name -> token 'x=y' is a POSITIONAL value bound to role.
+    result = registry.dispatch("/hire_member x=y")
+    # role coerces the literal string "x=y" (first-= split is irrelevant: positional).
+    assert "x=y" in result
+
+
+# --- AC6: unknown keyword name -> result string, not CommandNotRecognized ----
+
+
+def test_kw_unknown_keyword_is_result_string() -> None:
+    registry = _registry(_SearchCard())
+    result = registry.dispatch("/search_planning foo=bar")
+    assert isinstance(result, str)
+    assert "search_planning" in result
+    assert "foo" in result
+
+
+def test_kw_unknown_keyword_does_not_raise_command_not_recognized() -> None:
+    registry = _registry(_SearchCard())
+    result = registry.dispatch("/search_planning foo=bar")
+    assert isinstance(result, str)  # caught inside dispatch
+
+
+# --- AC7: duplicate binding -> result string --------------------------------
+
+
+def test_kw_duplicate_positional_and_keyword_is_result_string() -> None:
+    registry = _registry(_SearchCard())
+    result = registry.dispatch("/search_planning pending status=started")
+    assert isinstance(result, str)
+    assert "status" in result
+
+
+def test_kw_duplicate_same_keyword_twice_is_result_string() -> None:
+    registry = _registry(_SearchCard())
+    # shlex keeps both tokens; first-= classification yields a repeated keyword.
+    result = registry.dispatch("/search_planning status=pending status=started")
+    assert isinstance(result, str)
+    assert "status" in result
+
+
+# --- AC8: arity / required checks over the merged binding -------------------
+
+
+def test_kw_missing_required_over_merged_set() -> None:
+    registry = _registry(_RequiredPairCard())
+    result = registry.dispatch("/f a=x")  # b left unbound
+    assert isinstance(result, str)
+    assert "f" in result
+    assert "b" in result
+
+
+def test_kw_over_supply_positionals_is_result_string() -> None:
+    registry = _registry(_RequiredPairCard())
+    result = registry.dispatch("/f x y z")  # max 2
+    assert isinstance(result, str)
+    assert "f" in result
+
+
+# --- AC9: coercion identical for keyword and positional values --------------
+
+
+def test_kw_int_coercion() -> None:
+    registry = _registry(_IntCard())
+    # f(task_id) returns task_id * 2 -> 10 proves "5" coerced to int via keyword.
+    assert registry.dispatch("/f task_id=5") == "10"
+
+
+def test_kw_bad_int_coercion_is_result_string() -> None:
+    registry = _registry(_IntCard())
+    result = registry.dispatch("/f task_id=notanint")
+    assert isinstance(result, str)
+    assert "f" in result
+
+
+# --- AC10: descriptors unchanged; unknown first token still raises -----------
+
+
+def test_kw_descriptors_unchanged_with_keyword_support() -> None:
+    registry = _registry(_HireCard(), _FireCard())
+    descriptors = registry.descriptors()
+    by_name = {d.name: d for d in descriptors}
+    assert set(by_name) == {"hire_member", "fire_member"}
+    hire = by_name["hire_member"]
+    assert [a.name for a in hire.args] == ["role", "name"]
+    assert hire.args[0].required is True
+    assert hire.args[1].required is False
+
+
+def test_kw_unknown_first_token_still_raises() -> None:
+    registry = _registry(_SearchCard())
+    with pytest.raises(CommandNotRecognized):
+        registry.dispatch("/frobnicate status=pending")

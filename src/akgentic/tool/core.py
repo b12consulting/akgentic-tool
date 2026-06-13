@@ -427,61 +427,117 @@ class CommandRegistry:
         """Parse a ``/``-prefixed command, invoke it, and return a result string.
 
         Strips the leading ``/``, ``shlex.split``s the remainder, resolves the
-        first token to a command, coerces the remaining tokens as positional args,
-        invokes the command, and string-renders the result.
+        first token to a command, classifies the remaining tokens as positional or
+        ``name=value`` keyword arguments, coerces and merges them, invokes the
+        command, and string-renders the result.
+
+        A token is a **keyword** only when the text before its first ``=`` matches a
+        real parameter name on the command; otherwise it is positional (so values
+        containing ``=`` are never silently swallowed). Positionals must precede
+        keywords. ``key=value`` is opt-in — purely-positional dispatch is unchanged.
 
         Raises:
             CommandNotRecognized: If the first token does not name a known command
                 (so the caller may fall back to normal LLM processing). No command
                 is invoked in this case.
 
-        Post-identification failures (missing/extra args, coercion errors, or the
-        command body raising) are caught **inside** this method and returned as a
-        plain result string — ``CommandNotRecognized`` is never raised once a
-        command has been identified.
+        Post-identification failures (missing/extra args, coercion errors, unknown
+        keyword, duplicate binding, positional-after-keyword, or the command body
+        raising) are caught **inside** this method and returned as a plain result
+        string — ``CommandNotRecognized`` is never raised once a command has been
+        identified.
         """
         tokens = shlex.split(text[1:] if text.startswith("/") else text)
         if not tokens:
             raise CommandNotRecognized(text)
-        name, positional = tokens[0], tokens[1:]
+        name, args = tokens[0], tokens[1:]
         if name not in self._entries:
             raise CommandNotRecognized(name)
-        return self._invoke(name, positional)
+        return self._invoke(name, args)
 
-    def _invoke(self, name: str, positional: list[str]) -> str:
-        """Coerce *positional* tokens for command *name* and invoke it.
+    def _invoke(self, name: str, args: list[str]) -> str:
+        """Classify, merge, coerce *args* for command *name* and invoke it.
 
-        Any failure (too many args, missing required arg, coercion error, or the
-        command body raising) is caught and returned as a result string.
+        Any failure (positional-after-keyword, too many/missing args, unknown
+        keyword, duplicate binding, coercion error, or the command body raising) is
+        caught and returned as a result string.
         """
         entry = self._entries[name]
         try:
-            coerced = self._coerce(entry, positional)
-            return str(entry.fn(*coerced))
+            positional, keyword = self._classify_tokens(entry, args)
+            bound = self._bind(entry, positional, keyword)
+            return str(entry.fn(**bound))
         except Exception as exc:  # noqa: BLE001 — failures become result strings (ADR-028 §4)
             return f"Command '{name}' failed: {exc}"
 
     @staticmethod
-    def _coerce(entry: _CommandEntry, positional: list[str]) -> list[Any]:
-        """Coerce *positional* tokens against *entry*'s ordered arg adapters.
+    def _classify_tokens(
+        entry: _CommandEntry, args: list[str]
+    ) -> tuple[list[str], dict[str, str]]:
+        """Partition *args* into ``(positional, keyword)`` for *entry*.
 
-        Validates arity (at least ``required_count``, at most ``len(args)``) then
-        coerces each supplied token through its per-arg :class:`TypeAdapter`.
-        Unsupplied trailing optional args are omitted so the callable applies its
-        own defaults.
+        A token is a keyword iff it contains ``=`` AND the substring before the
+        **first** ``=`` is a known parameter name on *entry*; the value is the
+        remainder after that first ``=``. All other tokens are positional. A
+        positional token appearing after any keyword token is rejected.
+
+        Raises:
+            ValueError: If a positional token follows a keyword token (names the
+                offending positional value).
+        """
+        names = {spec.name for spec in entry.args}
+        positional: list[str] = []
+        keyword: dict[str, str] = {}
+        for token in args:
+            key, sep, value = token.partition("=")
+            if sep and key in names:
+                keyword[key] = value
+            elif keyword:
+                raise ValueError(
+                    f"positional argument '{token}' cannot follow a keyword argument"
+                )
+            else:
+                positional.append(token)
+        return positional, keyword
+
+    @staticmethod
+    def _bind(
+        entry: _CommandEntry, positional: list[str], keyword: dict[str, str]
+    ) -> dict[str, Any]:
+        """Merge *positional* + *keyword* onto *entry*'s params and coerce each.
+
+        Maps positionals onto the leading parameters in signature order, then binds
+        keywords by name, detecting unknown names and duplicate bindings. Validates
+        arity (at least ``required_count``, at most ``len(args)``) over the merged
+        set, then coerces every bound value through its per-arg :class:`TypeAdapter`.
+        Unbound trailing optionals are omitted so the callable applies its defaults.
+
+        Raises:
+            ValueError: Too many positionals, unknown keyword, duplicate binding, a
+                required parameter left unbound, or a coercion failure.
         """
         if len(positional) > len(entry.args):
             raise ValueError(
                 f"accepts at most {len(entry.args)} argument(s), got {len(positional)}"
             )
-        if len(positional) < entry.required_count:
-            raise ValueError(
-                f"requires at least {entry.required_count} argument(s), got {len(positional)}"
-            )
-        return [
-            spec.adapter.validate_python(token)
+        raw: dict[str, str] = {
+            spec.name: token
             for spec, token in zip(entry.args, positional, strict=False)
-        ]
+        }
+        specs_by_name = {spec.name: spec for spec in entry.args}
+        for key, value in keyword.items():
+            if key not in specs_by_name:
+                raise ValueError(f"unknown keyword argument '{key}'")
+            if key in raw:
+                raise ValueError(f"got multiple values for argument '{key}'")
+            raw[key] = value
+        missing = [spec.name for spec in entry.args if spec.required and spec.name not in raw]
+        if missing:
+            raise ValueError(f"missing required argument(s): {', '.join(missing)}")
+        return {
+            name: specs_by_name[name].adapter.validate_python(token)
+            for name, token in raw.items()
+        }
 
 
 class ToolFactory:
