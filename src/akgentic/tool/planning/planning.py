@@ -292,23 +292,23 @@ class PlanningTool(ToolCard):
         planning_proxy = self._planning_proxy
 
         def search_planning(
+            query: str | None = None,
+            mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
             status: TaskStatus | None = None,
             owner: str | None = None,
             creator: str | None = None,
-            query: str | None = None,
-            mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
             top_k: int | None = None,
             score_threshold: float | None = None,
         ) -> list[str]:
             """Search tasks. All filters are AND-combined; omit all for full list.
 
             Args:
-                status: Filter by status.
-                owner: Filter by owner.
-                creator: Filter by creator.
                 query: Search text for keyword and/or semantic matching.
                 mode: "hybrid" (default) = keyword + semantic,
                     "keyword" = substring only, "vector" = semantic only.
+                status: Filter by status.
+                owner: Filter by owner.
+                creator: Filter by creator.
                 top_k: Max semantic hits (default 10).
                 score_threshold: Min cosine similarity (default 0.5).
 
