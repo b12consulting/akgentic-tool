@@ -15,6 +15,7 @@ from .core import (  # noqa: F401
     TOOL_CALL,
     BaseToolParam,
     Channels,
+    CommandRegistry,
     ToolCard,
     ToolFactory,
 )
@@ -46,6 +47,7 @@ __all__ = [
     "BaseToolParam",
     "ToolCard",
     "ToolFactory",
+    "CommandRegistry",
     # Expose channel constants
     "COMMAND",
     "SYSTEM_PROMPT",

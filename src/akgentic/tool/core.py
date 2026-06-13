@@ -7,14 +7,20 @@ Defines the core contracts:
 """
 
 import functools
+import inspect
+import shlex
+import warnings
 from abc import ABC, abstractmethod
 from collections import deque
+from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Callable, TypeVar
+from typing import Any, Callable, TypeVar, get_type_hints
+
+from pydantic import TypeAdapter
 
 from akgentic.core.utils import SerializableBaseModel
-from akgentic.tool.errors import RetriableError
-from akgentic.tool.event import ToolObserver
+from akgentic.tool.errors import CommandNotRecognized, RetriableError
+from akgentic.tool.event import CommandArg, CommandDescriptor, ToolObserver
 
 T = TypeVar("T", bound="BaseToolParam")
 
@@ -257,6 +263,227 @@ def _topological_sort(cards: list[ToolCard]) -> list[ToolCard]:
     return ordered
 
 
+@dataclass(frozen=True)
+class _CommandArgSpec:
+    """Ordered metadata + per-arg coercion adapter for one command parameter.
+
+    Runtime-only (not serialized). Captured from the callable signature at
+    registry-construction time. Drives both positional coercion (dispatch) and
+    :class:`CommandDescriptor` building.
+    """
+
+    name: str
+    annotation: Any
+    required: bool
+    adapter: TypeAdapter
+
+
+@dataclass(frozen=True)
+class _CommandEntry:
+    """Runtime record for a single registered command (not a serialized model).
+
+    Holds the callable plus the ordered, per-argument coercion metadata derived
+    from its signature. Per Golden Rule #1b, runtime callables live here in a
+    plain dataclass — never inside a serialized Pydantic field.
+    """
+
+    name: str
+    fn: Callable
+    args: tuple[_CommandArgSpec, ...]
+    tool_card: str
+
+    @property
+    def required_count(self) -> int:
+        """Number of leading required (no-default) parameters."""
+        return sum(1 for spec in self.args if spec.required)
+
+
+def _json_type_name(annotation: Any) -> str:
+    """Return the JSON-schema type name for a parameter annotation.
+
+    Falls back to ``"string"`` when the schema has no top-level ``type`` (e.g.
+    a union like ``str | None`` produces ``anyOf``), matching how the human help
+    surface renders un-typed-or-optional args.
+    """
+    try:
+        schema = TypeAdapter(annotation).json_schema()
+    except Exception:
+        return "string"
+    return schema.get("type", "string")
+
+
+def _build_command_entry(fn: Callable, tool_card: str) -> _CommandEntry:
+    """Derive a per-command arg model + ordered metadata from a callable signature.
+
+    Mirrors how pydantic-ai derives a tool schema from a function signature:
+    inspect the parameters, reject anything un-derivable (``*args``, ``**kwargs``,
+    or an un-annotated parameter), and build a :class:`TypeAdapter` over the
+    ordered positional parameter types for later coercion.
+
+    Raises:
+        ValueError: If the signature has a ``VAR_POSITIONAL`` (``*args``),
+            ``VAR_KEYWORD`` (``**kwargs``), or un-annotated parameter. The message
+            names the command and the offending parameter.
+    """
+    sig = inspect.signature(fn)
+    try:
+        hints = get_type_hints(fn)
+    except Exception:
+        hints = {}
+
+    specs: list[_CommandArgSpec] = []
+    for pname, param in sig.parameters.items():
+        if param.kind is inspect.Parameter.VAR_POSITIONAL:
+            raise ValueError(
+                f"Command '{fn.__name__}' cannot be registered: parameter '*{pname}' "
+                "(*args) has no derivable argument schema."
+            )
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            raise ValueError(
+                f"Command '{fn.__name__}' cannot be registered: parameter '**{pname}' "
+                "(**kwargs) has no derivable argument schema."
+            )
+        annotation = hints.get(pname, param.annotation)
+        if annotation is inspect.Parameter.empty:
+            raise ValueError(
+                f"Command '{fn.__name__}' cannot be registered: parameter '{pname}' "
+                "has no type annotation."
+            )
+        required = param.default is inspect.Parameter.empty
+        specs.append(
+            _CommandArgSpec(
+                name=pname,
+                annotation=annotation,
+                required=required,
+                adapter=TypeAdapter(annotation),
+            )
+        )
+
+    return _CommandEntry(name=fn.__name__, fn=fn, args=tuple(specs), tool_card=tool_card)
+
+
+class CommandRegistry:
+    """Name-keyed registry of command callables with signature-derived dispatch.
+
+    Built by :meth:`ToolFactory.get_command_registry` from the ``get_commands()``
+    output of every wired :class:`ToolCard`. Each command is keyed by its
+    callable's ``__name__`` (e.g. ``hire_member``). The registry exposes a typed
+    programmatic surface (:meth:`callable`), a membership test (:meth:`has`),
+    discovery metadata (:meth:`descriptors`), and a human text surface
+    (:meth:`dispatch`) that parses ``/``-prefixed commands.
+
+    This is a runtime object holding callables — deliberately a plain class, not a
+    ``BaseModel`` (Golden Rule #1b): runtime callables must never live in a
+    serialized field.
+    """
+
+    def __init__(self, entries: dict[str, _CommandEntry]) -> None:
+        """Store the name → command-entry mapping. Use the factory to build one."""
+        self._entries = entries
+
+    def has(self, name: str) -> bool:
+        """Return ``True`` if a command named *name* is registered."""
+        return name in self._entries
+
+    def callable(self, name: str) -> Callable:
+        """Return the bound, typed command callable for programmatic invocation.
+
+        The returned callable preserves its **native** (non-stringified) return
+        value, so callers (e.g. ``StructuredOutput`` hire-by-role) can invoke it
+        with native arguments and use the result directly.
+
+        Raises:
+            CommandNotRecognized: If *name* is not a registered command.
+        """
+        try:
+            return self._entries[name].fn
+        except KeyError:
+            raise CommandNotRecognized(name) from None
+
+    def descriptors(self) -> list[CommandDescriptor]:
+        """Return serializable discovery metadata, one entry per command."""
+        result: list[CommandDescriptor] = []
+        for entry in self._entries.values():
+            args = [
+                CommandArg(
+                    name=spec.name,
+                    type=_json_type_name(spec.annotation),
+                    required=spec.required,
+                )
+                for spec in entry.args
+            ]
+            description = inspect.getdoc(entry.fn) or ""
+            result.append(
+                CommandDescriptor(
+                    name=entry.name,
+                    description=description,
+                    args=args,
+                    tool_card=entry.tool_card,
+                )
+            )
+        return result
+
+    def dispatch(self, text: str) -> str:
+        """Parse a ``/``-prefixed command, invoke it, and return a result string.
+
+        Strips the leading ``/``, ``shlex.split``s the remainder, resolves the
+        first token to a command, coerces the remaining tokens as positional args,
+        invokes the command, and string-renders the result.
+
+        Raises:
+            CommandNotRecognized: If the first token does not name a known command
+                (so the caller may fall back to normal LLM processing). No command
+                is invoked in this case.
+
+        Post-identification failures (missing/extra args, coercion errors, or the
+        command body raising) are caught **inside** this method and returned as a
+        plain result string — ``CommandNotRecognized`` is never raised once a
+        command has been identified.
+        """
+        tokens = shlex.split(text[1:] if text.startswith("/") else text)
+        if not tokens:
+            raise CommandNotRecognized(text)
+        name, positional = tokens[0], tokens[1:]
+        if name not in self._entries:
+            raise CommandNotRecognized(name)
+        return self._invoke(name, positional)
+
+    def _invoke(self, name: str, positional: list[str]) -> str:
+        """Coerce *positional* tokens for command *name* and invoke it.
+
+        Any failure (too many args, missing required arg, coercion error, or the
+        command body raising) is caught and returned as a result string.
+        """
+        entry = self._entries[name]
+        try:
+            coerced = self._coerce(entry, positional)
+            return str(entry.fn(*coerced))
+        except Exception as exc:  # noqa: BLE001 — failures become result strings (ADR-028 §4)
+            return f"Command '{name}' failed: {exc}"
+
+    @staticmethod
+    def _coerce(entry: _CommandEntry, positional: list[str]) -> list[Any]:
+        """Coerce *positional* tokens against *entry*'s ordered arg adapters.
+
+        Validates arity (at least ``required_count``, at most ``len(args)``) then
+        coerces each supplied token through its per-arg :class:`TypeAdapter`.
+        Unsupplied trailing optional args are omitted so the callable applies its
+        own defaults.
+        """
+        if len(positional) > len(entry.args):
+            raise ValueError(
+                f"accepts at most {len(entry.args)} argument(s), got {len(positional)}"
+            )
+        if len(positional) < entry.required_count:
+            raise ValueError(
+                f"requires at least {entry.required_count} argument(s), got {len(positional)}"
+            )
+        return [
+            spec.adapter.validate_python(token)
+            for spec, token in zip(entry.args, positional, strict=False)
+        ]
+
+
 class ToolFactory:
     """Resolves ``ToolCard`` instances into callable tools, prompts, and toolsets."""
 
@@ -328,9 +555,19 @@ class ToolFactory:
     def get_commands(self) -> dict[type[BaseToolParam], Callable]:
         """Return command callables aggregated from all tool cards.
 
+        Deprecated:
+            Use :meth:`get_command_registry` instead. This param-class-keyed dict
+            is retained for one migration cycle. The registry keys by canonical
+            command name and adds signature-derived dispatch + discovery metadata.
+
         Returns:
             Dict mapping param class to callable, merged from all tool cards.
         """
+        warnings.warn(
+            "ToolFactory.get_commands() is deprecated; use get_command_registry() instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         commands: dict[type[BaseToolParam], Callable] = {}
         for card in self.tool_cards:
             commands.update(card.get_commands())
@@ -338,6 +575,37 @@ class ToolFactory:
         if self._retry_exception is not None:
             commands = {k: self._wrap_with_retry(v) for k, v in commands.items()}
         return commands
+
+    def get_command_registry(self) -> CommandRegistry:
+        """Build a name-keyed :class:`CommandRegistry` from every wired tool card.
+
+        Iterates ``self.tool_cards`` in dependency order, calls each card's
+        ``get_commands()``, and registers every callable under its ``__name__``.
+        Each command's arg schema is derived from its signature at this point, so
+        an un-derivable signature (``*args``/``**kwargs``/un-annotated param) fails
+        loudly here. When ``retry_exception`` is configured, each command is
+        wrapped via :meth:`_wrap_with_retry` (``functools.wraps`` preserves
+        ``__name__``/``__doc__``), matching :meth:`get_commands` behavior.
+
+        Raises:
+            ValueError: If two tool cards expose commands with the same canonical
+                name (collision is a wiring-time error, never a silent overwrite),
+                or if a command has an un-derivable signature. The message names
+                the offending command.
+        """
+        entries: dict[str, _CommandEntry] = {}
+        for card in self.tool_cards:
+            tool_card_name = type(card).__name__
+            for fn in card.get_commands().values():
+                wrapped = self._wrap_with_retry(fn) if self._retry_exception is not None else fn
+                name = wrapped.__name__
+                if name in entries:
+                    raise ValueError(
+                        f"Command name collision: '{name}' is exposed by both "
+                        f"'{entries[name].tool_card}' and '{tool_card_name}'."
+                    )
+                entries[name] = _build_command_entry(wrapped, tool_card_name)
+        return CommandRegistry(entries)
 
     def get_toolsets(self) -> list[Any]:
         """Return toolset instances aggregated from all tool cards."""
