@@ -197,8 +197,9 @@ class PlanningTool(ToolCard):
         agent_name = self._observer.myAddress.name
         filter_by_agent = params.filter_by_agent
 
-        def planning_prompt() -> str:
-            """Get the full team planning."""
+        def planning_summary() -> str:
+            """Summarize the team planning: task totals, per-owner breakdown, and
+            the task list (all tasks, or only yours when ``filter_by_agent``)."""
             tasks = planning_proxy.get_planning()
             if not tasks:
                 return "No current team planning."
@@ -258,7 +259,7 @@ class PlanningTool(ToolCard):
             )
             return "\n".join(lines)
 
-        return planning_prompt
+        return planning_summary
 
     def _get_planning_task_factory(self, params: GetPlanningTask) -> Callable:
         planning_proxy = self._planning_proxy

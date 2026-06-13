@@ -283,8 +283,8 @@ def test_team_tool_get_system_prompts_disabled():
     assert len(prompts) == 0
 
 
-def test_team_roster_prompt():
-    """team_roster_prompt returns formatted team members."""
+def test_team_members():
+    """team_members returns formatted team members."""
     orchestrator_mock = Mock(spec=Orchestrator)
     orchestrator_mock.get_team.return_value = [
         create_test_address("@Manager", "Manager"),
@@ -311,8 +311,8 @@ def test_team_roster_prompt():
     assert "#PlanningTool" not in result  # Tool actors excluded
 
 
-def test_team_roster_prompt_empty():
-    """team_roster_prompt returns empty string if no members."""
+def test_team_members_empty():
+    """team_members returns empty string if no members."""
     orchestrator_mock = Mock(spec=Orchestrator)
     orchestrator_mock.get_team.return_value = []
 
@@ -329,8 +329,8 @@ def test_team_roster_prompt_empty():
     assert result == ""
 
 
-def test_role_profiles_prompt():
-    """role_profiles_prompt returns role descriptions + skills from agent catalog."""
+def test_team_roles():
+    """team_roles returns role descriptions + skills from agent catalog."""
     card1 = Mock(spec=AgentCard)
     card1.role = "Developer"
     card1.description = "Writes code"
@@ -360,8 +360,8 @@ def test_role_profiles_prompt():
     assert "Tester: Tests code (Skills: selenium, pytest)" in result
 
 
-def test_role_profiles_prompt_empty():
-    """role_profiles_prompt returns empty string if no roles."""
+def test_team_roles_empty():
+    """team_roles returns empty string if no roles."""
     orchestrator_mock = Mock(spec=Orchestrator)
     orchestrator_mock.get_agent_catalog.return_value = []
 
