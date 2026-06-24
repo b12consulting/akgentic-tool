@@ -18,6 +18,9 @@ from akgentic.tool.errors import ToolObserverGone
 class _DummyToolCard(ToolCard):
     """Minimal concrete ``ToolCard`` for exercising base observer storage."""
 
+    name: str = "dummy"
+    description: str = "dummy tool card"
+
     def get_tools(self) -> list[Callable]:
         return []
 

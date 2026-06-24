@@ -74,7 +74,7 @@ def test_in_life_roster_unchanged() -> None:
 
     roster_prompt = tool.get_system_prompts()[0]
     result = roster_prompt()
-    assert "Here is the team member list by name (and role):" in result
+    assert "**Team members:**" in result
     assert "@Manager (role: Manager)" in result
     assert "[you]" in result
 
