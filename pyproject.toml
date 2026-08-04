@@ -10,7 +10,7 @@ authors = [
 keywords = ["agents", "ai", "akgentic"]
 
 dependencies = [
-    "akgentic-core",
+    "akgentic-core>=1.5.0",
     "pydantic>=2.0.0",
     "tavily-python>=0.7.12",
     "pydantic-ai>=1.107.0,<2",
@@ -38,8 +38,7 @@ dev = [
 # Note: akgentic-* dependencies have NO [tool.uv.sources] entry here.
 # - Inside the akgentic-quick-start workspace, the workspace root's
 #   [tool.uv.sources] resolves them as editable workspace members.
-# - In standalone CI, they are built from RELEASE_BRANCH into a local
-#   wheelhouse and installed via `uv pip install --find-links` — see ci.yml.
+# - In standalone CI, they resolve from PyPI under the floors declared above.
 
 [build-system]
 requires = ["hatchling"]
