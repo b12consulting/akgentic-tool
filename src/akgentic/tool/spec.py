@@ -95,6 +95,17 @@ class ToolCardSpec(ToolCard):
         """Delegate dependency declaration to the built concrete card."""
         return self.build().depends_on
 
+    @property
+    def dependency_name(self) -> str:
+        """Key this envelope by the wrapped concrete tool's class name.
+
+        Without this override every ``ToolCardSpec`` would collapse into a
+        single ``"ToolCardSpec"`` node in the dependency graph, so wrapped tools
+        could not be ordered relative to one another and ``depends_on`` values
+        (which name the concrete class) would never resolve.
+        """
+        return self.get_tool_class().__name__
+
     def observer(self, observer: ToolObserver) -> ToolCard:
         """Attach the observer to the built concrete card and return self."""
         self.build().observer(observer)

@@ -133,6 +133,18 @@ class ToolCard(SerializableBaseModel, ABC):
         """
         return []
 
+    @property
+    def dependency_name(self) -> str:
+        """Identity used to key this card in the dependency graph.
+
+        Defaults to the runtime class name. Envelope cards (e.g.
+        ``ToolCardSpec``) override this to return the wrapped concrete tool's
+        class name so that ``depends_on`` values — which reference the concrete
+        class — resolve correctly and each wrapped tool is a distinct node in
+        ``ToolFactory``'s topological sort.
+        """
+        return type(self).__name__
+
     def observer(self, observer: ToolObserver) -> "ToolCard":
         """Attach an observer (held weakly) and perform runtime setup.
 
@@ -205,8 +217,10 @@ class ToolCard(SerializableBaseModel, ABC):
 def _topological_sort(cards: list[ToolCard]) -> list[ToolCard]:
     """Return ``cards`` topologically sorted by ``ToolCard.depends_on``.
 
-    Dependency keys are matched against ``type(card).__name__``. The sort uses
-    Kahn's algorithm with a FIFO queue seeded in input order, which produces a
+    Dependency keys are matched against ``ToolCard.dependency_name`` (the
+    runtime class name by default, or the wrapped concrete tool's class name
+    for envelope cards such as ``ToolCardSpec``). The sort uses Kahn's
+    algorithm with a FIFO queue seeded in input order, which produces a
     deterministic ordering: independent nodes retain their relative input order.
 
     Duplicate class names in ``cards`` (e.g. two ``VectorStoreTool`` instances
@@ -230,14 +244,14 @@ def _topological_sort(cards: list[ToolCard]) -> list[ToolCard]:
     """
     # Name → card map. Later duplicates overwrite earlier entries — dependency
     # relationships are at the class level, not per-instance.
-    by_name: dict[str, ToolCard] = {type(card).__name__: card for card in cards}
+    by_name: dict[str, ToolCard] = {card.dependency_name: card for card in cards}
 
     # Validate every declared dependency is present.
     for card in cards:
         for dep in card.depends_on:
             if dep not in by_name:
                 raise ValueError(
-                    f"{type(card).__name__} depends on {dep} but it was not found in the tool list"
+                    f"{card.dependency_name} depends on {dep} but it was not found in the tool list"
                 )
 
     # Build in-degree map keyed by class name (not instance — duplicates collapse).
@@ -255,7 +269,7 @@ def _topological_sort(cards: list[ToolCard]) -> list[ToolCard]:
     queue: deque[str] = deque()
     seen: set[str] = set()
     for card in cards:
-        name = type(card).__name__
+        name = card.dependency_name
         if name in seen:
             continue
         seen.add(name)
@@ -280,7 +294,7 @@ def _topological_sort(cards: list[ToolCard]) -> list[ToolCard]:
     # input, grouped by their class's position in the sorted name order.
     by_name_instances: dict[str, list[ToolCard]] = {name: [] for name in by_name}
     for card in cards:
-        by_name_instances[type(card).__name__].append(card)
+        by_name_instances[card.dependency_name].append(card)
     ordered: list[ToolCard] = []
     for name in ordered_names:
         ordered.extend(by_name_instances[name])

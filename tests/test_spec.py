@@ -108,3 +108,33 @@ def test_spec_rejects_non_toolcard_class() -> None:
 def test_spec_rejects_unqualified_path() -> None:
     with pytest.raises(ValueError, match="fully qualified dotted path"):
         ToolCardSpec(tool_class="NotDotted").get_tool_class()
+
+
+class _DependentTool(ToolCard):
+    """Application-owned tool that must be wired after ``_SegmentTool``."""
+
+    def get_tools(self) -> list[Callable]:
+        return [lambda: "dependent"]
+
+    @property
+    def depends_on(self) -> list[str]:
+        return ["_SegmentTool"]
+
+
+_DEPENDENT_TOOL_PATH = f"{__name__}._DependentTool"
+
+
+def test_spec_dependency_name_is_wrapped_class() -> None:
+    spec = ToolCardSpec(tool_class=_SEGMENT_TOOL_PATH)
+    assert spec.dependency_name == "_SegmentTool"
+
+
+def test_wrapped_tools_resolve_dependencies_when_both_wrapped() -> None:
+    # Dependent listed before its prerequisite; both wrapped in ToolCardSpec.
+    dependent = ToolCardSpec(tool_class=_DEPENDENT_TOOL_PATH)
+    segment = ToolCardSpec(tool_class=_SEGMENT_TOOL_PATH, config={"cap": {"value": "x"}})
+    factory = ToolFactory(tool_cards=[dependent, segment])
+    # No "depends on _SegmentTool but it was not found" error; both tools wired.
+    tools = factory.get_tools()
+    assert len(tools) == 2
+
