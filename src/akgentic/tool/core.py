@@ -126,10 +126,12 @@ class ToolCard(SerializableBaseModel, ABC):
 
         Default: no dependencies. Subclasses may override as a property
         whose return value depends on instance fields (e.g. the value of
-        a ``vector_store`` field on consumer tools). The string is matched
-        against ``type(card).__name__`` by ``ToolFactory``'s topological
-        sort. Not a Pydantic field — does not appear in ``model_dump`` and
-        cannot be set via ``model_validate``.
+        a ``vector_store`` field on consumer tools). Each string is matched
+        against the ``dependency_name`` of the other cards by ``ToolFactory``'s
+        topological sort (this is ``type(card).__name__`` for native cards, or
+        the wrapped concrete tool's class name for envelope cards such as
+        ``ToolCardSpec``). Not a Pydantic field — does not appear in
+        ``model_dump`` and cannot be set via ``model_validate``.
         """
         return []
 
@@ -698,7 +700,7 @@ class ToolFactory:
         """
         entries: dict[str, _CommandEntry] = {}
         for card in self.tool_cards:
-            tool_card_name = type(card).__name__
+            tool_card_name = card.dependency_name
             for fn in card.get_commands().values():
                 wrapped = self._wrap_with_retry(fn) if self._retry_exception is not None else fn
                 name = wrapped.__name__

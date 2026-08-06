@@ -136,5 +136,6 @@ def test_wrapped_tools_resolve_dependencies_when_both_wrapped() -> None:
     factory = ToolFactory(tool_cards=[dependent, segment])
     # No "depends on _SegmentTool but it was not found" error; both tools wired.
     tools = factory.get_tools()
-    assert len(tools) == 2
+    # Prerequisite (_SegmentTool) must be wired before its dependent.
+    assert [t() for t in tools] == ["seg-x", "dependent"]
 
