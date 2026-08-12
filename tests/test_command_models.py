@@ -64,7 +64,8 @@ class SerializableActorAddress(ActorAddress):
     def is_alive(self) -> bool:
         return True
 
-    def handle_user_message(self) -> bool:
+    @property
+    def is_user_proxy(self) -> bool:
         return False
 
     def serialize(self) -> dict:  # type: ignore[type-arg]
@@ -76,7 +77,7 @@ class SerializableActorAddress(ActorAddress):
             "role": self._role,
             "team_id": str(self._team_id),
             "squad_id": "",
-            "user_message": False,
+            "is_user_proxy": False,
         }
 
     def __repr__(self) -> str:

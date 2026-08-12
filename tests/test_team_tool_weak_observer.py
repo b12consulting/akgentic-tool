@@ -39,7 +39,7 @@ def _address(name: str, role: str = "Agent") -> ActorAddressProxy:
             "role": role,
             "team_id": str(uuid.uuid4()),
             "squad_id": str(uuid.uuid4()),
-            "user_message": True,
+            "is_user_proxy": False,
         }
     )
 
