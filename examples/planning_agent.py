@@ -79,7 +79,8 @@ class _MockAddress(ActorAddress):
     def stop(self) -> None:
         pass
 
-    def handle_user_message(self) -> bool:
+    @property
+    def is_user_proxy(self) -> bool:
         return False
 
     def serialize(self) -> ActorAddressDict:
@@ -91,7 +92,7 @@ class _MockAddress(ActorAddress):
             "role": self._role,
             "team_id": "",
             "squad_id": "",
-            "user_message": False,
+            "is_user_proxy": False,
         }
 
     def __repr__(self) -> str:

@@ -69,7 +69,8 @@ class _MockActorAddress(ActorAddress):
     def stop(self) -> None:
         pass
 
-    def handle_user_message(self) -> bool:
+    @property
+    def is_user_proxy(self) -> bool:
         return False
 
     def serialize(self) -> dict[str, Any]:
