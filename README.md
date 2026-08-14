@@ -57,7 +57,7 @@ ToolFactory
     ├── get_tools()          → list[Callable]  ─────▶ LLM ReAct loop
     ├── get_system_prompts() → list[Callable]  ─────▶ injected into LLM context
     ├── get_commands()       → dict[type, Callable] ▶ orchestrator / other agents
-    └── get_toolsets()       → list[MCPServer] ─────▶ pydantic-ai MCP integration
+    └── get_toolsets()       → list[MCPToolset] ────▶ pydantic-ai MCP integration
 ```
 
 ## Installation
