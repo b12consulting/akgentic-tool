@@ -48,6 +48,16 @@ def _read_timeout_of(toolset: Any) -> timedelta:
     return toolset.client._session_kwargs["read_timeout_seconds"]
 
 
+def _sse_read_timeout_of(toolset: Any) -> timedelta | None:
+    """Return the long-lived SSE event-stream timeout, read off the transport itself.
+
+    Deliberately not the session kwargs: `MCPToolset(read_timeout=)` reaches only
+    `ClientSession.read_timeout_seconds`, the *per-request* timeout. The stream timeout
+    lives on the transport, so a session-level assertion is blind to it.
+    """
+    return _transport_of(toolset).sse_read_timeout
+
+
 class _RecordingToolset:
     """Stand-in for `MCPToolset` that records how it was constructed.
 
@@ -345,6 +355,40 @@ def test_timeouts_are_passed_as_explicit_keywords(
     assert "tool_prefix" not in built.kwargs
 
 
+@pytest.mark.parametrize("read_timeout", [900.0, 45.0], ids=["longer", "shorter"])
+def test_sse_stream_timeout_comes_from_the_config(read_timeout: float) -> None:
+    """The configured value must govern how long the SSE event stream tolerates silence.
+
+    pydantic-ai would set this itself, but only when it builds the transport from a URL;
+    handed a pre-built transport it returns early. fastmcp then leaves `sse_read_timeout`
+    at `None` and omits the kwarg entirely, so `mcp.client.sse`'s own 5-minute default
+    applies — loosening every configured value below it and truncating every one above.
+    """
+    connection = MCPHTTPConnectionConfig(
+        url=ACME_URL,
+        transport="sse",
+        read_timeout=read_timeout,
+    )
+
+    toolset = _build_mcp_toolset(connection)
+
+    assert _sse_read_timeout_of(toolset) == timedelta(seconds=read_timeout)
+
+
+def test_streamable_http_keeps_its_session_timeout_and_gains_no_stream_timeout() -> None:
+    """The kwarg is SSE-only by design, verified against the installed fastmcp.
+
+    `StreamableHttpTransport` deprecates `sse_read_timeout` — it warns and ignores the
+    value — and drives its read timeout from the session's `read_timeout_seconds`, which
+    the toolset already supplies. So that branch must stay exactly as it was.
+    """
+    toolset = _build_mcp_toolset(MCPHTTPConnectionConfig(url=ACME_URL, read_timeout=77.0))
+
+    assert isinstance(_transport_of(toolset), StreamableHttpTransport)
+    assert _sse_read_timeout_of(toolset) is None
+    assert _read_timeout_of(toolset) == timedelta(seconds=77.0)
+
+
 # --------------------------------------------------------------------------------------
 # MCPTool.get_toolsets — shape and prefixing
 # --------------------------------------------------------------------------------------
@@ -482,6 +526,13 @@ async def test_probe_reports_infeasible_when_the_server_exposes_no_tools(
     result = await probe_mcp_connection(MCPHTTPConnectionConfig(url=ACME_URL))
 
     assert result == {"tool_count": 0, "tools": [], "feasible": False}
+
+
+def test_real_mcptoolset_still_exposes_list_tools() -> None:
+    """Every diagnostics test above runs against `_RecordingToolset`, which defines its own
+    `list_tools()`. An upstream rename would therefore leave them all green and break only
+    at runtime, so the real class is pinned here."""
+    assert hasattr(MCPToolset, "list_tools")
 
 
 def test_prefixed_toolset_really_has_no_list_tools() -> None:

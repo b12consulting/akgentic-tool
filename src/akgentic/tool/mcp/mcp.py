@@ -200,6 +200,17 @@ def _build_mcp_transport(connection: MCPConnectionConfig) -> Any:
     Auth headers are passed to the *transport* constructor, never to the toolset:
     pydantic-ai raises ValueError when `headers=` accompanies a transport object.
 
+    SSE additionally needs `read_timeout` forwarded here as `sse_read_timeout`, because
+    that is the only route to the long-lived event stream. The toolset's own
+    `read_timeout` reaches just the per-request session timeout, and pydantic-ai's
+    transport builder — which would set the stream timeout itself — returns early when
+    given a pre-built transport, as it is here. Left unset, fastmcp omits the kwarg and
+    `mcp.client.sse`'s 5-minute default silently overrides the configured value.
+
+    The streamable-HTTP branch deliberately gets nothing: upstream deprecates
+    `sse_read_timeout` there and derives that timeout from the session's
+    `read_timeout_seconds`, which the toolset already supplies.
+
     Args:
         connection: MCP connection configuration (HTTP/SSE or stdio).
 
@@ -216,7 +227,11 @@ def _build_mcp_transport(connection: MCPConnectionConfig) -> Any:
 
     headers = _mcp_auth_headers(connection.bearer_token)
     if connection.transport == "sse":
-        return sse_transport_cls(url=connection.url, headers=headers)
+        return sse_transport_cls(
+            url=connection.url,
+            headers=headers,
+            sse_read_timeout=connection.read_timeout,
+        )
     return http_transport_cls(url=connection.url, headers=headers)
 
 
@@ -226,6 +241,14 @@ def _build_mcp_toolset(connection: MCPConnectionConfig) -> Any:
     `timeout` is translated to pydantic-ai's `init_timeout` here rather than renamed on
     the config models, which are catalog-persisted. Both timeouts are always passed
     explicitly so the config's values win over pydantic-ai's own (different) defaults.
+
+    Accepted behaviour change — MCP tool-call retries. The v1 server classes hard-defaulted
+    `max_retries=1`; `MCPToolset` defaults it to `None` and falls back to `ctx.max_retries`,
+    so MCP tool calls now inherit the agent's retry budget (`Agent(retries=...)`, reached
+    from `ReactAgentConfig.runtime_cfg.retries`) instead of always being capped at one.
+    This is deliberate and left as-is: the connection configs are catalog-persisted, and
+    adding a field to carry the old constant would change their stored shape for a value
+    the agent already owns.
 
     Args:
         connection: MCP connection configuration (HTTP/SSE or stdio).
