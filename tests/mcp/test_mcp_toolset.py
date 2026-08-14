@@ -462,6 +462,28 @@ async def test_probe_mcp_connection_truncates_the_tool_list(
     assert result == {"tool_count": 2, "tools": ["read_file"], "feasible": True}
 
 
+@pytest.mark.asyncio
+async def test_probe_reports_infeasible_when_the_server_exposes_no_tools(
+    recording_toolset: type[_RecordingToolset],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty tool list is the negative feasibility verdict, and `--cov-branch` misses it.
+
+    `list_mcp_tools`' comprehension is a one-liner, so both endpoints of its loop arc share
+    a line and coverage.py records no branch for it — the not-entered direction is invisible
+    to branch measurement and has to be pinned behaviourally instead.
+    """
+
+    async def _no_tools(self: _RecordingToolset) -> list[Any]:
+        return []
+
+    monkeypatch.setattr(_RecordingToolset, "list_tools", _no_tools)
+
+    result = await probe_mcp_connection(MCPHTTPConnectionConfig(url=ACME_URL))
+
+    assert result == {"tool_count": 0, "tools": [], "feasible": False}
+
+
 def test_prefixed_toolset_really_has_no_list_tools() -> None:
     """Pins the upstream fact that makes the diagnostics routing necessary."""
     toolset = _build_mcp_toolset(MCPHTTPConnectionConfig(url=ACME_URL))
