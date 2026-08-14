@@ -13,11 +13,6 @@ from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.tool import WorkspaceTool, WorkspaceView
 from akgentic.tool.workspace.workspace import Filesystem
 
-try:
-    from pydantic_ai.messages import BinaryContent
-except ImportError:
-    BinaryContent = None  # type: ignore[assignment,misc]
-
 # ---------------------------------------------------------------------------
 # Helpers — mirror pattern from test_read_tool.py
 # ---------------------------------------------------------------------------
