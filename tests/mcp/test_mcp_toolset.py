@@ -10,6 +10,7 @@ env, cwd, init timeout, read timeout, prefix — never merely that construction 
 from __future__ import annotations
 
 import sys
+import warnings
 from datetime import timedelta
 from typing import Any
 
@@ -387,6 +388,38 @@ def test_streamable_http_keeps_its_session_timeout_and_gains_no_stream_timeout()
     assert isinstance(_transport_of(toolset), StreamableHttpTransport)
     assert _sse_read_timeout_of(toolset) is None
     assert _read_timeout_of(toolset) == timedelta(seconds=77.0)
+
+
+def _sse_read_timeout_deprecations(build: Any) -> list[str]:
+    """Return the `sse_read_timeout` deprecation messages emitted while building."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        build()
+    return [str(w.message) for w in caught if "sse_read_timeout" in str(w.message)]
+
+
+def test_sse_still_honours_the_kwarg_that_streamable_http_already_discards() -> None:
+    """Reading the value back off the transport is not enough on its own.
+
+    `StreamableHttpTransport` still *stores* `sse_read_timeout` after deprecating it —
+    it warns and then ignores it — so an attribute assertion would stay green there
+    while the value did nothing. If SSE is deprecated the same way, the assertion above
+    would go on passing and the 5-minute default would silently return.
+
+    The streamable-HTTP half is the positive control: it proves the deprecation signal
+    is live in this environment, so the SSE half failing to fire means something.
+    """
+    discarded = _sse_read_timeout_deprecations(
+        lambda: StreamableHttpTransport(url=ACME_URL, sse_read_timeout=900.0)
+    )
+    honoured = _sse_read_timeout_deprecations(
+        lambda: _build_mcp_toolset(
+            MCPHTTPConnectionConfig(url=ACME_URL, transport="sse", read_timeout=900.0)
+        )
+    )
+
+    assert discarded, "upstream stopped signalling the deprecation; the control is now vacuous"
+    assert honoured == []
 
 
 # --------------------------------------------------------------------------------------
