@@ -32,7 +32,9 @@ class MCPHTTPConnectionConfig(BaseModel):
     timeout: float = Field(
         default=10.0,
         gt=0,
-        description="Connection initialization timeout for MCP server",
+        description="Connection initialization timeout for MCP server "
+        "(translated to pydantic-ai's init_timeout; deliberately not renamed, "
+        "because this field name is persisted in catalog entries)",
     )
     read_timeout: float = Field(
         default=300.0,
@@ -41,7 +43,7 @@ class MCPHTTPConnectionConfig(BaseModel):
     )
     tool_prefix: str | None = Field(
         default=None,
-        description="Optional tool name prefix applied by pydantic-ai MCP wrapper",
+        description="Optional tool name prefix applied via the toolset's prefixed() wrapper",
     )
 
 
@@ -79,7 +81,9 @@ class MCPStdioConnectionConfig(BaseModel):
     timeout: float = Field(
         default=10.0,
         gt=0,
-        description="Connection initialization timeout for MCP server",
+        description="Connection initialization timeout for MCP server "
+        "(translated to pydantic-ai's init_timeout; deliberately not renamed, "
+        "because this field name is persisted in catalog entries)",
     )
     read_timeout: float = Field(
         default=300.0,
@@ -88,7 +92,7 @@ class MCPStdioConnectionConfig(BaseModel):
     )
     tool_prefix: str | None = Field(
         default=None,
-        description="Optional tool name prefix applied by pydantic-ai MCP wrapper",
+        description="Optional tool name prefix applied via the toolset's prefixed() wrapper",
     )
 
 
@@ -119,28 +123,125 @@ def _mcp_auth_headers(bearer_token: str | None) -> dict[str, str] | None:
     return {"Authorization": f"Bearer {bearer_token}"}
 
 
-def _load_mcp_server_classes() -> tuple[type[Any], type[Any], type[Any]]:
-    """Lazy-load MCP server classes from pydantic-ai.
+def _load_mcp_toolset_class() -> type[Any]:
+    """Lazy-load the pydantic-ai MCP toolset class.
+
+    The import stays lazy so `pydantic_ai` remains an implementation detail of this
+    module. It is deliberately NOT wrapped in a try/except: `mcp` ships unconditionally
+    with pydantic-ai, so a genuine ImportError must surface with its real cause instead
+    of being rewritten into misleading installation advice.
 
     Returns:
-        Tuple of (MCPServerSSE, MCPServerStreamableHTTP, MCPServerStdio) classes.
+        The `MCPToolset` class.
+    """
+    from pydantic_ai.mcp import MCPToolset  # noqa: PLC0415
+
+    return MCPToolset
+
+
+def _load_mcp_transport_classes() -> tuple[type[Any], type[Any], type[Any]]:
+    """Lazy-load the fastmcp transport classes re-exported by pydantic-ai.
+
+    These are module-level names in `pydantic_ai.mcp` (they are not listed in its
+    `__all__`). They are imported from there rather than from `fastmcp` directly:
+    fastmcp arrives transitively via pydantic-ai and is not a declared dependency
+    of this package.
+
+    Returns:
+        Tuple of (StdioTransport, SSETransport, StreamableHttpTransport) classes.
+    """
+    from pydantic_ai.mcp import (  # noqa: PLC0415
+        SSETransport,
+        StdioTransport,
+        StreamableHttpTransport,
+    )
+
+    return StdioTransport, SSETransport, StreamableHttpTransport
+
+
+def _build_stdio_transport(
+    connection: MCPStdioConnectionConfig,
+    stdio_transport_cls: type[Any],
+) -> Any:
+    """Map a stdio connection config onto a fastmcp stdio transport.
+
+    Args:
+        connection: stdio MCP connection configuration.
+        stdio_transport_cls: The `StdioTransport` class to instantiate.
+
+    Returns:
+        A configured stdio transport.
 
     Raises:
-        ImportError: If pydantic-ai MCP extras are not installed.
+        ValueError: If stdio_command is missing.
     """
-    try:
-        from pydantic_ai.mcp import (  # noqa: PLC0415
-            MCPServerSSE,
-            MCPServerStdio,
-            MCPServerStreamableHTTP,
-        )
-    except ImportError as error:  # pragma: no cover - environment-specific
-        raise ImportError(
-            "MCP support requires pydantic-ai MCP extras. "
-            'Install with: pip install "pydantic-ai-slim[mcp]"'
-        ) from error
+    if not connection.stdio_command:
+        raise ValueError("stdio_command is required for MCPStdioConnectionConfig")
 
-    return MCPServerSSE, MCPServerStreamableHTTP, MCPServerStdio
+    env = dict(connection.stdio_env or {})
+    if connection.stdio_token_env_var and connection.bearer_token:
+        env[connection.stdio_token_env_var] = connection.bearer_token
+
+    return stdio_transport_cls(
+        command=connection.stdio_command,
+        args=connection.stdio_args,
+        env=env or None,
+        cwd=connection.stdio_cwd,
+    )
+
+
+def _build_mcp_transport(connection: MCPConnectionConfig) -> Any:
+    """Map an MCP connection config onto a fastmcp transport object.
+
+    The transport is always constructed explicitly. In particular `transport="sse"`
+    must not fall through to URL-based inference, which only detects SSE for URLs
+    ending in `/sse` and would silently downgrade a configured SSE endpoint.
+
+    Auth headers are passed to the *transport* constructor, never to the toolset:
+    pydantic-ai raises ValueError when `headers=` accompanies a transport object.
+
+    Args:
+        connection: MCP connection configuration (HTTP/SSE or stdio).
+
+    Returns:
+        A configured fastmcp transport instance.
+
+    Raises:
+        ValueError: If stdio_command is missing for stdio transport.
+    """
+    stdio_transport_cls, sse_transport_cls, http_transport_cls = _load_mcp_transport_classes()
+
+    if isinstance(connection, MCPStdioConnectionConfig):
+        return _build_stdio_transport(connection, stdio_transport_cls)
+
+    headers = _mcp_auth_headers(connection.bearer_token)
+    if connection.transport == "sse":
+        return sse_transport_cls(url=connection.url, headers=headers)
+    return http_transport_cls(url=connection.url, headers=headers)
+
+
+def _build_mcp_toolset(connection: MCPConnectionConfig) -> Any:
+    """Build the bare, unprefixed MCP toolset for a connection config.
+
+    `timeout` is translated to pydantic-ai's `init_timeout` here rather than renamed on
+    the config models, which are catalog-persisted. Both timeouts are always passed
+    explicitly so the config's values win over pydantic-ai's own (different) defaults.
+
+    Args:
+        connection: MCP connection configuration (HTTP/SSE or stdio).
+
+    Returns:
+        An `MCPToolset` with no tool-name prefix applied.
+
+    Raises:
+        ValueError: If stdio_command is missing for stdio transport.
+    """
+    toolset_cls = _load_mcp_toolset_class()
+    return toolset_cls(
+        _build_mcp_transport(connection),
+        init_timeout=connection.timeout,
+        read_timeout=connection.read_timeout,
+    )
 
 
 class MCPTool(ToolCard):
@@ -157,64 +258,24 @@ class MCPTool(ToolCard):
         return []
 
     def get_toolsets(self) -> list[Any]:
-        """Create and return an MCP server toolset for pydantic-ai agents.
+        """Create and return an MCP toolset for pydantic-ai agents.
 
-        Creates the appropriate MCP server instance based on connection configuration:
-        - MCPServerStdio for stdio transport
-        - MCPServerSSE for SSE transport
-        - MCPServerStreamableHTTP for streamable-http transport
+        Builds a single `MCPToolset` over the fastmcp transport selected by the
+        connection configuration (stdio, SSE, or streamable-HTTP). When `tool_prefix`
+        is configured it is applied via the toolset's `prefixed()` wrapper — pydantic-ai
+        removed the constructor keyword.
 
         Returns:
-            List containing a single configured MCP server instance ready to be
-            used as a toolset in pydantic-ai agents.
+            List containing a single configured toolset ready to be used in
+            pydantic-ai agents.
 
         Raises:
             ValueError: If stdio_command is missing for stdio transport.
-            ImportError: If pydantic-ai MCP extras are not installed.
         """
-        mcp_server_sse, mcp_server_streamable_http, mcp_server_stdio = _load_mcp_server_classes()
-        headers = _mcp_auth_headers(self.connection.bearer_token)
-
-        if isinstance(self.connection, MCPStdioConnectionConfig):
-            if not self.connection.stdio_command:
-                raise ValueError("stdio_command is required for MCPStdioConnectionConfig")
-
-            env = dict(self.connection.stdio_env or {})
-            if self.connection.stdio_token_env_var and self.connection.bearer_token:
-                env[self.connection.stdio_token_env_var] = self.connection.bearer_token
-
-            return [
-                mcp_server_stdio(
-                    command=self.connection.stdio_command,
-                    args=self.connection.stdio_args,
-                    env=env or None,
-                    cwd=self.connection.stdio_cwd,
-                    tool_prefix=self.connection.tool_prefix,
-                    timeout=self.connection.timeout,
-                    read_timeout=self.connection.read_timeout,
-                )
-            ]
-
-        if self.connection.transport == "sse":
-            return [
-                mcp_server_sse(
-                    url=self.connection.url,
-                    headers=headers,
-                    tool_prefix=self.connection.tool_prefix,
-                    timeout=self.connection.timeout,
-                    read_timeout=self.connection.read_timeout,
-                )
-            ]
-
-        return [
-            mcp_server_streamable_http(
-                url=self.connection.url,
-                headers=headers,
-                tool_prefix=self.connection.tool_prefix,
-                timeout=self.connection.timeout,
-                read_timeout=self.connection.read_timeout,
-            )
-        ]
+        toolset = _build_mcp_toolset(self.connection)
+        if self.connection.tool_prefix:
+            return [toolset.prefixed(self.connection.tool_prefix)]
+        return [toolset]
 
 
 async def list_mcp_tools(connection: MCPConnectionConfig) -> list[str]:
@@ -224,18 +285,18 @@ async def list_mcp_tools(connection: MCPConnectionConfig) -> list[str]:
         connection: MCP connection configuration (HTTP/SSE or stdio).
 
     Returns:
-        List of tool names exposed by the MCP server.
+        List of tool names exposed by the MCP server, as the server itself reports
+        them (i.e. without any configured `tool_prefix` applied).
 
     Raises:
-        ImportError: If pydantic-ai MCP extras are not installed.
+        ValueError: If stdio_command is missing for stdio transport.
         Exception: If connection fails or server is unreachable.
     """
-    tool = MCPTool(connection=connection)
     print("## Creating MCP toolset for diagnostics...")
-    toolsets = tool.get_toolsets()
-    if not toolsets:
-        raise ValueError("MCPTool.get_toolsets() returned empty list")
-    server = toolsets[0]
+    # Deliberately built from the bare toolset rather than MCPTool.get_toolsets():
+    # a prefixed toolset is a wrapper with no list_tools() and no attribute proxy,
+    # so diagnostics would break for exactly the configs that set a tool_prefix.
+    server = _build_mcp_toolset(connection)
     print("## Server toolset created, connecting and listing tools...")
     async with server:
         print("## Connected to MCP server, fetching tool list...")
