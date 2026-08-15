@@ -57,8 +57,12 @@ ToolFactory
     ├── get_tools()          → list[Callable]  ─────▶ LLM ReAct loop
     ├── get_system_prompts() → list[Callable]  ─────▶ injected into LLM context
     ├── get_commands()       → dict[type, Callable] ▶ orchestrator / other agents
-    └── get_toolsets()       → list[MCPToolset] ────▶ pydantic-ai MCP integration
+    └── get_toolsets()       → list[Any]       ─────▶ pydantic-ai toolset objects
 ```
+
+`get_toolsets()` is typed `list[Any]` because its elements are runtime pydantic-ai
+objects: an `MCPToolset`, or a `PrefixedToolset` wrapping one when the connection
+configures a `tool_prefix`.
 
 ## Installation
 
@@ -84,6 +88,9 @@ workspace configuration.
 ```bash
 # Semantic search for planning and knowledge graph (numpy + OpenAI embeddings)
 uv sync --extra vector_search
+
+# Weaviate backend for the vector store (weaviate-client)
+uv sync --extra weaviate
 
 # Binary file reading for workspace_read (PDF, DOCX, XLSX, PPTX via MarkItDown)
 uv sync --extra docs
@@ -385,23 +392,59 @@ available profiles as a system prompt; `hire_team_member` and `fire_team_member`
 ### MCPTool
 
 Integrates external [Model Context Protocol](https://modelcontextprotocol.io) servers as native
-pydantic-ai toolsets, supporting both HTTP+SSE and stdio transport.
+pydantic-ai toolsets over three transports: `streamable-http` (default), `sse`, and `stdio`.
+
+`MCPTool` takes exactly one connection, on a required singular `connection` field:
 
 ```python
 from akgentic.tool.mcp import MCPTool, MCPHTTPConnectionConfig
 
+# Remote server over streamable HTTP (the default transport)
 MCPTool(
-    connections=[
-        MCPHTTPConnectionConfig(
-            url="https://my-mcp-server.example.com/sse",
-        )
-    ]
+    connection=MCPHTTPConnectionConfig(
+        url="https://mcp.acme.example/api/v1/endpoint",
+    )
 )
 ```
 
-Returns registered MCP tools via `get_toolsets()` — pydantic-ai handles schema resolution and
-dispatch. OAuth 2.0 flows are supported for MCP servers requiring authentication (see
-`mcp/oauth_handler.py`).
+The transport is always taken from the config, never inferred from the URL. pydantic-ai's
+own inference only recognises URLs ending in `/sse`, which would silently downgrade any SSE
+endpoint published on another path — so `sse` must be requested explicitly:
+
+```python
+# Server-Sent Events — `transport="sse"` is required, a /sse suffix is not enough
+MCPTool(
+    connection=MCPHTTPConnectionConfig(
+        url="https://mcp.acme.example/api/v1/endpoint",
+        transport="sse",
+        bearer_token="...",       # sent as an Authorization header on the transport
+        read_timeout=900.0,       # also governs how long the event stream tolerates silence
+    )
+)
+```
+
+```python
+from akgentic.tool.mcp import MCPTool, MCPStdioConnectionConfig
+
+# Local server launched as a subprocess — `stdio_command` is required
+MCPTool(
+    connection=MCPStdioConnectionConfig(
+        stdio_command="uvx",
+        stdio_args=["acme-mcp-server"],
+        tool_prefix="acme",       # applied via the toolset's prefixed() wrapper
+    )
+)
+```
+
+`get_tools()` is always empty — MCP capabilities reach the agent through `get_toolsets()`,
+which returns a single toolset and lets pydantic-ai handle schema resolution and dispatch.
+Setting `tool_prefix` wraps that toolset in a `PrefixedToolset`.
+
+For servers that answer `401` with an MCP `WWW-Authenticate` challenge, `mcp/oauth_handler.py`
+runs a browser-based authorization flow. Note that it stops at the **authorization code** —
+exchanging that code for an access token is not implemented, so the returned value is the code
+itself. The helpers are not wired into `MCPTool`; call them yourself and pass the result as
+`bearer_token`.
 
 ### ExecTool
 
@@ -529,13 +572,16 @@ produces no tool response and stalls the agent's ReAct loop.
 
 | Extra | Packages | Enables |
 |---|---|---|
-| `vector_search` | `numpy`, `openai` | Semantic search in `PlanningTool` and `KnowledgeGraphTool` |
-| `docs` | `markitdown[pdf,docx,xlsx,xls,pptx,outlook]` | Binary file reading in `workspace_read` |
+| `vector_search` | `openai>=1.0.0`, `numpy>=1.26.0` | Semantic search in `PlanningTool` and `KnowledgeGraphTool` |
+| `weaviate` | `weaviate-client>=4.9.0` | Weaviate backend for the vector store |
+| `docs` | `markitdown[pdf,docx,xlsx,xls,pptx,outlook]>=0.1` | Binary file reading in `workspace_read` |
 | `vision` | `Pillow>=10.0` | Image resizing + sidecar cache in `workspace_view` |
 
-All extras degrade gracefully when absent: planning falls back to keyword-only search,
-workspace binary reads raise `ValueError` with an install hint, image resizing is skipped
-with a one-time warning.
+No extra is required at import time. When one is absent the affected feature either falls
+back or fails with an actionable message: planning falls back to keyword-only search, image
+resizing is skipped with a one-time warning, workspace binary reads raise `ValueError` with
+an install hint, and selecting the Weaviate backend raises `ImportError` with install
+instructions.
 
 ## Development
 
@@ -574,26 +620,36 @@ uv run mypy packages/akgentic-tool/src/
 Every pull request runs the full quality gate via GitHub Actions
 (`.github/workflows/ci.yml`):
 
+The repository is checked out standalone, so the commands are package-relative:
+
 | Step | Command | Gate |
 |---|---|---|
-| Type check | `mypy packages/akgentic-tool/src/` (strict, Python 3.12) | Zero errors |
-| Lint | `ruff check packages/akgentic-tool/src/` | Zero errors |
-| Tests | `pytest packages/akgentic-tool/tests/ --cov=akgentic.tool --cov-fail-under=80` | All pass, ≥ 80% coverage |
+| Type check | `mypy src/` (strict, Python 3.12) | Zero errors |
+| Lint | `ruff check src/` | Zero errors |
+| Tests | `pytest tests/ --cov=akgentic.tool --cov-branch --cov-fail-under=80` | All pass, ≥ 80% branch coverage |
 
 The CI badge at the top of this README reflects the current state of `master`. PRs are
-blocked from merging until all four steps are green.
+blocked from merging until all three steps are green.
 
 ### Project Structure
 
 ```
 src/akgentic/tool/
     __init__.py               # Public API
+    py.typed                  # PEP 561 typing marker
     core.py                   # ToolCard, BaseToolParam, ToolFactory, Channels
     errors.py                 # RetriableError
     event.py                  # ToolObserver, ActorToolObserver,
     │                         #   TeamManagementToolObserver
     vector.py                 # VectorEntry, EmbeddingService, VectorIndex
     │                         #   [optional: vector_search extra]
+    vector_store/
+    │   protocol.py           # VectorStore Protocol, VectorStoreConfig, data models
+    │   inmemory.py           # InMemory backend
+    │   weaviate.py           # Weaviate backend [optional: weaviate extra]
+    │   actor.py              # VectorStoreActor singleton
+    │   embedding_actor.py    # EmbeddingActor (non-blocking embedding)
+    │   └── tool.py           # VectorStoreTool ToolCard
     planning/
     │   planning_actor.py     # Task models, PlanConfig, PlanActor
     │   └── planning.py       # PlanningTool ToolCard
