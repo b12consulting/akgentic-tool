@@ -10,7 +10,8 @@ Follows the same pattern as ``PlanningTool`` in akgentic.tool.planning.
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from collections.abc import Callable
+from typing import Any
 
 from pydantic import Field
 
@@ -267,14 +268,14 @@ class KnowledgeGraphTool(ToolCard):
     # System prompts (2.3)
     # ------------------------------------------------------------------
 
-    def get_system_prompts(self) -> list[Callable]:
+    def get_system_prompts(self) -> list[Callable[..., Any]]:
         """Return prompt callables when get_graph is exposed on SYSTEM_PROMPT."""
         gp = _resolve(self.get_graph, GetGraph)
         if gp and SYSTEM_PROMPT in gp.expose:
             return [self._get_graph_prompt_factory()]
         return []
 
-    def _get_graph_prompt_factory(self) -> Callable:
+    def _get_graph_prompt_factory(self) -> Callable[..., Any]:
         """Create a closure that returns a compact graph summary as a prompt string."""
         kg_proxy = self._kg_proxy
         format_summary = self._format_graph_summary
@@ -293,9 +294,9 @@ class KnowledgeGraphTool(ToolCard):
     # Tools (2.4)
     # ------------------------------------------------------------------
 
-    def get_tools(self) -> list[Callable]:
+    def get_tools(self) -> list[Callable[..., Any]]:
         """Return callable tool functions for LLM agents."""
-        tools: list[Callable] = []
+        tools: list[Callable[..., Any]] = []
 
         gp = _resolve(self.get_graph, GetGraph)
         if gp and TOOL_CALL in gp.expose:
@@ -316,9 +317,9 @@ class KnowledgeGraphTool(ToolCard):
     # Commands (2.5)
     # ------------------------------------------------------------------
 
-    def get_commands(self) -> dict[type[BaseToolParam], Callable]:
+    def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
         """Return command mappings for inter-agent orchestration."""
-        commands: dict[type[BaseToolParam], Callable] = {}
+        commands: dict[type[BaseToolParam], Callable[..., Any]] = {}
 
         gp = _resolve(self.get_graph, GetGraph)
         if gp and COMMAND in gp.expose:
@@ -334,7 +335,7 @@ class KnowledgeGraphTool(ToolCard):
     # Factory closures (2.6, 2.7, 2.8)
     # ------------------------------------------------------------------
 
-    def _get_graph_factory(self, params: GetGraph) -> Callable:
+    def _get_graph_factory(self, params: GetGraph) -> Callable[..., Any]:
         """Return a closure that fetches and formats the graph."""
         kg_proxy = self._kg_proxy
         format_view = self._format_graph_view
@@ -347,7 +348,7 @@ class KnowledgeGraphTool(ToolCard):
         get_graph.__doc__ = params.format_docstring(get_graph.__doc__)
         return get_graph
 
-    def _update_graph_factory(self, params: UpdateGraph) -> Callable:
+    def _update_graph_factory(self, params: UpdateGraph) -> Callable[..., Any]:
         """Return a closure that applies graph mutations."""
         kg_proxy = self._kg_proxy
 
@@ -361,7 +362,7 @@ class KnowledgeGraphTool(ToolCard):
         update_graph.__doc__ = params.format_docstring(update_graph.__doc__)
         return update_graph
 
-    def _search_factory(self, params: SearchGraph) -> Callable:
+    def _search_factory(self, params: SearchGraph) -> Callable[..., Any]:
         """Return a closure that searches the graph."""
         kg_proxy = self._kg_proxy
         format_result = self._format_search_result

@@ -6,7 +6,8 @@ that can be attached to any agent.
 
 import logging
 import random
-from typing import Callable
+from collections.abc import Callable
+from typing import Any, cast
 
 from pydantic import Field
 
@@ -24,7 +25,7 @@ from akgentic.tool.core import (
     _resolve,
 )
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.event import TeamManagementToolObserver
+from akgentic.tool.event import TeamManagementToolObserver, ToolObserver
 
 logger = logging.getLogger(__name__)
 
@@ -178,10 +179,13 @@ class TeamTool(ToolCard):
         default=True, description="Include team roster in system prompt (default: True)"
     )
 
-    def observer(self, observer: TeamManagementToolObserver) -> "TeamTool":
+    def observer(self, observer: ToolObserver) -> "TeamTool":
         """Attach observer and set up the orchestrator proxy.
 
-        Requires a TeamManagementToolObserver for actor system access.
+        Requires a TeamManagementToolObserver for actor system access. The
+        parameter keeps the base ``ToolObserver`` type — ``ToolFactory`` attaches
+        one observer to every card uniformly, so narrowing it would break
+        substitutability; :meth:`_team_observer` applies the narrower type.
 
         Args:
             observer: Observer implementing TeamManagementToolObserver protocol
@@ -193,19 +197,35 @@ class TeamTool(ToolCard):
             ValueError: If observer.orchestrator is None
         """
         super().observer(observer)  # store the observer weakly via the base setter
-        if observer.orchestrator is None:
+        team_observer = self._team_observer()
+        if team_observer.orchestrator is None:
             raise ValueError("TeamTool requires access to the orchestrator.")
 
-        self._orchestrator_proxy = observer.proxy_ask(observer.orchestrator, Orchestrator)
+        self._orchestrator_proxy = team_observer.proxy_ask(
+            team_observer.orchestrator, Orchestrator
+        )
         return self
 
-    def get_system_prompts(self) -> list[Callable]:
+    def _team_observer(self) -> TeamManagementToolObserver:
+        """Live observer typed as the team protocol. Raises once the agent stops.
+
+        Conformance is a documented precondition of :meth:`observer`, not a runtime
+        gate — observers are duck-typed, so a non-conforming one fails at first use
+        just as it did before.
+        """
+        return cast(TeamManagementToolObserver, self._observer)
+
+    def _team_observer_or_none(self) -> TeamManagementToolObserver | None:
+        """Live observer typed as the team protocol; ``None`` once the agent stops."""
+        return cast(TeamManagementToolObserver | None, self._observer_or_none())
+
+    def get_system_prompts(self) -> list[Callable[..., Any]]:
         """Get dynamic system prompts for team context.
 
         Returns:
             List of callable system prompts (roster and/or profiles)
         """
-        prompts: list[Callable] = []
+        prompts: list[Callable[..., Any]] = []
 
         gtr = _resolve(self.get_team_roster, GetTeamRoster)
         if gtr and SYSTEM_PROMPT in gtr.expose:
@@ -217,13 +237,13 @@ class TeamTool(ToolCard):
 
         return prompts
 
-    def get_tools(self) -> list[Callable]:
+    def get_tools(self) -> list[Callable[..., Any]]:
         """Get LLM-callable tools for team management.
 
         Returns:
             List of callable tools (hire_members and/or fire_members)
         """
-        tools: list[Callable] = []
+        tools: list[Callable[..., Any]] = []
 
         htm = _resolve(self.hire_team_members, HireTeamMember)
         if htm and TOOL_CALL in htm.expose:
@@ -235,13 +255,13 @@ class TeamTool(ToolCard):
 
         return tools
 
-    def get_commands(self) -> dict[type[BaseToolParam], Callable]:
+    def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
         """Get programmatic commands for inter-agent orchestration.
 
         Returns:
             Dict mapping param class to callable.
         """
-        commands: dict[type[BaseToolParam], Callable] = {}
+        commands: dict[type[BaseToolParam], Callable[..., Any]] = {}
 
         htm = _resolve(self.hire_team_members, HireTeamMember)
         if htm and COMMAND in htm.expose:
@@ -261,7 +281,7 @@ class TeamTool(ToolCard):
 
         return commands
 
-    def _hire_members_factory(self, params: HireTeamMember) -> Callable:
+    def _hire_members_factory(self, params: HireTeamMember) -> Callable[..., Any]:
         """Create hire_members tool callable.
 
         Args:
@@ -271,7 +291,7 @@ class TeamTool(ToolCard):
             Callable that hires team members
         """
         orchestrator_proxy = self._orchestrator_proxy
-        observer_or_none = self._observer_or_none  # bound method -> weak edge to agent
+        observer_or_none = self._team_observer_or_none  # bound method -> weak edge to agent
 
         def hire_members(roles: list[str]) -> str:
             """Hire multiple new team members with the given roles.
@@ -331,7 +351,7 @@ class TeamTool(ToolCard):
         hire_members.__doc__ = params.format_docstring(hire_members.__doc__)
         return hire_members
 
-    def _hire_member_command_factory(self, params: HireTeamMember) -> Callable:
+    def _hire_member_command_factory(self, params: HireTeamMember) -> Callable[..., Any]:
         """Create hire_member command callable.
 
         Args:
@@ -341,9 +361,9 @@ class TeamTool(ToolCard):
             Callable that hires a single team member
         """
         orchestrator_proxy = self._orchestrator_proxy
-        observer_or_none = self._observer_or_none  # bound method -> weak edge to agent
+        observer_or_none = self._team_observer_or_none  # bound method -> weak edge to agent
 
-        def hire_member(role: str, name: str | None = None):
+        def hire_member(role: str, name: str | None = None) -> ActorAddress:
             """Hire a single new team member with the given role.
 
             Creates a new agent actor with the specified role. If no name is
@@ -354,7 +374,7 @@ class TeamTool(ToolCard):
                 name: Optional specific name for the member
 
             Returns:
-                Tuple of (member_name, member_address)
+                Address of the newly hired member.
             """
             observer = observer_or_none()
             if observer is None:
@@ -364,7 +384,7 @@ class TeamTool(ToolCard):
 
         return hire_member
 
-    def _fire_members_factory(self, params: FireTeamMember) -> Callable:
+    def _fire_members_factory(self, params: FireTeamMember) -> Callable[..., Any]:
         """Create fire_members tool callable.
 
         Args:
@@ -374,7 +394,7 @@ class TeamTool(ToolCard):
             Callable that fires team members
         """
         orchestrator_proxy = self._orchestrator_proxy
-        observer_or_none = self._observer_or_none  # bound method -> weak edge to agent
+        observer_or_none = self._team_observer_or_none  # bound method -> weak edge to agent
 
         def fire_members(names: list[str]) -> str:
             """Fire multiple team members with the given names.
@@ -423,7 +443,7 @@ class TeamTool(ToolCard):
         fire_members.__doc__ = params.format_docstring(fire_members.__doc__)
         return fire_members
 
-    def _fire_member_command_factory(self, params: FireTeamMember) -> Callable:
+    def _fire_member_command_factory(self, params: FireTeamMember) -> Callable[..., Any]:
         """Create fire_member command callable.
 
         Args:
@@ -433,7 +453,7 @@ class TeamTool(ToolCard):
             Callable that fires a single team member
         """
         orchestrator_proxy = self._orchestrator_proxy
-        observer_or_none = self._observer_or_none  # bound method -> weak edge to agent
+        observer_or_none = self._team_observer_or_none  # bound method -> weak edge to agent
 
         def fire_member(name: str) -> str:
             """Fire a team member with the given name.
@@ -454,7 +474,7 @@ class TeamTool(ToolCard):
 
         return fire_member
 
-    def _team_roster_prompt_factory(self, params: GetTeamRoster) -> Callable:
+    def _team_roster_prompt_factory(self, params: GetTeamRoster) -> Callable[..., Any]:
         """Create team roster system prompt callable.
 
         Args:
@@ -464,7 +484,7 @@ class TeamTool(ToolCard):
             Callable that generates team roster prompt
         """
         orchestrator_proxy = self._orchestrator_proxy
-        observer_or_none = self._observer_or_none  # bound method -> weak edge to agent
+        observer_or_none = self._team_observer_or_none  # bound method -> weak edge to agent
 
         def team_members() -> str:
             """Get current team composition as context.
@@ -502,7 +522,7 @@ class TeamTool(ToolCard):
 
         return team_members
 
-    def _role_profiles_prompt_factory(self, params: GetRoleProfiles) -> Callable:
+    def _role_profiles_prompt_factory(self, params: GetRoleProfiles) -> Callable[..., Any]:
         """Create role profiles system prompt callable.
 
         Args:

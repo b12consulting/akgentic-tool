@@ -159,7 +159,7 @@ class DocumentReader(BaseModel):
             ImportError: If ``markitdown`` is not installed.
         """
         try:
-            from markitdown import MarkItDown  # type: ignore[import-not-found]
+            from markitdown import MarkItDown
         except ImportError as exc:
             raise ImportError(
                 'markitdown not installed. Run: pip install "akgentic-tool[docs]"'

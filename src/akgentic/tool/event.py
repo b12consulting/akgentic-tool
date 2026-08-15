@@ -15,7 +15,12 @@ if TYPE_CHECKING:
 # Defined as a ``TypeAlias`` so future stateful tools (e.g. ``VectorStoreStateEvent``)
 # can extend the union without touching ``ToolStateEvent``. Uses a string forward
 # reference to avoid the ``event.py → knowledge_graph.models`` import cycle.
-ToolStatePayload: TypeAlias = "KnowledgeGraphStateEvent"
+#
+# Not a PEP 695 ``type`` alias: those evaluate lazily in *this* module's scope, so
+# the ``model_rebuild(_types_namespace=...)`` in knowledge_graph/models.py — which is
+# what breaks the import cycle — can no longer supply the missing name, and building
+# ``ToolStateEvent`` fails with PydanticUndefinedAnnotation.
+ToolStatePayload: TypeAlias = "KnowledgeGraphStateEvent"  # noqa: UP040
 
 
 class ToolStateEvent(Message):

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable, Literal
+from collections.abc import Callable
+from typing import Any, Literal, cast
 
 from pydantic import Field
 
@@ -16,7 +17,7 @@ from akgentic.tool.core import (
     _resolve,
 )
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.event import ActorToolObserver
+from akgentic.tool.event import ActorToolObserver, ToolObserver
 from akgentic.tool.planning.planning_actor import (
     PlanActor,
     PlanConfig,
@@ -116,7 +117,7 @@ class PlanningTool(ToolCard):
     update_planning: UpdatePlanning | bool = True
     search_planning: SearchPlanning | bool = True
 
-    def observer(self, observer: ActorToolObserver) -> None:  # type: ignore[override]
+    def observer(self, observer: ToolObserver) -> PlanningTool:
         """Attach observer and set up the planning actor proxy.
 
         Assumes ``VectorStoreTool.observer()`` has already created the
@@ -124,13 +125,19 @@ class PlanningTool(ToolCard):
         ``ToolFactory`` topological sort via ``depends_on``). The
         ``PlanActor`` looks that actor up by name during its own ``on_start``.
 
-        Requires an ActorToolObserver for actor system access.
+        Requires an ActorToolObserver for actor system access; the parameter keeps
+        the base ``ToolObserver`` type so the override stays substitutable, and
+        :meth:`_actor_observer` applies the narrower type.
+
+        Raises:
+            ValueError: If observer.orchestrator is None.
         """
         super().observer(observer)  # store the observer weakly via the base setter
-        if observer.orchestrator is None:
+        actor_observer = self._actor_observer()
+        if actor_observer.orchestrator is None:
             raise ValueError("PlanningTool requires access to the orchestrator.")
 
-        orchestrator_proxy = observer.proxy_ask(observer.orchestrator, Orchestrator)
+        orchestrator_proxy = actor_observer.proxy_ask(actor_observer.orchestrator, Orchestrator)
 
         # Create/retrieve PlanActor singleton. VectorStoreActor creation is owned
         # by VectorStoreTool (depends_on enforces ordering).
@@ -146,16 +153,30 @@ class PlanningTool(ToolCard):
             ),
         )
 
-        self._planning_proxy = observer.proxy_ask(planning_tool_addr, PlanActor)
+        self._planning_proxy = actor_observer.proxy_ask(planning_tool_addr, PlanActor)
+        return self
 
-    def get_system_prompts(self) -> list[Callable]:
+    def _actor_observer(self) -> ActorToolObserver:
+        """Live observer typed as the actor protocol. Raises once the agent stops.
+
+        Conformance is a documented precondition of :meth:`observer`, not a runtime
+        gate — observers are duck-typed, so a non-conforming one fails at first use
+        just as it did before.
+        """
+        return cast(ActorToolObserver, self._observer)
+
+    def _actor_observer_or_none(self) -> ActorToolObserver | None:
+        """Live observer typed as the actor protocol; ``None`` once the agent stops."""
+        return cast(ActorToolObserver | None, self._observer_or_none())
+
+    def get_system_prompts(self) -> list[Callable[..., Any]]:
         gp = _resolve(self.get_planning, GetPlanning)
         if gp and SYSTEM_PROMPT in gp.expose:
             return [self._planning_prompt_factory(gp)]
         return []
 
-    def get_tools(self) -> list[Callable]:
-        tools: list[Callable] = []
+    def get_tools(self) -> list[Callable[..., Any]]:
+        tools: list[Callable[..., Any]] = []
 
         gp = _resolve(self.get_planning, GetPlanning)
         if gp and TOOL_CALL in gp.expose:
@@ -175,8 +196,8 @@ class PlanningTool(ToolCard):
 
         return tools
 
-    def get_commands(self) -> dict[type[BaseToolParam], Callable]:
-        commands: dict[type[BaseToolParam], Callable] = {}
+    def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
+        commands: dict[type[BaseToolParam], Callable[..., Any]] = {}
 
         gp = _resolve(self.get_planning, GetPlanning)
         if gp and COMMAND in gp.expose:
@@ -192,10 +213,10 @@ class PlanningTool(ToolCard):
 
         return commands
 
-    def _planning_prompt_factory(self, params: GetPlanning) -> Callable:
+    def _planning_prompt_factory(self, params: GetPlanning) -> Callable[..., Any]:
         planning_proxy = self._planning_proxy
         # Capture agent identity and filter setting at bind time — stable for actor's lifetime.
-        agent_name = self._observer.myAddress.name
+        agent_name = self._actor_observer().myAddress.name
         filter_by_agent = params.filter_by_agent
 
         def planning_summary() -> str:
@@ -262,7 +283,7 @@ class PlanningTool(ToolCard):
 
         return planning_summary
 
-    def _get_planning_task_factory(self, params: GetPlanningTask) -> Callable:
+    def _get_planning_task_factory(self, params: GetPlanningTask) -> Callable[..., Any]:
         planning_proxy = self._planning_proxy
 
         def get_planning_task(task_id: int) -> Task | str:
@@ -272,9 +293,9 @@ class PlanningTool(ToolCard):
         get_planning_task.__doc__ = params.format_docstring(get_planning_task.__doc__)
         return get_planning_task
 
-    def _update_planning_factory(self, params: UpdatePlanning) -> Callable:
+    def _update_planning_factory(self, params: UpdatePlanning) -> Callable[..., Any]:
         planning_proxy = self._planning_proxy
-        observer_or_none = self._observer_or_none  # bound method -> weak edge to agent
+        observer_or_none = self._actor_observer_or_none  # bound method -> weak edge to agent
 
         def update_planning(update: UpdatePlan) -> str:
             """Update team tasks (create, update, delete).
@@ -292,7 +313,7 @@ class PlanningTool(ToolCard):
         update_planning.__doc__ = params.format_docstring(update_planning.__doc__)
         return update_planning
 
-    def _search_planning_factory(self, params: SearchPlanning) -> Callable:
+    def _search_planning_factory(self, params: SearchPlanning) -> Callable[..., Any]:
         planning_proxy = self._planning_proxy
 
         def search_planning(

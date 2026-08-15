@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Callable, Literal
+from collections.abc import Callable
+from typing import Any, Literal
 
 from tavily import TavilyClient
 
@@ -64,9 +65,9 @@ class SearchTool(ToolCard):
     web_crawl: WebCrawl | bool = True
     web_fetch: WebFetch | bool = True
 
-    def get_tools(self) -> list[Callable]:
+    def get_tools(self) -> list[Callable[..., Any]]:
         _check_tavily_api_key()
-        tools: list[Callable] = []
+        tools: list[Callable[..., Any]] = []
         ws = _resolve(self.web_search, WebSearch)
         if ws and TOOL_CALL in ws.expose:
             tools.append(self._web_search_factory(ws))
@@ -78,7 +79,7 @@ class SearchTool(ToolCard):
             tools.append(self._web_fetch_factory(wf))
         return tools
 
-    def _web_search_factory(self, params: WebSearch) -> Callable:
+    def _web_search_factory(self, params: WebSearch) -> Callable[..., Any]:
         def web_search_tool(
             query: str,
             max_results: int = params.max_results,
@@ -127,7 +128,7 @@ class SearchTool(ToolCard):
         web_search_tool.__doc__ = params.format_docstring(web_search_tool.__doc__)
         return web_search_tool
 
-    def _web_fetch_factory(self, params: WebFetch) -> Callable:
+    def _web_fetch_factory(self, params: WebFetch) -> Callable[..., Any]:
         def web_fetch_tool(
             urls: list[str],
             timeout: float = params.timeout,
@@ -177,7 +178,7 @@ class SearchTool(ToolCard):
         web_fetch_tool.__doc__ = params.format_docstring(web_fetch_tool.__doc__)
         return web_fetch_tool
 
-    def _web_crawl_factory(self, params: WebCrawl) -> Callable:
+    def _web_crawl_factory(self, params: WebCrawl) -> Callable[..., Any]:
         def web_crawl_tool(
             url: str,
             timeout: float = params.timeout,

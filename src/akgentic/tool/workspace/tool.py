@@ -18,9 +18,10 @@ import io
 import re as _re
 import shutil
 import subprocess
+from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable
+from typing import Any, TypeVar
 
 from pydantic import PrivateAttr
 from pydantic_ai.messages import BinaryContent
@@ -32,6 +33,7 @@ from akgentic.tool.event import ActorToolObserver
 from akgentic.tool.workspace.edit import (
     EditItem,
     EditMatcher,
+    FilePatch,
     apply_file_patch,
     detect_line_ending,
     normalise_endings,
@@ -51,6 +53,9 @@ _PILLOW_FMT: dict[str, str] = {
     ".bmp": "BMP",
 }
 _PILLOW_WARN_EMITTED: bool = False  # guards the one-time Pillow-absent warning
+
+# Binds a capability's configuration field to the factory that consumes it.
+_ParamT = TypeVar("_ParamT", bound=BaseToolParam)
 
 
 class WorkspaceRead(BaseToolParam):
@@ -145,6 +150,103 @@ def _maybe_resize(data: bytes, suffix: str, max_dim: int, root: Path, path: str)
     resized = buf.getvalue()
     sidecar_path.write_bytes(resized)
     return resized
+
+
+def _read_text_for_edit(backend: Filesystem, path: str) -> str:
+    """Read a workspace file as UTF-8 text for editing.
+
+    Raises:
+        RetriableError: If the file does not exist — the LLM can retry with a
+            corrected path.
+    """
+    try:
+        return backend.read(path).decode("utf-8")
+    except FileNotFoundError:
+        raise RetriableError(f"File not found: {path}") from None
+
+
+def _substitute_edit(matcher: EditMatcher, content: str, item: EditItem) -> str | None:
+    """Apply one edit's substitution to *content*.
+
+    Returns:
+        The edited content, or ``None`` when ``old_string`` was not found — for
+        ``replace_all`` that means not found even once.
+    """
+    if not item.replace_all:
+        match = matcher.find(content, item.old_string)
+        if match is None:
+            return None
+        return content[: match.start] + item.new_string + content[match.end :]
+
+    result = content
+    found_any = False
+    while (match := matcher.find(result, item.old_string)) is not None:
+        found_any = True
+        result = result[: match.start] + item.new_string + result[match.end :]
+    return result if found_any else None
+
+
+def _write_and_diff(backend: Filesystem, path: str, raw: str, edited: str) -> str:
+    """Write *edited* back to *path* with *raw*'s line endings; return the unified diff.
+
+    Returns an empty string when the edit changed nothing.
+    """
+    normalised = normalise_endings(edited, detect_line_ending(raw))
+    backend.write(path, normalised.encode("utf-8"))
+    return "\n".join(
+        difflib.unified_diff(
+            raw.splitlines(),
+            normalised.splitlines(),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+            lineterm="",
+        )
+    )
+
+
+def _deleted_paths(patch_text: str) -> set[str]:
+    """Return the paths a patch deletes, read from the raw diff text.
+
+    ``parse_patch`` derives each path from the ``+++`` line, which is ``/dev/null``
+    for a deletion — so the real path must come from the preceding ``--- a/<path>``
+    line here.
+    """
+    delete_paths: set[str] = set()
+    lines = patch_text.splitlines()
+    for i, line in enumerate(lines):
+        if not (line.startswith("+++ /dev/null") or line.startswith("+++ b//dev/null")):
+            continue
+        for j in range(i - 1, max(i - 5, -1), -1):
+            if lines[j].startswith("--- "):
+                raw_del = lines[j][4:].strip()
+                del_path = raw_del[2:] if raw_del.startswith("a/") else raw_del
+                if del_path != "/dev/null":
+                    delete_paths.add(del_path)
+                break
+    return delete_paths
+
+
+def _apply_one_file_patch(
+    backend: Filesystem, file_patch: FilePatch, delete_paths: set[str]
+) -> list[str]:
+    """Apply a single file patch and return its summary lines.
+
+    A ``/dev/null`` target is a deletion batch: every path in *delete_paths* is
+    removed. Otherwise the patch is applied and labelled ``created`` when all its
+    hunk lines are additions, ``updated`` when not.
+    """
+    if file_patch.path == "/dev/null":
+        results = []
+        for del_path in delete_paths:
+            backend.delete(del_path)
+            results.append(f"deleted: {del_path}")
+        return results
+
+    apply_file_patch(backend, file_patch)
+    is_add = bool(file_patch.hunks) and all(
+        all(pl.startswith("+") for pl in hunk.lines if pl) for hunk in file_patch.hunks
+    )
+    return [f"{'created' if is_add else 'updated'}: {file_patch.path}"]
 
 
 def _grep_python(
@@ -451,7 +553,7 @@ class WorkspaceTool(ToolCard):
 
     def observer(  # type: ignore[override]
         self, observer: ActorToolObserver
-    ) -> "WorkspaceTool":
+    ) -> WorkspaceTool:
         """Attach observer and initialise the workspace backend.
 
         Args:
@@ -503,44 +605,51 @@ class WorkspaceTool(ToolCard):
         Returns:
             List of callables for all enabled capabilities.
         """
-        tools: list[Callable[..., Any]] = []
-        # Read tools — always included (regardless of read_only)
-        pr = _resolve(self.workspace_read, WorkspaceRead)
-        if pr is not None and TOOL_CALL in pr.expose:
-            tools.append(self._read_factory(pr))
-        pl = _resolve(self.workspace_list, WorkspaceList)
-        if pl is not None and TOOL_CALL in pl.expose:
-            tools.append(self._list_factory(pl))
-        pg = _resolve(self.workspace_glob, WorkspaceGlob)
-        if pg is not None and TOOL_CALL in pg.expose:
-            tools.append(self._glob_factory(pg))
-        pgr = _resolve(self.workspace_grep, WorkspaceGrep)
-        if pgr is not None and TOOL_CALL in pgr.expose:
-            tools.append(self._grep_factory(pgr))
-        vw = _resolve(self.workspace_view, WorkspaceView)
-        if vw is not None and TOOL_CALL in vw.expose:
-            tools.append(self._view_factory(vw))
-        # Write tools — only when not read_only
+        tools = self._read_tools()
         if not self.read_only:
-            pw = _resolve(self.workspace_write, WorkspaceWrite)
-            if pw is not None and TOOL_CALL in pw.expose:
-                tools.append(self._write_factory(pw))
-            pd = _resolve(self.workspace_delete, WorkspaceDelete)
-            if pd is not None and TOOL_CALL in pd.expose:
-                tools.append(self._delete_factory(pd))
-            pe = _resolve(self.workspace_edit, WorkspaceEdit)
-            if pe is not None and TOOL_CALL in pe.expose:
-                tools.append(self._edit_factory(pe))
-            pme = _resolve(self.workspace_multi_edit, WorkspaceMultiEdit)
-            if pme is not None and TOOL_CALL in pme.expose:
-                tools.append(self._multi_edit_factory(pme))
-            pp = _resolve(self.workspace_patch, WorkspacePatch)
-            if pp is not None and TOOL_CALL in pp.expose:
-                tools.append(self._patch_factory(pp))
-            pm = _resolve(self.workspace_mkdir, WorkspaceMkdir)
-            if pm is not None and TOOL_CALL in pm.expose:
-                tools.append(self._mkdir_factory(pm))
+            tools += self._write_tools()
         return tools
+
+    def _read_tools(self) -> list[Callable[..., Any]]:
+        """Return enabled read-side callables — included regardless of ``read_only``."""
+        candidates = [
+            self._tool_if_enabled(self.workspace_read, WorkspaceRead, self._read_factory),
+            self._tool_if_enabled(self.workspace_list, WorkspaceList, self._list_factory),
+            self._tool_if_enabled(self.workspace_glob, WorkspaceGlob, self._glob_factory),
+            self._tool_if_enabled(self.workspace_grep, WorkspaceGrep, self._grep_factory),
+            self._tool_if_enabled(self.workspace_view, WorkspaceView, self._view_factory),
+        ]
+        return [tool for tool in candidates if tool is not None]
+
+    def _write_tools(self) -> list[Callable[..., Any]]:
+        """Return enabled write-side callables — omitted entirely when ``read_only``."""
+        candidates = [
+            self._tool_if_enabled(self.workspace_write, WorkspaceWrite, self._write_factory),
+            self._tool_if_enabled(self.workspace_delete, WorkspaceDelete, self._delete_factory),
+            self._tool_if_enabled(self.workspace_edit, WorkspaceEdit, self._edit_factory),
+            self._tool_if_enabled(
+                self.workspace_multi_edit, WorkspaceMultiEdit, self._multi_edit_factory
+            ),
+            self._tool_if_enabled(self.workspace_patch, WorkspacePatch, self._patch_factory),
+            self._tool_if_enabled(self.workspace_mkdir, WorkspaceMkdir, self._mkdir_factory),
+        ]
+        return [tool for tool in candidates if tool is not None]
+
+    @staticmethod
+    def _tool_if_enabled(
+        value: _ParamT | bool,
+        param_cls: type[_ParamT],
+        factory: Callable[[_ParamT], Callable[..., Any]],
+    ) -> Callable[..., Any] | None:
+        """Build a capability's callable, or ``None`` when it is off the TOOL_CALL channel.
+
+        Pairs the configuration field with the factory that consumes it, so the type
+        checker verifies each row of :meth:`_read_tools` / :meth:`_write_tools`.
+        """
+        params = _resolve(value, param_cls)
+        if params is None or TOOL_CALL not in params.expose:
+            return None
+        return factory(params)
 
     def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
         """Return COMMAND-channel capabilities for this tool.
@@ -1130,48 +1239,13 @@ class WorkspaceTool(ToolCard):
             try:
                 all_diffs: list[str] = []
                 for item in edits:
-                    try:
-                        raw = backend.read(item.path).decode("utf-8")
-                    except FileNotFoundError:
-                        raise RetriableError(f"File not found: {item.path}")
-                    line_ending = detect_line_ending(raw)
-                    content = raw
-
-                    if item.replace_all:
-                        new_content = content
-                        found_any = False
-                        while True:
-                            match = matcher.find(new_content, item.old_string)
-                            if match is None:
-                                break
-                            found_any = True
-                            new_content = (
-                                new_content[: match.start]
-                                + item.new_string
-                                + new_content[match.end :]
-                            )
-                        if not found_any:
-                            return f"[ERROR] old_string not found in {item.path}"
-                        content = new_content
-                    else:
-                        match = matcher.find(content, item.old_string)
-                        if match is None:
-                            return f"[ERROR] old_string not found in {item.path}"
-                        content = content[: match.start] + item.new_string + content[match.end :]
-
-                    normalised = normalise_endings(content, line_ending)
-                    backend.write(item.path, normalised.encode("utf-8"))
-                    diff_lines = list(
-                        difflib.unified_diff(
-                            raw.splitlines(),
-                            normalised.splitlines(),
-                            fromfile=f"a/{item.path}",
-                            tofile=f"b/{item.path}",
-                            lineterm="",
-                        )
-                    )
-                    if diff_lines:
-                        all_diffs.append("\n".join(diff_lines))
+                    raw = _read_text_for_edit(backend, item.path)
+                    edited = _substitute_edit(matcher, raw, item)
+                    if edited is None:
+                        return f"[ERROR] old_string not found in {item.path}"
+                    diff = _write_and_diff(backend, item.path, raw, edited)
+                    if diff:
+                        all_diffs.append(diff)
 
                 return "\n".join(all_diffs) if all_diffs else "(no changes applied)"
             except PermissionError:
@@ -1207,38 +1281,12 @@ class WorkspaceTool(ToolCard):
                 RetriableError: If any path escapes the workspace root.
             """
             try:
-                file_patches = parse_patch(patch_text)
+                delete_paths = _deleted_paths(patch_text)
                 results: list[str] = []
 
-                # parse_patch derives path from +++ line; for delete patches (+++ /dev/null)
-                # we must extract the real path from the --- a/<path> line in the raw text.
-                delete_paths: set[str] = set()
-                lines = patch_text.splitlines()
-                for i, line in enumerate(lines):
-                    if line.startswith("+++ /dev/null") or line.startswith("+++ b//dev/null"):
-                        for j in range(i - 1, max(i - 5, -1), -1):
-                            if lines[j].startswith("--- "):
-                                raw_del = lines[j][4:].strip()
-                                del_path = raw_del[2:] if raw_del.startswith("a/") else raw_del
-                                if del_path != "/dev/null":
-                                    delete_paths.add(del_path)
-                                break
-
-                for fp in file_patches:
+                for fp in parse_patch(patch_text):
                     try:
-                        if fp.path == "/dev/null":
-                            for del_path in delete_paths:
-                                backend.delete(del_path)
-                                results.append(f"deleted: {del_path}")
-                        else:
-                            apply_file_patch(backend, fp)
-                            is_add = bool(fp.hunks) and all(
-                                all(pl.startswith("+") for pl in h.lines if pl) for h in fp.hunks
-                            )
-                            if is_add:
-                                results.append(f"created: {fp.path}")
-                            else:
-                                results.append(f"updated: {fp.path}")
+                        results += _apply_one_file_patch(backend, fp, delete_paths)
                     except Exception as exc:
                         return f"[ERROR] {fp.path}: {exc}"
 

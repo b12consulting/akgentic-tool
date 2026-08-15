@@ -13,9 +13,10 @@ import warnings
 import weakref
 from abc import ABC, abstractmethod
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Callable, TypeVar, get_type_hints
+from typing import Any, TypeVar, get_type_hints
 
 from pydantic import PrivateAttr, TypeAdapter
 
@@ -143,6 +144,12 @@ class ToolCard(SerializableBaseModel, ABC):
         The observer is stored through a ``weakref`` so a tool, its closures, and
         its command registry can never pin a stopped owning agent in memory.
 
+        Subclasses requiring a richer observer (``ActorToolObserver``,
+        ``TeamManagementToolObserver``) keep this parameter type and narrow the
+        stored observer in their own accessor — ``ToolFactory`` attaches one
+        observer to every card uniformly, so narrowing the parameter here would
+        violate the Liskov substitution principle.
+
         Args:
             observer: Optional observer for tool call events.
 
@@ -169,22 +176,23 @@ class ToolCard(SerializableBaseModel, ABC):
         """Return the live observer, or ``None`` if unset or already collected."""
         return self._observer_ref() if self._observer_ref is not None else None
 
+
     @abstractmethod
-    def get_tools(self) -> list[Callable]:
+    def get_tools(self) -> list[Callable[..., Any]]:
         """Return callable tool functions for LLM agents.
 
         Use ``self._observer`` when tool callables need to emit events.
         """
         ...
 
-    def get_system_prompts(self) -> list[Callable]:
+    def get_system_prompts(self) -> list[Callable[..., Any]]:
         """Return system prompt callables injected into LLM context.
 
         Use ``self._observer`` when prompts need runtime data.
         """
         return []
 
-    def get_commands(self) -> dict[type["BaseToolParam"], Callable]:
+    def get_commands(self) -> dict[type["BaseToolParam"], Callable[..., Any]]:
         """Return callable commands for programmatic invocation.
 
         Commands are methods exposed for inter-agent orchestration
@@ -232,7 +240,23 @@ def _topological_sort(cards: list[ToolCard]) -> list[ToolCard]:
     # relationships are at the class level, not per-instance.
     by_name: dict[str, ToolCard] = {type(card).__name__: card for card in cards}
 
-    # Validate every declared dependency is present.
+    _validate_dependencies_present(cards, by_name)
+    in_degree, dependents = _build_dependency_graph(by_name)
+    ordered_names = _kahn_order(cards, in_degree, dependents)
+
+    if len(ordered_names) < len(by_name):
+        remaining = sorted(set(by_name) - set(ordered_names))
+        raise ValueError(f"ToolCard dependency cycle detected: {remaining}")
+
+    return _expand_names_to_instances(cards, ordered_names)
+
+
+def _validate_dependencies_present(cards: list[ToolCard], by_name: dict[str, ToolCard]) -> None:
+    """Fail fast if any card declares a dependency absent from the card list.
+
+    Raises:
+        ValueError: Naming both the dependent card and the missing class.
+    """
     for card in cards:
         for dep in card.depends_on:
             if dep not in by_name:
@@ -240,18 +264,36 @@ def _topological_sort(cards: list[ToolCard]) -> list[ToolCard]:
                     f"{type(card).__name__} depends on {dep} but it was not found in the tool list"
                 )
 
-    # Build in-degree map keyed by class name (not instance — duplicates collapse).
-    in_degree: dict[str, int] = {name: 0 for name in by_name}
-    # Reverse adjacency: dep_name → list of class names that depend on it.
+
+def _build_dependency_graph(
+    by_name: dict[str, ToolCard],
+) -> tuple[dict[str, int], dict[str, list[str]]]:
+    """Return ``(in_degree, dependents)`` keyed by class name.
+
+    Both maps are keyed by class name rather than instance, so duplicate class
+    names collapse to a single node — dependencies are class-level.
+    """
+    in_degree: dict[str, int] = dict.fromkeys(by_name, 0)
     dependents: dict[str, list[str]] = {name: [] for name in by_name}
     for name, card in by_name.items():
         for dep in card.depends_on:
             in_degree[name] += 1
             dependents[dep].append(name)
+    return in_degree, dependents
 
-    # Seed the queue with zero-in-degree names in the order they appeared in
-    # the input (FIFO → deterministic for the same input). We iterate cards to
-    # preserve input order, skipping duplicates.
+
+def _kahn_order(
+    cards: list[ToolCard],
+    in_degree: dict[str, int],
+    dependents: dict[str, list[str]],
+) -> list[str]:
+    """Return class names in dependency order via Kahn's algorithm.
+
+    The queue is seeded with zero-in-degree names in input order (FIFO ⇒
+    deterministic for the same input), so independent nodes keep their relative
+    position. ``in_degree`` is consumed in place. A shorter-than-expected result
+    means a cycle; the caller reports it.
+    """
     queue: deque[str] = deque()
     seen: set[str] = set()
     for card in cards:
@@ -270,21 +312,19 @@ def _topological_sort(cards: list[ToolCard]) -> list[ToolCard]:
             in_degree[dependent] -= 1
             if in_degree[dependent] == 0:
                 queue.append(dependent)
+    return ordered_names
 
-    if len(ordered_names) < len(by_name):
-        remaining = sorted(set(by_name) - set(ordered_names))
-        raise ValueError(f"ToolCard dependency cycle detected: {remaining}")
 
-    # Map sorted names back to ToolCard instances. Preserve input order for
-    # duplicate class names: emit instances in the order they appeared in the
-    # input, grouped by their class's position in the sorted name order.
-    by_name_instances: dict[str, list[ToolCard]] = {name: [] for name in by_name}
+def _expand_names_to_instances(cards: list[ToolCard], ordered_names: list[str]) -> list[ToolCard]:
+    """Map sorted class names back to instances, preserving input order per class.
+
+    Duplicate class names emit their instances in the order they appeared in the
+    input, grouped by that class's position in ``ordered_names``.
+    """
+    by_name_instances: dict[str, list[ToolCard]] = {}
     for card in cards:
-        by_name_instances[type(card).__name__].append(card)
-    ordered: list[ToolCard] = []
-    for name in ordered_names:
-        ordered.extend(by_name_instances[name])
-    return ordered
+        by_name_instances.setdefault(type(card).__name__, []).append(card)
+    return [card for name in ordered_names for card in by_name_instances[name]]
 
 
 @dataclass(frozen=True)
@@ -299,7 +339,7 @@ class _CommandArgSpec:
     name: str
     annotation: Any
     required: bool
-    adapter: TypeAdapter
+    adapter: TypeAdapter[Any]
 
 
 @dataclass(frozen=True)
@@ -312,7 +352,7 @@ class _CommandEntry:
     """
 
     name: str
-    fn: Callable
+    fn: Callable[..., Any]
     args: tuple[_CommandArgSpec, ...]
     tool_card: str
 
@@ -333,10 +373,11 @@ def _json_type_name(annotation: Any) -> str:
         schema = TypeAdapter(annotation).json_schema()
     except Exception:
         return "string"
-    return schema.get("type", "string")
+    type_name = schema.get("type", "string")
+    return type_name if isinstance(type_name, str) else "string"
 
 
-def _build_command_entry(fn: Callable, tool_card: str) -> _CommandEntry:
+def _build_command_entry(fn: Callable[..., Any], tool_card: str) -> _CommandEntry:
     """Derive a per-command arg model + ordered metadata from a callable signature.
 
     Mirrors how pydantic-ai derives a tool schema from a function signature:
@@ -409,7 +450,7 @@ class CommandRegistry:
         """Return ``True`` if a command named *name* is registered."""
         return name in self._entries
 
-    def callable(self, name: str) -> Callable:
+    def callable(self, name: str) -> Callable[..., Any]:
         """Return the bound, typed command callable for programmatic invocation.
 
         The returned callable preserves its **native** (non-stringified) return
@@ -607,13 +648,13 @@ class ToolFactory:
             for card in self.tool_cards:
                 card.observer(self.observer)
 
-    def _wrap_with_retry(self, fn: Callable) -> Callable:
+    def _wrap_with_retry(self, fn: Callable[..., Any]) -> Callable[..., Any]:
         """Wrap a tool callable to convert ``RetriableError`` into retry_exception."""
         assert self._retry_exception is not None
         retry_exc = self._retry_exception
 
         @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
             try:
                 return fn(*args, **kwargs)
             except RetriableError as e:
@@ -621,18 +662,18 @@ class ToolFactory:
 
         return wrapper
 
-    def get_tools(self) -> list[Callable]:
+    def get_tools(self) -> list[Callable[..., Any]]:
         """Return tool callables aggregated from all tool cards."""
         tools = [t for card in self.tool_cards for t in card.get_tools()]
         if self._retry_exception is not None:
             tools = [self._wrap_with_retry(t) for t in tools]
         return tools
 
-    def get_system_prompts(self) -> list[Callable]:
+    def get_system_prompts(self) -> list[Callable[..., Any]]:
         """Return system prompt callables aggregated from all tool cards."""
         return [p for card in self.tool_cards for p in card.get_system_prompts()]
 
-    def get_commands(self) -> dict[type[BaseToolParam], Callable]:
+    def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
         """Return command callables aggregated from all tool cards.
 
         Deprecated:
@@ -648,7 +689,7 @@ class ToolFactory:
             DeprecationWarning,
             stacklevel=2,
         )
-        commands: dict[type[BaseToolParam], Callable] = {}
+        commands: dict[type[BaseToolParam], Callable[..., Any]] = {}
         for card in self.tool_cards:
             commands.update(card.get_commands())
 

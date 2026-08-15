@@ -260,6 +260,91 @@ class EditItem(BaseModel):
 _HUNK_HEADER: re.Pattern[str] = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
+def _parse_hunk_header(line: str) -> tuple[int, int, int, int] | None:
+    """Parse an ``@@ -a,b +c,d @@`` header into ``(old_start, old_count, new_start,
+    new_count)``, or ``None`` when *line* is not a hunk header. Omitted counts default to 1.
+    """
+    match = _HUNK_HEADER.match(line)
+    if match is None:
+        return None
+    return (
+        int(match.group(1)),
+        int(match.group(2)) if match.group(2) is not None else 1,
+        int(match.group(3)),
+        int(match.group(4)) if match.group(4) is not None else 1,
+    )
+
+
+class _PatchParser:
+    """Line-at-a-time parser accumulating one :class:`FilePatch` per ``+++`` header.
+
+    Holds the partial file/hunk state as attributes so each diff construct gets its
+    own named transition instead of a closure over shared locals.
+    """
+
+    def __init__(self) -> None:
+        """Start with no accumulated patches and no file in progress."""
+        self.patches: list[FilePatch] = []
+        self._path: str | None = None
+        self._hunks: list[Hunk] = []
+        self._hunk_lines: list[str] = []
+        self._hunk_header: tuple[int, int, int, int] | None = None
+
+    def feed(self, line: str) -> None:
+        """Consume one diff line, dispatching to the matching transition."""
+        if line.startswith("+++ "):
+            self._start_file(line)
+        elif line.startswith("--- "):
+            return  # skip --- lines; path is taken from the +++ line
+        elif (header := _parse_hunk_header(line)) is not None:
+            self._start_hunk(header)
+        elif self._hunk_header is not None and line[:1] in ("+", "-", " "):
+            self._hunk_lines.append(line)
+
+    def finish(self) -> list[FilePatch]:
+        """Close off the file in progress and return every parsed patch."""
+        self._flush_file()
+        return self.patches
+
+    def _start_file(self, line: str) -> None:
+        """Close the previous file and begin one for the ``+++`` path on *line*."""
+        self._flush_file()
+        raw_path = line[4:].strip()
+        self._path = raw_path[2:] if raw_path.startswith("b/") else raw_path
+        self._hunks = []
+        self._hunk_lines = []
+        self._hunk_header = None
+
+    def _start_hunk(self, header: tuple[int, int, int, int]) -> None:
+        """Close the previous hunk, if any, and begin one under *header*."""
+        if self._hunk_header is not None:
+            self._flush_hunk()
+            self._hunk_lines = []
+        self._hunk_header = header
+
+    def _flush_hunk(self) -> None:
+        """Append the hunk in progress to the current file's hunk list."""
+        if self._hunk_header is None:
+            return
+        old_start, old_count, new_start, new_count = self._hunk_header
+        self._hunks.append(
+            Hunk(
+                old_start=old_start,
+                old_count=old_count,
+                new_start=new_start,
+                new_count=new_count,
+                lines=list(self._hunk_lines),
+            )
+        )
+
+    def _flush_file(self) -> None:
+        """Append the file in progress, with its final hunk, to ``patches``."""
+        if self._path is None:
+            return
+        self._flush_hunk()
+        self.patches.append(FilePatch(path=self._path, hunks=list(self._hunks)))
+
+
 def parse_patch(patch_text: str) -> list[FilePatch]:
     """Parse a GNU unified diff string into a list of FilePatch objects.
 
@@ -267,64 +352,13 @@ def parse_patch(patch_text: str) -> list[FilePatch]:
     or ``+++ /dev/null`` are preserved in the path field as-is; consumers
     must handle the sentinel.
     """
-    patches: list[FilePatch] = []
-    current_path: str | None = None
-    current_hunks: list[Hunk] = []
-    current_hunk_lines: list[str] = []
-    current_hunk_header: tuple[int, int, int, int] | None = None
-
-    def _flush_hunk() -> None:
-        nonlocal current_hunk_lines, current_hunk_header
-        if current_hunk_header is not None:
-            os_, oc_, ns_, nc_ = current_hunk_header
-            current_hunks.append(
-                Hunk(
-                    old_start=os_,
-                    old_count=oc_,
-                    new_start=ns_,
-                    new_count=nc_,
-                    lines=list(current_hunk_lines),
-                )
-            )
-
-    def _flush_patch() -> None:
-        nonlocal current_path, current_hunks, current_hunk_lines, current_hunk_header
-        if current_path is not None:
-            _flush_hunk()
-            patches.append(FilePatch(path=current_path, hunks=list(current_hunks)))
-
+    parser = _PatchParser()
     for line in patch_text.splitlines():
-        if line.startswith("+++ "):
-            _flush_patch()  # save previous file patch if any
-            # path is after "+++ " prefix, strip optional "b/" git prefix
-            raw_path = line[4:].strip()
-            current_path = raw_path[2:] if raw_path.startswith("b/") else raw_path
-            current_hunks = []
-            current_hunk_lines = []
-            current_hunk_header = None
-        elif line.startswith("--- "):
-            continue  # skip --- lines; path taken from +++ line
-        else:
-            m = _HUNK_HEADER.match(line)
-            if m:
-                if current_hunk_header is not None:
-                    _flush_hunk()
-                    current_hunk_lines = []
-                os_ = int(m.group(1))
-                oc_ = int(m.group(2)) if m.group(2) is not None else 1
-                ns_ = int(m.group(3))
-                nc_ = int(m.group(4)) if m.group(4) is not None else 1
-                current_hunk_header = (os_, oc_, ns_, nc_)
-            elif current_hunk_header is not None and (
-                line.startswith("+") or line.startswith("-") or line.startswith(" ")
-            ):
-                current_hunk_lines.append(line)
-
-    _flush_patch()
-    return patches
+        parser.feed(line)
+    return parser.finish()
 
 
-def apply_file_patch(workspace: "Workspace", file_patch: FilePatch) -> None:
+def apply_file_patch(workspace: Workspace, file_patch: FilePatch) -> None:
     """Read a workspace file, apply all hunks, write result back.
 
     Handles add (path="new_file", all hunks are additions),

@@ -7,7 +7,8 @@ import platform
 import shutil
 import subprocess
 import warnings
-from typing import Any, Callable, Literal
+from collections.abc import Callable
+from typing import Any, Literal
 
 from pydantic import PrivateAttr
 
@@ -116,7 +117,7 @@ class ExecTool(ToolCard):
 
     _sandbox_proxy: SandboxActor | None = PrivateAttr(default=None)
 
-    def observer(self, observer: ActorToolObserver) -> "ExecTool":  # type: ignore[override]
+    def observer(self, observer: ActorToolObserver) -> ExecTool:  # type: ignore[override]
         """Attach observer and set up the sandbox actor proxy.
 
         Resolves ``SANDBOX_ACTOR_CLASSES[self.mode]`` at call time (not import
