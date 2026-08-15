@@ -198,7 +198,7 @@ class ToolCard(SerializableBaseModel, ABC):
         return {}
 
     def get_toolsets(self) -> list[Any]:
-        """Return runtime toolset objects (e.g., MCP servers)."""
+        """Return runtime pydantic-ai toolset objects (e.g., an ``MCPToolset``)."""
         return []
 
 

@@ -44,6 +44,7 @@ jobs:
         run: >
           uv run --no-sync pytest tests/
           --cov=akgentic.tool
+          --cov-branch
           --cov-report=term-missing
           --cov-report=json:coverage.json
           --cov-fail-under=80
