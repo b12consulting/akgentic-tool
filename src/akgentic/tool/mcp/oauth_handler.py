@@ -84,7 +84,7 @@ def parse_www_authenticate_header(header_value: str) -> dict[str, str]:
 async def handle_mcp_oauth_flow(
     auth_url: str,
     callback_port: int = 8765,
-    timeout: float = 300.0,
+    auth_timeout: float = 300.0,
 ) -> str:
     """Handle OAuth flow for MCP server authentication.
 
@@ -97,13 +97,13 @@ async def handle_mcp_oauth_flow(
     Args:
         auth_url: OAuth authorization URL from WWW-Authenticate header
         callback_port: Port for local OAuth callback server
-        timeout: Maximum time to wait for OAuth callback
+        auth_timeout: Maximum time to wait for the user to complete the browser flow
 
     Returns:
         Access token or authorization code
 
     Raises:
-        TimeoutError: If OAuth flow does not complete within timeout
+        TimeoutError: If OAuth flow does not complete within auth_timeout
         ValueError: If OAuth flow fails or is cancelled
     """
     # Reset class variables
@@ -118,11 +118,17 @@ async def handle_mcp_oauth_flow(
         separator = "&" if parsed_auth_url.query else "?"
         auth_url = f"{auth_url}{separator}redirect_uri={callback_url}"
 
-    # Start local HTTP server in a separate thread
+    # Start local HTTP server in a separate thread. The thread signals completion
+    # through the event loop rather than the async side polling a class variable.
     server = HTTPServer(("localhost", callback_port), OAuthCallbackHandler)
+    loop = asyncio.get_running_loop()
+    callback_handled = asyncio.Event()
 
     def run_server() -> None:
-        server.handle_request()  # Handle only one request
+        try:
+            server.handle_request()  # Handle only one request
+        finally:
+            loop.call_soon_threadsafe(callback_handled.set)
 
     server_thread = Thread(target=run_server, daemon=True)
     server_thread.start()
@@ -138,15 +144,17 @@ async def handle_mcp_oauth_flow(
     # Open browser for authorization
     webbrowser.open(auth_url)
 
-    # Wait for callback with timeout
-    start_time = asyncio.get_event_loop().time()
-    while OAuthCallbackHandler.auth_code is None:
-        if asyncio.get_event_loop().time() - start_time > timeout:
-            server.server_close()
-            raise TimeoutError(f"OAuth authentication timed out after {timeout} seconds")
-        await asyncio.sleep(0.5)
-
-    server.server_close()
+    # Wait for the browser callback. asyncio.timeout owns the deadline so the wait
+    # is cancellation-correct and the server socket is closed on every exit path.
+    try:
+        async with asyncio.timeout(auth_timeout):
+            await callback_handled.wait()
+    except TimeoutError:
+        raise TimeoutError(
+            f"OAuth authentication timed out after {auth_timeout} seconds"
+        ) from None
+    finally:
+        server.server_close()
 
     if OAuthCallbackHandler.auth_code is None:
         raise ValueError("OAuth flow failed: No authorization code received")
@@ -162,7 +170,7 @@ async def probe_mcp_with_oauth(
     url: str,
     bearer_token: str | None = None,
     callback_port: int = 8765,
-    timeout: float = 10.0,
+    http_timeout: float = 10.0,
 ) -> tuple[bool, str | None]:
     """Probe an MCP endpoint and handle OAuth if required.
 
@@ -170,7 +178,7 @@ async def probe_mcp_with_oauth(
         url: MCP endpoint URL
         bearer_token: Optional existing bearer token
         callback_port: Port for OAuth callback server
-        timeout: Connection timeout
+        http_timeout: Per-request HTTP connection timeout
 
     Returns:
         Tuple of (requires_oauth, auth_url_or_none)
@@ -185,7 +193,7 @@ async def probe_mcp_with_oauth(
     if bearer_token:
         headers["Authorization"] = f"Bearer {bearer_token}"
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=http_timeout) as client:
         try:
             response = await client.post(url, headers=headers or None)
             response.raise_for_status()
@@ -215,7 +223,7 @@ async def get_mcp_token_with_oauth_if_needed(
     url: str,
     bearer_token: str | None = None,
     callback_port: int = 8765,
-    timeout: float = 10.0,
+    http_timeout: float = 10.0,
     oauth_timeout: float = 300.0,
 ) -> str | None:
     """Get or refresh MCP token, handling OAuth flow if needed.
@@ -224,7 +232,7 @@ async def get_mcp_token_with_oauth_if_needed(
         url: MCP endpoint URL
         bearer_token: Optional existing bearer token
         callback_port: Port for OAuth callback server
-        timeout: Connection timeout
+        http_timeout: Per-request HTTP connection timeout
         oauth_timeout: OAuth flow timeout
 
     Returns:
@@ -236,7 +244,9 @@ async def get_mcp_token_with_oauth_if_needed(
         ...     bearer_token=os.getenv("FIGMA_TOKEN"),
         ... )
     """
-    requires_oauth, auth_url = await probe_mcp_with_oauth(url, bearer_token, callback_port, timeout)
+    requires_oauth, auth_url = await probe_mcp_with_oauth(
+        url, bearer_token, callback_port, http_timeout
+    )
 
     if not requires_oauth:
         return bearer_token

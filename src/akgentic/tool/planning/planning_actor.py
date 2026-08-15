@@ -7,7 +7,9 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 from akgentic.core.actor_address import ActorAddress
-from akgentic.core.agent import Akgent, BaseConfig, BaseState
+from akgentic.core.agent import Akgent
+from akgentic.core.agent_config import BaseConfig
+from akgentic.core.agent_state import BaseState
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.errors import RetriableError
@@ -307,92 +309,127 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
             for hits found by both keyword and semantic.
             When all parameters are None, returns the full task list (unscored).
         """
+        tasks: list[Task] = list(self.state.task_list)
+        scores: dict[int, tuple[float, str]] = {}
+
+        # Query phase: build the candidate set, then intersect with the AND filters.
+        if query is not None:
+            scores = self._score_query_matches(tasks, query, mode, top_k, score_threshold)
+            tasks = [t for t in tasks if t.id in scores]
+
+        tasks = self._apply_task_filters(tasks, status, owner, creator)
+
+        if query is not None:
+            tasks.sort(key=lambda t: scores.get(t.id, (0.0, ""))[0], reverse=True)
+
+        return [self._format_task_line(t, scores) for t in tasks]
+
+    def _score_query_matches(
+        self,
+        tasks: list[Task],
+        query: str,
+        mode: Literal["hybrid", "vector", "keyword"],
+        top_k: int | None,
+        score_threshold: float | None,
+    ) -> dict[int, tuple[float, str]]:
+        """Return ``{task_id: (score, label)}`` for tasks matching *query*.
+
+        Runs the keyword phase, the semantic phase, or both per *mode*. Tasks hit
+        by both are merged under a ``hybrid`` label with the higher score.
+        """
+        scores: dict[int, tuple[float, str]] = {}
+
+        if mode in ("hybrid", "keyword"):
+            q_lower = query.lower()
+            for task in tasks:
+                if q_lower in task.description.lower():
+                    scores[task.id] = (1.0, "keyword match")
+
+        if mode in ("hybrid", "vector"):
+            self._merge_semantic_scores(scores, query, mode, top_k, score_threshold)
+
+        return scores
+
+    def _merge_semantic_scores(
+        self,
+        scores: dict[int, tuple[float, str]],
+        query: str,
+        mode: Literal["hybrid", "vector", "keyword"],
+        top_k: int | None,
+        score_threshold: float | None,
+    ) -> None:
+        """Merge vector-search hits for *query* into *scores* in place.
+
+        Degrades without raising: a missing vector store or a failing embed/search
+        leaves *scores* as the keyword phase produced it, with a warning.
+        """
+        if self._vs_proxy is None:
+            self._warn_vector_store_unavailable(mode)
+            return
+
         effective_top_k = top_k if top_k is not None else self.config.search_top_k
         effective_threshold = (
             score_threshold if score_threshold is not None else self.config.search_score_threshold
         )
 
-        tasks: list[Task] = list(self.state.task_list)
+        try:
+            vectors = self._vs_proxy.embed([query])
+            if vectors:
+                result = self._vs_proxy.search(PLAN_COLLECTION, vectors[0], effective_top_k)
+                for hit in result.hits:
+                    if hit.score >= effective_threshold:
+                        self._record_semantic_hit(scores, int(hit.ref_id), hit.score)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Semantic search failed for query — falling back to keyword only",
+                exc_info=True,
+            )
 
-        # Track scores: {task_id: (score, label)}
-        scores: dict[int, tuple[float, str]] = {}
+    @staticmethod
+    def _record_semantic_hit(
+        scores: dict[int, tuple[float, str]], task_id: int, score: float
+    ) -> None:
+        """Record one semantic hit, promoting an existing keyword hit to ``hybrid``."""
+        if task_id in scores:
+            scores[task_id] = (max(scores[task_id][0], score), f"hybrid: {score:.2f}")
+        else:
+            scores[task_id] = (score, f"semantic: {score:.2f}")
 
-        # Query phase: build candidate set based on mode, then intersect with rest
-        if query is not None:
-            run_keyword = mode in ("hybrid", "keyword")
-            run_semantic = mode in ("hybrid", "vector")
+    @staticmethod
+    def _warn_vector_store_unavailable(mode: Literal["hybrid", "vector", "keyword"]) -> None:
+        """Warn that the semantic phase is skipped because no vector store is wired."""
+        if mode == "vector":
+            logger.warning("mode='vector' but _vs_proxy is None — returning empty results")
+        elif mode == "hybrid":
+            logger.warning("mode='hybrid' but _vs_proxy is None — falling back to keyword-only")
 
-            # Keyword phase
-            if run_keyword:
-                q_lower = query.lower()
-                for t in tasks:
-                    if q_lower in t.description.lower():
-                        scores[t.id] = (1.0, "keyword match")
-
-            # Semantic phase
-            if run_semantic and self._vs_proxy is not None:
-                try:
-                    vectors = self._vs_proxy.embed([query])
-                    if vectors:
-                        query_vector = vectors[0]
-                        result = self._vs_proxy.search(
-                            PLAN_COLLECTION, query_vector, effective_top_k
-                        )
-                        for hit in result.hits:
-                            if hit.score >= effective_threshold:
-                                tid = int(hit.ref_id)
-                                if tid in scores:
-                                    # Found by both keyword and semantic — hybrid label
-                                    scores[tid] = (
-                                        max(scores[tid][0], hit.score),
-                                        f"hybrid: {hit.score:.2f}",
-                                    )
-                                else:
-                                    scores[tid] = (hit.score, f"semantic: {hit.score:.2f}")
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "Semantic search failed for query — falling back to keyword only",
-                        exc_info=True,
-                    )
-            elif run_semantic and self._vs_proxy is None:
-                if mode == "vector":
-                    logger.warning(
-                        "mode='vector' but _vs_proxy is None — returning empty results"
-                    )
-                elif mode == "hybrid":
-                    logger.warning(
-                        "mode='hybrid' but _vs_proxy is None — falling back to keyword-only"
-                    )
-
-            candidate_ids = set(scores.keys())
-            tasks = [t for t in tasks if t.id in candidate_ids]
-
-        # Apply remaining AND filters
+    @staticmethod
+    def _apply_task_filters(
+        tasks: list[Task],
+        status: TaskStatus | None,
+        owner: str | None,
+        creator: str | None,
+    ) -> list[Task]:
+        """Return *tasks* narrowed by every non-``None`` criterion (AND logic)."""
         if status is not None:
             tasks = [t for t in tasks if t.status == status]
         if owner is not None:
             tasks = [t for t in tasks if t.owner == owner]
         if creator is not None:
             tasks = [t for t in tasks if t.creator == creator]
+        return tasks
 
-        # Sort by score descending when query was provided
-        if query is not None:
-            tasks.sort(key=lambda t: scores.get(t.id, (0.0, ""))[0], reverse=True)
-
-        # Format output
-        lines: list[str] = []
-        for t in tasks:
-            owner_label = t.owner or "unassigned"
-            base = (
-                f"Task {t.id}: {t.description} [{t.status}] "
-                f"(Owner: {owner_label}, Creator: {t.creator})"
-            )
-            if t.id in scores:
-                _, label = scores[t.id]
-                base += f" ({label})"
-            lines.append(base)
-
-        return lines
+    @staticmethod
+    def _format_task_line(task: Task, scores: dict[int, tuple[float, str]]) -> str:
+        """Render one search result, appending its score label when scored."""
+        owner_label = task.owner or "unassigned"
+        line = (
+            f"Task {task.id}: {task.description} [{task.status}] "
+            f"(Owner: {owner_label}, Creator: {task.creator})"
+        )
+        if task.id in scores:
+            line += f" ({scores[task.id][1]})"
+        return line
 
     def update_planning(self, update: UpdatePlan, actor_address: ActorAddress) -> str:
         """Update the plan with new, updated, or deleted task."""

@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import uuid
 from collections import deque
+from collections.abc import Iterator
 
 from pydantic import Field
 
@@ -360,37 +361,57 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
                 errors.append(f"Entity '{eu.name}' not found for update")
                 continue
 
-            changed: bool = False
-
-            if eu.description is not None and eu.description != entity.description:
-                if self._vs_proxy is not None:
-                    self._vs_proxy.remove(KG_COLLECTION, [str(entity.id)])
-                entity.description = eu.description
-                self._embed_entity(entity)
-                changed = True
-            elif eu.description is not None:
-                # Same value -> no-op
-                entity.description = eu.description
-            if eu.entity_type is not None and eu.entity_type != entity.entity_type:
-                entity.entity_type = eu.entity_type
-                changed = True
-            if eu.is_root is not None and eu.is_root != entity.is_root:
-                entity.is_root = eu.is_root
-                changed = True
-            if eu.add_observations:
-                entity.observations.extend(eu.add_observations)
-                changed = True
-            if eu.remove_observations is not None:
-                to_remove = set(eu.remove_observations)
-                before = entity.observations
-                after = [o for o in before if o not in to_remove]
-                if len(after) != len(before):
-                    changed = True
-                entity.observations = after
-
-            if changed:
+            if self._apply_entity_update(entity, eu):
                 applied.append(entity)
         return applied, errors
+
+    def _apply_entity_update(self, entity: Entity, update: EntityUpdate) -> bool:
+        """Apply *update*'s non-``None`` fields to *entity* in place.
+
+        Returns:
+            ``True`` if at least one mutation effectively changed the entity.
+            Setting a field to the value it already holds does not count.
+        """
+        changed = self._apply_description_update(entity, update.description)
+
+        if update.entity_type is not None and update.entity_type != entity.entity_type:
+            entity.entity_type = update.entity_type
+            changed = True
+        if update.is_root is not None and update.is_root != entity.is_root:
+            entity.is_root = update.is_root
+            changed = True
+        if update.add_observations:
+            entity.observations.extend(update.add_observations)
+            changed = True
+        if update.remove_observations is not None and self._remove_observations(
+            entity, update.remove_observations
+        ):
+            changed = True
+
+        return changed
+
+    def _apply_description_update(self, entity: Entity, description: str | None) -> bool:
+        """Replace *entity*'s description, re-embedding it when the text actually changes.
+
+        The stale vector is dropped before re-embedding so the store never holds two
+        entries for one entity.
+        """
+        if description is None or description == entity.description:
+            return False
+        if self._vs_proxy is not None:
+            self._vs_proxy.remove(KG_COLLECTION, [str(entity.id)])
+        entity.description = description
+        self._embed_entity(entity)
+        return True
+
+    @staticmethod
+    def _remove_observations(entity: Entity, to_remove: list[str]) -> bool:
+        """Drop *to_remove* from *entity*'s observations; return whether any were dropped."""
+        removable = set(to_remove)
+        before = entity.observations
+        after = [o for o in before if o not in removable]
+        entity.observations = after
+        return len(after) != len(before)
 
     # ------------------------------------------------------------------
     # CRUD: Delete
@@ -1005,55 +1026,69 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         hit_entities = [h.entity for h in entity_hits if h.entity is not None]
         hit_entity_names = {e.name for e in hit_entities}
 
-        neighbors: list[Entity] = []
-        connected_relations: list[Relation] = []
-        paths: list[list[Entity | Relation]] = []
-
-        if query.include_neighbors and entity_hits:
-            seen_neighbor_names: set[str] = set(hit_entity_names)
-            for hit in entity_hits:
-                if hit.entity is None:
-                    continue
-                # 1-hop BFS from the entity
-                subgraph = self._get_subgraph(
-                    entity_names=[hit.entity.name], depth=1, relation_types=[]
-                )
-                for e in subgraph.entities:
-                    if e.name not in seen_neighbor_names:
-                        neighbors.append(e)
-                        seen_neighbor_names.add(e.name)
-
-        if query.include_edges and entity_hits:
-            seen_rel_ids: set[str] = set()
-            for rel in self.state.knowledge_graph.relations:
-                if (
-                    rel.from_entity in hit_entity_names or rel.to_entity in hit_entity_names
-                ) and str(rel.id) not in seen_rel_ids:
-                    connected_relations.append(rel)
-                    seen_rel_ids.add(str(rel.id))
-
-        if query.find_paths:
-            top_entity_hits = entity_hits[:5]  # top 5 entity hits by score
-            pairs = [
-                (i, j)
-                for i in range(len(top_entity_hits))
-                for j in range(i + 1, len(top_entity_hits))
-            ]
-            for i, j in pairs[:10]:
-                e_i = top_entity_hits[i].entity
-                e_j = top_entity_hits[j].entity
-                if e_i is None or e_j is None:
-                    continue
-                path = self._find_shortest_path(e_i.name, e_j.name)
-                if path is not None:
-                    paths.append(path)
-
         return SearchResult(
             hits=hits,
-            neighbors=neighbors,
-            connected_relations=connected_relations,
-            paths=paths,
+            neighbors=(
+                self._collect_neighbors(entity_hits, hit_entity_names)
+                if query.include_neighbors
+                else []
+            ),
+            connected_relations=(
+                self._collect_connected_relations(hit_entity_names) if query.include_edges else []
+            ),
+            paths=self._collect_paths(entity_hits) if query.find_paths else [],
         )
+
+    def _collect_neighbors(
+        self, entity_hits: list[SearchHit], hit_entity_names: set[str]
+    ) -> list[Entity]:
+        """Return the 1-hop neighbours of every hit entity, excluding the hits themselves.
+
+        Deduplicated by name, in first-seen order.
+        """
+        neighbors: list[Entity] = []
+        seen: set[str] = set(hit_entity_names)
+        for hit in entity_hits:
+            if hit.entity is None:
+                continue
+            subgraph = self._get_subgraph(
+                entity_names=[hit.entity.name], depth=1, relation_types=[]
+            )
+            for entity in subgraph.entities:
+                if entity.name not in seen:
+                    neighbors.append(entity)
+                    seen.add(entity.name)
+        return neighbors
+
+    def _collect_connected_relations(self, hit_entity_names: set[str]) -> list[Relation]:
+        """Return every relation with an endpoint among *hit_entity_names*, deduplicated by id."""
+        connected: list[Relation] = []
+        seen_ids: set[str] = set()
+        for rel in self.state.knowledge_graph.relations:
+            touches_hit = rel.from_entity in hit_entity_names or rel.to_entity in hit_entity_names
+            if touches_hit and str(rel.id) not in seen_ids:
+                connected.append(rel)
+                seen_ids.add(str(rel.id))
+        return connected
+
+    def _collect_paths(self, entity_hits: list[SearchHit]) -> list[list[Entity | Relation]]:
+        """Return shortest paths between pairs drawn from the top hits.
+
+        Bounded twice over: only the top 5 entity hits pair up, and only the first
+        10 pairs are searched — path finding is the most expensive expansion.
+        """
+        top_hits = entity_hits[:5]
+        pairs = [(i, j) for i in range(len(top_hits)) for j in range(i + 1, len(top_hits))]
+
+        paths: list[list[Entity | Relation]] = []
+        for i, j in pairs[:10]:
+            source, target = top_hits[i].entity, top_hits[j].entity
+            if source is None or target is None:
+                continue
+            path = self._find_shortest_path(source.name, target.name)
+            if path is not None:
+                paths.append(path)
+        return paths
 
     def _find_shortest_path(
         self, from_entity: str, to_entity: str
@@ -1090,25 +1125,33 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
                     f"Expected Entity at path tail, got {type(current_entity).__name__}"
                 )
 
-            for rel in graph.relations:
-                neighbor_name: str | None = None
-                if rel.from_entity == current_entity.name:
-                    neighbor_name = rel.to_entity
-                elif rel.to_entity == current_entity.name:
-                    neighbor_name = rel.from_entity
-                else:
+            for rel, neighbor in self._incident_edges(current_entity.name, entity_map):
+                if neighbor.name in visited:
                     continue
-
-                if neighbor_name in visited:
-                    continue
-                neighbor = entity_map.get(neighbor_name)
-                if neighbor is None:
-                    continue
-
                 new_path: list[Entity | Relation] = [*path, rel, neighbor]
-                if neighbor_name == to_entity:
+                if neighbor.name == to_entity:
                     return new_path
-                visited.add(neighbor_name)
+                visited.add(neighbor.name)
                 queue.append(new_path)
 
         return None
+
+    def _incident_edges(
+        self, entity_name: str, entity_map: dict[str, Entity]
+    ) -> Iterator[tuple[Relation, Entity]]:
+        """Yield each ``(relation, neighbour)`` incident to *entity_name*, in either direction.
+
+        Relations pointing at a name absent from *entity_map* (a dangling endpoint)
+        are skipped.
+        """
+        for rel in self.state.knowledge_graph.relations:
+            if rel.from_entity == entity_name:
+                neighbor_name = rel.to_entity
+            elif rel.to_entity == entity_name:
+                neighbor_name = rel.from_entity
+            else:
+                continue
+
+            neighbor = entity_map.get(neighbor_name)
+            if neighbor is not None:
+                yield rel, neighbor

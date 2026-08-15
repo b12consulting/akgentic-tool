@@ -8,7 +8,8 @@ This module contains protocol-level concerns only:
 
 from __future__ import annotations
 
-from typing import Any, Callable, Literal
+from collections.abc import Callable
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -276,7 +277,7 @@ class MCPTool(ToolCard):
 
     connection: MCPConnectionConfig
 
-    def get_tools(self) -> list[Callable]:
+    def get_tools(self) -> list[Callable[..., Any]]:
         """MCP tools come via toolsets, not individual callables."""
         return []
 

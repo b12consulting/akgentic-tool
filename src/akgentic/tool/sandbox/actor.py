@@ -14,7 +14,9 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-from akgentic.core.agent import Akgent, BaseConfig, BaseState
+from akgentic.core.agent import Akgent
+from akgentic.core.agent_config import BaseConfig
+from akgentic.core.agent_state import BaseState
 
 logger = logging.getLogger(__name__)
 

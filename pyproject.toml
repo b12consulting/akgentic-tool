@@ -70,29 +70,31 @@ warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
 
-# Pre-existing type errors — exempted to keep CI green. New files in these
-# modules must pass strict mypy before the override is removed. Previously this
-# lived only in the akgentic-quick-start workspace root; moved here so the
-# package's own CI (which no longer checks out the workspace) sees it.
+# tavily-python ships no py.typed marker; SearchTool wraps it behind typed
+# signatures, so treat the client itself as untyped rather than failing strict mode.
 [[tool.mypy.overrides]]
-module = [
-    "akgentic.tool.core",
-    "akgentic.tool.event",
-    "akgentic.tool.team.team",
-    "akgentic.tool.planning.planning",
-    "akgentic.tool.planning.planning_actor",
-    "akgentic.tool.knowledge_graph.kg_tool",
-    "akgentic.tool.search.search",
-    "akgentic.tool.mcp.mcp",
-    "akgentic.tool.sandbox.actor",
-    "akgentic.tool.workspace.readers",
-]
-ignore_errors = true
+module = ["tavily.*"]
+ignore_missing_imports = true
+
+# MCPTool imports SSETransport/StdioTransport/StreamableHttpTransport from
+# pydantic_ai.mcp: real module-level names that pydantic-ai omits from __all__
+# (see _mcp_transport_classes). Allow the implicit re-export instead of scattering
+# per-import ignores.
+[[tool.mypy.overrides]]
+module = ["pydantic_ai.mcp"]
+implicit_reexport = true
 
 [tool.ruff]
 target-version = "py312"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "N", "W"]
-ignore = []
+select = ["E", "F", "I", "N", "UP", "ANN", "ASYNC", "C901", "PLR0912", "PLR0915"]
+ignore = ["ANN401", "N802"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-branches = 12
+max-statements = 50

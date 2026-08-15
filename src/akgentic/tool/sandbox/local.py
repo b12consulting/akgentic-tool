@@ -7,8 +7,8 @@ import os
 import resource
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from akgentic.tool.sandbox.actor import ExecResult, SandboxActor
 
