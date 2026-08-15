@@ -921,7 +921,7 @@ class WorkspaceTool(ToolCard):
                 raw_matches: list[Path] = []
                 for expanded_pattern in _expand_braces(pattern):
                     safe_pattern = _normalize_glob_pattern(expanded_pattern)
-                    for m in search_root.glob(safe_pattern):
+                    for m in search_root.glob(safe_pattern, case_sensitive=False):
                         if m.is_file() and m not in seen:
                             seen.add(m)
                             raw_matches.append(m)
