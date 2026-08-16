@@ -26,7 +26,6 @@ if TYPE_CHECKING:
     from akgentic.tool.core.event import ToolStateEvent as ToolStateEvent
     from akgentic.tool.core.observer import ActorToolObserver as ActorToolObserver
     from akgentic.tool.core.observer import ToolObserver as ToolObserver
-    from akgentic.tool.knowledge_graph.event import ToolStatePayload as ToolStatePayload
     from akgentic.tool.team.observer import (
         TeamManagementToolObserver as TeamManagementToolObserver,
     )
@@ -47,7 +46,6 @@ _MOVED: dict[str, str] = {
     "ToolObserver": "akgentic.tool.core.observer",
     "ActorToolObserver": "akgentic.tool.core.observer",
     "TeamManagementToolObserver": "akgentic.tool.team.observer",
-    "ToolStatePayload": "akgentic.tool.knowledge_graph.event",
 }
 
 

@@ -1,27 +1,16 @@
-"""Knowledge-graph payload typing for the tool-state event stream.
+"""Knowledge-graph event surface.
 
-``ToolStatePayload`` names the delta payload a ``ToolStateEvent`` carries for this
-domain. It lives here, not beside the envelope: the envelope is package-global and
-must name no domain type, while this alias is knowledge-graph business.
+Re-exports this domain's tool-state payload type, ``KnowledgeGraphStateEvent``, so a
+consumer reaching for the knowledge graph's event contract finds it under ``event``
+rather than having to know it is declared beside the graph models. The class itself
+lives in ``models.py``, alongside the entity and relation types whose deltas it carries.
 
-It is a real alias, not a string forward reference. The cycle the forward reference
-was dodging — ``event.py`` needing ``models.py`` while ``models.py`` needed
-``event.py`` — no longer exists now that ``ToolStateEvent.payload`` is typed
-structurally, so the import runs in the ordinary direction.
+Re-exporting a symbol of this module's own domain is what the ``core/`` purity rule
+permits; what it forbids is a domain module re-exporting a foreign one.
 """
 
 from __future__ import annotations
 
-from typing import TypeAlias
-
 from akgentic.tool.knowledge_graph.models import KnowledgeGraphStateEvent
 
-#: Delta payload carried by a ``ToolStateEvent`` emitted by the knowledge-graph tool.
-#
-# Deliberately a ``TypeAlias`` rather than a PEP 695 ``type`` alias: ``type`` builds a
-# ``TypeAliasType`` whose runtime value is a lazy wrapper, so ``ToolStatePayload`` would
-# stop *being* the class. Consumers that resolve the alias at runtime need the class
-# itself, which is what this name has always meant.
-ToolStatePayload: TypeAlias = KnowledgeGraphStateEvent  # noqa: UP040
-
-__all__ = ["KnowledgeGraphStateEvent", "ToolStatePayload"]
+__all__ = ["KnowledgeGraphStateEvent"]

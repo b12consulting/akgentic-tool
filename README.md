@@ -14,7 +14,10 @@ channel system — as tool calls, system prompt injections, or programmatic comm
 - [Quick Start](#quick-start)
 - [Architecture](#architecture)
 - [Migration: moved import paths](#migration-moved-import-paths)
+- [Observers: How a Tool Acts on the System](#observers-how-a-tool-acts-on-the-system)
+- [Tool Actors](#tool-actors)
 - [Deferred Results: Never Block a Tool Actor](#deferred-results-never-block-a-tool-actor)
+- [Tool State Events](#tool-state-events)
 - [Channel System](#channel-system)
 - [Tool Catalog](#tool-catalog)
   - [WorkspaceTool](#workspacetool)
@@ -285,7 +288,6 @@ is unchanged, and reaching a symbol through it emits no warning.
 | `akgentic.tool.event.ToolObserver` | `akgentic.tool.core.observer` | Stable |
 | `akgentic.tool.event.ActorToolObserver` | `akgentic.tool.core.observer` | Stable |
 | `akgentic.tool.event.TeamManagementToolObserver` | `akgentic.tool.team.observer` | Internal |
-| `akgentic.tool.event.ToolStatePayload` | `akgentic.tool.knowledge_graph.event` | Internal |
 | `akgentic.tool.vector.VectorEntry` | `akgentic.tool.vector_store.vector` | Internal |
 | `akgentic.tool.vector.EmbeddingService` | `akgentic.tool.vector_store.vector` | Internal |
 | `akgentic.tool.vector.VectorIndex` | `akgentic.tool.vector_store.vector` | Internal |
@@ -304,14 +306,144 @@ models. Their import paths are part of the API. If one moves, it is shimmed, and
 kept.
 
 **Internal — not a surface.** These belong to one specific tool: `TeamManagementToolObserver`
-is `TeamTool`'s contract, `ToolStatePayload` is the knowledge graph's, the vector primitives
-are `vector_store`'s. They move freely with the tool that owns them. Their rows above are a
-**courtesy, not a guarantee** — the shim entry exists because removing a working import for
-no reason is rude, not because the path was ever promised. Treating it as a promise would
-freeze this package's internal structure by accident, which is exactly what the split was
-done to avoid.
+is `TeamTool`'s contract, the vector primitives are `vector_store`'s. They move freely with the
+tool that owns them. Their rows above are a **courtesy, not a guarantee** — the shim entry exists
+because removing a working import for no reason is rude, not because the path was ever promised.
+Treating it as a promise would freeze this package's internal structure by accident, which is
+exactly what the split was done to avoid.
+
+An internal symbol may also be **removed outright**, not merely moved — and then there is no row
+and no warning. `ToolStatePayload` was removed this way: it was an alias for the knowledge graph's
+delta type, it stopped annotating anything once `ToolStateEvent.payload` was typed structurally,
+and it is now gone from every path it ever had. Importing it raises `ImportError` rather than
+warning, because a shim for a name with no meaning left would only preserve the confusion.
 
 If one of your imports is in the Internal tier, move it now rather than relying on the row.
+
+## Observers: How a Tool Acts on the System
+
+A `ToolCard` is **inert**. It is fully serializable configuration, and that is a hard rule rather
+than a default: every field must round-trip through Pydantic, so a card cannot hold an actor proxy,
+a connection, or an open file. Taken literally, a card has no way to reach the running system at
+all.
+
+The **observer** is the inversion that resolves this. At wiring time `ToolFactory` calls
+`observer()` on every card, handing it the agent that owns it. From that moment the observer is the
+tool's **only** channel to the runtime — and because it arrives after construction and is never a
+field, the card stays serializable. Everything a tool does to the system, it does through the
+observer.
+
+### Three levels — ask for the least you need
+
+The observer is a `Protocol`, and there are three, each extending the one above it:
+
+| Protocol | What it adds | What that lets a tool do |
+|---|---|---|
+| `ToolObserver` | `notify_event(event)` | Emit a domain event onto the orchestrator's stream. Nothing more. |
+| `ActorToolObserver` | `myAddress`, `orchestrator`, `team_id`, `proxy_ask(...)` | Reach any actor by address — including a singleton tool actor. |
+| `TeamManagementToolObserver` | `createActor(...)`, `on_hire(...)`, `on_fire(...)` | Create actors, and change the team's membership. |
+
+Each capability is gated by the level above it: a tool that only emits events cannot reach an
+actor, and a tool that reaches actors cannot hire anyone. Declare the narrowest level your tool
+genuinely uses. The third level is domain-specific rather than general — `TeamTool` is its only
+consumer in this package — which is why it lives beside that tool instead of on the core surface.
+
+### Narrow in an accessor, not in the signature
+
+One trap catches the obvious reading of "ask for the level you need". **Do not narrow the
+`observer()` parameter.** `ToolFactory` attaches one observer to every card uniformly, so a card
+demanding a richer parameter type is not substitutable for its base — a Liskov violation that a
+type checker will happily let you write and the factory will break at runtime.
+
+Keep the base parameter type, and narrow in your own accessor:
+
+```python
+class MyTool(ToolCard):
+    # A proxy is not serializable: runtime handles are private attributes, never fields.
+    _activity_proxy: TeamActivityActor | None = PrivateAttr(default=None)
+
+    def observer(self, observer: ToolObserver) -> "MyTool":   # base type, always
+        super().observer(observer)
+        obs = self._team_observer()                           # narrow here instead
+        address = obs.orchestrator_proxy.getChildrenOrCreate(...)
+        self._activity_proxy = obs.proxy_ask(address, TeamActivityActor)
+        return self
+
+    def _team_observer(self) -> TeamManagementToolObserver:
+        return cast(TeamManagementToolObserver, self._observer)
+```
+
+`TeamTool` and `PlanningTool` both ship exactly this shape.
+
+### The observer is held weakly
+
+`ToolCard` stores the observer through a **weak reference**. A tool, its closures and its command
+registry must never keep a stopped agent alive, and a strong reference in any one of them would do
+it. Closures are the easy mistake, which is why they capture the *accessor* rather than the agent.
+
+The consequence to plan for: **using a tool after its owning agent has stopped raises
+`ToolObserverGone`.** That is a defined outcome, not a crash — the framework telling you the owner
+is gone. There are two accessors for exactly this reason: one raises `ToolObserverGone`, the other
+returns `None`. Synchronous in-life code uses the raising form; a closure that may outlive its
+agent uses the `None`-returning one and handles the `None`.
+
+Do not stash the observer in a field of your own to avoid this. It would not be serializable, and
+it would reintroduce the strong reference the weak one exists to prevent.
+
+## Tool Actors
+
+Most tools are stateless: the card holds configuration, the callable does its work and returns. A
+few are not. A plan, a knowledge graph and a vector index are **shared, mutable state that outlives
+any single tool call**, and the framework gives that state a home — a **tool actor**, one per team,
+that every agent carrying the card talks to.
+
+Five ship in this package today: `#VectorStore`, `#PlanningTool`, `#KnowledgeGraphTool`,
+`#SandboxActor` and `#TeamActivity`.
+
+### One per team, and what that buys
+
+**Shared state.** Ten agents carrying `PlanningTool` do not get ten plans. They get ten proxies to
+one `#PlanningTool`, so when the researcher marks a task done the writer sees it. Give each agent
+its own copy and the tool stops meaning anything — agents would be coordinating through state they
+cannot both see.
+
+**Centralised processing.** One embedding path, one sandbox, one store, rather than N. The
+expensive machinery is built once, and configuration that must agree — which model embeds, which
+sandbox mode is permitted — is decided in one place instead of being replicated per agent and left
+to drift.
+
+**No locks.** An actor processes one message at a time, so a tool actor's mutations cannot
+interleave. Two agents updating the graph in the same instant are serialised by the mailbox, not by
+anything you write, which is why a tool actor's methods can read-modify-write without a mutex. The
+same one-thread property is why the next section exists: it also means a slow method blocks
+everyone queued behind it.
+
+**State that persists itself.** A tool actor's state reaches the team's event store without the
+tool arranging it — the actor calls `notify_state_change()`, and the framework snapshots the state
+and restores it when the team resumes. Persistence here is a property of being an actor, not
+something a tool implements.
+
+### Binding one: `getChildrenOrCreate`, never check-then-create
+
+A tool binds its actor through `orchestrator_proxy.getChildrenOrCreate(...)`, which is idempotent:
+it returns the existing singleton or creates it, in one step.
+
+The obvious alternative is a bug. "Ask whether it exists, create it if it does not" is two messages
+with a window between them — two agents wiring the same tool at startup both look, both find
+nothing, and both create. That is not a theoretical race. It produced duplicate singletons, which
+is the exact failure the singleton pattern exists to prevent, arrived at by the code written to
+prevent it.
+
+### The `#` prefix is a teardown invariant
+
+Every tool actor's name starts with `#`, and that is not a naming convention you may opt out of.
+The orchestrator decides what counts as a tool actor by that prefix, and drives a two-phase stop
+with it: regular members first, tool actors only once no regular member remains — which is what
+stops a tool actor being torn down while an agent is still calling it. If your tool creates an
+actor, prefix its name.
+
+What the prefix does and does not buy is covered in
+[Teardown: why the `#` prefix is not cosmetic](#teardown-why-the--prefix-is-not-cosmetic), below.
 
 ## Deferred Results: Never Block a Tool Actor
 
@@ -402,6 +534,94 @@ Because the parent's stop blocks on its children either way, every worker must b
 call with an explicit timeout below the orchestrator's stop backstop — and hand that budget to its
 I/O client. A Python thread cannot be cancelled, so a timeout that does not reach the client is
 decoration.
+
+## Tool State Events
+
+A stateful tool actor's state is the point of it — the plan, the graph, the index. Clients want to
+follow that state as it changes, and `ToolStateEvent` is how a tool actor tells them: by
+broadcasting **what changed**, not what it now holds.
+
+```python
+ToolStateEvent(tool_id="#KnowledgeGraphTool", seq=7, payload=delta)
+```
+
+- **`tool_id`** — the name of the emitting tool actor, `#`-prefixed like the actor itself. A client
+  following several stateful tools in one team routes on it.
+- **`seq`** — a **per-tool monotonic** counter starting at 1. Per-tool, not per-team: two tool
+  actors each number their own stream independently. A consumer detects a missed event by watching
+  it.
+- **`payload`** — the delta itself.
+
+The envelope inherits `team_id`, `timestamp`, `id`, `sender` and `display_type` from the framework's
+`Message` base without overriding any of them, so it travels on the ordinary event stream.
+
+### Why deltas, and why there is no snapshot protocol
+
+A tool actor's state can be large, and it changes in small increments. Republishing all of it on
+every mutation would be wasteful in the ordinary case and useless in the interesting one — a client
+that wants to show *"three entities were added"* cannot recover that from two snapshots without
+diffing them itself.
+
+So the event carries the increment, and it rides the path the orchestrator already has:
+`notify_event` puts it on the orchestrator's event stream, which is recorded in team history. A
+client that joins late does not ask for a snapshot — **there is no snapshot request and no snapshot
+message** — it replays the history it would have replayed anyway and applies the deltas in order.
+Tool state reconstructs itself out of the normal replay path, which is why the mechanism needs no
+protocol of its own.
+
+### `payload` is structurally typed
+
+`payload` is declared as *any* serializable model, not as a union of the concrete delta types. That
+is deliberate: a union naming the knowledge graph's delta and its peers would make the
+package-global envelope depend on every domain that emits one — exactly the dependency the package
+layout forbids.
+
+The concrete class is not lost. Serialization tags the payload with a `__model__` marker naming its
+class, so a consumer deserializes the real object and **discriminates on the object, not on the
+envelope** — an `isinstance` check, in Python terms. Your own delta type needs no registration and
+no entry in any union; it needs only to be a serializable model.
+
+One caveat if you ever move a delta class between modules: that marker records the class's module
+path, so it moves when the class moves. The payload's own fields are unaffected.
+
+### The emit-before-return contract
+
+A mutation method emits its event **before it returns** — and before it raises, if it collected
+errors along the way. A caller that gets a return value knows the event is already on its way; a
+caller that gets an exception still gets the events for the work that did succeed.
+
+The knowledge graph is the shipped example. `update_graph` applies its entity and relation changes,
+builds a delta from what it actually added, modified and removed, then:
+
+```python
+delta = KnowledgeGraphStateEvent(
+    entities_added=created_entities,
+    entities_modified=modified_entities,
+    entities_removed=deleted_entity_ids,
+    relations_added=created_relations,
+    relations_removed=merged_relations_removed,
+)
+
+self.state.notify_state_change()
+
+if self._delta_is_non_empty(delta):
+    self._state_event_seq += 1
+    self.notify_event(
+        ToolStateEvent(tool_id=KG_ACTOR_NAME, seq=self._state_event_seq, payload=delta)
+    )
+
+if errors:
+    raise RetriableError("Update errors: " + "; ".join(errors))
+return "Done"
+```
+
+Two details worth copying:
+
+- **An empty delta emits nothing.** "Emit before return" is not "emit unconditionally" — a call
+  that changed nothing is not a state change, and broadcasting it would make every consumer filter
+  noise.
+- **`seq` advances only when an event is actually emitted**, inside the guard. Numbering therefore
+  has no gaps for suppressed empty deltas — which is what makes a gap meaningful to a consumer.
 
 ## Channel System
 
@@ -888,7 +1108,7 @@ src/akgentic/tool/
     │   └── planning.py       # PlanningTool ToolCard
     knowledge_graph/
     │   models.py             # Entity, Relation, CRUD + query models
-    │   event.py              # ToolStatePayload — this domain's delta payload typing
+    │   event.py              # Re-exports KnowledgeGraphStateEvent, this domain's delta
     │   kg_actor.py           # KnowledgeGraphActor
     │   └── kg_tool.py        # KnowledgeGraphTool ToolCard
     search/

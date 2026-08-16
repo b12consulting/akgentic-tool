@@ -61,10 +61,10 @@ FACADE_FILENAMES: frozenset[str] = frozenset({"event.py", "vector.py"})
 _TOOL_PREFIX = "akgentic.tool."
 
 # The package root, which is a violation in its own right and not merely an ancestor of
-# one. ``akgentic/tool/__init__.py`` serves ``KnowledgeGraphStateEvent`` and
-# ``ToolStatePayload`` from a lazy module ``__getattr__``, so ``from akgentic.tool import
-# KnowledgeGraphStateEvent`` inside ``core/`` restores the runtime edge while naming no
-# domain package at all — the cheapest way past a guard that matches on domain names.
+# one. ``akgentic/tool/__init__.py`` serves ``KnowledgeGraphStateEvent`` from a lazy
+# module ``__getattr__``, so ``from akgentic.tool import KnowledgeGraphStateEvent``
+# inside ``core/`` restores the runtime edge while naming no domain package at all —
+# the cheapest way past a guard that matches on domain names.
 ROOT_PACKAGE = "akgentic.tool"
 
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from .knowledge_graph.event import ToolStatePayload as ToolStatePayload
     from .knowledge_graph.models import KnowledgeGraphStateEvent as KnowledgeGraphStateEvent
 
 # Submodules with their own __init__ files
@@ -61,7 +60,6 @@ __all__ = [
     "ActorToolObserver",
     "TeamManagementToolObserver",
     "ToolStateEvent",
-    "ToolStatePayload",
     "KnowledgeGraphStateEvent",
     # Command discovery models
     "CommandArg",
@@ -85,26 +83,16 @@ if _VECTOR_SEARCH_AVAILABLE:
 
 
 def __getattr__(name: str) -> Any:
-    """Lazy re-export of the KG delta payload and its alias (Story 17.1).
+    """Lazy re-export of the KG delta payload (Story 17.1).
 
     ``KnowledgeGraphStateEvent`` lives in ``akgentic.tool.knowledge_graph.models``
     and pulls the ``[vector_search]`` optional dependency chain when imported.
     Exposing it via module ``__getattr__`` keeps the bare ``akgentic.tool``
     import cheap (see ``test_tool_import_does_not_trigger_kg_import``) while
     still honoring AC #5 of Story 17.1.
-
-    ``ToolStatePayload`` joins it for the same reason: it is now a real alias to
-    that class rather than a string forward reference, so importing it eagerly
-    would drag the same dependency chain in. Unlike the ``akgentic.tool.event``
-    path, this one does not warn — the package-root API is unchanged and its
-    consumers need no migration.
     """
     if name == "KnowledgeGraphStateEvent":
         from .knowledge_graph.models import KnowledgeGraphStateEvent
 
         return KnowledgeGraphStateEvent
-    if name == "ToolStatePayload":
-        from .knowledge_graph.event import ToolStatePayload
-
-        return ToolStatePayload
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
