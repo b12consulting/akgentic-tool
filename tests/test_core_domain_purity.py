@@ -24,6 +24,8 @@ import ast
 import sys
 from pathlib import Path
 
+import pytest
+
 import akgentic.tool as tool_package
 import akgentic.tool.core as core_package
 import akgentic.tool.knowledge_graph as kg_package
@@ -82,34 +84,49 @@ def _package_parts(package_dir: Path) -> tuple[str, ...]:
     return ("akgentic", "tool", *package_dir.relative_to(TOOL_DIR).parts)
 
 
-def _imported_modules(module_path: Path, package_dir: Path) -> set[str]:
-    """Return the ``akgentic.tool*`` module paths imported by *module_path*.
+def _imports_in(tree: ast.Module, package_parts: tuple[str, ...]) -> set[str]:
+    """Return the ``akgentic.tool*`` module paths *tree* imports.
 
     Covers ``from x import y`` (relative and absolute) and plain ``import x``, at
     module level and inside function bodies alike. Relative imports are resolved
-    against the package *module_path* actually lives in — *package_dir* plus any
-    subpackage below it — so ``from ..team.observer import X`` is reported with its
-    absolute path, exactly as an absolute import would be.
+    against *package_parts*, the package the module actually lives in, so
+    ``from ..team.observer import X`` is reported with its absolute path, exactly as an
+    absolute import would be.
+
+    Each ``from`` clause contributes the module it names **and** that module plus each
+    imported name. ``from akgentic.tool import vector`` and ``from . import event`` carry
+    the module on the alias rather than on the clause, so a set built from the clause
+    alone reports only ``akgentic.tool`` and the façade slips through a guard matching on
+    module paths.
     """
-    tree = ast.parse(module_path.read_text(encoding="utf-8"))
-    package_parts = (
-        *_package_parts(package_dir),
-        *module_path.relative_to(package_dir).parts[:-1],
-    )
     imported: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             if node.level == 0:
-                if node.module and _is_tool_module(node.module):
-                    imported.add(node.module)
+                if not (node.module and _is_tool_module(node.module)):
+                    continue
+                module = node.module
             else:
                 base = package_parts[: len(package_parts) - node.level + 1]
-                imported.add(".".join([*base, node.module] if node.module else list(base)))
+                module = ".".join([*base, node.module] if node.module else list(base))
+            imported.add(module)
+            imported.update(f"{module}.{alias.name}" for alias in node.names)
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 if _is_tool_module(alias.name):
                     imported.add(alias.name)
     return imported
+
+
+def _imported_modules(module_path: Path, package_dir: Path) -> set[str]:
+    """Return the ``akgentic.tool*`` module paths imported by *module_path*."""
+    return _imports_in(
+        ast.parse(module_path.read_text(encoding="utf-8")),
+        (
+            *_package_parts(package_dir),
+            *module_path.relative_to(package_dir).parts[:-1],
+        ),
+    )
 
 
 def _domain_of(module: str) -> str | None:
@@ -182,6 +199,29 @@ def test_the_source_sweep_is_not_vacuous() -> None:
     assert "vector_store/vector.py" in swept, "the moved module is outside the sweep"
     assert {"core/event.py", "core/observer.py", "team/observer.py"} <= swept
     assert "event.py" not in swept and "vector.py" not in swept, "façades must be excluded"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from akgentic.tool.vector import VectorEntry",
+        "import akgentic.tool.vector",
+        "import akgentic.tool.vector as vector_mod",
+        "from akgentic.tool import vector",
+        "from . import vector",
+        "def f():\n    from akgentic.tool import event\n",
+    ],
+)
+def test_every_import_form_of_a_facade_is_reported(source: str) -> None:
+    """Guard the guard: the sweep matches module paths, so the parser must produce them.
+
+    Asking whether the sweep *would* go red is a question about this function, not about
+    today's tree — a reintroduced import will not be written in the form that was just
+    removed. The last three forms name the façade on the alias instead of on the ``from``
+    clause, and each one was invisible to the sweep until the parser reported it.
+    """
+    reported = _imports_in(ast.parse(source), ("akgentic", "tool"))
+    assert reported & FACADE_MODULES, reported
 
 
 def test_knowledge_graph_has_no_bottom_of_file_event_import() -> None:
