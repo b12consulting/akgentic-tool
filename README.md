@@ -181,7 +181,8 @@ tool composition happens at the agent level.
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │  Domain Tools                                                    │
-│  workspace  │  planning  │  knowledge_graph  │  search  │  team  │  mcp  │  sandbox  │
+│  workspace │ planning │ knowledge_graph │ search │ team          │
+│  vector_store │ mcp │ sandbox                                    │
 ├──────────────────────────────────────────────────────────────────┤
 │  Core Layer: ToolCard, BaseToolParam, ToolFactory, Channels      │
 │              RetriableError, Observer protocols                   │
@@ -292,6 +293,10 @@ production is in flight. The caller waits on its own thread — which is why the
 and a degraded answer always exists.
 
 ```python
+import uuid
+
+from akgentic.core.agent_config import BaseConfig
+from akgentic.core.agent_state import BaseState
 from akgentic.tool.core.deferred import DeferredResultActor, DeferredWorker, poll_deferred
 
 class SummaryCache(DeferredResultActor[BaseConfig, BaseState, uuid.UUID, str]):
