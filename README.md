@@ -21,7 +21,6 @@ channel system — as tool calls, system prompt injections, or programmatic comm
   - [KnowledgeGraphTool](#knowledgegraphtool)
   - [SearchTool](#searchtool)
   - [TeamTool](#teamtool)
-  - [TeamActivityTool](#teamactivitytool)
   - [MCPTool](#mcptool)
   - [ExecTool](#exectool)
 - [Error Handling](#error-handling)
@@ -46,9 +45,9 @@ running inside it. It provides:
   > from `akgentic.llm.event` instead.
 - **RetriableError** — tools signal recoverable failures; `ToolFactory` translates them to the
   framework-specific retry exception without coupling tool logic to pydantic-ai
-- **Domain tools** — seven production-ready tool implementations covering workspace I/O, task
-  planning, knowledge graph, web search, team management, MCP server integration, and sandboxed
-  shell execution
+- **Domain tools** — eight production-ready tool implementations covering workspace I/O, task
+  planning, knowledge graph, web search, team management, vector-store configuration, MCP server
+  integration, and sandboxed shell execution
 
 ```
 ToolCard(s)
@@ -266,9 +265,6 @@ class BadParam(BaseToolParam):
 
 ## Deferred Results: Never Block a Tool Actor
 
-> **Status: planned (ADR-033).** The base classes described here are not on `master` yet. The rule
-> they encode already applies to every tool actor in the package.
-
 A tool actor is a **team singleton with one thread**. If a method that callers reach via
 `proxy_ask` performs slow external work — an LLM call, a document conversion, a sandbox run, any
 network round-trip — that actor is occupied for the whole call and **every other team member queuing
@@ -283,7 +279,7 @@ tool closure                     #CacheActor                   #defer-<key> (wor
      │                                 │                                   │
      │── get(key) ─ask────────────────▶│  dict lookup, O(1)                │
      │◀──────────────────── None ──────│                                   │
-     │── request(key, payload) tell ──▶│  not cached, not in-flight        │
+     │── request(key, payload) ─ask ──▶│  not cached, not in-flight        │
      │                                 │──── createActor + tell ──────────▶│
      │                                 │                                   │
      │       … poll_deferred: N × (sleep, get(key)) …                      │  blocking call
@@ -296,18 +292,29 @@ production is in flight. The caller waits on its own thread — which is why the
 and a degraded answer always exists.
 
 ```python
-class SummaryCache(DeferredResultActor[uuid.UUID, str]):
+from akgentic.tool.core.deferred import DeferredResultActor, DeferredWorker, poll_deferred
+
+class SummaryCache(DeferredResultActor[BaseConfig, BaseState, uuid.UUID, str]):
     def worker_class(self) -> type[DeferredWorker]:
         return SummarizerWorker
 
-# In the tool closure:
-summary = cache.get(message_id)          # ask — instant
+# In the tool closure — `cache` is an ask proxy, and it is the only proxy there is:
+summary = cache.get(message_id)              # ask — O(1) dict lookup
 if summary is None:
-    cache_tell.request(message_id, payload)          # tell — never blocks
+    cache.request(message_id, payload)       # TELL-shaped, called on the ask proxy
     summary = poll_deferred(lambda: cache.get(message_id), attempts=5, delay=0.4)
 if summary is None:
-    summary = text[:200] + "…"           # degraded answer, always available
+    summary = text[:200] + "…"               # degraded answer, always available
 ```
+
+The four type parameters are `ConfigType`, `StateType`, the hashable cache key `K`, and the produced
+value `V` — the first two because `Akgent` already declares them. `deferred` is deliberately **not**
+on the `akgentic.tool.core` façade; import `akgentic.tool.core.deferred` directly.
+
+Calling `request` on the **ask** proxy is not a partial adoption of the mechanism. `request` adds to
+the in-flight set, spawns a worker and tells it the payload — all O(1) on the cache actor's thread,
+so the ask never waits on external work. A tool closure holds an ask proxy and nothing else:
+`ActorToolObserver` exposes no tell proxy.
 
 ### Seven rules — all of them, or none
 
@@ -325,13 +332,22 @@ if summary is None:
 
 Every actor announces itself to the orchestrator on start, so **a spawned worker is a visible team
 member**. The orchestrator stops tool actors only once no *non-tool* member remains, and it decides
-what is a tool actor by the `#` name prefix. A worker named `summarize-abc123` therefore counts as a
-regular member and **holds tool-actor teardown open until it finishes** — for a slow call, every team
-stop then rides the stop backstop instead of completing promptly.
+what is a tool actor by the `#` name prefix.
 
-A worker is also a child of its cache actor, and a parent's stop blocks on its children. Every
-worker must therefore bound its own external call with an explicit timeout below the orchestrator's
-stop backstop.
+What the prefix does **not** buy is a faster teardown. A worker is a *child* of its cache actor, and
+`stop_children(blocking=True)` waits for it under **either** name — so a worker mid-call holds its
+parent's stop open whatever it is called, total teardown time is the same with or without the prefix,
+and the stop backstop fires in both cases or neither.
+
+What the prefix buys is **sibling release**. Named `#defer-…`, a worker is a tool actor, so phase 2
+tears down unrelated tool actors — `#PlanningTool`, `#KnowledgeGraphTool`, … — in parallel. Named
+`summarize-abc123` it counts as a regular member, and every one of those siblings serializes behind a
+worker it has nothing to do with.
+
+Because the parent's stop blocks on its children either way, every worker must bound its own external
+call with an explicit timeout below the orchestrator's stop backstop — and hand that budget to its
+I/O client. A Python thread cannot be cancelled, so a timeout that does not reach the client is
+decoration.
 
 ## Channel System
 
@@ -473,59 +489,66 @@ Requires `TAVILY_API_KEY` environment variable.
 
 ### TeamTool
 
-Exposes team management capabilities (hire/fire agents, roster view) to the LLM. Used by
-`BaseAgent` in `akgentic-agent` to enable orchestrator-level agents to dynamically extend
-the team.
+Exposes team management capabilities (hire/fire agents, roster view) to the LLM, and — opt-in —
+answers *who is working right now, and on what*. Used by `BaseAgent` in `akgentic-agent` to enable
+orchestrator-level agents to dynamically extend the team.
 
 ```python
-from akgentic.tool.team import TeamTool
+from akgentic.tool.team import ActivitySummarizer, GetTeamActivity, TeamTool
 
-TeamTool()
+TeamTool()                                      # hire/fire/roster/profiles — no actor
+TeamTool(get_team_activity=True)                # + who_is_working(), truncation only, still no actor
+TeamTool(get_team_activity=GetTeamActivity(     # + summaries on demand; #TeamActivity is created
+    summarizer=ActivitySummarizer(model="openai:gpt-5.2-mini"),
+))
 ```
 
 Requires a `TeamManagementToolObserver` (provided by `BaseAgent`). Surfaces agent roster and
-available profiles as a system prompt; `hire_team_member` and `fire_team_member` as tool calls.
+available profiles as a system prompt; `hire_members(roles)` and `fire_members(names)` as tool calls.
+The single-member `hire_member(role, name=None)` and `fire_member(name)` are `COMMAND`-channel
+variants, not tool calls.
 
-### TeamActivityTool
+#### Team activity — `who_is_working`
 
-> **Status: planned (ADR-033).** Not on `master` yet.
+`get_team_activity` **defaults to `False`**, so an existing card keeps its behaviour and its surface
+byte-for-byte. Two independent gates then decide what turning it on costs:
 
-Answers *who is working right now, and on what* — `TeamTool` answers *who is on the team*. It is a
-separate card on purpose: `TeamTool` is actor-free and cheap, and a team using hire/fire should not
-inherit an actor, an LLM dependency and a cache it did not ask for.
+| Configuration | `who_is_working` | `#TeamActivity` actor | model call | `summarize_over` in the schema |
+|---|---|---|---|---|
+| `get_team_activity=False` *(default)* | not exposed | not created | never | n/a |
+| `get_team_activity=True`, `summarizer=None` | exposed, truncates | **not created** | never | **absent** |
+| `summarizer=ActivitySummarizer(...)` | exposed, summarizes | created | on demand | present |
 
-```python
-from akgentic.tool.team import TeamActivityTool
+The `#TeamActivity` cache actor is created **only** when `get_team_activity` resolves truthy **and**
+its `summarizer` is not `None`. The actor exists solely to cache summaries, so with the capability on
+and no summarizer there is nothing to cache: `who_is_working` answers by truncation and **no actor is
+created at all**.
 
-TeamActivityTool(summarizer_model="openai:gpt-5.2-mini", stale_after_seconds=300.0)
-```
+The signature follows the configuration rather than being fixed. Without a summarizer the callable is
+`who_is_working() -> TeamActivityReport`, and `summarize_over` is **absent from the tool schema** —
+not merely defaulted off — so the model cannot request a summary nothing could produce. With one
+configured it becomes `who_is_working(summarize_over: int | None = None)`, and **`summarize_over=None`
+still performs zero model calls**: long task text is truncated to `max_task_chars`. Passing an integer
+is the opt-in — only longer tasks go through the deferred-result cache above, keyed by `message_id` so
+a follow-up call costs nothing. The threshold *is* the consent; there is no eager warming.
 
-```python
-who_is_working(summarize_over: int | None = None) -> TeamActivityReport
-```
-
-Busy members are derived from the orchestrator's telemetry: an agent with a `ReceivedMessage` and no
-matching `ProcessedMessage` is mid-handler, and the task text comes from the corresponding
-`SentMessage`.
-
-**`summarize_over=None` — the default — performs zero LLM calls.** Long task descriptions are
-truncated. Passing an integer is the opt-in: only tasks longer than it are summarized, through the
-deferred-result cache above, keyed by `message_id` so a follow-up call costs nothing. The threshold
-*is* the consent — there is no eager warming.
-
-Three behaviours worth knowing:
+Busy members are derived from the orchestrator's own telemetry: an agent with a `ReceivedMessage` and
+no matching `ProcessedMessage` is mid-handler, and the task text comes from the corresponding
+`SentMessage`. Three behaviours worth knowing:
 
 - **Busy means exactly one open message.** Actors are sequential, so the open count is structurally
-  0 or 1; a higher count is reported as `suspect`, not as "working".
+  0 or 1; a higher count is reported as `suspect` rather than as plain "working", and never dropped.
 - **Stale entries are dropped.** A resumed team replays telemetry that can be permanently unbalanced
   (a message received before the stop, processed never). Anything open longer than
-  `stale_after_seconds` is excluded rather than reported as a phantom worker.
-- **The caller, tool actors, and the user proxy never appear.** The caller is busy by definition, and
-  a human proxy waiting on input is not working.
+  `stale_after_seconds` (default 300 s) is excluded rather than reported as a phantom worker.
+- **The caller, tool actors, and the user proxy never appear.** The caller is excluded by `agent_id`,
+  so a rename cannot slip it through; a human proxy waiting on input is not working.
 
-The summarizer is built from a pydantic-ai model spec string rather than the framework's
-`ModelConfig`, because `akgentic-tool` does not depend on `akgentic-llm`. Consequence: those tokens
-are produced outside `ReactAgent` and are not counted by its cost accounting or usage limits.
+`GetTeamActivity` also carries `expose` (`TOOL_CALL`, `COMMAND`) and `max_task_chars` (default 200),
+the budget for reported task text; `ActivitySummarizer` carries `poll_attempts` (5) and
+`poll_delay_seconds` (0.4). Its `model` is a pydantic-ai model spec string rather than the framework's
+`ModelConfig`, because `akgentic-tool` does not depend on `akgentic-llm` — so those tokens are
+produced outside `ReactAgent` and are counted by neither its cost accounting nor its usage limits.
 
 ### MCPTool
 
@@ -776,11 +799,16 @@ blocked from merging until all three steps are green.
 src/akgentic/tool/
     __init__.py               # Public API
     py.typed                  # PEP 561 typing marker
-    core.py                   # ToolCard, BaseToolParam, ToolFactory, Channels
-    │                         # planned (ADR-033): becomes a core/ package of the same
-    │                         #   name — channels, params, card, dependencies, commands,
-    │                         #   factory, deferred — with __init__.py re-exporting
-    │                         #   today's names, so `akgentic.tool.core` is unchanged
+    core/
+    │   __init__.py           # Façade: ToolCard, BaseToolParam, ToolFactory, Channels
+    │   channels.py           # Channels enum: TOOL_CALL, SYSTEM_PROMPT, COMMAND
+    │   params.py             # BaseToolParam
+    │   card.py               # ToolCard
+    │   dependencies.py       # Topological ordering of cards by depends_on
+    │   commands.py           # CommandRegistry
+    │   factory.py            # ToolFactory
+    │   └── deferred.py       # DeferredResultActor, DeferredWorker, poll_deferred
+    │                         #   NOT on the façade — import akgentic.tool.core.deferred
     errors.py                 # RetriableError
     event.py                  # ToolObserver, ActorToolObserver,
     │                         #   TeamManagementToolObserver
@@ -791,9 +819,9 @@ src/akgentic/tool/
     │   inmemory.py           # InMemory backend
     │   weaviate.py           # Weaviate backend [optional: weaviate extra]
     │   actor.py              # VectorStoreActor singleton
-    │   embedding_actor.py    # EmbeddingActor (non-blocking embedding)
-    │                         # planned (ADR-033): spawned name gains a "#" prefix
-    │                         #   (teardown invariant — see Deferred Results)
+    │   embedding_actor.py    # EmbeddingActor (non-blocking embedding); spawned as
+    │                         #   "#embed-<collection>-<request_id>" (teardown
+    │                         #   invariant — see Deferred Results)
     │   └── tool.py           # VectorStoreTool ToolCard
     planning/
     │   planning_actor.py     # Task models, PlanConfig, PlanActor
@@ -805,9 +833,9 @@ src/akgentic/tool/
     search/
     │   └── search.py         # SearchTool (Tavily)
     team/
-    │   team.py               # TeamTool
-    │   activity.py           # planned (ADR-033): TeamActivityTool, who_is_working
-    │   └── activity_actor.py # planned (ADR-033): TeamActivityActor, SummarizerWorker
+    │   team.py               # TeamTool — hire/fire/roster/profiles + get_team_activity
+    │   └── activity.py       # who_is_working models, GetTeamActivity,
+    │                         #   ActivitySummarizer, TeamActivityActor, SummarizerWorker
     mcp/
     │   mcp.py                # MCPTool, connection configs
     │   └── oauth_handler.py  # OAuth 2.0 flow
