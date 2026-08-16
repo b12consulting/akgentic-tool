@@ -1,5 +1,11 @@
 """Team management tool for akgentic framework."""
 
+from .activity import (
+    AgentActivity,
+    GetTeamActivity,
+    TeamActivityReport,
+    TeamActivityTool,
+)
 from .team import (
     FireTeamMember,
     GetRoleProfiles,
@@ -14,4 +20,8 @@ __all__ = [
     "FireTeamMember",
     "GetTeamRoster",
     "GetRoleProfiles",
+    "TeamActivityTool",
+    "GetTeamActivity",
+    "AgentActivity",
+    "TeamActivityReport",
 ]
