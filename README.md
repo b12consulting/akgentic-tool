@@ -13,16 +13,20 @@ channel system — as tool calls, system prompt injections, or programmatic comm
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Architecture](#architecture)
+  - [ToolCard](#toolcard)
+  - [ToolFactory](#toolfactory)
+  - [BaseToolParam: Configuration, Not Schema](#basetoolparam-configuration-not-schema)
+  - [Channel System](#channel-system)
 - [Migration: moved import paths](#migration-moved-import-paths)
 - [Observers: How a Tool Acts on the System](#observers-how-a-tool-acts-on-the-system)
+- [Tool State Events](#tool-state-events)
 - [Tool Actors](#tool-actors)
 - [Deferred Results: Never Block a Tool Actor](#deferred-results-never-block-a-tool-actor)
-- [Tool State Events](#tool-state-events)
-- [Channel System](#channel-system)
 - [Tool Catalog](#tool-catalog)
   - [WorkspaceTool](#workspacetool)
   - [PlanningTool](#planningtool)
   - [KnowledgeGraphTool](#knowledgegraphtool)
+  - [VectorStoreTool](#vectorstoretool)
   - [SearchTool](#searchtool)
   - [TeamTool](#teamtool)
   - [MCPTool](#mcptool)
@@ -268,6 +272,29 @@ class BadParam(BaseToolParam):
     status: str | None = None  # never consumed by factory
 ```
 
+### Channel System
+
+The `Channels` enum (`TOOL_CALL`, `SYSTEM_PROMPT`, `COMMAND`) controls how a capability is
+surfaced. Each `BaseToolParam` subclass declares its `expose` set. A single capability can
+appear on multiple channels simultaneously.
+
+| Channel | Consumer | Invocation |
+|---|---|---|
+| `TOOL_CALL` | LLM agent | Called by the LLM during the ReAct loop |
+| `SYSTEM_PROMPT` | LLM context | Injected as dynamic content before each LLM call |
+| `COMMAND` | Orchestrator / agents | Called programmatically via `proxy_call` |
+
+```python
+class GetPlanning(BaseToolParam):
+    expose: set[Channels] = {SYSTEM_PROMPT, COMMAND}  # never a direct LLM call
+
+class GetPlanningTask(BaseToolParam):
+    expose: set[Channels] = {TOOL_CALL, COMMAND}      # LLM + programmatic
+```
+
+`BaseToolParam.instructions` appends runtime guidance to a tool's docstring without modifying
+source — useful for injecting team-specific constraints at configuration time.
+
 ## Migration: moved import paths
 
 Two modules were reorganised: `akgentic.tool.event` was split by audience, and
@@ -392,6 +419,94 @@ agent uses the `None`-returning one and handles the `None`.
 Do not stash the observer in a field of your own to avoid this. It would not be serializable, and
 it would reintroduce the strong reference the weak one exists to prevent.
 
+## Tool State Events
+
+A stateful tool actor's state is the point of it — the plan, the graph, the index. Clients want to
+follow that state as it changes, and `ToolStateEvent` is how a tool actor tells them: by
+broadcasting **what changed**, not what it now holds.
+
+```python
+ToolStateEvent(tool_id="#KnowledgeGraphTool", seq=7, payload=delta)
+```
+
+- **`tool_id`** — the name of the emitting tool actor, `#`-prefixed like the actor itself. A client
+  following several stateful tools in one team routes on it.
+- **`seq`** — a **per-tool monotonic** counter starting at 1. Per-tool, not per-team: two tool
+  actors each number their own stream independently. A consumer detects a missed event by watching
+  it.
+- **`payload`** — the delta itself.
+
+The envelope inherits `team_id`, `timestamp`, `id`, `sender` and `display_type` from the framework's
+`Message` base without overriding any of them, so it travels on the ordinary event stream.
+
+### Why deltas, and why there is no snapshot protocol
+
+A tool actor's state can be large, and it changes in small increments. Republishing all of it on
+every mutation would be wasteful in the ordinary case and useless in the interesting one — a client
+that wants to show *"three entities were added"* cannot recover that from two snapshots without
+diffing them itself.
+
+So the event carries the increment, and it rides the path the orchestrator already has:
+`notify_event` puts it on the orchestrator's event stream, which is recorded in team history. A
+client that joins late does not ask for a snapshot — **there is no snapshot request and no snapshot
+message** — it replays the history it would have replayed anyway and applies the deltas in order.
+Tool state reconstructs itself out of the normal replay path, which is why the mechanism needs no
+protocol of its own.
+
+### `payload` is structurally typed
+
+`payload` is declared as *any* serializable model, not as a union of the concrete delta types. That
+is deliberate: a union naming the knowledge graph's delta and its peers would make the
+package-global envelope depend on every domain that emits one — exactly the dependency the package
+layout forbids.
+
+The concrete class is not lost. Serialization tags the payload with a `__model__` marker naming its
+class, so a consumer deserializes the real object and **discriminates on the object, not on the
+envelope** — an `isinstance` check, in Python terms. Your own delta type needs no registration and
+no entry in any union; it needs only to be a serializable model.
+
+One caveat if you ever move a delta class between modules: that marker records the class's module
+path, so it moves when the class moves. The payload's own fields are unaffected.
+
+### The emit-before-return contract
+
+A mutation method emits its event **before it returns** — and before it raises, if it collected
+errors along the way. A caller that gets a return value knows the event is already on its way; a
+caller that gets an exception still gets the events for the work that did succeed.
+
+The knowledge graph is the shipped example. `update_graph` applies its entity and relation changes,
+builds a delta from what it actually added, modified and removed, then:
+
+```python
+delta = KnowledgeGraphStateEvent(
+    entities_added=created_entities,
+    entities_modified=modified_entities,
+    entities_removed=deleted_entity_ids,
+    relations_added=created_relations,
+    relations_removed=merged_relations_removed,
+)
+
+self.state.notify_state_change()
+
+if self._delta_is_non_empty(delta):
+    self._state_event_seq += 1
+    self.notify_event(
+        ToolStateEvent(tool_id=KG_ACTOR_NAME, seq=self._state_event_seq, payload=delta)
+    )
+
+if errors:
+    raise RetriableError("Update errors: " + "; ".join(errors))
+return "Done"
+```
+
+Two details worth copying:
+
+- **An empty delta emits nothing.** "Emit before return" is not "emit unconditionally" — a call
+  that changed nothing is not a state change, and broadcasting it would make every consumer filter
+  noise.
+- **`seq` advances only when an event is actually emitted**, inside the guard. Numbering therefore
+  has no gaps for suppressed empty deltas — which is what makes a gap meaningful to a consumer.
+
 ## Tool Actors
 
 Most tools are stateless: the card holds configuration, the callable does its work and returns. A
@@ -428,7 +543,8 @@ something a tool implements.
 ### Binding one: `getChildrenOrCreate`, never check-then-create
 
 A tool binds its actor through `orchestrator_proxy.getChildrenOrCreate(...)`, which is idempotent:
-it returns the existing singleton or creates it, in one step.
+it returns the existing singleton or creates it, in one step. The actor is created as a child of
+the orchestrator — the team's single orchestrator owning it is what guarantees unicity.
 
 The obvious alternative is a bug. "Ask whether it exists, create it if it does not" is two messages
 with a window between them — two agents wiring the same tool at startup both look, both find
@@ -537,117 +653,6 @@ call with an explicit timeout below the orchestrator's stop backstop — and han
 I/O client. A Python thread cannot be cancelled, so a timeout that does not reach the client is
 decoration.
 
-## Tool State Events
-
-A stateful tool actor's state is the point of it — the plan, the graph, the index. Clients want to
-follow that state as it changes, and `ToolStateEvent` is how a tool actor tells them: by
-broadcasting **what changed**, not what it now holds.
-
-```python
-ToolStateEvent(tool_id="#KnowledgeGraphTool", seq=7, payload=delta)
-```
-
-- **`tool_id`** — the name of the emitting tool actor, `#`-prefixed like the actor itself. A client
-  following several stateful tools in one team routes on it.
-- **`seq`** — a **per-tool monotonic** counter starting at 1. Per-tool, not per-team: two tool
-  actors each number their own stream independently. A consumer detects a missed event by watching
-  it.
-- **`payload`** — the delta itself.
-
-The envelope inherits `team_id`, `timestamp`, `id`, `sender` and `display_type` from the framework's
-`Message` base without overriding any of them, so it travels on the ordinary event stream.
-
-### Why deltas, and why there is no snapshot protocol
-
-A tool actor's state can be large, and it changes in small increments. Republishing all of it on
-every mutation would be wasteful in the ordinary case and useless in the interesting one — a client
-that wants to show *"three entities were added"* cannot recover that from two snapshots without
-diffing them itself.
-
-So the event carries the increment, and it rides the path the orchestrator already has:
-`notify_event` puts it on the orchestrator's event stream, which is recorded in team history. A
-client that joins late does not ask for a snapshot — **there is no snapshot request and no snapshot
-message** — it replays the history it would have replayed anyway and applies the deltas in order.
-Tool state reconstructs itself out of the normal replay path, which is why the mechanism needs no
-protocol of its own.
-
-### `payload` is structurally typed
-
-`payload` is declared as *any* serializable model, not as a union of the concrete delta types. That
-is deliberate: a union naming the knowledge graph's delta and its peers would make the
-package-global envelope depend on every domain that emits one — exactly the dependency the package
-layout forbids.
-
-The concrete class is not lost. Serialization tags the payload with a `__model__` marker naming its
-class, so a consumer deserializes the real object and **discriminates on the object, not on the
-envelope** — an `isinstance` check, in Python terms. Your own delta type needs no registration and
-no entry in any union; it needs only to be a serializable model.
-
-One caveat if you ever move a delta class between modules: that marker records the class's module
-path, so it moves when the class moves. The payload's own fields are unaffected.
-
-### The emit-before-return contract
-
-A mutation method emits its event **before it returns** — and before it raises, if it collected
-errors along the way. A caller that gets a return value knows the event is already on its way; a
-caller that gets an exception still gets the events for the work that did succeed.
-
-The knowledge graph is the shipped example. `update_graph` applies its entity and relation changes,
-builds a delta from what it actually added, modified and removed, then:
-
-```python
-delta = KnowledgeGraphStateEvent(
-    entities_added=created_entities,
-    entities_modified=modified_entities,
-    entities_removed=deleted_entity_ids,
-    relations_added=created_relations,
-    relations_removed=merged_relations_removed,
-)
-
-self.state.notify_state_change()
-
-if self._delta_is_non_empty(delta):
-    self._state_event_seq += 1
-    self.notify_event(
-        ToolStateEvent(tool_id=KG_ACTOR_NAME, seq=self._state_event_seq, payload=delta)
-    )
-
-if errors:
-    raise RetriableError("Update errors: " + "; ".join(errors))
-return "Done"
-```
-
-Two details worth copying:
-
-- **An empty delta emits nothing.** "Emit before return" is not "emit unconditionally" — a call
-  that changed nothing is not a state change, and broadcasting it would make every consumer filter
-  noise.
-- **`seq` advances only when an event is actually emitted**, inside the guard. Numbering therefore
-  has no gaps for suppressed empty deltas — which is what makes a gap meaningful to a consumer.
-
-## Channel System
-
-The `Channels` enum (`TOOL_CALL`, `SYSTEM_PROMPT`, `COMMAND`) controls how a capability is
-surfaced. Each `BaseToolParam` subclass declares its `expose` set. A single capability can
-appear on multiple channels simultaneously.
-
-| Channel | Consumer | Invocation |
-|---|---|---|
-| `TOOL_CALL` | LLM agent | Called by the LLM during the ReAct loop |
-| `SYSTEM_PROMPT` | LLM context | Injected as dynamic content before each LLM call |
-| `COMMAND` | Orchestrator / agents | Called programmatically via `proxy_call` |
-
-```python
-class GetPlanning(BaseToolParam):
-    expose: set[Channels] = {SYSTEM_PROMPT, COMMAND}  # never a direct LLM call
-
-class GetPlanningTask(BaseToolParam):
-    expose: set[Channels] = {TOOL_CALL, COMMAND}      # LLM + programmatic
-```
-
-`BaseToolParam.instructions` appends runtime guidance to a tool's docstring without modifying
-source — useful for injecting team-specific constraints at configuration time.
-
 ## Tool Catalog
 
 ### WorkspaceTool
@@ -692,7 +697,8 @@ with a sidecar cache for the resized version.
 ### PlanningTool
 
 Shared actor-based task board for multi-agent teams. A singleton `PlanActor` (named
-`#PlanningTool`) lives in the orchestrator and persists across all agents' tool calls.
+`#PlanningTool`) is created by the orchestrator as one of its children — get-or-create
+semantics guarantee unicity — and persists across all agents' tool calls.
 
 ```python
 from akgentic.tool.planning import PlanningTool
@@ -714,7 +720,12 @@ LLMs respect them before composing a call.
 
 **Semantic search** (requires `akgentic-tool[vector_search]`): task descriptions are embedded
 on create/update. `search_planning(query=...)` runs keyword UNION semantic search (cosine ≥ 0.5,
-top_k=20). Degrades gracefully to keyword-only when vector deps are absent.
+top_k=10; defaults configurable via `search_score_threshold` / `search_top_k`). Controlled by the
+`vector_store` field: `True` (default) wires the shared `#VectorStore` actor, a `str` selects a
+named store created by `VectorStoreTool(vector_store_name=...)` (see
+[VectorStoreTool](#vectorstoretool)), `PlanningTool(vector_store=False)` disables semantic
+search — the tool then runs keyword-only. It also degrades gracefully to keyword-only when
+vector deps are absent.
 
 ```python
 # System prompt output example (filter_by_agent=True)
@@ -741,9 +752,77 @@ from akgentic.tool.knowledge_graph import KnowledgeGraphTool
 KnowledgeGraphTool()
 ```
 
-Exposes `get_graph`, `update_graph`, and `search_graph` capabilities. Entities and relations
-are stored in a `KnowledgeGraphActor`. Semantic search uses the shared `VectorIndex`
-infrastructure (requires `akgentic-tool[vector_search]`).
+| Capability | Default channel | Description |
+|---|---|---|
+| `get_graph` | `SYSTEM_PROMPT`, `COMMAND` | Full graph (type schema + root entities) injected into LLM context |
+| `update_graph` | `TOOL_CALL` | Batch create / update / delete entities and relations |
+| `search_graph` | `TOOL_CALL`, `COMMAND` | Search by keyword, vector, or hybrid mode |
+
+Entities and relations are stored in a `KnowledgeGraphActor`.
+Semantic search uses the shared vector store
+(requires `akgentic-tool[vector_search]`) and is controlled by the same `vector_store` field as
+`PlanningTool`: `KnowledgeGraphTool(vector_store=False)` disables it (keyword-only search),
+`True` wires the shared `#VectorStore` actor, a `str` selects a named store created by
+`VectorStoreTool(vector_store_name=...)`.
+
+**`search_graph`** searches entities *and* relations, and can expand hits into their graph
+neighbourhood. Parameters (a `SearchQuery`):
+
+- `mode` — `"hybrid"` (default, keyword ∪ semantic), `"keyword"` (substring only, no embedding
+  call), or `"vector"` (cosine similarity only)
+- `top_k` / `score_threshold` — per-call overrides; `None` falls back to the ToolCard defaults
+  (`search_top_k=10`, `search_score_threshold=0.3` — lower than PlanningTool's 0.5, favouring
+  recall for exploration)
+- `include_neighbors` — add the 1-hop neighbours of entity hits
+- `include_edges` — add all relations connected to entity hits
+- `find_paths` — BFS shortest paths between the top 5 entity hits (max 10 pairs)
+
+Results are ordered by score, highest first: a keyword match scores `1.0`, a vector hit its
+cosine similarity, a hit found by both `cosine + 0.5`.
+
+### VectorStoreTool
+
+Configuration-only companion card for the `VectorStoreActor` singleton — it exposes **no LLM
+tools, system prompts, or commands** (`get_tools()` returns `[]`). Its sole runtime job is to
+ensure the singleton exists when the observer attaches, via the same idempotent
+`getChildrenOrCreate` binding as every other tool actor. Consumer cards (`PlanningTool`,
+`KnowledgeGraphTool`) never create the actor themselves — they look it up by name and declare a
+conditional `depends_on: ["VectorStoreTool"]`, so `ToolFactory`'s topological sort wires this
+card first.
+
+```python
+from akgentic.tool.vector_store import VectorStoreTool
+
+VectorStoreTool()                                  # "#VectorStore", OpenAI embeddings
+VectorStoreTool(vector_store_name="#VectorStore-RAG", embedding_provider="azure")
+```
+
+| Field | Default | Purpose |
+|---|---|---|
+| `vector_store_name` | `"#VectorStore"` | Singleton actor name — several named stores can coexist |
+| `embedding_model` | `"text-embedding-3-small"` | Embedding model identifier |
+| `embedding_provider` | `"openai"` | `"openai"` or `"azure"` |
+
+**Collections are configured by the consumer, not this card.** Each consumer card carries a
+`collection: CollectionConfig` field, passed to the actor's `create_collection` when the
+consumer's actor starts:
+
+| `CollectionConfig` field | Default | Purpose |
+|---|---|---|
+| `dimension` | `1536` | Embedding vector dimensionality |
+| `backend` | `"inmemory"` | `"inmemory"` (numpy) or `"weaviate"` (requires `akgentic-tool[weaviate]`) |
+| `persistence` | `"actor_state"` | `"actor_state"` or `"workspace"` (inmemory backend only) |
+| `workspace_path` | `None` | Filesystem path when persistence is `"workspace"` |
+| `tenant` | `None` | Weaviate tenant ID for multi-tenancy |
+
+```python
+PlanningTool(collection=CollectionConfig(backend="weaviate", tenant="team-42"))
+```
+
+Weaviate connection settings are deliberately not fields on any card — they are
+infrastructure-level, injected by the deployment layer. A team can omit vector search entirely
+by setting `vector_store=False` on the consumer cards; both degrade gracefully to keyword-only
+search.
 
 ### SearchTool
 
