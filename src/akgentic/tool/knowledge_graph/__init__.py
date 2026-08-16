@@ -56,7 +56,9 @@ from akgentic.tool.knowledge_graph.models import (
     SearchQuery,
     SearchResult,
 )
-from akgentic.tool.vector import _check_vector_search_dependencies as _check_kg_dependencies
+from akgentic.tool.vector_store.vector import (
+    _check_vector_search_dependencies as _check_kg_dependencies,
+)
 
 __all__ = [
     # Core domain models

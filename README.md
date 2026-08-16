@@ -13,6 +13,7 @@ channel system — as tool calls, system prompt injections, or programmatic comm
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Architecture](#architecture)
+- [Migration: moved import paths](#migration-moved-import-paths)
 - [Deferred Results: Never Block a Tool Actor](#deferred-results-never-block-a-tool-actor)
 - [Channel System](#channel-system)
 - [Tool Catalog](#tool-catalog)
@@ -263,6 +264,54 @@ class SearchGraph(BaseToolParam):
 class BadParam(BaseToolParam):
     status: str | None = None  # never consumed by factory
 ```
+
+## Migration: moved import paths
+
+Two modules were reorganised: `akgentic.tool.event` was split by audience, and
+`akgentic.tool.vector` moved next to the code built on it. **Every old path below still
+works.** Each one now resolves through a compatibility façade that emits a
+`DeprecationWarning` on **attribute access** — not at import time, so code that touches
+none of these symbols is never warned. **No removal release is scheduled.**
+
+**Importing from the `akgentic.tool` package root needs no migration at all.** That surface
+is unchanged, and reaching a symbol through it emits no warning.
+
+| Old path | New home | Tier |
+|---|---|---|
+| `akgentic.tool.event.ToolStateEvent` | `akgentic.tool.core.event` | Stable |
+| `akgentic.tool.event.CommandArg` | `akgentic.tool.core.event` | Stable |
+| `akgentic.tool.event.CommandDescriptor` | `akgentic.tool.core.event` | Stable |
+| `akgentic.tool.event.CommandsAnnouncedEvent` | `akgentic.tool.core.event` | Stable |
+| `akgentic.tool.event.ToolObserver` | `akgentic.tool.core.observer` | Stable |
+| `akgentic.tool.event.ActorToolObserver` | `akgentic.tool.core.observer` | Stable |
+| `akgentic.tool.event.TeamManagementToolObserver` | `akgentic.tool.team.observer` | Internal |
+| `akgentic.tool.event.ToolStatePayload` | `akgentic.tool.knowledge_graph.event` | Internal |
+| `akgentic.tool.vector.VectorEntry` | `akgentic.tool.vector_store.vector` | Internal |
+| `akgentic.tool.vector.EmbeddingService` | `akgentic.tool.vector_store.vector` | Internal |
+| `akgentic.tool.vector.VectorIndex` | `akgentic.tool.vector_store.vector` | Internal |
+| `akgentic.tool.vector._check_vector_search_dependencies` | `akgentic.tool.vector_store.vector` | Internal |
+
+### What the two tiers mean
+
+The tier is not a measure of how important a symbol is. It says **whether its import path is
+something you may build against**, and the two answers carry different promises.
+
+**Stable — a supported surface.** These are the contracts a custom `ToolCard` author outside
+this package writes against: the `akgentic.tool` package root, the core abstractions
+(`ToolCard`, `BaseToolParam`, `ToolFactory`, `Channels`, `CommandRegistry`), the *global*
+observers `ToolObserver` and `ActorToolObserver`, `ToolStateEvent`, and the command-discovery
+models. Their import paths are part of the API. If one moves, it is shimmed, and the shim is
+kept.
+
+**Internal — not a surface.** These belong to one specific tool: `TeamManagementToolObserver`
+is `TeamTool`'s contract, `ToolStatePayload` is the knowledge graph's, the vector primitives
+are `vector_store`'s. They move freely with the tool that owns them. Their rows above are a
+**courtesy, not a guarantee** — the shim entry exists because removing a working import for
+no reason is rude, not because the path was ever promised. Treating it as a promise would
+freeze this package's internal structure by accident, which is exactly what the split was
+done to avoid.
+
+If one of your imports is in the Internal tier, move it now rather than relying on the row.
 
 ## Deferred Results: Never Block a Tool Actor
 
@@ -812,14 +861,20 @@ src/akgentic/tool/
     │   dependencies.py       # Topological ordering of cards by depends_on
     │   commands.py           # CommandRegistry
     │   factory.py            # ToolFactory
+    │   event.py              # ToolStateEvent, CommandArg, CommandDescriptor,
+    │   │                     #   CommandsAnnouncedEvent — package-global contracts
+    │   observer.py           # ToolObserver, ActorToolObserver — the global observers
     │   └── deferred.py       # DeferredResultActor, DeferredWorker, poll_deferred
     │                         #   NOT on the façade — import akgentic.tool.core.deferred
     errors.py                 # RetriableError
-    event.py                  # ToolObserver, ActorToolObserver,
-    │                         #   TeamManagementToolObserver
-    vector.py                 # VectorEntry, EmbeddingService, VectorIndex
-    │                         #   [optional: vector_search extra]
+    event.py                  # Compatibility façade only — the symbols that lived here
+    │                         #   moved to core/, team/ and knowledge_graph/.
+    │                         #   See "Migration: moved import paths"
+    vector.py                 # Compatibility façade only — moved to
+    │                         #   vector_store/vector.py. See the migration table
     vector_store/
+    │   vector.py             # VectorEntry, EmbeddingService, VectorIndex
+    │   │                     #   [optional: vector_search extra]
     │   protocol.py           # VectorStore Protocol, VectorStoreConfig, data models
     │   inmemory.py           # InMemory backend
     │   weaviate.py           # Weaviate backend [optional: weaviate extra]
@@ -833,12 +888,14 @@ src/akgentic/tool/
     │   └── planning.py       # PlanningTool ToolCard
     knowledge_graph/
     │   models.py             # Entity, Relation, CRUD + query models
+    │   event.py              # ToolStatePayload — this domain's delta payload typing
     │   kg_actor.py           # KnowledgeGraphActor
     │   └── kg_tool.py        # KnowledgeGraphTool ToolCard
     search/
     │   └── search.py         # SearchTool (Tavily)
     team/
     │   team.py               # TeamTool — hire/fire/roster/profiles + get_team_activity
+    │   observer.py           # TeamManagementToolObserver — TeamTool's own contract
     │   └── activity.py       # who_is_working models, GetTeamActivity,
     │                         #   ActivitySummarizer, TeamActivityActor, SummarizerWorker
     mcp/

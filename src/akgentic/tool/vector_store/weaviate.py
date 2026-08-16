@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     import weaviate
     import weaviate.collections
 
-    from akgentic.tool.vector import VectorEntry
+    from akgentic.tool.vector_store.vector import VectorEntry
 
 logger = logging.getLogger(__name__)
 

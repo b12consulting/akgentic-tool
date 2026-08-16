@@ -3,12 +3,13 @@
 ``02-core.md`` has stated this in prose for a while. These tests make it mechanical:
 prose does not go red when someone adds an import.
 
-Three invariants:
+Four invariants:
 
-* no module under ``core/`` imports a domain package, the deprecated
-  ``akgentic.tool.event`` façade, or the package root — the root is listed because its
-  lazy ``__getattr__`` hands out knowledge-graph types, so an import through it restores
-  the edge without ever naming a domain;
+* no module under ``core/`` imports a domain package, a deprecated façade, or the package
+  root — the root is listed because its lazy ``__getattr__`` hands out knowledge-graph
+  types, so an import through it restores the edge without ever naming a domain;
+* no module anywhere under ``src/`` imports either deprecated façade — a package must not
+  consume its own deprecated path, and that reasoning was never specific to ``core/``;
 * no module under ``knowledge_graph/`` reaches back for the event modules, and
   ``models.py`` calls no ``model_rebuild`` — the bottom-of-file rebuild was one of
   three coupled mechanisms holding the old cycle open, and it is the cheapest one to
@@ -23,9 +24,11 @@ import ast
 import sys
 from pathlib import Path
 
+import akgentic.tool as tool_package
 import akgentic.tool.core as core_package
 import akgentic.tool.knowledge_graph as kg_package
 
+TOOL_DIR = Path(tool_package.__file__).parent
 CORE_DIR = Path(core_package.__file__).parent
 KG_DIR = Path(kg_package.__file__).parent
 
@@ -44,9 +47,14 @@ DOMAIN_PACKAGES: frozenset[str] = frozenset(
     }
 )
 
-# The deprecated façade. A ``core/`` module reaching through it would re-create the
-# domain edge indirectly, since the façade can resolve knowledge-graph symbols.
-FACADE_MODULE = "akgentic.tool.event"
+# The deprecated façades. A ``core/`` module reaching through ``event`` would re-create the
+# domain edge indirectly, since that façade resolves knowledge-graph symbols. More
+# generally, no module in this package may consume a path the package itself deprecated —
+# which is why the sweep below covers all of ``src/`` and not only ``core/``.
+FACADE_MODULES: frozenset[str] = frozenset({"akgentic.tool.event", "akgentic.tool.vector"})
+
+# The façade files themselves, which are the one legitimate place these names appear.
+FACADE_FILENAMES: frozenset[str] = frozenset({"event.py", "vector.py"})
 
 _TOOL_PREFIX = "akgentic.tool."
 
@@ -63,6 +71,17 @@ def _is_tool_module(module: str) -> bool:
     return module == ROOT_PACKAGE or module.startswith(_TOOL_PREFIX)
 
 
+def _package_parts(package_dir: Path) -> tuple[str, ...]:
+    """Dotted parts of the package *package_dir* holds, e.g. ``('akgentic', 'tool', 'core')``.
+
+    Derived from the path rather than from ``package_dir.name`` so the tool package root
+    itself is a legal argument — ``TOOL_DIR.name`` is ``"tool"``, which a name-based form
+    would render as ``akgentic.tool.tool`` and silently mis-resolve every relative import
+    in the whole-``src/`` sweep.
+    """
+    return ("akgentic", "tool", *package_dir.relative_to(TOOL_DIR).parts)
+
+
 def _imported_modules(module_path: Path, package_dir: Path) -> set[str]:
     """Return the ``akgentic.tool*`` module paths imported by *module_path*.
 
@@ -74,9 +93,7 @@ def _imported_modules(module_path: Path, package_dir: Path) -> set[str]:
     """
     tree = ast.parse(module_path.read_text(encoding="utf-8"))
     package_parts = (
-        "akgentic",
-        "tool",
-        package_dir.name,
+        *_package_parts(package_dir),
         *module_path.relative_to(package_dir).parts[:-1],
     )
     imported: set[str] = set()
@@ -111,7 +128,7 @@ def test_core_modules_import_no_domain_package() -> None:
         for imported in sorted(_imported_modules(module_path, CORE_DIR)):
             if _domain_of(imported) is not None:
                 violations.append(f"{name} imports {imported}")
-            elif imported == FACADE_MODULE:
+            elif imported in FACADE_MODULES:
                 violations.append(f"{name} imports the deprecated {imported}")
             elif imported == ROOT_PACKAGE:
                 violations.append(f"{name} imports {imported}, which serves domain types lazily")
@@ -128,9 +145,43 @@ def test_knowledge_graph_does_not_import_the_deprecated_facade() -> None:
     """A KG module going through the façade would re-open the edge indirectly."""
     violations: list[str] = []
     for module_path in sorted(KG_DIR.rglob("*.py")):
-        if FACADE_MODULE in _imported_modules(module_path, KG_DIR):
+        if _imported_modules(module_path, KG_DIR) & FACADE_MODULES:
             violations.append(module_path.relative_to(KG_DIR).as_posix())
-    assert not violations, f"knowledge_graph/ imports the deprecated façade: {violations}"
+    assert not violations, f"knowledge_graph/ imports a deprecated façade: {violations}"
+
+
+def _swept_source_modules() -> list[Path]:
+    """Every module under ``src/akgentic/tool/`` except the façades themselves."""
+    return [
+        path
+        for path in sorted(TOOL_DIR.rglob("*.py"))
+        if not (path.parent == TOOL_DIR and path.name in FACADE_FILENAMES)
+    ]
+
+
+def test_no_source_module_imports_a_deprecated_facade() -> None:
+    """The package does not consume its own deprecated paths — anywhere under ``src/``.
+
+    27.6 forbade this for ``core/`` and ``knowledge_graph/`` against one façade. There are
+    two façades now, and the eleven internal import sites the vector move re-pointed were
+    re-pointed by hand: nothing would have caught a twelfth. The sweep is the thing that
+    would, and it covers function-body imports because ``_imported_modules`` walks the
+    whole AST rather than only the module-level statements.
+    """
+    violations: list[str] = []
+    for module_path in _swept_source_modules():
+        name = module_path.relative_to(TOOL_DIR).as_posix()
+        for imported in sorted(_imported_modules(module_path, TOOL_DIR) & FACADE_MODULES):
+            violations.append(f"{name} imports the deprecated {imported}")
+    assert not violations, f"src/ consumes its own deprecated path: {violations}"
+
+
+def test_the_source_sweep_is_not_vacuous() -> None:
+    """Guard the guard: a mistyped glob would make the sweep above trivially green."""
+    swept = {path.relative_to(TOOL_DIR).as_posix() for path in _swept_source_modules()}
+    assert "vector_store/vector.py" in swept, "the moved module is outside the sweep"
+    assert {"core/event.py", "core/observer.py", "team/observer.py"} <= swept
+    assert "event.py" not in swept and "vector.py" not in swept, "façades must be excluded"
 
 
 def test_knowledge_graph_has_no_bottom_of_file_event_import() -> None:
@@ -141,7 +192,7 @@ def test_knowledge_graph_has_no_bottom_of_file_event_import() -> None:
     cycle used: an import pushed below the class definitions so it runs late enough
     to paper over a circular dependency. That shape is the tell, not the import.
     """
-    event_modules = {FACADE_MODULE, "akgentic.tool.core.event"}
+    event_modules = {"akgentic.tool.event", "akgentic.tool.core.event"}
     violations: list[str] = []
     for module_path in sorted(KG_DIR.rglob("*.py")):
         tree = ast.parse(module_path.read_text(encoding="utf-8"))

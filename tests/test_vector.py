@@ -1,4 +1,4 @@
-"""Unit tests for akgentic.tool vector module (Story SR-1.3).
+"""Unit tests for the akgentic.tool.vector_store.vector module (Story SR-1.3).
 
 Covers:
   - Public API exports: VectorEntry, EmbeddingService, VectorIndex in __all__ (AC #1, #2)
@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pydantic import ValidationError
 
-from akgentic.tool.vector import (
+from akgentic.tool.vector_store.vector import (
     EmbeddingService,
     VectorEntry,
     VectorIndex,

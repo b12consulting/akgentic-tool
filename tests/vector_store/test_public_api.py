@@ -23,11 +23,14 @@ class TestPublicApi:
             "EmbeddingProvider",
             "EmbeddingRequest",
             "EmbeddingResult",
+            "EmbeddingService",
             "InMemoryBackend",
             "SearchHit",
             "SearchResult",
             "VS_ACTOR_NAME",
             "VS_ACTOR_ROLE",
+            "VectorEntry",
+            "VectorIndex",
             "VectorStoreActor",
             "VectorStoreConfig",
             "VectorStoreService",
@@ -36,3 +39,10 @@ class TestPublicApi:
             "WeaviateBackend",
         }
         assert set(vs.__all__) == expected
+
+    def test_private_dependency_check_is_re_exported_but_unlisted(self) -> None:
+        """Six modules import it by name, so it must resolve — without being public."""
+        from akgentic.tool.vector_store.vector import _check_vector_search_dependencies
+
+        assert vs._check_vector_search_dependencies is _check_vector_search_dependencies
+        assert "_check_vector_search_dependencies" not in vs.__all__

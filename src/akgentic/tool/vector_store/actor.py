@@ -26,12 +26,12 @@ from akgentic.tool.vector_store.protocol import (
 )
 
 if TYPE_CHECKING:
-    from akgentic.tool.vector import EmbeddingService, VectorEntry
     from akgentic.tool.vector_store.embedding_actor import (
         EmbeddingError,
         EmbeddingResult,
     )
     from akgentic.tool.vector_store.inmemory import InMemoryBackend
+    from akgentic.tool.vector_store.vector import EmbeddingService, VectorEntry
     from akgentic.tool.vector_store.weaviate import WeaviateBackend
 
 logger = logging.getLogger(__name__)
@@ -138,7 +138,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         if self._embedding_svc is not None:
             return self._embedding_svc
         try:
-            from akgentic.tool.vector import EmbeddingService
+            from akgentic.tool.vector_store.vector import EmbeddingService
 
             self._embedding_svc = EmbeddingService(
                 model=self.config.embedding_model,

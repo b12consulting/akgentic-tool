@@ -36,7 +36,7 @@ from akgentic.tool.core.deferred import (
     DeferredWorker,
     poll_deferred,
 )
-from akgentic.tool.vector import VectorEntry
+from akgentic.tool.vector_store.vector import VectorEntry
 from akgentic.tool.vector_store.actor import VectorStoreActor
 from akgentic.tool.vector_store.embedding_actor import EmbeddingActor
 from akgentic.tool.vector_store.protocol import VectorStoreConfig

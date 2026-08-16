@@ -38,10 +38,10 @@ from akgentic.tool.knowledge_graph.models import (
     SearchQuery,
     SearchResult,
 )
-from akgentic.tool.vector import VectorEntry
 from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
 from akgentic.tool.vector_store.protocol import CollectionConfig
 from akgentic.tool.vector_store.protocol import SearchResult as VsSearchResult
+from akgentic.tool.vector_store.vector import VectorEntry
 
 logger = logging.getLogger(__name__)
 

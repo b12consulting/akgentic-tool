@@ -12,7 +12,7 @@ from __future__ import annotations
 import time
 from unittest.mock import MagicMock, patch
 
-from akgentic.tool.vector import EmbeddingService, VectorEntry, VectorIndex
+from akgentic.tool.vector_store.vector import EmbeddingService, VectorEntry, VectorIndex
 
 # ---------------------------------------------------------------------------
 # VectorEntry (Task 1.3)
@@ -262,5 +262,6 @@ class TestVectorIndexPerformance:
 # ---------------------------------------------------------------------------
 # Backward-compat shim removed (Story 11.1 AC-9)
 # vector_index.py shim and KG re-exports of VectorEntry/EmbeddingService are deleted.
-# VectorEntry and EmbeddingService should be imported from akgentic.tool.vector directly.
+# VectorEntry and EmbeddingService should be imported from
+# akgentic.tool.vector_store.vector directly.
 # ---------------------------------------------------------------------------

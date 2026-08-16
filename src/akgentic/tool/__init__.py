@@ -35,7 +35,7 @@ from .team.observer import TeamManagementToolObserver  # noqa: F401
 from .workspace.tool import WorkspaceTool  # noqa: F401
 
 try:
-    from .vector import EmbeddingService, VectorEntry, VectorIndex  # noqa: F401
+    from .vector_store.vector import EmbeddingService, VectorEntry, VectorIndex  # noqa: F401
 
     _VECTOR_SEARCH_AVAILABLE = True
 except ImportError:
