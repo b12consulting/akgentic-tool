@@ -3,8 +3,8 @@
 [![CI](https://github.com/b12consulting/akgentic-tool/actions/workflows/ci.yml/badge.svg)](https://github.com/b12consulting/akgentic-tool/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/gpiroux/c0f2e0aa0a8c184ee8823dd4feefddd5/raw/coverage.json)](https://github.com/b12consulting/akgentic-tool/actions/workflows/ci.yml)
 
-Tool infrastructure and domain tools for the [Akgentic](https://github.com/b12consulting/akgentic-quick-start)
-multi-agent framework. Define, compose, and expose capabilities to LLM agents through a unified
+Tool infrastructure and domain tools for the [Akgentic](https://github.com/b12consulting/akgentic-framework)
+multi-agent framework (open-source bundle). Define, compose, and expose capabilities to LLM agents through a unified
 channel system — as tool calls, system prompt injections, or programmatic commands.
 
 ## Table of Contents
@@ -66,41 +66,67 @@ configures a `tool_prefix`.
 
 ## Installation
 
-### Workspace Installation (Recommended)
-
-This package is designed for use within the Akgentic monorepo workspace:
+Published on PyPI. Python 3.12 or newer.
 
 ```bash
-git clone git@github.com:b12consulting/akgentic-quick-start.git
-cd akgentic-quick-start
-git submodule update --init --recursive
-
-uv venv
-source .venv/bin/activate
-uv sync --all-packages --all-extras
+uv add akgentic-tool
+# or
+pip install akgentic-tool
 ```
 
-All dependencies (`akgentic-core`, `pydantic-ai`, `tavily-python`) resolve automatically via
-workspace configuration.
+That is the whole install. `akgentic-core`, `pydantic-ai`, `tavily-python` and
+`httpx` come with it as ordinary dependencies — no workspace checkout, no
+submodules.
 
-### Optional Extras
+### Installing Extras
+
+The base install gives you the `ToolCard` / `ToolFactory` machinery and every
+tool's text path. Each extra adds one optional surface — see
+[Optional Extras](#optional-extras) below for what degrades without it:
 
 ```bash
 # Semantic search for planning and knowledge graph (numpy + OpenAI embeddings)
-uv sync --extra vector_search
+uv add "akgentic-tool[vector_search]"
 
 # Weaviate backend for the vector store (weaviate-client)
-uv sync --extra weaviate
+uv add "akgentic-tool[weaviate]"
 
 # Binary file reading for workspace_read (PDF, DOCX, XLSX, PPTX via MarkItDown)
-uv sync --extra docs
+uv add "akgentic-tool[docs]"
 
 # Image resizing for workspace_view (Pillow)
-uv sync --extra vision
+uv add "akgentic-tool[vision]"
 
 # Everything
-uv sync --all-extras
+uv add "akgentic-tool[vector_search,weaviate,docs,vision]"
 ```
+
+### As part of the framework bundle
+
+`akgentic-framework` is the meta-distribution that pins every akgentic package
+at versions built and tested together. Install `akgentic-tool` through it when
+you want the release-wide pin rather than a single package:
+
+```bash
+pip install "akgentic-framework[tool]"   # this package + its closure, release-pinned
+pip install "akgentic-framework[all]"    # the whole framework
+```
+
+### Working on the package itself
+
+To develop `akgentic-tool` rather than use it, clone the open-source bundle
+[akgentic-framework](https://github.com/b12consulting/akgentic-framework), which
+carries every package together as submodules:
+
+```bash
+git clone git@github.com:b12consulting/akgentic-framework.git
+cd akgentic-framework
+git submodule update --init
+# uncomment the two "SOURCE MODE" blocks in pyproject.toml
+uv sync
+```
+
+Source mode resolves `akgentic-*` to the local checkouts, editable.
 
 ## Quick Start
 
@@ -600,19 +626,19 @@ uv sync --all-extras
 
 ```bash
 # Run tests
-uv run pytest packages/akgentic-tool/tests/
+uv run pytest tests/
 
 # Run tests with coverage
-uv run pytest packages/akgentic-tool/tests/ --cov=akgentic.tool --cov-fail-under=80
+uv run pytest tests/ --cov=akgentic.tool --cov-fail-under=80
 
 # Lint
-uv run ruff check packages/akgentic-tool/src/
+uv run ruff check src/ tests/
 
 # Format
-uv run ruff format packages/akgentic-tool/src/
+uv run ruff format src/ tests/
 
 # Type check
-uv run mypy packages/akgentic-tool/src/
+uv run mypy src/
 ```
 
 ### CI Pipeline
@@ -620,7 +646,8 @@ uv run mypy packages/akgentic-tool/src/
 Every pull request runs the full quality gate via GitHub Actions
 (`.github/workflows/ci.yml`):
 
-The repository is checked out standalone, so the commands are package-relative:
+The repository is checked out standalone and `akgentic-*` dependencies resolve
+from PyPI, so CI runs the same repo-relative commands listed above:
 
 | Step | Command | Gate |
 |---|---|---|
