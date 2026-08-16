@@ -13,6 +13,7 @@ channel system — as tool calls, system prompt injections, or programmatic comm
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Architecture](#architecture)
+- [Deferred Results: Never Block a Tool Actor](#deferred-results-never-block-a-tool-actor)
 - [Channel System](#channel-system)
 - [Tool Catalog](#tool-catalog)
   - [WorkspaceTool](#workspacetool)
@@ -20,6 +21,7 @@ channel system — as tool calls, system prompt injections, or programmatic comm
   - [KnowledgeGraphTool](#knowledgegraphtool)
   - [SearchTool](#searchtool)
   - [TeamTool](#teamtool)
+  - [TeamActivityTool](#teamactivitytool)
   - [MCPTool](#mcptool)
   - [ExecTool](#exectool)
 - [Error Handling](#error-handling)
@@ -262,6 +264,75 @@ class BadParam(BaseToolParam):
     status: str | None = None  # never consumed by factory
 ```
 
+## Deferred Results: Never Block a Tool Actor
+
+> **Status: planned (ADR-033).** The base classes described here are not on `master` yet. The rule
+> they encode already applies to every tool actor in the package.
+
+A tool actor is a **team singleton with one thread**. If a method that callers reach via
+`proxy_ask` performs slow external work — an LLM call, a document conversion, a sandbox run, any
+network round-trip — that actor is occupied for the whole call and **every other team member queuing
+on it is blocked**. The obvious mitigation does not work: a Pykka `timeout=` on the ask abandons the
+future without cancelling the work, so the actor stays occupied and its mailbox backs up.
+
+The pattern: a **cache actor** that never performs slow work, **short-lived workers** that do, and a
+**bounded caller-side poll**.
+
+```
+tool closure                     #CacheActor                   #defer-<key> (worker)
+     │                                 │                                   │
+     │── get(key) ─ask────────────────▶│  dict lookup, O(1)                │
+     │◀──────────────────── None ──────│                                   │
+     │── request(key, payload) tell ──▶│  not cached, not in-flight        │
+     │                                 │──── createActor + tell ──────────▶│
+     │                                 │                                   │
+     │       … poll_deferred: N × (sleep, get(key)) …                      │  blocking call
+     │                                 │◀───── deliver(key, value) tell ───│
+     │◀──────────────────── value ─────│                                   │  self.stop()
+```
+
+The cache actor's thread is held only for dict lookups, so N members query it concurrently while one
+production is in flight. The caller waits on its own thread — which is why the poll budget is bounded
+and a degraded answer always exists.
+
+```python
+class SummaryCache(DeferredResultActor[uuid.UUID, str]):
+    def worker_class(self) -> type[DeferredWorker]:
+        return SummarizerWorker
+
+# In the tool closure:
+summary = cache.get(message_id)          # ask — instant
+if summary is None:
+    cache_tell.request(message_id, payload)          # tell — never blocks
+    summary = poll_deferred(lambda: cache.get(message_id), attempts=5, delay=0.4)
+if summary is None:
+    summary = text[:200] + "…"           # degraded answer, always available
+```
+
+### Seven rules — all of them, or none
+
+1. **The cache actor never performs the slow call.** It spawns, caches, and answers `get`.
+2. **One worker per key, short-lived, self-stopping.** Never reused, never accumulates state.
+3. **The worker's actor name MUST start with `#`.** See the teardown note below.
+4. **De-duplicate through the in-flight set.** Three callers, one key ⇒ one external call.
+5. **Failures are cached negatively.** A failed key does not respawn a worker on every poll; retry
+   policy is a TTL on the negative entry, never an uncapped respawn.
+6. **The cache is capped (LRU).** An uncapped cache on a team singleton leaks for the life of the team.
+7. **Callers poll with a bounded budget and always have a degraded answer.** An unbounded ask —
+   with or without a timeout — is forbidden.
+
+### Teardown: why the `#` prefix is not cosmetic
+
+Every actor announces itself to the orchestrator on start, so **a spawned worker is a visible team
+member**. The orchestrator stops tool actors only once no *non-tool* member remains, and it decides
+what is a tool actor by the `#` name prefix. A worker named `summarize-abc123` therefore counts as a
+regular member and **holds tool-actor teardown open until it finishes** — for a slow call, every team
+stop then rides the stop backstop instead of completing promptly.
+
+A worker is also a child of its cache actor, and a parent's stop blocks on its children. Every
+worker must therefore bound its own external call with an explicit timeout below the orchestrator's
+stop backstop.
+
 ## Channel System
 
 The `Channels` enum (`TOOL_CALL`, `SYSTEM_PROMPT`, `COMMAND`) controls how a capability is
@@ -414,6 +485,47 @@ TeamTool()
 
 Requires a `TeamManagementToolObserver` (provided by `BaseAgent`). Surfaces agent roster and
 available profiles as a system prompt; `hire_team_member` and `fire_team_member` as tool calls.
+
+### TeamActivityTool
+
+> **Status: planned (ADR-033).** Not on `master` yet.
+
+Answers *who is working right now, and on what* — `TeamTool` answers *who is on the team*. It is a
+separate card on purpose: `TeamTool` is actor-free and cheap, and a team using hire/fire should not
+inherit an actor, an LLM dependency and a cache it did not ask for.
+
+```python
+from akgentic.tool.team import TeamActivityTool
+
+TeamActivityTool(summarizer_model="openai:gpt-5.2-mini", stale_after_seconds=300.0)
+```
+
+```python
+who_is_working(summarize_over: int | None = None) -> TeamActivityReport
+```
+
+Busy members are derived from the orchestrator's telemetry: an agent with a `ReceivedMessage` and no
+matching `ProcessedMessage` is mid-handler, and the task text comes from the corresponding
+`SentMessage`.
+
+**`summarize_over=None` — the default — performs zero LLM calls.** Long task descriptions are
+truncated. Passing an integer is the opt-in: only tasks longer than it are summarized, through the
+deferred-result cache above, keyed by `message_id` so a follow-up call costs nothing. The threshold
+*is* the consent — there is no eager warming.
+
+Three behaviours worth knowing:
+
+- **Busy means exactly one open message.** Actors are sequential, so the open count is structurally
+  0 or 1; a higher count is reported as `suspect`, not as "working".
+- **Stale entries are dropped.** A resumed team replays telemetry that can be permanently unbalanced
+  (a message received before the stop, processed never). Anything open longer than
+  `stale_after_seconds` is excluded rather than reported as a phantom worker.
+- **The caller, tool actors, and the user proxy never appear.** The caller is busy by definition, and
+  a human proxy waiting on input is not working.
+
+The summarizer is built from a pydantic-ai model spec string rather than the framework's
+`ModelConfig`, because `akgentic-tool` does not depend on `akgentic-llm`. Consequence: those tokens
+are produced outside `ReactAgent` and are not counted by its cost accounting or usage limits.
 
 ### MCPTool
 
@@ -665,6 +777,10 @@ src/akgentic/tool/
     __init__.py               # Public API
     py.typed                  # PEP 561 typing marker
     core.py                   # ToolCard, BaseToolParam, ToolFactory, Channels
+    │                         # planned (ADR-033): becomes a core/ package of the same
+    │                         #   name — channels, params, card, dependencies, commands,
+    │                         #   factory, deferred — with __init__.py re-exporting
+    │                         #   today's names, so `akgentic.tool.core` is unchanged
     errors.py                 # RetriableError
     event.py                  # ToolObserver, ActorToolObserver,
     │                         #   TeamManagementToolObserver
@@ -676,6 +792,8 @@ src/akgentic/tool/
     │   weaviate.py           # Weaviate backend [optional: weaviate extra]
     │   actor.py              # VectorStoreActor singleton
     │   embedding_actor.py    # EmbeddingActor (non-blocking embedding)
+    │                         # planned (ADR-033): spawned name gains a "#" prefix
+    │                         #   (teardown invariant — see Deferred Results)
     │   └── tool.py           # VectorStoreTool ToolCard
     planning/
     │   planning_actor.py     # Task models, PlanConfig, PlanActor
@@ -687,7 +805,9 @@ src/akgentic/tool/
     search/
     │   └── search.py         # SearchTool (Tavily)
     team/
-    │   └── team.py           # TeamTool
+    │   team.py               # TeamTool
+    │   activity.py           # planned (ADR-033): TeamActivityTool, who_is_working
+    │   └── activity_actor.py # planned (ADR-033): TeamActivityActor, SummarizerWorker
     mcp/
     │   mcp.py                # MCPTool, connection configs
     │   └── oauth_handler.py  # OAuth 2.0 flow
