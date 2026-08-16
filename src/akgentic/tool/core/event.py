@@ -9,7 +9,7 @@ make this global module depend on a domain package, which is the edge ``core/`` 
 not have. Nothing about a payload's serialization depends on the annotation —
 ``SerializableBaseModel`` serializes from the runtime instance and tags it with a
 ``__model__`` marker, so a concrete payload round-trips as itself either way. The
-domain-side alias for the knowledge-graph payload lives in
+knowledge graph's payload type, ``KnowledgeGraphStateEvent``, is re-exported from
 ``akgentic.tool.knowledge_graph.event``.
 """
 

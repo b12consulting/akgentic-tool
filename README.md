@@ -365,7 +365,9 @@ class MyTool(ToolCard):
     def observer(self, observer: ToolObserver) -> "MyTool":   # base type, always
         super().observer(observer)
         obs = self._team_observer()                           # narrow here instead
-        address = obs.orchestrator_proxy.getChildrenOrCreate(...)
+        # The observer hands you the orchestrator's *address*; ask it for a proxy first.
+        orchestrator = obs.proxy_ask(obs.orchestrator, Orchestrator)
+        address = orchestrator.getChildrenOrCreate(...)
         self._activity_proxy = obs.proxy_ask(address, TeamActivityActor)
         return self
 
