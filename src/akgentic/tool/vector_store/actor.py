@@ -376,7 +376,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         self.state.collection_statuses[collection] = CollectionStatus.INDEXING
 
         # Spawn EmbeddingActor child
-        embed_config = BaseConfig(name=f"embed-{collection}-{request_id}")
+        embed_config = BaseConfig(name=f"#embed-{collection}-{request_id}")
         embed_addr = self.createActor(EmbeddingActor, config=embed_config)
 
         request = EmbeddingRequest(
