@@ -36,17 +36,21 @@ _PREFIX = "akgentic.tool.core."
 def _sibling_imports(module_path: Path) -> set[str]:
     """Return the ``core`` siblings imported by the module at *module_path*.
 
-    Covers relative (``from .card import ...``), absolute
-    (``from akgentic.tool.core.card import ...``) and plain-``import`` forms, at
-    module level and inside function bodies alike.
+    Covers relative (``from .card import ...``), sibling-as-name (``from . import
+    card``), absolute (``from akgentic.tool.core.card import ...``) and plain-``import``
+    forms, at module level and inside function bodies alike. The sibling-as-name form is
+    tracked because it names the module on the alias rather than on ``node.module``,
+    which is exactly where a guard matching only on ``node.module`` stops looking.
     """
     tree = ast.parse(module_path.read_text(encoding="utf-8"))
     siblings: set[str] = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module:
-            if node.level == 1:
+        if isinstance(node, ast.ImportFrom):
+            if node.level == 1 and node.module is None:
+                siblings.update(alias.name for alias in node.names)
+            elif node.level == 1 and node.module:
                 siblings.add(node.module.split(".")[0])
-            elif node.level == 0 and node.module.startswith(_PREFIX):
+            elif node.level == 0 and node.module and node.module.startswith(_PREFIX):
                 siblings.add(node.module.removeprefix(_PREFIX).split(".")[0])
         elif isinstance(node, ast.Import):
             for alias in node.names:

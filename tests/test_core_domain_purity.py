@@ -5,8 +5,10 @@ prose does not go red when someone adds an import.
 
 Three invariants:
 
-* no module under ``core/`` imports a domain package, or the deprecated
-  ``akgentic.tool.event`` façade;
+* no module under ``core/`` imports a domain package, the deprecated
+  ``akgentic.tool.event`` façade, or the package root — the root is listed because its
+  lazy ``__getattr__`` hands out knowledge-graph types, so an import through it restores
+  the edge without ever naming a domain;
 * no module under ``knowledge_graph/`` reaches back for the event modules, and
   ``models.py`` calls no ``model_rebuild`` — the bottom-of-file rebuild was one of
   three coupled mechanisms holding the old cycle open, and it is the cheapest one to
@@ -48,29 +50,47 @@ FACADE_MODULE = "akgentic.tool.event"
 
 _TOOL_PREFIX = "akgentic.tool."
 
+# The package root, which is a violation in its own right and not merely an ancestor of
+# one. ``akgentic/tool/__init__.py`` serves ``KnowledgeGraphStateEvent`` and
+# ``ToolStatePayload`` from a lazy module ``__getattr__``, so ``from akgentic.tool import
+# KnowledgeGraphStateEvent`` inside ``core/`` restores the runtime edge while naming no
+# domain package at all — the cheapest way past a guard that matches on domain names.
+ROOT_PACKAGE = "akgentic.tool"
+
+
+def _is_tool_module(module: str) -> bool:
+    """Whether *module* names the tool package root or something inside it."""
+    return module == ROOT_PACKAGE or module.startswith(_TOOL_PREFIX)
+
 
 def _imported_modules(module_path: Path, package_dir: Path) -> set[str]:
-    """Return the ``akgentic.tool.*`` module paths imported by *module_path*.
+    """Return the ``akgentic.tool*`` module paths imported by *module_path*.
 
     Covers ``from x import y`` (relative and absolute) and plain ``import x``, at
     module level and inside function bodies alike. Relative imports are resolved
-    against *package_dir* so ``from ..team.observer import X`` is reported with its
+    against the package *module_path* actually lives in — *package_dir* plus any
+    subpackage below it — so ``from ..team.observer import X`` is reported with its
     absolute path, exactly as an absolute import would be.
     """
     tree = ast.parse(module_path.read_text(encoding="utf-8"))
-    package_parts = ("akgentic", "tool", package_dir.name)
+    package_parts = (
+        "akgentic",
+        "tool",
+        package_dir.name,
+        *module_path.relative_to(package_dir).parts[:-1],
+    )
     imported: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             if node.level == 0:
-                if node.module and node.module.startswith(_TOOL_PREFIX):
+                if node.module and _is_tool_module(node.module):
                     imported.add(node.module)
             else:
                 base = package_parts[: len(package_parts) - node.level + 1]
                 imported.add(".".join([*base, node.module] if node.module else list(base)))
         elif isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name.startswith(_TOOL_PREFIX):
+                if _is_tool_module(alias.name):
                     imported.add(alias.name)
     return imported
 
@@ -84,14 +104,17 @@ def _domain_of(module: str) -> str | None:
 
 
 def test_core_modules_import_no_domain_package() -> None:
-    """No module under ``core/`` names a domain package or the deprecated façade."""
+    """No module under ``core/`` names a domain package, the façade, or the root."""
     violations: list[str] = []
-    for module_path in sorted(CORE_DIR.glob("*.py")):
+    for module_path in sorted(CORE_DIR.rglob("*.py")):
+        name = module_path.relative_to(CORE_DIR).as_posix()
         for imported in sorted(_imported_modules(module_path, CORE_DIR)):
             if _domain_of(imported) is not None:
-                violations.append(f"{module_path.name} imports {imported}")
+                violations.append(f"{name} imports {imported}")
             elif imported == FACADE_MODULE:
-                violations.append(f"{module_path.name} imports the deprecated {imported}")
+                violations.append(f"{name} imports the deprecated {imported}")
+            elif imported == ROOT_PACKAGE:
+                violations.append(f"{name} imports {imported}, which serves domain types lazily")
     assert not violations, f"core/ reached into a domain: {violations}"
 
 
@@ -104,9 +127,9 @@ def test_core_directory_is_not_empty() -> None:
 def test_knowledge_graph_does_not_import_the_deprecated_facade() -> None:
     """A KG module going through the façade would re-open the edge indirectly."""
     violations: list[str] = []
-    for module_path in sorted(KG_DIR.glob("*.py")):
+    for module_path in sorted(KG_DIR.rglob("*.py")):
         if FACADE_MODULE in _imported_modules(module_path, KG_DIR):
-            violations.append(module_path.name)
+            violations.append(module_path.relative_to(KG_DIR).as_posix())
     assert not violations, f"knowledge_graph/ imports the deprecated façade: {violations}"
 
 
@@ -120,7 +143,7 @@ def test_knowledge_graph_has_no_bottom_of_file_event_import() -> None:
     """
     event_modules = {FACADE_MODULE, "akgentic.tool.core.event"}
     violations: list[str] = []
-    for module_path in sorted(KG_DIR.glob("*.py")):
+    for module_path in sorted(KG_DIR.rglob("*.py")):
         tree = ast.parse(module_path.read_text(encoding="utf-8"))
         seen_definition = False
         for node in tree.body:
@@ -131,7 +154,8 @@ def test_knowledge_graph_has_no_bottom_of_file_event_import() -> None:
                     {node.module} if isinstance(node, ast.ImportFrom) and node.module else set()
                 ) | {alias.name for alias in node.names}
                 if names & event_modules:
-                    violations.append(f"{module_path.name}:{node.lineno}")
+                    rel = module_path.relative_to(KG_DIR).as_posix()
+                    violations.append(f"{rel}:{node.lineno}")
     assert not violations, f"bottom-of-file event import is back: {violations}"
 
 
