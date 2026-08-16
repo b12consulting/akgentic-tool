@@ -236,7 +236,7 @@ class TestVectorStoreService:
 
     def test_structural_subtyping(self) -> None:
         """A class implementing all 4 methods satisfies VectorStoreService."""
-        from akgentic.tool.vector import VectorEntry
+        from akgentic.tool.vector_store.vector import VectorEntry
 
         class _FakeStore:
             def create_collection(self, name: str, config: CollectionConfig) -> None:

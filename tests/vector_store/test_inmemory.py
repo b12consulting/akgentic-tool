@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from akgentic.tool.vector import VectorEntry
+from akgentic.tool.vector_store.vector import VectorEntry
 from akgentic.tool.vector_store.inmemory import InMemoryBackend
 from akgentic.tool.vector_store.protocol import CollectionConfig, CollectionStatus
 

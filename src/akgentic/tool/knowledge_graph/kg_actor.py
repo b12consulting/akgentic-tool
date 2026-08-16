@@ -19,8 +19,8 @@ from pydantic import Field
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.orchestrator import Orchestrator
+from akgentic.tool.core.event import ToolStateEvent
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.event import ToolStateEvent
 from akgentic.tool.knowledge_graph.models import (
     Entity,
     EntityCreate,
@@ -38,10 +38,10 @@ from akgentic.tool.knowledge_graph.models import (
     SearchQuery,
     SearchResult,
 )
-from akgentic.tool.vector import VectorEntry
 from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
 from akgentic.tool.vector_store.protocol import CollectionConfig
 from akgentic.tool.vector_store.protocol import SearchResult as VsSearchResult
+from akgentic.tool.vector_store.vector import VectorEntry
 
 logger = logging.getLogger(__name__)
 

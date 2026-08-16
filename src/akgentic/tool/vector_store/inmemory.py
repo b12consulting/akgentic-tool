@@ -14,12 +14,16 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from akgentic.tool.vector import VectorEntry, VectorIndex, _check_vector_search_dependencies
 from akgentic.tool.vector_store.protocol import (
     CollectionConfig,
     CollectionStatus,
     SearchHit,
     SearchResult,
+)
+from akgentic.tool.vector_store.vector import (
+    VectorEntry,
+    VectorIndex,
+    _check_vector_search_dependencies,
 )
 
 logger = logging.getLogger(__name__)

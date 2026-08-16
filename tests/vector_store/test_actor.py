@@ -438,7 +438,7 @@ class TestReceiveEmbeddingResult:
 
     def _make_result(self, collection: str = "col1") -> EmbeddingResult:
         """Create a mock EmbeddingResult with VectorEntry objects."""
-        from akgentic.tool.vector import VectorEntry
+        from akgentic.tool.vector_store.vector import VectorEntry
 
         entries = [
             VectorEntry(ref_type="entity", ref_id="e1", text="hi", vector=[0.1]),
@@ -915,20 +915,26 @@ class TestLazyBackend:
         result = actor._get_or_create_embedding_svc()
         assert result is mock_svc
 
-    def test_get_or_create_embedding_svc_returns_none_on_failure(self) -> None:
-        """Returns None when EmbeddingService creation fails."""
-        actor = _make_actor()
-        import akgentic.tool.vector as vector_mod
+    def test_get_or_create_embedding_svc_returns_none_on_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Returns None when EmbeddingService creation fails.
 
-        original_cls = vector_mod.EmbeddingService
-        vector_mod.EmbeddingService = MagicMock(  # type: ignore[misc]
-            side_effect=Exception("no API key"),
+        The patch has to land in the module ``actor.py`` actually imports from
+        (``vector_store.vector``). Patching the deprecated ``akgentic.tool.vector``
+        façade would write into the façade's globals, shadowing its ``__getattr__``
+        for the rest of the session — which is why this uses ``monkeypatch``.
+        """
+        actor = _make_actor()
+        import akgentic.tool.vector_store.vector as vector_mod
+
+        monkeypatch.setattr(
+            vector_mod,
+            "EmbeddingService",
+            MagicMock(side_effect=Exception("no API key")),
         )
-        try:
-            result = actor._get_or_create_embedding_svc()
-            assert result is None
-        finally:
-            vector_mod.EmbeddingService = original_cls  # type: ignore[misc]
+        result = actor._get_or_create_embedding_svc()
+        assert result is None
 
 
 # ---------------------------------------------------------------------------

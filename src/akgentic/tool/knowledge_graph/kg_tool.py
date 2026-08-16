@@ -25,7 +25,7 @@ from akgentic.tool.core import (
     ToolCard,
     _resolve,
 )
-from akgentic.tool.event import ActorToolObserver
+from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.knowledge_graph.kg_actor import (
     KG_ACTOR_NAME,
     KG_ACTOR_ROLE,

@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from akgentic.tool.vector import VectorEntry
+from akgentic.tool.vector_store.vector import VectorEntry
 from akgentic.tool.vector_store.actor import (
     VS_ACTOR_NAME,
     VS_ACTOR_ROLE,

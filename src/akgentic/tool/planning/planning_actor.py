@@ -13,9 +13,9 @@ from akgentic.core.agent_state import BaseState
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.vector import VectorEntry
 from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
 from akgentic.tool.vector_store.protocol import CollectionConfig
+from akgentic.tool.vector_store.vector import VectorEntry
 
 logger = logging.getLogger(__name__)
 

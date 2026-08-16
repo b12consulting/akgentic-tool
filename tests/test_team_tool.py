@@ -15,7 +15,7 @@ from akgentic.core.orchestrator import Orchestrator
 
 from akgentic.tool.core import TOOL_CALL
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.event import TeamManagementToolObserver
+from akgentic.tool.team.observer import TeamManagementToolObserver
 from akgentic.tool.team import (
     FireTeamMember,
     GetRoleProfiles,

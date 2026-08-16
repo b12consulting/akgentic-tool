@@ -19,7 +19,7 @@ from akgentic.core.agent_state import BaseState
 from akgentic.core.utils.serializer import SerializableBaseModel
 
 if TYPE_CHECKING:
-    from akgentic.tool.vector import EmbeddingService, VectorEntry
+    from akgentic.tool.vector_store.vector import EmbeddingService, VectorEntry
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +103,7 @@ class EmbeddingActor(Akgent[BaseConfig, BaseState]):
         if self._embedding_svc is not None:
             return self._embedding_svc
         try:
-            from akgentic.tool.vector import EmbeddingService as EmbSvc
+            from akgentic.tool.vector_store.vector import EmbeddingService as EmbSvc
 
             self._embedding_svc = EmbSvc(model=model, provider=provider)
         except Exception as exc:  # noqa: BLE001
@@ -130,7 +130,7 @@ class EmbeddingActor(Akgent[BaseConfig, BaseState]):
                 self._send_error(msg, "EmbeddingService unavailable")
                 return
 
-            from akgentic.tool.vector import VectorEntry
+            from akgentic.tool.vector_store.vector import VectorEntry
 
             texts = [e["text"] for e in msg.entries]
             vectors: list[list[float]] = svc.embed(texts)

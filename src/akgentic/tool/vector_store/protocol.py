@@ -16,7 +16,7 @@ from akgentic.core.agent_config import BaseConfig
 from akgentic.core.utils.serializer import SerializableBaseModel
 
 if TYPE_CHECKING:
-    from akgentic.tool.vector import VectorEntry
+    from akgentic.tool.vector_store.vector import VectorEntry
 
 
 # ---------------------------------------------------------------------------

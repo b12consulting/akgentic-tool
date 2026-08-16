@@ -14,7 +14,7 @@ from pydantic import PrivateAttr
 
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.tool.core import TOOL_CALL, BaseToolParam, Channels, ToolCard, _resolve
-from akgentic.tool.event import ActorToolObserver
+from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.sandbox.actor import (
     ALLOWED_COMMANDS,
     SANDBOX_ACTOR_NAME,

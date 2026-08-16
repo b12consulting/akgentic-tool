@@ -364,16 +364,3 @@ class KnowledgeGraphStateEvent(SerializableBaseModel):
     relations_removed: list[uuid.UUID] = Field(
         default_factory=list, description="UUIDs of relations removed in this delta."
     )
-
-
-# ---------------------------------------------------------------------------
-# Resolve the forward-referenced ``ToolStatePayload`` alias on ``ToolStateEvent``
-# now that ``KnowledgeGraphStateEvent`` is defined. ``event.py`` cannot import
-# this module directly without creating a cycle, so the rebuild lives here
-# (Story 17.1, ADR-024).
-# ---------------------------------------------------------------------------
-from akgentic.tool.event import ToolStateEvent as _ToolStateEvent  # noqa: E402
-
-_ToolStateEvent.model_rebuild(
-    _types_namespace={"KnowledgeGraphStateEvent": KnowledgeGraphStateEvent}
-)

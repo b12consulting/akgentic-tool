@@ -19,24 +19,22 @@ from .core import (  # noqa: F401
     ToolCard,
     ToolFactory,
 )
-from .errors import CommandNotRecognized, RetriableError, ToolObserverGone  # noqa: F401
-from .event import (  # noqa: F401
-    ActorToolObserver,
+from .core.event import (  # noqa: F401
     CommandArg,
     CommandDescriptor,
     CommandsAnnouncedEvent,
-    TeamManagementToolObserver,
-    ToolObserver,
     ToolStateEvent,
-    ToolStatePayload,
 )
+from .core.observer import ActorToolObserver, ToolObserver  # noqa: F401
+from .errors import CommandNotRecognized, RetriableError, ToolObserverGone  # noqa: F401
 from .sandbox.bwrap import BwrapSandboxActor  # noqa: F401
 from .sandbox.seatbelt import SeatbeltSandboxActor  # noqa: F401
 from .sandbox.tool import ExecTool  # noqa: F401
+from .team.observer import TeamManagementToolObserver  # noqa: F401
 from .workspace.tool import WorkspaceTool  # noqa: F401
 
 try:
-    from .vector import EmbeddingService, VectorEntry, VectorIndex  # noqa: F401
+    from .vector_store.vector import EmbeddingService, VectorEntry, VectorIndex  # noqa: F401
 
     _VECTOR_SEARCH_AVAILABLE = True
 except ImportError:
@@ -62,7 +60,6 @@ __all__ = [
     "ActorToolObserver",
     "TeamManagementToolObserver",
     "ToolStateEvent",
-    "ToolStatePayload",
     "KnowledgeGraphStateEvent",
     # Command discovery models
     "CommandArg",
