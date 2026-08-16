@@ -55,9 +55,14 @@ _worker_left = threading.Event()
 
 @pytest.fixture(autouse=True)
 def cleanup_actors() -> Generator[None, None, None]:
-    """Stop leaked actors after each test so a failure cannot bleed into the suite."""
-    _worker_entered.clear()
-    _worker_left.clear()
+    """Stop leaked actors after each test so a failure cannot bleed into the suite.
+
+    Every module-level event is cleared, not just the two the first test uses: a
+    stale set event is the one way these assertions could pass without the
+    behaviour they claim to check.
+    """
+    for event in (_worker_entered, _worker_left, _embed_entered, _embed_left, _idle_tool_stopped):
+        event.clear()
     yield
     pykka.ActorRegistry.stop_all()
 
@@ -106,7 +111,8 @@ def test_get_returns_while_a_worker_is_in_flight() -> None:
 
         # And the value does land once production completes.
         cache_proxy = system.proxy_ask(cache_addr, _SlowCache)
-        assert poll_deferred(lambda: cache_proxy.get("k1"), attempts=10, delay=0.4) == "value-for-k1"
+        produced = poll_deferred(lambda: cache_proxy.get("k1"), attempts=10, delay=0.4)
+        assert produced == "value-for-k1"
     finally:
         system.shutdown(timeout=10)
 
@@ -122,6 +128,12 @@ def test_second_request_while_in_flight_spawns_no_second_worker() -> None:
         cache_tell.request("k1", DeferredPayload(deferred_key="k1"))
         assert _worker_entered.wait(timeout=10.0)
         cache_tell.request("k1", DeferredPayload(deferred_key="k1"))
+
+        # Flush the cache actor's mailbox before counting: `request` is a TELL,
+        # so without a blocking ask behind it the registry could be read before
+        # the second request was ever processed — and the count would then be 1
+        # even for a cache that does not de-duplicate at all.
+        assert system.proxy_ask(cache_addr, _SlowCache).get("k1") is None
 
         workers = [
             ref

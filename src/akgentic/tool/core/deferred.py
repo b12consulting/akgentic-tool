@@ -231,9 +231,7 @@ class DeferredWorker(Akgent[BaseConfig, BaseState], ABC):
             parent_proxy = self.proxy_tell(self._parent, DeferredResultActor)
             parent_proxy.fail(key, error)
         except Exception as send_exc:  # noqa: BLE001
-            logger.warning(
-                "[%s] Failed to send failure to parent: %s", self.config.name, send_exc
-            )
+            logger.warning("[%s] Failed to send failure to parent: %s", self.config.name, send_exc)
 
 
 class DeferredResultActor[
@@ -303,20 +301,36 @@ class DeferredResultActor[
         what de-duplicates: three callers asking for one key produce one worker
         and one external call.
 
+        ``payload.deferred_key`` is overwritten with *key*: the worker reports
+        back under the payload's key while the in-flight mark is held under this
+        one, so a caller that lets the two drift would clear a different mark and
+        leave this key in flight for the lifetime of the actor — silently, and
+        for ever. Binding them here makes that unrepresentable.
+
         Args:
             key: Cache key the worker will produce.
-            payload: The unit of work, carrying ``deferred_key``.
+            payload: The unit of work; its ``deferred_key`` is set from *key*.
         """
         if key in self._in_flight or self._is_known(key):
             return
         self._in_flight.add(key)
+        payload = payload.model_copy(update={"deferred_key": key})
         # createActor, NOT getChildrenOrCreate: the singleton rule applies to the
         # cache actor itself, never to per-key workers.
-        worker = self.createActor(
-            self.worker_class(),
-            config=BaseConfig(name=self._worker_name(key), role=WORKER_ROLE),
-        )
-        self.proxy_tell(worker, DeferredWorker).receiveMsg_DeferredPayload(payload)
+        try:
+            worker = self.createActor(
+                self.worker_class(),
+                config=BaseConfig(name=self._worker_name(key), role=WORKER_ROLE),
+            )
+            self.proxy_tell(worker, DeferredWorker).receiveMsg_DeferredPayload(payload)
+        except Exception as exc:  # noqa: BLE001
+            # A worker that never started can never report, so nothing else would
+            # ever clear the mark. Record it as a failure instead: the TTL then
+            # governs the retry, exactly as it does for a production that failed.
+            logger.warning(
+                "[%s] Deferred worker spawn failed for %s: %s", self.config.name, key, exc
+            )
+            self.fail(key, f"worker spawn failed: {exc}")
 
     def deliver(self, key: K, value: V) -> None:
         """TELL, from the worker. Cache *value* and clear the in-flight mark."""

@@ -184,6 +184,38 @@ class TestRequestSpawnsOneWorker:
             actor.request("k1", payload)
         proxy.receiveMsg_DeferredPayload.assert_called_once_with(payload)
 
+    def test_request_binds_the_payload_key_to_the_cache_key(self) -> None:
+        """A payload whose key drifted from the request key would wedge the key:
+        the worker would clear a different in-flight mark and this one would stay
+        set for the life of the actor."""
+        actor = _make_cache()
+        proxy = MagicMock()
+        with (
+            patch.object(actor, "createActor", return_value=MagicMock()),
+            patch.object(actor, "proxy_tell", return_value=proxy),
+        ):
+            actor.request("k1", _payload("some-other-key"))
+        forwarded = proxy.receiveMsg_DeferredPayload.call_args.args[0]
+        assert forwarded.deferred_key == "k1"
+
+    def test_spawn_failure_does_not_wedge_the_key(self) -> None:
+        """A worker that never starts can never report, so ``request`` itself has
+        to clear the in-flight mark — otherwise the key is dead for ever."""
+        actor = _make_cache(ttl=0.05)
+        with (
+            patch.object(actor, "createActor", side_effect=RuntimeError("no thread")),
+            patch.object(actor, "proxy_tell", return_value=MagicMock()),
+        ):
+            actor.request("k1", _payload())
+        assert "k1" not in actor._in_flight
+        time.sleep(0.08)  # the failure is negatively cached, so wait out its TTL
+        with (
+            patch.object(actor, "createActor", return_value=MagicMock()) as mock_create,
+            patch.object(actor, "proxy_tell", return_value=MagicMock()),
+        ):
+            actor.request("k1", _payload())
+        assert mock_create.call_count == 1
+
     def test_cached_key_spawns_no_worker(self) -> None:
         actor = _make_cache()
         actor.deliver("k1", "cached")
