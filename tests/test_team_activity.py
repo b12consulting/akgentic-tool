@@ -15,7 +15,7 @@ import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, get_args
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -32,7 +32,7 @@ from akgentic.core.messages.orchestrator import (
 from akgentic.core.orchestrator import Orchestrator
 
 import akgentic.tool.team.activity as activity_module
-from akgentic.tool.core import COMMAND, TOOL_CALL
+from akgentic.tool.core import COMMAND, TOOL_CALL, BaseToolParam
 from akgentic.tool.core.deferred import DeferredPayload, DeferredWorker, poll_deferred
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.team import (
@@ -395,10 +395,21 @@ class TestCardShape:
         assert restored._activity_proxy is None, "runtime state must not survive a round trip"
 
     def test_every_field_is_a_capability_union(self) -> None:
-        """No raw runtime type may reach a Pydantic field (Golden Rule #1b)."""
+        """No raw runtime type may reach a Pydantic field (Golden Rule #1b).
+
+        Asserted on the union's *members*, not on ``str(annotation)``: a substring
+        check for ``"bool"`` also passes for ``dict[str, bool]``, which is exactly
+        the shape the rule forbids.
+        """
         for name, field in TeamTool.model_fields.items():
-            annotation = str(field.annotation)
-            assert "bool" in annotation, f"{name} is not a `ParamModel | bool` capability field"
+            members = set(get_args(field.annotation))
+            assert bool in members, f"{name} is not a `ParamModel | bool` capability field"
+            others = members - {bool}
+            assert len(others) == 1, f"{name} is not a two-member union: {members}"
+            param = others.pop()
+            assert isinstance(param, type) and issubclass(param, BaseToolParam), (
+                f"{name} carries {param!r}, which is not a BaseToolParam"
+            )
 
     def test_the_activity_proxy_is_a_private_attribute_not_a_field(self) -> None:
         assert "_activity_proxy" not in TeamTool.model_fields
@@ -1175,6 +1186,59 @@ class TestSummarization:
         assert _SpyWorker.spawned == []
         assert report.members[0].task == "a previously produced summary"
         assert report.members[0].summarized is True
+        assert report.pending_summaries == 0
+
+    def test_a_cached_summary_is_clipped_to_this_card_s_budget(self) -> None:
+        """``#TeamActivity`` is one singleton shared by every card on the team.
+
+        The worker clips to the budget of whoever requested the summary, so a card
+        configured with a smaller ``max_task_chars`` can read back a summary
+        produced under a larger one. The reported text must respect the budget of
+        the card doing the reporting, not the one that paid for the summary.
+        """
+        sender = _address("@Dev1")
+        message = _task("q" * 400)
+        harness = _Harness(
+            [_sent(sender, message), _received(sender, message.id)],
+            spy_worker=True,
+            max_task_chars=50,
+        )
+        harness.activity.deliver(message.id, "s" * 300)
+
+        report = harness.run(summarize_over=100)
+
+        assert _SpyWorker.spawned == []
+        assert report.members[0].summarized is True
+        assert len(report.members[0].task) == 50
+
+    def test_a_harvested_summary_is_clipped_to_the_budget_too(self) -> None:
+        """The post-poll sweep goes through the same budget as the cache hit."""
+        harness = self._long_task_harness(
+            count=1, poll_attempts=1, poll_delay_seconds=0.0, max_task_chars=50
+        )
+        message_id = next(
+            msg.message_id
+            for msg in harness.orchestrator._messages
+            if isinstance(msg, ReceivedMessage)
+        )
+        landed: dict[uuid.UUID, str] = {}
+
+        def fake_get(key: uuid.UUID) -> str | None:
+            return landed.get(key)
+
+        def fake_poll(fetch: Callable[[], Any], attempts: int = 5, delay: float = 0.4) -> Any:
+            fetch()  # one honest attempt: nothing has landed yet
+            landed[message_id] = "t" * 300
+            return None
+
+        with (
+            patch.object(harness.activity, "get", side_effect=fake_get),
+            patch.object(activity_module, "poll_deferred", side_effect=fake_poll),
+        ):
+            report = harness.run(summarize_over=100)
+
+        assert report.members[0].summarized is True
+        assert len(report.members[0].task) == 50
         assert report.pending_summaries == 0
 
     def test_the_summary_request_carries_the_message_id_as_its_key(self) -> None:

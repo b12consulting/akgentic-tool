@@ -534,6 +534,11 @@ def apply_summaries(
     ``summarize_over is None`` short-circuits before the cache is touched at all:
     no ``get``, no ``request``, no worker, no tokens. That short-circuit is the
     whole point of the default, not an optimization.
+
+    A cached summary is clipped like any other text. The worker already clips to
+    the budget of whoever requested it, but ``#TeamActivity`` is one singleton
+    shared by every card on the team, so a card with a smaller ``max_task_chars``
+    can read back a summary produced under a larger one.
     """
     out: list[AgentActivity] = []
     pending: set[uuid.UUID] = set()
@@ -544,7 +549,11 @@ def apply_summaries(
             continue
         cached = activity_proxy.get(row.message_id)
         if cached is not None:
-            out.append(row.model_copy(update={"task": cached, "summarized": True}))
+            out.append(
+                row.model_copy(
+                    update={"task": _truncate(cached, budget.max_chars), "summarized": True}
+                )
+            )
             continue
         activity_proxy.request(
             row.message_id,
@@ -590,7 +599,12 @@ def _harvest_summaries(
         resolved = {key: value for key in keys if (value := activity_proxy.get(key)) is not None}
 
     harvested = [
-        row.model_copy(update={"task": resolved[row.message_id], "summarized": True})
+        row.model_copy(
+            update={
+                "task": _truncate(resolved[row.message_id], budget.max_chars),
+                "summarized": True,
+            }
+        )
         if row.message_id in pending and row.message_id in resolved
         else row
         for row in rows
