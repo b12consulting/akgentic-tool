@@ -1,5 +1,15 @@
 """``who_is_working`` — who on the team is mid-handler, and on what (ADR-033 §Decision 3).
 
+Team activity is a **capability on ``TeamTool``**, not a card of its own, and it
+rests on two independent gates:
+
+* ``TeamTool.get_team_activity`` decides whether ``who_is_working`` is exposed at
+  all. It defaults to ``False``, so an existing card keeps its behaviour.
+* :attr:`GetTeamActivity.summarizer` decides whether the ``#TeamActivity`` cache
+  actor exists. The actor is there **only** to cache summaries, so with no
+  summarizer there is nothing to cache: no actor, no worker, and no
+  ``summarize_over`` parameter in the signature the model sees.
+
 Nothing new is instrumented. ``Akgent.on_receive`` already wraps every handler in
 a telemetry sandwich — ``ReceivedMessage`` before dispatch, ``ProcessedMessage``
 after — and both carry the *receiving* agent's address as ``sender``. An agent
@@ -23,21 +33,36 @@ Four properties of this derivation are load-bearing:
   integer is the opt-in — the threshold *is* the consent — and routes only longer
   tasks through the deferred cache, keyed by ``message_id`` so a follow-up call is
   free.
+
+The last property is enforced structurally rather than by inspection:
+:func:`apply_truncations` and :func:`apply_summaries` are separate functions, and
+the truncate-only one has no cache proxy in scope at all.
+
+**No ``akgentic-llm`` import appears here, by design** (NFR1). ``akgentic-tool``
+may reach for ``akgentic-core``, pydantic and pydantic-ai only, so ``ModelConfig``
+does not exist at this layer; pydantic-ai's own model spec string
+(``"openai:gpt-5.2-mini"``) needs no new dependency.
+
+Known and accepted: summarizer tokens are produced outside ``ReactAgent``, so they
+reach neither cost accounting nor any usage limit. Summarization is opt-in,
+per-``message_id`` and cached, which bounds the exposure to roughly one small
+call per distinct long task per team.
 """
 
 from __future__ import annotations
 
-import logging
 import uuid
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
-from pydantic import Field, PrivateAttr
+from pydantic import Field
+from pydantic_ai import Agent
+from pydantic_ai.settings import ModelSettings
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent_config import BaseConfig
+from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import Message
 from akgentic.core.messages.orchestrator import (
     ProcessedMessage,
@@ -51,26 +76,32 @@ from akgentic.tool.core import (
     TOOL_CALL,
     BaseToolParam,
     Channels,
-    ToolCard,
-    _resolve,
 )
-from akgentic.tool.core.deferred import poll_deferred
-from akgentic.tool.errors import RetriableError
-from akgentic.tool.event import ActorToolObserver, ToolObserver
-from akgentic.tool.team.activity_actor import (
-    TEAM_ACTIVITY_ACTOR_NAME,
-    TEAM_ACTIVITY_ACTOR_ROLE,
-    SummarizePayload,
-    TeamActivityActor,
+from akgentic.tool.core.deferred import (
+    DeferredPayload,
+    DeferredResultActor,
+    DeferredWorker,
+    poll_deferred,
 )
-
-logger = logging.getLogger(__name__)
 
 UNRESOLVED_TASK = "<task text unavailable>"
 """Reported when no ``SentMessage`` matches an open ``message_id``.
 
 A member with an unresolvable task is still working, so it is still reported —
 the text degrades, the row does not disappear.
+"""
+
+TEAM_ACTIVITY_ACTOR_NAME = "#TeamActivity"
+TEAM_ACTIVITY_ACTOR_ROLE = "ToolActor"
+
+SUMMARY_INSTRUCTION = (
+    "Summarize what the following task asks for, in at most {max_chars} characters. "
+    "Answer with the summary only: no preamble, no quotes, no trailing commentary."
+)
+"""Prompt wrapped around the task text.
+
+Deliberately short and deterministic — one instruction plus the text — so the
+call stays cheap and its output stays a single unadorned sentence.
 """
 
 _ELLIPSIS = "…"
@@ -119,10 +150,161 @@ class TeamActivityReport(SerializableBaseModel):
     pending_summaries: int
 
 
+class ActivitySummarizer(SerializableBaseModel):
+    """Opt-in summarization of long task text.
+
+    Configuring one is what brings the ``#TeamActivity`` cache actor into
+    existence: the actor stores summaries and nothing else, so without a
+    summarizer there is nothing for it to hold. Even with one configured, no
+    model call happens until a caller passes ``summarize_over``.
+
+    Attributes:
+        model: pydantic-ai model spec string, never a ``ModelConfig`` — this
+            package must not import ``akgentic-llm``.
+        poll_attempts: Attempts spent waiting for in-flight summaries.
+        poll_delay_seconds: Seconds slept between attempts.
+    """
+
+    model: str = Field(
+        default="openai:gpt-5.2-mini",
+        description="pydantic-ai model spec string used to summarize long tasks.",
+    )
+    poll_attempts: int = Field(
+        default=5, description="Attempts spent waiting for in-flight summaries."
+    )
+    poll_delay_seconds: float = Field(
+        default=0.4, description="Seconds slept between summary poll attempts."
+    )
+
+
 class GetTeamActivity(BaseToolParam):
     """Report which team members are currently working, and on what."""
 
     expose: set[Channels] = {TOOL_CALL, COMMAND}
+    summarizer: ActivitySummarizer | None = Field(
+        default=None,
+        description="Configure to summarize long tasks on demand. None: truncate, no actor.",
+    )
+    stale_after_seconds: float = Field(
+        default=300.0,
+        description="Open handlers older than this are treated as replayed history.",
+    )
+    max_task_chars: int = Field(
+        default=200, description="Character budget for reported task text."
+    )
+
+
+class SummaryBudget(SerializableBaseModel):
+    """Bind-time summarization configuration, read once per report.
+
+    Attributes:
+        model: pydantic-ai model spec string handed to the summarizer worker.
+        max_chars: Character budget for both truncation and summaries.
+        poll_attempts: Attempts spent waiting for in-flight summaries.
+        poll_delay_seconds: Seconds slept between attempts.
+    """
+
+    model: str
+    max_chars: int
+    poll_attempts: int
+    poll_delay_seconds: float
+
+    @classmethod
+    def from_params(cls, params: GetTeamActivity) -> SummaryBudget:
+        """Build the budget from a param model that configures a summarizer.
+
+        Args:
+            params: Capability configuration whose ``summarizer`` is set.
+
+        Returns:
+            The bind-time budget.
+
+        Raises:
+            ValueError: If ``params.summarizer`` is ``None`` — the summarizing
+                path must never be reachable without one.
+        """
+        if params.summarizer is None:
+            raise ValueError("A summary budget requires a configured summarizer.")
+        return cls(
+            model=params.summarizer.model,
+            max_chars=params.max_task_chars,
+            poll_attempts=params.summarizer.poll_attempts,
+            poll_delay_seconds=params.summarizer.poll_delay_seconds,
+        )
+
+
+class SummarizePayload(DeferredPayload):
+    """One task text to summarize, with its budget and its model.
+
+    ``deferred_key`` narrows the base's ``Any`` to the ``message_id`` of the task,
+    which is also the cache key. Never set it independently of the ``request()``
+    key: ``request`` rebinds it, and a caller that let the two drift would clear
+    a different in-flight mark and strand this one for the actor's lifetime.
+
+    Attributes:
+        deferred_key: ``message_id`` of the task being summarized.
+        text: Full task text.
+        model: pydantic-ai model spec string (e.g. ``"openai:gpt-5.2-mini"``).
+        max_chars: Character budget for the produced summary.
+    """
+
+    deferred_key: uuid.UUID = Field(
+        ...,
+        description="message_id of the task being summarized; also the cache key.",
+    )
+    text: str = Field(..., description="Full task text to summarize.")
+    model: str = Field(..., description="pydantic-ai model spec string.")
+    max_chars: int = Field(..., description="Character budget for the summary.")
+
+
+class SummarizerWorker(DeferredWorker):
+    """Summarizes one task text with one model call, then stops.
+
+    ``produce`` runs on the worker's own thread, which is why the pydantic-ai
+    call is the synchronous ``run_sync`` form rather than an awaited one.
+    """
+
+    def produce(self, payload: DeferredPayload) -> Any:
+        """Summarize ``payload.text`` within ``payload.max_chars``.
+
+        :attr:`~akgentic.tool.core.deferred.DeferredWorker.timeout_s` is handed to
+        the model call through ``ModelSettings``. A budget that does not reach the
+        client is decoration: a Python thread cannot be cancelled, and this worker
+        holds its parent's ``stop_children(blocking=True)`` open until it returns.
+
+        Args:
+            payload: A :class:`SummarizePayload`.
+
+        Returns:
+            The summary, clipped to ``payload.max_chars``.
+
+        Raises:
+            TypeError: If handed a payload that is not a :class:`SummarizePayload`.
+        """
+        if not isinstance(payload, SummarizePayload):
+            raise TypeError(f"SummarizerWorker requires a SummarizePayload, got {type(payload)}")
+
+        agent = Agent(payload.model)
+        prompt = (
+            f"{SUMMARY_INSTRUCTION.format(max_chars=payload.max_chars)}\n\n"
+            f"Task:\n{payload.text}"
+        )
+        result = agent.run_sync(prompt, model_settings=ModelSettings(timeout=self.timeout_s))
+        return str(result.output).strip()[: payload.max_chars]
+
+
+class TeamActivityActor(DeferredResultActor[BaseConfig, BaseState, uuid.UUID, str]):
+    """The ``#TeamActivity`` singleton: task summaries keyed by ``message_id``.
+
+    Keeps the base's capacity and negative-TTL defaults. A summary is only ever
+    requested for a task that is *currently open*, so the working set is bounded
+    by the size of the team rather than by conversation length, and 128 slots is
+    already generous for it.
+    """
+
+    def worker_class(self) -> type[DeferredWorker]:
+        """Return :class:`SummarizerWorker`."""
+        return SummarizerWorker
 
 
 @dataclass(slots=True)
@@ -139,20 +321,24 @@ class _OpenGroup:
     entries: list[ReceivedMessage] = field(default_factory=list)
 
 
-class _SummaryBudget(SerializableBaseModel):
-    """Bind-time summarization configuration, read once per report.
+@dataclass(slots=True)
+class ActivitySnapshot:
+    """Everything derived from telemetry, before any task text is applied.
+
+    Runtime bookkeeping local to one ``who_is_working`` call, like
+    :class:`_OpenGroup`. It exists so the two report paths share one derivation:
+    the truncate-only path and the summarizing path differ solely in what they do
+    with ``texts``, never in how the rows are found.
 
     Attributes:
-        model: pydantic-ai model spec string handed to the summarizer worker.
-        max_chars: Character budget for both truncation and summaries.
-        poll_attempts: Attempts spent waiting for in-flight summaries.
-        poll_delay_seconds: Seconds slept between attempts.
+        generated_at: When the derivation ran; also the report timestamp.
+        rows: One row per busy member, with ``task`` still a placeholder.
+        texts: Resolved task text per open ``message_id``.
     """
 
-    model: str
-    max_chars: int
-    poll_attempts: int
-    poll_delay_seconds: float
+    generated_at: datetime
+    rows: list[AgentActivity]
+    texts: dict[uuid.UUID, str]
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -291,11 +477,56 @@ def _resolve_task_texts(
     return resolved
 
 
-def _apply_summaries(
+def build_snapshot(
+    orchestrator_proxy: Orchestrator,
+    caller_id: uuid.UUID,
+    stale_after_seconds: float,
+) -> ActivitySnapshot:
+    """Derive the busy members and their task texts from team telemetry.
+
+    Shared by both report paths, and cost-free in the sense that matters: three
+    filtered history scans on the orchestrator's own thread, no actor spawned and
+    no model consulted.
+
+    Args:
+        orchestrator_proxy: Ask-proxy to the orchestrator.
+        caller_id: ``agent_id`` of the asking agent, excluded from the report.
+        stale_after_seconds: Replay cut-off for an unbalanced open handler.
+
+    Returns:
+        The rows, their resolved task texts, and the derivation timestamp.
+    """
+    now = datetime.now(UTC)
+    groups = _collect_open_groups(orchestrator_proxy, caller_id, now, stale_after_seconds)
+    rows = _build_rows(groups, now)
+    return ActivitySnapshot(
+        generated_at=now,
+        rows=rows,
+        texts=_resolve_task_texts(orchestrator_proxy, rows),
+    )
+
+
+def apply_truncations(
+    rows: list[AgentActivity], texts: dict[uuid.UUID, str], max_chars: int
+) -> list[AgentActivity]:
+    """Attach truncated task text to every row.
+
+    The whole summarizer-less path, and deliberately a function that takes **no
+    cache proxy**: "no model call happens here" is then true by construction
+    rather than by a runtime ``if`` that a later edit could invert.
+    """
+    out: list[AgentActivity] = []
+    for row in rows:
+        text = texts.get(row.message_id, UNRESOLVED_TASK)
+        out.append(row.model_copy(update={"task": _truncate(text, max_chars)}))
+    return out
+
+
+def apply_summaries(
     rows: list[AgentActivity],
     texts: dict[uuid.UUID, str],
     activity_proxy: TeamActivityActor,
-    budget: _SummaryBudget,
+    budget: SummaryBudget,
     summarize_over: int | None,
 ) -> tuple[list[AgentActivity], int]:
     """Attach the task text to every row, summarizing only where asked.
@@ -336,7 +567,7 @@ def _harvest_summaries(
     rows: list[AgentActivity],
     pending: set[uuid.UUID],
     activity_proxy: TeamActivityActor,
-    budget: _SummaryBudget,
+    budget: SummaryBudget,
 ) -> tuple[list[AgentActivity], int]:
     """Poll ONCE for the whole pending set, then sweep for partial arrivals.
 
@@ -368,159 +599,3 @@ def _harvest_summaries(
         1 for row in rows if row.message_id in pending and row.message_id not in resolved
     )
     return harvested, still_pending
-
-
-class TeamActivityTool(ToolCard):
-    """Reports which team members are mid-handler, and on what.
-
-    A card of its own rather than a capability on ``TeamTool``: this one owns an
-    actor, a cache and an optional model dependency, and a team that only wants
-    hire/fire must not inherit those by accident.
-
-    Attributes:
-        get_team_activity: Enables ``who_is_working`` (default: True).
-        summarizer_model: pydantic-ai model spec used when summarization is
-            requested. Never consulted while ``summarize_over`` is None.
-        summary_max_chars: Character budget for both truncated and summarized
-            task text.
-        stale_after_seconds: An open handler older than this is treated as
-            replayed history and excluded.
-        poll_attempts: Attempts spent waiting for in-flight summaries.
-        poll_delay_seconds: Seconds slept between attempts.
-    """
-
-    get_team_activity: GetTeamActivity | bool = Field(
-        default=True, description="Enable the who_is_working report (default: True)"
-    )
-    summarizer_model: str = Field(
-        default="openai:gpt-5.2-mini",
-        description="pydantic-ai model spec string used to summarize long tasks.",
-    )
-    summary_max_chars: int = Field(
-        default=200, description="Character budget for reported task text."
-    )
-    stale_after_seconds: float = Field(
-        default=300.0,
-        description="Open handlers older than this are treated as replayed history.",
-    )
-    poll_attempts: int = Field(
-        default=5, description="Attempts spent waiting for in-flight summaries."
-    )
-    poll_delay_seconds: float = Field(
-        default=0.4, description="Seconds slept between summary poll attempts."
-    )
-
-    # Runtime handles: actor proxies are not serializable and never fields.
-    _orchestrator_proxy: Orchestrator | None = PrivateAttr(default=None)
-    _activity_proxy: TeamActivityActor | None = PrivateAttr(default=None)
-
-    def observer(self, observer: ToolObserver) -> TeamActivityTool:
-        """Attach the observer and bind the ``#TeamActivity`` singleton.
-
-        Requires an ``ActorToolObserver``; the parameter keeps the base
-        ``ToolObserver`` type so the override stays substitutable, and
-        :meth:`_actor_observer` applies the narrower one.
-
-        The cache actor is reached through an **ask** proxy and its TELL-shaped
-        ``request`` is called on that same proxy. That is safe rather than a
-        partial adoption of the mechanism: ``request`` adds to a set, spawns a
-        worker and tells it the payload — all O(1) on the cache actor's thread, so
-        the ask never waits on external work. What the mechanism forbids is a
-        blocking ask on a method that performs the slow call.
-
-        Raises:
-            ValueError: If the observer exposes no orchestrator.
-        """
-        super().observer(observer)  # store the observer weakly via the base setter
-        actor_observer = self._actor_observer()
-        if actor_observer.orchestrator is None:
-            raise ValueError("TeamActivityTool requires access to the orchestrator.")
-
-        orchestrator_proxy = actor_observer.proxy_ask(actor_observer.orchestrator, Orchestrator)
-        activity_addr = orchestrator_proxy.getChildrenOrCreate(
-            TeamActivityActor,
-            config=BaseConfig(
-                name=TEAM_ACTIVITY_ACTOR_NAME,
-                role=TEAM_ACTIVITY_ACTOR_ROLE,
-            ),
-        )
-        self._orchestrator_proxy = orchestrator_proxy
-        self._activity_proxy = actor_observer.proxy_ask(activity_addr, TeamActivityActor)
-        return self
-
-    def _actor_observer(self) -> ActorToolObserver:
-        """Live observer typed as the actor protocol. Raises once the agent stops."""
-        return cast(ActorToolObserver, self._observer)
-
-    def _actor_observer_or_none(self) -> ActorToolObserver | None:
-        """Live observer typed as the actor protocol; ``None`` once the agent stops."""
-        return cast(ActorToolObserver | None, self._observer_or_none())
-
-    def get_tools(self) -> list[Callable[..., Any]]:
-        """Return ``who_is_working`` when it is exposed on the tool-call channel."""
-        gta = _resolve(self.get_team_activity, GetTeamActivity)
-        if gta and TOOL_CALL in gta.expose:
-            return [self._who_is_working_factory(gta)]
-        return []
-
-    def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
-        """Return ``who_is_working`` when it is exposed on the command channel."""
-        gta = _resolve(self.get_team_activity, GetTeamActivity)
-        if gta and COMMAND in gta.expose:
-            return {GetTeamActivity: self._who_is_working_factory(gta)}
-        return {}
-
-    def _who_is_working_factory(self, params: GetTeamActivity) -> Callable[..., Any]:
-        """Build the ``who_is_working`` callable, reading configuration once."""
-        orchestrator_proxy, activity_proxy = self._require_proxies()
-        observer_or_none = self._actor_observer_or_none  # bound method -> weak edge to agent
-        stale_after_seconds = self.stale_after_seconds
-        budget = _SummaryBudget(
-            model=self.summarizer_model,
-            max_chars=self.summary_max_chars,
-            poll_attempts=self.poll_attempts,
-            poll_delay_seconds=self.poll_delay_seconds,
-        )
-
-        def who_is_working(summarize_over: int | None = None) -> TeamActivityReport:
-            """Report which teammates are currently handling a message, and on what.
-
-            Derived from team telemetry, so it costs no LLM call by default: task
-            text longer than the report budget is simply truncated.
-
-            Args:
-                summarize_over: Omit (the default) for zero-cost truncation. Pass a
-                    character count to summarize only tasks longer than it; the
-                    summary is cached per task, so asking again is free. A summary
-                    that has not arrived in time comes back truncated and is counted
-                    in ``pending_summaries``.
-
-            Returns:
-                A ``TeamActivityReport``. Members that are idle, are you, are tool
-                actors, or are the user proxy never appear.
-            """
-            observer = observer_or_none()
-            if observer is None:
-                raise RetriableError("Team is shutting down; cannot report team activity.")
-
-            now = datetime.now(UTC)
-            groups = _collect_open_groups(
-                orchestrator_proxy, observer.myAddress.agent_id, now, stale_after_seconds
-            )
-            rows = _build_rows(groups, now)
-            texts = _resolve_task_texts(orchestrator_proxy, rows)
-            members, pending_summaries = _apply_summaries(
-                rows, texts, activity_proxy, budget, summarize_over
-            )
-            return TeamActivityReport(
-                generated_at=now, members=members, pending_summaries=pending_summaries
-            )
-
-        who_is_working.__doc__ = params.format_docstring(who_is_working.__doc__)
-        return who_is_working
-
-    def _require_proxies(self) -> tuple[Orchestrator, TeamActivityActor]:
-        """Return the bound proxies, or fail loudly if :meth:`observer` never ran."""
-        if self._orchestrator_proxy is None or self._activity_proxy is None:
-            raise ValueError("TeamActivityTool.observer() must run before its callables are built.")
-        return self._orchestrator_proxy, self._activity_proxy

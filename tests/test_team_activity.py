@@ -1,4 +1,4 @@
-"""Unit tests for ``TeamActivityTool`` and ``who_is_working``.
+"""Unit tests for ``who_is_working``, the team-activity capability on ``TeamTool``.
 
 Mock-based throughout: telemetry is hand-built and handed to a fake orchestrator
 proxy, so no real team runs. Every test is synchronous — the package pyproject
@@ -10,6 +10,7 @@ synchronous keeps that divergence benign.
 from __future__ import annotations
 
 import ast
+import inspect
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -35,15 +36,20 @@ from akgentic.tool.core import COMMAND, TOOL_CALL
 from akgentic.tool.core.deferred import DeferredPayload, DeferredWorker, poll_deferred
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.team import (
+    ActivitySummarizer,
     AgentActivity,
+    FireTeamMember,
+    GetRoleProfiles,
     GetTeamActivity,
+    GetTeamRoster,
+    HireTeamMember,
     TeamActivityReport,
-    TeamActivityTool,
+    TeamTool,
 )
-from akgentic.tool.team.activity import UNRESOLVED_TASK
-from akgentic.tool.team.activity_actor import (
+from akgentic.tool.team.activity import (
     TEAM_ACTIVITY_ACTOR_NAME,
     TEAM_ACTIVITY_ACTOR_ROLE,
+    UNRESOLVED_TASK,
     SummarizePayload,
     SummarizerWorker,
     TeamActivityActor,
@@ -100,6 +106,7 @@ class _FakeOrchestrator:
         self.get_messages_calls: list[type | None] = []
         self.children_created: list[tuple[type, BaseConfig]] = []
         self.sent_view: _RecordingList | None = None
+        self.team: list[ActorAddress] = []
 
     def get_messages(
         self, sender: ActorAddress | None = None, message_type: type | None = None
@@ -115,6 +122,9 @@ class _FakeOrchestrator:
             return self.sent_view
         return matched
 
+    def get_team(self) -> list[ActorAddress]:
+        return self.team
+
     def getChildrenOrCreate(  # noqa: N802
         self, actor_class: type, config: BaseConfig
     ) -> ActorAddress:
@@ -123,7 +133,13 @@ class _FakeOrchestrator:
 
 
 class _FakeObserver:
-    """Minimal ``ActorToolObserver``: one address, two proxies, no actor system."""
+    """Minimal ``TeamManagementToolObserver``: one address, two proxies, no actor system.
+
+    ``TeamTool`` casts its observer to the team protocol and the cast is
+    unchecked, so the hire/fire members are present as no-ops: a test that
+    exercises the shared card through hire or fire must not explode on a missing
+    attribute instead of failing on what it asserts.
+    """
 
     def __init__(
         self,
@@ -140,6 +156,16 @@ class _FakeObserver:
 
     def notify_event(self, event: object) -> None:
         """Unused here; present so the observer satisfies the protocol."""
+
+    def createActor(self, actor_class: type, *, config: object) -> ActorAddress:  # noqa: N802
+        """Unused here; present so the team protocol is satisfied."""
+        return _address("@Child")
+
+    def on_hire(self, address: ActorAddress) -> None:
+        """Unused here; present so the team protocol is satisfied."""
+
+    def on_fire(self, address: ActorAddress) -> None:
+        """Unused here; present so the team protocol is satisfied."""
 
     def proxy_ask(
         self, actor: ActorAddress, actor_type: type | None = None, timeout: int | None = None
@@ -217,7 +243,13 @@ def _task(content: str, message_id: uuid.UUID | None = None) -> UserMessage:
 
 
 class _Harness:
-    """A bound ``TeamActivityTool`` plus the doubles behind it."""
+    """A bound ``TeamTool`` plus the doubles behind it.
+
+    ``get_team_activity`` defaults to a **summarizer-configured** capability, so
+    the derivation tests exercise the path that owns the cache actor. Pass the
+    field explicitly (``True``, ``False``, or a hand-built ``GetTeamActivity``) to
+    test the gates themselves.
+    """
 
     def __init__(
         self,
@@ -225,25 +257,47 @@ class _Harness:
         *,
         caller: ActorAddress | None = None,
         spy_worker: bool = False,
-        **card_kwargs: Any,
+        get_team_activity: GetTeamActivity | bool | None = None,
+        max_task_chars: int = 200,
+        stale_after_seconds: float = 300.0,
+        model: str = "openai:gpt-5.2-mini",
+        poll_attempts: int = 5,
+        poll_delay_seconds: float = 0.4,
     ) -> None:
+        if get_team_activity is None:
+            get_team_activity = GetTeamActivity(
+                summarizer=ActivitySummarizer(
+                    model=model,
+                    poll_attempts=poll_attempts,
+                    poll_delay_seconds=poll_delay_seconds,
+                ),
+                max_task_chars=max_task_chars,
+                stale_after_seconds=stale_after_seconds,
+            )
         self.caller = caller or _address("@Manager", "Manager")
         self.orchestrator = _FakeOrchestrator(messages)
         self.activity = _make_activity_actor(spy=spy_worker)
         self.observer = _FakeObserver(self.orchestrator, self.activity, self.caller)
-        self.tool = TeamActivityTool(**card_kwargs)
+        self.tool = TeamTool(get_team_activity=get_team_activity)
         self.tool.observer(self.observer)
 
     @property
     def who_is_working(self) -> Callable[..., TeamActivityReport]:
-        return self.tool.get_tools()[0]
+        """The activity callable, selected by name — ``get_tools()[0]`` is hire."""
+        return next(
+            tool for tool in self.tool.get_tools() if tool.__name__ == "who_is_working"
+        )
 
     def run(self, summarize_over: int | None = None) -> TeamActivityReport:
         with (
             patch.object(self.activity, "createActor", side_effect=_spawning_create),
             patch.object(self.activity, "proxy_tell", return_value=MagicMock()),
         ):
-            return self.who_is_working(summarize_over=summarize_over)
+            callable_ = self.who_is_working
+            if "summarize_over" in inspect.signature(callable_).parameters:
+                return callable_(summarize_over=summarize_over)
+            assert summarize_over is None, "the truncate-only variant takes no threshold"
+            return callable_()
 
 
 @pytest.fixture(autouse=True)
@@ -301,20 +355,26 @@ class TestReportModels:
 
 
 # ---------------------------------------------------------------------------
-# AC2 — the card is separate from TeamTool, config-only fields
+# AC2 — a capability ON TeamTool, configured through the param models
 # ---------------------------------------------------------------------------
 
 
 class TestCardShape:
-    """AC2: configuration fields on the card, runtime handles in PrivateAttr."""
+    """AC2: configuration on the param models, runtime handles in PrivateAttr."""
+
+    def test_the_capability_is_off_by_default(self) -> None:
+        assert TeamTool().get_team_activity is False
 
     def test_configuration_defaults(self) -> None:
-        tool = TeamActivityTool()
-        assert tool.summarizer_model == "openai:gpt-5.2-mini"
-        assert tool.summary_max_chars == 200
-        assert tool.stale_after_seconds == 300.0
-        assert tool.poll_attempts == 5
-        assert tool.poll_delay_seconds == 0.4
+        params = GetTeamActivity()
+        assert params.summarizer is None
+        assert params.stale_after_seconds == 300.0
+        assert params.max_task_chars == 200
+
+        summarizer = ActivitySummarizer()
+        assert summarizer.model == "openai:gpt-5.2-mini"
+        assert summarizer.poll_attempts == 5
+        assert summarizer.poll_delay_seconds == 0.4
 
     def test_a_bound_card_still_round_trips_through_serialization(self) -> None:
         """Golden Rule #1b, stated as the guarantee it exists for.
@@ -325,42 +385,240 @@ class TestCardShape:
         proxies** still serializes, which holds only while those proxies are
         private attributes rather than fields.
         """
-        harness = _Harness([], summary_max_chars=99)
+        harness = _Harness([], max_task_chars=99)
         assert harness.tool._activity_proxy is not None  # genuinely bound
 
-        restored = TeamActivityTool.model_validate(harness.tool.model_dump())
-        assert restored.summary_max_chars == 99
-        assert restored.summarizer_model == harness.tool.summarizer_model
+        restored = TeamTool.model_validate(harness.tool.model_dump())
+        assert isinstance(restored.get_team_activity, GetTeamActivity)
+        assert restored.get_team_activity.max_task_chars == 99
+        assert restored.get_team_activity.summarizer is not None
         assert restored._activity_proxy is None, "runtime state must not survive a round trip"
 
-    def test_every_field_is_a_serializable_primitive(self) -> None:
-        allowed = {str, int, float, bool}
-        for name, field in TeamActivityTool.model_fields.items():
-            if name == "get_team_activity":
-                continue  # GetTeamActivity | bool — a SerializableBaseModel union
-            assert field.annotation in allowed, f"{name} is not a serializable primitive"
+    def test_every_field_is_a_capability_union(self) -> None:
+        """No raw runtime type may reach a Pydantic field (Golden Rule #1b)."""
+        for name, field in TeamTool.model_fields.items():
+            annotation = str(field.annotation)
+            assert "bool" in annotation, f"{name} is not a `ParamModel | bool` capability field"
 
-    def test_proxies_are_private_attributes_not_fields(self) -> None:
-        assert "_activity_proxy" not in TeamActivityTool.model_fields
-        assert "_orchestrator_proxy" not in TeamActivityTool.model_fields
-        assert "_activity_proxy" in TeamActivityTool.__private_attributes__
-        assert "_orchestrator_proxy" in TeamActivityTool.__private_attributes__
+    def test_the_activity_proxy_is_a_private_attribute_not_a_field(self) -> None:
+        assert "_activity_proxy" not in TeamTool.model_fields
+        assert "_activity_proxy" in TeamTool.__private_attributes__
+
+    def test_the_param_models_survive_a_json_round_trip(self) -> None:
+        """Golden Rule #1b: configuration must reach a catalog entry and come back.
+
+        Asserting on ``arbitrary_types_allowed`` would be vacuous — it is already
+        True on ``SerializableBaseModel`` and every model in the package inherits
+        it. JSON is the guarantee that actually matters: it fails the moment a
+        non-serializable type reaches a field.
+        """
+        params = GetTeamActivity(
+            summarizer=ActivitySummarizer(model="openai:gpt-5.2-mini", poll_attempts=2),
+            max_task_chars=42,
+        )
+        restored = GetTeamActivity.model_validate_json(params.model_dump_json())
+        assert restored.max_task_chars == 42
+        assert restored.summarizer is not None
+        assert restored.summarizer.poll_attempts == 2
+        assert restored.expose == params.expose
 
     def test_card_serializes_without_runtime_state(self) -> None:
         harness = _Harness([])
         dumped = harness.tool.model_dump()
-        assert dumped["summarizer_model"] == "openai:gpt-5.2-mini"
+        assert dumped["get_team_activity"]["summarizer"]["model"] == "openai:gpt-5.2-mini"
         assert "_activity_proxy" not in dumped
 
     def test_observer_requires_an_orchestrator(self) -> None:
         observer = _FakeObserver(_FakeOrchestrator([]), _make_activity_actor(), _address("@Me"))
         observer.orchestrator = None
         with pytest.raises(ValueError, match="requires access to the orchestrator"):
-            TeamActivityTool().observer(observer)
+            TeamTool().observer(observer)
 
-    def test_callables_require_a_bound_observer(self) -> None:
+    def test_the_summarizing_callable_requires_a_bound_observer(self) -> None:
+        """Hire and fire are switched off so the activity gate is what is reached."""
+        tool = TeamTool(
+            hire_team_members=False,
+            fire_team_members=False,
+            get_team_activity=GetTeamActivity(summarizer=ActivitySummarizer()),
+        )
         with pytest.raises(ValueError, match="observer\\(\\) must run"):
-            TeamActivityTool().get_tools()
+            tool.get_tools()
+
+    def test_a_summary_budget_refuses_to_exist_without_a_summarizer(self) -> None:
+        """The summarizing path must be unreachable without a configured summarizer."""
+        with pytest.raises(ValueError, match="requires a configured summarizer"):
+            activity_module.SummaryBudget.from_params(GetTeamActivity())
+
+
+class TestNoTeamActivityToolAnywhere:
+    """AC2/AC16: the separate card is gone from both namespaces."""
+
+    def test_absent_from_the_team_package(self) -> None:
+        import akgentic.tool.team as team_package
+
+        assert "TeamActivityTool" not in team_package.__all__
+        assert not hasattr(team_package, "TeamActivityTool")
+
+    def test_absent_from_the_top_level_facade(self) -> None:
+        import akgentic.tool as tool_package
+
+        assert "TeamActivityTool" not in tool_package.__all__
+        assert not hasattr(tool_package, "TeamActivityTool")
+
+    def test_absent_from_the_activity_module(self) -> None:
+        assert not hasattr(activity_module, "TeamActivityTool")
+
+
+# ---------------------------------------------------------------------------
+# AC2a — two independent gates; the summarizer is what creates the actor
+# ---------------------------------------------------------------------------
+
+
+class TestActorGate:
+    """AC2a: the actor exists only to cache summaries, so no summarizer, no actor."""
+
+    def test_no_actor_when_the_summarizer_is_absent(self) -> None:
+        """RED when actor creation stops being gated on the summarizer.
+
+        The assertion is on the ORCHESTRATOR'S CHILDREN, not on
+        ``tool._activity_proxy is None``. The proxy-flavoured assertion passes
+        against an implementation that calls ``getChildrenOrCreate`` and merely
+        forgets to store the result — and that is the expensive half of the bug:
+        the team has paid for an actor it will never use. Drop the
+        ``summarizer is not None`` clause from ``_bind_activity_actor`` and this
+        list holds one entry instead of none.
+        """
+        harness = _Harness([], get_team_activity=True)
+        assert harness.orchestrator.children_created == []
+
+    def test_no_actor_on_a_default_card(self) -> None:
+        harness = _Harness([], get_team_activity=False)
+        assert harness.orchestrator.children_created == []
+        assert harness.tool._activity_proxy is None
+
+    def test_the_summarizer_is_what_creates_the_actor(self) -> None:
+        """Guard on the guard: the probe fires when the gate opens."""
+        harness = _Harness([])
+        assert len(harness.orchestrator.children_created) == 1
+        assert harness.tool._activity_proxy is not None
+
+    def test_no_proxy_ask_for_the_cache_actor_without_a_summarizer(self) -> None:
+        harness = _Harness([], get_team_activity=True)
+        assert harness.observer.proxy_ask_calls == [Orchestrator]
+
+
+# ---------------------------------------------------------------------------
+# AC2b — the tool signature is built from the configuration
+# ---------------------------------------------------------------------------
+
+
+class TestSignatureFollowsConfiguration:
+    """AC2b: absent from the schema, not merely defaulted off."""
+
+    def test_no_summarize_over_parameter_without_a_summarizer(self) -> None:
+        """RED against a merely-defaulted parameter.
+
+        A parameter given a default still appears in ``inspect.signature``, and it
+        still appears in the JSON schema pydantic-ai derives for the model. Only
+        its absence from ``parameters`` proves the model cannot ask for a summary
+        that nothing is configured to produce — a behavioural assertion on the
+        returned report cannot tell the two apart.
+        """
+        harness = _Harness([], get_team_activity=True)
+        signature = inspect.signature(harness.who_is_working)
+        assert "summarize_over" not in signature.parameters
+        assert signature.parameters == {}
+
+    def test_the_summarize_over_parameter_appears_with_a_summarizer(self) -> None:
+        signature = inspect.signature(_Harness([]).who_is_working)
+        assert signature.parameters["summarize_over"].default is None
+
+    def test_both_variants_are_named_who_is_working(self) -> None:
+        """The command registry derives the command name from ``__name__``."""
+        assert _Harness([], get_team_activity=True).who_is_working.__name__ == "who_is_working"
+        assert _Harness([]).who_is_working.__name__ == "who_is_working"
+
+    def test_the_truncating_docstring_never_mentions_the_threshold(self) -> None:
+        doc = _Harness([], get_team_activity=True).who_is_working.__doc__
+        assert doc is not None
+        assert "summarize_over" not in doc
+
+    def test_the_summarizing_docstring_documents_the_threshold(self) -> None:
+        doc = _Harness([]).who_is_working.__doc__
+        assert doc is not None
+        assert "summarize_over" in doc
+
+    def test_instructions_are_appended_to_both_variants(self) -> None:
+        truncating = _Harness(
+            [], get_team_activity=GetTeamActivity(instructions="Ask sparingly.")
+        ).who_is_working
+        summarizing = _Harness(
+            [],
+            get_team_activity=GetTeamActivity(
+                instructions="Ask sparingly.", summarizer=ActivitySummarizer()
+            ),
+        ).who_is_working
+        assert "Ask sparingly." in (truncating.__doc__ or "")
+        assert "Ask sparingly." in (summarizing.__doc__ or "")
+
+
+# ---------------------------------------------------------------------------
+# AC2c — backward compatibility, proven not assumed
+# ---------------------------------------------------------------------------
+
+
+class TestBackwardCompatibility:
+    """AC2c: a payload that predates the field still validates and still behaves."""
+
+    def _bound_default_tool(self) -> tuple[TeamTool, _FakeOrchestrator, _FakeObserver]:
+        orchestrator = _FakeOrchestrator([])
+        observer = _FakeObserver(orchestrator, _make_activity_actor(), _address("@Manager"))
+        tool = TeamTool()
+        tool.observer(observer)
+        return tool, orchestrator, observer
+
+    def test_a_payload_without_the_field_still_validates(self) -> None:
+        payload = TeamTool().model_dump()
+        del payload["get_team_activity"]
+        restored = TeamTool.model_validate(payload)
+        assert restored.get_team_activity is False
+
+    def test_the_dispatch_surface_is_unchanged(self) -> None:
+        tool, _, _ = self._bound_default_tool()
+
+        assert [callable_.__name__ for callable_ in tool.get_tools()] == [
+            "hire_members",
+            "fire_members",
+        ]
+        assert set(tool.get_commands()) == {
+            HireTeamMember,
+            FireTeamMember,
+            GetTeamRoster,
+            GetRoleProfiles,
+        }
+        assert len(tool.get_system_prompts()) == 2
+        assert GetTeamActivity not in tool.get_commands()
+        assert all(
+            callable_.__name__ != "who_is_working"
+            for callable_ in [*tool.get_tools(), *tool.get_system_prompts()]
+        )
+
+    def test_a_default_card_creates_no_actor(self) -> None:
+        _, orchestrator, _ = self._bound_default_tool()
+        assert orchestrator.children_created == []
+
+    def test_an_old_payload_behaves_exactly_like_a_fresh_default_card(self) -> None:
+        payload = TeamTool().model_dump()
+        del payload["get_team_activity"]
+        restored = TeamTool.model_validate(payload)
+        orchestrator = _FakeOrchestrator([])
+        restored.observer(_FakeObserver(orchestrator, _make_activity_actor(), _address("@M")))
+
+        assert [callable_.__name__ for callable_ in restored.get_tools()] == [
+            "hire_members",
+            "fire_members",
+        ]
+        assert orchestrator.children_created == []
 
 
 # ---------------------------------------------------------------------------
@@ -369,41 +627,47 @@ class TestCardShape:
 
 
 class TestChannels:
-    """AC3: both channels registered, command name is ``who_is_working``."""
+    """AC3: both channels registered alongside hire/fire."""
 
     def test_default_expose_set(self) -> None:
         assert GetTeamActivity().expose == {TOOL_CALL, COMMAND}
 
     def test_tool_channel_registers_the_callable(self) -> None:
         tools = _Harness([]).tool.get_tools()
-        assert len(tools) == 1
-        assert tools[0].__name__ == "who_is_working"
+        assert [callable_.__name__ for callable_ in tools] == [
+            "hire_members",
+            "fire_members",
+            "who_is_working",
+        ]
 
     def test_command_channel_maps_the_param_class(self) -> None:
         commands = _Harness([]).tool.get_commands()
-        assert list(commands) == [GetTeamActivity]
+        assert GetTeamActivity in commands
         assert commands[GetTeamActivity].__name__ == "who_is_working"
 
     def test_disabled_capability_registers_nothing(self) -> None:
         harness = _Harness([], get_team_activity=False)
-        assert harness.tool.get_tools() == []
-        assert harness.tool.get_commands() == {}
+        assert all(
+            callable_.__name__ != "who_is_working" for callable_ in harness.tool.get_tools()
+        )
+        assert GetTeamActivity not in harness.tool.get_commands()
 
     def test_tool_call_only_leaves_the_command_channel_empty(self) -> None:
         harness = _Harness([], get_team_activity=GetTeamActivity(expose={TOOL_CALL}))
-        assert len(harness.tool.get_tools()) == 1
-        assert harness.tool.get_commands() == {}
+        assert harness.who_is_working.__name__ == "who_is_working"
+        assert GetTeamActivity not in harness.tool.get_commands()
 
     def test_command_only_leaves_the_tool_channel_empty(self) -> None:
         harness = _Harness([], get_team_activity=GetTeamActivity(expose={COMMAND}))
-        assert harness.tool.get_tools() == []
-        assert len(harness.tool.get_commands()) == 1
+        assert all(
+            callable_.__name__ != "who_is_working" for callable_ in harness.tool.get_tools()
+        )
+        assert GetTeamActivity in harness.tool.get_commands()
 
-    def test_signature_defaults_to_no_summarization(self) -> None:
-        import inspect
-
-        signature = inspect.signature(_Harness([]).who_is_working)
-        assert signature.parameters["summarize_over"].default is None
+    def test_hire_and_fire_are_untouched_by_the_new_capability(self) -> None:
+        harness = _Harness([])
+        assert HireTeamMember in harness.tool.get_commands()
+        assert FireTeamMember in harness.tool.get_commands()
 
     def test_gone_observer_raises_retriable(self) -> None:
         harness = _Harness([])
@@ -438,6 +702,19 @@ class TestFilteredHistoryAccess:
         harness = _Harness([_sent(sender, message), _received(sender, message.id)])
         harness.run()
         assert len(harness.orchestrator.get_messages_calls) == 3
+
+    def test_the_truncating_variant_is_filtered_too(self) -> None:
+        sender = _address("@Dev1")
+        message = _task("build the thing")
+        harness = _Harness(
+            [_sent(sender, message), _received(sender, message.id)], get_team_activity=True
+        )
+        harness.run()
+        assert set(harness.orchestrator.get_messages_calls) <= {
+            ReceivedMessage,
+            ProcessedMessage,
+            SentMessage,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -667,6 +944,20 @@ class TestExclusions:
         harness = _Harness([_sent(_address("@Dev1"), message), orphan])
         assert harness.run().members == []
 
+    def test_the_report_is_not_intersected_with_the_roster(self) -> None:
+        """A busy member absent from ``get_team()`` is still reported.
+
+        Every exclusion is read off the address itself, and the hard-kill case a
+        roster filter would catch is already covered by the staleness cut-off.
+        """
+        sender = _address("@Dev1")
+        message = _task("working, but missing from the roster")
+        harness = _Harness([_sent(sender, message), _received(sender, message.id)])
+        harness.orchestrator.team = []
+
+        report = harness.run()
+        assert [row.name for row in report.members] == ["@Dev1"]
+
 
 # ---------------------------------------------------------------------------
 # AC9 — task-text resolution
@@ -722,6 +1013,11 @@ class TestTaskTextResolution:
         assert len(report.members) == 1
         assert report.members[0].task == UNRESOLVED_TASK
 
+    def test_an_unresolvable_id_degrades_on_the_truncating_path_too(self) -> None:
+        sender = _address("@Dev1")
+        harness = _Harness([_received(sender, uuid.uuid4())], get_team_activity=True)
+        assert harness.run().members[0].task == UNRESOLVED_TASK
+
     def test_a_contentless_message_degrades_to_its_class_name(self) -> None:
         sender = _address("@Dev1")
         contentless = StartMessage(config=BaseConfig(name="@Dev1", role="Developer"))
@@ -741,42 +1037,72 @@ class TestTaskTextResolution:
 
 
 # ---------------------------------------------------------------------------
-# AC10 — the default performs ZERO LLM calls
+# AC10 — zero LLM calls unless activated
 # ---------------------------------------------------------------------------
 
 
-class TestDefaultCostsNothing:
-    """AC10: ``summarize_over=None`` must not produce a summary at all."""
+class TestActivationCostsNothing:
+    """AC10: two cases — no summarizer at all, and a summarizer left dormant."""
 
-    def test_no_worker_is_spawned_and_no_request_is_made(self) -> None:
-        """RED against an implementation that summarizes eagerly.
+    def test_no_summarizer_means_no_actor_and_no_worker(self) -> None:
+        """AC10(a). RED against un-gated actor creation or an eager warm.
 
-        The realistic defect is warming the cache regardless and *then* deciding
-        whether to use the summary. That defect returns the truncated text, so an
-        assertion on the returned string passes against it — it is the **cost**
-        this AC protects, not the text.
+        Asserting on the returned string does NOT satisfy this AC, and that is not
+        a hypothetical: the superseded attempt asserted exactly that, and a
+        mutation that warmed the cache and decided afterwards still returned the
+        truncation, still reported ``summarized=False`` and still passed green
+        while a worker had been spawned and paid for.
 
-        Two independent probes close that gap: the cache actor's ``request`` is
-        wrapped and must never fire, and ``worker_class()`` resolves to a spy that
-        counts its own instantiation, so a worker reached through any other path
-        is still caught.
+        So the probes are on the **cost**: ``getChildrenOrCreate`` was never
+        called, and the worker spy — which counts its own ``__init__`` — is at
+        zero even though the history holds a task twenty-five times longer than
+        the character budget.
         """
         sender = _address("@Dev1")
-        long_text = "x" * 5_000
-        message = _task(long_text)
+        message = _task("x" * 5_000)
+        harness = _Harness(
+            [_sent(sender, message), _received(sender, message.id)],
+            get_team_activity=GetTeamActivity(max_task_chars=200),
+            spy_worker=True,
+        )
+
+        report = harness.run()
+
+        assert harness.orchestrator.children_created == [], "an unused cache actor was created"
+        assert _SpyWorker.spawned == [], "a summarizer worker was spawned and paid for"
+        assert harness.tool._activity_proxy is None
+        assert report.members[0].summarized is False
+        assert len(report.members[0].task) == 200
+        assert report.pending_summaries == 0
+
+    def test_a_configured_summarizer_left_dormant_touches_nothing(self) -> None:
+        """AC10(b). The actor exists; the cache must still be untouched.
+
+        ``summarize_over=None`` is the caller withholding consent, so neither
+        ``get`` nor ``request`` may fire — a ``get`` alone would be harmless today
+        but is exactly the eager-warm shape that the returned string cannot
+        distinguish from the correct one.
+        """
+        sender = _address("@Dev1")
+        message = _task("y" * 5_000)
         harness = _Harness(
             [_sent(sender, message), _received(sender, message.id)],
             spy_worker=True,
-            summary_max_chars=200,
+            max_task_chars=200,
         )
+        assert harness.tool._activity_proxy is not None, "case (b) needs the actor to exist"
 
-        with patch.object(
-            harness.activity, "request", wraps=harness.activity.request
-        ) as request_spy:
+        with (
+            patch.object(harness.activity, "get", wraps=harness.activity.get) as get_spy,
+            patch.object(
+                harness.activity, "request", wraps=harness.activity.request
+            ) as request_spy,
+        ):
             report = harness.run(summarize_over=None)
 
-        assert _SpyWorker.spawned == [], "a summarizer worker was spawned and paid for"
+        get_spy.assert_not_called()
         request_spy.assert_not_called()
+        assert _SpyWorker.spawned == [], "a summarizer worker was spawned and paid for"
         assert report.members[0].summarized is False
         assert len(report.members[0].task) == 200
         assert report.pending_summaries == 0
@@ -784,11 +1110,11 @@ class TestDefaultCostsNothing:
     def test_the_spy_would_catch_a_spawn(self) -> None:
         """Guard on the guard: the spy is wired to the path it is watching.
 
-        Without this, a spy that could never fire would make the test above
-        vacuous — it would pass whether or not the short-circuit exists.
+        Without this, a spy that could never fire would make both tests above
+        vacuous — they would pass whether or not the short-circuits exist.
         """
         sender = _address("@Dev1")
-        message = _task("y" * 5_000)
+        message = _task("z" * 5_000)
         harness = _Harness(
             [_sent(sender, message), _received(sender, message.id)], spy_worker=True
         )
@@ -817,7 +1143,7 @@ class TestSummarization:
         sender = _address("@Dev1")
         message = _task("some task text")
         harness = _Harness(
-            [_sent(sender, message), _received(sender, message.id)], summary_max_chars=0
+            [_sent(sender, message), _received(sender, message.id)], max_task_chars=0
         )
         assert harness.run().members[0].task == ""
 
@@ -857,8 +1183,8 @@ class TestSummarization:
         harness = _Harness(
             [_sent(sender, message), _received(sender, message.id)],
             spy_worker=True,
-            summarizer_model="openai:gpt-5.2-mini",
-            summary_max_chars=180,
+            model="openai:gpt-5.2-mini",
+            max_task_chars=180,
         )
 
         with patch.object(
@@ -887,7 +1213,7 @@ class TestSummarization:
 
     def test_unresolved_summaries_degrade_to_truncated_text(self) -> None:
         harness = self._long_task_harness(
-            count=2, poll_attempts=1, poll_delay_seconds=0.0, summary_max_chars=60
+            count=2, poll_attempts=1, poll_delay_seconds=0.0, max_task_chars=60
         )
         report = harness.run(summarize_over=100)
 
@@ -1002,7 +1328,7 @@ class TestActorWiring:
         agent = MagicMock()
         agent.run_sync.return_value = MagicMock(output="  a concise summary  ")
 
-        with patch("akgentic.tool.team.activity_actor.Agent", return_value=agent) as agent_cls:
+        with patch("akgentic.tool.team.activity.Agent", return_value=agent) as agent_cls:
             produced = worker.produce(payload)
 
         agent_cls.assert_called_once_with("openai:gpt-5.2-mini")
@@ -1022,7 +1348,7 @@ class TestActorWiring:
         agent = MagicMock()
         agent.run_sync.return_value = MagicMock(output="summary")
 
-        with patch("akgentic.tool.team.activity_actor.Agent", return_value=agent):
+        with patch("akgentic.tool.team.activity.Agent", return_value=agent):
             worker.produce(payload)
 
         settings = agent.run_sync.call_args.kwargs["model_settings"]
@@ -1038,7 +1364,7 @@ class TestActorWiring:
         agent = MagicMock()
         agent.run_sync.return_value = MagicMock(output="k" * 500)
 
-        with patch("akgentic.tool.team.activity_actor.Agent", return_value=agent):
+        with patch("akgentic.tool.team.activity.Agent", return_value=agent):
             assert worker.produce(payload) == "k" * 10
 
     def test_a_foreign_payload_is_rejected(self) -> None:
@@ -1054,13 +1380,26 @@ class TestActorWiring:
                 deferred_key="not-a-uuid", text="t", model="openai:gpt-5.2-mini", max_chars=10
             )
 
+    def test_the_budget_is_built_from_the_two_param_models(self) -> None:
+        params = GetTeamActivity(
+            summarizer=ActivitySummarizer(
+                model="openai:gpt-5.2-mini", poll_attempts=3, poll_delay_seconds=0.1
+            ),
+            max_task_chars=77,
+        )
+        budget = activity_module.SummaryBudget.from_params(params)
+        assert budget.model == "openai:gpt-5.2-mini"
+        assert budget.max_chars == 77
+        assert budget.poll_attempts == 3
+        assert budget.poll_delay_seconds == 0.1
+
 
 # ---------------------------------------------------------------------------
 # AC12 (NFR1) / AC13 — the boundary and the public API
 # ---------------------------------------------------------------------------
 
 
-_NEW_MODULES = ("activity.py", "activity_actor.py")
+_STORY_MODULES = ("activity.py", "team.py")
 
 
 def _imported_roots(module_path: Path) -> set[str]:
@@ -1078,10 +1417,10 @@ def _imported_roots(module_path: Path) -> set[str]:
 class TestPackageBoundary:
     """NFR1: ``akgentic-tool`` never reaches for ``akgentic-llm``."""
 
-    def test_no_akgentic_llm_import_in_the_new_modules(self) -> None:
+    def test_no_akgentic_llm_import_in_the_story_modules(self) -> None:
         team_dir = Path(activity_module.__file__).parent
         violations: list[str] = []
-        for module_name in _NEW_MODULES:
+        for module_name in _STORY_MODULES:
             for imported in sorted(_imported_roots(team_dir / module_name)):
                 if imported == "akgentic.llm" or imported.startswith("akgentic.llm."):
                     violations.append(f"{module_name} imports {imported}")
@@ -1093,26 +1432,36 @@ class TestPackageBoundary:
 
     def test_the_summarizer_depends_on_pydantic_ai_directly(self) -> None:
         team_dir = Path(activity_module.__file__).parent
-        assert "pydantic_ai" in _imported_roots(team_dir / "activity_actor.py")
+        assert "pydantic_ai" in _imported_roots(team_dir / "activity.py")
+
+    def test_the_folded_actor_module_is_gone(self) -> None:
+        team_dir = Path(activity_module.__file__).parent
+        assert not (team_dir / "activity_actor.py").exists()
 
 
 class TestPublicApi:
-    """AC13: exported from the team package and the top-level façade."""
+    """AC13: the new names are exported; the dissolved card is not."""
 
     def test_team_package_exports(self) -> None:
         import akgentic.tool.team as team_package
 
-        for name in ("TeamActivityTool", "GetTeamActivity", "AgentActivity", "TeamActivityReport"):
+        for name in (
+            "GetTeamActivity",
+            "ActivitySummarizer",
+            "AgentActivity",
+            "TeamActivityReport",
+        ):
             assert name in team_package.__all__
             assert getattr(team_package, name) is not None
 
-    def test_top_level_export(self) -> None:
-        import akgentic.tool as tool_package
-
-        assert "TeamActivityTool" in tool_package.__all__
-        assert tool_package.TeamActivityTool is TeamActivityTool
-
-    def test_team_tool_is_still_exported_alongside(self) -> None:
+    def test_team_tool_and_its_param_classes_keep_their_exports(self) -> None:
         import akgentic.tool.team as team_package
 
-        assert "TeamTool" in team_package.__all__
+        for name in (
+            "TeamTool",
+            "HireTeamMember",
+            "FireTeamMember",
+            "GetTeamRoster",
+            "GetRoleProfiles",
+        ):
+            assert name in team_package.__all__

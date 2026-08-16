@@ -33,7 +33,6 @@ from .event import (  # noqa: F401
 from .sandbox.bwrap import BwrapSandboxActor  # noqa: F401
 from .sandbox.seatbelt import SeatbeltSandboxActor  # noqa: F401
 from .sandbox.tool import ExecTool  # noqa: F401
-from .team.activity import TeamActivityTool  # noqa: F401
 from .workspace.tool import WorkspaceTool  # noqa: F401
 
 try:
@@ -79,7 +78,6 @@ __all__ = [
     "BwrapSandboxActor",
     "ExecTool",
     "SeatbeltSandboxActor",
-    "TeamActivityTool",
     "WorkspaceTool",
 ]
 
