@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.event import ToolStateEvent
+from akgentic.tool.core.event import ToolStateEvent
 from akgentic.tool.knowledge_graph.kg_actor import (
     KG_ACTOR_NAME,
     KnowledgeGraphActor,

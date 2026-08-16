@@ -6,6 +6,7 @@ from .activity import (
     GetTeamActivity,
     TeamActivityReport,
 )
+from .observer import TeamManagementToolObserver
 from .team import (
     FireTeamMember,
     GetRoleProfiles,
@@ -16,6 +17,7 @@ from .team import (
 
 __all__ = [
     "TeamTool",
+    "TeamManagementToolObserver",
     "HireTeamMember",
     "FireTeamMember",
     "GetTeamRoster",

@@ -5,8 +5,8 @@ import warnings
 from collections.abc import Callable
 from typing import Any
 
+from akgentic.tool.core.observer import ToolObserver
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.event import ToolObserver
 
 from .card import ToolCard
 from .commands import CommandRegistry, _build_command_entry, _CommandEntry

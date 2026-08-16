@@ -19,8 +19,8 @@ from pydantic import Field
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.orchestrator import Orchestrator
+from akgentic.tool.core.event import ToolStateEvent
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.event import ToolStateEvent
 from akgentic.tool.knowledge_graph.models import (
     Entity,
     EntityCreate,

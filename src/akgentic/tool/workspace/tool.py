@@ -28,8 +28,8 @@ from pydantic_ai.messages import BinaryContent
 
 from akgentic.core.utils import SerializableBaseModel
 from akgentic.tool.core import COMMAND, TOOL_CALL, BaseToolParam, Channels, ToolCard, _resolve
+from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.event import ActorToolObserver
 from akgentic.tool.workspace.edit import (
     EditItem,
     EditMatcher,

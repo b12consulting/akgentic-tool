@@ -6,7 +6,21 @@ from pathlib import Path
 import akgentic.tool.core as core_package
 
 # Strict layering: a module may only import siblings that appear EARLIER here.
-CHAIN: list[str] = ["channels", "params", "card", "dependencies", "commands", "factory"]
+#
+# ``observer`` and ``event`` are chain heads, not outside-chain modules: ``card`` and
+# ``factory`` import ``ToolObserver``, and ``commands`` imports the command-discovery
+# models, so the chain depends on them. They import no core sibling themselves, which
+# is what makes them legal at the front.
+CHAIN: list[str] = [
+    "channels",
+    "observer",
+    "event",
+    "params",
+    "card",
+    "dependencies",
+    "commands",
+    "factory",
+]
 
 # Modules that sit OUTSIDE the chain: they depend on ``akgentic.core`` only, and
 # nothing in the chain may reach for them either.

@@ -20,7 +20,7 @@ import pytest
 from akgentic.core.actor_address import ActorAddress
 
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.event import ToolStateEvent
+from akgentic.tool.core.event import ToolStateEvent
 from akgentic.tool.knowledge_graph.kg_actor import (
     KG_ACTOR_NAME,
     KG_ACTOR_ROLE,

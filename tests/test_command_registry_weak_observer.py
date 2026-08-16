@@ -23,7 +23,7 @@ from akgentic.core import ActorAddressProxy
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.tool.core import ToolFactory
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.event import TeamManagementToolObserver
+from akgentic.tool.team.observer import TeamManagementToolObserver
 from akgentic.tool.planning.planning import PlanningTool, UpdatePlanning
 from akgentic.tool.team import TeamTool
 

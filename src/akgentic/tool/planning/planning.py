@@ -16,8 +16,8 @@ from akgentic.tool.core import (
     ToolCard,
     _resolve,
 )
+from akgentic.tool.core.observer import ActorToolObserver, ToolObserver
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.event import ActorToolObserver, ToolObserver
 from akgentic.tool.planning.planning_actor import (
     PlanActor,
     PlanConfig,

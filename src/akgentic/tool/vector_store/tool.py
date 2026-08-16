@@ -21,7 +21,7 @@ from pydantic import Field
 
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.tool.core import ToolCard
-from akgentic.tool.event import ActorToolObserver
+from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE, VectorStoreActor
 from akgentic.tool.vector_store.protocol import VectorStoreConfig
 

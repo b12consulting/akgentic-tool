@@ -8,8 +8,8 @@ from typing import Any, get_type_hints
 
 from pydantic import TypeAdapter
 
+from akgentic.tool.core.event import CommandArg, CommandDescriptor
 from akgentic.tool.errors import CommandNotRecognized
-from akgentic.tool.event import CommandArg, CommandDescriptor
 
 
 @dataclass(frozen=True)

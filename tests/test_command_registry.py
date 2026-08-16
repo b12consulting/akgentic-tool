@@ -22,7 +22,7 @@ from akgentic.tool.core import (
     ToolFactory,
 )
 from akgentic.tool.errors import CommandNotRecognized, RetriableError
-from akgentic.tool.event import CommandDescriptor
+from akgentic.tool.core.event import CommandDescriptor
 
 # ---------------------------------------------------------------------------
 # Fixtures: ToolCards exposing command callables (TeamTool-shaped signatures)

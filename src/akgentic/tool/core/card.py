@@ -8,8 +8,8 @@ from typing import Any
 from pydantic import PrivateAttr
 
 from akgentic.core.utils import SerializableBaseModel
+from akgentic.tool.core.observer import ToolObserver
 from akgentic.tool.errors import ToolObserverGone
-from akgentic.tool.event import ToolObserver
 
 from .params import BaseToolParam
 

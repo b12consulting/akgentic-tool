@@ -25,8 +25,8 @@ from akgentic.tool.core import (
     ToolCard,
     _resolve,
 )
+from akgentic.tool.core.observer import ToolObserver
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.event import TeamManagementToolObserver, ToolObserver
 from akgentic.tool.team.activity import (
     TEAM_ACTIVITY_ACTOR_NAME,
     TEAM_ACTIVITY_ACTOR_ROLE,
@@ -39,6 +39,7 @@ from akgentic.tool.team.activity import (
     apply_truncations,
     build_snapshot,
 )
+from akgentic.tool.team.observer import TeamManagementToolObserver
 
 logger = logging.getLogger(__name__)
 
