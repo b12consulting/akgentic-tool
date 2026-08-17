@@ -35,6 +35,9 @@ from akgentic.tool.event import _MOVED
 # ``ToolStatePayload`` left this list for that reason and is the only name that has. A
 # move never justifies an edit here; only a removal decision does, and the list keeps
 # guarding every remaining name.
+# A brand-new export breaks no consumer, so a new tool card joins the list with its
+# story (``NotificationTool``, epic 28). What the list still forbids is a name leaving
+# or changing.
 _EXPECTED_ROOT_ALL: list[str] = [
     "BaseToolParam",
     "ToolCard",
@@ -63,6 +66,7 @@ _EXPECTED_ROOT_ALL: list[str] = [
     "workspace",
     "BwrapSandboxActor",
     "ExecTool",
+    "NotificationTool",
     "SeatbeltSandboxActor",
     "WorkspaceTool",
 ]

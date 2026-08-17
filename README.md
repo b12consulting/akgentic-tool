@@ -29,6 +29,7 @@ channel system — as tool calls, system prompt injections, or programmatic comm
   - [VectorStoreTool](#vectorstoretool)
   - [SearchTool](#searchtool)
   - [TeamTool](#teamtool)
+  - [NotificationTool](#notificationtool)
   - [MCPTool](#mcptool)
   - [ExecTool](#exectool)
 - [Error Handling](#error-handling)
@@ -53,9 +54,9 @@ running inside it. It provides:
   > from `akgentic.llm.event` instead.
 - **RetriableError** — tools signal recoverable failures; `ToolFactory` translates them to the
   framework-specific retry exception without coupling tool logic to pydantic-ai
-- **Domain tools** — eight production-ready tool implementations covering workspace I/O, task
+- **Domain tools** — nine production-ready tool implementations covering workspace I/O, task
   planning, knowledge graph, web search, team management, vector-store configuration, MCP server
-  integration, and sandboxed shell execution
+  integration, sandboxed shell execution, and self-scheduled notifications
 
 ```
 ToolCard(s)
@@ -190,7 +191,7 @@ tool composition happens at the agent level.
 ┌──────────────────────────────────────────────────────────────────┐
 │  Domain Tools                                                    │
 │  workspace │ planning │ knowledge_graph │ search │ team          │
-│  vector_store │ mcp │ sandbox                                    │
+│  vector_store │ mcp │ sandbox │ notification                     │
 ├──────────────────────────────────────────────────────────────────┤
 │  Core Layer: ToolCard, BaseToolParam, ToolFactory, Channels      │
 │              RetriableError, Observer protocols                   │
@@ -532,8 +533,8 @@ few are not. A plan, a knowledge graph and a vector index are **shared, mutable 
 any single tool call**, and the framework gives that state a home — a **tool actor**, one per team,
 that every agent carrying the card talks to.
 
-Five ship in this package today: `#VectorStore`, `#PlanningTool`, `#KnowledgeGraphTool`,
-`#SandboxActor` and `#TeamActivity`.
+Six ship in this package today: `#VectorStore`, `#PlanningTool`, `#KnowledgeGraphTool`,
+`#SandboxActor`, `#TeamActivity` and `#NotificationTool`.
 
 ### One per team, and what that buys
 
@@ -931,6 +932,90 @@ the budget for reported task text; `ActivitySummarizer` carries `poll_attempts` 
 `ModelConfig`, because `akgentic-tool` does not depend on `akgentic-llm` — so those tokens are
 produced outside `ReactAgent` and are counted by neither its cost accounting nor its usage limits.
 
+### NotificationTool
+
+Lets an agent schedule a message **to itself**, delivered after a delay — to defer its own
+attention, check a long-running result later, or nudge itself if nothing has happened by then. A
+team singleton (named `#NotificationTool`) holds the pending entries and delivers them, bound
+through the same idempotent `getChildrenOrCreate` call as every other tool actor.
+
+```python
+from akgentic.tool import NotificationTool
+from akgentic.tool.core import COMMAND, TOOL_CALL
+from akgentic.tool.notification import CancelNotification, RegisterNotification
+
+NotificationTool()                            # AgentMessage delivery, 300 s cap
+NotificationTool(max_delay_seconds=60)        # tighter cap
+NotificationTool(message_class="acme_core.messages.ReminderMessage")
+
+NotificationTool(
+    register_notification=RegisterNotification(
+        expose={COMMAND},                     # a human schedules; the LLM cannot
+        instructions="Only for CI checks.",   # appended to the tool description
+    ),
+    cancel_notification=CancelNotification(expose={TOOL_CALL}),
+    pending_notification=False,               # capability removed from both channels
+)
+```
+
+| Field | Default | Purpose |
+|---|---|---|
+| `message_class` | `"akgentic.agent.messages.AgentMessage"` | Dotted import path of the class delivered when a notification comes due |
+| `max_delay_seconds` | `300` | Largest delay an agent may schedule |
+| `register_notification` | `True` | The scheduling capability — `False` removes it, a `RegisterNotification` configures it |
+| `pending_notification` | `True` | The listing capability, same shape |
+| `cancel_notification` | `True` | The cancellation capability, same shape |
+
+Each capability is a `bool | BaseToolParam` field like everywhere else in this package: `True`
+enables it with defaults, `False` removes it from every channel, and a param instance narrows its
+`expose` set or adds `instructions`.
+
+| Capability | Channels | Description |
+|---|---|---|
+| `register_notification` | `TOOL_CALL`, `COMMAND` | Schedule a message to yourself from `content` and `delay_seconds`; returns a confirmation carrying the notification id |
+| `pending_notification` | `TOOL_CALL`, `COMMAND` | `pending_notification(all=False)` — your own pending entries with the time left on each, or every team member's when `all=True`, each line marked `@owner`. It widens what you can see, never what you can cancel |
+| `cancel_notification` | `TOOL_CALL`, `COMMAND` | Cancel one of your own pending entries by id |
+
+The `COMMAND` column is the human `/`-command surface too, so with the shipped defaults
+`/register_notification "check CI" 120` schedules an entry from the command line,
+`/pending_notification` lists that agent's own entries, and `/pending_notification all=true`
+lists the whole team's.
+
+**The `message_class` contract.** The path must resolve to a `Message` subclass declaring `content`
+and `type` model fields, and that `type` must *accept* the value `"notification"`, which is what
+delivery writes. A path that is not importable, that does not name a `Message` subclass, that names
+one missing either field, or that names one whose `type` is a `Literal` excluding `"notification"`
+raises `ValueError` at `observer()` bind time — never when a notification comes due. Naming the
+class by string rather than importing it is what keeps this package free of any dependency on the
+package that owns it: the deployment picks the delivery class, and the card resolves it at wiring
+time.
+
+**The delay cap.** `delay_seconds` must fall between 1 and `max_delay_seconds`; anything outside
+that range raises `RetriableError`, so an over-long delay reaches the LLM as a correctable mistake
+rather than as a failure. Delivery granularity is ±1 s — the actor scans for due entries about once
+a second.
+
+**Ownership is scoped per agent, and visibility is the one thing an argument widens.** Each
+capability is bound to the address of the agent carrying the card, captured once at bind time.
+Listing defaults to that agent's own entries; `pending_notification(all=True)` reports every team
+member's, each line marked with its owner, which is how an agent sees what the team is already
+waiting on. Cancel authority does **not** widen with it: `cancel_notification` always passes the
+captured owner, so cancelling another agent's id — including one just read through `all=True` —
+fails exactly as cancelling an unknown one does, a `RetriableError`, while that entry stays pending
+for its real owner.
+
+**Delivery comes from the notification actor.** It sends as itself, so the delivered `sender` is
+`#NotificationTool`, and the message's `type` is `"notification"`. The send is a tell, so a busy
+agent never blocks the actor. Delivery waits while the owner is off the team — an agent between
+hire and start, or a resumed team whose agents have not re-registered yet — for up to five minutes,
+and goes through as soon as it is back; past that window, and for a send that fails despite the
+owner being on the team, the entry is logged and dropped rather than retried.
+
+**Stop and resume.** A pending entry stores an absolute due time, not a remaining delay. An entry
+whose delay expired while the team was stopped is therefore simply due on the first tick after the
+resume, and is delivered on the first tick at which its owner is back on the team. There is no
+re-arm logic and nothing to reschedule.
+
 ### MCPTool
 
 Integrates external [Model Context Protocol](https://modelcontextprotocol.io) servers as native
@@ -1225,6 +1310,14 @@ src/akgentic/tool/
     │   observer.py           # TeamManagementToolObserver — TeamTool's own contract
     │   └── activity.py       # team_activity models, GetTeamActivity,
     │                         #   ActivitySummarizer, TeamActivityActor, SummarizerWorker
+    notification/
+    │   __init__.py           # Public exports: NotificationTool, its capability params,
+    │                         #   NotificationActor, models
+    │   models.py             # PendingNotification, NotificationConfig,
+    │                         #   NotificationState, resolve_message_class
+    │   actor.py              # NotificationActor singleton "#NotificationTool" + tick loop
+    │   └── tool.py           # NotificationTool ToolCard + RegisterNotification,
+    │                         #   PendingNotifications, CancelNotification
     mcp/
     │   mcp.py                # MCPTool, connection configs
     │   └── oauth_handler.py  # OAuth 2.0 flow

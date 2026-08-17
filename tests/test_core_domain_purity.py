@@ -46,6 +46,7 @@ DOMAIN_PACKAGES: frozenset[str] = frozenset(
         "mcp",
         "vector_store",
         "vector",
+        "notification",
     }
 )
 
