@@ -374,6 +374,34 @@ class TestExposeDrivenChannels:
         assert "pending_notification" not in [tool.__name__ for tool in card.get_tools()]
         assert PendingNotifications not in card.get_commands()
 
+    def test_narrowing_the_listing_capability_gates_each_channel_on_its_own(
+        self, observer: FakeActorToolObserver
+    ) -> None:
+        """The two directions for the one capability whose four names moved together.
+
+        ``False`` above short-circuits in ``_resolve`` before ``expose`` is read,
+        and both defaults are ``{TOOL_CALL, COMMAND}``, so nothing else here would
+        notice if the rename had left one of the two gates reading the wrong
+        channel constant.
+        """
+        tool_only = NotificationTool(
+            message_class=FAKE_MESSAGE_PATH,
+            pending_notification=PendingNotifications(expose={TOOL_CALL}),
+        )
+        tool_only.observer(observer)
+
+        assert "pending_notification" in [tool.__name__ for tool in tool_only.get_tools()]
+        assert PendingNotifications not in tool_only.get_commands()
+
+        command_only = NotificationTool(
+            message_class=FAKE_MESSAGE_PATH,
+            pending_notification=PendingNotifications(expose={COMMAND}),
+        )
+        command_only.observer(observer)
+
+        assert "pending_notification" not in [tool.__name__ for tool in command_only.get_tools()]
+        assert command_only.get_commands()[PendingNotifications].__name__ == "pending_notification"
+
     def test_instructions_reach_the_callable_docstring(
         self, observer: FakeActorToolObserver
     ) -> None:
@@ -487,7 +515,6 @@ class TestListingDefaultsToTheCallerAndCancelStaysScoped:
 
         assert listing(all=False) == listing()
         assert listing() == "Pending notifications:\n- id 1: soon (in 60 seconds)"
-
 
     def test_cancel_removes_the_callers_own_entry(
         self, wired_card: NotificationTool, notification_actor: NotificationActor
