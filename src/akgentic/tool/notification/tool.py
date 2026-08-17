@@ -251,11 +251,13 @@ class NotificationTool(ToolCard):
         max_delay = self.max_delay_seconds
 
         def register_notification(content: str, delay_seconds: int) -> str:
-            """Schedule a message to yourself, delivered after a delay.
+            """Schedule a message to yourself after a delay.
 
-            Use it to defer your own attention — check a result later, or nudge
-            yourself if nothing has happened by then. The delay may not exceed
-            {max_delay} seconds; a larger one is rejected.
+            Use this as a reminder or follow-up prompt: for example, remind
+            yourself to check a result later, ask another teammate something
+            later, or nudge yourself if nothing has happened by then. The delay
+            must be between 1 and {max_delay} seconds; larger values are
+            rejected.
 
             Args:
                 content: The text you want to receive.
