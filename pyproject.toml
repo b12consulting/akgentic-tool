@@ -1,6 +1,6 @@
 [project]
 name = "akgentic-tool"
-version = "1.6.3"
+version = "1.6.4"
 description = "Tool interface and factory for Akgentic agent systems"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -20,7 +20,7 @@ authors = [
 keywords = ["agents", "ai", "akgentic"]
 
 dependencies = [
-    "akgentic-core>=1.5.4",
+    "akgentic-core>=1.5.7",
     # Direct since the notification actor names ActorRef/ActorDeadError itself.
     "pykka>=4.4.2",
     "pydantic>=2.0.0",
