@@ -954,7 +954,7 @@ NotificationTool(
         instructions="Only for CI checks.",   # appended to the tool description
     ),
     cancel_notification=CancelNotification(expose={TOOL_CALL}),
-    list_pending_notifications=False,         # capability removed from both channels
+    pending_notification=False,               # capability removed from both channels
 )
 ```
 
@@ -963,7 +963,7 @@ NotificationTool(
 | `message_class` | `"akgentic.agent.messages.AgentMessage"` | Dotted import path of the class delivered when a notification comes due |
 | `max_delay_seconds` | `300` | Largest delay an agent may schedule |
 | `register_notification` | `True` | The scheduling capability — `False` removes it, a `RegisterNotification` configures it |
-| `list_pending_notifications` | `True` | The listing capability, same shape |
+| `pending_notification` | `True` | The listing capability, same shape |
 | `cancel_notification` | `True` | The cancellation capability, same shape |
 
 Each capability is a `bool | BaseToolParam` field like everywhere else in this package: `True`
@@ -973,11 +973,13 @@ enables it with defaults, `False` removes it from every channel, and a param ins
 | Capability | Channels | Description |
 |---|---|---|
 | `register_notification` | `TOOL_CALL`, `COMMAND` | Schedule a message to yourself from `content` and `delay_seconds`; returns a confirmation carrying the notification id |
-| `list_pending_notifications` | `TOOL_CALL`, `COMMAND` | Your own pending entries, with the time left on each |
+| `pending_notification` | `TOOL_CALL`, `COMMAND` | `pending_notification(all=False)` — your own pending entries with the time left on each, or every team member's when `all=True`, each line marked `@owner`. It widens what you can see, never what you can cancel |
 | `cancel_notification` | `TOOL_CALL`, `COMMAND` | Cancel one of your own pending entries by id |
 
 The `COMMAND` column is the human `/`-command surface too, so with the shipped defaults
-`/register_notification "check CI" 120` schedules an entry from the command line.
+`/register_notification "check CI" 120` schedules an entry from the command line,
+`/pending_notification` lists that agent's own entries, and `/pending_notification all=true`
+lists the whole team's.
 
 **The `message_class` contract.** The path must resolve to a `Message` subclass declaring `content`
 and `type` model fields, and that `type` must *accept* the value `"notification"`, which is what
@@ -993,10 +995,14 @@ that range raises `RetriableError`, so an over-long delay reaches the LLM as a c
 rather than as a failure. Delivery granularity is ±1 s — the actor scans for due entries about once
 a second.
 
-**Ownership is scoped per agent.** Each capability is bound to the address of the agent carrying
-the card, captured once at bind time. An agent lists only its own entries, and cancelling another
-agent's id fails exactly as cancelling an unknown one does — a `RetriableError` — while that entry
-stays pending for its real owner.
+**Ownership is scoped per agent, and visibility is the one thing an argument widens.** Each
+capability is bound to the address of the agent carrying the card, captured once at bind time.
+Listing defaults to that agent's own entries; `pending_notification(all=True)` reports every team
+member's, each line marked with its owner, which is how an agent sees what the team is already
+waiting on. Cancel authority does **not** widen with it: `cancel_notification` always passes the
+captured owner, so cancelling another agent's id — including one just read through `all=True` —
+fails exactly as cancelling an unknown one does, a `RetriableError`, while that entry stays pending
+for its real owner.
 
 **Delivery comes from the notification actor.** It sends as itself, so the delivered `sender` is
 `#NotificationTool`, and the message's `type` is `"notification"`. The send is a tell, so a busy
@@ -1308,7 +1314,7 @@ src/akgentic/tool/
     │                         #   NotificationState, resolve_message_class
     │   actor.py              # NotificationActor singleton "#NotificationTool" + tick loop
     │   └── tool.py           # NotificationTool ToolCard + RegisterNotification,
-    │                         #   ListPendingNotifications, CancelNotification
+    │                         #   PendingNotifications, CancelNotification
     mcp/
     │   mcp.py                # MCPTool, connection configs
     │   └── oauth_handler.py  # OAuth 2.0 flow

@@ -266,6 +266,16 @@ class TestOwnershipOnTheActor:
         assert [e.content for e in notifier.list_for(alice)] == ["alice's"]
         assert [e.content for e in notifier.list_for(bob)] == ["bob's"]
 
+    def test_list_for_none_returns_every_owners_entries_in_id_order(
+        self, notifier: NotificationActor, address_factory: Callable[[str], ActorAddress]
+    ) -> None:
+        """``None`` is the widening the card's ``all=True`` passes down."""
+        alice, bob = address_factory("alice"), address_factory("bob")
+        notifier.schedule(bob, "bob's", 30)
+        notifier.schedule(alice, "alice's", 30)
+
+        assert [e.content for e in notifier.list_for(None)] == ["bob's", "alice's"]
+
     def test_cancel_refuses_another_owners_entry_and_keeps_it(
         self, notifier: NotificationActor, address_factory: Callable[[str], ActorAddress]
     ) -> None:

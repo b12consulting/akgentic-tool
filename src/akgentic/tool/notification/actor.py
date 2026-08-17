@@ -156,12 +156,23 @@ class NotificationActor(Akgent[NotificationConfig, NotificationState]):
         self.state.notify_state_change()
         return notification_id
 
-    def list_for(self, owner: ActorAddress) -> list[PendingNotification]:
-        """Return *owner*'s pending entries, oldest id first."""
+    def list_for(self, owner: ActorAddress | None) -> list[PendingNotification]:
+        """Return pending entries, oldest id first.
+
+        Args:
+            owner: Whose entries to return, or ``None`` for every owner's. The
+                parameter is required and positional on purpose — this actor is
+                ask-reachable from every card in the team, so widening the
+                listing must always be something a caller wrote deliberately
+                rather than something a forgotten argument grants.
+
+        Returns:
+            The matching entries, sorted by ``notification_id`` ascending.
+        """
         return [
             entry
             for entry in sorted(self.state.pending.values(), key=lambda e: e.notification_id)
-            if _same_owner(entry.owner, owner)
+            if owner is None or _same_owner(entry.owner, owner)
         ]
 
     def cancel(self, notification_id: int, owner: ActorAddress) -> bool:

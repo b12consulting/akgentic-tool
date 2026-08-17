@@ -4,9 +4,11 @@ Two fields configure delivery — the dotted path of the message class and the
 maximum schedulable delay — and one field per capability decides whether it
 exists and which channels it reaches, through the ``expose`` set of its own
 ``BaseToolParam``, like every other card in this package. All three capabilities
-are ownership-scoped by the caller's ``myAddress``, captured once at bind time,
-and they reach the ``#NotificationTool`` singleton through the ask proxy
-(ADR-035 §2).
+capture the caller's ``myAddress`` once at bind time and reach the
+``#NotificationTool`` singleton through the ask proxy (ADR-035 §2). That capture
+fixes what a caller may **cancel**, and the default scope of what it lists;
+``pending_notification(all=True)`` widens the listing to the whole team without
+widening the authority.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from akgentic.tool.notification.actor import (
 from akgentic.tool.notification.models import (
     DEFAULT_MESSAGE_CLASS,
     NotificationConfig,
+    PendingNotification,
     resolve_message_class,
 )
 
@@ -50,8 +53,14 @@ class RegisterNotification(BaseToolParam):
     expose: set[Channels] = {TOOL_CALL, COMMAND}
 
 
-class ListPendingNotifications(BaseToolParam):
-    """List your own pending notifications — on both channels by default."""
+class PendingNotifications(BaseToolParam):
+    """Configuration of the listing capability — on both channels by default.
+
+    Lists the caller's own pending entries by default, and every team member's
+    when called with ``all=True``. Plural because the singular already names the
+    persisted entry this capability lists — :class:`PendingNotification`, a state
+    model rather than a configuration one.
+    """
 
     expose: set[Channels] = {TOOL_CALL, COMMAND}
 
@@ -72,6 +81,16 @@ def _with_instructions(params: BaseToolParam, doc: str | None) -> str | None:
     ``cleandoc`` first is what keeps the two compatible.
     """
     return params.format_docstring(cleandoc(doc) if doc else doc)
+
+
+def _owner_marker(entry: PendingNotification, show_owner: bool) -> str:
+    """Return the ``"@name "`` prefix for a listing line, or ``""`` when scoped.
+
+    The name comes off the entry's stored address and nothing else: both
+    ``ActorAddress`` implementations answer ``name`` without a live actor, so the
+    marker survives a resume and an owner fired before its notification came due.
+    """
+    return f"@{entry.owner.name} " if show_owner else ""
 
 
 def _require_live_agent(observer_or_none: Callable[[], ActorToolObserver | None]) -> None:
@@ -99,7 +118,8 @@ class NotificationTool(ToolCard):
         register_notification: The scheduling capability. ``False`` removes it
             entirely; a param instance narrows its channels or adds
             ``instructions``.
-        list_pending_notifications: The listing capability, same shape.
+        pending_notification: The listing capability, same shape. It reports the
+            caller's own entries, and every member's when asked.
         cancel_notification: The cancellation capability, same shape.
     """
 
@@ -116,7 +136,7 @@ class NotificationTool(ToolCard):
     )
 
     register_notification: RegisterNotification | bool = True
-    list_pending_notifications: ListPendingNotifications | bool = True
+    pending_notification: PendingNotifications | bool = True
     cancel_notification: CancelNotification | bool = True
 
     _notification_proxy: NotificationActor | None = PrivateAttr(default=None)
@@ -193,9 +213,9 @@ class NotificationTool(ToolCard):
         if rn and TOOL_CALL in rn.expose:
             tools.append(self._register_factory(rn))
 
-        lpn = _resolve(self.list_pending_notifications, ListPendingNotifications)
-        if lpn and TOOL_CALL in lpn.expose:
-            tools.append(self._list_factory(lpn))
+        pn = _resolve(self.pending_notification, PendingNotifications)
+        if pn and TOOL_CALL in pn.expose:
+            tools.append(self._pending_factory(pn))
 
         cn = _resolve(self.cancel_notification, CancelNotification)
         if cn and TOOL_CALL in cn.expose:
@@ -211,9 +231,9 @@ class NotificationTool(ToolCard):
         if rn and COMMAND in rn.expose:
             commands[RegisterNotification] = self._register_factory(rn)
 
-        lpn = _resolve(self.list_pending_notifications, ListPendingNotifications)
-        if lpn and COMMAND in lpn.expose:
-            commands[ListPendingNotifications] = self._list_factory(lpn)
+        pn = _resolve(self.pending_notification, PendingNotifications)
+        if pn and COMMAND in pn.expose:
+            commands[PendingNotifications] = self._pending_factory(pn)
 
         cn = _resolve(self.cancel_notification, CancelNotification)
         if cn and COMMAND in cn.expose:
@@ -270,29 +290,37 @@ class NotificationTool(ToolCard):
         register_notification.__doc__ = _with_instructions(params, substituted)
         return register_notification
 
-    def _list_factory(self, params: ListPendingNotifications) -> Callable[..., Any]:
+    def _pending_factory(self, params: PendingNotifications) -> Callable[..., Any]:
         proxy = self._actor_proxy()
         owner: ActorAddress = self._actor_observer().myAddress
         observer_or_none = self._actor_observer_or_none
 
-        def list_pending_notifications() -> str:
-            """List your own pending notifications, with the time left on each."""
+        def pending_notification(all: bool = False) -> str:
+            """List pending notifications, with the time left on each.
+
+            Args:
+                all: List every team member's pending notifications instead of
+                    only your own, each line naming its owner. It widens what you
+                    can see, never what you can cancel: another agent's entry
+                    still refuses to be cancelled.
+
+            Returns:
+                One line per pending notification, or a note that there are none.
+            """
             _require_live_agent(observer_or_none)
-            entries = proxy.list_for(owner)
+            entries = proxy.list_for(None if all else owner)
             if not entries:
                 return "No pending notifications."
             now = datetime.now(UTC)
             lines = [
-                f"- id {entry.notification_id}: {entry.content} "
+                f"- {_owner_marker(entry, all)}id {entry.notification_id}: {entry.content} "
                 f"(in {max(0, round((entry.fire_at - now).total_seconds()))} seconds)"
                 for entry in entries
             ]
             return "\n".join(["Pending notifications:", *lines])
 
-        list_pending_notifications.__doc__ = _with_instructions(
-            params, list_pending_notifications.__doc__
-        )
-        return list_pending_notifications
+        pending_notification.__doc__ = _with_instructions(params, pending_notification.__doc__)
+        return pending_notification
 
     def _cancel_factory(self, params: CancelNotification) -> Callable[..., Any]:
         proxy = self._actor_proxy()
@@ -304,7 +332,7 @@ class NotificationTool(ToolCard):
 
             Args:
                 notification_id: Id of the notification to cancel, as reported by
-                    register_notification or list_pending_notifications.
+                    register_notification or pending_notification.
 
             Returns:
                 A confirmation that the notification was cancelled.
@@ -313,7 +341,7 @@ class NotificationTool(ToolCard):
             if not proxy.cancel(notification_id, owner):
                 raise RetriableError(
                     f"No pending notification with id {notification_id}; "
-                    f"use list_pending_notifications to see your own."
+                    f"use pending_notification to see your own."
                 )
             return f"Notification {notification_id} cancelled."
 

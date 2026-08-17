@@ -15,8 +15,8 @@ from akgentic.tool.notification.models import (
 )
 from akgentic.tool.notification.tool import (
     CancelNotification,
-    ListPendingNotifications,
     NotificationTool,
+    PendingNotifications,
     RegisterNotification,
 )
 
@@ -26,12 +26,12 @@ __all__ = [
     "NOTIFICATION_ACTOR_ROLE",
     "TICK_INTERVAL_S",
     "CancelNotification",
-    "ListPendingNotifications",
     "NotificationActor",
     "NotificationConfig",
     "NotificationState",
     "NotificationTool",
     "PendingNotification",
+    "PendingNotifications",
     "RegisterNotification",
     "resolve_message_class",
 ]

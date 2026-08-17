@@ -19,8 +19,8 @@ from akgentic.tool.notification.models import DEFAULT_MESSAGE_CLASS, Notificatio
 from akgentic.tool.notification.tool import (
     DEFAULT_MAX_DELAY_SECONDS,
     CancelNotification,
-    ListPendingNotifications,
     NotificationTool,
+    PendingNotifications,
     RegisterNotification,
 )
 from pydantic_ai.tools import Tool
@@ -43,7 +43,7 @@ class TestCardSurface:
             "message_class",
             "max_delay_seconds",
             "register_notification",
-            "list_pending_notifications",
+            "pending_notification",
             "cancel_notification",
         }
 
@@ -52,11 +52,11 @@ class TestCardSurface:
         assert card.message_class == DEFAULT_MESSAGE_CLASS
         assert card.max_delay_seconds == DEFAULT_MAX_DELAY_SECONDS
         assert card.register_notification is True
-        assert card.list_pending_notifications is True
+        assert card.pending_notification is True
         assert card.cancel_notification is True
 
     @pytest.mark.parametrize(
-        "param_class", [RegisterNotification, ListPendingNotifications, CancelNotification]
+        "param_class", [RegisterNotification, PendingNotifications, CancelNotification]
     )
     def test_every_capability_param_ships_on_both_channels(
         self, param_class: type[Any]
@@ -64,7 +64,7 @@ class TestCardSurface:
         assert param_class().expose == {TOOL_CALL, COMMAND}
 
     @pytest.mark.parametrize(
-        "param_class", [RegisterNotification, ListPendingNotifications, CancelNotification]
+        "param_class", [RegisterNotification, PendingNotifications, CancelNotification]
     )
     def test_a_capability_param_carries_no_custom_fields(self, param_class: type[Any]) -> None:
         """ADR-020: configuration only — channel placement and instructions, nothing else."""
@@ -74,7 +74,7 @@ class TestCardSurface:
         """A config author cannot narrow ``expose`` without importing the param class."""
         import akgentic.tool.notification as notification
 
-        for param_class in (RegisterNotification, ListPendingNotifications, CancelNotification):
+        for param_class in (RegisterNotification, PendingNotifications, CancelNotification):
             assert getattr(notification, param_class.__name__) is param_class
             assert param_class.__name__ in notification.__all__
 
@@ -189,7 +189,7 @@ class TestWiring:
         assert second_card._notification_proxy is wired_card._notification_proxy
 
         _tool_named(wired_card, "register_notification")("via the first card", 30)
-        listed = _tool_named(second_card, "list_pending_notifications")()
+        listed = _tool_named(second_card, "pending_notification")()
         assert "via the first card" in listed
 
 
@@ -197,7 +197,7 @@ class TestCapabilitySurface:
     def test_get_tools_returns_the_three_capabilities(self, wired_card: NotificationTool) -> None:
         assert [tool.__name__ for tool in wired_card.get_tools()] == [
             "register_notification",
-            "list_pending_notifications",
+            "pending_notification",
             "cancel_notification",
         ]
 
@@ -207,12 +207,12 @@ class TestCapabilitySurface:
         commands = wired_card.get_commands()
         assert set(commands) == {
             RegisterNotification,
-            ListPendingNotifications,
+            PendingNotifications,
             CancelNotification,
         }
         assert {fn.__name__ for fn in commands.values()} == {
             "register_notification",
-            "list_pending_notifications",
+            "pending_notification",
             "cancel_notification",
         }
 
@@ -254,15 +254,57 @@ class TestCapabilitySurface:
         for capability in wired_card.get_tools():
             Tool(capability, require_parameter_descriptions=True)
 
+    def test_the_listing_schema_carries_its_optional_argument(
+        self, wired_card: NotificationTool
+    ) -> None:
+        """``all`` must reach the model described, not just exist on the signature."""
+        tool = Tool(
+            _tool_named(wired_card, "pending_notification"),
+            require_parameter_descriptions=True,
+        )
+
+        assert set(tool.function_schema.json_schema["properties"]) == {"all"}
+        assert "all" not in tool.function_schema.json_schema.get("required", [])
+
     def test_the_commands_reach_the_registry_by_name(self, observer: FakeActorToolObserver) -> None:
         """Signatures must be derivable, or registry construction raises."""
         card = NotificationTool(message_class=FAKE_MESSAGE_PATH)
         registry = ToolFactory(tool_cards=[card], observer=observer).get_command_registry()
 
         assert registry.has("register_notification")
-        assert registry.has("list_pending_notifications")
+        assert registry.has("pending_notification")
         assert registry.has("cancel_notification")
-        assert registry.dispatch("/list_pending_notifications") == "No pending notifications."
+        assert registry.dispatch("/pending_notification") == "No pending notifications."
+
+    def test_the_old_listing_command_name_is_gone(self, observer: FakeActorToolObserver) -> None:
+        """A leftover alias would be a second public surface nobody decided to ship."""
+        card = NotificationTool(message_class=FAKE_MESSAGE_PATH)
+        registry = ToolFactory(tool_cards=[card], observer=observer).get_command_registry()
+
+        assert not registry.has("list_pending_notifications")
+
+    def test_the_listing_command_dispatches_in_both_forms(
+        self, orchestrator_proxy: FakeOrchestratorProxy, observer: FakeActorToolObserver
+    ) -> None:
+        """``all=true`` is coerced to ``True`` by the argument's own ``TypeAdapter``."""
+        other_observer = FakeActorToolObserver(orchestrator_proxy, name="bob")
+        alice_card = NotificationTool(message_class=FAKE_MESSAGE_PATH)
+        alice_card.observer(observer)
+        bob_card = NotificationTool(message_class=FAKE_MESSAGE_PATH)
+        bob_card.observer(other_observer)
+
+        _tool_named(alice_card, "register_notification")("alice's own", 60)
+        _tool_named(bob_card, "register_notification")("bob's own", 60)
+
+        registry = ToolFactory(tool_cards=[alice_card], observer=observer).get_command_registry()
+
+        scoped = registry.dispatch("/pending_notification")
+        assert "alice's own" in scoped
+        assert "bob's own" not in scoped
+
+        team_wide = registry.dispatch("/pending_notification all=true")
+        assert "@alice id 1: alice's own" in team_wide
+        assert "@bob id 2: bob's own" in team_wide
 
     def test_a_command_coerces_its_integer_argument(
         self, observer: FakeActorToolObserver, wired_card: NotificationTool
@@ -325,25 +367,25 @@ class TestExposeDrivenChannels:
     ) -> None:
         card = NotificationTool(
             message_class=FAKE_MESSAGE_PATH,
-            list_pending_notifications=False,
+            pending_notification=False,
         )
         card.observer(observer)
 
-        assert "list_pending_notifications" not in [tool.__name__ for tool in card.get_tools()]
-        assert ListPendingNotifications not in card.get_commands()
+        assert "pending_notification" not in [tool.__name__ for tool in card.get_tools()]
+        assert PendingNotifications not in card.get_commands()
 
     def test_instructions_reach_the_callable_docstring(
         self, observer: FakeActorToolObserver
     ) -> None:
         card = NotificationTool(
             message_class=FAKE_MESSAGE_PATH,
-            list_pending_notifications=ListPendingNotifications(
+            pending_notification=PendingNotifications(
                 instructions="Check this before reporting idle."
             ),
         )
         card.observer(observer)
 
-        doc = _tool_named(card, "list_pending_notifications").__doc__ or ""
+        doc = _tool_named(card, "pending_notification").__doc__ or ""
         assert "Additional Instructions:" in doc
         assert "Check this before reporting idle." in doc
 
@@ -408,7 +450,7 @@ class TestSchedule:
         assert len(notification_actor.state.pending) == 1
 
 
-class TestListAndCancelAreOwnershipScoped:
+class TestListingDefaultsToTheCallerAndCancelStaysScoped:
     def test_list_shows_only_the_callers_own_entries(
         self, orchestrator_proxy: FakeOrchestratorProxy, wired_card: NotificationTool
     ) -> None:
@@ -419,8 +461,8 @@ class TestListAndCancelAreOwnershipScoped:
         _tool_named(wired_card, "register_notification")("alice's own", 60)
         _tool_named(other_card, "register_notification")("bob's own", 60)
 
-        alice_view = _tool_named(wired_card, "list_pending_notifications")()
-        bob_view = _tool_named(other_card, "list_pending_notifications")()
+        alice_view = _tool_named(wired_card, "pending_notification")()
+        bob_view = _tool_named(other_card, "pending_notification")()
 
         assert "alice's own" in alice_view
         assert "bob's own" not in alice_view
@@ -429,14 +471,23 @@ class TestListAndCancelAreOwnershipScoped:
 
     def test_list_reports_the_remaining_time(self, wired_card: NotificationTool) -> None:
         _tool_named(wired_card, "register_notification")("soon", 60)
-        listed = _tool_named(wired_card, "list_pending_notifications")()
+        listed = _tool_named(wired_card, "pending_notification")()
         assert "id 1: soon" in listed
         assert "60 seconds" in listed
 
     def test_list_is_friendly_when_there_is_nothing(self, wired_card: NotificationTool) -> None:
-        assert _tool_named(wired_card, "list_pending_notifications")() == (
-            "No pending notifications."
-        )
+        assert _tool_named(wired_card, "pending_notification")() == "No pending notifications."
+
+    def test_writing_the_default_explicitly_matches_the_no_argument_call(
+        self, wired_card: NotificationTool
+    ) -> None:
+        """The default output is a byte-for-byte contract, so the two forms must agree."""
+        _tool_named(wired_card, "register_notification")("soon", 60)
+        listing = _tool_named(wired_card, "pending_notification")
+
+        assert listing(all=False) == listing()
+        assert listing() == "Pending notifications:\n- id 1: soon (in 60 seconds)"
+
 
     def test_cancel_removes_the_callers_own_entry(
         self, wired_card: NotificationTool, notification_actor: NotificationActor
@@ -447,7 +498,11 @@ class TestListAndCancelAreOwnershipScoped:
         assert notification_actor.state.pending == {}
 
     def test_cancelling_an_unknown_id_is_retriable(self, wired_card: NotificationTool) -> None:
-        with pytest.raises(RetriableError, match="No pending notification with id 99"):
+        """The message reaches the LLM verbatim, so it must name the capability that exists."""
+        with pytest.raises(
+            RetriableError,
+            match="No pending notification with id 99; use pending_notification to see your own.",
+        ):
             _tool_named(wired_card, "cancel_notification")(99)
 
     def test_cancelling_another_agents_entry_is_refused_and_keeps_it(
@@ -461,6 +516,54 @@ class TestListAndCancelAreOwnershipScoped:
         other_card = NotificationTool(message_class=FAKE_MESSAGE_PATH)
         other_card.observer(other_observer)
         _tool_named(other_card, "register_notification")("bob's own", 60)
+
+        with pytest.raises(RetriableError, match="No pending notification with id 1"):
+            _tool_named(wired_card, "cancel_notification")(1)
+
+        assert notification_actor.state.pending[1].content == "bob's own"
+
+
+class TestListingTheWholeTeam:
+    def test_all_lists_every_members_entries_whichever_card_calls(
+        self, orchestrator_proxy: FakeOrchestratorProxy, wired_card: NotificationTool
+    ) -> None:
+        """Visibility is symmetric: alice's card and bob's card see the same two entries."""
+        other_observer = FakeActorToolObserver(orchestrator_proxy, name="bob")
+        other_card = NotificationTool(message_class=FAKE_MESSAGE_PATH)
+        other_card.observer(other_observer)
+
+        _tool_named(wired_card, "register_notification")("alice's own", 60)
+        _tool_named(other_card, "register_notification")("bob's own", 60)
+
+        expected = (
+            "Pending notifications:\n"
+            "- @alice id 1: alice's own (in 60 seconds)\n"
+            "- @bob id 2: bob's own (in 60 seconds)"
+        )
+        assert _tool_named(wired_card, "pending_notification")(all=True) == expected
+        assert _tool_named(other_card, "pending_notification")(all=True) == expected
+
+    def test_the_empty_state_is_the_same_string_as_the_default(
+        self, wired_card: NotificationTool
+    ) -> None:
+        assert _tool_named(wired_card, "pending_notification")(all=True) == (
+            "No pending notifications."
+        )
+
+    def test_seeing_another_agents_entry_does_not_let_you_cancel_it(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        wired_card: NotificationTool,
+        notification_actor: NotificationActor,
+    ) -> None:
+        """The asymmetry this story exists for: visibility widens, authority does not."""
+        other_observer = FakeActorToolObserver(orchestrator_proxy, name="bob")
+        other_card = NotificationTool(message_class=FAKE_MESSAGE_PATH)
+        other_card.observer(other_observer)
+        _tool_named(other_card, "register_notification")("bob's own", 60)
+
+        team_wide = _tool_named(wired_card, "pending_notification")(all=True)
+        assert "@bob id 1: bob's own" in team_wide
 
         with pytest.raises(RetriableError, match="No pending notification with id 1"):
             _tool_named(wired_card, "cancel_notification")(1)
