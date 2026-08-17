@@ -139,7 +139,7 @@ class TestWiring:
         assert len(orchestrator_proxy.create_calls) == 2  # both asked; one actor exists
         assert second_card._notification_proxy is wired_card._notification_proxy
 
-        _tool_named(wired_card, "send_notification_message")("via the first card", 30)
+        _tool_named(wired_card, "register_notification")("via the first card", 30)
         listed = _tool_named(second_card, "list_pending_notifications")()
         assert "via the first card" in listed
 
@@ -147,7 +147,7 @@ class TestWiring:
 class TestCapabilitySurface:
     def test_get_tools_returns_the_three_capabilities(self, wired_card: NotificationTool) -> None:
         assert [tool.__name__ for tool in wired_card.get_tools()] == [
-            "send_notification_message",
+            "register_notification",
             "list_pending_notifications",
             "cancel_notification",
         ]
@@ -164,7 +164,7 @@ class TestCapabilitySurface:
         """AC2: the LLM sees the cap in the tool schema, which is the docstring."""
         card = NotificationTool(message_class=FAKE_MESSAGE_PATH, max_delay_seconds=45)
         card.observer(observer)
-        doc = _tool_named(card, "send_notification_message").__doc__
+        doc = _tool_named(card, "register_notification").__doc__
         assert doc is not None
         assert "45 seconds" in doc
 
@@ -184,7 +184,7 @@ class TestCapabilitySurface:
         card.observer(observer)
 
         tool = Tool(
-            _tool_named(card, "send_notification_message"),
+            _tool_named(card, "register_notification"),
             require_parameter_descriptions=True,
         )
 
@@ -205,14 +205,14 @@ class TestCapabilitySurface:
 
         assert registry.has("list_pending_notifications")
         assert registry.has("cancel_notification")
-        assert not registry.has("send_notification_message")
+        assert not registry.has("register_notification")
         assert registry.dispatch("/list_pending_notifications") == "No pending notifications."
 
     def test_a_command_coerces_its_integer_argument(
         self, observer: FakeActorToolObserver, wired_card: NotificationTool
     ) -> None:
         """``/cancel_notification 1`` must reach the callable with an ``int``."""
-        _tool_named(wired_card, "send_notification_message")("cancel me by command", 60)
+        _tool_named(wired_card, "register_notification")("cancel me by command", 60)
 
         card = NotificationTool(message_class=FAKE_MESSAGE_PATH)
         registry = ToolFactory(tool_cards=[card], observer=observer).get_command_registry()
@@ -224,7 +224,7 @@ class TestSchedule:
     def test_returns_an_id_and_stores_an_absolute_due_time(
         self, wired_card: NotificationTool, notification_actor: NotificationActor
     ) -> None:
-        result = _tool_named(wired_card, "send_notification_message")("check CI", 30)
+        result = _tool_named(wired_card, "register_notification")("check CI", 30)
 
         assert "1" in result
         entry = notification_actor.state.pending[1]
@@ -234,7 +234,7 @@ class TestSchedule:
         assert (entry.fire_at - entry.created_at).total_seconds() == pytest.approx(30, abs=1)
 
     def test_ids_are_monotonic(self, wired_card: NotificationTool) -> None:
-        send = _tool_named(wired_card, "send_notification_message")
+        send = _tool_named(wired_card, "register_notification")
         first, second = send("a", 10), send("b", 10)
         assert "1" in first
         assert "2" in second
@@ -243,7 +243,7 @@ class TestSchedule:
     def test_a_delay_outside_the_range_is_retriable(
         self, wired_card: NotificationTool, notification_actor: NotificationActor, delay: int
     ) -> None:
-        send = _tool_named(wired_card, "send_notification_message")
+        send = _tool_named(wired_card, "register_notification")
         with pytest.raises(RetriableError, match=f"between 1 and {DEFAULT_MAX_DELAY_SECONDS}"):
             send("nope", delay)
         assert notification_actor.state.pending == {}
@@ -252,7 +252,7 @@ class TestSchedule:
     def test_both_ends_of_the_range_are_accepted(
         self, wired_card: NotificationTool, notification_actor: NotificationActor, delay: int
     ) -> None:
-        _tool_named(wired_card, "send_notification_message")("edge", delay)
+        _tool_named(wired_card, "register_notification")("edge", delay)
         assert len(notification_actor.state.pending) == 1
 
 
@@ -264,8 +264,8 @@ class TestListAndCancelAreOwnershipScoped:
         other_card = NotificationTool(message_class=FAKE_MESSAGE_PATH)
         other_card.observer(other_observer)
 
-        _tool_named(wired_card, "send_notification_message")("alice's own", 60)
-        _tool_named(other_card, "send_notification_message")("bob's own", 60)
+        _tool_named(wired_card, "register_notification")("alice's own", 60)
+        _tool_named(other_card, "register_notification")("bob's own", 60)
 
         alice_view = _tool_named(wired_card, "list_pending_notifications")()
         bob_view = _tool_named(other_card, "list_pending_notifications")()
@@ -276,7 +276,7 @@ class TestListAndCancelAreOwnershipScoped:
         assert "alice's own" not in bob_view
 
     def test_list_reports_the_remaining_time(self, wired_card: NotificationTool) -> None:
-        _tool_named(wired_card, "send_notification_message")("soon", 60)
+        _tool_named(wired_card, "register_notification")("soon", 60)
         listed = _tool_named(wired_card, "list_pending_notifications")()
         assert "id 1: soon" in listed
         assert "60 seconds" in listed
@@ -289,7 +289,7 @@ class TestListAndCancelAreOwnershipScoped:
     def test_cancel_removes_the_callers_own_entry(
         self, wired_card: NotificationTool, notification_actor: NotificationActor
     ) -> None:
-        _tool_named(wired_card, "send_notification_message")("drop me", 60)
+        _tool_named(wired_card, "register_notification")("drop me", 60)
         result = _tool_named(wired_card, "cancel_notification")(1)
         assert "cancelled" in result
         assert notification_actor.state.pending == {}
@@ -308,7 +308,7 @@ class TestListAndCancelAreOwnershipScoped:
         other_observer = FakeActorToolObserver(orchestrator_proxy, name="bob")
         other_card = NotificationTool(message_class=FAKE_MESSAGE_PATH)
         other_card.observer(other_observer)
-        _tool_named(other_card, "send_notification_message")("bob's own", 60)
+        _tool_named(other_card, "register_notification")("bob's own", 60)
 
         with pytest.raises(RetriableError, match="No pending notification with id 1"):
             _tool_named(wired_card, "cancel_notification")(1)
@@ -324,7 +324,7 @@ class TestWeakObserver:
         observer = FakeActorToolObserver(orchestrator_proxy)
         card = NotificationTool(message_class=FAKE_MESSAGE_PATH)
         card.observer(observer)
-        send = _tool_named(card, "send_notification_message")
+        send = _tool_named(card, "register_notification")
         cancel = _tool_named(card, "cancel_notification")
 
         del observer

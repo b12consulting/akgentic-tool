@@ -177,7 +177,7 @@ class NotificationTool(ToolCard):
         observer_or_none = self._actor_observer_or_none  # bound method -> weak edge to agent
         max_delay = self.max_delay_seconds
 
-        def send_notification_message(content: str, delay_seconds: int) -> str:
+        def register_notification(content: str, delay_seconds: int) -> str:
             """Schedule a message to yourself, delivered after a delay.
 
             Use it to defer your own attention — check a result later, or nudge
@@ -209,10 +209,10 @@ class NotificationTool(ToolCard):
         # the docstring with griffe, which dedents only when every line shares
         # one margin — a flush-left line appended to an indented docstring leaves
         # the Args section unparsed and both parameters undescribed.
-        send_notification_message.__doc__ = (send_notification_message.__doc__ or "").format(
+        register_notification.__doc__ = (register_notification.__doc__ or "").format(
             max_delay=max_delay
         )
-        return send_notification_message
+        return register_notification
 
     def _list_factory(self) -> Callable[..., Any]:
         proxy = self._actor_proxy()
@@ -245,7 +245,7 @@ class NotificationTool(ToolCard):
 
             Args:
                 notification_id: Id of the notification to cancel, as reported by
-                    send_notification_message or list_pending_notifications.
+                    register_notification or list_pending_notifications.
 
             Returns:
                 A confirmation that the notification was cancelled.
