@@ -83,6 +83,9 @@ class NotificationActor(Akgent[NotificationConfig, NotificationState]):
     this actor's thread and the deferred-result pattern is not engaged.
     """
 
+    _stop_event: threading.Event | None = None
+    _tick_thread: threading.Thread | None = None
+
     def on_start(self) -> None:
         """Initialise state, resolve the delivery class, and start the tick thread."""
         super().on_start()
@@ -99,9 +102,18 @@ class NotificationActor(Akgent[NotificationConfig, NotificationState]):
         self._tick_thread.start()
 
     def on_stop(self) -> None:
-        """Stop the tick thread, then run the base teardown."""
-        self._stop_event.set()
-        self._tick_thread.join(timeout=TICK_JOIN_TIMEOUT_S)
+        """Stop the tick thread, then run the base teardown.
+
+        The thread may not exist: pykka logs a failing ``on_start`` and runs the
+        actor anyway, so a config naming a delivery class this deployment cannot
+        import leaves the actor short of its thread. The base teardown — the
+        state checkpoint and the stop telemetry the ``#`` prefix relies on — has
+        to run in that case too, which it would not if this raised first.
+        """
+        if self._stop_event is not None:
+            self._stop_event.set()
+        if self._tick_thread is not None:
+            self._tick_thread.join(timeout=TICK_JOIN_TIMEOUT_S)
         super().on_stop()
 
     ##

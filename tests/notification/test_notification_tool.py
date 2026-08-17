@@ -22,6 +22,7 @@ from akgentic.tool.notification.tool import (
     ListPendingNotifications,
     NotificationTool,
 )
+from pydantic_ai.tools import Tool
 
 from tests.notification.conftest import (
     FAKE_MESSAGE_PATH,
@@ -166,6 +167,36 @@ class TestCapabilitySurface:
         doc = _tool_named(card, "send_notification_message").__doc__
         assert doc is not None
         assert "45 seconds" in doc
+
+    def test_the_send_schema_the_model_sees_states_the_cap(
+        self, observer: FakeActorToolObserver
+    ) -> None:
+        """AC2 as the model experiences it, not as a raw ``__doc__`` string.
+
+        The cap is appended to the docstring at bind time, so the append must
+        leave a docstring the schema builder can still parse. Asserting on
+        ``__doc__`` alone cannot see that: a docstring whose sections stopped
+        parsing still contains the substring. ``require_parameter_descriptions``
+        is what makes a broken Args section fail here rather than silently ship
+        an argument-less schema.
+        """
+        card = NotificationTool(message_class=FAKE_MESSAGE_PATH, max_delay_seconds=45)
+        card.observer(observer)
+
+        tool = Tool(
+            _tool_named(card, "send_notification_message"),
+            require_parameter_descriptions=True,
+        )
+
+        assert "45 seconds" in (tool.description or "")
+        assert set(tool.function_schema.json_schema["properties"]) == {"content", "delay_seconds"}
+
+    def test_every_capability_reaches_the_model_with_described_parameters(
+        self, wired_card: NotificationTool
+    ) -> None:
+        """An undescribed argument is an argument the model has to guess at."""
+        for capability in wired_card.get_tools():
+            Tool(capability, require_parameter_descriptions=True)
 
     def test_the_commands_reach_the_registry_by_name(self, observer: FakeActorToolObserver) -> None:
         """Signatures must be derivable, or registry construction raises."""

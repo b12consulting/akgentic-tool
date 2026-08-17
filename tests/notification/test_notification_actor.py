@@ -332,6 +332,25 @@ class TestTeardownAndRetention:
 
         assert not thread.is_alive()
 
+    def test_on_stop_still_tears_down_after_a_failed_on_start(self) -> None:
+        """A config this deployment cannot resolve must not cost the stop telemetry.
+
+        Pykka logs a failing ``on_start`` and keeps the actor running, so
+        ``on_stop`` has to cope with an actor that never got its tick thread. If
+        it raises on the missing thread instead, ``Akgent.on_stop`` never runs
+        and the ``#``-prefixed singleton goes without announcing its stop.
+        """
+        actor = NotificationActor(
+            config=NotificationConfig(
+                name=NOTIFICATION_ACTOR_NAME,
+                message_class="tests.notification.conftest.NotAMessage",
+            )
+        )
+        with pytest.raises(ValueError, match="not a Message subclass"):
+            actor.on_start()
+
+        actor.on_stop()  # must not raise
+
     def test_the_loop_exits_when_the_actor_is_dead(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A dead actor ends the loop; it never ticks a corpse forever."""
         monkeypatch.setattr(actor_module, "TICK_INTERVAL_S", 0.01)

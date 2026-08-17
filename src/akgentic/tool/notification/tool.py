@@ -181,11 +181,13 @@ class NotificationTool(ToolCard):
             """Schedule a message to yourself, delivered after a delay.
 
             Use it to defer your own attention — check a result later, or nudge
-            yourself if nothing has happened by then.
+            yourself if nothing has happened by then. The delay may not exceed
+            {max_delay} seconds; a larger one is rejected.
 
             Args:
                 content: The text you want to receive.
-                delay_seconds: Delay before delivery, at least 1 second.
+                delay_seconds: Delay before delivery, from 1 to {max_delay}
+                    seconds.
 
             Returns:
                 A confirmation carrying the notification id, which
@@ -202,10 +204,13 @@ class NotificationTool(ToolCard):
             )
 
         # The cap is configuration, so it reaches the LLM through the schema
-        # rather than through a literal in the source docstring.
-        send_notification_message.__doc__ = (
-            f"{send_notification_message.__doc__}\n"
-            f"The maximum delay is {max_delay} seconds; a larger one is rejected."
+        # rather than through a literal in the source docstring. Substituted into
+        # the docstring rather than appended after it: the schema builder parses
+        # the docstring with griffe, which dedents only when every line shares
+        # one margin — a flush-left line appended to an indented docstring leaves
+        # the Args section unparsed and both parameters undescribed.
+        send_notification_message.__doc__ = (send_notification_message.__doc__ or "").format(
+            max_delay=max_delay
         )
         return send_notification_message
 
@@ -236,7 +241,15 @@ class NotificationTool(ToolCard):
         observer_or_none = self._actor_observer_or_none
 
         def cancel_notification(notification_id: int) -> str:
-            """Cancel one of your own pending notifications by id."""
+            """Cancel one of your own pending notifications by id.
+
+            Args:
+                notification_id: Id of the notification to cancel, as reported by
+                    send_notification_message or list_pending_notifications.
+
+            Returns:
+                A confirmation that the notification was cancelled.
+            """
             _require_live_agent(observer_or_none)
             if not proxy.cancel(notification_id, owner):
                 raise RetriableError(
