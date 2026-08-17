@@ -862,15 +862,16 @@ Requires `TAVILY_API_KEY` environment variable.
 
 ### TeamTool
 
-Exposes team management capabilities (hire/fire agents, roster view) to the LLM, and — opt-in —
-answers *who is working right now, and on what*. Used by `BaseAgent` in `akgentic-agent` to enable
+Exposes team management capabilities (hire/fire agents, roster view) to the LLM, and answers *who
+is working right now, and on what*. Used by `BaseAgent` in `akgentic-agent` to enable
 orchestrator-level agents to dynamically extend the team.
 
 ```python
 from akgentic.tool.team import ActivitySummarizer, GetTeamActivity, TeamTool
 
-TeamTool()                                      # hire/fire/roster/profiles — no actor
-TeamTool(get_team_activity=True)                # + who_is_working(), truncation only, still no actor
+TeamTool()                                      # hire/fire/roster/profiles + team_activity()
+                                                #   (truncation only — no actor, no model call)
+TeamTool(get_team_activity=False)               # team management only
 TeamTool(get_team_activity=GetTeamActivity(     # + summaries on demand; #TeamActivity is created
     summarizer=ActivitySummarizer(model="openai:gpt-5.2-mini"),
 ))
@@ -881,29 +882,36 @@ available profiles as a system prompt; `hire_members(roles)` and `fire_members(n
 The single-member `hire_member(role, name=None)` and `fire_member(name)` are `COMMAND`-channel
 variants, not tool calls.
 
-#### Team activity — `who_is_working`
+#### Team activity — `team_activity`
 
-`get_team_activity` **defaults to `False`**, so an existing card keeps its behaviour and its surface
-byte-for-byte. Two independent gates then decide what turning it on costs:
+`get_team_activity` **defaults to `True`** (with no summarizer): the truncate-only report is pure
+telemetry, so it is cheap enough to be on everywhere. A card persisted with an explicit `False`
+keeps it off. Two independent gates decide what the capability costs:
 
-| Configuration | `who_is_working` | `#TeamActivity` actor | model call | `summarize_over` in the schema |
+| Configuration | `team_activity` | `#TeamActivity` actor | model call | `summarize_over` in the schema |
 |---|---|---|---|---|
-| `get_team_activity=False` *(default)* | not exposed | not created | never | n/a |
-| `get_team_activity=True`, `summarizer=None` | exposed, truncates | **not created** | never | **absent** |
+| `get_team_activity=False` | not exposed | not created | never | n/a |
+| `get_team_activity=True`, `summarizer=None` *(default)* | exposed, truncates | **not created** | never | **absent** |
 | `summarizer=ActivitySummarizer(...)` | exposed, summarizes | created | on demand | present |
 
 The `#TeamActivity` cache actor is created **only** when `get_team_activity` resolves truthy **and**
 its `summarizer` is not `None`. The actor exists solely to cache summaries, so with the capability on
-and no summarizer there is nothing to cache: `who_is_working` answers by truncation and **no actor is
+and no summarizer there is nothing to cache: `team_activity` answers by truncation and **no actor is
 created at all**.
 
 The signature follows the configuration rather than being fixed. Without a summarizer the callable is
-`who_is_working() -> TeamActivityReport`, and `summarize_over` is **absent from the tool schema** —
+`team_activity() -> TeamActivityReport`, and `summarize_over` is **absent from the tool schema** —
 not merely defaulted off — so the model cannot request a summary nothing could produce. With one
-configured it becomes `who_is_working(summarize_over: int | None = None)`, and **`summarize_over=None`
+configured it becomes `team_activity(summarize_over: int | None = None)`, and **`summarize_over=None`
 still performs zero model calls**: long task text is truncated to `max_task_chars`. Passing an integer
 is the opt-in — only longer tasks go through the deferred-result cache above, keyed by `message_id` so
 a follow-up call costs nothing. The threshold *is* the consent; there is no eager warming.
+
+**The report is lean by design.** It is read back by the calling model on every invocation, so every
+field is prompt cost. A member row carries `name`, `role`, `task`, `summarized`, `started_at` and
+`suspect` — nothing else. The derivation keys never reach the wire: grouping happens by `agent_id`
+and the summary cache is keyed by `message_id`, but both stay internal, and the busy duration is
+simply `generated_at − started_at`.
 
 Busy members are derived from the orchestrator's own telemetry: an agent with a `ReceivedMessage` and
 no matching `ProcessedMessage` is mid-handler, and the task text comes from the corresponding
@@ -1215,7 +1223,7 @@ src/akgentic/tool/
     team/
     │   team.py               # TeamTool — hire/fire/roster/profiles + get_team_activity
     │   observer.py           # TeamManagementToolObserver — TeamTool's own contract
-    │   └── activity.py       # who_is_working models, GetTeamActivity,
+    │   └── activity.py       # team_activity models, GetTeamActivity,
     │                         #   ActivitySummarizer, TeamActivityActor, SummarizerWorker
     mcp/
     │   mcp.py                # MCPTool, connection configs

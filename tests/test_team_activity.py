@@ -1,4 +1,4 @@
-"""Unit tests for ``who_is_working``, the team-activity capability on ``TeamTool``.
+"""Unit tests for ``team_activity``, the team-activity capability on ``TeamTool``.
 
 Mock-based throughout: telemetry is hand-built and handed to a fake orchestrator
 proxy, so no real team runs. Every test is synchronous — the package pyproject
@@ -282,10 +282,10 @@ class _Harness:
         self.tool.observer(self.observer)
 
     @property
-    def who_is_working(self) -> Callable[..., TeamActivityReport]:
+    def team_activity(self) -> Callable[..., TeamActivityReport]:
         """The activity callable, selected by name — ``get_tools()[0]`` is hire."""
         return next(
-            tool for tool in self.tool.get_tools() if tool.__name__ == "who_is_working"
+            tool for tool in self.tool.get_tools() if tool.__name__ == "team_activity"
         )
 
     def run(self, summarize_over: int | None = None) -> TeamActivityReport:
@@ -293,7 +293,7 @@ class _Harness:
             patch.object(self.activity, "createActor", side_effect=_spawning_create),
             patch.object(self.activity, "proxy_tell", return_value=MagicMock()),
         ):
-            callable_ = self.who_is_working
+            callable_ = self.team_activity
             if "summarize_over" in inspect.signature(callable_).parameters:
                 return callable_(summarize_over=summarize_over)
             assert summarize_over is None, "the truncate-only variant takes no threshold"
@@ -314,18 +314,48 @@ class TestReportModels:
     """AC1: typed report shapes, no ``dict[str, Any]`` anywhere."""
 
     def test_agent_activity_fields(self) -> None:
+        """The wire row is lean: no derivation key and no derivable duration."""
         expected = {
             "name",
-            "agent_id",
             "role",
-            "message_id",
             "task",
             "summarized",
             "started_at",
-            "busy_for_seconds",
             "suspect",
         }
         assert set(AgentActivity.model_fields) == expected
+
+    def test_the_serialized_member_row_carries_no_derivation_key(self) -> None:
+        """What the model reads back, asserted on the serialized key set.
+
+        ``agent_id`` and ``message_id`` are two UUIDs a reader can use for
+        nothing, and ``busy_for_seconds`` is ``generated_at − started_at``.
+        The serializer's ``__model__`` marker is the only non-field key.
+        """
+        report = TeamActivityReport(
+            generated_at=datetime.now(UTC),
+            members=[
+                AgentActivity(
+                    name="@Dev1",
+                    role="Developer",
+                    task="t",
+                    summarized=False,
+                    started_at=datetime.now(UTC),
+                )
+            ],
+            pending_summaries=0,
+        )
+        dumped = report.model_dump()
+        assert set(dumped) == {"generated_at", "members", "pending_summaries", "__model__"}
+        assert set(dumped["members"][0]) == {
+            "name",
+            "role",
+            "task",
+            "summarized",
+            "started_at",
+            "suspect",
+            "__model__",
+        }
 
     def test_report_fields(self) -> None:
         assert set(TeamActivityReport.model_fields) == {
@@ -337,13 +367,10 @@ class TestReportModels:
     def test_suspect_defaults_to_false(self) -> None:
         row = AgentActivity(
             name="@Dev1",
-            agent_id=uuid.uuid4(),
             role="Developer",
-            message_id=uuid.uuid4(),
             task="t",
             summarized=False,
             started_at=datetime.now(UTC),
-            busy_for_seconds=1.0,
         )
         assert row.suspect is False
 
@@ -362,8 +389,9 @@ class TestReportModels:
 class TestCardShape:
     """AC2: configuration on the param models, runtime handles in PrivateAttr."""
 
-    def test_the_capability_is_off_by_default(self) -> None:
-        assert TeamTool().get_team_activity is False
+    def test_the_capability_is_on_by_default_without_a_summarizer(self) -> None:
+        """Default ``True`` resolves to a summarizer-less ``GetTeamActivity``."""
+        assert TeamTool().get_team_activity is True
 
     def test_configuration_defaults(self) -> None:
         params = GetTeamActivity()
@@ -536,39 +564,39 @@ class TestSignatureFollowsConfiguration:
         returned report cannot tell the two apart.
         """
         harness = _Harness([], get_team_activity=True)
-        signature = inspect.signature(harness.who_is_working)
+        signature = inspect.signature(harness.team_activity)
         assert "summarize_over" not in signature.parameters
         assert signature.parameters == {}
 
     def test_the_summarize_over_parameter_appears_with_a_summarizer(self) -> None:
-        signature = inspect.signature(_Harness([]).who_is_working)
+        signature = inspect.signature(_Harness([]).team_activity)
         assert signature.parameters["summarize_over"].default is None
 
-    def test_both_variants_are_named_who_is_working(self) -> None:
+    def test_both_variants_are_named_team_activity(self) -> None:
         """The command registry derives the command name from ``__name__``."""
-        assert _Harness([], get_team_activity=True).who_is_working.__name__ == "who_is_working"
-        assert _Harness([]).who_is_working.__name__ == "who_is_working"
+        assert _Harness([], get_team_activity=True).team_activity.__name__ == "team_activity"
+        assert _Harness([]).team_activity.__name__ == "team_activity"
 
     def test_the_truncating_docstring_never_mentions_the_threshold(self) -> None:
-        doc = _Harness([], get_team_activity=True).who_is_working.__doc__
+        doc = _Harness([], get_team_activity=True).team_activity.__doc__
         assert doc is not None
         assert "summarize_over" not in doc
 
     def test_the_summarizing_docstring_documents_the_threshold(self) -> None:
-        doc = _Harness([]).who_is_working.__doc__
+        doc = _Harness([]).team_activity.__doc__
         assert doc is not None
         assert "summarize_over" in doc
 
     def test_instructions_are_appended_to_both_variants(self) -> None:
         truncating = _Harness(
             [], get_team_activity=GetTeamActivity(instructions="Ask sparingly.")
-        ).who_is_working
+        ).team_activity
         summarizing = _Harness(
             [],
             get_team_activity=GetTeamActivity(
                 instructions="Ask sparingly.", summarizer=ActivitySummarizer()
             ),
-        ).who_is_working
+        ).team_activity
         assert "Ask sparingly." in (truncating.__doc__ or "")
         assert "Ask sparingly." in (summarizing.__doc__ or "")
 
@@ -579,7 +607,13 @@ class TestSignatureFollowsConfiguration:
 
 
 class TestBackwardCompatibility:
-    """AC2c: a payload that predates the field still validates and still behaves."""
+    """AC2c/AC4: old payloads still validate; the new default costs no actor.
+
+    The default flipped to ``True`` (2026-08-17 revision), so a payload that
+    predates the field now *gains* the truncate-only capability — deliberately.
+    What must not change: an explicit persisted value survives, hire/fire and the
+    prompts are untouched, and no actor is ever created without a summarizer.
+    """
 
     def _bound_default_tool(self) -> tuple[TeamTool, _FakeOrchestrator, _FakeObserver]:
         orchestrator = _FakeOrchestrator([])
@@ -588,31 +622,33 @@ class TestBackwardCompatibility:
         tool.observer(observer)
         return tool, orchestrator, observer
 
-    def test_a_payload_without_the_field_still_validates(self) -> None:
+    def test_a_payload_without_the_field_validates_to_the_new_default(self) -> None:
         payload = TeamTool().model_dump()
         del payload["get_team_activity"]
         restored = TeamTool.model_validate(payload)
+        assert restored.get_team_activity is True
+
+    def test_a_persisted_explicit_false_survives_the_default_flip(self) -> None:
+        payload = TeamTool(get_team_activity=False).model_dump()
+        restored = TeamTool.model_validate(payload)
         assert restored.get_team_activity is False
 
-    def test_the_dispatch_surface_is_unchanged(self) -> None:
+    def test_the_default_dispatch_surface_gains_only_team_activity(self) -> None:
         tool, _, _ = self._bound_default_tool()
 
         assert [callable_.__name__ for callable_ in tool.get_tools()] == [
             "hire_members",
             "fire_members",
+            "team_activity",
         ]
         assert set(tool.get_commands()) == {
             HireTeamMember,
             FireTeamMember,
             GetTeamRoster,
             GetRoleProfiles,
+            GetTeamActivity,
         }
         assert len(tool.get_system_prompts()) == 2
-        assert GetTeamActivity not in tool.get_commands()
-        assert all(
-            callable_.__name__ != "who_is_working"
-            for callable_ in [*tool.get_tools(), *tool.get_system_prompts()]
-        )
 
     def test_a_default_card_creates_no_actor(self) -> None:
         _, orchestrator, _ = self._bound_default_tool()
@@ -628,6 +664,7 @@ class TestBackwardCompatibility:
         assert [callable_.__name__ for callable_ in restored.get_tools()] == [
             "hire_members",
             "fire_members",
+            "team_activity",
         ]
         assert orchestrator.children_created == []
 
@@ -648,30 +685,30 @@ class TestChannels:
         assert [callable_.__name__ for callable_ in tools] == [
             "hire_members",
             "fire_members",
-            "who_is_working",
+            "team_activity",
         ]
 
     def test_command_channel_maps_the_param_class(self) -> None:
         commands = _Harness([]).tool.get_commands()
         assert GetTeamActivity in commands
-        assert commands[GetTeamActivity].__name__ == "who_is_working"
+        assert commands[GetTeamActivity].__name__ == "team_activity"
 
     def test_disabled_capability_registers_nothing(self) -> None:
         harness = _Harness([], get_team_activity=False)
         assert all(
-            callable_.__name__ != "who_is_working" for callable_ in harness.tool.get_tools()
+            callable_.__name__ != "team_activity" for callable_ in harness.tool.get_tools()
         )
         assert GetTeamActivity not in harness.tool.get_commands()
 
     def test_tool_call_only_leaves_the_command_channel_empty(self) -> None:
         harness = _Harness([], get_team_activity=GetTeamActivity(expose={TOOL_CALL}))
-        assert harness.who_is_working.__name__ == "who_is_working"
+        assert harness.team_activity.__name__ == "team_activity"
         assert GetTeamActivity not in harness.tool.get_commands()
 
     def test_command_only_leaves_the_tool_channel_empty(self) -> None:
         harness = _Harness([], get_team_activity=GetTeamActivity(expose={COMMAND}))
         assert all(
-            callable_.__name__ != "who_is_working" for callable_ in harness.tool.get_tools()
+            callable_.__name__ != "team_activity" for callable_ in harness.tool.get_tools()
         )
         assert GetTeamActivity in harness.tool.get_commands()
 
@@ -682,7 +719,7 @@ class TestChannels:
 
     def test_gone_observer_raises_retriable(self) -> None:
         harness = _Harness([])
-        callable_ = harness.who_is_working
+        callable_ = harness.team_activity
         harness.tool._observer_ref = None
         with pytest.raises(RetriableError, match="shutting down"):
             callable_()
@@ -703,7 +740,7 @@ class TestFilteredHistoryAccess:
         harness.run()
 
         calls = harness.orchestrator.get_messages_calls
-        assert calls, "who_is_working never read the message history"
+        assert calls, "team_activity never read the message history"
         assert all(call is not None for call in calls)
         assert set(calls) <= {ReceivedMessage, ProcessedMessage, SentMessage}
 
@@ -762,7 +799,6 @@ class TestGroupingKey:
         report = harness.run()
 
         assert len(report.members) == 2
-        assert {row.agent_id for row in report.members} == {first.agent_id, second.agent_id}
         assert {row.name for row in report.members} == {"@Dev123"}
         assert {row.task for row in report.members} == {
             "first incarnation task",
@@ -806,7 +842,7 @@ class TestBusyPredicate:
 
         assert len(report.members) == 1
         assert report.members[0].suspect is False
-        assert report.members[0].message_id == message.id
+        assert report.members[0].task == "a normal turn"
 
     def test_two_open_messages_are_suspect_and_still_reported(self) -> None:
         sender = _address("@Dev1")
@@ -824,8 +860,7 @@ class TestBusyPredicate:
 
         assert len(report.members) == 1, "an anomalous member must never be dropped"
         assert report.members[0].suspect is True
-        assert report.members[0].message_id == older.id, "report the oldest open entry"
-        assert report.members[0].task == "older open task"
+        assert report.members[0].task == "older open task", "report the oldest open entry"
 
     def test_a_closed_handler_is_not_reported(self) -> None:
         sender = _address("@Dev1")
@@ -840,12 +875,14 @@ class TestBusyPredicate:
         assert _Harness([]).run().members == []
         assert harness.run().members == []
 
-    def test_busy_for_seconds_tracks_the_open_entry(self) -> None:
+    def test_started_at_tracks_the_open_entry(self) -> None:
+        """The duration itself left the wire — it is ``generated_at − started_at``."""
         sender = _address("@Dev1")
         message = _task("long-running turn")
         harness = _Harness([_sent(sender, message), _received(sender, message.id, age_seconds=42)])
         report = harness.run()
-        assert report.members[0].busy_for_seconds == pytest.approx(42, abs=2)
+        busy_for = (report.generated_at - report.members[0].started_at).total_seconds()
+        assert busy_for == pytest.approx(42, abs=2)
 
 
 # ---------------------------------------------------------------------------
@@ -934,7 +971,7 @@ class TestExclusions:
         report = harness.run()
 
         assert len(report.members) == 1
-        assert report.members[0].agent_id == namesake.agent_id
+        assert report.members[0].task == "what the namesake is doing"
 
     def test_hash_prefixed_tool_actors_are_excluded(self) -> None:
         tool_actor = _address("#TeamActivity", "ToolActor")
@@ -1319,7 +1356,6 @@ class TestSummarization:
 
         summarized = [row for row in report.members if row.summarized]
         assert len(summarized) == 1
-        assert summarized[0].message_id == first_id
         assert summarized[0].task == "arrived just after the budget ran out"
         assert report.pending_summaries == 1
 
@@ -1330,11 +1366,6 @@ class TestSummarization:
         the row is served from cache and the poll is never reached at all.
         """
         harness = self._long_task_harness(count=1, poll_attempts=2, poll_delay_seconds=0.0)
-        message_id = next(
-            msg.message_id
-            for msg in harness.orchestrator._messages
-            if isinstance(msg, ReceivedMessage)
-        )
         landed: dict[uuid.UUID, str] = {}
 
         def fake_get(key: uuid.UUID) -> str | None:
@@ -1349,7 +1380,6 @@ class TestSummarization:
         assert report.pending_summaries == 0
         assert report.members[0].summarized is True
         assert report.members[0].task == "the finished summary"
-        assert report.members[0].message_id == message_id
 
 
 # ---------------------------------------------------------------------------

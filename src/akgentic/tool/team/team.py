@@ -176,7 +176,7 @@ class TeamTool(ToolCard):
     Provides:
     - hire_members(roles: list[str]) -> str: Hire team members
     - fire_members(names: list[str]) -> str: Fire team members
-    - who_is_working() -> TeamActivityReport: Who is mid-handler (opt-in, off by default)
+    - team_activity() -> TeamActivityReport: Who is mid-handler (on by default, no summarizer)
     - Team roster system prompt: Current team composition
     - Role profiles system prompt: Available roles and descriptions
     """
@@ -194,7 +194,8 @@ class TeamTool(ToolCard):
         default=True, description="Include team roster in system prompt (default: True)"
     )
     get_team_activity: GetTeamActivity | bool = Field(
-        default=False, description="Enable the who_is_working report (default: False)"
+        default=True,
+        description="Enable the team_activity report (default: True, no summarizer)",
     )
 
     # Runtime handle: an actor proxy is not serializable and never a field.
@@ -232,11 +233,11 @@ class TeamTool(ToolCard):
         """Bind the ``#TeamActivity`` singleton — only when a summarizer is configured.
 
         Two independent gates, and conflating them is the defect this shape exists
-        to prevent. ``get_team_activity`` alone exposes ``who_is_working`` as pure
+        to prevent. ``get_team_activity`` alone exposes ``team_activity`` as pure
         telemetry plus truncation; the actor exists *solely* to cache summaries, so
         with no summarizer there is nothing to cache and the team pays for no actor
-        at all — which is what makes an opt-in capability safe on the most widely
-        used card in the package.
+        at all — which is what makes a default-on capability safe on the most
+        widely used card in the package.
 
         The cache actor is reached through an **ask** proxy and its TELL-shaped
         ``request`` is called on that same proxy. That is safe rather than a partial
@@ -309,7 +310,7 @@ class TeamTool(ToolCard):
 
         gta = _resolve(self.get_team_activity, GetTeamActivity)
         if gta and TOOL_CALL in gta.expose:
-            tools.append(self._who_is_working(gta))
+            tools.append(self._team_activity(gta))
 
         return tools
 
@@ -339,7 +340,7 @@ class TeamTool(ToolCard):
 
         gta = _resolve(self.get_team_activity, GetTeamActivity)
         if gta and COMMAND in gta.expose:
-            commands[GetTeamActivity] = self._who_is_working(gta)
+            commands[GetTeamActivity] = self._team_activity(gta)
 
         return commands
 
@@ -626,8 +627,8 @@ class TeamTool(ToolCard):
 
         return team_roles
 
-    def _who_is_working(self, params: GetTeamActivity) -> Callable[..., Any]:
-        """Build the ``who_is_working`` variant this configuration calls for.
+    def _team_activity(self, params: GetTeamActivity) -> Callable[..., Any]:
+        """Build the ``team_activity`` variant this configuration calls for.
 
         The signature follows the configuration rather than being fixed: without a
         summarizer the callable takes no ``summarize_over`` parameter at all, so
@@ -636,11 +637,11 @@ class TeamTool(ToolCard):
         name in one function body is a redefinition mypy rejects.
         """
         if params.summarizer is not None:
-            return self._who_is_working_summarizing_factory(params)
-        return self._who_is_working_factory(params)
+            return self._team_activity_summarizing_factory(params)
+        return self._team_activity_factory(params)
 
     def _activity_collector(self, params: GetTeamActivity) -> Callable[[], ActivitySnapshot]:
-        """Bind the telemetry derivation shared by both ``who_is_working`` variants.
+        """Bind the telemetry derivation shared by both ``team_activity`` variants.
 
         Args:
             params: Configuration for the team-activity capability.
@@ -662,8 +663,8 @@ class TeamTool(ToolCard):
 
         return collect
 
-    def _who_is_working_factory(self, params: GetTeamActivity) -> Callable[..., Any]:
-        """Create the truncate-only ``who_is_working``: no cache proxy in scope.
+    def _team_activity_factory(self, params: GetTeamActivity) -> Callable[..., Any]:
+        """Create the truncate-only ``team_activity``: no cache proxy in scope.
 
         Args:
             params: Configuration for the team-activity capability.
@@ -674,7 +675,7 @@ class TeamTool(ToolCard):
         collect = self._activity_collector(params)
         max_task_chars = params.max_task_chars
 
-        def who_is_working() -> TeamActivityReport:
+        def team_activity() -> TeamActivityReport:
             """Report which teammates are currently handling a message, and on what.
 
             Derived from the team's own telemetry, so it costs nothing at all. Task
@@ -691,11 +692,11 @@ class TeamTool(ToolCard):
                 pending_summaries=0,
             )
 
-        who_is_working.__doc__ = params.format_docstring(who_is_working.__doc__)
-        return who_is_working
+        team_activity.__doc__ = params.format_docstring(team_activity.__doc__)
+        return team_activity
 
-    def _who_is_working_summarizing_factory(self, params: GetTeamActivity) -> Callable[..., Any]:
-        """Create the summarizing ``who_is_working``: the threshold is the consent.
+    def _team_activity_summarizing_factory(self, params: GetTeamActivity) -> Callable[..., Any]:
+        """Create the summarizing ``team_activity``: the threshold is the consent.
 
         Args:
             params: Configuration for the team-activity capability, with a
@@ -708,7 +709,7 @@ class TeamTool(ToolCard):
         collect = self._activity_collector(params)
         budget = SummaryBudget.from_params(params)
 
-        def who_is_working(summarize_over: int | None = None) -> TeamActivityReport:
+        def team_activity(summarize_over: int | None = None) -> TeamActivityReport:
             """Report which teammates are currently handling a message, and on what.
 
             Derived from team telemetry, so it costs no model call by default: task
@@ -735,13 +736,13 @@ class TeamTool(ToolCard):
                 pending_summaries=pending_summaries,
             )
 
-        who_is_working.__doc__ = params.format_docstring(who_is_working.__doc__)
-        return who_is_working
+        team_activity.__doc__ = params.format_docstring(team_activity.__doc__)
+        return team_activity
 
     def _require_activity_proxy(self) -> TeamActivityActor:
         """Return the bound cache proxy, or fail loudly if :meth:`observer` never ran."""
         if self._activity_proxy is None:
             raise ValueError(
-                "TeamTool.observer() must run before the summarizing who_is_working is built."
+                "TeamTool.observer() must run before the summarizing team_activity is built."
             )
         return self._activity_proxy

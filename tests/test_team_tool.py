@@ -19,6 +19,7 @@ from akgentic.tool.team.observer import TeamManagementToolObserver
 from akgentic.tool.team import (
     FireTeamMember,
     GetRoleProfiles,
+    GetTeamActivity,
     GetTeamRoster,
     HireTeamMember,
     TeamTool,
@@ -78,19 +79,22 @@ def test_team_tool_observer_requires_orchestrator():
 
 
 def test_team_tool_get_tools_default():
-    """TeamTool.get_tools() returns hire + fire by default."""
+    """TeamTool.get_tools() returns hire + fire + team_activity by default."""
     tool = TeamTool()
     tool.observer(mock_observer())
 
     tools = tool.get_tools()
-    assert len(tools) == 2
+    assert len(tools) == 3
     assert tools[0].__name__ == "hire_members"
     assert tools[1].__name__ == "fire_members"
+    assert tools[2].__name__ == "team_activity"
 
 
 def test_team_tool_get_tools_disabled():
     """TeamTool.get_tools() excludes disabled capabilities."""
-    tool = TeamTool(hire_team_members=False, fire_team_members=False)
+    tool = TeamTool(
+        hire_team_members=False, fire_team_members=False, get_team_activity=False
+    )
     tool.observer(mock_observer())
 
     tools = tool.get_tools()
@@ -99,7 +103,9 @@ def test_team_tool_get_tools_disabled():
 
 def test_team_tool_get_tools_partial():
     """TeamTool.get_tools() includes only enabled capabilities."""
-    tool = TeamTool(hire_team_members=True, fire_team_members=False)
+    tool = TeamTool(
+        hire_team_members=True, fire_team_members=False, get_team_activity=False
+    )
     tool.observer(mock_observer())
 
     tools = tool.get_tools()
@@ -536,16 +542,17 @@ def test_fire_members_batch_partial_success():
 
 
 def test_team_tool_get_commands_default():
-    """TeamTool.get_commands() returns dict keyed by param class with 4 commands."""
+    """TeamTool.get_commands() returns dict keyed by param class with 5 commands."""
     tool = TeamTool()
     tool.observer(mock_observer())
 
     commands = tool.get_commands()
-    assert len(commands) == 4
+    assert len(commands) == 5
     assert HireTeamMember in commands
     assert FireTeamMember in commands
     assert GetTeamRoster in commands
     assert GetRoleProfiles in commands
+    assert GetTeamActivity in commands
     assert all(callable(c) for c in commands.values())
 
 
@@ -556,6 +563,7 @@ def test_team_tool_get_commands_disabled():
         fire_team_members=False,
         get_team_roster=False,
         get_role_profiles=False,
+        get_team_activity=False,
     )
     tool.observer(mock_observer())
 
@@ -568,6 +576,7 @@ def test_team_tool_get_commands_partial():
     tool = TeamTool(
         hire_team_members=HireTeamMember(expose={TOOL_CALL}),  # no command
         fire_team_members=True,  # default includes command
+        get_team_activity=False,
     )
     tool.observer(mock_observer())
 

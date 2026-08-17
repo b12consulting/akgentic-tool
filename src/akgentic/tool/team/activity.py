@@ -1,10 +1,11 @@
-"""``who_is_working`` — who on the team is mid-handler, and on what (ADR-033 §Decision 3).
+"""``team_activity`` — who on the team is mid-handler, and on what (ADR-033 §Decision 3).
 
 Team activity is a **capability on ``TeamTool``**, not a card of its own, and it
 rests on two independent gates:
 
-* ``TeamTool.get_team_activity`` decides whether ``who_is_working`` is exposed at
-  all. It defaults to ``False``, so an existing card keeps its behaviour.
+* ``TeamTool.get_team_activity`` decides whether ``team_activity`` is exposed at
+  all. It defaults to ``True`` — the truncate-only report is pure telemetry and
+  cheap enough to be on everywhere.
 * :attr:`GetTeamActivity.summarizer` decides whether the ``#TeamActivity`` cache
   actor exists. The actor is there **only** to cache summaries, so with no
   summarizer there is nothing to cache: no actor, no worker, and no
@@ -108,30 +109,30 @@ _ELLIPSIS = "…"
 
 
 class AgentActivity(SerializableBaseModel):
-    """One team member currently inside a message handler.
+    """One team member currently inside a message handler — the wire row.
+
+    This model is read back by the calling model on every invocation, so every
+    field is prompt cost. The derivation keys deliberately never appear here:
+    ``agent_id`` (the grouping key) and ``message_id`` (the summary cache key)
+    live on :class:`MemberRow`, and the busy duration is derivable from
+    ``generated_at − started_at``.
 
     Attributes:
         name: Member name at the time the message was received.
-        agent_id: Identity of the actor. The grouping key — names are reusable.
         role: Member role.
-        message_id: The open message being handled. Also the summary cache key.
         task: Task text — full, truncated, or summarized (see ``summarized``).
         summarized: True when ``task`` came back from the summarizer.
         started_at: When the handler started (the ``ReceivedMessage`` timestamp).
-        busy_for_seconds: Seconds between ``started_at`` and report generation.
         suspect: True when more than one message is open for this member, which
             cannot happen on a live team and therefore signals replayed or
             malformed telemetry. The member is still reported.
     """
 
     name: str
-    agent_id: uuid.UUID
     role: str
-    message_id: uuid.UUID
     task: str
     summarized: bool
     started_at: datetime
-    busy_for_seconds: float
     suspect: bool = False
 
 
@@ -311,7 +312,7 @@ class TeamActivityActor(DeferredResultActor[BaseConfig, BaseState, uuid.UUID, st
 class _OpenGroup:
     """Open handlers of one actor, plus the address they were reported under.
 
-    Runtime bookkeeping local to one ``who_is_working`` call — it never crosses an
+    Runtime bookkeeping local to one ``team_activity`` call — it never crosses an
     actor boundary, which is why it is a dataclass rather than a serializable
     model. Carrying the sender alongside the entries keeps the address non-optional
     downstream without re-deriving it from an arbitrary entry.
@@ -322,22 +323,49 @@ class _OpenGroup:
 
 
 @dataclass(slots=True)
+class MemberRow:
+    """One busy member with its derivation keys, before any task text is applied.
+
+    Runtime bookkeeping local to one ``team_activity`` call, like
+    :class:`_OpenGroup` — it never crosses an actor boundary and never reaches
+    the wire. It exists so the keys the derivation needs — ``agent_id`` for
+    grouping, ``message_id`` for the summary cache — have a home that is not the
+    report the model reads back (:class:`AgentActivity`).
+
+    Attributes:
+        name: Member name at the time the message was received.
+        agent_id: Identity of the actor. The grouping key — names are reusable.
+        role: Member role.
+        message_id: The open message being handled. Also the summary cache key.
+        started_at: When the handler started (the ``ReceivedMessage`` timestamp).
+        suspect: True when more than one message is open for this member.
+    """
+
+    name: str
+    agent_id: uuid.UUID
+    role: str
+    message_id: uuid.UUID
+    started_at: datetime
+    suspect: bool
+
+
+@dataclass(slots=True)
 class ActivitySnapshot:
     """Everything derived from telemetry, before any task text is applied.
 
-    Runtime bookkeeping local to one ``who_is_working`` call, like
+    Runtime bookkeeping local to one ``team_activity`` call, like
     :class:`_OpenGroup`. It exists so the two report paths share one derivation:
     the truncate-only path and the summarizing path differ solely in what they do
     with ``texts``, never in how the rows are found.
 
     Attributes:
         generated_at: When the derivation ran; also the report timestamp.
-        rows: One row per busy member, with ``task`` still a placeholder.
+        rows: One internal row per busy member, derivation keys included.
         texts: Resolved task text per open ``message_id``.
     """
 
     generated_at: datetime
-    rows: list[AgentActivity]
+    rows: list[MemberRow]
     texts: dict[uuid.UUID, str]
 
 
@@ -418,7 +446,7 @@ def _collect_open_groups(
     return groups
 
 
-def _build_rows(groups: dict[uuid.UUID, _OpenGroup], now: datetime) -> list[AgentActivity]:
+def _build_rows(groups: dict[uuid.UUID, _OpenGroup]) -> list[MemberRow]:
     """One row per group, reported against its OLDEST open entry.
 
     A group holding more than one open entry cannot arise on a live team — Pykka
@@ -427,22 +455,18 @@ def _build_rows(groups: dict[uuid.UUID, _OpenGroup], now: datetime) -> list[Agen
     row names the entry the agent is most plausibly still inside and carries
     ``suspect=True``; it is never folded into a plain "working" and never dropped.
 
-    ``task`` is a placeholder here — :func:`_resolve_task_texts` fills it in.
+    Task text is not resolved here — :func:`_resolve_task_texts` does that.
     """
-    rows: list[AgentActivity] = []
+    rows: list[MemberRow] = []
     for agent_id, group in groups.items():
         oldest = min(group.entries, key=lambda msg: _as_utc(cast(datetime, msg.timestamp)))
-        started_at = _as_utc(cast(datetime, oldest.timestamp))
         rows.append(
-            AgentActivity(
+            MemberRow(
                 name=group.sender.name,
                 agent_id=agent_id,
                 role=group.sender.role,
                 message_id=oldest.message_id,
-                task=UNRESOLVED_TASK,
-                summarized=False,
-                started_at=started_at,
-                busy_for_seconds=max((now - started_at).total_seconds(), 0.0),
+                started_at=_as_utc(cast(datetime, oldest.timestamp)),
                 suspect=len(group.entries) > 1,
             )
         )
@@ -450,7 +474,7 @@ def _build_rows(groups: dict[uuid.UUID, _OpenGroup], now: datetime) -> list[Agen
 
 
 def _resolve_task_texts(
-    orchestrator_proxy: Orchestrator, rows: list[AgentActivity]
+    orchestrator_proxy: Orchestrator, rows: list[MemberRow]
 ) -> dict[uuid.UUID, str]:
     """Task text per open ``message_id``, walking ``SentMessage`` newest-first.
 
@@ -498,7 +522,7 @@ def build_snapshot(
     """
     now = datetime.now(UTC)
     groups = _collect_open_groups(orchestrator_proxy, caller_id, now, stale_after_seconds)
-    rows = _build_rows(groups, now)
+    rows = _build_rows(groups)
     return ActivitySnapshot(
         generated_at=now,
         rows=rows,
@@ -506,8 +530,20 @@ def build_snapshot(
     )
 
 
+def _to_activity(row: MemberRow, task: str, summarized: bool) -> AgentActivity:
+    """Build the wire row from an internal one — the derivation keys stop here."""
+    return AgentActivity(
+        name=row.name,
+        role=row.role,
+        task=task,
+        summarized=summarized,
+        started_at=row.started_at,
+        suspect=row.suspect,
+    )
+
+
 def apply_truncations(
-    rows: list[AgentActivity], texts: dict[uuid.UUID, str], max_chars: int
+    rows: list[MemberRow], texts: dict[uuid.UUID, str], max_chars: int
 ) -> list[AgentActivity]:
     """Attach truncated task text to every row.
 
@@ -518,12 +554,12 @@ def apply_truncations(
     out: list[AgentActivity] = []
     for row in rows:
         text = texts.get(row.message_id, UNRESOLVED_TASK)
-        out.append(row.model_copy(update={"task": _truncate(text, max_chars)}))
+        out.append(_to_activity(row, _truncate(text, max_chars), summarized=False))
     return out
 
 
 def apply_summaries(
-    rows: list[AgentActivity],
+    rows: list[MemberRow],
     texts: dict[uuid.UUID, str],
     activity_proxy: TeamActivityActor,
     budget: SummaryBudget,
@@ -540,20 +576,16 @@ def apply_summaries(
     shared by every card on the team, so a card with a smaller ``max_task_chars``
     can read back a summary produced under a larger one.
     """
-    out: list[AgentActivity] = []
+    tasks: dict[uuid.UUID, tuple[str, bool]] = {}
     pending: set[uuid.UUID] = set()
     for row in rows:
         text = texts.get(row.message_id, UNRESOLVED_TASK)
         if summarize_over is None or len(text) <= summarize_over:
-            out.append(row.model_copy(update={"task": _truncate(text, budget.max_chars)}))
+            tasks[row.message_id] = (_truncate(text, budget.max_chars), False)
             continue
         cached = activity_proxy.get(row.message_id)
         if cached is not None:
-            out.append(
-                row.model_copy(
-                    update={"task": _truncate(cached, budget.max_chars), "summarized": True}
-                )
-            )
+            tasks[row.message_id] = (_truncate(cached, budget.max_chars), True)
             continue
         activity_proxy.request(
             row.message_id,
@@ -565,19 +597,20 @@ def apply_summaries(
             ),
         )
         pending.add(row.message_id)
-        out.append(row.model_copy(update={"task": _truncate(text, budget.max_chars)}))
+        tasks[row.message_id] = (_truncate(text, budget.max_chars), False)
 
-    if not pending:
-        return out, 0
-    return _harvest_summaries(out, pending, activity_proxy, budget)
+    still_pending = (
+        _harvest_summaries(tasks, pending, activity_proxy, budget) if pending else 0
+    )
+    return [_to_activity(row, *tasks[row.message_id]) for row in rows], still_pending
 
 
 def _harvest_summaries(
-    rows: list[AgentActivity],
+    tasks: dict[uuid.UUID, tuple[str, bool]],
     pending: set[uuid.UUID],
     activity_proxy: TeamActivityActor,
     budget: SummaryBudget,
-) -> tuple[list[AgentActivity], int]:
+) -> int:
     """Poll ONCE for the whole pending set, then sweep for partial arrivals.
 
     ``poll_deferred`` returns the first non-``None`` result, so a ``fetch`` that
@@ -585,6 +618,9 @@ def _harvest_summaries(
     therefore answers only when every key has landed — and the sweep afterwards
     picks up whatever arrived while the budget was running out. Without the sweep
     ``pending_summaries`` over-counts members whose summary actually did land.
+
+    Mutates ``tasks`` in place for every arrival and returns the count of keys
+    still unresolved when the budget ran out.
     """
     keys = sorted(pending, key=str)
 
@@ -598,18 +634,6 @@ def _harvest_summaries(
     if resolved is None:
         resolved = {key: value for key in keys if (value := activity_proxy.get(key)) is not None}
 
-    harvested = [
-        row.model_copy(
-            update={
-                "task": _truncate(resolved[row.message_id], budget.max_chars),
-                "summarized": True,
-            }
-        )
-        if row.message_id in pending and row.message_id in resolved
-        else row
-        for row in rows
-    ]
-    still_pending = sum(
-        1 for row in rows if row.message_id in pending and row.message_id not in resolved
-    )
-    return harvested, still_pending
+    for key, summary in resolved.items():
+        tasks[key] = (_truncate(summary, budget.max_chars), True)
+    return len(pending - resolved.keys())
