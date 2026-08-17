@@ -24,6 +24,7 @@ from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import Message
+from akgentic.core.orchestrator import Orchestrator
 from akgentic.tool.notification import actor as actor_module
 from akgentic.tool.notification.actor import (
     NOTIFICATION_ACTOR_NAME,
@@ -66,6 +67,7 @@ class FakeRoster:
     def __init__(self, *members: ActorAddress) -> None:
         self.members = list(members)
         self.calls = 0
+        self.asked: list[tuple[ActorAddress, type]] = []
 
     def get_team(self) -> list[ActorAddress]:
         self.calls += 1
@@ -86,9 +88,19 @@ class OrchestratorAddress(MockActorAddress):
 
 
 def _give_roster(actor: NotificationActor, roster: FakeRoster) -> None:
-    """Point *actor* at an orchestrator whose ask returns *roster*."""
+    """Point *actor* at an orchestrator whose ask returns *roster*.
+
+    The fake records what it was asked for, so a test can pin the ask target as
+    well as the ask count — a guard that read the roster off the wrong address
+    would otherwise satisfy every counting assertion here.
+    """
     actor._orchestrator = OrchestratorAddress()
-    actor.proxy_ask = lambda *_args, **_kwargs: roster  # type: ignore[method-assign]
+
+    def _ask(address: ActorAddress, cls: type) -> FakeRoster:
+        roster.asked.append((address, cls))
+        return roster
+
+    actor.proxy_ask = _ask  # type: ignore[method-assign]
 
 
 def _new_actor() -> NotificationActor:
@@ -269,7 +281,12 @@ class TestAvailabilityGuard:
         _give_roster(notifier, FakeRoster(MockActorAddress("someone-else")))
         notification_id = notifier.schedule(address, "waiting for alice", 30)
         _make_due(notifier, notification_id)
-        before = notifier.state.pending[notification_id]
+        # A copy, not the stored object: `PendingNotification` is not frozen, so an in-place
+        # `fire_at` bump — the first trap this story names — would compare equal to itself
+        # and leave the central claim of this test unasserted. Shallow is right: it rebinds
+        # every scalar field, and `owner` is the one field that must stay the same object
+        # (a live address holds a thread lock and cannot be deep-copied).
+        before = notifier.state.pending[notification_id].model_copy()
 
         spy = StateChangeSpy()
         notifier.state.observer(spy)
@@ -362,6 +379,9 @@ class TestAvailabilityGuard:
             notifier.deliver_due()
 
             assert roster.calls == 1, "the roster is read once a scan, never once an entry"
+            assert roster.asked == [(notifier.orchestrator, Orchestrator)], (
+                "the roster comes from this actor's own orchestrator, asked as an Orchestrator"
+            )
             assert notifier.state.pending == {}
         finally:
             first.stop()

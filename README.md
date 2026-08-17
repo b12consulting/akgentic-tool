@@ -1007,8 +1007,8 @@ for its real owner.
 **Delivery comes from the notification actor.** It sends as itself, so the delivered `sender` is
 `#NotificationTool`, and the message's `type` is `"notification"`. The send is a tell, so a busy
 agent never blocks the actor. Delivery waits while the owner is off the team — an agent between
-hire and start, or a resumed team whose agents have not re-registered yet — and goes through as
-soon as it is back, for up to five minutes; past that window, and for a send that fails despite the
+hire and start, or a resumed team whose agents have not re-registered yet — for up to five minutes,
+and goes through as soon as it is back; past that window, and for a send that fails despite the
 owner being on the team, the entry is logged and dropped rather than retried.
 
 **Stop and resume.** A pending entry stores an absolute due time, not a remaining delay. An entry

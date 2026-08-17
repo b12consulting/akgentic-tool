@@ -271,13 +271,14 @@ class NotificationActor(Akgent[NotificationConfig, NotificationState]):
             True when the entry was dropped, which the caller counts as the
             mutation behind its single end-of-scan notification.
         """
-        if (now - entry.fire_at).total_seconds() < DELIVERY_GRACE_S:
+        waited_s = (now - entry.fire_at).total_seconds()
+        if waited_s < DELIVERY_GRACE_S:
             return False
         del self.state.pending[entry.notification_id]
         logger.warning(
             "Notification %s waited %.0f s for absent owner %s — dropped",
             entry.notification_id,
-            DELIVERY_GRACE_S,
+            waited_s,
             entry.owner.name,
         )
         return True
@@ -290,9 +291,12 @@ class NotificationActor(Akgent[NotificationConfig, NotificationState]):
         actor performs the send. The call is a tell underneath, so a busy owner
         never blocks this actor's mailbox.
 
-        A failure — most often an owner fired before its notification came due —
-        is logged and the entry dropped. It is never retried and never raised:
-        one dead recipient must not break the scan for everyone else.
+        A failure — most often a restored address with no live ref — is logged
+        and the entry dropped. It is never retried and never raised: one dead
+        recipient must not break the scan for everyone else. An owner *fired*
+        before its notification came due no longer arrives here: it leaves the
+        roster with its stop, so the availability guard postpones its entry and
+        drops it on the grace expiry instead.
         """
         try:
             message = self._message_cls.model_validate(
