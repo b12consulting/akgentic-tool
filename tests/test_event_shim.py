@@ -7,8 +7,14 @@ access and not on import, it names the destination, and it resolves to the very 
 object as the new module.
 
 One symbol took a different exit. ``ToolStatePayload`` was not moved but **removed**, so
-the last class here pins the opposite behaviour: no warning, no resolution, on every path
+a class below pins the opposite behaviour: no warning, no resolution, on every path
 the name ever had.
+
+The three observer entries followed it out of the shim (2026-08-17): their Stable-tier
+surface is the ``akgentic.tool`` package root, which never changed, and their
+``event.py`` residence was an accident of the pre-split layout. The façade now carries
+exactly the four event symbols — the ones that are load-bearing for persisted
+``__model__`` markers and for the sibling ``CommandsAnnouncedEvent`` import.
 """
 
 from __future__ import annotations
@@ -121,11 +127,21 @@ class TestShimWarnsOnAccess:
             resolved = getattr(event_shim, name)
         assert resolved is expected
 
+    def test_moved_map_covers_exactly_the_four_event_symbols(self) -> None:
+        """Guard the guard: a drifted ``_MOVED`` would make the sweeps above vacuous."""
+        assert sorted(_MOVED) == [
+            "CommandArg",
+            "CommandDescriptor",
+            "CommandsAnnouncedEvent",
+            "ToolStateEvent",
+        ]
+        assert set(_MOVED.values()) == {"akgentic.tool.core.event"}
+
     def test_repeated_access_keeps_warning(self) -> None:
         """Caching into ``globals()`` would silence every access after the first."""
         for _ in range(2):
             with pytest.warns(DeprecationWarning):
-                _ = event_shim.ToolObserver
+                _ = event_shim.CommandArg
 
     def test_warning_names_no_removal_release(self) -> None:
         """No version number and no date — the schedule is deliberately open."""
@@ -198,6 +214,44 @@ class TestToolStatePayloadIsGoneNotMoved:
         assert "ToolStatePayload" not in akgentic.tool.__all__
         assert "ToolStatePayload" not in _MOVED
         assert "ToolStatePayload" not in dir(event_shim)
+
+
+class TestObserversAreGoneFromTheShim:
+    """The three observer entries were withdrawn from the façade, not moved again.
+
+    Unlike ``ToolStatePayload`` they still exist — at the package root, which is their
+    Stable-tier surface, and in their post-split homes. What is pinned here is that the
+    ``akgentic.tool.event`` path no longer serves them on either statement form, without
+    warning, while the root keeps resolving them silently.
+    """
+
+    _OBSERVERS = ["ToolObserver", "ActorToolObserver", "TeamManagementToolObserver"]
+
+    @pytest.mark.parametrize("name", _OBSERVERS)
+    def test_from_import_raises_import_error(self, name: str) -> None:
+        with pytest.raises(ImportError):
+            _from_import("akgentic.tool.event", name)
+
+    @pytest.mark.parametrize("name", _OBSERVERS)
+    def test_facade_attribute_access_raises_and_does_not_warn(self, name: str) -> None:
+        with warnings.catch_warnings(record=True) as records:
+            warnings.simplefilter("always")
+            with pytest.raises(AttributeError):
+                _ = getattr(event_shim, name)
+        assert [str(record.message) for record in records] == []
+
+    @pytest.mark.parametrize("name", _OBSERVERS)
+    def test_package_root_still_resolves_without_warning(self, name: str) -> None:
+        with warnings.catch_warnings(record=True) as records:
+            warnings.simplefilter("always")
+            resolved = getattr(akgentic.tool, name)
+        assert resolved is not None
+        assert [str(record.message) for record in records] == []
+
+    @pytest.mark.parametrize("name", _OBSERVERS)
+    def test_the_name_survives_in_no_shim_export_list(self, name: str) -> None:
+        assert name not in _MOVED
+        assert name not in dir(event_shim)
 
 
 class TestKnowledgeGraphStateEventIsUntouched:

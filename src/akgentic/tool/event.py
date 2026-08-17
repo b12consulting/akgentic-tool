@@ -1,10 +1,16 @@
 """Compatibility façade for the pre-split ``akgentic.tool.event`` module.
 
 The symbols that lived here were split by audience: package-global contracts into
-``akgentic.tool.core``, domain types into their domain. This module stays on disk so
-no consumer has to change an import line — sibling packages and anyone on PyPI keep
-working, and events persisted with a pre-split ``__model__`` marker keep resolving,
-since that lookup is ``import_module`` plus ``getattr``.
+``akgentic.tool.core``, domain types into their domain. This module stays on disk
+for the **event symbols only** — they are load-bearing twice over: a sibling package
+imports ``CommandsAnnouncedEvent`` from here, and events persisted with a pre-split
+``__model__`` marker keep resolving through this path, since that lookup is
+``import_module`` plus ``getattr``.
+
+The observer entries were withdrawn (2026-08-17): their supported surface is the
+``akgentic.tool`` package root, which never changed, so their residence here was an
+accident of the pre-split layout. Importing one from this module raises, without a
+deprecation detour.
 
 Resolution goes through PEP 562, so the warning fires on **attribute access** and
 never at import time. An import-time warning would hit every consumer of the
@@ -24,11 +30,6 @@ if TYPE_CHECKING:
     from akgentic.tool.core.event import CommandDescriptor as CommandDescriptor
     from akgentic.tool.core.event import CommandsAnnouncedEvent as CommandsAnnouncedEvent
     from akgentic.tool.core.event import ToolStateEvent as ToolStateEvent
-    from akgentic.tool.core.observer import ActorToolObserver as ActorToolObserver
-    from akgentic.tool.core.observer import ToolObserver as ToolObserver
-    from akgentic.tool.team.observer import (
-        TeamManagementToolObserver as TeamManagementToolObserver,
-    )
 
 # No removal release is named here, and that is deliberate rather than an oversight.
 # Naming one commits this shim's fate to a version number chosen before anyone knows
@@ -43,9 +44,6 @@ _MOVED: dict[str, str] = {
     "CommandArg": "akgentic.tool.core.event",
     "CommandDescriptor": "akgentic.tool.core.event",
     "CommandsAnnouncedEvent": "akgentic.tool.core.event",
-    "ToolObserver": "akgentic.tool.core.observer",
-    "ActorToolObserver": "akgentic.tool.core.observer",
-    "TeamManagementToolObserver": "akgentic.tool.team.observer",
 }
 
 

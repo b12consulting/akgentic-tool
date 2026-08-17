@@ -298,13 +298,18 @@ source — useful for injecting team-specific constraints at configuration time.
 ## Migration: moved import paths
 
 Two modules were reorganised: `akgentic.tool.event` was split by audience, and
-`akgentic.tool.vector` moved next to the code built on it. **Every old path below still
-works.** Each one now resolves through a compatibility façade that emits a
-`DeprecationWarning` on **attribute access** — not at import time, so code that touches
-none of these symbols is never warned. **No removal release is scheduled.**
+`akgentic.tool.vector` moved next to the code built on it. The event symbols still resolve
+through a compatibility façade at the old path, which emits a `DeprecationWarning` on
+**attribute access** — not at import time, so code that touches none of them is never
+warned. **No removal release is scheduled** for that façade. The Internal-tier courtesy
+entries, by contrast, have been **withdrawn**: those old paths now raise `ImportError`.
 
 **Importing from the `akgentic.tool` package root needs no migration at all.** That surface
-is unchanged, and reaching a symbol through it emits no warning.
+is unchanged, and reaching a symbol through it emits no warning. The root is also the
+supported home of the global observers — `from akgentic.tool import ToolObserver` has
+always worked and still does.
+
+### Still shimmed — resolves, with a `DeprecationWarning`
 
 | Old path | New home | Tier |
 |---|---|---|
@@ -312,13 +317,24 @@ is unchanged, and reaching a symbol through it emits no warning.
 | `akgentic.tool.event.CommandArg` | `akgentic.tool.core.event` | Stable |
 | `akgentic.tool.event.CommandDescriptor` | `akgentic.tool.core.event` | Stable |
 | `akgentic.tool.event.CommandsAnnouncedEvent` | `akgentic.tool.core.event` | Stable |
-| `akgentic.tool.event.ToolObserver` | `akgentic.tool.core.observer` | Stable |
-| `akgentic.tool.event.ActorToolObserver` | `akgentic.tool.core.observer` | Stable |
-| `akgentic.tool.event.TeamManagementToolObserver` | `akgentic.tool.team.observer` | Internal |
-| `akgentic.tool.vector.VectorEntry` | `akgentic.tool.vector_store.vector` | Internal |
-| `akgentic.tool.vector.EmbeddingService` | `akgentic.tool.vector_store.vector` | Internal |
-| `akgentic.tool.vector.VectorIndex` | `akgentic.tool.vector_store.vector` | Internal |
-| `akgentic.tool.vector._check_vector_search_dependencies` | `akgentic.tool.vector_store.vector` | Internal |
+
+These four stay shimmed because the façade is load-bearing beyond source compatibility:
+events persisted before the split carry `__model__` markers that resolve through this
+module, and a sibling package imports `CommandsAnnouncedEvent` from it.
+
+### Withdrawn — raises `ImportError`, move now
+
+| Old path | Import instead |
+|---|---|
+| `akgentic.tool.event.ToolObserver` | `akgentic.tool` (root) or `akgentic.tool.core.observer` |
+| `akgentic.tool.event.ActorToolObserver` | `akgentic.tool` (root) or `akgentic.tool.core.observer` |
+| `akgentic.tool.event.TeamManagementToolObserver` | `akgentic.tool` (root) or `akgentic.tool.team.observer` |
+| `akgentic.tool.vector.*` (module removed) | `akgentic.tool` (root) or `akgentic.tool.vector_store.vector` |
+
+The observers are Stable-tier **symbols** — but the promise attaches to the package root,
+their supported surface, not to every path they historically resolved from. Their `event.py`
+residence was an accident of the pre-split layout. The `akgentic.tool.vector` module was
+Internal-tier in its entirety and is gone from disk.
 
 ### What the two tiers mean
 
@@ -328,24 +344,26 @@ something you may build against**, and the two answers carry different promises.
 **Stable — a supported surface.** These are the contracts a custom `ToolCard` author outside
 this package writes against: the `akgentic.tool` package root, the core abstractions
 (`ToolCard`, `BaseToolParam`, `ToolFactory`, `Channels`, `CommandRegistry`), the *global*
-observers `ToolObserver` and `ActorToolObserver`, `ToolStateEvent`, and the command-discovery
-models. Their import paths are part of the API. If one moves, it is shimmed, and the shim is
-kept.
+observers `ToolObserver` and `ActorToolObserver` **at the package root**, `ToolStateEvent`,
+and the command-discovery models. That surface is part of the API: if a symbol on it moves,
+it is shimmed, and the shim is kept.
 
 **Internal — not a surface.** These belong to one specific tool: `TeamManagementToolObserver`
 is `TeamTool`'s contract, the vector primitives are `vector_store`'s. They move freely with the
-tool that owns them. Their rows above are a **courtesy, not a guarantee** — the shim entry exists
-because removing a working import for no reason is rude, not because the path was ever promised.
+tool that owns them. A shim entry for one is a **courtesy, not a guarantee** — it exists because
+removing a working import for no reason is rude, not because the path was ever promised.
 Treating it as a promise would freeze this package's internal structure by accident, which is
 exactly what the split was done to avoid.
 
-An internal symbol may also be **removed outright**, not merely moved — and then there is no row
-and no warning. `ToolStatePayload` was removed this way: it was an alias for the knowledge graph's
-delta type, it stopped annotating anything once `ToolStateEvent.payload` was typed structurally,
-and it is now gone from every path it ever had. Importing it raises `ImportError` rather than
-warning, because a shim for a name with no meaning left would only preserve the confusion.
+An internal symbol may also be **removed outright**, not merely moved — and then there is no
+shim and no warning. `ToolStatePayload` went first: an alias for the knowledge graph's delta
+type that stopped annotating anything once `ToolStateEvent.payload` was typed structurally.
+The courtesy entries above were withdrawn the same way, this time at module scale: the whole
+`akgentic.tool.vector` module and the observer entries in `event.py`. Importing a withdrawn
+path raises `ImportError` rather than warning.
 
-If one of your imports is in the Internal tier, move it now rather than relying on the row.
+If one of your imports is in the *Withdrawn* table, it has already stopped working — move it
+to the path in its *Import instead* column.
 
 ## Observers: How a Tool Acts on the System
 
