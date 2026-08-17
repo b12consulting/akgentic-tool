@@ -952,9 +952,11 @@ NotificationTool(message_class="acme_core.messages.ReminderMessage")
 | `message_class` | `"akgentic.agent.messages.AgentMessage"` | Dotted import path of the class delivered when a notification comes due |
 | `max_delay_seconds` | `300` | Largest delay an agent may schedule |
 
-Those two fields are the whole configuration — no capability adds one of its own, and channel
-placement comes from which card method returns the callable: `get_tools()` for `TOOL_CALL`,
-`get_commands()` for `COMMAND`.
+Those two fields are the whole configuration — no capability adds one of its own. With no param
+model to carry an `expose` set, this card places its capabilities by **which method returns the
+callable** — `get_tools()` for `TOOL_CALL`, `get_commands()` for `COMMAND` — rather than through
+`BaseToolParam.expose`, which is how the rest of the package declares channel placement. That is
+how this card ships today, not a pattern to copy.
 
 | Capability | Channels | Description |
 |---|---|---|
@@ -968,6 +970,11 @@ that names one missing either field raises `ValueError` at `observer()` bind tim
 notification comes due. Naming the class by string rather than importing it is what keeps this
 package free of any dependency on the package that owns it: the deployment picks the delivery
 class, and the card resolves it at wiring time.
+
+One requirement is **not** covered by that bind-time check: the `type` field must also *accept* the
+value `"notification"`, which is what delivery writes. A class whose `type` is a `Literal` set
+excluding it passes wiring and then fails when the entry comes due — the failure is logged and the
+entry dropped, not raised. The default `AgentMessage` accepts it; a custom delivery class must too.
 
 **The delay cap.** `delay_seconds` must fall between 1 and `max_delay_seconds`; anything outside
 that range raises `RetriableError`, so an over-long delay reaches the LLM as a correctable mistake
