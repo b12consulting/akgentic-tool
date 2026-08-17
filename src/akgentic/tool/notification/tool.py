@@ -1,23 +1,33 @@
 """``NotificationTool``: let an agent schedule a delayed message to itself.
 
-The card carries exactly two fields — the dotted path of the delivery message
-class and the maximum schedulable delay. Everything else is behaviour: the three
-capabilities are ownership-scoped by the caller's ``myAddress``, captured once at
-bind time, and they reach the ``#NotificationTool`` singleton through the ask
-proxy (ADR-035 §2).
+Two fields configure delivery — the dotted path of the message class and the
+maximum schedulable delay — and one field per capability decides whether it
+exists and which channels it reaches, through the ``expose`` set of its own
+``BaseToolParam``, like every other card in this package. All three capabilities
+are ownership-scoped by the caller's ``myAddress``, captured once at bind time,
+and they reach the ``#NotificationTool`` singleton through the ask proxy
+(ADR-035 §2).
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import UTC, datetime
+from inspect import cleandoc
 from typing import Any, cast
 
 from pydantic import Field, PrivateAttr
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.orchestrator import Orchestrator
-from akgentic.tool.core import BaseToolParam, ToolCard
+from akgentic.tool.core import (
+    COMMAND,
+    TOOL_CALL,
+    BaseToolParam,
+    Channels,
+    ToolCard,
+    _resolve,
+)
 from akgentic.tool.core.observer import ActorToolObserver, ToolObserver
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.notification.actor import (
@@ -34,22 +44,34 @@ from akgentic.tool.notification.models import (
 DEFAULT_MAX_DELAY_SECONDS = 300
 
 
-class ListPendingNotifications(BaseToolParam):
-    """Registry key for ``list_pending_notifications``. Carries no configuration.
+class RegisterNotification(BaseToolParam):
+    """Schedule a delayed message to yourself — on both channels by default."""
 
-    Per-capability parameter classes are out of scope for this tool: the card's
-    two fields are its whole configuration, and channel placement comes from
-    which card method returns the callable — ``get_tools()`` for ``TOOL_CALL``,
-    ``get_commands()`` for ``COMMAND``. This class exists only because
-    ``ToolCard.get_commands()`` is keyed by ``type[BaseToolParam]``.
-    """
+    expose: set[Channels] = {TOOL_CALL, COMMAND}
+
+
+class ListPendingNotifications(BaseToolParam):
+    """List your own pending notifications — on both channels by default."""
+
+    expose: set[Channels] = {TOOL_CALL, COMMAND}
 
 
 class CancelNotification(BaseToolParam):
-    """Registry key for ``cancel_notification``. Carries no configuration.
+    """Cancel one of your own pending notifications — on both channels by default."""
 
-    See :class:`ListPendingNotifications` for why it exists.
+    expose: set[Channels] = {TOOL_CALL, COMMAND}
+
+
+def _with_instructions(params: BaseToolParam, doc: str | None) -> str | None:
+    """Append *params*' instructions to *doc*, keeping the docstring parseable.
+
+    ``format_docstring`` appends a flush-left block, and the schema builder
+    parses the result with griffe, which dedents only when every line past the
+    first shares one margin. Appending to a still-indented docstring therefore
+    leaves the ``Args:`` section unparsed and every parameter undescribed —
+    ``cleandoc`` first is what keeps the two compatible.
     """
+    return params.format_docstring(cleandoc(doc) if doc else doc)
 
 
 def _require_live_agent(observer_or_none: Callable[[], ActorToolObserver | None]) -> None:
@@ -68,11 +90,17 @@ class NotificationTool(ToolCard):
     Attributes:
         message_class: Dotted import path of the class delivered when a
             notification comes due. It must resolve to a ``Message`` subclass
-            declaring ``content`` and ``type`` fields; any violation raises
-            ``ValueError`` at ``observer()`` bind time, never at fire time.
-            Naming the class by path rather than importing it is what keeps this
-            package free of any dependency on the package that owns it.
+            declaring ``content`` and ``type`` fields and able to carry
+            ``type="notification"``; any violation raises ``ValueError`` at
+            ``observer()`` bind time, never at fire time. Naming the class by
+            path rather than importing it is what keeps this package free of any
+            dependency on the package that owns it.
         max_delay_seconds: Upper bound on a schedulable delay.
+        register_notification: The scheduling capability. ``False`` removes it
+            entirely; a param instance narrows its channels or adds
+            ``instructions``.
+        list_pending_notifications: The listing capability, same shape.
+        cancel_notification: The cancellation capability, same shape.
     """
 
     message_class: str = Field(
@@ -86,6 +114,10 @@ class NotificationTool(ToolCard):
         default=DEFAULT_MAX_DELAY_SECONDS,
         description="Maximum delay, in seconds, that an agent may schedule.",
     )
+
+    register_notification: RegisterNotification | bool = True
+    list_pending_notifications: ListPendingNotifications | bool = True
+    cancel_notification: CancelNotification | bool = True
 
     _notification_proxy: NotificationActor | None = PrivateAttr(default=None)
 
@@ -154,24 +186,45 @@ class NotificationTool(ToolCard):
     ## Capability surface
     ##
     def get_tools(self) -> list[Callable[..., Any]]:
-        """Return the three LLM-callable capabilities."""
-        return [
-            self._send_factory(),
-            self._list_factory(),
-            self._cancel_factory(),
-        ]
+        """Return the enabled capabilities that reach the ``TOOL_CALL`` channel."""
+        tools: list[Callable[..., Any]] = []
+
+        rn = _resolve(self.register_notification, RegisterNotification)
+        if rn and TOOL_CALL in rn.expose:
+            tools.append(self._register_factory(rn))
+
+        lpn = _resolve(self.list_pending_notifications, ListPendingNotifications)
+        if lpn and TOOL_CALL in lpn.expose:
+            tools.append(self._list_factory(lpn))
+
+        cn = _resolve(self.cancel_notification, CancelNotification)
+        if cn and TOOL_CALL in cn.expose:
+            tools.append(self._cancel_factory(cn))
+
+        return tools
 
     def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
-        """Return the two capabilities that are also programmatic commands."""
-        return {
-            ListPendingNotifications: self._list_factory(),
-            CancelNotification: self._cancel_factory(),
-        }
+        """Return the enabled capabilities that reach the ``COMMAND`` channel."""
+        commands: dict[type[BaseToolParam], Callable[..., Any]] = {}
+
+        rn = _resolve(self.register_notification, RegisterNotification)
+        if rn and COMMAND in rn.expose:
+            commands[RegisterNotification] = self._register_factory(rn)
+
+        lpn = _resolve(self.list_pending_notifications, ListPendingNotifications)
+        if lpn and COMMAND in lpn.expose:
+            commands[ListPendingNotifications] = self._list_factory(lpn)
+
+        cn = _resolve(self.cancel_notification, CancelNotification)
+        if cn and COMMAND in cn.expose:
+            commands[CancelNotification] = self._cancel_factory(cn)
+
+        return commands
 
     ##
     ## Closure factories — owner captured as data, observer captured weakly
     ##
-    def _send_factory(self) -> Callable[..., Any]:
+    def _register_factory(self, params: RegisterNotification) -> Callable[..., Any]:
         proxy = self._actor_proxy()
         owner: ActorAddress = self._actor_observer().myAddress
         observer_or_none = self._actor_observer_or_none  # bound method -> weak edge to agent
@@ -209,12 +262,15 @@ class NotificationTool(ToolCard):
         # the docstring with griffe, which dedents only when every line shares
         # one margin — a flush-left line appended to an indented docstring leaves
         # the Args section unparsed and both parameters undescribed.
-        register_notification.__doc__ = (register_notification.__doc__ or "").format(
-            max_delay=max_delay
-        )
+        #
+        # The order is load-bearing. Substituting first keeps that dedent intact;
+        # appending first would both re-break it and feed user-supplied
+        # `instructions` to str.format, where a single brace raises.
+        substituted = (register_notification.__doc__ or "").format(max_delay=max_delay)
+        register_notification.__doc__ = _with_instructions(params, substituted)
         return register_notification
 
-    def _list_factory(self) -> Callable[..., Any]:
+    def _list_factory(self, params: ListPendingNotifications) -> Callable[..., Any]:
         proxy = self._actor_proxy()
         owner: ActorAddress = self._actor_observer().myAddress
         observer_or_none = self._actor_observer_or_none
@@ -233,9 +289,12 @@ class NotificationTool(ToolCard):
             ]
             return "\n".join(["Pending notifications:", *lines])
 
+        list_pending_notifications.__doc__ = _with_instructions(
+            params, list_pending_notifications.__doc__
+        )
         return list_pending_notifications
 
-    def _cancel_factory(self) -> Callable[..., Any]:
+    def _cancel_factory(self, params: CancelNotification) -> Callable[..., Any]:
         proxy = self._actor_proxy()
         owner: ActorAddress = self._actor_observer().myAddress
         observer_or_none = self._actor_observer_or_none
@@ -258,4 +317,5 @@ class NotificationTool(ToolCard):
                 )
             return f"Notification {notification_id} cancelled."
 
+        cancel_notification.__doc__ = _with_instructions(params, cancel_notification.__doc__)
         return cancel_notification

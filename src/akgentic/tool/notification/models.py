@@ -1,20 +1,19 @@
 """Data models for the notification tool, and the delivery-class resolver.
 
-Everything that crosses an actor boundary here is a Pydantic model. ``Tick`` is a
-plain :class:`SerializableBaseModel` rather than a ``Message`` on purpose: the
-``Akgent`` telemetry sandwich fires only for ``Message`` instances, and a
-``Message`` tick would put ``#NotificationTool`` in busy telemetry once a second.
+Everything that crosses an actor boundary here is a Pydantic model.
 
 ``resolve_message_class`` lives here beside :class:`NotificationConfig` because it
 validates that config value: the card checks it at ``observer()`` bind time, and
-the actor resolves the same string when it starts (ADR-035 §2).
+the actor resolves the same string when it starts (ADR-035 §2). It also owns
+:data:`NOTIFICATION_TYPE`, because the resolver's last check is that the named
+class can actually carry that value.
 """
 
 from __future__ import annotations
 
 from importlib import import_module
 
-from pydantic import AwareDatetime, Field
+from pydantic import AwareDatetime, Field, ValidationError
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent_config import BaseConfig
@@ -31,6 +30,9 @@ so the concrete class is named by the deployment and resolved at wiring time.
 
 REQUIRED_MESSAGE_FIELDS = ("content", "type")
 """Model fields the resolved delivery class must declare."""
+
+NOTIFICATION_TYPE = "notification"
+"""Value written to the delivered message's ``type`` field."""
 
 
 class PendingNotification(SerializableBaseModel):
@@ -53,10 +55,6 @@ class PendingNotification(SerializableBaseModel):
     content: str
     created_at: AwareDatetime
     fire_at: AwareDatetime
-
-
-class Tick(SerializableBaseModel):
-    """Heartbeat payload told to the actor by its tick thread. Not a ``Message``."""
 
 
 class NotificationConfig(BaseConfig):
@@ -107,9 +105,10 @@ def resolve_message_class(dotted_path: str) -> type[Message]:
 
     Raises:
         ValueError: When the path is not importable, does not name a ``Message``
-            subclass, or names one that lacks a ``content`` or ``type`` field.
-            All three are configuration defects and surface at wiring time,
-            never when a notification comes due.
+            subclass, names one that lacks a ``content`` or ``type`` field, or
+            names one that cannot carry ``type="notification"``. All four are
+            configuration defects and surface at wiring time, never when a
+            notification comes due.
     """
     module_path, _, class_name = dotted_path.rpartition(".")
     if not module_path:
@@ -136,4 +135,16 @@ def resolve_message_class(dotted_path: str) -> type[Message]:
             f"message_class {dotted_path!r} does not declare the required "
             f"field(s): {', '.join(missing)}."
         )
+    # Declaring the two fields is not the same as accepting what delivery writes:
+    # a `type` narrowed to a Literal, an Enum, a pattern or a validator can still
+    # reject "notification". Probing with the payload delivery builds catches any
+    # of those, and catches them here rather than inside `_deliver`, where the
+    # broad except would log one line per fire and drop the entry.
+    try:
+        resolved.model_validate({"content": "", "type": NOTIFICATION_TYPE})
+    except ValidationError as exc:
+        raise ValueError(
+            f"message_class {dotted_path!r} cannot carry type={NOTIFICATION_TYPE!r}, "
+            f"which is the value written on delivery: {exc}"
+        ) from exc
     return resolved

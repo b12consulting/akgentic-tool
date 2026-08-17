@@ -8,7 +8,7 @@ from typing import Any
 import akgentic.tool
 import pytest
 from akgentic.core.agent_config import BaseConfig
-from akgentic.tool.core import ToolCard, ToolFactory
+from akgentic.tool.core import COMMAND, TOOL_CALL, ToolCard, ToolFactory
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.notification.actor import (
     NOTIFICATION_ACTOR_NAME,
@@ -21,6 +21,7 @@ from akgentic.tool.notification.tool import (
     CancelNotification,
     ListPendingNotifications,
     NotificationTool,
+    RegisterNotification,
 )
 from pydantic_ai.tools import Tool
 
@@ -37,13 +38,45 @@ def _tool_named(card: NotificationTool, name: str) -> Any:
 
 
 class TestCardSurface:
-    def test_declares_exactly_two_fields(self) -> None:
-        assert set(NotificationTool.model_fields) == {"message_class", "max_delay_seconds"}
+    def test_declares_exactly_five_fields(self) -> None:
+        assert set(NotificationTool.model_fields) == {
+            "message_class",
+            "max_delay_seconds",
+            "register_notification",
+            "list_pending_notifications",
+            "cancel_notification",
+        }
 
     def test_defaults(self) -> None:
         card = NotificationTool()
         assert card.message_class == DEFAULT_MESSAGE_CLASS
         assert card.max_delay_seconds == DEFAULT_MAX_DELAY_SECONDS
+        assert card.register_notification is True
+        assert card.list_pending_notifications is True
+        assert card.cancel_notification is True
+
+    @pytest.mark.parametrize(
+        "param_class", [RegisterNotification, ListPendingNotifications, CancelNotification]
+    )
+    def test_every_capability_param_ships_on_both_channels(
+        self, param_class: type[Any]
+    ) -> None:
+        assert param_class().expose == {TOOL_CALL, COMMAND}
+
+    @pytest.mark.parametrize(
+        "param_class", [RegisterNotification, ListPendingNotifications, CancelNotification]
+    )
+    def test_a_capability_param_carries_no_custom_fields(self, param_class: type[Any]) -> None:
+        """ADR-020: configuration only — channel placement and instructions, nothing else."""
+        assert set(param_class.model_fields) == {"instructions", "expose"}
+
+    def test_the_capability_params_are_exported_from_the_package(self) -> None:
+        """A config author cannot narrow ``expose`` without importing the param class."""
+        import akgentic.tool.notification as notification
+
+        for param_class in (RegisterNotification, ListPendingNotifications, CancelNotification):
+            assert getattr(notification, param_class.__name__) is param_class
+            assert param_class.__name__ in notification.__all__
 
     def test_is_a_tool_card_exported_from_the_package_root(self) -> None:
         assert issubclass(NotificationTool, ToolCard)
@@ -74,6 +107,22 @@ class TestCardSurface:
         restored = NotificationTool.model_validate_json(card.model_dump_json())
         assert restored.message_class == FAKE_MESSAGE_PATH
         assert restored.max_delay_seconds == 42
+
+    def test_a_configured_capability_param_survives_a_json_round_trip(self) -> None:
+        """The capability fields are ``bool | BaseToolParam`` — serializable by construction."""
+        card = NotificationTool(
+            message_class=FAKE_MESSAGE_PATH,
+            register_notification=RegisterNotification(
+                expose={COMMAND}, instructions="Only for CI checks."
+            ),
+            cancel_notification=False,
+        )
+        restored = NotificationTool.model_validate_json(card.model_dump_json())
+
+        assert isinstance(restored.register_notification, RegisterNotification)
+        assert restored.register_notification.expose == {COMMAND}
+        assert restored.register_notification.instructions == "Only for CI checks."
+        assert restored.cancel_notification is False
 
 
 class TestWiring:
@@ -152,10 +201,17 @@ class TestCapabilitySurface:
             "cancel_notification",
         ]
 
-    def test_get_commands_returns_only_list_and_cancel(self, wired_card: NotificationTool) -> None:
+    def test_get_commands_returns_all_three_capabilities(
+        self, wired_card: NotificationTool
+    ) -> None:
         commands = wired_card.get_commands()
-        assert set(commands) == {ListPendingNotifications, CancelNotification}
+        assert set(commands) == {
+            RegisterNotification,
+            ListPendingNotifications,
+            CancelNotification,
+        }
         assert {fn.__name__ for fn in commands.values()} == {
+            "register_notification",
             "list_pending_notifications",
             "cancel_notification",
         }
@@ -203,9 +259,9 @@ class TestCapabilitySurface:
         card = NotificationTool(message_class=FAKE_MESSAGE_PATH)
         registry = ToolFactory(tool_cards=[card], observer=observer).get_command_registry()
 
+        assert registry.has("register_notification")
         assert registry.has("list_pending_notifications")
         assert registry.has("cancel_notification")
-        assert not registry.has("register_notification")
         assert registry.dispatch("/list_pending_notifications") == "No pending notifications."
 
     def test_a_command_coerces_its_integer_argument(
@@ -218,6 +274,102 @@ class TestCapabilitySurface:
         registry = ToolFactory(tool_cards=[card], observer=observer).get_command_registry()
 
         assert registry.dispatch("/cancel_notification 1") == "Notification 1 cancelled."
+
+    def test_register_notification_dispatches_from_the_command_line(
+        self,
+        observer: FakeActorToolObserver,
+        notification_actor: NotificationActor,
+    ) -> None:
+        """The capability this story exists for: a human can schedule from the CLI."""
+        card = NotificationTool(message_class=FAKE_MESSAGE_PATH)
+        registry = ToolFactory(tool_cards=[card], observer=observer).get_command_registry()
+
+        result = registry.dispatch('/register_notification "check CI" 120')
+
+        assert "scheduled" in result
+        entry = notification_actor.state.pending[1]
+        assert entry.content == "check CI"
+        assert isinstance(entry.content, str)
+        assert (entry.fire_at - entry.created_at).total_seconds() == pytest.approx(120, abs=1)
+
+
+class TestExposeDrivenChannels:
+    """Channel placement comes from the resolved param's ``expose`` set, nothing else."""
+
+    def test_narrowing_to_tool_call_removes_a_capability_from_the_command_channel(
+        self, observer: FakeActorToolObserver
+    ) -> None:
+        card = NotificationTool(
+            message_class=FAKE_MESSAGE_PATH,
+            cancel_notification=CancelNotification(expose={TOOL_CALL}),
+        )
+        card.observer(observer)
+
+        assert "cancel_notification" in [tool.__name__ for tool in card.get_tools()]
+        assert CancelNotification not in card.get_commands()
+
+    def test_narrowing_to_command_removes_a_capability_from_the_tool_channel(
+        self, observer: FakeActorToolObserver
+    ) -> None:
+        card = NotificationTool(
+            message_class=FAKE_MESSAGE_PATH,
+            register_notification=RegisterNotification(expose={COMMAND}),
+        )
+        card.observer(observer)
+
+        assert "register_notification" not in [tool.__name__ for tool in card.get_tools()]
+        assert card.get_commands()[RegisterNotification].__name__ == "register_notification"
+
+    def test_false_removes_a_capability_from_both_channels(
+        self, observer: FakeActorToolObserver
+    ) -> None:
+        card = NotificationTool(
+            message_class=FAKE_MESSAGE_PATH,
+            list_pending_notifications=False,
+        )
+        card.observer(observer)
+
+        assert "list_pending_notifications" not in [tool.__name__ for tool in card.get_tools()]
+        assert ListPendingNotifications not in card.get_commands()
+
+    def test_instructions_reach_the_callable_docstring(
+        self, observer: FakeActorToolObserver
+    ) -> None:
+        card = NotificationTool(
+            message_class=FAKE_MESSAGE_PATH,
+            list_pending_notifications=ListPendingNotifications(
+                instructions="Check this before reporting idle."
+            ),
+        )
+        card.observer(observer)
+
+        doc = _tool_named(card, "list_pending_notifications").__doc__ or ""
+        assert "Additional Instructions:" in doc
+        assert "Check this before reporting idle." in doc
+
+    def test_instructions_compose_with_the_cap_substitution_in_that_order(
+        self, observer: FakeActorToolObserver
+    ) -> None:
+        """Substitute first, append second — and a brace in the instructions proves it.
+
+        Appending before substituting would feed the instructions text to
+        ``str.format``, where a single ``{`` raises, and would re-break the
+        griffe dedent the parameter descriptions depend on.
+        """
+        card = NotificationTool(
+            message_class=FAKE_MESSAGE_PATH,
+            max_delay_seconds=45,
+            register_notification=RegisterNotification(instructions="Prefer {json} payloads."),
+        )
+        card.observer(observer)
+
+        capability = _tool_named(card, "register_notification")
+        doc = capability.__doc__ or ""
+        assert "45 seconds" in doc, "the cap substitution still ran"
+        assert "Prefer {json} payloads." in doc, "the brace survived, so it was appended after"
+
+        tool = Tool(capability, require_parameter_descriptions=True)
+        assert set(tool.function_schema.json_schema["properties"]) == {"content", "delay_seconds"}
 
 
 class TestSchedule:

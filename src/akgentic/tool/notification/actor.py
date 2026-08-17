@@ -1,9 +1,11 @@
 """``#NotificationTool``: the team singleton that holds pending timers.
 
 The actor owns a dict of :class:`PendingNotification` and one daemon thread that
-tells it a ``Tick`` about once a second. Every mutation happens on the mailbox
-thread, so there is no lock here and none is needed; the thread's only action is
-the tell (ADR-035 §3).
+calls :meth:`NotificationActor.deliver_due` through the actor's own proxy about
+once a second. The call is mailbox-routed, so the scan runs on the actor thread
+where ``schedule`` and ``cancel`` run: every mutation of ``pending`` happens on
+one thread, and no lock is needed. The thread's only action is that
+fire-and-forget call, whose future it never waits on (ADR-035 §3).
 
 Delivery of an entry whose ``fire_at`` has passed needs no re-arm logic — a
 restored entry is simply due on the first tick after a resume.
@@ -22,10 +24,10 @@ from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import Akgent
 from akgentic.core.messages.message import Message
 from akgentic.tool.notification.models import (
+    NOTIFICATION_TYPE,
     NotificationConfig,
     NotificationState,
     PendingNotification,
-    Tick,
     resolve_message_class,
 )
 
@@ -43,17 +45,18 @@ TICK_JOIN_TIMEOUT_S = 2.0
 """Join budget in ``on_stop`` — bounded, because the loop observes the stop
 event within one tick."""
 
-NOTIFICATION_TYPE = "notification"
-"""Value written to the delivered message's ``type`` field."""
-
 
 def _tick_loop(stop_event: threading.Event, actor_ref: ActorRef[Any]) -> None:
-    """Tell *actor_ref* a ``Tick`` every ``TICK_INTERVAL_S`` until *stop_event* is set.
+    """Call ``deliver_due`` on *actor_ref* every ``TICK_INTERVAL_S`` until *stop_event* is set.
 
     Module-level, and capturing only its two arguments: a bound-method target
     would root the actor instance for as long as the thread lives, which is the
     one real leak this design could have. A dead actor breaks the loop rather
     than leaving it ticking a corpse forever.
+
+    The proxy call is fire-and-forget — the returned future is discarded, never
+    waited on, so a busy actor turns a one-second tick into a later one rather
+    than into a blocked timer thread.
 
     Args:
         stop_event: Set by ``on_stop`` to end the loop.
@@ -61,7 +64,7 @@ def _tick_loop(stop_event: threading.Event, actor_ref: ActorRef[Any]) -> None:
     """
     while not stop_event.wait(TICK_INTERVAL_S):
         try:
-            actor_ref.tell(Tick())
+            actor_ref.proxy().deliver_due()
         except ActorDeadError:
             break
 
@@ -170,11 +173,13 @@ class NotificationActor(Akgent[NotificationConfig, NotificationState]):
     ##
     ## Delivery
     ##
-    def receiveMsg_Tick(self, msg: Tick) -> None:
+    def deliver_due(self) -> None:
         """Deliver every entry that has come due, and drop it.
 
-        A tick that finds nothing due is a no-op: no message, and no state-change
-        notification for an empty scan.
+        Called once per tick by the timer thread through this actor's own proxy,
+        so it runs on the mailbox thread and cannot interleave with ``schedule``
+        or ``cancel``. A scan that finds nothing due is a no-op: no message, and
+        no state-change notification for an empty scan.
         """
         now = datetime.now(UTC)
         due = [entry for entry in self.state.pending.values() if entry.fire_at <= now]
@@ -186,22 +191,22 @@ class NotificationActor(Akgent[NotificationConfig, NotificationState]):
         self.state.notify_state_change()
 
     def _deliver(self, entry: PendingNotification) -> None:
-        """Send one due entry to its owner, as a message from that owner to itself.
+        """Send one due entry to its owner.
 
-        The owner is asked to send the message so the delivered ``sender`` is the
-        owner rather than this actor — ``Akgent.send`` stamps the sender of
-        whichever actor performs the send. The call is a tell, so a busy owner
+        This actor sends as itself, so the delivered ``sender`` is
+        ``#NotificationTool`` — ``Akgent.send`` stamps the sender of whichever
+        actor performs the send. The call is a tell underneath, so a busy owner
         never blocks this actor's mailbox.
 
         A failure — most often an owner fired before its notification came due —
         is logged and the entry dropped. It is never retried and never raised:
-        one dead recipient must not break the tick for everyone else.
+        one dead recipient must not break the scan for everyone else.
         """
         try:
             message = self._message_cls.model_validate(
                 {"content": entry.content, "type": NOTIFICATION_TYPE}
             )
-            self.proxy_tell(entry.owner, Akgent).send(entry.owner, message)
+            self.send(entry.owner, message)
         except Exception:  # noqa: BLE001 — a dead or unreachable owner drops the entry
             logger.warning(
                 "Notification %s could not be delivered to %s — dropped",

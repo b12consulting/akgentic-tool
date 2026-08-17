@@ -1,4 +1,4 @@
-"""Agent self-scheduled notifications: the card, its singleton actor, its models."""
+"""Agent self-scheduled notifications: the card, its capability params, its actor."""
 
 from akgentic.tool.notification.actor import (
     NOTIFICATION_ACTOR_NAME,
@@ -11,21 +11,27 @@ from akgentic.tool.notification.models import (
     NotificationConfig,
     NotificationState,
     PendingNotification,
-    Tick,
     resolve_message_class,
 )
-from akgentic.tool.notification.tool import NotificationTool
+from akgentic.tool.notification.tool import (
+    CancelNotification,
+    ListPendingNotifications,
+    NotificationTool,
+    RegisterNotification,
+)
 
 __all__ = [
     "DEFAULT_MESSAGE_CLASS",
     "NOTIFICATION_ACTOR_NAME",
     "NOTIFICATION_ACTOR_ROLE",
     "TICK_INTERVAL_S",
+    "CancelNotification",
+    "ListPendingNotifications",
     "NotificationActor",
     "NotificationConfig",
     "NotificationState",
     "NotificationTool",
     "PendingNotification",
-    "Tick",
+    "RegisterNotification",
     "resolve_message_class",
 ]

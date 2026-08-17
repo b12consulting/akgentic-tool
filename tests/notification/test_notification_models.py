@@ -13,12 +13,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.messages.message import Message, UserMessage
-from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.notification.models import (
     DEFAULT_MESSAGE_CLASS,
     NotificationState,
     PendingNotification,
-    Tick,
     resolve_message_class,
 )
 from pydantic import ValidationError
@@ -71,13 +69,18 @@ class TestResolveMessageClass:
         with pytest.raises(ValueError, match=r"field\(s\): type\."):
             resolve_message_class("akgentic.core.messages.message.UserMessage")
 
+    def test_a_type_that_cannot_hold_notification_raises_value_error(self) -> None:
+        """Declaring ``type`` is not accepting ``"notification"`` into it.
+
+        Without this check the class passes wiring and fails inside ``_deliver``,
+        where the broad except logs one line per fire and drops the entry — a
+        configuration defect surfacing as silently missing notifications.
+        """
+        with pytest.raises(ValueError, match="cannot carry type='notification'"):
+            resolve_message_class("tests.notification.conftest.NarrowTypeMessage")
+
 
 class TestModels:
-    def test_tick_is_serializable_but_not_a_message(self) -> None:
-        """A ``Message`` tick would put the actor in busy telemetry once a second."""
-        assert issubclass(Tick, SerializableBaseModel)
-        assert not issubclass(Tick, Message)
-
     def test_pending_notification_round_trips(self, owner_address: ActorAddress) -> None:
         now = datetime.now(UTC)
         entry = PendingNotification(

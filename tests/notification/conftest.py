@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Generator
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from akgentic.core.actor_address import ActorAddress
@@ -33,6 +33,17 @@ class FakeNotificationMessage(Message):
     """Stand-in for the configured delivery class: carries ``content`` and ``type``."""
 
     type: str = "request"
+    content: str = ""
+
+
+class NarrowTypeMessage(Message):
+    """Declares both fields, but its ``type`` cannot hold ``"notification"``.
+
+    The defect the resolver's fourth check exists for: declaring ``type`` is not
+    the same as accepting the value delivery writes into it.
+    """
+
+    type: Literal["chat"] = "chat"
     content: str = ""
 
 

@@ -941,55 +941,67 @@ through the same idempotent `getChildrenOrCreate` call as every other tool actor
 
 ```python
 from akgentic.tool import NotificationTool
+from akgentic.tool.core import COMMAND, TOOL_CALL
+from akgentic.tool.notification import CancelNotification, RegisterNotification
 
 NotificationTool()                            # AgentMessage delivery, 300 s cap
 NotificationTool(max_delay_seconds=60)        # tighter cap
 NotificationTool(message_class="acme_core.messages.ReminderMessage")
+
+NotificationTool(
+    register_notification=RegisterNotification(
+        expose={COMMAND},                     # a human schedules; the LLM cannot
+        instructions="Only for CI checks.",   # appended to the tool description
+    ),
+    cancel_notification=CancelNotification(expose={TOOL_CALL}),
+    list_pending_notifications=False,         # capability removed from both channels
+)
 ```
 
 | Field | Default | Purpose |
 |---|---|---|
 | `message_class` | `"akgentic.agent.messages.AgentMessage"` | Dotted import path of the class delivered when a notification comes due |
 | `max_delay_seconds` | `300` | Largest delay an agent may schedule |
+| `register_notification` | `True` | The scheduling capability — `False` removes it, a `RegisterNotification` configures it |
+| `list_pending_notifications` | `True` | The listing capability, same shape |
+| `cancel_notification` | `True` | The cancellation capability, same shape |
 
-Those two fields are the whole configuration — no capability adds one of its own. With no param
-model to carry an `expose` set, this card places its capabilities by **which method returns the
-callable** — `get_tools()` for `TOOL_CALL`, `get_commands()` for `COMMAND` — rather than through
-`BaseToolParam.expose`, which is how the rest of the package declares channel placement. That is
-how this card ships today, not a pattern to copy.
+Each capability is a `bool | BaseToolParam` field like everywhere else in this package: `True`
+enables it with defaults, `False` removes it from every channel, and a param instance narrows its
+`expose` set or adds `instructions`.
 
 | Capability | Channels | Description |
 |---|---|---|
-| `register_notification` | `TOOL_CALL` | Schedule a message to yourself from `content` and `delay_seconds`; returns a confirmation carrying the notification id |
+| `register_notification` | `TOOL_CALL`, `COMMAND` | Schedule a message to yourself from `content` and `delay_seconds`; returns a confirmation carrying the notification id |
 | `list_pending_notifications` | `TOOL_CALL`, `COMMAND` | Your own pending entries, with the time left on each |
 | `cancel_notification` | `TOOL_CALL`, `COMMAND` | Cancel one of your own pending entries by id |
 
-**The `message_class` contract.** The path must resolve to a `Message` subclass declaring `content`
-and `type` model fields. A path that is not importable, that does not name a `Message` subclass, or
-that names one missing either field raises `ValueError` at `observer()` bind time — never when a
-notification comes due. Naming the class by string rather than importing it is what keeps this
-package free of any dependency on the package that owns it: the deployment picks the delivery
-class, and the card resolves it at wiring time.
+The `COMMAND` column is the human `/`-command surface too, so with the shipped defaults
+`/register_notification "check CI" 120` schedules an entry from the command line.
 
-One requirement is **not** covered by that bind-time check: the `type` field must also *accept* the
-value `"notification"`, which is what delivery writes. A class whose `type` is a `Literal` set
-excluding it passes wiring and then fails when the entry comes due — the failure is logged and the
-entry dropped, not raised. The default `AgentMessage` accepts it; a custom delivery class must too.
+**The `message_class` contract.** The path must resolve to a `Message` subclass declaring `content`
+and `type` model fields, and that `type` must *accept* the value `"notification"`, which is what
+delivery writes. A path that is not importable, that does not name a `Message` subclass, that names
+one missing either field, or that names one whose `type` is a `Literal` excluding `"notification"`
+raises `ValueError` at `observer()` bind time — never when a notification comes due. Naming the
+class by string rather than importing it is what keeps this package free of any dependency on the
+package that owns it: the deployment picks the delivery class, and the card resolves it at wiring
+time.
 
 **The delay cap.** `delay_seconds` must fall between 1 and `max_delay_seconds`; anything outside
 that range raises `RetriableError`, so an over-long delay reaches the LLM as a correctable mistake
-rather than as a failure. Delivery granularity is ±1 s — the actor is told a tick about once a
-second.
+rather than as a failure. Delivery granularity is ±1 s — the actor scans for due entries about once
+a second.
 
 **Ownership is scoped per agent.** Each capability is bound to the address of the agent carrying
 the card, captured once at bind time. An agent lists only its own entries, and cancelling another
 agent's id fails exactly as cancelling an unknown one does — a `RetriableError` — while that entry
 stays pending for its real owner.
 
-**Delivery is a message from the agent to itself.** The owner performs the send, so the delivered
-`sender` is the agent rather than the notification actor, and the message's `type` is
-`"notification"`. The send is a tell, so a busy agent never blocks the actor; an owner fired before
-its notification came due has the entry logged and dropped rather than retried.
+**Delivery comes from the notification actor.** It sends as itself, so the delivered `sender` is
+`#NotificationTool`, and the message's `type` is `"notification"`. The send is a tell, so a busy
+agent never blocks the actor; an owner fired before its notification came due has the entry logged
+and dropped rather than retried.
 
 **Stop and resume.** A pending entry stores an absolute due time, not a remaining delay. An entry
 whose delay expired while the team was stopped is therefore simply due on the first tick after the
@@ -1290,11 +1302,13 @@ src/akgentic/tool/
     │   └── activity.py       # team_activity models, GetTeamActivity,
     │                         #   ActivitySummarizer, TeamActivityActor, SummarizerWorker
     notification/
-    │   __init__.py           # Public exports: NotificationTool, NotificationActor, models
-    │   models.py             # PendingNotification, Tick, NotificationConfig,
+    │   __init__.py           # Public exports: NotificationTool, its capability params,
+    │                         #   NotificationActor, models
+    │   models.py             # PendingNotification, NotificationConfig,
     │                         #   NotificationState, resolve_message_class
     │   actor.py              # NotificationActor singleton "#NotificationTool" + tick loop
-    │   └── tool.py           # NotificationTool ToolCard
+    │   └── tool.py           # NotificationTool ToolCard + RegisterNotification,
+    │                         #   ListPendingNotifications, CancelNotification
     mcp/
     │   mcp.py                # MCPTool, connection configs
     │   └── oauth_handler.py  # OAuth 2.0 flow

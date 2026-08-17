@@ -32,7 +32,6 @@ from akgentic.tool.notification.models import (
     NotificationConfig,
     NotificationState,
     PendingNotification,
-    Tick,
 )
 from pykka import ActorDeadError, ActorRef
 
@@ -130,16 +129,19 @@ class TestDelivery:
         notification_id = notifier.schedule(address, "check the build", 30)
         _make_due(notifier, notification_id)
 
-        notifier.receiveMsg_Tick(Tick())
+        notifier.deliver_due()
 
         delivered = _DELIVERED.get(timeout=2.0)
         assert isinstance(delivered, FakeNotificationMessage)
         assert delivered.content == "check the build"
         assert delivered.type == "notification"
-        assert delivered.sender == address, "the notification comes from the owner itself"
+        assert delivered.sender is not None
+        assert delivered.sender.name == NOTIFICATION_ACTOR_NAME, (
+            "the actor sends as itself — no owner-proxy hop to spoof the sender"
+        )
         assert notifier.state.pending == {}
 
-        notifier.receiveMsg_Tick(Tick())
+        notifier.deliver_due()
         with pytest.raises(queue.Empty):
             _DELIVERED.get(timeout=0.2)
 
@@ -151,7 +153,7 @@ class TestDelivery:
         _, address = live_owner
         notifier.schedule(address, "later", 300)
 
-        notifier.receiveMsg_Tick(Tick())
+        notifier.deliver_due()
 
         assert list(notifier.state.pending) == [1]
         with pytest.raises(queue.Empty):
@@ -186,7 +188,7 @@ class TestDelivery:
         notification_id = notifier.schedule(address, "into the void", 30)
         _make_due(notifier, notification_id)
 
-        notifier.receiveMsg_Tick(Tick())  # must not raise
+        notifier.deliver_due()  # must not raise
 
         assert notifier.state.pending == {}
         assert "could not be delivered" in caplog.text
@@ -199,7 +201,7 @@ class TestDelivery:
         notification_id = notifier.schedule(restored, "orphan", 30)
         _make_due(notifier, notification_id)
 
-        notifier.receiveMsg_Tick(Tick())
+        notifier.deliver_due()
 
         assert notifier.state.pending == {}
 
@@ -215,7 +217,7 @@ class TestCancelVersusTick:
         _make_due(notifier, notification_id)
 
         assert notifier.cancel(notification_id, address) is True
-        notifier.receiveMsg_Tick(Tick())
+        notifier.deliver_due()
 
         with pytest.raises(queue.Empty):
             _DELIVERED.get(timeout=0.2)
@@ -226,7 +228,7 @@ class TestCancelVersusTick:
         notifier.state.observer(spy)
         spy.calls = 0
 
-        notifier.receiveMsg_Tick(Tick())
+        notifier.deliver_due()
 
         assert spy.calls == 0
 
@@ -245,7 +247,7 @@ class TestCancelVersusTick:
         notifier.state.observer(spy)
         spy.calls = 0
 
-        notifier.receiveMsg_Tick(Tick())
+        notifier.deliver_due()
 
         assert spy.calls == 1, "one notification per tick, not one per entry"
         assert notifier.state.pending == {}
@@ -313,7 +315,7 @@ class TestResume:
             )
         )
 
-        notifier.receiveMsg_Tick(Tick())
+        notifier.deliver_due()
 
         delivered = _DELIVERED.get(timeout=2.0)
         assert delivered.content == "due while the team was down"
@@ -355,7 +357,7 @@ class TestTeardownAndRetention:
         """A dead actor ends the loop; it never ticks a corpse forever."""
         monkeypatch.setattr(actor_module, "TICK_INTERVAL_S", 0.01)
         ref = MagicMock()
-        ref.tell.side_effect = ActorDeadError("gone")
+        ref.proxy.side_effect = ActorDeadError("gone")
         stop_event = threading.Event()
 
         thread = threading.Thread(target=_tick_loop, args=(stop_event, ref), daemon=True)
@@ -363,7 +365,7 @@ class TestTeardownAndRetention:
         thread.join(timeout=2.0)
 
         assert not thread.is_alive()
-        assert ref.tell.call_count == 1
+        assert ref.proxy.call_count == 1
         assert not stop_event.is_set(), "it exited on the error, not on a stop"
 
     def test_the_tick_thread_does_not_root_the_actor(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -372,8 +374,14 @@ class TestTeardownAndRetention:
         The thread is still running here, holding the loop's arguments. If those
         arguments included the actor — a bound method as the target would do it —
         the weakref below would still resolve.
+
+        The interval is long on purpose: the thread must be parked in its wait
+        when the collection happens, so it provably still holds those arguments.
+        A short one lets it tick, notice the collected actor and exit first,
+        which would leave the guard asserting over a thread that had already
+        dropped everything it held.
         """
-        monkeypatch.setattr(actor_module, "TICK_INTERVAL_S", 0.01)
+        monkeypatch.setattr(actor_module, "TICK_INTERVAL_S", 30.0)
         actor = _new_actor()
         actor.on_start()
         stop_event, thread = actor._stop_event, actor._tick_thread
@@ -388,6 +396,25 @@ class TestTeardownAndRetention:
         finally:
             stop_event.set()
             thread.join(timeout=2.0)
+
+    def test_a_collected_actor_also_ends_the_loop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A collected actor retires its thread, not only a stopped one.
+
+        The old tell went on filling the inbox of an actor nobody could reach;
+        the proxy call raises ``ActorDeadError`` for a deallocated actor as
+        readily as for a stopped one, so the thread ends itself.
+        """
+        monkeypatch.setattr(actor_module, "TICK_INTERVAL_S", 0.01)
+        actor = _new_actor()
+        actor.on_start()
+        stop_event, thread = actor._stop_event, actor._tick_thread
+
+        del actor
+        gc.collect()
+        thread.join(timeout=2.0)
+
+        assert not thread.is_alive()
+        assert not stop_event.is_set(), "it exited on the dead actor, not on a stop"
 
     def test_a_pending_entry_does_not_pin_its_owner(self, notifier: NotificationActor) -> None:
         """``owner`` is data, not a proxy, so an entry cannot keep an agent alive."""
