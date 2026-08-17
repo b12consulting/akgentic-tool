@@ -34,6 +34,13 @@ REQUIRED_MESSAGE_FIELDS = ("content", "type")
 NOTIFICATION_TYPE = "notification"
 """Value written to the delivered message's ``type`` field."""
 
+PROBE_CONTENT = "notification probe"
+"""Stand-in content the resolver validates the delivery class against.
+
+Shaped like what ``_deliver`` writes rather than minimal, so the probe rejects a
+class only for a constraint real delivery would also hit.
+"""
+
 
 class PendingNotification(SerializableBaseModel):
     """One scheduled notification, owned by the agent that asked for it.
@@ -140,8 +147,12 @@ def resolve_message_class(dotted_path: str) -> type[Message]:
     # reject "notification". Probing with the payload delivery builds catches any
     # of those, and catches them here rather than inside `_deliver`, where the
     # broad except would log one line per fire and drop the entry.
+    #
+    # The probe content is non-empty on purpose: `_deliver` writes the scheduled
+    # text, never "", so a class that constrains `content` away from the empty
+    # string must not be refused at wiring time over a payload it never sees.
     try:
-        resolved.model_validate({"content": "", "type": NOTIFICATION_TYPE})
+        resolved.model_validate({"content": PROBE_CONTENT, "type": NOTIFICATION_TYPE})
     except ValidationError as exc:
         raise ValueError(
             f"message_class {dotted_path!r} cannot carry type={NOTIFICATION_TYPE!r}, "

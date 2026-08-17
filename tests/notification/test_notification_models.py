@@ -79,6 +79,18 @@ class TestResolveMessageClass:
         with pytest.raises(ValueError, match="cannot carry type='notification'"):
             resolve_message_class("tests.notification.conftest.NarrowTypeMessage")
 
+    def test_a_class_that_rejects_empty_content_still_resolves(self) -> None:
+        """The probe carries a delivery-shaped content, not a minimal one.
+
+        ``_deliver`` writes the scheduled text, never ``""``. A class whose
+        ``content`` is constrained away from the empty string delivers fine, so
+        refusing it at ``observer()`` bind time would break a working card over a
+        payload the tool never builds.
+        """
+        resolved = resolve_message_class("tests.notification.conftest.NonEmptyContentMessage")
+
+        assert resolved.__name__ == "NonEmptyContentMessage"
+
 
 class TestModels:
     def test_pending_notification_round_trips(self, owner_address: ActorAddress) -> None:

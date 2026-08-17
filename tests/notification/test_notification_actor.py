@@ -8,8 +8,10 @@ the interval instead of sleeping through it.
 from __future__ import annotations
 
 import gc
+import logging
 import queue
 import threading
+import time
 import weakref
 from collections.abc import Callable, Generator
 from datetime import UTC, datetime, timedelta
@@ -367,6 +369,32 @@ class TestTeardownAndRetention:
         assert not thread.is_alive()
         assert ref.proxy.call_count == 1
         assert not stop_event.is_set(), "it exited on the error, not on a stop"
+
+    def test_a_failing_tick_is_logged_and_retried_rather_than_ending_the_loop(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Only a dead actor retires the thread; anything else ticks again.
+
+        Building the proxy runs pykka's attribute introspection on the timer
+        thread, so the failure surface is wider than a bare tell's. An escaping
+        exception would stop delivery for the team's lifetime with nothing to
+        report it — the bounded join in ``on_stop`` would still succeed.
+        """
+        monkeypatch.setattr(actor_module, "TICK_INTERVAL_S", 0.01)
+        ref = MagicMock()
+        ref.proxy.side_effect = RuntimeError("dict mutated during update")
+        stop_event = threading.Event()
+
+        thread = threading.Thread(target=_tick_loop, args=(stop_event, ref), daemon=True)
+        with caplog.at_level(logging.WARNING):
+            thread.start()
+            time.sleep(0.1)
+            stop_event.set()
+            thread.join(timeout=2.0)
+
+        assert not thread.is_alive()
+        assert ref.proxy.call_count > 1, "it kept ticking after the failure"
+        assert "Notification tick failed" in caplog.text
 
     def test_the_tick_thread_does_not_root_the_actor(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The regression guard for the one real leak: a ``self``-capturing target.

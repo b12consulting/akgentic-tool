@@ -22,6 +22,7 @@ from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import Message
 from akgentic.tool.notification.actor import NOTIFICATION_ACTOR_NAME, NotificationActor
 from akgentic.tool.notification.tool import NotificationTool
+from pydantic import Field
 
 from tests.conftest import MockActorAddress
 
@@ -45,6 +46,17 @@ class NarrowTypeMessage(Message):
 
     type: Literal["chat"] = "chat"
     content: str = ""
+
+
+class NonEmptyContentMessage(Message):
+    """Accepts ``"notification"``, but constrains ``content`` away from ``""``.
+
+    Delivery never writes an empty content, so this class is perfectly usable and
+    the resolver must not refuse it over a payload it would never build.
+    """
+
+    type: str = "notification"
+    content: str = Field(min_length=1, default="x")
 
 
 class NotAMessage:

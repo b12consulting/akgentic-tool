@@ -58,6 +58,13 @@ def _tick_loop(stop_event: threading.Event, actor_ref: ActorRef[Any]) -> None:
     waited on, so a busy actor turns a one-second tick into a later one rather
     than into a blocked timer thread.
 
+    Only a dead actor ends the loop. Anything else is logged and retried on the
+    next tick: building the proxy runs pykka's attribute introspection on *this*
+    thread, so the failure surface is wider than a bare ``tell``'s, and a single
+    escaping exception would retire the thread for the team's lifetime — every
+    pending notification silently undelivered, with the bounded join in
+    ``on_stop`` still succeeding so nothing would report it.
+
     Args:
         stop_event: Set by ``on_stop`` to end the loop.
         actor_ref: Reference to the notification actor (holds it weakly).
@@ -67,6 +74,8 @@ def _tick_loop(stop_event: threading.Event, actor_ref: ActorRef[Any]) -> None:
             actor_ref.proxy().deliver_due()
         except ActorDeadError:
             break
+        except Exception:  # noqa: BLE001 — a failed tick must not retire the thread
+            logger.warning("Notification tick failed; retrying on the next tick", exc_info=True)
 
 
 def _same_owner(left: ActorAddress, right: ActorAddress) -> bool:
