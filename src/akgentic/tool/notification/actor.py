@@ -8,7 +8,10 @@ one thread, and no lock is needed. The thread's only action is that
 fire-and-forget call, whose future it never waits on (ADR-035 §3).
 
 Delivery of an entry whose ``fire_at`` has passed needs no re-arm logic — a
-restored entry is simply due on the first tick after a resume.
+restored entry is simply due on the first tick after a resume. It does need its
+owner to be on the team: a scan that finds work reads the roster once and
+postpones, rather than delivers, an entry whose owner is absent, for up to
+``DELIVERY_GRACE_S`` (ADR-035 §3).
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from pykka import ActorDeadError, ActorRef
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import Akgent
 from akgentic.core.messages.message import Message
+from akgentic.core.orchestrator import Orchestrator
 from akgentic.tool.notification.models import (
     NOTIFICATION_TYPE,
     NotificationConfig,
@@ -44,6 +48,13 @@ TICK_INTERVAL_S = 1.0
 TICK_JOIN_TIMEOUT_S = 2.0
 """Join budget in ``on_stop`` — bounded, because the loop observes the stop
 event within one tick."""
+
+DELIVERY_GRACE_S = 300.0
+"""How long a due entry waits for an owner that is off the team.
+
+The bound is what keeps ``pending`` self-draining: an owner that never comes
+back would otherwise pin its entry for the team's lifetime, and unbounded
+postponement turns the wait into the leak the scan was designed to avoid."""
 
 
 def _tick_loop(stop_event: threading.Event, actor_ref: ActorRef[Any]) -> None:
@@ -91,8 +102,10 @@ def _same_owner(left: ActorAddress, right: ActorAddress) -> bool:
 class NotificationActor(Akgent[NotificationConfig, NotificationState]):
     """Team singleton holding pending notifications and delivering them on time.
 
-    Every ask-reachable method is a dict operation, so nothing slow ever runs on
-    this actor's thread and the deferred-result pattern is not engaged.
+    Every ask-reachable method is a dict operation, and the one cross-actor call
+    — the roster read a firing scan makes — is an in-memory lookup on the
+    orchestrator's cached team. Nothing slow ever runs on this actor's thread, so
+    the deferred-result pattern stays disengaged.
     """
 
     _stop_event: threading.Event | None = None
@@ -194,21 +207,80 @@ class NotificationActor(Akgent[NotificationConfig, NotificationState]):
     ## Delivery
     ##
     def deliver_due(self) -> None:
-        """Deliver every entry that has come due, and drop it.
+        """Deliver every entry whose owner is on the team, and postpone the rest.
 
         Called once per tick by the timer thread through this actor's own proxy,
         so it runs on the mailbox thread and cannot interleave with ``schedule``
-        or ``cancel``. A scan that finds nothing due is a no-op: no message, and
-        no state-change notification for an empty scan.
+        or ``cancel``. A scan that finds nothing due is a no-op: no roster read,
+        no message, and no state-change notification.
+
+        A scan that does find work reads the roster **once**, then classifies
+        every due entry against it. An owner that is off the team has its entry
+        left exactly where it is — the ``fire_at <= now`` scan is already a retry
+        loop, so the next tick re-examines it and delivers as soon as the owner
+        is back. That wait is bounded by ``DELIVERY_GRACE_S`` (ADR-035 §3).
         """
         now = datetime.now(UTC)
         due = [entry for entry in self.state.pending.values() if entry.fire_at <= now]
         if not due:
             return
+        present = self._present_member_names()
+        mutated = False
         for entry in due:
+            if present is not None and entry.owner.name not in present:
+                mutated |= self._postpone_or_drop(entry, now)
+                continue
             del self.state.pending[entry.notification_id]
+            mutated = True
             self._deliver(entry)
-        self.state.notify_state_change()
+        if mutated:
+            self.state.notify_state_change()
+
+    def _present_member_names(self) -> set[str] | None:
+        """Names of the agents currently on the team, or ``None`` for "no roster".
+
+        Matching is by **name** rather than by ``agent_id``: an entry restored
+        with a team resume carries the id the owner had before the restart,
+        while the roster holds the freshly started agent. The ids differ, the
+        names do not — which is why ``_same_owner`` is deliberately not used
+        here.
+
+        ``None`` means there is nothing to check against, and the caller reads
+        it as deliver-everything. That is the harness path — in production the
+        singleton is reached through ``getChildrenOrCreate`` and always has an
+        orchestrator — and ``kg_actor.py`` degrades on the same condition.
+
+        The ask is an in-memory read of a cached roster, so it stays well inside
+        what may run on this actor's thread, and the orchestrator never blocking-
+        asks a tool actor, so there is no cycle to deadlock on.
+        """
+        if self.orchestrator is None:
+            return None
+        orchestrator = self.proxy_ask(self.orchestrator, Orchestrator)
+        return {member.name for member in orchestrator.get_team()}
+
+    def _postpone_or_drop(self, entry: PendingNotification, now: datetime) -> bool:
+        """Leave *entry* pending for its absent owner, unless the grace has run out.
+
+        Postponing is silent and free by design: no send, no ``fire_at`` bump, no
+        state-change notification. A postponed entry is re-examined once a
+        second, so anything logged here at WARNING — or persisted here — would
+        repeat for as long as the owner stays away.
+
+        Returns:
+            True when the entry was dropped, which the caller counts as the
+            mutation behind its single end-of-scan notification.
+        """
+        if (now - entry.fire_at).total_seconds() < DELIVERY_GRACE_S:
+            return False
+        del self.state.pending[entry.notification_id]
+        logger.warning(
+            "Notification %s waited %.0f s for absent owner %s — dropped",
+            entry.notification_id,
+            DELIVERY_GRACE_S,
+            entry.owner.name,
+        )
+        return True
 
     def _deliver(self, entry: PendingNotification) -> None:
         """Send one due entry to its owner.

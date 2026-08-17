@@ -37,6 +37,7 @@ from akgentic.tool.notification.models import (
 )
 from pykka import ActorDeadError, ActorRef
 
+from tests.conftest import MockActorAddress
 from tests.notification.conftest import FAKE_MESSAGE_PATH, FakeNotificationMessage
 
 _DELIVERED: queue.Queue[Message] = queue.Queue()
@@ -57,6 +58,37 @@ class StateChangeSpy:
 
     def notify_state_change(self, state: BaseState) -> None:
         self.calls += 1
+
+
+class FakeRoster:
+    """``Orchestrator`` stand-in: hands back a team roster and counts its asks."""
+
+    def __init__(self, *members: ActorAddress) -> None:
+        self.members = list(members)
+        self.calls = 0
+
+    def get_team(self) -> list[ActorAddress]:
+        self.calls += 1
+        return list(self.members)
+
+
+class OrchestratorAddress(MockActorAddress):
+    """A mock address that can absorb the telemetry an agent tells its orchestrator.
+
+    ``_notify_orchestrator`` reaches straight for ``orchestrator._actor_ref``, which a
+    bare ``MockActorAddress`` does not have — construction, delivery and ``on_stop``
+    would each raise ``AttributeError`` without it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("#Orchestrator", "orchestrator")
+        self._actor_ref = MagicMock()
+
+
+def _give_roster(actor: NotificationActor, roster: FakeRoster) -> None:
+    """Point *actor* at an orchestrator whose ask returns *roster*."""
+    actor._orchestrator = OrchestratorAddress()
+    actor.proxy_ask = lambda *_args, **_kwargs: roster  # type: ignore[method-assign]
 
 
 def _new_actor() -> NotificationActor:
@@ -206,6 +238,171 @@ class TestDelivery:
         notifier.deliver_due()
 
         assert notifier.state.pending == {}
+
+
+class TestAvailabilityGuard:
+    """Delivery waits for an owner that is off the team, for a bounded while."""
+
+    def test_a_due_entry_whose_owner_is_on_the_roster_is_delivered(
+        self,
+        notifier: NotificationActor,
+        live_owner: tuple[ActorRef[RecordingAgent], ActorAddress],
+    ) -> None:
+        _, address = live_owner
+        _give_roster(notifier, FakeRoster(MockActorAddress("alice")))
+        notification_id = notifier.schedule(address, "the build is red", 30)
+        _make_due(notifier, notification_id)
+
+        notifier.deliver_due()
+
+        assert _DELIVERED.get(timeout=2.0).content == "the build is red"
+        assert notifier.state.pending == {}
+
+    def test_a_due_entry_whose_owner_is_absent_is_postponed_untouched(
+        self,
+        notifier: NotificationActor,
+        live_owner: tuple[ActorRef[RecordingAgent], ActorAddress],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Postponing costs nothing: no send, no mutation, no checkpoint, no log line."""
+        _, address = live_owner
+        _give_roster(notifier, FakeRoster(MockActorAddress("someone-else")))
+        notification_id = notifier.schedule(address, "waiting for alice", 30)
+        _make_due(notifier, notification_id)
+        before = notifier.state.pending[notification_id]
+
+        spy = StateChangeSpy()
+        notifier.state.observer(spy)
+        spy.calls = 0
+
+        with caplog.at_level(logging.WARNING):
+            notifier.deliver_due()
+
+        assert notifier.state.pending[notification_id] == before, "postponing mutates nothing"
+        assert spy.calls == 0, "a scan that only postpones has changed no state"
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == [], (
+            "a per-tick warning would be one line a second, for every absent owner"
+        )
+        with pytest.raises(queue.Empty):
+            _DELIVERED.get(timeout=0.2)
+
+    def test_an_owner_that_returns_within_the_grace_window_is_delivered(
+        self,
+        notifier: NotificationActor,
+        live_owner: tuple[ActorRef[RecordingAgent], ActorAddress],
+    ) -> None:
+        """The postponed entry is re-examined every tick, so a returning owner gets it."""
+        _, address = live_owner
+        roster = FakeRoster()
+        _give_roster(notifier, roster)
+        notification_id = notifier.schedule(address, "welcome back", 30)
+        _make_due(notifier, notification_id)
+
+        notifier.deliver_due()
+        assert notification_id in notifier.state.pending
+
+        roster.members.append(MockActorAddress("alice"))
+        notifier.deliver_due()
+
+        assert _DELIVERED.get(timeout=2.0).content == "welcome back"
+        assert notifier.state.pending == {}
+        assert roster.calls == 2, "one ask per firing scan, and both scans found work"
+
+    def test_an_absent_owner_past_the_grace_window_is_dropped_with_one_warning(
+        self,
+        notifier: NotificationActor,
+        live_owner: tuple[ActorRef[RecordingAgent], ActorAddress],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The bound is what keeps ``pending`` self-draining, and it is loud."""
+        _, address = live_owner
+        _give_roster(notifier, FakeRoster())
+        long_ago = datetime.now(UTC) - timedelta(hours=1)
+        notifier.init_state(
+            NotificationState(
+                next_id=2,
+                pending={
+                    1: PendingNotification(
+                        notification_id=1,
+                        owner=address,
+                        content="nobody came back",
+                        created_at=long_ago,
+                        fire_at=long_ago,
+                    )
+                },
+            )
+        )
+        spy = StateChangeSpy()
+        notifier.state.observer(spy)
+        spy.calls = 0
+
+        with caplog.at_level(logging.WARNING):
+            notifier.deliver_due()
+
+        assert notifier.state.pending == {}
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1, "one line for the drop, not one a tick for the wait"
+        assert "1" in warnings[0].getMessage()
+        assert "alice" in warnings[0].getMessage()
+        assert spy.calls == 1
+        with pytest.raises(queue.Empty):  # no speculative send to an absent owner
+            _DELIVERED.get(timeout=0.2)
+
+    def test_one_firing_scan_asks_the_orchestrator_exactly_once(
+        self, notifier: NotificationActor
+    ) -> None:
+        first = RecordingAgent.start(config=BaseConfig(name="alice", role="tester"))
+        second = RecordingAgent.start(config=BaseConfig(name="bob", role="tester"))
+        try:
+            roster = FakeRoster(MockActorAddress("alice"), MockActorAddress("bob"))
+            _give_roster(notifier, roster)
+            for ref, content in ((first, "alice's"), (second, "bob's")):
+                _make_due(notifier, notifier.schedule(ActorAddressImpl(ref), content, 30))
+
+            notifier.deliver_due()
+
+            assert roster.calls == 1, "the roster is read once a scan, never once an entry"
+            assert notifier.state.pending == {}
+        finally:
+            first.stop()
+            second.stop()
+
+    def test_an_idle_scan_never_touches_the_orchestrator(
+        self,
+        notifier: NotificationActor,
+        live_owner: tuple[ActorRef[RecordingAgent], ActorAddress],
+    ) -> None:
+        """On an idle team the orchestrator sees nothing from this actor, ever."""
+        _, address = live_owner
+        roster = FakeRoster(MockActorAddress("alice"))
+        _give_roster(notifier, roster)
+
+        notifier.deliver_due()
+        assert roster.calls == 0, "nothing pending, nothing asked"
+
+        notifier.schedule(address, "not yet", 300)
+        notifier.deliver_due()
+
+        assert roster.calls == 0, "pending but nothing due is still an idle scan"
+
+    def test_without_an_orchestrator_every_due_entry_is_delivered(
+        self,
+        notifier: NotificationActor,
+        live_owner: tuple[ActorRef[RecordingAgent], ActorAddress],
+    ) -> None:
+        """The harness path: no roster to consult means deliver, not withhold."""
+        _, address = live_owner
+        roster = FakeRoster()
+        notifier.proxy_ask = lambda *_args, **_kwargs: roster  # type: ignore[method-assign]
+        assert notifier.orchestrator is None
+
+        _make_due(notifier, notifier.schedule(address, "harness path", 30))
+
+        notifier.deliver_due()
+
+        assert _DELIVERED.get(timeout=2.0).content == "harness path"
+        assert notifier.state.pending == {}
+        assert roster.calls == 0, "no orchestrator, no ask"
 
 
 class TestCancelVersusTick:

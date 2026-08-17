@@ -1006,12 +1006,15 @@ for its real owner.
 
 **Delivery comes from the notification actor.** It sends as itself, so the delivered `sender` is
 `#NotificationTool`, and the message's `type` is `"notification"`. The send is a tell, so a busy
-agent never blocks the actor; an owner fired before its notification came due has the entry logged
-and dropped rather than retried.
+agent never blocks the actor. Delivery waits while the owner is off the team — an agent between
+hire and start, or a resumed team whose agents have not re-registered yet — and goes through as
+soon as it is back, for up to five minutes; past that window, and for a send that fails despite the
+owner being on the team, the entry is logged and dropped rather than retried.
 
 **Stop and resume.** A pending entry stores an absolute due time, not a remaining delay. An entry
 whose delay expired while the team was stopped is therefore simply due on the first tick after the
-resume and is delivered then. There is no re-arm logic and nothing to reschedule.
+resume, and is delivered on the first tick at which its owner is back on the team. There is no
+re-arm logic and nothing to reschedule.
 
 ### MCPTool
 
