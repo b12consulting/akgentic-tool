@@ -299,11 +299,11 @@ source — useful for injecting team-specific constraints at configuration time.
 ## Migration: moved import paths
 
 Two modules were reorganised: `akgentic.tool.event` was split by audience, and
-`akgentic.tool.vector` moved next to the code built on it. The event symbols still resolve
-through a compatibility façade at the old path, which emits a `DeprecationWarning` on
-**attribute access** — not at import time, so code that touches none of them is never
-warned. **No removal release is scheduled** for that façade. The Internal-tier courtesy
-entries, by contrast, have been **withdrawn**: those old paths now raise `ImportError`.
+`akgentic.tool.vector` moved next to the code built on it. Both old paths keep a
+compatibility façade, which emits a `DeprecationWarning` on **attribute access** — not at
+import time, so code that touches none of the moved symbols is never warned. **No removal
+release is scheduled** for either façade. The Internal-tier courtesy entries that no stored
+payload can name have been **withdrawn**: those old paths now raise `ImportError`.
 
 **Importing from the `akgentic.tool` package root needs no migration at all.** That surface
 is unchanged, and reaching a symbol through it emits no warning. The root is also the
@@ -318,10 +318,15 @@ always worked and still does.
 | `akgentic.tool.event.CommandArg` | `akgentic.tool.core.event` | Stable |
 | `akgentic.tool.event.CommandDescriptor` | `akgentic.tool.core.event` | Stable |
 | `akgentic.tool.event.CommandsAnnouncedEvent` | `akgentic.tool.core.event` | Stable |
+| `akgentic.tool.vector.VectorEntry` | `akgentic.tool.vector_store.vector` | Internal |
 
-These four stay shimmed because the façade is load-bearing beyond source compatibility:
-events persisted before the split carry `__model__` markers that resolve through this
-module, and a sibling package imports `CommandsAnnouncedEvent` from it.
+These stay shimmed because the façades are load-bearing beyond source compatibility, and
+persisted data is what makes them so. `__model__` markers are written for Pydantic models
+and dataclasses, and resolving one is `import_module` plus `getattr` on the path recorded
+at write time — so any row stored before a move keeps naming the old path for as long as
+that row exists. `VectorEntry` is on this list for that reason alone, and it is the only
+entry of its module that qualifies. The event symbols additionally have a source consumer:
+a sibling package imports `CommandsAnnouncedEvent` from the old path.
 
 ### Withdrawn — raises `ImportError`, move now
 
@@ -330,12 +335,15 @@ module, and a sibling package imports `CommandsAnnouncedEvent` from it.
 | `akgentic.tool.event.ToolObserver` | `akgentic.tool` (root) or `akgentic.tool.core.observer` |
 | `akgentic.tool.event.ActorToolObserver` | `akgentic.tool` (root) or `akgentic.tool.core.observer` |
 | `akgentic.tool.event.TeamManagementToolObserver` | `akgentic.tool` (root) or `akgentic.tool.team.observer` |
-| `akgentic.tool.vector.*` (module removed) | `akgentic.tool` (root) or `akgentic.tool.vector_store.vector` |
+| `akgentic.tool.vector.EmbeddingService` | `akgentic.tool` (root) or `akgentic.tool.vector_store.vector` |
+| `akgentic.tool.vector.VectorIndex` | `akgentic.tool` (root) or `akgentic.tool.vector_store.vector` |
 
 The observers are Stable-tier **symbols** — but the promise attaches to the package root,
 their supported surface, not to every path they historically resolved from. Their `event.py`
 residence was an accident of the pre-split layout. The `akgentic.tool.vector` module was
-Internal-tier in its entirety and is gone from disk.
+Internal-tier in its entirety, and everything in it that cannot appear in a stored payload
+went with it — a plain class is never written to a `__model__` marker, so nothing in a
+database can ask for one back.
 
 ### What the two tiers mean
 
@@ -359,9 +367,16 @@ exactly what the split was done to avoid.
 An internal symbol may also be **removed outright**, not merely moved — and then there is no
 shim and no warning. `ToolStatePayload` went first: an alias for the knowledge graph's delta
 type that stopped annotating anything once `ToolStateEvent.payload` was typed structurally.
-The courtesy entries above were withdrawn the same way, this time at module scale: the whole
-`akgentic.tool.vector` module and the observer entries in `event.py`. Importing a withdrawn
-path raises `ImportError` rather than warning.
+The courtesy entries above were withdrawn the same way: the observer entries in `event.py`,
+and every entry of `akgentic.tool.vector` except `VectorEntry`. Importing a withdrawn path
+raises `ImportError` rather than warning.
+
+That exception is the general rule rather than a special case, and it is worth stating on its
+own: **a symbol's tier governs its import path, not its wire format.** Internal-tier says no
+caller may build against the path. It says nothing about the rows already on disk that name
+it, and those rows are not a caller — they cannot be migrated by editing an import, and they
+outlive the release that moved the class. So a persisted model keeps its old path regardless
+of tier, and the courtesy that may be withdrawn from it is only the courtesy owed to source.
 
 If one of your imports is in the *Withdrawn* table, it has already stopped working — move it
 to the path in its *Import instead* column.
