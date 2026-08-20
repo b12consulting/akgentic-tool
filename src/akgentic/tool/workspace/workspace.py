@@ -10,6 +10,7 @@ variable (default: ``./workspaces``).
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 from pathlib import Path
@@ -22,6 +23,12 @@ from pydantic import BaseModel
 # the kernel.  Matching what a plain ``open(path, "wb")`` would request keeps the
 # staged file's mode identical to an unstaged write's — see Filesystem.write.
 _DEFAULT_FILE_MODE = 0o666
+
+# Budget in bytes for the target's own name inside a staging file's name.  The
+# affixes around it cost 38 bytes (two dots, 32 hex digits, ".tmp"), and a name
+# over the usual 255-byte limit is rejected outright by ``os.open`` — so copying
+# a long target name whole would fail writes that used to succeed.
+_STAGED_NAME_BUDGET = 255 - 38
 
 
 class FileEntry(BaseModel):
@@ -117,6 +124,11 @@ class Filesystem:
         a new file gets the mode a plain write would have produced under the
         current umask.  ``os.replace`` publishes the staged inode, so its mode
         becomes the target's — left unset, every written file would become 0600.
+        Nothing else the old inode carried survives the swap: ownership reverts to
+        the writing process, extended attributes are dropped, and a hardlink to
+        the old file detaches.  That is inherent to publishing by rename, and it
+        matters where the workspace is bind-mounted into a sandbox container
+        running as another uid.
 
         No ``fsync`` is performed.  The guarantee offered here is atomicity for
         concurrent readers on one machine, not durability across a crash.
@@ -128,7 +140,8 @@ class Filesystem:
         resolved.parent.mkdir(parents=True, exist_ok=True)
         # A ".tmp" suffix keeps the staging file out of the read path's sidecar
         # rule, which claims names that both start with "." and end with ".md".
-        staged = resolved.parent / f".{resolved.name}.{uuid4().hex}.tmp"
+        stem = resolved.name.encode()[:_STAGED_NAME_BUDGET].decode(errors="ignore")
+        staged = resolved.parent / f".{stem}.{uuid4().hex}.tmp"
         try:
             fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _DEFAULT_FILE_MODE)
             with os.fdopen(fd, "wb") as handle:
@@ -137,7 +150,10 @@ class Filesystem:
                 shutil.copymode(resolved, staged)
             os.replace(staged, resolved)
         except BaseException:
-            staged.unlink(missing_ok=True)
+            # Cleanup must not mask the failure that caused it — whatever made the
+            # publish fail will often make the unlink fail in the same way.
+            with contextlib.suppress(OSError):
+                staged.unlink(missing_ok=True)
             raise
 
     def delete(self, path: str) -> None:
