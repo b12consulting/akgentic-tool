@@ -11,10 +11,17 @@ variable (default: ``./workspaces``).
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 from typing import Protocol, runtime_checkable
+from uuid import uuid4
 
 from pydantic import BaseModel
+
+# Creation mode for a newly written file, before the process umask is applied by
+# the kernel.  Matching what a plain ``open(path, "wb")`` would request keeps the
+# staged file's mode identical to an unstaged write's — see Filesystem.write.
+_DEFAULT_FILE_MODE = 0o666
 
 
 class FileEntry(BaseModel):
@@ -92,14 +99,46 @@ class Filesystem:
         return resolved.read_bytes()
 
     def write(self, path: str, data: bytes) -> None:
-        """Write *data* to *path*, creating missing parent directories.
+        """Atomically write *data* to *path*, creating missing parent directories.
+
+        The bytes are staged in a temporary file and published with
+        :func:`os.replace`, so a concurrent reader resolves the path to either the
+        complete previous file or the complete new one — never to a truncated
+        prefix.  Agents each hold their own :class:`Filesystem` and run workspace
+        calls on their own thread, so nothing else serializes a writer against a
+        reader (see ADR-036, *Filesystem.write becomes atomic*).
+
+        The staging file is created **in the target's own directory**, which is
+        load-bearing rather than cosmetic: ``os.replace`` is atomic only within a
+        single filesystem, and staging under the default temp directory would
+        silently degrade to copy-then-unlink wherever that is a separate mount.
+
+        Permission bits are preserved: an existing target keeps its own mode, and
+        a new file gets the mode a plain write would have produced under the
+        current umask.  ``os.replace`` publishes the staged inode, so its mode
+        becomes the target's — left unset, every written file would become 0600.
+
+        No ``fsync`` is performed.  The guarantee offered here is atomicity for
+        concurrent readers on one machine, not durability across a crash.
 
         Raises:
             PermissionError: if *path* escapes the workspace root.
         """
         resolved = self._validate_path(path)
         resolved.parent.mkdir(parents=True, exist_ok=True)
-        resolved.write_bytes(data)
+        # A ".tmp" suffix keeps the staging file out of the read path's sidecar
+        # rule, which claims names that both start with "." and end with ".md".
+        staged = resolved.parent / f".{resolved.name}.{uuid4().hex}.tmp"
+        try:
+            fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _DEFAULT_FILE_MODE)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            if resolved.exists():
+                shutil.copymode(resolved, staged)
+            os.replace(staged, resolved)
+        except BaseException:
+            staged.unlink(missing_ok=True)
+            raise
 
     def delete(self, path: str) -> None:
         """Delete the file at *path*.
