@@ -213,23 +213,34 @@ class TestFilesystemWriteAtomicity:
         thread = threading.Thread(target=writer)
         # Summaries only — never the torn bytes themselves, which would be unbounded.
         torn: list[tuple[int, bytes]] = []
-        reads = 0
+        # First byte of each whole payload seen, so the evidence stays two entries
+        # wide however many reads happen.
+        whole: set[bytes] = set()
         previous_interval = sys.getswitchinterval()
+        # The interval is restored on every path, including a failure to start the
+        # thread: left at 1e-5 it would slow and destabilise the rest of the session
+        # with nothing pointing back here.
         sys.setswitchinterval(_SWITCH_INTERVAL)
-        thread.start()
         try:
-            while not finished.is_set():
-                observed = target.read_bytes()
-                reads += 1
-                if observed != payload_a and observed != payload_b:
-                    torn.append((len(observed), observed[:1]))
+            thread.start()
+            try:
+                while not finished.is_set():
+                    observed = target.read_bytes()
+                    if observed == payload_a or observed == payload_b:
+                        whole.add(observed[:1])
+                    else:
+                        torn.append((len(observed), observed[:1]))
+            finally:
+                thread.join(timeout=_THREAD_JOIN_TIMEOUT)
         finally:
-            thread.join(timeout=_THREAD_JOIN_TIMEOUT)
             sys.setswitchinterval(previous_interval)
 
         assert not thread.is_alive(), "writer thread did not finish"
         assert not writer_error, f"writer raised: {writer_error}"
-        assert reads > 0, "reader never got a chance to observe the file"
+        # Seeing both payloads is the evidence that the reader actually sampled
+        # across a publish; without it a starved reader would report a green run
+        # having observed nothing, which is worse than no guard at all.
+        assert whole == {b"a", b"b"}, f"reader never raced the writer, saw only {whole}"
         assert not torn, f"observed {len(torn)} partial reads, e.g. {torn[:5]}"
 
     def test_publishing_rename_stays_inside_the_target_directory(self, tmp_path: Path) -> None:
@@ -299,6 +310,30 @@ class TestFilesystemWriteAtomicity:
 
         written = tmp_path / "team-1" / "via_workspace.txt"
         assert stat.S_IMODE(written.stat().st_mode) == stat.S_IMODE(control.stat().st_mode)
+
+    def test_long_target_name_still_writes(self, tmp_path: Path) -> None:
+        """Staging must not push a legal name past the filesystem's 255-byte limit.
+
+        The staging name wraps the target's own name in 38 bytes of affixes, so
+        copying that name whole turns a write that used to succeed into
+        ``OSError: File name too long`` for any target above ~217 bytes.
+        """
+        name = "n" * 250 + ".txt"
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+
+        fs.write(name, b"payload")
+
+        assert (tmp_path / "team-1" / name).read_bytes() == b"payload"
+
+    def test_rejected_path_leaves_nothing_on_disk(self, tmp_path: Path) -> None:
+        """Validation precedes every filesystem effect, staging included."""
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+
+        with pytest.raises(PermissionError, match="escapes workspace root"):
+            fs.write("../escape.txt", b"x")
+
+        assert list((tmp_path / "team-1").iterdir()) == []
+        assert not (tmp_path / "escape.txt").exists()
 
 
 # ---------------------------------------------------------------------------
