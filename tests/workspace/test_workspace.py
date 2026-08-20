@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import stat
+import sys
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -157,6 +161,144 @@ class TestFilesystemWrite:
         fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
         with pytest.raises(PermissionError):
             fs.write("../../evil.txt", b"x")
+
+
+# ---------------------------------------------------------------------------
+# Filesystem.write — atomicity
+# ---------------------------------------------------------------------------
+
+# Large enough that a non-atomic write cannot land in one syscall, so a reader
+# can observe a genuine prefix and not only the empty truncate window.
+_PAYLOAD_SIZE = 512 * 1024
+
+# Bounded by iteration count, never by wall-clock sleeping.  Each iteration opens
+# exactly one vulnerable window, so the count — not the payload size — is what
+# decides whether a regression is caught: measured against the non-atomic
+# implementation, 150 iterations let it escape one run in three.
+_WRITER_ITERATIONS = 1500
+_THREAD_JOIN_TIMEOUT = 60.0
+
+# The reader must be scheduled *during* the writer's truncate-to-rewrite window,
+# not merely between whole writes.  The default 5 ms switch interval lets the
+# writer finish a whole cycle while holding the GIL, hiding the defect.
+_SWITCH_INTERVAL = 1e-5
+
+
+class TestFilesystemWriteAtomicity:
+    def test_concurrent_reader_never_observes_a_partial_write(self, tmp_path: Path) -> None:
+        """A reader racing a writer sees only whole payloads, never a prefix.
+
+        Against the non-atomic ``resolved.write_bytes(data)`` implementation the
+        reader observes short reads inside the window between ``O_TRUNC`` and the
+        final byte; against write-temp-then-rename that window does not exist.
+        """
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        target = tmp_path / "team-1" / "big.bin"
+        payload_a = b"a" * _PAYLOAD_SIZE
+        payload_b = b"b" * _PAYLOAD_SIZE
+        fs.write("big.bin", payload_a)
+
+        finished = threading.Event()
+        writer_error: list[BaseException] = []
+
+        def writer() -> None:
+            try:
+                for i in range(_WRITER_ITERATIONS):
+                    fs.write("big.bin", payload_b if i % 2 else payload_a)
+            except BaseException as exc:  # pragma: no cover - surfaced via assertion
+                writer_error.append(exc)
+            finally:
+                finished.set()
+
+        thread = threading.Thread(target=writer)
+        # Summaries only — never the torn bytes themselves, which would be unbounded.
+        torn: list[tuple[int, bytes]] = []
+        reads = 0
+        previous_interval = sys.getswitchinterval()
+        sys.setswitchinterval(_SWITCH_INTERVAL)
+        thread.start()
+        try:
+            while not finished.is_set():
+                observed = target.read_bytes()
+                reads += 1
+                if observed != payload_a and observed != payload_b:
+                    torn.append((len(observed), observed[:1]))
+        finally:
+            thread.join(timeout=_THREAD_JOIN_TIMEOUT)
+            sys.setswitchinterval(previous_interval)
+
+        assert not thread.is_alive(), "writer thread did not finish"
+        assert not writer_error, f"writer raised: {writer_error}"
+        assert reads > 0, "reader never got a chance to observe the file"
+        assert not torn, f"observed {len(torn)} partial reads, e.g. {torn[:5]}"
+
+    def test_publishing_rename_stays_inside_the_target_directory(self, tmp_path: Path) -> None:
+        """``os.replace`` is atomic only within one filesystem — same dir or nothing.
+
+        The invariant asserted is the directory, not the temporary file's name:
+        a cross-directory stage degrades to copy-then-unlink behind an API that
+        claims atomicity, and would pass a name-shaped assertion unnoticed.
+        """
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        real_replace = os.replace
+        calls: list[tuple[Path, Path]] = []
+
+        def recording_replace(src: str | Path, dst: str | Path) -> None:
+            calls.append((Path(src), Path(dst)))
+            real_replace(src, dst)
+
+        with patch("akgentic.tool.workspace.workspace.os.replace", recording_replace):
+            fs.write("deep/nested/file.txt", b"payload")
+
+        assert len(calls) == 1
+        src, dst = calls[0]
+        assert src.parent == dst.parent
+        assert (tmp_path / "team-1" / "deep" / "nested" / "file.txt").read_bytes() == b"payload"
+
+    def test_success_path_leaves_no_temporary_file(self, tmp_path: Path) -> None:
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        fs.write("fresh/out.txt", b"data")
+        directory = tmp_path / "team-1" / "fresh"
+        assert sorted(child.name for child in directory.iterdir()) == ["out.txt"]
+
+    def test_failed_publish_removes_temp_and_leaves_original_intact(self, tmp_path: Path) -> None:
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        fs.write("keep.txt", b"original")
+        directory = tmp_path / "team-1"
+
+        with patch("akgentic.tool.workspace.workspace.os.replace", side_effect=OSError("boom")):
+            with pytest.raises(OSError, match="boom"):
+                fs.write("keep.txt", b"replacement")
+
+        assert sorted(child.name for child in directory.iterdir()) == ["keep.txt"]
+        assert (directory / "keep.txt").read_bytes() == b"original"
+
+    def test_overwrite_preserves_the_existing_file_mode(self, tmp_path: Path) -> None:
+        """Staging must not carry ``mkstemp``'s 0600 onto the published file.
+
+        ``os.replace`` publishes the temporary file's inode, so its mode becomes
+        the target's mode — a workspace bind-mounted into a container running as
+        another uid would silently become unreadable.
+        """
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        fs.write("perm.txt", b"first")
+        target = tmp_path / "team-1" / "perm.txt"
+        target.chmod(0o640)
+
+        fs.write("perm.txt", b"second")
+
+        assert stat.S_IMODE(target.stat().st_mode) == 0o640
+        assert target.read_bytes() == b"second"
+
+    def test_new_file_mode_matches_a_plain_write(self, tmp_path: Path) -> None:
+        """Parity with today's behaviour: whatever the umask would have produced."""
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        fs.write("via_workspace.txt", b"x")
+        control = tmp_path / "team-1" / "control.txt"
+        control.write_bytes(b"x")
+
+        written = tmp_path / "team-1" / "via_workspace.txt"
+        assert stat.S_IMODE(written.stat().st_mode) == stat.S_IMODE(control.stat().st_mode)
 
 
 # ---------------------------------------------------------------------------
