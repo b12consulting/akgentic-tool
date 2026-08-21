@@ -31,7 +31,8 @@ channel system — as tool calls, system prompt injections, or programmatic comm
   - [TeamTool](#teamtool)
   - [NotificationTool](#notificationtool)
   - [MCPTool](#mcptool)
-  - [ExecTool](#exectool)
+  - [ExecTool — deprecated](#exectool--deprecated-use-workspacetoolworkspace_exec)
+  - [Deprecating a card](#deprecating-a-card--not-the-same-as-moving-an-import-path)
 - [Error Handling](#error-handling)
 - [Optional Extras](#optional-extras)
 - [Development](#development)
@@ -54,9 +55,11 @@ running inside it. It provides:
   > from `akgentic.llm.event` instead.
 - **RetriableError** — tools signal recoverable failures; `ToolFactory` translates them to the
   framework-specific retry exception without coupling tool logic to pydantic-ai
-- **Domain tools** — nine production-ready tool implementations covering workspace I/O, task
-  planning, knowledge graph, web search, team management, vector-store configuration, MCP server
-  integration, sandboxed shell execution, and self-scheduled notifications
+- **Domain tools** — eight production-ready tool implementations covering workspace I/O **with
+  sandboxed shell execution**, task planning, knowledge graph, web search, team management,
+  vector-store configuration, MCP server integration, and self-scheduled notifications. A ninth
+  card, `ExecTool`, still ships as a deprecated shim over `WorkspaceTool(workspace_exec=…)` and is
+  not counted — it advertises no capability the workspace card does not
 
 ```
 ToolCard(s)
@@ -184,8 +187,11 @@ PlanningTool(
 ## Architecture
 
 The package follows a two-layer design: a **core layer** of abstract contracts and a **domain
-layer** of independent tool implementations. Domain submodules never import each other — cross-
-tool composition happens at the agent level.
+layer** of tool implementations. Domain submodules are independent of each other and cross-tool
+composition happens at the agent level, with **one deliberate exception**: `workspace` imports
+`sandbox`, because `workspace_exec` runs commands on the sandbox backend. That edge is
+one-directional — `workspace` → `sandbox`, never back — and an import the other way would make the
+pair a cycle.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -401,8 +407,17 @@ The observer is a `Protocol`, and there are three, each extending the one above 
 | Protocol | What it adds | What that lets a tool do |
 |---|---|---|
 | `ToolObserver` | `notify_event(event)` | Emit a domain event onto the orchestrator's stream. Nothing more. |
-| `ActorToolObserver` | `myAddress`, `orchestrator`, `team_id`, `proxy_ask(...)` | Reach any actor by address — including a singleton tool actor. |
+| `ActorToolObserver` | `myAddress`, `orchestrator`, `team_id`, `proxy_ask(...)`, `proxy_tell(...)` | Reach any actor by address — including a singleton tool actor. |
 | `TeamManagementToolObserver` | `createActor(...)`, `on_hire(...)`, `on_fire(...)` | Create actors, and change the team's membership. |
+
+**`proxy_ask` or `proxy_tell` is a correctness choice, not a style one.** A tool that sends an actor
+something it needs no answer to must send it as a **tell**. An ask has no default timeout, so a
+merely *slow* target stalls the caller indefinitely — and a fail-open `except` around the call
+catches a raising target and a dead one, never a hung one. A tell cannot stall the sender at all,
+which makes "this call never blocks the caller" a property of the mechanism rather than of a tuned
+number. `WorkspaceTool` binds both over one address for exactly that reason: mutations *ask*,
+because the closure needs the verdict; read observations *tell*, because the reader needs nothing
+back.
 
 Each capability is gated by the level above it: a tool that only emits events cannot reach an
 actor, and a tool that reaches actors cannot hire anyone. Declare the narrowest level your tool
@@ -548,8 +563,16 @@ few are not. A plan, a knowledge graph and a vector index are **shared, mutable 
 any single tool call**, and the framework gives that state a home — a **tool actor**, one per team,
 that every agent carrying the card talks to.
 
-Six ship in this package today: `#VectorStore`, `#PlanningTool`, `#KnowledgeGraphTool`,
-`#SandboxActor`, `#TeamActivity` and `#NotificationTool`.
+Seven ship in this package today: `#VectorStore`, `#PlanningTool`, `#KnowledgeGraphTool`,
+`#SandboxActor-<workspace>`, `#TeamActivity`, `#NotificationTool` and
+`#Workspace-<workspace_id or team_id>`.
+
+**Note the two names that carry a suffix.** Five of the seven are one per *team*, and their name is
+a constant. The workspace actor and the sandbox actor are one per *workspace tree*, so their names
+are **built** from the workspace rather than being literals — which means two of them can coexist in
+one team, each owning its own directory. `getChildrenOrCreate` keys on the name, so this is not
+cosmetic: a fixed name would collapse two trees onto one actor, silently. The unicity domain of an
+actor must equal the resource it owns.
 
 ### One per team, and what that buys
 
@@ -651,8 +674,8 @@ on the `akgentic.tool.core` façade; import `akgentic.tool.core.deferred` direct
 
 Calling `request` on the **ask** proxy is not a partial adoption of the mechanism. `request` adds to
 the in-flight set, spawns a worker and tells it the payload — all O(1) on the cache actor's thread,
-so the ask never waits on external work. A tool closure holds an ask proxy and nothing else:
-`ActorToolObserver` exposes no tell proxy.
+so the ask never waits on external work. A tell proxy would do here too — `ActorToolObserver`
+exposes one — but it buys nothing: the call it would replace already cannot block.
 
 ### Seven rules — all of them, or none
 
@@ -689,14 +712,21 @@ decoration.
 
 ## Tool Catalog
 
-Nine tool cards ship with the package. Each one has its own README next to the code, covering the
-`ToolCard` definition, every field and every nested capability parameter, and the full
+**Eight** tool cards ship with the package. Each one has its own README next to the code, covering
+the `ToolCard` definition, every field and every nested capability parameter, and the full
 configuration surface — environment, extras, actor wiring and failure modes. The entries below
 are the index; the detail lives beside the module it documents.
 
+`ExecTool` has a row below and is **not** one of the eight: it is a deprecated shim over
+`WorkspaceTool(workspace_exec=…)`, kept working and kept listed so a reader who arrives looking for
+it is told where the capability went. A shim is not a distinct usable capability, so it does not
+count towards what the package advertises. See
+[Deprecating a card](#deprecating-a-card--not-the-same-as-moving-an-import-path) for what that
+status commits us to.
+
 | Tool | Module | What it does | Reference |
 |---|---|---|---|
-| `WorkspaceTool` | `akgentic.tool.workspace` | Team-scoped filesystem: read, list, glob, grep, view, write, edit, patch | [README](src/akgentic/tool/workspace/README.md) |
+| `WorkspaceTool` | `akgentic.tool.workspace` | Team-scoped filesystem behind a write gate, with a git journal and sandboxed shell execution | [README](src/akgentic/tool/workspace/README.md) |
 | `PlanningTool` | `akgentic.tool.planning` | Shared task board backed by the `#PlanningTool` actor | [README](src/akgentic/tool/planning/README.md) |
 | `KnowledgeGraphTool` | `akgentic.tool.knowledge_graph` | Entities and relations with hybrid keyword + semantic search | [README](src/akgentic/tool/knowledge_graph/README.md) |
 | `VectorStoreTool` | `akgentic.tool.vector_store` | Configuration-only card owning the shared embedding store | [README](src/akgentic/tool/vector_store/README.md) |
@@ -704,32 +734,45 @@ are the index; the detail lives beside the module it documents.
 | `TeamTool` | `akgentic.tool.team` | Hire, fire, roster, role profiles, and who is busy right now | [README](src/akgentic/tool/team/README.md) |
 | `NotificationTool` | `akgentic.tool.notification` | Delayed messages an agent schedules to itself | [README](src/akgentic/tool/notification/README.md) |
 | `MCPTool` | `akgentic.tool.mcp` | External MCP servers as pydantic-ai toolsets | [README](src/akgentic/tool/mcp/README.md) |
-| `ExecTool` | `akgentic.tool.sandbox` | Sandboxed shell execution in the team workspace | [README](src/akgentic/tool/sandbox/README.md) |
+| ~~`ExecTool`~~ | `akgentic.tool.sandbox` | **Deprecated** — use `WorkspaceTool(workspace_exec=…)`. The sandbox *backend* it wired is not deprecated and is documented in the same place | [README](src/akgentic/tool/sandbox/README.md) |
 
 ### WorkspaceTool
 
-Sandboxed read/write access to a shared team filesystem — `workspace_read`, `workspace_list`,
+Read/write access to a shared team filesystem — `workspace_read`, `workspace_list`,
 `workspace_glob`, `workspace_grep`, `workspace_view` on the read side; `workspace_write`,
 `workspace_edit`, `workspace_multi_edit`, `workspace_patch`, `workspace_delete`,
-`workspace_mkdir` on the write side. One class covers both modes via a `read_only: bool` gate.
-All paths are anchored to `<AKGENTIC_WORKSPACES_ROOT>/<workspace_id or team_id>` and traversal
-out of that root is rejected.
+`workspace_mkdir` and (opt-in) `workspace_exec` / `workspace_exec_result` on the write side. One
+class covers both modes via a `read_only: bool` gate. All paths are anchored to
+`<AKGENTIC_WORKSPACES_ROOT>/<workspace_id or team_id>` and traversal out of that root is rejected.
+
+**A `#Workspace-<workspace>` singleton owns the tree, and every mutation is refused unless the file
+is still what the writing agent last read.** Reads stay on the agent's own thread and are never
+serialized. A refusal is a `RetriableError`, so it lands in the model's next turn carrying a diff of
+what the write would have destroyed — the agent re-reads and redoes without anyone writing recovery
+logic. No digest, `expected` or `force` appears in any tool signature: the precondition is derived
+server-side from what the agent was observed to read, and there is deliberately no bypass. Accepted
+mutations are committed to a linear git history authored by the agent; that journal is optional and
+degrades off, the gate is not and does not.
 
 ```python
 from akgentic.tool import WorkspaceTool
 
-WorkspaceTool()                                      # full access (default)
+WorkspaceTool()                                      # full access (default), journal on, exec off
 WorkspaceTool(read_only=True)                        # read tools only
 WorkspaceTool(workspace_id="shared")                 # shared workspace across teams
+WorkspaceTool(workspace_exec=True)                   # + sandboxed shell over the same tree
+WorkspaceTool(workspace_git=False)                   # no history; the gate is unaffected
 WorkspaceTool(read_only=True, workspace_glob=False)  # fine-grained capability control
 ```
 
 Binary reads (PDF, DOCX, XLSX, PPTX) need `akgentic-tool[docs]`; image resizing for
-`workspace_view` needs `akgentic-tool[vision]`. Both degrade rather than fail.
+`workspace_view` needs `akgentic-tool[vision]`; the journal needs `git` on `PATH`. All three degrade
+rather than fail.
 
 **[Full reference → `src/akgentic/tool/workspace/README.md`](src/akgentic/tool/workspace/README.md)** —
-every capability parameter, the `DocumentReader` two-pass extraction, resource seeding, sidecar
-caching and the edit-matching cascade.
+the gate's rules and what a refusal looks like, the journal and the five ways it degrades off, the
+exec lease and its three budgets, every capability parameter, the `DocumentReader` two-pass
+extraction, resource seeding, sidecar caching and the edit-matching cascade.
 
 ### PlanningTool
 
@@ -885,27 +928,47 @@ be requested explicitly.
 both connection models field by field, the SSE timeout subtlety, tool prefixing, diagnostics and
 the OAuth helpers.
 
-### ExecTool
+### ExecTool — deprecated, use `WorkspaceTool(workspace_exec=…)`
 
-Sandboxed shell command execution inside the team workspace. A single `SandboxActor` is spawned
-per team and reused across all `ExecTool` calls; the backend is selected via the `mode` field,
-with `auto` probing the host (`bwrap` → `seatbelt` → `docker` → `local`).
+**The card moved; the backend did not.** Sandboxed execution is a capability of `WorkspaceTool`,
+because exec and the write gate share one resource — the tree — and two cards over one tree means
+two mailboxes that interleave. `SANDBOX_ACTOR_CLASSES`, the four backends and the bundled Docker
+image are unchanged, are not deprecated, and are what `workspace_exec` resolves through.
 
 ```python
-from akgentic.tool import ExecTool
+# Before
+ToolFactory([WorkspaceTool(workspace_id="proj-42"), ExecTool(workspace_id="proj-42")], observer=agent)
 
-ExecTool()                        # auto mode (default)
-ExecTool(mode="docker")           # persistent container per team
-ExecTool(workspace_id="shared")   # share the workspace directory with WorkspaceTool
+# After
+ToolFactory([WorkspaceTool(workspace_id="proj-42", workspace_exec=True)], observer=agent)
 ```
 
-Commands are checked against the `ALLOWED_COMMANDS` allowlist — first token only. Disallowed
-commands and backend failures come back as strings, never as exceptions. Set
-`AKGENTIC_SANDBOX_IMAGE` to use a pre-built Docker image instead of the auto-built one.
+`ExecTool` still resolves and `exec_command` still behaves identically — same lease, same worker,
+same discovery, same commit — because it is a shim over `workspace_exec` rather than a second
+implementation. It emits a `DeprecationWarning` when the card is **wired**, not at import. What it
+cannot express is `workspace_git`: its three fields are frozen, so an `ExecTool`-only agent always
+gets the journal's defaults.
 
 **[Full reference → `src/akgentic/tool/sandbox/README.md`](src/akgentic/tool/sandbox/README.md)** —
-the four backends compared (isolation, timeouts, rlimits, network), the Docker image lifecycle,
-and how to register a backend of your own.
+the migration table, the four backends compared (isolation, timeouts, rlimits, network), the
+allowlist and why it is not the boundary, the Docker image lifecycle, and how to register a backend
+of your own.
+
+### Deprecating a card — not the same as moving an import path
+
+[§Migration](#migration-moved-import-paths) governs **import paths** and their Stable/Internal
+tiers: a symbol that moves modules gets a shim, and the tier says whether the old path was ever a
+promise. A deprecated **card** is a different thing — no module moved, and the class keeps working.
+The policy, stated once because `ExecTool` is the first to need it:
+
+- **It keeps working, identically**, for as long as it ships. A shim that behaves differently from
+  its replacement is worse than no shim.
+- **It warns when it is wired**, naming its replacement. Not at import: an import-time warning fires
+  for anybody who merely has the module in a dependency's `__init__`, which is nobody's decision to
+  change.
+- **It leaves the Tool Catalog for a migration pointer** and stops counting towards the number of
+  tools the package advertises.
+- **It is removed no earlier than the minor release after** the one that deprecated it.
 
 ## Error Handling
 
@@ -934,8 +997,16 @@ produces no tool response and stalls the agent's ReAct loop.
 |---|---|
 | `FileNotFoundError` | Wrap as `RetriableError("File not found: {path}")` |
 | `PermissionError` (path escape) | Wrap as `RetriableError("Path escapes workspace root ...")` |
+| `PermissionError` (OS denied the write) | Wrap as a **different** `RetriableError` saying the path was fine and the file is not replaceable — told the first message, an agent rewrites a correct path for ever |
 | `re.error` (bad regex) | Wrap as `RetriableError("Invalid regex pattern: {error}")` |
 | `RuntimeError` (uninitialised state) | Let propagate — programming error, not an LLM error |
+
+**A refused workspace mutation is a `RetriableError` too**, and that is what makes the write gate
+work end to end: the refusal, its diff and its "read the file again, then retry" instruction all
+land in the model's next turn, so an agent recovers from a lost-update collision without anyone
+writing recovery logic. The accepted cost is that each refusal consumes one of pydantic-ai's
+retries. A returned string would not — and would be easy for a model to ignore, which is exactly
+what must not happen when the point is that the write does not land.
 
 ## Optional Extras
 
@@ -1071,20 +1142,34 @@ src/akgentic/tool/
     │   mcp.py                # MCPTool, connection configs
     │   └── oauth_handler.py  # OAuth 2.0 flow
     workspace/
-        README.md           # WorkspaceTool reference — every capability parameter
-        workspace.py          # Workspace Protocol, Filesystem, get_workspace()
-        edit.py               # EditMatcher (7-strategy), FilePatch, parse_patch
+        README.md           # WorkspaceTool reference — the gate, the journal, exec, every param
+        __init__.py           # Public exports: the card, its params, the actor, the models
+        workspace.py          # Workspace Protocol, Filesystem (atomic write / write_many),
+        │                     #   PathEscapeError, WriteEntry, get_workspace(), is_staging_name
+        actor.py              # WorkspaceActor "#Workspace-<workspace>" — the six gated
+        │                     #   mutations, the live-hash check, the lease, the staging sweep
+        models.py             # Observation, MutationOutcome, LastWrite, WorkspaceConfig,
+        │                     #   content_sha, the refusal texts and every cap
+        journal.py            # GitJournal, Identity — linear history, out-of-band commits,
+        │                     #   the seeded .gitignore, graceful absence
+        execution.py          # workspace_exec's models, budgets, ExecWorker and the one
+        │                     #   formatter both exec surfaces render through
+        edit.py               # EditMatcher (7-strategy), FilePatch, parse_patch,
+        │                     #   render_file_patch (hunk-context verified), HunkContextError
         readers.py            # DocumentReader (Pydantic BaseModel), TEXT_EXTENSIONS
         └── tool.py           # WorkspaceTool ToolCard
     sandbox/
-        README.md           # ExecTool reference — backends compared, allowlist, image
+        README.md           # The exec backend — backends compared, allowlist, image;
+        │                     #   and ExecTool's migration pointer
         __init__.py           # Public exports: ExecTool, SandboxActor subclasses, models
-        actor.py              # SandboxActor (abstract), SandboxConfig, ALLOWED_COMMANDS
+        actor.py              # SandboxActor (abstract), SandboxConfig, ALLOWED_COMMANDS,
+        │                     #   sandbox_actor_name() — the name carries the workspace
         local.py              # LocalSandboxActor (subprocess, resource limits)
         docker.py             # DockerSandboxActor (persistent container per team)
         seatbelt.py           # SeatbeltSandboxActor (macOS Apple Seatbelt)
         bwrap.py              # BwrapSandboxActor (Linux bubblewrap)
-        tool.py               # ExecTool ToolCard, SANDBOX_ACTOR_CLASSES registry
+        tool.py               # ExecTool ToolCard (deprecated shim over workspace_exec),
+        │                     #   SANDBOX_ACTOR_CLASSES registry, auto-mode probing
         └── sandbox.Dockerfile # Bundled image definition for akgentic-sandbox:latest
 tests/                        # Tests organised by domain
 ```

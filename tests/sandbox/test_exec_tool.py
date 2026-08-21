@@ -38,10 +38,10 @@ import pytest
 from akgentic.core.actor_address import ActorAddress
 
 from akgentic.tool.sandbox.actor import (
-    SANDBOX_ACTOR_NAME,
     CommandNotAllowedError,
     SandboxActor,
     SandboxConfig,
+    sandbox_actor_name,
 )
 from akgentic.tool.sandbox.bwrap import BwrapSandboxActor
 from akgentic.tool.sandbox.docker import DockerSandboxActor
@@ -258,7 +258,9 @@ def test_observer_creates_actor_with_correct_config() -> None:
     wire(tool, observer)
 
     config = sandbox_config_of(observer)
-    assert config.name == SANDBOX_ACTOR_NAME
+    # No workspace_id on this card, so the workspace — and therefore the actor's
+    # name — falls back to the team id, exactly as Filesystem resolution does.
+    assert config.name == sandbox_actor_name("team-test")
     assert config.role == "ToolActor"
     assert config.team_id == "team-test"
     assert config.mode == "local"
@@ -881,8 +883,26 @@ def test_wiring_creates_the_workspace_actor_as_well() -> None:
         call[1]["config"].name
         for call in observer._orch_proxy.getChildrenOrCreate.call_args_list
     ]
-    assert SANDBOX_ACTOR_NAME in names
+    assert sandbox_actor_name("shared") in names
     assert "#Workspace-shared" in names
+
+
+def test_the_sandbox_actor_is_named_per_workspace_like_the_workspace_actor() -> None:
+    """Two workspaces in one team must not collapse onto one sandbox actor.
+
+    ``getChildrenOrCreate`` resolves on ``config.name`` alone, so a constant name
+    handed the second card the first card's actor — whose directory is the first
+    card's tree. Asserted on the two names being distinct, because that is the
+    whole of what the orchestrator keys on.
+    """
+    names: list[str] = []
+    for workspace in ("alpha", "beta"):
+        observer = MockObserver(existing_actor=None)
+        wire(ExecTool(mode="local", workspace_id=workspace), observer)
+        names.append(sandbox_config_of(observer).name)
+
+    assert names == [sandbox_actor_name("alpha"), sandbox_actor_name("beta")]
+    assert names[0] != names[1]
 
 
 def test_exec_command_routes_through_the_workspace_actor() -> None:

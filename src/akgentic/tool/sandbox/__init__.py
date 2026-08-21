@@ -10,6 +10,7 @@ from .actor import (
     SandboxActor,
     SandboxConfig,
     SandboxState,
+    sandbox_actor_name,
 )
 from .bwrap import BwrapSandboxActor
 from .docker import DockerSandboxActor
@@ -30,4 +31,5 @@ __all__ = [
     "SandboxConfig",
     "SandboxState",
     "SeatbeltSandboxActor",
+    "sandbox_actor_name",
 ]

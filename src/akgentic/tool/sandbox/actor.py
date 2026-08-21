@@ -25,7 +25,39 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 SANDBOX_ACTOR_NAME: str = "#SandboxActor"
+"""Base actor name. The live name appends the workspace — see :func:`sandbox_actor_name`.
+
+The ``#`` prefix is the orchestrator's teardown invariant: it is what classifies
+the actor as a tool actor during the two-phase stop.
+"""
+
 SANDBOX_ACTOR_ROLE: str = "ToolActor"
+
+
+def sandbox_actor_name(workspace_name: str) -> str:
+    """Return the sandbox actor name owning *workspace_name*'s tree.
+
+    ``getChildrenOrCreate`` resolves purely on ``config.name``, so a fixed
+    ``#SandboxActor`` collapses two exec-capable cards carrying different
+    ``workspace_id`` values onto the **first** actor — whose directory is the
+    *other* card's tree. The second agent's commands then run in tree ``a`` while
+    ``#Workspace-b`` gates, discovers and commits tree ``b``: tree ``a`` is
+    mutated entirely outside the gate, with nothing raised and nothing logged.
+
+    Same rule as the workspace actor, in the one place it was not applied — the
+    unicity domain of an actor must equal the resource it owns, and the resource
+    is a tree.
+
+    Args:
+        workspace_name: The resolved workspace — a card's ``workspace_id``, or
+            the team id when it has none. It must be derived exactly as
+            ``Filesystem`` resolution derives it, or the actor's name and the
+            directory it opens would disagree.
+
+    Returns:
+        ``#SandboxActor-<workspace_name>``.
+    """
+    return f"{SANDBOX_ACTOR_NAME}-{workspace_name}"
 
 SandboxMode = Literal["local", "bwrap", "seatbelt", "docker"]
 """A backend that has been resolved. ``"auto"`` is not one of these."""

@@ -22,9 +22,11 @@ from akgentic.tool.core.deferred import DEFAULT_WORKER_TIMEOUT_S, WORKER_NAME_PR
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.sandbox.actor import (
     DEFAULT_BACKEND_TIMEOUT_S,
+    SANDBOX_ACTOR_NAME,
     SandboxActor,
     SandboxConfig,
     SandboxState,
+    sandbox_actor_name,
 )
 from akgentic.tool.sandbox.bwrap import BwrapSandboxActor
 from akgentic.tool.sandbox.docker import DockerSandboxActor
@@ -50,6 +52,7 @@ from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
 
 from tests.workspace.conftest import (
     HANDSHAKE_TIMEOUT_S,
+    WORKSPACE_NAME,
     ExecHarness,
     FakeActorToolObserver,
     FakeOrchestratorProxy,
@@ -168,7 +171,7 @@ class TestTheCapability:
         card.observer(FakeActorToolObserver(orchestrator_proxy))
 
         created = [config.name for _cls, config in orchestrator_proxy.create_calls]
-        assert not any(name == "#SandboxActor" for name in created)
+        assert not any(name.startswith(SANDBOX_ACTOR_NAME) for name in created)
 
     def test_read_only_creates_no_sandbox_actor_either(
         self,
@@ -178,7 +181,7 @@ class TestTheCapability:
     ) -> None:
         exec_card_for(orchestrator_proxy, read_only=True)
         created = [config.name for _cls, config in orchestrator_proxy.create_calls]
-        assert "#SandboxActor" not in created
+        assert not any(name.startswith(SANDBOX_ACTOR_NAME) for name in created)
 
     def test_on_creates_the_sandbox_actor(
         self,
@@ -186,7 +189,52 @@ class TestTheCapability:
         orchestrator_proxy: FakeOrchestratorProxy,
     ) -> None:
         created = [config.name for _cls, config in orchestrator_proxy.create_calls]
-        assert "#SandboxActor" in created
+        assert sandbox_actor_name(WORKSPACE_NAME) in created
+
+    def test_two_workspaces_in_one_team_get_two_sandbox_actors(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspaces_root: Path,
+        sandbox_script: SandboxScript,
+    ) -> None:
+        # getChildrenOrCreate resolves on config.name alone, so a constant name
+        # handed the second card the FIRST card's actor — whose directory is the
+        # first card's tree. The second agent's commands then ran in tree `a`
+        # while its own #Workspace-b gated, discovered and committed tree `b`:
+        # `a` mutated entirely outside the gate, nothing raised, nothing logged.
+        #
+        # Asserted on where each backend actually ended up, not only on the
+        # names: the name is the mechanism, the directory is the consequence.
+        for name in ("alpha", "beta"):
+            (workspaces_root / name).mkdir(parents=True, exist_ok=True)
+        exec_card_for(orchestrator_proxy, name="a", workspace_id="alpha")
+        exec_card_for(orchestrator_proxy, name="b", workspace_id="beta")
+
+        alpha = orchestrator_proxy.children[sandbox_actor_name("alpha")][1]
+        beta = orchestrator_proxy.children[sandbox_actor_name("beta")][1]
+
+        assert alpha is not beta
+        assert alpha.state.workspace_path == (workspaces_root / "alpha").resolve()
+        assert beta.state.workspace_path == (workspaces_root / "beta").resolve()
+
+    def test_two_cards_on_one_workspace_still_share_one_sandbox_actor(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        sandbox_script: SandboxScript,
+    ) -> None:
+        # The other half of "one actor per tree": naming by workspace must not
+        # turn into naming by card. Two agents over one tree share one backend,
+        # exactly as they share one #Workspace.
+        exec_card_for(orchestrator_proxy, name="a")
+        exec_card_for(orchestrator_proxy, name="b")
+
+        created = [
+            config.name
+            for _cls, config in orchestrator_proxy.create_calls
+            if config.name.startswith(SANDBOX_ACTOR_NAME)
+        ]
+        assert set(created) == {sandbox_actor_name(WORKSPACE_NAME)}
 
     def test_off_the_tool_channel_creates_no_sandbox_actor_and_probes_nothing(
         self,
@@ -210,7 +258,7 @@ class TestTheCapability:
         card.observer(FakeActorToolObserver(orchestrator_proxy))
 
         created = [config.name for _cls, config in orchestrator_proxy.create_calls]
-        assert "#SandboxActor" not in created
+        assert not any(name.startswith(SANDBOX_ACTOR_NAME) for name in created)
         names = {tool.__name__ for tool in card.get_tools()}
         assert "workspace_exec" not in names
 
@@ -668,6 +716,53 @@ class TestCollectingARun:
             actor._track_run(AGENT, new_run_id())
 
         assert len(actor._recent_runs[AGENT]) == MAX_TRACKED_RUNS
+
+    def test_a_settled_run_is_never_reported_as_running_once_its_result_is_evicted(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        # The two maps have different capacities: _recent_runs holds 32 ids PER
+        # AGENT, _slots holds 128 results IN TOTAL. Past five agents the tracking
+        # outlives the results, and answering from the tracking map then reports
+        # a run that finished long ago as still running — a dead end for a model,
+        # because no later poll can ever settle it.
+        _card, actor, harness = exec_setup
+        run_id = start_run(actor, sandbox_script)
+        finish_run(sandbox_script, harness)
+        assert actor.exec_status(AGENT, run_id).state is ExecState.DONE
+
+        for index in range(actor.cache_capacity):
+            actor.deliver(f"other{index}", ExecOutcome(stdout="", stderr="", exit_code=0))
+
+        # The tracking still holds it; the result no longer does.
+        assert run_id in actor._recent_runs[AGENT]
+        assert actor.get(run_id) is None
+        assert run_id not in actor._in_flight
+
+        status = actor.exec_status(AGENT, run_id)
+        assert status.state is ExecState.UNKNOWN
+        assert run_id in status.recent_run_ids  # still correctable, never "running"
+
+    def test_running_is_answered_from_the_in_flight_set_not_from_the_tracking_map(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        # A run is running iff it is in flight. Asserted in both directions
+        # against the tracking map, which is what the two capacities make unable
+        # to answer it: tracked-and-in-flight is RUNNING, tracked-and-not is not.
+        _card, actor, harness = exec_setup
+        run_id = start_run(actor, sandbox_script)
+
+        assert run_id in actor._in_flight
+        assert actor.exec_status(AGENT, run_id).state is ExecState.RUNNING
+
+        never_ran = new_run_id()
+        actor._track_run(AGENT, never_ran)
+        assert actor.exec_status(AGENT, never_ran).state is ExecState.UNKNOWN
+
+        finish_run(sandbox_script, harness)
 
     def test_two_polls_during_one_run_do_not_queue_behind_it(
         self,
