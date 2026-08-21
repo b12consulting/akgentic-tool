@@ -165,14 +165,23 @@ class MetadataTool(ToolCard):
     """The team's business context, rendered once into every agent's prefix.
 
     Attributes:
-        render_metadata: The one capability. ``False`` removes it entirely; a
-            param instance supplies the template and narrows the channels.
-            ``True`` — the default — means "enabled with defaults", and since
-            there is no default template it fails at :meth:`observer`, which is
-            where a missing template should be noticed.
+        render_metadata: The one capability, and the one capability in this
+            package that ships **off**. Every other capability here defaults on,
+            because every other one is meaningful with no configuration at all —
+            a roster renders itself, a graph summarises itself. This one cannot:
+            its entire content is an operator-written ``template``, and there is
+            no template a framework could supply. That makes ``True`` here not
+            merely unhelpful but *unsatisfiable*: it means "enabled with
+            defaults", ``template`` is required, and so it raises at
+            :meth:`observer` — which is where a missing template should be
+            noticed, and why ``True`` stays a legal value. The card is turned on
+            by handing it the template it exists to render: a ``RenderMetadata``
+            instance supplies that and narrows the channels. ``False``, the
+            default, removes the capability entirely, so a card nobody has
+            configured contributes nothing and raises nothing.
     """
 
-    render_metadata: RenderMetadata | bool = True
+    render_metadata: RenderMetadata | bool = False
 
     # Runtime handles: an actor proxy is not serializable and never a field, and
     # neither is the snapshot — a restored card renders afresh against its own team.

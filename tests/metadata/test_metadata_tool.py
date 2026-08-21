@@ -121,6 +121,11 @@ class TestCardSurface:
     def test_the_card_declares_exactly_one_field(self) -> None:
         assert set(MetadataTool.model_fields) == {"render_metadata"}
 
+    def test_the_one_capability_ships_off(self) -> None:
+        """The package's one default-off capability — its whole content is operator-written."""
+        assert MetadataTool.model_fields["render_metadata"].default is False
+        assert MetadataTool().render_metadata is False
+
     def test_the_capability_declares_template_header_and_the_inherited_pair(self) -> None:
         assert set(RenderMetadata.model_fields) == {
             "instructions",
@@ -281,9 +286,9 @@ class TestNameValidation:
             card.observer(observer)
 
     def test_enabling_the_capability_without_a_template_fails_at_wiring(self) -> None:
-        """``render_metadata=True`` means "defaults", and there is no default template."""
+        """An explicit ``render_metadata=True`` asks for defaults, and there is no default."""
         with pytest.raises(ValueError):
-            MetadataTool().observer(_make_observer(_TeamContext()))
+            MetadataTool(render_metadata=True).observer(_make_observer(_TeamContext()))
 
 
 # ── AC4: deferred name validation when metadata is unset at wiring ────────────
@@ -460,6 +465,26 @@ class TestSnapshot:
         assert card._rendered is None, "the previous team's block must not survive"
         assert _prompt(card)() == "Fiscal year: FY27. Engagement: Audit."
 
+    def test_rebinding_a_disabled_card_serves_nothing_from_the_previous_team(self) -> None:
+        """The clear runs *before* the capability is resolved, and only this proves it.
+
+        The counterpart of the test above, which rebinds an **enabled** card and so
+        stays green even if the clear is moved below the disabled-card early return.
+        Reaching ``False`` by assignment: the card is not frozen and does not
+        validate on assignment, and the assertions are what matter.
+        """
+        card, _ = _wire(_TeamContext())
+        assert _prompt(card)() == RENDERED
+        assert card._orchestrator_proxy is not None
+
+        card.render_metadata = False
+        card.observer(_make_observer(_TeamContext(fiscal_year="FY27", engagement="Audit")))
+
+        assert card._orchestrator_proxy is None, "no live edge to the previous team may survive"
+        assert card._rendered is None, "the previous team's business context must be gone"
+        assert card.get_system_prompts() == []
+        assert card.get_commands() == {}
+
     def test_the_snapshot_is_shared_across_channels(self) -> None:
         card, observer = _wire(_TeamContext())
         proxy = _proxy(observer)
@@ -498,6 +523,29 @@ class TestChannels:
         card, _ = _wire(_TeamContext(), expose={SYSTEM_PROMPT})
         assert card.get_commands() == {}
         assert len(card.get_system_prompts()) == 1
+
+    def test_a_bare_card_contributes_nothing_and_raises_nothing(self) -> None:
+        """FR7: the card nobody has configured must fail neither wiring nor a turn.
+
+        Both channel methods resolve the capability **outside** any guard, so a
+        default that cannot be constructed raises out of prompt and command
+        collection instead of returning the ``list`` / ``dict`` their base
+        declarations promise. Wiring is checked on the same card afterwards, because
+        ``ToolFactory`` binds an observer to every card it is handed.
+        """
+        card = MetadataTool()
+
+        assert card.get_system_prompts() == []
+        assert card.get_commands() == {}
+        assert card.get_tools() == []
+
+        assert card.observer(_make_observer(_TeamContext())) is card
+
+        assert card.get_system_prompts() == []
+        assert card.get_commands() == {}
+        assert card.get_tools() == []
+        assert card._orchestrator_proxy is None
+        assert card._names == []
 
     def test_a_disabled_capability_contributes_nothing_anywhere(self) -> None:
         card = MetadataTool(render_metadata=False)

@@ -851,7 +851,9 @@ Renders the team's **business context** — the model the deployment wrote with
 `Orchestrator.set_metadata()` — into every agent's system prompt, from one operator-written
 template. Without it the same facts get copied into every role's backstory, where they duplicate
 and drift away from the authoritative copy. The card owns no actor and holds no state beyond the
-block it rendered.
+block it rendered. Alone among the cards here its capability ships **off**, there being no template
+a framework could supply: a `RenderMetadata` turns it on, and a card left unconfigured contributes
+nothing rather than failing.
 
 ```python
 from akgentic.tool.core import COMMAND

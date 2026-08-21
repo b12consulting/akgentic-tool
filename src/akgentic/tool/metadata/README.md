@@ -23,17 +23,19 @@ from akgentic.tool import MetadataTool
 
 ```python
 class MetadataTool(ToolCard):
-    render_metadata: RenderMetadata | bool = True
+    render_metadata: RenderMetadata | bool = False
 
     _orchestrator_proxy: Orchestrator | None = PrivateAttr(default=None)
     _rendered: str | None = PrivateAttr(default=None)
     _names: list[str] = PrivateAttr(default_factory=list)
 ```
 
-**One field, one capability.** `False` removes the capability entirely; a `RenderMetadata` instance
-supplies the template and narrows the channels. `True` — the default — means *enabled with
-defaults*, and since there is no default template it fails at `observer()`, which is where a
-missing template should be noticed rather than at the first turn.
+**One field, one capability — and the one capability in this package that ships off.** `False`, the
+default, removes the capability entirely, so a card nobody has configured contributes nothing and
+raises nothing. A `RenderMetadata` instance turns it on: it supplies the template and narrows the
+channels. `True` stays legal and still means *enabled with defaults*, but since there is no default
+template it fails at `observer()`, which is where a missing template should be noticed rather than
+at the first turn.
 
 **Nothing runtime is a Pydantic field.** The orchestrator proxy is not serializable, and neither is
 the rendered block: a card restored from configuration renders afresh against *its own* team. All
@@ -51,7 +53,7 @@ in the log.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `render_metadata` | `RenderMetadata \| bool` | `True` | The one capability. `False` removes it from both channels; `True` enables it with defaults and therefore **fails at wiring**, there being no default template. |
+| `render_metadata` | `RenderMetadata \| bool` | `False` | The one capability, and the package's one exception to its default-on convention: every other capability here is meaningful unconfigured — a roster renders itself, a graph summarises itself — whereas this card's whole content is an operator-written `template` no framework could supply. So it **contributes nothing until a `RenderMetadata` gives it one**, and an unconfigured card raises nothing. `True` enables it with defaults and therefore **fails at wiring**, there being no default template. |
 
 ## Capability parameter — `RenderMetadata`
 
@@ -185,8 +187,9 @@ MetadataTool(render_metadata=False)          # capability removed from both chan
 
 ### Failure modes worth knowing
 
-- **`render_metadata=True` with no template raises at wiring.** `True` means *defaults*, and there
-  is no default template.
+- **Opting in with `render_metadata=True` raises at wiring.** `True` means *defaults*, and there is
+  no default template — so it is an explicit mistake rather than a shipped one; the card is turned
+  on by handing it a `RenderMetadata`, never by a bare `True`.
 - **An observer with no orchestrator raises `ValueError` at wiring** — there is nothing to read the
   metadata from.
 - **A card that was never wired degrades rather than raising.** The render path catches its own
