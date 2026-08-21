@@ -1,32 +1,235 @@
-# Planning Module
+# PlanningTool
 
-This module provides team planning management capabilities via an actor-based plan store.
+A shared task board for a multi-agent team: one actor holds the plan, every agent reads and
+writes it, and the plan is injected into each agent's system prompt so nobody has to ask what the
+team is doing.
 
-## Architecture Note
+```python
+from akgentic.tool.planning import PlanningTool
+```
 
-**FUTURE REFACTORING**: This planning submodule has an explicit dependency on `akgentic-core`
-(via imports of `ActorAddress`, `Akgent`, `BaseConfig`, `Orchestrator`, etc.). This violates
-the original design goal where `akgentic-tool` had zero infrastructure dependencies.
+| | |
+|---|---|
+| Module | `akgentic.tool.planning.planning` |
+| Actor | `PlanActor`, singleton named `#PlanningTool` |
+| Channels used | `SYSTEM_PROMPT`, `TOOL_CALL`, `COMMAND` |
+| Depends on | `VectorStoreTool` — conditionally, see [`vector_store`](#vector_store) |
+| Optional extras | `[vector_search]` for semantic search |
 
-The recommended approach is to extract the planning module into a separate package
-(e.g., `akgentic-tool-planning` or incorporate it into `akgentic-team`) that explicitly
-depends on `akgentic-core`. This would restore the clean separation and allow
-`akgentic-tool` to remain infrastructure-agnostic for tools that don't require actor
-system integration.
+---
 
-## Current Structure
+## The ToolCard
 
-- **planning.py**: `PlanningTool` - the main tool card that exposes planning capabilities
-- **planning_actor.py**: `PlanActor` - the actor that manages plan state
-- **event.py**: Empty module
+```python
+class PlanningTool(ToolCard):
+    # Vector-search wiring
+    vector_store: bool | str = True
+    collection: CollectionConfig = CollectionConfig()
+    search_top_k: int = 10
+    search_score_threshold: float = 0.5
 
-## Dependencies
+    # Capabilities
+    get_planning: GetPlanning | bool = True
+    get_planning_task: GetPlanningTask | bool = True
+    update_planning: UpdatePlanning | bool = True
+    search_planning: SearchPlanning | bool = True
 
-The planning module requires:
-- `akgentic-core` for actor system integration (`ActorAddress`, `Akgent`, `Orchestrator`)
-- `ActorToolObserver` protocol from parent `event.py` module
+    @property
+    def depends_on(self) -> list[str]:
+        return ["VectorStoreTool"] if self.vector_store is not False else []
+```
 
-## Usage
+**The card is a thin proxy; the plan lives in an actor.** `observer()` asks the orchestrator for
+`getChildrenOrCreate(PlanActor, config=PlanConfig(...))` — get-or-create, so every agent carrying
+a `PlanningTool` binds to the *same* `#PlanningTool` singleton and sees the same task list. All
+four capabilities are closures over that actor's ask proxy.
 
-Tools that need actor system features should use `ActorToolObserver` instead of the
-basic `ToolObserver` protocol.
+**`depends_on` is a property, not a field.** It returns `["VectorStoreTool"]` only when
+`vector_store` is not `False`, so `ToolFactory`'s topological sort wires `VectorStoreTool` first
+when it is needed and does not demand one when the tool runs keyword-only. Because it is a
+property it never appears in `model_dump()` and cannot be set through `model_validate`.
+
+---
+
+## ToolCard fields
+
+### `vector_store`
+
+| Value | Effect |
+|---|---|
+| `True` *(default)* | Bind to the default `#VectorStore` actor. `depends_on` requires a `VectorStoreTool` in the team. |
+| `"#VectorStore-RAG"` (any `str`) | Bind to that named singleton, created by `VectorStoreTool(vector_store_name=...)`. |
+| `False` | Degraded mode: no vector wiring, no `depends_on`, `search_planning` runs keyword-only. |
+
+The card never creates the vector store actor — `VectorStoreTool` owns it. `PlanActor` looks it up
+by name during its own `on_start`. If the lookup fails, or `[vector_search]` is not installed, the
+tool degrades to keyword-only search rather than failing.
+
+### `collection`
+
+A `CollectionConfig` forwarded to `VectorStoreActor.create_collection("planning", …)` when
+`PlanActor` starts.
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `dimension` | `int` | `1536` | Embedding dimensionality; must match the embedding model. |
+| `backend` | `"inmemory" \| "weaviate"` | `"inmemory"` | `weaviate` requires `akgentic-tool[weaviate]`. |
+| `persistence` | `"actor_state" \| "workspace"` | `"actor_state"` | inmemory backend only. |
+| `workspace_path` | `str \| None` | `None` | Filesystem path when `persistence="workspace"`. |
+| `tenant` | `str \| None` | `None` | Weaviate tenant id for multi-tenancy — usually the team id. |
+
+### `search_top_k` / `search_score_threshold`
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `search_top_k` | `int` | `10` | Default number of semantic hits. Overridable per call via `search_planning(top_k=…)`. |
+| `search_score_threshold` | `float` | `0.5` | Minimum cosine similarity for a semantic hit. Overridable per call. Higher than `KnowledgeGraphTool`'s `0.3`: a task board wants precision, graph exploration wants recall. |
+
+Both are propagated to `PlanConfig`, so the actor applies them when the per-call argument is
+`None`.
+
+---
+
+## Capability parameters
+
+### `GetPlanning` — the plan itself
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `expose` | `set[Channels]` | `{SYSTEM_PROMPT, COMMAND}` | **Not a tool call by default.** The plan is context, not something the model must remember to fetch. Add `TOOL_CALL` to also offer it as a callable. |
+| `filter_by_agent` | `bool` | `True` | When `True` the rendered plan lists only tasks the calling agent owns *or* created (and that have an owner). The team summary — totals and per-owner breakdown — is always shown. `False` lists every task. |
+
+`filter_by_agent=True` is what keeps the prompt cost of a 200-task board bounded: every agent sees
+the same two summary lines plus its own slice.
+
+```
+**Team planning:** 5 tasks total
+Owners: @Alice: 3 | @Bob: 1 | unassigned: 1
+
+**Your tasks** (owner or creator: @Alice):
+- ID 3 [started] Implement auth module (Owner: @Alice, Creator: @Alice)
+- ID 7 [pending] Review PR #42 — Output: pending (Owner: @Bob, Creator: @Alice)
+
+Use get_planning_task(id) for exact ID lookup or search_planning(...) to filter tasks.
+```
+
+### `GetPlanningTask` — `get_planning_task(task_id: int)`
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `expose` | `set[Channels]` | `{TOOL_CALL, COMMAND}` | |
+
+Exact lookup by integer id. No extra fields.
+
+### `UpdatePlanning` — `update_planning(update: UpdatePlan)`
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `expose` | `set[Channels]` | `{TOOL_CALL}` | **Tool call only** — writing the plan is not offered on the `COMMAND` channel, and `get_commands()` does not register it even if you add `COMMAND` to `expose`. |
+
+One batched mutation carries creates, updates and deletes:
+
+```python
+class UpdatePlan(BaseModel):
+    create_tasks: list[TaskCreate] = []
+    update_tasks: list[TaskUpdate] = []
+    delete_tasks: list[int] = []
+```
+
+| Model | Fields |
+|---|---|
+| `TaskCreate` | `id: int`, `status`, `description` (**max 300 chars**), `owner: str` (empty ⇒ unassigned), `dependencies: list[int]` |
+| `TaskUpdate` | `id: int` plus optional `status`, `description` (max 300), `output` (**max 150, silently truncated**), `owner`, `dependencies` |
+| `Task` | `TaskCreate` + `output: str`, `creator: str`, `updated_at: datetime` |
+
+`status` is `"pending" | "started" | "completed" | "abort"`.
+
+`description` over 300 characters is a **validation error** the model must correct; `output` over
+150 characters is **truncated to 147 characters plus `...`** by a `before` validator, so a verbose
+result never fails a call. Both limits are stated in the tool docstring so the model respects them
+before composing the call.
+
+`creator` is never supplied by the model — the closure stamps it from the calling agent's address.
+
+### `SearchPlanning` — `search_planning(...)`
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `expose` | `set[Channels]` | `{TOOL_CALL, COMMAND}` | |
+
+```python
+search_planning(
+    query: str | None = None,
+    mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
+    status: TaskStatus | None = None,
+    owner: str | None = None,
+    creator: str | None = None,
+    top_k: int | None = None,             # None -> search_top_k
+    score_threshold: float | None = None, # None -> search_score_threshold
+) -> list[str]
+```
+
+All filters are AND-combined; omitting everything returns the full list. Results are tagged with
+how they were found — `(keyword match)`, `(semantic: 0.85)`, `(hybrid: 0.90)`.
+
+`mode="keyword"` performs **no embedding call at all**, which is the mode to use when the query is
+a known substring and you do not want to pay for an embedding.
+
+---
+
+## Configuration
+
+### Wiring order
+
+```python
+from akgentic.tool.planning import PlanningTool
+from akgentic.tool.vector_store import VectorStoreTool
+
+ToolFactory([PlanningTool(), VectorStoreTool()], observer=agent)
+# -> topologically sorted to [VectorStoreTool, PlanningTool]; order in the list is irrelevant
+```
+
+Listing `PlanningTool` with `vector_store=True` and **no** `VectorStoreTool` raises `ValueError`
+at factory construction — fail fast at team creation, not at the first search.
+
+### Recipes
+
+```python
+PlanningTool()                                               # defaults
+
+PlanningTool(get_planning=GetPlanning(filter_by_agent=False))  # everyone sees every task
+
+PlanningTool(get_planning=GetPlanning(expose={SYSTEM_PROMPT, TOOL_CALL, COMMAND}))
+                                                             # also fetchable on demand
+
+PlanningTool(vector_store=False)                             # keyword-only, no vector store needed
+
+PlanningTool(update_planning=False)                          # read-only board for an observer agent
+
+PlanningTool(                                                # persistent, multi-tenant board
+    collection=CollectionConfig(backend="weaviate", tenant="team-42"),
+    search_score_threshold=0.65,
+)
+```
+
+### Semantic search
+
+With `[vector_search]` installed, task descriptions are embedded on create and update and stored
+in the `planning` collection of the bound `VectorStoreActor`. `mode="hybrid"` unions keyword and
+semantic hits; a task found by both scores `cosine + 0.5`, so exact matches outrank fuzzy ones.
+
+Without the extra, or with `vector_store=False`, `search_planning` still answers — keyword and
+field filters only. There is no error and no warning at call time; the degradation is by design.
+
+### Import paths
+
+```python
+from akgentic.tool.planning import GetPlanning, GetPlanningTask, PlanningTool, UpdatePlanning
+from akgentic.tool.planning.planning import SearchPlanning        # not re-exported from the package
+from akgentic.tool.planning.planning_actor import Task, TaskCreate, TaskUpdate, UpdatePlan
+```
+
+---
+
+See the [package README](../../../../README.md) for the `ToolCard` / `ToolFactory` machinery, the
+channel system, and the tool-actor conventions (`#`-prefixed names, `getChildrenOrCreate`).
