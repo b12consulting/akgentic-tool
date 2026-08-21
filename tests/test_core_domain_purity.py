@@ -47,6 +47,8 @@ DOMAIN_PACKAGES: frozenset[str] = frozenset(
         "vector_store",
         "vector",
         "notification",
+        "metadata",
+        "skill",
     }
 )
 
@@ -157,6 +159,20 @@ def test_core_directory_is_not_empty() -> None:
     """Guard the guard: an empty glob would make the purity test vacuously green."""
     modules = {path.name for path in CORE_DIR.glob("*.py")}
     assert {"event.py", "observer.py", "card.py", "factory.py"} <= modules
+
+
+def test_every_subpackage_is_listed_as_a_domain() -> None:
+    """Guard the guard: a new card's package must join the denylist with it.
+
+    ``DOMAIN_PACKAGES`` is hand-written and claims to name every domain, so a package
+    absent from it is invisible to the purity sweep — ``core/`` could import it and
+    nothing would go red. Nothing made the omission surface, and two packages had
+    already drifted out of the list. Deriving the expectation from the tree is what
+    turns "someone remembered" into "the suite noticed".
+    """
+    packages = {path.name for path in TOOL_DIR.iterdir() if (path / "__init__.py").is_file()}
+    missing = packages - {"core"} - DOMAIN_PACKAGES
+    assert not missing, f"subpackages absent from DOMAIN_PACKAGES: {sorted(missing)}"
 
 
 def test_knowledge_graph_does_not_import_the_deprecated_facade() -> None:
