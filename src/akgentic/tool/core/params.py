@@ -61,7 +61,8 @@ class BaseToolParam(SerializableBaseModel):
     it participates in. Use the module-level channel constants:
 
     - ``TOOL_CALL``: callable tool invoked by the LLM (default).
-    - ``SYSTEM_PROMPT``: prompt injected into the LLM context.
+    - ``SYSTEM_PROMPT``: prompt rendered once into the frozen system block.
+    - ``LLM_CONTEXT``: structured context state pushed into the context tail.
     - ``COMMAND``: programmatic call for inter-agent orchestration.
     """
 
@@ -77,7 +78,7 @@ class BaseToolParam(SerializableBaseModel):
 
     Defaults to ``{TOOL_CALL}``. Override in subclasses or at instantiation.
     Use ``Channels`` enum members or module-level aliases: ``TOOL_CALL``, ``SYSTEM_PROMPT``,
-    ``COMMAND``.
+    ``LLM_CONTEXT``, ``COMMAND``.
     """
 
     def format_docstring(self, original: str | None) -> str | None:

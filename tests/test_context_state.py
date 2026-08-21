@@ -141,7 +141,7 @@ class _DependentCard(ToolCard):
 
 def test_factory_aggregates_providers_in_dependency_order() -> None:
     """The dependent card's providers come after its prerequisite's, whatever the input order."""
-    factory = ToolFactory(tool_cards=[_DependentCard(), _PrereqCard()])
+    factory = ToolFactory(tool_cards=[_DependentCard(), _BareCard(), _PrereqCard()])
     providers = factory.get_context_states()
     assert [p.__name__ for p in providers] == ["prereq_state", "dependent_state"]
     state = providers[0]()

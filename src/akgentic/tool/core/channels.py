@@ -27,7 +27,7 @@ class Channels(StrEnum):
     """
 
 
-# Backward-compatible module-level aliases
+# Module-level aliases, importable without naming the enum
 SYSTEM_PROMPT = Channels.SYSTEM_PROMPT
 TOOL_CALL = Channels.TOOL_CALL
 COMMAND = Channels.COMMAND
