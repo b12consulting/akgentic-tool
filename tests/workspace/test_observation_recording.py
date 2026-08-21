@@ -14,19 +14,24 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
-from akgentic.tool.workspace.models import WorkspaceConfig, content_sha
+from akgentic.tool.workspace.models import Observation, WorkspaceConfig, content_sha
 from akgentic.tool.workspace.tool import WorkspaceTool, _paginate
+from akgentic.tool.workspace.workspace import Filesystem
 
 from tests.workspace.conftest import (
     HANDSHAKE_TIMEOUT_S,
     WORKSPACE_NAME,
+    AskOnlyProxy,
     BusyProxy,
     CountingProxy,
     FailingProxy,
     FakeActorToolObserver,
     FakeOrchestratorProxy,
+    RecordingTellProxy,
+    card_for,
     tool_named,
 )
 
@@ -418,23 +423,167 @@ class TestNoRetention:
 
 
 class TestMutationsAreUnchanged:
-    def test_a_write_still_goes_straight_to_the_filesystem(
+    def test_a_write_to_a_new_path_still_needs_no_read(
         self,
         wired_card: WorkspaceTool,
         workspace_actor: WorkspaceActor,
         observer: FakeActorToolObserver,
         workspace_tree: Path,
     ) -> None:
-        # The gate arrives in the next story: an unread file is still writable,
-        # and writing records nothing.
+        # Story 29-2 asserted here that a write recorded nothing, because the
+        # actor did not yet gate. It does now: creating a file the agent has not
+        # read is still accepted — there is nothing to clobber — but the write
+        # refreshes the writer's own observation so its next write is not
+        # refused with a diff against its own content.
         tool_named(wired_card, "workspace_write")("fresh.md", "content")
 
         assert (workspace_tree / "fresh.md").read_text(encoding="utf-8") == "content"
-        assert workspace_actor.observation_for(agent_id_of(observer), "fresh.md") is None
+        recorded = workspace_actor.observation_for(agent_id_of(observer), "fresh.md")
+        assert recorded is not None
+        assert recorded == Observation(sha=content_sha(b"content"), full=True)
 
     def test_the_read_signature_gained_no_parameter(self, wired_card: WorkspaceTool) -> None:
         params = list(inspect.signature(tool_named(wired_card, "workspace_read")).parameters)
         assert params == ["path", "offset", "limit", "force_document_regeneration"]
+
+
+# ---------------------------------------------------------------------------
+# Story 29-3, AC8 / AC9: the observation is a fire-and-forget tell
+# ---------------------------------------------------------------------------
+
+
+class TestTheObservationIsATell:
+    """29-2 shipped the record as a blocking ``proxy_ask``; this story converts it.
+
+    The hazard became real here rather than earlier: from this story the actor
+    hashes files on its ask path, so a read's observation would queue behind
+    another agent's mutation reading a large file — and ``ask_wrapper`` does
+    ``future.get(timeout=None)``. The recorder's fail-open ``except`` covers a
+    raising actor and a dead one; it can never cover a hung one, which is the
+    single failure mode that loses the *read* instead of refusing a *write*.
+    """
+
+    def test_the_recorder_uses_the_tell_proxy_and_not_the_ask_proxy(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_actor: WorkspaceActor,
+        seeded_tree: Path,
+    ) -> None:
+        # The ask proxy refuses to carry an observation, so a read that still
+        # asked would fail loudly rather than pass while holding the wrong
+        # invariant.
+        telling = RecordingTellProxy(workspace_actor)
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+        card.observer(
+            FakeActorToolObserver(
+                orchestrator_proxy,
+                workspace_proxy=AskOnlyProxy(workspace_actor),
+                workspace_tell_proxy=telling,
+            )
+        )
+
+        result = tool_named(card, "workspace_read")("notes.md")
+
+        assert "alpha" in result
+        assert [path for _, path, _ in telling.calls] == ["notes.md"]
+
+    def test_the_card_binds_both_proxies_over_the_one_address(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+    ) -> None:
+        observer = FakeActorToolObserver(orchestrator_proxy)
+        WorkspaceTool(workspace_id=WORKSPACE_NAME).observer(observer)
+
+        assert len(observer.ask_targets) == 1
+        assert observer.tell_targets == observer.ask_targets
+
+    def test_a_mutation_still_asks(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_actor: WorkspaceActor,
+        seeded_tree: Path,
+    ) -> None:
+        # The split is not "everything becomes a tell": a mutation needs the
+        # verdict, so it must ask.
+        telling = RecordingTellProxy(workspace_actor)
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+        card.observer(FakeActorToolObserver(orchestrator_proxy, workspace_tell_proxy=telling))
+
+        assert tool_named(card, "workspace_write")("fresh.md", "body\n") == "Written: fresh.md"
+        assert telling.calls == []
+
+    def test_the_widened_protocol_is_satisfied_by_the_suites_observer(
+        self, observer: FakeActorToolObserver
+    ) -> None:
+        assert isinstance(observer, ActorToolObserver)
+
+    def test_a_read_completes_while_the_actor_is_busy_hashing_for_someone_else(
+        self,
+        threaded_orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The NFR1 property, against a real mailbox rather than a stand-in.
+
+        One agent's mutation is held inside the actor's own thread, exactly
+        where the live hash reads the file. A reader arriving during that window
+        must return its file regardless — driven by an event handshake with an
+        upper-bound failure budget, never a wall-clock sleep.
+        """
+        (workspace_tree / "notes.md").write_text(BODY, encoding="utf-8")
+        alice, _alice_observer = card_for(threaded_orchestrator_proxy, "alice")
+        bob, _bob_observer = card_for(threaded_orchestrator_proxy, "bob")
+
+        holding = threading.Event()
+        release = threading.Event()
+        real_read = Filesystem.read
+
+        def slow_read(self: Filesystem, path: str) -> bytes:
+            if path == "big.md":
+                holding.set()
+                release.wait(timeout=HANDSHAKE_TIMEOUT_S)
+            return real_read(self, path)
+
+        monkeypatch.setattr(Filesystem, "read", slow_read)
+
+        mutations: list[str] = []
+        mutator = threading.Thread(
+            target=lambda: mutations.append(
+                tool_named(bob, "workspace_write")("big.md", "payload\n")
+            )
+        )
+        mutator.start()
+        assert holding.wait(timeout=HANDSHAKE_TIMEOUT_S), "the actor never reached the hash"
+
+        reads: list[str] = []
+        reader = threading.Thread(
+            target=lambda: reads.append(tool_named(alice, "workspace_read")("notes.md"))
+        )
+        reader.start()
+        reader.join(timeout=HANDSHAKE_TIMEOUT_S)
+
+        assert not reader.is_alive(), "the read waited on a busy actor — it must not ask"
+        assert reads and "alpha" in reads[0]
+
+        release.set()
+        mutator.join(timeout=HANDSHAKE_TIMEOUT_S)
+        assert mutations == ["Written: big.md"]
+
+    def test_a_read_immediately_followed_by_a_write_is_accepted(
+        self,
+        threaded_orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+    ) -> None:
+        # Ordering survives the conversion: the read's tell and the write's ask
+        # are two messages from one thread to one mailbox, delivered in order.
+        notes = workspace_tree / "notes.md"
+        notes.write_text(BODY, encoding="utf-8")
+        alice, _observer = card_for(threaded_orchestrator_proxy, "alice")
+
+        tool_named(alice, "workspace_read")("notes.md")
+        assert tool_named(alice, "workspace_write")("notes.md", "mine\n") == "Written: notes.md"
+        assert notes.read_text(encoding="utf-8") == "mine\n"
 
 
 def test_the_actor_config_is_fully_serialisable(workspaces_root: Path) -> None:

@@ -129,6 +129,13 @@ class _MockActorToolObserver:
             return self._orchestrator_proxy
         return MagicMock()
 
+    def proxy_tell(
+        self,
+        actor: ActorAddress,
+        actor_type: type[AkgentType] | None = None,
+    ) -> Any:
+        return MagicMock()
+
 
 def test_mock_actor_tool_observer_conforms_to_protocol() -> None:
     """Story 35-1 sweep: the fake satisfies the widened ``ActorToolObserver``."""

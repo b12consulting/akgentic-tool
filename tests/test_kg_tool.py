@@ -147,6 +147,13 @@ class MockActorToolObserver:
             return self._kg_actor
         return MagicMock()
 
+    def proxy_tell(
+        self,
+        actor: ActorAddress,
+        actor_type: type[AkgentType] | None = None,
+    ) -> Any:
+        return self.proxy_ask(actor, actor_type)
+
     def setup_kg_actor(self) -> KnowledgeGraphActor:
         """Create a real KG actor and wire it for proxy_ask."""
         from akgentic.tool.knowledge_graph.models import KnowledgeGraphState

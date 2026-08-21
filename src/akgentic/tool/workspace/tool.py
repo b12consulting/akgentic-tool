@@ -5,15 +5,24 @@ Pass ``read_only=True`` to restrict to read-side callables only (``workspace_rea
 ``workspace_list``, ``workspace_glob``, ``workspace_grep``, ``workspace_view``).
 The default ``read_only=False`` also includes write-side callables (``workspace_write``,
 ``workspace_delete``, ``workspace_edit``, ``workspace_multi_edit``, ``workspace_patch``,
-``workspace_mkdir``).  All operations are anchored to a team-scoped
-:class:`~akgentic.tool.workspace.workspace.Filesystem` backend obtained via
-:func:`~akgentic.tool.workspace.workspace.get_workspace`.
+``workspace_mkdir``).
+
+**Reads and mutations take different routes.** A read runs on the calling agent's
+own thread against its own
+:class:`~akgentic.tool.workspace.workspace.Filesystem`, exactly as it always has,
+and reports what it saw to ``#Workspace`` through a fire-and-forget ``tell``. A
+mutation is an ``ask`` to ``#Workspace``, which checks the live file against that
+observation and performs the write itself, in one mailbox turn (ADR-036 §1, §3).
+
+Nothing about the gate is visible in an LLM-facing signature: the six mutation
+callables take exactly what they always took, and the precondition is derived
+server-side from what the actor observed. There is no digest, no ``expected``,
+and no ``force``.
 """
 
 from __future__ import annotations
 
 import base64
-import difflib
 import io
 import logging
 import re as _re
@@ -38,22 +47,25 @@ from akgentic.tool.workspace.actor import (
     WorkspaceActor,
     workspace_actor_name,
 )
-from akgentic.tool.workspace.edit import (
-    EditItem,
-    EditMatcher,
-    FilePatch,
-    apply_file_patch,
-    detect_line_ending,
-    normalise_endings,
-    parse_patch,
+from akgentic.tool.workspace.edit import EditItem
+from akgentic.tool.workspace.models import (
+    PERM_ERR_MSG,
+    MutationOutcome,
+    MutationStatus,
+    Observation,
+    WorkspaceConfig,
+    content_sha,
 )
-from akgentic.tool.workspace.models import Observation, WorkspaceConfig, content_sha
 from akgentic.tool.workspace.readers import _MIME_MAP, DocumentReader, MediaContent
 from akgentic.tool.workspace.workspace import Filesystem, get_workspace
 
 logger = logging.getLogger(__name__)
 
-_PERM_ERR_MSG = "Path escapes workspace root — use a path relative to the workspace"
+_PERM_ERR_MSG = PERM_ERR_MSG
+_UNBOUND_MSG = (
+    "The workspace actor is not bound — a mutating WorkspaceTool must be wired "
+    "through observer() with a live orchestrator."
+)
 _REF_RE = _re.compile(r'!!"([^"]+)"|!!(\S+)')
 _PILLOW_FMT: dict[str, str] = {
     ".png": "PNG",
@@ -182,101 +194,40 @@ def _paginate(raw: str, offset: int, limit: int) -> tuple[str, bool]:
     return numbered, start == 0 and end == total
 
 
-def _read_text_for_edit(backend: Filesystem, path: str) -> str:
-    """Read a workspace file as UTF-8 text for editing.
+def _resolve_outcome(outcome: MutationOutcome) -> str:
+    """Turn the actor's verdict into what the tool callable does.
 
-    Raises:
-        RetriableError: If the file does not exist — the LLM can retry with a
-            corrected path.
-    """
-    try:
-        return backend.read(path).decode("utf-8")
-    except FileNotFoundError:
-        raise RetriableError(f"File not found: {path}") from None
+    A refusal is raised as a :class:`RetriableError` — the package's declared
+    "recoverable, retry with corrected input" signal — because that is what
+    carries the rejection, and its diff, into the model's next turn. A returned
+    string is easy for a model to ignore, and the entire point of the gate is
+    that the write must not land.
 
-
-def _substitute_edit(matcher: EditMatcher, content: str, item: EditItem) -> str | None:
-    """Apply one edit's substitution to *content*.
+    Args:
+        outcome: What ``#Workspace`` decided.
 
     Returns:
-        The edited content, or ``None`` when ``old_string`` was not found — for
-        ``replace_all`` that means not found even once.
+        The message, for the accepted and failed statuses alike.
+
+    Raises:
+        RetriableError: When the mutation was rejected.
     """
-    if not item.replace_all:
-        match = matcher.find(content, item.old_string)
-        if match is None:
-            return None
-        return content[: match.start] + item.new_string + content[match.end :]
-
-    result = content
-    found_any = False
-    while (match := matcher.find(result, item.old_string)) is not None:
-        found_any = True
-        result = result[: match.start] + item.new_string + result[match.end :]
-    return result if found_any else None
+    if outcome.status is MutationStatus.REJECTED:
+        raise RetriableError(outcome.message)
+    return outcome.message
 
 
-def _write_and_diff(backend: Filesystem, path: str, raw: str, edited: str) -> str:
-    """Write *edited* back to *path* with *raw*'s line endings; return the unified diff.
+def _bound(proxy: WorkspaceActor | None) -> WorkspaceActor:
+    """Return the mutation proxy, refusing to fall back to an ungated write.
 
-    Returns an empty string when the edit changed nothing.
+    Raises:
+        RuntimeError: When the card was never wired to an orchestrator. There is
+            deliberately no ungated path to fall back to: one would be a bypass
+            of the gate reachable from any harness that skipped the binding.
     """
-    normalised = normalise_endings(edited, detect_line_ending(raw))
-    backend.write(path, normalised.encode("utf-8"))
-    return "\n".join(
-        difflib.unified_diff(
-            raw.splitlines(),
-            normalised.splitlines(),
-            fromfile=f"a/{path}",
-            tofile=f"b/{path}",
-            lineterm="",
-        )
-    )
-
-
-def _deleted_paths(patch_text: str) -> set[str]:
-    """Return the paths a patch deletes, read from the raw diff text.
-
-    ``parse_patch`` derives each path from the ``+++`` line, which is ``/dev/null``
-    for a deletion — so the real path must come from the preceding ``--- a/<path>``
-    line here.
-    """
-    delete_paths: set[str] = set()
-    lines = patch_text.splitlines()
-    for i, line in enumerate(lines):
-        if not (line.startswith("+++ /dev/null") or line.startswith("+++ b//dev/null")):
-            continue
-        for j in range(i - 1, max(i - 5, -1), -1):
-            if lines[j].startswith("--- "):
-                raw_del = lines[j][4:].strip()
-                del_path = raw_del[2:] if raw_del.startswith("a/") else raw_del
-                if del_path != "/dev/null":
-                    delete_paths.add(del_path)
-                break
-    return delete_paths
-
-
-def _apply_one_file_patch(
-    backend: Filesystem, file_patch: FilePatch, delete_paths: set[str]
-) -> list[str]:
-    """Apply a single file patch and return its summary lines.
-
-    A ``/dev/null`` target is a deletion batch: every path in *delete_paths* is
-    removed. Otherwise the patch is applied and labelled ``created`` when all its
-    hunk lines are additions, ``updated`` when not.
-    """
-    if file_patch.path == "/dev/null":
-        results = []
-        for del_path in delete_paths:
-            backend.delete(del_path)
-            results.append(f"deleted: {del_path}")
-        return results
-
-    apply_file_patch(backend, file_patch)
-    is_add = bool(file_patch.hunks) and all(
-        all(pl.startswith("+") for pl in hunk.lines if pl) for hunk in file_patch.hunks
-    )
-    return [f"{'created' if is_add else 'updated'}: {file_patch.path}"]
+    if proxy is None:
+        raise RuntimeError(_UNBOUND_MSG)
+    return proxy
 
 
 def _grep_python(
@@ -581,11 +532,18 @@ class WorkspaceTool(ToolCard):
     # reliably under both normal execution and coverage instrumentation.
     _workspace: Filesystem | None = PrivateAttr(default=None)
 
-    # The ``#Workspace-<workspace>`` singleton, and the owning agent's identity as
-    # a plain string.  Both are PrivateAttr: a proxy in a Pydantic field breaks the
-    # card's serialisation contract, and the id is captured as a string so no
-    # closure below holds an edge back to the agent (ADR-030).
+    # Two proxies over the one ``#Workspace-<workspace>`` singleton, and the owning
+    # agent's identity as a plain string.  All three are PrivateAttr: a proxy in a
+    # Pydantic field breaks the card's serialisation contract, and the id is
+    # captured as a string so no closure below holds an edge back to the agent
+    # (ADR-030).  The proxies point at a *different* actor, so holding them
+    # strongly roots nothing.
+    #
+    # The split is not stylistic.  Mutations must ask — the closure needs the
+    # verdict.  Observations must tell — the reader needs nothing back, and an
+    # ask would let a slow actor stall a read instead of refusing a write.
     _workspace_proxy: WorkspaceActor | None = PrivateAttr(default=None)
+    _workspace_tell: WorkspaceActor | None = PrivateAttr(default=None)
     _agent_id: str = PrivateAttr(default="")
 
     def observer(  # type: ignore[override]
@@ -624,6 +582,10 @@ class WorkspaceTool(ToolCard):
         ``workspace_id`` values in one team get two actors, each owning its own
         tree — the unicity domain of the actor equals the resource it owns.
 
+        Two proxies are bound over the one address: an ask proxy for mutations,
+        which need the verdict, and a tell proxy for observations, which need
+        nothing back.
+
         Args:
             observer: The owning agent, live at bind time.
             orchestrator: Address of the orchestrator.
@@ -639,15 +601,22 @@ class WorkspaceTool(ToolCard):
             ),
         )
         self._workspace_proxy = observer.proxy_ask(workspace_addr, WorkspaceActor)
+        self._workspace_tell = observer.proxy_tell(workspace_addr, WorkspaceActor)
         self._agent_id = str(observer.myAddress.agent_id)
 
     def _observation_recorder(self) -> Callable[[str, bytes, bool], None]:
         """Build the closure a read closure uses to report what it saw.
 
-        The proxy and the agent id are captured **here**, at ``get_tools`` time,
-        as a proxy to a different actor and a plain string. Neither is an edge
-        back to the owning agent, which is what keeps the read closures free of
-        the retention ADR-030 forbids.
+        The **tell** proxy and the agent id are captured **here**, at
+        ``get_tools`` time, as a proxy to a different actor and a plain string.
+        Neither is an edge back to the owning agent, which is what keeps the read
+        closures free of the retention ADR-030 forbids.
+
+        The tell is what makes "a read never waits on the actor" a property
+        rather than a hope. From this story the actor hashes files on its ask
+        path, so a read that asked would queue behind another agent's mutation
+        hashing a large file; the ``except`` below would not save it, because a
+        fail-open guard covers a raising actor and a dead one, never a hung one.
 
         Returns:
             A callable taking the path, the file's raw bytes and whether the read
@@ -655,7 +624,7 @@ class WorkspaceTool(ToolCard):
             precondition, which the gate turns into a *refused* write — it must
             never turn into a failed read.
         """
-        proxy = self._workspace_proxy
+        proxy = self._workspace_tell
         agent_id = self._agent_id
 
         def record(path: str, data: bytes, full: bool) -> None:
@@ -1166,12 +1135,18 @@ class WorkspaceTool(ToolCard):
             params: Write capability configuration.
 
         Returns:
-            Callable that writes content to a workspace file.
+            Callable that writes content to a workspace file, through the actor.
         """
-        backend = self.workspace
+        proxy = self._workspace_proxy
+        agent_id = self._agent_id
 
         def workspace_write(path: str, content: str) -> str:
             """Write content to a file in the team workspace.
+
+            Refused if another writer has changed the file since you last read
+            it, or if you have not read it at all — the refusal shows you what
+            your content would have replaced. Read the file again and redo the
+            change against what is now there.
 
             Args:
                 path: Relative path from workspace root (e.g. "src/main.py").
@@ -1181,19 +1156,10 @@ class WorkspaceTool(ToolCard):
                 Confirmation string "Written: <path>".
 
             Raises:
-                RetriableError: If the path escapes the workspace root.
+                RetriableError: If the write is refused, or the path escapes the
+                    workspace root.
             """
-            try:
-                try:
-                    existing = backend.read(path).decode("utf-8")
-                    line_ending = detect_line_ending(existing)
-                    normalised = normalise_endings(content, line_ending)
-                except (FileNotFoundError, UnicodeDecodeError):
-                    normalised = content  # new file or non-UTF-8 — use content as-is
-                backend.write(path, normalised.encode("utf-8"))
-                return f"Written: {path}"
-            except PermissionError:
-                raise RetriableError(_PERM_ERR_MSG)
+            return _resolve_outcome(_bound(proxy).apply_write(agent_id, path, content))
 
         workspace_write.__doc__ = params.format_docstring(workspace_write.__doc__)
         return workspace_write
@@ -1205,12 +1171,17 @@ class WorkspaceTool(ToolCard):
             params: Delete capability configuration.
 
         Returns:
-            Callable that deletes a file from the workspace.
+            Callable that deletes a file from the workspace, through the actor.
         """
-        backend = self.workspace
+        proxy = self._workspace_proxy
+        agent_id = self._agent_id
 
         def workspace_delete(path: str) -> str:
             """Delete a file from the team workspace.
+
+            Refused unless you have read the whole file and it has not changed
+            since — deleting a file someone else has just rewritten destroys
+            work you never saw.
 
             Args:
                 path: Relative path from workspace root (e.g. "src/old.py").
@@ -1219,15 +1190,10 @@ class WorkspaceTool(ToolCard):
                 Confirmation string "Deleted: <path>".
 
             Raises:
-                RetriableError: If the path does not exist or escapes the workspace root.
+                RetriableError: If the delete is refused, the path does not
+                    exist, or it escapes the workspace root.
             """
-            try:
-                backend.delete(path)
-                return f"Deleted: {path}"
-            except FileNotFoundError:
-                raise RetriableError(f"File not found: {path}")
-            except PermissionError:
-                raise RetriableError(_PERM_ERR_MSG)
+            return _resolve_outcome(_bound(proxy).apply_delete(agent_id, path))
 
         workspace_delete.__doc__ = params.format_docstring(workspace_delete.__doc__)
         return workspace_delete
@@ -1239,10 +1205,10 @@ class WorkspaceTool(ToolCard):
             params: Edit capability configuration.
 
         Returns:
-            Callable that applies a surgical find-and-replace edit to a workspace file.
+            Callable that applies a surgical find-and-replace edit, through the actor.
         """
-        backend = self.workspace
-        matcher = EditMatcher()
+        proxy = self._workspace_proxy
+        agent_id = self._agent_id
 
         def workspace_edit(
             path: str,
@@ -1251,6 +1217,11 @@ class WorkspaceTool(ToolCard):
             replace_all: bool = False,
         ) -> str:
             """Apply a surgical find-and-replace edit to a workspace file.
+
+            Preferred over workspace_write for changing part of a file: an edit
+            survives a concurrent change to an unrelated region, where replacing
+            the whole file cannot. On a file that changed since you read it,
+            old_string must match exactly.
 
             Args:
                 path: Relative path from workspace root.
@@ -1262,50 +1233,12 @@ class WorkspaceTool(ToolCard):
                 Unified diff string of the change, or "[ERROR] ..." on failure.
 
             Raises:
-                RetriableError: If path does not exist or escapes the workspace root.
+                RetriableError: If the edit is refused, the path does not exist,
+                    or it escapes the workspace root.
             """
-            try:
-                raw = backend.read(path).decode("utf-8")
-                line_ending = detect_line_ending(raw)
-                content = raw
-
-                if replace_all:
-                    new_content = content
-                    found_any = False
-                    while True:
-                        match = matcher.find(new_content, old_string)
-                        if match is None:
-                            break
-                        found_any = True
-                        new_content = (
-                            new_content[: match.start] + new_string + new_content[match.end :]
-                        )
-                    if not found_any:
-                        return f"[ERROR] old_string not found in {path}"
-                    content = new_content
-                else:
-                    match = matcher.find(content, old_string)
-                    if match is None:
-                        return f"[ERROR] old_string not found in {path}"
-                    content = content[: match.start] + new_string + content[match.end :]
-
-                normalised = normalise_endings(content, line_ending)
-                backend.write(path, normalised.encode("utf-8"))
-
-                diff_lines = list(
-                    difflib.unified_diff(
-                        raw.splitlines(),
-                        normalised.splitlines(),
-                        fromfile=f"a/{path}",
-                        tofile=f"b/{path}",
-                        lineterm="",
-                    )
-                )
-                return "\n".join(diff_lines) if diff_lines else f"(no change) {path}"
-            except FileNotFoundError:
-                raise RetriableError(f"File not found: {path}")
-            except PermissionError:
-                raise RetriableError(_PERM_ERR_MSG)
+            return _resolve_outcome(
+                _bound(proxy).apply_edit(agent_id, path, old_string, new_string, replace_all)
+            )
 
         workspace_edit.__doc__ = params.format_docstring(workspace_edit.__doc__)
         return workspace_edit
@@ -1317,40 +1250,29 @@ class WorkspaceTool(ToolCard):
             params: Multi-edit capability configuration.
 
         Returns:
-            Callable that applies a sequence of find-and-replace edits to workspace files.
+            Callable that applies a batch of find-and-replace edits, through the actor.
         """
-        backend = self.workspace
-        matcher = EditMatcher()
+        proxy = self._workspace_proxy
+        agent_id = self._agent_id
 
         def workspace_multi_edit(edits: list[EditItem]) -> str:
             """Apply a sequence of find-and-replace edits to workspace files.
 
+            All-or-nothing: if any edit is refused or its old_string is not
+            found, no file in the batch is changed on disk.
+
             Args:
                 edits: Ordered list of EditItem objects. Each edit is applied
                     sequentially; each sees the result of the previous one.
-                    Stops on first failure — no rollback.
 
             Returns:
                 Combined unified diff of all applied edits, or "[ERROR] ..." on failure.
 
             Raises:
-                RetriableError: If a target file does not exist or a path escapes
-                    the workspace root.
+                RetriableError: If any edit is refused, a target file does not
+                    exist, or a path escapes the workspace root.
             """
-            try:
-                all_diffs: list[str] = []
-                for item in edits:
-                    raw = _read_text_for_edit(backend, item.path)
-                    edited = _substitute_edit(matcher, raw, item)
-                    if edited is None:
-                        return f"[ERROR] old_string not found in {item.path}"
-                    diff = _write_and_diff(backend, item.path, raw, edited)
-                    if diff:
-                        all_diffs.append(diff)
-
-                return "\n".join(all_diffs) if all_diffs else "(no changes applied)"
-            except PermissionError:
-                raise RetriableError(_PERM_ERR_MSG)
+            return _resolve_outcome(_bound(proxy).apply_multi_edit(agent_id, edits))
 
         workspace_multi_edit.__doc__ = params.format_docstring(workspace_multi_edit.__doc__)
         return workspace_multi_edit
@@ -1362,14 +1284,17 @@ class WorkspaceTool(ToolCard):
             params: Patch capability configuration.
 
         Returns:
-            Callable that applies a unified diff patch to the team workspace.
+            Callable that applies a unified diff patch, through the actor.
         """
-        backend = self.workspace
+        proxy = self._workspace_proxy
+        agent_id = self._agent_id
 
         def workspace_patch(patch_text: str) -> str:
             """Apply a unified diff patch to the team workspace.
 
             Supports add (--- /dev/null), update, and delete (+++ /dev/null).
+            Every file the patch touches is checked against what you last read
+            of it. Application stops at the first file that fails.
 
             Args:
                 patch_text: GNU unified diff string.
@@ -1379,21 +1304,10 @@ class WorkspaceTool(ToolCard):
                 "deleted: ...". Returns "[ERROR] ..." on failure.
 
             Raises:
-                RetriableError: If any path escapes the workspace root.
+                RetriableError: If a file's change is refused, or any path
+                    escapes the workspace root.
             """
-            try:
-                delete_paths = _deleted_paths(patch_text)
-                results: list[str] = []
-
-                for fp in parse_patch(patch_text):
-                    try:
-                        results += _apply_one_file_patch(backend, fp, delete_paths)
-                    except Exception as exc:
-                        return f"[ERROR] {fp.path}: {exc}"
-
-                return "\n".join(results) if results else "(no patches applied)"
-            except PermissionError:
-                raise RetriableError(_PERM_ERR_MSG)
+            return _resolve_outcome(_bound(proxy).apply_patch(agent_id, patch_text))
 
         workspace_patch.__doc__ = params.format_docstring(workspace_patch.__doc__)
         return workspace_patch
@@ -1405,9 +1319,10 @@ class WorkspaceTool(ToolCard):
             params: Mkdir capability configuration.
 
         Returns:
-            Callable that creates a directory in the workspace.
+            Callable that creates a directory in the workspace, through the actor.
         """
-        backend = self.workspace
+        proxy = self._workspace_proxy
+        agent_id = self._agent_id
 
         def workspace_mkdir(path: str) -> str:
             """Create a directory and all missing parents in the team workspace.
@@ -1421,11 +1336,7 @@ class WorkspaceTool(ToolCard):
             Raises:
                 RetriableError: If the path escapes the workspace root.
             """
-            try:
-                backend.mkdir(path)
-                return f"Created: {path}"
-            except PermissionError:
-                raise RetriableError(_PERM_ERR_MSG)
+            return _resolve_outcome(_bound(proxy).apply_mkdir(agent_id, path))
 
         workspace_mkdir.__doc__ = params.format_docstring(workspace_mkdir.__doc__)
         return workspace_mkdir

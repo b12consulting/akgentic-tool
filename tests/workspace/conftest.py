@@ -27,7 +27,7 @@ from akgentic.core.agent import Akgent, AkgentType
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
-from akgentic.tool.workspace.models import Observation
+from akgentic.tool.workspace.models import MutationOutcome, Observation
 from akgentic.tool.workspace.tool import WorkspaceTool
 
 from tests.conftest import MockActorAddress
@@ -44,11 +44,21 @@ class SilentAgent(Akgent[BaseConfig, BaseState]):
 
 
 class FakeOrchestratorProxy:
-    """Get-or-create singletons by config name, exactly as the orchestrator does."""
+    """Get-or-create singletons by config name, exactly as the orchestrator does.
 
-    def __init__(self) -> None:
-        self.children: dict[str, tuple[ActorAddress, Akgent[Any, Any]]] = {}
+    With *live* set, the actors it creates are genuinely started on their own
+    thread and handed out behind a real ``ActorAddressImpl``. That is what lets a
+    test reach one through a real ``ProxyWrapper`` and assert a property of the
+    mailbox rather than of a stand-in.
+    """
+
+    def __init__(self, live: bool = False) -> None:
+        # The second element is a live actor instance in the inert mode and a
+        # Pykka proxy over one in the live mode — both answer the same calls.
+        self.children: dict[str, tuple[ActorAddress, Any]] = {}
         self.create_calls: list[tuple[type[Akgent[Any, Any]], BaseConfig]] = []
+        self.live = live
+        self._refs: list[Any] = []
 
     def getChildrenOrCreate(  # noqa: N802 — mirrors the orchestrator's method name
         self, actor_class: type[Akgent[Any, Any]], config: BaseConfig
@@ -57,13 +67,19 @@ class FakeOrchestratorProxy:
         existing = self.children.get(config.name)
         if existing is not None:
             return existing[0]
+        if self.live:
+            ref = actor_class.start(config=config)
+            self._refs.append(ref)
+            address: ActorAddress = ActorAddressImpl(ref)
+            self.children[config.name] = (address, ref.proxy())
+            return address
         actor = actor_class(config=config)
         actor.on_start()
         address = MockActorAddress(config.name, config.role)
         self.children[config.name] = (address, actor)
         return address
 
-    def actor_for(self, address: ActorAddress) -> Akgent[Any, Any] | None:
+    def actor_for(self, address: ActorAddress) -> Any:
         """Return the actor behind *address*, or ``None`` when it is unknown."""
         for known_address, actor in self.children.values():
             if known_address is address:
@@ -71,9 +87,13 @@ class FakeOrchestratorProxy:
         return None
 
     def stop_all(self) -> None:
-        """Run ``on_stop`` on every created actor."""
-        for _, actor in self.children.values():
-            actor.on_stop()
+        """Stop every created actor — a live one on its thread, an inert one in place."""
+        for ref in self._refs:
+            ref.stop()
+        self._refs.clear()
+        if not self.live:
+            for _, actor in self.children.values():
+                actor.on_stop()
         self.children.clear()
 
 
@@ -81,8 +101,14 @@ class FakeActorToolObserver:
     """``ActorToolObserver`` stand-in wired to a :class:`FakeOrchestratorProxy`.
 
     *workspace_proxy*, when given, is handed back by ``proxy_ask`` in place of the
-    live actor. That is how the counting, failing and busy stand-ins below reach
-    the card without any of them having to impersonate an orchestrator.
+    live actor, and *workspace_tell_proxy* likewise by ``proxy_tell``. That is how
+    the counting, failing and busy stand-ins below reach the card without any of
+    them having to impersonate an orchestrator — and how a test can tell the two
+    proxies apart, which is the only way to assert that a read records through
+    the *tell* one.
+
+    With no stand-in given and a live orchestrator, both methods build real
+    proxies over the actor's address, through the agent this observer holds.
     """
 
     def __init__(
@@ -90,14 +116,18 @@ class FakeActorToolObserver:
         orchestrator_proxy: FakeOrchestratorProxy,
         name: str = "alice",
         workspace_proxy: object | None = None,
+        workspace_tell_proxy: object | None = None,
     ) -> None:
         self._agent = SilentAgent(config=BaseConfig(name=name, role="tester"))
         self._address: ActorAddress = ActorAddressImpl(self._agent.actor_ref)
         self._orchestrator: ActorAddress | None = MockActorAddress("orchestrator")
         self._orchestrator_proxy = orchestrator_proxy
         self._workspace_proxy = workspace_proxy
+        self._workspace_tell_proxy = workspace_tell_proxy
         self._team_id = uuid.uuid4()
         self.events: list[object] = []
+        self.ask_targets: list[ActorAddress] = []
+        self.tell_targets: list[ActorAddress] = []
 
     @property
     def myAddress(self) -> ActorAddress:  # noqa: N802
@@ -122,17 +152,35 @@ class FakeActorToolObserver:
     ) -> Any:
         if actor is self._orchestrator:
             return self._orchestrator_proxy
+        self.ask_targets.append(actor)
         if self._workspace_proxy is not None:
             return self._workspace_proxy
+        if self._orchestrator_proxy.live:
+            return self._agent.proxy_ask(actor, actor_type)
+        return self._orchestrator_proxy.actor_for(actor)
+
+    def proxy_tell(
+        self,
+        actor: ActorAddress,
+        actor_type: type[AkgentType] | None = None,
+    ) -> Any:
+        self.tell_targets.append(actor)
+        if self._workspace_tell_proxy is not None:
+            return self._workspace_tell_proxy
+        if self._workspace_proxy is not None:
+            return self._workspace_proxy
+        if self._orchestrator_proxy.live:
+            return self._agent.proxy_tell(actor, actor_type)
         return self._orchestrator_proxy.actor_for(actor)
 
 
 class CountingProxy:
-    """Counts recording calls and forwards them to a real actor.
+    """Counts recording calls and forwards them, and everything else, to a real actor.
 
     Exists for the one-call-per-invocation assertion: the property has to be
     *counted*, not inferred from the resulting map, which a per-line recorder
-    would leave looking identical.
+    would leave looking identical. Every other method — the six mutations
+    included — passes straight through, so a card wired to one behaves normally.
     """
 
     def __init__(self, target: WorkspaceActor) -> None:
@@ -143,8 +191,8 @@ class CountingProxy:
         self.calls.append((agent_id, path, observation))
         self.target.record_observation(agent_id, path, observation)
 
-    def observation_for(self, agent_id: str, path: str) -> Observation | None:
-        return self.target.observation_for(agent_id, path)
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.target, name)
 
 
 class FailingProxy:
@@ -156,6 +204,36 @@ class FailingProxy:
     def record_observation(self, agent_id: str, path: str, observation: Observation) -> None:
         self.calls += 1
         raise RuntimeError("actor is dead")
+
+
+class AskOnlyProxy:
+    """An ask proxy that refuses to carry an observation.
+
+    Handed to a card as its **ask** proxy alongside a working tell proxy: if any
+    read path still records through the ask side, the read fails loudly instead
+    of passing while quietly holding the wrong invariant.
+    """
+
+    def __init__(self, target: WorkspaceActor) -> None:
+        self.target = target
+
+    def record_observation(self, agent_id: str, path: str, observation: Observation) -> None:
+        raise AssertionError("a read recorded through the ask proxy — it must use proxy_tell")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.target, name)
+
+
+class RecordingTellProxy:
+    """A tell proxy that forwards observations and remembers them."""
+
+    def __init__(self, target: WorkspaceActor) -> None:
+        self.target = target
+        self.calls: list[tuple[str, str, Observation]] = []
+
+    def record_observation(self, agent_id: str, path: str, observation: Observation) -> None:
+        self.calls.append((agent_id, path, observation))
+        self.target.record_observation(agent_id, path, observation)
 
 
 class BusyProxy:
@@ -244,9 +322,50 @@ def workspace_actor(
     return actor
 
 
+@pytest.fixture
+def threaded_orchestrator_proxy() -> Generator[FakeOrchestratorProxy, None, None]:
+    """A fake orchestrator that starts its actors on real threads."""
+    proxy = FakeOrchestratorProxy(live=True)
+    yield proxy
+    proxy.stop_all()
+
+
+def card_for(
+    orchestrator_proxy: FakeOrchestratorProxy,
+    name: str,
+    workspace_id: str = WORKSPACE_NAME,
+) -> tuple[WorkspaceTool, FakeActorToolObserver]:
+    """Wire a second (or third) agent's card onto the same workspace.
+
+    The observer comes back with the card because the card holds it weakly — a
+    test that drops it would collect the agent mid-assertion.
+    """
+    observer = FakeActorToolObserver(orchestrator_proxy, name=name)
+    card = WorkspaceTool(workspace_id=workspace_id)
+    card.observer(observer)
+    return card, observer
+
+
 def tool_named(card: WorkspaceTool, name: str) -> Any:
     """Return the card's LLM-facing callable named *name*."""
     for tool in card.get_tools():
         if tool.__name__ == name:
             return tool
     raise AssertionError(f"{name} is not exposed by this card")
+
+
+def read(card: WorkspaceTool, path: str, **kwargs: Any) -> str:
+    """Read *path* through *card*, exactly as its agent would."""
+    return str(tool_named(card, "workspace_read")(path, **kwargs))
+
+
+def mutate(card: WorkspaceTool, name: str, *args: Any, **kwargs: Any) -> str:
+    """Call one of *card*'s mutation callables and return what the agent sees."""
+    return str(tool_named(card, name)(*args, **kwargs))
+
+
+def outcome_of(actor: WorkspaceActor, method: str, *args: Any) -> MutationOutcome:
+    """Call one of the actor's ``apply_*`` methods directly, for status assertions."""
+    result = getattr(actor, method)(*args)
+    assert isinstance(result, MutationOutcome)
+    return result

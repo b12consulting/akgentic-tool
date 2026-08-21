@@ -75,6 +75,9 @@ class MockObserver:
             return self._orch_proxy
         return MagicMock()  # sandbox proxy
 
+    def proxy_tell(self, actor: ActorAddress, actor_type: object = None) -> object:
+        return MagicMock()
+
     def notify_event(self, event: object) -> None:
         pass
 
