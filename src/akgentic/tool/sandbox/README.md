@@ -44,7 +44,7 @@ identically — same lease, same worker, same discovery, same commit. It is a sh
 replacement. Deliberately not at import: an import-time warning fires for anybody who merely has
 the module in a dependency's `__init__`, which is nobody's decision to change.
 
-**What an `ExecTool`-only agent gives up.** It creates the `#Workspace` actor for its workspace, and
+**What an `ExecTool`-only agent gives up.** It creates the `#Workspace-<workspace>` actor for its workspace, and
 the first card to create that actor decides the configuration — so it always gets the journal's
 defaults. `AC2` froze the shim's three fields, so there is no `workspace_git` on it and no way to
 reach one. Move to `WorkspaceTool` if you need that.

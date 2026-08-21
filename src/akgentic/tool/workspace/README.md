@@ -221,7 +221,7 @@ a77e214 edit: src/main.py      (reviewer)
 ### When the journal is off
 
 It degrades off — with **one** warning naming the workspace and the reason, and no further output —
-in five situations:
+in these situations:
 
 | Condition | Deliberate? |
 |---|---|
@@ -229,7 +229,11 @@ in five situations:
 | `git` is not on `PATH` | yes — an environment fact |
 | The workspace is itself named `<name>.git`, colliding with workspace `<name>`'s journal | no — an operator mistake |
 | A sibling `<name>.git` exists and is **not** a repository (it is another workspace's tree) | no — refusing here costs one workspace's history; not refusing scatters git internals through another team's tree |
-| An earlier `git` invocation exceeded its 15 s budget in this actor's life | no |
+| `git init` or `git config core.bare false` fails, so there is no usable repository | no — an old or broken git |
+| An earlier `git` invocation exceeded its 15 s budget, or could not be spawned at all, in this actor's life | no |
+
+The first four are the ones a configuration can cause; the last two are a git that will not work on
+this machine.
 
 The warning goes to the `akgentic.tool.workspace.journal` logger at bind time, and there is nothing
 else to read: no card field, no tool output, no state that says "this tree has no history". If you

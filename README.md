@@ -770,7 +770,7 @@ Binary reads (PDF, DOCX, XLSX, PPTX) need `akgentic-tool[docs]`; image resizing 
 rather than fail.
 
 **[Full reference → `src/akgentic/tool/workspace/README.md`](src/akgentic/tool/workspace/README.md)** —
-the gate's rules and what a refusal looks like, the journal and the five ways it degrades off, the
+the gate's rules and what a refusal looks like, the journal and the ways it degrades off, the
 exec lease and its three budgets, every capability parameter, the `DocumentReader` two-pass
 extraction, resource seeding, sidecar caching and the edit-matching cascade.
 
