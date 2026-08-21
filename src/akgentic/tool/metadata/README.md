@@ -36,8 +36,9 @@ defaults*, and since there is no default template it fails at `observer()`, whic
 missing template should be noticed rather than at the first turn.
 
 **Nothing runtime is a Pydantic field.** The orchestrator proxy is not serializable, and neither is
-the rendered block: a card restored from configuration renders afresh against *its own* team. Both
-live in `PrivateAttr`, so `model_dump()` carries the template and the channels and nothing else.
+the rendered block: a card restored from configuration renders afresh against *its own* team. All
+three runtime handles — the proxy, the block and the parsed placeholder names — live in
+`PrivateAttr`, so `model_dump()` carries the configured capability and nothing else.
 
 **Loud at wiring, degrading at render.** A malformed or unresolvable placeholder raises in
 `observer()`, next to the mistake. Nothing on the render path raises: a prompt callable that throws
@@ -119,8 +120,8 @@ The render path never raises:
 | metadata present, a name is missing | `""` | ERROR naming the placeholder and the model type |
 | anything else fails | `""` | `logger.exception` — the traceback is kept |
 
-The first three are expected and self-describing, and a message-only log carries everything worth
-knowing. The fourth is a genuine surprise, and a prompt callable is the one place a traceback
+The second and third are expected and self-describing, so a message-only log carries everything
+worth knowing. The fourth is a genuine surprise, and a prompt callable is the one place a traceback
 cannot be recovered afterwards — so it keeps its stack.
 
 **Only a successful render is cached.** A degraded render caches nothing and is retried on the next
@@ -166,10 +167,16 @@ MetadataTool(render_metadata=RenderMetadata(
     expose={COMMAND},
 ))
 
-# Prompt only, with extra guidance on the command docstring where one is exposed.
+# Prompt only — the agents get the block, no command surface is registered.
 MetadataTool(render_metadata=RenderMetadata(
     template="Engagement: {engagement}.",
     expose={SYSTEM_PROMPT},
+))
+
+# Extra guidance, appended to the team_metadata() docstring — which only the COMMAND
+# channel carries, so keep that channel exposed for it to be visible anywhere.
+MetadataTool(render_metadata=RenderMetadata(
+    template="Engagement: {engagement}.",
     instructions="Quote these facts verbatim; never infer beyond them.",
 ))
 

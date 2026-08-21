@@ -869,8 +869,11 @@ MetadataTool(render_metadata=RenderMetadata(     # command only — nothing in t
 ```
 
 Placeholders are **bare field names** of the team's metadata model — no dotted paths, indices,
-conversions or format specs — and a template that breaks that rule, or names a field the model does
-not declare, raises `ValueError` at wiring time, next to the mistake.
+conversions or format specs — and a template that breaks that rule raises `ValueError` at wiring
+time, next to the mistake. A name the model does not declare raises there too, but only when the
+team already holds metadata: `set_metadata` may legitimately run after the agents start, so
+otherwise the name check moves to the first render, where it degrades to an empty block and an
+ERROR in the log rather than raising.
 
 **The block is a snapshot.** It is rendered **once**, at the first render that *succeeds*, and a
 later `set_metadata` is **not** reflected. That is deliberate, not a limitation waiting to be
