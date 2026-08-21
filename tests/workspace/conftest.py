@@ -14,6 +14,7 @@ an import, because a test package is not a library for other test packages.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import threading
@@ -76,7 +77,16 @@ class Commit:
 
 
 def _git(tree: Path, *args: str) -> str:
-    """Run one read-only git command against *tree*'s sibling journal."""
+    """Run one read-only git command against *tree*'s sibling journal.
+
+    Reads under the same neutralised configuration the journal writes under. A
+    developer whose ``~/.gitconfig`` carries ``core.autocrlf`` would otherwise
+    see ``git show`` hand back different bytes from the ones committed, and the
+    content assertions would go red on their machine and nowhere else.
+    """
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
     result = subprocess.run(
         [
             "git",
@@ -90,6 +100,7 @@ def _git(tree: Path, *args: str) -> str:
         capture_output=True,
         text=True,
         timeout=15,
+        env=env,
         check=False,
     )
     assert result.returncode == 0, f"git {args} failed: {result.stderr}"

@@ -1021,7 +1021,16 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
         return None
 
     def _publish_patch(self, agent_id: str, batch: _PatchBatch) -> MutationOutcome:
-        """Publish a fully gated patch: every write together, then every deletion."""
+        """Publish a fully gated patch: every write together, then every deletion.
+
+        The all-or-nothing guarantee is against the **gate** and against staging:
+        by the time this runs, every file has passed and every hunk has rendered.
+        It is not a transaction over the filesystem, and one residual window says
+        so — a deletion failing after the writes have landed refuses the mutation
+        with those writes on disk. They are then committed as ``out-of-band`` by
+        the next mutation, which is the honest record: no agent owns a state no
+        agent asked for. Nothing on POSIX makes the pair atomic.
+        """
         self._workspace.write_many(batch.writes)
         for entry in batch.writes:
             self._accept(agent_id, entry.path, entry.data)
