@@ -31,8 +31,7 @@ from akgentic.tool.core import COMMAND, SYSTEM_PROMPT, TOOL_CALL, ToolCard
 from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.skill import SkillEntry, Skills, SkillTool
-
-HEADER = "**Skills available to you** — call use_skill(name) to load one."
+from akgentic.tool.skill.tool import MENU_HEADER as HEADER
 
 REFUND = SkillEntry(
     name="refund-policy",
@@ -188,7 +187,10 @@ class TestMenuCostIsIndependentOfBodySize:
         small = _menu(library("y" * 20))
 
         assert large == small
-        assert len(large) < 200
+        # Bounded against the header, not against a bare number: the header is prose and
+        # gets reworded, while what must never change is that the menu does not grow with
+        # the bodies. Inlining one 50 kB body blows past this by two orders of magnitude.
+        assert len(large) < len(HEADER) + 200
 
 
 # ── AC6: use_skill returns the body ───────────────────────────────────────────

@@ -83,13 +83,32 @@ never touches `content`.
 A header line, then one `name — description` line per entry, in declaration order:
 
 ```
-**Skills available to you** — call use_skill(name) to load one.
+**Skills available to you.** Call use_skill(name) before producing work of a kind named below,
+even when you already know how. Match on the act, not the topic.
 refund-policy — How refunds are approved, and the thresholds that need a second signature.
 escalation — When to escalate to a human, and what the handover must contain.
 ```
 
 An **empty library contributes the empty string**, not a bare header: a header alone would advertise
 nothing.
+
+**The header is imperative, and it is the only place that works.** A menu the model is free to
+ignore is paid for on every turn and returns nothing, and no event records that a skill was skipped.
+Measured on a live team, one variable at a time:
+
+| header | `use_skill` description | skill loaded? |
+|---|---|---|
+| informational | permissive | no |
+| informational | imperative | no |
+| **imperative** | permissive, unedited | **yes** |
+
+With an informational header a manager asked for a report searched, fetched and wrote it without
+opening `write-report`; the human had to say "use the skill" for it to fire. Rewriting the
+description to demand the call did not change that. Making the header imperative did — on the
+original description, untouched. The prefix is where the model decides *how* to do the work; a tool
+description is read once it has already decided to reach for a tool, which is after the decision the
+obligation was meant to change. Costs ~20 tokens of prefix. Soften it and the skipping returns,
+whatever the description says.
 
 ### `TOOL_CALL` — `use_skill(name)`
 
