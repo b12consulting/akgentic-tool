@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Callable
 from unittest.mock import MagicMock
 
-from akgentic.tool.core import COMMAND, SYSTEM_PROMPT  # noqa: I001
+from akgentic.tool.core import COMMAND, LLM_CONTEXT  # noqa: I001
 from akgentic.tool.planning.planning import GetPlanning, GetPlanningTask, PlanningTool
 from akgentic.tool.planning.planning_actor import Task
 
@@ -379,10 +379,10 @@ class TestGetPlanningModel:
         params = GetPlanning(filter_by_agent=False)
         assert params.filter_by_agent is False
 
-    def test_expose_defaults_include_system_prompt_and_command(self) -> None:
-        """GetPlanning default expose channels unchanged."""
+    def test_expose_defaults_include_llm_context_and_command(self) -> None:
+        """GetPlanning defaults to the LLM_CONTEXT and COMMAND channels."""
         params = GetPlanning()
-        assert SYSTEM_PROMPT in params.expose
+        assert LLM_CONTEXT in params.expose
         assert COMMAND in params.expose
 
     def test_filter_by_agent_field_has_description(self) -> None:
@@ -421,20 +421,20 @@ def _make_tool_with_mocks(
 class TestPlanningToolRoutingMethods:
     """Coverage for get_system_prompts, get_tools, get_commands routing."""
 
-    def test_get_system_prompts_returns_callable_when_system_prompt_exposed(self) -> None:
-        """get_system_prompts returns list with one callable when SYSTEM_PROMPT in expose."""
+    def test_get_context_states_returns_provider_when_llm_context_exposed(self) -> None:
+        """get_context_states returns list with one provider when LLM_CONTEXT in expose."""
         tasks = [make_task(id=1, owner="@DevAgent")]
         tool = _make_tool_with_mocks(tasks)
-        prompts = tool.get_system_prompts()
-        assert len(prompts) == 1
-        assert callable(prompts[0])
+        providers = tool.get_context_states()
+        assert len(providers) == 1
+        assert callable(providers[0])
 
-    def test_get_system_prompts_empty_when_not_exposed(self) -> None:
-        """get_system_prompts returns empty list when SYSTEM_PROMPT not in expose."""
+    def test_get_context_states_empty_when_not_exposed(self) -> None:
+        """get_context_states returns empty list when LLM_CONTEXT not in expose."""
         tool = _make_tool_with_mocks([])
-        tool.get_planning = GetPlanning(expose={COMMAND})  # no SYSTEM_PROMPT
-        prompts = tool.get_system_prompts()
-        assert prompts == []
+        tool.get_planning = GetPlanning(expose={COMMAND})  # no LLM_CONTEXT
+        providers = tool.get_context_states()
+        assert providers == []
 
     def test_get_commands_returns_get_planning_when_command_exposed(self) -> None:
         """get_commands returns GetPlanning entry when COMMAND in expose."""

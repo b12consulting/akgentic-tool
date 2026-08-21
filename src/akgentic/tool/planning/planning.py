@@ -4,17 +4,19 @@ import logging
 from collections.abc import Callable
 from typing import Any, Literal, cast
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.tool.core import (
     COMMAND,
-    SYSTEM_PROMPT,
+    LLM_CONTEXT,
     TOOL_CALL,
     BaseToolParam,
     Channels,
+    ContextState,
     ToolCard,
     _resolve,
+    normalize_system_prompt_to_llm_context,
 )
 from akgentic.tool.core.observer import ActorToolObserver, ToolObserver
 from akgentic.tool.errors import RetriableError
@@ -25,6 +27,7 @@ from akgentic.tool.planning.planning_actor import (
     TaskStatus,
     UpdatePlan,
 )
+from akgentic.tool.planning.state import PlanningState, TaskRow
 from akgentic.tool.vector_store.protocol import CollectionConfig
 
 logger = logging.getLogger(__name__)
@@ -35,9 +38,9 @@ PLANNING_ACTOR_ROLE = "ToolActor"
 
 
 class GetPlanning(BaseToolParam):
-    """Get the full team plan — as system prompt and/or tool."""
+    """Get the full team plan — as structured context state and/or tool."""
 
-    expose: set[Channels] = {SYSTEM_PROMPT, COMMAND}
+    expose: set[Channels] = {LLM_CONTEXT, COMMAND}
     filter_by_agent: bool = Field(
         default=True,
         description=(
@@ -45,6 +48,10 @@ class GetPlanning(BaseToolParam):
             "calling agent. The team summary (totals + owner breakdown) is always shown. "
             "Set False to list all tasks."
         ),
+    )
+
+    _normalize_expose = field_validator("expose", mode="after")(
+        normalize_system_prompt_to_llm_context
     )
 
 
@@ -62,6 +69,55 @@ class SearchPlanning(BaseToolParam):
     """Search tasks by status, owner, creator, and/or natural-language description."""
 
     expose: set[Channels] = {TOOL_CALL, COMMAND}
+
+
+def _build_planning_state(
+    tasks: list[Task], agent_name: str, filter_by_agent: bool
+) -> PlanningState:
+    """Snapshot the planning board, shaped for one agent (ADR-037 §5).
+
+    Per-agent shaping happens here, at production time: when ``filter_by_agent``
+    is on, only tasks the agent owns — or created and are assigned — enter the
+    rows (an unassigned task never appears even if the agent created it), while
+    ``total`` and ``owner_counts`` always cover the whole board.
+
+    Args:
+        tasks: All tasks on the board.
+        agent_name: The observing agent's own actor name.
+        filter_by_agent: Whether ``tasks`` is narrowed to the agent's own tasks.
+
+    Returns:
+        The planning state; an empty board is a real state whose
+        ``render_full()`` is the sentinel line.
+    """
+    owner_counts: dict[str, int] = {}
+    for task in tasks:
+        key = task.owner if task.owner else "unassigned"
+        owner_counts[key] = owner_counts.get(key, 0) + 1
+
+    visible = (
+        [t for t in tasks if t.owner == agent_name or (t.owner and t.creator == agent_name)]
+        if filter_by_agent
+        else tasks
+    )
+    rows = [
+        TaskRow(
+            id=t.id,
+            status=t.status,
+            description=t.description,
+            owner=t.owner,
+            creator=t.creator,
+            output=t.output,
+        )
+        for t in visible
+    ]
+    return PlanningState(
+        total=len(tasks),
+        owner_counts=owner_counts,
+        tasks=rows,
+        agent_name=agent_name,
+        filter_by_agent=filter_by_agent,
+    )
 
 
 class PlanningTool(ToolCard):
@@ -169,10 +225,16 @@ class PlanningTool(ToolCard):
         """Live observer typed as the actor protocol; ``None`` once the agent stops."""
         return cast(ActorToolObserver | None, self._observer_or_none())
 
-    def get_system_prompts(self) -> list[Callable[..., Any]]:
+    def get_context_states(self) -> list[Callable[[], ContextState | None]]:
+        """Get context-state providers for planning context (ADR-037 §5).
+
+        Returns:
+            List with the planning-state provider, or empty when disabled or
+            not exposed on ``LLM_CONTEXT``.
+        """
         gp = _resolve(self.get_planning, GetPlanning)
-        if gp and SYSTEM_PROMPT in gp.expose:
-            return [self._planning_prompt_factory(gp)]
+        if gp and LLM_CONTEXT in gp.expose:
+            return [self._planning_state_factory(gp)]
         return []
 
     def get_tools(self) -> list[Callable[..., Any]]:
@@ -213,6 +275,34 @@ class PlanningTool(ToolCard):
 
         return commands
 
+    def _planning_state_factory(self, params: GetPlanning) -> Callable[[], ContextState | None]:
+        """Create the planning context-state provider.
+
+        Args:
+            params: Configuration for the get_planning capability
+
+        Returns:
+            Zero-arg provider producing a planning snapshot, or ``None`` when
+            the state is unavailable. Never raises.
+        """
+        planning_proxy = self._planning_proxy
+        observer_or_none = self._actor_observer_or_none  # bound method -> weak edge to agent
+        filter_by_agent = params.filter_by_agent
+
+        def planning_state() -> PlanningState | None:
+            try:
+                observer = observer_or_none()
+                if observer is None:
+                    return None  # agent gone -> state unavailable
+                return _build_planning_state(
+                    planning_proxy.get_planning(), observer.myAddress.name, filter_by_agent
+                )
+            except Exception:
+                logger.error("Failed to get planning state", exc_info=True)
+                return None
+
+        return planning_state
+
     def _planning_prompt_factory(self, params: GetPlanning) -> Callable[..., Any]:
         planning_proxy = self._planning_proxy
         # Capture agent identity and filter setting at bind time — stable for actor's lifetime.
@@ -223,63 +313,7 @@ class PlanningTool(ToolCard):
             """Summarize the team planning: task totals, per-owner breakdown, and
             the task list (all tasks, or only yours when ``filter_by_agent``)."""
             tasks = planning_proxy.get_planning()
-            if not tasks:
-                return "No current team planning."
-
-            total = len(tasks)
-
-            # --- Build per-owner breakdown ---
-            owner_counts: dict[str, int] = {}
-            for task in tasks:
-                key = task.owner if task.owner else "unassigned"
-                owner_counts[key] = owner_counts.get(key, 0) + 1
-
-            named = sorted((k, v) for k, v in owner_counts.items() if k != "unassigned")
-            unassigned_count = owner_counts.get("unassigned", 0)
-            breakdown_parts = [f"{name}: {count}" for name, count in named]
-            if unassigned_count:
-                breakdown_parts.append(f"unassigned: {unassigned_count}")
-            breakdown = " | ".join(breakdown_parts)
-
-            lines = [f"**Team planning:** {total} task{'s' if total != 1 else ''} total"]
-            lines.append(f"Owners: {breakdown}")
-
-            if filter_by_agent:
-                # Only include tasks where the calling agent is owner or creator.
-                # Unassigned tasks (empty owner) never appear here even if creator matches.
-                own_tasks = [
-                    t
-                    for t in tasks
-                    if t.owner == agent_name or (t.owner and t.creator == agent_name)
-                ]
-                if own_tasks:
-                    lines.append(f"\n**Your tasks** (owner or creator: {agent_name}):")
-                    for task in own_tasks:
-                        output_part = f" — Output: {task.output}" if task.output else ""
-                        # own_tasks filter ensures task.owner is non-empty; fallback is defensive.
-                        owner_label = task.owner or "unassigned"
-                        suffix = f" (Owner: {owner_label}, Creator: {task.creator})"
-                        lines.append(
-                            f"- ID {task.id} [{task.status}] {task.description}"
-                            f"{output_part}{suffix}"
-                        )
-                else:
-                    lines.append(f"\nNo tasks assigned to or created by {agent_name} yet.")
-            else:
-                lines.append("\n**All tasks:**")
-                for task in tasks:
-                    output_part = f" — Output: {task.output}" if task.output else ""
-                    owner_label = task.owner or "unassigned"
-                    suffix = f" (Owner: {owner_label}, Creator: {task.creator})"
-                    lines.append(
-                        f"- ID {task.id} [{task.status}] {task.description}{output_part}{suffix}"
-                    )
-
-            lines.append(
-                "\nUse get_planning_task(id) for exact ID lookup or "
-                "search_planning(...) to filter tasks."
-            )
-            return "\n".join(lines)
+            return _build_planning_state(tasks, agent_name, filter_by_agent).render_full()
 
         return planning_summary
 
