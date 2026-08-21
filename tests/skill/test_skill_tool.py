@@ -56,7 +56,7 @@ MENU = (
 def _card(**params: Any) -> SkillTool:
     """A card carrying the two example skills, plus any *params* overrides."""
     params.setdefault("skills", [REFUND, ESCALATION])
-    return SkillTool(skill_param=Skills(**params))
+    return SkillTool(param=Skills(**params))
 
 
 def _menu(card: SkillTool) -> str:
@@ -80,11 +80,11 @@ def _observer() -> Mock:
 
 class TestCardSurface:
     def test_the_card_declares_exactly_one_field(self) -> None:
-        assert set(SkillTool.model_fields) == {"skill_param"}
+        assert set(SkillTool.model_fields) == {"param"}
 
     def test_the_capability_ships_on(self) -> None:
-        assert SkillTool.model_fields["skill_param"].default is True
-        assert SkillTool().skill_param is True
+        assert SkillTool.model_fields["param"].default is True
+        assert SkillTool().param is True
 
     def test_the_entry_declares_exactly_name_description_and_content(self) -> None:
         assert set(SkillEntry.model_fields) == {"name", "description", "content"}
@@ -155,7 +155,7 @@ class TestMenu:
         assert [line.split(" — ")[0] for line in lines] == ["refund-policy", "escalation"]
 
     def test_an_empty_library_contributes_the_empty_string(self) -> None:
-        card = SkillTool(skill_param=Skills(skills=[]))
+        card = SkillTool(param=Skills(skills=[]))
         assert card.get_system_prompts(), "the capability is still enabled"
         assert _menu(card) == ""
 
@@ -165,7 +165,7 @@ class TestMenu:
         assert ESCALATION.content not in rendered
 
     def test_the_default_card_renders_an_empty_menu(self) -> None:
-        """``skill_param=True`` means "enabled with defaults", and the default library is empty."""
+        """``param=True`` means "enabled with defaults", and the default library is empty."""
         assert _menu(SkillTool()) == ""
 
 
@@ -176,7 +176,7 @@ class TestMenuCostIsIndependentOfBodySize:
     def test_fifty_kilobyte_bodies_render_the_same_menu_as_twenty_character_ones(self) -> None:
         def library(content: str) -> SkillTool:
             return SkillTool(
-                skill_param=Skills(
+                param=Skills(
                     skills=[
                         SkillEntry(name="refund-policy", description="Refunds.", content=content),
                         SkillEntry(name="escalation", description="Escalation.", content=content),
@@ -215,7 +215,7 @@ class TestUseSkill:
         assert "escalation" in message
 
     def test_an_unknown_name_against_an_empty_library_still_raises_retriable(self) -> None:
-        card = SkillTool(skill_param=Skills(skills=[]))
+        card = SkillTool(param=Skills(skills=[]))
         with pytest.raises(RetriableError):
             card.get_tools()[0]("refund-policy")
 
@@ -288,7 +288,7 @@ class TestChannels:
         assert list(card.get_commands()) == [Skills]
 
     def test_a_disabled_card_contributes_nothing_and_raises_nothing(self) -> None:
-        card = SkillTool(skill_param=False)
+        card = SkillTool(param=False)
         card.observer(_observer())
 
         assert card.get_system_prompts() == []
@@ -334,26 +334,26 @@ class TestSerialization:
         card = _card(expose={SYSTEM_PROMPT, TOOL_CALL})
         restored = SkillTool.model_validate(card.model_dump())
 
-        assert isinstance(restored.skill_param, Skills)
-        assert restored.skill_param.skills == [REFUND, ESCALATION]
-        assert restored.skill_param.expose == {SYSTEM_PROMPT, TOOL_CALL}
+        assert isinstance(restored.param, Skills)
+        assert restored.param.skills == [REFUND, ESCALATION]
+        assert restored.param.expose == {SYSTEM_PROMPT, TOOL_CALL}
 
     def test_it_round_trips_through_json_preserving_every_entry_in_order(self) -> None:
         card = _card()
         restored = SkillTool.model_validate_json(card.model_dump_json())
 
-        assert isinstance(restored.skill_param, Skills)
+        assert isinstance(restored.param, Skills)
         assert [
-            (entry.name, entry.description, entry.content) for entry in restored.skill_param.skills
+            (entry.name, entry.description, entry.content) for entry in restored.param.skills
         ] == [
             (REFUND.name, REFUND.description, REFUND.content),
             (ESCALATION.name, ESCALATION.description, ESCALATION.content),
         ]
-        assert restored.skill_param.expose == {SYSTEM_PROMPT, TOOL_CALL, COMMAND}
+        assert restored.param.expose == {SYSTEM_PROMPT, TOOL_CALL, COMMAND}
 
     def test_a_disabled_card_round_trips_as_false(self) -> None:
-        card = SkillTool(skill_param=False)
-        assert SkillTool.model_validate_json(card.model_dump_json()).skill_param is False
+        card = SkillTool(param=False)
+        assert SkillTool.model_validate_json(card.model_dump_json()).param is False
 
     def test_a_restored_card_renders_the_same_menu(self) -> None:
         restored = SkillTool.model_validate_json(_card().model_dump_json())
