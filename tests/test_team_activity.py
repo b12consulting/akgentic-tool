@@ -175,6 +175,9 @@ class _FakeObserver:
             return self._orchestrator_actor
         return self._activity_actor
 
+    def proxy_tell(self, actor: ActorAddress, actor_type: type | None = None) -> Any:
+        return self._activity_actor
+
 
 class _SpyWorker(DeferredWorker):
     """Counts its own instantiation, so "no worker was spawned" is provable."""

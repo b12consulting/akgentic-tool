@@ -130,6 +130,13 @@ class IntegrationObserver:
             return MagicMock()  # mock VectorStoreActor proxy
         return self._kg_actor
 
+    def proxy_tell(
+        self,
+        actor: ActorAddress,
+        actor_type: type[AkgentType] | None = None,
+    ) -> Any:
+        return self.proxy_ask(actor, actor_type)
+
 
 class _OrchestratorStub:
     """Minimal orchestrator stub that returns known actor addresses."""

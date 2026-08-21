@@ -11,7 +11,7 @@ import tempfile
 import warnings
 from pathlib import Path
 
-from akgentic.tool.sandbox.actor import ExecResult, SandboxActor
+from akgentic.tool.sandbox.actor import DEFAULT_BACKEND_TIMEOUT_S, ExecResult, SandboxActor
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +117,7 @@ class SeatbeltSandboxActor(SandboxActor):
         """
         logger.debug("SeatbeltSandboxActor stopped.")
 
-    def _exec(self, cmd: str, cwd: str) -> ExecResult:
+    def _exec(self, cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
         """Execute a command inside an Apple Seatbelt policy sandbox.
 
         Writes the deny-by-default SBPL policy to a temporary ``.sb`` file
@@ -128,10 +128,16 @@ class SeatbeltSandboxActor(SandboxActor):
         No ``preexec_fn`` or env-stripping is applied — ``resource.setrlimit``
         behaviour differs on macOS and the SBPL policy covers the threat model.
 
+        **The only writable subpath is the workspace root.** The journal at the
+        sibling ``<root>.git`` is outside it, which is what keeps a sandboxed run
+        from rewriting the history; widening this policy to a parent directory
+        would undo that with no other visible effect.
+
         Args:
             cmd: Full command string to execute (pre-validated by ``exec()``).
             cwd: Working directory for the sandboxed process. Falls back to the
                  workspace path when empty or not provided.
+            timeout: Wall-clock budget in seconds, or ``None`` for the default.
 
         Returns:
             ExecResult with stdout, stderr, and exit_code from the process.
@@ -154,7 +160,7 @@ class SeatbeltSandboxActor(SandboxActor):
                 ["sandbox-exec", "-f", policy_path] + cmd.split(),
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=DEFAULT_BACKEND_TIMEOUT_S if timeout is None else timeout,
                 cwd=effective_cwd,
             )
             return ExecResult(

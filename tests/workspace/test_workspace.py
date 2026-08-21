@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import os
+import stat
+import sys
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -11,6 +15,7 @@ from akgentic.tool.workspace.workspace import (
     FileEntry,
     Filesystem,
     Workspace,
+    WriteEntry,
     get_workspace,
 )
 
@@ -157,6 +162,329 @@ class TestFilesystemWrite:
         fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
         with pytest.raises(PermissionError):
             fs.write("../../evil.txt", b"x")
+
+
+# ---------------------------------------------------------------------------
+# Filesystem.write — atomicity
+# ---------------------------------------------------------------------------
+
+# Large enough that a non-atomic write cannot land in one syscall, so a reader
+# can observe a genuine prefix and not only the empty truncate window.
+_PAYLOAD_SIZE = 512 * 1024
+
+# Bounded by iteration count, never by wall-clock sleeping.  Each iteration opens
+# exactly one vulnerable window, so the count — not the payload size — is what
+# decides whether a regression is caught: measured against the non-atomic
+# implementation, 150 iterations let it escape one run in three.
+_WRITER_ITERATIONS = 1500
+_THREAD_JOIN_TIMEOUT = 60.0
+
+# The reader must be scheduled *during* the writer's truncate-to-rewrite window,
+# not merely between whole writes.  The default 5 ms switch interval lets the
+# writer finish a whole cycle while holding the GIL, hiding the defect.
+_SWITCH_INTERVAL = 1e-5
+
+
+class TestFilesystemWriteAtomicity:
+    def test_concurrent_reader_never_observes_a_partial_write(self, tmp_path: Path) -> None:
+        """A reader racing a writer sees only whole payloads, never a prefix.
+
+        Against the non-atomic ``resolved.write_bytes(data)`` implementation the
+        reader observes short reads inside the window between ``O_TRUNC`` and the
+        final byte; against write-temp-then-rename that window does not exist.
+        """
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        target = tmp_path / "team-1" / "big.bin"
+        payload_a = b"a" * _PAYLOAD_SIZE
+        payload_b = b"b" * _PAYLOAD_SIZE
+        fs.write("big.bin", payload_a)
+
+        finished = threading.Event()
+        writer_error: list[BaseException] = []
+
+        def writer() -> None:
+            try:
+                for i in range(_WRITER_ITERATIONS):
+                    fs.write("big.bin", payload_b if i % 2 else payload_a)
+            except BaseException as exc:  # pragma: no cover - surfaced via assertion
+                writer_error.append(exc)
+            finally:
+                finished.set()
+
+        thread = threading.Thread(target=writer)
+        # Summaries only — never the torn bytes themselves, which would be unbounded.
+        torn: list[tuple[int, bytes]] = []
+        # First byte of each whole payload seen, so the evidence stays two entries
+        # wide however many reads happen.
+        whole: set[bytes] = set()
+        previous_interval = sys.getswitchinterval()
+        # The interval is restored on every path, including a failure to start the
+        # thread: left at 1e-5 it would slow and destabilise the rest of the session
+        # with nothing pointing back here.
+        sys.setswitchinterval(_SWITCH_INTERVAL)
+        try:
+            thread.start()
+            try:
+                while not finished.is_set():
+                    observed = target.read_bytes()
+                    if observed == payload_a or observed == payload_b:
+                        whole.add(observed[:1])
+                    else:
+                        torn.append((len(observed), observed[:1]))
+            finally:
+                thread.join(timeout=_THREAD_JOIN_TIMEOUT)
+        finally:
+            sys.setswitchinterval(previous_interval)
+
+        assert not thread.is_alive(), "writer thread did not finish"
+        assert not writer_error, f"writer raised: {writer_error}"
+        # Seeing both payloads is the evidence that the reader actually sampled
+        # across a publish; without it a starved reader would report a green run
+        # having observed nothing, which is worse than no guard at all.
+        assert whole == {b"a", b"b"}, f"reader never raced the writer, saw only {whole}"
+        assert not torn, f"observed {len(torn)} partial reads, e.g. {torn[:5]}"
+
+    def test_publishing_rename_stays_inside_the_target_directory(self, tmp_path: Path) -> None:
+        """``os.replace`` is atomic only within one filesystem — same dir or nothing.
+
+        The invariant asserted is the directory, not the temporary file's name:
+        a cross-directory stage degrades to copy-then-unlink behind an API that
+        claims atomicity, and would pass a name-shaped assertion unnoticed.
+        """
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        real_replace = os.replace
+        calls: list[tuple[Path, Path]] = []
+
+        def recording_replace(src: str | Path, dst: str | Path) -> None:
+            calls.append((Path(src), Path(dst)))
+            real_replace(src, dst)
+
+        with patch("akgentic.tool.workspace.workspace.os.replace", recording_replace):
+            fs.write("deep/nested/file.txt", b"payload")
+
+        assert len(calls) == 1
+        src, dst = calls[0]
+        assert src.parent == dst.parent
+        assert (tmp_path / "team-1" / "deep" / "nested" / "file.txt").read_bytes() == b"payload"
+
+    def test_success_path_leaves_no_temporary_file(self, tmp_path: Path) -> None:
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        fs.write("fresh/out.txt", b"data")
+        directory = tmp_path / "team-1" / "fresh"
+        assert sorted(child.name for child in directory.iterdir()) == ["out.txt"]
+
+    def test_failed_publish_removes_temp_and_leaves_original_intact(self, tmp_path: Path) -> None:
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        fs.write("keep.txt", b"original")
+        directory = tmp_path / "team-1"
+
+        with patch("akgentic.tool.workspace.workspace.os.replace", side_effect=OSError("boom")):
+            with pytest.raises(OSError, match="boom"):
+                fs.write("keep.txt", b"replacement")
+
+        assert sorted(child.name for child in directory.iterdir()) == ["keep.txt"]
+        assert (directory / "keep.txt").read_bytes() == b"original"
+
+    def test_overwrite_preserves_the_existing_file_mode(self, tmp_path: Path) -> None:
+        """Staging must not carry ``mkstemp``'s 0600 onto the published file.
+
+        ``os.replace`` publishes the temporary file's inode, so its mode becomes
+        the target's mode — a workspace bind-mounted into a container running as
+        another uid would silently become unreadable.
+        """
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        fs.write("perm.txt", b"first")
+        target = tmp_path / "team-1" / "perm.txt"
+        target.chmod(0o640)
+
+        fs.write("perm.txt", b"second")
+
+        assert stat.S_IMODE(target.stat().st_mode) == 0o640
+        assert target.read_bytes() == b"second"
+
+    def test_new_file_mode_matches_a_plain_write(self, tmp_path: Path) -> None:
+        """Parity with today's behaviour: whatever the umask would have produced."""
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        fs.write("via_workspace.txt", b"x")
+        control = tmp_path / "team-1" / "control.txt"
+        control.write_bytes(b"x")
+
+        written = tmp_path / "team-1" / "via_workspace.txt"
+        assert stat.S_IMODE(written.stat().st_mode) == stat.S_IMODE(control.stat().st_mode)
+
+    def test_long_target_name_still_writes(self, tmp_path: Path) -> None:
+        """Staging must not push a legal name past the filesystem's 255-byte limit.
+
+        The staging name wraps the target's own name in 38 bytes of affixes, so
+        copying that name whole turns a write that used to succeed into
+        ``OSError: File name too long`` for any target above ~217 bytes.
+        """
+        name = "n" * 250 + ".txt"
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+
+        fs.write(name, b"payload")
+
+        assert (tmp_path / "team-1" / name).read_bytes() == b"payload"
+
+    def test_rejected_path_leaves_nothing_on_disk(self, tmp_path: Path) -> None:
+        """Validation precedes every filesystem effect, staging included."""
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+
+        with pytest.raises(PermissionError, match="escapes workspace root"):
+            fs.write("../escape.txt", b"x")
+
+        assert list((tmp_path / "team-1").iterdir()) == []
+        assert not (tmp_path / "escape.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# Filesystem.write_many — one publication mechanism for a batch
+# ---------------------------------------------------------------------------
+
+
+class TestFilesystemWriteMany:
+    """Stage every file, then publish every file.
+
+    ``multi_edit`` was already atomic against the *gate*; it was not atomic
+    against the *filesystem*, so a failure on the second of three files left the
+    first one written. ``patch`` needs the same treatment for a different reason:
+    from FR7, one mutation is one commit, and a half-applied patch commits a
+    state no agent intended.
+    """
+
+    def test_it_publishes_every_entry(self, tmp_path: Path) -> None:
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        root = tmp_path / "team-1"
+
+        fs.write_many(
+            [
+                WriteEntry(path="a.txt", data=b"first"),
+                WriteEntry(path="deep/b.txt", data=b"second"),
+            ]
+        )
+
+        assert (root / "a.txt").read_bytes() == b"first"
+        assert (root / "deep" / "b.txt").read_bytes() == b"second"
+
+    def test_an_empty_batch_is_a_no_op(self, tmp_path: Path) -> None:
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        fs.write_many([])
+        assert list((tmp_path / "team-1").iterdir()) == []
+
+    def test_a_staging_failure_on_the_second_file_publishes_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The realistic failures — permissions, ENOSPC, an escaping path — all
+        # land during staging, which is exactly why staging comes first.
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        root = tmp_path / "team-1"
+        (root / "a.txt").write_bytes(b"original")
+        real_open = os.open
+        calls: list[int] = []
+
+        def fail_second(path: object, flags: int, mode: int = 0o777) -> int:
+            calls.append(1)
+            if len(calls) == 2:
+                raise PermissionError("no room at the inn")
+            return real_open(path, flags, mode)
+
+        monkeypatch.setattr(os, "open", fail_second)
+
+        with pytest.raises(PermissionError):
+            fs.write_many(
+                [
+                    WriteEntry(path="a.txt", data=b"replacement"),
+                    WriteEntry(path="b.txt", data=b"second"),
+                ]
+            )
+
+        monkeypatch.undo()
+        assert (root / "a.txt").read_bytes() == b"original"
+        assert not (root / "b.txt").exists()
+
+    def test_every_staged_file_is_cleaned_up_on_the_failure_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        root = tmp_path / "team-1"
+        real_open = os.open
+        calls: list[int] = []
+
+        def fail_third(path: object, flags: int, mode: int = 0o777) -> int:
+            calls.append(1)
+            if len(calls) == 3:
+                raise PermissionError("no room at the inn")
+            return real_open(path, flags, mode)
+
+        monkeypatch.setattr(os, "open", fail_third)
+
+        with pytest.raises(PermissionError):
+            fs.write_many(
+                [
+                    WriteEntry(path="a.txt", data=b"one"),
+                    WriteEntry(path="b.txt", data=b"two"),
+                    WriteEntry(path="c.txt", data=b"three"),
+                ]
+            )
+
+        monkeypatch.undo()
+        assert list(root.iterdir()) == []
+
+    def test_an_escaping_path_anywhere_publishes_nothing(self, tmp_path: Path) -> None:
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        root = tmp_path / "team-1"
+
+        with pytest.raises(PermissionError, match="escapes workspace root"):
+            fs.write_many(
+                [
+                    WriteEntry(path="a.txt", data=b"one"),
+                    WriteEntry(path="../escape.txt", data=b"two"),
+                ]
+            )
+
+        assert list(root.iterdir()) == []
+        assert not (tmp_path / "escape.txt").exists()
+
+    def test_it_preserves_an_existing_files_mode(self, tmp_path: Path) -> None:
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        target = tmp_path / "team-1" / "script.sh"
+        target.write_bytes(b"old")
+        target.chmod(0o750)
+
+        fs.write_many([WriteEntry(path="script.sh", data=b"new")])
+
+        assert stat.S_IMODE(target.stat().st_mode) == 0o750
+
+    def test_a_concurrent_reader_never_sees_a_prefix(self, tmp_path: Path) -> None:
+        # The same guarantee the single write offers: publication is by rename,
+        # so a reader resolves the path to one complete file or the other.
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        target = tmp_path / "team-1" / "big.txt"
+        old = b"o" * 200_000
+        new = b"n" * 200_000
+        target.write_bytes(old)
+        seen: list[bytes] = []
+        stop = threading.Event()
+
+        def reader() -> None:
+            while not stop.is_set():
+                try:
+                    seen.append(target.read_bytes())
+                except FileNotFoundError:
+                    continue
+
+        thread = threading.Thread(target=reader)
+        thread.start()
+        try:
+            for _ in range(20):
+                fs.write_many([WriteEntry(path="big.txt", data=new)])
+                fs.write_many([WriteEntry(path="big.txt", data=old)])
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+
+        assert seen
+        assert all(observed in (old, new) for observed in seen)
 
 
 # ---------------------------------------------------------------------------

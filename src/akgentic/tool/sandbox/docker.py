@@ -10,12 +10,20 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from akgentic.tool.sandbox.actor import ExecResult, SandboxActor
+from akgentic.tool.sandbox.actor import DEFAULT_BACKEND_TIMEOUT_S, ExecResult, SandboxActor
 
 logger = logging.getLogger(__name__)
 
 SANDBOX_IMAGE: str = "akgentic-sandbox:latest"
-DOCKER_EXEC_TIMEOUT: int = 60
+
+DOCKER_EXEC_TIMEOUT: float = DEFAULT_BACKEND_TIMEOUT_S
+"""Default budget for one ``docker exec``, when the caller names none.
+
+This used to be 60 s — twice the orchestrator's 30 s stop backstop — which made
+docker the one backend able to hold a team's teardown open past the point that
+teardown gives up. A Python thread cannot be cancelled, so the difference is real
+wall clock, not a formality. Docker is no longer the exception.
+"""
 
 
 class DockerSandboxActor(SandboxActor):
@@ -128,7 +136,12 @@ class DockerSandboxActor(SandboxActor):
         )
         # Do NOT run docker rm — container filesystem preserved between restarts
 
-    def _exec(self, cmd: str, cwd: str) -> ExecResult:
+    def _exec(self, cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
+        """Execute a command in the team's container.
+
+        Only ``<root>:/workspace`` is mounted (see ``_start_sandbox``), so the
+        sibling journal at ``<root>.git`` is not visible inside the container.
+        """
         assert self.state.container_name is not None
         effective_workdir = f"/workspace/{cwd}" if cwd else "/workspace"
         docker_cmd = [
@@ -142,7 +155,7 @@ class DockerSandboxActor(SandboxActor):
             docker_cmd,
             capture_output=True,
             text=True,
-            timeout=DOCKER_EXEC_TIMEOUT,
+            timeout=DOCKER_EXEC_TIMEOUT if timeout is None else timeout,
         )
         return ExecResult(
             stdout=result.stdout,
