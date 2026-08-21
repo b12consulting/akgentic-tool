@@ -75,3 +75,29 @@ class ActorToolObserver(ToolObserver, Protocol):
             Proxy object to interact with the target actor
         """
         ...
+
+    def proxy_tell(
+        self,
+        actor: ActorAddress,
+        actor_type: type[AkgentType] | None = None,
+    ) -> AkgentType:
+        """Get a fire-and-forget proxy to another actor.
+
+        A tool that sends an actor something it needs no answer to must send it
+        this way. An ask has no default timeout, so a merely *slow* target stalls
+        the caller indefinitely — and a fail-open ``except`` around the call
+        catches a raising target and a dead one, never a hung one. A tell cannot
+        stall the sender at all, which makes "this call never blocks the caller"
+        a property of the mechanism rather than of a tuned timeout.
+
+        Every real observer is an ``Akgent`` and already has this; the protocol
+        is widened here so a tool can name it.
+
+        Args:
+            actor: Address of the target actor
+            actor_type: Optional expected type of the target actor for better type checking
+
+        Returns:
+            Proxy object whose calls return immediately, discarding any result
+        """
+        ...

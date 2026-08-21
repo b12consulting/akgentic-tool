@@ -13,7 +13,14 @@ import pytest
 from akgentic.core.utils import SerializableBaseModel
 
 from akgentic.tool.errors import RetriableError
+from akgentic.tool.workspace.actor import (
+    WORKSPACE_ACTOR_ROLE,
+    WorkspaceActor,
+    _preserve_endings,
+    workspace_actor_name,
+)
 from akgentic.tool.workspace.edit import EditItem
+from akgentic.tool.workspace.models import WorkspaceConfig
 from akgentic.tool.workspace.tool import (
     Resource,
     ResourceType,
@@ -41,12 +48,54 @@ def make_observer(
 
 
 def make_wired_tool(tmp_path: Path) -> tuple[WorkspaceTool, Filesystem]:
-    """Create a WorkspaceTool wired to a real tmp Filesystem."""
+    """Create a WorkspaceTool wired to a real tmp Filesystem and a real actor.
+
+    Both ``get_workspace`` call sites are patched, not just the tool's: the actor
+    resolves its own tree through its own module, and pointing only one of them
+    at *fs* would leave the card and the gate on two different directories.
+
+    The observer stays a ``MagicMock`` for everything except the two proxies,
+    which hand back a genuine ``WorkspaceActor``. A ``MagicMock`` behind
+    ``proxy_ask`` would turn every mutation into a silent no-op that still
+    returned a truthy mock — every assertion below would pass having exercised
+    nothing.
+    """
     observer, fs = make_observer(tmp_path)
-    with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+    with (
+        patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs),
+        patch("akgentic.tool.workspace.actor.get_workspace", return_value=fs),
+    ):
+        actor = WorkspaceActor(
+            config=WorkspaceConfig(
+                name=workspace_actor_name(str(observer.team_id)),
+                role=WORKSPACE_ACTOR_ROLE,
+                workspace_name=str(observer.team_id),
+            )
+        )
+        actor.on_start()
+
+        def ask(target: object, actor_type: object = None, timeout: object = None) -> object:
+            return actor if actor_type is WorkspaceActor else MagicMock()
+
+        observer.proxy_ask.side_effect = ask
+        observer.proxy_tell.side_effect = lambda target, actor_type=None: actor
+
         tool = WorkspaceTool()
         tool.observer(observer)
     return tool, fs
+
+
+def seed(tool: WorkspaceTool, fs: Filesystem, path: str, data: bytes) -> None:
+    """Put *data* at *path* and let the tool's agent read it, as a real agent would.
+
+    The read is not decoration. Every whole-file mutation is refused on a file
+    the writing agent has never read (ADR-036 §3), so a test that seeds a
+    fixture behind the gate and then writes it is asserting on a state no agent
+    can reach. Inserting the read the agent would really have made is the fix;
+    relaxing the assertion is not.
+    """
+    fs.write(path, data)
+    next(t for t in tool.get_tools() if t.__name__ == "workspace_read")(path)
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +194,7 @@ class TestWorkspaceWriteLineEndingPreservation:
     def test_write_preserves_crlf(self, tmp_path: Path) -> None:
         """Overwriting a CRLF file with LF content normalises to CRLF."""
         tool, fs = make_wired_tool(tmp_path)
-        fs.write("existing.py", b"line1\r\nline2\r\n")
+        seed(tool, fs, "existing.py", b"line1\r\nline2\r\n")
         write_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_write")
         result = write_fn("existing.py", "new_line1\nnew_line2\n")
         assert result == "Written: existing.py"
@@ -156,7 +205,7 @@ class TestWorkspaceWriteLineEndingPreservation:
     def test_write_preserves_lf(self, tmp_path: Path) -> None:
         """Overwriting an LF file with LF content keeps LF."""
         tool, fs = make_wired_tool(tmp_path)
-        fs.write("lf_file.py", b"line1\nline2\n")
+        seed(tool, fs, "lf_file.py", b"line1\nline2\n")
         write_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_write")
         result = write_fn("lf_file.py", "new_line1\nnew_line2\n")
         assert result == "Written: lf_file.py"
@@ -167,21 +216,35 @@ class TestWorkspaceWriteLineEndingPreservation:
     def test_write_overwrite_no_crlf_difference(self, tmp_path: Path) -> None:
         """Overwrite where content already matches line endings writes correctly."""
         tool, fs = make_wired_tool(tmp_path)
-        fs.write("same.py", b"a\nb\n")
+        seed(tool, fs, "same.py", b"a\nb\n")
         write_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_write")
         result = write_fn("same.py", "updated\n")
         assert result == "Written: same.py"
         assert b"updated" in fs.read("same.py")
 
-    def test_write_non_utf8_existing_file_does_not_raise(self, tmp_path: Path) -> None:
-        """Overwriting a non-UTF-8 binary file writes content as-is without raising."""
+    def test_write_over_an_unread_non_utf8_file_is_refused(self, tmp_path: Path) -> None:
+        """A binary file an agent cannot read is a file it cannot replace.
+
+        This test asserted the opposite until the gate landed: that overwriting
+        a non-UTF-8 file wrote the content as-is. The write path still behaves
+        that way — see ``test_preserve_endings_falls_through_on_non_utf8`` — but
+        an agent can no longer reach it, because ``workspace_read`` cannot decode
+        the file and so records no observation to satisfy the precondition with.
+        """
         tool, fs = make_wired_tool(tmp_path)
         # Write a file with non-UTF-8 bytes (Windows-1252 / Latin-1 encoded)
         fs.write("binary.dat", b"\xff\xfe binary garbage \x80\x81")
         write_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_write")
-        result = write_fn("binary.dat", "replacement\n")
-        assert result == "Written: binary.dat"
-        assert b"replacement" in fs.read("binary.dat")
+        with pytest.raises(RetriableError, match="read it before overwriting"):
+            write_fn("binary.dat", "replacement\n")
+        assert fs.read("binary.dat") == b"\xff\xfe binary garbage \x80\x81"
+
+    def test_preserve_endings_falls_through_on_non_utf8(self) -> None:
+        """Non-UTF-8 live bytes leave the proposed content verbatim, never raising."""
+        assert _preserve_endings("replacement\n", b"\xff\xfe garbage \x80") == "replacement\n"
+
+    def test_preserve_endings_leaves_a_new_file_alone(self) -> None:
+        assert _preserve_endings("a\nb\n", None) == "a\nb\n"
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +256,7 @@ class TestWorkspaceDelete:
     def test_delete_existing_file(self, tmp_path: Path) -> None:
         """workspace_delete removes the file and returns confirmation."""
         tool, fs = make_wired_tool(tmp_path)
-        fs.write("to_delete.py", b"# delete me\n")
+        seed(tool, fs, "to_delete.py", b"# delete me\n")
         delete_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_delete")
         result = delete_fn("to_delete.py")
         assert result == "Deleted: to_delete.py"
@@ -209,7 +272,7 @@ class TestWorkspaceDelete:
     def test_delete_returns_deleted_path(self, tmp_path: Path) -> None:
         """Returned string includes the path that was deleted."""
         tool, fs = make_wired_tool(tmp_path)
-        fs.write("src/old.py", b"pass\n")
+        seed(tool, fs, "src/old.py", b"pass\n")
         delete_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_delete")
         result = delete_fn("src/old.py")
         assert result == "Deleted: src/old.py"
@@ -297,7 +360,7 @@ class TestWorkspaceEdit:
     def test_edit_exact_match_returns_diff(self, tmp_path: Path) -> None:
         """workspace_edit finds exact match, applies replacement, returns unified diff."""
         tool, fs = make_wired_tool(tmp_path)
-        fs.write("main.py", b"old code\nmore code\n")
+        seed(tool, fs, "main.py", b"old code\nmore code\n")
         edit_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_edit")
         result = edit_fn("main.py", "old code", "new code")
         assert "-old code" in result or "old code" in result
@@ -307,7 +370,7 @@ class TestWorkspaceEdit:
         """workspace_edit uses EditMatcher cascade — near-match is accepted."""
         tool, fs = make_wired_tool(tmp_path)
         # Write content with slight whitespace variation
-        fs.write("main.py", b"def  foo():\n    pass\n")
+        seed(tool, fs, "main.py", b"def  foo():\n    pass\n")
         edit_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_edit")
         # EditMatcher should handle the double-space via normalisation strategies
         result = edit_fn("main.py", "def foo():\n    pass", "def bar():\n    pass")
@@ -317,7 +380,7 @@ class TestWorkspaceEdit:
     def test_edit_not_found_returns_error(self, tmp_path: Path) -> None:
         """workspace_edit returns [ERROR] when old_string is not found."""
         tool, fs = make_wired_tool(tmp_path)
-        fs.write("main.py", b"some content\n")
+        seed(tool, fs, "main.py", b"some content\n")
         edit_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_edit")
         result = edit_fn("main.py", "nonexistent string xyz", "replacement")
         assert result.startswith("[ERROR]")
@@ -326,7 +389,7 @@ class TestWorkspaceEdit:
     def test_edit_replace_all_replaces_all_occurrences(self, tmp_path: Path) -> None:
         """workspace_edit with replace_all=True replaces all occurrences."""
         tool, fs = make_wired_tool(tmp_path)
-        fs.write("main.py", b"foo\nfoo\nfoo\n")
+        seed(tool, fs, "main.py", b"foo\nfoo\nfoo\n")
         edit_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_edit")
         result = edit_fn("main.py", "foo", "bar", replace_all=True)
         content = fs.read("main.py").decode("utf-8")
@@ -337,7 +400,7 @@ class TestWorkspaceEdit:
     def test_edit_replace_all_not_found_returns_error(self, tmp_path: Path) -> None:
         """workspace_edit with replace_all=True returns [ERROR] when not found."""
         tool, fs = make_wired_tool(tmp_path)
-        fs.write("main.py", b"hello world\n")
+        seed(tool, fs, "main.py", b"hello world\n")
         edit_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_edit")
         result = edit_fn("main.py", "xyz not here", "replacement", replace_all=True)
         assert result.startswith("[ERROR]")
@@ -345,7 +408,7 @@ class TestWorkspaceEdit:
     def test_edit_preserves_crlf_line_endings(self, tmp_path: Path) -> None:
         """workspace_edit preserves CRLF line endings after replacement."""
         tool, fs = make_wired_tool(tmp_path)
-        fs.write("main.py", b"old code\r\nmore code\r\n")
+        seed(tool, fs, "main.py", b"old code\r\nmore code\r\n")
         edit_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_edit")
         edit_fn("main.py", "old code", "new code")
         content = fs.read("main.py")
@@ -374,8 +437,8 @@ class TestWorkspaceMultiEdit:
         from akgentic.tool.workspace.edit import EditItem
 
         tool, fs = make_wired_tool(tmp_path)
-        fs.write("a.py", b"x = 1\n")
-        fs.write("b.py", b"y = 2\n")
+        seed(tool, fs, "a.py", b"x = 1\n")
+        seed(tool, fs, "b.py", b"y = 2\n")
         multi_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_multi_edit")
         result = multi_fn(
             [
@@ -388,14 +451,20 @@ class TestWorkspaceMultiEdit:
         assert isinstance(result, str)
         assert not result.startswith("[ERROR]")
 
-    def test_multi_edit_stops_on_failure(self, tmp_path: Path) -> None:
-        """workspace_multi_edit stops on first failure; prior edits persist, later ones skipped."""
+    def test_multi_edit_is_all_or_nothing_on_failure(self, tmp_path: Path) -> None:
+        """A batch with one unmatched anchor leaves every file unchanged.
+
+        This asserted the opposite before the gate landed — that the first edit
+        persisted while the rest were skipped. AC7 makes the batch atomic: the
+        actor stages every substitution in memory and publishes nothing until
+        all of them pass, so a half-applied batch is no longer reachable.
+        """
         from akgentic.tool.workspace.edit import EditItem
 
         tool, fs = make_wired_tool(tmp_path)
-        fs.write("a.py", b"x = 1\n")
-        fs.write("b.py", b"y = 2\n")
-        fs.write("c.py", b"z = 3\n")
+        seed(tool, fs, "a.py", b"x = 1\n")
+        seed(tool, fs, "b.py", b"y = 2\n")
+        seed(tool, fs, "c.py", b"z = 3\n")
         multi_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_multi_edit")
         result = multi_fn(
             [
@@ -404,9 +473,9 @@ class TestWorkspaceMultiEdit:
                 EditItem(path="c.py", old_string="z = 3", new_string="z = 30"),
             ]
         )
-        assert b"x = 10" in fs.read("a.py")  # first edit applied
-        assert b"y = 2" in fs.read("b.py")  # second not changed (just the error)
-        assert b"z = 3" in fs.read("c.py")  # third never reached
+        assert fs.read("a.py") == b"x = 1\n"  # staged, never published
+        assert fs.read("b.py") == b"y = 2\n"  # the anchor that failed
+        assert fs.read("c.py") == b"z = 3\n"  # never reached
         assert result.startswith("[ERROR]")
 
     def test_multi_edit_replace_all_in_item(self, tmp_path: Path) -> None:
@@ -414,7 +483,7 @@ class TestWorkspaceMultiEdit:
         from akgentic.tool.workspace.edit import EditItem
 
         tool, fs = make_wired_tool(tmp_path)
-        fs.write("a.py", b"foo\nfoo\nfoo\n")
+        seed(tool, fs, "a.py", b"foo\nfoo\nfoo\n")
         multi_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_multi_edit")
         result = multi_fn(
             [
@@ -432,7 +501,7 @@ class TestWorkspaceMultiEdit:
         from akgentic.tool.workspace.edit import EditItem
 
         tool, fs = make_wired_tool(tmp_path)
-        fs.write("a.py", b"hello world\n")
+        seed(tool, fs, "a.py", b"hello world\n")
         multi_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_multi_edit")
         result = multi_fn(
             [
@@ -480,7 +549,7 @@ class TestWorkspacePatch:
     def test_patch_update_existing_file(self, tmp_path: Path) -> None:
         """workspace_patch applies hunks to an existing file and returns updated:."""
         tool, fs = make_wired_tool(tmp_path)
-        fs.write("existing.py", b"line1\nold_line\nline3\n")
+        seed(tool, fs, "existing.py", b"line1\nold_line\nline3\n")
         patch_text = (
             "--- a/existing.py\n"
             "+++ b/existing.py\n"
@@ -498,7 +567,7 @@ class TestWorkspacePatch:
     def test_patch_delete_file(self, tmp_path: Path) -> None:
         """workspace_patch deletes a file from +++ /dev/null patch."""
         tool, fs = make_wired_tool(tmp_path)
-        fs.write("old_file.py", b"to be deleted\n")
+        seed(tool, fs, "old_file.py", b"to be deleted\n")
         patch_text = "--- a/old_file.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-to be deleted\n"
         patch_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_patch")
         result = patch_fn(patch_text)
@@ -725,8 +794,9 @@ class TestRetriableErrorWorkspaceTool:
         patch_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_patch")
         # parse_patch is called before any per-patch try/except, so a PermissionError
         # raised there will be caught by the outer except PermissionError handler.
+        # It now runs on the actor, which is why the patch target moved modules.
         with patch(
-            "akgentic.tool.workspace.tool.parse_patch",
+            "akgentic.tool.workspace.actor.parse_patch",
             side_effect=PermissionError("path escapes workspace root"),
         ):
             with pytest.raises(RetriableError, match="Path escapes workspace root"):
@@ -735,7 +805,7 @@ class TestRetriableErrorWorkspaceTool:
     def test_multi_edit_permission_error_raises_retriable_error(self, tmp_path: Path) -> None:
         """workspace_multi_edit raises RetriableError when backend raises PermissionError."""
         tool, fs = make_wired_tool(tmp_path)
-        fs.write("src/file.py", b"old\n")
+        seed(tool, fs, "src/file.py", b"old\n")
         multi_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_multi_edit")
         with patch.object(fs, "write", side_effect=PermissionError("escaped")):
             with pytest.raises(RetriableError, match="Path escapes workspace root"):
@@ -1191,9 +1261,7 @@ class TestWorkspaceToolSeedResources:
         tool, fs = _seed_tool(tmp_path, [])
         assert fs.list() == []
 
-    def test_observer_root_escaping_resource_raises_permission_error(
-        self, tmp_path: Path
-    ) -> None:
+    def test_observer_root_escaping_resource_raises_permission_error(self, tmp_path: Path) -> None:
         """A root-escaping file_name raises PermissionError out of observer() (AC #6)."""
         observer, fs = make_observer(tmp_path)
         resources = [Resource(file_name="../escape.txt", content="evil")]
@@ -1202,9 +1270,7 @@ class TestWorkspaceToolSeedResources:
             with pytest.raises(PermissionError):
                 tool.observer(observer)
 
-    def test_observer_malformed_base64_image_raises_binascii_error(
-        self, tmp_path: Path
-    ) -> None:
+    def test_observer_malformed_base64_image_raises_binascii_error(self, tmp_path: Path) -> None:
         """An IMAGE resource with malformed base64 raises binascii.Error (AC #7)."""
         observer, fs = make_observer(tmp_path)
         resources = [
@@ -1215,9 +1281,7 @@ class TestWorkspaceToolSeedResources:
             with pytest.raises(binascii.Error):
                 tool.observer(observer)
 
-    def test_observer_run_twice_preserves_existing_and_seeds_missing(
-        self, tmp_path: Path
-    ) -> None:
+    def test_observer_run_twice_preserves_existing_and_seeds_missing(self, tmp_path: Path) -> None:
         """A second observer() run preserves existing files, seeds still-missing ones (AC #8)."""
         observer, fs = make_observer(tmp_path)
         resources = [

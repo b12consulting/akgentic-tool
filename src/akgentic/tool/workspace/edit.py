@@ -1,13 +1,19 @@
 """Workspace edit utilities — EditMatcher, line ending helpers, unified diff patch.
 
-All functionality required by WorkspaceTool.workspace_edit, workspace_multi_edit,
-and workspace_patch lives here. This module has no dependency on tool.py or
-ToolCard — it is pure algorithmic logic consumed by WorkspaceTool in tool.py.
+All functionality required by ``workspace_edit``, ``workspace_multi_edit`` and
+``workspace_patch`` lives here. This module has no dependency on ``tool.py`` or
+``ToolCard`` — it is pure algorithmic logic, consumed by ``WorkspaceActor``,
+which is where the mutations themselves now run (ADR-036 §3).
+
+The substitution and patch helpers moved here from ``tool.py`` for that reason:
+``tool.py`` imports ``actor.py``, so leaving them where they were would have made
+the actor's import of them a cycle Python refuses at import time.
 """
 
 from __future__ import annotations
 
 import codecs
+import difflib
 import re
 import textwrap
 from dataclasses import dataclass
@@ -36,8 +42,22 @@ class EditMatcher:
 
     FUZZY_THRESHOLD: float = 0.85
 
-    def find(self, content: str, old_string: str) -> MatchResult | None:
-        for strategy in (
+    def find(self, content: str, old_string: str, exact_only: bool = False) -> MatchResult | None:
+        """Locate *old_string* in *content*, first match wins.
+
+        Args:
+            content: The file's current text.
+            old_string: The anchor to locate.
+            exact_only: Run strategy 1 alone, skipping the six approximate ones.
+                The write gate selects this when the file changed since the
+                editing agent read it: approximate matching against text another
+                agent has just rewritten is how a plausible edit lands in the
+                wrong place (ADR-036 §3, FR6).
+
+        Returns:
+            The winning match, or ``None`` when no strategy matched.
+        """
+        cascade = (
             self._exact,
             self._line_trimmed,
             self._whitespace_normalised,
@@ -45,7 +65,8 @@ class EditMatcher:
             self._trimmed_boundary,
             self._escape_normalised,
             self._fuzzy,
-        ):
+        )
+        for strategy in cascade[:1] if exact_only else cascade:
             result = strategy(content, old_string)
             if result is not None:
                 return result
@@ -358,39 +379,51 @@ def parse_patch(patch_text: str) -> list[FilePatch]:
     return parser.finish()
 
 
-def apply_file_patch(workspace: Workspace, file_patch: FilePatch) -> None:
-    """Read a workspace file, apply all hunks, write result back.
+def is_pure_add(file_patch: FilePatch) -> bool:
+    """Whether *file_patch* creates a file rather than updating one.
 
-    Handles add (path="new_file", all hunks are additions),
-    update (normal patch), and delete (path is sentinel "/dev/null" — but
-    callers handle delete by checking file_patch.path against "/dev/null"
-    BEFORE calling this function — see workspace_patch in tool.py).
+    Note: ``all()`` on an empty sequence returns True, so the empty hunk list is
+    guarded explicitly — an empty patch is not a new-file patch.
 
     Args:
-        workspace: Workspace backend (Filesystem instance in practice).
-        file_patch: Parsed FilePatch with one or more Hunk objects.
+        file_patch: A parsed unified diff for one file.
 
-    Raises:
-        FileNotFoundError: If file does not exist and patch is not a pure add.
-        PermissionError: If path escapes the workspace root.
+    Returns:
+        True when every hunk line is an addition.
     """
-    # Determine if this is a new-file creation (all lines are additions).
-    # Note: `all()` on an empty sequence returns True, so we guard against
-    # empty hunk lists explicitly to avoid treating an empty patch as new-file.
-    is_new_file = bool(file_patch.hunks) and all(
+    return bool(file_patch.hunks) and all(
         all(patch_line.startswith("+") for patch_line in hunk.lines if patch_line)
         for hunk in file_patch.hunks
     )
 
-    if is_new_file:
-        new_content = "\n".join(
+
+def render_file_patch(raw: str | None, file_patch: FilePatch) -> str:
+    """Return the text *file_patch* produces, without touching the filesystem.
+
+    Rendering is separate from writing because the write gate has to run
+    *between* the two: the actor computes the new content, checks the live file
+    against what the agent observed, and only then publishes.
+
+    Args:
+        raw: The file's current text, or ``None`` when it does not exist.
+        file_patch: A parsed unified diff for one file.
+
+    Returns:
+        The file's full text after every hunk is applied.
+
+    Raises:
+        FileNotFoundError: If *raw* is ``None`` and the patch is not a pure add.
+    """
+    if is_pure_add(file_patch):
+        added = "\n".join(
             line[1:] for hunk in file_patch.hunks for line in hunk.lines if line.startswith("+")
         )
-        workspace.write(file_patch.path, (new_content + "\n").encode("utf-8"))
-        return
+        return added + "\n"
 
-    raw = workspace.read(file_patch.path)
-    lines = raw.decode("utf-8").splitlines()
+    if raw is None:
+        raise FileNotFoundError(file_patch.path)
+
+    lines = raw.splitlines()
     offset = 0
     for hunk in file_patch.hunks:
         start = hunk.old_start - 1 + offset
@@ -404,4 +437,137 @@ def apply_file_patch(workspace: Workspace, file_patch: FilePatch) -> None:
             # Lines starting with '-' are dropped
         lines[start : start + hunk.old_count] = new_lines
         offset += len(new_lines) - hunk.old_count
-    workspace.write(file_patch.path, ("\n".join(lines) + "\n").encode("utf-8"))
+    return "\n".join(lines) + "\n"
+
+
+def patch_label(file_patch: FilePatch) -> str:
+    """Return the summary line ``workspace_patch`` reports for *file_patch*."""
+    return f"{'created' if is_pure_add(file_patch) else 'updated'}: {file_patch.path}"
+
+
+def apply_file_patch(workspace: Workspace, file_patch: FilePatch) -> None:
+    """Read a workspace file, apply all hunks, write result back.
+
+    Handles add (path="new_file", all hunks are additions),
+    update (normal patch), and delete (path is sentinel "/dev/null" — but
+    callers handle delete by checking file_patch.path against "/dev/null"
+    BEFORE calling this function).
+
+    Ungated by construction: it takes a backend and writes to it. The gated path
+    goes through ``WorkspaceActor.apply_patch``, which renders and checks before
+    it publishes.
+
+    Args:
+        workspace: Workspace backend (Filesystem instance in practice).
+        file_patch: Parsed FilePatch with one or more Hunk objects.
+
+    Raises:
+        FileNotFoundError: If file does not exist and patch is not a pure add.
+        PermissionError: If path escapes the workspace root.
+    """
+    raw = None if is_pure_add(file_patch) else workspace.read(file_patch.path).decode("utf-8")
+    workspace.write(file_patch.path, render_file_patch(raw, file_patch).encode("utf-8"))
+
+
+def deleted_paths(patch_text: str) -> set[str]:
+    """Return the paths a patch deletes, read from the raw diff text.
+
+    ``parse_patch`` derives each path from the ``+++`` line, which is ``/dev/null``
+    for a deletion — so the real path must come from the preceding ``--- a/<path>``
+    line here.
+    """
+    delete_paths: set[str] = set()
+    lines = patch_text.splitlines()
+    for i, line in enumerate(lines):
+        if not (line.startswith("+++ /dev/null") or line.startswith("+++ b//dev/null")):
+            continue
+        for j in range(i - 1, max(i - 5, -1), -1):
+            if lines[j].startswith("--- "):
+                raw_del = lines[j][4:].strip()
+                del_path = raw_del[2:] if raw_del.startswith("a/") else raw_del
+                if del_path != "/dev/null":
+                    delete_paths.add(del_path)
+                break
+    return delete_paths
+
+
+def substitute_edit(
+    matcher: EditMatcher, content: str, item: EditItem, exact_only: bool = False
+) -> str | None:
+    """Apply one edit's substitution to *content*.
+
+    Args:
+        matcher: The cascade used to locate ``old_string``.
+        content: The text to edit.
+        item: The edit to apply.
+        exact_only: Restrict the cascade to exact matching — see
+            :meth:`EditMatcher.find`.
+
+    Returns:
+        The edited content, or ``None`` when ``old_string`` was not found — for
+        ``replace_all`` that means not found even once.
+    """
+    if not item.replace_all:
+        match = matcher.find(content, item.old_string, exact_only=exact_only)
+        if match is None:
+            return None
+        return content[: match.start] + item.new_string + content[match.end :]
+
+    result = content
+    found_any = False
+    while (match := matcher.find(result, item.old_string, exact_only=exact_only)) is not None:
+        found_any = True
+        result = result[: match.start] + item.new_string + result[match.end :]
+    return result if found_any else None
+
+
+def unified(
+    path: str,
+    before: str,
+    after: str,
+    *,
+    before_label: str = "a",
+    after_label: str = "b",
+) -> str:
+    """Return the unified diff from *before* to *after*, or ``""`` when equal.
+
+    Args:
+        path: Workspace-relative path, used in both file headers.
+        before: The left-hand text.
+        after: The right-hand text.
+        before_label: Header prefix for the left side. A rejection labels it
+            ``live`` against ``proposed``, so the direction the agent is being
+            shown cannot be misread as an applied change.
+        after_label: Header prefix for the right side.
+    """
+    return "\n".join(
+        difflib.unified_diff(
+            before.splitlines(),
+            after.splitlines(),
+            fromfile=f"{before_label}/{path}",
+            tofile=f"{after_label}/{path}",
+            lineterm="",
+        )
+    )
+
+
+def write_and_diff(backend: Workspace, path: str, raw: str, edited: str) -> tuple[bytes, str]:
+    """Write *edited* back to *path* with *raw*'s line endings.
+
+    Args:
+        backend: The tree to publish into — the actor's own handle on the gated
+            path.
+        path: Workspace-relative path.
+        raw: The file's text before the edit, and the source of its dominant
+            line ending.
+        edited: The text to publish.
+
+    Returns:
+        The bytes written, and the unified diff — empty when the edit changed
+        nothing. The bytes come back because the actor records the writer's own
+        observation of them, in the same mailbox turn as the write.
+    """
+    normalised = normalise_endings(edited, detect_line_ending(raw))
+    data = normalised.encode("utf-8")
+    backend.write(path, data)
+    return data, unified(path, raw, normalised)

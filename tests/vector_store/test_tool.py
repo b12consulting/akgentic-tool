@@ -117,6 +117,13 @@ class _MockActorToolObserver:
             return self._orchestrator_proxy
         return MagicMock()
 
+    def proxy_tell(
+        self,
+        actor: ActorAddress,
+        actor_type: type[AkgentType] | None = None,
+    ) -> Any:
+        return MagicMock()
+
 
 # ===========================================================================
 # AC-4: field defaults and type surface
