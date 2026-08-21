@@ -67,13 +67,13 @@ def _make_observer() -> Mock:
 
 
 def test_in_life_roster_unchanged() -> None:
-    # While the agent is alive, the roster prompt produces its usual output.
+    # While the agent is alive, the roster command produces its usual output.
     observer = _make_observer()
     tool = TeamTool()
     tool.observer(observer)
 
-    roster_prompt = tool.get_system_prompts()[0]
-    result = roster_prompt()
+    roster_command = tool.get_commands()[GetTeamRoster]
+    result = roster_command()
     assert "Here is the team member list by name (and role):" in result
     assert "@Manager (role: Manager)" in result
     assert "[you]" in result
@@ -113,11 +113,13 @@ def test_closures_do_not_pin_stopped_agent() -> None:
     tool.observer(observer)
 
     ref = weakref.ref(observer)
-    # Build (and hold) tool/command/prompt closures — they must NOT pin the agent.
+    # Build (and hold) tool/command/prompt/provider closures — they must NOT pin
+    # the agent.
     held = [
         *tool.get_tools(),
         *tool.get_system_prompts(),
         *tool.get_commands().values(),
+        *tool.get_context_states(),
     ]
 
     del observer
@@ -180,3 +182,17 @@ def test_roster_prompt_returns_fallback_after_stop() -> None:
     result = roster_prompt()
     assert isinstance(result, str)
     assert result == ""
+
+
+def test_roster_provider_returns_none_after_stop() -> None:
+    # A collected observer makes the roster provider return None — never raise.
+    observer = _make_observer()
+    tool = TeamTool()
+    tool.observer(observer)
+
+    roster_provider = tool.get_context_states()[0]
+
+    del observer
+    gc.collect()
+
+    assert roster_provider() is None

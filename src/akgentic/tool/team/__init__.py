@@ -7,6 +7,12 @@ from .activity import (
     TeamActivityReport,
 )
 from .observer import TeamManagementToolObserver
+from .state import (
+    RoleCatalogState,
+    RoleRow,
+    TeamMemberRow,
+    TeamRosterState,
+)
 from .team import (
     FireTeamMember,
     GetRoleProfiles,
@@ -26,4 +32,8 @@ __all__ = [
     "ActivitySummarizer",
     "AgentActivity",
     "TeamActivityReport",
+    "TeamMemberRow",
+    "TeamRosterState",
+    "RoleRow",
+    "RoleCatalogState",
 ]
