@@ -8,7 +8,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from akgentic.tool.sandbox.actor import ExecResult, SandboxActor
+from akgentic.tool.sandbox.actor import DEFAULT_BACKEND_TIMEOUT_S, ExecResult, SandboxActor
 from akgentic.tool.sandbox.local import _make_preexec
 
 logger = logging.getLogger(__name__)
@@ -63,7 +63,7 @@ class BwrapSandboxActor(SandboxActor):
         """
         logger.debug("BwrapSandboxActor stopped.")
 
-    def _exec(self, cmd: str, cwd: str) -> ExecResult:
+    def _exec(self, cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
         """Execute a command inside a bubblewrap namespace.
 
         Builds a ``bwrap`` command that mounts the workspace at ``/workspace``
@@ -73,10 +73,17 @@ class BwrapSandboxActor(SandboxActor):
         as ``LocalSandboxActor`` (via ``_make_preexec()``) and runs with a
         minimal PATH-only environment.
 
+        **Only the workspace root is bound.** The journal lives at the sibling
+        ``<root>.git``, which is therefore not inside the namespace at all —
+        that placement, not the command allowlist, is what keeps a sandboxed run
+        from reaching the history. Binding a parent directory here for
+        convenience would silently undo it.
+
         Args:
             cmd: Full command string to execute (pre-validated by ``exec()``).
             cwd: Working directory inside the sandbox (relative to ``/workspace``).
                  Empty string means ``/workspace`` root.
+            timeout: Wall-clock budget in seconds, or ``None`` for the default.
 
         Returns:
             ExecResult with stdout, stderr, and exit_code from the process.
@@ -103,7 +110,7 @@ class BwrapSandboxActor(SandboxActor):
             bwrap_cmd,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=DEFAULT_BACKEND_TIMEOUT_S if timeout is None else timeout,
             preexec_fn=_make_preexec(),
             env={"PATH": "/usr/bin:/bin:/usr/local/bin"},
         )

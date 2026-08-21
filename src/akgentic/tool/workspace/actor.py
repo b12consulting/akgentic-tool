@@ -39,9 +39,19 @@ bodies, so the out-of-band commit happens before any of them touches disk and
 the agent's own commit happens after exactly one of them succeeds. A seventh
 mutation added later cannot forget it, because there is nowhere else to put one.
 
-The deferred-result mechanism (ADR-033) stays disengaged. What the ask path does
-is bounded — one file read, one write, a few short-lived ``git`` forks under an
-explicit timeout — and never external.
+**Exec is fenced, not gated, and that is the whole difference.** Every other
+writer here says what it is about to do, so the gate can check a precondition
+against the file it names. A shell command cannot, so ``workspace_exec`` takes an
+exclusive lease over the tree instead, and its write set is *discovered*
+afterwards from ``git status --porcelain -uall`` (ADR-036 §5). A mutation
+arriving under that lease is refused immediately, naming the holder; reads are
+untouched and keep working throughout.
+
+The deferred-result mechanism (ADR-033) is **engaged** from story 29-5, and its
+seven rules apply in full: the blocking sandbox call happens in a ``#defer-``
+worker, never on this thread. Everything the ask path still does is bounded — one
+file read, one write, a few short-lived ``git`` forks under an explicit timeout —
+and never external.
 """
 
 from __future__ import annotations
@@ -54,7 +64,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from akgentic.core.agent import Akgent
+from akgentic.tool.core.deferred import (
+    DEFAULT_WORKER_TIMEOUT_S,
+    DeferredResultActor,
+    DeferredWorker,
+)
 from akgentic.tool.workspace.edit import (
     EditItem,
     EditMatcher,
@@ -71,12 +85,27 @@ from akgentic.tool.workspace.edit import (
     unified,
     write_and_diff,
 )
+from akgentic.tool.workspace.execution import (
+    LEASE_GRACE_S,
+    MAX_TRACKED_RUNS,
+    ExecConfig,
+    ExecLease,
+    ExecOutcome,
+    ExecPayload,
+    ExecStart,
+    ExecState,
+    ExecStatus,
+    ExecWorker,
+    new_run_id,
+    unconfigured,
+)
 from akgentic.tool.workspace.journal import GitJournal, Identity
 from akgentic.tool.workspace.models import (
     MAX_REJECTION_DIFF_LINES,
     PERM_ERR_MSG,
     PUBLISH_LOST_MSG,
     STAGING_SWEEP_GRACE_S,
+    WRITE_DENIED_MSG,
     LastWrite,
     MutationOutcome,
     MutationStatus,
@@ -88,6 +117,7 @@ from akgentic.tool.workspace.models import (
 )
 from akgentic.tool.workspace.workspace import (
     Filesystem,
+    PathEscapeError,
     WriteEntry,
     get_workspace,
     is_staging_name,
@@ -144,6 +174,16 @@ _OUT_OF_BAND = (
 )
 _NEXT_STEP = "Read the file again, reconsider your change against what is there now, then retry."
 
+EXEC_CAPABILITY = "exec"
+"""First field of a discovered commit's subject, beside ``write``, ``edit``, ``patch``."""
+
+_BUSY_PREFIX = "workspace busy"
+"""Opening words of every refusal a lease causes.
+
+Fixed wording because it is what an agent recognises across all seven refused
+operations — the six mutations and a second ``workspace_exec``.
+"""
+
 
 def workspace_actor_name(workspace_name: str) -> str:
     """Return the singleton actor name owning *workspace_name*.
@@ -171,6 +211,25 @@ def _rejected(message: str) -> MutationOutcome:
 def _failed(message: str) -> MutationOutcome:
     """The mutation did not happen; *message* is **returned**, not raised."""
     return MutationOutcome(status=MutationStatus.FAILED, message=message)
+
+
+def _denied(exc: PermissionError) -> MutationOutcome:
+    """Refuse a mutation the filesystem would not allow, saying which kind of denial.
+
+    Both arrive as ``PermissionError`` and they mean opposite things. A path
+    escape is the agent's fault and is fixed by naming a different path; an
+    OS-level denial means the path was right and the file could not be replaced,
+    which no amount of rewriting the path will fix. Told the first when the
+    second is true, an agent loops.
+
+    Args:
+        exc: Whatever the backend raised.
+
+    Returns:
+        The matching refusal. Both are retriable — the second because the file's
+        owner may change, or the agent may pick another path knowing why.
+    """
+    return _rejected(PERM_ERR_MSG if isinstance(exc, PathEscapeError) else WRITE_DENIED_MSG)
 
 
 def _precondition(seen: Observation | None) -> Precondition:
@@ -291,8 +350,8 @@ class _PatchBatch:
     labels: list[str] = field(default_factory=list)
 
 
-class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
-    """Team singleton owning one workspace tree, the observations, and the gate.
+class WorkspaceActor(DeferredResultActor[WorkspaceConfig, WorkspaceState, str, ExecOutcome]):
+    """Team singleton owning one workspace tree, the observations, the gate, and the lease.
 
     Neither map is a state field: recording is not persisted state (see
     :class:`WorkspaceState`). The observation map is keyed
@@ -300,24 +359,43 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
     :class:`~collections.OrderedDict`, which is the whole of the LRU — recording
     moves an entry to the end, eviction pops from the front. The last-writer map
     is keyed by path across all agents and is capped independently.
+
+    From story 29-5 it is also a :class:`~akgentic.tool.core.deferred.DeferredResultActor`
+    keyed by run id. The base supplies ``_slots`` and ``_in_flight``; do not
+    shadow them, do not reach into them from :meth:`exec_status`, and do not add
+    a second cache. Its LRU and its negative TTL are two of the seven deferred
+    rules, and reimplementing either is how a partial adoption starts.
     """
 
     def on_start(self) -> None:
         """Initialise state, take the tree handle, sweep staging files, open the journal.
 
-        **The order is load-bearing and there is only one correct one.** Sweeping
-        after the initial commit would commit orphaned staging files and then
-        delete them; seeding ``.gitignore`` after that commit would leave the
-        sidecars inside it.
+        **The order is load-bearing and there is only one correct one**, and two
+        different orderings are being satisfied at once.
+
+        ``self.state`` is assigned *before* ``super().on_start()`` because
+        ``DeferredResultActor.on_start`` touches ``self.state`` on its first
+        line. It also does not chain to ``Akgent.on_start`` — which is a no-op
+        today, so nothing is lost, but that is a fact about the current core
+        rather than a guarantee, and it is why this comment exists rather than
+        silence.
+
+        Everything after it keeps 29-4's order: sweeping *after* the initial
+        commit would commit orphaned staging files and then delete them, and
+        seeding ``.gitignore`` after that commit would leave the sidecars inside
+        it.
         """
-        super().on_start()
         self.state = WorkspaceState()
-        self.state.observer(self)
+        super().on_start()
         self._observations: dict[str, OrderedDict[str, Observation]] = {}
         self._last_writers: OrderedDict[str, LastWrite] = OrderedDict()
         self._agent_names: OrderedDict[str, str] = OrderedDict()
         self._touched: list[str] = []
         self._matcher = EditMatcher()
+        self._exec_config: ExecConfig | None = None
+        self._lease: ExecLease | None = None
+        self._run_errors: OrderedDict[str, str] = OrderedDict()
+        self._recent_runs: dict[str, OrderedDict[str, str]] = {}
         self._workspace: Filesystem = get_workspace(self.config.workspace_name)
         self._sweep_staging_files()
         self._journal = GitJournal(
@@ -328,6 +406,10 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
         if self._journal.initialise():
             self._journal.seed_gitignore(self._workspace.write)
             self._journal.commit_out_of_band()
+
+    def worker_class(self) -> type[DeferredWorker]:
+        """Return :class:`~akgentic.tool.workspace.execution.ExecWorker`."""
+        return ExecWorker
 
     ##
     ## Identity — reached through the card's **tell** proxy, once, at bind time
@@ -363,6 +445,194 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
     def _identity(self, agent_id: str) -> Identity:
         """Compose the git identity for *agent_id*: name to read, id to distinguish."""
         return Identity(self._name_of(agent_id), agent_id)
+
+    ##
+    ## Exec — the lease, the run, and the discovered commit
+    ##
+    def configure_exec(self, config: ExecConfig) -> None:
+        """Record which backend to run commands on — **tell** path, once per card.
+
+        The actor cannot take this from :class:`WorkspaceConfig`, because
+        ``getChildrenOrCreate`` fixes that at creation and the card that creates
+        the actor for a workspace is routinely one with no exec capability at
+        all. So an exec-capable card announces itself here instead, at bind time,
+        exactly as :meth:`register_agent` does.
+
+        Last writer wins, and that is correct: two exec-capable cards over one
+        tree must agree on the backend anyway, since they share one
+        ``#SandboxActor``.
+
+        Args:
+            config: The resolved backend and the ids to build payloads from.
+        """
+        self._exec_config = config
+
+    def request_exec(self, agent_id: str, cmd: str, cwd: str = "") -> ExecStart:
+        """Take the lease and spawn the worker, or refuse — in one mailbox turn.
+
+        Everything here is O(1) plus the journal's bounded git calls. **No
+        sandbox call happens on this thread**: that is what keeps the actor's
+        mailbox draining, which is what makes reads work during a run and a
+        refused mutation cost one turn instead of the run's whole duration.
+
+        Args:
+            agent_id: Identity of the requesting agent, as a string.
+            cmd: The command string.
+            cwd: Working directory below the workspace root.
+
+        Returns:
+            The issued run id, or the refusal that stopped it.
+        """
+        busy = self._busy_refusal()
+        if busy is not None:
+            return ExecStart(refusal=busy)
+        config = self._exec_config
+        if config is None:
+            return ExecStart(refusal=unconfigured())
+        # The tree's existing dirt belongs to nobody, and must not end up inside
+        # this run's discovered commit — which is exactly what would happen,
+        # since that commit takes whatever the tree shows afterwards.
+        self._journal.commit_out_of_band()
+        run_id = new_run_id()
+        budget = min(config.timeout_s, DEFAULT_WORKER_TIMEOUT_S)
+        now = time.monotonic()
+        self._lease = ExecLease(
+            run_id=run_id,
+            agent_id=agent_id,
+            cmd=cmd,
+            started_at=now,
+            deadline=now + budget + LEASE_GRACE_S,
+        )
+        self._track_run(agent_id, run_id)
+        # The lease is taken BEFORE request(), because a spawn failure reports
+        # through fail() synchronously and must find a lease to release.
+        self.request(
+            run_id,
+            ExecPayload(
+                deferred_key=run_id,
+                cmd=cmd,
+                cwd=cwd,
+                mode=config.mode,
+                team_id=config.team_id,
+                workspace_id=config.workspace_id,
+                timeout_s=budget,
+            ),
+        )
+        return ExecStart(run_id=run_id)
+
+    def exec_status(self, agent_id: str, run_id: str) -> ExecStatus:
+        """Report where *run_id* stands, for *agent_id*.
+
+        The base's ``get`` cannot answer this alone: it returns ``None`` for an
+        unknown key, an in-flight one and a negatively-cached one alike, and
+        telling a model "still running" about an id it invented is a dead end it
+        cannot recover from. So a failure is read from this actor's own small
+        error map, and "running" is distinguished from "unknown" by whether the
+        id was ever issued to this agent.
+
+        Args:
+            agent_id: Identity of the asking agent, as a string.
+            run_id: The run to report on.
+
+        Returns:
+            Done with the outcome, failed with the reason, running, or unknown
+            with this agent's recent run ids.
+        """
+        outcome = self.get(run_id)
+        if outcome is not None:
+            return ExecStatus(state=ExecState.DONE, run_id=run_id, outcome=outcome)
+        error = self._run_errors.get(run_id)
+        if error is not None:
+            return ExecStatus(state=ExecState.FAILED, run_id=run_id, reason=error)
+        if run_id in self._recent_runs.get(agent_id, {}):
+            return ExecStatus(state=ExecState.RUNNING, run_id=run_id)
+        return ExecStatus(
+            state=ExecState.UNKNOWN,
+            run_id=run_id,
+            recent_run_ids=list(self._recent_runs.get(agent_id, {})),
+        )
+
+    def deliver(self, key: str, value: ExecOutcome) -> None:
+        """TELL, from the worker. Cache the outcome, then close the run out."""
+        super().deliver(key, value)
+        self._finish_run(key)
+
+    def fail(self, key: str, error: str) -> None:
+        """TELL, from the worker. Record the failure, then close the run out.
+
+        The base caches negatively with a TTL, which is what stops a broken
+        backend from being respawned once per poll. The reason is kept here as
+        well because the base deliberately does not expose it — ``get`` answers
+        ``None`` for a failure exactly as it does for an unknown key, and a run
+        that failed must never be reported as still running.
+        """
+        super().fail(key, error)
+        self._run_errors[key] = error
+        self._run_errors.move_to_end(key)
+        while len(self._run_errors) > self.cache_capacity:
+            self._run_errors.popitem(last=False)
+        self._finish_run(key)
+
+    def _finish_run(self, run_id: str) -> None:
+        """Commit what the run produced and release its lease.
+
+        **Only a report from the lease's own run releases it.** A late report
+        from a run whose lease was already reclaimed on deadline must not clear a
+        newer agent's lease, and must not commit its tree either.
+        """
+        lease = self._lease
+        if lease is None or lease.run_id != run_id:
+            return
+        self._lease = None
+        self._journal.commit_discovered(
+            self._identity(lease.agent_id), EXEC_CAPABILITY, detail=lease.cmd
+        )
+
+    def _busy_refusal(self) -> str | None:
+        """Refuse under a live lease, reclaim an expired one, or allow.
+
+        Fail fast, never stall. Ten seconds of silence inside a tool call is
+        indistinguishable from a hang and gives the model nothing to react to; an
+        immediate refusal naming the holder lets it read a file, answer the user,
+        or ask the holder. That is only affordable because the actor's thread is
+        free — the blocking call is in a worker.
+
+        Returns:
+            The refusal text, or ``None`` when the tree is free.
+        """
+        lease = self._lease
+        if lease is None:
+            return None
+        if time.monotonic() > lease.deadline:
+            logger.warning(
+                "Workspace %s: reclaiming the lease of run %s (agent %s) — it passed its "
+                "deadline without reporting, which means its worker died with the team's "
+                "teardown. Anything it is still writing will land in a later commit.",
+                self.config.workspace_name,
+                lease.run_id,
+                self._name_of(lease.agent_id),
+            )
+            self._lease = None
+            return None
+        return (
+            f"{_BUSY_PREFIX} — exec run {lease.run_id} is in progress "
+            f"(agent '{self._name_of(lease.agent_id)}'). Reads still work; retry the change "
+            f"once the run has finished."
+        )
+
+    def _track_run(self, agent_id: str, run_id: str) -> None:
+        """Remember *run_id* as one of *agent_id*'s recent runs, LRU-capped.
+
+        Capped for the reason every map on a team singleton is: an uncapped one
+        leaks for the life of the team. Losing the oldest id is safe — a finished
+        run is still answered from the result cache, and the list exists only to
+        make a mistyped id correctable.
+        """
+        runs = self._recent_runs.setdefault(agent_id, OrderedDict())
+        runs[run_id] = run_id
+        runs.move_to_end(run_id)
+        while len(runs) > MAX_TRACKED_RUNS:
+            runs.popitem(last=False)
 
     ##
     ## The observation map — reached through the card's **tell** proxy
@@ -426,12 +696,19 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
     ) -> MutationOutcome:
         """Run one mutation between the out-of-band commit and the agent's own.
 
-        Order per mutation: commit anything nobody claimed → run the gate and the
-        write → stage the mutation's **own** paths and commit them as the agent.
-        The out-of-band check runs *before* the gate decides, which is correct —
-        the dirt exists whether the mutation is accepted or refused, and it
-        belongs to nobody either way. A refused mutation performs no commit of
-        its own, because :meth:`_accept` and :meth:`_forget` never ran.
+        Order per mutation: refuse if the tree is leased → commit anything nobody
+        claimed → run the gate and the write → stage the mutation's **own** paths
+        and commit them as the agent. The out-of-band check runs *before* the
+        gate decides, which is correct — the dirt exists whether the mutation is
+        accepted or refused, and it belongs to nobody either way. A refused
+        mutation performs no commit of its own, because :meth:`_accept` and
+        :meth:`_forget` never ran.
+
+        **The busy check is first, and it is here rather than in six places.**
+        This is the one point all six mutations converge on, so a seventh added
+        later cannot forget it — and being ahead of the body, it is ahead of the
+        gate's file read too. A refusal that first opens a file is doing work it
+        is about to throw away, once per refused mutation on a busy tree.
 
         Args:
             agent_id: Identity of the mutating agent, as a string.
@@ -443,6 +720,9 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
             Whatever the body returned, untouched. No journal failure can change
             a mutation's outcome — the bytes are already on disk.
         """
+        busy = self._busy_refusal()
+        if busy is not None:
+            return _rejected(busy)
         self._journal.commit_out_of_band()
         self._touched = []
         outcome = run()
@@ -473,8 +753,8 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
                 return _rejected(refusal)
             data = _preserve_endings(content, live).encode("utf-8")
             self._workspace.write(path, data)
-        except PermissionError:
-            return _rejected(PERM_ERR_MSG)
+        except PermissionError as exc:
+            return _denied(exc)
         except FileNotFoundError:
             return _rejected(PUBLISH_LOST_MSG)
         self._accept(agent_id, path, data)
@@ -504,8 +784,8 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
             if live is None:
                 return _rejected(f"File not found: {path}")
             self._workspace.delete(path)
-        except PermissionError:
-            return _rejected(PERM_ERR_MSG)
+        except PermissionError as exc:
+            return _denied(exc)
         except FileNotFoundError:
             return _rejected(PUBLISH_LOST_MSG)
         self._forget(agent_id, path)
@@ -571,8 +851,8 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
             if edited is None:
                 return self._anchor_miss(path, live, exact_only)
             data, diff = write_and_diff(self._workspace, path, raw, edited)
-        except PermissionError:
-            return _rejected(PERM_ERR_MSG)
+        except PermissionError as exc:
+            return _denied(exc)
         except FileNotFoundError:
             return _rejected(PUBLISH_LOST_MSG)
         self._accept(agent_id, path, data)
@@ -604,8 +884,8 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
                 if blocked is not None:
                     return blocked
             return self._publish_staged(agent_id, staged)
-        except PermissionError:
-            return _rejected(PERM_ERR_MSG)
+        except PermissionError as exc:
+            return _denied(exc)
         except FileNotFoundError:
             return _rejected(PUBLISH_LOST_MSG)
 
@@ -642,8 +922,8 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
             if not batch.labels:
                 return _accepted("(no patches applied)")
             return self._publish_patch(agent_id, batch)
-        except PermissionError:
-            return _rejected(PERM_ERR_MSG)
+        except PermissionError as exc:
+            return _denied(exc)
         except FileNotFoundError:
             return _rejected(PUBLISH_LOST_MSG)
 
@@ -676,8 +956,8 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
         """
         try:
             self._workspace.mkdir(path)
-        except PermissionError:
-            return _rejected(PERM_ERR_MSG)
+        except PermissionError as exc:
+            return _denied(exc)
         return _accepted(f"Created: {path}")
 
     ##

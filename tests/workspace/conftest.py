@@ -20,9 +20,9 @@ import subprocess
 import threading
 import uuid
 from collections.abc import Generator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 from akgentic.core.actor_address import ActorAddress
@@ -30,10 +30,14 @@ from akgentic.core.actor_address_impl import ActorAddressImpl
 from akgentic.core.agent import Akgent, AkgentType
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
+from akgentic.tool.core.deferred import DeferredPayload
+from akgentic.tool.sandbox.actor import ExecResult, SandboxActor
+from akgentic.tool.sandbox.tool import SANDBOX_ACTOR_CLASSES
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
+from akgentic.tool.workspace.execution import ExecWorker
 from akgentic.tool.workspace.journal import git_dir_for
 from akgentic.tool.workspace.models import MutationOutcome, Observation
-from akgentic.tool.workspace.tool import WorkspaceTool
+from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
 
 from tests.conftest import MockActorAddress
 
@@ -132,6 +136,13 @@ def journal_log(tree: Path) -> list[Commit]:
             )
         )
     return commits
+
+
+def journal_body(tree: Path, sha: str) -> str:
+    """Return one commit's message body — everything below the subject line."""
+    full = _git(tree, "log", "-1", "--format=%B", sha)
+    _subject, _, body = full.partition("\n")
+    return body.strip()
 
 
 def git_show(tree: Path, revision: str) -> str:
@@ -493,3 +504,217 @@ def outcome_of(actor: WorkspaceActor, method: str, *args: Any) -> MutationOutcom
     result = getattr(actor, method)(*args)
     assert isinstance(result, MutationOutcome)
     return result
+
+
+##
+## Exec (29-5) — a fake backend at the ``local`` key, and a worker on a real
+## thread.  No docker, no bwrap, no sandbox-exec, and no wall-clock sleeps: a run
+## is held open by an event and released by the test, so every concurrency
+## assertion is a handshake with a failure budget rather than a wait.
+##
+
+
+@dataclass
+class SandboxScript:
+    """What the fake backend does when a run reaches it, and what it saw.
+
+    Attributes:
+        started: Set the moment the backend is entered — a test waits on this to
+            know a run is genuinely in flight before asserting anything about it.
+        gate: The run blocks here until the test sets it. Set from the start when
+            a test wants a run that simply completes.
+        files: ``(relative path, content)`` written before the run returns —
+            including nested paths, which is how the ``-uall`` property is
+            exercised.
+        stdout, stderr, exit_code: What the run reports.
+        raise_with: Raised instead of returning, for the failure path.
+        timeouts: Every budget the backend was handed, in order.
+        commands: Every ``(cmd, cwd)`` it was handed, in order.
+    """
+
+    started: threading.Event = field(default_factory=threading.Event)
+    gate: threading.Event = field(default_factory=threading.Event)
+    files: list[tuple[str, str]] = field(default_factory=list)
+    stdout: str = "ok"
+    stderr: str = ""
+    exit_code: int = 0
+    raise_with: BaseException | None = None
+    timeouts: list[float | None] = field(default_factory=list)
+    commands: list[tuple[str, str]] = field(default_factory=list)
+
+
+class FakeSandboxActor(SandboxActor):
+    """A backend that writes what a test asks for and blocks when a test asks it to.
+
+    Injected into ``SANDBOX_ACTOR_CLASSES`` at the ``local`` key, which the
+    module documents as a mutable injection window. It is a real
+    :class:`SandboxActor` subclass, so it goes through the same
+    ``getChildrenOrCreate`` the production path uses and honours the same
+    allowlist — what it does not do is start a process.
+    """
+
+    script: ClassVar[SandboxScript] = SandboxScript()
+
+    def _start_sandbox(self) -> None:
+        base = os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
+        name = self.config.workspace_id or self.config.team_id
+        root = Path(base) / name
+        root.mkdir(parents=True, exist_ok=True)
+        self.state.workspace_path = root.resolve()
+
+    def _stop_sandbox(self) -> None:
+        pass
+
+    def _exec(self, cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
+        script = type(self).script
+        script.commands.append((cmd, cwd))
+        script.timeouts.append(timeout)
+        script.started.set()
+        assert script.gate.wait(timeout=HANDSHAKE_TIMEOUT_S), "the run was never released"
+        assert self.state.workspace_path is not None
+        for relative, body in script.files:
+            target = self.state.workspace_path / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(body, encoding="utf-8")
+        if script.raise_with is not None:
+            raise script.raise_with
+        return ExecResult(stdout=script.stdout, stderr=script.stderr, exit_code=script.exit_code)
+
+
+class DeadAddress(MockActorAddress):
+    """An address that reports itself dead, so telemetry never leaves the worker.
+
+    ``Akgent._notify_orchestrator`` reaches into ``ActorAddressImpl._actor_ref``
+    for anything it believes is alive, which a stand-in does not have. Reporting
+    dead is the honest answer here — there is no orchestrator behind this address
+    — and it keeps the worker's own ``StartMessage`` and state notifications out
+    of the way of what these tests are about.
+    """
+
+    def is_alive(self) -> bool:
+        return False
+
+
+class ExecHarness:
+    """Runs ``#Workspace``'s exec worker on a real thread, with no actor system.
+
+    The actor itself stays inert — the tests call its methods directly, exactly
+    as the other workspace suites do — but the worker genuinely runs elsewhere,
+    which is the only way a lease can be observed *while it is held*. Follows the
+    ``createActor`` / ``proxy_tell`` patching in ``tests/test_core_deferred.py``
+    rather than starting a second actor system.
+
+    The base's ``request`` is untouched, so its in-flight de-duplication and its
+    spawn-failure path are the real ones.
+    """
+
+    def __init__(self, actor: WorkspaceActor, orchestrator_proxy: FakeOrchestratorProxy) -> None:
+        self.actor = actor
+        self.orchestrator_proxy = orchestrator_proxy
+        self.threads: list[threading.Thread] = []
+        self.worker_names: list[str] = []
+        self.payloads: list[DeferredPayload] = []
+        self.spawn_error: BaseException | None = None
+        self._orchestrator = DeadAddress("orchestrator")
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Point the actor's spawn path at this harness."""
+        monkeypatch.setattr(self.actor, "createActor", self._create_actor)
+        monkeypatch.setattr(self.actor, "proxy_tell", self._proxy_tell)
+
+    def _create_actor(
+        self,
+        actor_class: type[Akgent[Any, Any]],
+        agent_id: uuid.UUID | None = None,
+        config: BaseConfig | None = None,
+    ) -> ActorAddress:
+        if self.spawn_error is not None:
+            raise self.spawn_error
+        assert config is not None
+        assert issubclass(actor_class, ExecWorker)
+        self.worker_names.append(config.name)
+        return MockActorAddress(config.name, config.role)
+
+    def _proxy_tell(self, address: ActorAddress, actor_type: Any = None) -> Any:
+        return _WorkerLauncher(self)
+
+    def _run_worker(self, payload: DeferredPayload) -> None:
+        """Build a worker, wire its two proxies to this harness, and let it produce."""
+        worker = ExecWorker()
+        worker.config = BaseConfig(name=self.worker_names[-1], role="ToolActor")
+        worker._parent = DeadAddress("#Workspace")
+        worker._orchestrator = self._orchestrator
+        worker.on_start()
+
+        def proxy_ask(target: ActorAddress, actor_type: Any = None) -> Any:
+            if target is self._orchestrator:
+                return self.orchestrator_proxy
+            return self.orchestrator_proxy.actor_for(target)
+
+        def proxy_tell(target: ActorAddress, actor_type: Any = None) -> Any:
+            return self.actor  # deliver() / fail() land on the real actor
+
+        worker.proxy_ask = proxy_ask  # type: ignore[method-assign]
+        worker.proxy_tell = proxy_tell  # type: ignore[method-assign]
+        worker.stop = lambda *args, **kwargs: None  # type: ignore[method-assign,assignment]
+        worker.receiveMsg_DeferredPayload(payload)
+
+    def join(self) -> None:
+        """Wait for every spawned worker, bounded — a hang is a failure, not a wait."""
+        for thread in self.threads:
+            thread.join(timeout=HANDSHAKE_TIMEOUT_S)
+            assert not thread.is_alive(), "an exec worker never finished"
+        self.threads.clear()
+
+
+class _WorkerLauncher:
+    """The tell proxy ``request`` hands its payload to — starts the worker's thread."""
+
+    def __init__(self, harness: ExecHarness) -> None:
+        self.harness = harness
+
+    def receiveMsg_DeferredPayload(self, payload: DeferredPayload) -> None:  # noqa: N802
+        self.harness.payloads.append(payload)
+        thread = threading.Thread(target=self.harness._run_worker, args=(payload,), daemon=True)
+        self.harness.threads.append(thread)
+        thread.start()
+
+
+@pytest.fixture
+def sandbox_script() -> Generator[SandboxScript, None, None]:
+    """Install :class:`FakeSandboxActor` at the ``local`` key for one test."""
+    script = SandboxScript()
+    FakeSandboxActor.script = script
+    previous = SANDBOX_ACTOR_CLASSES["local"]
+    SANDBOX_ACTOR_CLASSES["local"] = FakeSandboxActor
+    yield script
+    SANDBOX_ACTOR_CLASSES["local"] = previous
+    script.gate.set()  # never leave a worker blocked behind a failed assertion
+
+
+def exec_card_for(
+    orchestrator_proxy: FakeOrchestratorProxy,
+    name: str = "alice",
+    workspace_id: str = WORKSPACE_NAME,
+    poll_attempts: int = 1,
+    poll_delay_seconds: float = 0.0,
+    **card_kwargs: Any,
+) -> tuple[WorkspaceTool, FakeActorToolObserver]:
+    """Wire an exec-capable card onto *workspace_id*, with a tight poll by default.
+
+    ``poll_attempts=1`` is what keeps the suite free of real sleeps: a test that
+    wants the ``in progress`` handoff gets it in one attempt, and a test that
+    wants a completed run raises the count against a 10 ms delay instead.
+    """
+    observer = FakeActorToolObserver(orchestrator_proxy, name=name)
+    card = WorkspaceTool(
+        workspace_id=workspace_id,
+        workspace_exec=WorkspaceExec(
+            mode="local",
+            poll_attempts=poll_attempts,
+            poll_delay_seconds=poll_delay_seconds,
+        ),
+        **card_kwargs,
+    )
+    card.observer(observer)
+    return card, observer

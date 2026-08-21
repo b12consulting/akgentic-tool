@@ -551,7 +551,11 @@ class TestAPartPublishedBatchIsNeverCommitted:
 
         monkeypatch.setattr(tree, "_stage", fail_second)
 
-        with pytest.raises(RetriableError, match="Path escapes workspace root"):
+        # A bare PermissionError from the write point is the OS refusing the
+        # write, not a path leaving the root, and since 29-5 the two say
+        # different things (AC12). Which refusal it is does not matter here —
+        # what matters is that it refuses, and that nothing landed.
+        with pytest.raises(RetriableError, match="was not published"):
             mutate(
                 wired_card,
                 "workspace_multi_edit",

@@ -186,19 +186,30 @@ class TestTheHashIsRead:
         workspace_actor: WorkspaceActor,
         notes: Path,
     ) -> None:
-        # A structural companion to the behavioural tests above: the only maps
-        # the actor keeps are per-agent observations, per-path attribution and
-        # agent display names, and not one of them can answer "what is in this
-        # file now". A map appearing here that could is the regression this
-        # guards — the list is exhaustive on purpose, so adding one is a
-        # deliberate act.
+        # A structural companion to the behavioural tests above: not one map the
+        # actor keeps can answer "what is in this file now". A map appearing here
+        # that could is the regression this guards — the list is exhaustive on
+        # purpose, so adding one is a deliberate act.
+        #
+        # Three of the six arrived with exec (29-5) and none of them holds file
+        # content either: ``_slots`` is the deferred base's result cache, keyed
+        # by run id and holding an ``ExecOutcome``; ``_run_errors`` and
+        # ``_recent_runs`` are keyed by run id and agent id respectively and hold
+        # strings.
         read(wired_card, "notes.md")
         mutate(wired_card, "workspace_write", "notes.md", "mine\n")
 
         maps = {
             name: value for name, value in vars(workspace_actor).items() if isinstance(value, dict)
         }
-        assert set(maps) == {"_observations", "_last_writers", "_agent_names"}
+        assert set(maps) == {
+            "_observations",
+            "_last_writers",
+            "_agent_names",
+            "_slots",
+            "_run_errors",
+            "_recent_runs",
+        }
 
 
 class TestSeedingIsNotGated:

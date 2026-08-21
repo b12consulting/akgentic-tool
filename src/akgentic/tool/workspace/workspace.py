@@ -56,6 +56,23 @@ def is_staging_name(name: str) -> bool:
     return _STAGED_NAME_RE.match(name) is not None
 
 
+class PathEscapeError(PermissionError):
+    """A path that resolved outside the workspace root.
+
+    A subclass rather than a new exception so that every existing
+    ``except PermissionError`` keeps catching it and nothing outside changes by
+    accident. What it buys is the one distinction the workspace could not make
+    before: an *escaping path* and an *OS-denied write* both arrive as
+    ``PermissionError``, and telling an agent its path escaped the workspace
+    when the path is fine and the file is simply not replaceable sends it
+    rewriting a correct path for ever.
+
+    The second case stopped being hypothetical with ``workspace_exec``: a run in
+    a container writes as another uid, and publication by rename means the host
+    process must be able to replace that inode on the next write.
+    """
+
+
 class FileEntry(BaseModel):
     """Metadata for a single filesystem entry inside a workspace."""
 
@@ -119,11 +136,14 @@ class Filesystem:
         begins with the same characters (e.g. ``team-1`` vs ``team-11``).
 
         Raises:
-            PermissionError: if the resolved path escapes the workspace root.
+            PathEscapeError: if the resolved path escapes the workspace root. It
+                is a ``PermissionError``, so existing handlers are unaffected —
+                but it lets a caller tell an escaping path apart from an
+                OS-level denial on a path that is perfectly legal.
         """
         resolved = (self._root / path).resolve()
         if not resolved.is_relative_to(self._root):
-            raise PermissionError(f"Path '{path}' escapes workspace root")
+            raise PathEscapeError(f"Path '{path}' escapes workspace root")
         return resolved
 
     def read(self, path: str) -> bytes:

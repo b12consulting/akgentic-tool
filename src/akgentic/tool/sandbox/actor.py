@@ -27,6 +27,35 @@ logger = logging.getLogger(__name__)
 SANDBOX_ACTOR_NAME: str = "#SandboxActor"
 SANDBOX_ACTOR_ROLE: str = "ToolActor"
 
+SandboxMode = Literal["local", "bwrap", "seatbelt", "docker"]
+"""A backend that has been resolved. ``"auto"`` is not one of these."""
+
+CardMode = Literal["local", "bwrap", "seatbelt", "docker", "auto"]
+"""What a card may ask for, which includes ``"auto"``: probe the host and pick.
+
+Both aliases live here, in the module with no dependencies of its own, because
+both sides of the exec merge need them and a second definition in either would
+be a second place to add a backend to.
+"""
+
+DEFAULT_BACKEND_TIMEOUT_S: float = 30.0
+"""What a backend gives a command when the caller names no budget.
+
+Strictly at the orchestrator's stop backstop rather than above it: a worker
+cannot cancel a Python thread, so a subprocess still running past the backstop
+holds its parent's ``stop_children(blocking=True)`` open for the difference.
+Callers that own a tighter budget pass it to :meth:`SandboxActor.exec`.
+"""
+
+##
+## Only the FIRST token of a command is checked against this set, and both
+## ``bash`` and ``sh`` are in it — so ``bash -c "git reset --hard"`` walks
+## straight past it.  Nothing may rely on this allowlist for safety.  The real
+## guarantee that a sandboxed run cannot reach the workspace journal is a
+## filesystem fact: the repository lives at the sibling ``<root>.git``, outside
+## every backend's mount, so it is not there to be reached.  ``git`` is absent
+## below as defence in depth, not as the boundary.
+##
 ALLOWED_COMMANDS: frozenset[str] = frozenset(
     {
         "python",
@@ -34,7 +63,6 @@ ALLOWED_COMMANDS: frozenset[str] = frozenset(
         "pytest",
         "ruff",
         "mypy",
-        "git",
         "uv",
         "pip",
         "cat",
@@ -81,7 +109,7 @@ class SandboxConfig(BaseConfig):
 
     team_id: str
     workspace_id: str | None = None
-    mode: Literal["local", "bwrap", "seatbelt", "docker", "auto"] = "local"
+    mode: CardMode = "local"
 
 
 class SandboxState(BaseState):
@@ -166,15 +194,23 @@ class SandboxActor(Akgent[SandboxConfig, SandboxState], ABC):
             )
         super().on_stop()
 
-    def exec(self, cmd: str, cwd: str = "") -> ExecResult:
+    def exec(self, cmd: str, cwd: str = "", timeout: float | None = None) -> ExecResult:
         """Execute a command inside the sandbox after allowlist validation.
 
         Only the first whitespace-delimited token (the binary name) is checked
-        against ALLOWED_COMMANDS. Argument-level filtering is out of scope.
+        against ALLOWED_COMMANDS. Argument-level filtering is out of scope, and
+        so is the allowlist as a security boundary — see the note above the set.
 
         Args:
             cmd: Full command string to execute (e.g. "python main.py").
             cwd: Working directory inside the sandbox. Defaults to "".
+            timeout: Wall-clock budget for the command, in seconds. ``None``
+                keeps the backend's own default, so no existing caller changes
+                behaviour. A caller that owns a budget — a ``DeferredWorker``
+                above all — must pass it: a budget that stops at the proxy is
+                decoration, because a Python thread cannot be cancelled and the
+                worker holds its parent's teardown open until the subprocess
+                returns.
 
         Returns:
             ExecResult with stdout, stderr, and exit_code from the backend.
@@ -193,7 +229,7 @@ class SandboxActor(Akgent[SandboxConfig, SandboxState], ABC):
                 f"Command '{binary}' is not in the allowed commands list. "
                 f"Allowed: {sorted(ALLOWED_COMMANDS)}"
             )
-        return self._exec(cmd, cwd)
+        return self._exec(cmd, cwd, timeout)
 
     # ------------------------------------------------------------------
     # Abstract methods — must be implemented by concrete subclasses
@@ -218,15 +254,18 @@ class SandboxActor(Akgent[SandboxConfig, SandboxState], ABC):
         """
 
     @abstractmethod
-    def _exec(self, cmd: str, cwd: str) -> ExecResult:
+    def _exec(self, cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
         """Execute a pre-validated command inside the sandbox.
 
         Called by exec() after the allowlist check passes. Subclasses handle
-        the actual process execution (subprocess, Docker exec API, etc.).
+        the actual process execution (subprocess, Docker exec API, etc.) and
+        MUST hand *timeout* to it — a budget the backend drops is no budget.
 
         Args:
             cmd: Full command string (already validated by exec()).
             cwd: Working directory inside the sandbox.
+            timeout: Wall-clock budget in seconds, or ``None`` for the
+                backend's own default.
 
         Returns:
             ExecResult with captured stdout, stderr, and exit code.

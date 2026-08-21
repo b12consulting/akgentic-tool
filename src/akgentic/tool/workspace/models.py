@@ -53,6 +53,25 @@ Shared by the read closures and the actor's mutation methods so the two cannot
 drift; agents see one wording whichever side rejects them.
 """
 
+WRITE_DENIED_MSG = (
+    "The change was not published: the operating system refused this process permission to "
+    "replace the file. The path is correct and inside the workspace — it did not escape it. "
+    "A file created by a sandboxed run under a different user does this. Retry, or write to a "
+    "different path."
+)
+"""Refusal text for an OS-level permission denial while publishing.
+
+Deliberately **not** :data:`PERM_ERR_MSG`. The two arrive as the same
+``PermissionError`` and mean opposite things: one says the path is illegal, the
+other says the path is fine and the file is not replaceable. Told the first when
+the second is true, an agent rewrites a correct path indefinitely — the one
+refusal in the gate with no recoverable next step.
+
+The distinction became reachable with ``workspace_exec``: publication is by
+rename, so a file a container created as root is a file the host process may not
+replace on the next write.
+"""
+
 PUBLISH_LOST_MSG = (
     "The change was not published: a staged file vanished before it could be put in place. "
     "Nothing about the file changed and nobody else wrote it — retry exactly the same change."
