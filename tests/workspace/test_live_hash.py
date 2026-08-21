@@ -187,15 +187,18 @@ class TestTheHashIsRead:
         notes: Path,
     ) -> None:
         # A structural companion to the behavioural tests above: the only maps
-        # the actor keeps are per-agent observations and per-path attribution,
-        # and neither can answer "what is in this file now".
+        # the actor keeps are per-agent observations, per-path attribution and
+        # agent display names, and not one of them can answer "what is in this
+        # file now". A map appearing here that could is the regression this
+        # guards — the list is exhaustive on purpose, so adding one is a
+        # deliberate act.
         read(wired_card, "notes.md")
         mutate(wired_card, "workspace_write", "notes.md", "mine\n")
 
         maps = {
             name: value for name, value in vars(workspace_actor).items() if isinstance(value, dict)
         }
-        assert set(maps) == {"_observations", "_last_writers"}
+        assert set(maps) == {"_observations", "_last_writers", "_agent_names"}
 
 
 class TestSeedingIsNotGated:

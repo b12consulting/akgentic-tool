@@ -281,6 +281,79 @@ class EditItem(BaseModel):
 _HUNK_HEADER: re.Pattern[str] = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
+def hunk_header(hunk: Hunk) -> str:
+    """Render *hunk*'s ``@@ -a,b +c,d @@`` header, for naming it in a failure."""
+    return f"@@ -{hunk.old_start},{hunk.old_count} +{hunk.new_start},{hunk.new_count} @@"
+
+
+class HunkContextError(Exception):
+    """A hunk's old block does not verify against the file it targets.
+
+    Raised by :func:`render_file_patch` rather than splicing anyway.  A unified
+    diff carries its anchor in its context and removal lines; applying a hunk
+    whose anchor is not there rewrites whichever lines now occupy those numbers
+    and reports success, which is silent corruption — strictly worse than
+    refusing, because the file afterwards looks plausible.
+
+    Attributes:
+        path: The file the patch names.
+        header: The failing hunk's ``@@`` header.
+        occurrences: How many times the old block was found in the file — 0 when
+            it is absent, 2 or more when it is ambiguous.  Never 1: a single
+            occurrence is applied at that offset instead of raising.
+    """
+
+    def __init__(self, path: str, hunk: Hunk, occurrences: int) -> None:
+        self.path = path
+        self.header = hunk_header(hunk)
+        self.occurrences = occurrences
+        found = "is not in the file" if occurrences == 0 else f"appears {occurrences} times"
+        super().__init__(f"hunk {self.header} does not apply to {path}: its context {found}")
+
+
+def _old_block(hunk: Hunk) -> list[str]:
+    """Return the lines *hunk* expects to find, in order, stripped of prefixes.
+
+    Context (``" "``) and removal (``"-"``) lines together are what the hunk was
+    cut against; additions are what it produces and verify nothing.
+    """
+    return [line[1:] for line in hunk.lines if line[:1] in (" ", "-")]
+
+
+def _locate_hunk(lines: list[str], block: list[str], guess: int, path: str, hunk: Hunk) -> int:
+    """Return the index in *lines* where *hunk*'s old *block* actually sits.
+
+    Args:
+        lines: The file's current lines.
+        block: The hunk's old block, from :func:`_old_block`.
+        guess: The offset-adjusted ``old_start - 1`` the diff claims.
+        path: The file the patch names, for the failure message.
+        hunk: The hunk, for the failure message.
+
+    Returns:
+        *guess* when the block verifies there; otherwise the single offset
+        elsewhere in the file where it does verify — the lines moved, and the
+        patch is still anchored to text that exists exactly once.
+
+    Raises:
+        HunkContextError: when the block is absent, or occurs more than once.
+            There is deliberately no fuzzy fallback: this function is the
+            anchor, and an approximate anchor is not one.
+    """
+    if not block:
+        return guess  # a pure insertion has nothing to verify — see render_file_patch
+    if 0 <= guess and lines[guess : guess + len(block)] == block:
+        return guess
+    matches = [
+        index
+        for index in range(len(lines) - len(block) + 1)
+        if lines[index : index + len(block)] == block
+    ]
+    if len(matches) != 1:
+        raise HunkContextError(path, hunk, len(matches))
+    return matches[0]
+
+
 def _parse_hunk_header(line: str) -> tuple[int, int, int, int] | None:
     """Parse an ``@@ -a,b +c,d @@`` header into ``(old_start, old_count, new_start,
     new_count)``, or ``None`` when *line* is not a hunk header. Omitted counts default to 1.
@@ -404,6 +477,13 @@ def render_file_patch(raw: str | None, file_patch: FilePatch) -> str:
     *between* the two: the actor computes the new content, checks the live file
     against what the agent observed, and only then publishes.
 
+    **Every hunk is verified before it is spliced.**  Its old block — the
+    context and removal lines, in order — must be the text at the line numbers
+    the diff names, or occur exactly once elsewhere, in which case it is applied
+    at that offset because the lines merely moved.  A hunk whose old block is
+    empty is a pure insertion at a position: there is nothing to verify, and it
+    goes in at ``old_start`` as it always did.
+
     Args:
         raw: The file's current text, or ``None`` when it does not exist.
         file_patch: A parsed unified diff for one file.
@@ -413,6 +493,8 @@ def render_file_patch(raw: str | None, file_patch: FilePatch) -> str:
 
     Raises:
         FileNotFoundError: If *raw* is ``None`` and the patch is not a pure add.
+        HunkContextError: If any hunk's context is absent from the file, or
+            occurs more than once so that no offset is unambiguous.
     """
     if is_pure_add(file_patch):
         added = "\n".join(
@@ -426,17 +508,13 @@ def render_file_patch(raw: str | None, file_patch: FilePatch) -> str:
     lines = raw.splitlines()
     offset = 0
     for hunk in file_patch.hunks:
-        start = hunk.old_start - 1 + offset
-        # Collect replacement lines (context + additions)
-        new_lines: list[str] = []
-        for patch_line in hunk.lines:
-            if patch_line.startswith("+"):
-                new_lines.append(patch_line[1:])
-            elif patch_line.startswith(" "):
-                new_lines.append(patch_line[1:])
-            # Lines starting with '-' are dropped
-        lines[start : start + hunk.old_count] = new_lines
-        offset += len(new_lines) - hunk.old_count
+        block = _old_block(hunk)
+        start = _locate_hunk(lines, block, hunk.old_start - 1 + offset, file_patch.path, hunk)
+        new_lines = [line[1:] for line in hunk.lines if line[:1] in ("+", " ")]
+        lines[start : start + len(block)] = new_lines
+        # Carry the *actual* position forward, not just the length delta: a hunk
+        # applied at a relocated offset moves the frame for every hunk after it.
+        offset = start + len(new_lines) - (hunk.old_start - 1 + len(block))
     return "\n".join(lines) + "\n"
 
 
@@ -463,6 +541,10 @@ def apply_file_patch(workspace: Workspace, file_patch: FilePatch) -> None:
 
     Raises:
         FileNotFoundError: If file does not exist and patch is not a pure add.
+        HunkContextError: If a hunk's context does not verify — see
+            :func:`render_file_patch`.  A patch whose hunks never matched their
+            context used to be applied positionally; that was the defect, and a
+            caller relying on the lenient behaviour now sees it here.
         PermissionError: If path escapes the workspace root.
     """
     raw = None if is_pure_add(file_patch) else workspace.read(file_patch.path).decode("utf-8")

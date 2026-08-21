@@ -27,7 +27,11 @@ import pytest
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.actor import WorkspaceActor
 from akgentic.tool.workspace.edit import EditItem
-from akgentic.tool.workspace.models import MAX_REJECTION_DIFF_LINES, MutationStatus
+from akgentic.tool.workspace.models import (
+    GITIGNORE_NAME,
+    MAX_REJECTION_DIFF_LINES,
+    MutationStatus,
+)
 from akgentic.tool.workspace.tool import WorkspaceTool
 from akgentic.tool.workspace.workspace import Filesystem
 
@@ -108,7 +112,11 @@ class TestEveryMutationRunsOnTheActor:
         wired_card._workspace_proxy = None
         with pytest.raises(RuntimeError, match="workspace actor is not bound"):
             tool_named(wired_card, name)(*args)
-        assert list(workspace_tree.iterdir()) == []
+        # The seeded .gitignore is the journal's, written at actor start and
+        # before any agent existed; nothing else may have appeared.
+        assert [
+            entry.name for entry in workspace_tree.iterdir() if entry.name != GITIGNORE_NAME
+        ] == []
 
     def test_two_agents_creating_one_path_produce_one_winner(
         self,
@@ -439,6 +447,13 @@ class TestRejectionText:
         bob: tuple[WorkspaceTool, FakeActorToolObserver],
         notes: Path,
     ) -> None:
+        """The refusal names the agent, not the UUID the actor keys it under.
+
+        The card can only capture ``str(observer.myAddress.agent_id)`` without
+        holding an edge back to the agent, so what the actor has on hand is a
+        UUID — and *"last written by agent '3f2a…'"* is something a model can
+        read and nothing it can act on. The rejection message is the product.
+        """
         bob_card, bob_observer = bob
         read(wired_card, "notes.md")
         read(bob_card, "notes.md")
@@ -447,7 +462,19 @@ class TestRejectionText:
         with pytest.raises(RetriableError) as refusal:
             mutate(wired_card, "workspace_write", "notes.md", "alice's version\n")
 
-        assert f"last written by agent '{bob_observer.myAddress.agent_id}'" in str(refusal.value)
+        message = str(refusal.value)
+        assert "last written by agent 'bob'" in message
+        assert str(bob_observer.myAddress.agent_id) not in message
+
+    def test_it_falls_back_to_the_id_for_an_agent_that_never_registered(
+        self, workspace_actor: WorkspaceActor, notes: Path
+    ) -> None:
+        # A harness that skipped the binding, or a name evicted from the cap:
+        # degraded, never broken. The refusal still names *someone*.
+        outcome = outcome_of(workspace_actor, "apply_write", "unregistered-id", "fresh.md", "a\n")
+        assert outcome.status is MutationStatus.ACCEPTED
+        refused = outcome_of(workspace_actor, "apply_write", "other-id", "fresh.md", "b\n")
+        assert "last written by agent 'unregistered-id'" in refused.message
 
     def test_a_refusal_always_says_what_to_do_next(
         self, wired_card: WorkspaceTool, notes: Path
@@ -628,42 +655,273 @@ class TestPatchIsGated:
         # The patch refreshed the observation, so a follow-up write is accepted.
         assert mutate(wired_card, "workspace_write", "notes.md", "after\n") == ("Written: notes.md")
 
-    def test_an_update_patch_on_a_changed_file_is_refused_rather_than_spliced(
+    def test_a_stale_patch_does_not_destroy_the_line_that_shifted_it(
         self, wired_card: WorkspaceTool, notes: Path
     ) -> None:
-        """The anchored table admits a patch only while its line numbers still hold.
+        """The corruption case, asserted directly. This is why hunks are verified.
 
-        ``edit`` earns its admission on a changed file by degrading to exact
-        matching — its ``old_string`` is an anchor the actor can verify. A
-        unified diff has no such anchor: its hunks are spliced at ``old_start``
-        with no context check, so against a file whose lines have shifted it
-        rewrites the wrong region, destroys the other writer's addition, and
-        still reports ``updated:``.
+        alice reads, bob prepends a line, and alice's patch still carries the old
+        line numbers. Spliced at ``old_start`` with no context check, it would
+        overwrite ``# banner`` and ``alpha`` — destroying bob's addition and
+        reporting ``updated:`` while doing it. Verification finds the hunk's
+        context one line lower, applies it *there*, and bob's line survives.
         """
         read(wired_card, "notes.md")
-        # Another writer prepends a line: every line number in the patch shifts.
         notes.write_text("# banner\n" + BODY, encoding="utf-8")
+        patch_text = "--- a/notes.md\n+++ b/notes.md\n@@ -1,2 +1,2 @@\n alpha\n-bravo\n+BRAVO\n"
+
+        assert mutate(wired_card, "workspace_patch", patch_text) == "updated: notes.md"
+
+        assert notes.read_text(encoding="utf-8") == "# banner\nalpha\nBRAVO\ncharlie\ndelta\n"
+
+    def test_a_changed_file_whose_context_still_verifies_is_admitted(
+        self, wired_card: WorkspaceTool, notes: Path
+    ) -> None:
+        # FR6's degradation, restored: a surgical change survives a concurrent
+        # change to an unrelated region of the same file. The hunk's line
+        # numbers happen to still hold here; its context is what admits it.
+        read(wired_card, "notes.md")
+        notes.write_text(BODY + "echo\n", encoding="utf-8")
+        patch_text = "--- a/notes.md\n+++ b/notes.md\n@@ -1,2 +1,2 @@\n alpha\n-bravo\n+BRAVO\n"
+
+        assert mutate(wired_card, "workspace_patch", patch_text) == "updated: notes.md"
+        assert notes.read_text(encoding="utf-8") == "alpha\nBRAVO\ncharlie\ndelta\necho\n"
+
+    def test_a_changed_file_whose_context_is_gone_is_refused_as_stale(
+        self, wired_card: WorkspaceTool, notes: Path
+    ) -> None:
+        # The other branch: the text the hunk was cut against is not in the file
+        # any more, at any offset. There is nothing to anchor to, so the agent is
+        # told the file moved under it rather than handed a plausible splice.
+        read(wired_card, "notes.md")
+        notes.write_text("wholly different content\n", encoding="utf-8")
         patch_text = "--- a/notes.md\n+++ b/notes.md\n@@ -1,2 +1,2 @@\n alpha\n-bravo\n+BRAVO\n"
 
         with pytest.raises(RetriableError) as refusal:
             mutate(wired_card, "workspace_patch", patch_text)
 
         assert "line numbers that have since moved" in str(refusal.value)
-        assert notes.read_text(encoding="utf-8") == "# banner\n" + BODY
+        assert notes.read_text(encoding="utf-8") == "wholly different content\n"
 
-    def test_the_same_patch_lands_once_the_agent_re_reads(
+    def test_the_refused_patch_lands_once_the_agent_re_reads(
         self, wired_card: WorkspaceTool, notes: Path
     ) -> None:
         # The refusal above is recoverable by the step it names.
         read(wired_card, "notes.md")
-        notes.write_text("# banner\n" + BODY, encoding="utf-8")
-        patch_text = "--- a/notes.md\n+++ b/notes.md\n@@ -2,2 +2,2 @@\n alpha\n-bravo\n+BRAVO\n"
+        notes.write_text("wholly different content\n", encoding="utf-8")
+        patch_text = "--- a/notes.md\n+++ b/notes.md\n@@ -1,2 +1,2 @@\n alpha\n-bravo\n+BRAVO\n"
         with pytest.raises(RetriableError):
             mutate(wired_card, "workspace_patch", patch_text)
 
         read(wired_card, "notes.md")
+        notes.write_text(BODY, encoding="utf-8")
+        read(wired_card, "notes.md")
         assert mutate(wired_card, "workspace_patch", patch_text) == "updated: notes.md"
-        assert notes.read_text(encoding="utf-8") == "# banner\nalpha\nBRAVO\ncharlie\ndelta\n"
+        assert notes.read_text(encoding="utf-8") == "alpha\nBRAVO\ncharlie\ndelta\n"
+
+    def test_a_bad_hunk_on_an_unchanged_file_is_a_returned_error_not_a_refusal(
+        self, wired_card: WorkspaceTool, notes: Path
+    ) -> None:
+        # Nothing moved under the agent: the patch is simply wrong about what the
+        # file contains. A refusal telling it to re-read would teach it nothing,
+        # so this stays the returned [ERROR] string a bad patch has always been.
+        read(wired_card, "notes.md")
+        patch_text = "--- a/notes.md\n+++ b/notes.md\n@@ -1,2 +1,2 @@\n nope\n-absent\n+NEW\n"
+
+        result = mutate(wired_card, "workspace_patch", patch_text)
+
+        assert result.startswith("[ERROR] notes.md:")
+        assert "@@ -1,2 +1,2 @@" in result
+        assert notes.read_text(encoding="utf-8") == BODY
+
+    def test_an_ambiguous_hunk_is_not_applied_anywhere(
+        self, wired_card: WorkspaceTool, workspace_tree: Path
+    ) -> None:
+        # Context occurring twice gives no unambiguous offset, and guessing is
+        # exactly the behaviour being removed.
+        repeated = workspace_tree / "repeated.md"
+        repeated.write_text("x\nmarker\ny\nmarker\n", encoding="utf-8")
+        read(wired_card, "repeated.md")
+        repeated.write_text("lead\nx\nmarker\ny\nmarker\n", encoding="utf-8")
+        patch_text = "--- a/repeated.md\n+++ b/repeated.md\n@@ -2,1 +2,1 @@\n-marker\n+MARKER\n"
+
+        with pytest.raises(RetriableError):
+            mutate(wired_card, "workspace_patch", patch_text)
+
+        assert repeated.read_text(encoding="utf-8") == "lead\nx\nmarker\ny\nmarker\n"
+
+
+# ---------------------------------------------------------------------------
+# AC12 / AC14: workspace_patch is all-or-nothing, and a vanished file refuses
+# ---------------------------------------------------------------------------
+
+
+class TestPatchIsAtomic:
+    @pytest.fixture
+    def two_files(self, wired_card: WorkspaceTool, workspace_tree: Path) -> Path:
+        for name, body in (("a.py", "x = 1\n"), ("b.py", "y = 2\n")):
+            (workspace_tree / name).write_text(body, encoding="utf-8")
+            read(wired_card, name)
+        return workspace_tree
+
+    def test_a_refusal_on_the_second_file_leaves_the_first_untouched(
+        self, wired_card: WorkspaceTool, two_files: Path
+    ) -> None:
+        # c.py was never read by this agent, so the gate refuses it — and a.py,
+        # which the patch names first, must not have been written.
+        (two_files / "c.py").write_text("z = 3\n", encoding="utf-8")
+        patch_text = (
+            "--- a/a.py\n+++ b/a.py\n@@ -1,1 +1,1 @@\n-x = 1\n+x = 10\n"
+            "--- a/c.py\n+++ b/c.py\n@@ -1,1 +1,1 @@\n-z = 3\n+z = 30\n"
+        )
+
+        with pytest.raises(RetriableError, match="read it before editing"):
+            mutate(wired_card, "workspace_patch", patch_text)
+
+        assert (two_files / "a.py").read_text(encoding="utf-8") == "x = 1\n"
+        assert (two_files / "c.py").read_text(encoding="utf-8") == "z = 3\n"
+
+    def test_a_hunk_failure_on_the_second_file_leaves_the_first_untouched(
+        self, wired_card: WorkspaceTool, two_files: Path
+    ) -> None:
+        patch_text = (
+            "--- a/a.py\n+++ b/a.py\n@@ -1,1 +1,1 @@\n-x = 1\n+x = 10\n"
+            "--- a/b.py\n+++ b/b.py\n@@ -1,1 +1,1 @@\n-not there\n+whatever\n"
+        )
+
+        result = mutate(wired_card, "workspace_patch", patch_text)
+
+        assert result.startswith("[ERROR] b.py:")
+        # The successfully-rendered a.py line is *not* reported, because nothing
+        # was applied. That is the visible consequence of atomicity.
+        assert "updated: a.py" not in result
+        assert (two_files / "a.py").read_text(encoding="utf-8") == "x = 1\n"
+
+    def test_a_patch_that_all_applies_lands_together(
+        self, wired_card: WorkspaceTool, two_files: Path
+    ) -> None:
+        patch_text = (
+            "--- a/a.py\n+++ b/a.py\n@@ -1,1 +1,1 @@\n-x = 1\n+x = 10\n"
+            "--- a/b.py\n+++ b/b.py\n@@ -1,1 +1,1 @@\n-y = 2\n+y = 20\n"
+        )
+
+        assert mutate(wired_card, "workspace_patch", patch_text) == "updated: a.py\nupdated: b.py"
+        assert (two_files / "a.py").read_text(encoding="utf-8") == "x = 10\n"
+        assert (two_files / "b.py").read_text(encoding="utf-8") == "y = 20\n"
+
+    def test_a_vanished_file_gives_the_deleted_since_you_read_it_refusal(
+        self, wired_card: WorkspaceTool, notes: Path
+    ) -> None:
+        """Not ``[ERROR] notes.md: notes.md``, which is what render-then-check gave.
+
+        Checking first also means the refusal clears the observation, exactly as
+        every other mutation's does — so the agent's next write to the path is
+        judged as a create rather than refused forever.
+        """
+        read(wired_card, "notes.md")
+        notes.unlink()
+        patch_text = "--- a/notes.md\n+++ b/notes.md\n@@ -1,2 +1,2 @@\n alpha\n-bravo\n+BRAVO\n"
+
+        with pytest.raises(RetriableError, match="deleted since you read it"):
+            mutate(wired_card, "workspace_patch", patch_text)
+
+        assert mutate(wired_card, "workspace_write", "notes.md", "rebuilt\n") == (
+            "Written: notes.md"
+        )
+
+    def test_two_deletion_sections_naming_one_set_delete_it_once(
+        self, wired_card: WorkspaceTool, two_files: Path
+    ) -> None:
+        # deleted_paths reads the whole diff at once, so both sections arrive
+        # carrying the same set. Publication is deferred now, so a duplicate
+        # would reach delete() a second time on a file already gone.
+        patch_text = (
+            "--- a/a.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-x = 1\n"
+            "--- a/b.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-y = 2\n"
+        )
+
+        assert mutate(wired_card, "workspace_patch", patch_text) == ("deleted: a.py\ndeleted: b.py")
+        assert not (two_files / "a.py").exists()
+        assert not (two_files / "b.py").exists()
+
+    def test_an_unread_missing_file_is_still_the_returned_error(
+        self, wired_card: WorkspaceTool, workspace_tree: Path
+    ) -> None:
+        # No observation to refuse against: the patch simply names a file that is
+        # not there, which has always been an [ERROR] line.
+        patch_text = "--- a/missing.py\n+++ b/missing.py\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+        assert mutate(wired_card, "workspace_patch", patch_text) == "[ERROR] missing.py: missing.py"
+
+
+# ---------------------------------------------------------------------------
+# AC11: losing a staged file is a refusal the agent can act on, not a traceback
+# ---------------------------------------------------------------------------
+
+
+class TestALostStagedFileIsARefusal:
+    """The other half of the sweep race, contained where PermissionError already is.
+
+    Two teams sharing a ``workspace_id`` get two actors over one tree, and either
+    one's startup sweep can unlink the other's staged file in the sub-millisecond
+    window inside ``Filesystem.write``. Nothing is corrupted — the target keeps
+    its previous bytes — but ``os.replace`` raises ``FileNotFoundError``, and
+    29-3's mutation methods caught only ``PermissionError``.
+    """
+
+    def test_a_single_write_refuses_and_says_to_retry(
+        self,
+        wired_card: WorkspaceTool,
+        workspace_actor: WorkspaceActor,
+        workspace_tree: Path,
+    ) -> None:
+        tree = workspace_actor._workspace
+        with patch.object(tree, "write", side_effect=FileNotFoundError("staged file gone")):
+            with pytest.raises(RetriableError) as refusal:
+                mutate(wired_card, "workspace_write", "fresh.md", "body\n")
+
+        message = str(refusal.value)
+        assert "retry exactly the same change" in message
+        # It must NOT claim staleness: nothing about the file changed, and
+        # sending the agent to re-read would have it redo work already correct.
+        assert "changed since you read it" not in message
+        assert "Read the file again" not in message
+
+    def test_the_batch_path_refuses_the_same_way(
+        self,
+        wired_card: WorkspaceTool,
+        workspace_actor: WorkspaceActor,
+        workspace_tree: Path,
+    ) -> None:
+        for name, body in (("a.py", "x = 1\n"), ("b.py", "y = 2\n")):
+            (workspace_tree / name).write_text(body, encoding="utf-8")
+            read(wired_card, name)
+        tree = workspace_actor._workspace
+
+        with patch.object(tree, "write_many", side_effect=FileNotFoundError("gone")):
+            with pytest.raises(RetriableError, match="retry exactly the same change"):
+                mutate(
+                    wired_card,
+                    "workspace_multi_edit",
+                    [
+                        EditItem(path="a.py", old_string="x = 1", new_string="x = 10"),
+                        EditItem(path="b.py", old_string="y = 2", new_string="y = 20"),
+                    ],
+                )
+
+        assert (workspace_tree / "a.py").read_text(encoding="utf-8") == "x = 1\n"
+
+    def test_a_patch_refuses_the_same_way(
+        self, wired_card: WorkspaceTool, workspace_actor: WorkspaceActor, notes: Path
+    ) -> None:
+        read(wired_card, "notes.md")
+        tree = workspace_actor._workspace
+        patch_text = "--- a/notes.md\n+++ b/notes.md\n@@ -1,2 +1,2 @@\n alpha\n-bravo\n+BRAVO\n"
+
+        with patch.object(tree, "write_many", side_effect=FileNotFoundError("gone")):
+            with pytest.raises(RetriableError, match="retry exactly the same change"):
+                mutate(wired_card, "workspace_patch", patch_text)
+
+        assert notes.read_text(encoding="utf-8") == BODY
 
 
 # ---------------------------------------------------------------------------

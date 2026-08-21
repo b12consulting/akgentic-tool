@@ -15,6 +15,7 @@ from akgentic.tool.workspace.workspace import (
     FileEntry,
     Filesystem,
     Workspace,
+    WriteEntry,
     get_workspace,
 )
 
@@ -334,6 +335,156 @@ class TestFilesystemWriteAtomicity:
 
         assert list((tmp_path / "team-1").iterdir()) == []
         assert not (tmp_path / "escape.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# Filesystem.write_many — one publication mechanism for a batch
+# ---------------------------------------------------------------------------
+
+
+class TestFilesystemWriteMany:
+    """Stage every file, then publish every file.
+
+    ``multi_edit`` was already atomic against the *gate*; it was not atomic
+    against the *filesystem*, so a failure on the second of three files left the
+    first one written. ``patch`` needs the same treatment for a different reason:
+    from FR7, one mutation is one commit, and a half-applied patch commits a
+    state no agent intended.
+    """
+
+    def test_it_publishes_every_entry(self, tmp_path: Path) -> None:
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        root = tmp_path / "team-1"
+
+        fs.write_many(
+            [
+                WriteEntry(path="a.txt", data=b"first"),
+                WriteEntry(path="deep/b.txt", data=b"second"),
+            ]
+        )
+
+        assert (root / "a.txt").read_bytes() == b"first"
+        assert (root / "deep" / "b.txt").read_bytes() == b"second"
+
+    def test_an_empty_batch_is_a_no_op(self, tmp_path: Path) -> None:
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        fs.write_many([])
+        assert list((tmp_path / "team-1").iterdir()) == []
+
+    def test_a_staging_failure_on_the_second_file_publishes_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The realistic failures — permissions, ENOSPC, an escaping path — all
+        # land during staging, which is exactly why staging comes first.
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        root = tmp_path / "team-1"
+        (root / "a.txt").write_bytes(b"original")
+        real_open = os.open
+        calls: list[int] = []
+
+        def fail_second(path: object, flags: int, mode: int = 0o777) -> int:
+            calls.append(1)
+            if len(calls) == 2:
+                raise PermissionError("no room at the inn")
+            return real_open(path, flags, mode)
+
+        monkeypatch.setattr(os, "open", fail_second)
+
+        with pytest.raises(PermissionError):
+            fs.write_many(
+                [
+                    WriteEntry(path="a.txt", data=b"replacement"),
+                    WriteEntry(path="b.txt", data=b"second"),
+                ]
+            )
+
+        monkeypatch.undo()
+        assert (root / "a.txt").read_bytes() == b"original"
+        assert not (root / "b.txt").exists()
+
+    def test_every_staged_file_is_cleaned_up_on_the_failure_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        root = tmp_path / "team-1"
+        real_open = os.open
+        calls: list[int] = []
+
+        def fail_third(path: object, flags: int, mode: int = 0o777) -> int:
+            calls.append(1)
+            if len(calls) == 3:
+                raise PermissionError("no room at the inn")
+            return real_open(path, flags, mode)
+
+        monkeypatch.setattr(os, "open", fail_third)
+
+        with pytest.raises(PermissionError):
+            fs.write_many(
+                [
+                    WriteEntry(path="a.txt", data=b"one"),
+                    WriteEntry(path="b.txt", data=b"two"),
+                    WriteEntry(path="c.txt", data=b"three"),
+                ]
+            )
+
+        monkeypatch.undo()
+        assert list(root.iterdir()) == []
+
+    def test_an_escaping_path_anywhere_publishes_nothing(self, tmp_path: Path) -> None:
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        root = tmp_path / "team-1"
+
+        with pytest.raises(PermissionError, match="escapes workspace root"):
+            fs.write_many(
+                [
+                    WriteEntry(path="a.txt", data=b"one"),
+                    WriteEntry(path="../escape.txt", data=b"two"),
+                ]
+            )
+
+        assert list(root.iterdir()) == []
+        assert not (tmp_path / "escape.txt").exists()
+
+    def test_it_preserves_an_existing_files_mode(self, tmp_path: Path) -> None:
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        target = tmp_path / "team-1" / "script.sh"
+        target.write_bytes(b"old")
+        target.chmod(0o750)
+
+        fs.write_many([WriteEntry(path="script.sh", data=b"new")])
+
+        assert stat.S_IMODE(target.stat().st_mode) == 0o750
+
+    def test_a_concurrent_reader_never_sees_a_prefix(self, tmp_path: Path) -> None:
+        # The same guarantee the single write offers: publication is by rename,
+        # so a reader resolves the path to one complete file or the other.
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        target = tmp_path / "team-1" / "big.txt"
+        old = b"o" * 200_000
+        new = b"n" * 200_000
+        target.write_bytes(old)
+        seen: list[bytes] = []
+        stop = threading.Event()
+
+        def reader() -> None:
+            while not stop.is_set():
+                try:
+                    seen.append(target.read_bytes())
+                except FileNotFoundError:
+                    continue
+
+        thread = threading.Thread(target=reader)
+        thread.start()
+        try:
+            for _ in range(20):
+                fs.write_many([WriteEntry(path="big.txt", data=new)])
+                fs.write_many([WriteEntry(path="big.txt", data=old)])
+        finally:
+            stop.set()
+            thread.join(timeout=5)
+
+        assert seen
+        assert all(observed in (old, new) for observed in seen)
 
 
 # ---------------------------------------------------------------------------

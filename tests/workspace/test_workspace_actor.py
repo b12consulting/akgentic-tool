@@ -8,6 +8,7 @@ not persisted state, and the startup sweep of orphaned staging files.
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -20,7 +21,13 @@ from akgentic.tool.workspace.actor import (
     WorkspaceActor,
     workspace_actor_name,
 )
-from akgentic.tool.workspace.models import Observation, WorkspaceConfig, WorkspaceState, content_sha
+from akgentic.tool.workspace.models import (
+    STAGING_SWEEP_GRACE_S,
+    Observation,
+    WorkspaceConfig,
+    WorkspaceState,
+    content_sha,
+)
 from akgentic.tool.workspace.workspace import Filesystem, is_staging_name
 
 from tests.workspace.conftest import WORKSPACE_NAME
@@ -225,6 +232,17 @@ class TestStagingPredicate:
         assert (tmp_path / "ws" / "a.md").read_bytes() == b"hello"
 
 
+def abandon(path: Path) -> None:
+    """Age *path* past the sweep's grace window, as an interrupted write would.
+
+    The window exists so a second team's in-flight staging file is not unlinked
+    mid-publish; an orphan is by definition older than that. Backdating the mtime
+    is how a test gets an orphan without waiting for one.
+    """
+    stale = time.time() - STAGING_SWEEP_GRACE_S - 60
+    os.utime(path, (stale, stale))
+
+
 class TestStartupSweep:
     def test_removes_orphaned_staging_files_at_any_depth(self, workspace_tree: Path) -> None:
         root_orphan = workspace_tree / staging_name("a.md")
@@ -233,11 +251,30 @@ class TestStartupSweep:
         nested_orphan = nested / staging_name("b.md")
         root_orphan.write_bytes(b"partial")
         nested_orphan.write_bytes(b"partial")
+        abandon(root_orphan)
+        abandon(nested_orphan)
 
         start_actor()
 
         assert not root_orphan.exists()
         assert not nested_orphan.exists()
+
+    def test_a_staging_file_being_published_right_now_survives(self, workspace_tree: Path) -> None:
+        """The other half of the sweep race, and the reason the window exists.
+
+        ``WorkspaceTool(workspace_id="shared")`` is a supported configuration and
+        a tool actor's unicity domain is the team, so two teams over one tree
+        means two actors, each sweeping the whole tree at start. Team B's sweep
+        must not unlink team A's staged file in the window between ``os.open``
+        and ``os.replace`` — nothing is corrupted if it does, but A's healthy
+        write turns into a refusal it did nothing to deserve.
+        """
+        in_flight = workspace_tree / staging_name("a.md")
+        in_flight.write_bytes(b"being published right now")
+
+        start_actor()
+
+        assert in_flight.exists()
 
     def test_leaves_every_other_name_untouched(self, workspace_tree: Path) -> None:
         survivors = [
@@ -263,6 +300,7 @@ class TestStartupSweep:
         masquerading = workspace_tree / staging_name("a.md")
         masquerading.mkdir()
         (masquerading / "kept.md").write_text("keep me", encoding="utf-8")
+        abandon(masquerading)  # old enough that only is_file() can save it
 
         start_actor()
 
@@ -274,6 +312,7 @@ class TestStartupSweep:
     ) -> None:
         orphan = workspace_tree / staging_name("a.md")
         orphan.write_bytes(b"partial")
+        abandon(orphan)  # so the unlink is actually attempted, and actually fails
 
         def refuse(self: Path, missing_ok: bool = False) -> None:
             raise PermissionError("read-only directory")

@@ -33,16 +33,25 @@ owning one of the two trees — silently, in a team where
 unicity domain of an actor must equal the resource it owns, and the resource is a
 tree. The ``#`` prefix stays: it is the orchestrator's two-phase-stop invariant.
 
+**Every accepted mutation is one commit, and the journal sits at the one place
+they converge.** :meth:`WorkspaceActor._journalled` wraps all six ``apply_*``
+bodies, so the out-of-band commit happens before any of them touches disk and
+the agent's own commit happens after exactly one of them succeeds. A seventh
+mutation added later cannot forget it, because there is nowhere else to put one.
+
 The deferred-result mechanism (ADR-033) stays disengaged. What the ask path does
-is bounded — one file read, one write, dict operations — and never external.
+is bounded — one file read, one write, a few short-lived ``git`` forks under an
+explicit timeout — and never external.
 """
 
 from __future__ import annotations
 
 import contextlib
 import logging
+import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from akgentic.core.agent import Akgent
@@ -50,6 +59,7 @@ from akgentic.tool.workspace.edit import (
     EditItem,
     EditMatcher,
     FilePatch,
+    HunkContextError,
     deleted_paths,
     detect_line_ending,
     is_pure_add,
@@ -61,9 +71,12 @@ from akgentic.tool.workspace.edit import (
     unified,
     write_and_diff,
 )
+from akgentic.tool.workspace.journal import GitJournal, Identity
 from akgentic.tool.workspace.models import (
     MAX_REJECTION_DIFF_LINES,
     PERM_ERR_MSG,
+    PUBLISH_LOST_MSG,
+    STAGING_SWEEP_GRACE_S,
     LastWrite,
     MutationOutcome,
     MutationStatus,
@@ -73,7 +86,12 @@ from akgentic.tool.workspace.models import (
     WorkspaceState,
     content_sha,
 )
-from akgentic.tool.workspace.workspace import Filesystem, get_workspace, is_staging_name
+from akgentic.tool.workspace.workspace import (
+    Filesystem,
+    WriteEntry,
+    get_workspace,
+    is_staging_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -101,8 +119,8 @@ _REASON_EXACT_MISS = (
     "approximate matching is disabled on a file another writer has touched"
 )
 _REASON_PATCH_STALE = (
-    "it changed since you read it, and a unified diff carries no anchor that can be "
-    "verified — its hunks address line numbers that have since moved"
+    "it changed since you read it, and none of your patch's context could be found in "
+    "what is there now — its hunks address line numbers that have since moved"
 )
 
 _CHANGE_REASONS = frozenset({_REASON_CHANGED, _REASON_EXACT_MISS, _REASON_PATCH_STALE})
@@ -189,6 +207,26 @@ def _capped(diff: str) -> str:
     return f"{kept}\n... {elided} more diff line(s) not shown — read the file to see the rest."
 
 
+def _is_sweepable_orphan(entry: Path, cutoff: float) -> bool:
+    """Whether *entry* is a staging file old enough to have been abandoned.
+
+    Args:
+        entry: A path found under the workspace root.
+        cutoff: The mtime below which a staging file counts as orphaned.
+
+    Returns:
+        True only for a regular file carrying the full staging shape and last
+        modified before *cutoff*. A failed ``stat`` answers False: an entry this
+        process cannot inspect is one it must not delete.
+    """
+    if not is_staging_name(entry.name):
+        return False
+    try:
+        return entry.is_file() and entry.stat().st_mtime < cutoff
+    except OSError:
+        return False
+
+
 def _preserve_endings(content: str, live: bytes | None) -> str:
     """Give *content* the dominant line ending of the file it replaces.
 
@@ -230,6 +268,29 @@ class _Staged:
     exact_only: bool
 
 
+@dataclass
+class _PatchBatch:
+    """One ``workspace_patch`` call, gated in full before anything is published.
+
+    A patch that applied file by file could commit a state no agent intended —
+    half its files updated, the rest refused — and the journal would then record
+    that state as one agent's deliberate change. Gating everything into this
+    batch first is what makes "one mutation is one commit" true of ``patch``.
+
+    Attributes:
+        removals: The paths a ``+++ /dev/null`` section names, read from the raw
+            diff text because ``parse_patch`` only sees ``/dev/null``.
+        writes: Rendered file contents, ready for one batch publication.
+        deletions: Paths to unlink once every write has landed.
+        labels: The per-file summary lines, in the order the patch names them.
+    """
+
+    removals: set[str]
+    writes: list[WriteEntry] = field(default_factory=list)
+    deletions: list[str] = field(default_factory=list)
+    labels: list[str] = field(default_factory=list)
+
+
 class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
     """Team singleton owning one workspace tree, the observations, and the gate.
 
@@ -242,15 +303,66 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
     """
 
     def on_start(self) -> None:
-        """Initialise state, take the tree handle, and sweep orphaned staging files."""
+        """Initialise state, take the tree handle, sweep staging files, open the journal.
+
+        **The order is load-bearing and there is only one correct one.** Sweeping
+        after the initial commit would commit orphaned staging files and then
+        delete them; seeding ``.gitignore`` after that commit would leave the
+        sidecars inside it.
+        """
         super().on_start()
         self.state = WorkspaceState()
         self.state.observer(self)
         self._observations: dict[str, OrderedDict[str, Observation]] = {}
         self._last_writers: OrderedDict[str, LastWrite] = OrderedDict()
+        self._agent_names: OrderedDict[str, str] = OrderedDict()
+        self._touched: list[str] = []
         self._matcher = EditMatcher()
         self._workspace: Filesystem = get_workspace(self.config.workspace_name)
         self._sweep_staging_files()
+        self._journal = GitJournal(
+            self._workspace._root,
+            enabled=self.config.workspace_git,
+            timeout_s=self.config.git_timeout_s,
+        )
+        if self._journal.initialise():
+            self._journal.seed_gitignore(self._workspace.write)
+            self._journal.commit_out_of_band()
+
+    ##
+    ## Identity — reached through the card's **tell** proxy, once, at bind time
+    ##
+    def register_agent(self, agent_id: str, name: str) -> None:
+        """Record the human-readable name behind *agent_id*.
+
+        Fire-and-forget, sent once per card at bind time — O(1), never on the
+        mutation path. The actor holds ``agent_id`` because that is what the
+        card can capture without an edge back to the agent (ADR-030), but an
+        ``agent_id`` is a **UUID**: a journal authored by UUID satisfies the
+        letter of "the git log is the who-changed-what record" and defeats its
+        purpose, and a refusal reading *"last written by agent '3f2a…'"* tells a
+        model nothing it can act on.
+
+        Capped like the last-writer map, and for the same reason: an uncapped map
+        on a team singleton leaks for the life of the team. Losing a name is a
+        safe degradation — the id is used instead.
+
+        Args:
+            agent_id: Identity of the agent, as a string.
+            name: Its configured, human-readable name.
+        """
+        self._agent_names[agent_id] = name
+        self._agent_names.move_to_end(agent_id)
+        while len(self._agent_names) > self.config.max_tracked_writers:
+            self._agent_names.popitem(last=False)
+
+    def _name_of(self, agent_id: str) -> str:
+        """Return *agent_id*'s registered name, falling back to the id itself."""
+        return self._agent_names.get(agent_id) or agent_id
+
+    def _identity(self, agent_id: str) -> Identity:
+        """Compose the git identity for *agent_id*: name to read, id to distinguish."""
+        return Identity(self._name_of(agent_id), agent_id)
 
     ##
     ## The observation map — reached through the card's **tell** proxy
@@ -304,8 +416,40 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
         return None if seen is None else seen.get(path)
 
     ##
-    ## The six mutations — ask path.  Each gates, then writes, in one turn.
+    ## The six mutations — ask path.  Each gates, then writes, in one turn, with
+    ## the journal wrapped around it.  The public methods are thin on purpose:
+    ## the wrapper is the only place a commit is made, so a seventh mutation
+    ## cannot be added without one.
     ##
+    def _journalled(
+        self, agent_id: str, capability: str, run: Callable[[], MutationOutcome]
+    ) -> MutationOutcome:
+        """Run one mutation between the out-of-band commit and the agent's own.
+
+        Order per mutation: commit anything nobody claimed → run the gate and the
+        write → stage the mutation's **own** paths and commit them as the agent.
+        The out-of-band check runs *before* the gate decides, which is correct —
+        the dirt exists whether the mutation is accepted or refused, and it
+        belongs to nobody either way. A refused mutation performs no commit of
+        its own, because :meth:`_accept` and :meth:`_forget` never ran.
+
+        Args:
+            agent_id: Identity of the mutating agent, as a string.
+            capability: The mutation's short name, which becomes the commit
+                subject's first field.
+            run: The mutation body.
+
+        Returns:
+            Whatever the body returned, untouched. No journal failure can change
+            a mutation's outcome — the bytes are already on disk.
+        """
+        self._journal.commit_out_of_band()
+        self._touched = []
+        outcome = run()
+        if outcome.status is MutationStatus.ACCEPTED and self._touched:
+            self._journal.commit_paths(self._touched, self._identity(agent_id), capability)
+        return outcome
+
     def apply_write(self, agent_id: str, path: str, content: str) -> MutationOutcome:
         """Replace *path* wholesale with *content*, if the live file still matches.
 
@@ -318,6 +462,10 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
             ``Written: <path>`` on acceptance, or a refusal carrying the diff of
             the live file against *content* — what the write would have destroyed.
         """
+        return self._journalled(agent_id, "write", lambda: self._write(agent_id, path, content))
+
+    def _write(self, agent_id: str, path: str, content: str) -> MutationOutcome:
+        """Gate and perform one whole-file write — see :meth:`apply_write`."""
         try:
             live = self._live(path)
             refusal, _ = self._check(agent_id, path, whole_file=True, live=live, proposed=content)
@@ -327,6 +475,8 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
             self._workspace.write(path, data)
         except PermissionError:
             return _rejected(PERM_ERR_MSG)
+        except FileNotFoundError:
+            return _rejected(PUBLISH_LOST_MSG)
         self._accept(agent_id, path, data)
         return _accepted(f"Written: {path}")
 
@@ -342,6 +492,10 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
             drops the agent's observation, so its next write to the path is a
             create rather than a stale rejection.
         """
+        return self._journalled(agent_id, "delete", lambda: self._delete(agent_id, path))
+
+    def _delete(self, agent_id: str, path: str) -> MutationOutcome:
+        """Gate and perform one delete — see :meth:`apply_delete`."""
         try:
             live = self._live(path)
             refusal, _ = self._check(agent_id, path, whole_file=True, live=live)
@@ -352,6 +506,8 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
             self._workspace.delete(path)
         except PermissionError:
             return _rejected(PERM_ERR_MSG)
+        except FileNotFoundError:
+            return _rejected(PUBLISH_LOST_MSG)
         self._forget(agent_id, path)
         return _accepted(f"Deleted: {path}")
 
@@ -382,6 +538,21 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
             The unified diff on acceptance, ``[ERROR] old_string not found …``
             when the anchor simply is not there, or a refusal.
         """
+        return self._journalled(
+            agent_id,
+            "edit",
+            lambda: self._edit(agent_id, path, old_string, new_string, replace_all),
+        )
+
+    def _edit(
+        self,
+        agent_id: str,
+        path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool,
+    ) -> MutationOutcome:
+        """Gate and perform one anchored edit — see :meth:`apply_edit`."""
         try:
             live = self._live(path)
             refusal, exact_only = self._check(agent_id, path, whole_file=False, live=live)
@@ -402,6 +573,8 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
             data, diff = write_and_diff(self._workspace, path, raw, edited)
         except PermissionError:
             return _rejected(PERM_ERR_MSG)
+        except FileNotFoundError:
+            return _rejected(PUBLISH_LOST_MSG)
         self._accept(agent_id, path, data)
         return _accepted(diff or f"(no change) {path}")
 
@@ -420,6 +593,10 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
         Returns:
             The combined diff on acceptance, or the first failure or refusal.
         """
+        return self._journalled(agent_id, "multi_edit", lambda: self._multi_edit(agent_id, edits))
+
+    def _multi_edit(self, agent_id: str, edits: list[EditItem]) -> MutationOutcome:
+        """Gate every edit in memory, then publish the batch — see :meth:`apply_multi_edit`."""
         staged: dict[str, _Staged] = {}
         try:
             for item in edits:
@@ -429,13 +606,21 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
             return self._publish_staged(agent_id, staged)
         except PermissionError:
             return _rejected(PERM_ERR_MSG)
+        except FileNotFoundError:
+            return _rejected(PUBLISH_LOST_MSG)
 
     def apply_patch(self, agent_id: str, patch_text: str) -> MutationOutcome:
-        """Apply a unified diff, gating every file it touches.
+        """Apply a unified diff, gating every file it touches, all-or-nothing.
 
-        Partial by design, as it has always been: application stops at the first
-        file that fails and earlier files stay applied. The all-or-nothing
-        treatment belongs to ``multi_edit``.
+        A file refused by the gate, or a hunk that does not apply, leaves
+        **every** file the patch names unchanged on disk and adds no commit. The
+        journal is what forces this: from FR7 one mutation is one commit, and a
+        half-applied patch produces a commit of a state no agent intended.
+
+        The consequence is visible in the return value. Where a partial patch
+        used to return the summary lines it had managed plus the failing file's
+        ``[ERROR]``, it now returns only the failure — nothing was applied, so
+        there is nothing to report.
 
         Args:
             agent_id: Identity of the patching agent, as a string.
@@ -444,18 +629,23 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
         Returns:
             The per-file summary on acceptance, or the first failure or refusal.
         """
+        return self._journalled(agent_id, "patch", lambda: self._patch(agent_id, patch_text))
+
+    def _patch(self, agent_id: str, patch_text: str) -> MutationOutcome:
+        """Gate the whole patch, then publish it in one step — see :meth:`apply_patch`."""
+        batch = _PatchBatch(removals=deleted_paths(patch_text))
         try:
-            removals = deleted_paths(patch_text)
-            results: list[str] = []
             for file_patch in parse_patch(patch_text):
-                outcome = self._patch_one(agent_id, file_patch, removals)
-                if outcome.status is not MutationStatus.ACCEPTED:
-                    return outcome
-                if outcome.message:
-                    results.append(outcome.message)
+                blocked = self._gate_patch_entry(agent_id, file_patch, batch)
+                if blocked is not None:
+                    return blocked
+            if not batch.labels:
+                return _accepted("(no patches applied)")
+            return self._publish_patch(agent_id, batch)
         except PermissionError:
             return _rejected(PERM_ERR_MSG)
-        return _accepted("\n".join(results) if results else "(no patches applied)")
+        except FileNotFoundError:
+            return _rejected(PUBLISH_LOST_MSG)
 
     def apply_mkdir(self, agent_id: str, path: str) -> MutationOutcome:
         """Create *path* and its missing parents — serialized, but not gated.
@@ -474,7 +664,16 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
         Returns:
             ``Created: <path>``, or a refusal for a path outside the root.
         """
-        del agent_id  # no content, no precondition — see the docstring
+        return self._journalled(agent_id, "mkdir", lambda: self._mkdir(path))
+
+    def _mkdir(self, path: str) -> MutationOutcome:
+        """Create a directory — see :meth:`apply_mkdir`.
+
+        Nothing is recorded as touched, so the journal makes no commit of its
+        own: git does not track empty directories, and asking it to commit one
+        would be a failure where there is none. A dirty tree still commits as
+        ``out-of-band`` beforehand, because that dirt is real.
+        """
         try:
             self._workspace.mkdir(path)
         except PermissionError:
@@ -595,7 +794,10 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
         lines = [f"Refused to modify {path}: {reason}."]
         writer = self._writer_of(path, live)
         if writer is not None:
-            lines.append(f"It was last written by agent '{writer}'.")
+            # The agent's *name*, not its UUID. The rejection message is the
+            # product; "last written by agent '3f2a…'" is something a model can
+            # read and nothing it can act on.
+            lines.append(f"It was last written by agent '{self._name_of(writer)}'.")
         elif reason in _CHANGE_REASONS:
             lines.append(_OUT_OF_BAND)
         lines.append(_NEXT_STEP)
@@ -652,7 +854,13 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
         *next* write to the same path would be refused with a diff against its
         own content. Doing it here rather than in the closure keeps it inside the
         one turn; a second round trip would be a second window.
+
+        This is also where the mutation's write set is collected, for the commit
+        :meth:`_journalled` makes once the body returns. The list is plain actor
+        state rather than a return value because the alternative is widening six
+        signatures, and the actor is single-threaded — the mailbox is the lock.
         """
+        self._touched.append(path)
         sha = content_sha(data)
         self.record_observation(agent_id, path, Observation(sha=sha, full=True))
         self._last_writers[path] = LastWrite(agent_id=agent_id, sha=sha)
@@ -666,7 +874,11 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
         Only the deleting agent's observation goes: another agent still holding
         one is meant to be refused, because from its point of view the file
         vanished under it.
+
+        A delete is a change to the path like any other, so it joins the write
+        set — ``git add -A -- <path>`` stages a removal as readily as a write.
         """
+        self._touched.append(path)
         seen = self._observations.get(agent_id)
         if seen is not None:
             seen.pop(path, None)
@@ -696,81 +908,127 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
         return None
 
     def _publish_staged(self, agent_id: str, staged: dict[str, _Staged]) -> MutationOutcome:
-        """Write every staged file and return the combined diff."""
+        """Publish every staged file through the batch write and return the combined diff.
+
+        ``multi_edit`` was already atomic against the *gate*; it was not atomic
+        against the *filesystem*, because a failure on the second of three files
+        left the first one written. It now shares one publication mechanism with
+        ``patch`` — two publication paths that differ is how one of them drifts.
+        """
+        entries: list[WriteEntry] = []
         diffs: list[str] = []
         for path, entry in staged.items():
             raw = entry.live.decode("utf-8")
-            data, diff = write_and_diff(self._workspace, path, raw, entry.text)
-            self._accept(agent_id, path, data)
+            text = normalise_endings(entry.text, detect_line_ending(raw))
+            entries.append(WriteEntry(path=path, data=text.encode("utf-8")))
+            diff = unified(path, raw, text)
             if diff:
                 diffs.append(diff)
+        self._workspace.write_many(entries)
+        for written in entries:
+            self._accept(agent_id, written.path, written.data)
         return _accepted("\n".join(diffs) if diffs else "(no changes applied)")
 
     ##
-    ## patch
+    ## patch — gate everything, publish once
     ##
-    def _patch_one(
-        self, agent_id: str, file_patch: FilePatch, removals: set[str]
-    ) -> MutationOutcome:
-        """Apply one file's patch, reporting any failure as the returned ``[ERROR]``.
+    def _gate_patch_entry(
+        self, agent_id: str, file_patch: FilePatch, batch: _PatchBatch
+    ) -> MutationOutcome | None:
+        """Gate one section of a patch into *batch*, publishing nothing.
 
         The blanket ``except`` is the shape ``workspace_patch`` has always had:
-        anything a single file's application raises — a missing target, an
-        escaping path — becomes that file's ``[ERROR]`` line rather than an
-        exception out of the tool call.
+        anything a single file raises — a missing target, an escaping path —
+        becomes that file's ``[ERROR]`` line rather than an exception out of the
+        tool call. What has changed is that it can no longer leave earlier files
+        written, because no file is written until every one of them has passed.
+
+        Returns:
+            ``None`` when the section was accepted into *batch*, otherwise the
+            refusal or failure that ends the whole patch.
         """
         try:
             if file_patch.path == "/dev/null":
-                return self._patch_removals(agent_id, removals)
-            return self._patch_file(agent_id, file_patch)
+                return self._gate_removals(agent_id, batch)
+            return self._gate_file_patch(agent_id, file_patch, batch)
         except Exception as exc:
             return _failed(f"[ERROR] {file_patch.path}: {exc}")
 
-    def _patch_removals(self, agent_id: str, removals: set[str]) -> MutationOutcome:
-        """Delete every path a ``+++ /dev/null`` batch names, each one gated."""
-        lines: list[str] = []
-        for path in sorted(removals):
+    def _gate_removals(self, agent_id: str, batch: _PatchBatch) -> MutationOutcome | None:
+        """Gate every path a ``+++ /dev/null`` section names, deleting nothing yet.
+
+        ``deleted_paths`` reads the whole diff at once, so a patch carrying two
+        deletion sections would arrive here twice with the same set. Publication
+        is now deferred, so a duplicate would reach ``delete`` a second time on a
+        file that is already gone — skip what is already staged.
+        """
+        for path in sorted(batch.removals):
+            if path in batch.deletions:
+                continue
             live = self._live(path)
             refusal, _ = self._check(agent_id, path, whole_file=True, live=live)
             if refusal is not None:
                 return _rejected(refusal)
-            self._workspace.delete(path)  # a missing file raises, exactly as before
-            self._forget(agent_id, path)
-            lines.append(f"deleted: {path}")
-        return _accepted("\n".join(lines))
+            if live is None:
+                raise FileNotFoundError(path)  # the blanket except reports it, as before
+            batch.deletions.append(path)
+            batch.labels.append(f"deleted: {path}")
+        return None
 
-    def _patch_file(self, agent_id: str, file_patch: FilePatch) -> MutationOutcome:
-        """Render one file's hunks, gate the result, then publish it.
+    def _gate_file_patch(
+        self, agent_id: str, file_patch: FilePatch, batch: _PatchBatch
+    ) -> MutationOutcome | None:
+        """Gate one file's patch and render it into *batch*.
 
-        A pure-add patch replaces the file wholesale, so it is gated by the
-        whole-file table rather than as an anchored mutation — otherwise a patch
-        could create over a file the agent had never read.
+        **The check runs before the render**, which is what makes a patch against
+        a file that vanished say *"it was deleted since you read it"* rather than
+        ``[ERROR] <path>: <path>`` — and, being a refusal, clears the observation
+        so the agent's next write to that path is judged as a create.
 
-        An update patch is admitted onto the anchored table, but unlike ``edit``
-        it cannot degrade to exact matching on a changed file: ``render_file_patch``
-        splices each hunk at ``old_start`` and verifies no context, so a diff cut
-        against an older revision is applied at line numbers that have moved —
-        silently destroying the very lines the other writer added and reporting
-        ``updated:``. The anchored table's admission is earned by an anchor the
-        actor can check; a unified diff offers none, so a changed file is refused.
+        A pure-add patch replaces the file wholesale, so it answers to the
+        whole-file table — otherwise a patch would be a way around the gate.
+
+        An update patch is on the **anchored** table, and now earns its place
+        there: ``render_file_patch`` verifies each hunk's context before splicing
+        it. On a file that changed since the agent read it, a patch whose hunks
+        still verify is applied (that is FR6's degradation, which 29-3 had to
+        refuse wholesale); one whose hunks do not is stale. On an *unchanged*
+        file the same failure is a bad patch, not a staleness problem, and stays
+        the returned ``[ERROR]`` string it has always been.
         """
         live = self._live(file_patch.path)
-        proposed = render_file_patch(None if live is None else live.decode("utf-8"), file_patch)
+        pure_add = is_pure_add(file_patch)
         refusal, changed = self._check(
             agent_id,
             file_patch.path,
-            whole_file=is_pure_add(file_patch),
+            whole_file=pure_add,
             live=live,
-            proposed=proposed,
+            proposed=render_file_patch(None, file_patch) if pure_add else None,
         )
         if refusal is not None:
             return _rejected(refusal)
-        if changed:
-            return _rejected(self._rejection(file_patch.path, _REASON_PATCH_STALE, live, proposed))
-        data = proposed.encode("utf-8")
-        self._workspace.write(file_patch.path, data)
-        self._accept(agent_id, file_patch.path, data)
-        return _accepted(patch_label(file_patch))
+        raw = None if live is None else live.decode("utf-8")
+        try:
+            # raw is None only for a create; an update patch raises FileNotFoundError
+            # here, which the caller turns into the [ERROR] line it always was.
+            proposed = render_file_patch(raw, file_patch)
+        except HunkContextError as miss:
+            if changed:
+                return _rejected(self._rejection(file_patch.path, _REASON_PATCH_STALE, live, None))
+            return _failed(f"[ERROR] {file_patch.path}: {miss}")
+        batch.writes.append(WriteEntry(path=file_patch.path, data=proposed.encode("utf-8")))
+        batch.labels.append(patch_label(file_patch))
+        return None
+
+    def _publish_patch(self, agent_id: str, batch: _PatchBatch) -> MutationOutcome:
+        """Publish a fully gated patch: every write together, then every deletion."""
+        self._workspace.write_many(batch.writes)
+        for entry in batch.writes:
+            self._accept(agent_id, entry.path, entry.data)
+        for path in batch.deletions:
+            self._workspace.delete(path)
+            self._forget(agent_id, path)
+        return _accepted("\n".join(batch.labels))
 
     ##
     ## Startup housekeeping
@@ -786,15 +1044,21 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
         mutation — and matches the full staging shape, so a user's own
         ``.notes.tmp`` survives. Every failure is suppressed: a directory this
         process cannot clean must not stop the team's workspace from starting.
+
+        **A staging file younger than the grace window is left alone**, because
+        it is being written *now* and — with a ``workspace_id`` shared between
+        two teams, which is a supported configuration — by somebody who may not
+        be us. A tool actor's unicity domain is the team, so two teams over one
+        tree means two actors each sweeping the whole tree at start; unlinking
+        the other's staged file in the window between ``os.open`` and
+        ``os.replace`` turns their healthy write into a refusal. An orphan is
+        minutes or a restart old, so no realistic window confuses the two.
         """
         root = self._workspace._root
+        cutoff = time.time() - STAGING_SWEEP_GRACE_S
         staged: list[Path] = []
         with contextlib.suppress(OSError):
-            staged = [
-                entry
-                for entry in root.rglob("*")
-                if is_staging_name(entry.name) and entry.is_file()
-            ]
+            staged = [entry for entry in root.rglob("*") if _is_sweepable_orphan(entry, cutoff)]
         removed = 0
         for entry in staged:
             with contextlib.suppress(OSError):
