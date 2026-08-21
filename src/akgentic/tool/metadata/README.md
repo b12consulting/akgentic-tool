@@ -136,7 +136,8 @@ after start-up still produces its block, rather than freezing the agent at `""` 
 
 ### The `/`-command surface
 
-`COMMAND` is the human command surface, so with the shipped defaults:
+`COMMAND` is the human command surface, and `RenderMetadata` exposes it by default — so a card that
+has been given a template registers:
 
 ```
 /team_metadata          prints the block exactly as the agents received it
