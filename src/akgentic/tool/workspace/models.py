@@ -53,6 +53,88 @@ Shared by the read closures and the actor's mutation methods so the two cannot
 drift; agents see one wording whichever side rejects them.
 """
 
+PUBLISH_LOST_MSG = (
+    "The change was not published: a staged file vanished before it could be put in place. "
+    "Nothing about the file changed and nobody else wrote it — retry exactly the same change."
+)
+"""Refusal text for a file lost between staging and ``os.replace``.
+
+This is the sweep race, and it is real: ``WorkspaceTool(workspace_id="shared")``
+is a supported configuration, a tool actor's unicity domain is the *team*, so two
+teams over one tree means two actors each sweeping it at start. One can unlink
+the other's staged file in the sub-millisecond window inside ``Filesystem.write``.
+
+The wording deliberately does **not** reuse a staleness reason. Nothing about the
+file changed, and telling the agent it did would send it re-reading a file that
+is exactly as it left it, then redoing work that was already correct.
+"""
+
+DEFAULT_GIT_TIMEOUT_S = 15.0
+"""Wall-clock budget for a single ``git`` invocation.
+
+Comfortably below the orchestrator's 30 s stop backstop, because every
+invocation runs on the actor's single thread — the one every mutation in the
+team shares. A budget above the backstop would let one hung fork outlive the
+teardown that is trying to reclaim it.
+"""
+
+STAGING_SWEEP_GRACE_S = 30.0
+"""How recently a staging file may have been touched to survive the startup sweep.
+
+A staging file this young is being written **now** by somebody, and with a
+``workspace_id`` shared across two teams that somebody may not be us. Sweeping it
+would make the other team's ``os.replace`` raise, turning a healthy write into a
+refusal. Orphans, by contrast, are minutes or restarts old — no real value of
+this constant separates the two badly.
+"""
+
+GIT_DIR_SUFFIX = ".git"
+"""Suffix of the sibling repository directory: workspace ``foo`` journals to ``foo.git``."""
+
+GITIGNORE_NAME = ".gitignore"
+
+OUT_OF_BAND_AUTHOR = "out-of-band"
+"""Author of every commit no agent in this team is responsible for."""
+
+_EXEC_DEBRIS = ("__pycache__/", "*.pyc", ".venv/", "node_modules/")
+
+
+def gitignore_seed() -> str:
+    """Return the ignore file written once at journal init.
+
+    Derived from what this package actually writes, not from a generic template.
+    Every pattern is anchor-free so it matches at **every** depth: sidecars are
+    written beside their source file, wherever that is.
+
+    Without this the tree is dirty continuously — read paths write sidecars, so
+    a document read or an image view dirties the tree, and every agent's commit
+    would then be preceded by an ``out-of-band`` commit of regenerable noise.
+
+    Returns:
+        The file's full text, ending in a newline.
+    """
+    from akgentic.tool.workspace.readers import _MIME_MAP  # noqa: PLC0415 — avoids a cycle
+
+    lines = [
+        "# Seeded once by the workspace journal, and never rewritten.",
+        "# Edit or delete it freely — an existing .gitignore is left alone.",
+        "",
+        "# Atomic-write staging files: .<name>.<32 hex>.tmp",
+        ".*.tmp",
+        "",
+        "# Extracted-document sidecars: .<name>.md",
+        ".*.md",
+        "",
+        "# Resized-image sidecars: .<stem>.<ext>.<max_dim>.<ext>",
+        *(f".*{suffix}" for suffix in sorted(_MIME_MAP)),
+        "",
+        "# Exec debris",
+        *_EXEC_DEBRIS,
+        "",
+    ]
+    return "\n".join(lines)
+
+
 Precondition = str | Literal["absent"]
 """What must hold of a file before an agent may replace it wholesale.
 
@@ -159,11 +241,16 @@ class WorkspaceConfig(BaseConfig):
         max_observations_per_agent: Cap on the per-agent observation map.
         max_tracked_writers: Cap on the path-keyed last-writer map, which the
             gate consults only to name the other writer in a refusal.
+        workspace_git: Whether to keep a git journal of accepted mutations. The
+            gate is unaffected either way — it is pure Python and independent.
+        git_timeout_s: Wall-clock budget for one ``git`` invocation.
     """
 
     workspace_name: str
     max_observations_per_agent: int = DEFAULT_MAX_OBSERVATIONS_PER_AGENT
     max_tracked_writers: int = DEFAULT_MAX_TRACKED_WRITERS
+    workspace_git: bool = True
+    git_timeout_s: float = DEFAULT_GIT_TIMEOUT_S
 
 
 class WorkspaceState(BaseState):

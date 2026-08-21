@@ -14,9 +14,12 @@ an import, because a test package is not a library for other test packages.
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 import threading
 import uuid
 from collections.abc import Generator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +30,7 @@ from akgentic.core.agent import Akgent, AkgentType
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
+from akgentic.tool.workspace.journal import git_dir_for
 from akgentic.tool.workspace.models import MutationOutcome, Observation
 from akgentic.tool.workspace.tool import WorkspaceTool
 
@@ -37,6 +41,101 @@ WORKSPACE_NAME = "test-workspace"
 
 HANDSHAKE_TIMEOUT_S = 5.0
 """Upper bound on a thread handshake — never a delay, only a failure budget."""
+
+GIT_ON_PATH = shutil.which("git") is not None
+"""Whether this host can run the journal at all.
+
+The journal is the suite's first dependency on an external binary, and it is kept
+contained: this one probe, the skip marker below, and — for the *absence* path —
+a patched resolver rather than a mutated ``PATH``. Mutating the session's ``PATH``
+would leak into every other test that shells out.
+"""
+
+requires_git = pytest.mark.skipif(not GIT_ON_PATH, reason="git is not on PATH")
+
+
+@dataclass
+class Commit:
+    """One commit as the tests read it — parsed fields, never a formatted log line.
+
+    Attributes:
+        sha: The full hash.
+        author_name: ``%an`` — the agent's display name, or ``out-of-band``.
+        author_email: ``%ae``.
+        parents: ``%P`` split — linear history means at most one.
+        subject: ``%s``.
+        files: Paths this commit touched.
+    """
+
+    sha: str
+    author_name: str
+    author_email: str
+    parents: list[str]
+    subject: str
+    files: list[str]
+
+
+def _git(tree: Path, *args: str) -> str:
+    """Run one read-only git command against *tree*'s sibling journal."""
+    result = subprocess.run(
+        [
+            "git",
+            "--git-dir",
+            str(git_dir_for(tree)),
+            "--work-tree",
+            str(tree),
+            *args,
+        ],
+        cwd=tree,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode == 0, f"git {args} failed: {result.stderr}"
+    return result.stdout
+
+
+def journal_log(tree: Path) -> list[Commit]:
+    """Return *tree*'s journal, oldest commit first.
+
+    Assertions are made against these parsed fields rather than against a
+    formatted log string, so a change in git's default output cannot turn a test
+    red without a behaviour changing.
+    """
+    raw = _git(tree, "log", "--reverse", "--format=%H%x1f%an%x1f%ae%x1f%P%x1f%s")
+    commits: list[Commit] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        sha, author_name, author_email, parents, subject = line.split("\x1f")
+        files = _git(tree, "show", "--name-only", "--format=", sha).split()
+        commits.append(
+            Commit(
+                sha=sha,
+                author_name=author_name,
+                author_email=author_email,
+                parents=parents.split(),
+                subject=subject,
+                files=files,
+            )
+        )
+    return commits
+
+
+def git_show(tree: Path, revision: str) -> str:
+    """Return the content of one object in *tree*'s journal, e.g. ``<sha>:notes.md``."""
+    return _git(tree, "show", revision)
+
+
+def journal_branches(tree: Path) -> list[str]:
+    """Return every branch in *tree*'s journal — linear history means exactly one."""
+    return _git(tree, "for-each-ref", "--format=%(refname:short)", "refs/heads").split()
+
+
+def working_tree_is_clean(tree: Path) -> bool:
+    """Whether git sees nothing to commit — ``-uall`` so an untracked directory expands."""
+    return not _git(tree, "status", "--porcelain", "-uall").strip()
 
 
 class SilentAgent(Akgent[BaseConfig, BaseState]):
@@ -267,6 +366,20 @@ class BusyProxy:
         self.queued.set()
         with self._lock:
             self.calls.append(path)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_workspaces_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep every test in this package off the default ``./workspaces``.
+
+    ``get_workspace`` falls back to ``./workspaces`` relative to the *current
+    working directory* when the variable is unset, so a test that forgets the
+    :func:`workspaces_root` fixture writes into the developer's own checkout —
+    and, since 29-4, runs ``git init`` there. That looks like nothing at all
+    until it does. Tests that want a named base still request
+    :func:`workspaces_root`, whose ``setenv`` runs after this one and wins.
+    """
+    monkeypatch.setenv("AKGENTIC_WORKSPACES_ROOT", str(tmp_path / "unclaimed-workspaces"))
 
 
 @pytest.fixture

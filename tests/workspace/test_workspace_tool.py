@@ -803,11 +803,16 @@ class TestRetriableErrorWorkspaceTool:
                 patch_fn("--- a/file.py\n+++ b/file.py\n@@ -1 +1 @@\n-old\n+new\n")
 
     def test_multi_edit_permission_error_raises_retriable_error(self, tmp_path: Path) -> None:
-        """workspace_multi_edit raises RetriableError when backend raises PermissionError."""
+        """workspace_multi_edit raises RetriableError when backend raises PermissionError.
+
+        ``write_many`` is the publication point, not ``write``: multi_edit stages
+        every file before publishing any, so that a failure on the second of
+        three happens before the first is visible.
+        """
         tool, fs = make_wired_tool(tmp_path)
         seed(tool, fs, "src/file.py", b"old\n")
         multi_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_multi_edit")
-        with patch.object(fs, "write", side_effect=PermissionError("escaped")):
+        with patch.object(fs, "write_many", side_effect=PermissionError("escaped")):
             with pytest.raises(RetriableError, match="Path escapes workspace root"):
                 multi_fn([EditItem(path="src/file.py", old_string="old", new_string="new")])
 

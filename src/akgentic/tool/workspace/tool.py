@@ -514,6 +514,20 @@ class WorkspaceTool(ToolCard):
     # Read-only gate (NEW)
     read_only: bool = False
 
+    workspace_git: bool = True
+    """Whether accepted mutations are recorded in a git journal.
+
+    A plain field, not a capability param: it exposes no tool, appears in no
+    signature, and nothing about it is expressible by a model. Turning it off
+    loses history, attribution and out-of-band *detection* — it does not loosen
+    the gate by one row, because the gate is pure Python and independent.
+
+    Note what ``getChildrenOrCreate`` implies: the **first** card to create the
+    actor for a workspace decides its configuration, exactly as the observation
+    caps already do. A second card arriving with ``workspace_git=False`` does not
+    turn off a journal that is already running.
+    """
+
     # Write capability fields
     workspace_write: WorkspaceWrite | bool = True
     workspace_delete: WorkspaceDelete | bool = True
@@ -586,6 +600,12 @@ class WorkspaceTool(ToolCard):
         which need the verdict, and a tell proxy for observations, which need
         nothing back.
 
+        The agent's **name** is registered here, once, over the tell proxy. What
+        the card can capture without an edge back to the agent is
+        ``agent_id`` — a UUID — and a journal authored by UUID, or a refusal
+        naming one, is a record nobody can read. This is the only new message the
+        journal adds, and it is O(1), once per card, never on the mutation path.
+
         Args:
             observer: The owning agent, live at bind time.
             orchestrator: Address of the orchestrator.
@@ -598,11 +618,29 @@ class WorkspaceTool(ToolCard):
                 name=workspace_actor_name(workspace_name),
                 role=WORKSPACE_ACTOR_ROLE,
                 workspace_name=workspace_name,
+                workspace_git=self.workspace_git,
             ),
         )
         self._workspace_proxy = observer.proxy_ask(workspace_addr, WorkspaceActor)
         self._workspace_tell = observer.proxy_tell(workspace_addr, WorkspaceActor)
         self._agent_id = str(observer.myAddress.agent_id)
+        self._register_agent_name(observer)
+
+    def _register_agent_name(self, observer: ActorToolObserver) -> None:
+        """Tell the actor this agent's display name — fire and forget.
+
+        Never raises: a harness that hands back a stand-in proxy without the
+        method, or an actor that is already gone, must not stop a card binding.
+        The consequence of a lost registration is that the journal and the
+        refusals fall back to the agent id, which is degraded and not broken.
+        """
+        proxy = self._workspace_tell
+        if proxy is None:
+            return
+        try:
+            proxy.register_agent(self._agent_id, str(observer.myAddress.name))
+        except Exception:
+            logger.debug("Could not register the agent's name with #Workspace", exc_info=True)
 
     def _observation_recorder(self) -> Callable[[str, bytes, bool], None]:
         """Build the closure a read closure uses to report what it saw.

@@ -64,6 +64,22 @@ class FileEntry(BaseModel):
     size: int  # bytes; 0 for directories
 
 
+class WriteEntry(BaseModel):
+    """One file's contribution to a batch write.
+
+    A model rather than a tuple because it crosses a boundary: the actor builds
+    the batch from what a ``multi_edit`` or a ``patch`` computed in memory, and
+    hands it to the backend to publish as a unit.
+
+    Attributes:
+        path: Workspace-relative path.
+        data: The exact bytes to publish there.
+    """
+
+    path: str
+    data: bytes
+
+
 @runtime_checkable
 class Workspace(Protocol):
     """Protocol that all workspace backends must satisfy."""
@@ -161,6 +177,76 @@ class Filesystem:
         Raises:
             PermissionError: if *path* escapes the workspace root.
         """
+        staged, resolved = self._stage(path, data)
+        try:
+            os.replace(staged, resolved)
+        except BaseException:
+            # Cleanup must not mask the failure that caused it — whatever made the
+            # publish fail will often make the unlink fail in the same way.
+            with contextlib.suppress(OSError):
+                staged.unlink(missing_ok=True)
+            raise
+
+    def write_many(self, entries: list[WriteEntry]) -> None:
+        """Stage **every** entry, then publish every entry.
+
+        This is the one publication mechanism for a batch — ``multi_edit`` and
+        ``patch`` both use it, because two publication paths that differ is how
+        one of them drifts.  Staging everything first moves the failures that
+        actually happen — a permission error, ENOSPC, a path that escapes the
+        root — to a point where **nothing** is visible yet: a batch that fails on
+        its second file leaves the first file's previous bytes untouched, and
+        every staged file is removed on the way out.
+
+        **What this does not offer, stated plainly.**  N renames are not one
+        atomic operation, and nothing on POSIX makes them so.  A rename that
+        fails *after* an earlier rename in the same batch succeeded leaves that
+        earlier file published, and there is no way to take it back from here:
+        the previous inode is already gone.  The remaining staged files are
+        cleaned up and the exception is re-raised, so the caller — which still
+        holds the original bytes it read — is the only party able to attempt a
+        restore.  The window is small and the failure mode is rare; a claim of
+        atomicity a reader could disprove would be worse than this note.
+
+        Args:
+            entries: The files to publish, in order.  An empty list is a no-op.
+
+        Raises:
+            PermissionError: if any entry's path escapes the workspace root.
+            OSError: whatever staging or publishing raised.
+        """
+        staged: list[tuple[Path, Path]] = []
+        try:
+            for entry in entries:
+                staged.append(self._stage(entry.path, entry.data))
+        except BaseException:
+            for pending, _ in staged:
+                with contextlib.suppress(OSError):
+                    pending.unlink(missing_ok=True)
+            raise
+        for index, (source, target) in enumerate(staged):
+            try:
+                os.replace(source, target)
+            except BaseException:
+                for pending, _ in staged[index:]:
+                    with contextlib.suppress(OSError):
+                        pending.unlink(missing_ok=True)
+                raise
+
+    def _stage(self, path: str, data: bytes) -> tuple[Path, Path]:
+        """Write *data* to a staging file beside *path*, ready to be published.
+
+        Shared by :meth:`write` and :meth:`write_many` so the two cannot drift on
+        the details that matter: the staging name ``#Workspace`` sweeps, the
+        same-directory placement ``os.replace`` needs, and the mode the target
+        keeps.
+
+        Returns:
+            The staging file and the resolved target, in that order.
+
+        Raises:
+            PermissionError: if *path* escapes the workspace root.
+        """
         resolved = self._validate_path(path)
         resolved.parent.mkdir(parents=True, exist_ok=True)
         # A ".tmp" suffix keeps the staging file out of the read path's sidecar
@@ -173,13 +259,11 @@ class Filesystem:
                 handle.write(data)
             if resolved.exists():
                 shutil.copymode(resolved, staged)
-            os.replace(staged, resolved)
         except BaseException:
-            # Cleanup must not mask the failure that caused it — whatever made the
-            # publish fail will often make the unlink fail in the same way.
             with contextlib.suppress(OSError):
                 staged.unlink(missing_ok=True)
             raise
+        return staged, resolved
 
     def delete(self, path: str) -> None:
         """Delete the file at *path*.
