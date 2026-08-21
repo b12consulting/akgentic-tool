@@ -85,6 +85,52 @@ model therefore learns both what happened and what to fix.
 Both tool docstrings carry an explicit note that these should only be used when the user asks —
 hiring is the one capability in the package with an unbounded blast radius.
 
+#### Hire and fire are not symmetric
+
+They look like a pair, and they are not. Hire creates through the observer; fire stops the member
+directly and lets the member tell the orchestrator.
+
+```python
+# hire — the orchestrator proxy answers "which class, and is the name free?"
+child_address = observer.createActor(actor_class, config=agent_card_config)
+observer.on_hire(child_address)
+
+# fire — the orchestrator proxy only resolves the name
+address = orchestrator_proxy.get_team_member(name)
+observer.proxy_ask(address, Akgent).stop()
+observer.on_fire(address)
+```
+
+**The orchestrator is a directory on the fire path, not the executor.** It is asked for
+`get_team_member(name)` — and for `get_team()` when that lookup fails, to list the current members
+in the error — and nothing else. Nobody asks it to remove the member. The stop is delivered to the
+**member itself** through `proxy_ask(address, Akgent)`, and the orchestrator finds out afterwards
+because `Akgent.on_stop()` sends it a `StopMessage`. That is also why a member stopped by any
+other route leaves the roster correctly: the notification is the actor's, not the tool's.
+
+**`proxy_ask` is the public route to another actor, and it blocks.** Reaching through
+`ActorAddressImpl._actor_ref._actor` to call Pykka's `stop()` on the raw actor would bypass the
+mailbox and the teardown chain; `proxy_ask(address, Akgent).stop()` delivers `stop` as a message
+and waits for it. Firing is therefore synchronous from the caller's point of view.
+
+**Firing one member fires its subtree.** `Akgent.stop()` publishes the agent's state, calls
+`stop_children(blocking=True)`, and only then stops itself — so a fired coordinator takes every
+agent it hired with it, depth-first, and the call returns once the whole subtree is down. State is
+published *before* the child teardown on purpose: a child that hangs or raises means `on_stop()`
+is never reached, and the state would otherwise die with the actor.
+
+**The roster catches up asynchronously.** `on_stop` reaches the orchestrator through a *tell*, so
+the fire call returns before the orchestrator has necessarily processed the `StopMessage` and
+dropped the member. Between those two moments `get_team_member(name)` can still hand back the
+address of an actor that is already down.
+
+Two consequences for `fire_members(names)`: members are stopped **one at a time**, each waiting
+for its own subtree, so firing a deep team is not instantaneous; and firing a coordinator and one
+of the agents it hired in the same call is a genuine race — the descendant is already stopped by
+the ancestor's teardown, but the lookup that guards the second stop may not know it yet. Nothing
+on the fire path re-checks liveness before building the proxy, and the per-name handling in
+`fire_members` catches only `RetriableError`. Fire ancestors last, or fire them alone.
+
 ### `GetTeamRoster` — `team_members()`
 
 | Field | Type | Default | Meaning |
