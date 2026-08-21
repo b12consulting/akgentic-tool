@@ -131,32 +131,32 @@ class SkillTool(ToolCard):
     """A library of skills: the menu in the prefix, the bodies on demand.
 
     Attributes:
-        skills: The one capability. ``True`` — the default — enables it with an empty
+        skill_param: The one capability. ``True`` — the default — enables it with an empty
             library, which contributes an empty menu and a ``use_skill`` that knows no
             names: harmless, and the shape an operator sees before configuring anything.
             A ``Skills`` instance supplies the entries and may narrow the channels.
             ``False`` removes the capability entirely.
     """
 
-    skills: Skills | bool = True
+    skill_param: Skills | bool = True
 
     def get_system_prompts(self) -> list[Callable[..., Any]]:
         """Return the menu callable when the prompt channel is exposed."""
-        params = _resolve(self.skills, Skills)
+        params = _resolve(self.skill_param, Skills)
         if params and SYSTEM_PROMPT in params.expose:
             return [self._menu_factory(params)]
         return []
 
     def get_tools(self) -> list[Callable[..., Any]]:
         """Return ``use_skill`` when the tool channel is exposed."""
-        params = _resolve(self.skills, Skills)
+        params = _resolve(self.skill_param, Skills)
         if params and TOOL_CALL in params.expose:
             return [self._use_skill_factory(params)]
         return []
 
     def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
         """Return ``skills`` when the command channel is exposed."""
-        params = _resolve(self.skills, Skills)
+        params = _resolve(self.skill_param, Skills)
         if params and COMMAND in params.expose:
             return {Skills: self._menu_factory(params)}
         return {}

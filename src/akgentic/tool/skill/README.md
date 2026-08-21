@@ -23,7 +23,7 @@ from akgentic.tool import SkillTool
 
 ```python
 class SkillTool(ToolCard):
-    skills: Skills | bool = True
+    skill_param: Skills | bool = True
 ```
 
 **One field, one capability, and no private attribute of its own.** The inherited weak observer is
@@ -47,7 +47,7 @@ or worse, resolve an attribute. The card concatenates, and that is all.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `skills` | `Skills \| bool` | `True` | The one capability. `True` enables it with an empty library — an empty menu and a `use_skill` that knows no names. A `Skills` instance supplies the entries and narrows the channels. `False` removes the capability from all three channels. |
+| `skill_param` | `Skills \| bool` | `True` | The one capability. `True` enables it with an empty library — an empty menu and a `use_skill` that knows no names. A `Skills` instance supplies the entries and narrows the channels. `False` removes the capability from all three channels. |
 
 ## Capability parameter — `Skills`
 
@@ -155,23 +155,23 @@ ESCALATION = SkillEntry(
 )
 
 # The normal case: all three channels.
-SkillTool(skills=Skills(skills=[REFUND, ESCALATION]))
+SkillTool(skill_param=Skills(skills=[REFUND, ESCALATION]))
 
 # Prompt + tool, no human command surface.
-SkillTool(skills=Skills(skills=[REFUND, ESCALATION], expose={SYSTEM_PROMPT, TOOL_CALL}))
+SkillTool(skill_param=Skills(skills=[REFUND, ESCALATION], expose={SYSTEM_PROMPT, TOOL_CALL}))
 
 # Command only — a human can list the library, the agents are told nothing and can load nothing.
-SkillTool(skills=Skills(skills=[REFUND, ESCALATION], expose={COMMAND}))
+SkillTool(skill_param=Skills(skills=[REFUND, ESCALATION], expose={COMMAND}))
 
 # Extra guidance, appended to the use_skill() docstring on the tool channel.
-SkillTool(skills=Skills(
+SkillTool(skill_param=Skills(
     skills=[REFUND, ESCALATION],
     expose={SYSTEM_PROMPT, TOOL_CALL},
     instructions="Load the relevant skill before answering a policy question.",
 ))
 
 SkillTool()                    # enabled with defaults: an empty library on all three channels
-SkillTool(skills=False)        # capability removed from all three channels
+SkillTool(skill_param=False)        # capability removed from all three channels
 ```
 
 ### Failure modes worth knowing
