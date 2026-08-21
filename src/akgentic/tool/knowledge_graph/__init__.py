@@ -17,6 +17,9 @@ Models:
 ToolCard:
     KnowledgeGraphTool, GetGraph, UpdateGraph, SearchGraph
 
+Context state (ADR-037):
+    KnowledgeGraphSummaryState, RootRow
+
 Actor:
     KnowledgeGraphActor, KG_ACTOR_NAME, KG_ACTOR_ROLE
 
@@ -56,6 +59,7 @@ from akgentic.tool.knowledge_graph.models import (
     SearchQuery,
     SearchResult,
 )
+from akgentic.tool.knowledge_graph.state import KnowledgeGraphSummaryState, RootRow
 from akgentic.tool.vector_store.vector import (
     _check_vector_search_dependencies as _check_kg_dependencies,
 )
@@ -86,6 +90,9 @@ __all__ = [
     "GetGraph",
     "UpdateGraph",
     "SearchGraph",
+    # Context state (ADR-037)
+    "KnowledgeGraphSummaryState",
+    "RootRow",
     # Actor (Story 2.1: KnowledgeGraphConfig added)
     "KnowledgeGraphActor",
     "KnowledgeGraphConfig",

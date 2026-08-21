@@ -13,17 +13,19 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.tool.core import (
     COMMAND,
-    SYSTEM_PROMPT,
+    LLM_CONTEXT,
     TOOL_CALL,
     BaseToolParam,
     Channels,
+    ContextState,
     ToolCard,
     _resolve,
+    normalize_system_prompt_to_llm_context,
 )
 from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.knowledge_graph.kg_actor import (
@@ -39,6 +41,7 @@ from akgentic.tool.knowledge_graph.models import (
     SearchQuery,
     SearchResult,
 )
+from akgentic.tool.knowledge_graph.state import KnowledgeGraphSummaryState, RootRow
 from akgentic.tool.vector_store.protocol import CollectionConfig
 
 logger = logging.getLogger(__name__)
@@ -51,16 +54,20 @@ logger.setLevel(logging.INFO)
 
 
 class GetGraph(BaseToolParam):
-    """Get the full knowledge graph — as system prompt and/or command."""
+    """Get the full knowledge graph — as structured context state and/or command."""
 
-    expose: set[Channels] = {SYSTEM_PROMPT, COMMAND}
+    expose: set[Channels] = {LLM_CONTEXT, COMMAND}
     prompt_include_schema: bool = Field(
         default=True,
-        description="Include entity/relation type schema in system prompt.",
+        description="Include entity/relation type schema in the graph summary context state.",
     )
     prompt_include_roots: bool = Field(
         default=True,
-        description="Include root entities listing in system prompt.",
+        description="Include root entities listing in the graph summary context state.",
+    )
+
+    _normalize_expose = field_validator("expose", mode="after")(
+        normalize_system_prompt_to_llm_context
     )
 
 
@@ -74,6 +81,38 @@ class SearchGraph(BaseToolParam):
     """Search the knowledge graph by keyword, vector, or hybrid mode."""
 
     expose: set[Channels] = {TOOL_CALL, COMMAND}
+
+
+def _build_kg_summary_state(
+    view: GraphView, include_schema: bool, include_roots: bool
+) -> KnowledgeGraphSummaryState:
+    """Snapshot the compact graph summary from a ``GraphView`` (ADR-037 §5).
+
+    Carries the full type/root data regardless of the flags — the flags only
+    gate rendering. Output scales as O(types + roots), never O(entities).
+
+    Args:
+        view: The graph view to summarize.
+        include_schema: Resolved ``GetGraph.prompt_include_schema`` flag.
+        include_roots: Resolved ``GetGraph.prompt_include_roots`` flag.
+
+    Returns:
+        The summary state; an empty graph is a real state whose
+        ``render_full()`` is the sentinel line.
+    """
+    root_entities = sorted((e for e in view.entities if e.is_root), key=lambda e: e.name)
+    return KnowledgeGraphSummaryState(
+        entity_count=len(view.entities),
+        relation_count=len(view.relations),
+        entity_types=sorted({e.entity_type for e in view.entities}),
+        relation_types=sorted({r.relation_type for r in view.relations}),
+        roots=[
+            RootRow(name=e.name, entity_type=e.entity_type, description=e.description)
+            for e in root_entities
+        ],
+        include_schema=include_schema,
+        include_roots=include_roots,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +178,9 @@ class KnowledgeGraphTool(ToolCard):
 
     get_graph: GetGraph | bool = Field(
         default=True,
-        description="Get the full graph — SYSTEM_PROMPT + COMMAND by default",
+        description=(
+            "Get the full graph — exposed as structured context state and command by default"
+        ),
     )
     update_graph: UpdateGraph | bool = Field(
         default=True,
@@ -211,40 +252,6 @@ class KnowledgeGraphTool(ToolCard):
         return "\n".join(lines)
 
     @staticmethod
-    def _format_graph_summary(
-        view: GraphView,
-        include_schema: bool = True,
-        include_roots: bool = True,
-    ) -> str:
-        """Format a compact system prompt summary of the graph.
-
-        Output scales as O(types + roots), not O(entities + relations).
-        """
-        if not view.entities:
-            return "Knowledge graph is empty."
-
-        lines = ["**Knowledge Graph Summary:**"]
-        lines.append(f"Entities: {len(view.entities)} | Relations: {len(view.relations)}")
-
-        if include_schema:
-            entity_types = sorted({e.entity_type for e in view.entities})
-            relation_types = sorted({r.relation_type for r in view.relations})
-            lines.append(f"Entity types: {', '.join(entity_types)}")
-            if relation_types:
-                lines.append(f"Relation types: {', '.join(relation_types)}")
-
-        if include_roots:
-            root_entities = sorted((e for e in view.entities if e.is_root), key=lambda e: e.name)
-            if root_entities:
-                lines.append("Root entities:")
-                for e in root_entities:
-                    lines.append(f"- {e.name} ({e.entity_type}): {e.description}")
-
-        lines.append("")
-        lines.append("Use the get_graph tool to explore the full graph or subgraphs.")
-        return "\n".join(lines)
-
-    @staticmethod
     def _format_search_result(result: SearchResult) -> str:
         """Format a ``SearchResult`` as a human-readable string."""
         if not result.hits:
@@ -265,30 +272,44 @@ class KnowledgeGraphTool(ToolCard):
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
-    # System prompts (2.3)
+    # Context states (2.3)
     # ------------------------------------------------------------------
 
-    def get_system_prompts(self) -> list[Callable[..., Any]]:
-        """Return prompt callables when get_graph is exposed on SYSTEM_PROMPT."""
+    def get_context_states(self) -> list[Callable[[], ContextState | None]]:
+        """Get context-state providers for the graph summary (ADR-037 §5).
+
+        Returns:
+            List with the graph-summary provider, or empty when disabled or
+            not exposed on ``LLM_CONTEXT``.
+        """
         gp = _resolve(self.get_graph, GetGraph)
-        if gp and SYSTEM_PROMPT in gp.expose:
-            return [self._get_graph_prompt_factory()]
+        if gp and LLM_CONTEXT in gp.expose:
+            return [self._kg_summary_state_factory(gp)]
         return []
 
-    def _get_graph_prompt_factory(self) -> Callable[..., Any]:
-        """Create a closure that returns a compact graph summary as a prompt string."""
+    def _kg_summary_state_factory(self, params: GetGraph) -> Callable[[], ContextState | None]:
+        """Create the graph-summary context-state provider.
+
+        Args:
+            params: Configuration for the get_graph capability
+
+        Returns:
+            Zero-arg provider producing a summary snapshot, or ``None`` when
+            the state is unavailable. Never raises.
+        """
         kg_proxy = self._kg_proxy
-        format_summary = self._format_graph_summary
-        gp = _resolve(self.get_graph, GetGraph)
-        include_schema = gp.prompt_include_schema if gp else True
-        include_roots = gp.prompt_include_roots if gp else True
+        include_schema = params.prompt_include_schema
+        include_roots = params.prompt_include_roots
 
-        def graph_prompt() -> str:
-            """Get the current knowledge graph state."""
-            view = kg_proxy.get_graph(GetGraphQuery())
-            return format_summary(view, include_schema=include_schema, include_roots=include_roots)
+        def knowledge_graph_summary_state() -> KnowledgeGraphSummaryState | None:
+            try:
+                view = kg_proxy.get_graph(GetGraphQuery())
+                return _build_kg_summary_state(view, include_schema, include_roots)
+            except Exception:
+                logger.error("Failed to get knowledge graph summary state", exc_info=True)
+                return None
 
-        return graph_prompt
+        return knowledge_graph_summary_state
 
     # ------------------------------------------------------------------
     # Tools (2.4)
