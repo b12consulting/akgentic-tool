@@ -62,6 +62,7 @@ from akgentic.tool.workspace.edit import (
     write_and_diff,
 )
 from akgentic.tool.workspace.models import (
+    MAX_REJECTION_DIFF_LINES,
     PERM_ERR_MSG,
     LastWrite,
     MutationOutcome,
@@ -99,12 +100,24 @@ _REASON_EXACT_MISS = (
     "it changed since you read it, and your old_string no longer matches it exactly — "
     "approximate matching is disabled on a file another writer has touched"
 )
+_REASON_PATCH_STALE = (
+    "it changed since you read it, and a unified diff carries no anchor that can be "
+    "verified — its hunks address line numbers that have since moved"
+)
 
-_CHANGE_REASONS = frozenset({_REASON_CHANGED, _REASON_GONE, _REASON_EXACT_MISS})
-"""Reasons that describe a file moving under the agent, rather than never being read.
+_CHANGE_REASONS = frozenset({_REASON_CHANGED, _REASON_EXACT_MISS, _REASON_PATCH_STALE})
+"""Reasons that earn the out-of-band sentence.
 
-Only these earn the out-of-band sentence: saying "the change came from outside"
-about a file nobody changed would be false.
+Each describes a file whose *content* moved under the agent while it still
+exists, so the live bytes have an author and :meth:`WorkspaceActor._writer_of`
+either names them or establishes that no agent wrote them.
+
+``_REASON_GONE`` is deliberately absent. A deleted file has no live bytes to
+attribute, so nothing distinguishes another agent's ``workspace_delete`` from an
+outside removal — an accepted delete drops its own last-writer entry. Claiming
+"it came from outside the workspace tools" there would be a guess stated as a
+fact, and would misattribute a teammate's delete exactly as naming the wrong
+writer would.
 """
 
 _OUT_OF_BAND = (
@@ -153,6 +166,27 @@ def _precondition(seen: Observation | None) -> Precondition:
         that has not read a file may only create it.
     """
     return "absent" if seen is None else seen.sha
+
+
+def _capped(diff: str) -> str:
+    """Trim *diff* to the cap a refusal may carry, noting what was cut.
+
+    The refusal travels back into the model's next turn, so an uncapped diff of
+    a large file makes the *refusal* the thing that breaks the turn.
+
+    Args:
+        diff: A unified diff.
+
+    Returns:
+        *diff* unchanged when it is short enough, otherwise its first
+        ``MAX_REJECTION_DIFF_LINES`` lines followed by a one-line notice.
+    """
+    lines = diff.splitlines()
+    if len(lines) <= MAX_REJECTION_DIFF_LINES:
+        return diff
+    elided = len(lines) - MAX_REJECTION_DIFF_LINES
+    kept = "\n".join(lines[:MAX_REJECTION_DIFF_LINES])
+    return f"{kept}\n... {elided} more diff line(s) not shown — read the file to see the rest."
 
 
 def _preserve_endings(content: str, live: bytes | None) -> str:
@@ -493,7 +527,7 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
         if live is None:
             if seen is None:
                 return None, False
-            return self._rejection(path, _REASON_GONE, None, proposed), False
+            return self._gone(agent_id, path), False
         if whole_file:
             return self._check_whole(path, seen, live, proposed), False
         if seen is None:
@@ -518,6 +552,26 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
         if seen is not None and not seen.full:
             return self._rejection(path, _REASON_PARTIAL, live, proposed)
         return None
+
+    def _gone(self, agent_id: str, path: str) -> str:
+        """Refuse a mutation on a vanished file, and clear the observation that refused it.
+
+        The refusal has to be recoverable, and this is the one row of either
+        table whose stated next step cannot be taken: ``workspace_read`` on a
+        missing file raises and records nothing, so a retained observation would
+        refuse **every** later mutation of the path — write and delete alike —
+        for the life of the team. The agent could never recreate a file a
+        teammate or an outside writer removed.
+
+        Dropping it makes the refusal a one-time warning. The agent is told the
+        file went; its next write is judged as a create against whatever is on
+        disk at that moment, so a file that reappeared in the meantime is still
+        protected by the "read it before overwriting" row.
+        """
+        seen = self._observations.get(agent_id)
+        if seen is not None:
+            seen.pop(path, None)
+        return self._rejection(path, _REASON_GONE, None, None)
 
     def _anchor_miss(self, path: str, live: bytes, exact_only: bool) -> MutationOutcome:
         """What to say when ``old_string`` did not match.
@@ -585,7 +639,7 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
         diff = unified(path, text, proposed, before_label="live", after_label="proposed")
         if not diff:
             return ""
-        return f"Your content would have replaced the live file:\n{diff}"
+        return f"Your content would have replaced the live file:\n{_capped(diff)}"
 
     ##
     ## Bookkeeping on the accept path
@@ -691,10 +745,18 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
         A pure-add patch replaces the file wholesale, so it is gated by the
         whole-file table rather than as an anchored mutation — otherwise a patch
         could create over a file the agent had never read.
+
+        An update patch is admitted onto the anchored table, but unlike ``edit``
+        it cannot degrade to exact matching on a changed file: ``render_file_patch``
+        splices each hunk at ``old_start`` and verifies no context, so a diff cut
+        against an older revision is applied at line numbers that have moved —
+        silently destroying the very lines the other writer added and reporting
+        ``updated:``. The anchored table's admission is earned by an anchor the
+        actor can check; a unified diff offers none, so a changed file is refused.
         """
         live = self._live(file_patch.path)
         proposed = render_file_patch(None if live is None else live.decode("utf-8"), file_patch)
-        refusal, _ = self._check(
+        refusal, changed = self._check(
             agent_id,
             file_patch.path,
             whole_file=is_pure_add(file_patch),
@@ -703,6 +765,8 @@ class WorkspaceActor(Akgent[WorkspaceConfig, WorkspaceState]):
         )
         if refusal is not None:
             return _rejected(refusal)
+        if changed:
+            return _rejected(self._rejection(file_patch.path, _REASON_PATCH_STALE, live, proposed))
         data = proposed.encode("utf-8")
         self._workspace.write(file_patch.path, data)
         self._accept(agent_id, file_patch.path, data)

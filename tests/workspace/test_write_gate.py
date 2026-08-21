@@ -27,7 +27,7 @@ import pytest
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.actor import WorkspaceActor
 from akgentic.tool.workspace.edit import EditItem
-from akgentic.tool.workspace.models import MutationStatus
+from akgentic.tool.workspace.models import MAX_REJECTION_DIFF_LINES, MutationStatus
 from akgentic.tool.workspace.tool import WorkspaceTool
 from akgentic.tool.workspace.workspace import Filesystem
 
@@ -628,6 +628,163 @@ class TestPatchIsGated:
         # The patch refreshed the observation, so a follow-up write is accepted.
         assert mutate(wired_card, "workspace_write", "notes.md", "after\n") == ("Written: notes.md")
 
+    def test_an_update_patch_on_a_changed_file_is_refused_rather_than_spliced(
+        self, wired_card: WorkspaceTool, notes: Path
+    ) -> None:
+        """The anchored table admits a patch only while its line numbers still hold.
+
+        ``edit`` earns its admission on a changed file by degrading to exact
+        matching — its ``old_string`` is an anchor the actor can verify. A
+        unified diff has no such anchor: its hunks are spliced at ``old_start``
+        with no context check, so against a file whose lines have shifted it
+        rewrites the wrong region, destroys the other writer's addition, and
+        still reports ``updated:``.
+        """
+        read(wired_card, "notes.md")
+        # Another writer prepends a line: every line number in the patch shifts.
+        notes.write_text("# banner\n" + BODY, encoding="utf-8")
+        patch_text = "--- a/notes.md\n+++ b/notes.md\n@@ -1,2 +1,2 @@\n alpha\n-bravo\n+BRAVO\n"
+
+        with pytest.raises(RetriableError) as refusal:
+            mutate(wired_card, "workspace_patch", patch_text)
+
+        assert "line numbers that have since moved" in str(refusal.value)
+        assert notes.read_text(encoding="utf-8") == "# banner\n" + BODY
+
+    def test_the_same_patch_lands_once_the_agent_re_reads(
+        self, wired_card: WorkspaceTool, notes: Path
+    ) -> None:
+        # The refusal above is recoverable by the step it names.
+        read(wired_card, "notes.md")
+        notes.write_text("# banner\n" + BODY, encoding="utf-8")
+        patch_text = "--- a/notes.md\n+++ b/notes.md\n@@ -2,2 +2,2 @@\n alpha\n-bravo\n+BRAVO\n"
+        with pytest.raises(RetriableError):
+            mutate(wired_card, "workspace_patch", patch_text)
+
+        read(wired_card, "notes.md")
+        assert mutate(wired_card, "workspace_patch", patch_text) == "updated: notes.md"
+        assert notes.read_text(encoding="utf-8") == "# banner\nalpha\nBRAVO\ncharlie\ndelta\n"
+
+
+# ---------------------------------------------------------------------------
+# A refusal has to be recoverable, and it must not attribute what it cannot know
+# ---------------------------------------------------------------------------
+
+
+class TestAVanishedFileIsRecoverable:
+    def test_the_agent_can_recreate_a_file_deleted_under_it(
+        self, wired_card: WorkspaceTool, notes: Path
+    ) -> None:
+        """The stale-because-gone refusal is a one-time warning, not a dead end.
+
+        Its stated next step is "read the file again", which a missing file
+        cannot satisfy — ``workspace_read`` raises and records nothing. If the
+        observation survived the refusal, every later write *and* delete of the
+        path would be refused for the life of the team and the agent could never
+        recreate what a teammate removed.
+        """
+        read(wired_card, "notes.md")
+        notes.unlink()
+
+        with pytest.raises(RetriableError, match="deleted since you read it"):
+            mutate(wired_card, "workspace_write", "notes.md", "rebuilt\n")
+
+        assert mutate(wired_card, "workspace_write", "notes.md", "rebuilt\n") == (
+            "Written: notes.md"
+        )
+        assert notes.read_text(encoding="utf-8") == "rebuilt\n"
+
+    def test_a_file_that_came_back_is_still_protected(
+        self,
+        wired_card: WorkspaceTool,
+        bob: tuple[WorkspaceTool, FakeActorToolObserver],
+        notes: Path,
+    ) -> None:
+        # Clearing the observation does not license a clobber: the retry is a
+        # create, and the whole-file table judges it against what is on disk now.
+        bob_card, _ = bob
+        read(wired_card, "notes.md")
+        notes.unlink()
+        with pytest.raises(RetriableError, match="deleted since you read it"):
+            mutate(wired_card, "workspace_write", "notes.md", "alice's version\n")
+
+        mutate(bob_card, "workspace_write", "notes.md", "bob rebuilt it\n")
+
+        with pytest.raises(RetriableError, match="read it before overwriting"):
+            mutate(wired_card, "workspace_write", "notes.md", "alice's version\n")
+        assert notes.read_text(encoding="utf-8") == "bob rebuilt it\n"
+
+    def test_a_teammates_delete_is_not_reported_as_an_outside_change(
+        self,
+        wired_card: WorkspaceTool,
+        bob: tuple[WorkspaceTool, FakeActorToolObserver],
+        notes: Path,
+    ) -> None:
+        # bob deleted it through the tool. A deleted file has no live bytes to
+        # attribute, so the refusal must not claim the change came from outside
+        # the team — that misattributes a teammate exactly as naming the wrong
+        # writer would.
+        bob_card, _ = bob
+        read(wired_card, "notes.md")
+        read(bob_card, "notes.md")
+        mutate(bob_card, "workspace_delete", "notes.md")
+
+        with pytest.raises(RetriableError) as refusal:
+            mutate(wired_card, "workspace_write", "notes.md", "alice's version\n")
+
+        message = str(refusal.value)
+        assert "deleted since you read it" in message
+        assert "came from outside" not in message
+        assert "last written by agent" not in message
+
+
+# ---------------------------------------------------------------------------
+# The refusal travels back into the model's turn, so its diff is bounded
+# ---------------------------------------------------------------------------
+
+
+class TestTheRefusalDiffIsBounded:
+    def test_a_large_stale_write_does_not_carry_the_whole_file(
+        self,
+        wired_card: WorkspaceTool,
+        bob: tuple[WorkspaceTool, FakeActorToolObserver],
+        workspace_tree: Path,
+    ) -> None:
+        bob_card, _ = bob
+        big = workspace_tree / "big.md"
+        big.write_text("\n".join(f"line {n}" for n in range(5_000)) + "\n", encoding="utf-8")
+        read(wired_card, "big.md", limit=10_000)
+        read(bob_card, "big.md", limit=10_000)
+        mutate(bob_card, "workspace_write", "big.md", "bob replaced it\n")
+
+        with pytest.raises(RetriableError) as refusal:
+            mutate(
+                wired_card,
+                "workspace_write",
+                "big.md",
+                "\n".join(f"mine {n}" for n in range(5_000)) + "\n",
+            )
+
+        message = str(refusal.value)
+        assert message.count("\n") < MAX_REJECTION_DIFF_LINES + 20
+        assert "more diff line(s) not shown" in message
+
+    def test_a_small_diff_is_shown_whole(
+        self,
+        wired_card: WorkspaceTool,
+        bob: tuple[WorkspaceTool, FakeActorToolObserver],
+        notes: Path,
+    ) -> None:
+        bob_card, _ = bob
+        read(wired_card, "notes.md")
+        read(bob_card, "notes.md")
+        mutate(bob_card, "workspace_write", "notes.md", "bob's version\n")
+
+        with pytest.raises(RetriableError) as refusal:
+            mutate(wired_card, "workspace_write", "notes.md", "alice's version\n")
+
+        assert "not shown" not in str(refusal.value)
+
 
 # ---------------------------------------------------------------------------
 # AC10: mkdir is serialized but not content-gated
@@ -655,6 +812,8 @@ class TestMkdirIsRoutedNotGated:
         mutate(wired_card, "workspace_mkdir", "src")
         agent_id = str(observer.myAddress.agent_id)
         assert workspace_actor.observation_for(agent_id, "src") is None
+        # And no last-writer entry either — there is no content to attribute.
+        assert workspace_actor._last_writers.get("src") is None
 
 
 # ---------------------------------------------------------------------------

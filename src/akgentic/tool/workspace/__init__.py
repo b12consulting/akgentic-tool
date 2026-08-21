@@ -27,6 +27,7 @@ from akgentic.tool.workspace.edit import (
 from akgentic.tool.workspace.models import (
     DEFAULT_MAX_OBSERVATIONS_PER_AGENT,
     DEFAULT_MAX_TRACKED_WRITERS,
+    MAX_REJECTION_DIFF_LINES,
     PERM_ERR_MSG,
     LastWrite,
     MutationOutcome,
@@ -71,6 +72,7 @@ from akgentic.tool.workspace.workspace import (
 __all__ = [
     "DEFAULT_MAX_OBSERVATIONS_PER_AGENT",
     "DEFAULT_MAX_TRACKED_WRITERS",
+    "MAX_REJECTION_DIFF_LINES",
     "PERM_ERR_MSG",
     "WORKSPACE_ACTOR_NAME",
     "WORKSPACE_ACTOR_ROLE",
