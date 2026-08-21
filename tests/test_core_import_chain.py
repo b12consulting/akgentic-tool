@@ -15,6 +15,7 @@ CHAIN: list[str] = [
     "channels",
     "observer",
     "event",
+    "context_state",
     "params",
     "card",
     "dependencies",

@@ -10,6 +10,7 @@ from akgentic.tool.errors import RetriableError
 
 from .card import ToolCard
 from .commands import CommandRegistry, _build_command_entry, _CommandEntry
+from .context_state import ContextState
 from .dependencies import _topological_sort
 from .params import BaseToolParam
 
@@ -81,6 +82,34 @@ class ToolFactory:
     def get_system_prompts(self) -> list[Callable[..., Any]]:
         """Return system prompt callables aggregated from all tool cards."""
         return [p for card in self.tool_cards for p in card.get_system_prompts()]
+
+    def get_context_states(self) -> list[Callable[[], ContextState | None]]:
+        """Return context-state providers aggregated from all tool cards.
+
+        Iterates ``self.tool_cards`` in dependency order (same as
+        :meth:`get_system_prompts`). A provider's key is its callable
+        ``__name__`` — the same convention :meth:`get_command_registry` uses.
+        This method runs at agent wiring/``on_start``, never mid-turn, so a
+        collision fails at team-creation time.
+
+        Raises:
+            ValueError: If two providers share a ``__name__`` — never silent
+                shadowing. The message names both owning card classes.
+        """
+        providers: list[Callable[[], ContextState | None]] = []
+        owners: dict[str, str] = {}
+        for card in self.tool_cards:
+            card_name = type(card).__name__
+            for provider in card.get_context_states():
+                name = provider.__name__
+                if name in owners:
+                    raise ValueError(
+                        f"Context-state provider name collision: '{name}' is exposed "
+                        f"by both '{owners[name]}' and '{card_name}'."
+                    )
+                owners[name] = card_name
+                providers.append(provider)
+        return providers
 
     def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
         """Return command callables aggregated from all tool cards.
