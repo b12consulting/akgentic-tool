@@ -340,6 +340,11 @@ class TestRendering:
         assert card._names == ["fiscal_year"]
         assert _prompt(card)() == "FY26, again FY26"
 
+    def test_an_empty_header_renders_as_no_header_rather_than_empty_bold(self) -> None:
+        """A blank header is a configuration slip; ``****`` on its own line is worse."""
+        card, _ = _wire(_TeamContext(), header="")
+        assert _prompt(card)() == RENDERED
+
     def test_a_non_string_field_is_rendered_with_str(self) -> None:
         card, _ = _wire(_OtherContext(), template="Q{quarter} in {region}")
         assert _prompt(card)() == "Q3 in EMEA"
@@ -439,6 +444,21 @@ class TestSnapshot:
         _proxy(observer).get_metadata.return_value = _TeamContext()
 
         assert prompt() == RENDERED
+
+    def test_rewiring_drops_the_snapshot_of_the_previous_team(self) -> None:
+        """``ToolFactory`` binds every card it is handed; a shared card must not leak.
+
+        The snapshot belongs to the team it was rendered for. A card wired a second
+        time — against another orchestrator — that kept it would serve the first
+        team's business context to the second team's agents.
+        """
+        card, _ = _wire(_TeamContext())
+        assert _prompt(card)() == RENDERED
+
+        card.observer(_make_observer(_TeamContext(fiscal_year="FY27", engagement="Audit")))
+
+        assert card._rendered is None, "the previous team's block must not survive"
+        assert _prompt(card)() == "Fiscal year: FY27. Engagement: Audit."
 
     def test_the_snapshot_is_shared_across_channels(self) -> None:
         card, observer = _wire(_TeamContext())

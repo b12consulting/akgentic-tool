@@ -205,6 +205,14 @@ class MetadataTool(ToolCard):
                 team's metadata model.
         """
         super().observer(observer)  # store the observer weakly via the base setter
+        # A card can be wired more than once — ``ToolFactory`` attaches an observer
+        # to every card it is handed — and the snapshot belongs to the team it was
+        # rendered for. Drop it, or a second binding would serve the first team's
+        # business context to the second team's agents.
+        self._orchestrator_proxy = None
+        self._rendered = None
+        self._names = []
+
         params = _resolve(self.render_metadata, RenderMetadata)
         if params is None:
             return self  # nothing configured: no proxy to bind, no template to check
@@ -266,7 +274,7 @@ class MetadataTool(ToolCard):
         card = self
 
         def team_metadata() -> str:
-            """Get the team's business context: account, period, engagement scope.
+            """Get the team's business context, exactly as the agents received it.
 
             Returns:
                 The rendered metadata block, or an empty string when the team
@@ -302,8 +310,15 @@ class MetadataTool(ToolCard):
                 return ""
             _check_names(self._names, metadata)
             rendered = _render(params, self._names, metadata)
-        except Exception as exc:
+        except ValueError as exc:
+            # Expected and self-describing: an unresolvable placeholder, or a card
+            # that was never wired. The message carries everything worth knowing.
             logger.error(f"MetadataTool: cannot render the team metadata block. {exc}")
+            return ""
+        except Exception:
+            # Anything else is a genuine surprise, and a prompt callable is the one
+            # place a traceback cannot be recovered afterwards — keep it.
+            logger.exception("MetadataTool: cannot render the team metadata block.")
             return ""
         self._rendered = rendered
         return rendered
