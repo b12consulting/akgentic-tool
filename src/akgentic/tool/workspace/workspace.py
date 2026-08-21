@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -29,6 +30,30 @@ _DEFAULT_FILE_MODE = 0o666
 # over the usual 255-byte limit is rejected outright by ``os.open`` — so copying
 # a long target name whole would fail writes that used to succeed.
 _STAGED_NAME_BUDGET = 255 - 38
+
+# The staging name ``write`` publishes from, and the predicate that recognises
+# one afterwards.  They sit together because they are two halves of one shape:
+# ``#Workspace`` sweeps orphaned staging files at start, and a reader-side
+# pattern that drifted from the writer would either miss them or delete a
+# legitimate file.
+_STAGED_NAME_TEMPLATE = ".{stem}.{token}.tmp"
+_STAGED_NAME_RE = re.compile(r"^\..+\.[0-9a-f]{32}\.tmp$")
+
+
+def is_staging_name(name: str) -> bool:
+    """Whether *name* is a staging file :meth:`Filesystem.write` left behind.
+
+    The 32 hex digits are load-bearing rather than decoration: they are what
+    keeps an agent's own ``.notes.tmp`` — or any hand-written ``.tmp`` file — out
+    of a sweep that would otherwise delete it.
+
+    Args:
+        name: A single path component, not a path.
+
+    Returns:
+        True for the ``.<name>.<32 hex digits>.tmp`` shape, False otherwise.
+    """
+    return _STAGED_NAME_RE.match(name) is not None
 
 
 class FileEntry(BaseModel):
@@ -141,7 +166,7 @@ class Filesystem:
         # A ".tmp" suffix keeps the staging file out of the read path's sidecar
         # rule, which claims names that both start with "." and end with ".md".
         stem = resolved.name.encode()[:_STAGED_NAME_BUDGET].decode(errors="ignore")
-        staged = resolved.parent / f".{stem}.{uuid4().hex}.tmp"
+        staged = resolved.parent / _STAGED_NAME_TEMPLATE.format(stem=stem, token=uuid4().hex)
         try:
             fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _DEFAULT_FILE_MODE)
             with os.fdopen(fd, "wb") as handle:

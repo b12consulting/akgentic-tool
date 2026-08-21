@@ -1,0 +1,393 @@
+"""The read path reports what it observed to ``#Workspace`` (story 29-2).
+
+One O(1) call per tool invocation, on the plain-text read branch only, and
+fail-open: a lost observation is a lost precondition, never a lost read.
+"""
+
+from __future__ import annotations
+
+import gc
+import inspect
+import threading
+import weakref
+from pathlib import Path
+from typing import Any
+
+import pytest
+from akgentic.tool.errors import RetriableError
+from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
+from akgentic.tool.workspace.models import WorkspaceConfig, content_sha
+from akgentic.tool.workspace.tool import WorkspaceTool
+
+from tests.workspace.conftest import (
+    HANDSHAKE_TIMEOUT_S,
+    WORKSPACE_NAME,
+    BusyProxy,
+    CountingProxy,
+    FailingProxy,
+    FakeActorToolObserver,
+    FakeOrchestratorProxy,
+    tool_named,
+)
+
+BODY = "alpha\nbravo\ncharlie\ndelta\necho\n"
+
+
+@pytest.fixture
+def seeded_tree(workspace_tree: Path) -> Path:
+    """A tree holding ``notes.md`` plus a couple of siblings."""
+    (workspace_tree / "notes.md").write_text(BODY, encoding="utf-8")
+    (workspace_tree / "other.md").write_text("other\n", encoding="utf-8")
+    sub = workspace_tree / "sub"
+    sub.mkdir()
+    (sub / "nested.md").write_text("nested\n", encoding="utf-8")
+    return workspace_tree
+
+
+def agent_id_of(observer: FakeActorToolObserver) -> str:
+    """The identity the card captured for *observer*, as the actor sees it."""
+    return str(observer.myAddress.agent_id)
+
+
+# ---------------------------------------------------------------------------
+# AC1 / AC2: one actor per workspace, reached with a single get-or-create
+# ---------------------------------------------------------------------------
+
+
+class TestSingleton:
+    def test_two_cards_share_one_actor(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        wired_card: WorkspaceTool,
+        workspace_actor: WorkspaceActor,
+        observer: FakeActorToolObserver,
+        seeded_tree: Path,
+    ) -> None:
+        second_observer = FakeActorToolObserver(orchestrator_proxy, name="bob")
+        second_card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+        second_card.observer(second_observer)
+
+        tool_named(wired_card, "workspace_read")("notes.md")
+
+        # Recorded through card A's proxy, readable through card B's.
+        second_proxy = second_card._workspace_proxy
+        assert second_proxy is not None
+        assert second_proxy.observation_for(agent_id_of(observer), "notes.md") is not None
+
+    def test_the_actor_is_obtained_with_one_get_or_create_call(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        wired_card: WorkspaceTool,
+    ) -> None:
+        # Never a check-then-create pair: one message, per ADR-025.
+        assert len(orchestrator_proxy.create_calls) == 1
+
+    def test_the_config_name_carries_the_tool_actor_prefix(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        wired_card: WorkspaceTool,
+    ) -> None:
+        _, config = orchestrator_proxy.create_calls[0]
+        assert config.name.startswith("#")
+
+    def test_two_workspaces_in_one_team_get_two_actors(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        wired_card: WorkspaceTool,
+        workspaces_root: Path,
+    ) -> None:
+        # The card's workspace is the actor's unicity domain: a second card on a
+        # different tree must not be handed the first tree's actor.
+        shared_observer = FakeActorToolObserver(orchestrator_proxy, name="bob")
+        shared_card = WorkspaceTool(workspace_id="shared")
+        shared_card.observer(shared_observer)
+
+        assert workspace_actor_name("shared") in orchestrator_proxy.children
+        assert workspace_actor_name(WORKSPACE_NAME) in orchestrator_proxy.children
+        assert shared_card._workspace_proxy is not wired_card._workspace_proxy
+
+    def test_the_actor_owns_the_tree_its_card_is_anchored_to(
+        self,
+        workspace_actor: WorkspaceActor,
+        workspace_tree: Path,
+    ) -> None:
+        assert workspace_actor.config.workspace_name == WORKSPACE_NAME
+        assert workspace_actor._workspace._root == workspace_tree.resolve()
+
+
+# ---------------------------------------------------------------------------
+# AC3: full vs paginated
+# ---------------------------------------------------------------------------
+
+
+class TestWhatAReadRecords:
+    def test_a_whole_file_read_records_full_true(
+        self,
+        wired_card: WorkspaceTool,
+        workspace_actor: WorkspaceActor,
+        observer: FakeActorToolObserver,
+        seeded_tree: Path,
+    ) -> None:
+        tool_named(wired_card, "workspace_read")("notes.md")
+        recorded = workspace_actor.observation_for(agent_id_of(observer), "notes.md")
+        assert recorded is not None
+        assert recorded.full is True
+        assert recorded.sha == content_sha(BODY.encode())
+
+    def test_a_limit_truncated_read_records_full_false_with_the_same_sha(
+        self,
+        wired_card: WorkspaceTool,
+        workspace_actor: WorkspaceActor,
+        observer: FakeActorToolObserver,
+        seeded_tree: Path,
+    ) -> None:
+        tool_named(wired_card, "workspace_read")("notes.md", limit=2)
+        recorded = workspace_actor.observation_for(agent_id_of(observer), "notes.md")
+        assert recorded is not None
+        assert recorded.full is False
+        assert recorded.sha == content_sha(BODY.encode())
+
+    def test_an_offset_shifted_read_records_full_false(
+        self,
+        wired_card: WorkspaceTool,
+        workspace_actor: WorkspaceActor,
+        observer: FakeActorToolObserver,
+        seeded_tree: Path,
+    ) -> None:
+        tool_named(wired_card, "workspace_read")("notes.md", offset=2)
+        recorded = workspace_actor.observation_for(agent_id_of(observer), "notes.md")
+        assert recorded is not None
+        assert recorded.full is False
+        assert recorded.sha == content_sha(BODY.encode())
+
+    def test_an_empty_file_read_records_full_true(
+        self,
+        wired_card: WorkspaceTool,
+        workspace_actor: WorkspaceActor,
+        observer: FakeActorToolObserver,
+        workspace_tree: Path,
+    ) -> None:
+        (workspace_tree / "empty.md").write_bytes(b"")
+        tool_named(wired_card, "workspace_read")("empty.md")
+        recorded = workspace_actor.observation_for(agent_id_of(observer), "empty.md")
+        assert recorded is not None
+        assert recorded.full is True
+
+    def test_a_failed_read_records_nothing(
+        self,
+        wired_card: WorkspaceTool,
+        workspace_actor: WorkspaceActor,
+        observer: FakeActorToolObserver,
+        seeded_tree: Path,
+    ) -> None:
+        with pytest.raises(RetriableError):
+            tool_named(wired_card, "workspace_read")("missing.md")
+        assert workspace_actor.observation_for(agent_id_of(observer), "missing.md") is None
+
+
+# ---------------------------------------------------------------------------
+# AC4: the silent capabilities
+# ---------------------------------------------------------------------------
+
+
+class TestSilentCapabilities:
+    @pytest.mark.parametrize(
+        ("name", "args"),
+        [
+            ("workspace_list", ()),
+            ("workspace_glob", ("*.md",)),
+            ("workspace_grep", ("alpha",)),
+        ],
+    )
+    def test_they_record_nothing(
+        self,
+        name: str,
+        args: tuple[Any, ...],
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_actor: WorkspaceActor,
+        observer: FakeActorToolObserver,
+        seeded_tree: Path,
+    ) -> None:
+        counting = CountingProxy(workspace_actor)
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+        card.observer(FakeActorToolObserver(orchestrator_proxy, workspace_proxy=counting))
+
+        tool_named(card, name)(*args)
+
+        assert counting.calls == []
+
+    def test_view_records_nothing(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_actor: WorkspaceActor,
+        workspace_tree: Path,
+    ) -> None:
+        pytest.importorskip("PIL")
+        from PIL import Image
+
+        image_path = workspace_tree / "logo.png"
+        Image.new("RGB", (4, 4), "red").save(image_path)
+
+        counting = CountingProxy(workspace_actor)
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+        card.observer(FakeActorToolObserver(orchestrator_proxy, workspace_proxy=counting))
+
+        tool_named(card, "workspace_view")("logo.png")
+
+        assert counting.calls == []
+
+    def test_a_cached_document_read_records_nothing(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_actor: WorkspaceActor,
+        workspace_tree: Path,
+    ) -> None:
+        # On a sidecar cache hit the source bytes are never read, so hashing them
+        # would put a full file read back onto the path NFR1 keeps free.
+        (workspace_tree / "report.pdf").write_bytes(b"%PDF-1.4 not really a pdf")
+        (workspace_tree / ".report.pdf.md").write_text("extracted", encoding="utf-8")
+
+        counting = CountingProxy(workspace_actor)
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+        card.observer(FakeActorToolObserver(orchestrator_proxy, workspace_proxy=counting))
+
+        result = tool_named(card, "workspace_read")("report.pdf")
+
+        assert "extracted" in result
+        assert counting.calls == []
+
+
+# ---------------------------------------------------------------------------
+# AC5: exactly one recording call per invocation
+# ---------------------------------------------------------------------------
+
+
+class TestOneCallPerInvocation:
+    def test_a_large_file_read_makes_exactly_one_call(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_actor: WorkspaceActor,
+        workspace_tree: Path,
+    ) -> None:
+        big = "\n".join(f"line {n}" for n in range(5000))
+        (workspace_tree / "big.md").write_text(big, encoding="utf-8")
+
+        counting = CountingProxy(workspace_actor)
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+        card.observer(FakeActorToolObserver(orchestrator_proxy, workspace_proxy=counting))
+
+        tool_named(card, "workspace_read")("big.md", limit=10_000)
+
+        assert len(counting.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# AC6: content never travels through the actor, and recording is fail-open
+# ---------------------------------------------------------------------------
+
+
+class TestFailOpen:
+    def test_a_raising_recording_still_returns_the_whole_file(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        seeded_tree: Path,
+    ) -> None:
+        failing = FailingProxy()
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+        card.observer(FakeActorToolObserver(orchestrator_proxy, workspace_proxy=failing))
+
+        result = tool_named(card, "workspace_read")("notes.md")
+
+        assert failing.calls == 1
+        for line in BODY.splitlines():
+            assert line in result
+
+    def test_a_read_completes_while_the_actor_is_occupied(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        seeded_tree: Path,
+    ) -> None:
+        busy = BusyProxy()
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+        card.observer(FakeActorToolObserver(orchestrator_proxy, workspace_proxy=busy))
+        read = tool_named(card, "workspace_read")
+
+        results: list[str] = []
+        occupier = threading.Thread(target=busy.occupy)
+        reader = threading.Thread(target=lambda: results.append(read("notes.md")))
+
+        occupier.start()
+        assert busy.occupied.wait(timeout=HANDSHAKE_TIMEOUT_S)
+        reader.start()
+        busy.release.set()
+        occupier.join(timeout=HANDSHAKE_TIMEOUT_S)
+        reader.join(timeout=HANDSHAKE_TIMEOUT_S)
+
+        assert not reader.is_alive()
+        assert len(results) == 1
+        for line in BODY.splitlines():
+            assert line in results[0]
+        assert busy.calls == ["notes.md"]
+
+    def test_a_card_with_no_bound_actor_still_reads(
+        self,
+        wired_card: WorkspaceTool,
+        seeded_tree: Path,
+    ) -> None:
+        # The harness shapes that hand a card a bare observer never bind an actor.
+        wired_card._workspace_proxy = None
+        result = tool_named(wired_card, "workspace_read")("notes.md")
+        assert "alpha" in result
+
+
+# ---------------------------------------------------------------------------
+# AC12: the owning agent is still reclaimed
+# ---------------------------------------------------------------------------
+
+
+class TestNoRetention:
+    def test_the_owning_agent_is_collected_after_a_read(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        seeded_tree: Path,
+    ) -> None:
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+        owner = FakeActorToolObserver(orchestrator_proxy, name="carol")
+        card.observer(owner)
+        tool_named(card, "workspace_read")("notes.md")
+
+        ref = weakref.ref(owner)
+        del owner
+        gc.collect()
+
+        assert ref() is None
+
+
+# ---------------------------------------------------------------------------
+# AC11: nothing an agent can do behaves differently
+# ---------------------------------------------------------------------------
+
+
+class TestMutationsAreUnchanged:
+    def test_a_write_still_goes_straight_to_the_filesystem(
+        self,
+        wired_card: WorkspaceTool,
+        workspace_actor: WorkspaceActor,
+        observer: FakeActorToolObserver,
+        workspace_tree: Path,
+    ) -> None:
+        # The gate arrives in the next story: an unread file is still writable,
+        # and writing records nothing.
+        tool_named(wired_card, "workspace_write")("fresh.md", "content")
+
+        assert (workspace_tree / "fresh.md").read_text(encoding="utf-8") == "content"
+        assert workspace_actor.observation_for(agent_id_of(observer), "fresh.md") is None
+
+    def test_the_read_signature_gained_no_parameter(self, wired_card: WorkspaceTool) -> None:
+        params = list(inspect.signature(tool_named(wired_card, "workspace_read")).parameters)
+        assert params == ["path", "offset", "limit", "force_document_regeneration"]
+
+
+def test_the_actor_config_is_fully_serialisable(workspaces_root: Path) -> None:
+    config = WorkspaceConfig(name="#Workspace-x", role="ToolActor", workspace_name="x")
+    assert WorkspaceConfig.model_validate(config.model_dump()) == config

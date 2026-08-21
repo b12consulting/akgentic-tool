@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import difflib
 import io
+import logging
 import re as _re
 import shutil
 import subprocess
@@ -26,10 +27,17 @@ from typing import Any, TypeVar
 from pydantic import PrivateAttr
 from pydantic_ai.messages import BinaryContent
 
+from akgentic.core.actor_address import ActorAddress
+from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.utils import SerializableBaseModel
 from akgentic.tool.core import COMMAND, TOOL_CALL, BaseToolParam, Channels, ToolCard, _resolve
 from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.errors import RetriableError
+from akgentic.tool.workspace.actor import (
+    WORKSPACE_ACTOR_ROLE,
+    WorkspaceActor,
+    workspace_actor_name,
+)
 from akgentic.tool.workspace.edit import (
     EditItem,
     EditMatcher,
@@ -39,8 +47,11 @@ from akgentic.tool.workspace.edit import (
     normalise_endings,
     parse_patch,
 )
+from akgentic.tool.workspace.models import Observation, WorkspaceConfig, content_sha
 from akgentic.tool.workspace.readers import _MIME_MAP, DocumentReader, MediaContent
 from akgentic.tool.workspace.workspace import Filesystem, get_workspace
+
+logger = logging.getLogger(__name__)
 
 _PERM_ERR_MSG = "Path escapes workspace root — use a path relative to the workspace"
 _REF_RE = _re.compile(r'!!"([^"]+)"|!!(\S+)')
@@ -150,6 +161,25 @@ def _maybe_resize(data: bytes, suffix: str, max_dim: int, root: Path, path: str)
     resized = buf.getvalue()
     sidecar_path.write_bytes(resized)
     return resized
+
+
+def _paginate(raw: str, offset: int, limit: int) -> tuple[str, bool]:
+    """Number *raw*'s lines within the requested window.
+
+    Returns:
+        The numbered text — with a truncation notice when the window stops short
+        — and whether the window covered the **whole** file. The flag is derived
+        from the same clamped bounds the text is, so what a read records about
+        itself can never disagree with what the agent was shown.
+    """
+    lines = raw.splitlines()
+    total = len(lines)
+    start = max(0, offset - 1)
+    end = min(start + limit, total)
+    numbered = "\n".join(f"{start + i + 1:<6}{line}" for i, line in enumerate(lines[start:end]))
+    if end < total:
+        numbered += f"\n[... truncated: {total} lines total, showing {start + 1}-{end} ...]"
+    return numbered, start == 0 and end == total
 
 
 def _read_text_for_edit(backend: Filesystem, path: str) -> str:
@@ -551,10 +581,17 @@ class WorkspaceTool(ToolCard):
     # reliably under both normal execution and coverage instrumentation.
     _workspace: Filesystem | None = PrivateAttr(default=None)
 
+    # The ``#Workspace-<workspace>`` singleton, and the owning agent's identity as
+    # a plain string.  Both are PrivateAttr: a proxy in a Pydantic field breaks the
+    # card's serialisation contract, and the id is captured as a string so no
+    # closure below holds an edge back to the agent (ADR-030).
+    _workspace_proxy: WorkspaceActor | None = PrivateAttr(default=None)
+    _agent_id: str = PrivateAttr(default="")
+
     def observer(  # type: ignore[override]
         self, observer: ActorToolObserver
     ) -> WorkspaceTool:
-        """Attach observer and initialise the workspace backend.
+        """Attach observer, initialise the backend, and bind the workspace singleton.
 
         Args:
             observer: Actor tool observer; must have a non-None orchestrator.
@@ -571,7 +608,67 @@ class WorkspaceTool(ToolCard):
         ws_name = self.workspace_id or str(observer.team_id)
         self._workspace = get_workspace(ws_name)
         self._seed_resources()
+        self._bind_workspace_actor(observer, observer.orchestrator, ws_name)
         return self
+
+    def _bind_workspace_actor(
+        self, observer: ActorToolObserver, orchestrator: ActorAddress, workspace_name: str
+    ) -> None:
+        """Bind the ``#Workspace-<workspace_name>`` singleton that owns this tree.
+
+        Get-or-create in one message (ADR-025): a check-then-create pair is a
+        TOCTOU window that produces two singletons over one tree, which is the
+        exact failure the pattern exists to prevent.
+
+        The actor's name carries the workspace, so two cards with different
+        ``workspace_id`` values in one team get two actors, each owning its own
+        tree — the unicity domain of the actor equals the resource it owns.
+
+        Args:
+            observer: The owning agent, live at bind time.
+            orchestrator: Address of the orchestrator.
+            workspace_name: The resolved workspace this card is anchored to.
+        """
+        orchestrator_proxy = observer.proxy_ask(orchestrator, Orchestrator)
+        workspace_addr = orchestrator_proxy.getChildrenOrCreate(
+            WorkspaceActor,
+            config=WorkspaceConfig(
+                name=workspace_actor_name(workspace_name),
+                role=WORKSPACE_ACTOR_ROLE,
+                workspace_name=workspace_name,
+            ),
+        )
+        self._workspace_proxy = observer.proxy_ask(workspace_addr, WorkspaceActor)
+        self._agent_id = str(observer.myAddress.agent_id)
+
+    def _observation_recorder(self) -> Callable[[str, bytes, bool], None]:
+        """Build the closure a read closure uses to report what it saw.
+
+        The proxy and the agent id are captured **here**, at ``get_tools`` time,
+        as a proxy to a different actor and a plain string. Neither is an edge
+        back to the owning agent, which is what keeps the read closures free of
+        the retention ADR-030 forbids.
+
+        Returns:
+            A callable taking the path, the file's raw bytes and whether the read
+            covered the whole file. It never raises: a lost observation is a lost
+            precondition, which the gate turns into a *refused* write — it must
+            never turn into a failed read.
+        """
+        proxy = self._workspace_proxy
+        agent_id = self._agent_id
+
+        def record(path: str, data: bytes, full: bool) -> None:
+            if proxy is None:
+                return  # harness shapes that wire a bare observer never bind one
+            try:
+                proxy.record_observation(
+                    agent_id, path, Observation(sha=content_sha(data), full=full)
+                )
+            except Exception:  # noqa: BLE001 — a lost precondition, never a lost read
+                logger.debug("Could not record an observation for %s", path, exc_info=True)
+
+        return record
 
     def _seed_resources(self) -> None:
         """Write each configured resource that is not already present.
@@ -741,6 +838,7 @@ class WorkspaceTool(ToolCard):
             Callable that reads a workspace file with pagination.
         """
         backend = self.workspace
+        record = self._observation_recorder()
         _dr_cfg = params.document_reader
         if _dr_cfg is True:
             document_reader: DocumentReader | None = DocumentReader()
@@ -788,6 +886,11 @@ class WorkspaceTool(ToolCard):
                 )
 
             try:
+                # Raw source bytes, and only on the branch that actually read them.
+                # A document read shows extracted Markdown rather than the file, and
+                # on a sidecar cache hit the source is never opened at all — hashing
+                # it would put a full file read back onto the path NFR1 keeps free.
+                observed: bytes | None = None
                 if (
                     not is_sidecar
                     and document_reader is not None
@@ -803,19 +906,13 @@ class WorkspaceTool(ToolCard):
                         sidecar.write_text(raw, encoding="utf-8")
                 else:
                     # Text path (existing logic)
-                    raw = backend.read(path).decode("utf-8")
+                    observed = backend.read(path)
+                    raw = observed.decode("utf-8")
 
-                lines = raw.splitlines()
-                total = len(lines)
-                start = max(0, offset - 1)
-                end = min(start + limit, total)
-                numbered = "\n".join(
-                    f"{start + i + 1:<6}{line}" for i, line in enumerate(lines[start:end])
-                )
-                if end < total:
-                    numbered += (
-                        f"\n[... truncated: {total} lines total, showing {start + 1}-{end} ...]"
-                    )
+                numbered, full = _paginate(raw, offset, limit)
+                if observed is not None:
+                    # One recording call per invocation, whatever the file's size.
+                    record(path, observed, full)
                 return numbered
             except FileNotFoundError:
                 raise RetriableError(f"File not found: {path}")

@@ -1,5 +1,11 @@
 """Workspace module — filesystem backend for team-scoped file operations."""
 
+from akgentic.tool.workspace.actor import (
+    WORKSPACE_ACTOR_NAME,
+    WORKSPACE_ACTOR_ROLE,
+    WorkspaceActor,
+    workspace_actor_name,
+)
 from akgentic.tool.workspace.edit import (
     EditItem,
     EditMatcher,
@@ -10,6 +16,13 @@ from akgentic.tool.workspace.edit import (
     detect_line_ending,
     normalise_endings,
     parse_patch,
+)
+from akgentic.tool.workspace.models import (
+    DEFAULT_MAX_OBSERVATIONS_PER_AGENT,
+    Observation,
+    WorkspaceConfig,
+    WorkspaceState,
+    content_sha,
 )
 from akgentic.tool.workspace.readers import (
     TEXT_EXTENSIONS,
@@ -39,9 +52,20 @@ from akgentic.tool.workspace.workspace import (
     Filesystem,
     Workspace,
     get_workspace,
+    is_staging_name,
 )
 
 __all__ = [
+    "DEFAULT_MAX_OBSERVATIONS_PER_AGENT",
+    "WORKSPACE_ACTOR_NAME",
+    "WORKSPACE_ACTOR_ROLE",
+    "Observation",
+    "WorkspaceActor",
+    "WorkspaceConfig",
+    "WorkspaceState",
+    "content_sha",
+    "is_staging_name",
+    "workspace_actor_name",
     "DocumentReader",
     "FileTypeReader",
     "MediaContent",
