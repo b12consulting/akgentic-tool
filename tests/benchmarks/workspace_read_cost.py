@@ -154,6 +154,22 @@ OP_DOCUMENT = "document"
 OP_OWNED = "read:owned"
 OP_WRITE = "write"
 
+RECORDING_FREE_OPS = (OP_GLOB, OP_GREP, OP_DOCUMENT)
+"""The operations that record nothing at all, in every arm — the negative controls.
+
+``workspace_glob`` never opens a file; ``workspace_grep`` reads content the agent
+is never shown in full; and the document branch of ``workspace_read`` leaves the
+observed bytes unset, on the extraction branch and on the sidecar cache hit alike.
+The recorder is therefore not called for any of them, whichever arm is running, so
+their ``off`` -> ``on`` p95 delta has **no true effect in it at all**: it is a
+direct measurement of this harness's own noise on the statistic every verdict is
+computed from.
+
+That makes the band they span the honest scale to read a *read* delta against —
+a stricter test than the run-to-run spread, which is a min-max over three runs and
+routinely narrower than the controls show the real variance to be.
+"""
+
 DEFAULT_BUCKETS: tuple[tuple[str, int], ...] = (
     ("small", 2_048),
     ("medium", 200_000),
@@ -220,6 +236,18 @@ class ActorSnapshot(SerializableBaseModel):
             so this series is **approximate**; T3's threshold is coarse enough to
             survive the imprecision, and the report says so rather than
             presenting the series as exact.
+
+            A second imprecision, which the arms do not share equally: the sample
+            is taken at a *turn boundary*, and the arms have different turns. With
+            no observation arriving, ``off`` and ``hash-only`` sample only at the
+            six mutation entry points, while ``on`` also samples at every read
+            observation — several times as many samples, taken predominantly while
+            read traffic is being served. ``on``'s series is therefore weighted
+            towards the busy moments in a way the baseline's is not, so part of any
+            ``off`` -> ``on`` gap is the difference in *what gets sampled* rather
+            than in queue behaviour. There is no cheaper instrument that does not
+            add cost to the path under measurement, so this is stated rather than
+            corrected.
         read_observations: Recordings that arrived from a read closure.
         mutation_observations: Recordings an accepted mutation made for its own
             writer, which are not read-path traffic and are counted apart.
@@ -432,7 +460,15 @@ def _off_recorder(_card: WorkspaceTool) -> _Recorder:
 
 
 def _hash_only_recorder(_card: WorkspaceTool) -> _Recorder:
-    """Build a recorder that computes the digest and sends nothing."""
+    """Build a recorder that computes the digest and sends nothing.
+
+    It stops at :func:`content_sha`, where the shipped recorder goes on to build an
+    ``Observation`` and send it inside a ``try``/``except``. So the ``hash-only``
+    -> ``on`` step is an **upper bound** on what per-turn batching removes rather
+    than an estimate of it: batching drops the message, not the model behind it.
+    The bound flatters batching, which is the safe direction for a conclusion that
+    batching is not the instrument this cost calls for.
+    """
 
     def record(path: str, data: bytes, full: bool) -> None:
         content_sha(data)
@@ -1002,6 +1038,7 @@ def _drive(
     # under-report its own traffic.
     snapshot = workspace.bench_snapshot()
     _assert_arm_behaved(arm, snapshot)
+    assert_samples_complete(spec, results)
     return _summarise_run(arm, results, snapshot, tree, journal)
 
 
@@ -1080,13 +1117,55 @@ def _assert_arm_behaved(arm: str, snapshot: ActorSnapshot) -> None:
         raise RuntimeError(f"arm {arm!r} ran with the journal ON — not a valid read-path result")
 
 
+def assert_samples_complete(spec: RunSpec, results: list[AgentResult]) -> None:
+    """Fail the run rather than publish a percentile over calls that never happened.
+
+    :meth:`_BenchAgent._timed` drops the sample of any call that raised or was
+    refused, and every statistic downstream is computed over whatever survived. So
+    an arm can quietly do less work than the arm it is compared against, and the
+    report shows only a smaller ``n`` in a column nobody is reading. Worse,
+    :func:`_rule_t2` baselines a *missing* ``write`` operation at 0.0 ms: an arm
+    whose writes were all refused yields a 25 ms threshold measured against
+    nothing.
+
+    That is not a hypothetical. It is what the first shake-out run of this harness
+    did — with recording patched out, no read recorded, so every whole-file write
+    was refused and the two baseline arms contributed the latency of a refusal. It
+    was caught by reading the refusal counter by hand. The rest of the harness
+    already holds the principle this restores: fail the run rather than publish a
+    number from an arm that did the wrong thing.
+    """
+    wanted = spec.iterations
+    expected = set(expected_operations(spec))
+    for result in results:
+        if result.refusals or result.errors:
+            raise RuntimeError(
+                f"agent {result.agent} reported {result.refusals} refusals and"
+                f" {len(result.errors)} errors — its samples are not comparable:"
+                f" {result.errors}"
+            )
+        missing = sorted(expected - {samples.operation for samples in result.operations})
+        if missing:
+            raise RuntimeError(f"agent {result.agent} produced no samples at all for {missing}")
+        for samples in result.operations:
+            if len(samples.durations_ms) != wanted:
+                raise RuntimeError(
+                    f"agent {result.agent} produced {len(samples.durations_ms)} samples for"
+                    f" {samples.operation}, not the {wanted} measured turns it was asked for"
+                )
+
+
 ##
 ## Statistics
 ##
 
 
-def percentile_ms(samples: list[float], fraction: float) -> float:
-    """Nearest-rank percentile on the sorted samples, so the number reproduces."""
+def percentile(samples: list[float], fraction: float) -> float:
+    """Nearest-rank percentile on the sorted samples, so the number reproduces.
+
+    Deliberately unit-free: it serves both the latencies and the mailbox depths,
+    and the depths are counts.
+    """
     if not samples:
         return 0.0
     ordered = sorted(samples)
@@ -1098,8 +1177,8 @@ def _stat(samples: list[float]) -> Stat:
     """Summarise one operation's samples within one run."""
     return Stat(
         samples=len(samples),
-        p50_ms=percentile_ms(samples, _PERCENTILE_P50),
-        p95_ms=percentile_ms(samples, _PERCENTILE_P95),
+        p50_ms=percentile(samples, _PERCENTILE_P50),
+        p95_ms=percentile(samples, _PERCENTILE_P95),
         max_ms=max(samples) if samples else 0.0,
     )
 
@@ -1128,8 +1207,8 @@ def _summarise_run(
     return ArmRun(
         arm=arm,
         operations={key: _stat(values) for key, values in pooled.items()},
-        depth_p50=percentile_ms(depths, _PERCENTILE_P50),
-        depth_p95=percentile_ms(depths, _PERCENTILE_P95),
+        depth_p50=percentile(depths, _PERCENTILE_P50),
+        depth_p95=percentile(depths, _PERCENTILE_P95),
         depth_max=max(snapshot.depths) if snapshot.depths else 0,
         depth_samples=len(snapshot.depths),
         read_observations=snapshot.read_observations,
@@ -1344,6 +1423,17 @@ def decomposition_notes(arms: dict[str, ArmSummary]) -> list[str]:
     reader's own thread before anything is sent. So if the cost sits in the
     ``off`` -> ``hash-only`` step, batching is the wrong instrument however
     clearly the headline argues for a fallback.
+
+    Two things to read carefully in the output. The rows for
+    :data:`RECORDING_FREE_OPS` are marked as controls: they carry no digest and no
+    message whatsoever, so whatever appears in their two columns is this harness's
+    noise wearing the labels of a cost. And the ``message`` column is an **upper
+    bound** on what per-turn batching would remove, not an estimate of it: the
+    ``hash-only`` arm stops after :func:`content_sha`, so the step from it to
+    ``on`` also carries the ``Observation`` model construction and the recorder's
+    ``try``/``except``, and a batching scheme would still build an observation per
+    path. The bound errs towards making batching look *better* than it is, which
+    is the safe direction for a conclusion that batching is not worth building.
     """
     off = arms.get(ARM_OFF)
     hash_only = arms.get(ARM_HASH_ONLY)
@@ -1357,10 +1447,49 @@ def decomposition_notes(arms: dict[str, ArmSummary]) -> list[str]:
         base = off.operations[key].p95_ms.median
         digest = hash_only.operations[key].p95_ms.median - base
         message = on.operations[key].p95_ms.median - hash_only.operations[key].p95_ms.median
+        is_control = key in RECORDING_FREE_OPS
+        control = "  [control: records nothing — this is noise]" if is_control else ""
         notes.append(
-            f"{key}: p95 {base:.3f} ms baseline, digest {digest:+.3f} ms, message {message:+.3f} ms"
+            f"{key}: p95 {base:.3f} ms baseline, digest {digest:+.3f} ms,"
+            f" message {message:+.3f} ms{control}"
         )
     return notes
+
+
+def control_notes(arms: dict[str, ArmSummary]) -> list[str]:
+    """Report the noise band measured on the operations that cannot carry a cost.
+
+    :data:`RECORDING_FREE_OPS` never call the recorder, in any arm, so their
+    ``off`` -> ``on`` delta is a *measurement of this harness* rather than of the
+    design. Printing the band they span puts the honest scale beside every read
+    delta: a read delta inside it is not distinguishable from the instrument,
+    whatever :func:`noise_notes` concludes from a three-run min-max.
+
+    It cuts both ways, and that is the point. In the run this story published, the
+    controls span a few milliseconds while the 5 MB read delta is +5.97 ms — close
+    enough that the run-to-run spread is the *weakest* argument available for it.
+    The strong ones are elsewhere and belong in the reader's hands: the digest term
+    reproduces across every team size measured, and it is what sha256 over five
+    megabytes costs.
+    """
+    off = arms.get(ARM_OFF)
+    on = arms.get(ARM_ON)
+    if off is None or on is None:
+        return []
+    deltas = [
+        (key, on.operations[key].p95_ms.median - off.operations[key].p95_ms.median)
+        for key in RECORDING_FREE_OPS
+        if key in off.operations and key in on.operations
+    ]
+    if not deltas:
+        return []
+    widest = max(abs(delta) for _key, delta in deltas)
+    detail = ", ".join(f"{key} {delta:+.3f} ms" for key, delta in deltas)
+    return [
+        f"negative controls (record nothing in any arm, so off -> on is pure noise): {detail}",
+        f"control band +/-{widest:.3f} ms — read the read-path deltas against this, not only"
+        " against the run-to-run spread, which is a min-max over a handful of runs",
+    ]
 
 
 def noise_notes(arms: dict[str, ArmSummary]) -> list[str]:
@@ -1464,11 +1593,19 @@ def run_benchmark(
     summaries = {arm: summarise_arm(arm, collected[arm]) for arm in arms}
     rules = evaluate_rules(spec, summaries)
     notes = decomposition_notes(summaries)
+    notes += control_notes(summaries)
     notes += noise_notes(summaries)
     notes.append(f"mutation path (journal off -> on): {mutation_path_note(summaries)}")
     notes.append(
         "mailbox depth is sampled with queue.Queue.qsize(), which Python documents"
         " as unreliable under concurrency — read the depth series as approximate"
+    )
+    notes.append(
+        "the arms do not sample depth at the same events: with no observation"
+        " arriving, off and hash-only sample only at mutation turns while on also"
+        " samples at every observation, so on's series is weighted towards the"
+        " moments read traffic is being served — part of any off -> on gap is that"
+        " difference in sampling rather than in queue behaviour"
     )
     return BenchmarkResult(
         environment=describe_environment(),

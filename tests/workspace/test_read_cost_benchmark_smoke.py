@@ -25,11 +25,14 @@ import pytest
 from tests.benchmarks.workspace_read_cost import (
     ARM_ON,
     QUICK_BUCKETS,
+    AgentResult,
     BenchmarkResult,
+    OperationSamples,
     RunSpec,
+    assert_samples_complete,
     expected_operations,
     minimal_pdf,
-    percentile_ms,
+    percentile,
     render,
     run_benchmark,
 )
@@ -141,7 +144,55 @@ def test_the_report_renders(smoke_result: BenchmarkResult) -> None:
 )
 def test_nearest_rank_percentile(samples: list[float], fraction: float, expected: float) -> None:
     """Nearest rank on the sorted samples, so a published number reproduces exactly."""
-    assert percentile_ms(samples, fraction) == expected
+    assert percentile(samples, fraction) == expected
+
+
+def _complete_results(spec: RunSpec) -> list[AgentResult]:
+    """Build what one agent's clean run of *spec* looks like, with nothing dropped."""
+    return [
+        AgentResult(
+            agent="bench-0",
+            operations=[
+                OperationSamples(operation=key, durations_ms=[1.0] * spec.iterations)
+                for key in expected_operations(spec)
+            ],
+            refusals=0,
+            errors=[],
+        )
+    ]
+
+
+def test_the_sample_guard_accepts_a_run_that_dropped_nothing() -> None:
+    """The guard must not fire on the shape a healthy run actually produces."""
+    assert_samples_complete(SMOKE_SPEC, _complete_results(SMOKE_SPEC))
+
+
+@pytest.mark.parametrize(
+    ("damage", "expected"),
+    [
+        ("short", "not the 3 measured turns"),
+        ("missing", "produced no samples at all"),
+        ("refused", "refusals"),
+    ],
+)
+def test_the_sample_guard_refuses_to_publish_an_incomplete_arm(damage: str, expected: str) -> None:
+    """A dropped call must fail the run, not shrink an ``n`` nobody reads.
+
+    ``_timed`` drops the sample of any call that raised or was refused, so an arm
+    can silently do less work than the arm it is compared against — and the first
+    shake-out run of this harness did exactly that, with every whole-file write
+    refused in the two baseline arms. This is the check that would have caught it.
+    """
+    results = _complete_results(SMOKE_SPEC)
+    if damage == "short":
+        results[0].operations[0].durations_ms.pop()
+    elif damage == "missing":
+        del results[0].operations[0]
+    else:
+        results[0].refusals = 1
+
+    with pytest.raises(RuntimeError, match=expected):
+        assert_samples_complete(SMOKE_SPEC, results)
 
 
 def test_the_generated_pdf_is_long_enough_to_avoid_the_llm_pass() -> None:
