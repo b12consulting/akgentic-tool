@@ -7,7 +7,7 @@ not. This card splits one library by size and volatility: the **menu** (small,
 immutable) goes into the frozen system prefix, the **bodies** (large, optional) arrive
 at the tail on demand as ordinary tool returns (ADR-039).
 
-Three properties are load-bearing, and each is a review rejection if weakened:
+Four properties are load-bearing, and each is a review rejection if weakened:
 
 * **``use_skill`` returns the body as its tool result.** The model asked because it
   needs the body for the answer it is composing; anything that arrives on the next turn
@@ -19,6 +19,16 @@ Three properties are load-bearing, and each is a review rejection if weakened:
   it. Re-calling ``use_skill`` on the same name simply returns the body again — there is
   no "already loaded" case to special-case, and after a compaction the repeat call is
   exactly the intended recovery.
+* **The obligation lives in ``MENU_HEADER``, and only there does it work.** A menu the
+  model is free to ignore is paid for in the prefix on every turn and returns nothing,
+  and no event records that a skill was skipped. Measured, one variable at a time: with
+  an informational header, a manager asked for a report searched, fetched and wrote it
+  without opening ``write-report`` -- and rewriting ``use_skill``'s description to demand
+  the call did not change that. Making the *header* imperative did, on the original
+  description, unedited. The prefix is where the model decides how to do the work; a
+  tool description is read once it has already decided to reach for a tool, which is
+  after the decision the obligation was meant to change. Soften the header and the
+  skipping returns, whatever the description says.
 * **The menu lives in the frozen prefix, and that is the recovery path.** After a
   restart or a fold the model can always re-call ``use_skill`` because the menu survives
   everything. A menu at the tail would be one compaction away from an agent that no
@@ -49,8 +59,18 @@ from akgentic.tool.core import (
 )
 from akgentic.tool.errors import RetriableError
 
-MENU_HEADER = "**Skills available to you** — call use_skill(name) to load one."
-"""The one line that tells the model the library exists and how to open it."""
+MENU_HEADER = (
+    "**Skills available to you.** Call use_skill(name) before producing work of a kind "
+    "named below, even when you already know how. Match on the act, not the topic."
+)
+"""The lines that tell the model the library exists, how to open it, and that it must.
+
+Informational phrasing here fails in a way that is invisible: the model reads a menu it
+is never obliged to open, answers from its own defaults, and nothing in the run says a
+skill was skipped. The obligation has to sit in the frozen prefix, where the model
+decides *how* to do the work, and not only in ``use_skill``'s description, which it
+reads once it has already decided to reach for a tool.
+"""
 
 
 class SkillEntry(SerializableBaseModel):
@@ -205,10 +225,8 @@ class SkillTool(ToolCard):
         def use_skill(name: str) -> str:
             """Load a skill's full instructions.
 
-            Call this when the menu says a skill covers the question in front of you.
-            The instructions come back in the result, so you can use them for the answer
-            you are composing right now. Calling it again later is fine and is how you
-            recover a skill whose text has since dropped out of the conversation.
+            Call this when the menu names a skill for the act you are about to
+            perform.
 
             Args:
                 name: The skill's name, exactly as the menu spells it.
