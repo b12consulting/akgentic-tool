@@ -1,10 +1,12 @@
 """Fixtures and test doubles for the ``#Workspace`` actor and the recording read path.
 
 The doubles here reach the actor only through the public surface a card uses —
-``getChildrenOrCreate`` on a fake orchestrator, then ``proxy_ask`` — so nothing
-in these tests depends on actor internals. The fake orchestrator holds the real
-actor instances, which is what lets the singleton test prove that an observation
-recorded through one card is visible through another.
+``getChildrenOrCreate`` on a fake orchestrator, then ``proxy_ask``. The fake
+orchestrator holds the real actor instances, which is what lets the singleton
+test prove that an observation recorded through one card is visible through
+another. A handful of assertions do read a card's or an actor's private
+attribute where there is no public equivalent — which tree an actor took, which
+proxy a card bound — and they say so where they do it.
 
 Shaped after ``tests/notification/conftest.py``; deliberately a copy rather than
 an import, because a test package is not a library for other test packages.
@@ -162,11 +164,19 @@ class BusyProxy:
     :meth:`occupy` stands in for another agent's in-flight call: it holds the
     lock until :attr:`release` is set, so a concurrent ``record_observation``
     queues behind it exactly as it would behind a busy actor thread.
+
+    :attr:`queued` is what makes the contention real rather than incidental.
+    Without it a test can only release the occupier and hope the reader had
+    already arrived; a scheduler that ran the occupier to completion first
+    would leave the test green having exercised no contention at all. The
+    recorder sets it *before* reaching for the lock, so a test that waits on it
+    knows the read is committed to blocking.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.occupied = threading.Event()
+        self.queued = threading.Event()
         self.release = threading.Event()
         self.calls: list[str] = []
 
@@ -176,6 +186,7 @@ class BusyProxy:
             self.release.wait(timeout=HANDSHAKE_TIMEOUT_S)
 
     def record_observation(self, agent_id: str, path: str, observation: Observation) -> None:
+        self.queued.set()
         with self._lock:
             self.calls.append(path)
 

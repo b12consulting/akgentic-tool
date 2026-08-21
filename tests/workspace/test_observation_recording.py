@@ -17,7 +17,7 @@ import pytest
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
 from akgentic.tool.workspace.models import WorkspaceConfig, content_sha
-from akgentic.tool.workspace.tool import WorkspaceTool
+from akgentic.tool.workspace.tool import WorkspaceTool, _paginate
 
 from tests.workspace.conftest import (
     HANDSHAKE_TIMEOUT_S,
@@ -185,6 +185,49 @@ class TestWhatAReadRecords:
         assert workspace_actor.observation_for(agent_id_of(observer), "missing.md") is None
 
 
+class TestPaginateIsTheSingleSourceOfFull:
+    """``_paginate`` decides what every observation's ``full`` flag says.
+
+    It is reached through ``workspace_read`` above, but only over the two or
+    three windows those tests happen to use. The flag is a precondition the
+    write gate will key on, so the edges it is wrong at are worth pinning
+    directly — an exact-fit window, a file with no lines at all, and a window
+    that starts past the end.
+    """
+
+    @pytest.mark.parametrize(
+        ("raw", "offset", "limit", "expected_full"),
+        [
+            ("a\nb\nc\n", 1, 100, True),  # window wider than the file
+            ("a\nb\nc\n", 1, 3, True),  # window exactly the file
+            ("a\nb\nc\n", 1, 2, False),  # stops one line short
+            ("a\nb\nc\n", 2, 100, False),  # starts one line late
+            ("a\nb\nc\n", 0, 100, True),  # offset below 1 clamps to the start
+            ("a\nb\nc\n", 9, 100, False),  # window begins past the end
+            ("", 1, 100, True),  # no lines at all is a whole file
+            ("only\n", 1, 100, True),  # single line
+        ],
+    )
+    def test_full_tracks_the_window_the_reader_was_shown(
+        self, raw: str, offset: int, limit: int, expected_full: bool
+    ) -> None:
+        _, full = _paginate(raw, offset, limit)
+        assert full is expected_full
+
+    def test_the_text_and_the_flag_come_from_the_same_bounds(self) -> None:
+        # Whenever the flag says "not whole", the text must carry the truncation
+        # notice or start below line 1 — the two cannot disagree.
+        numbered, full = _paginate("a\nb\nc\n", offset=1, limit=2)
+        assert full is False
+        assert "truncated: 3 lines total, showing 1-2" in numbered
+        assert numbered.startswith("1     a")
+
+    def test_a_window_past_the_end_shows_nothing_and_claims_nothing(self) -> None:
+        numbered, full = _paginate("a\nb\nc\n", offset=9, limit=100)
+        assert numbered == ""
+        assert full is False
+
+
 # ---------------------------------------------------------------------------
 # AC4: the silent capabilities
 # ---------------------------------------------------------------------------
@@ -319,6 +362,12 @@ class TestFailOpen:
         occupier.start()
         assert busy.occupied.wait(timeout=HANDSHAKE_TIMEOUT_S)
         reader.start()
+        # Wait until the read has actually reached the recording call and is
+        # queueing behind the occupier. Releasing on ``reader.start()`` alone
+        # would let a scheduler run the occupier to completion first, and the
+        # test would pass having exercised no contention whatsoever.
+        assert busy.queued.wait(timeout=HANDSHAKE_TIMEOUT_S)
+        assert results == []  # nothing was returned early, and nothing was lost
         busy.release.set()
         occupier.join(timeout=HANDSHAKE_TIMEOUT_S)
         reader.join(timeout=HANDSHAKE_TIMEOUT_S)

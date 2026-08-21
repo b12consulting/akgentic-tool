@@ -253,6 +253,22 @@ class TestStartupSweep:
 
         assert all(path.exists() for path in survivors)
 
+    def test_a_directory_shaped_like_a_staging_file_is_left_alone(
+        self, workspace_tree: Path
+    ) -> None:
+        # The sweep matches on a name, so the only thing keeping it off a
+        # directory that happens to carry that name — and off everything the
+        # user put inside it — is the is_file() conjunct. Assert it, because
+        # the name check short-circuits ahead of it in every other test.
+        masquerading = workspace_tree / staging_name("a.md")
+        masquerading.mkdir()
+        (masquerading / "kept.md").write_text("keep me", encoding="utf-8")
+
+        start_actor()
+
+        assert masquerading.is_dir()
+        assert (masquerading / "kept.md").exists()
+
     def test_an_unremovable_staging_file_does_not_stop_the_actor(
         self, workspace_tree: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

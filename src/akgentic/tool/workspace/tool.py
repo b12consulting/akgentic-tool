@@ -665,7 +665,11 @@ class WorkspaceTool(ToolCard):
                 proxy.record_observation(
                     agent_id, path, Observation(sha=content_sha(data), full=full)
                 )
-            except Exception:  # noqa: BLE001 — a lost precondition, never a lost read
+            except Exception:
+                # Deliberately blind: a lost precondition, never a lost read. The
+                # gate reads a missing observation as "you have not read this" and
+                # refuses the overwrite, so every failure here degrades towards
+                # refusing a write rather than accepting a stale one.
                 logger.debug("Could not record an observation for %s", path, exc_info=True)
 
         return record
