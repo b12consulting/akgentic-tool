@@ -22,6 +22,7 @@ from akgentic.tool.sandbox.actor import (
     SandboxActor,
     SandboxConfig,
     SandboxState,
+    sandbox_actor_name,
 )
 
 # ---------------------------------------------------------------------------
@@ -55,8 +56,20 @@ class FailingStopSandboxActor(ConcreteSandboxActor):
 
 
 def test_sandbox_actor_name_constant() -> None:
-    """AC3: SANDBOX_ACTOR_NAME is the expected string."""
+    """AC3: SANDBOX_ACTOR_NAME is the expected string.
+
+    It is the **prefix**, not the actor's name — the live name appends the
+    workspace, see ``sandbox_actor_name`` below.
+    """
     assert SANDBOX_ACTOR_NAME == "#SandboxActor"
+
+
+def test_sandbox_actor_name_carries_the_workspace() -> None:
+    """One actor per tree: the name is what ``getChildrenOrCreate`` keys on."""
+    assert sandbox_actor_name("proj-42") == "#SandboxActor-proj-42"
+    assert sandbox_actor_name("a") != sandbox_actor_name("b")
+    # The teardown invariant survives the suffix: a tool actor is one by prefix.
+    assert sandbox_actor_name("proj-42").startswith("#")
 
 
 def test_sandbox_actor_role_constant() -> None:

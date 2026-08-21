@@ -1,23 +1,69 @@
-# ExecTool
+# The sandbox backend — and `ExecTool`, deprecated
 
-Sandboxed shell execution inside the team workspace. One `SandboxActor` per team, an allow-listed
-binary set, and four interchangeable isolation backends selected by a single `mode` field.
-
-```python
-from akgentic.tool import ExecTool
-```
+Sandboxed shell execution inside the team workspace: one `SandboxActor` per workspace tree, an
+allow-listed binary set, and four interchangeable isolation backends selected by a single `mode`.
 
 | | |
 |---|---|
-| Module | `akgentic.tool.sandbox.tool` |
-| Actor | a `SandboxActor` subclass, singleton named `#SandboxActor` |
-| Channels used | `TOOL_CALL` |
+| Module | `akgentic.tool.sandbox` |
+| Actor | a `SandboxActor` subclass, singleton named `#SandboxActor-<workspace_id or team_id>` |
+| Channels used | `TOOL_CALL`, through `WorkspaceTool` |
 | Optional extras | none — `bwrap` / `sandbox-exec` / `docker` are host tools, not Python packages |
 | Environment | `AKGENTIC_WORKSPACES_ROOT`, `AKGENTIC_SANDBOX_IMAGE` |
 
 ---
 
-## The ToolCard
+## `ExecTool` is deprecated — use `WorkspaceTool(workspace_exec=…)`
+
+**The card moved. The backend did not.** Sandboxed execution is now a capability of
+`WorkspaceTool`, because exec and the write gate share one resource — the tree — and two cards over
+one tree means two mailboxes that interleave. Everything on *this* page below the next section is
+the exec **backend**, is not deprecated, and is what `workspace_exec` resolves through.
+
+```python
+# Before
+ToolFactory([WorkspaceTool(workspace_id="proj-42"), ExecTool(workspace_id="proj-42")], observer=agent)
+
+# After — one card, one tree, one gate, one history
+ToolFactory([WorkspaceTool(workspace_id="proj-42", workspace_exec=True)], observer=agent)
+```
+
+| | `ExecTool` | `WorkspaceTool(workspace_exec=…)` |
+|---|---|---|
+| Callable | `exec_command(cmd, cwd="")` | `workspace_exec(cmd, cwd="")` + `workspace_exec_result(run_id)` |
+| Mode | `ExecTool(mode=…)` | `WorkspaceExec(mode=…)` |
+| Budget | not configurable | `WorkspaceExec(timeout_s=…, poll_attempts=…, poll_delay_seconds=…)` |
+| Directory | `ExecTool(workspace_id=…)` | `WorkspaceTool(workspace_id=…)` |
+| Journal | always on, and **not reachable** by any `ExecTool` field | `WorkspaceTool(workspace_git=…)` |
+
+**What still works.** The class resolves, the field names are unchanged, and `exec_command` behaves
+identically — same lease, same worker, same discovery, same commit. It is a shim over
+`workspace_exec`, not a second implementation, so the two cannot drift.
+
+**What warns.** A `DeprecationWarning` when the card is **wired** — at `observer()` — naming its
+replacement. Deliberately not at import: an import-time warning fires for anybody who merely has
+the module in a dependency's `__init__`, which is nobody's decision to change.
+
+**What an `ExecTool`-only agent gives up.** It creates the `#Workspace` actor for its workspace, and
+the first card to create that actor decides the configuration — so it always gets the journal's
+defaults. `AC2` froze the shim's three fields, so there is no `workspace_git` on it and no way to
+reach one. Move to `WorkspaceTool` if you need that.
+
+### What "a deprecated card" means here
+
+The package's [§Migration](../../../../README.md#migration-moved-import-paths) policy governs moved
+**import paths** and their Stable/Internal tiers. `ExecTool` moves no module, so that policy does
+not cover it. The policy for a deprecated *card* is:
+
+- it keeps working, identically, for as long as it ships;
+- it emits a `DeprecationWarning` naming its replacement;
+- it leaves the package README's Tool Catalog for a migration pointer, and stops counting towards
+  the number of tools the package advertises — a shim is not a distinct usable capability;
+- it is removed **no earlier than the minor release after** the one that deprecated it.
+
+---
+
+## The `ExecTool` card, as it stands
 
 ```python
 class ExecTool(ToolCard):
@@ -26,6 +72,8 @@ class ExecTool(ToolCard):
     workspace_id: str | None = None
 
     _sandbox_proxy: SandboxActor | None = PrivateAttr(default=None)
+    _workspace_proxy: WorkspaceActor | None = PrivateAttr(default=None)
+    _agent_id: str = PrivateAttr(default="")
 ```
 
 **The backend class is resolved at `observer()` time, not at import time.** `observer()` looks
@@ -33,14 +81,18 @@ class ExecTool(ToolCard):
 extend before any card is constructed. A `mode` naming an unregistered backend raises `KeyError` —
 deliberately fail-fast, at team creation.
 
-**One actor, many callers.** `getChildrenOrCreate(actor_class, config=SandboxConfig(...))` is
-idempotent, so every agent carrying an `ExecTool` shares one `#SandboxActor` and one workspace
-directory. With `mode="docker"` that means one container per team, reused across every call
-rather than started per command.
+**One actor per tree, many callers.** `getChildrenOrCreate(actor_class, config=SandboxConfig(...))`
+is idempotent and keys on the actor **name**, so every agent whose card resolves to one workspace
+shares one `#SandboxActor-<workspace>`. The name carries the workspace for the same reason
+`#Workspace-<workspace>` does: a constant name would resolve two exec-capable cards on two
+workspaces onto the *first* actor, and the second agent's commands would then run in the first
+agent's tree while its own workspace actor gated an untouched one. With `mode="docker"`, note that
+the **container** is still named per team (`sandbox-{team_id}`), so two workspaces in one team on
+the docker backend still share one container and therefore one mount.
 
 ---
 
-## ToolCard fields
+## Backend selection
 
 ### `mode`
 
@@ -68,16 +120,14 @@ anything the host user can read; the **command allowlist is the primary boundary
 | `None` *(default)* | The workspace directory is named after the team id. |
 | any `str` | That directory is used instead. |
 
-Forwarded to `SandboxConfig.workspace_id`, so pairing it with `WorkspaceTool(workspace_id=…)`
-gives the file tools and the shell the **same directory** — the usual setup for a coding agent
-that writes a file and then runs it:
+Forwarded to `SandboxConfig.workspace_id`, and to the sandbox actor's own **name**, so a card
+resolving to one workspace gets one backend over one directory. On `WorkspaceTool` the same value
+also names the tree the file tools use and the workspace actor that gates it — one field, one tree.
 
-```python
-ToolFactory([WorkspaceTool(workspace_id="proj-42"), ExecTool(workspace_id="proj-42")], observer=agent)
-```
-
-The Docker **container** name always derives from the team id: containers are per-team, not
-per-workspace.
+The Docker **container** name still derives from the team id (`sandbox-{team_id}`): containers are
+per-team execution resources. Two workspaces in one team therefore get two sandbox *actors* but one
+container, whose mount is whichever tree started first — use one workspace per team on the docker
+backend, or a different `mode`.
 
 ### `exec_command`
 
@@ -99,7 +149,8 @@ ExecTool(exec_command=ExecCommand(
 ## The callable
 
 ```python
-exec_command(cmd: str, cwd: str = "") -> str
+exec_command(cmd: str, cwd: str = "") -> str          # the shim
+workspace_exec(cmd: str, cwd: str = "") -> str        # the replacement — same arguments
 ```
 
 | Argument | Meaning |
@@ -107,7 +158,7 @@ exec_command(cmd: str, cwd: str = "") -> str
 | `cmd` | Full command string. The **first token** must be in `ALLOWED_COMMANDS`. |
 | `cwd` | Subdirectory relative to the workspace root. Empty ⇒ the root. |
 
-Returns a combined summary, never raises:
+Both render a finished run through one formatter, so the two surfaces cannot drift:
 
 ```
 exit_code: 0 (OK)
@@ -117,32 +168,45 @@ stderr (note: many tools write progress to stderr even on success):
 ...
 ```
 
+A command still running when the caller's poll budget runs out returns
+`Run <id> is still in progress. …` instead, and its output is collected on the next turn — through
+`workspace_exec_result(run_id)` on the capability, or by a second `exec_command` poll on the shim.
+
 The allowed binaries are appended to the docstring at build time, so the model sees the list in
 the tool description rather than discovering it by failing.
 
 ### The allowlist
 
-`ALLOWED_COMMANDS` is a module-level `frozenset`:
+`ALLOWED_COMMANDS` is a module-level `frozenset` of 25 binaries:
 
-`python`, `python3`, `pytest`, `ruff`, `mypy`, `git`, `uv`, `pip`, `cat`, `ls`, `find`, `grep`,
+`python`, `python3`, `pytest`, `ruff`, `mypy`, `uv`, `pip`, `cat`, `ls`, `find`, `grep`,
 `mkdir`, `cp`, `mv`, `rm`, `echo`, `touch`, `curl`, `wget`, `make`, `bash`, `sh`, `node`, `npm`,
 `npx`
 
+**`git` is not on it.** With a repository under the workspace root, `git reset --hard` or
+`git checkout` from inside the sandbox would destroy the journal. The real guarantee is not this
+list, though: the repository lives at the sibling `<root>.git`, **outside every backend's mount**,
+so it is not there to be reached. Removing `git` from the list is defence in depth.
+
 **Only the first whitespace-delimited token is checked.** Argument-level filtering is explicitly
-out of scope, and `bash` and `sh` are on the list — so the allowlist bounds *which interpreters
-start*, not what they subsequently do. That is why the filesystem backend matters: on `local` the
-allowlist is the whole boundary, on `bwrap` / `seatbelt` / `docker` it is one layer of two.
+out of scope, and `bash` and `sh` are on the list — so `bash -c "git reset --hard"` walks straight
+past it. The allowlist bounds *which interpreters start*, not what they subsequently do. **Nothing
+may rely on it for safety.** That is why the filesystem backend matters: on `local` the allowlist is
+all there is, on `bwrap` / `seatbelt` / `docker` it is one layer of two.
 
-An empty `cmd`, or a first token outside the set, produces a `CommandNotAllowedError` **string**
-listing the allowed commands. Any backend failure produces a `SandboxError: <Type>: <message>`
-string. Nothing propagates as an exception — a tool call must always yield a tool response.
+An empty `cmd`, or a first token outside the set, raises `CommandNotAllowedError` — **on the
+worker's thread**, where the allowlist check now runs. It therefore reaches the agent as a reported
+run *failure* rather than as an exception out of the tool call, and it still lists the allowed
+commands:
 
 ```
-CommandNotAllowedError: Command 'psql' is not in the allowed commands list.
+Run 3f2ac91d failed: Command 'psql' is not in the allowed commands list.
  Allowed: ['bash', 'cat', 'cp', ...]
-
-SandboxError: TimeoutExpired: Command 'python main.py' timed out after 30s
 ```
+
+A command its budget killed is an **outcome**, not a failure — "too slow" is the ordinary case for
+a shell, so it comes back collectible, with exit code 124 and a stderr saying so. Nothing
+propagates as an exception from either surface: a tool call must always yield a tool response.
 
 ---
 
@@ -152,22 +216,37 @@ SandboxError: TimeoutExpired: Command 'python main.py' timed out after 30s
 
 ```
 $AKGENTIC_WORKSPACES_ROOT/          # default ./workspaces
-└── <workspace_id or team_id>/      # created on actor start; cwd is resolved under it
+├── <workspace_id or team_id>/      # created on actor start; cwd is resolved under it
+└── <workspace_id or team_id>.git/  # the journal — outside every mount, deliberately
 ```
 
-The directory is created by `_start_sandbox()` and recorded in `SandboxState.workspace_path`.
+The directory is created by `_start_sandbox()` and recorded in `SandboxState.workspace_path`. Only
+the first line is ever mounted.
 
 ### Backend specifics
 
 | | `local` | `bwrap` | `seatbelt` | `docker` |
 |---|---|---|---|---|
-| Per-command timeout | 30 s | 30 s | 30 s | 60 s (`DOCKER_EXEC_TIMEOUT`) |
+| Timeout when the caller passes none | 30 s | 30 s | 30 s | 30 s (`DOCKER_EXEC_TIMEOUT`) |
 | Process group | new group, so a timeout kills the whole subtree | same | not applied | container-side |
 | `RLIMIT_AS` | 512 MB on Linux, **skipped on Darwin** where it is not reliably enforceable | same | not applied | n/a |
 | Network | host network | **disabled** (`--unshare-net`) | allowed | container network |
 | Reads outside the workspace | allowed | denied — `/usr`, `/lib*`, `/tmp`, `/dev`, `/proc` bound read-only, everything else invisible | **allowed** (macOS tooling needs broad reads); writes confined | container filesystem only |
 
 CPU-time and file-size limits are applied on all POSIX platforms for `local` and `bwrap`.
+
+**These four are per-backend *defaults*, not the budget a run actually gets.** Every real caller
+passes one: `WorkspaceExec.timeout_s` (15 s by default) travels to `subprocess.run(timeout=…)` after
+being clamped to the deferred worker's own 20 s, which sits below the orchestrator's 30 s stop
+backstop. A budget that stopped at the proxy would be decoration — a Python thread cannot be
+cancelled, so a subprocess still running past its worker's budget holds its parent's teardown open
+for the difference. The 30 s above applies only to a caller that names no budget at all, such as a
+harness starting a backend directly.
+
+**`.git` is never inside a mount.** `bwrap` binds only the workspace root; `docker` mounts only
+`<root>:/workspace`; `seatbelt` confines *writes* to the workspace and the tmpdir. The journal lives
+at the sibling `<root>.git`, so it is outside all three by construction — binding a parent directory
+here for convenience would silently undo it.
 
 `SeatbeltSandboxActor._start_sandbox()` emits a `DeprecationWarning`: `sandbox-exec` has been
 deprecated since macOS 10.15 and may be removed. Treat seatbelt as a developer-workstation
@@ -212,28 +291,39 @@ leave a Pykka actor wedged.
 
 ### Recipes
 
+Written on `WorkspaceTool`, which is where the card now lives. Every line has an `ExecTool`
+equivalent that still works and still warns.
+
 ```python
-ExecTool()                        # auto: bwrap -> seatbelt -> docker -> local
-ExecTool(mode="docker")           # deterministic toolchain, per-team container
-ExecTool(mode="bwrap")            # Linux CI runner with real isolation
-ExecTool(mode="local")            # local development, no isolation
-ExecTool(workspace_id="proj-42")  # share the directory with WorkspaceTool
-ExecTool(exec_command=False)      # card wired, capability withheld
+WorkspaceTool(workspace_exec=True)                              # auto: bwrap -> seatbelt -> docker -> local
+WorkspaceTool(workspace_exec=WorkspaceExec(mode="docker"))      # deterministic toolchain
+WorkspaceTool(workspace_exec=WorkspaceExec(mode="bwrap"))       # Linux CI runner, real isolation
+WorkspaceTool(workspace_exec=WorkspaceExec(mode="local"))       # local development, no isolation
+WorkspaceTool(workspace_id="proj-42", workspace_exec=True)      # named tree, shell over the same one
+WorkspaceTool(workspace_exec=WorkspaceExec(timeout_s=8.0))      # tighter command budget
+WorkspaceTool()                                                 # exec withheld — the default
 ```
 
 ### Import paths
 
 ```python
-from akgentic.tool import ExecTool
+from akgentic.tool import ExecTool, WorkspaceTool          # ExecTool: deprecated, still resolves
+from akgentic.tool.workspace import WorkspaceExec
 from akgentic.tool.sandbox import (
     ALLOWED_COMMANDS, SANDBOX_ACTOR_NAME, CommandNotAllowedError, ExecResult,
-    SandboxActor, SandboxConfig, SandboxState,
+    SandboxActor, SandboxConfig, SandboxState, sandbox_actor_name,
     LocalSandboxActor, BwrapSandboxActor, SeatbeltSandboxActor, DockerSandboxActor,
 )
 from akgentic.tool.sandbox.tool import SANDBOX_ACTOR_CLASSES, ExecCommand
 ```
 
+`SANDBOX_ACTOR_NAME` is the `#`-prefix, **not** the actor's name; `sandbox_actor_name(workspace)`
+builds the live one. Copying the constant expecting a name is the mistake this pair exists to make
+hard.
+
 ---
 
-See the [package README](../../../../README.md) for the `ToolCard` / `ToolFactory` machinery and
-the tool-actor conventions.
+See the [`WorkspaceTool` reference](../workspace/README.md) for the `workspace_exec` capability, the
+tree lease, the discovered write set and the journal; and the
+[package README](../../../../README.md) for the `ToolCard` / `ToolFactory` machinery and the
+tool-actor conventions.

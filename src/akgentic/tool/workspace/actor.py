@@ -362,9 +362,15 @@ class WorkspaceActor(DeferredResultActor[WorkspaceConfig, WorkspaceState, str, E
 
     From story 29-5 it is also a :class:`~akgentic.tool.core.deferred.DeferredResultActor`
     keyed by run id. The base supplies ``_slots`` and ``_in_flight``; do not
-    shadow them, do not reach into them from :meth:`exec_status`, and do not add
-    a second cache. Its LRU and its negative TTL are two of the seven deferred
-    rules, and reimplementing either is how a partial adoption starts.
+    shadow them and do not add a second cache. Its LRU and its negative TTL are
+    two of the seven deferred rules, and reimplementing either is how a partial
+    adoption starts.
+
+    :meth:`exec_status` **does** read ``_in_flight``, and that is deliberate: a
+    run is running iff it is in flight, and the earlier prohibition forced the
+    question onto a map with a different capacity, which answered ``RUNNING`` for
+    settled runs. Reading an own attribute on an own thread is not a partial
+    adoption; duplicating the cache would be.
     """
 
     def on_start(self) -> None:
@@ -460,7 +466,8 @@ class WorkspaceActor(DeferredResultActor[WorkspaceConfig, WorkspaceState, str, E
 
         Last writer wins, and that is correct: two exec-capable cards over one
         tree must agree on the backend anyway, since they share one
-        ``#SandboxActor``.
+        ``#SandboxActor-<workspace>`` — the sandbox actor is named per workspace,
+        for the same reason this one is.
 
         Args:
             config: The resolved backend and the ids to build payloads from.
@@ -527,8 +534,22 @@ class WorkspaceActor(DeferredResultActor[WorkspaceConfig, WorkspaceState, str, E
         unknown key, an in-flight one and a negatively-cached one alike, and
         telling a model "still running" about an id it invented is a dead end it
         cannot recover from. So a failure is read from this actor's own small
-        error map, and "running" is distinguished from "unknown" by whether the
-        id was ever issued to this agent.
+        error map.
+
+        **A run is running iff it is in flight**, and that is the definition
+        rather than a shortcut — which is why the base's ``_in_flight`` is read
+        here directly. The tracking map cannot answer it: ``_recent_runs`` holds
+        32 ids *per agent* while ``_slots`` holds 128 results *in total*, so past
+        five agents the tracking outlives the results and a settled run whose
+        outcome has been evicted would report as still running for ever.
+        ``_in_flight`` is this actor's own attribute, read on its own thread, and
+        it is cleared in the same mailbox turn that stores the outcome — so there
+        is no window in which a run is neither in flight nor answerable.
+
+        A settled run whose result has since been evicted therefore answers
+        ``UNKNOWN`` with this agent's recent ids, which is recoverable; the
+        alternative was a fourth state meaning "finished, result no longer held",
+        which invents semantics for the agent to reason about.
 
         Args:
             agent_id: Identity of the asking agent, as a string.
@@ -544,7 +565,7 @@ class WorkspaceActor(DeferredResultActor[WorkspaceConfig, WorkspaceState, str, E
         error = self._run_errors.get(run_id)
         if error is not None:
             return ExecStatus(state=ExecState.FAILED, run_id=run_id, reason=error)
-        if run_id in self._recent_runs.get(agent_id, {}):
+        if run_id in self._in_flight:
             return ExecStatus(state=ExecState.RUNNING, run_id=run_id)
         return ExecStatus(
             state=ExecState.UNKNOWN,

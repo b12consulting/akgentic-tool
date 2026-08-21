@@ -36,12 +36,12 @@ from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.core.deferred import DeferredPayload, DeferredWorker
 from akgentic.tool.sandbox.actor import (
-    SANDBOX_ACTOR_NAME,
     SANDBOX_ACTOR_ROLE,
     CardMode,
     SandboxActor,
     SandboxConfig,
     SandboxMode,
+    sandbox_actor_name,
 )
 
 logger = logging.getLogger(__name__)
@@ -343,20 +343,29 @@ def sandbox_config(payload_or_config: ExecPayload | ExecConfig) -> SandboxConfig
     """Build the sandbox actor's configuration — in one place, for both callers.
 
     ``getChildrenOrCreate`` keys on the actor **name**, so a config that differs
-    in name creates a *second* ``#SandboxActor`` per run instead of resolving the
-    team's one; a config that differs in ``workspace_id`` would point the reused
-    actor's container at the wrong directory. The card builds one at wiring time
-    and the worker builds one per run, and the two must be identical — so they
-    are built here rather than twice by hand.
+    in name creates a *second* actor per run instead of resolving the existing
+    one; a config that differs in ``workspace_id`` would point the reused actor
+    at the wrong directory. The card builds one at wiring time and the worker
+    builds one per run, and the two must be identical — so they are built here
+    rather than twice by hand.
+
+    **The name carries the workspace**, exactly as ``#Workspace-<workspace>``
+    does. A constant name resolved two exec-capable cards on two workspaces onto
+    the first actor, so one agent's commands ran in the other's tree while its
+    own ``#Workspace`` gated an untouched one — see :func:`sandbox_actor_name`.
+    The workspace is resolved as ``workspace_id or team_id``, which is what
+    ``Filesystem`` and every backend's ``_start_sandbox`` already do, so the name
+    and the directory cannot disagree.
 
     Args:
         payload_or_config: Either side's carrier of the same four values.
 
     Returns:
-        The configuration for ``#SandboxActor``.
+        The configuration for ``#SandboxActor-<workspace>``.
     """
+    workspace_name = payload_or_config.workspace_id or payload_or_config.team_id
     return SandboxConfig(
-        name=SANDBOX_ACTOR_NAME,
+        name=sandbox_actor_name(workspace_name),
         role=SANDBOX_ACTOR_ROLE,
         team_id=payload_or_config.team_id,
         workspace_id=payload_or_config.workspace_id,
