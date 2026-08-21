@@ -73,7 +73,7 @@ Returns Tavily's raw search response — titles, URLs and snippets.
 Takes a **list** of absolute URLs and returns extracted content for each. Use it when the agent
 already has the links — from a `web_search` result, from the user, from a document.
 
-### `WebCrawl` — `web_crawl(url, timeout=…, max_depth=…, max_breadth=…, limit=…, instructions=…, extract_depth=…)`
+### `WebCrawl` — `web_crawl(url, timeout=…, max_depth=…, max_breadth=…, limit=…, crawl_instructions=…, extract_depth=…)`
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
@@ -82,8 +82,23 @@ already has the links — from a `web_search` result, from the user, from a docu
 | `max_depth` | `int \| None` | `None` | Link depth from the root URL. Tavily supports 1–5. |
 | `max_breadth` | `int \| None` | `None` | Links followed per level. Tavily supports 1–500. |
 | `limit` | `int \| None` | `None` | Total pages processed before stopping. Must be ≥ 1. |
-| `instructions` | `str \| None` | `None` | Natural-language guidance biasing the crawl and extraction toward a topic or section. **See the caveat below.** |
+| `crawl_instructions` | `str \| None` | `None` | Natural-language guidance biasing the crawl and extraction toward a topic or section. Reaches Tavily under its own kwarg name, `instructions`. |
 | `extract_depth` | `"basic" \| "advanced" \| None` | `None` | Extraction depth applied to crawled pages. |
+
+`crawl_instructions` is **not** the inherited `instructions`, and the difference is the whole
+point of the name:
+
+| Field | Effect |
+|---|---|
+| `crawl_instructions` | Sent to Tavily. Biases which pages are crawled and what is extracted. Invisible to the model except as an argument default. |
+| `instructions` *(inherited from `BaseToolParam`)* | Appended to the tool description the model reads. Never sent anywhere. |
+
+```python
+WebCrawl(
+    crawl_instructions="focus on the API reference",   # biases the crawl
+    instructions="Only crawl public documentation.",   # tells the model when to use it
+)
+```
 
 Every `None` field is omitted from the Tavily call rather than sent as null, so Tavily's own
 defaults apply.
@@ -91,14 +106,14 @@ defaults apply.
 Crawling is the expensive capability: a `max_depth=5, max_breadth=500` crawl can walk thousands of
 pages. Set `limit` when exposing it to an agent that decides its own arguments.
 
-> **`instructions` means two things on `WebCrawl`.**
-> `BaseToolParam` defines `instructions` as the text appended to the tool's docstring, and
-> `WebCrawl` redeclares the same name as Tavily's crawl guidance. The field is used for **both**:
-> the value is passed to `tavily_client.crawl(instructions=...)` *and* appended to the description
-> the model reads. Setting `WebCrawl(instructions="focus on the API reference")` therefore biases
-> the crawl and adds that sentence to the tool description. That is usually harmless, and often
-> what you want — but it is the one place in the package where `instructions` is not purely
-> documentation.
+> **Migrating from a single `instructions` field.**
+> `WebCrawl` used to re-declare `instructions`, so one value did both jobs at once — it was
+> passed to Tavily *and* appended to the tool description, with no way to ask for either alone.
+> A stored `WebCrawl(instructions=...)` still loads, but it now only appends to the description;
+> the crawl is no longer biased by it. The two intents cannot be told apart in persisted config,
+> so this is not migrated automatically. Re-point any catalog entry that relied on the crawl
+> bias at `crawl_instructions`. The tool callable's argument was renamed to match, so a model
+> that used to pass `instructions=` now passes `crawl_instructions=`.
 
 ---
 

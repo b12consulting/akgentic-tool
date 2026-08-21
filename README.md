@@ -813,7 +813,8 @@ Requires the `TAVILY_API_KEY` environment variable. A missing or invalid key nev
 tool returns a message telling the model it is unavailable.
 
 **[Full reference → `src/akgentic/tool/search/README.md`](src/akgentic/tool/search/README.md)** —
-every Tavily parameter with its accepted range, and the `WebCrawl.instructions` double meaning.
+every Tavily parameter with its accepted range, and how `crawl_instructions` differs from the
+inherited `instructions`.
 
 ### TeamTool
 
