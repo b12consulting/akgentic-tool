@@ -46,9 +46,12 @@ point it would bite:
   fork into an indefinite one, on the single thread every mutation in the team
   shares. ``-c commit.gpgsign=false`` and ``--no-verify`` remove both;
 - an inherited ``GIT_*`` environment — a developer running the suite inside a
-  repository, or CI — reaches the child. Explicit flags beat ``GIT_DIR``, but
-  the identity variables have no flag equivalent, so the child environment is
-  scrubbed of every ``GIT_`` key before ours are set.
+  repository, or CI — reaches the child, and so does that machine's
+  ``~/.gitconfig``. Explicit flags beat ``GIT_DIR``, but the identity variables
+  have no flag equivalent, so the child environment is scrubbed of every
+  ``GIT_`` key before ours are set, and both configuration files are switched
+  off with it — ``core.excludesFile`` and ``core.autocrlf`` change what a commit
+  *contains*, not how it looks.
 """
 
 from __future__ import annotations
@@ -92,9 +95,18 @@ def _scrubbed_env() -> dict[str, str]:
     ``GIT_DIR``, ``GIT_INDEX_FILE`` or an identity. Explicit flags beat
     ``GIT_DIR``, but the identity variables have no flag equivalent and
     ``GIT_INDEX_FILE`` would silently point the staging area somewhere else.
+
+    Both configuration files go with them. The system one is the rarer of the
+    two; the **global** one is the file every developer and every CI image
+    actually has, and two of its ordinary settings change what the journal
+    records rather than merely how it looks: ``core.excludesFile`` drops an
+    agent's own file out of that agent's commit (and logs a warning for every
+    mutation thereafter), and ``core.autocrlf`` rewrites the bytes the commit
+    holds. Neither is a failure anybody would trace back to ``~/.gitconfig``.
     """
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
     env["GIT_TERMINAL_PROMPT"] = "0"
     return env
 
@@ -228,6 +240,22 @@ class GitJournal:
                 "Workspace %s: name collides with a sibling journal directory — git "
                 "journal disabled. Rename the workspace to record history.",
                 self._root.name,
+            )
+            self._enabled = False
+            return False
+        if self._git_dir.exists() and not (self._git_dir / "HEAD").is_file():
+            # The same collision from the other side, and this is its destructive
+            # half: workspace "foo" journals to "foo.git", which is *workspace*
+            # "foo.git"'s tree. Initialising there would scatter HEAD, config,
+            # objects/ and refs/ through another team's workspace — listable,
+            # readable and writable by its agents, one of whom overwrites config
+            # and takes this journal with it. Refusing costs the history of one
+            # misnamed workspace; not refusing costs another team's tree.
+            logger.warning(
+                "Workspace %s: %s exists and is not a repository — git journal disabled "
+                "rather than initialised over it.",
+                self._root.name,
+                self._git_dir,
             )
             self._enabled = False
             return False

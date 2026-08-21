@@ -172,6 +172,54 @@ class TestTheRepository:
         with pytest.raises(RetriableError, match="read it before overwriting"):
             mutate(card, "workspace_write", "unseen.md", "mine\n")
 
+    def test_a_journal_never_initialises_inside_another_workspaces_tree(
+        self, workspaces_root: Path, orchestrator_proxy: FakeOrchestratorProxy
+    ) -> None:
+        """The same collision from the other side, and the half that destroys data.
+
+        Workspace ``shared`` journals to ``shared.git``, which is *workspace*
+        ``shared.git``'s tree. Guarding only the ``.git``-named workspace's own
+        journal leaves that tree open: ``git init`` there scatters ``HEAD``,
+        ``config``, ``objects/`` and ``refs/`` through another team's workspace,
+        where its agents can list, read and overwrite them — and overwriting
+        ``config`` or ``HEAD`` takes this journal with it.
+        """
+        victim = workspaces_root / "shared.git"
+        victim.mkdir()
+        (victim / "theirs.md").write_text("another team's file\n", encoding="utf-8")
+        mine = workspaces_root / "shared"
+        mine.mkdir()
+        (mine / "unseen.md").write_text("already here\n", encoding="utf-8")
+
+        card, _observer = card_for(orchestrator_proxy, "alice", workspace_id="shared")
+
+        # The other team's tree is exactly as they left it …
+        assert [entry.name for entry in victim.iterdir()] == ["theirs.md"]
+        # … and the gate is untouched: only the history is lost.
+        assert mutate(card, "workspace_write", "fresh.md", "body\n") == "Written: fresh.md"
+        with pytest.raises(RetriableError, match="read it before overwriting"):
+            mutate(card, "workspace_write", "unseen.md", "mine\n")
+
+    def test_a_real_repository_is_reused_rather_than_refused(
+        self, wired_card: WorkspaceTool, workspace_tree: Path
+    ) -> None:
+        # The guard above keys on "exists but has no HEAD". A repository this
+        # actor already created has one, so a restart must still reuse it —
+        # otherwise the guard would disable the journal on every second start.
+        mutate(wired_card, "workspace_write", "fresh.md", "body\n")
+        assert (git_dir_for(workspace_tree) / "HEAD").is_file()
+
+        second = WorkspaceActor(
+            config=WorkspaceConfig(
+                name=workspace_actor_name(WORKSPACE_NAME),
+                role=WORKSPACE_ACTOR_ROLE,
+                workspace_name=WORKSPACE_NAME,
+            )
+        )
+        second.on_start()
+
+        assert second._journal.enabled
+
 
 # ---------------------------------------------------------------------------
 # AC2 / AC2b: one accepted mutation is exactly one commit, authored by its agent
@@ -696,6 +744,44 @@ class TestIdentity:
         assert commit.author_name == "alice"
         assert commit.author_email == alice_email(wired_card)
 
+    def test_a_global_git_config_cannot_change_what_is_recorded(
+        self,
+        wired_card: WorkspaceTool,
+        workspace_tree: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``~/.gitconfig`` is the file every machine has, and two of its settings bite.
+
+        ``core.excludesFile`` drops the agent's own file out of the agent's own
+        commit — silently, and with a warning per mutation for the rest of the
+        team's life — and ``core.autocrlf`` rewrites the bytes the commit holds.
+        Scrubbing ``GIT_*`` does not reach either: git finds the file through
+        ``HOME``. Both configuration files are switched off in the child instead.
+
+        ``excludesFile`` is the half asserted here, because it is the half this
+        harness can see: ``subprocess`` reads git's output with universal
+        newlines, so an ``autocrlf`` rewrite is invisible through any helper that
+        shells out. It is carried in the config anyway — one setting reaching the
+        child and the other not is not a shape this fix can produce.
+        """
+        home = tmp_path / "hostile-home"
+        home.mkdir()
+        (home / "ignore").write_text("*.md\n", encoding="utf-8")
+        (home / ".gitconfig").write_text(
+            f"[core]\n\texcludesFile = {home / 'ignore'}\n\tautocrlf = true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+
+        mutate(wired_card, "workspace_write", "fresh.md", "the exact bytes\n")
+
+        commit = journal_log(workspace_tree)[-1]
+        assert commit.author_name == "alice"
+        assert commit.files == ["fresh.md"]  # excludesFile did not reach it
+        assert git_show(workspace_tree, f"{commit.sha}:fresh.md") == "the exact bytes\n"
+
 
 # ---------------------------------------------------------------------------
 # AC9: no journal failure can fail a mutation
@@ -997,23 +1083,30 @@ class TestTheGateSurvivesWithoutGit:
         monkeypatch.setattr(subprocess, "run", forbidden)
         assert mutate(journal_off, "workspace_write", "fresh.md", "body\n") == "Written: fresh.md"
 
+    @pytest.mark.parametrize("mode", ["git-absent", "card-disabled"])
     def test_exactly_one_warning_is_logged_not_one_per_mutation(
         self,
-        request: pytest.FixtureRequest,
+        mode: str,
         orchestrator_proxy: FakeOrchestratorProxy,
         workspace_tree: Path,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        real_which = shutil.which
-        monkeypatch.setattr(
-            shutil,
-            "which",
-            lambda cmd, *a, **k: None if cmd == "git" else real_which(cmd, *a, **k),
-        )
+        # Both ways of turning the journal off, because AC8 asks for one warning
+        # from each and they leave `initialise` down different branches.
+        if mode == "git-absent":
+            real_which = shutil.which
+            monkeypatch.setattr(
+                shutil,
+                "which",
+                lambda cmd, *a, **k: None if cmd == "git" else real_which(cmd, *a, **k),
+            )
         with caplog.at_level(logging.WARNING, logger="akgentic.tool.workspace.journal"):
             observer = FakeActorToolObserver(orchestrator_proxy, name="alice")
-            card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+            card = WorkspaceTool(
+                workspace_id=WORKSPACE_NAME,
+                workspace_git=mode != "card-disabled",
+            )
             card.observer(observer)
             for index in range(5):
                 mutate(card, "workspace_write", f"file{index}.md", "body\n")
