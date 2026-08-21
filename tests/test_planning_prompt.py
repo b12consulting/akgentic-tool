@@ -419,7 +419,7 @@ def _make_tool_with_mocks(
 
 
 class TestPlanningToolRoutingMethods:
-    """Coverage for get_system_prompts, get_tools, get_commands routing."""
+    """Coverage for get_context_states, get_tools, get_commands routing."""
 
     def test_get_context_states_returns_provider_when_llm_context_exposed(self) -> None:
         """get_context_states returns list with one provider when LLM_CONTEXT in expose."""

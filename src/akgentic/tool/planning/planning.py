@@ -167,7 +167,8 @@ class PlanningTool(ToolCard):
         return ["VectorStoreTool"] if self.vector_store is not False else []
 
     get_planning: GetPlanning | bool = Field(
-        default=True, description="By default the plan in included in the system prompt"
+        default=True,
+        description="By default the plan is exposed as structured context state and as a command",
     )
     get_planning_task: GetPlanningTask | bool = True
     update_planning: UpdatePlanning | bool = True
