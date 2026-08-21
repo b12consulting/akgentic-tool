@@ -29,6 +29,7 @@ channel system — as tool calls, system prompt injections, or programmatic comm
   - [VectorStoreTool](#vectorstoretool)
   - [SearchTool](#searchtool)
   - [TeamTool](#teamtool)
+  - [MetadataTool](#metadatatool)
   - [NotificationTool](#notificationtool)
   - [MCPTool](#mcptool)
   - [ExecTool](#exectool)
@@ -54,9 +55,10 @@ running inside it. It provides:
   > from `akgentic.llm.event` instead.
 - **RetriableError** — tools signal recoverable failures; `ToolFactory` translates them to the
   framework-specific retry exception without coupling tool logic to pydantic-ai
-- **Domain tools** — nine production-ready tool implementations covering workspace I/O, task
-  planning, knowledge graph, web search, team management, vector-store configuration, MCP server
-  integration, sandboxed shell execution, and self-scheduled notifications
+- **Domain tools** — ten production-ready tool implementations covering workspace I/O, task
+  planning, knowledge graph, web search, team management, the team's business context, vector-store
+  configuration, MCP server integration, sandboxed shell execution, and self-scheduled
+  notifications
 
 ```
 ToolCard(s)
@@ -689,7 +691,7 @@ decoration.
 
 ## Tool Catalog
 
-Nine tool cards ship with the package. Each one has its own README next to the code, covering the
+Ten tool cards ship with the package. Each one has its own README next to the code, covering the
 `ToolCard` definition, every field and every nested capability parameter, and the full
 configuration surface — environment, extras, actor wiring and failure modes. The entries below
 are the index; the detail lives beside the module it documents.
@@ -702,6 +704,7 @@ are the index; the detail lives beside the module it documents.
 | `VectorStoreTool` | `akgentic.tool.vector_store` | Configuration-only card owning the shared embedding store | [README](src/akgentic/tool/vector_store/README.md) |
 | `SearchTool` | `akgentic.tool.search` | Web search, fetch and crawl via Tavily | [README](src/akgentic/tool/search/README.md) |
 | `TeamTool` | `akgentic.tool.team` | Hire, fire, roster, role profiles, and who is busy right now | [README](src/akgentic/tool/team/README.md) |
+| `MetadataTool` | `akgentic.tool.metadata` | The team's business context, rendered once into every agent's prefix | [README](src/akgentic/tool/metadata/README.md) |
 | `NotificationTool` | `akgentic.tool.notification` | Delayed messages an agent schedules to itself | [README](src/akgentic/tool/notification/README.md) |
 | `MCPTool` | `akgentic.tool.mcp` | External MCP servers as pydantic-ai toolsets | [README](src/akgentic/tool/mcp/README.md) |
 | `ExecTool` | `akgentic.tool.sandbox` | Sandboxed shell execution in the team workspace | [README](src/akgentic/tool/sandbox/README.md) |
@@ -841,6 +844,49 @@ when a summarizer is configured, and the callable's signature follows the config
 **[Full reference → `src/akgentic/tool/team/README.md`](src/akgentic/tool/team/README.md)** —
 the hire/fire channel split, partial-success reporting, the two activity gates, and how "busy" is
 derived from telemetry.
+
+### MetadataTool
+
+Renders the team's **business context** — the model the deployment wrote with
+`Orchestrator.set_metadata()` — into every agent's system prompt, from one operator-written
+template. Without it the same facts get copied into every role's backstory, where they duplicate
+and drift away from the authoritative copy. The card owns no actor and holds no state beyond the
+block it rendered.
+
+```python
+from akgentic.tool.core import COMMAND
+from akgentic.tool.metadata import MetadataTool, RenderMetadata
+
+MetadataTool(render_metadata=RenderMetadata(
+    header="Team context",
+    template="Fiscal year: {fiscal_year}. Engagement: {engagement}.",
+))
+
+MetadataTool(render_metadata=RenderMetadata(     # command only — nothing in the prompt
+    template="Fiscal year: {fiscal_year}.",
+    expose={COMMAND},
+))
+```
+
+Placeholders are **bare field names** of the team's metadata model — no dotted paths, indices,
+conversions or format specs — and a template that breaks that rule, or names a field the model does
+not declare, raises `ValueError` at wiring time, next to the mistake.
+
+**The block is a snapshot.** It is rendered **once**, at the first render that *succeeds*, and a
+later `set_metadata` is **not** reflected. That is deliberate, not a limitation waiting to be
+fixed: re-reading per turn would make the system prompt volatile and one write would invalidate
+every agent's prefix cache. (A *degraded* render caches nothing, so metadata that arrives just
+after start-up still produces its block on a later turn.) A deployment whose business context
+genuinely changes mid-life does not want this card.
+
+`expose` defaults to `{SYSTEM_PROMPT, COMMAND}`: the prompt the agents read, and `team_metadata()`
+for a human who wants to see exactly what they were given. `get_tools()` is **always** empty — the
+model is never handed a tool to fetch metadata, which would cost a round trip for content that
+never changes and require the model to know it should ask.
+
+**[Full reference → `src/akgentic/tool/metadata/README.md`](src/akgentic/tool/metadata/README.md)** —
+the template grammar in full, both validation points, the degradation table, and the recipes for
+metadata set before and after the team starts.
 
 ### NotificationTool
 
@@ -1057,6 +1103,10 @@ src/akgentic/tool/
     │   observer.py           # TeamManagementToolObserver — TeamTool's own contract
     │   └── activity.py       # team_activity models, GetTeamActivity,
     │                         #   ActivitySummarizer, TeamActivityActor, SummarizerWorker
+    metadata/
+    │   README.md           # MetadataTool reference — template grammar, snapshot contract
+    │   __init__.py           # Public exports: MetadataTool, RenderMetadata
+    │   └── tool.py           # MetadataTool ToolCard + RenderMetadata; no actor, no state
     notification/
     │   README.md           # NotificationTool reference — message_class contract, delivery
     │   __init__.py           # Public exports: NotificationTool, its capability params,
