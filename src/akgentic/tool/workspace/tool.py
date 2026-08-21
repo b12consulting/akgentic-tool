@@ -40,14 +40,27 @@ from akgentic.core.actor_address import ActorAddress
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.utils import SerializableBaseModel
 from akgentic.tool.core import COMMAND, TOOL_CALL, BaseToolParam, Channels, ToolCard, _resolve
+from akgentic.tool.core.deferred import poll_deferred
 from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.errors import RetriableError
+from akgentic.tool.sandbox.actor import CardMode
 from akgentic.tool.workspace.actor import (
     WORKSPACE_ACTOR_ROLE,
     WorkspaceActor,
     workspace_actor_name,
 )
 from akgentic.tool.workspace.edit import EditItem
+from akgentic.tool.workspace.execution import (
+    DEFAULT_EXEC_POLL_ATTEMPTS,
+    DEFAULT_EXEC_POLL_DELAY_S,
+    DEFAULT_EXEC_TIMEOUT_S,
+    ExecConfig,
+    ExecStatus,
+    format_status,
+    in_progress,
+    resolve_mode,
+    sandbox_config,
+)
 from akgentic.tool.workspace.models import (
     PERM_ERR_MSG,
     MutationOutcome,
@@ -215,6 +228,17 @@ def _resolve_outcome(outcome: MutationOutcome) -> str:
     if outcome.status is MutationStatus.REJECTED:
         raise RetriableError(outcome.message)
     return outcome.message
+
+
+def _settled_status(status: ExecStatus) -> ExecStatus | None:
+    """Answer the poll only once there is something final to say.
+
+    ``poll_deferred`` stops at the first non-``None``, so a fetch that answered
+    with a *running* status would end the poll on its first attempt and hand the
+    agent a run id it did not need. A failure, by contrast, is final — it is
+    collected as a failure with its reason, never reported as still running.
+    """
+    return status if status.settled else None
 
 
 def _bound(proxy: WorkspaceActor | None) -> WorkspaceActor:
@@ -445,6 +469,30 @@ class WorkspaceMkdir(BaseToolParam):
     expose: set[Channels] = {TOOL_CALL}
 
 
+class WorkspaceExec(BaseToolParam):
+    """Run a sandboxed shell command against the team workspace.
+
+    Configuration only — nothing here duplicates an argument of the callables it
+    enables. The three budgets it carries are three different things and are
+    easy to conflate:
+
+    - ``timeout_s`` bounds the **subprocess**, and reaches
+      ``subprocess.run(timeout=...)`` in the backend. It is clamped to the
+      worker's own budget, which sits below the orchestrator's stop backstop.
+    - ``poll_attempts`` × ``poll_delay_seconds`` bounds how long the **agent's
+      own thread** waits inside the tool call before it is handed a run id.
+
+    A run outlives the second and is collected on the next turn; it never
+    outlives the first.
+    """
+
+    expose: set[Channels] = {TOOL_CALL}
+    mode: CardMode = "auto"
+    timeout_s: float = DEFAULT_EXEC_TIMEOUT_S
+    poll_attempts: int = DEFAULT_EXEC_POLL_ATTEMPTS
+    poll_delay_seconds: float = DEFAULT_EXEC_POLL_DELAY_S
+
+
 class ResourceType(StrEnum):
     """Encoding of a seeded resource's ``content`` field.
 
@@ -536,6 +584,28 @@ class WorkspaceTool(ToolCard):
     workspace_patch: WorkspacePatch | bool = True
     workspace_mkdir: WorkspaceMkdir | bool = True
 
+    workspace_exec: WorkspaceExec | bool = False
+    """Sandboxed shell execution — **off unless asked for**, and that is a security
+    decision rather than a style one.
+
+    Every other capability on this card defaults to on because every other one is
+    a file operation the card already implies. Exec is not: defaulting it to
+    ``True`` would give every ``WorkspaceTool()`` in existence sandboxed shell
+    execution through a dependency bump, probe the host for docker at wiring
+    time, and bring a ``#SandboxActor`` into teams that never asked for one.
+    Capability escalation must be opt-in.
+
+    It is also the one field that registers **two** callables — ``workspace_exec``
+    and ``workspace_exec_result`` — breaking the card's otherwise strict
+    one-field-one-callable convention. Deliberate: the result collector is
+    meaningless without the runner, and separate fields would let a team enable
+    the half that cannot do anything.
+
+    Both live on the write side of ``read_only``: exec mutates the tree, whatever
+    the command happens to be, so ``WorkspaceTool(read_only=True,
+    workspace_exec=True)`` registers neither.
+    """
+
     resources: list[Resource] = []
     """Files seeded into the team workspace at observer() time, before the
     agent's first turn. Each resource is written only if its path does not
@@ -581,7 +651,44 @@ class WorkspaceTool(ToolCard):
         self._workspace = get_workspace(ws_name)
         self._seed_resources()
         self._bind_workspace_actor(observer, observer.orchestrator, ws_name)
+        self._bind_sandbox(observer, observer.orchestrator)
         return self
+
+    def _bind_sandbox(self, observer: ActorToolObserver, orchestrator: ActorAddress) -> None:
+        """Bring up the team's ``#SandboxActor`` and tell ``#Workspace`` about it.
+
+        **Nothing happens here when the capability is off** — no host probe, no
+        actor, no message. That is the whole of what ``workspace_exec=False``
+        buys, and it is why the check is at the top rather than inside.
+
+        The order matters: this runs *after* ``_bind_workspace_actor``, because
+        ``configure_exec`` travels over the tell proxy that method binds, and
+        after ``register_agent``, so the actor can already name this agent in a
+        refusal the first run causes.
+
+        Args:
+            observer: The owning agent, live at bind time.
+            orchestrator: Address of the orchestrator.
+
+        Raises:
+            KeyError: If the configured mode names no registered backend —
+                fail-fast at wiring time rather than at the first command.
+        """
+        params = _resolve(self.workspace_exec, WorkspaceExec)
+        if params is None or self.read_only:
+            return
+        mode, actor_class = resolve_mode(params.mode)
+        config = ExecConfig(
+            mode=mode,
+            team_id=str(observer.team_id),
+            workspace_id=self.workspace_id,
+            timeout_s=params.timeout_s,
+        )
+        orchestrator_proxy = observer.proxy_ask(orchestrator, Orchestrator)
+        orchestrator_proxy.getChildrenOrCreate(actor_class, config=sandbox_config(config))
+        tell = self._workspace_tell
+        if tell is not None:
+            tell.configure_exec(config)
 
     def _bind_workspace_actor(
         self, observer: ActorToolObserver, orchestrator: ActorAddress, workspace_name: str
@@ -730,7 +837,12 @@ class WorkspaceTool(ToolCard):
         return [tool for tool in candidates if tool is not None]
 
     def _write_tools(self) -> list[Callable[..., Any]]:
-        """Return enabled write-side callables — omitted entirely when ``read_only``."""
+        """Return enabled write-side callables — omitted entirely when ``read_only``.
+
+        Exec lands here rather than beside the reads because a command mutates
+        the tree whatever it happens to be, so it belongs on the write side of
+        the ``read_only`` gate.
+        """
         candidates = [
             self._tool_if_enabled(self.workspace_write, WorkspaceWrite, self._write_factory),
             self._tool_if_enabled(self.workspace_delete, WorkspaceDelete, self._delete_factory),
@@ -741,7 +853,21 @@ class WorkspaceTool(ToolCard):
             self._tool_if_enabled(self.workspace_patch, WorkspacePatch, self._patch_factory),
             self._tool_if_enabled(self.workspace_mkdir, WorkspaceMkdir, self._mkdir_factory),
         ]
-        return [tool for tool in candidates if tool is not None]
+        tools = [tool for tool in candidates if tool is not None]
+        return tools + self._exec_tools()
+
+    def _exec_tools(self) -> list[Callable[..., Any]]:
+        """Return both exec callables, or neither.
+
+        The one place in this card where a single capability field yields two
+        callables. ``_tool_if_enabled`` encodes the 1:1 shape and is deliberately
+        not used here — ``workspace_exec_result`` can do nothing without
+        ``workspace_exec``, so the pair is enabled or absent as a unit.
+        """
+        params = _resolve(self.workspace_exec, WorkspaceExec)
+        if params is None or TOOL_CALL not in params.expose:
+            return []
+        return [self._exec_factory(params), self._exec_result_factory(params)]
 
     @staticmethod
     def _tool_if_enabled(
@@ -1378,3 +1504,82 @@ class WorkspaceTool(ToolCard):
 
         workspace_mkdir.__doc__ = params.format_docstring(workspace_mkdir.__doc__)
         return workspace_mkdir
+
+    def _exec_factory(self, params: WorkspaceExec) -> Callable[..., Any]:
+        """Create the ``workspace_exec`` tool callable.
+
+        Args:
+            params: Exec capability configuration.
+
+        Returns:
+            Callable that runs a sandboxed command, through the actor.
+        """
+        proxy = self._workspace_proxy
+        agent_id = self._agent_id
+        attempts = params.poll_attempts
+        delay = params.poll_delay_seconds
+
+        def workspace_exec(cmd: str, cwd: str = "") -> str:
+            """Run a shell command in the team workspace, in a sandbox.
+
+            The workspace is held exclusively for the duration of the run: your
+            teammates can still read files, but every change they attempt is
+            refused until it finishes. Everything the command touched — files you
+            never named included — is recorded as one change attributed to you.
+
+            A command that outlives the wait returns a run id instead of output.
+            Call workspace_exec_result with that id on your next turn.
+
+            Args:
+                cmd: Full command string. The binary (first token) must be in
+                    the allow-list.
+                cwd: Subdirectory relative to workspace root. Defaults to root.
+
+            Returns:
+                Combined stdout, stderr and exit code, or a message naming the
+                run id to collect later.
+
+            Raises:
+                RetriableError: If another agent's run holds the workspace.
+            """
+            start = _bound(proxy).request_exec(agent_id, cmd, cwd)
+            if not start.run_id:
+                raise RetriableError(start.refusal)
+            run_id = start.run_id
+            settled = poll_deferred(
+                lambda: _settled_status(_bound(proxy).exec_status(agent_id, run_id)),
+                attempts=attempts,
+                delay=delay,
+            )
+            return format_status(settled) if settled is not None else in_progress(run_id)
+
+        workspace_exec.__doc__ = params.format_docstring(workspace_exec.__doc__)
+        return workspace_exec
+
+    def _exec_result_factory(self, params: WorkspaceExec) -> Callable[..., Any]:
+        """Create the ``workspace_exec_result`` tool callable.
+
+        Args:
+            params: Exec capability configuration.
+
+        Returns:
+            Callable that collects a finished run's output, through the actor.
+        """
+        proxy = self._workspace_proxy
+        agent_id = self._agent_id
+
+        def workspace_exec_result(run_id: str) -> str:
+            """Collect the output of a command started by workspace_exec.
+
+            Args:
+                run_id: The id workspace_exec handed back.
+
+            Returns:
+                The command's output if it has finished, a note that it is still
+                running, why it failed, or — for an id nothing was issued under —
+                your recent run ids so you can retry with the right one.
+            """
+            return format_status(_bound(proxy).exec_status(agent_id, run_id))
+
+        workspace_exec_result.__doc__ = params.format_docstring(workspace_exec_result.__doc__)
+        return workspace_exec_result

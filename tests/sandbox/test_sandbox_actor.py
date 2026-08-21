@@ -38,7 +38,7 @@ class ConcreteSandboxActor(SandboxActor):
     def _stop_sandbox(self) -> None:
         pass  # no-op for testing
 
-    def _exec(self, cmd: str, cwd: str) -> ExecResult:
+    def _exec(self, cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
         return ExecResult(stdout="ok", stderr="", exit_code=0)
 
 
@@ -184,7 +184,7 @@ def test_allowed_commands_is_frozenset() -> None:
 
 
 def test_allowed_commands_exact_set() -> None:
-    """AC2: ALLOWED_COMMANDS contains exactly the FR-SB-5 binaries."""
+    """AC2: ALLOWED_COMMANDS contains exactly the FR-SB-5 binaries, minus ``git``."""
     expected = frozenset(
         {
             "python",
@@ -192,7 +192,6 @@ def test_allowed_commands_exact_set() -> None:
             "pytest",
             "ruff",
             "mypy",
-            "git",
             "uv",
             "pip",
             "cat",
@@ -216,6 +215,28 @@ def test_allowed_commands_exact_set() -> None:
         }
     )
     assert ALLOWED_COMMANDS == expected
+    assert len(ALLOWED_COMMANDS) == 25
+
+
+def test_git_is_not_allowed() -> None:
+    """``git`` is off the list, because the workspace now keeps a repository.
+
+    Defence in depth only, and the test says so: ``bash`` and ``sh`` are still on
+    the list and only the first token is checked, so ``bash -c "git ..."`` walks
+    straight past this. What actually protects the journal is that it lives at
+    the sibling ``<root>.git``, outside every backend's mount — see
+    ``tests/sandbox/test_journal_placement.py``.
+    """
+    assert "git" not in ALLOWED_COMMANDS
+
+
+def test_a_git_command_is_refused_with_the_existing_error() -> None:
+    """The removal surfaces through the wording exec has always used."""
+    actor = ConcreteSandboxActor()
+    actor.on_start()
+
+    with pytest.raises(CommandNotAllowedError, match="git"):
+        actor.exec("git status")
 
 
 # ---------------------------------------------------------------------------
@@ -236,23 +257,32 @@ def test_exec_allowed_command_delegates_to_exec_impl() -> None:
 
 
 def test_exec_allowed_command_passes_cmd_and_cwd() -> None:
-    """exec() passes cmd and cwd to _exec unmodified."""
+    """exec() passes cmd, cwd and the timeout to _exec unmodified.
+
+    The timeout joined this tuple in 29-5: a worker owning a budget has to be
+    able to hand it to the subprocess, and a budget that stops at the proxy is
+    decoration — a Python thread cannot be cancelled.
+    """
     actor = ConcreteSandboxActor()
     actor.on_start()
 
-    received: list[tuple[str, str]] = []
+    received: list[tuple[str, str, float | None]] = []
 
     original_exec = actor._exec
 
-    def capturing_exec(cmd: str, cwd: str) -> ExecResult:
-        received.append((cmd, cwd))
-        return original_exec(cmd, cwd)
+    def capturing_exec(cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
+        received.append((cmd, cwd, timeout))
+        return original_exec(cmd, cwd, timeout)
 
     actor._exec = capturing_exec  # type: ignore[method-assign]
 
     actor.exec("python main.py", "/workspace")
+    actor.exec("python main.py", "/workspace", timeout=7.5)
 
-    assert received == [("python main.py", "/workspace")]
+    assert received == [
+        ("python main.py", "/workspace", None),
+        ("python main.py", "/workspace", 7.5),
+    ]
 
 
 # ---------------------------------------------------------------------------

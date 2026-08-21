@@ -27,7 +27,7 @@ from akgentic.tool.workspace.tool import (
     WorkspaceTool,
     _normalize_glob_pattern,
 )
-from akgentic.tool.workspace.workspace import Filesystem, Workspace
+from akgentic.tool.workspace.workspace import Filesystem, PathEscapeError, Workspace
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -748,7 +748,7 @@ class TestRetriableErrorWorkspaceTool:
         """workspace_write raises RetriableError when backend.write raises PermissionError."""
         tool, fs = make_wired_tool(tmp_path)
         write_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_write")
-        with patch.object(fs, "write", side_effect=PermissionError("escaped")):
+        with patch.object(fs, "write", side_effect=PathEscapeError("escaped")):
             with pytest.raises(RetriableError, match="Path escapes workspace root"):
                 write_fn("src/file.py", "content")
 
@@ -777,7 +777,7 @@ class TestRetriableErrorWorkspaceTool:
         """workspace_edit raises RetriableError when backend raises PermissionError."""
         tool, fs = make_wired_tool(tmp_path)
         edit_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_edit")
-        with patch.object(fs, "read", side_effect=PermissionError("escaped")):
+        with patch.object(fs, "read", side_effect=PathEscapeError("escaped")):
             with pytest.raises(RetriableError, match="Path escapes workspace root"):
                 edit_fn("src/file.py", "old", "new")
 
@@ -797,7 +797,7 @@ class TestRetriableErrorWorkspaceTool:
         # It now runs on the actor, which is why the patch target moved modules.
         with patch(
             "akgentic.tool.workspace.actor.parse_patch",
-            side_effect=PermissionError("path escapes workspace root"),
+            side_effect=PathEscapeError("path escapes workspace root"),
         ):
             with pytest.raises(RetriableError, match="Path escapes workspace root"):
                 patch_fn("--- a/file.py\n+++ b/file.py\n@@ -1 +1 @@\n-old\n+new\n")
@@ -812,7 +812,7 @@ class TestRetriableErrorWorkspaceTool:
         tool, fs = make_wired_tool(tmp_path)
         seed(tool, fs, "src/file.py", b"old\n")
         multi_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_multi_edit")
-        with patch.object(fs, "write_many", side_effect=PermissionError("escaped")):
+        with patch.object(fs, "write_many", side_effect=PathEscapeError("escaped")):
             with pytest.raises(RetriableError, match="Path escapes workspace root"):
                 multi_fn([EditItem(path="src/file.py", old_string="old", new_string="new")])
 
@@ -1142,7 +1142,7 @@ class TestResourceModel:
     def test_to_bytes_text_returns_utf8(self) -> None:
         """to_bytes() on a TEXT resource returns UTF-8 bytes of content (AC #3)."""
         res = Resource(file_name="notes.md", file_type=ResourceType.TEXT, content="héllo")
-        assert res.to_bytes() == "héllo".encode("utf-8")
+        assert res.to_bytes() == "héllo".encode()
 
     def test_to_bytes_image_returns_decoded_bytes(self) -> None:
         """to_bytes() on an IMAGE resource returns base64-decoded bytes (AC #4)."""
@@ -1242,7 +1242,7 @@ class TestWorkspaceToolSeedResources:
             Resource(file_name="logo.png", file_type=ResourceType.IMAGE, content=encoded),
         ]
         tool, fs = _seed_tool(tmp_path, resources)
-        assert fs.read("notes.md") == "héllo".encode("utf-8")
+        assert fs.read("notes.md") == "héllo".encode()
         assert fs.read("logo.png") == raw
 
     def test_observer_does_not_overwrite_existing_file(self, tmp_path: Path) -> None:

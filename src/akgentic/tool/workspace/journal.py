@@ -56,12 +56,14 @@ point it would bite:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import re
 import shutil
 import subprocess
-from collections.abc import Callable, Sequence
+import tempfile
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 from akgentic.tool.workspace.models import (
@@ -72,6 +74,15 @@ from akgentic.tool.workspace.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+MAX_COMMIT_BODY_CHARS = 500
+"""Cap on the agent-supplied text a commit body may carry.
+
+The command string is the one place untrusted input reaches the journal. A
+control character would end the subject line early and an unbounded string would
+put a whole heredoc into the log, so it is stripped and clipped — and the message
+travels through ``-F <file>``, never interpolated into an argument.
+"""
 
 IDENTITY_FALLBACK = "unknown-agent"
 """Stands in for an identity that sanitises to nothing.
@@ -116,6 +127,55 @@ def _detail(result: subprocess.CompletedProcess[str]) -> str:
     return (result.stderr or result.stdout).strip()[:400]
 
 
+def _subject(capability: str, paths: Sequence[str]) -> str:
+    """Compose a commit subject — one convention, whether the paths were declared or found.
+
+    Args:
+        capability: ``write``, ``edit``, ``exec`` … — the first field.
+        paths: The write set. Non-empty; a caller with nothing to record makes
+            no commit at all.
+
+    Returns:
+        ``<capability>: <path>`` for a single file, else ``<capability>: <n> files``.
+    """
+    return f"{capability}: {paths[0]}" if len(paths) == 1 else f"{capability}: {len(paths)} files"
+
+
+def _porcelain_path(line: str) -> str:
+    """Extract the path from one ``git status --porcelain`` line.
+
+    The first two characters are the status codes and the third is a space, so
+    the path starts at index 3. A rename is reported as ``old -> new``; the new
+    name is the one the tree now has.
+    """
+    path = line[3:] if len(line) > 3 else line.strip()
+    _, separator, renamed = path.partition(" -> ")
+    return renamed if separator else path
+
+
+@contextlib.contextmanager
+def _message_file(subject: str, body: str) -> Iterator[Path]:
+    """Write the commit message to a temporary file and yield its path.
+
+    ``-F <file>`` rather than ``-m <text>`` because the body carries
+    agent-supplied text, and a message that travels as an argument is a message
+    that can be made to look like something else. The file lives in the system
+    temp directory, never in the workspace — one written inside the tree would
+    dirty it and land in the very commit it describes.
+    """
+    handle = tempfile.NamedTemporaryFile(  # noqa: SIM115 — closed below, unlinked in finally
+        mode="w", encoding="utf-8", suffix=".msg", delete=False
+    )
+    try:
+        handle.write(f"{subject}\n\n{body}\n" if body else f"{subject}\n")
+        handle.close()
+        yield Path(handle.name)
+    finally:
+        handle.close()
+        with contextlib.suppress(OSError):
+            os.unlink(handle.name)
+
+
 def git_dir_for(root: Path) -> Path:
     """Return the repository directory for the workspace tree at *root*.
 
@@ -146,6 +206,23 @@ def sanitise_name(value: str) -> str:
     """
     cleaned = _ANGLE_RE.sub("", _CONTROL_RE.sub("", value)).strip()
     return cleaned or IDENTITY_FALLBACK
+
+
+def sanitise_command(value: str) -> str:
+    """Return *value* usable as commit-body text.
+
+    Args:
+        value: An agent-supplied command string — untrusted text.
+
+    Returns:
+        The command with control characters collapsed to spaces and the whole
+        clipped to :data:`MAX_COMMIT_BODY_CHARS`, or ``""`` when nothing
+        survives. A body is optional, so an empty result is simply no body.
+    """
+    cleaned = " ".join(_CONTROL_RE.sub(" ", value).split())
+    if len(cleaned) > MAX_COMMIT_BODY_CHARS:
+        cleaned = cleaned[:MAX_COMMIT_BODY_CHARS] + " …"
+    return cleaned
 
 
 def sanitise_email_local(value: str) -> str:
@@ -290,21 +367,32 @@ class GitJournal:
         write(GITIGNORE_NAME, gitignore_seed().encode("utf-8"))
 
     def is_dirty(self) -> bool:
-        """Whether the tree holds changes no commit has taken yet.
+        """Whether the tree holds changes no commit has taken yet."""
+        return bool(self.changed_paths())
 
-        ``-uall`` is not optional: bare ``--porcelain`` collapses an untracked
-        *directory* to a single entry, so a tree dirtied by a new directory of
-        files would report one path where there are many.
+    def changed_paths(self) -> list[str]:
+        """Every path the tree has changed since the last commit.
+
+        ``-uall`` is not optional, and this is the call story 29-5's mutation
+        test guards. Bare ``--porcelain`` collapses an untracked *directory* to a
+        single entry, so a build that creates ``dist/`` with forty files inside
+        is reported as ``dist/`` — one path where there are forty. That is wrong
+        for exactly the case exec exists for, because exec mostly *creates*
+        files. Do not simplify the flag away.
+
+        Returns:
+            The changed paths, or an empty list when the tree is clean, the
+            journal is off, or git could not answer.
         """
         if not self.enabled:
-            return False
+            return []
         result = self._run(["status", "--porcelain", "-uall"])
         if result is None:
-            return False
+            return []
         if result.returncode != 0:
             self._warn("status", result)
-            return False
-        return bool(result.stdout.strip())
+            return []
+        return [_porcelain_path(line) for line in result.stdout.splitlines() if line.strip()]
 
     def commit_out_of_band(self) -> None:
         """Commit whatever is in the tree as ``out-of-band``, if anything is.
@@ -334,10 +422,35 @@ class GitJournal:
         """
         if not self.enabled or not paths:
             return
-        subject = (
-            f"{capability}: {paths[0]}" if len(paths) == 1 else f"{capability}: {len(paths)} files"
-        )
-        self._commit(["-A", "--", *paths], identity, subject)
+        self._commit(["-A", "--", *paths], identity, _subject(capability, paths))
+
+    def commit_discovered(self, identity: Identity, capability: str, detail: str = "") -> None:
+        """Commit whatever the tree now shows, as *identity*'s one run.
+
+        The counterpart of :meth:`commit_paths`, and the difference is the whole
+        point of it. A gated mutation **declares** its write set, so it stages by
+        explicit pathspec and a write landing in between cannot be swept into an
+        agent's commit. Exec cannot declare anything, so its write set has to be
+        **discovered** — which is the one thing git is genuinely needed for here:
+        not branching, not merging, but post-hoc discovery of mutations nobody
+        named.
+
+        A run that changed nothing adds no commit and is not a failure.
+
+        Args:
+            identity: Who to attribute the run to.
+            capability: The commit subject's first field.
+            detail: Agent-supplied text for the commit **body** — the command
+                string. Sanitised here, and passed through a message file rather
+                than an argument. It never reaches the subject: a subject is not
+                the place for untrusted text.
+        """
+        if not self.enabled:
+            return
+        paths = self.changed_paths()
+        if not paths:
+            return
+        self._commit(["-A"], identity, _subject(capability, paths), body=sanitise_command(detail))
 
     ##
     ## Everything below runs git
@@ -362,7 +475,9 @@ class GitJournal:
             return False
         return True
 
-    def _commit(self, add_args: list[str], identity: Identity, subject: str) -> None:
+    def _commit(
+        self, add_args: list[str], identity: Identity, subject: str, body: str = ""
+    ) -> None:
         """Stage, then commit. A commit with nothing staged is a no-op, not a failure."""
         staged = self._run(["add", *add_args])
         if staged is None:
@@ -370,9 +485,11 @@ class GitJournal:
         if staged.returncode != 0:
             self._warn("add", staged)
             return
-        committed = self._run(
-            ["commit", "--no-verify", "-m", subject], env=self._child_env(identity)
-        )
+        with _message_file(subject, body) as message_path:
+            committed = self._run(
+                ["commit", "--no-verify", "-F", str(message_path)],
+                env=self._child_env(identity),
+            )
         if committed is None or committed.returncode == 0:
             return
         if committed.returncode == 1:

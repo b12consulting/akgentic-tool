@@ -10,7 +10,7 @@ Covers AC1 through AC11 for Story 6.3 (updated for Story 6.5):
 - AC7: _exec("pytest tests/", cwd="") builds docker exec -w /workspace
 - AC8: state.container_name is set after _start_sandbox() (volume sharing by convention)
 - AC9: SANDBOX_IMAGE == "akgentic-sandbox:latest"
-- AC10: DOCKER_EXEC_TIMEOUT == 60
+- AC10: DOCKER_EXEC_TIMEOUT is the shared backend default, not docker's own 60 s
 - AC11: 80%+ branch coverage
 - Story 6.5: volume mount host path derived from AKGENTIC_WORKSPACES_ROOT
 """
@@ -22,8 +22,10 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from akgentic.core.orchestrator import STOP_TIMEOUT
 
 from akgentic.tool.sandbox.actor import (
+    DEFAULT_BACKEND_TIMEOUT_S,
     ExecResult,
     SandboxConfig,
     SandboxState,
@@ -68,8 +70,15 @@ def test_sandbox_image_constant() -> None:
 
 
 def test_docker_exec_timeout_constant() -> None:
-    """AC10: DOCKER_EXEC_TIMEOUT equals 60."""
-    assert DOCKER_EXEC_TIMEOUT == 60
+    """Docker's default budget no longer outlives the orchestrator's stop backstop.
+
+    It was 60 s — twice the 30 s backstop — which made docker the one backend
+    able to hold a team's teardown open past the point that teardown gives up.
+    The assertion is on the relationship, not on a number: what matters is that
+    docker stopped being the exception.
+    """
+    assert DOCKER_EXEC_TIMEOUT == DEFAULT_BACKEND_TIMEOUT_S
+    assert DOCKER_EXEC_TIMEOUT <= STOP_TIMEOUT
 
 
 # ---------------------------------------------------------------------------

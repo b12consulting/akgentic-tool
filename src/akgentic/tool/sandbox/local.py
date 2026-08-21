@@ -10,7 +10,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
-from akgentic.tool.sandbox.actor import ExecResult, SandboxActor
+from akgentic.tool.sandbox.actor import DEFAULT_BACKEND_TIMEOUT_S, ExecResult, SandboxActor
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +121,7 @@ class LocalSandboxActor(SandboxActor):
     def _stop_sandbox(self) -> None:
         logger.debug("LocalSandboxActor stopped.")
 
-    def _exec(self, cmd: str, cwd: str) -> ExecResult:
+    def _exec(self, cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
         assert self.state.workspace_path is not None
         effective_cwd = self.state.workspace_path / cwd if cwd else self.state.workspace_path
         logger.debug("LocalSandboxActor exec: cmd=%r cwd=%s", cmd, effective_cwd)
@@ -131,7 +131,7 @@ class LocalSandboxActor(SandboxActor):
                 cwd=str(effective_cwd),
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=DEFAULT_BACKEND_TIMEOUT_S if timeout is None else timeout,
                 preexec_fn=_make_preexec(),
                 env=_make_sandbox_env(),
             )

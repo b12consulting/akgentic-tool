@@ -1,6 +1,6 @@
 """Tests for ExecTool — observer wiring, mode field, tool behaviour.
 
-Covers AC1–AC13 for Story 6.4 (updated for Story 6.5, Story 8.4):
+Covers AC1–AC13 for Story 6.4 (updated for Story 6.5, Story 8.4, Story 29-5):
 - SANDBOX_ACTOR_CLASSES dict (AC1)
 - ExecTool fields including mode (AC2)
 - observer() raises ValueError when orchestrator is None (AC3)
@@ -13,11 +13,26 @@ Covers AC1–AC13 for Story 6.4 (updated for Story 6.5, Story 8.4):
 - get_tools() returns [] when exec_command=False (AC10)
 - Story 6.5: mode comes from ExecTool.mode field, not SANDBOX_MODE env var
 - Story 8.4: bwrap/seatbelt keys in registry, auto-mode resolution, DeprecationWarning
+
+**Story 29-5 changed the shape of this file, and for a structural reason rather
+than a behavioural one.** ``ExecTool`` is now a shim over
+``WorkspaceTool(workspace_exec=...)``: it wires ``#Workspace`` as well as
+``#SandboxActor``, and ``exec_command`` routes through the former rather than
+calling the latter directly. So the double below answers two
+``getChildrenOrCreate`` calls instead of one — ``sandbox_config_of`` picks out
+the sandbox one by actor class rather than by call order — and the
+``exec_command`` tests stand in a workspace proxy where they used to stand in a
+sandbox proxy. Every assertion about *behaviour* is unchanged.
+
+The end-to-end equivalence of the two surfaces, against real actors and a real
+journal, is asserted in ``tests/workspace/test_exec.py``.
 """
 
 from __future__ import annotations
 
+import warnings
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -28,7 +43,6 @@ from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.sandbox.actor import (
     SANDBOX_ACTOR_NAME,
     CommandNotAllowedError,
-    ExecResult,
     SandboxActor,
     SandboxConfig,
 )
@@ -37,6 +51,12 @@ from akgentic.tool.sandbox.docker import DockerSandboxActor
 from akgentic.tool.sandbox.local import LocalSandboxActor
 from akgentic.tool.sandbox.seatbelt import SeatbeltSandboxActor
 from akgentic.tool.sandbox.tool import SANDBOX_ACTOR_CLASSES, ExecTool, _resolve_auto_mode
+from akgentic.tool.workspace.execution import (
+    ExecOutcome,
+    ExecStart,
+    ExecState,
+    ExecStatus,
+)
 
 # ---------------------------------------------------------------------------
 # Mock observer infrastructure
@@ -85,6 +105,84 @@ class MockObserver:
 def test_mock_observer_conforms_to_protocol() -> None:
     """Story 35-1 sweep: the fake satisfies the widened ``ActorToolObserver``."""
     assert isinstance(MockObserver(), ActorToolObserver)
+
+
+def sandbox_call(observer: MockObserver) -> Any:
+    """Return the one ``getChildrenOrCreate`` call that created a sandbox backend.
+
+    The shim now makes two — ``#SandboxActor`` and ``#Workspace`` — so a test
+    about the *backend* has to name which one it means. Selecting by actor class
+    rather than by call index keeps that true if the wiring order ever changes.
+    """
+    calls = [
+        call
+        for call in observer._orch_proxy.getChildrenOrCreate.call_args_list
+        if isinstance(call[0][0], type) and issubclass(call[0][0], SandboxActor)
+    ]
+    assert len(calls) == 1, f"expected exactly one sandbox creation, got {len(calls)}"
+    return calls[0]
+
+
+def sandbox_config_of(observer: MockObserver) -> SandboxConfig:
+    """Return the ``SandboxConfig`` the backend was created with."""
+    config = sandbox_call(observer)[1]["config"]
+    assert isinstance(config, SandboxConfig)
+    return config
+
+
+def wire(tool: ExecTool, observer: MockObserver) -> None:
+    """Wire *tool*, swallowing the card's own deprecation warning.
+
+    Every wiring in this file now emits it — that is the point of the shim — and
+    it is asserted on its own below rather than in every unrelated test.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        tool.observer(observer)  # type: ignore[arg-type]
+
+
+class FakeWorkspaceProxy:
+    """Stands in for ``#Workspace`` on the ask path, for the shim's closure.
+
+    Answers ``request_exec`` with an issued run id and ``exec_status`` with
+    whatever the test set up. It is deliberately not a ``MagicMock``: the closure
+    branches on ``ExecStart.run_id`` and ``ExecStatus.settled``, and a mock would
+    make both truthy and prove nothing.
+    """
+
+    def __init__(self, status: ExecStatus | None = None, refusal: str = "") -> None:
+        self.status = status
+        self.refusal = refusal
+        self.requests: list[tuple[str, str, str]] = []
+
+    def request_exec(self, agent_id: str, cmd: str, cwd: str = "") -> ExecStart:
+        self.requests.append((agent_id, cmd, cwd))
+        if self.refusal:
+            return ExecStart(refusal=self.refusal)
+        return ExecStart(run_id="abc12345")
+
+    def exec_status(self, agent_id: str, run_id: str) -> ExecStatus:
+        assert self.status is not None
+        return self.status
+
+
+class RaisingWorkspaceProxy:
+    """A workspace proxy whose ``request_exec`` raises — the error-string paths."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    def request_exec(self, agent_id: str, cmd: str, cwd: str = "") -> ExecStart:
+        raise self.error
+
+
+def done(stdout: str = "", stderr: str = "", exit_code: int = 0) -> ExecStatus:
+    """A settled, successful status carrying *stdout* / *stderr* / *exit_code*."""
+    return ExecStatus(
+        state=ExecState.DONE,
+        run_id="abc12345",
+        outcome=ExecOutcome(stdout=stdout, stderr=stderr, exit_code=exit_code),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -156,11 +254,9 @@ def test_observer_creates_local_sandbox_actor() -> None:
     observer = MockObserver(existing_actor=None)
     tool = ExecTool(mode="local")
 
-    tool.observer(observer)  # type: ignore[arg-type]
+    wire(tool, observer)
 
-    observer._orch_proxy.getChildrenOrCreate.assert_called_once()
-    call_args = observer._orch_proxy.getChildrenOrCreate.call_args
-    assert call_args[0][0] is LocalSandboxActor
+    assert sandbox_call(observer)[0][0] is LocalSandboxActor
 
 
 def test_observer_creates_actor_with_correct_config() -> None:
@@ -168,10 +264,9 @@ def test_observer_creates_actor_with_correct_config() -> None:
     observer = MockObserver(existing_actor=None)
     tool = ExecTool(mode="local")
 
-    tool.observer(observer)  # type: ignore[arg-type]
+    wire(tool, observer)
 
-    call_kwargs = observer._orch_proxy.getChildrenOrCreate.call_args[1]
-    config: SandboxConfig = call_kwargs["config"]
+    config = sandbox_config_of(observer)
     assert config.name == SANDBOX_ACTOR_NAME
     assert config.role == "ToolActor"
     assert config.team_id == "team-test"
@@ -183,9 +278,10 @@ def test_observer_stores_sandbox_proxy() -> None:
     observer = MockObserver(existing_actor=None)
     tool = ExecTool(mode="local")
 
-    tool.observer(observer)  # type: ignore[arg-type]
+    wire(tool, observer)
 
     assert tool._sandbox_proxy is not None
+    assert tool._workspace_proxy is not None
 
 
 # ---------------------------------------------------------------------------
@@ -198,11 +294,9 @@ def test_observer_creates_docker_sandbox_actor() -> None:
     observer = MockObserver(existing_actor=None)
     tool = ExecTool(mode="docker")
 
-    tool.observer(observer)  # type: ignore[arg-type]
+    wire(tool, observer)
 
-    observer._orch_proxy.getChildrenOrCreate.assert_called_once()
-    call_args = observer._orch_proxy.getChildrenOrCreate.call_args
-    assert call_args[0][0] is DockerSandboxActor
+    assert sandbox_call(observer)[0][0] is DockerSandboxActor
 
 
 def test_observer_creates_docker_actor_config_has_mode_docker() -> None:
@@ -210,11 +304,9 @@ def test_observer_creates_docker_actor_config_has_mode_docker() -> None:
     observer = MockObserver(existing_actor=None)
     tool = ExecTool(mode="docker")
 
-    tool.observer(observer)  # type: ignore[arg-type]
+    wire(tool, observer)
 
-    call_kwargs = observer._orch_proxy.getChildrenOrCreate.call_args[1]
-    config: SandboxConfig = call_kwargs["config"]
-    assert config.mode == "docker"
+    assert sandbox_config_of(observer).mode == "docker"
 
 
 # ---------------------------------------------------------------------------
@@ -228,9 +320,9 @@ def test_observer_reuses_existing_actor() -> None:
     observer = MockObserver(existing_actor=existing_addr)
     tool = ExecTool()
 
-    tool.observer(observer)  # type: ignore[arg-type]
+    wire(tool, observer)
 
-    observer._orch_proxy.getChildrenOrCreate.assert_called_once()
+    sandbox_call(observer)  # exactly one sandbox creation, no matter how many cards
 
 
 def test_observer_second_call_reuses_actor() -> None:
@@ -238,15 +330,15 @@ def test_observer_second_call_reuses_actor() -> None:
     # First call: no existing actor → getChildrenOrCreate creates one
     observer1 = MockObserver(existing_actor=None)
     tool = ExecTool()
-    tool.observer(observer1)  # type: ignore[arg-type]
-    assert observer1._orch_proxy.getChildrenOrCreate.call_count == 1
+    wire(tool, observer1)
+    sandbox_call(observer1)
 
     # Second call: actor now exists — getChildrenOrCreate returns existing
     existing_addr = MagicMock(spec=ActorAddress)
     observer2 = MockObserver(existing_actor=existing_addr)
-    tool.observer(observer2)  # type: ignore[arg-type]
+    wire(tool, observer2)
 
-    observer2._orch_proxy.getChildrenOrCreate.assert_called_once()
+    sandbox_call(observer2)
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +354,7 @@ def test_observer_raises_key_error_on_unknown_mode() -> None:
     object.__setattr__(tool, "mode", "unknown-backend")
 
     with pytest.raises(KeyError):
-        tool.observer(observer)  # type: ignore[arg-type]
+        wire(tool, observer)
 
 
 # ---------------------------------------------------------------------------
@@ -274,12 +366,9 @@ def test_exec_command_returns_formatted_output() -> None:
     """AC8: exec_command returns 'stdout:\\n...\\nstderr:\\n...\\nexit_code: 0'."""
     observer = MockObserver(existing_actor=None)
     tool = ExecTool(mode="local")
-    tool.observer(observer)  # type: ignore[arg-type]
+    wire(tool, observer)
 
-    # Replace proxy with a controlled mock
-    mock_proxy = MagicMock(spec=SandboxActor)
-    mock_proxy.exec.return_value = ExecResult(stdout="===== 5 passed =====", stderr="", exit_code=0)
-    tool._sandbox_proxy = mock_proxy
+    tool._workspace_proxy = FakeWorkspaceProxy(done(stdout="===== 5 passed ====="))  # type: ignore[assignment]
 
     tools = tool.get_tools()
     assert len(tools) == 1
@@ -295,11 +384,9 @@ def test_exec_command_includes_stderr_in_output() -> None:
     """AC8: exec_command includes stderr in the returned string."""
     observer = MockObserver(existing_actor=None)
     tool = ExecTool(mode="local")
-    tool.observer(observer)  # type: ignore[arg-type]
+    wire(tool, observer)
 
-    mock_proxy = MagicMock(spec=SandboxActor)
-    mock_proxy.exec.return_value = ExecResult(stdout="", stderr="SyntaxError", exit_code=1)
-    tool._sandbox_proxy = mock_proxy
+    tool._workspace_proxy = FakeWorkspaceProxy(done(stderr="SyntaxError", exit_code=1))  # type: ignore[assignment]
 
     tools = tool.get_tools()
     result = tools[0](cmd="python bad.py")
@@ -317,11 +404,11 @@ def test_exec_command_catches_command_not_allowed_error() -> None:
     """AC9: CommandNotAllowedError is caught and returned as an error string — not raised."""
     observer = MockObserver(existing_actor=None)
     tool = ExecTool(mode="local")
-    tool.observer(observer)  # type: ignore[arg-type]
+    wire(tool, observer)
 
-    mock_proxy = MagicMock(spec=SandboxActor)
-    mock_proxy.exec.side_effect = CommandNotAllowedError("malware not allowed")
-    tool._sandbox_proxy = mock_proxy
+    tool._workspace_proxy = RaisingWorkspaceProxy(  # type: ignore[assignment]
+        CommandNotAllowedError("malware not allowed")
+    )
 
     tools = tool.get_tools()
     result = tools[0](cmd="malware --install")
@@ -338,11 +425,11 @@ def test_exec_command_catches_subprocess_error() -> None:
 
     observer = MockObserver(existing_actor=None)
     tool = ExecTool(mode="local")
-    tool.observer(observer)  # type: ignore[arg-type]
+    wire(tool, observer)
 
-    mock_proxy = MagicMock(spec=SandboxActor)
-    mock_proxy.exec.side_effect = subprocess.SubprocessError("Exception occurred in preexec_fn.")
-    tool._sandbox_proxy = mock_proxy
+    tool._workspace_proxy = RaisingWorkspaceProxy(  # type: ignore[assignment]
+        subprocess.SubprocessError("Exception occurred in preexec_fn.")
+    )
 
     tools = tool.get_tools()
     result = tools[0](cmd="echo hello")
@@ -358,11 +445,9 @@ def test_exec_command_catches_generic_exception() -> None:
     """
     observer = MockObserver(existing_actor=None)
     tool = ExecTool(mode="local")
-    tool.observer(observer)  # type: ignore[arg-type]
+    wire(tool, observer)
 
-    mock_proxy = MagicMock(spec=SandboxActor)
-    mock_proxy.exec.side_effect = RuntimeError("sandbox crashed")
-    tool._sandbox_proxy = mock_proxy
+    tool._workspace_proxy = RaisingWorkspaceProxy(RuntimeError("sandbox crashed"))  # type: ignore[assignment]
 
     tools = tool.get_tools()
     result = tools[0](cmd="echo hello")
@@ -376,11 +461,11 @@ def test_exec_command_error_string_lists_allowed_commands() -> None:
     """AC9: error string contains the sorted list of ALLOWED_COMMANDS."""
     observer = MockObserver(existing_actor=None)
     tool = ExecTool(mode="local")
-    tool.observer(observer)  # type: ignore[arg-type]
+    wire(tool, observer)
 
-    mock_proxy = MagicMock(spec=SandboxActor)
-    mock_proxy.exec.side_effect = CommandNotAllowedError("malware not in allowlist")
-    tool._sandbox_proxy = mock_proxy
+    tool._workspace_proxy = RaisingWorkspaceProxy(  # type: ignore[assignment]
+        CommandNotAllowedError("malware not in allowlist")
+    )
 
     tools = tool.get_tools()
     result = tools[0](cmd="malware --install")
@@ -405,14 +490,12 @@ def test_get_tools_returns_one_callable_when_enabled() -> None:
     """get_tools() returns exactly one callable when exec_command=True."""
     observer = MockObserver(existing_actor=None)
     tool = ExecTool(mode="local")
-    tool.observer(observer)  # type: ignore[arg-type]
-
-    mock_proxy = MagicMock(spec=SandboxActor)
-    tool._sandbox_proxy = mock_proxy
+    wire(tool, observer)
 
     tools = tool.get_tools()
     assert len(tools) == 1
     assert callable(tools[0])
+    assert tools[0].__name__ == "exec_command"
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +508,9 @@ def test_observer_returns_self() -> None:
     observer = MockObserver(existing_actor=None)
     tool = ExecTool()
 
-    result = tool.observer(observer)  # type: ignore[arg-type]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        result = tool.observer(observer)  # type: ignore[arg-type]
 
     assert result is tool
 
@@ -444,11 +529,10 @@ def test_exec_tool_mode_not_affected_by_sandbox_mode_env(
     observer = MockObserver(existing_actor=None)
     tool = ExecTool(mode="local")  # explicit local
 
-    tool.observer(observer)  # type: ignore[arg-type]
+    wire(tool, observer)
 
-    call_args = observer._orch_proxy.getChildrenOrCreate.call_args
     # Despite env var, LocalSandboxActor must be chosen (mode="local")
-    assert call_args[0][0] is LocalSandboxActor
+    assert sandbox_call(observer)[0][0] is LocalSandboxActor
 
 
 # ---------------------------------------------------------------------------
@@ -473,11 +557,9 @@ def test_observer_passes_workspace_id_to_sandbox_config() -> None:
     observer = MockObserver(existing_actor=None)
     tool = ExecTool(workspace_id="test")
 
-    tool.observer(observer)  # type: ignore[arg-type]
+    wire(tool, observer)
 
-    call_kwargs = observer._orch_proxy.getChildrenOrCreate.call_args[1]
-    config: SandboxConfig = call_kwargs["config"]
-    assert config.workspace_id == "test"
+    assert sandbox_config_of(observer).workspace_id == "test"
 
 
 def test_observer_passes_workspace_id_none_to_sandbox_config() -> None:
@@ -485,11 +567,9 @@ def test_observer_passes_workspace_id_none_to_sandbox_config() -> None:
     observer = MockObserver(existing_actor=None)
     tool = ExecTool()
 
-    tool.observer(observer)  # type: ignore[arg-type]
+    wire(tool, observer)
 
-    call_kwargs = observer._orch_proxy.getChildrenOrCreate.call_args[1]
-    config: SandboxConfig = call_kwargs["config"]
-    assert config.workspace_id is None
+    assert sandbox_config_of(observer).workspace_id is None
 
 
 def test_observer_config_has_team_id_and_workspace_id_independently() -> None:
@@ -498,10 +578,9 @@ def test_observer_config_has_team_id_and_workspace_id_independently() -> None:
     observer.team_id = "t1"
     tool = ExecTool(workspace_id="my-ws")
 
-    tool.observer(observer)  # type: ignore[arg-type]
+    wire(tool, observer)
 
-    call_kwargs = observer._orch_proxy.getChildrenOrCreate.call_args[1]
-    config: SandboxConfig = call_kwargs["config"]
+    config = sandbox_config_of(observer)
     assert config.team_id == "t1"
     assert config.workspace_id == "my-ws"
 
@@ -579,10 +658,9 @@ def test_observer_creates_bwrap_sandbox_actor() -> None:
     observer = MockObserver(existing_actor=None)
     tool = ExecTool(mode="bwrap")
 
-    tool.observer(observer)  # type: ignore[arg-type]
+    wire(tool, observer)
 
-    call_args = observer._orch_proxy.getChildrenOrCreate.call_args
-    assert call_args[0][0] is BwrapSandboxActor
+    assert sandbox_call(observer)[0][0] is BwrapSandboxActor
 
 
 def test_observer_creates_seatbelt_sandbox_actor() -> None:
@@ -590,10 +668,9 @@ def test_observer_creates_seatbelt_sandbox_actor() -> None:
     observer = MockObserver(existing_actor=None)
     tool = ExecTool(mode="seatbelt")
 
-    tool.observer(observer)  # type: ignore[arg-type]
+    wire(tool, observer)
 
-    call_args = observer._orch_proxy.getChildrenOrCreate.call_args
-    assert call_args[0][0] is SeatbeltSandboxActor
+    assert sandbox_call(observer)[0][0] is SeatbeltSandboxActor
 
 
 # ---------------------------------------------------------------------------
@@ -687,10 +764,9 @@ def test_observer_auto_mode_creates_bwrap_actor() -> None:
     tool = ExecTool(mode="auto")
 
     with patch("akgentic.tool.sandbox.tool._resolve_auto_mode", return_value="bwrap"):
-        tool.observer(observer)  # type: ignore[arg-type]
+        wire(tool, observer)
 
-    call_args = observer._orch_proxy.getChildrenOrCreate.call_args
-    assert call_args[0][0] is BwrapSandboxActor
+    assert sandbox_call(observer)[0][0] is BwrapSandboxActor
 
 
 def test_observer_auto_mode_creates_seatbelt_actor() -> None:
@@ -699,10 +775,9 @@ def test_observer_auto_mode_creates_seatbelt_actor() -> None:
     tool = ExecTool(mode="auto")
 
     with patch("akgentic.tool.sandbox.tool._resolve_auto_mode", return_value="seatbelt"):
-        tool.observer(observer)  # type: ignore[arg-type]
+        wire(tool, observer)
 
-    call_args = observer._orch_proxy.getChildrenOrCreate.call_args
-    assert call_args[0][0] is SeatbeltSandboxActor
+    assert sandbox_call(observer)[0][0] is SeatbeltSandboxActor
 
 
 def test_observer_auto_mode_fallback_to_local_emits_deprecation_warning() -> None:
@@ -716,8 +791,7 @@ def test_observer_auto_mode_fallback_to_local_emits_deprecation_warning() -> Non
     ):
         tool.observer(observer)  # type: ignore[arg-type]
 
-    call_args = observer._orch_proxy.getChildrenOrCreate.call_args
-    assert call_args[0][0] is LocalSandboxActor
+    assert sandbox_call(observer)[0][0] is LocalSandboxActor
 
 
 def test_observer_auto_mode_config_uses_resolved_mode() -> None:
@@ -726,11 +800,9 @@ def test_observer_auto_mode_config_uses_resolved_mode() -> None:
     tool = ExecTool(mode="auto")
 
     with patch("akgentic.tool.sandbox.tool._resolve_auto_mode", return_value="bwrap"):
-        tool.observer(observer)  # type: ignore[arg-type]
+        wire(tool, observer)
 
-    call_kwargs = observer._orch_proxy.getChildrenOrCreate.call_args[1]
-    config: SandboxConfig = call_kwargs["config"]
-    assert config.mode == "bwrap"  # resolved mode stored, not "auto"
+    assert sandbox_config_of(observer).mode == "bwrap"
 
 
 def test_observer_auto_mode_creates_docker_actor() -> None:
@@ -739,26 +811,112 @@ def test_observer_auto_mode_creates_docker_actor() -> None:
     tool = ExecTool(mode="auto")
 
     with patch("akgentic.tool.sandbox.tool._resolve_auto_mode", return_value="docker"):
-        tool.observer(observer)  # type: ignore[arg-type]
+        wire(tool, observer)
 
-    call_args = observer._orch_proxy.getChildrenOrCreate.call_args
-    assert call_args[0][0] is DockerSandboxActor
+    assert sandbox_call(observer)[0][0] is DockerSandboxActor
 
 
-def test_observer_local_mode_explicit_does_not_emit_deprecation_warning() -> None:
-    """AC8/AC9 (8.4): ExecTool(mode='local') explicit — no DeprecationWarning emitted.
+def test_observer_local_mode_explicit_does_not_emit_the_fallback_warning() -> None:
+    """AC8/AC9 (8.4): the auto-fallback warning fires only on the auto path.
 
-    DeprecationWarning must ONLY fire when mode='auto' falls back to 'local',
-    not when mode='local' is explicitly requested by the caller.
+    ``ExecTool`` itself is now deprecated and warns on every wiring, so this can
+    no longer be "no DeprecationWarning at all". The property it was written to
+    guard is unchanged and is what is asserted: an explicit ``mode='local'`` is a
+    choice, not a fallback, and must not be reported as one.
     """
-    import warnings
-
     observer = MockObserver(existing_actor=None)
     tool = ExecTool(mode="local")
 
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        tool.observer(observer)  # type: ignore[arg-type]
+
+    messages = [str(warning.message) for warning in caught]
+    assert not any("no isolation backend found" in message for message in messages)
+    assert sandbox_call(observer)[0][0] is LocalSandboxActor
+
+
+# ---------------------------------------------------------------------------
+# Story 29-5 — the card is a shim: it warns on use, and wires #Workspace too
+# ---------------------------------------------------------------------------
+
+
+def test_wiring_warns_and_names_its_replacement() -> None:
+    """AC2: the deprecation fires on use and says what to use instead."""
+    observer = MockObserver(existing_actor=None)
+    tool = ExecTool(mode="local")
+
+    with pytest.warns(DeprecationWarning, match=r"WorkspaceTool\(workspace_exec="):
+        tool.observer(observer)  # type: ignore[arg-type]
+
+
+def test_importing_the_module_does_not_warn() -> None:
+    """AC2: the warning is on *use*, never on import.
+
+    An import-time warning fires for anybody who merely has this module in a
+    dependency's ``__init__`` — which is nobody's decision to change. The module
+    object is cached, so what this asserts is that nothing at module scope emits
+    one; the sibling test above proves the warning does exist.
+    """
     with warnings.catch_warnings():
         warnings.simplefilter("error", DeprecationWarning)
-        tool.observer(observer)  # type: ignore[arg-type]  # must not raise
+        import importlib  # noqa: PLC0415
 
-    call_args = observer._orch_proxy.getChildrenOrCreate.call_args
-    assert call_args[0][0] is LocalSandboxActor
+        importlib.import_module("akgentic.tool.sandbox.tool")
+
+
+def test_wiring_creates_the_workspace_actor_as_well() -> None:
+    """AC2: the shim owns no tree of its own — it goes through ``#Workspace``."""
+    observer = MockObserver(existing_actor=None)
+    tool = ExecTool(mode="local", workspace_id="shared")
+
+    wire(tool, observer)
+
+    names = [
+        call[1]["config"].name
+        for call in observer._orch_proxy.getChildrenOrCreate.call_args_list
+    ]
+    assert SANDBOX_ACTOR_NAME in names
+    assert "#Workspace-shared" in names
+
+
+def test_exec_command_routes_through_the_workspace_actor() -> None:
+    """AC2: the command reaches ``request_exec``, not the sandbox proxy."""
+    observer = MockObserver(existing_actor=None)
+    tool = ExecTool(mode="local")
+    wire(tool, observer)
+    fake = FakeWorkspaceProxy(done(stdout="hi"))
+    tool._workspace_proxy = fake  # type: ignore[assignment]
+
+    result = tool.get_tools()[0](cmd="echo hi", cwd="src")
+
+    assert [(cmd, cwd) for _, cmd, cwd in fake.requests] == [("echo hi", "src")]
+    assert "hi" in result
+
+
+def test_exec_command_returns_a_busy_refusal_rather_than_raising() -> None:
+    """A lease held elsewhere is a returned string, as every other failure here is."""
+    observer = MockObserver(existing_actor=None)
+    tool = ExecTool(mode="local")
+    wire(tool, observer)
+    busy = FakeWorkspaceProxy(refusal="workspace busy — exec run x")
+    tool._workspace_proxy = busy  # type: ignore[assignment]
+
+    result = tool.get_tools()[0](cmd="echo hi")
+
+    assert "workspace busy" in result
+
+
+def test_exec_command_hands_back_a_run_id_when_the_poll_runs_out() -> None:
+    """A run still going past the poll budget degrades to the run id, echoed verbatim."""
+    observer = MockObserver(existing_actor=None)
+    tool = ExecTool(mode="local")
+    wire(tool, observer)
+    running = ExecStatus(state=ExecState.RUNNING, run_id="abc12345")
+    tool._workspace_proxy = FakeWorkspaceProxy(running)  # type: ignore[assignment]
+
+    with patch("akgentic.tool.core.deferred.time.sleep"):
+        result = tool.get_tools()[0](cmd="pytest")
+
+    assert "abc12345" in result
+    assert "in progress" in result
