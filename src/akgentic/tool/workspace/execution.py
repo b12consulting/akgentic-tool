@@ -270,6 +270,39 @@ def new_run_id() -> str:
     return uuid4().hex[:RUN_ID_CHARS]
 
 
+def poll_attempts_within(attempts: int, delay: float, run_budget: float) -> int:
+    """Return an attempt count whose poll cannot outlast the run it waits for.
+
+    A poll longer than the run budget parks the agent's thread inside the tool
+    call past the point where there is anything left to wait for: by then the run
+    has either reported or been killed by its own budget, so every further
+    attempt is a sleep with no possible answer. It is the one budget on this card
+    that can be misconfigured into costing the team real time and buying nobody
+    anything, so it is clamped rather than accepted.
+
+    The bound is the **effective** run budget — the card's ``timeout_s`` after
+    the worker's own ceiling — because that is what actually stops the run.
+    Clamping against the requested value would leave a card asking for 999 s
+    polling long past the 20 s the worker allows it.
+
+    Args:
+        attempts: What the card asked for.
+        delay: Seconds between attempts.
+        run_budget: The effective wall-clock budget of the run being waited on.
+
+    Returns:
+        *attempts* unchanged when the poll already fits, otherwise the largest
+        count that does — never below 1, because a caller that polls zero times
+        gets the handoff message without ever looking, which is worse than
+        looking once.
+    """
+    if attempts <= 0 or delay <= 0:
+        return attempts
+    if attempts * delay <= run_budget:
+        return attempts
+    return max(1, int(run_budget // delay))
+
+
 def resolve_mode(mode: CardMode) -> tuple[SandboxMode, type[SandboxActor]]:
     """Turn a card's requested mode into a backend, warning where the host has none.
 

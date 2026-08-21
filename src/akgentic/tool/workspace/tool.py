@@ -40,7 +40,7 @@ from akgentic.core.actor_address import ActorAddress
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.utils import SerializableBaseModel
 from akgentic.tool.core import COMMAND, TOOL_CALL, BaseToolParam, Channels, ToolCard, _resolve
-from akgentic.tool.core.deferred import poll_deferred
+from akgentic.tool.core.deferred import DEFAULT_WORKER_TIMEOUT_S, poll_deferred
 from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.sandbox.actor import CardMode
@@ -58,6 +58,7 @@ from akgentic.tool.workspace.execution import (
     ExecStatus,
     format_status,
     in_progress,
+    poll_attempts_within,
     resolve_mode,
     sandbox_config,
 )
@@ -654,6 +655,25 @@ class WorkspaceTool(ToolCard):
         self._bind_sandbox(observer, observer.orchestrator)
         return self
 
+    def _enabled_exec(self) -> WorkspaceExec | None:
+        """Return the exec configuration only when it will register callables.
+
+        One predicate, because the two halves of this capability have to agree on
+        what "on" means. They did not: the wiring looked at the field and
+        ``read_only``, while ``_exec_tools`` also required the ``TOOL_CALL``
+        channel — so a card that put exec off the tool channel still resolved the
+        backend, still emitted the ``auto`` fallback warning, and still brought up
+        a ``#SandboxActor`` (a running container, on the docker backend) to serve
+        two callables it then never registered.
+
+        Returns:
+            The parameters, or ``None`` when nothing exec-related should happen.
+        """
+        params = _resolve(self.workspace_exec, WorkspaceExec)
+        if params is None or self.read_only or TOOL_CALL not in params.expose:
+            return None
+        return params
+
     def _bind_sandbox(self, observer: ActorToolObserver, orchestrator: ActorAddress) -> None:
         """Bring up the team's ``#SandboxActor`` and tell ``#Workspace`` about it.
 
@@ -674,8 +694,8 @@ class WorkspaceTool(ToolCard):
             KeyError: If the configured mode names no registered backend —
                 fail-fast at wiring time rather than at the first command.
         """
-        params = _resolve(self.workspace_exec, WorkspaceExec)
-        if params is None or self.read_only:
+        params = self._enabled_exec()
+        if params is None:
             return
         mode, actor_class = resolve_mode(params.mode)
         config = ExecConfig(
@@ -686,9 +706,27 @@ class WorkspaceTool(ToolCard):
         )
         orchestrator_proxy = observer.proxy_ask(orchestrator, Orchestrator)
         orchestrator_proxy.getChildrenOrCreate(actor_class, config=sandbox_config(config))
+        self._announce_exec(config)
+
+    def _announce_exec(self, config: ExecConfig) -> None:
+        """Tell the actor which backend to run commands on — fire and forget.
+
+        Guarded exactly as :meth:`_register_agent_name` is, and for the same
+        reason: a stand-in proxy that does not carry the method, or an actor that
+        died between the get-or-create and this line, must not take the whole card
+        down. Unguarded, this one line was the harsher of two adjacent messages on
+        one binding path — the registration a line earlier already degrades.
+
+        The degradation is an exec request refused for want of a backend: visible,
+        and recoverable by rebinding. A raise at wiring time is neither.
+        """
         tell = self._workspace_tell
-        if tell is not None:
+        if tell is None:
+            return
+        try:
             tell.configure_exec(config)
+        except Exception:
+            logger.debug("Could not announce the exec backend to #Workspace", exc_info=True)
 
     def _bind_workspace_actor(
         self, observer: ActorToolObserver, orchestrator: ActorAddress, workspace_name: str
@@ -863,9 +901,12 @@ class WorkspaceTool(ToolCard):
         callables. ``_tool_if_enabled`` encodes the 1:1 shape and is deliberately
         not used here — ``workspace_exec_result`` can do nothing without
         ``workspace_exec``, so the pair is enabled or absent as a unit.
+
+        Shares :meth:`_enabled_exec` with the wiring, so the callables and the
+        actor they need can never disagree about whether the capability is on.
         """
-        params = _resolve(self.workspace_exec, WorkspaceExec)
-        if params is None or TOOL_CALL not in params.expose:
+        params = self._enabled_exec()
+        if params is None:
             return []
         return [self._exec_factory(params), self._exec_result_factory(params)]
 
@@ -1516,8 +1557,15 @@ class WorkspaceTool(ToolCard):
         """
         proxy = self._workspace_proxy
         agent_id = self._agent_id
-        attempts = params.poll_attempts
         delay = params.poll_delay_seconds
+        # Clamped, not accepted: a poll outlasting the run is a sleep with no
+        # possible answer, because by then the run has reported or its own budget
+        # has killed it. Bounded by the *effective* run budget, which is what
+        # stops the run — a card asking for 999 s never gets more than the worker
+        # allows it either.
+        attempts = poll_attempts_within(
+            params.poll_attempts, delay, min(params.timeout_s, DEFAULT_WORKER_TIMEOUT_S)
+        )
 
         def workspace_exec(cmd: str, cwd: str = "") -> str:
             """Run a shell command in the team workspace, in a sandbox.
