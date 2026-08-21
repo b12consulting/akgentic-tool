@@ -106,15 +106,6 @@ defaults apply.
 Crawling is the expensive capability: a `max_depth=5, max_breadth=500` crawl can walk thousands of
 pages. Set `limit` when exposing it to an agent that decides its own arguments.
 
-> **Migrating from a single `instructions` field.**
-> `WebCrawl` used to re-declare `instructions`, so one value did both jobs at once — it was
-> passed to Tavily *and* appended to the tool description, with no way to ask for either alone.
-> A stored `WebCrawl(instructions=...)` still loads, but it now only appends to the description;
-> the crawl is no longer biased by it. The two intents cannot be told apart in persisted config,
-> so this is not migrated automatically. Re-point any catalog entry that relied on the crawl
-> bias at `crawl_instructions`. The tool callable's argument was renamed to match, so a model
-> that used to pass `instructions=` now passes `crawl_instructions=`.
-
 ---
 
 ## Configuration
