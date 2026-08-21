@@ -1,10 +1,11 @@
-"""The README's MCPTool samples, transcribed verbatim and executed.
+"""The MCPTool README samples, transcribed verbatim and executed.
 
-Every runnable Python snippet in the README's MCPTool section appears below exactly as a
-reader would copy it, so a sample that cannot construct fails CI rather than failing for
-whoever pastes it. Before this file existed the published sample raised `ValidationError`
-twice over — it passed a plural `connections=[...]` list to a field that is singular and
-required.
+The samples live in `src/akgentic/tool/mcp/README.md`; the package README's Tool Catalog
+carries a short entry that links to it. Every runnable Python snippet in that file appears
+below exactly as a reader would copy it, so a sample that cannot construct fails CI rather
+than failing for whoever pastes it. Before this file existed the published sample raised
+`ValidationError` twice over — it passed a plural `connections=[...]` list to a field that
+is singular and required.
 
 Construction alone is too weak a gate, for the reason given in `test_mcp_toolset.py`:
 `akgentic.tool.mcp.mcp` sits on the mypy `ignore_errors` list, so a wrong translation of the

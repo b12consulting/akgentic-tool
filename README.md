@@ -689,140 +689,98 @@ decoration.
 
 ## Tool Catalog
 
+Nine tool cards ship with the package. Each one has its own README next to the code, covering the
+`ToolCard` definition, every field and every nested capability parameter, and the full
+configuration surface — environment, extras, actor wiring and failure modes. The entries below
+are the index; the detail lives beside the module it documents.
+
+| Tool | Module | What it does | Reference |
+|---|---|---|---|
+| `WorkspaceTool` | `akgentic.tool.workspace` | Team-scoped filesystem: read, list, glob, grep, view, write, edit, patch | [README](src/akgentic/tool/workspace/README.md) |
+| `PlanningTool` | `akgentic.tool.planning` | Shared task board backed by the `#PlanningTool` actor | [README](src/akgentic/tool/planning/README.md) |
+| `KnowledgeGraphTool` | `akgentic.tool.knowledge_graph` | Entities and relations with hybrid keyword + semantic search | [README](src/akgentic/tool/knowledge_graph/README.md) |
+| `VectorStoreTool` | `akgentic.tool.vector_store` | Configuration-only card owning the shared embedding store | [README](src/akgentic/tool/vector_store/README.md) |
+| `SearchTool` | `akgentic.tool.search` | Web search, fetch and crawl via Tavily | [README](src/akgentic/tool/search/README.md) |
+| `TeamTool` | `akgentic.tool.team` | Hire, fire, roster, role profiles, and who is busy right now | [README](src/akgentic/tool/team/README.md) |
+| `NotificationTool` | `akgentic.tool.notification` | Delayed messages an agent schedules to itself | [README](src/akgentic/tool/notification/README.md) |
+| `MCPTool` | `akgentic.tool.mcp` | External MCP servers as pydantic-ai toolsets | [README](src/akgentic/tool/mcp/README.md) |
+| `ExecTool` | `akgentic.tool.sandbox` | Sandboxed shell execution in the team workspace | [README](src/akgentic/tool/sandbox/README.md) |
+
 ### WorkspaceTool
 
-Sandboxed read/write access to a shared team filesystem. A single `WorkspaceTool` class covers
-both read-only and full access via a `read_only: bool` field.
+Sandboxed read/write access to a shared team filesystem — `workspace_read`, `workspace_list`,
+`workspace_glob`, `workspace_grep`, `workspace_view` on the read side; `workspace_write`,
+`workspace_edit`, `workspace_multi_edit`, `workspace_patch`, `workspace_delete`,
+`workspace_mkdir` on the write side. One class covers both modes via a `read_only: bool` gate.
+All paths are anchored to `<AKGENTIC_WORKSPACES_ROOT>/<workspace_id or team_id>` and traversal
+out of that root is rejected.
 
 ```python
 from akgentic.tool import WorkspaceTool
 
-WorkspaceTool()                          # full access (default)
-WorkspaceTool(read_only=True)            # read tools only
-WorkspaceTool(workspace_id="shared")     # shared workspace across teams
+WorkspaceTool()                                      # full access (default)
+WorkspaceTool(read_only=True)                        # read tools only
+WorkspaceTool(workspace_id="shared")                 # shared workspace across teams
 WorkspaceTool(read_only=True, workspace_glob=False)  # fine-grained capability control
 ```
 
-| Tool | Description |
-|---|---|
-| `workspace_read` | Read file with line-number pagination; auto-converts PDF, DOCX, XLSX, images to Markdown |
-| `workspace_list` | List directory (flat or ASCII tree by depth) |
-| `workspace_glob` | Find files by glob pattern with `{py,ts}` brace expansion; results sorted by mtime |
-| `workspace_grep` | Regex search across files; uses `rg` if available, falls back to Python |
-| `workspace_view` | View image as `BinaryContent` for LLM vision (PNG, JPG, WebP, GIF, BMP) |
-| `workspace_write` | Overwrite or create a file; auto-detects CRLF/LF line endings |
-| `workspace_edit` | Surgical find-and-replace with 7-strategy cascade (exact → fuzzy, threshold 0.85) |
-| `workspace_multi_edit` | Apply multiple `EditItem` operations across files in one call |
-| `workspace_patch` | Apply unified diff patch (GNU format) |
-| `workspace_delete` | Delete a file |
-| `workspace_mkdir` | Create directory tree (parents included, idempotent) |
+Binary reads (PDF, DOCX, XLSX, PPTX) need `akgentic-tool[docs]`; image resizing for
+`workspace_view` needs `akgentic-tool[vision]`. Both degrade rather than fail.
 
-The workspace root is resolved from `AKGENTIC_WORKSPACES_ROOT` (default `./workspaces`). All
-path operations validate against the root — traversal attacks (`../`) raise `RetriableError`.
-
-**Binary file reading** (requires `akgentic-tool[docs]`): `workspace_read` transparently
-handles PDF, DOCX, XLSX, PPTX, and images via MarkItDown. A sidecar cache (`.report.pdf.md`)
-avoids re-extraction on subsequent reads.
-
-**Image viewing** (requires `akgentic-tool[vision]`): `workspace_view` delivers raw pixels
-to the model's vision endpoint. Images are optionally resized (default `max_dimension=1568`)
-with a sidecar cache for the resized version.
+**[Full reference → `src/akgentic/tool/workspace/README.md`](src/akgentic/tool/workspace/README.md)** —
+every capability parameter, the `DocumentReader` two-pass extraction, resource seeding, sidecar
+caching and the edit-matching cascade.
 
 ### PlanningTool
 
 Shared actor-based task board for multi-agent teams. A singleton `PlanActor` (named
-`#PlanningTool`) is created by the orchestrator as one of its children — get-or-create
-semantics guarantee unicity — and persists across all agents' tool calls.
+`#PlanningTool`) is created by the orchestrator as one of its children — get-or-create semantics
+guarantee unicity — and persists across all agents' tool calls. The plan is injected into each
+agent's system prompt, scoped to that agent's own tasks by default.
 
 ```python
-from akgentic.tool.planning import PlanningTool
+from akgentic.tool.planning import GetPlanning, PlanningTool
 
-PlanningTool()                                    # default config
-PlanningTool(get_planning=GetPlanning(filter_by_agent=False))  # show all tasks
+PlanningTool()                                                  # default config
+PlanningTool(get_planning=GetPlanning(filter_by_agent=False))   # show all tasks
+PlanningTool(vector_store=False)                                # keyword-only search
 ```
 
-| Capability | Default channel | Description |
-|---|---|---|
-| `get_planning` | `SYSTEM_PROMPT`, `COMMAND` | Team plan injected into LLM context; scoped to calling agent by default |
-| `get_planning_task` | `TOOL_CALL`, `COMMAND` | Look up a single task by integer ID |
-| `update_planning` | `TOOL_CALL` | Batch create / update / delete tasks in one call |
-| `search_planning` | `TOOL_CALL`, `COMMAND` | Filter tasks by status, owner, creator, or natural-language query |
+Semantic search needs `akgentic-tool[vector_search]` and a `VectorStoreTool` in the team; without
+either it degrades to keyword-only.
 
-**Task model constraints:** `description` max 300 chars; `output` max 150 chars (auto-truncated
-if exceeded — no `ValidationError`). Constraints are stated explicitly in the tool schema so
-LLMs respect them before composing a call.
-
-**Semantic search** (requires `akgentic-tool[vector_search]`): task descriptions are embedded
-on create/update. `search_planning(query=...)` runs keyword UNION semantic search (cosine ≥ 0.5,
-top_k=10; defaults configurable via `search_score_threshold` / `search_top_k`). Controlled by the
-`vector_store` field: `True` (default) wires the shared `#VectorStore` actor, a `str` selects a
-named store created by `VectorStoreTool(vector_store_name=...)` (see
-[VectorStoreTool](#vectorstoretool)), `PlanningTool(vector_store=False)` disables semantic
-search — the tool then runs keyword-only. It also degrades gracefully to keyword-only when
-vector deps are absent.
-
-```python
-# System prompt output example (filter_by_agent=True)
-"""
-**Team planning:** 5 tasks total
-Owners: @Alice: 3 | @Bob: 1 | unassigned: 1
-
-**Your tasks** (owner or creator: @Alice):
-- ID 3 [started] Implement auth module (Owner: @Alice, Creator: @Alice)
-- ID 7 [pending] Review PR #42 — Output: pending (Owner: @Bob, Creator: @Alice)
-
-Use get_planning_task(id) for exact ID lookup or search_planning(...) to filter tasks.
-"""
-```
+**[Full reference → `src/akgentic/tool/planning/README.md`](src/akgentic/tool/planning/README.md)** —
+task model constraints, the four capabilities and their channels, collection configuration and
+the `depends_on` contract.
 
 ### KnowledgeGraphTool
 
-Persistent actor-based knowledge graph for structured entity and relationship storage with
-hybrid keyword + semantic search.
+Persistent actor-based knowledge graph for structured entity and relationship storage with hybrid
+keyword + semantic search. The system prompt carries a summary that scales as *O(types + roots)*
+rather than *O(entities)*, so a large graph stays affordable as context.
 
 ```python
 from akgentic.tool.knowledge_graph import KnowledgeGraphTool
 
 KnowledgeGraphTool()
+KnowledgeGraphTool(read_only=True)
 ```
 
-| Capability | Default channel | Description |
-|---|---|---|
-| `get_graph` | `SYSTEM_PROMPT`, `COMMAND` | Full graph (type schema + root entities) injected into LLM context |
-| `update_graph` | `TOOL_CALL` | Batch create / update / delete entities and relations |
-| `search_graph` | `TOOL_CALL`, `COMMAND` | Search by keyword, vector, or hybrid mode |
+Requires `akgentic-tool[vector_search]` — the dependency is checked at wiring time even when
+`vector_store=False`.
 
-Entities and relations are stored in a `KnowledgeGraphActor`.
-Semantic search uses the shared vector store
-(requires `akgentic-tool[vector_search]`) and is controlled by the same `vector_store` field as
-`PlanningTool`: `KnowledgeGraphTool(vector_store=False)` disables it (keyword-only search),
-`True` wires the shared `#VectorStore` actor, a `str` selects a named store created by
-`VectorStoreTool(vector_store_name=...)`.
-
-**`search_graph`** searches entities *and* relations, and can expand hits into their graph
-neighbourhood. Parameters (a `SearchQuery`):
-
-- `mode` — `"hybrid"` (default, keyword ∪ semantic), `"keyword"` (substring only, no embedding
-  call), or `"vector"` (cosine similarity only)
-- `top_k` / `score_threshold` — per-call overrides; `None` falls back to the ToolCard defaults
-  (`search_top_k=10`, `search_score_threshold=0.3` — lower than PlanningTool's 0.5, favouring
-  recall for exploration)
-- `include_neighbors` — add the 1-hop neighbours of entity hits
-- `include_edges` — add all relations connected to entity hits
-- `find_paths` — BFS shortest paths between the top 5 entity hits (max 10 pairs)
-
-Results are ordered by score, highest first: a keyword match scores `1.0`, a vector hit its
-cosine similarity, a hit found by both `cosine + 0.5`.
+**[Full reference → `src/akgentic/tool/knowledge_graph/README.md`](src/akgentic/tool/knowledge_graph/README.md)** —
+the mutation and query models, search modes and expansion flags, scoring, and the state-delta
+events.
 
 ### VectorStoreTool
 
 Configuration-only companion card for the `VectorStoreActor` singleton — it exposes **no LLM
 tools, system prompts, or commands** (`get_tools()` returns `[]`). Its sole runtime job is to
-ensure the singleton exists when the observer attaches, via the same idempotent
-`getChildrenOrCreate` binding as every other tool actor. Consumer cards (`PlanningTool`,
-`KnowledgeGraphTool`) never create the actor themselves — they look it up by name and declare a
-conditional `depends_on: ["VectorStoreTool"]`, so `ToolFactory`'s topological sort wires this
-card first.
+ensure the singleton exists when the observer attaches. Consumer cards (`PlanningTool`,
+`KnowledgeGraphTool`) never create the actor themselves: they look it up by name and declare a
+conditional `depends_on: ["VectorStoreTool"]`, so `ToolFactory`'s topological sort wires this card
+first.
 
 ```python
 from akgentic.tool.vector_store import VectorStoreTool
@@ -831,56 +789,38 @@ VectorStoreTool()                                  # "#VectorStore", OpenAI embe
 VectorStoreTool(vector_store_name="#VectorStore-RAG", embedding_provider="azure")
 ```
 
-| Field | Default | Purpose |
-|---|---|---|
-| `vector_store_name` | `"#VectorStore"` | Singleton actor name — several named stores can coexist |
-| `embedding_model` | `"text-embedding-3-small"` | Embedding model identifier |
-| `embedding_provider` | `"openai"` | `"openai"` or `"azure"` |
+Collections are configured on the *consumer* card (`collection: CollectionConfig`), and Weaviate
+connection settings are deliberately not fields on any card — they are infrastructure, injected by
+the deployment layer.
 
-**Collections are configured by the consumer, not this card.** Each consumer card carries a
-`collection: CollectionConfig` field, passed to the actor's `create_collection` when the
-consumer's actor starts:
-
-| `CollectionConfig` field | Default | Purpose |
-|---|---|---|
-| `dimension` | `1536` | Embedding vector dimensionality |
-| `backend` | `"inmemory"` | `"inmemory"` (numpy) or `"weaviate"` (requires `akgentic-tool[weaviate]`) |
-| `persistence` | `"actor_state"` | `"actor_state"` or `"workspace"` (inmemory backend only) |
-| `workspace_path` | `None` | Filesystem path when persistence is `"workspace"` |
-| `tenant` | `None` | Weaviate tenant ID for multi-tenancy |
-
-```python
-PlanningTool(collection=CollectionConfig(backend="weaviate", tenant="team-42"))
-```
-
-Weaviate connection settings are deliberately not fields on any card — they are
-infrastructure-level, injected by the deployment layer. A team can omit vector search entirely
-by setting `vector_store=False` on the consumer cards; both degrade gracefully to keyword-only
-search.
+**[Full reference → `src/akgentic/tool/vector_store/README.md`](src/akgentic/tool/vector_store/README.md)** —
+`CollectionConfig` in full, the service protocol, asynchronous embedding, and multi-store setups.
 
 ### SearchTool
 
-Web search and content fetching via the [Tavily](https://tavily.com/) API.
+Web search and content fetching via the [Tavily](https://tavily.com/) API: `web_search`,
+`web_fetch` and `web_crawl`. Every capability parameter becomes the *default value* of the
+corresponding tool argument, so configuration biases the model without removing its judgement.
 
 ```python
-from akgentic.tool.search import SearchTool
+from akgentic.tool.search import SearchTool, WebCrawl
 
 SearchTool()
+SearchTool(web_crawl=WebCrawl(max_depth=2, limit=50))
 ```
 
-| Tool | Description |
-|---|---|
-| `web_search` | Tavily search — returns titles, URLs, and snippets |
-| `web_fetch` | Fetch and extract clean text from a URL (Tavily extract) |
-| `web_crawl` | Crawl a URL and return structured content |
+Requires the `TAVILY_API_KEY` environment variable. A missing or invalid key never raises — the
+tool returns a message telling the model it is unavailable.
 
-Requires `TAVILY_API_KEY` environment variable.
+**[Full reference → `src/akgentic/tool/search/README.md`](src/akgentic/tool/search/README.md)** —
+every Tavily parameter with its accepted range, and how `crawl_instructions` differs from the
+inherited `instructions`.
 
 ### TeamTool
 
-Exposes team management capabilities (hire/fire agents, roster view) to the LLM, and answers *who
-is working right now, and on what*. Used by `BaseAgent` in `akgentic-agent` to enable
-orchestrator-level agents to dynamically extend the team.
+Exposes team management capabilities (hire/fire agents, roster, role profiles) to the LLM, and
+answers *who is working right now, and on what*. Used by `BaseAgent` in `akgentic-agent` to let
+orchestrator-level agents extend the team at runtime. Requires a `TeamManagementToolObserver`.
 
 ```python
 from akgentic.tool.team import ActivitySummarizer, GetTeamActivity, TeamTool
@@ -893,292 +833,79 @@ TeamTool(get_team_activity=GetTeamActivity(     # + summaries on demand; #TeamAc
 ))
 ```
 
-Requires a `TeamManagementToolObserver` (provided by `BaseAgent`). Surfaces agent roster and
-available profiles as a system prompt; `hire_members(roles)` and `fire_members(names)` as tool calls.
-The single-member `hire_member(role, name=None)` and `fire_member(name)` are `COMMAND`-channel
-variants, not tool calls.
+`team_activity` defaults to on because the truncate-only report is derived from telemetry the
+orchestrator already keeps — it costs nothing. The `#TeamActivity` cache actor is created **only**
+when a summarizer is configured, and the callable's signature follows the configuration:
+`summarize_over` is absent from the schema when nothing could produce a summary.
 
-#### Team activity — `team_activity`
-
-`get_team_activity` **defaults to `True`** (with no summarizer): the truncate-only report is pure
-telemetry, so it is cheap enough to be on everywhere. A card persisted with an explicit `False`
-keeps it off. Two independent gates decide what the capability costs:
-
-| Configuration | `team_activity` | `#TeamActivity` actor | model call | `summarize_over` in the schema |
-|---|---|---|---|---|
-| `get_team_activity=False` | not exposed | not created | never | n/a |
-| `get_team_activity=True`, `summarizer=None` *(default)* | exposed, truncates | **not created** | never | **absent** |
-| `summarizer=ActivitySummarizer(...)` | exposed, summarizes | created | on demand | present |
-
-The `#TeamActivity` cache actor is created **only** when `get_team_activity` resolves truthy **and**
-its `summarizer` is not `None`. The actor exists solely to cache summaries, so with the capability on
-and no summarizer there is nothing to cache: `team_activity` answers by truncation and **no actor is
-created at all**.
-
-The signature follows the configuration rather than being fixed. Without a summarizer the callable is
-`team_activity() -> TeamActivityReport`, and `summarize_over` is **absent from the tool schema** —
-not merely defaulted off — so the model cannot request a summary nothing could produce. With one
-configured it becomes `team_activity(summarize_over: int | None = None)`, and **`summarize_over=None`
-still performs zero model calls**: long task text is truncated to `max_task_chars`. Passing an integer
-is the opt-in — only longer tasks go through the deferred-result cache above, keyed by `message_id` so
-a follow-up call costs nothing. The threshold *is* the consent; there is no eager warming.
-
-**The report is lean by design.** It is read back by the calling model on every invocation, so every
-field is prompt cost. A member row carries `name`, `role`, `task`, `summarized`, `started_at` and
-`suspect` — nothing else. The derivation keys never reach the wire: grouping happens by `agent_id`
-and the summary cache is keyed by `message_id`, but both stay internal, and the busy duration is
-simply `generated_at − started_at`.
-
-Busy members are derived from the orchestrator's own telemetry: an agent with a `ReceivedMessage` and
-no matching `ProcessedMessage` is mid-handler, and the task text comes from the corresponding
-`SentMessage`. Three behaviours worth knowing:
-
-- **Busy means exactly one open message.** Actors are sequential, so the open count is structurally
-  0 or 1; a higher count is reported as `suspect` rather than as plain "working", and never dropped.
-- **Stale entries are dropped.** A resumed team replays telemetry that can be permanently unbalanced
-  (a message received before the stop, processed never). Anything open longer than
-  `stale_after_seconds` (default 300 s) is excluded rather than reported as a phantom worker.
-- **The caller, tool actors, and the user proxy never appear.** The caller is excluded by `agent_id`,
-  so a rename cannot slip it through; a human proxy waiting on input is not working.
-
-`GetTeamActivity` also carries `expose` (`TOOL_CALL`, `COMMAND`) and `max_task_chars` (default 200),
-the budget for reported task text; `ActivitySummarizer` carries `poll_attempts` (5) and
-`poll_delay_seconds` (0.4). Its `model` is a pydantic-ai model spec string rather than the framework's
-`ModelConfig`, because `akgentic-tool` does not depend on `akgentic-llm` — so those tokens are
-produced outside `ReactAgent` and are counted by neither its cost accounting nor its usage limits.
+**[Full reference → `src/akgentic/tool/team/README.md`](src/akgentic/tool/team/README.md)** —
+the hire/fire channel split, partial-success reporting, the two activity gates, and how "busy" is
+derived from telemetry.
 
 ### NotificationTool
 
 Lets an agent schedule a message **to itself**, delivered after a delay — to defer its own
 attention, check a long-running result later, or nudge itself if nothing has happened by then. A
-team singleton (named `#NotificationTool`) holds the pending entries and delivers them, bound
-through the same idempotent `getChildrenOrCreate` call as every other tool actor.
+team singleton (named `#NotificationTool`) holds the pending entries and delivers them.
 
 ```python
 from akgentic.tool import NotificationTool
-from akgentic.tool.core import COMMAND, TOOL_CALL
-from akgentic.tool.notification import CancelNotification, RegisterNotification
 
 NotificationTool()                            # AgentMessage delivery, 300 s cap
 NotificationTool(max_delay_seconds=60)        # tighter cap
 NotificationTool(message_class="acme_core.messages.ReminderMessage")
-
-NotificationTool(
-    register_notification=RegisterNotification(
-        expose={COMMAND},                     # a human schedules; the LLM cannot
-        instructions="Only for CI checks.",   # appended to the tool description
-    ),
-    cancel_notification=CancelNotification(expose={TOOL_CALL}),
-    pending_notification=False,               # capability removed from both channels
-)
 ```
 
-| Field | Default | Purpose |
-|---|---|---|
-| `message_class` | `"akgentic.agent.messages.AgentMessage"` | Dotted import path of the class delivered when a notification comes due |
-| `max_delay_seconds` | `300` | Largest delay an agent may schedule |
-| `register_notification` | `True` | The scheduling capability — `False` removes it, a `RegisterNotification` configures it |
-| `pending_notification` | `True` | The listing capability, same shape |
-| `cancel_notification` | `True` | The cancellation capability, same shape |
+Ownership is scoped per agent: listing can be widened to the whole team with
+`pending_notification(all=True)`, but cancel authority never widens with it. Entries store an
+absolute due time, so a delay that expired while the team was stopped simply fires on resume.
 
-Each capability is a `bool | BaseToolParam` field like everywhere else in this package: `True`
-enables it with defaults, `False` removes it from every channel, and a param instance narrows its
-`expose` set or adds `instructions`.
-
-| Capability | Channels | Description |
-|---|---|---|
-| `register_notification` | `TOOL_CALL`, `COMMAND` | Schedule a message to yourself from `content` and `delay_seconds`; returns a confirmation carrying the notification id |
-| `pending_notification` | `TOOL_CALL`, `COMMAND` | `pending_notification(all=False)` — your own pending entries with the time left on each, or every team member's when `all=True`, each line marked `@owner`. It widens what you can see, never what you can cancel |
-| `cancel_notification` | `TOOL_CALL`, `COMMAND` | Cancel one of your own pending entries by id |
-
-The `COMMAND` column is the human `/`-command surface too, so with the shipped defaults
-`/register_notification "check CI" 120` schedules an entry from the command line,
-`/pending_notification` lists that agent's own entries, and `/pending_notification all=true`
-lists the whole team's.
-
-**The `message_class` contract.** The path must resolve to a `Message` subclass declaring `content`
-and `type` model fields, and that `type` must *accept* the value `"notification"`, which is what
-delivery writes. A path that is not importable, that does not name a `Message` subclass, that names
-one missing either field, or that names one whose `type` is a `Literal` excluding `"notification"`
-raises `ValueError` at `observer()` bind time — never when a notification comes due. Naming the
-class by string rather than importing it is what keeps this package free of any dependency on the
-package that owns it: the deployment picks the delivery class, and the card resolves it at wiring
-time.
-
-**The delay cap.** `delay_seconds` must fall between 1 and `max_delay_seconds`; anything outside
-that range raises `RetriableError`, so an over-long delay reaches the LLM as a correctable mistake
-rather than as a failure. Delivery granularity is ±1 s — the actor scans for due entries about once
-a second.
-
-**Ownership is scoped per agent, and visibility is the one thing an argument widens.** Each
-capability is bound to the address of the agent carrying the card, captured once at bind time.
-Listing defaults to that agent's own entries; `pending_notification(all=True)` reports every team
-member's, each line marked with its owner, which is how an agent sees what the team is already
-waiting on. Cancel authority does **not** widen with it: `cancel_notification` always passes the
-captured owner, so cancelling another agent's id — including one just read through `all=True` —
-fails exactly as cancelling an unknown one does, a `RetriableError`, while that entry stays pending
-for its real owner.
-
-**Delivery comes from the notification actor.** It sends as itself, so the delivered `sender` is
-`#NotificationTool`, and the message's `type` is `"notification"`. The send is a tell, so a busy
-agent never blocks the actor. Delivery waits while the owner is off the team — an agent between
-hire and start, or a resumed team whose agents have not re-registered yet — for up to five minutes,
-and goes through as soon as it is back; past that window, and for a send that fails despite the
-owner being on the team, the entry is logged and dropped rather than retried.
-
-**Stop and resume.** A pending entry stores an absolute due time, not a remaining delay. An entry
-whose delay expired while the team was stopped is therefore simply due on the first tick after the
-resume, and is delivered on the first tick at which its owner is back on the team. There is no
-re-arm logic and nothing to reschedule.
+**[Full reference → `src/akgentic/tool/notification/README.md`](src/akgentic/tool/notification/README.md)** —
+the `message_class` validation contract, delivery and grace semantics, and the `/`-command
+surface.
 
 ### MCPTool
 
 Integrates external [Model Context Protocol](https://modelcontextprotocol.io) servers as native
 pydantic-ai toolsets over three transports: `streamable-http` (default), `sse`, and `stdio`.
-
-`MCPTool` takes exactly one connection, on a required singular `connection` field:
-
-```python
-from akgentic.tool.mcp import MCPTool, MCPHTTPConnectionConfig
-
-# Remote server over streamable HTTP (the default transport)
-MCPTool(
-    connection=MCPHTTPConnectionConfig(
-        url="https://mcp.acme.example/api/v1/endpoint",
-    )
-)
-```
-
-The transport is always taken from the config, never inferred from the URL. pydantic-ai's
-own inference only recognises URLs ending in `/sse`, which would silently downgrade any SSE
-endpoint published on another path — so `sse` must be requested explicitly:
+`MCPTool` takes exactly one connection, on a required singular `connection` field.
 
 ```python
-# Server-Sent Events — `transport="sse"` is required, a /sse suffix is not enough
-MCPTool(
-    connection=MCPHTTPConnectionConfig(
-        url="https://mcp.acme.example/api/v1/endpoint",
-        transport="sse",
-        bearer_token="...",       # sent as an Authorization header on the transport
-        read_timeout=900.0,       # also governs how long the event stream tolerates silence
-    )
-)
+from akgentic.tool.mcp import MCPTool, MCPHTTPConnectionConfig, MCPStdioConnectionConfig
+
+MCPTool(connection=MCPHTTPConnectionConfig(url="https://mcp.acme.example/api/v1/endpoint"))
+MCPTool(connection=MCPStdioConnectionConfig(stdio_command="uvx", stdio_args=["acme-mcp-server"]))
 ```
 
-```python
-from akgentic.tool.mcp import MCPTool, MCPStdioConnectionConfig
+`get_tools()` is always empty — MCP capabilities reach the agent through `get_toolsets()`. The
+transport is always taken from the config, never inferred from the URL, so `transport="sse"` must
+be requested explicitly.
 
-# Local server launched as a subprocess — `stdio_command` is required
-MCPTool(
-    connection=MCPStdioConnectionConfig(
-        stdio_command="uvx",
-        stdio_args=["acme-mcp-server"],
-        tool_prefix="acme",       # applied via the toolset's prefixed() wrapper
-    )
-)
-```
-
-`get_tools()` is always empty — MCP capabilities reach the agent through `get_toolsets()`,
-which returns a single toolset and lets pydantic-ai handle schema resolution and dispatch.
-Setting `tool_prefix` wraps that toolset in a `PrefixedToolset`.
-
-For servers that answer `401` with an MCP `WWW-Authenticate` challenge, `mcp/oauth_handler.py`
-runs a browser-based authorization flow. Note that it stops at the **authorization code** —
-exchanging that code for an access token is not implemented, so the returned value is the code
-itself. The helpers are not wired into `MCPTool`; call them yourself and pass the result as
-`bearer_token`.
+**[Full reference → `src/akgentic/tool/mcp/README.md`](src/akgentic/tool/mcp/README.md)** —
+both connection models field by field, the SSE timeout subtlety, tool prefixing, diagnostics and
+the OAuth helpers.
 
 ### ExecTool
 
 Sandboxed shell command execution inside the team workspace. A single `SandboxActor` is spawned
-per team and reused across all `ExecTool` calls. The backend is selected via the `mode` field.
+per team and reused across all `ExecTool` calls; the backend is selected via the `mode` field,
+with `auto` probing the host (`bwrap` → `seatbelt` → `docker` → `local`).
 
 ```python
-from akgentic.tool.sandbox.tool import ExecTool
+from akgentic.tool import ExecTool
 
-ExecTool()                        # auto mode (default — probe: bwrap → seatbelt → docker → local)
-ExecTool(mode="local")            # local mode (subprocess, no filesystem isolation)
-ExecTool(mode="bwrap")            # Linux bubblewrap (filesystem namespace isolation)
-ExecTool(mode="seatbelt")         # macOS Apple Seatbelt (sandbox-exec profile)
-ExecTool(mode="docker")           # persistent Docker container per team
-ExecTool(workspace_id="shared")   # share workspace directory with WorkspaceTool
+ExecTool()                        # auto mode (default)
+ExecTool(mode="docker")           # persistent container per team
+ExecTool(workspace_id="shared")   # share the workspace directory with WorkspaceTool
 ```
 
-**Sandbox modes:**
+Commands are checked against the `ALLOWED_COMMANDS` allowlist — first token only. Disallowed
+commands and backend failures come back as strings, never as exceptions. Set
+`AKGENTIC_SANDBOX_IMAGE` to use a pre-built Docker image instead of the auto-built one.
 
-| Mode | Platform | Isolation | Requirement |
-|---|---|---|---|
-| `local` | Any | None — subprocess only | No extra tools needed |
-| `bwrap` | Linux | Filesystem namespace (bubblewrap) | `bwrap` on PATH |
-| `seatbelt` | macOS | Apple Seatbelt profile (`sandbox-exec`) | `sandbox-exec` on PATH |
-| `docker` | Any | Persistent container per team | Docker daemon on PATH |
-| `auto` | Any | Best available (probe order: bwrap → seatbelt → docker → local) | Automatic |
-
-**Allowed commands** (enforced by `ALLOWED_COMMANDS` allowlist — first token only):
-
-`python`, `python3`, `pytest`, `ruff`, `mypy`, `git`, `uv`, `pip`, `cat`, `ls`, `find`,
-`grep`, `mkdir`, `cp`, `mv`, `rm`, `echo`, `touch`, `curl`, `wget`, `make`, `bash`, `sh`,
-`node`, `npm`, `npx`
-
-**Auto-mode probe order (`_resolve_auto_mode()`):** When `mode="auto"`, the function probes
-the host at `ExecTool.observer()` call time in the following order: `bwrap` (Linux bubblewrap)
-→ `seatbelt` (macOS `sandbox-exec`) → `docker` → `local` (fallback, no isolation). If `local`
-is selected as the fallback, a `DeprecationWarning` is emitted to alert that no isolation
-backend was found.
-
-**Platform notes:**
-
-- **RLIMIT_AS on Darwin:** The `local` mode sets `RLIMIT_AS` (virtual address space limit) to
-  512 MB on Linux but skips this resource limit on macOS/Darwin, where `RLIMIT_AS` is not
-  reliably enforceable. CPU time and file size limits are applied on all platforms.
-- **Seatbelt DeprecationWarning:** `SeatbeltSandboxActor._start_sandbox()` emits a
-  `DeprecationWarning` because `sandbox-exec` is deprecated since macOS 10.15 Catalina and
-  may be removed in a future macOS release. The seatbelt mode is intended for macOS developer
-  workstations only.
-
-**Docker sandbox image:** The `docker` mode (and `auto` when it resolves to Docker) runs containers
-from the image `akgentic-sandbox:latest` (the `SANDBOX_IMAGE` constant in `sandbox/docker.py`). The
-image is **built automatically on first use** by `DockerSandboxActor._ensure_image()` from the bundled
-`sandbox.Dockerfile` (Python 3.12 + pytest/ruff/mypy, uv, Node.js 18) — no manual step is required.
-The build runs once; Docker's layer cache makes later container starts instant.
-
-**Pre-built / CI image (`AKGENTIC_SANDBOX_IMAGE`):** Set `AKGENTIC_SANDBOX_IMAGE=<name>` to use a
-pre-built or registry image. When set, the auto-build check is skipped and that image is used directly
-— recommended for CI and production, where the image is pre-built and pushed to a registry.
-
-To pre-build the image manually (optional — e.g. to warm the cache before first use):
-
-```bash
-docker build \
-  -f packages/akgentic-tool/src/akgentic/tool/sandbox/sandbox.Dockerfile \
-  -t akgentic-sandbox:latest \
-  packages/akgentic-tool/src/akgentic/tool/sandbox
-```
-
-**Error handling:** All errors from the sandbox backend surface as a `SandboxError` string
-returned to the LLM (never raised). Disallowed commands return a `CommandNotAllowedError`
-string listing the allowed commands.
-
-```python
-# Example tool response for a disallowed command:
-# "CommandNotAllowedError: Command 'curl' is not in the allowed commands list.
-#  Allowed: ['bash', 'cat', 'cp', ...]"
-
-# Example tool response for a backend failure:
-# "SandboxError: TimeoutExpired: Command 'python main.py' timed out after 30s"
-```
-
-**`SANDBOX_ACTOR_CLASSES` registry:** The backend registry is a mutable `dict[str, type[SandboxActor]]`
-exposed at `akgentic.tool.sandbox.tool.SANDBOX_ACTOR_CLASSES`. Infrastructure packages (e.g.,
-`akgentic-infra`) can inject additional backends at import time before any `ExecTool` is
-constructed:
-
-```python
-from akgentic.tool.sandbox.tool import SANDBOX_ACTOR_CLASSES
-from my_infra.e2b_actor import E2BSandboxActor
-
-SANDBOX_ACTOR_CLASSES["e2b"] = E2BSandboxActor  # now available as ExecTool(mode="e2b")
-```
+**[Full reference → `src/akgentic/tool/sandbox/README.md`](src/akgentic/tool/sandbox/README.md)** —
+the four backends compared (isolation, timeouts, rlimits, network), the Docker image lifecycle,
+and how to register a backend of your own.
 
 ## Error Handling
 
@@ -1300,6 +1027,7 @@ src/akgentic/tool/
     vector.py                 # Compatibility façade only — moved to
     │                         #   vector_store/vector.py. See the migration table
     vector_store/
+    │   README.md           # VectorStoreTool reference — fields, CollectionConfig, backends
     │   vector.py             # VectorEntry, EmbeddingService, VectorIndex
     │   │                     #   [optional: vector_search extra]
     │   protocol.py           # VectorStore Protocol, VectorStoreConfig, data models
@@ -1311,21 +1039,26 @@ src/akgentic/tool/
     │                         #   invariant — see Deferred Results)
     │   └── tool.py           # VectorStoreTool ToolCard
     planning/
+    │   README.md           # PlanningTool reference — capabilities, task models, wiring
     │   planning_actor.py     # Task models, PlanConfig, PlanActor
     │   └── planning.py       # PlanningTool ToolCard
     knowledge_graph/
+    │   README.md           # KnowledgeGraphTool reference — params, search modes, deltas
     │   models.py             # Entity, Relation, CRUD + query models
     │   event.py              # Re-exports KnowledgeGraphStateEvent, this domain's delta
     │   kg_actor.py           # KnowledgeGraphActor
     │   └── kg_tool.py        # KnowledgeGraphTool ToolCard
     search/
+    │   README.md           # SearchTool reference — Tavily parameters and ranges
     │   └── search.py         # SearchTool (Tavily)
     team/
+    │   README.md           # TeamTool reference — hire/fire channels, activity gates
     │   team.py               # TeamTool — hire/fire/roster/profiles + get_team_activity
     │   observer.py           # TeamManagementToolObserver — TeamTool's own contract
     │   └── activity.py       # team_activity models, GetTeamActivity,
     │                         #   ActivitySummarizer, TeamActivityActor, SummarizerWorker
     notification/
+    │   README.md           # NotificationTool reference — message_class contract, delivery
     │   __init__.py           # Public exports: NotificationTool, its capability params,
     │                         #   NotificationActor, models
     │   models.py             # PendingNotification, NotificationConfig,
@@ -1334,14 +1067,17 @@ src/akgentic/tool/
     │   └── tool.py           # NotificationTool ToolCard + RegisterNotification,
     │                         #   PendingNotifications, CancelNotification
     mcp/
+    │   README.md           # MCPTool reference — transports, timeouts, diagnostics
     │   mcp.py                # MCPTool, connection configs
     │   └── oauth_handler.py  # OAuth 2.0 flow
     workspace/
+        README.md           # WorkspaceTool reference — every capability parameter
         workspace.py          # Workspace Protocol, Filesystem, get_workspace()
         edit.py               # EditMatcher (7-strategy), FilePatch, parse_patch
         readers.py            # DocumentReader (Pydantic BaseModel), TEXT_EXTENSIONS
         └── tool.py           # WorkspaceTool ToolCard
     sandbox/
+        README.md           # ExecTool reference — backends compared, allowlist, image
         __init__.py           # Public exports: ExecTool, SandboxActor subclasses, models
         actor.py              # SandboxActor (abstract), SandboxConfig, ALLOWED_COMMANDS
         local.py              # LocalSandboxActor (subprocess, resource limits)

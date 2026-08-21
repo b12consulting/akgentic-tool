@@ -48,13 +48,20 @@ class WebFetch(BaseToolParam):
 
 
 class WebCrawl(BaseToolParam):
-    """Parameters for the web crawl capability."""
+    """Parameters for the web crawl capability.
+
+    ``crawl_instructions`` is deliberately not named ``instructions``: that name is
+    already taken by :class:`~akgentic.tool.core.params.BaseToolParam`, where it
+    appends to the tool docstring the model reads. A single field spelled
+    ``instructions`` drove both effects at once, so a crawl could not be biased
+    without also rewriting its description, nor described without also biasing it.
+    """
 
     timeout: float = 150
     max_depth: int | None = None
     max_breadth: int | None = None
     limit: int | None = None
-    instructions: str | None = None
+    crawl_instructions: str | None = None
     extract_depth: Literal["basic", "advanced"] | None = None
 
 
@@ -185,7 +192,7 @@ class SearchTool(ToolCard):
             max_depth: int | None = params.max_depth,
             max_breadth: int | None = params.max_breadth,
             limit: int | None = params.limit,
-            instructions: str | None = params.instructions,
+            crawl_instructions: str | None = params.crawl_instructions,
             extract_depth: Literal["basic", "advanced"] | None = params.extract_depth,
         ) -> Any:
             """Crawl a website from a root URL and extract content from discovered pages.
@@ -203,7 +210,7 @@ class SearchTool(ToolCard):
                     Tavily supports values between 1 and 500.
                 limit: Total number of links/pages processed before stopping.
                     Must be >= 1.
-                instructions: Optional natural-language guidance to bias crawl
+                crawl_instructions: Optional natural-language guidance to bias crawl
                     and extraction toward specific topics or sections.
                 extract_depth: Extraction depth applied to crawled pages.
                     - ``basic``: faster and cheaper.
@@ -226,8 +233,10 @@ class SearchTool(ToolCard):
                     crawl_kwargs["max_breadth"] = max_breadth
                 if limit is not None:
                     crawl_kwargs["limit"] = limit
-                if instructions is not None:
-                    crawl_kwargs["instructions"] = instructions
+                if crawl_instructions is not None:
+                    # Tavily's own kwarg keeps the name `instructions`; only the field
+                    # and the tool argument are renamed.
+                    crawl_kwargs["instructions"] = crawl_instructions
                 if extract_depth is not None:
                     crawl_kwargs["extract_depth"] = extract_depth
 
