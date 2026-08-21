@@ -36,6 +36,16 @@ wrong at one end or the other. Both exist for the same reason — an uncapped ma
 on a team singleton leaks for the life of the team.
 """
 
+MAX_REJECTION_DIFF_LINES = 200
+"""Cap on the unified diff a refusal carries back to the model.
+
+A refusal is a ``RetriableError``, so its whole text lands in the agent's next
+turn. Uncapped, a stale write to a large file would put that file's entire diff
+into the context window — the refusal, not the write, would then be what breaks
+the turn. Two hundred lines is well past what an agent needs to see that its
+change collided, and the notice below the cut says what was elided.
+"""
+
 PERM_ERR_MSG = "Path escapes workspace root — use a path relative to the workspace"
 """Refusal text for a path that resolves outside the workspace root.
 
