@@ -46,6 +46,7 @@ from akgentic.tool.workspace.execution import (
     format_status,
     in_progress,
     new_run_id,
+    poll_attempts_within,
     resolve_mode,
     sandbox_config,
 )
@@ -157,6 +158,7 @@ __all__ = [
     "format_status",
     "in_progress",
     "new_run_id",
+    "poll_attempts_within",
     "resolve_mode",
     "sanitise_command",
     "sandbox_config",

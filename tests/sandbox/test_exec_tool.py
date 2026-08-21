@@ -401,7 +401,16 @@ def test_exec_command_includes_stderr_in_output() -> None:
 
 
 def test_exec_command_catches_command_not_allowed_error() -> None:
-    """AC9: CommandNotAllowedError is caught and returned as an error string — not raised."""
+    """AC9: CommandNotAllowedError is caught and returned as an error string — not raised.
+
+    **This covers the defensive branch, not the production path.** From story 29-5
+    the allowlist is checked in ``SandboxActor.exec``, which runs on the worker's
+    thread, so the error reaches the agent as a *reported failure* rather than as
+    an exception out of ``request_exec``. What an agent is really told for
+    ``git status`` is asserted end to end in
+    ``tests/workspace/test_exec.py::TestADisallowedCommand``. The handler stays
+    because a synchronous raise is still representable and must not escape.
+    """
     observer = MockObserver(existing_actor=None)
     tool = ExecTool(mode="local")
     wire(tool, observer)
@@ -458,7 +467,12 @@ def test_exec_command_catches_generic_exception() -> None:
 
 
 def test_exec_command_error_string_lists_allowed_commands() -> None:
-    """AC9: error string contains the sorted list of ALLOWED_COMMANDS."""
+    """AC9: error string contains the sorted list of ALLOWED_COMMANDS.
+
+    Defensive branch, as above — on the production path the same list reaches the
+    agent inside the reported failure, because ``CommandNotAllowedError``'s own
+    message carries it.
+    """
     observer = MockObserver(existing_actor=None)
     tool = ExecTool(mode="local")
     wire(tool, observer)

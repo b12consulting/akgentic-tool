@@ -43,6 +43,7 @@ from akgentic.tool.workspace.execution import (
     ExecState,
     ExecWorker,
     new_run_id,
+    poll_attempts_within,
 )
 from akgentic.tool.workspace.journal import MAX_COMMIT_BODY_CHARS
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
@@ -186,6 +187,52 @@ class TestTheCapability:
     ) -> None:
         created = [config.name for _cls, config in orchestrator_proxy.create_calls]
         assert "#SandboxActor" in created
+
+    def test_off_the_tool_channel_creates_no_sandbox_actor_and_probes_nothing(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The two halves of the capability have to agree on what "on" means. A
+        # card that takes exec off the tool channel registers no callable, so it
+        # must not resolve a backend, warn about the fallback, or bring up a
+        # #SandboxActor either — on the docker backend that last one is a running
+        # container, brought up to serve tools that do not exist.
+        def explode() -> str:
+            raise AssertionError("a card with exec off the tool channel probed the host")
+
+        monkeypatch.setattr("akgentic.tool.sandbox.tool._resolve_auto_mode", explode)
+        card = WorkspaceTool(
+            workspace_id=workspace_tree.name,
+            workspace_exec=WorkspaceExec(expose=set()),
+        )
+        card.observer(FakeActorToolObserver(orchestrator_proxy))
+
+        created = [config.name for _cls, config in orchestrator_proxy.create_calls]
+        assert "#SandboxActor" not in created
+        names = {tool.__name__ for tool in card.get_tools()}
+        assert "workspace_exec" not in names
+
+    def test_a_backend_announcement_that_fails_does_not_take_the_card_down(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        sandbox_script: SandboxScript,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The registration one line earlier already degrades rather than raises,
+        # for the stand-in proxies and dead actors this window is full of. This
+        # message has to degrade the same way: the cost is an exec request refused
+        # for want of a backend, which is visible and recoverable, where a raise
+        # at wiring time takes the whole agent with it.
+        def refuse(_self: WorkspaceActor, _config: ExecConfig) -> None:
+            raise RuntimeError("the actor died between the get-or-create and here")
+
+        monkeypatch.setattr(WorkspaceActor, "configure_exec", refuse)
+        card, _ = exec_card_for(orchestrator_proxy)
+
+        assert "workspace_exec" in {tool.__name__ for tool in card.get_tools()}
 
     def test_an_unknown_mode_fails_at_wiring_time(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
@@ -407,6 +454,53 @@ class TestTheLease:
 
         assert actor._lease is not None
         assert actor._lease.run_id == current.run_id
+
+
+class TestADisallowedCommand:
+    """What an agent is actually told when the allowlist refuses its command.
+
+    The allowlist check lives in ``SandboxActor.exec``, which from this story runs
+    on the **worker's** thread — so ``CommandNotAllowedError`` never propagates
+    out of ``request_exec`` or ``exec_status`` to a caller. It arrives as a
+    reported failure instead, and this is where that is asserted end to end. The
+    handler in ``ExecTool.exec_command`` is defence against a future path that
+    raises synchronously, and the tests over it in ``tests/sandbox/`` say so.
+    """
+
+    def test_it_is_reported_as_a_failure_naming_the_binary_and_the_allowed_list(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        card, actor, harness = exec_setup
+        # The fake backend is a real SandboxActor subclass, so exec() runs the
+        # real allowlist — the command never reaches _exec at all.
+        start = actor.request_exec(AGENT, "git status")
+        assert start.run_id, start.refusal
+        harness.join()
+
+        status = actor.exec_status(AGENT, start.run_id)
+        assert status.state is ExecState.FAILED
+        assert "git" in status.reason
+        assert "pytest" in status.reason  # the allowed list travels with it
+        assert not sandbox_script.commands  # it was refused before the backend
+
+        answer = mutate(card, "workspace_exec_result", start.run_id)
+        assert "git" in answer
+
+    def test_it_does_not_leave_the_tree_leased(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        # The lease is taken before the worker is spawned, so a command the
+        # backend refuses is one more exit that has to release it.
+        card, actor, harness = exec_setup
+        actor.request_exec(AGENT, "git status")
+        harness.join()
+
+        assert actor._lease is None
+        assert "Created" in mutate(card, "workspace_mkdir", "src")
 
 
 class TestReadsDuringARun:
@@ -689,6 +783,46 @@ class TestTheBudgets:
     def test_the_poll_budget_defaults_below_the_run_budget(self) -> None:
         params = WorkspaceExec()
         assert params.poll_attempts * params.poll_delay_seconds < params.timeout_s
+
+    def test_a_poll_longer_than_the_run_is_clamped(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        sandbox_script: SandboxScript,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # A poll outlasting the run is a sleep with no possible answer: by then
+        # the run has reported or its own budget has killed it. Asserted on the
+        # budget the closure hands ``poll_deferred``, which is where it becomes
+        # wall clock the agent's thread actually spends.
+        card, _ = exec_card_for(
+            orchestrator_proxy, poll_attempts=1000, poll_delay_seconds=1.0
+        )
+        seen: list[tuple[int, float]] = []
+
+        def capture(fetch: Any, attempts: int, delay: float) -> None:
+            seen.append((attempts, delay))
+            return None
+
+        monkeypatch.setattr("akgentic.tool.workspace.tool.poll_deferred", capture)
+        _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
+        assert isinstance(actor, WorkspaceActor)
+        harness = ExecHarness(actor, orchestrator_proxy)
+        harness.install(monkeypatch)
+        sandbox_script.gate.set()
+
+        tool_named(card, "workspace_exec")(cmd="pytest")
+        harness.join()
+
+        attempts, delay = seen[0]
+        assert attempts * delay <= min(DEFAULT_EXEC_TIMEOUT_S, DEFAULT_WORKER_TIMEOUT_S)
+        assert attempts >= 1
+
+    def test_a_poll_that_already_fits_is_left_alone(self) -> None:
+        assert poll_attempts_within(12, 0.4, 15.0) == 12
+        assert poll_attempts_within(0, 0.4, 15.0) == 0  # opting out of polling stands
+        assert poll_attempts_within(1000, 1.0, 15.0) == 15
+        assert poll_attempts_within(1000, 60.0, 15.0) == 1  # never below one look
 
 
 # ---------------------------------------------------------------------------
@@ -987,6 +1121,25 @@ class TestTheDiscoveredWriteSet:
 
         body = journal_body(workspace_tree, journal_log(workspace_tree)[-1].sha)
         assert len(body) <= MAX_COMMIT_BODY_CHARS + 2
+
+    def test_a_refused_mutation_adds_no_commit(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+        workspace_tree: Path,
+    ) -> None:
+        # The last clause of "nothing happened". The busy check returns ahead of
+        # the out-of-band commit as well as ahead of the gate, so a refusal costs
+        # no git fork either — not only no file read.
+        card, actor, harness = exec_setup
+        before = journal_log(workspace_tree)
+        start_run(actor, sandbox_script)
+
+        with pytest.raises(RetriableError, match="workspace busy"):
+            mutate(card, "workspace_mkdir", "src")
+
+        assert journal_log(workspace_tree) == before
+        finish_run(sandbox_script, harness)
 
     def test_the_tree_is_clean_after_a_run(
         self,
