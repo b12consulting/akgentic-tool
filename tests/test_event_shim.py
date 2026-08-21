@@ -69,6 +69,7 @@ _EXPECTED_ROOT_ALL: list[str] = [
     "MetadataTool",
     "NotificationTool",
     "SeatbeltSandboxActor",
+    "SkillTool",
     "WorkspaceTool",
 ]
 

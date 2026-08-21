@@ -31,6 +31,7 @@ channel system — as tool calls, system prompt injections, or programmatic comm
   - [TeamTool](#teamtool)
   - [MetadataTool](#metadatatool)
   - [NotificationTool](#notificationtool)
+  - [SkillTool](#skilltool)
   - [MCPTool](#mcptool)
   - [ExecTool](#exectool)
 - [Error Handling](#error-handling)
@@ -55,10 +56,10 @@ running inside it. It provides:
   > from `akgentic.llm.event` instead.
 - **RetriableError** — tools signal recoverable failures; `ToolFactory` translates them to the
   framework-specific retry exception without coupling tool logic to pydantic-ai
-- **Domain tools** — ten production-ready tool implementations covering workspace I/O, task
-  planning, knowledge graph, web search, team management, the team's business context, vector-store
-  configuration, MCP server integration, sandboxed shell execution, and self-scheduled
-  notifications
+- **Domain tools** — eleven production-ready tool implementations covering workspace I/O, task
+  planning, knowledge graph, web search, team management, the team's business context, on-demand
+  skill guidance, vector-store configuration, MCP server integration, sandboxed shell execution,
+  and self-scheduled notifications
 
 ```
 ToolCard(s)
@@ -691,7 +692,7 @@ decoration.
 
 ## Tool Catalog
 
-Ten tool cards ship with the package. Each one has its own README next to the code, covering the
+Eleven tool cards ship with the package. Each one has its own README next to the code, covering the
 `ToolCard` definition, every field and every nested capability parameter, and the full
 configuration surface — environment, extras, actor wiring and failure modes. The entries below
 are the index; the detail lives beside the module it documents.
@@ -706,6 +707,7 @@ are the index; the detail lives beside the module it documents.
 | `TeamTool` | `akgentic.tool.team` | Hire, fire, roster, role profiles, and who is busy right now | [README](src/akgentic/tool/team/README.md) |
 | `MetadataTool` | `akgentic.tool.metadata` | The team's business context, rendered once into every agent's prefix | [README](src/akgentic/tool/metadata/README.md) |
 | `NotificationTool` | `akgentic.tool.notification` | Delayed messages an agent schedules to itself | [README](src/akgentic/tool/notification/README.md) |
+| `SkillTool` | `akgentic.tool.skill` | A library of skills: the menu in the prefix, the bodies on demand | [README](src/akgentic/tool/skill/README.md) |
 | `MCPTool` | `akgentic.tool.mcp` | External MCP servers as pydantic-ai toolsets | [README](src/akgentic/tool/mcp/README.md) |
 | `ExecTool` | `akgentic.tool.sandbox` | Sandboxed shell execution in the team workspace | [README](src/akgentic/tool/sandbox/README.md) |
 
@@ -915,6 +917,67 @@ absolute due time, so a delay that expired while the team was stopped simply fir
 the `message_class` validation contract, delivery and grace semantics, and the `/`-command
 surface.
 
+### SkillTool
+
+A library of domain guidance — a refund procedure, an escalation policy, a report playbook — split
+by size and volatility. The **menu** (one `name — description` line per skill) is small and
+immutable, so it goes into the frozen system prefix. The **bodies** are large and optional, so they
+arrive at the tail on demand, as ordinary tool returns. Without the split every agent pays for every
+playbook on every turn, and the instructions that matter for the turn compete with seven that do
+not.
+
+```python
+from akgentic.tool import SkillTool
+from akgentic.tool.core import SYSTEM_PROMPT, TOOL_CALL
+from akgentic.tool.skill import SkillEntry, Skills
+
+REFUND = SkillEntry(
+    name="refund-policy",
+    description="How refunds are approved, and the thresholds that need a second signature.",
+    content="Refunds under 100 EUR are approved by the agent handling the case. …",
+)
+ESCALATION = SkillEntry(
+    name="escalation",
+    description="When to escalate to a human, and what the handover must contain.",
+    content="Escalate whenever the customer asks for a person, or after two failed fixes. …",
+)
+
+SkillTool(skills=Skills(skills=[REFUND, ESCALATION]))   # all three channels (default)
+
+SkillTool(skills=Skills(                                # prompt + tool only: no /skills command
+    skills=[REFUND, ESCALATION],
+    expose={SYSTEM_PROMPT, TOOL_CALL},
+))
+
+SkillTool(skills=False)                                 # capability removed entirely
+```
+
+**Three channels, each carrying what it is good at.** `SYSTEM_PROMPT` carries the menu — a header
+line, then one `name — description` line per skill. `TOOL_CALL` carries `use_skill(name)`.
+`COMMAND` registers `skills()`, the same menu rendered for a human, from the same renderer, so it is
+an honest answer to *what was this agent actually given?*
+
+**`use_skill` returns the body as its tool result, in the same turn** — `"{name}\n\n{content}"`, not
+an acknowledgement and not a next-turn delivery. The model asked because it needs the body for the
+answer it is composing, so anything arriving on the next turn arrives after the answer it was needed
+for. An unknown name raises `RetriableError` listing the available names, so the model corrects
+itself in-loop.
+
+**One loading rule.** A body lives in the conversation until a compaction or the sliding window
+drops it; after that the model re-calls `use_skill`. The menu is in the frozen prefix and survives
+that, which is why re-calling always works — a restart is **not** a special case. That placement is
+load-bearing rather than merely economical: a menu at the tail would be one compaction away from an
+agent that no longer knows its skills exist.
+
+The prefix cost is **O(skills), not O(content)** — only `name` and `description` are rendered, so
+body size is paid solely by the conversations that ask for it. The card holds **no state**: it keeps
+no loaded set, so calling `use_skill` on the same name again is the intended recovery rather than a
+redundancy to suppress.
+
+**[Full reference → `src/akgentic/tool/skill/README.md`](src/akgentic/tool/skill/README.md)** —
+every field of `SkillEntry` and `Skills` with what it costs, the menu quoted as rendered, the
+loading model, and the failure modes worth knowing.
+
 ### MCPTool
 
 Integrates external [Model Context Protocol](https://modelcontextprotocol.io) servers as native
@@ -1121,6 +1184,11 @@ src/akgentic/tool/
     │   actor.py              # NotificationActor singleton "#NotificationTool" + tick loop
     │   └── tool.py           # NotificationTool ToolCard + RegisterNotification,
     │                         #   PendingNotifications, CancelNotification
+    skill/
+    │   README.md           # SkillTool reference — the three channels, the loading model
+    │   __init__.py           # Public exports: SkillEntry, Skills, SkillTool
+    │   └── tool.py           # SkillTool ToolCard + SkillEntry, Skills, MENU_HEADER;
+    │                         #   no actor, no state
     mcp/
     │   README.md           # MCPTool reference — transports, timeouts, diagnostics
     │   mcp.py                # MCPTool, connection configs
