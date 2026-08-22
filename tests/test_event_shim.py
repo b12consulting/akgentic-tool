@@ -72,6 +72,7 @@ _EXPECTED_ROOT_ALL: list[str] = [
     "workspace",
     "BwrapSandboxActor",
     "ExecTool",
+    "MailboxTool",  # epic 34: the mailbox card joins the stable surface
     "MetadataTool",
     "NotificationTool",
     "SeatbeltSandboxActor",

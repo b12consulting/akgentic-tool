@@ -23,6 +23,7 @@ commands.
 - [Tool State Events](#tool-state-events)
 - [Tool Actors](#tool-actors)
 - [Deferred Results: Never Block a Tool Actor](#deferred-results-never-block-a-tool-actor)
+- [Building a feature as a card](#building-a-feature-as-a-card)
 - [Tool Catalog](#tool-catalog)
   - [WorkspaceTool](#workspacetool)
   - [PlanningTool](#planningtool)
@@ -33,6 +34,7 @@ commands.
   - [MetadataTool](#metadatatool)
   - [NotificationTool](#notificationtool)
   - [SkillTool](#skilltool)
+  - [MailboxTool](#mailboxtool)
   - [MCPTool](#mcptool)
   - [ExecTool](#exectool)
 - [Error Handling](#error-handling)
@@ -58,10 +60,10 @@ running inside it. It provides:
   > from `akgentic.llm.event` instead.
 - **RetriableError** — tools signal recoverable failures; `ToolFactory` translates them to the
   framework-specific retry exception without coupling tool logic to pydantic-ai
-- **Domain tools** — eleven production-ready tool implementations covering workspace I/O, task
+- **Domain tools** — twelve production-ready tool implementations covering workspace I/O, task
   planning, knowledge graph, web search, team management, the team's business context, on-demand
-  skill guidance, vector-store configuration, MCP server integration, sandboxed shell execution,
-  and self-scheduled notifications
+  skill guidance, the agent's own mailbox and run-cancellation surface, vector-store configuration,
+  MCP server integration, sandboxed shell execution, and self-scheduled notifications
 
 ```
 ToolCard(s)
@@ -378,7 +380,7 @@ capability can appear on multiple channels simultaneously.
 | `TOOL_CALL` | LLM agent | Called by the LLM during the ReAct loop |
 | `SYSTEM_PROMPT` | LLM context | Rendered once into the frozen system block |
 | `LLM_CONTEXT` | LLM context | Structured context state appended into the context tail per turn, as a delta |
-| `COMMAND` | Orchestrator / agents | Called programmatically via `proxy_call` |
+| `COMMAND` | Orchestrator / agents / humans | Called programmatically, or by `/`-prefixed text through `CommandRegistry.dispatch` |
 
 The two prompt-bearing channels carry different promises, and picking between them is the card
 author's contract with the runtime:
@@ -792,9 +794,79 @@ call with an explicit timeout below the orchestrator's stop backstop — and han
 I/O client. A Python thread cannot be cancelled, so a timeout that does not reach the client is
 decoration.
 
+## Building a feature as a card
+
+A `BaseAgent` feature is not a method added to `BaseAgent` — **it is a `ToolCard` whose
+capabilities declare, channel by channel, how they reach the agent's world.** The agent grows
+behaviour by hosting cards, not by accreting methods, so authoring a feature starts with one
+question per capability: which channel actually serves it?
+
+### The four-channel contract
+
+Each channel is a promise about how a capability reaches the model or the humans around it — and
+each fails in its own way when misused:
+
+| Channel | Promise | Failure mode |
+|---|---|---|
+| `SYSTEM_PROMPT` | Rendered **once** into the frozen prefix — static instructions, cached | Volatile content here invalidates every agent's prefix cache on every turn — the anti-pattern ADR-037 removed |
+| `LLM_CONTEXT` | Structured state, diffed and appended per turn at the tail — volatile awareness | A provider that raises breaks context construction — providers return `None`, never raise |
+| `TOOL_CALL` | Model-invoked, pull — deliberate action | The model only calls what the docstring teaches; the docstring **is** the contract |
+| `COMMAND` | Human- or code-invoked by name, push — control | Dispatch replies only — a command is not an enforcement point |
+
+**The silent drop.** A capability exposed on a channel its card cannot serve is dropped with **no
+error and no warning** — the factory aggregates only what the card's hooks return, and nothing
+cross-checks that `expose` and the hooks agree. A `GetPlanning` left on `SYSTEM_PROMPT` after the
+card stopped overriding `get_system_prompts()` would simply vanish from the prompt — the drop is
+real enough that the params the epic-31 migration moved each carry the per-param
+`normalize_system_prompt_to_llm_context` validator to rewrite exactly that persisted exposure.
+This is why a card's wiring tests assert the actual provider / tool / command lists rather than
+trusting the declaration.
+
+**The routing rule.** A capability is served exactly when both gates pass: its param **resolves**
+(`True` or a param instance — `False` removes it), **and** its `expose` set contains the channel
+the serving hook covers. Every hook applies that same two-step gate: `get_context_states()` serves
+`LLM_CONTEXT`, `get_tools()` serves `TOOL_CALL`, `get_commands()` serves `COMMAND`, and
+`get_system_prompts()` serves `SYSTEM_PROMPT`.
+
+The machinery behind each row is documented above and not restated here — the
+[Channel System](#channel-system) section covers the enum and the two prompt-bearing promises, and
+[Context state: the `get_context_states()` hook](#context-state-the-get_context_states-hook)
+covers the provider contract (`render_full` / `render_delta`, aggregation, the `__name__` key).
+
+### Worked example: `MailboxTool`, one capability per row
+
+`MailboxTool` (`akgentic.tool.mailbox`) routes **each of its capabilities onto its own channel**,
+which makes it a compact reference shape for routing. Two capabilities, two params, one channel
+each:
+
+| Capability | Param (default) | Channel | Serving hook | Gate |
+|---|---|---|---|---|
+| On-demand read | `read_mailbox: ReadMailbox \| bool = True` | `TOOL_CALL` | `get_tools()` | param resolves **and** `TOOL_CALL` in its `expose` |
+| Run cancellation | `stop: Stop \| bool = True` | `COMMAND` | `get_commands()` | param resolves **and** `COMMAND` in its `expose` |
+
+**`read_mailbox` → `TOOL_CALL`.** Looking at what is waiting is a deliberate act, so the model
+pulls it. The read **consumes what it renders**, and the docstring carries that load-bearing
+contract: the messages listed have been removed from the mailbox and will not arrive again as
+their own turn, so the model must deal with them in this run. The card originally promised the
+opposite — a non-consuming peek — and the inversion is instructive: a promise of redelivery let
+the model answer a pending message mid-run and answer it again when the message got its turn.
+Consumption removes the failure by construction rather than by docstring. A cancel is the one
+exclusion, filtered out of both the rendering and the consumption, because the mailbox is the
+cancellation's single source of truth.
+
+**`stop` → `COMMAND`.** Cancellation is control, pushed by a human or a program, so it is a named
+command — string surface `/stop`, announced to every frontend for free via
+`CommandsAnnouncedEvent`. Dispatched while the agent is idle it answers *"There is no run to
+cancel."*, because that is by construction the only case a dispatched `/stop` can be: the agent
+purges a mid-run cancel at recognition, so one never survives to reach a handler. **The card owns
+the registration, the agent owns both the vocabulary and the enforcement** — recognising the
+`/stop` string and the mid-run interrupt both live in `akgentic-agent` (its Epic 20), because
+cancellation must work even on an agent configured without this card, which has no card to import
+a predicate from.
+
 ## Tool Catalog
 
-Eleven tool cards ship with the package. Each one has its own README next to the code, covering the
+Twelve tool cards ship with the package. Each one has its own README next to the code, covering the
 `ToolCard` definition, every field and every nested capability parameter, and the full
 configuration surface — environment, extras, actor wiring and failure modes. The entries below
 are the index; the detail lives beside the module it documents.
@@ -810,6 +882,7 @@ are the index; the detail lives beside the module it documents.
 | `MetadataTool` | `akgentic.tool.metadata` | The team's business context, rendered once into every agent's prefix | [README](src/akgentic/tool/metadata/README.md) |
 | `NotificationTool` | `akgentic.tool.notification` | Delayed messages an agent schedules to itself | [README](src/akgentic/tool/notification/README.md) |
 | `SkillTool` | `akgentic.tool.skill` | A library of skills: the menu in the prefix, the bodies on demand | [README](src/akgentic/tool/skill/README.md) |
+| `MailboxTool` | `akgentic.tool.mailbox` | A consuming read over the agent's own mailbox, and the `/stop` cancel surface | [README](src/akgentic/tool/mailbox/README.md) |
 | `MCPTool` | `akgentic.tool.mcp` | External MCP servers as pydantic-ai toolsets | [README](src/akgentic/tool/mcp/README.md) |
 | `ExecTool` | `akgentic.tool.sandbox` | Sandboxed shell execution in the team workspace | [README](src/akgentic/tool/sandbox/README.md) |
 
@@ -1084,6 +1157,34 @@ redundancy to suppress.
 every field of `SkillEntry` and `Skills` with what it costs, the menu quoted as rendered, the
 loading model, and the failure modes worth knowing.
 
+### MailboxTool
+
+The agent's own mailbox as a capability, on two channels: a **consuming** `read_mailbox` on
+`TOOL_CALL`, and the `/stop` cancellation surface on `COMMAND`. Both read the owning agent's inbox
+locally — the card creates no actor and performs no proxy round trip.
+
+```python
+from akgentic.tool import MailboxTool
+
+MailboxTool()                     # both capabilities on (the default)
+MailboxTool(read_mailbox=False)   # /stop only — no on-demand read
+MailboxTool(stop=False)           # no cancellation surface
+```
+
+Reading absorbs: every message `read_mailbox` lists has been removed from the mailbox and will not
+also arrive as its own turn, so the model is expected to deal with it in the current run — which
+is what stops it answering the same message twice. A cancel is the one exclusion: a `CancelMessage`
+or a `/stop` is neither rendered nor consumed, because the mailbox is the cancellation's single
+source of truth. The `stop` command registers the `/stop` surface only — dispatched while the agent
+is idle it answers *"There is no run to cancel."*, and both recognising the string and the mid-run
+enforcement are the agent's, in `akgentic-agent` (its Epic 20). Nothing in this card raises, tracks
+or interrupts.
+
+**[Full reference → `src/akgentic/tool/mailbox/README.md`](src/akgentic/tool/mailbox/README.md)** —
+the two capability params, the consumption contract and its cancel exclusion, the per-message reply
+protocol, where the cancel vocabulary lives, the observer protocol, and the cross-package half that
+`akgentic-agent` owns.
+
 ### MCPTool
 
 Integrates external [Model Context Protocol](https://modelcontextprotocol.io) servers as native
@@ -1302,6 +1403,13 @@ src/akgentic/tool/
     │   __init__.py           # Public exports: SkillEntry, Skills, SkillTool
     │   └── tool.py           # SkillTool ToolCard + SkillEntry, Skills, MENU_HEADER;
     │                         #   no actor, no state
+    mailbox/
+    │   README.md           # MailboxTool reference — params, consumption contract, /stop
+    │   __init__.py           # Public exports: the card, its params, the observer protocol
+    │   observer.py           # MailboxToolObserver — get_mailbox + consume_mailbox
+    │   params.py             # ReadMailbox, Stop
+    │   └── mailbox.py        # MailboxTool ToolCard — consuming read, reply protocol,
+    │                         #   idle /stop; no actor, no proxy round trip
     mcp/
     │   README.md           # MCPTool reference — transports, timeouts, diagnostics
     │   mcp.py                # MCPTool, connection configs

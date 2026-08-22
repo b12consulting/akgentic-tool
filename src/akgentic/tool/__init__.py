@@ -32,6 +32,7 @@ from .core.event import (  # noqa: F401
 )
 from .core.observer import ActorToolObserver, ToolObserver, ToolStateCarrier  # noqa: F401
 from .errors import CommandNotRecognized, RetriableError, ToolObserverGone  # noqa: F401
+from .mailbox.mailbox import MailboxTool  # noqa: F401
 from .metadata.tool import MetadataTool  # noqa: F401
 from .notification.tool import NotificationTool  # noqa: F401
 from .sandbox.bwrap import BwrapSandboxActor  # noqa: F401
@@ -88,6 +89,7 @@ __all__ = [
     "workspace",
     "BwrapSandboxActor",
     "ExecTool",
+    "MailboxTool",
     "MetadataTool",
     "NotificationTool",
     "SeatbeltSandboxActor",
