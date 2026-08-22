@@ -835,42 +835,38 @@ covers the provider contract (`render_full` / `render_delta`, aggregation, the `
 
 ### Worked example: `MailboxTool`, one capability per row
 
-`MailboxTool` (`akgentic.tool.mailbox`) is the first card whose **three separate capabilities
-each ride their own channel** (`SkillTool` reaches three channels too, but with one capability
-exposed on all of them), which makes it the reference shape for routing. Three capabilities,
-three params, one channel each:
+`MailboxTool` (`akgentic.tool.mailbox`) routes **each of its capabilities onto its own channel**,
+which makes it a compact reference shape for routing. Two capabilities, two params, one channel
+each:
 
 | Capability | Param (default) | Channel | Serving hook | Gate |
 |---|---|---|---|---|
-| Live mailbox status | `mailbox_status: MailboxStatus \| bool = True` | `LLM_CONTEXT` | `get_context_states()` | param resolves **and** `LLM_CONTEXT` in its `expose` |
 | On-demand read | `read_mailbox: ReadMailbox \| bool = True` | `TOOL_CALL` | `get_tools()` | param resolves **and** `TOOL_CALL` in its `expose` |
 | Run cancellation | `stop: Stop \| bool = True` | `COMMAND` | `get_commands()` | param resolves **and** `COMMAND` in its `expose` |
 
-**`mailbox_status` → `LLM_CONTEXT`.** The pending mailbox is volatile awareness — it changes
-while the agent works, so it must never touch the frozen prefix. The card's
-`get_context_states()` returns the provider `mailbox_state`, built by
-`make_mailbox_state_provider` on the card's bound `None`-returning observer accessor: it never
-raises, and returns `None` once the owning agent is gone. Its delta names **arrivals only** —
-messages that left the mailbox became turns, and narrating them would be double delivery.
-
 **`read_mailbox` → `TOOL_CALL`.** Looking at what is waiting is a deliberate act, so the model
-pulls it. The read is a **non-consuming peek**, and the docstring carries the load-bearing
-contract: every message listed is still delivered as its own turn, so reading is prioritisation —
-never consumption, and never a licence to answer a pending message from inside the current run.
+pulls it. The read **consumes what it renders**, and the docstring carries that load-bearing
+contract: the messages listed have been removed from the mailbox and will not arrive again as
+their own turn, so the model must deal with them in this run. The card originally promised the
+opposite — a non-consuming peek — and the inversion is instructive: a promise of redelivery let
+the model answer a pending message mid-run and answer it again when the message got its turn.
+Consumption removes the failure by construction rather than by docstring. A cancel is the one
+exclusion, filtered out of both the rendering and the consumption, because the mailbox is the
+cancellation's single source of truth.
 
 **`stop` → `COMMAND`.** Cancellation is control, pushed by a human or a program, so it is a named
 command — string surface `/stop`, announced to every frontend for free via
-`CommandsAnnouncedEvent`. Dispatched while the agent is idle it returns `None` — *handled, say
-nothing*, since there is nothing to cancel and a reply would double-report the outcome: **the card
-owns the registration, the agent owns both the vocabulary and the enforcement** — recognising the
+`CommandsAnnouncedEvent`. Dispatched while the agent is idle it answers *"There is no run to
+cancel."*, because that is by construction the only case a dispatched `/stop` can be: the agent
+purges a mid-run cancel at recognition, so one never survives to reach a handler. **The card owns
+the registration, the agent owns both the vocabulary and the enforcement** — recognising the
 `/stop` string and the mid-run interrupt both live in `akgentic-agent` (its Epic 20), because
 cancellation must work even on an agent configured without this card, which has no card to import
 a predicate from.
 
-Note what the card ships versus what activates elsewhere: the state model reaches no model until
-`akgentic-agent`'s context delivery loop lands (its Epic 19), and `/stop` interrupts nothing until
-the agent-side enforcement lands (its Epic 20). The card is complete and inert-but-ready — the
-same merge-order shape every `LLM_CONTEXT` card accepted.
+Note what the card ships versus what activates elsewhere: `/stop` interrupts nothing until the
+agent-side enforcement lands (its Epic 20). The card is complete and inert-but-ready — the same
+merge-order shape the cross-package capabilities accepted.
 
 ## Tool Catalog
 
@@ -890,7 +886,7 @@ are the index; the detail lives beside the module it documents.
 | `MetadataTool` | `akgentic.tool.metadata` | The team's business context, rendered once into every agent's prefix | [README](src/akgentic/tool/metadata/README.md) |
 | `NotificationTool` | `akgentic.tool.notification` | Delayed messages an agent schedules to itself | [README](src/akgentic/tool/notification/README.md) |
 | `SkillTool` | `akgentic.tool.skill` | A library of skills: the menu in the prefix, the bodies on demand | [README](src/akgentic/tool/skill/README.md) |
-| `MailboxTool` | `akgentic.tool.mailbox` | Live mailbox status, non-consuming read, and the `/stop` cancel vocabulary | [README](src/akgentic/tool/mailbox/README.md) |
+| `MailboxTool` | `akgentic.tool.mailbox` | A consuming read over the agent's own mailbox, and the `/stop` cancel surface | [README](src/akgentic/tool/mailbox/README.md) |
 | `MCPTool` | `akgentic.tool.mcp` | External MCP servers as pydantic-ai toolsets | [README](src/akgentic/tool/mcp/README.md) |
 | `ExecTool` | `akgentic.tool.sandbox` | Sandboxed shell execution in the team workspace | [README](src/akgentic/tool/sandbox/README.md) |
 
@@ -1167,30 +1163,31 @@ loading model, and the failure modes worth knowing.
 
 ### MailboxTool
 
-The agent's own mailbox as a capability, on three channels at once: live pending-message status as
-structured context state on `LLM_CONTEXT`, a **non-consuming** `read_mailbox` peek on `TOOL_CALL`,
-and the `/stop` cancellation surface on `COMMAND`. Every capability reads the owning agent's inbox
+The agent's own mailbox as a capability, on two channels: a **consuming** `read_mailbox` on
+`TOOL_CALL`, and the `/stop` cancellation surface on `COMMAND`. Both read the owning agent's inbox
 locally — the card creates no actor and performs no proxy round trip.
 
 ```python
 from akgentic.tool import MailboxTool
 
-MailboxTool()                     # all three capabilities on (the default)
-MailboxTool(read_mailbox=False)   # status + /stop only — no on-demand peek
+MailboxTool()                     # both capabilities on (the default)
+MailboxTool(read_mailbox=False)   # /stop only — no on-demand read
 MailboxTool(stop=False)           # no cancellation surface
 ```
 
-Reading never consumes: every message `read_mailbox` lists is still delivered to the agent as its
-own turn, so the tool is for prioritisation, never for answering a pending message mid-run. The
-`stop` command registers the `/stop` surface only — dispatched while the agent is idle it returns
-`None` and reports nothing, and both recognising the string and the mid-run enforcement are the
-agent's, in `akgentic-agent` (its Epic 20). Until that package's context delivery loop (Epic 19)
-and enforcement (Epic 20) land, the card is inert-but-ready: the state reaches no model and
-`/stop` interrupts nothing.
+Reading absorbs: every message `read_mailbox` lists has been removed from the mailbox and will not
+also arrive as its own turn, so the model is expected to deal with it in the current run — which
+is what stops it answering the same message twice. A cancel is the one exclusion: a `CancelMessage`
+or a `/stop` is neither rendered nor consumed, because the mailbox is the cancellation's single
+source of truth. The `stop` command registers the `/stop` surface only — dispatched while the agent
+is idle it answers *"There is no run to cancel."*, and both recognising the string and the mid-run
+enforcement are the agent's, in `akgentic-agent` (its Epic 20). Until that enforcement lands, the
+card is inert-but-ready: `/stop` interrupts nothing.
 
 **[Full reference → `src/akgentic/tool/mailbox/README.md`](src/akgentic/tool/mailbox/README.md)** —
-the three capability params, the redelivery contract, where the cancel vocabulary lives, the
-observer protocol, and what stays inert until the agent epics land.
+the two capability params, the consumption contract and its cancel exclusion, the per-message reply
+protocol, where the cancel vocabulary lives, the observer protocol, and what stays inert until the
+agent epics land.
 
 ### MCPTool
 
@@ -1411,13 +1408,12 @@ src/akgentic/tool/
     │   └── tool.py           # SkillTool ToolCard + SkillEntry, Skills, MENU_HEADER;
     │                         #   no actor, no state
     mailbox/
-    │   README.md           # MailboxTool reference — params, redelivery contract, /stop
-    │   __init__.py           # Public exports: the card, its params, the state models,
-    │                         #   the observer protocol, make_mailbox_state_provider
-    │   observer.py           # MailboxToolObserver — this tool's own contract
-    │   state.py              # MailboxRow, MailboxState, make_mailbox_state_provider
-    │   params.py             # MailboxStatus, ReadMailbox, Stop
-    │   └── mailbox.py        # MailboxTool ToolCard; no actor, no proxy round trip
+    │   README.md           # MailboxTool reference — params, consumption contract, /stop
+    │   __init__.py           # Public exports: the card, its params, the observer protocol
+    │   observer.py           # MailboxToolObserver — get_mailbox + consume_mailbox
+    │   params.py             # ReadMailbox, Stop
+    │   └── mailbox.py        # MailboxTool ToolCard — consuming read, reply protocol,
+    │                         #   idle /stop; no actor, no proxy round trip
     mcp/
     │   README.md           # MCPTool reference — transports, timeouts, diagnostics
     │   mcp.py                # MCPTool, connection configs

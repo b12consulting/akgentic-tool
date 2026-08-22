@@ -1,18 +1,21 @@
-"""``MailboxTool``: the mailbox on three channels (ADR-040 §7).
+"""``MailboxTool``: the mailbox on two channels (ADR-040 §7, ADR-019 §4).
 
-One card, three capabilities, one channel each: live status on
-``LLM_CONTEXT`` (the model sees mail arriving), ``read_mailbox`` on
-``TOOL_CALL`` (a non-consuming peek at what is waiting), and ``stop`` on
-``COMMAND`` (a human or program can request cancellation). Every capability
-reads ``observer.get_mailbox()`` — a local peek; the card creates no actor
-and performs no proxy round trip (NFR1).
+One card, two capabilities, one channel each: ``read_mailbox`` on
+``TOOL_CALL`` — a *consuming* read, which absorbs the mail it shows — and
+``stop`` on ``COMMAND``, so a human or program can request cancellation. The
+card creates no actor and performs no proxy round trip (NFR1).
+
+The card no longer serves ``LLM_CONTEXT``. Mailbox awareness reaches the model
+through the agent's mid-run arrival notice alone (ADR-019 §4b); a second,
+card-side carrier only narrated the same arrivals twice.
 
 The card owns the ``/stop`` *registration* only. Both the cancellation
 vocabulary (recognising the string) and its *enforcement* — matching pending
 messages, raising into a run — are the agent's, in another package
 (ADR-040 §5): ``BaseAgent`` builds its cancel capability unconditionally, so
 an agent configured without this card is still interruptible and has no card
-to borrow a predicate from.
+to borrow a predicate from. The private predicate below is not a second
+vocabulary; it is this card declining to swallow the agent's input.
 """
 
 from __future__ import annotations
@@ -21,22 +24,71 @@ from collections.abc import Callable
 from inspect import cleandoc
 from typing import Any, cast
 
-from akgentic.core.messages import Message
+from akgentic.core.messages import CancelMessage, Message
 from akgentic.tool.core import (
     COMMAND,
-    LLM_CONTEXT,
     TOOL_CALL,
     BaseToolParam,
-    ContextState,
     ToolCard,
     _resolve,
 )
 from akgentic.tool.errors import ToolObserverGone
 from akgentic.tool.mailbox.observer import MailboxToolObserver
-from akgentic.tool.mailbox.params import MailboxStatus, ReadMailbox, Stop
-from akgentic.tool.mailbox.state import make_mailbox_state_provider, sender_name
+from akgentic.tool.mailbox.params import ReadMailbox, Stop
 
 _EMPTY_MAILBOX = "Your mailbox is empty — nothing is pending."
+
+_NOTHING_TO_CANCEL = "There is no run to cancel."
+
+_REPLY_PROTOCOLS: dict[str, str] = {
+    "request": "A reply is expected: respond to {sender} with the result.",
+    "response": "This is a reply to something you asked. Take it into account and continue.",
+    "instruction": "Carry it out; acknowledge to {sender} only if asked to.",
+    "notification": "Informational message. No reply is expected.",
+    "acknowledgment": "Receipt confirmed. No further action needed.",
+}
+"""What each message type asks of its recipient, mirroring the agent's table.
+
+The canonical table is ``REPLY_PROTOCOLS`` in ``akgentic.agent.output_models``,
+alongside ``AgentMessage.type``. Both are out of reach here — ``akgentic-tool``
+may import from ``akgentic-core`` only — so the domain carries its own copy and
+reads the type duck-typed. Nothing keeps the two in sync; a reworded protocol
+line in the agent diverges here silently.
+
+These strings describe **message mechanics only**: what arrived, and whether a
+reply is owed. No team policy, nothing about who should do the work or whether
+to delegate — that belongs in the agents' prompts, where it can differ per role.
+"""
+
+
+def _is_cancel_envelope(message: Message) -> bool:
+    """Whether this card must leave ``message`` in the mailbox untouched.
+
+    A *defensive exclusion*, not a cancellation predicate. The canonical one is
+    the agent's ``is_cancel`` (``akgentic.agent.capabilities.mailbox_capability``),
+    which is unreachable from here, so this mirrors its two branches from what
+    this package legitimately owns: ``CancelMessage`` is core vocabulary, and
+    ``/stop`` is this card's own registered command surface.
+
+    It must stay **at least as broad** as the agent's. If the two ever disagree,
+    over-excluding costs one message its place in a consuming read — it still
+    arrives as its own turn — while under-excluding consumes a cancel and
+    silently kills the interrupt.
+    """
+    if isinstance(message, CancelMessage):
+        return True
+    content = getattr(message, "content", "")
+    if not isinstance(content, str):
+        return False
+    tokens = content.split(maxsplit=1)
+    return bool(tokens) and tokens[0] == "/stop"
+
+
+def sender_name(message: Message) -> str:
+    """The sender's display name, or ``"unknown"`` when the message has none."""
+    sender = getattr(message, "sender", None)
+    name = getattr(sender, "name", None)
+    return name if isinstance(name, str) and name else "unknown"
 
 
 def _content_of(message: Message) -> str:
@@ -47,11 +99,37 @@ def _content_of(message: Message) -> str:
     return content if isinstance(content, str) else str(content)
 
 
+def _protocol_line(message: Message) -> str:
+    """The framing ``receiveMsg_AgentMessage`` would have applied; ``""`` if none.
+
+    The type is read duck-typed: the base ``Message`` declares no ``type`` at
+    all, so a bare ``UserMessage`` or a ``CancelMessage`` simply gets no line
+    rather than an error. A type outside the table is treated the same way.
+    """
+    message_type = getattr(message, "type", None)
+    if not isinstance(message_type, str) or not message_type:
+        return ""
+    protocol = _REPLY_PROTOCOLS.get(message_type)
+    if protocol is None:
+        return ""
+    article = "an" if message_type[0] in "aeiou" else "a"
+    sender = sender_name(message)
+    return f"You received {article} {message_type} from {sender}. " + protocol.format(sender=sender)
+
+
+def _render_message(index: int, message: Message) -> str:
+    """One numbered block: header, the reply protocol when known, full content."""
+    header = f"{index}. From {sender_name(message)} ({type(message).__name__}):"
+    protocol = _protocol_line(message)
+    body = _content_of(message)
+    return f"{header}\n{protocol}\n\n{body}" if protocol else f"{header}\n{body}"
+
+
 def _render_mailbox(messages: list[Message]) -> str:
-    """Render sender, type and full content of each pending message.
+    """Render sender, type, reply protocol and full content of each message.
 
     Args:
-        messages: The pending messages, oldest first.
+        messages: The messages the read absorbed, oldest first.
 
     Returns:
         One numbered block per message, or the empty-mailbox sentence — never
@@ -61,28 +139,23 @@ def _render_mailbox(messages: list[Message]) -> str:
         return _EMPTY_MAILBOX
     count = len(messages)
     noun = "message" if count == 1 else "messages"
-    blocks = [
-        f"{index}. From {sender_name(message)} ({type(message).__name__}):\n{_content_of(message)}"
-        for index, message in enumerate(messages, start=1)
-    ]
-    return "\n\n".join([f"{count} pending {noun}:", *blocks])
+    blocks = [_render_message(index, message) for index, message in enumerate(messages, start=1)]
+    head = f"{count} {noun} taken from your mailbox — they will not be delivered again:"
+    return "\n\n".join([head, *blocks])
 
 
 class MailboxTool(ToolCard):
-    """The mailbox capability: status, on-demand peek, and cancellation surface.
+    """The mailbox capability: a consuming read and a cancellation surface.
 
     Attributes:
-        mailbox_status: The pending-mailbox snapshot on ``LLM_CONTEXT``.
+        read_mailbox: The consuming ``read_mailbox`` tool on ``TOOL_CALL``.
             ``True`` (the default) enables it with the param's defaults; a
-            ``MailboxStatus`` instance may narrow the channels; ``False``
+            ``ReadMailbox`` instance may narrow the channels; ``False``
             removes exactly this capability and nothing else.
-        read_mailbox: The non-consuming ``read_mailbox`` tool on ``TOOL_CALL``.
-            Same ``Param | bool`` convention.
         stop: The ``stop`` command (``/stop`` surface) on ``COMMAND``.
             Same ``Param | bool`` convention.
     """
 
-    mailbox_status: MailboxStatus | bool = True
     read_mailbox: ReadMailbox | bool = True
     stop: Stop | bool = True
 
@@ -94,19 +167,6 @@ class MailboxTool(ToolCard):
         at first use (the ``TeamTool`` convention).
         """
         return cast(MailboxToolObserver | None, self._observer_or_none())
-
-    def get_context_states(self) -> list[Callable[[], ContextState | None]]:
-        """Return the mailbox provider when the status capability serves ``LLM_CONTEXT``.
-
-        The provider is 34-1's ``make_mailbox_state_provider``, handed the
-        card's bound ``None``-returning accessor — it never raises and returns
-        ``None`` once the observer is collected (ADR-030).
-        """
-        providers: list[Callable[[], ContextState | None]] = []
-        status = _resolve(self.mailbox_status, MailboxStatus)
-        if status and LLM_CONTEXT in status.expose:
-            providers.append(make_mailbox_state_provider(self._mailbox_observer_or_none))
-        return providers
 
     def get_tools(self) -> list[Callable[..., Any]]:
         """Return ``read_mailbox`` when its capability serves ``TOOL_CALL``."""
@@ -131,6 +191,14 @@ class MailboxTool(ToolCard):
         cannot pin a stopped agent (ADR-030). This is in-life code, so the
         raising form applies: ``ToolObserverGone`` is a defined outcome.
 
+        The read consumes: it renders what ``consume_mailbox`` *returned*,
+        never the peeked list. The peek is a superset — the primitive skips
+        ``reply_to`` envelopes and ignores ids dequeued in between — and
+        rendering the superset would show the model a message it did not
+        absorb, which is the double answer this whole capability removes.
+        The telemetry for each removal is the primitive's own; nothing is
+        emitted here.
+
         Args:
             params: Configuration for the read capability.
 
@@ -140,21 +208,26 @@ class MailboxTool(ToolCard):
         observer_or_none = self._mailbox_observer_or_none  # bound method -> weak edge to agent
 
         def read_mailbox() -> str:
-            """Peek at the messages waiting in your mailbox.
+            """Read the messages waiting in your mailbox and take them on.
 
-            Reading does NOT consume them: every message listed here will still
-            be delivered to you as its own turn after the current run ends. Use
-            this to decide whether to wrap up early or how to prioritise —
-            never to answer a pending message from inside the current run.
+            Reading ABSORBS them: everything listed below has been removed from
+            your mailbox and will NOT be delivered to you again as its own
+            turn. Deal with it in this run — answer it, act on it, or fold it
+            into what you are already doing. Anything you leave unread stays
+            queued and arrives as its own turn later, so read only when you
+            mean to handle what you find.
 
             Returns:
-                Sender, message type and full content of every pending message,
-                or a sentence saying the mailbox is empty.
+                Sender, message type, the reply protocol each message expects
+                and its full content, or a sentence saying the mailbox is empty.
             """
             observer = observer_or_none()
             if observer is None:
                 raise ToolObserverGone("read_mailbox used after its owning agent was stopped")
-            return _render_mailbox(observer.get_mailbox())
+            pending = observer.get_mailbox()
+            consumable = [message for message in pending if not _is_cancel_envelope(message)]
+            absorbed = observer.consume_mailbox([message.id for message in consumable])
+            return _render_mailbox(absorbed)
 
         read_mailbox.__doc__ = params.format_docstring(cleandoc(read_mailbox.__doc__ or ""))
         return read_mailbox
@@ -162,12 +235,18 @@ class MailboxTool(ToolCard):
     def _stop_factory(self, params: Stop) -> Callable[..., Any]:
         """Create the ``stop`` command callable (``/stop`` string surface).
 
-        The handler reports nothing: commands dispatch while the agent is idle,
-        so there is nothing to cancel by the time it runs, and ``None`` says
-        *handled, nothing to report* (ADR-040 §4). The mid-run effect of a
-        ``/stop`` message is the agent's enforcement, in another package —
-        nothing here raises, tracks, or interrupts. Nothing observer-shaped is
-        captured, so the closure outlives its agent without pinning it.
+        The handler answers, because by the time it runs the answer is known.
+        Commands dispatch while the agent is idle, and a cancel that reaches a
+        handler is by construction the idle case — the agent purges a mid-run
+        cancel at the moment it recognises it, so one can never be dequeued
+        into a handler (ADR-019 §3). There is therefore exactly one thing this
+        can mean, and saying it is better than silence: a human who typed
+        ``/stop`` and heard nothing back cannot tell a no-op from a failure.
+
+        The mid-run effect of a ``/stop`` message is the agent's enforcement,
+        in another package — nothing here raises, tracks, or interrupts.
+        Nothing observer-shaped is captured, so the closure outlives its agent
+        without pinning it.
 
         The callable's docstring is user-facing surface: ``descriptors()``
         builds each ``CommandDescriptor.description`` from it, and those are
@@ -180,14 +259,14 @@ class MailboxTool(ToolCard):
             A zero-argument callable named ``stop``.
         """
 
-        def stop() -> None:
+        def stop() -> str:
             """Cancel the agent's current run.
 
             Sent while the agent is busy, the request interrupts the run at the
             next step boundary. Dispatched while the agent is idle there is
-            nothing to cancel, and nothing is reported.
+            nothing to cancel, and it says so.
             """
-            return None
+            return _NOTHING_TO_CANCEL
 
         stop.__doc__ = params.format_docstring(cleandoc(stop.__doc__ or ""))
         return stop

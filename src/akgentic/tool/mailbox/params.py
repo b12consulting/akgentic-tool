@@ -1,22 +1,15 @@
-"""Capability parameters for the mailbox card (ADR-040).
+"""Capability parameters for the mailbox card (ADR-040, ADR-019 §4b).
 
-Three capabilities, one channel each by default: live status on
-``LLM_CONTEXT``, a non-consuming ``read_mailbox`` on ``TOOL_CALL``, and
-``stop`` on ``COMMAND``. None of them needs a field beyond ``expose`` —
-configuration read at factory bind time, never tool-call schema.
+Two capabilities, one channel each by default: a consuming ``read_mailbox`` on
+``TOOL_CALL``, and ``stop`` on ``COMMAND``. Neither needs a field beyond
+``expose`` — configuration read at factory bind time, never tool-call schema.
 """
 
-from akgentic.tool.core import COMMAND, LLM_CONTEXT, TOOL_CALL, BaseToolParam, Channels
-
-
-class MailboxStatus(BaseToolParam):
-    """Expose the pending mailbox as structured context state."""
-
-    expose: set[Channels] = {LLM_CONTEXT}
+from akgentic.tool.core import COMMAND, TOOL_CALL, BaseToolParam, Channels
 
 
 class ReadMailbox(BaseToolParam):
-    """Peek at pending messages on demand, without consuming them."""
+    """Read pending messages on demand, absorbing the ones it shows."""
 
     expose: set[Channels] = {TOOL_CALL}
 
