@@ -864,10 +864,6 @@ the registration, the agent owns both the vocabulary and the enforcement** — r
 cancellation must work even on an agent configured without this card, which has no card to import
 a predicate from.
 
-Note what the card ships versus what activates elsewhere: `/stop` interrupts nothing until the
-agent-side enforcement lands (its Epic 20). The card is complete and inert-but-ready — the same
-merge-order shape the cross-package capabilities accepted.
-
 ## Tool Catalog
 
 Twelve tool cards ship with the package. Each one has its own README next to the code, covering the
@@ -1181,13 +1177,13 @@ is what stops it answering the same message twice. A cancel is the one exclusion
 or a `/stop` is neither rendered nor consumed, because the mailbox is the cancellation's single
 source of truth. The `stop` command registers the `/stop` surface only — dispatched while the agent
 is idle it answers *"There is no run to cancel."*, and both recognising the string and the mid-run
-enforcement are the agent's, in `akgentic-agent` (its Epic 20). Until that enforcement lands, the
-card is inert-but-ready: `/stop` interrupts nothing.
+enforcement are the agent's, in `akgentic-agent` (its Epic 20). Nothing in this card raises, tracks
+or interrupts.
 
 **[Full reference → `src/akgentic/tool/mailbox/README.md`](src/akgentic/tool/mailbox/README.md)** —
 the two capability params, the consumption contract and its cancel exclusion, the per-message reply
-protocol, where the cancel vocabulary lives, the observer protocol, and what stays inert until the
-agent epics land.
+protocol, where the cancel vocabulary lives, the observer protocol, and the cross-package half that
+`akgentic-agent` owns.
 
 ### MCPTool
 

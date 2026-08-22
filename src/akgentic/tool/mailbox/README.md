@@ -183,12 +183,16 @@ MailboxTool(read_mailbox=ReadMailbox(expose={TOOL_CALL}))  # explicit param form
   — constructs happily and drops the value on the floor rather than raising.
 - **The reply-protocol table can drift.** It is a copy of the agent's, kept in sync by nothing.
 
-## What is inert until the agent epics land
+## The cross-package half
 
 Auto-adding this card to every agent, the cancel vocabulary, its enforcement hook,
 `RunInterruptedError` and the mid-run arrival-notice injection are all agent-side (that package's
-Epic 20). Until then, adding the card does **not** enable cancellation — `/stop` is announced,
-dispatches to the idle answer, and interrupts nothing.
+Epic 20). `MailboxCapability.before_model_request` is what sees a queued cancel, purges it through
+`consume_mailbox` and raises; `act()` absorbs the error, so the run dies while the agent carries
+on. Cancellation therefore does not **depend on** this card — that capability is built
+unconditionally, and an agent configured without a `MailboxTool` is interruptible just the same.
+What the card contributes is the string surface: `/stop` registered, announced via
+`CommandsAnnouncedEvent`, and answered when it dispatches while idle.
 
 `read_mailbox` works as soon as the card is wired to an agent that satisfies the observer
 protocol.
