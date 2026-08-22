@@ -38,6 +38,7 @@ KG_DIR = Path(kg_package.__file__).parent
 DOMAIN_PACKAGES: frozenset[str] = frozenset(
     {
         "knowledge_graph",
+        "mailbox",
         "team",
         "workspace",
         "planning",
