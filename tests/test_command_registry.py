@@ -93,6 +93,23 @@ class _IntCard(ToolCard):
         return {_HireParam: f}
 
 
+class _NoneCard(ToolCard):
+    """Card exposing ``quiet()``, a command whose whole effect is elsewhere."""
+
+    name: str = "none-card"
+    description: str = "none card"
+
+    def get_tools(self) -> list[Callable]:
+        return []
+
+    def get_commands(self) -> dict[type[BaseToolParam], Callable]:
+        def quiet() -> None:
+            """Handle the request and report nothing."""
+            return None
+
+        return {_HireParam: quiet}
+
+
 class _RaisingCard(ToolCard):
     """Card whose command body raises when invoked."""
 
@@ -266,6 +283,17 @@ def test_dispatch_coerces_int_arg() -> None:
     registry = _registry(_IntCard())
     # f(task_id) returns task_id * 2 -> 10 proves "5" coerced to int, not "55"
     assert registry.dispatch("/f 5") == "10"
+
+
+def test_dispatch_propagates_none_unchanged() -> None:
+    registry = _registry(_NoneCard())
+    # None means "handled, say nothing" — never the four-character string "None".
+    assert registry.dispatch("/quiet") is None
+
+
+def test_callable_of_a_none_returning_command_still_returns_none() -> None:
+    registry = _registry(_NoneCard())
+    assert registry.callable("quiet")() is None
 
 
 # ---------------------------------------------------------------------------

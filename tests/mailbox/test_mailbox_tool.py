@@ -157,19 +157,42 @@ def test_read_mailbox_after_observer_collected_raises_tool_observer_gone() -> No
 # ── stop (FR5) ───────────────────────────────────────────────────────────────
 
 
-def test_stop_dispatched_idle_replies_nothing_is_running() -> None:
+def test_stop_invoked_directly_returns_none() -> None:
     card, observer = _wired_card()
     stop = card.get_commands()[Stop]
 
-    assert "nothing is running" in stop()
+    assert stop() is None
 
 
-def test_stop_dispatch_through_registry_string_surface() -> None:
+def test_stop_dispatch_through_registry_returns_none() -> None:
+    # The registry must propagate None, not string-render it as "None".
     observer = _FakeObserver()
     factory = ToolFactory([MailboxTool()], observer=observer)
 
-    reply = factory.get_command_registry().dispatch("/stop")
-    assert "nothing is running" in reply
+    assert factory.get_command_registry().dispatch("/stop") is None
+
+
+# ── ownership: the cancel vocabulary lives with the enforcement, not the card ──
+
+
+def test_cancel_vocabulary_is_not_importable_from_this_package() -> None:
+    # A stale re-export is exactly what story 34-4 removes; assert the absence.
+    import akgentic.tool.mailbox as mailbox_module
+
+    with pytest.raises(ImportError):
+        from akgentic.tool.mailbox import is_cancel  # noqa: F401
+    with pytest.raises(ImportError):
+        from akgentic.tool.mailbox import render_arrival_notice  # noqa: F401
+
+    assert "is_cancel" not in dir(mailbox_module)
+    assert "render_arrival_notice" not in dir(mailbox_module)
+
+
+def test_mailbox_tool_observer_still_imports_from_the_package_root() -> None:
+    # The agent's capability module imports this symbol from exactly this path.
+    from akgentic.tool.mailbox import MailboxToolObserver as ObserverProtocol
+
+    assert isinstance(_FakeObserver(), ObserverProtocol)
 
 
 # ── channel gating (FR3): disabling removes exactly one capability ───────────

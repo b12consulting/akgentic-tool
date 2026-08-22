@@ -6,7 +6,6 @@ wires that vocabulary onto three channels — status on ``LLM_CONTEXT``,
 ``read_mailbox`` on ``TOOL_CALL``, and ``stop`` on ``COMMAND``.
 """
 
-from akgentic.tool.mailbox.cancel import is_cancel, render_arrival_notice
 from akgentic.tool.mailbox.mailbox import MailboxTool
 from akgentic.tool.mailbox.observer import MailboxToolObserver
 from akgentic.tool.mailbox.params import MailboxStatus, ReadMailbox, Stop
@@ -24,7 +23,5 @@ __all__ = [
     "MailboxToolObserver",
     "ReadMailbox",
     "Stop",
-    "is_cancel",
     "make_mailbox_state_provider",
-    "render_arrival_notice",
 ]

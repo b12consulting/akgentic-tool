@@ -860,10 +860,12 @@ never consumption, and never a licence to answer a pending message from inside t
 
 **`stop` → `COMMAND`.** Cancellation is control, pushed by a human or a program, so it is a named
 command — string surface `/stop`, announced to every frontend for free via
-`CommandsAnnouncedEvent`. Dispatched while the agent is idle it only replies ("nothing is
-running"): **the card owns the vocabulary (`is_cancel`, `/stop`), the agent owns the
-enforcement** — the mid-run interrupt lives in `akgentic-agent` (its Epic 20), because
-cancellation must work even on an agent configured without this card.
+`CommandsAnnouncedEvent`. Dispatched while the agent is idle it returns `None` — *handled, say
+nothing*, since there is nothing to cancel and a reply would double-report the outcome: **the card
+owns the registration, the agent owns both the vocabulary and the enforcement** — recognising the
+`/stop` string and the mid-run interrupt both live in `akgentic-agent` (its Epic 20), because
+cancellation must work even on an agent configured without this card, which has no card to import
+a predicate from.
 
 Note what the card ships versus what activates elsewhere: the state model reaches no model until
 `akgentic-agent`'s context delivery loop lands (its Epic 19), and `/stop` interrupts nothing until
@@ -1180,15 +1182,15 @@ MailboxTool(stop=False)           # no cancellation surface
 
 Reading never consumes: every message `read_mailbox` lists is still delivered to the agent as its
 own turn, so the tool is for prioritisation, never for answering a pending message mid-run. The
-`stop` command defines the vocabulary only (`/stop`, `is_cancel`) — dispatched while the agent is
-idle it replies that nothing is running, and the mid-run enforcement is the agent's, in
-`akgentic-agent` (its Epic 20). Until that package's context delivery loop (Epic 19) and
-enforcement (Epic 20) land, the card is inert-but-ready: the state reaches no model and `/stop`
-interrupts nothing.
+`stop` command registers the `/stop` surface only — dispatched while the agent is idle it returns
+`None` and reports nothing, and both recognising the string and the mid-run enforcement are the
+agent's, in `akgentic-agent` (its Epic 20). Until that package's context delivery loop (Epic 19)
+and enforcement (Epic 20) land, the card is inert-but-ready: the state reaches no model and
+`/stop` interrupts nothing.
 
 **[Full reference → `src/akgentic/tool/mailbox/README.md`](src/akgentic/tool/mailbox/README.md)** —
-the three capability params, the redelivery contract, the cancel vocabulary and arrival notice,
-the observer protocol, and what stays inert until the agent epics land.
+the three capability params, the redelivery contract, where the cancel vocabulary lives, the
+observer protocol, and what stays inert until the agent epics land.
 
 ### MCPTool
 
@@ -1409,12 +1411,11 @@ src/akgentic/tool/
     │   └── tool.py           # SkillTool ToolCard + SkillEntry, Skills, MENU_HEADER;
     │                         #   no actor, no state
     mailbox/
-    │   README.md           # MailboxTool reference — params, redelivery contract, cancel vocabulary
+    │   README.md           # MailboxTool reference — params, redelivery contract, /stop
     │   __init__.py           # Public exports: the card, its params, the state models,
-    │                         #   is_cancel, render_arrival_notice
+    │                         #   the observer protocol, make_mailbox_state_provider
     │   observer.py           # MailboxToolObserver — this tool's own contract
     │   state.py              # MailboxRow, MailboxState, make_mailbox_state_provider
-    │   cancel.py             # is_cancel, render_arrival_notice — the cancel vocabulary
     │   params.py             # MailboxStatus, ReadMailbox, Stop
     │   └── mailbox.py        # MailboxTool ToolCard; no actor, no proxy round trip
     mcp/

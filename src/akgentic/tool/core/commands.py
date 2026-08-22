@@ -173,13 +173,18 @@ class CommandRegistry:
             )
         return result
 
-    def dispatch(self, text: str) -> str:
-        """Parse a ``/``-prefixed command, invoke it, and return a result string.
+    def dispatch(self, text: str) -> str | None:
+        """Parse a ``/``-prefixed command, invoke it, and return its result surface.
 
         Strips the leading ``/``, ``shlex.split``s the remainder, resolves the
         first token to a command, classifies the remaining tokens as positional or
         ``name=value`` keyword arguments, coerces and merges them, invokes the
         command, and string-renders the result.
+
+        A command returning ``None`` dispatches to ``None`` — it handled itself
+        and has nothing to report, and the caller says nothing rather than
+        echoing the literal string ``"None"`` (ADR-040 §4). Every other result
+        is string-rendered as before.
 
         A token is a **keyword** only when the text before its first ``=`` matches a
         real parameter name on the command; otherwise it is positional (so values
@@ -205,8 +210,12 @@ class CommandRegistry:
             raise CommandNotRecognized(name)
         return self._invoke(name, args)
 
-    def _invoke(self, name: str, args: list[str]) -> str:
+    def _invoke(self, name: str, args: list[str]) -> str | None:
         """Classify, merge, coerce *args* for command *name* and invoke it.
+
+        A ``None`` result is propagated unchanged; every other result is
+        string-rendered, so commands returning a non-``str`` value still reach
+        the caller as text.
 
         Any failure (positional-after-keyword, too many/missing args, unknown
         keyword, duplicate binding, coercion error, or the command body raising) is
@@ -216,7 +225,8 @@ class CommandRegistry:
         try:
             positional, keyword = self._classify_tokens(entry, args)
             bound = self._bind(entry, positional, keyword)
-            return str(entry.fn(**bound))
+            result = entry.fn(**bound)
+            return None if result is None else str(result)
         except Exception as exc:  # noqa: BLE001 — failures become result strings (ADR-028 §4)
             return f"Command '{name}' failed: {exc}"
 

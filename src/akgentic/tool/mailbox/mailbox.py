@@ -7,10 +7,12 @@ One card, three capabilities, one channel each: live status on
 reads ``observer.get_mailbox()`` — a local peek; the card creates no actor
 and performs no proxy round trip (NFR1).
 
-The card owns the vocabulary only. Cancellation *enforcement* — matching
-pending messages, raising into a run — is the agent's, in another package
-(ADR-040 §5): a hook here would make cancellation de-configurable by
-omitting the card.
+The card owns the ``/stop`` *registration* only. Both the cancellation
+vocabulary (recognising the string) and its *enforcement* — matching pending
+messages, raising into a run — are the agent's, in another package
+(ADR-040 §5): ``BaseAgent`` builds its cancel capability unconditionally, so
+an agent configured without this card is still interruptible and has no card
+to borrow a predicate from.
 """
 
 from __future__ import annotations
@@ -160,11 +162,16 @@ class MailboxTool(ToolCard):
     def _stop_factory(self, params: Stop) -> Callable[..., Any]:
         """Create the ``stop`` command callable (``/stop`` string surface).
 
-        The handler only replies: commands dispatch while the agent is idle,
-        so there is nothing to cancel by the time it runs. The mid-run effect
-        of a ``/stop`` message is the agent's enforcement, in another package —
+        The handler reports nothing: commands dispatch while the agent is idle,
+        so there is nothing to cancel by the time it runs, and ``None`` says
+        *handled, nothing to report* (ADR-040 §4). The mid-run effect of a
+        ``/stop`` message is the agent's enforcement, in another package —
         nothing here raises, tracks, or interrupts. Nothing observer-shaped is
         captured, so the closure outlives its agent without pinning it.
+
+        The callable's docstring is user-facing surface: ``descriptors()``
+        builds each ``CommandDescriptor.description`` from it, and those are
+        announced to every frontend's command palette.
 
         Args:
             params: Configuration for the stop capability.
@@ -173,17 +180,14 @@ class MailboxTool(ToolCard):
             A zero-argument callable named ``stop``.
         """
 
-        def stop() -> str:
+        def stop() -> None:
             """Cancel the agent's current run.
 
             Sent while the agent is busy, the request interrupts the run at the
-            next step boundary. Dispatched while the agent is idle, there is
-            nothing to cancel and this only replies.
-
-            Returns:
-                A confirmation that nothing is running.
+            next step boundary. Dispatched while the agent is idle there is
+            nothing to cancel, and nothing is reported.
             """
-            return "nothing is running — there is no active run to cancel."
+            return None
 
         stop.__doc__ = params.format_docstring(cleandoc(stop.__doc__ or ""))
         return stop

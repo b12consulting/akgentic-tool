@@ -90,30 +90,31 @@ owning agent stopped raises `ToolObserverGone` — a defined outcome, not a cras
 Canonical name `stop`, string surface `/stop`, zero arguments, registered in the command registry
 and therefore announced to every frontend for free via `CommandsAnnouncedEvent`.
 
-**Idle semantics: the handler only replies.** Commands dispatch while the agent is idle, so by the
-time `stop()` runs there is nothing to cancel — it returns a confirmation that nothing is running.
-Its real effect is mid-run, and that effect is not implemented here: a `/stop` message sitting in
-a busy agent's mailbox is recognised by the agent-side cancel hook, which is `akgentic-agent`'s
-enforcement (its Epic 20). Nothing in this card raises, tracks, or interrupts.
+**Idle semantics: the handler reports nothing.** Commands dispatch while the agent is idle, so by
+the time `stop()` runs there is nothing to cancel — it returns `None`, which the registry
+propagates unchanged and the caller reads as *handled, say nothing*. Its real effect is mid-run,
+and that effect is not implemented here: a `/stop` message sitting in a busy agent's mailbox is
+recognised by the agent-side cancel hook, which is `akgentic-agent`'s enforcement. Nothing in this
+card raises, tracks, or interrupts.
+
+A reply would double-report the outcome: a cancel that mattered was already reported by the
+interruption path, and one that arrived too late has nothing to add.
 
 ---
 
-## The cancel vocabulary
+## Where the cancel vocabulary lives
 
-The card owns the **vocabulary** of cancellation; the agent owns the **enforcement**. Two helpers
-are exported from `akgentic.tool.mailbox` for the enforcement site to import instead of restate:
+**Not here.** `is_cancel` and `render_arrival_notice` used to be exported from
+`akgentic.tool.mailbox`; they now live in `akgentic-agent`, beside the enforcement that uses them,
+in `akgentic/agent/capabilities/mailbox_capability.py`.
 
-- **`is_cancel(msg)`** — `True` for a `CancelMessage` instance (the typed carrier for
-  programmatic senders, defined in `akgentic-core`), or for a message whose content strips to a
-  string whose first whitespace-delimited token is **exactly** `/stop` — so `"  /stop now"`
-  cancels and `"/stopwatch"` does not. A message without usable string content is simply `False`.
-- **`render_arrival_notice(new_messages)`** — the one-line mid-run doorbell: *"N new message(s)
-  arrived (from …) — call `read_mailbox` to see them, or finish your current work first."*
-  Returns `""` for an empty list and never raises. The line is injected ephemerally at each step
-  boundary by the agent-side hook (Epic 20); this card only defines the wording.
+The reason is ownership, not tidiness: `BaseAgent` builds its cancel capability **unconditionally**,
+precisely so that an agent configured with no `MailboxTool` at all is still interruptible. A
+predicate shipping with this card cannot serve that case — there is no card to import it from.
 
-Both spellings of cancellation — the typed message and the string surface — are recognised by the
-one predicate, so the frontend's Esc key can map to `/stop` with no new protocol.
+What this card keeps is its own surface: the `MailboxState` provider, the `read_mailbox` tool, and
+the `/stop` command **registration**. Recognising the `/stop` string is the agent's job, and it
+does that without importing anything from here.
 
 ## The observer protocol
 
@@ -149,15 +150,14 @@ MailboxTool(mailbox_status=MailboxStatus(expose={LLM_CONTEXT}))  # explicit para
 ### Failure modes worth knowing
 
 - **An empty mailbox is not an error anywhere.** The state renders `""` (say nothing), the delta
-  is `None`, `read_mailbox` returns its empty-mailbox sentence, and the arrival notice for an
-  empty list is `""`.
+  is `None`, and `read_mailbox` returns its empty-mailbox sentence.
 - **A collected observer degrades, in the channel-appropriate way.** The context-state provider
   returns `None` (never raises); `read_mailbox` raises `ToolObserverGone` (in-life code, raising
   form); the `stop` closure captures nothing observer-shaped at all and outlives its agent
   without pinning it.
-- **`/stopwatch` is not a cancel.** `is_cancel` matches the exact token `/stop` followed by
-  end-of-string or whitespace — a prefix match would swallow every command starting with those
-  five characters.
+- **A silent `/stop` is the designed outcome, not a broken command.** `dispatch("/stop")` returns
+  `None` rather than a string; a caller that string-renders every dispatch result would show the
+  literal word `None` to the user.
 - **The preview is spec-literal.** A message whose first content line is empty or
   whitespace-only yields that whitespace as its row's preview — there is no fallback to later
   lines.
@@ -170,10 +170,10 @@ The card is complete on its side, and two of its three capabilities activate onl
 - `MailboxState` reaches **no model** until the agent-side context delivery loop lands (that
   package's Epic 19) — the provider is collected today only by code that also serves the other
   `LLM_CONTEXT` cards.
-- Auto-adding this card to every agent, the cancel enforcement hook, `RunInterruptedError` and
-  the mid-run arrival-notice injection are all agent-side (that package's Epic 20). Until then,
-  adding the card does **not** enable cancellation — `/stop` is announced, dispatches idle, and
-  interrupts nothing.
+- Auto-adding this card to every agent, the cancel vocabulary, its enforcement hook,
+  `RunInterruptedError` and the mid-run arrival-notice injection are all agent-side (that
+  package's Epic 20). Until then, adding the card does **not** enable cancellation — `/stop` is
+  announced, dispatches silently, and interrupts nothing.
 
 `read_mailbox` works as soon as the card is wired to an agent that satisfies the observer
 protocol.
@@ -190,16 +190,13 @@ from akgentic.tool.mailbox import (
     MailboxToolObserver,
     ReadMailbox,
     Stop,
-    is_cancel,
     make_mailbox_state_provider,
-    render_arrival_notice,
 )
 ```
 
 Only `MailboxTool` is re-exported from the package root — the import a deployment writes. The
-params, the state models, the observer protocol and the cancel vocabulary come from
-`akgentic.tool.mailbox` — the vocabulary being what the agent package imports instead of
-restating.
+params, the state models and the observer protocol come from `akgentic.tool.mailbox`;
+`MailboxToolObserver` in particular is the one symbol the agent package imports from this path.
 
 ---
 

@@ -146,6 +146,7 @@ def _preview(message: Message) -> str:
 def unique_ordered(values: Iterable[str]) -> list[str]:
     """Deduplicate while preserving first-seen order.
 
-    Public like ``sender_name``: shared with ``cancel.py`` for sender rendering.
+    Public like ``sender_name``: used by ``render_full`` to list each sender
+    once, and available to any other renderer in the domain.
     """
     return list(dict.fromkeys(values))
