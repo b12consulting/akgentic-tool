@@ -44,8 +44,8 @@ class GetPlanning(BaseToolParam):
     filter_by_agent: bool = Field(
         default=True,
         description=(
-            "When True (default), the system prompt shows only tasks owned or created by the "
-            "calling agent. The team summary (totals + owner breakdown) is always shown. "
+            "When True (default), the planning context state shows only tasks owned or created "
+            "by the calling agent. The team summary (totals + owner breakdown) is always shown. "
             "Set False to list all tasks."
         ),
     )
