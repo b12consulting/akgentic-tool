@@ -816,9 +816,11 @@ each fails in its own way when misused:
 **The silent drop.** A capability exposed on a channel its card cannot serve is dropped with **no
 error and no warning** — the factory aggregates only what the card's hooks return, and nothing
 cross-checks that `expose` and the hooks agree. A `GetPlanning` left on `SYSTEM_PROMPT` after the
-card stopped overriding `get_system_prompts()` would simply vanish from the prompt. This is why a
-card's wiring tests assert the actual provider / tool / command lists rather than trusting the
-declaration.
+card stopped overriding `get_system_prompts()` would simply vanish from the prompt — the drop is
+real enough that the params the epic-31 migration moved each carry the per-param
+`normalize_system_prompt_to_llm_context` validator to rewrite exactly that persisted exposure.
+This is why a card's wiring tests assert the actual provider / tool / command lists rather than
+trusting the declaration.
 
 **The routing rule.** A capability is served exactly when both gates pass: its param **resolves**
 (`True` or a param instance — `False` removes it), **and** its `expose` set contains the channel
