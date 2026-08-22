@@ -243,6 +243,44 @@ def test_empty_full_rendering_contributes_and_advances_nothing() -> None:
     assert tool_state.context_update_seq == 0
 
 
+def test_empty_delta_rendering_contributes_and_advances_nothing() -> None:
+    observer = _Observer()
+
+    class _EmptyDeltaState(_LabelState):
+        def render_delta(self, previous: Self) -> str | None:
+            return ""
+
+    holder: dict[str, ContextState] = {"state": _EmptyDeltaState(label="start")}
+
+    def blank_delta_provider() -> ContextState | None:
+        return holder["state"]
+
+    updater = ContextUpdater(observer, [blank_delta_provider])
+    first = updater.compose_update([])
+    assert first is not None
+    baseline = observer.state.tool_state.context_baselines["blank_delta_provider"]
+    holder["state"] = _EmptyDeltaState(label="moved")
+    assert updater.compose_update([_user(first)]) is None
+    tool_state = observer.state.tool_state
+    # Unlike a None delta, an empty delta does not advance its baseline.
+    assert tool_state.context_baselines["blank_delta_provider"] is baseline
+    assert tool_state.context_update_seq == 1
+
+
+def test_type_changed_state_renders_full_against_existing_baseline() -> None:
+    observer, updater, states = _make_env()
+    first = updater.compose_update([])
+    assert first is not None
+    # A card reconfigured mid-life: a different concrete type renders full, never a delta.
+    states["counter_provider"] = _LabelState(label="swapped")
+    block = updater.compose_update([_user(first)])
+    assert block == (
+        "**Context update 2** — state has changed since the last update.\n\nlabel full: swapped"
+    )
+    baselines = observer.state.tool_state.context_baselines
+    assert isinstance(baselines["counter_provider"], _LabelState)
+
+
 # ---------------------------------------------------------------------------
 # AC 11.6 — a collected observer degrades, never raises
 # ---------------------------------------------------------------------------
