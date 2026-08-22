@@ -1,7 +1,8 @@
 # KnowledgeGraphTool
 
 A shared, persistent knowledge graph for a team: entities and typed relations, mutated in
-batches, searched by keyword, vector or both, and summarised into every agent's system prompt.
+batches, searched by keyword, vector or both, and summarised into structured context state
+delivered to every agent as per-turn deltas.
 
 ```python
 from akgentic.tool.knowledge_graph import KnowledgeGraphTool
@@ -11,7 +12,7 @@ from akgentic.tool.knowledge_graph import KnowledgeGraphTool
 |---|---|
 | Module | `akgentic.tool.knowledge_graph.kg_tool` |
 | Actor | `KnowledgeGraphActor`, singleton named `#KnowledgeGraphTool` |
-| Channels used | `SYSTEM_PROMPT`, `TOOL_CALL`, `COMMAND` |
+| Channels used | `LLM_CONTEXT`, `TOOL_CALL`, `COMMAND` |
 | Depends on | `VectorStoreTool` — conditionally, see [`vector_store`](#vector_store) |
 | Required extra | `[vector_search]` — checked at `observer()` time, see [below](#the-dependency-check-is-unconditional) |
 
@@ -94,12 +95,16 @@ agent curates.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `expose` | `set[Channels]` | `{SYSTEM_PROMPT, COMMAND}` | **Not a tool call by default.** Add `TOOL_CALL` to also expose `get_graph()` as a callable that returns the *full* rendering. |
-| `prompt_include_schema` | `bool` | `True` | Include the sorted entity-type and relation-type lists in the prompt summary. |
+| `expose` | `set[Channels]` | `{LLM_CONTEXT, COMMAND}` | **Not a tool call by default.** The summary is structured context state delivered as per-turn deltas. Add `TOOL_CALL` to also expose `get_graph()` as a callable that returns the *full* rendering. |
+| `prompt_include_schema` | `bool` | `True` | Include the sorted entity-type and relation-type lists in the summary context state. |
 | `prompt_include_roots` | `bool` | `True` | Include entities marked `is_root=True`, with their descriptions. |
 
-The two `prompt_*` fields shape the **system-prompt summary only**; the `TOOL_CALL` and `COMMAND`
-renderings always emit the full graph.
+A card persisted with an explicit `expose: ["system_prompt", ...]` from before the move is
+revalidated onto `LLM_CONTEXT` by the attached `normalize_system_prompt_to_llm_context` validator.
+
+The two `prompt_*` fields shape the **summary context state only** — they are carried on the state
+as fields and gate their blocks in both the full rendering and the deltas; the `TOOL_CALL` and
+`COMMAND` renderings always emit the full graph.
 
 That distinction is the point. The summary is designed to scale as *O(types + roots)*, not
 *O(entities + relations)*:
@@ -115,8 +120,8 @@ Root entities:
 Use the get_graph tool to explore the full graph or subgraphs.
 ```
 
-Turning both flags off reduces the prompt to the two count lines. `is_root` is therefore a
-prompt-budget decision as much as a modelling one: root entities are the entry points an agent is
+Turning both flags off reduces the summary to the two count lines. `is_root` is therefore a
+context-budget decision as much as a modelling one: root entities are the entry points an agent is
 told about without being told everything.
 
 ### `UpdateGraph` — `update_graph(update: ManageGraph)`
@@ -218,13 +223,13 @@ KnowledgeGraphTool()                                  # defaults
 
 KnowledgeGraphTool(read_only=True)                    # reader agent
 
-KnowledgeGraphTool(get_graph=GetGraph(                # minimal prompt footprint
+KnowledgeGraphTool(get_graph=GetGraph(                # minimal context footprint
     prompt_include_schema=False,
     prompt_include_roots=False,
 ))
 
 KnowledgeGraphTool(get_graph=GetGraph(                # also fetchable on demand
-    expose={SYSTEM_PROMPT, TOOL_CALL, COMMAND},
+    expose={LLM_CONTEXT, TOOL_CALL, COMMAND},
 ))
 
 KnowledgeGraphTool(                                   # persistent, tenant-isolated

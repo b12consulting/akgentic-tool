@@ -1,8 +1,8 @@
 # PlanningTool
 
 A shared task board for a multi-agent team: one actor holds the plan, every agent reads and
-writes it, and the plan is injected into each agent's system prompt so nobody has to ask what the
-team is doing.
+writes it, and the plan is exposed as structured context state delivered into each agent's context
+as per-turn deltas, so nobody has to ask what the team is doing.
 
 ```python
 from akgentic.tool.planning import PlanningTool
@@ -12,7 +12,7 @@ from akgentic.tool.planning import PlanningTool
 |---|---|
 | Module | `akgentic.tool.planning.planning` |
 | Actor | `PlanActor`, singleton named `#PlanningTool` |
-| Channels used | `SYSTEM_PROMPT`, `TOOL_CALL`, `COMMAND` |
+| Channels used | `LLM_CONTEXT`, `TOOL_CALL`, `COMMAND` |
 | Depends on | `VectorStoreTool` — conditionally, see [`vector_store`](#vector_store) |
 | Optional extras | `[vector_search]` for semantic search |
 
@@ -96,10 +96,13 @@ Both are propagated to `PlanConfig`, so the actor applies them when the per-call
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `expose` | `set[Channels]` | `{SYSTEM_PROMPT, COMMAND}` | **Not a tool call by default.** The plan is context, not something the model must remember to fetch. Add `TOOL_CALL` to also offer it as a callable. |
+| `expose` | `set[Channels]` | `{LLM_CONTEXT, COMMAND}` | **Not a tool call by default.** The plan is context — structured context state delivered as per-turn deltas, not something the model must remember to fetch. Add `TOOL_CALL` to also offer it as a callable. |
 | `filter_by_agent` | `bool` | `True` | When `True` the rendered plan lists only tasks the calling agent owns *or* created (and that have an owner). The team summary — totals and per-owner breakdown — is always shown. `False` lists every task. |
 
-`filter_by_agent=True` is what keeps the prompt cost of a 200-task board bounded: every agent sees
+A card persisted with an explicit `expose: ["system_prompt", ...]` from before the move is
+revalidated onto `LLM_CONTEXT` by the attached `normalize_system_prompt_to_llm_context` validator.
+
+`filter_by_agent=True` is what keeps the context cost of a 200-task board bounded: every agent sees
 the same two summary lines plus its own slice.
 
 ```
@@ -199,7 +202,7 @@ PlanningTool()                                               # defaults
 
 PlanningTool(get_planning=GetPlanning(filter_by_agent=False))  # everyone sees every task
 
-PlanningTool(get_planning=GetPlanning(expose={SYSTEM_PROMPT, TOOL_CALL, COMMAND}))
+PlanningTool(get_planning=GetPlanning(expose={LLM_CONTEXT, TOOL_CALL, COMMAND}))
                                                              # also fetchable on demand
 
 PlanningTool(vector_store=False)                             # keyword-only, no vector store needed

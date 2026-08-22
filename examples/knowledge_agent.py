@@ -264,7 +264,7 @@ def build_tech_stack_graph(kg_actor: KnowledgeGraphActor) -> None:
 
 
 def demonstrate_queries(kg_actor: KnowledgeGraphActor, tool: KnowledgeGraphTool) -> None:
-    """Show different query patterns: full graph, subgraph, and system prompt summary.
+    """Show different query patterns: full graph, subgraph, and context-state summary.
 
     Args:
         kg_actor: Direct actor access for subgraph queries.
@@ -294,12 +294,12 @@ def demonstrate_queries(kg_actor: KnowledgeGraphActor, tool: KnowledgeGraphTool)
     for entity in roots_view.entities:
         print(f"  {entity.name} ({entity.entity_type})")
 
-    # System prompt summary — compact graph context injection for LLM agents
-    print("\n--- Step 3: System prompt summary (compact graph context) ---")
-    prompts = tool.get_system_prompts()
-    if prompts:
-        summary = prompts[0]()
-        print(summary)
+    # Context-state summary — compact graph context, delivered per turn as deltas
+    print("\n--- Step 3: Context-state summary (compact graph context) ---")
+    providers = tool.get_context_states()
+    state = providers[0]()
+    if state is not None:
+        print(state.render_full())
 
 
 def demonstrate_search(tool: KnowledgeGraphTool) -> None:
@@ -350,8 +350,8 @@ def main() -> None:
     """Run the knowledge agent example end-to-end.
 
     Sets up an actor-based knowledge graph tool, builds a tech stack
-    knowledge graph, demonstrates queries, search, and system prompt
-    injection, then shuts down cleanly.
+    knowledge graph, demonstrates queries, search, and the context-state
+    summary, then shuts down cleanly.
     """
     print("=" * 60)
     print("Knowledge Graph Tool — End-to-End Example")
