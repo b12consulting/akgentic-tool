@@ -5,7 +5,8 @@
 
 Tool infrastructure and domain tools for the [Akgentic](https://github.com/b12consulting/akgentic-framework)
 multi-agent framework (open-source bundle). Define, compose, and expose capabilities to LLM agents through a unified
-channel system — as tool calls, system prompt injections, or programmatic commands.
+channel system — as tool calls, system prompt injections, structured context state, or programmatic
+commands.
 
 ## Table of Contents
 
@@ -47,7 +48,8 @@ running inside it. It provides:
 - **Abstract contracts** — `ToolCard` and `BaseToolParam` define the serializable configuration
   model every tool follows; `ToolFactory` aggregates multiple cards into agent-ready callables
 - **Channel system** — each capability declares whether it surfaces as a `TOOL_CALL` (LLM
-  invokes it), a `SYSTEM_PROMPT` (injected into context before each LLM call), or a `COMMAND`
+  invokes it), a `SYSTEM_PROMPT` (rendered once into the frozen system block), an `LLM_CONTEXT`
+  (structured context state appended into the context tail per turn, as a delta), or a `COMMAND`
   (programmatic call from another agent or the orchestrator)
 - **Observer protocols** — `ToolObserver`, `ActorToolObserver`, and `TeamManagementToolObserver`
   give tools access to the actor system, event emission, and team lifecycle hooks.
@@ -69,6 +71,7 @@ ToolFactory
     │
     ├── get_tools()          → list[Callable]  ─────▶ LLM ReAct loop
     ├── get_system_prompts() → list[Callable]  ─────▶ injected into LLM context
+    ├── get_context_states() → list[Callable[[], ContextState | None]] ▶ per-turn context deltas
     ├── get_commands()       → dict[type, Callable] ▶ orchestrator / other agents
     └── get_toolsets()       → list[Any]       ─────▶ pydantic-ai toolset objects
 ```
@@ -166,7 +169,8 @@ factory = ToolFactory(
 
 # Get callables ready for pydantic-ai agent registration
 tools = factory.get_tools()            # LLM-callable functions
-prompts = factory.get_system_prompts() # dynamic context injections
+prompts = factory.get_system_prompts() # static prompt injections
+states = factory.get_context_states()  # structured context state, delivered as deltas
 commands = factory.get_commands()      # programmatic calls from orchestrator
 ```
 
@@ -238,6 +242,42 @@ class MyTool(ToolCard):
         return [my_tool]
 ```
 
+#### Context state: the `get_context_states()` hook
+
+A stateful card exposes its volatile prompt content as **structured context state** on the
+`LLM_CONTEXT` channel, through `get_context_states()`. The hook returns zero-arg **providers** —
+callables returning a `ContextState` snapshot, or `None` when the state is unavailable (collected
+observer, stopped actor). Providers **never raise**; the default is `[]`. It sits alongside
+`get_system_prompts()`, which stays for **static** text that belongs in the cached prefix.
+
+`ContextState` is a small contract:
+
+- `render_full()` — the whole state, as the model should first see it; `""` when there is nothing
+  to say.
+- `render_delta(previous)` — what changed since `previous`; `None` when nothing did. The caller
+  guarantees `previous` is the **same concrete type**, and a first-seen state is always rendered
+  full — `render_delta` is never asked to diff against nothing.
+
+The states are collected and delivered by the agent layer (ADR-037 §6-8).
+
+**The channel a capability declares is the card author's promise** — `SYSTEM_PROMPT` means
+*rendered once, cached prefix*; `LLM_CONTEXT` means *per-turn delta at the tail*. Choose carefully:
+a capability exposed on a channel its card cannot serve is **dropped silently** — no error, no
+warning. A `GetPlanning` left on `SYSTEM_PROMPT` after the card stopped overriding
+`get_system_prompts()` would simply vanish from the prompt.
+
+Two mechanics back the hook:
+
+- **Aggregation** — `ToolFactory.get_context_states()` iterates cards in dependency order. A
+  provider's key is its callable `__name__` (the same convention `get_command_registry()` uses),
+  and two providers sharing a name raise `ValueError` at build time, naming both owning cards —
+  never silent shadowing.
+- **Persisted-payload migration** — a card persisted with an explicit
+  `expose: ["system_prompt", ...]` before its content moved would resolve to a channel the card no
+  longer serves. `normalize_system_prompt_to_llm_context` rewrites that persisted exposure to
+  `LLM_CONTEXT`, attached as a `field_validator` **per param class, on moved params only** — never
+  globally, which would silently drag static content out of the cached prefix.
+
 ### ToolFactory
 
 Aggregates multiple `ToolCard` instances into flat lists. When `retry_exception` is set, wraps
@@ -278,19 +318,28 @@ class BadParam(BaseToolParam):
 
 ### Channel System
 
-The `Channels` enum (`TOOL_CALL`, `SYSTEM_PROMPT`, `COMMAND`) controls how a capability is
-surfaced. Each `BaseToolParam` subclass declares its `expose` set. A single capability can
-appear on multiple channels simultaneously.
+The `Channels` enum (`TOOL_CALL`, `SYSTEM_PROMPT`, `LLM_CONTEXT`, `COMMAND`) controls how a
+capability is surfaced. Each `BaseToolParam` subclass declares its `expose` set. A single
+capability can appear on multiple channels simultaneously.
 
 | Channel | Consumer | Invocation |
 |---|---|---|
 | `TOOL_CALL` | LLM agent | Called by the LLM during the ReAct loop |
-| `SYSTEM_PROMPT` | LLM context | Injected as dynamic content before each LLM call |
+| `SYSTEM_PROMPT` | LLM context | Rendered once into the frozen system block |
+| `LLM_CONTEXT` | LLM context | Structured context state appended into the context tail per turn, as a delta |
 | `COMMAND` | Orchestrator / agents | Called programmatically via `proxy_call` |
+
+The two prompt-bearing channels carry different promises, and picking between them is the card
+author's contract with the runtime:
+
+- **`SYSTEM_PROMPT`** — rendered **once** into the frozen system block, never re-rendered, part of
+  the cached prefix. Static content only.
+- **`LLM_CONTEXT`** — structured context state appended into the context tail **per turn, as a
+  delta**. The channel for volatile tool state that must not invalidate the cached prefix.
 
 ```python
 class GetPlanning(BaseToolParam):
-    expose: set[Channels] = {SYSTEM_PROMPT, COMMAND}  # never a direct LLM call
+    expose: set[Channels] = {LLM_CONTEXT, COMMAND}    # context state, never a direct LLM call
 
 class GetPlanningTask(BaseToolParam):
     expose: set[Channels] = {TOOL_CALL, COMMAND}      # LLM + programmatic
@@ -740,8 +789,9 @@ caching and the edit-matching cascade.
 
 Shared actor-based task board for multi-agent teams. A singleton `PlanActor` (named
 `#PlanningTool`) is created by the orchestrator as one of its children — get-or-create semantics
-guarantee unicity — and persists across all agents' tool calls. The plan is injected into each
-agent's system prompt, scoped to that agent's own tasks by default.
+guarantee unicity — and persists across all agents' tool calls. The plan is exposed as structured
+context state on `LLM_CONTEXT`, delivered into the context tail as per-turn deltas and scoped to
+each agent's own tasks by default.
 
 ```python
 from akgentic.tool.planning import GetPlanning, PlanningTool
@@ -761,7 +811,8 @@ the `depends_on` contract.
 ### KnowledgeGraphTool
 
 Persistent actor-based knowledge graph for structured entity and relationship storage with hybrid
-keyword + semantic search. The system prompt carries a summary that scales as *O(types + roots)*
+keyword + semantic search. The graph summary is exposed as structured context state on
+`LLM_CONTEXT` — delivered into the context tail as deltas — and scales as *O(types + roots)*
 rather than *O(entities)*, so a large graph stays affordable as context.
 
 ```python
@@ -824,8 +875,10 @@ inherited `instructions`.
 ### TeamTool
 
 Exposes team management capabilities (hire/fire agents, roster, role profiles) to the LLM, and
-answers *who is working right now, and on what*. Used by `BaseAgent` in `akgentic-agent` to let
-orchestrator-level agents extend the team at runtime. Requires a `TeamManagementToolObserver`.
+answers *who is working right now, and on what*. The roster and the hireable-role catalog are
+exposed as structured context state on `LLM_CONTEXT`, delivered into the context tail as deltas.
+Used by `BaseAgent` in `akgentic-agent` to let orchestrator-level agents extend the team at
+runtime. Requires a `TeamManagementToolObserver`.
 
 ```python
 from akgentic.tool.team import ActivitySummarizer, GetTeamActivity, TeamTool
@@ -1123,8 +1176,9 @@ src/akgentic/tool/
     py.typed                  # PEP 561 typing marker
     core/
     │   __init__.py           # Façade: ToolCard, BaseToolParam, ToolFactory, Channels
-    │   channels.py           # Channels enum: TOOL_CALL, SYSTEM_PROMPT, COMMAND
-    │   params.py             # BaseToolParam
+    │   channels.py           # Channels enum: TOOL_CALL, SYSTEM_PROMPT, LLM_CONTEXT, COMMAND
+    │   context_state.py      # ContextState ABC — diffable prompt state for LLM_CONTEXT
+    │   params.py             # BaseToolParam, normalize_system_prompt_to_llm_context
     │   card.py               # ToolCard
     │   dependencies.py       # Topological ordering of cards by depends_on
     │   commands.py           # CommandRegistry
@@ -1155,12 +1209,14 @@ src/akgentic/tool/
     planning/
     │   README.md           # PlanningTool reference — capabilities, task models, wiring
     │   planning_actor.py     # Task models, PlanConfig, PlanActor
+    │   state.py              # TaskRow, PlanningState — planning context state + deltas
     │   └── planning.py       # PlanningTool ToolCard
     knowledge_graph/
     │   README.md           # KnowledgeGraphTool reference — params, search modes, deltas
     │   models.py             # Entity, Relation, CRUD + query models
     │   event.py              # Re-exports KnowledgeGraphStateEvent, this domain's delta
     │   kg_actor.py           # KnowledgeGraphActor
+    │   state.py              # RootRow, KnowledgeGraphSummaryState — summary state + deltas
     │   └── kg_tool.py        # KnowledgeGraphTool ToolCard
     search/
     │   README.md           # SearchTool reference — Tavily parameters and ranges
@@ -1168,6 +1224,7 @@ src/akgentic/tool/
     team/
     │   README.md           # TeamTool reference — hire/fire channels, activity gates
     │   team.py               # TeamTool — hire/fire/roster/profiles + get_team_activity
+    │   state.py              # TeamMemberRow/TeamRosterState, RoleRow/RoleCatalogState
     │   observer.py           # TeamManagementToolObserver — TeamTool's own contract
     │   └── activity.py       # team_activity models, GetTeamActivity,
     │                         #   ActivitySummarizer, TeamActivityActor, SummarizerWorker

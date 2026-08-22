@@ -11,7 +11,7 @@ from akgentic.tool.team import TeamTool
 |---|---|
 | Module | `akgentic.tool.team.team` |
 | Actor | `TeamActivityActor` (`#TeamActivity`) — **created only when a summarizer is configured** |
-| Channels used | `SYSTEM_PROMPT`, `TOOL_CALL`, `COMMAND` |
+| Channels used | `LLM_CONTEXT`, `TOOL_CALL`, `COMMAND` |
 | Observer required | `TeamManagementToolObserver` (provided by `BaseAgent` in `akgentic-agent`) |
 | Optional extras | none |
 
@@ -50,8 +50,8 @@ know about.
 |---|---|---|---|
 | `hire_team_members` | `HireTeamMember \| bool` | `True` | `hire_members(roles)` on `TOOL_CALL`, `hire_member(role, name=None)` on `COMMAND`. |
 | `fire_team_members` | `FireTeamMember \| bool` | `True` | `fire_members(names)` on `TOOL_CALL`, `fire_member(name)` on `COMMAND`. |
-| `get_team_roster` | `GetTeamRoster \| bool` | `True` | The current roster as a system prompt. |
-| `get_role_profiles` | `GetRoleProfiles \| bool` | `True` | The hireable role catalog as a system prompt. |
+| `get_team_roster` | `GetTeamRoster \| bool` | `True` | The current roster as structured context state on `LLM_CONTEXT`, delivered as per-turn deltas. |
+| `get_role_profiles` | `GetRoleProfiles \| bool` | `True` | The hireable role catalog as structured context state on `LLM_CONTEXT`, delivered as per-turn deltas. |
 | `get_team_activity` | `GetTeamActivity \| bool` | `True` | `team_activity()` — who is mid-handler. Free by default. |
 
 ---
@@ -135,21 +135,31 @@ on the fire path re-checks liveness before building the proxy, and the per-name 
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `expose` | `set[Channels]` | `{SYSTEM_PROMPT, COMMAND}` | Context, not a tool call. |
+| `expose` | `set[Channels]` | `{LLM_CONTEXT, COMMAND}` | Context state, not a tool call. |
 
-Renders `name (role: X)` per member, marking the calling agent with `- [you]`. **Tool actors are
-excluded** — any member whose name starts with `#`. Returns `""` when the team is empty or the
-calling agent has already stopped, so an empty roster adds nothing to the prompt. Any failure is
-logged and rendered as `"Cannot get team roster..."` rather than raised.
+On `LLM_CONTEXT` the capability yields a `TeamRosterState` (`team/state.py`) whose
+`render_full()` renders `name (role: X)` per member, marking the calling agent with `- [you]` —
+byte-identical to the historical prompt — and whose deltas report who joined and who left, keyed
+on `(name, role)`. **Tool actors are excluded** — any member whose name starts with `#`. The
+provider returns `None` once the calling agent has stopped (state unavailable, never raises); an
+empty team is a real state rendering `""`. The `/team_members` **command** still returns the same
+rendered string, `""` when the agent has stopped, and `"Cannot get team roster..."` on a logged
+failure.
+
+A card persisted with an explicit `expose: ["system_prompt", ...]` from before the move is
+revalidated onto `LLM_CONTEXT` by the attached `normalize_system_prompt_to_llm_context` validator.
 
 ### `GetRoleProfiles` — `team_roles()`
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `expose` | `set[Channels]` | `{SYSTEM_PROMPT, COMMAND}` | |
+| `expose` | `set[Channels]` | `{LLM_CONTEXT, COMMAND}` | |
 
-Renders `role: description (Skills: a, b)` for every `AgentCard` in the orchestrator's catalog —
-the menu `hire_members` draws from. Same soft-failure behaviour as the roster.
+On `LLM_CONTEXT` the capability yields a `RoleCatalogState` whose `render_full()` renders
+`role: description (Skills: a, b)` for every `AgentCard` in the orchestrator's catalog — the menu
+`hire_members` draws from — and whose deltas report roles added, removed, or re-described, keyed
+on the role name. Same soft-failure behaviour as the roster, and the same persisted-payload
+normalizer.
 
 ### `GetTeamActivity` — `team_activity()`
 
@@ -250,7 +260,7 @@ TeamTool(                                      # hiring only via the human /-com
     fire_team_members=FireTeamMember(expose={COMMAND}),
 )
 
-TeamTool(get_team_roster=False)                # drop the roster from the prompt
+TeamTool(get_team_roster=False)                # drop the roster from the context
 ```
 
 ### Failure modes worth knowing
@@ -259,8 +269,9 @@ TeamTool(get_team_roster=False)                # drop the roster from the prompt
 - Building the summarizing `team_activity` without a bound `#TeamActivity` proxy raises
   `ValueError` — it means `observer()` never ran.
 - Every capability captures a **weak** reference to its owning agent. Once that agent stops, hire
-  and fire raise `RetriableError("Team is shutting down; …")` and the roster prompt returns `""`,
-  so a stopped agent's tools can never pin it in memory.
+  and fire raise `RetriableError("Team is shutting down; …")`, the roster context-state provider
+  returns `None`, and the `/team_members` command returns `""` — so a stopped agent's tools can
+  never pin it in memory.
 
 ### Import paths
 

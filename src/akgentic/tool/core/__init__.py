@@ -7,8 +7,9 @@ Defines the core contracts:
 """
 
 from .card import ToolCard
-from .channels import COMMAND, SYSTEM_PROMPT, TOOL_CALL, Channels
+from .channels import COMMAND, LLM_CONTEXT, SYSTEM_PROMPT, TOOL_CALL, Channels
 from .commands import CommandRegistry
+from .context_state import ContextState
 
 # ``_resolve`` and ``_topological_sort`` stay on the façade: six modules under
 # src/ and the test suite import them from ``akgentic.tool.core`` directly. The
@@ -16,16 +17,19 @@ from .commands import CommandRegistry
 # off implicit re-export) without promoting them into ``__all__``.
 from .dependencies import _topological_sort as _topological_sort  # noqa: F401
 from .factory import ToolFactory
-from .params import BaseToolParam
+from .params import BaseToolParam, normalize_system_prompt_to_llm_context
 from .params import _resolve as _resolve  # noqa: F401
 
 __all__ = [
     "COMMAND",
+    "LLM_CONTEXT",
     "SYSTEM_PROMPT",
     "TOOL_CALL",
     "BaseToolParam",
     "Channels",
     "CommandRegistry",
+    "ContextState",
     "ToolCard",
     "ToolFactory",
+    "normalize_system_prompt_to_llm_context",
 ]

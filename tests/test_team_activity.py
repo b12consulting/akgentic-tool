@@ -648,7 +648,11 @@ class TestBackwardCompatibility:
             GetRoleProfiles,
             GetTeamActivity,
         }
-        assert len(tool.get_system_prompts()) == 2
+        assert len(tool.get_system_prompts()) == 0
+        assert [provider.__name__ for provider in tool.get_context_states()] == [
+            "team_roster_state",
+            "role_catalog_state",
+        ]
 
     def test_a_default_card_creates_no_actor(self) -> None:
         _, orchestrator, _ = self._bound_default_tool()

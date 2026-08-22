@@ -9,7 +9,7 @@ import random
 from collections.abc import Callable
 from typing import Any, cast
 
-from pydantic import Field, PrivateAttr
+from pydantic import Field, PrivateAttr, field_validator
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import Akgent
@@ -18,12 +18,14 @@ from akgentic.core.agent_config import BaseConfig
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.tool.core import (
     COMMAND,
-    SYSTEM_PROMPT,
+    LLM_CONTEXT,
     TOOL_CALL,
     BaseToolParam,
     Channels,
+    ContextState,
     ToolCard,
     _resolve,
+    normalize_system_prompt_to_llm_context,
 )
 from akgentic.tool.core.observer import ToolObserver
 from akgentic.tool.errors import RetriableError
@@ -40,6 +42,12 @@ from akgentic.tool.team.activity import (
     build_snapshot,
 )
 from akgentic.tool.team.observer import TeamManagementToolObserver
+from akgentic.tool.team.state import (
+    RoleCatalogState,
+    RoleRow,
+    TeamMemberRow,
+    TeamRosterState,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,15 +65,23 @@ class FireTeamMember(BaseToolParam):
 
 
 class GetTeamRoster(BaseToolParam):
-    """Get current team roster as system prompt."""
+    """Get current team roster as structured context state."""
 
-    expose: set[Channels] = {SYSTEM_PROMPT, COMMAND}
+    expose: set[Channels] = {LLM_CONTEXT, COMMAND}
+
+    _normalize_expose = field_validator("expose", mode="after")(
+        normalize_system_prompt_to_llm_context
+    )
 
 
 class GetRoleProfiles(BaseToolParam):
-    """Get available role profiles as system prompt."""
+    """Get available role profiles as structured context state."""
 
-    expose: set[Channels] = {SYSTEM_PROMPT, COMMAND}
+    expose: set[Channels] = {LLM_CONTEXT, COMMAND}
+
+    _normalize_expose = field_validator("expose", mode="after")(
+        normalize_system_prompt_to_llm_context
+    )
 
 
 def _hire_single_member(
@@ -170,6 +186,46 @@ def _fire_single_member(
     return name
 
 
+def _build_roster_state(orchestrator_proxy: Orchestrator, self_name: str) -> TeamRosterState:
+    """Snapshot the team roster, shaped for one agent (ADR-037 §5).
+
+    Per-agent shaping happens here, at production time: ``#``-prefixed tool
+    actors never enter the rows, and ``is_self`` is baked in so the renderers
+    take no agent argument.
+
+    Args:
+        orchestrator_proxy: Proxy to the orchestrator actor.
+        self_name: The observing agent's own actor name.
+
+    Returns:
+        The roster state; empty ``members`` when the team is empty.
+    """
+    members = [
+        TeamMemberRow(
+            name=member.name, role=member.role, is_self=member.name == self_name
+        )
+        for member in orchestrator_proxy.get_team()
+        if not member.name.startswith("#")  # Exclude tool actors
+    ]
+    return TeamRosterState(members=members)
+
+
+def _build_role_catalog_state(orchestrator_proxy: Orchestrator) -> RoleCatalogState:
+    """Snapshot the hireable-role catalog (ADR-037 §5).
+
+    Args:
+        orchestrator_proxy: Proxy to the orchestrator actor.
+
+    Returns:
+        The catalog state; empty ``roles`` when the catalog is empty.
+    """
+    roles = [
+        RoleRow(role=card.role, description=card.description, skills=list(card.skills))
+        for card in orchestrator_proxy.get_agent_catalog()
+    ]
+    return RoleCatalogState(roles=roles)
+
+
 class TeamTool(ToolCard):
     """Team management tool for hiring, firing, and team awareness.
 
@@ -177,8 +233,8 @@ class TeamTool(ToolCard):
     - hire_members(roles: list[str]) -> str: Hire team members
     - fire_members(names: list[str]) -> str: Fire team members
     - team_activity() -> TeamActivityReport: Who is mid-handler (on by default, no summarizer)
-    - Team roster system prompt: Current team composition
-    - Role profiles system prompt: Available roles and descriptions
+    - Team roster context state: Current team composition, delivered as deltas
+    - Role catalog context state: Available roles and descriptions, delivered as deltas
     """
 
     hire_team_members: HireTeamMember | bool = Field(
@@ -188,10 +244,12 @@ class TeamTool(ToolCard):
         default=True, description="Enable firing team members (default: True)"
     )
     get_role_profiles: GetRoleProfiles | bool = Field(
-        default=True, description="Include role profiles in system prompt (default: True)"
+        default=True,
+        description="Expose the role catalog as structured context state (default: True)",
     )
     get_team_roster: GetTeamRoster | bool = Field(
-        default=True, description="Include team roster in system prompt (default: True)"
+        default=True,
+        description="Expose the team roster as structured context state (default: True)",
     )
     get_team_activity: GetTeamActivity | bool = Field(
         default=True,
@@ -274,23 +332,23 @@ class TeamTool(ToolCard):
         """Live observer typed as the team protocol; ``None`` once the agent stops."""
         return cast(TeamManagementToolObserver | None, self._observer_or_none())
 
-    def get_system_prompts(self) -> list[Callable[..., Any]]:
-        """Get dynamic system prompts for team context.
+    def get_context_states(self) -> list[Callable[[], ContextState | None]]:
+        """Get context-state providers for team context (ADR-037 §5).
 
         Returns:
-            List of callable system prompts (roster and/or profiles)
+            List of zero-arg providers (roster and/or role catalog).
         """
-        prompts: list[Callable[..., Any]] = []
+        providers: list[Callable[[], ContextState | None]] = []
 
         gtr = _resolve(self.get_team_roster, GetTeamRoster)
-        if gtr and SYSTEM_PROMPT in gtr.expose:
-            prompts.append(self._team_roster_prompt_factory(gtr))
+        if gtr and LLM_CONTEXT in gtr.expose:
+            providers.append(self._team_roster_state_factory(gtr))
 
         grp = _resolve(self.get_role_profiles, GetRoleProfiles)
-        if grp and SYSTEM_PROMPT in grp.expose:
-            prompts.append(self._role_profiles_prompt_factory(grp))
+        if grp and LLM_CONTEXT in grp.expose:
+            providers.append(self._role_catalog_state_factory(grp))
 
-        return prompts
+        return providers
 
     def get_tools(self) -> list[Callable[..., Any]]:
         """Get LLM-callable tools for team management.
@@ -332,11 +390,11 @@ class TeamTool(ToolCard):
 
         gtr = _resolve(self.get_team_roster, GetTeamRoster)
         if gtr and COMMAND in gtr.expose:
-            commands[GetTeamRoster] = self._team_roster_prompt_factory(gtr)
+            commands[GetTeamRoster] = self._team_roster_command_factory(gtr)
 
         grp = _resolve(self.get_role_profiles, GetRoleProfiles)
         if grp and COMMAND in grp.expose:
-            commands[GetRoleProfiles] = self._role_profiles_prompt_factory(grp)
+            commands[GetRoleProfiles] = self._role_profiles_command_factory(grp)
 
         gta = _resolve(self.get_team_activity, GetTeamActivity)
         if gta and COMMAND in gta.expose:
@@ -537,14 +595,64 @@ class TeamTool(ToolCard):
 
         return fire_member
 
-    def _team_roster_prompt_factory(self, params: GetTeamRoster) -> Callable[..., Any]:
-        """Create team roster system prompt callable.
+    def _team_roster_state_factory(
+        self, params: GetTeamRoster
+    ) -> Callable[[], ContextState | None]:
+        """Create the roster context-state provider.
 
         Args:
-            params: Configuration for roster prompt
+            params: Configuration for the roster capability
 
         Returns:
-            Callable that generates team roster prompt
+            Zero-arg provider producing a roster snapshot, or ``None`` when the
+            state is unavailable. Never raises.
+        """
+        orchestrator_proxy = self._orchestrator_proxy
+        observer_or_none = self._team_observer_or_none  # bound method -> weak edge to agent
+
+        def team_roster_state() -> TeamRosterState | None:
+            try:
+                observer = observer_or_none()
+                if observer is None:
+                    return None  # agent gone -> state unavailable
+                return _build_roster_state(orchestrator_proxy, observer.myAddress.name)
+            except Exception:
+                logger.error("Failed to get team roster state", exc_info=True)
+                return None
+
+        return team_roster_state
+
+    def _role_catalog_state_factory(
+        self, params: GetRoleProfiles
+    ) -> Callable[[], ContextState | None]:
+        """Create the role-catalog context-state provider.
+
+        Args:
+            params: Configuration for the role-profiles capability
+
+        Returns:
+            Zero-arg provider producing a catalog snapshot, or ``None`` when the
+            state is unavailable. Never raises.
+        """
+        orchestrator_proxy = self._orchestrator_proxy
+
+        def role_catalog_state() -> RoleCatalogState | None:
+            try:
+                return _build_role_catalog_state(orchestrator_proxy)
+            except Exception:
+                logger.error("Failed to get role catalog state", exc_info=True)
+                return None
+
+        return role_catalog_state
+
+    def _team_roster_command_factory(self, params: GetTeamRoster) -> Callable[..., Any]:
+        """Create the team roster command callable.
+
+        Args:
+            params: Configuration for the roster capability
+
+        Returns:
+            Callable that renders the team roster
         """
         orchestrator_proxy = self._orchestrator_proxy
         observer_or_none = self._team_observer_or_none  # bound method -> weak edge to agent
@@ -562,37 +670,23 @@ class TeamTool(ToolCard):
                 observer = observer_or_none()
                 if observer is None:
                     return ""  # agent gone -> no roster context
-                team_members = orchestrator_proxy.get_team()
-                if not team_members:
-                    return ""
-
-                team_members_names = [
-                    f"{member.name} (role: {member.role})"
-                    + (" - [you]" if member.name == observer.myAddress.name else "")
-                    for member in team_members
-                    if not member.name.startswith("#")  # Exclude tool actors
-                ]
-
-                if not team_members_names:
-                    return ""
-
-                return "**Here is the team member list by name (and role):**\n" + "\n".join(
-                    team_members_names
-                )
+                return _build_roster_state(
+                    orchestrator_proxy, observer.myAddress.name
+                ).render_full()
             except Exception:
                 logger.error("Failed to get team roster", exc_info=True)
                 return "Cannot get team roster..."
 
         return team_members
 
-    def _role_profiles_prompt_factory(self, params: GetRoleProfiles) -> Callable[..., Any]:
-        """Create role profiles system prompt callable.
+    def _role_profiles_command_factory(self, params: GetRoleProfiles) -> Callable[..., Any]:
+        """Create the role profiles command callable.
 
         Args:
-            params: Configuration for profiles prompt
+            params: Configuration for the role-profiles capability
 
         Returns:
-            Callable that generates role profiles prompt
+            Callable that renders the role profiles
         """
         orchestrator_proxy = self._orchestrator_proxy
 
@@ -606,21 +700,7 @@ class TeamTool(ToolCard):
                 Formatted role profiles or empty string if no roles
             """
             try:
-                agent_catalog = orchestrator_proxy.get_agent_catalog()
-                if not agent_catalog:
-                    return ""
-
-                profiles = []
-                for card in agent_catalog:
-                    skills_str = ", ".join(card.skills) if card.skills else "none"
-                    profiles.append(f"{card.role}: {card.description} (Skills: {skills_str})")
-
-                if not profiles:
-                    return ""
-
-                return "**Here is the available team role list (for hiring):**\n" + "\n".join(
-                    profiles
-                )
+                return _build_role_catalog_state(orchestrator_proxy).render_full()
             except Exception:
                 logger.error("Failed to get role profiles", exc_info=True)
                 return "Cannot get role profiles..."

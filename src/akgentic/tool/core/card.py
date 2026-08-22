@@ -11,6 +11,7 @@ from akgentic.core.utils import SerializableBaseModel
 from akgentic.tool.core.observer import ToolObserver
 from akgentic.tool.errors import ToolObserverGone
 
+from .context_state import ContextState
 from .params import BaseToolParam
 
 
@@ -94,6 +95,15 @@ class ToolCard(SerializableBaseModel, ABC):
         """Return system prompt callables injected into LLM context.
 
         Use ``self._observer`` when prompts need runtime data.
+        """
+        return []
+
+    def get_context_states(self) -> list[Callable[[], "ContextState | None"]]:
+        """Return context-state providers for capabilities on ``LLM_CONTEXT``.
+
+        Each provider is a zero-arg callable returning a :class:`ContextState`
+        snapshot, or ``None`` when its state is unavailable (collected observer,
+        stopped actor). Providers never raise. Default: no providers.
         """
         return []
 

@@ -27,6 +27,30 @@ def _resolve(value: "T | bool", cls: "type[T]") -> "T | None":
     return value  # already a ParamModel instance
 
 
+def normalize_system_prompt_to_llm_context(expose: set[Channels]) -> set[Channels]:
+    """Normalize a persisted ``SYSTEM_PROMPT`` exposure to ``LLM_CONTEXT``.
+
+    For capability params whose card moved its prompt content to the
+    ``LLM_CONTEXT`` channel (ADR-037 §4): a card persisted with an explicit
+    ``expose: ["system_prompt", ...]`` would otherwise resolve to a channel its
+    card no longer serves — and be dropped silently. Opt-in **per param class**,
+    on the moved params only; never a global rewrite, which would silently drag
+    static content out of the cached prefix. Attach as a field validator:
+
+    .. code-block:: python
+
+        class GetTeamRoster(BaseToolParam):
+            expose: set[Channels] = {LLM_CONTEXT, COMMAND}
+
+            _normalize_expose = field_validator("expose", mode="after")(
+                normalize_system_prompt_to_llm_context
+            )
+    """
+    if Channels.SYSTEM_PROMPT not in expose:
+        return expose
+    return (expose - {Channels.SYSTEM_PROMPT}) | {Channels.LLM_CONTEXT}
+
+
 class BaseToolParam(SerializableBaseModel):
     """Base for capability parameter models.
 
@@ -37,7 +61,8 @@ class BaseToolParam(SerializableBaseModel):
     it participates in. Use the module-level channel constants:
 
     - ``TOOL_CALL``: callable tool invoked by the LLM (default).
-    - ``SYSTEM_PROMPT``: prompt injected into the LLM context.
+    - ``SYSTEM_PROMPT``: prompt rendered once into the frozen system block.
+    - ``LLM_CONTEXT``: structured context state pushed into the context tail.
     - ``COMMAND``: programmatic call for inter-agent orchestration.
     """
 
@@ -53,7 +78,7 @@ class BaseToolParam(SerializableBaseModel):
 
     Defaults to ``{TOOL_CALL}``. Override in subclasses or at instantiation.
     Use ``Channels`` enum members or module-level aliases: ``TOOL_CALL``, ``SYSTEM_PROMPT``,
-    ``COMMAND``.
+    ``LLM_CONTEXT``, ``COMMAND``.
     """
 
     def format_docstring(self, original: str | None) -> str | None:

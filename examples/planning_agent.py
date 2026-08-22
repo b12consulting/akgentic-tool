@@ -2,7 +2,7 @@
 
 Shows how to integrate ``PlanningTool`` with an actor-based setup, create
 sprint tasks, perform exact-ID and semantic lookups, and observe the
-agent-scoped planning system prompt.
+agent-scoped planning context state.
 
 Run without OpenAI API key for exact-ID lookup only (semantic falls back gracefully):
     uv run python packages/akgentic-tool/examples/planning_agent.py
@@ -266,16 +266,16 @@ def demonstrate_semantic_search(plan_actor: PlanActor) -> None:
 
 
 def demonstrate_planning_prompt(tool: PlanningTool) -> None:
-    """Show the agent-scoped planning system prompt.
+    """Show the agent-scoped planning context state.
 
     Args:
-        tool: The configured PlanningTool for system-prompt demonstration.
+        tool: The configured PlanningTool for context-state demonstration.
     """
-    print("\n--- Step 4: Agent-scoped planning system prompt ---")
-    prompts = tool.get_system_prompts()
-    if prompts:
-        system_prompt = prompts[0]()
-        print(system_prompt)
+    print("\n--- Step 4: Agent-scoped planning context state ---")
+    providers = tool.get_context_states()
+    state = providers[0]()
+    if state is not None:
+        print(state.render_full())
 
 
 def main() -> None:
@@ -283,7 +283,7 @@ def main() -> None:
 
     Sets up an actor-based planning tool, creates sprint tasks,
     demonstrates exact-ID and semantic lookups, prints the agent-scoped
-    system prompt, then shuts down cleanly.
+    planning context state, then shuts down cleanly.
     """
     print("=" * 60)
     print("Planning Tool — Semantic Search Example")
@@ -313,7 +313,7 @@ def main() -> None:
     # --- Semantic search ---
     demonstrate_semantic_search(plan_actor)
 
-    # --- Agent-scoped planning system prompt ---
+    # --- Agent-scoped planning context state ---
     demonstrate_planning_prompt(tool)
 
     # --- Summary of tool call events ---

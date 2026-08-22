@@ -177,7 +177,7 @@ class TestEndToEndUpdateGetSearch:
         tool.observer(observer)
         return tool, observer
 
-    def test_update_then_get_graph_prompt(self) -> None:
+    def test_update_then_get_graph_summary_state(self) -> None:
         tool, observer = self._make_tool()
 
         # Update via tool factory
@@ -203,9 +203,10 @@ class TestEndToEndUpdateGetSearch:
             )
         )
 
-        # Get via system prompt — compact summary shows counts + types
-        prompts = tool.get_system_prompts()
-        result = prompts[0]()
+        # Get via the context-state provider — compact summary shows counts + types
+        state = tool.get_context_states()[0]()
+        assert state is not None
+        result = state.render_full()
         assert "Knowledge Graph Summary:" in result
         assert "Entities: 2" in result
         assert "Relations: 1" in result
@@ -311,11 +312,13 @@ class TestEndToEndUpdateGetSearch:
             )
         )
 
-        # Read — compact summary shows counts + types
-        prompts = tool.get_system_prompts()
-        prompt_result = prompts[0]()
-        assert "Entities: 1" in prompt_result
-        assert "Language" in prompt_result
+        # Read — compact summary state shows counts + types
+        provider = tool.get_context_states()[0]
+        state = provider()
+        assert state is not None
+        summary = state.render_full()
+        assert "Entities: 1" in summary
+        assert "Language" in summary
 
         # Search
         search_result = search_fn(SearchQuery(query="Go"))
@@ -325,5 +328,6 @@ class TestEndToEndUpdateGetSearch:
         update_fn(ManageGraph(delete_entities=["Go"]))
 
         # Verify empty
-        prompt_after = prompts[0]()
-        assert "empty" in prompt_after.lower()
+        state_after = provider()
+        assert state_after is not None
+        assert "empty" in state_after.render_full().lower()

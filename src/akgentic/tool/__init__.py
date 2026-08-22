@@ -11,13 +11,16 @@ if TYPE_CHECKING:
 from . import mcp, planning, sandbox, search, team, workspace  # noqa: F401
 from .core import (  # noqa: F401
     COMMAND,
+    LLM_CONTEXT,
     SYSTEM_PROMPT,
     TOOL_CALL,
     BaseToolParam,
     Channels,
     CommandRegistry,
+    ContextState,
     ToolCard,
     ToolFactory,
+    normalize_system_prompt_to_llm_context,
 )
 from .core.event import (  # noqa: F401
     CommandArg,
@@ -46,11 +49,14 @@ except ImportError:
 __all__ = [
     # Core abstractions
     "BaseToolParam",
+    "ContextState",
     "ToolCard",
     "ToolFactory",
     "CommandRegistry",
+    "normalize_system_prompt_to_llm_context",
     # Expose channel constants
     "COMMAND",
+    "LLM_CONTEXT",
     "SYSTEM_PROMPT",
     "TOOL_CALL",
     "Channels",

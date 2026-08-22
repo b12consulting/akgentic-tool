@@ -267,26 +267,34 @@ def test_fire_members_not_found():
 
 
 def test_team_tool_get_system_prompts_default():
-    """TeamTool.get_system_prompts() returns roster + profiles by default."""
+    """TeamTool.get_system_prompts() no longer serves roster/profiles (ADR-037)."""
     tool = TeamTool()
     tool.observer(mock_observer())
 
     prompts = tool.get_system_prompts()
-    assert len(prompts) == 2
-    # Callables don't have __name__ reliably, check they're callable
-    assert all(callable(p) for p in prompts)
+    assert len(prompts) == 0
 
 
-def test_team_tool_get_system_prompts_disabled():
-    """TeamTool.get_system_prompts() excludes disabled prompts."""
+def test_team_tool_get_context_states_default() -> None:
+    """TeamTool.get_context_states() returns roster + catalog providers by default."""
+    tool = TeamTool()
+    tool.observer(mock_observer())
+
+    providers = tool.get_context_states()
+    assert len(providers) == 2
+    assert [p.__name__ for p in providers] == ["team_roster_state", "role_catalog_state"]
+
+
+def test_team_tool_get_context_states_disabled() -> None:
+    """TeamTool.get_context_states() excludes capabilities without LLM_CONTEXT."""
     tool = TeamTool(
         get_team_roster=GetTeamRoster(expose=set()),
         get_role_profiles=GetRoleProfiles(expose=set()),
     )
     tool.observer(mock_observer())
 
-    prompts = tool.get_system_prompts()
-    assert len(prompts) == 0
+    providers = tool.get_context_states()
+    assert len(providers) == 0
 
 
 def test_team_members():
@@ -305,10 +313,9 @@ def test_team_members():
 
     tool = TeamTool()
     tool.observer(observer_mock)
-    prompts = tool.get_system_prompts()
-    roster_prompt = prompts[0]
+    roster_command = tool.get_commands()[GetTeamRoster]
 
-    result = roster_prompt()
+    result = roster_command()
 
     assert "Here is the team member list by name (and role):" in result
     assert "@Manager (role: Manager)" in result
@@ -328,10 +335,9 @@ def test_team_members_empty():
 
     tool = TeamTool()
     tool.observer(observer_mock)
-    prompts = tool.get_system_prompts()
-    roster_prompt = prompts[0]
+    roster_command = tool.get_commands()[GetTeamRoster]
 
-    result = roster_prompt()
+    result = roster_command()
     assert result == ""
 
 
@@ -356,10 +362,9 @@ def test_team_roles():
 
     tool = TeamTool()
     tool.observer(observer_mock)
-    prompts = tool.get_system_prompts()
-    profiles_prompt = prompts[1]
+    profiles_command = tool.get_commands()[GetRoleProfiles]
 
-    result = profiles_prompt()
+    result = profiles_command()
 
     assert "Here is the available team role list (for hiring):" in result
     assert "Developer: Writes code (Skills: python, testing)" in result
@@ -377,10 +382,9 @@ def test_team_roles_empty():
 
     tool = TeamTool()
     tool.observer(observer_mock)
-    prompts = tool.get_system_prompts()
-    profiles_prompt = prompts[1]
+    profiles_command = tool.get_commands()[GetRoleProfiles]
 
-    result = profiles_prompt()
+    result = profiles_command()
     assert result == ""
 
 
