@@ -72,6 +72,7 @@ ToolFactory
     ├── get_tools()          → list[Callable]  ─────▶ LLM ReAct loop
     ├── get_system_prompts() → list[Callable]  ─────▶ injected into LLM context
     ├── get_context_states() → list[Callable[[], ContextState | None]] ▶ per-turn context deltas
+    ├── get_context_updater() → ContextUpdater ▶ composes one delta block per turn
     ├── get_commands()       → dict[type, Callable] ▶ orchestrator / other agents
     └── get_toolsets()       → list[Any]       ─────▶ pydantic-ai toolset objects
 ```
@@ -258,7 +259,11 @@ observer, stopped actor). Providers **never raise**; the default is `[]`. It sit
   guarantees `previous` is the **same concrete type**, and a first-seen state is always rendered
   full — `render_delta` is never asked to diff against nothing.
 
-The states are collected and delivered by the agent layer (ADR-037 §6-8).
+Composition lives **in this package**: `ContextUpdater` reads every provider, diffs each against its
+persisted baseline, and returns the block. The agent layer's one remaining job is to **append** what
+it gets back (ADR-037 §6-8) — wiring that `akgentic-agent`'s Epic 21 rebuilds against a released
+`akgentic-tool` carrying this contract. That is a documented merge-order dependency, not a defect of
+this package. See *Persisted baselines and the `ContextUpdater`* below.
 
 **The channel a capability declares is the card author's promise** — `SYSTEM_PROMPT` means
 *rendered once, cached prefix*; `LLM_CONTEXT` means *per-turn delta at the tail*. Choose carefully:
@@ -278,6 +283,46 @@ Two mechanics back the hook:
   `LLM_CONTEXT`, attached as a `field_validator` **per param class, on moved params only** — never
   globally, which would silently drag static content out of the cached prefix.
 
+#### Persisted baselines and the `ContextUpdater`
+
+The per-provider baselines are persisted, so a restored agent resumes delta delivery instead of
+re-sending a full snapshot on its first turn. They live in `ToolState` — `context_baselines`
+(`dict[str, ContextState]`, keyed by provider `__name__`) and `context_update_seq` (`int`) — carried
+by the agent's own state object and written out by the agent's existing state checkpoints.
+
+**They are a cache, never a record.** The durable record of what the model was told is the message
+history; the baselines only spare the engine from repeating it. This package therefore has **no save
+path** — no event, no retry, no write-ahead anything — because it needs none.
+
+**The engine.** `ToolFactory.get_context_updater()` builds a `ContextUpdater` from the factory's
+observer and the same providers `get_context_states()` yields — so a duplicate provider `__name__`
+fails through this path too, and a factory whose observer is missing or is not an
+`ActorToolObserver` raises `ValueError` at team-creation time rather than going silently inert. Its
+surface is two methods:
+
+- `compose_update(messages)` returns at most **one** `**Context update N**` block per turn, or
+  `None` when nothing changed. It **never appends** — the append stays with the agent layer.
+- `reset()` zeroes both fields. That is the `/clear` path, and the only legitimate zeroing of the
+  counter: it matches a history whose markers were wiped along with it.
+
+**The trust gate.** Baselines are honoured only while the last marker they claim to have delivered
+is still visible in the history. If the persisted counter has fallen behind the markers, the
+baselines are kept and the next delta simply re-states what the missed blocks said — a repeat, never
+an omission. If the last delivered marker is no longer visible at all (compaction, trimming, an
+out-of-band wipe), the baselines are dropped and the next block is a full snapshot. A wrong, stale
+or missing save therefore degrades to a wider delta or a full snapshot, never to a lost update.
+
+> **The trap: never cache a `ToolState` reference.** Read it through the observer —
+> `observer.state.tool_state` — on **every** call. The agent replaces its state object wholesale on
+> restore, so a `ToolState`, a carrier, or a strong observer reference stored anywhere outside the
+> agent's state goes silently stale. It is the first thing a review of this area looks for.
+
+Both types are importable from the package root:
+
+```python
+from akgentic.tool import ContextUpdater, ToolState
+```
+
 ### ToolFactory
 
 Aggregates multiple `ToolCard` instances into flat lists. When `retry_exception` is set, wraps
@@ -291,6 +336,10 @@ ToolFactory(
     retry_exception=ModelRetry,
 )
 ```
+
+Beside the five aggregators it also builds one runtime object: `get_context_updater()` returns a
+`ContextUpdater` over this factory's observer and its context-state providers — see *Persisted
+baselines and the `ContextUpdater`* above.
 
 ### BaseToolParam: Configuration, Not Schema
 
@@ -335,7 +384,9 @@ author's contract with the runtime:
 - **`SYSTEM_PROMPT`** — rendered **once** into the frozen system block, never re-rendered, part of
   the cached prefix. Static content only.
 - **`LLM_CONTEXT`** — structured context state appended into the context tail **per turn, as a
-  delta**. The channel for volatile tool state that must not invalidate the cached prefix.
+  delta**. The channel for volatile tool state that must not invalidate the cached prefix. That
+  per-turn delta is composed by the `ContextUpdater` against the baselines persisted in `ToolState`
+  on the agent's state.
 
 ```python
 class GetPlanning(BaseToolParam):
@@ -453,7 +504,7 @@ The observer is a `Protocol`, and there are three, each extending the one above 
 | Protocol | What it adds | What that lets a tool do |
 |---|---|---|
 | `ToolObserver` | `notify_event(event)` | Emit a domain event onto the orchestrator's stream. Nothing more. |
-| `ActorToolObserver` | `myAddress`, `orchestrator`, `team_id`, `proxy_ask(...)` | Reach any actor by address — including a singleton tool actor. |
+| `ActorToolObserver` | `myAddress`, `orchestrator`, `team_id`, `state`, `proxy_ask(...)` | Reach any actor by address — including a singleton tool actor. Reach the persisted tool-layer slot, `state.tool_state`, read live on every call. |
 | `TeamManagementToolObserver` | `createActor(...)`, `on_hire(...)`, `on_fire(...)` | Create actors, and change the team's membership. |
 
 Each capability is gated by the level above it: a tool that only emits events cannot reach an
@@ -1178,14 +1229,17 @@ src/akgentic/tool/
     │   __init__.py           # Façade: ToolCard, BaseToolParam, ToolFactory, Channels
     │   channels.py           # Channels enum: TOOL_CALL, SYSTEM_PROMPT, LLM_CONTEXT, COMMAND
     │   context_state.py      # ContextState ABC — diffable prompt state for LLM_CONTEXT
+    │   state.py              # ToolState — the persisted per-agent tool-layer slot
     │   params.py             # BaseToolParam, normalize_system_prompt_to_llm_context
     │   card.py               # ToolCard
     │   dependencies.py       # Topological ordering of cards by depends_on
     │   commands.py           # CommandRegistry
+    │   context_update.py     # ContextUpdater — one Context update block per turn
     │   factory.py            # ToolFactory
     │   event.py              # ToolStateEvent, CommandArg, CommandDescriptor,
     │   │                     #   CommandsAnnouncedEvent — package-global contracts
-    │   observer.py           # ToolObserver, ActorToolObserver — the global observers
+    │   observer.py           # ToolObserver, ActorToolObserver — the global observers;
+    │                         #   ToolStateCarrier — the structural carrier of ToolState
     │   └── deferred.py       # DeferredResultActor, DeferredWorker, poll_deferred
     │                         #   NOT on the façade — import akgentic.tool.core.deferred
     errors.py                 # RetriableError
