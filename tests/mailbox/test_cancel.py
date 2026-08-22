@@ -2,35 +2,10 @@
 
 from __future__ import annotations
 
-import uuid
-
-from akgentic.core import ActorAddressProxy
 from akgentic.core.messages import CancelMessage, Message, UserMessage
 
 from akgentic.tool.mailbox import is_cancel, render_arrival_notice
-
-
-def _address(name: str) -> ActorAddressProxy:
-    """Create a mock ActorAddress for testing."""
-    return ActorAddressProxy(
-        {
-            "__actor_address__": True,
-            "__actor_type__": "test.Agent",
-            "agent_id": str(uuid.uuid4()),
-            "name": name,
-            "role": "Agent",
-            "team_id": str(uuid.uuid4()),
-            "squad_id": str(uuid.uuid4()),
-            "is_user_proxy": False,
-        }
-    )
-
-
-def _user_message(sender: str, content: str) -> UserMessage:
-    message = UserMessage(content=content)
-    message.sender = _address(sender)
-    return message
-
+from tests.mailbox.conftest import _user_message
 
 # ── is_cancel: both spellings of one intent ──────────────────────────────────
 

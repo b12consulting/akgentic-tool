@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import gc
-import uuid
 import weakref
 
-from akgentic.core import ActorAddressProxy
-from akgentic.core.messages import Message, ResultMessage, UserMessage
+from akgentic.core.messages import Message, ResultMessage
 
 from akgentic.tool.mailbox import (
     MailboxRow,
@@ -15,28 +13,7 @@ from akgentic.tool.mailbox import (
     MailboxToolObserver,
     make_mailbox_state_provider,
 )
-
-
-def _address(name: str, role: str = "Agent") -> ActorAddressProxy:
-    """Create a mock ActorAddress for testing."""
-    return ActorAddressProxy(
-        {
-            "__actor_address__": True,
-            "__actor_type__": "test.Agent",
-            "agent_id": str(uuid.uuid4()),
-            "name": name,
-            "role": role,
-            "team_id": str(uuid.uuid4()),
-            "squad_id": str(uuid.uuid4()),
-            "is_user_proxy": False,
-        }
-    )
-
-
-def _user_message(sender: str, content: str) -> UserMessage:
-    message = UserMessage(content=content)
-    message.sender = _address(sender)
-    return message
+from tests.mailbox.conftest import _user_message
 
 
 def _row(sender: str, message_type: str = "UserMessage", preview: str = "hi") -> MailboxRow:
