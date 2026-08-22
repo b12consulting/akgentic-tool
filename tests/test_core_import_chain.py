@@ -7,15 +7,18 @@ import akgentic.tool.core as core_package
 
 # Strict layering: a module may only import siblings that appear EARLIER here.
 #
-# ``observer`` and ``event`` are chain heads, not outside-chain modules: ``card`` and
-# ``factory`` import ``ToolObserver``, and ``commands`` imports the command-discovery
-# models, so the chain depends on them. They import no core sibling themselves, which
-# is what makes them legal at the front.
+# ``channels``, ``context_state`` and ``event`` are chain heads, not outside-chain
+# modules: ``card`` and ``factory`` import ``ToolObserver``, and ``commands`` imports
+# the command-discovery models, so the chain depends on them. ``context_state`` sits
+# ahead of ``observer`` because ``observer`` imports ``state``, which imports
+# ``context_state``; ``context_state`` itself imports no core sibling (its outward
+# edge is ``akgentic.core``), which is what makes it legal at the front.
 CHAIN: list[str] = [
     "channels",
+    "context_state",
+    "state",
     "observer",
     "event",
-    "context_state",
     "params",
     "card",
     "dependencies",

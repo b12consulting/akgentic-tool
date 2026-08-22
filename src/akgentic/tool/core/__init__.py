@@ -19,6 +19,7 @@ from .dependencies import _topological_sort as _topological_sort  # noqa: F401
 from .factory import ToolFactory
 from .params import BaseToolParam, normalize_system_prompt_to_llm_context
 from .params import _resolve as _resolve  # noqa: F401
+from .state import ToolState
 
 __all__ = [
     "COMMAND",
@@ -31,5 +32,6 @@ __all__ = [
     "ContextState",
     "ToolCard",
     "ToolFactory",
+    "ToolState",
     "normalize_system_prompt_to_llm_context",
 ]

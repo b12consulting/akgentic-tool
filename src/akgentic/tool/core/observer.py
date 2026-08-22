@@ -16,6 +16,22 @@ from typing import Protocol, runtime_checkable
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import AkgentType
 
+from .state import ToolState
+
+
+@runtime_checkable
+class ToolStateCarrier(Protocol):
+    """Anything that carries the tool layer's persistent slot on a ``tool_state`` attribute.
+
+    Structural on purpose: the agent-side state object satisfies it the moment
+    it grows a ``tool_state`` field, with no import edge back to this package.
+    """
+
+    @property
+    def tool_state(self) -> ToolState:
+        """The tool layer's persistent per-agent slot."""
+        ...
+
 
 @runtime_checkable
 class ToolObserver(Protocol):
@@ -56,6 +72,16 @@ class ActorToolObserver(ToolObserver, Protocol):
     @property
     def team_id(self) -> uuid.UUID:
         """Get the team id."""
+        ...
+
+    @property
+    def state(self) -> ToolStateCarrier:
+        """The agent's live state object, as a carrier of the tool layer's slot.
+
+        Read ``state.tool_state`` at the moment of use, on every call — the
+        agent replaces its state object wholesale on restore, so neither the
+        carrier nor the ``ToolState`` it holds may be stored.
+        """
         ...
 
     def proxy_ask(

@@ -12,6 +12,7 @@ Covers:
 from __future__ import annotations
 
 import uuid
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -20,7 +21,8 @@ from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import AkgentType
 from akgentic.core.orchestrator import Orchestrator
 
-from akgentic.tool.core import COMMAND, LLM_CONTEXT, TOOL_CALL, BaseToolParam, _resolve
+from akgentic.tool.core import COMMAND, LLM_CONTEXT, TOOL_CALL, BaseToolParam, ToolState, _resolve
+from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.knowledge_graph.kg_actor import (
     KG_ACTOR_NAME,
     KG_ACTOR_ROLE,
@@ -106,6 +108,8 @@ class MockActorToolObserver:
         self._kg_actor: KnowledgeGraphActor | None = None
         self._orchestrator_proxy = MagicMock(spec=Orchestrator)
         self._vs_addr = MockActorAddress("#VectorStore", "ToolActor")
+        self._team_id = uuid.uuid4()
+        self._state_carrier = SimpleNamespace(tool_state=ToolState())
 
     @property
     def myAddress(self) -> ActorAddress:  # noqa: N802
@@ -114,6 +118,14 @@ class MockActorToolObserver:
     @property
     def orchestrator(self) -> ActorAddress:
         return self._orchestrator
+
+    @property
+    def team_id(self) -> uuid.UUID:
+        return self._team_id
+
+    @property
+    def state(self) -> SimpleNamespace:
+        return self._state_carrier
 
     def notify_event(self, event: object) -> None:
         self.events.append(event)
@@ -162,6 +174,11 @@ class MockActorToolObserver:
 
         self._orchestrator_proxy.getChildrenOrCreate.side_effect = _get_children_or_create
         return actor
+
+
+def test_mock_actor_tool_observer_conforms_to_protocol() -> None:
+    """Story 35-1 sweep: the fake satisfies the widened ``ActorToolObserver``."""
+    assert isinstance(MockActorToolObserver(), ActorToolObserver)
 
 
 # ===========================================================================

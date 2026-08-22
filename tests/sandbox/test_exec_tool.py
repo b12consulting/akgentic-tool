@@ -17,11 +17,14 @@ Covers AC1–AC13 for Story 6.4 (updated for Story 6.5, Story 8.4):
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 from akgentic.core.actor_address import ActorAddress
 
+from akgentic.tool.core import ToolState
+from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.sandbox.actor import (
     SANDBOX_ACTOR_NAME,
     CommandNotAllowedError,
@@ -51,6 +54,7 @@ class MockObserver:
         self.team_id = "team-test"
         self.myAddress = MagicMock(spec=ActorAddress)
         self.orchestrator = MagicMock(spec=ActorAddress) if has_orchestrator else None
+        self.state = SimpleNamespace(tool_state=ToolState())
 
         # Set up orchestrator proxy mock
         self._orch_proxy = MagicMock()
@@ -73,6 +77,11 @@ class MockObserver:
 
     def notify_event(self, event: object) -> None:
         pass
+
+
+def test_mock_observer_conforms_to_protocol() -> None:
+    """Story 35-1 sweep: the fake satisfies the widened ``ActorToolObserver``."""
+    assert isinstance(MockObserver(), ActorToolObserver)
 
 
 # ---------------------------------------------------------------------------

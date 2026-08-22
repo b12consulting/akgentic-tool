@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Generator
+from types import SimpleNamespace
 from typing import Any, Literal
 
 import pytest
@@ -20,10 +21,11 @@ from akgentic.core.agent import Akgent, AkgentType
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import Message
-from akgentic.tool.notification.actor import NOTIFICATION_ACTOR_NAME, NotificationActor
-from akgentic.tool.notification.tool import NotificationTool
 from pydantic import Field
 
+from akgentic.tool.core import ToolState
+from akgentic.tool.notification.actor import NOTIFICATION_ACTOR_NAME, NotificationActor
+from akgentic.tool.notification.tool import NotificationTool
 from tests.conftest import MockActorAddress
 
 FAKE_MESSAGE_PATH = "tests.notification.conftest.FakeNotificationMessage"
@@ -129,11 +131,16 @@ class FakeActorToolObserver:
         self._orchestrator: ActorAddress | None = MockActorAddress("orchestrator")
         self._orchestrator_proxy = orchestrator_proxy
         self._team_id = uuid.uuid4()
+        self._state_carrier = SimpleNamespace(tool_state=ToolState())
         self.events: list[object] = []
 
     @property
     def myAddress(self) -> ActorAddress:  # noqa: N802
         return self._address
+
+    @property
+    def state(self) -> SimpleNamespace:
+        return self._state_carrier
 
     @property
     def orchestrator(self) -> ActorAddress | None:

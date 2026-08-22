@@ -43,6 +43,7 @@ _EXPECTED_ROOT_ALL: list[str] = [
     "ContextState",  # epic 31: the context-state contract joins the stable surface
     "ToolCard",
     "ToolFactory",
+    "ToolState",  # epic 35: the persistent tool-state slot joins the stable surface
     "CommandRegistry",
     "normalize_system_prompt_to_llm_context",  # epic 31
     "COMMAND",
@@ -55,6 +56,7 @@ _EXPECTED_ROOT_ALL: list[str] = [
     "ToolObserverGone",
     "ToolObserver",
     "ActorToolObserver",
+    "ToolStateCarrier",  # epic 35: how tools reach the slot — beside the observers
     "TeamManagementToolObserver",
     "ToolStateEvent",
     "KnowledgeGraphStateEvent",
