@@ -18,6 +18,7 @@ from .core import (  # noqa: F401
     Channels,
     CommandRegistry,
     ContextState,
+    ContextUpdater,
     ToolCard,
     ToolFactory,
     ToolState,
@@ -51,6 +52,7 @@ __all__ = [
     # Core abstractions
     "BaseToolParam",
     "ContextState",
+    "ContextUpdater",
     "ToolCard",
     "ToolFactory",
     "ToolState",

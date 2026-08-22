@@ -10,6 +10,7 @@ from .card import ToolCard
 from .channels import COMMAND, LLM_CONTEXT, SYSTEM_PROMPT, TOOL_CALL, Channels
 from .commands import CommandRegistry
 from .context_state import ContextState
+from .context_update import ContextUpdater
 
 # ``_resolve`` and ``_topological_sort`` stay on the façade: six modules under
 # src/ and the test suite import them from ``akgentic.tool.core`` directly. The
@@ -30,6 +31,7 @@ __all__ = [
     "Channels",
     "CommandRegistry",
     "ContextState",
+    "ContextUpdater",
     "ToolCard",
     "ToolFactory",
     "ToolState",

@@ -23,6 +23,7 @@ CHAIN: list[str] = [
     "card",
     "dependencies",
     "commands",
+    "context_update",
     "factory",
 ]
 

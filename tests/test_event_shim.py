@@ -41,6 +41,7 @@ from akgentic.tool.event import _MOVED
 _EXPECTED_ROOT_ALL: list[str] = [
     "BaseToolParam",
     "ContextState",  # epic 31: the context-state contract joins the stable surface
+    "ContextUpdater",  # epic 35: the context-update engine joins the stable surface
     "ToolCard",
     "ToolFactory",
     "ToolState",  # epic 35: the persistent tool-state slot joins the stable surface

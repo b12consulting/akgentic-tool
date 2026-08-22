@@ -5,12 +5,13 @@ import warnings
 from collections.abc import Callable
 from typing import Any
 
-from akgentic.tool.core.observer import ToolObserver
+from akgentic.tool.core.observer import ActorToolObserver, ToolObserver
 from akgentic.tool.errors import RetriableError
 
 from .card import ToolCard
 from .commands import CommandRegistry, _build_command_entry, _CommandEntry
 from .context_state import ContextState
+from .context_update import ContextUpdater
 from .dependencies import _topological_sort
 from .params import BaseToolParam
 
@@ -110,6 +111,32 @@ class ToolFactory:
                 owners[name] = card_name
                 providers.append(provider)
         return providers
+
+    def get_context_updater(self) -> ContextUpdater:
+        """Build the context-update engine from this factory's observer and providers.
+
+        The updater reads and mutates its persisted baselines through
+        ``observer.state.tool_state``, so the factory's observer must satisfy
+        :class:`ActorToolObserver`. Like every other factory build error, a
+        misconfiguration fails loudly at team-creation time — never a silently
+        inert updater. Because this calls :meth:`get_context_states`, a
+        duplicate provider ``__name__`` raises through this path too.
+
+        Raises:
+            ValueError: If the factory has no observer, the observer does not
+                satisfy ``ActorToolObserver``, or two context-state providers
+                share a ``__name__``.
+        """
+        if self.observer is None:
+            raise ValueError(
+                "get_context_updater() requires an observer, but the factory has none."
+            )
+        if not isinstance(self.observer, ActorToolObserver):
+            raise ValueError(
+                "get_context_updater() requires an ActorToolObserver; the factory's "
+                f"observer ({type(self.observer).__name__}) does not satisfy it."
+            )
+        return ContextUpdater(self.observer, self.get_context_states())
 
     def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
         """Return command callables aggregated from all tool cards.
