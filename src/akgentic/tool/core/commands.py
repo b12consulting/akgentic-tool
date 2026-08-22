@@ -179,7 +179,7 @@ class CommandRegistry:
         Strips the leading ``/``, ``shlex.split``s the remainder, resolves the
         first token to a command, classifies the remaining tokens as positional or
         ``name=value`` keyword arguments, coerces and merges them, invokes the
-        command, and string-renders the result.
+        command, and renders the result.
 
         A command returning ``None`` dispatches to ``None`` — it handled itself
         and has nothing to report, and the caller says nothing rather than

@@ -172,6 +172,17 @@ def test_stop_dispatch_through_registry_returns_none() -> None:
     assert factory.get_command_registry().dispatch("/stop") is None
 
 
+def test_stop_still_announces_a_description_to_the_command_palette() -> None:
+    # The docstring is the wire surface: descriptors() feeds
+    # CommandDescriptor.description from it and CommandsAnnouncedEvent carries it
+    # to every frontend. Losing the return value must not empty the palette entry.
+    observer = _FakeObserver()
+    factory = ToolFactory([MailboxTool()], observer=observer)
+
+    descriptor = factory.get_command_registry().descriptors()[0]
+    assert "cancel" in descriptor.description.lower()
+
+
 # ── ownership: the cancel vocabulary lives with the enforcement, not the card ──
 
 
