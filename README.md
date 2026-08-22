@@ -69,12 +69,12 @@ ToolCard(s)
     ▼
 ToolFactory
     │
-    ├── get_tools()          → list[Callable]  ─────▶ LLM ReAct loop
-    ├── get_system_prompts() → list[Callable]  ─────▶ injected into LLM context
-    ├── get_context_states() → list[Callable[[], ContextState | None]] ▶ per-turn context deltas
-    ├── get_context_updater() → ContextUpdater ▶ composes one delta block per turn
-    ├── get_commands()       → dict[type, Callable] ▶ orchestrator / other agents
-    └── get_toolsets()       → list[Any]       ─────▶ pydantic-ai toolset objects
+    ├── get_tools()           → list[Callable]  ─────▶ LLM ReAct loop
+    ├── get_system_prompts()  → list[Callable]  ─────▶ injected into LLM context
+    ├── get_context_states()  → list[Callable[[], ContextState | None]] ▶ per-turn context deltas
+    ├── get_context_updater() → ContextUpdater  ─────▶ composes one delta block per turn
+    ├── get_commands()        → dict[type, Callable] ▶ orchestrator / other agents
+    └── get_toolsets()        → list[Any]       ─────▶ pydantic-ai toolset objects
 ```
 
 `get_toolsets()` is typed `list[Any]` because its elements are runtime pydantic-ai
@@ -288,7 +288,9 @@ Two mechanics back the hook:
 The per-provider baselines are persisted, so a restored agent resumes delta delivery instead of
 re-sending a full snapshot on its first turn. They live in `ToolState` — `context_baselines`
 (`dict[str, ContextState]`, keyed by provider `__name__`) and `context_update_seq` (`int`) — carried
-by the agent's own state object and written out by the agent's existing state checkpoints.
+by the agent's own state object and written out by the agent's existing state checkpoints. This
+package ships the slot, the engine and the contract; the state field that carries them is
+`akgentic-agent`'s half of the same decision, on the merge-order dependency noted above.
 
 **They are a cache, never a record.** The durable record of what the model was told is the message
 history; the baselines only spare the engine from repeating it. This package therefore has **no save
