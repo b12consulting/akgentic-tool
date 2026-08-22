@@ -18,8 +18,10 @@ from .core import (  # noqa: F401
     Channels,
     CommandRegistry,
     ContextState,
+    ContextUpdater,
     ToolCard,
     ToolFactory,
+    ToolState,
     normalize_system_prompt_to_llm_context,
 )
 from .core.event import (  # noqa: F401
@@ -28,7 +30,7 @@ from .core.event import (  # noqa: F401
     CommandsAnnouncedEvent,
     ToolStateEvent,
 )
-from .core.observer import ActorToolObserver, ToolObserver  # noqa: F401
+from .core.observer import ActorToolObserver, ToolObserver, ToolStateCarrier  # noqa: F401
 from .errors import CommandNotRecognized, RetriableError, ToolObserverGone  # noqa: F401
 from .metadata.tool import MetadataTool  # noqa: F401
 from .notification.tool import NotificationTool  # noqa: F401
@@ -50,8 +52,10 @@ __all__ = [
     # Core abstractions
     "BaseToolParam",
     "ContextState",
+    "ContextUpdater",
     "ToolCard",
     "ToolFactory",
+    "ToolState",
     "CommandRegistry",
     "normalize_system_prompt_to_llm_context",
     # Expose channel constants
@@ -67,6 +71,7 @@ __all__ = [
     # Events and observers
     "ToolObserver",
     "ActorToolObserver",
+    "ToolStateCarrier",
     "TeamManagementToolObserver",
     "ToolStateEvent",
     "KnowledgeGraphStateEvent",

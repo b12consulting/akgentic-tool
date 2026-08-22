@@ -5,9 +5,11 @@ from __future__ import annotations
 import gc
 from typing import Any
 
-import akgentic.tool
 import pytest
 from akgentic.core.agent_config import BaseConfig
+from pydantic_ai.tools import Tool
+
+import akgentic.tool
 from akgentic.tool.core import COMMAND, TOOL_CALL, ToolCard, ToolFactory
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.notification.actor import (
@@ -23,8 +25,6 @@ from akgentic.tool.notification.tool import (
     PendingNotifications,
     RegisterNotification,
 )
-from pydantic_ai.tools import Tool
-
 from tests.notification.conftest import (
     FAKE_MESSAGE_PATH,
     FakeActorToolObserver,
@@ -35,6 +35,13 @@ from tests.notification.conftest import (
 def _tool_named(card: NotificationTool, name: str) -> Any:
     """Return the card's tool callable called *name*."""
     return next(tool for tool in card.get_tools() if tool.__name__ == name)
+
+
+def test_fake_actor_tool_observer_conforms_to_protocol(
+    observer: FakeActorToolObserver,
+) -> None:
+    """Story 35-1 sweep: the fake satisfies the widened ``ActorToolObserver``."""
+    assert isinstance(observer, akgentic.tool.ActorToolObserver)
 
 
 class TestCardSurface:

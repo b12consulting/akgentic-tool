@@ -15,6 +15,7 @@ import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, ClassVar, get_args
 from unittest.mock import MagicMock, patch
 
@@ -32,8 +33,9 @@ from akgentic.core.messages.orchestrator import (
 from akgentic.core.orchestrator import Orchestrator
 
 import akgentic.tool.team.activity as activity_module
-from akgentic.tool.core import COMMAND, TOOL_CALL, BaseToolParam
+from akgentic.tool.core import COMMAND, TOOL_CALL, BaseToolParam, ToolState
 from akgentic.tool.core.deferred import DeferredPayload, DeferredWorker, poll_deferred
+from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.team import (
     ActivitySummarizer,
@@ -150,6 +152,7 @@ class _FakeObserver:
         self.orchestrator: ActorAddress | None = _address("@Orchestrator", "Orchestrator")
         self.myAddress = my_address  # noqa: N815 — protocol member name
         self.team_id = uuid.uuid4()
+        self.state = SimpleNamespace(tool_state=ToolState())
         self.proxy_ask_calls: list[type | None] = []
         self._orchestrator_actor = orchestrator_actor
         self._activity_actor = activity_actor
@@ -303,6 +306,12 @@ class _Harness:
 @pytest.fixture(autouse=True)
 def _reset_spy() -> None:
     _SpyWorker.spawned.clear()
+
+
+def test_fake_observer_conforms_to_protocol() -> None:
+    """Story 35-1 sweep: the team stand-in satisfies the widened ``ActorToolObserver``."""
+    harness = _Harness([])
+    assert isinstance(harness.observer, ActorToolObserver)
 
 
 # ---------------------------------------------------------------------------

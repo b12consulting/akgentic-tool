@@ -7,12 +7,14 @@ verify update_graph → get_graph → search round-trip through the ToolCard.
 from __future__ import annotations
 
 import uuid
+from types import SimpleNamespace
 from typing import Any
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import AkgentType
 
-from akgentic.tool.core import TOOL_CALL
+from akgentic.tool.core import TOOL_CALL, ToolState
+from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.knowledge_graph.kg_actor import (
     KG_ACTOR_NAME,
     KG_ACTOR_ROLE,
@@ -104,6 +106,8 @@ class IntegrationObserver:
         self._kg_actor._state_event_seq = 0
         self._kg_addr = MockActorAddress(KG_ACTOR_NAME, KG_ACTOR_ROLE)
         self._vs_addr = MockActorAddress(VS_ACTOR_NAME, "ToolActor")
+        self._team_id = uuid.uuid4()
+        self._state_carrier = SimpleNamespace(tool_state=ToolState())
 
     @property
     def myAddress(self) -> ActorAddress:  # noqa: N802
@@ -112,6 +116,14 @@ class IntegrationObserver:
     @property
     def orchestrator(self) -> ActorAddress:
         return self._orchestrator_addr
+
+    @property
+    def team_id(self) -> uuid.UUID:
+        return self._team_id
+
+    @property
+    def state(self) -> SimpleNamespace:
+        return self._state_carrier
 
     def notify_event(self, event: object) -> None:
         self.events.append(event)
@@ -129,6 +141,11 @@ class IntegrationObserver:
         if actor == self._vs_addr:
             return MagicMock()  # mock VectorStoreActor proxy
         return self._kg_actor
+
+
+def test_integration_observer_conforms_to_protocol() -> None:
+    """Story 35-1 sweep: the fake satisfies the widened ``ActorToolObserver``."""
+    assert isinstance(IntegrationObserver(), ActorToolObserver)
 
 
 class _OrchestratorStub:

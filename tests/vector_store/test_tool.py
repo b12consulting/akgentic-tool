@@ -14,6 +14,7 @@ Covers story 10.7:
 from __future__ import annotations
 
 import uuid
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -22,7 +23,8 @@ from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import AkgentType
 from akgentic.core.orchestrator import Orchestrator
 
-from akgentic.tool.core import ToolCard
+from akgentic.tool.core import ToolCard, ToolState
+from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE, VectorStoreActor
 from akgentic.tool.vector_store.protocol import VectorStoreConfig
 from akgentic.tool.vector_store.tool import VectorStoreTool
@@ -95,6 +97,8 @@ class _MockActorToolObserver:
                 getattr(config, "role", VS_ACTOR_ROLE),
             )
         )
+        self._team_id = uuid.uuid4()
+        self._state_carrier = SimpleNamespace(tool_state=ToolState())
 
     @property
     def myAddress(self) -> ActorAddress:  # noqa: N802
@@ -103,6 +107,14 @@ class _MockActorToolObserver:
     @property
     def orchestrator(self) -> ActorAddress | None:
         return self._orchestrator
+
+    @property
+    def team_id(self) -> uuid.UUID:
+        return self._team_id
+
+    @property
+    def state(self) -> SimpleNamespace:
+        return self._state_carrier
 
     def notify_event(self, event: object) -> None:
         self.events.append(event)
@@ -116,6 +128,11 @@ class _MockActorToolObserver:
         if actor == self._orchestrator:
             return self._orchestrator_proxy
         return MagicMock()
+
+
+def test_mock_actor_tool_observer_conforms_to_protocol() -> None:
+    """Story 35-1 sweep: the fake satisfies the widened ``ActorToolObserver``."""
+    assert isinstance(_MockActorToolObserver(), ActorToolObserver)
 
 
 # ===========================================================================
