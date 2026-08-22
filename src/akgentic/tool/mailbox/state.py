@@ -54,7 +54,7 @@ class MailboxState(ContextState):
             return ""
         count = len(self.rows)
         noun = "message" if count == 1 else "messages"
-        senders = ", ".join(_unique_ordered(row.sender for row in self.rows))
+        senders = ", ".join(unique_ordered(row.sender for row in self.rows))
         return f"{count} {noun} pending from {senders}, consider wrapping up the current thread"
 
     def render_delta(self, previous: Self) -> str | None:
@@ -143,6 +143,9 @@ def _preview(message: Message) -> str:
     return first_line[:_PREVIEW_LIMIT]
 
 
-def _unique_ordered(values: Iterable[str]) -> list[str]:
-    """Deduplicate while preserving first-seen order."""
+def unique_ordered(values: Iterable[str]) -> list[str]:
+    """Deduplicate while preserving first-seen order.
+
+    Public like ``sender_name``: shared with ``cancel.py`` for sender rendering.
+    """
     return list(dict.fromkeys(values))

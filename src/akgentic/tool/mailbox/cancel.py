@@ -9,7 +9,7 @@ imports these instead of restating them.
 """
 
 from akgentic.core.messages import CancelMessage, Message
-from akgentic.tool.mailbox.state import _unique_ordered, sender_name
+from akgentic.tool.mailbox.state import sender_name, unique_ordered
 
 
 def is_cancel(msg: Message) -> bool:
@@ -39,7 +39,7 @@ def render_arrival_notice(new_messages: list[Message]) -> str:
         return ""
     count = len(new_messages)
     noun = "message" if count == 1 else "messages"
-    senders = ", ".join(_unique_ordered(sender_name(message) for message in new_messages))
+    senders = ", ".join(unique_ordered(sender_name(message) for message in new_messages))
     return (
         f"{count} new {noun} arrived (from {senders}) — "
         "call `read_mailbox` to see them, or finish your current work first."

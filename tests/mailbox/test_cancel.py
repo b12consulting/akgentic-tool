@@ -63,6 +63,17 @@ def test_message_without_content_is_not_cancel() -> None:
     assert is_cancel(Message()) is False
 
 
+class _PayloadMessage(Message):
+    """A message whose content is not a string."""
+
+    content: int
+
+
+def test_non_string_content_is_not_cancel() -> None:
+    # The non-str content guard: simply False, never an error.
+    assert is_cancel(_PayloadMessage(content=5)) is False
+
+
 def test_empty_content_is_not_cancel() -> None:
     assert is_cancel(UserMessage(content="")) is False
 
