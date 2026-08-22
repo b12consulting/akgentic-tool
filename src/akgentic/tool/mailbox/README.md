@@ -1,9 +1,9 @@
 # MailboxTool
 
 The agent's own mailbox as a capability. An agent's mailbox is its actor inbox: while one turn is
-being processed, every message told to it queues up behind the one in flight. This card exposes
-that queue on two channels — an on-demand **consuming** read, and the `/stop` cancellation surface
-— through a **local peek**: the card creates no actor and performs no proxy round trip.
+being processed, every message told to it queues up behind the one in flight. This card gives the
+model two channels onto that queue — an on-demand **signal** that names one waiting message by id,
+and the `/stop` cancellation surface: the card creates no actor and performs no proxy round trip.
 
 ```python
 from akgentic.tool import MailboxTool
@@ -24,6 +24,7 @@ from akgentic.tool import MailboxTool
 class MailboxTool(ToolCard):
     read_mailbox: ReadMailbox | bool = True
     stop: Stop | bool = True
+    mailbox_preview_handlers: list[str] | None = None
 ```
 
 Two capabilities, one channel each by default, both fields following the same `Param | bool`
@@ -32,12 +33,16 @@ instance may narrow the channels, and `False` removes **exactly that capability*
 else. Neither param carries a field beyond `expose` — configuration read at factory bind time,
 never tool-call schema.
 
+`mailbox_preview_handlers` is not a capability but a deployment setting; it is documented under
+[Configuration](#the-mailbox-preview-whitelist).
+
 ## ToolCard fields
 
 | Field | Type | Default | Channel default | Meaning |
 |---|---|---|---|---|
-| `read_mailbox` | `ReadMailbox \| bool` | `True` | `{TOOL_CALL}` | The on-demand consuming read, exposed to the model. |
+| `read_mailbox` | `ReadMailbox \| bool` | `True` | `{TOOL_CALL}` | The on-demand signal, exposed to the model. |
 | `stop` | `Stop \| bool` | `True` | `{COMMAND}` | The `stop` command — the `/stop` string surface. |
+| `mailbox_preview_handlers` | `list[str] \| None` | `None` | — | Dotted paths of the *handler* message classes whose runs show the mailbox preview. `None` means every handler shows it; `[]` means none does. Resolved at wiring time. |
 
 Every capability is gated twice: the param must resolve, **and** its `expose` set must contain the
 channel the serving hook covers (`get_tools()` for `TOOL_CALL`, `get_commands()` for `COMMAND`). A
@@ -48,52 +53,52 @@ rule, not a mailbox quirk.
 
 ## The two channels
 
-### `TOOL_CALL` — `read_mailbox()`
+### `TOOL_CALL` — `read_mailbox(message_id)`
 
-Renders sender, type, the reply protocol each message expects and its **full content**, numbered,
-oldest first. An empty mailbox returns a sentence saying so — never `""`, which reads as a
-malfunction to the model.
+```python
+def read_mailbox(message_id: str) -> str: ...
+```
 
-**The read consumes what it renders, and that contract lives in the docstring the model reads.**
-Everything listed has been removed from the mailbox and will not arrive again as its own turn, so
-the model is expected to deal with it inside the current run. Anything left unread stays queued
-and arrives as its own turn later.
+**A signal, not a read.** The call takes the id of one message waiting in the agent's mailbox,
+checks the owning agent is still alive, and returns a short acknowledgement. That is the whole
+body: it reads nothing, consumes nothing and renders nothing.
 
-This inverts the card's original non-consuming contract, and the inversion is the point: a peek
-that promised redelivery let the model answer a pending message mid-run and then answer it a
-second time when the message got its turn. Consumption removes that failure by construction
-rather than by docstring.
+**It deliberately does not validate the id.** There is no useful thing the card could do with a bad
+one — it holds no content to withhold and can offer the model no error it could act on — and
+looking an id up would put `get_mailbox` back into a card that has just stopped calling it.
 
-Two properties of the implementation carry the guarantee:
+**The absorption contract survives; what changed is the mechanism, not the promise.** Naming a
+message takes it on in the current run: it will not be delivered again as its own turn, so the
+model is expected to deal with it now. Anything left unnamed stays queued and arrives as its own
+turn later. That contract lives in the docstring the model reads, which is the only place it can
+be taught.
 
-- **A cancel is neither rendered nor consumed.** A `CancelMessage`, or a message whose first
-  whitespace-delimited token is exactly `/stop`, is filtered out of both halves and stays queued.
-  The mailbox is the cancellation's single source of truth; consuming a cancel would let the model
-  read its way out of being cancelled. `/stopwatch` and `please /stop` are ordinary mail. When
-  every pending message is a cancel, the read returns the empty-mailbox sentence — correct: the
-  model must not learn about the cancel here.
-- **What renders is what consumption *returned*, never the peeked list.** `consume_mailbox` skips
-  envelopes carrying a `reply_to` and ignores ids dequeued in between, so a peek is a superset.
-  Rendering the superset would show the model a message it did not absorb — the exact hazard being
-  removed. The cost is that a `reply_to` envelope is invisible to the read; it still arrives as its
-  own turn, so nothing is lost.
+**What makes the acknowledgement true lives in `akgentic-agent`.** That package's mailbox
+capability reads the id back off the completed tool call through `after_tool_execute`, consumes
+that one message, and injects its content into the run; the message renders itself via
+`render_for_llm()`. None of that is this card's, and none of it has shipped yet — see
+[Release coupling](#release-coupling) below.
 
-The removal telemetry (one `HandledMessage` per message) is emitted by `consume_mailbox` itself.
-The card emits nothing: no call site can forget it, and none can double it.
+That division is also why an acknowledgement is a *complete* return rather than a stub. The model
+already holds the message's preview from the arrival notice, and its content arrives through the
+agent's injection. Returning the body here as well would make the card a second carrier of one
+fact — the same duplication that got the card's `LLM_CONTEXT` half deleted in epic 34.
 
-**The reply protocol per message.** Each rendered message carries the framing the agent's
-`receiveMsg_AgentMessage` would have applied — *"You received a `request` from `@Alice`. A reply is
-expected: respond to @Alice with the result."* — for each of the five known types (`request`,
-`response`, `instruction`, `notification`, `acknowledgment`). The type is read duck-typed, so a
-message carrying none (a bare `UserMessage`, a `CancelMessage`) renders sender, type name and
-content with no protocol line and no error.
+#### `message_id` is a contract with another repository
 
-The canonical table is `REPLY_PROTOCOLS` in `akgentic.agent.output_models`, which this package may
-not import. The duplication is real and unavoidable across the package boundary — nothing keeps the
-two copies in sync.
+The documented signature is `read_mailbox(message_id: str) -> str`, and the parameter name is part
+of the contract: `akgentic-agent`'s capability reads the id out of the completed tool call's
+arguments **by name**. Rename it to `msg_id` or `id` and this package's suite stays green, the
+agent's suite stays green, and in production the model names a message and silently receives
+nothing — no exception, no log line. Neither test suite can detect the mismatch.
 
-This is in-life code, so the raising accessor form applies: calling `read_mailbox` after the
-owning agent stopped raises `ToolObserverGone` — a defined outcome, not a crash.
+Renaming it is therefore a coordinated two-repository change with a joint release, never a local
+tidy-up.
+
+This is in-life code, so the raising accessor form applies: calling `read_mailbox` after the owning
+agent stopped raises `ToolObserverGone` — a defined outcome, not a crash. The liveness check is
+load-bearing rather than defensive here, because an acknowledgement from a card whose agent has
+stopped is a false one: the capability that would have acted on it went with the agent.
 
 ### `COMMAND` — `stop()`
 
@@ -127,15 +132,11 @@ The reason is ownership, not tidiness: `BaseAgent` builds its cancel capability 
 precisely so that an agent configured with no `MailboxTool` at all is still interruptible. A
 predicate shipping with this card cannot serve that case — there is no card to import it from.
 
-The card does hold a **private** exclusion filter, so that its consuming read leaves a cancel
-alone. That is not a second vocabulary and is not exported: it runs the opposite way round — the
-card protecting the agent's source of truth rather than the agent depending on the card. It must
-stay at least as broad as the agent's predicate, because over-excluding costs a message its place
-in one read while under-excluding silently kills an interrupt.
-
-What this card keeps is its own surface: the `read_mailbox` tool and the `/stop` command
-**registration**. Recognising the `/stop` string as a cancellation is the agent's job, and it does
-that without importing anything from here.
+The card holds no cancel predicate of its own, not even a private one. Keeping a cancel out of what
+the model is offered is `akgentic-agent`'s offer rule, on the same side of the boundary as the
+enforcement it protects. This card keeps only its own surface: the `read_mailbox` signal and the
+`/stop` command **registration**. Recognising the `/stop` string as a cancellation is the agent's
+job, and it does that without importing anything from here.
 
 ## The observer protocol
 
@@ -149,12 +150,18 @@ class MailboxToolObserver(ToolObserver, Protocol):
     def consume_mailbox(self, message_ids: list[uuid.UUID]) -> list[Message]: ...
 ```
 
-`get_mailbox()` peeks over the owning agent's inbox, oldest first, dequeuing nothing — but it is no
-longer a promise of redelivery, since `read_mailbox` goes on to consume most of what it returns.
+`get_mailbox()` peeks over the owning agent's inbox, oldest first, dequeuing nothing.
 `consume_mailbox()` performs the removal and returns what it actually removed; it is
-caller-idempotent on ids no longer queued. `Akgent` provides both, so no agent-side change was
-needed to satisfy the widened protocol. Conformance is a documented precondition rather than a
-runtime gate: observers are duck-typed, so a non-conforming one fails at first use.
+caller-idempotent on ids no longer queued, and it skips envelopes carrying a `reply_to`, so its
+return is a subset of what was asked for. The removal telemetry — one `HandledMessage` per message
+— is emitted by `consume_mailbox` itself, so no call site can forget it and none can double it.
+
+**Neither method is called by this card.** The protocol is unchanged and both methods are still
+needed, but their caller is now `akgentic-agent`'s mailbox capability: it peeks to build the
+arrival notice that offers the model a message id, and consumes the one message the model went on
+to name. `Akgent` provides both, so no agent-side change was needed to satisfy the protocol.
+Conformance is a documented precondition rather than a runtime gate: observers are duck-typed, so
+a non-conforming one fails at first use.
 
 ---
 
@@ -166,22 +173,65 @@ from akgentic.tool.core import TOOL_CALL
 from akgentic.tool.mailbox import ReadMailbox, Stop
 
 MailboxTool()                     # both capabilities on (the default)
-MailboxTool(read_mailbox=False)   # /stop only — no on-demand read
+MailboxTool(read_mailbox=False)   # /stop only — no on-demand signal
 MailboxTool(stop=False)           # no cancellation surface
 MailboxTool(read_mailbox=ReadMailbox(expose={TOOL_CALL}))  # explicit param form
 ```
 
+### The mailbox preview whitelist
+
+```python
+MailboxTool(mailbox_preview_handlers=["akgentic.agent.messages.AgentMessage"])
+```
+
+> The example path is what a deployment actually writes, and it is deliberately not something this
+> package can resolve on its own: `akgentic-agent` is a dependency of the deployment, not of
+> `akgentic-tool`. That is exactly why the setting is a string resolved at runtime rather than a
+> class — and why this value must not be copied into a test in this package, where the class is
+> absent from CI.
+
+`mailbox_preview_handlers` narrows *when* the model is offered its mailbox. Four things about it:
+
+- **It names the handler's message class** — the message the agent is *currently handling* — not
+  the mail waiting in the box. An entry says "runs that started from one of these show the
+  preview", never "show me messages of this type".
+- **`None` (the default) means every handler shows the preview.**
+- **`[]` means none does.** It is a different value from `None` and is never coerced back to it: an
+  empty list is a deployment saying *no handler*, and it is honoured as written.
+- **Every entry is resolved when the card is wired to an observer** — agent init, via the
+  `observer()` override. A bad entry raises `ValueError` naming the offending string, so a typo
+  fails before the agent's first run rather than going quiet for its whole life.
+
+The `ValueError` covers four shapes, all configuration defects:
+
+| Shape | Example |
+|---|---|
+| The path carries no module part | `"AgentMessage"` |
+| The module is not importable | `"akgentic.agent.mesages.AgentMessage"` |
+| The module has no such attribute | `"akgentic.agent.messages.AgnetMessage"` |
+| The path resolves to something that is not a `Message` subclass | `"akgentic.tool.mailbox.MailboxTool"` |
+
+**Constructing or deserializing the card never raises.** Validation is a wiring-time event on
+purpose: a field validator would make a card carrying a perfectly valid entry impossible to load in
+any process where that class happens not to be importable — a catalog reader, a serialization round
+trip. Reading the card is always safe; wiring it to an agent is where a typo surfaces.
+
+Building the preview itself, and deciding which of the pending messages are offered with an id, is
+`akgentic-agent`'s. This card only carries the list.
+
 ### Failure modes worth knowing
 
-- **An empty mailbox is not an error.** `read_mailbox` returns its empty-mailbox sentence, and so
-  does a mailbox holding nothing but cancels.
+- **A bad id is not an error.** `read_mailbox` does not look the id up, so an id that names nothing
+  returns the same acknowledgement as one that names a message. What it acknowledges is then
+  nothing at all — no message is absorbed, and any real mail still arrives as its own turn.
 - **A collected observer degrades, in the channel-appropriate way.** `read_mailbox` raises
   `ToolObserverGone` (in-life code, raising form); the `stop` closure captures nothing
   observer-shaped at all and outlives its agent without pinning it.
 - **A removed field fails silently.** `ToolCard` keeps Pydantic's default `extra="ignore"`, so
   `MailboxTool(mailbox_status=True)` — or a catalog entry persisted before that field was deleted
   — constructs happily and drops the value on the floor rather than raising.
-- **The reply-protocol table can drift.** It is a copy of the agent's, kept in sync by nothing.
+- **A whitelist typo fails loudly, but only at wiring time.** A card sitting in a catalog with an
+  unresolvable entry is perfectly loadable; it is the agent that will not start.
 
 ## The cross-package half
 
@@ -194,8 +244,22 @@ unconditionally, and an agent configured without a `MailboxTool` is interruptibl
 What the card contributes is the string surface: `/stop` registered, announced via
 `CommandsAnnouncedEvent`, and answered when it dispatches while idle.
 
-`read_mailbox` works as soon as the card is wired to an agent that satisfies the observer
-protocol.
+The delivery half of `read_mailbox` — consuming the named message and injecting its content, the
+message rendering itself, and the offer rule that decides which messages are shown with an id —
+is likewise `akgentic-agent`'s, and is **not yet released**.
+
+### Release coupling
+
+**This package must not be released alone.** Released ahead of the agent half,
+`read_mailbox(message_id)` returns an acknowledgement and delivers nothing, and an agent still
+running the older code emits an arrival notice telling the model to call `read_mailbox` with no
+argument at all — which the new signature rejects.
+
+The window is **inert but noisy**: retries are burned and tokens spent on a call the model cannot
+satisfy, but nothing is lost. The card consumes nothing, so every unread message still arrives as
+its own turn — the designed fallback. It self-heals the moment the agent release lands. Merge both
+halves, release this package first, and release `akgentic-agent` immediately after with its floor
+raised.
 
 ### Import paths
 
