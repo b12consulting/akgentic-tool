@@ -40,10 +40,13 @@ from akgentic.tool.event import _MOVED
 # or changing.
 _EXPECTED_ROOT_ALL: list[str] = [
     "BaseToolParam",
+    "ContextState",  # epic 31: the context-state contract joins the stable surface
     "ToolCard",
     "ToolFactory",
     "CommandRegistry",
+    "normalize_system_prompt_to_llm_context",  # epic 31
     "COMMAND",
+    "LLM_CONTEXT",  # epic 31: the fourth expose channel
     "SYSTEM_PROMPT",
     "TOOL_CALL",
     "Channels",

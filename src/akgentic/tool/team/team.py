@@ -244,10 +244,12 @@ class TeamTool(ToolCard):
         default=True, description="Enable firing team members (default: True)"
     )
     get_role_profiles: GetRoleProfiles | bool = Field(
-        default=True, description="Include role profiles in system prompt (default: True)"
+        default=True,
+        description="Expose the role catalog as structured context state (default: True)",
     )
     get_team_roster: GetTeamRoster | bool = Field(
-        default=True, description="Include team roster in system prompt (default: True)"
+        default=True,
+        description="Expose the team roster as structured context state (default: True)",
     )
     get_team_activity: GetTeamActivity | bool = Field(
         default=True,
