@@ -841,7 +841,7 @@ each:
 
 | Capability | Param (default) | Channel | Serving hook | Gate |
 |---|---|---|---|---|
-| On-demand read | `read_mailbox: ReadMailbox \| bool = True` | `TOOL_CALL` | `get_tools()` | param resolves **and** `TOOL_CALL` in its `expose` |
+| On-demand signal | `read_mailbox: ReadMailbox \| bool = True` | `TOOL_CALL` | `get_tools()` | param resolves **and** `TOOL_CALL` in its `expose` |
 | Run cancellation | `stop: Stop \| bool = True` | `COMMAND` | `get_commands()` | param resolves **and** `COMMAND` in its `expose` |
 
 **`read_mailbox` → `TOOL_CALL`.** Taking on a waiting message is a deliberate act, so the model

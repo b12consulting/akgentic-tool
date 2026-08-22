@@ -1,9 +1,10 @@
 # MailboxTool
 
 The agent's own mailbox as a capability. An agent's mailbox is its actor inbox: while one turn is
-being processed, every message told to it queues up behind the one in flight. This card gives the
-model two channels onto that queue — an on-demand **signal** that names one waiting message by id,
-and the `/stop` cancellation surface: the card creates no actor and performs no proxy round trip.
+being processed, every message told to it queues up behind the one in flight. This card gives that
+queue two channels — an on-demand **signal** the model calls to name one waiting message by id, and
+the `/stop` cancellation surface a human or a program drives: the card creates no actor and performs
+no proxy round trip.
 
 ```python
 from akgentic.tool import MailboxTool
