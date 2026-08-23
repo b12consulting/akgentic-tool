@@ -20,17 +20,22 @@ class MailboxToolObserver(ToolObserver, Protocol):
     """Observer protocol for the mailbox capability (ADR-040 §1, ADR-019 §4).
 
     Extends ToolObserver with the two mailbox methods the capability needs: a
-    peek over the owning agent's inbox, and the removal that makes
-    ``read_mailbox`` a consuming read. ``Akgent`` provides both, so no
-    agent-side change is needed to satisfy the widened protocol.
+    peek over the owning agent's inbox, and the removal that absorbs a message
+    into the current run. ``Akgent`` provides both, so no agent-side change is
+    needed to satisfy the widened protocol.
+
+    Neither method is called by ``MailboxTool``, which reads and consumes
+    nothing. Their caller is the agent's mailbox capability, in
+    ``akgentic-agent`` (ADR-010 §4).
     """
 
     def get_mailbox(self) -> list[Message]:
         """Peek at the pending messages without dequeuing them.
 
-        The peek itself removes nothing. It is no longer a promise of
-        redelivery, though: ``read_mailbox`` goes on to consume most of what a
-        peek returns, so a message seen here may well never get its own turn.
+        The peek itself removes nothing, and it is not a promise of redelivery:
+        the agent's capability peeks to build the arrival notice, and a message
+        offered there may go on to be consumed within the same run, never
+        getting its own turn.
 
         Returns:
             Messages currently pending in the agent's inbox, oldest first.
@@ -40,8 +45,9 @@ class MailboxToolObserver(ToolObserver, Protocol):
     def consume_mailbox(self, message_ids: list[uuid.UUID]) -> list[Message]:
         """Remove the named messages from the mailbox without delivering them.
 
-        Each removed message loses its own turn — this is how a consuming read
-        absorbs its mail. Caller-idempotent: an id that is no longer queued is
+        Each removed message loses its own turn — this is how the agent's
+        capability absorbs the message the model named, once ``read_mailbox``
+        has signalled that id. Caller-idempotent: an id that is no longer queued is
         ignored silently, so a message dequeued between a peek and this call
         simply does not come back. Messages whose envelope carries a
         ``reply_to`` are left alone, so the return is a subset of what was

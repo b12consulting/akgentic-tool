@@ -1,6 +1,6 @@
-"""Capability parameters for the mailbox card (ADR-040, ADR-019 §4b).
+"""Capability parameters for the mailbox card (ADR-010, ADR-040).
 
-Two capabilities, one channel each by default: a consuming ``read_mailbox`` on
+Two capabilities, one channel each by default: the ``read_mailbox`` signal on
 ``TOOL_CALL``, and ``stop`` on ``COMMAND``. Neither needs a field beyond
 ``expose`` — configuration read at factory bind time, never tool-call schema.
 """
@@ -9,7 +9,7 @@ from akgentic.tool.core import COMMAND, TOOL_CALL, BaseToolParam, Channels
 
 
 class ReadMailbox(BaseToolParam):
-    """Read pending messages on demand, absorbing the ones it shows."""
+    """Take on a pending message by id, absorbing it into the current run."""
 
     expose: set[Channels] = {TOOL_CALL}
 
