@@ -128,7 +128,32 @@ the actor on start, so a resumed team delivers the same class.
 **The actor sends as itself.** The delivered `sender` is `#NotificationTool` and the message's
 `type` is `"notification"`. The send is a tell, so a busy agent never blocks the actor.
 
-**Granularity is ±1 s.** The actor scans for due entries once per `TICK_INTERVAL_S` (1.0 s).
+The actor is reached entirely through core's public surface — `ActorAddress.ask` to deliver the tick, `ActorAddress.is_alive()` to decide when to stop,
+and `akgentic.core.ActorDeadError` where the exception needs naming.
+
+**Granularity is ±1 s.** A daemon thread sends the actor a `NotificationTick` once per
+`TICK_INTERVAL_S` (1.0 s); the handler runs the scan on the actor thread, alongside `schedule` and
+`cancel`, so every mutation of `pending` happens on one thread and no lock is needed.
+
+### How the timer thread reaches the actor
+
+The tick is a **message, not a proxied method call**, and each part of that is load-bearing:
+
+| Choice | Why |
+|---|---|
+| An `ActorAddress`, not a proxy | An actor proxy holds the actor **strongly**, so a thread retaining one keeps the actor alive for the team's lifetime — the one real leak this design can have. An address holds it weakly. |
+| `ask`, not `tell` | Waiting for the scan to be handled is what stops a slow actor being handed ticks faster than it drains them. A `tell` loop enqueues regardless and the mailbox grows without bound. |
+| Bounded by `TICK_ASK_TIMEOUT_S` (10 s) | An unbounded `ask` lets a wedged actor park the timer thread for good. |
+| `NotificationTick` is not a `Message` | The orchestrator's telemetry sandwich fires on `Message` instances, so a tick modelled as one would emit a Received/Processed pair every second, for every team. A plain object still routes through the MRO dispatcher to `receiveMsg_NotificationTick`. |
+
+**Only a dead actor ends the loop.** Anything else — a timeout, a transient failure inside the
+scan — is logged and retried on the next tick. A single escaping exception would retire the thread
+for the team's lifetime, leaving every pending notification silently undelivered while the bounded
+join in `on_stop` still succeeded, so nothing would report it.
+
+Deadness is `ActorAddress.is_alive()`, which is true to its name for both a *stopped* actor and a
+*garbage-collected* one. That distinction matters here: the raw actor reference underneath reports
+a collected actor as alive, and a loop trusting it would tick a corpse forever.
 
 **Delivery waits for an absent owner, briefly.** An owner off the team — an agent between hire and
 start, or a resumed team whose agents have not re-registered — is retried for up to
@@ -199,6 +224,7 @@ from akgentic.tool.notification import (
     NotificationActor, NotificationConfig, NotificationState, PendingNotification,
     DEFAULT_MESSAGE_CLASS, NOTIFICATION_ACTOR_NAME, TICK_INTERVAL_S, resolve_message_class,
 )
+from akgentic.tool.notification.actor import NotificationTick, TICK_ASK_TIMEOUT_S
 ```
 
 ---

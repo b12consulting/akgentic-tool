@@ -1099,6 +1099,11 @@ Ownership is scoped per agent: listing can be widened to the whole team with
 `pending_notification(all=True)`, but cancel authority never widens with it. Entries store an
 absolute due time, so a delay that expired while the team was stopped simply fires on resume.
 
+A daemon thread drives delivery by sending the singleton a `NotificationTick` once a second — an
+`ActorAddress.ask`, bounded by a timeout. Holding an address rather than a proxy is what keeps the
+thread from pinning the actor in memory; asking rather than telling is what keeps a slow actor from
+being handed ticks faster than it drains them.
+
 **[Full reference → `src/akgentic/tool/notification/README.md`](src/akgentic/tool/notification/README.md)** —
 the `message_class` validation contract, delivery and grace semantics, and the `/`-command
 surface.
