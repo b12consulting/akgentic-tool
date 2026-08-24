@@ -26,8 +26,20 @@ from akgentic.tool.search import SearchTool
 
 @pytest.fixture
 def tool_schemas() -> dict[str, dict[str, Any]]:
-    """Build the SearchTool tools and return each one's JSON schema by tool name."""
-    agent = Agent("openai:gpt-4o", tools=SearchTool().get_tools())
+    """Build the SearchTool tools and return each one's JSON schema by tool name.
+
+    ``Agent("test")`` is pydantic-ai's built-in model, and the point of it here is
+    that it constructs **without a provider or an API key**. Naming a real model
+    (``"openai:gpt-4o"``) makes the provider validate credentials at construction,
+    so every test below would fail with ``UserError`` wherever no key is set — which
+    is any CI job that does not deliberately inject one.
+
+    That would be a key spent on nothing: these tests never call a model. They read
+    the JSON schema pydantic-ai builds from the tool signatures, and that schema is
+    identical whichever model is named, because it is derived from the functions
+    rather than from the provider.
+    """
+    agent = Agent("test", tools=SearchTool().get_tools())
     return {
         name: tool.function_schema.json_schema
         for name, tool in agent._function_toolset.tools.items()
