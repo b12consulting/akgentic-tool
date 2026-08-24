@@ -62,9 +62,7 @@ class TestHasTavilyApiKey:
         monkeypatch.setenv("TAVILY_API_KEY", "")
         assert _has_tavily_api_key() is False
 
-    def test_returns_false_when_key_whitespace_only(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_false_when_key_whitespace_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("TAVILY_API_KEY", "   ")
         assert _has_tavily_api_key() is False
 
@@ -170,7 +168,7 @@ class TestWebFetchGraceful:
         monkeypatch.delenv("TAVILY_API_KEY", raising=False)
         tools = SearchTool().get_tools()
         tool = _get_tool_by_name(tools, "web_fetch_tool")
-        result = tool(urls=["http://example.com"])
+        result = tool(urls=["http://example.com"], query="what is it")
         assert isinstance(result, str)
         assert "unavailable" in result.lower()
         assert "TAVILY_API_KEY" in result
@@ -182,7 +180,7 @@ class TestWebFetchGraceful:
         monkeypatch.delenv("TAVILY_API_KEY", raising=False)
         tools = SearchTool().get_tools()
         tool = _get_tool_by_name(tools, "web_fetch_tool")
-        result = tool(urls=["http://example.com"])
+        result = tool(urls=["http://example.com"], query="what is it")
         assert isinstance(result, str)
 
 
@@ -201,7 +199,7 @@ class TestWebCrawlGraceful:
         monkeypatch.delenv("TAVILY_API_KEY", raising=False)
         tools = SearchTool().get_tools()
         tool = _get_tool_by_name(tools, "web_crawl_tool")
-        result = tool(url="http://example.com")
+        result = tool(url="http://example.com", crawl_instructions="the pricing page")
         assert isinstance(result, str)
         assert "unavailable" in result.lower()
         assert "TAVILY_API_KEY" in result
@@ -213,7 +211,7 @@ class TestWebCrawlGraceful:
         monkeypatch.delenv("TAVILY_API_KEY", raising=False)
         tools = SearchTool().get_tools()
         tool = _get_tool_by_name(tools, "web_crawl_tool")
-        result = tool(url="http://example.com")
+        result = tool(url="http://example.com", crawl_instructions="the pricing page")
         assert isinstance(result, str)
 
 
@@ -231,9 +229,7 @@ class TestSearchToolHappyPath:
     ) -> None:
         monkeypatch.setenv("TAVILY_API_KEY", "test-key")
         mock_client = _MockTavilyClient()
-        monkeypatch.setattr(
-            "akgentic.tool.search.search.TavilyClient", lambda: mock_client
-        )
+        monkeypatch.setattr("akgentic.tool.search.search.TavilyClient", lambda: mock_client)
         tools = SearchTool().get_tools()
         tool = _get_tool_by_name(tools, "web_search_tool")
         result = tool(query="python testing")
@@ -246,12 +242,10 @@ class TestSearchToolHappyPath:
     ) -> None:
         monkeypatch.setenv("TAVILY_API_KEY", "test-key")
         mock_client = _MockTavilyClient()
-        monkeypatch.setattr(
-            "akgentic.tool.search.search.TavilyClient", lambda: mock_client
-        )
+        monkeypatch.setattr("akgentic.tool.search.search.TavilyClient", lambda: mock_client)
         tools = SearchTool().get_tools()
         tool = _get_tool_by_name(tools, "web_fetch_tool")
-        result = tool(urls=["http://example.com"])
+        result = tool(urls=["http://example.com"], query="what is it")
         assert result == {"results": [{"url": "http://example.com"}]}
         mock_client.extract.assert_called_once()
 
@@ -261,12 +255,10 @@ class TestSearchToolHappyPath:
     ) -> None:
         monkeypatch.setenv("TAVILY_API_KEY", "test-key")
         mock_client = _MockTavilyClient()
-        monkeypatch.setattr(
-            "akgentic.tool.search.search.TavilyClient", lambda: mock_client
-        )
+        monkeypatch.setattr("akgentic.tool.search.search.TavilyClient", lambda: mock_client)
         tools = SearchTool().get_tools()
         tool = _get_tool_by_name(tools, "web_crawl_tool")
-        result = tool(url="http://example.com")
+        result = tool(url="http://example.com", crawl_instructions="the pricing page")
         assert result == {"results": [{"url": "http://example.com"}]}
         mock_client.crawl.assert_called_once()
 
@@ -286,9 +278,7 @@ class TestSearchToolApiError:
     ) -> None:
         monkeypatch.setenv("TAVILY_API_KEY", "test-key")
         mock_client = _RaisingTavilyClient()
-        monkeypatch.setattr(
-            "akgentic.tool.search.search.TavilyClient", lambda: mock_client
-        )
+        monkeypatch.setattr("akgentic.tool.search.search.TavilyClient", lambda: mock_client)
         with caplog.at_level(logging.WARNING, logger="akgentic.tool.search.search"):
             tools = SearchTool().get_tools()
             tool = _get_tool_by_name(tools, "web_search_tool")
@@ -305,13 +295,11 @@ class TestSearchToolApiError:
     ) -> None:
         monkeypatch.setenv("TAVILY_API_KEY", "test-key")
         mock_client = _RaisingTavilyClient()
-        monkeypatch.setattr(
-            "akgentic.tool.search.search.TavilyClient", lambda: mock_client
-        )
+        monkeypatch.setattr("akgentic.tool.search.search.TavilyClient", lambda: mock_client)
         with caplog.at_level(logging.WARNING, logger="akgentic.tool.search.search"):
             tools = SearchTool().get_tools()
             tool = _get_tool_by_name(tools, "web_fetch_tool")
-            result = tool(urls=["http://example.com"])
+            result = tool(urls=["http://example.com"], query="what is it")
         assert isinstance(result, str)
         assert "failed" in result.lower()
         assert "network timeout" in result
@@ -324,13 +312,11 @@ class TestSearchToolApiError:
     ) -> None:
         monkeypatch.setenv("TAVILY_API_KEY", "test-key")
         mock_client = _RaisingTavilyClient()
-        monkeypatch.setattr(
-            "akgentic.tool.search.search.TavilyClient", lambda: mock_client
-        )
+        monkeypatch.setattr("akgentic.tool.search.search.TavilyClient", lambda: mock_client)
         with caplog.at_level(logging.WARNING, logger="akgentic.tool.search.search"):
             tools = SearchTool().get_tools()
             tool = _get_tool_by_name(tools, "web_crawl_tool")
-            result = tool(url="http://example.com")
+            result = tool(url="http://example.com", crawl_instructions="the pricing page")
         assert isinstance(result, str)
         assert "failed" in result.lower()
         assert "invalid key" in result
@@ -347,9 +333,7 @@ class TestSearchToolApiError:
             msg = "invalid API key format"
             raise ValueError(msg)
 
-        monkeypatch.setattr(
-            "akgentic.tool.search.search.TavilyClient", _raise_on_construct
-        )
+        monkeypatch.setattr("akgentic.tool.search.search.TavilyClient", _raise_on_construct)
         tools = SearchTool().get_tools()
         tool = _get_tool_by_name(tools, "web_search_tool")
         result = tool(query="test")
