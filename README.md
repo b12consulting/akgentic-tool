@@ -984,18 +984,26 @@ Web search and content fetching via the [Tavily](https://tavily.com/) API: `web_
 corresponding tool argument, so configuration biases the model without removing its judgement.
 
 ```python
-from akgentic.tool.search import SearchTool, WebCrawl
+from akgentic.tool.search import SearchTool, WebCrawl, WebFetch
 
 SearchTool()
 SearchTool(web_crawl=WebCrawl(max_depth=2, limit=50))
+SearchTool(web_fetch=WebFetch(chunks_per_source=2))   # tighter fetch responses
 ```
+
+**Both content capabilities require the model to say what it is looking for.** `web_fetch` takes a
+required `query` selecting which passages of each URL come back, bounded by a configurable
+`chunks_per_source` (default `3`); `web_crawl` takes a required `crawl_instructions` directing
+which links it follows and what it extracts. Neither has a configurable default, because a default
+is something the model may omit — and the unfiltered forms return whole pages and undirected site
+walks, enough tool output to crowd out the conversation the agent is meant to be having.
 
 Requires the `TAVILY_API_KEY` environment variable. A missing or invalid key never raises — the
 tool returns a message telling the model it is unavailable.
 
 **[Full reference → `src/akgentic/tool/search/README.md`](src/akgentic/tool/search/README.md)** —
-every Tavily parameter with its accepted range, and how `crawl_instructions` differs from the
-inherited `instructions`.
+every Tavily parameter with its accepted range, how `query` and `chunks_per_source` bound the
+response, and how `crawl_instructions` differs from the inherited `instructions`.
 
 ### TeamTool
 
