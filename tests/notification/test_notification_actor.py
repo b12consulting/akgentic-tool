@@ -18,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pytest
+from akgentic.core import ActorDeadError, ActorRef
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.actor_address_impl import ActorAddressImpl, ActorAddressProxy
 from akgentic.core.agent import Akgent
@@ -25,6 +26,7 @@ from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.message import Message
 from akgentic.core.orchestrator import Orchestrator
+
 from akgentic.tool.notification import actor as actor_module
 from akgentic.tool.notification.actor import (
     NOTIFICATION_ACTOR_NAME,
@@ -36,8 +38,6 @@ from akgentic.tool.notification.models import (
     NotificationState,
     PendingNotification,
 )
-from pykka import ActorDeadError, ActorRef
-
 from tests.conftest import MockActorAddress
 from tests.notification.conftest import FAKE_MESSAGE_PATH, FakeNotificationMessage
 
@@ -585,16 +585,17 @@ class TestTeardownAndRetention:
     def test_the_loop_exits_when_the_actor_is_dead(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A dead actor ends the loop; it never ticks a corpse forever."""
         monkeypatch.setattr(actor_module, "TICK_INTERVAL_S", 0.01)
-        ref = MagicMock()
-        ref.proxy.side_effect = ActorDeadError("gone")
+        address = MagicMock()
+        address.ask.side_effect = ActorDeadError("gone")
+        address.is_alive.return_value = False
         stop_event = threading.Event()
 
-        thread = threading.Thread(target=_tick_loop, args=(stop_event, ref), daemon=True)
+        thread = threading.Thread(target=_tick_loop, args=(stop_event, address), daemon=True)
         thread.start()
         thread.join(timeout=2.0)
 
         assert not thread.is_alive()
-        assert ref.proxy.call_count == 1
+        assert address.ask.call_count == 1
         assert not stop_event.is_set(), "it exited on the error, not on a stop"
 
     def test_a_failing_tick_is_logged_and_retried_rather_than_ending_the_loop(
@@ -602,17 +603,18 @@ class TestTeardownAndRetention:
     ) -> None:
         """Only a dead actor retires the thread; anything else ticks again.
 
-        Building the proxy runs pykka's attribute introspection on the timer
-        thread, so the failure surface is wider than a bare tell's. An escaping
-        exception would stop delivery for the team's lifetime with nothing to
-        report it — the bounded join in ``on_stop`` would still succeed.
+        The tick can fail without the actor being gone — a timeout on a busy
+        scan, a transient error inside it. An escaping exception would stop
+        delivery for the team's lifetime with nothing to report it: the bounded
+        join in ``on_stop`` would still succeed.
         """
         monkeypatch.setattr(actor_module, "TICK_INTERVAL_S", 0.01)
-        ref = MagicMock()
-        ref.proxy.side_effect = RuntimeError("dict mutated during update")
+        address = MagicMock()
+        address.ask.side_effect = RuntimeError("dict mutated during update")
+        address.is_alive.return_value = True
         stop_event = threading.Event()
 
-        thread = threading.Thread(target=_tick_loop, args=(stop_event, ref), daemon=True)
+        thread = threading.Thread(target=_tick_loop, args=(stop_event, address), daemon=True)
         with caplog.at_level(logging.WARNING):
             thread.start()
             time.sleep(0.1)
@@ -620,7 +622,7 @@ class TestTeardownAndRetention:
             thread.join(timeout=2.0)
 
         assert not thread.is_alive()
-        assert ref.proxy.call_count > 1, "it kept ticking after the failure"
+        assert address.ask.call_count > 1, "it kept ticking after the failure"
         assert "Notification tick failed" in caplog.text
 
     def test_the_tick_thread_does_not_root_the_actor(self, monkeypatch: pytest.MonkeyPatch) -> None:

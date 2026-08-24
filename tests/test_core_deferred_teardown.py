@@ -22,8 +22,8 @@ from collections.abc import Generator
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-import pykka
 import pytest
+from akgentic.core import ActorRegistry
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
@@ -36,10 +36,10 @@ from akgentic.tool.core.deferred import (
     DeferredWorker,
     poll_deferred,
 )
-from akgentic.tool.vector_store.vector import VectorEntry
 from akgentic.tool.vector_store.actor import VectorStoreActor
 from akgentic.tool.vector_store.embedding_actor import EmbeddingActor
 from akgentic.tool.vector_store.protocol import VectorStoreConfig
+from akgentic.tool.vector_store.vector import VectorEntry
 
 # How long the deliberately slow production takes. Everything else is measured
 # against it, so the margins stay structural rather than a timing race.
@@ -64,7 +64,7 @@ def cleanup_actors() -> Generator[None, None, None]:
     for event in (_worker_entered, _worker_left, _embed_entered, _embed_left, _idle_tool_stopped):
         event.clear()
     yield
-    pykka.ActorRegistry.stop_all()
+    ActorRegistry.stop_all()
 
 
 # ---------------------------------------------------------------------------
@@ -135,11 +135,7 @@ def test_second_request_while_in_flight_spawns_no_second_worker() -> None:
         # even for a cache that does not de-duplicate at all.
         assert system.proxy_ask(cache_addr, _SlowCache).get("k1") is None
 
-        workers = [
-            ref
-            for ref in pykka.ActorRegistry.get_by_class(_SlowWorker)
-            if ref.is_alive()
-        ]
+        workers = [ref for ref in ActorRegistry.get_by_class(_SlowWorker) if ref.is_alive()]
         assert len(workers) == 1
     finally:
         system.shutdown(timeout=10)

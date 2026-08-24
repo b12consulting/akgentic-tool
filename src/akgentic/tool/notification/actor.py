@@ -1,11 +1,10 @@
 """``#NotificationTool``: the team singleton that holds pending timers.
 
 The actor owns a dict of :class:`PendingNotification` and one daemon thread that
-calls :meth:`NotificationActor.deliver_due` through the actor's own proxy about
-once a second. The call is mailbox-routed, so the scan runs on the actor thread
-where ``schedule`` and ``cancel`` run: every mutation of ``pending`` happens on
-one thread, and no lock is needed. The thread's only action is that
-fire-and-forget call, whose future it never waits on (ADR-035 §3).
+sends the actor a :class:`NotificationTick` about once a second. The tick is
+mailbox-routed, so the scan runs on the actor thread where ``schedule`` and
+``cancel`` run: every mutation of ``pending`` happens on one thread, and no lock
+is needed (ADR-035 §3).
 
 Delivery of an entry whose ``fire_at`` has passed needs no re-arm logic — a
 restored entry is simply due on the first tick after a resume. It does need its
@@ -19,9 +18,6 @@ from __future__ import annotations
 import logging
 import threading
 from datetime import UTC, datetime, timedelta
-from typing import Any
-
-from pykka import ActorDeadError, ActorRef
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import Akgent
@@ -45,6 +41,13 @@ NOTIFICATION_ACTOR_ROLE = "ToolActor"
 TICK_INTERVAL_S = 1.0
 """Tick period. Delivery granularity is ±1 s, accepted against a 300 s cap."""
 
+TICK_ASK_TIMEOUT_S = 10.0
+"""How long a tick waits for the scan to be handled.
+
+Bounded so a wedged actor cannot park the timer thread forever. Generous against
+a scan that is a dict walk plus one cached roster read — a timeout here means
+something is wrong, not merely busy, so it is logged rather than absorbed."""
+
 TICK_JOIN_TIMEOUT_S = 2.0
 """Join budget in ``on_stop`` — bounded, because the loop observes the stop
 event within one tick."""
@@ -57,35 +60,40 @@ back would otherwise pin its entry for the team's lifetime, and unbounded
 postponement turns the wait into the leak the scan was designed to avoid."""
 
 
-def _tick_loop(stop_event: threading.Event, actor_ref: ActorRef[Any]) -> None:
-    """Call ``deliver_due`` on *actor_ref* every ``TICK_INTERVAL_S`` until *stop_event* is set.
+def _tick_loop(stop_event: threading.Event, address: ActorAddress) -> None:
+    """Tick the actor every ``TICK_INTERVAL_S`` until *stop_event* is set.
 
     Module-level, and capturing only its two arguments: a bound-method target
     would root the actor instance for as long as the thread lives, which is the
-    one real leak this design could have. A dead actor breaks the loop rather
-    than leaving it ticking a corpse forever.
+    one real leak this design could have. An ``ActorAddress`` holds the actor
+    weakly, so the parked thread never keeps it alive.
 
-    The proxy call is fire-and-forget — the returned future is discarded, never
-    waited on, so a busy actor turns a one-second tick into a later one rather
-    than into a blocked timer thread.
+    The tick is a **message, not a proxied method call**. Building a Pykka proxy
+    takes a strong reference to the actor and introspects its attributes, so a
+    retained proxy is exactly the leak above and a per-tick one costs a
+    quarter-millisecond of introspection to send one small message.
 
-    Only a dead actor ends the loop. Anything else is logged and retried on the
-    next tick: building the proxy runs pykka's attribute introspection on *this*
-    thread, so the failure surface is wider than a bare ``tell``'s, and a single
-    escaping exception would retire the thread for the team's lifetime — every
+    ``ask`` rather than ``tell``, and bounded: waiting for the scan to be handled
+    is what keeps a slow actor from being handed ticks faster than it drains
+    them, and ``TICK_ASK_TIMEOUT_S`` is what keeps a wedged one from parking this
+    thread for the team's lifetime.
+
+    Only a dead actor ends the loop. Anything else — a timeout, a transient
+    failure inside the scan — is logged and retried on the next tick: a single
+    escaping exception would retire the thread for the team's lifetime, every
     pending notification silently undelivered, with the bounded join in
     ``on_stop`` still succeeding so nothing would report it.
 
     Args:
         stop_event: Set by ``on_stop`` to end the loop.
-        actor_ref: Reference to the notification actor (holds it weakly).
+        address: Address of the notification actor (holds it weakly).
     """
     while not stop_event.wait(TICK_INTERVAL_S):
         try:
-            actor_ref.proxy().deliver_due()
-        except ActorDeadError:
-            break
+            address.ask(NotificationTick(), timeout=TICK_ASK_TIMEOUT_S)
         except Exception:  # noqa: BLE001 — a failed tick must not retire the thread
+            if not address.is_alive():
+                break
             logger.warning("Notification tick failed; retrying on the next tick", exc_info=True)
 
 
@@ -97,6 +105,17 @@ def _same_owner(left: ActorAddress, right: ActorAddress) -> bool:
     equal to each other.
     """
     return left.agent_id == right.agent_id
+
+
+class NotificationTick:
+    """The timer thread's request for a delivery scan.
+
+    Deliberately not a :class:`~akgentic.core.messages.message.Message`: the
+    orchestrator's telemetry sandwich fires on those, so a tick modelled as one
+    would emit a Received/Processed pair every second for every team. A plain
+    object still routes to ``receiveMsg_NotificationTick`` through the MRO
+    dispatcher, and carries no conversational meaning to anything else.
+    """
 
 
 class NotificationActor(Akgent[NotificationConfig, NotificationState]):
@@ -120,7 +139,7 @@ class NotificationActor(Akgent[NotificationConfig, NotificationState]):
         self._stop_event = threading.Event()
         self._tick_thread = threading.Thread(
             target=_tick_loop,
-            args=(self._stop_event, self.actor_ref),
+            args=(self._stop_event, self.myAddress),
             name=f"{NOTIFICATION_ACTOR_NAME}-tick",
             daemon=True,
         )
@@ -140,6 +159,21 @@ class NotificationActor(Akgent[NotificationConfig, NotificationState]):
         if self._tick_thread is not None:
             self._tick_thread.join(timeout=TICK_JOIN_TIMEOUT_S)
         super().on_stop()
+
+    def receiveMsg_NotificationTick(self, msg: NotificationTick) -> None:
+        """Run one delivery scan on the actor thread.
+
+        The indirection is what puts :meth:`deliver_due` on the mailbox thread
+        without the timer thread holding a proxy to this actor.
+
+        Single-parameter on purpose: the dispatcher passes a sender only to
+        handlers that declare a parameter named exactly ``sender``, and a tick
+        has none to speak of.
+
+        Args:
+            msg: The tick itself, which carries nothing.
+        """
+        self.deliver_due()
 
     ##
     ## Ask-path methods — dict operations only
