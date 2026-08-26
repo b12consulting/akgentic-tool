@@ -1182,6 +1182,7 @@ MailboxTool()                     # both capabilities on (the default)
 MailboxTool(read_mailbox=False)   # /stop only — no on-demand signal
 MailboxTool(stop=False)           # no cancellation surface
 MailboxTool(mailbox_preview_handlers=["akgentic.agent.messages.AgentMessage"])
+MailboxTool(arrival_closing="Read one now if it changes your work; otherwise finish first.")
 ```
 
 Reading absorbs: naming a message takes it on in the current run, so it will not also arrive as its
@@ -1191,16 +1192,21 @@ itself reads, consumes and renders nothing, and returns an acknowledgement. Cons
 message and injecting its content is `akgentic-agent`'s, and that half has not yet shipped, so this
 package must not be released alone. `mailbox_preview_handlers` names which handlers' runs are
 offered the mailbox at all; every entry is resolved at agent init, and a typo raises `ValueError`
-there. The `stop` command registers the `/stop` surface only — dispatched while the agent is idle it
+there. `absorbed_prefix` and `arrival_closing` carry the wording a mid-run arrival reads with,
+defaulting to the text `akgentic-agent` injects today so a catalog entry shows an operator what the
+agent is currently being told; this card never reads either — it carries them for that package's
+mailbox capability, which picks them up defensively. The `stop` command registers the `/stop`
+surface only — dispatched while the agent is idle it
 answers *"There is no run to cancel."*, and both recognising the string and the mid-run enforcement
 are the agent's, in `akgentic-agent` (its Epic 20). Nothing in this card raises, tracks or
 interrupts.
 
 **[Full reference → `src/akgentic/tool/mailbox/README.md`](src/akgentic/tool/mailbox/README.md)** —
 the two capability params, the absorption contract and why the id is not validated, the
-`mailbox_preview_handlers` whitelist and its four failure shapes, the `message_id` cross-repository
-contract, where the cancel vocabulary lives, the observer protocol, and the cross-package half that
-`akgentic-agent` owns — including the release coupling.
+`mailbox_preview_handlers` whitelist and its four failure shapes, the two injected-prompt-text
+fields and the clause an edit can delete, the `message_id` cross-repository contract, where the
+cancel vocabulary lives, the observer protocol, and the cross-package half that `akgentic-agent`
+owns — including the release coupling.
 
 ### MCPTool
 

@@ -121,11 +121,42 @@ class MailboxTool(ToolCard):
             is a different value and is never coerced back to ``None``. Every
             entry is resolved when the card is wired to an observer, so a typo
             raises at agent init rather than going quiet for the agent's life.
+        absorbed_prefix: What a message absorbed through ``read_mailbox`` is
+            prefixed with when it is injected into the run. The default is the
+            wording shipped today, reproduced here so a catalog entry shows an
+            operator what the agent is currently being told rather than a
+            ``null``. **A deployment editing this can delete the clause "It does
+            NOT replace what you were already asked to do"** — the sentence that
+            stops the failure it was written for, where an agent that had just
+            finished a report answered only the newer mid-run question and the
+            report reached nobody. That is inherent to making the wording
+            configurable, and it is stated here rather than hidden. **This card
+            never reads the field**: it carries it for ``akgentic-agent``'s
+            mailbox capability to pick up at capability construction.
+        arrival_closing: The mid-run arrival notice's closing line, for a
+            listing that offers at least one message id. Default as above — the
+            wording shipped today. There is deliberately **no** field for the
+            no-id closing: a listing carrying no id offers no read, so there is
+            no timing to advise on. **This card never reads the field** either;
+            rendering the notice is ``akgentic-agent``'s, and it reads both
+            fields defensively, so an older card still works.
     """
 
     read_mailbox: ReadMailbox | bool = True
     stop: Stop | bool = True
     mailbox_preview_handlers: list[str] | None = None
+    absorbed_prefix: str = (
+        "Additional work, taken on mid-run. It does NOT replace what you were already asked "
+        "to do. It may be a separate request, in which case answer both before this run ends, "
+        "one message each in your output; or it may add to or correct the request already in "
+        "flight, in which case one message answers both. When unsure, answer separately."
+    )
+    arrival_closing: str = (
+        "Call `read_mailbox` with one of the ids above to take that message on now — worth doing "
+        "if it may add to or change what you are working on, since a correction only helps before "
+        "the work is finished. Otherwise finish your current work first — you will get them just "
+        "after."
+    )
 
     def observer(self, observer: ToolObserver) -> MailboxTool:
         """Store the observer, then resolve every whitelisted handler class.

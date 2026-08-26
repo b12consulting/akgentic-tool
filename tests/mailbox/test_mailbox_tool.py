@@ -13,7 +13,7 @@ import pytest
 from akgentic.core.messages import Message
 
 from akgentic.tool import ToolFactory
-from akgentic.tool.core import COMMAND, LLM_CONTEXT, TOOL_CALL
+from akgentic.tool.core import COMMAND, LLM_CONTEXT, TOOL_CALL, ToolCard
 from akgentic.tool.errors import ToolObserverGone
 from akgentic.tool.mailbox import (
     MailboxTool,
@@ -563,3 +563,197 @@ def test_card_with_explicit_params_round_trips() -> None:
     assert restored.read_mailbox.instructions == "prefer wrapping up"
     assert isinstance(restored.stop, Stop)
     assert restored.mailbox_preview_handlers == ["akgentic.core.messages.UserMessage"]
+
+
+# ── the injected prompt text: two fields the card carries and never reads ────
+#
+# The two literals below are the test's OWN copy of the field defaults, and the
+# duplication is the whole guard — DO NOT delete either as redundancy.
+#
+# Nothing can verify the transcription itself. This package may not import
+# akgentic-agent (module boundary rule: akgentic-tool may import from core only),
+# and akgentic-agent is not installed in this package's standalone CI, so no
+# mechanism anywhere compares the card default against the constant it was copied
+# from. Importing the card's own value here, or comparing the field against a
+# constant defined in mailbox.py, would assert x == x and pass against any text.
+#
+# What the second literal buys is precise: a LATER edit to the field default —
+# a reflow, a "fixed" em dash, a shortened sentence — goes red instead of
+# silently changing the live prompt. Being right the FIRST time is bought only by
+# copying the block out of akgentic-agent rather than retyping it.
+
+_ABSORBED_PREFIX_AS_SHIPPED = (
+    "Additional work, taken on mid-run. It does NOT replace what you were already asked "
+    "to do. It may be a separate request, in which case answer both before this run ends, "
+    "one message each in your output; or it may add to or correct the request already in "
+    "flight, in which case one message answers both. When unsure, answer separately."
+)
+
+_ARRIVAL_CLOSING_AS_SHIPPED = (
+    "Call `read_mailbox` with one of the ids above to take that message on now — worth doing "
+    "if it may add to or change what you are working on, since a correction only helps before "
+    "the work is finished. Otherwise finish your current work first — you will get them just "
+    "after."
+)
+
+_SENTINEL_PREFIX = "SENTINEL-PREFIX-9f3c: nothing the card produces may contain this."
+_SENTINEL_CLOSING = "SENTINEL-CLOSING-4a71: nor this."
+
+
+def test_absorbed_prefix_defaults_to_the_shipped_wording() -> None:
+    assert MailboxTool().absorbed_prefix == _ABSORBED_PREFIX_AS_SHIPPED
+
+
+def test_arrival_closing_defaults_to_the_shipped_wording() -> None:
+    assert MailboxTool().arrival_closing == _ARRIVAL_CLOSING_AS_SHIPPED
+
+
+def test_both_fields_are_plain_required_strings_with_a_literal_default() -> None:
+    # Not `str | None`, not `""`: a catalog entry showing `absorbed_prefix: null`
+    # tells an operator nothing about what the agent is currently being told, and
+    # a None-means-use-the-agent's-default sentinel reintroduces exactly that null.
+    for name in ("absorbed_prefix", "arrival_closing"):
+        field = MailboxTool.model_fields[name]
+        assert field.annotation is str
+        assert isinstance(field.default, str)
+        assert field.default.strip() != ""
+
+
+def test_there_is_no_third_prompt_field_for_the_no_id_closing() -> None:
+    # A listing carrying no id offers no read, so there is no timing to advise
+    # on. Two fields, not three — the no-id closing stays a constant one package
+    # over and is not configurable from here.
+    prompt_fields = {name for name in MailboxTool.model_fields if "closing" in name}
+
+    assert prompt_fields == {"arrival_closing"}
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        pytest.param({}, id="defaults"),
+        pytest.param(
+            {
+                "absorbed_prefix": "an em dash — a `backtick` span\nand a newline",
+                "arrival_closing": "closing — with `read_mailbox`\non two lines",
+            },
+            id="custom-text-with-em-dash-backtick-and-newline",
+        ),
+    ],
+)
+def test_the_prompt_fields_round_trip_through_pydantic_and_json(fields: dict[str, str]) -> None:
+    # Golden Rule #1b: plain serializable str fields on a ToolCard — no
+    # arbitrary_types_allowed, no PrivateAttr, nothing to hand-roll.
+    card = MailboxTool.model_validate(fields)
+
+    restored = MailboxTool.model_validate(card.model_dump())
+    assert restored == card
+
+    from_json = MailboxTool.model_validate_json(card.model_dump_json())
+    assert from_json == card
+
+    for name, value in fields.items():
+        assert getattr(restored, name) == value
+        assert getattr(from_json, name) == value
+
+
+def test_the_card_adds_no_private_attr_and_no_config_of_its_own() -> None:
+    # The prompt text is ordinary serializable configuration, so it needs no
+    # escape hatch — the card must add neither a PrivateAttr nor a ConfigDict of
+    # its own (Golden Rule #1b). Compared against the base rather than against
+    # empty: `_observer_ref` is the weak observer edge every card inherits, and
+    # `arbitrary_types_allowed` is SerializableBaseModel's, in akgentic-core.
+    assert MailboxTool.__private_attributes__ == ToolCard.__private_attributes__
+    assert MailboxTool.model_config == ToolCard.model_config
+
+
+# ── the card carries the configuration and does not act on it (the AC-5 guard) ──
+
+
+def _default_and_sentinel_cards() -> tuple[MailboxTool, MailboxTool, _FakeObserver, _FakeObserver]:
+    """One default card and one carrying sentinel text, both wired."""
+    plain, plain_observer = _wired_card()
+    sentinel, sentinel_observer = _wired_card(
+        absorbed_prefix=_SENTINEL_PREFIX, arrival_closing=_SENTINEL_CLOSING
+    )
+    return plain, sentinel, plain_observer, sentinel_observer
+
+
+def test_the_prompt_text_reaches_no_surface_the_card_serves() -> None:
+    # The card's job is to CARRY this configuration; akgentic-agent consumes it.
+    # A card that starts rendering prompt text is the regression story 37-1 undid.
+    plain, sentinel, _plain_observer, _sentinel_observer = _default_and_sentinel_cards()
+
+    plain_tools, sentinel_tools = plain.get_tools(), sentinel.get_tools()
+    assert [tool.__name__ for tool in sentinel_tools] == [tool.__name__ for tool in plain_tools]
+    assert sentinel_tools[0].__doc__ == plain_tools[0].__doc__
+
+    plain_commands, sentinel_commands = plain.get_commands(), sentinel.get_commands()
+    assert set(sentinel_commands) == set(plain_commands)
+    assert sentinel_commands[Stop].__doc__ == plain_commands[Stop].__doc__
+
+    # The card serves no LLM_CONTEXT, and carrying prompt text does not change that.
+    assert sentinel.get_context_states() == plain.get_context_states() == []
+
+    rendered = "\n".join(
+        [
+            sentinel_tools[0].__doc__ or "",
+            sentinel_commands[Stop].__doc__ or "",
+            str(sentinel.get_context_states()),
+        ]
+    )
+    assert _SENTINEL_PREFIX not in rendered
+    assert _SENTINEL_CLOSING not in rendered
+
+
+def test_read_mailbox_returns_the_same_acknowledgement_whatever_the_prompt_text_says() -> None:
+    plain, sentinel, _plain_observer, _sentinel_observer = _default_and_sentinel_cards()
+
+    plain_answer = plain.get_tools()[0](message_id="some-id")
+    sentinel_answer = sentinel.get_tools()[0](message_id="some-id")
+
+    assert sentinel_answer == plain_answer
+    assert _SENTINEL_PREFIX not in sentinel_answer
+    assert _SENTINEL_CLOSING not in sentinel_answer
+
+
+def test_stop_answers_the_same_idle_string_whatever_the_prompt_text_says() -> None:
+    plain, sentinel, _plain_observer, _sentinel_observer = _default_and_sentinel_cards()
+
+    assert sentinel.get_commands()[Stop]() == plain.get_commands()[Stop]()
+
+
+@pytest.mark.parametrize(
+    "dotted_path",
+    [
+        pytest.param("NotDotted", id="no-module-part"),
+        pytest.param("no_such_module.Thing", id="module-not-importable"),
+        pytest.param("akgentic.tool.mailbox.NoSuchClass", id="no-such-attribute"),
+        pytest.param("akgentic.tool.mailbox.MailboxTool", id="not-a-message-subclass"),
+    ],
+)
+def test_observer_wiring_is_unaffected_by_the_prompt_text(dotted_path: str) -> None:
+    # observer() resolves the whitelist and nothing else — the same four
+    # ValueError shapes, on a card carrying sentinel text.
+    card = MailboxTool(
+        mailbox_preview_handlers=[dotted_path],
+        absorbed_prefix=_SENTINEL_PREFIX,
+        arrival_closing=_SENTINEL_CLOSING,
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        card.observer(_FakeObserver())
+
+    assert dotted_path in str(excinfo.value)
+
+
+def test_a_sentinel_card_with_a_resolvable_whitelist_wires_cleanly() -> None:
+    card, observer = _wired_card(
+        mailbox_preview_handlers=["akgentic.core.messages.UserMessage"],
+        absorbed_prefix=_SENTINEL_PREFIX,
+        arrival_closing=_SENTINEL_CLOSING,
+    )
+
+    assert card.absorbed_prefix == _SENTINEL_PREFIX
+    assert card.arrival_closing == _SENTINEL_CLOSING
+    assert [tool.__name__ for tool in card.get_tools()] == ["read_mailbox"]

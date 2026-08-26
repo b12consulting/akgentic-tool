@@ -26,6 +26,8 @@ class MailboxTool(ToolCard):
     read_mailbox: ReadMailbox | bool = True
     stop: Stop | bool = True
     mailbox_preview_handlers: list[str] | None = None
+    absorbed_prefix: str = "Additional work, taken on mid-run. It does NOT replace …"
+    arrival_closing: str = "Call `read_mailbox` with one of the ids above …"
 ```
 
 Two capabilities, one channel each by default, both fields following the same `Param | bool`
@@ -35,7 +37,9 @@ else. Neither param carries a field beyond `expose` — configuration read at fa
 never tool-call schema.
 
 `mailbox_preview_handlers` is not a capability but a deployment setting; it is documented under
-[Configuration](#the-mailbox-preview-whitelist).
+[Configuration](#the-mailbox-preview-whitelist). The last two are deployment settings as well —
+prompt text this card **carries and never reads**, documented under
+[The injected prompt text](#the-injected-prompt-text).
 
 ## ToolCard fields
 
@@ -44,6 +48,8 @@ never tool-call schema.
 | `read_mailbox` | `ReadMailbox \| bool` | `True` | `{TOOL_CALL}` | The on-demand signal, exposed to the model. |
 | `stop` | `Stop \| bool` | `True` | `{COMMAND}` | The `stop` command — the `/stop` string surface. |
 | `mailbox_preview_handlers` | `list[str] \| None` | `None` | — | Dotted paths of the *handler* message classes whose runs show the mailbox preview. `None` means every handler shows it; `[]` means none does. Resolved at wiring time. |
+| `absorbed_prefix` | `str` | the wording `akgentic-agent` injects today | — | What a message absorbed through `read_mailbox` is prefixed with when it is injected. See [The injected prompt text](#the-injected-prompt-text). |
+| `arrival_closing` | `str` | the wording `akgentic-agent` injects today | — | The mid-run arrival notice's closing line, for a listing that offers at least one id. See [The injected prompt text](#the-injected-prompt-text). |
 
 Every capability is gated twice: the param must resolve, **and** its `expose` set must contain the
 channel the serving hook covers (`get_tools()` for `TOOL_CALL`, `get_commands()` for `COMMAND`). A
@@ -219,6 +225,43 @@ trip. Reading the card is always safe; wiring it to an agent is where a typo sur
 
 Building the preview itself, and deciding which of the pending messages are offered with an id, is
 `akgentic-agent`'s. This card only carries the list.
+
+### The injected prompt text
+
+```python
+MailboxTool(
+    absorbed_prefix=(
+        "Additional work, taken on mid-run. It does NOT replace what you were already asked "
+        "to do. Answer both before this run ends, one message each, unless the new message "
+        "is plainly a correction of the one in flight."
+    )
+)
+```
+
+Two `str` fields carrying the wording a mid-run mailbox arrival reads with: `absorbed_prefix`
+frames a message the model took on through `read_mailbox`, and `arrival_closing` is the last line
+of the notice announcing mail that landed while a run was in flight. Both **default to the wording
+`akgentic-agent` injects today** — the default is the text itself rather than `None`, so a catalog
+entry shows an operator what the agent is currently being told and can be judged before it is
+edited. Tuning a sentence is then a catalog edit rather than a code change, a release across two
+packages and a redeploy.
+
+> **The knob can break delivery, and it is worth knowing how.** `absorbed_prefix` opens with
+> *"It does NOT replace what you were already asked to do"*, and a deployment may delete that
+> clause. It is there because of an observed failure: an agent that had just finished a report
+> took on a newer mid-run question, answered only that, and the report reached nobody. Rewrite the
+> wording freely; keep something that says the arrival is *additional* work.
+
+**This card reads neither field.** It carries them, exactly as it carries
+`mailbox_preview_handlers`: nothing here renders prompt text, and a card constructed with either
+field set produces byte-identical tools, commands and context states to a default one.
+`akgentic-agent`'s mailbox capability picks both up at capability construction, and reads them
+**defensively**, so a card published before these fields existed still works and the two halves may
+be released in either order.
+
+There is deliberately **no third field** for the closing line of a listing that offers no id. A
+listing carrying no id offers no read, so there is no timing to advise on and nothing to configure;
+that line stays a constant in `akgentic-agent`.
 
 ### Failure modes worth knowing
 
