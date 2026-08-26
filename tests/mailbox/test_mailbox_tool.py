@@ -666,6 +666,20 @@ def test_the_card_adds_no_private_attr_and_no_config_of_its_own() -> None:
     assert MailboxTool.__private_attributes__ == ToolCard.__private_attributes__
     assert MailboxTool.model_config == ToolCard.model_config
 
+    # On the reach of the second assertion, so the next reader does not retread a
+    # dead end this one was walked down in review. Adding a PrivateAttr to the card
+    # DOES go red (verified by mutation). Re-declaring the parent's own
+    # `ConfigDict(arbitrary_types_allowed=True)` does NOT: pydantic merges a
+    # subclass's config into its parent's, and the parent already carries that flag
+    # (SerializableBaseModel's, in akgentic-core), so the merged dict compares equal.
+    #
+    # That gap cannot be closed at runtime and does not need to be. Pydantic writes
+    # `model_config` into EVERY model's class namespace, so `"model_config" not in
+    # vars(MailboxTool)` is false for a card declaring none — it cannot tell the two
+    # apart either. The distinction is erased at class construction. A redeclaration
+    # of the identical flag is also a behavioural no-op; any config that changes an
+    # effective value differs from ToolCard's and the assertion above catches it.
+
 
 # ── the card carries the configuration and does not act on it (the AC-5 guard) ──
 
