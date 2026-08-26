@@ -25,7 +25,8 @@ from akgentic.tool import MailboxTool
 class MailboxTool(ToolCard):
     read_mailbox: ReadMailbox | bool = True
     stop: Stop | bool = True
-    mailbox_preview_handlers: list[str] | None = None
+    absorbed_prefix: str = "Additional work, taken on mid-run. It does NOT replace …"
+    arrival_closing: str = "Call `read_mailbox` with one of the ids above …"
 ```
 
 Two capabilities, one channel each by default, both fields following the same `Param | bool`
@@ -34,8 +35,10 @@ instance may narrow the channels, and `False` removes **exactly that capability*
 else. Neither param carries a field beyond `expose` — configuration read at factory bind time,
 never tool-call schema.
 
-`mailbox_preview_handlers` is not a capability but a deployment setting; it is documented under
-[Configuration](#the-mailbox-preview-whitelist).
+The last two are deployment settings rather than capabilities — prompt text this card **carries and
+never reads**, documented under [The injected prompt text](#the-injected-prompt-text). Which
+messages may be absorbed mid-run is decided by the message *type*, not by a card field: see
+[Which messages may be absorbed mid-run](#which-messages-may-be-absorbed-mid-run).
 
 ## ToolCard fields
 
@@ -43,7 +46,8 @@ never tool-call schema.
 |---|---|---|---|---|
 | `read_mailbox` | `ReadMailbox \| bool` | `True` | `{TOOL_CALL}` | The on-demand signal, exposed to the model. |
 | `stop` | `Stop \| bool` | `True` | `{COMMAND}` | The `stop` command — the `/stop` string surface. |
-| `mailbox_preview_handlers` | `list[str] \| None` | `None` | — | Dotted paths of the *handler* message classes whose runs show the mailbox preview. `None` means every handler shows it; `[]` means none does. Resolved at wiring time. |
+| `absorbed_prefix` | `str` | the wording `akgentic-agent` injects today | — | What a message absorbed through `read_mailbox` is prefixed with when it is injected. See [The injected prompt text](#the-injected-prompt-text). |
+| `arrival_closing` | `str` | the wording `akgentic-agent` injects today | — | The mid-run arrival notice's closing line, for a listing that offers at least one id. See [The injected prompt text](#the-injected-prompt-text). |
 
 Every capability is gated twice: the param must resolve, **and** its `expose` set must contain the
 channel the serving hook covers (`get_tools()` for `TOOL_CALL`, `get_commands()` for `COMMAND`). A
@@ -74,27 +78,27 @@ model is expected to deal with it now. Anything left unnamed stays queued and ar
 turn later. That contract lives in the docstring the model reads, which is the only place it can
 be taught.
 
-**What makes the acknowledgement true lives in `akgentic-agent`.** That package's mailbox
-capability reads the id back off the completed tool call through `after_tool_execute`, consumes
-that one message, and injects its content into the run; the message renders itself via
-`render_for_llm()`. None of that is this card's, and none of it has shipped yet — see
-[Release coupling](#release-coupling) below.
+**What makes the acknowledgement true is `MailboxCapability`, in this package.** It reads the id
+back off the completed tool call through `after_tool_execute`, consumes that one message, and
+injects its content into the run; the message renders itself via `rendering()`. None of that
+is the *card's* — carrying configuration and serving channels is one job, acting on the mailbox is
+another — but both now ship together, so there is no cross-release window between them.
 
 That division is also why an acknowledgement is a *complete* return rather than a stub. The model
 already holds the message's preview from the arrival notice, and its content arrives through the
-agent's injection. Returning the body here as well would make the card a second carrier of one
+capability's injection. Returning the body here as well would make the card a second carrier of one
 fact — the same duplication that got the card's `LLM_CONTEXT` half deleted in epic 34.
 
 #### `message_id` is a contract with another repository
 
 The documented signature is `read_mailbox(message_id: str) -> str`, and the parameter name is part
-of the contract: `akgentic-agent`'s capability reads the id out of the completed tool call's
-arguments **by name**. Rename it to `msg_id` or `id` and this package's suite stays green, the
-agent's suite stays green, and in production the model names a message and silently receives
-nothing — no exception, no log line. Neither test suite can detect the mismatch.
+of the contract: `MailboxCapability` reads the id out of the completed tool call's arguments **by
+name**, through the `MESSAGE_ID_ARG` constant. Rename one side only and the suite stays green while
+in production the model names a message and silently receives nothing — no exception, no log line.
 
-Renaming it is therefore a coordinated two-repository change with a joint release, never a local
-tidy-up.
+Both sides now live in this package, so a rename is a local change rather than a coordinated
+two-repository release — but it is still a rename of *two* things, and the type system will not
+tell you if you do one.
 
 This is in-life code, so the raising accessor form applies: calling `read_mailbox` after the owning
 agent stopped raises `ToolObserverGone` — a defined outcome, not a crash. The liveness check is
@@ -113,9 +117,11 @@ dequeued into a handler. There is therefore exactly one thing a dispatched `/sto
 saying it beats silence: a human who typed `/stop` and heard nothing back cannot tell a no-op from
 a failure.
 
-Its real effect is mid-run, and that effect is not implemented here: a `/stop` message sitting in a
-busy agent's mailbox is recognised by the agent-side cancel hook, which is `akgentic-agent`'s
-enforcement. Nothing in this card raises, tracks, or interrupts.
+Its real effect is mid-run, and it is not the *card* that delivers it: a `/stop` sitting in a busy
+agent's mailbox is recognised by `MailboxCapability.before_model_request`, which purges it and
+raises. Nothing in this card raises, tracks, or interrupts. `BaseAgent` builds that capability for
+every agent and `act()` catches the error — the enforcement stays `akgentic-agent`'s, which is what
+keeps cancellation impossible to de-configure.
 
 The registry's `dispatch` and `_invoke` keep their `str | None` signature. *A command may decide it
 has nothing to say* is a general primitive of the command system; `/stop` merely stops being its
@@ -125,13 +131,21 @@ first user.
 
 ## Where the cancel vocabulary lives
 
-**Not here.** `is_cancel` and `render_arrival_notice` used to be exported from
-`akgentic.tool.mailbox`; they now live in `akgentic-agent`, beside the enforcement that uses them,
-in `akgentic/agent/capabilities/mailbox_capability.py`.
+**Here, in `capability.py`, beside the card.** `is_cancel` and `render_arrival_notice` are exported
+from `akgentic.tool.mailbox` along with `MailboxCapability` itself.
 
-The reason is ownership, not tidiness: `BaseAgent` builds its cancel capability **unconditionally**,
-precisely so that an agent configured with no `MailboxTool` at all is still interruptible. A
-predicate shipping with this card cannot serve that case — there is no card to import it from.
+They spent a while in `akgentic-agent`, on the argument that `BaseAgent` builds the capability
+**unconditionally** — so an agent configured with no `MailboxTool` is still interruptible — and a
+predicate shipping with the card could not serve that case, there being no card to import it from.
+Two things retired that argument: `BaseAgent` auto-inserts a default `MailboxTool` when the config
+carries none, so the card is never absent; and this package is a hard dependency of
+`akgentic-agent`, so what ships here is never unavailable there.
+
+The property the argument protected is untouched. Cancellation still cannot be de-configured,
+because it rests on the *wiring* being unconditional — `BaseAgent` builds the capability for every
+agent and `act()` catches `RunInterruptedError` — not on which package the code sits in. What the
+move buys is that card, capability and vocabulary are one subject in one repository: a mailbox
+change is one story instead of two, with no release in between.
 
 The card holds no cancel predicate of its own, not even a private one. Keeping a cancel out of what
 the model is offered is `akgentic-agent`'s offer rule, on the same side of the boundary as the
@@ -158,7 +172,7 @@ return is a subset of what was asked for. The removal telemetry — one `Handled
 — is emitted by `consume_mailbox` itself, so no call site can forget it and none can double it.
 
 **Neither method is called by this card.** The protocol is unchanged and both methods are still
-needed, but their caller is now `akgentic-agent`'s mailbox capability: it peeks to build the
+needed, but their caller is `MailboxCapability` rather than the card: it peeks to build the
 arrival notice that offers the model a message id, and consumes the one message the model went on
 to name. `Akgent` provides both, so no agent-side change was needed to satisfy the protocol.
 Conformance is a documented precondition rather than a runtime gate: observers are duck-typed, so
@@ -179,46 +193,81 @@ MailboxTool(stop=False)           # no cancellation surface
 MailboxTool(read_mailbox=ReadMailbox(expose={TOOL_CALL}))  # explicit param form
 ```
 
-### The mailbox preview whitelist
+### Which messages may be absorbed mid-run
+
+**Decided by the type, not by a setting.** A class extends `MailboxMessage` to declare it can
+travel through a mailbox:
 
 ```python
-MailboxTool(mailbox_preview_handlers=["akgentic.agent.messages.AgentMessage"])
+from akgentic.tool.mailbox import MailboxMessage
+
+class AgentMessage(MailboxMessage):
+    def rendering(self) -> str: ...
+    def rendering_preview(self) -> str: ...
 ```
 
-> The example path is what a deployment actually writes, and it is deliberately not something this
-> package can resolve on its own: `akgentic-agent` is a dependency of the deployment, not of
-> `akgentic-tool`. That is exactly why the setting is a string resolved at runtime rather than a
-> class — and why this value must not be copied into a test in this package, where the class is
-> absent from CI.
+Both methods are **required**, and the base raises `NotImplementedError` for either one a subclass
+leaves unanswered. A message that can be delivered can be listed, so there is no coherent class that
+renders but declines a preview — and an optional preview returning `None` would be a second way of
+saying "not offerable", competing with the rule that already decides it.
 
-`mailbox_preview_handlers` narrows *when* the model is offered its mailbox. Four things about it:
+Opting out is one mechanism only: **do not extend `MailboxMessage`.** A class that declares
+`rendering()` alone still satisfies `LlmRenderable` and can be handed to `act()`; it is simply never
+offered an id in the arrival notice. `TriageMessage` in `akgentic-agent`'s exemplar is the worked
+case.
 
-- **It names the handler's message class** — the message the agent is *currently handling* — not
-  the mail waiting in the box. An entry says "runs that started from one of these show the
-  preview", never "show me messages of this type".
-- **`None` (the default) means every handler shows the preview.**
-- **`[]` means none does.** It is a different value from `None` and is never coerced back to it: an
-  empty list is a deployment saying *no handler*, and it is honoured as written.
-- **Every entry is resolved when the card is wired to an observer** — agent init, via the
-  `observer()` override. A bad entry raises `ValueError` naming the offending string, so a typo
-  fails before the agent's first run rather than going quiet for its whole life.
+The offer filter then adds two conditions of its own: the pending message's class must be *exactly*
+the class being handled (same class means same handler means same output type, so an absorbed
+message is answered in the shape its own handler would have produced), and it must not be a cancel.
 
-The `ValueError` covers four shapes, all configuration defects:
+> **A `mailbox_preview_handlers` field used to do this**, naming handler classes by dotted path,
+> resolved at agent init with four `ValueError` shapes for a malformed entry. It is gone and nothing
+> replaced it: the type and the exact-class match already decided exactly what it decided, at no
+> configuration cost. The coarse switch survives as `read_mailbox=False`, which suppresses the
+> notice outright.
 
-| Shape | Example |
-|---|---|
-| The path carries no module part | `"AgentMessage"` |
-| The module is not importable | `"akgentic.agent.mesages.AgentMessage"` |
-| The module has no such attribute | `"akgentic.agent.messages.AgnetMessage"` |
-| The path resolves to something that is not a `Message` subclass | `"akgentic.tool.mailbox.MailboxTool"` |
+### The injected prompt text
 
-**Constructing or deserializing the card never raises.** Validation is a wiring-time event on
-purpose: a field validator would make a card carrying a perfectly valid entry impossible to load in
-any process where that class happens not to be importable — a catalog reader, a serialization round
-trip. Reading the card is always safe; wiring it to an agent is where a typo surfaces.
+```python
+MailboxTool(
+    absorbed_prefix=(
+        "Additional work, taken on mid-run. It does NOT replace what you were already asked "
+        "to do. Answer both before this run ends, one message each, unless the new message "
+        "is plainly a correction of the one in flight."
+    )
+)
+```
 
-Building the preview itself, and deciding which of the pending messages are offered with an id, is
-`akgentic-agent`'s. This card only carries the list.
+Two `str` fields carrying the wording a mid-run mailbox arrival reads with: `absorbed_prefix`
+frames a message the model took on through `read_mailbox`, and `arrival_closing` is the last line
+of the notice announcing mail that landed while a run was in flight. Both **default to the wording
+`akgentic-agent` injects today** — the default is the text itself rather than `None`, so a catalog
+entry shows an operator what the agent is currently being told and can be judged before it is
+edited. Tuning a sentence is then a catalog edit rather than a code change, a release across two
+packages and a redeploy.
+
+> **The knob can break delivery, and it is worth knowing how.** `absorbed_prefix` opens with
+> *"It does NOT replace what you were already asked to do"*, and a deployment may delete that
+> clause. It is there because of an observed failure: an agent that had just finished a report
+> took on a newer mid-run question, answered only that, and the report reached nobody. Rewrite the
+> wording freely; keep something that says the arrival is *additional* work.
+
+**This card reads neither field.** It carries them, exactly as it carries
+any other field: nothing here renders prompt text, and a card constructed with either
+field set produces byte-identical tools, commands and context states to a default one.
+**The whole card is handed to `MailboxCapability`** (`capability.py`, same package), which reads
+these two fields — and `read_mailbox` — off it at construction.
+`BaseAgent` passes the card and unpacks nothing, holding no knowledge of which fields the mailbox
+needs. The card is a required argument, so a card predating these fields fails loudly rather than
+quietly running wording nobody can see in the catalog.
+
+An empty string is the one value that does not reach the model: it falls back to the capability's
+own constant, because honouring `""` would ship a mid-run injection with no framing at all — the
+failure the paragraph above describes.
+
+There is deliberately **no third field** for the closing line of a listing that offers no id. A
+listing carrying no id offers no read, so there is no timing to advise on and nothing to configure;
+that line stays a constant in `akgentic-agent`.
 
 ### Failure modes worth knowing
 
@@ -246,21 +295,21 @@ What the card contributes is the string surface: `/stop` registered, announced v
 `CommandsAnnouncedEvent`, and answered when it dispatches while idle.
 
 The delivery half of `read_mailbox` — consuming the named message and injecting its content, the
-message rendering itself, and the offer rule that decides which messages are shown with an id —
-is likewise `akgentic-agent`'s, and is **not yet released**.
+message rendering itself, and the offer rule deciding which messages are shown with an id — is
+`MailboxCapability`, in this package, beside the card.
 
 ### Release coupling
 
-**This package must not be released alone.** Released ahead of the agent half,
-`read_mailbox(message_id)` returns an acknowledgement and delivers nothing, and an agent still
-running the older code emits an arrival notice telling the model to call `read_mailbox` with no
-argument at all — which the new signature rejects.
+**The signal and its delivery ship together, which is the point of them sharing a package.** They
+were split across two repositories once, and the split had a real cost: releasing this package
+ahead of the agent half left `read_mailbox(message_id)` acknowledging and delivering nothing, while
+an agent on older code emitted a notice telling the model to call `read_mailbox` with no argument —
+which the new signature rejected. Inert but noisy: retries burned, tokens spent, nothing lost,
+self-healing once the other release landed. That window no longer exists.
 
-The window is **inert but noisy**: retries are burned and tokens spent on a call the model cannot
-satisfy, but nothing is lost. The card consumes nothing, so every unread message still arrives as
-its own turn — the designed fallback. It self-heals the moment the agent release lands. Merge both
-halves, release this package first, and release `akgentic-agent` immediately after with its floor
-raised.
+What remains is a one-directional floor: `akgentic-agent` imports `MailboxCapability` from here and
+passes it a card, so it needs a release of this package carrying both. The reverse is not true —
+this package depends on `akgentic-core` alone and knows nothing of `akgentic-agent`.
 
 ### Import paths
 

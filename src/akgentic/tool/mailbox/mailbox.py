@@ -27,11 +27,9 @@ the agent's offer rule now (ADR-010 §7), not a filter here.
 from __future__ import annotations
 
 from collections.abc import Callable
-from importlib import import_module
 from inspect import cleandoc
 from typing import Any
 
-from akgentic.core.messages import Message
 from akgentic.tool.core import (
     COMMAND,
     TOOL_CALL,
@@ -39,7 +37,6 @@ from akgentic.tool.core import (
     ToolCard,
     _resolve,
 )
-from akgentic.tool.core.observer import ToolObserver
 from akgentic.tool.errors import ToolObserverGone
 from akgentic.tool.mailbox.params import ReadMailbox, Stop
 
@@ -48,60 +45,6 @@ _ACKNOWLEDGED = (
 )
 
 _NOTHING_TO_CANCEL = "There is no run to cancel."
-
-
-def _resolve_message_class(dotted_path: str) -> type[Message]:
-    """Import *dotted_path* and check it names a ``Message`` subclass.
-
-    Deliberately **not** ``akgentic.tool.notification.models.resolve_message_class``,
-    and deliberately not shared with it. That one additionally requires the class
-    to declare ``content`` and ``type``, because a notification's payload is
-    written into those two fields. Here there is no payload: an entry only names
-    a handler whose runs show the mailbox preview, and a message class is under no
-    obligation to have either field — the classes this whitelist exists to name
-    are precisely the ones carrying their own fields instead. Do not deduplicate
-    the two.
-
-    No check for ``mailbox_preview()`` either: that Protocol belongs to
-    ``akgentic-agent`` (ADR-010 §2), which this package may not import and whose
-    vocabulary it is not entitled to.
-
-    Args:
-        dotted_path: Dotted import path of a handler's message class.
-
-    Returns:
-        The resolved class.
-
-    Raises:
-        ValueError: When the path carries no module part, names a module that is
-            not importable, names an attribute the module does not have, or
-            resolves to something that is not a ``Message`` subclass. All four
-            are configuration defects and surface at wiring time.
-    """
-    module_path, _, class_name = dotted_path.rpartition(".")
-    if not module_path:
-        raise ValueError(
-            f"mailbox_preview_handlers entry {dotted_path!r} is not a dotted path to a class."
-        )
-    try:
-        module = import_module(module_path)
-    except ImportError as exc:
-        raise ValueError(
-            f"mailbox_preview_handlers entry {dotted_path!r} is not importable: {exc}"
-        ) from exc
-
-    resolved = getattr(module, class_name, None)
-    if resolved is None:
-        raise ValueError(
-            f"mailbox_preview_handlers entry {dotted_path!r} is not importable: "
-            f"module {module_path!r} has no attribute {class_name!r}."
-        )
-    if not (isinstance(resolved, type) and issubclass(resolved, Message)):
-        raise ValueError(
-            f"mailbox_preview_handlers entry {dotted_path!r} resolves to {resolved!r}, "
-            f"which is not a Message subclass."
-        )
-    return resolved
 
 
 class MailboxTool(ToolCard):
@@ -114,53 +57,22 @@ class MailboxTool(ToolCard):
             capability and nothing else.
         stop: The ``stop`` command (``/stop`` surface) on ``COMMAND``.
             Same ``Param | bool`` convention.
-        mailbox_preview_handlers: Dotted paths of the *handler* message classes
-            whose runs show the mailbox preview — the message the agent is
-            currently handling, not the mail waiting in the box. ``None`` (the
-            default) means every handler shows it; ``[]`` means none does, which
-            is a different value and is never coerced back to ``None``. Every
-            entry is resolved when the card is wired to an observer, so a typo
-            raises at agent init rather than going quiet for the agent's life.
     """
 
     read_mailbox: ReadMailbox | bool = True
     stop: Stop | bool = True
-    mailbox_preview_handlers: list[str] | None = None
-
-    def observer(self, observer: ToolObserver) -> MailboxTool:
-        """Store the observer, then resolve every whitelisted handler class.
-
-        This is agent init: ``ToolFactory.__init__`` calls this hook for every
-        card it holds, and ``BaseAgent`` builds its factory with ``observer=self``
-        — so an unresolvable entry stops the agent before its first run.
-
-        Validation lives here rather than in a Pydantic validator on purpose. A
-        field validator would raise at *construction*, making a card carrying a
-        perfectly valid entry impossible to deserialize in any process where that
-        class happens not to be importable — a catalog reader, a serialization
-        round trip. It does not live in ``get_tools`` either: that returns early
-        when ``read_mailbox`` is disabled, so a typo on a disabled capability
-        would never be seen.
-
-        The parameter keeps the base ``ToolObserver`` type so the override stays
-        substitutable — ``ToolFactory`` attaches one observer to every card
-        uniformly.
-
-        Args:
-            observer: The owning agent, held weakly by the base class.
-
-        Returns:
-            Self, enabling method chaining.
-
-        Raises:
-            ValueError: If any ``mailbox_preview_handlers`` entry does not
-                resolve to a ``Message`` subclass. The message names the
-                offending path.
-        """
-        super().observer(observer)
-        for dotted_path in self.mailbox_preview_handlers or []:
-            _resolve_message_class(dotted_path)
-        return self
+    absorbed_prefix: str = (
+        "Additional work, taken on mid-run. It does NOT replace what you were already asked "
+        "to do. It may be a separate request, in which case answer both before this run ends, "
+        "one message each in your output; or it may add to or correct the request already in "
+        "flight, in which case one message answers both. When unsure, answer separately."
+    )
+    arrival_closing: str = (
+        "Call `read_mailbox` with one of the ids above to take that message on now — worth doing "
+        "if it may add to or change what you are working on, since a correction only helps before "
+        "the work is finished. Otherwise finish your current work first — you will get them just "
+        "after."
+    )
 
     def get_tools(self) -> list[Callable[..., Any]]:
         """Return ``read_mailbox`` when its capability serves ``TOOL_CALL``."""
