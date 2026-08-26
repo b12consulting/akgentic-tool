@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 import gc
 import inspect
-import json
 import uuid
 from pathlib import Path
 
@@ -13,7 +12,7 @@ import pytest
 from akgentic.core.messages import Message
 
 from akgentic.tool import ToolFactory
-from akgentic.tool.core import COMMAND, LLM_CONTEXT, TOOL_CALL, ToolCard
+from akgentic.tool.core import COMMAND, LLM_CONTEXT, ToolCard
 from akgentic.tool.errors import ToolObserverGone
 from akgentic.tool.mailbox import (
     MailboxTool,
@@ -274,10 +273,23 @@ def test_the_rendering_and_cancel_machinery_is_gone_from_the_module(name: str) -
     assert not hasattr(MailboxTool, name)
 
 
-def test_message_stays_because_the_whitelist_resolver_needs_it() -> None:
+def test_the_preview_whitelist_is_gone_with_its_resolver() -> None:
+    """Replaced by the type, not by another setting.
+
+    ``mailbox_preview_handlers`` named by dotted path which handlers' runs could
+    be offered the mailbox. ``MailboxMessage`` says the same thing in the class:
+    a message is offerable when it extends that base and answers
+    ``rendering_preview()``, and the offer filter's exact-class match means
+    declining a preview excludes its own handler's runs too. The field, the
+    dotted-path resolver and its four ``ValueError`` shapes all go with it.
+    """
     import akgentic.tool.mailbox.mailbox as mailbox_module
 
-    assert mailbox_module.Message is Message
+    assert "mailbox_preview_handlers" not in MailboxTool.model_fields
+    assert not hasattr(mailbox_module, "_resolve_message_class")
+    # The card no longer overrides observer() at all: it had nothing left to
+    # validate, so it falls through to ToolCard's.
+    assert "observer" not in vars(MailboxTool)
 
 
 def test_no_module_under_src_imports_from_the_agent_package() -> None:
@@ -312,142 +324,7 @@ def test_no_module_under_src_imports_from_the_agent_package() -> None:
 # ── the whitelist field (AC 4, AC 6) ─────────────────────────────────────────
 
 
-def test_the_whitelist_defaults_to_none_meaning_every_handler_shows_the_preview() -> None:
-    assert MailboxTool().mailbox_preview_handlers is None
-
-
-@pytest.mark.parametrize(
-    "handlers",
-    [
-        pytest.param(None, id="none"),
-        pytest.param([], id="empty"),
-        pytest.param(["akgentic.core.messages.UserMessage"], id="populated"),
-    ],
-)
-def test_the_whitelist_round_trips_unchanged(handlers: list[str] | None) -> None:
-    card = MailboxTool(mailbox_preview_handlers=handlers)
-    restored = MailboxTool.model_validate(card.model_dump())
-
-    assert restored == card
-    assert restored.mailbox_preview_handlers == handlers
-
-
-def test_empty_list_is_not_coerced_to_none_on_round_trip() -> None:
-    # None and [] are different values: None means every handler shows the
-    # preview, [] means none does. Collapsing them would silently re-enable it.
-    restored = MailboxTool.model_validate(MailboxTool(mailbox_preview_handlers=[]).model_dump())
-
-    assert restored.mailbox_preview_handlers == []
-    assert restored.mailbox_preview_handlers is not None
-
-
-def test_the_whitelist_survives_a_json_round_trip_as_plain_strings() -> None:
-    # Golden Rule #1b: the whitelist names classes as strings precisely so the
-    # card stays JSON-serializable — a resolved `type[Message]` on the model
-    # would need an arbitrary-types escape hatch and would not survive a catalog.
-    card = MailboxTool(mailbox_preview_handlers=["akgentic.core.messages.UserMessage"])
-
-    encoded = json.dumps(card.model_dump(mode="json"))
-    restored = MailboxTool.model_validate(json.loads(encoded))
-
-    assert restored.mailbox_preview_handlers == ["akgentic.core.messages.UserMessage"]
-
-
 # ── the whitelist is validated at wiring, not at construction (AC 5, AC 6) ───
-
-
-@pytest.mark.parametrize(
-    "dotted_path",
-    [
-        pytest.param("NotDotted", id="no-module-part"),
-        pytest.param("no_such_module.Thing", id="module-not-importable"),
-        pytest.param("akgentic.tool.mailbox.NoSuchClass", id="no-such-attribute"),
-        pytest.param("akgentic.tool.mailbox.MailboxTool", id="not-a-message-subclass"),
-    ],
-)
-def test_wiring_an_unresolvable_handler_raises_value_error_naming_the_path(
-    dotted_path: str,
-) -> None:
-    # Dotted paths are stringly typed: a rename breaks one silently, and the
-    # capability it gates then never fires again for the agent's whole life.
-    card = MailboxTool(mailbox_preview_handlers=[dotted_path])
-    observer = _FakeObserver()
-
-    with pytest.raises(ValueError) as excinfo:
-        card.observer(observer)
-
-    assert dotted_path in str(excinfo.value)
-
-
-def test_an_unresolvable_entry_is_caught_even_when_the_read_capability_is_off() -> None:
-    # get_tools() returns early when read_mailbox is False, so validating there
-    # would let a typo through on exactly the cards nobody reads back.
-    card = MailboxTool(read_mailbox=False, mailbox_preview_handlers=["NotDotted"])
-
-    with pytest.raises(ValueError):
-        card.observer(_FakeObserver())
-
-
-def test_the_offending_entry_is_named_even_among_valid_ones() -> None:
-    card = MailboxTool(
-        mailbox_preview_handlers=["akgentic.core.messages.UserMessage", "no_such_module.Thing"]
-    )
-
-    with pytest.raises(ValueError) as excinfo:
-        card.observer(_FakeObserver())
-
-    assert "no_such_module.Thing" in str(excinfo.value)
-
-
-@pytest.mark.parametrize(
-    "dotted_path",
-    ["NotDotted", "no_such_module.Thing", "akgentic.tool.mailbox.MailboxTool"],
-)
-def test_constructing_or_deserializing_a_bad_entry_never_raises(dotted_path: str) -> None:
-    # Validation is a wiring-time event. A field validator would make a card
-    # carrying a perfectly valid entry undeserializable wherever that class
-    # happens not to be importable — a catalog reader, a serialization round trip.
-    assert MailboxTool(mailbox_preview_handlers=[dotted_path]).mailbox_preview_handlers == [
-        dotted_path
-    ]
-    assert MailboxTool.model_validate(
-        {"mailbox_preview_handlers": [dotted_path]}
-    ).mailbox_preview_handlers == [dotted_path]
-
-
-@pytest.mark.parametrize(
-    "handlers",
-    [
-        pytest.param(None, id="none-means-all"),
-        pytest.param([], id="empty-means-none"),
-        pytest.param(["akgentic.core.messages.UserMessage"], id="a-core-message"),
-        # Built, never hardcoded: akgentic-agent is not installed in this
-        # package's CI, so no test may name a class under it in either polarity.
-        pytest.param([f"{_Probe.__module__}.{_Probe.__name__}"], id="a-locally-declared-message"),
-        pytest.param(
-            ["akgentic.core.messages.UserMessage", f"{_Probe.__module__}.{_Probe.__name__}"],
-            id="both",
-        ),
-    ],
-)
-def test_a_resolvable_whitelist_wires_cleanly(handlers: list[str] | None) -> None:
-    card, observer = _wired_card(mailbox_preview_handlers=handlers)
-
-    assert card.mailbox_preview_handlers == handlers
-    assert [tool.__name__ for tool in card.get_tools()] == ["read_mailbox"]
-
-
-def test_a_handler_class_without_a_content_field_is_accepted() -> None:
-    # The resolver deliberately does not require content/type, unlike the
-    # notification one. Requiring them would reject exactly the classes this
-    # whitelist exists to name — the ones carrying their own fields.
-    assert "content" not in _Probe.model_fields
-
-    card, observer = _wired_card(
-        mailbox_preview_handlers=[f"{_Probe.__module__}.{_Probe.__name__}"]
-    )
-
-    assert card.mailbox_preview_handlers is not None
 
 
 # ── stop (FR5, AC 7) ─────────────────────────────────────────────────────────
@@ -483,23 +360,37 @@ def test_stop_still_announces_a_description_to_the_command_palette() -> None:
 # ── ownership: the cancel vocabulary lives with the enforcement, not the card ──
 
 
-def test_cancel_vocabulary_is_not_importable_from_this_package() -> None:
-    # The card's exclusion filter is gone entirely — the cancel filter moved to
-    # the agent's offer rule — and must not reappear as a public vocabulary here.
+def test_cancel_vocabulary_and_capability_ship_from_this_package() -> None:
+    # Reverses an earlier rule that pinned the opposite. The vocabulary lived in
+    # akgentic-agent on the argument that a capability built unconditionally
+    # must not depend on a card that may be absent; BaseAgent auto-inserts a
+    # default MailboxTool, so the card is never absent and the argument is spent.
+    # Card, capability and vocabulary are one subject and now ship together.
     import akgentic.tool.mailbox as mailbox_module
+    from akgentic.tool.mailbox import (  # noqa: F401
+        MailboxCapability,
+        RunInterruptedError,
+        is_cancel,
+        render_arrival_notice,
+    )
 
-    with pytest.raises(ImportError):
-        from akgentic.tool.mailbox import is_cancel  # noqa: F401
-    with pytest.raises(ImportError):
-        from akgentic.tool.mailbox import render_arrival_notice  # noqa: F401
+    for name in ("is_cancel", "render_arrival_notice", "MailboxCapability"):
+        assert name in dir(mailbox_module)
 
-    assert "is_cancel" not in dir(mailbox_module)
-    assert "render_arrival_notice" not in dir(mailbox_module)
+
+def test_the_card_itself_still_uses_none_of_the_vocabulary() -> None:
+    # The half of the old rule that survives, and the one worth guarding: living
+    # in the same package must not tempt the CARD into filtering or rendering.
+    # It carries configuration; the capability acts on it.
+    source = inspect.getsource(MailboxTool)
+
+    for name in ("is_cancel", "render_arrival_notice", "MailboxCapability"):
+        assert name not in source
 
 
 def test_mailbox_tool_observer_still_imports_from_the_package_root() -> None:
-    # The agent's capability module imports this symbol from exactly this path,
-    # and still calls both mailbox methods even though the card no longer does.
+    # The capability imports this symbol from exactly this path, and still calls
+    # both mailbox methods even though the card no longer does.
     from akgentic.tool.mailbox import MailboxToolObserver as ObserverProtocol
 
     assert isinstance(_FakeObserver(), ObserverProtocol)
@@ -549,20 +440,6 @@ def test_card_with_disabled_param_round_trips(field: str) -> None:
     restored = MailboxTool.model_validate(card.model_dump())
     assert restored == card
     assert getattr(restored, field) is False
-
-
-def test_card_with_explicit_params_round_trips() -> None:
-    card = MailboxTool(
-        read_mailbox=ReadMailbox(instructions="prefer wrapping up", expose={TOOL_CALL}),
-        stop=Stop(),
-        mailbox_preview_handlers=["akgentic.core.messages.UserMessage"],
-    )
-    restored = MailboxTool.model_validate(card.model_dump())
-    assert restored == card
-    assert isinstance(restored.read_mailbox, ReadMailbox)
-    assert restored.read_mailbox.instructions == "prefer wrapping up"
-    assert isinstance(restored.stop, Stop)
-    assert restored.mailbox_preview_handlers == ["akgentic.core.messages.UserMessage"]
 
 
 # ── the injected prompt text: two fields the card carries and never reads ────
@@ -736,38 +613,3 @@ def test_stop_answers_the_same_idle_string_whatever_the_prompt_text_says() -> No
 
     assert sentinel.get_commands()[Stop]() == plain.get_commands()[Stop]()
 
-
-@pytest.mark.parametrize(
-    "dotted_path",
-    [
-        pytest.param("NotDotted", id="no-module-part"),
-        pytest.param("no_such_module.Thing", id="module-not-importable"),
-        pytest.param("akgentic.tool.mailbox.NoSuchClass", id="no-such-attribute"),
-        pytest.param("akgentic.tool.mailbox.MailboxTool", id="not-a-message-subclass"),
-    ],
-)
-def test_observer_wiring_is_unaffected_by_the_prompt_text(dotted_path: str) -> None:
-    # observer() resolves the whitelist and nothing else — the same four
-    # ValueError shapes, on a card carrying sentinel text.
-    card = MailboxTool(
-        mailbox_preview_handlers=[dotted_path],
-        absorbed_prefix=_SENTINEL_PREFIX,
-        arrival_closing=_SENTINEL_CLOSING,
-    )
-
-    with pytest.raises(ValueError) as excinfo:
-        card.observer(_FakeObserver())
-
-    assert dotted_path in str(excinfo.value)
-
-
-def test_a_sentinel_card_with_a_resolvable_whitelist_wires_cleanly() -> None:
-    card, observer = _wired_card(
-        mailbox_preview_handlers=["akgentic.core.messages.UserMessage"],
-        absorbed_prefix=_SENTINEL_PREFIX,
-        arrival_closing=_SENTINEL_CLOSING,
-    )
-
-    assert card.absorbed_prefix == _SENTINEL_PREFIX
-    assert card.arrival_closing == _SENTINEL_CLOSING
-    assert [tool.__name__ for tool in card.get_tools()] == ["read_mailbox"]
