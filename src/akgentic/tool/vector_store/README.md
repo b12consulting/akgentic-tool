@@ -89,6 +89,75 @@ the same card is reused across every team in a catalog.
 `PlanningTool` creates `planning`, `KnowledgeGraphTool` creates `knowledge_graph`. The
 `CollectionConfig` therefore lives on the *consumer* card, not here.
 
+**Keyword search.** The backends answer pure similarity queries — `search` takes a vector and
+nothing else, and neither backend is ever asked for text. The lexical half of a hybrid search runs
+in the calling actor, over its own authoritative state. See below for why.
+
+---
+
+## Hybrid search lives here, not in the backends
+
+`akgentic.tool.vector_store.hybrid` owns the one rule that combines keyword and vector hits. Both
+`KnowledgeGraphActor` and `PlanActor` search through it, so they rank identically.
+
+```python
+from akgentic.tool.vector_store.hybrid import hybrid_search
+
+result = hybrid_search(
+    keyword_keys,            # ref_ids the caller's own keyword phase found
+    vs_proxy, "planning", "deployment plan",
+    top_k=10,
+    score_threshold=0.5,     # minimum *raw* cosine, before normalisation
+    alpha=0.7,
+)
+result.ranked          # [(ref_id, fused score)], best first, NOT cut to top_k
+result.vector_scores   # raw cosine per ref_id, for callers that render a score
+```
+
+### The rule
+
+Weaviate's `relativeScoreFusion` — the default behind `collection.query.hybrid()` — reproduced
+in Python:
+
+```
+score = alpha * norm(cosine) + (1 - alpha) * keyword
+```
+
+Each leg is min-max normalised onto `[0, 1]`. The keyword leg is an *indicator*, not a normalised
+score: the lexical match is a substring test, so every keyword hit is equally good and normalising
+a flat list yields `1.0` throughout. Three outcomes follow:
+
+| Hit found by | Score at `alpha = 0.7` |
+|---|---|
+| vector only | `0.7 × norm(cosine)` — `0.7` for the strongest hit in the set, `0.0` for the weakest |
+| keyword only | `0.3` |
+| both | the sum |
+
+`alpha` defaults to `0.7`, the value the Weaviate client sends. **This weights semantics above
+lexical matching:** a strong vector hit at `0.7` outranks a keyword-only hit at `0.3`. Set
+`hybrid_alpha` below `0.5` on `PlanningTool` or `KnowledgeGraphTool` to invert that, which is the
+right call when your lexical matches are the precise ones — exact ids, product names, error codes.
+
+### Two consequences worth knowing before you tune it
+
+**Normalisation is relative, so scores compare only within one query.** A result set whose cosines
+are `0.9 / 0.7 / 0.5` fuses exactly like one at `0.5 / 0.3 / 0.1`. The weakest vector hit always
+normalises to `0.0` however good its absolute cosine was — most visible on small result sets. This
+is Weaviate's behaviour, kept deliberately so a collection moved to a cluster does not reorder.
+
+**`score_threshold` gates the vector leg only, on the raw cosine, before normalisation.** That
+keeps its absolute meaning, and means a keyword hit can never be dropped by it. The two are on
+different scales by design.
+
+### Why not push it into the backend?
+
+Weaviate can do hybrid natively and the in-memory index cannot, so putting the rule behind the
+backend seam would make the same data rank differently on the two backends — dev on in-memory,
+production on Weaviate. It also could not reproduce today's recall: the embedded text is
+`f"{entity.name}: {entity.description}"`, which omits `entity_type`, and ingest is best-effort, so
+BM25 over the stored `text` would silently miss what the in-process scan finds. Revisit when the
+store is an authoritative index of the graph rather than a lossy projection of it.
+
 ---
 
 ## Collection configuration (on the consumer card)

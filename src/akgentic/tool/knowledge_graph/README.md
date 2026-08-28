@@ -27,6 +27,7 @@ class KnowledgeGraphTool(ToolCard):
     collection: CollectionConfig = CollectionConfig()
     search_top_k: int = 10
     search_score_threshold: float = 0.3
+    hybrid_alpha: float = 0.7
 
     # Capabilities
     get_graph: GetGraph | bool = True
@@ -75,12 +76,13 @@ it by name during `on_start`.
 | `workspace_path` | `str \| None` | `None` | Path when `persistence="workspace"`. |
 | `tenant` | `str \| None` | `None` | Weaviate tenant id. |
 
-### `search_top_k` / `search_score_threshold`
+### `search_top_k` / `search_score_threshold` / `hybrid_alpha`
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `search_top_k` | `int` | `10` | Default hit count; a `SearchQuery.top_k` overrides it. |
-| `search_score_threshold` | `float` | `0.3` | Minimum cosine similarity; `SearchQuery.score_threshold` overrides it. Deliberately lower than `PlanningTool`'s `0.5` — graph exploration favours recall. |
+| `search_score_threshold` | `float` | `0.3` | Minimum **raw** cosine similarity, applied to the vector leg before fusion; `SearchQuery.score_threshold` overrides it. Deliberately lower than `PlanningTool`'s `0.5` — graph exploration favours recall. A keyword hit is never dropped by it. |
+| `hybrid_alpha` | `float` (0–1) | `0.7` | Weight of the vector leg when fusing; the keyword leg gets `1 - alpha`. Below `0.5` a keyword match outranks a strong semantic hit. See [the fusion rule](../vector_store/README.md#hybrid-search-lives-here-not-in-the-backends). |
 
 ### `read_only`
 
@@ -175,7 +177,7 @@ class SearchQuery(SerializableBaseModel):
 
 | Field | Effect |
 |---|---|
-| `mode` | `"hybrid"` unions keyword and semantic hits; `"keyword"` is substring-only and makes **no embedding call**; `"vector"` is cosine similarity only. |
+| `mode` | `"hybrid"` fuses keyword and semantic hits; `"keyword"` is substring-only and makes **no embedding call**; `"vector"` is cosine similarity only, and returns raw cosines rather than fused scores. |
 | `include_neighbors` | Adds the 1-hop neighbours of every entity hit to `SearchResult.neighbors`. |
 | `include_edges` | Adds every relation connected to an entity hit to `SearchResult.connected_relations`. |
 | `find_paths` | BFS shortest paths between the top 5 entity hits, capped at 10 pairs, into `SearchResult.paths` as alternating `[Entity, Relation, Entity, …]` lists. |
@@ -183,8 +185,17 @@ class SearchQuery(SerializableBaseModel):
 All three expansion flags default to `False`; each one multiplies the size of the answer the model
 reads back, so turn them on for a question that is actually about structure.
 
-Searching covers **entities and relations**. Scoring: a keyword match is `1.0`, a vector hit is
-its cosine similarity, a hit found by both is `cosine + 0.5`. Results are ordered highest first.
+Searching covers **entities and relations**. Keyword matching is a case-insensitive substring test
+across `name`, `description` and `entity_type` for entities, and `relation_type`, `description`,
+`from_entity` and `to_entity` for relations — it runs in-process over graph state, not in the
+vector store.
+
+`mode="hybrid"` fuses the two legs with the shared rule, Weaviate's `relativeScoreFusion` at
+`alpha = 0.7`: `alpha * norm(cosine) + (1 - alpha) * keyword`, scores in `[0, 1]`, highest first.
+A strong semantic hit therefore outranks a keyword-only one; lower `hybrid_alpha` to invert that.
+With no embeddings available the query degrades to keyword-only — no error, no warning at call
+time. The rule, and the reasons behind it, are documented once in
+[the vector store README](../vector_store/README.md#hybrid-search-lives-here-not-in-the-backends).
 
 ---
 
@@ -236,10 +247,25 @@ KnowledgeGraphTool(                                   # persistent, tenant-isola
     collection=CollectionConfig(backend="weaviate", tenant="team-42"),
     search_score_threshold=0.45,
     search_top_k=25,
+    hybrid_alpha=0.3,                                 # trust exact names over similarity
 )
 
 KnowledgeGraphTool(vector_store=False)                # keyword-only search
 ```
+
+> **`backend="weaviate"` alone does not reach a cluster.** The connection is read from the
+> environment at `observer()` time, never from the card — a catalog entry must not carry a cluster
+> URL and an API key as plain configuration:
+>
+> ```bash
+> export AKGENTIC_WEAVIATE_URL="https://your-cluster.weaviate.network"
+> export AKGENTIC_WEAVIATE_API_KEY="..."          # omit for an unauthenticated cluster
+> ```
+>
+> **Exporting the URL is what turns Weaviate on.** Leave it unset — or export it empty, which
+> counts as unset — and every collection stays on the in-memory backend whatever
+> `CollectionConfig` asks for; selecting `backend="weaviate"` without a URL logs a warning and
+> leaves the backend unavailable. Requires `akgentic-tool[weaviate]`.
 
 ### State events
 

@@ -57,3 +57,18 @@ The `[vector_search]` extra installs `openai` and `numpy` required by
 embedding-based search. Keyword search, exact-ID lookup, and basic
 operations work without an OpenAI API key; only semantic/hybrid search
 requires a valid `OPENAI_API_KEY`.
+
+Every example runs against the in-memory vector backend, which needs no
+extra setup. To run them against a Weaviate cluster instead, install
+`akgentic-tool[weaviate]` and export the connection — it is read from
+the environment, never from a tool card:
+
+```bash
+export AKGENTIC_WEAVIATE_URL="https://your-cluster.weaviate.network"
+export AKGENTIC_WEAVIATE_API_KEY="..."          # omit if unauthenticated
+```
+
+Exporting the URL is what turns Weaviate on. Leave it unset and every
+collection stays in memory, whatever `CollectionConfig(backend=...)`
+asks for. Hybrid ranking is identical either way — the fusion runs above
+the backend, not inside it.

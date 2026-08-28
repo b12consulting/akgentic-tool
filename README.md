@@ -936,7 +936,8 @@ the `depends_on` contract.
 ### KnowledgeGraphTool
 
 Persistent actor-based knowledge graph for structured entity and relationship storage with hybrid
-keyword + semantic search. The graph summary is exposed as structured context state on
+keyword + semantic search, fused with the shared
+[Weaviate-compatible rule](src/akgentic/tool/vector_store/README.md#hybrid-search-lives-here-not-in-the-backends). The graph summary is exposed as structured context state on
 `LLM_CONTEXT` — delivered into the context tail as deltas — and scales as *O(types + roots)*
 rather than *O(entities)*, so a large graph stays affordable as context.
 
@@ -972,8 +973,24 @@ VectorStoreTool(vector_store_name="#VectorStore-RAG", embedding_provider="azure"
 
 Collections are configured on the *consumer* card (`collection: CollectionConfig`), and Weaviate
 connection settings are deliberately not fields on any card — they are infrastructure. The card
-reads them from `AKGENTIC_WEAVIATE_URL` / `AKGENTIC_WEAVIATE_API_KEY` when the observer attaches;
-exporting a URL is what turns the Weaviate backend on.
+reads them from the environment when the observer attaches:
+
+```bash
+export AKGENTIC_WEAVIATE_URL="https://your-cluster.weaviate.network"
+export AKGENTIC_WEAVIATE_API_KEY="..."          # omit for an unauthenticated cluster
+```
+
+**Exporting the URL is what turns the Weaviate backend on.** Unset — or exported empty, which
+counts as unset — every collection stays in memory whatever `CollectionConfig(backend="weaviate")`
+asks for. Requires `akgentic-tool[weaviate]`.
+
+This card is also where **hybrid search** lives. `akgentic.tool.vector_store.hybrid` owns the one
+rule that fuses keyword and vector hits, shared by `PlanningTool` and `KnowledgeGraphTool` so both
+rank identically: Weaviate's `relativeScoreFusion`, `alpha * norm(cosine) + (1 - alpha) * keyword`,
+at the client's default `alpha = 0.7`. The backends themselves answer pure similarity queries and
+are never asked for text — keeping the rule above them is what makes in-memory and Weaviate agree.
+`hybrid_alpha` on either consumer card shifts the balance; below `0.5` a keyword match outranks a
+strong semantic hit.
 
 Every object `WeaviateBackend` writes is stamped with the owning team's id (`team_id`, taken from
 the actor, never from a card), so `delete_by_team()` and `list_collections()` give a deployment the
