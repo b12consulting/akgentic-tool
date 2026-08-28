@@ -38,6 +38,8 @@ class VectorStoreTool(ToolCard):
                 role=VS_ACTOR_ROLE,
                 embedding_model=self.embedding_model,
                 embedding_provider=self.embedding_provider,
+                weaviate_url=os.environ.get("AKGENTIC_WEAVIATE_URL") or None,
+                weaviate_api_key=os.environ.get("AKGENTIC_WEAVIATE_API_KEY") or None,
             ),
         )
 ```
@@ -68,10 +70,20 @@ nothing to expose on a channel.
 ### What is deliberately *not* here
 
 **Weaviate connection settings.** `VectorStoreConfig` carries `weaviate_url` and
-`weaviate_api_key`, but the card does not surface them: they are infrastructure, injected by the
-deployment layer (from `AKGENTIC_WEAVIATE_URL` / `AKGENTIC_WEAVIATE_API_KEY`), not something a
+`weaviate_api_key`, but the card does not surface them: they are infrastructure, not something a
 catalog entry should carry. A card persisted in a catalog would otherwise store a cluster URL and
 an API key as plain configuration.
+
+The card reads them from the environment instead, at `observer()` time — `AKGENTIC_WEAVIATE_URL`
+and `AKGENTIC_WEAVIATE_API_KEY`. **Exporting a URL is what turns Weaviate on**; leave it unset and
+every collection stays on the in-memory backend, whatever a `CollectionConfig` asks for (selecting
+`backend="weaviate"` without a URL logs a warning and leaves the backend unavailable). An exported
+but *empty* variable counts as unset — `or None` — so a deployment template that always exports
+the name does not read as a cluster at `""`.
+
+**The team id.** Also not a field, and deliberately not configurable: it is `VectorStoreActor.team_id`,
+which the actor system propagates. A card cannot be trusted to say which team it belongs to —
+the same card is reused across every team in a catalog.
 
 **Collections.** The store is a container of named collections, and each consumer owns its own —
 `PlanningTool` creates `planning`, `KnowledgeGraphTool` creates `knowledge_graph`. The
@@ -129,6 +141,61 @@ routed through the store.
 `VectorIndex` keeps a pre-allocated numpy matrix that grows geometrically, with each row's L2 norm
 computed at insertion. `search_cosine` is then a single BLAS pass over zero-copy views —
 sub-millisecond for 10 000 entries at 1536 dimensions. `remove` compacts the buffers.
+
+### Every Weaviate object carries its team
+
+`WeaviateBackend` declares a fourth schema property, `team_id`, alongside `ref_type` / `ref_id` /
+`text`, and stamps it onto every object it writes. The value is the owning `VectorStoreActor`'s
+`team_id` — propagated by the actor system, never configured, never on a card:
+
+```python
+WeaviateBackend(url=..., api_key=..., team_id=str(actor.team_id))
+```
+
+**Why it is there.** An in-memory collection dies with its actor; a Weaviate collection does not.
+When a team is deleted its vectors stay in the cluster, and until now nothing on the object said
+who had produced them — there was no filter that could find them, so they were unreachable
+garbage accumulating in a shared cluster. `team_id` is the handle a cleanup process needs.
+
+A backend built without a `team_id` still writes the property, as the empty string, so the schema
+is uniform and a sweep never has to reason about objects that predate the field or come from an
+unattributed writer.
+
+`team_id` is written, never read back: `SearchHit` does not expose it and search is unaffected.
+
+### Reaping a deleted team
+
+Two methods sit outside the `VectorStoreService` protocol because they are cluster
+administration, not vector storage — the in-memory backend has no equivalent and needs none:
+
+| Method | Purpose |
+|---|---|
+| `list_collections()` | Every collection name in the cluster, read from Weaviate rather than from this backend's own bookkeeping. |
+| `delete_by_team(collection, team_id)` | Delete every object in one collection stamped with `team_id`. Returns the number deleted. Raises `ValueError` if the cluster has no such collection. |
+
+Both work on a backend that created nothing — which is the point, since the sweeper runs after
+the team and its actors are gone:
+
+```python
+from akgentic.tool.vector_store.weaviate import WeaviateBackend
+
+backend = WeaviateBackend(url=WEAVIATE_URL, api_key=WEAVIATE_API_KEY)
+try:
+    for team_id in deleted_team_ids:
+        for collection in backend.list_collections():
+            deleted = backend.delete_by_team(collection, team_id)
+            log.info("reaped %d objects from %s for team %s", deleted, collection, team_id)
+finally:
+    backend.close()
+```
+
+On a **multi-tenant** collection the delete is scoped to the backend's tenant, so pass the tenant
+too when the deployment maps one tenant per team — `WeaviateBackend(url=..., tenant=team_id)`.
+`tenant` and `team_id` are independent: the tenant partitions storage, `team_id` is a property on
+the object, and a backend given both stamps its own `team_id` rather than the tenant name.
+
+The sweeper process itself — what decides a team is deleted, and on what schedule — lives in the
+deployment layer, not in this package.
 
 ---
 
