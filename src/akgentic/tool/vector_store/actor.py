@@ -159,6 +159,10 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         Uses ``self.config.weaviate_url`` and ``self.config.weaviate_api_key``
         for connection. Returns ``None`` when ``weaviate-client`` is missing
         or connection fails.
+
+        The owning team's id is taken from ``self.team_id`` — propagated by the
+        actor system, never configured — and stamped onto every object the
+        backend writes, so a deleted team's vectors stay findable.
         """
         if self._weaviate_backend is not None:
             return self._weaviate_backend
@@ -175,6 +179,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
             self._weaviate_backend = WeaviateBackend(
                 url=url,
                 api_key=self.config.weaviate_api_key,
+                team_id=str(self.team_id),
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
