@@ -29,7 +29,7 @@ from akgentic.tool.planning.planning_actor import (
 )
 from akgentic.tool.planning.state import PlanningState, TaskRow
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA
-from akgentic.tool.vector_store.protocol import CollectionConfig
+from akgentic.tool.vector_store.protocol import CollectionConfig, require_weaviate_configured
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -200,6 +200,7 @@ class PlanningTool(ToolCard):
         Raises:
             ValueError: If observer.orchestrator is None.
         """
+        require_weaviate_configured(self.collection, "PlanningTool")
         super().observer(observer)  # store the observer weakly via the base setter
         actor_observer = self._actor_observer()
         if actor_observer.orchestrator is None:

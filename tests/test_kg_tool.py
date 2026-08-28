@@ -29,7 +29,6 @@ from akgentic.tool.knowledge_graph.kg_actor import (
     KnowledgeGraphActor,
     KnowledgeGraphConfig,
 )
-from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA
 from akgentic.tool.knowledge_graph.kg_tool import (
     GetGraph,
     KnowledgeGraphTool,
@@ -44,7 +43,8 @@ from akgentic.tool.knowledge_graph.models import (
     SearchQuery,
 )
 from akgentic.tool.vector_store.actor import VectorStoreActor
-from akgentic.tool.vector_store.protocol import CollectionConfig
+from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA
+from akgentic.tool.vector_store.protocol import WEAVIATE_URL_ENV, CollectionConfig
 
 # ---------------------------------------------------------------------------
 # Mock helpers
@@ -830,8 +830,11 @@ class TestKnowledgeGraphToolObserverCollection:
         tool.observer(mock_observer)
         return captured
 
-    def test_observer_propagates_custom_collection_identity(self) -> None:
+    def test_observer_propagates_custom_collection_identity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """The exact CollectionConfig object on the ToolCard reaches the config."""
+        monkeypatch.setenv(WEAVIATE_URL_ENV, "http://localhost:8080")
         custom = CollectionConfig(backend="weaviate", tenant="t1")
         tool = KnowledgeGraphTool(collection=custom)
 
@@ -857,8 +860,11 @@ class TestKnowledgeGraphToolObserverCollection:
         assert len(captured) == 1
         assert captured[0].collection == CollectionConfig()
 
-    def test_observer_does_not_mutate_tool_collection(self) -> None:
+    def test_observer_does_not_mutate_tool_collection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """observer() passes collection through without mutating the ToolCard."""
+        monkeypatch.setenv(WEAVIATE_URL_ENV, "http://localhost:8080")
         custom = CollectionConfig(backend="weaviate", tenant="zz")
         tool = KnowledgeGraphTool(collection=custom)
         before_dump = tool.collection.model_dump()

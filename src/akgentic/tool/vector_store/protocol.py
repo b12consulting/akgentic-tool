@@ -7,8 +7,9 @@ and Pydantic models (``CollectionConfig``, ``SearchHit``, ``SearchResult``,
 
 from __future__ import annotations
 
+import os
 from enum import StrEnum
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Final, Literal, Protocol
 
 from pydantic import Field
 
@@ -17,6 +18,50 @@ from akgentic.core.utils.serializer import SerializableBaseModel
 
 if TYPE_CHECKING:
     from akgentic.tool.vector_store.vector import VectorEntry
+
+
+# ---------------------------------------------------------------------------
+# Weaviate deployment, read from the environment
+# ---------------------------------------------------------------------------
+
+WEAVIATE_URL_ENV: Final[str] = "AKGENTIC_WEAVIATE_URL"
+"""Environment variable naming the Weaviate cluster.
+
+Connection settings are infrastructure, never card fields: a card persisted in a
+catalog would otherwise carry a cluster URL and an API key as plain configuration.
+**Exporting this is what turns Weaviate on.**
+"""
+
+WEAVIATE_API_KEY_ENV: Final[str] = "AKGENTIC_WEAVIATE_API_KEY"
+"""Environment variable holding the Weaviate API key. Optional — an unauthenticated
+cluster needs only the URL."""
+
+
+def weaviate_url() -> str | None:
+    """Return the configured Weaviate cluster URL, or ``None`` when unset.
+
+    An exported but *empty* variable counts as unset, so a deployment template that
+    always exports the name does not read as a cluster at ``""``.
+    """
+    return os.environ.get(WEAVIATE_URL_ENV) or None
+
+
+def weaviate_api_key() -> str | None:
+    """Return the configured Weaviate API key, or ``None`` when unset."""
+    return os.environ.get(WEAVIATE_API_KEY_ENV) or None
+
+
+def default_backend() -> Literal["inmemory", "weaviate"]:
+    """Return the backend a collection uses when its card names none.
+
+    The environment decides: a cluster URL means Weaviate is deployed, and a
+    collection that expresses no preference should land there rather than in a
+    process-local index that disappears with the actor.
+
+    Resolved per instantiation rather than at import, so a process that exports the
+    variable after the module loads — a test, a late-configured worker — still sees it.
+    """
+    return "weaviate" if weaviate_url() else "inmemory"
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +91,11 @@ class CollectionConfig(SerializableBaseModel):
 
     dimension: int = Field(default=1536, ge=1, description="Embedding vector dimensionality")
     backend: Literal["inmemory", "weaviate"] = Field(
-        default="inmemory", description="Storage backend for this collection"
+        default_factory=default_backend,
+        description=(
+            "Storage backend for this collection. Defaults to 'weaviate' when "
+            f"{WEAVIATE_URL_ENV} names a cluster, otherwise 'inmemory'."
+        ),
     )
     persistence: Literal["actor_state", "workspace"] = Field(
         default="actor_state", description="Persistence mode (inmemory backend only)"
@@ -57,6 +106,34 @@ class CollectionConfig(SerializableBaseModel):
     tenant: str | None = Field(
         default=None,
         description="Weaviate tenant ID for multi-tenancy (maps to workspace/team ID)",
+    )
+
+
+def require_weaviate_configured(config: CollectionConfig, card_name: str) -> None:
+    """Raise when *config* asks for Weaviate and the environment has no cluster.
+
+    Called by a consumer card at ``observer()`` time, so the team fails to build
+    rather than starting up silently pointed at a process-local index. A card that
+    asks for Weaviate has asked for durable, shared, tenant-isolated storage; giving
+    it an in-memory index instead is not a degradation, it is the wrong answer to a
+    question the deployment already settled.
+
+    A card that names no backend never reaches here: :func:`default_backend` has
+    already resolved it to ``inmemory`` in that environment.
+
+    Args:
+        config: The collection configuration carried by the card.
+        card_name: Card class name, for the error message.
+
+    Raises:
+        ValueError: When ``config.backend == "weaviate"`` and no cluster URL is set.
+    """
+    if config.backend != "weaviate" or weaviate_url():
+        return
+    raise ValueError(
+        f"{card_name} configures backend='weaviate' but {WEAVIATE_URL_ENV} is not set. "
+        f"Export {WEAVIATE_URL_ENV} (and {WEAVIATE_API_KEY_ENV} for an authenticated "
+        f"cluster), or drop the backend setting to use the in-memory index."
     )
 
 

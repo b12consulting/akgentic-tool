@@ -25,6 +25,8 @@ try:
 except ImportError:
     WeaviateBackend = None  # type: ignore[assignment,misc]
 from akgentic.tool.vector_store.protocol import (
+    WEAVIATE_API_KEY_ENV,
+    WEAVIATE_URL_ENV,
     CollectionConfig,
     CollectionStatus,
     EmbeddingProvider,
@@ -32,6 +34,10 @@ from akgentic.tool.vector_store.protocol import (
     SearchResult,
     VectorStoreConfig,
     VectorStoreService,
+    default_backend,
+    require_weaviate_configured,
+    weaviate_api_key,
+    weaviate_url,
 )
 from akgentic.tool.vector_store.tool import VectorStoreTool
 from akgentic.tool.vector_store.vector import EmbeddingService, VectorEntry, VectorIndex
@@ -45,6 +51,8 @@ from akgentic.tool.vector_store.vector import (  # noqa: F401
 )
 
 __all__ = [
+    "WEAVIATE_API_KEY_ENV",
+    "WEAVIATE_URL_ENV",
     "CollectionConfig",
     "CollectionStatus",
     "EmbeddingActor",
@@ -66,4 +74,8 @@ __all__ = [
     "VectorStoreService",
     "VectorStoreState",
     "VectorStoreTool",
+    "default_backend",
+    "require_weaviate_configured",
+    "weaviate_api_key",
+    "weaviate_url",
 ]
