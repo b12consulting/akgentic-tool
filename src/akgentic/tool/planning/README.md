@@ -222,7 +222,7 @@ PlanningTool(                                                # persistent, multi
 PlanningTool(hybrid_alpha=0.3)                               # trust exact wording over similarity
 ```
 
-> **`backend="weaviate"` alone does not reach a cluster.** The connection is read from the
+> **The environment picks the backend; you only override it.** The connection is read from the
 > environment at `observer()` time, never from the card — a catalog entry must not carry a cluster
 > URL and an API key as plain configuration:
 >
@@ -231,10 +231,13 @@ PlanningTool(hybrid_alpha=0.3)                               # trust exact wordi
 > export AKGENTIC_WEAVIATE_API_KEY="..."          # omit for an unauthenticated cluster
 > ```
 >
-> **Exporting the URL is what turns Weaviate on.** Leave it unset — or export it empty, which
-> counts as unset — and every collection stays on the in-memory backend whatever
-> `CollectionConfig` asks for; selecting `backend="weaviate"` without a URL logs a warning and
-> leaves the backend unavailable. Requires `akgentic-tool[weaviate]`.
+> **Exporting the URL is what turns Weaviate on**, and a `CollectionConfig` that names no backend
+> then defaults to `weaviate` rather than to the in-memory index. An exported but empty variable
+> counts as unset. Requires `akgentic-tool[weaviate]`.
+>
+> Naming `backend="weaviate"` with no URL exported **raises at team creation** — the card asked for
+> durable, shared, tenant-isolated storage, and a process-local index is the wrong answer to a
+> question the deployment already settled, not a lesser one. Drop the setting to opt into memory.
 
 ### Semantic search
 

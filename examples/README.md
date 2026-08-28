@@ -68,7 +68,8 @@ export AKGENTIC_WEAVIATE_URL="https://your-cluster.weaviate.network"
 export AKGENTIC_WEAVIATE_API_KEY="..."          # omit if unauthenticated
 ```
 
-Exporting the URL is what turns Weaviate on. Leave it unset and every
-collection stays in memory, whatever `CollectionConfig(backend=...)`
-asks for. Hybrid ranking is identical either way — the fusion runs above
-the backend, not inside it.
+Exporting the URL is what turns Weaviate on, and it also becomes the
+default: a collection that names no backend follows the environment.
+Naming `backend="weaviate"` with no URL exported raises at team creation
+rather than falling back to memory. Hybrid ranking is identical either
+way — the fusion runs above the backend, not inside it.

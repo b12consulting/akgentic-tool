@@ -980,9 +980,14 @@ export AKGENTIC_WEAVIATE_URL="https://your-cluster.weaviate.network"
 export AKGENTIC_WEAVIATE_API_KEY="..."          # omit for an unauthenticated cluster
 ```
 
-**Exporting the URL is what turns the Weaviate backend on.** Unset — or exported empty, which
-counts as unset — every collection stays in memory whatever `CollectionConfig(backend="weaviate")`
-asks for. Requires `akgentic-tool[weaviate]`.
+**Exporting the URL is what turns the Weaviate backend on**, and it also picks the *default*:
+`CollectionConfig.backend` resolves to `weaviate` when a cluster is configured and `inmemory`
+otherwise, so a card that names no backend lands wherever the deployment actually is. An exported
+but empty variable counts as unset. Requires `akgentic-tool[weaviate]`.
+
+Naming `backend="weaviate"` with no URL exported **raises at team creation** rather than degrading
+to memory — a card asking for durable, shared storage should not be silently handed a process-local
+index that everything downstream assumes is persisted.
 
 This card is also where **hybrid search** lives. `akgentic.tool.vector_store.hybrid` owns the one
 rule that fuses keyword and vector hits, shared by `PlanningTool` and `KnowledgeGraphTool` so both

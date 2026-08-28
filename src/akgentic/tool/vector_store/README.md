@@ -85,6 +85,9 @@ the name does not read as a cluster at `""`.
 which the actor system propagates. A card cannot be trusted to say which team it belongs to —
 the same card is reused across every team in a catalog.
 
+**The backend choice, mostly.** Which backend a collection uses follows the environment rather than
+a field — see *The environment picks the backend* below. A card only overrides it.
+
 **Collections.** The store is a container of named collections, and each consumer owns its own —
 `PlanningTool` creates `planning`, `KnowledgeGraphTool` creates `knowledge_graph`. The
 `CollectionConfig` therefore lives on the *consumer* card, not here.
@@ -92,6 +95,55 @@ the same card is reused across every team in a catalog.
 **Keyword search.** The backends answer pure similarity queries — `search` takes a vector and
 nothing else, and neither backend is ever asked for text. The lexical half of a hybrid search runs
 in the calling actor, over its own authoritative state. See below for why.
+
+---
+
+## The environment picks the backend
+
+```bash
+export AKGENTIC_WEAVIATE_URL="https://your-cluster.weaviate.network"
+export AKGENTIC_WEAVIATE_API_KEY="..."          # omit for an unauthenticated cluster
+```
+
+**Exporting the URL is what turns Weaviate on.** `CollectionConfig.backend` resolves through
+`default_backend()` at instantiation: `weaviate` when a cluster URL is set, `inmemory` otherwise.
+A card that names no backend therefore lands wherever the deployment actually is — a cluster is
+deployed to be used, and a collection with no opinion should not quietly get a process-local index
+that disappears with the actor.
+
+An exported but *empty* variable counts as unset, so a deployment template that always exports the
+name does not read as a cluster at `""`. Resolution happens per instantiation, not at import, so a
+process that exports the variable late still sees it.
+
+### Naming a cluster that is not there is an error
+
+```python
+PlanningTool(collection=CollectionConfig(backend="weaviate"))   # with no URL exported
+# ValueError: PlanningTool configures backend='weaviate' but AKGENTIC_WEAVIATE_URL is not set.
+#   Export AKGENTIC_WEAVIATE_URL (and AKGENTIC_WEAVIATE_API_KEY for an authenticated cluster),
+#   or drop the backend setting to use the in-memory index.
+```
+
+`require_weaviate_configured` runs in each consumer card's `observer()`, **before any actor is
+created**, so the team fails to build rather than starting up half-wired. This is deliberately not
+a degradation: a card that says `weaviate` has asked for durable, shared, tenant-isolated storage,
+and an in-memory index is the wrong answer to a question the deployment already settled — silently
+substituting it loses data that everything downstream assumes is persisted.
+
+A card that names *no* backend never reaches the guard: without a cluster the default already
+resolved to `inmemory`, so there is nothing to contradict.
+
+> **A catalog entry records the resolved value.** `CollectionConfig()` dumped on a machine with a
+> cluster writes `backend: weaviate`, and loading that entry where no URL is exported raises. That
+> is the intended behaviour — the entry is asking for a cluster — but it is why an environment
+> promoting catalogs between tiers must export the variable in every tier that runs them.
+
+| Helper | Purpose |
+|---|---|
+| `weaviate_url()` | Cluster URL, or `None`. Empty counts as unset. |
+| `weaviate_api_key()` | API key, or `None`. |
+| `default_backend()` | `"weaviate"` when a URL is set, else `"inmemory"`. |
+| `require_weaviate_configured(config, card_name)` | Raises `ValueError` when *config* names Weaviate and no URL is set. |
 
 ---
 
@@ -169,7 +221,7 @@ PlanningTool(collection=CollectionConfig(backend="weaviate", tenant="team-42"))
 | `CollectionConfig` field | Type | Default | Meaning |
 |---|---|---|---|
 | `dimension` | `int` (≥1) | `1536` | Embedding vector dimensionality. Must match `embedding_model`. |
-| `backend` | `"inmemory" \| "weaviate"` | `"inmemory"` | `inmemory` is a numpy cosine index inside the actor; `weaviate` delegates to a cluster and requires `akgentic-tool[weaviate]`. |
+| `backend` | `"inmemory" \| "weaviate"` | **follows the environment** | `weaviate` when `AKGENTIC_WEAVIATE_URL` is set, else `inmemory`. `inmemory` is a numpy cosine index inside the actor; `weaviate` delegates to a cluster and requires `akgentic-tool[weaviate]`. See below. |
 | `persistence` | `"actor_state" \| "workspace"` | `"actor_state"` | **inmemory backend only.** `actor_state` keeps vectors in the actor's persisted state; `workspace` writes them to a file. |
 | `workspace_path` | `str \| None` | `None` | The file path used when `persistence="workspace"`. |
 | `tenant` | `str \| None` | `None` | Weaviate tenant id for multi-tenancy — normally the workspace or team id. |
