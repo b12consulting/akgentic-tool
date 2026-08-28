@@ -421,7 +421,7 @@ class TeamTool(ToolCard):
             as @<Role><RandomNumber>. Validates roles against available roles.
 
             Note: Should only be used when explicitly requested by user to prevent
-            unnecessary agent proliferation.
+            unnecessary agent proliferation. Do not contact him just to greet.
 
             Args:
                 roles: List of roles to hire (each must be in available_roles)
