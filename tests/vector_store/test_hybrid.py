@@ -13,6 +13,7 @@ rather than against particular constants.
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock
 
 import pytest
@@ -226,3 +227,48 @@ class TestSemanticScores:
         proxy = _proxy([])
         proxy.search.side_effect = RuntimeError("backend unreachable")
         assert semantic_scores(proxy, "c", "query", 5) == {}
+
+    def test_an_empty_embedding_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The one failure mode that otherwise leaves no evidence at all."""
+        proxy = _proxy([])
+        proxy.embed.return_value = []
+        with caplog.at_level(logging.WARNING):
+            semantic_scores(proxy, "planning", "query", 5)
+        assert "planning" in caplog.text
+
+    def test_a_missing_proxy_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING):
+            semantic_scores(None, "c", "query", 5)
+        assert "No vector store proxy" in caplog.text
+
+
+class TestSemanticOptOut:
+    """`semantic=False` is a caller skipping the leg, not a missing vector store."""
+
+    def test_the_backend_is_not_queried(self) -> None:
+        proxy = _proxy([SearchHit(ref_type="t", ref_id="a", text="", score=0.9)])
+        hybrid_search(["b"], proxy, "c", "query", top_k=5, semantic=False)
+        proxy.embed.assert_not_called()
+        proxy.search.assert_not_called()
+
+    def test_it_does_not_warn_about_a_missing_proxy(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An operator grepping that warning must not be sent after a healthy wiring."""
+        proxy = _proxy([])
+        with caplog.at_level(logging.WARNING):
+            hybrid_search(["b"], proxy, "c", "query", top_k=5, semantic=False)
+        assert "No vector store proxy" not in caplog.text
+
+    def test_the_keyword_leg_still_ranks(self) -> None:
+        proxy = _proxy([SearchHit(ref_type="t", ref_id="a", text="", score=0.9)])
+        result = hybrid_search(["b", "c"], proxy, "col", "query", top_k=5, semantic=False)
+        assert [key for key, _ in result.ranked] == ["b", "c"]
+        assert result.vector_scores == {}
+
+    def test_a_missing_proxy_still_warns_when_the_leg_was_wanted(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING):
+            hybrid_search(["b"], None, "c", "query", top_k=5)
+        assert "No vector store proxy" in caplog.text

@@ -24,12 +24,8 @@ from akgentic.tool.vector_store.protocol import (
 
 CLUSTER = "http://localhost:8080"
 
-
-@pytest.fixture(autouse=True)
-def _no_ambient_cluster(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Neutralise a developer's exported cluster so the tests read the same everywhere."""
-    monkeypatch.delenv(WEAVIATE_URL_ENV, raising=False)
-    monkeypatch.delenv(WEAVIATE_API_KEY_ENV, raising=False)
+# The package conftest already hides any ambient cluster from every test, so an
+# unset variable is the baseline here; tests that want one opt in with setenv.
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +184,16 @@ class TestCardsFailAtWiring:
 
         observer = self._observer()
         tool = PlanningTool(collection=CollectionConfig(backend="weaviate"))
+        with pytest.raises(ValueError):
+            tool.observer(observer)  # type: ignore[arg-type]
+        observer.proxy_ask.assert_not_called()  # type: ignore[attr-defined]
+
+    def test_the_graph_card_also_raises_before_any_actor_is_created(self) -> None:
+        """AC 7 holds on both cards, not just the one that happens to check first."""
+        from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
+
+        observer = self._observer()
+        tool = KnowledgeGraphTool(collection=CollectionConfig(backend="weaviate"))
         with pytest.raises(ValueError):
             tool.observer(observer)  # type: ignore[arg-type]
         observer.proxy_ask.assert_not_called()  # type: ignore[attr-defined]

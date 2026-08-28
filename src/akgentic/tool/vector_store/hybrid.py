@@ -80,6 +80,7 @@ def semantic_scores(
     try:
         vectors = proxy.embed([query_text])
         if not vectors:
+            logger.warning("Embedding returned nothing for collection '%s'", collection)
             return {}
         result = proxy.search(collection, vectors[0], top_k)
     except Exception:  # noqa: BLE001
@@ -161,7 +162,11 @@ class HybridResult(NamedTuple):
     """``(key, fused score)`` pairs, best first."""
 
     vector_scores: dict[str, float]
-    """Raw cosine score per key, for keys the semantic leg returned."""
+    """Raw cosine score per key, for keys that survived ``score_threshold``.
+
+    Raw, not normalised: fusion is relative to the result set, so this is the only
+    absolute number a caller can render.
+    """
 
 
 def hybrid_search(
@@ -173,6 +178,7 @@ def hybrid_search(
     top_k: int,
     score_threshold: float = 0.0,
     alpha: float = DEFAULT_ALPHA,
+    semantic: bool = True,
 ) -> HybridResult:
     """Run the semantic leg, fuse it with *keyword_keys*, and rank the result.
 
@@ -195,19 +201,26 @@ def hybrid_search(
         score_threshold: Minimum **raw** cosine score for a semantic hit.
             Applied before normalisation, so it keeps its absolute meaning.
         alpha: Weight of the vector leg. See :data:`DEFAULT_ALPHA`.
+        semantic: ``False`` skips the semantic leg outright, for a caller running a
+            keyword-only search. Distinct from passing ``proxy=None``, which means the
+            leg was wanted and no vector store was wired — and says so in the log.
 
     Returns:
         A :class:`HybridResult`. Its ``ranked`` list is **not** cut to ``top_k``
         — slice after materialising, so that a key which no longer resolves does
         not consume a result slot.
     """
-    vector_scores = {
-        key: score
-        for key, score in semantic_scores(
-            proxy, collection, query_text, top_k * OVERFETCH
-        ).items()
-        if score >= score_threshold
-    }
+    vector_scores = (
+        {
+            key: score
+            for key, score in semantic_scores(
+                proxy, collection, query_text, top_k * OVERFETCH
+            ).items()
+            if score >= score_threshold
+        }
+        if semantic
+        else {}
+    )
     fused = fuse(keyword_keys, vector_scores, alpha=alpha)
     return HybridResult(
         ranked=sorted(fused.items(), key=lambda item: item[1], reverse=True),

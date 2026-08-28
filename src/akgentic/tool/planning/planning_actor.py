@@ -24,6 +24,27 @@ logger = logging.getLogger(__name__)
 TaskStatus = Literal["pending", "started", "completed", "abort"]
 
 
+def _as_task_id(ref_id: str) -> int | None:
+    """Parse a vector-store ``ref_id`` back to a task id, or ``None`` when it is not one.
+
+    A ``planning`` collection outlives the actor that wrote it, and on a shared cluster
+    it can outlive the id format too. One foreign entry must not fail every search, so
+    it is skipped with a warning — matching how the knowledge graph drops a ``ref_id``
+    that no longer resolves.
+
+    Args:
+        ref_id: Reference id as the vector store returned it.
+
+    Returns:
+        The task id, or ``None`` when *ref_id* is not an integer.
+    """
+    try:
+        return int(ref_id)
+    except ValueError:
+        logger.warning("Skipping vector store entry with a non-numeric ref_id: %r", ref_id)
+        return None
+
+
 def _score_label(task_id: int, keyword_ids: set[int], vector_scores: Mapping[int, float]) -> str:
     """Describe how *task_id* was found, for the rendered search line."""
     if task_id in vector_scores:
@@ -363,8 +384,8 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
             keyword_ids = {t.id for t in tasks if q_lower in t.description.lower()}
 
         result = hybrid_search(
-            {str(task_id) for task_id in keyword_ids},
-            None if mode == "keyword" else self._vs_proxy,
+            [str(task_id) for task_id in sorted(keyword_ids)],
+            self._vs_proxy,
             PLAN_COLLECTION,
             query,
             top_k=top_k if top_k is not None else self.config.search_top_k,
@@ -374,13 +395,25 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
                 else self.config.search_score_threshold
             ),
             alpha=self.config.hybrid_alpha,
+            semantic=mode != "keyword",
         )
 
-        # The vector store keys by ref_id string; a plan keys by task id.
-        vector_scores = {int(ref_id): score for ref_id, score in result.vector_scores.items()}
-        return {
-            int(ref_id): (score, _score_label(int(ref_id), keyword_ids, vector_scores))
+        # The vector store keys by ref_id string; a plan keys by task id. A collection
+        # can outlive the id format that wrote it — a shared cluster especially — so a
+        # foreign entry is skipped rather than allowed to fail the whole search.
+        resolved = [
+            (task_id, ref_id, score)
             for ref_id, score in result.ranked
+            if (task_id := _as_task_id(ref_id)) is not None
+        ]
+        vector_scores = {
+            task_id: result.vector_scores[ref_id]
+            for task_id, ref_id, _ in resolved
+            if ref_id in result.vector_scores
+        }
+        return {
+            task_id: (score, _score_label(task_id, keyword_ids, vector_scores))
+            for task_id, _, score in resolved
         }
 
     @staticmethod

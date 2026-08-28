@@ -7,8 +7,11 @@ YAML configuration, and backward compatibility.
 
 from __future__ import annotations
 
+import logging
 import re
 from unittest.mock import MagicMock
+
+import pytest
 
 from akgentic.tool.planning.planning_actor import (
     PlanActor,
@@ -708,3 +711,65 @@ class TestSearchModeHybrid:
 
         sig = inspect.signature(PlanActor.search_planning)
         assert sig.parameters["mode"].default == "hybrid"
+
+
+# ---------------------------------------------------------------------------
+# A malformed ref_id must not fail the whole search
+# ---------------------------------------------------------------------------
+
+
+class TestForeignRefIds:
+    """A planning collection outlives the id format that wrote it."""
+
+    def test_a_non_numeric_ref_id_is_skipped_not_raised(self) -> None:
+        """Before the shared rule this conversion sat inside a try/except; it must stay safe."""
+        actor = _make_actor(vector_store=True)
+        _add_task(actor, 1, "auth flow setup")
+        actor._vs_proxy = _make_vs_proxy_mock(
+            embed_return=[[0.1]],
+            search_hits=[("not-an-int", 0.9)],
+        )
+
+        result = actor.search_planning(query="auth")
+
+        assert _extract_ids(result) == {1}
+
+    def test_a_good_ref_id_survives_alongside_a_foreign_one(self) -> None:
+        actor = _make_actor(vector_store=True)
+        _add_task(actor, 1, "auth flow setup")
+        _add_task(actor, 2, "database schema")
+        actor._vs_proxy = _make_vs_proxy_mock(
+            embed_return=[[0.1]],
+            search_hits=[("not-an-int", 0.95), ("2", 0.9)],
+        )
+
+        result = actor.search_planning(query="auth")
+
+        assert _extract_ids(result) == {1, 2}
+
+    def test_the_skipped_entry_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        actor = _make_actor(vector_store=True)
+        _add_task(actor, 1, "auth flow setup")
+        actor._vs_proxy = _make_vs_proxy_mock(
+            embed_return=[[0.1]],
+            search_hits=[("not-an-int", 0.9)],
+        )
+
+        with caplog.at_level(logging.WARNING):
+            actor.search_planning(query="auth")
+
+        assert "not-an-int" in caplog.text
+
+    def test_keyword_mode_does_not_warn_about_a_missing_proxy(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """mode='keyword' skips the leg deliberately; a healthy proxy is wired."""
+        actor = _make_actor(vector_store=True)
+        _add_task(actor, 1, "auth flow setup")
+        actor._vs_proxy = _make_vs_proxy_mock(embed_return=[[0.1]], search_hits=[])
+
+        with caplog.at_level(logging.WARNING):
+            result = actor.search_planning(query="auth", mode="keyword")
+
+        assert _extract_ids(result) == {1}
+        assert "No vector store proxy" not in caplog.text
