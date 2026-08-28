@@ -15,6 +15,7 @@ from akgentic.tool.planning.planning_actor import (
     PlanConfig,
     Task,
 )
+from akgentic.tool.vector_store.hybrid import OVERFETCH
 
 
 def _extract_id(line: str) -> int:
@@ -216,7 +217,7 @@ class TestLLMTunableParameters:
         # Verify search was called with config default (5)
         actor._vs_proxy.search.assert_called_once()
         call_args = actor._vs_proxy.search.call_args
-        assert call_args[0][2] == 5  # third positional arg is top_k
+        assert call_args[0][2] == 5 * OVERFETCH  # third positional arg is top_k
 
     def test_explicit_top_k_overrides_config(self) -> None:
         actor = _make_actor(vector_store=True, search_top_k=5)
@@ -229,7 +230,7 @@ class TestLLMTunableParameters:
         actor.search_planning(query="auth", top_k=50)
 
         call_args = actor._vs_proxy.search.call_args
-        assert call_args[0][2] == 50
+        assert call_args[0][2] == 50 * OVERFETCH
 
     def test_none_score_threshold_uses_config_default(self) -> None:
         """Score threshold=0.7 in config: hit at 0.6 excluded."""
@@ -325,10 +326,14 @@ class TestScoreExposure:
 class TestResultOrdering:
     """AC-5: Results ordered by score descending."""
 
-    def test_keyword_matches_before_semantic(self) -> None:
-        """Keyword matches (score=1.0) sort above semantic matches."""
+    def test_semantic_matches_before_keyword_at_the_default_alpha(self) -> None:
+        """The vector leg carries alpha=0.7 of the score, the keyword leg only 0.3.
+
+        This is Weaviate's relativeScoreFusion weighting, so a strong semantic hit
+        outranks a keyword-only one. Set ``hybrid_alpha`` below 0.5 to invert it.
+        """
         actor = _make_actor(vector_store=True)
-        _add_task(actor, 1, "auth flow setup")  # keyword match
+        _add_task(actor, 1, "auth flow setup")  # keyword only
         _add_task(actor, 2, "database schema")  # semantic only
 
         actor._vs_proxy = _make_vs_proxy_mock(
@@ -339,8 +344,25 @@ class TestResultOrdering:
         result = actor.search_planning(query="auth flow")
 
         assert len(result) == 2
-        assert _extract_id(result[0]) == 1  # keyword (1.0) first
-        assert _extract_id(result[1]) == 2  # semantic (0.75) second
+        assert _extract_id(result[0]) == 2  # semantic: 0.7 * 1.0
+        assert _extract_id(result[1]) == 1  # keyword: 1 - 0.7
+
+    def test_low_alpha_restores_keyword_priority(self) -> None:
+        """hybrid_alpha is the knob for teams whose lexical matches are the precise ones."""
+        actor = _make_actor(vector_store=True)
+        actor.config.hybrid_alpha = 0.2
+        _add_task(actor, 1, "auth flow setup")  # keyword only
+        _add_task(actor, 2, "database schema")  # semantic only
+
+        actor._vs_proxy = _make_vs_proxy_mock(
+            embed_return=[[0.1]],
+            search_hits=[("2", 0.75)],
+        )
+
+        result = actor.search_planning(query="auth flow")
+
+        assert _extract_id(result[0]) == 1  # keyword: 1 - 0.2
+        assert _extract_id(result[1]) == 2  # semantic: 0.2 * 1.0
 
     def test_semantic_results_ordered_by_score(self) -> None:
         """Multiple semantic matches sorted by score descending."""
@@ -381,7 +403,7 @@ class TestActorParameterizedValues:
         actor.search_planning(query="auth")
 
         call_args = actor._vs_proxy.search.call_args
-        assert call_args[0][2] == 15
+        assert call_args[0][2] == 15 * OVERFETCH
 
     def test_uses_config_threshold_when_param_none(self) -> None:
         actor = _make_actor(vector_store=True, search_score_threshold=0.8)
@@ -407,7 +429,7 @@ class TestActorParameterizedValues:
         actor.search_planning(query="auth", top_k=30)
 
         call_args = actor._vs_proxy.search.call_args
-        assert call_args[0][2] == 30
+        assert call_args[0][2] == 30 * OVERFETCH
 
     def test_param_threshold_overrides_config(self) -> None:
         actor = _make_actor(vector_store=True, search_score_threshold=0.8)
@@ -501,7 +523,7 @@ class TestBackwardCompatibility:
         actor.search_planning(query="auth")
 
         call_args = actor._vs_proxy.search.call_args
-        assert call_args[0][2] == 10
+        assert call_args[0][2] == 10 * OVERFETCH
 
     def test_default_mode_is_hybrid(self) -> None:
         """Default mode is hybrid — same as current implicit behavior."""
