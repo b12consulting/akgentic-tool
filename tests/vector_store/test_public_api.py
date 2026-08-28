@@ -37,6 +37,12 @@ class TestPublicApi:
             "VectorStoreState",
             "VectorStoreTool",
             "WeaviateBackend",
+            "WEAVIATE_API_KEY_ENV",
+            "WEAVIATE_URL_ENV",
+            "default_backend",
+            "require_weaviate_configured",
+            "weaviate_api_key",
+            "weaviate_url",
         }
         assert set(vs.__all__) == expected
 

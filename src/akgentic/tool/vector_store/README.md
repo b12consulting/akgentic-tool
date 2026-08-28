@@ -85,9 +85,130 @@ the name does not read as a cluster at `""`.
 which the actor system propagates. A card cannot be trusted to say which team it belongs to —
 the same card is reused across every team in a catalog.
 
+**The backend choice, mostly.** Which backend a collection uses follows the environment rather than
+a field — see *The environment picks the backend* below. A card only overrides it.
+
 **Collections.** The store is a container of named collections, and each consumer owns its own —
 `PlanningTool` creates `planning`, `KnowledgeGraphTool` creates `knowledge_graph`. The
 `CollectionConfig` therefore lives on the *consumer* card, not here.
+
+**Keyword search.** The backends answer pure similarity queries — `search` takes a vector and
+nothing else, and neither backend is ever asked for text. The lexical half of a hybrid search runs
+in the calling actor, over its own authoritative state. See below for why.
+
+---
+
+## The environment picks the backend
+
+```bash
+export AKGENTIC_WEAVIATE_URL="https://your-cluster.weaviate.network"
+export AKGENTIC_WEAVIATE_API_KEY="..."          # omit for an unauthenticated cluster
+```
+
+**Exporting the URL is what turns Weaviate on.** `CollectionConfig.backend` resolves through
+`default_backend()` at instantiation: `weaviate` when a cluster URL is set, `inmemory` otherwise.
+A card that names no backend therefore lands wherever the deployment actually is — a cluster is
+deployed to be used, and a collection with no opinion should not quietly get a process-local index
+that disappears with the actor.
+
+An exported but *empty* variable counts as unset, so a deployment template that always exports the
+name does not read as a cluster at `""`. Resolution happens per instantiation, not at import, so a
+process that exports the variable late still sees it.
+
+### Naming a cluster that is not there is an error
+
+```python
+PlanningTool(collection=CollectionConfig(backend="weaviate"))   # with no URL exported
+# ValueError: PlanningTool configures backend='weaviate' but AKGENTIC_WEAVIATE_URL is not set.
+#   Export AKGENTIC_WEAVIATE_URL (and AKGENTIC_WEAVIATE_API_KEY for an authenticated cluster),
+#   or drop the backend setting to use the in-memory index.
+```
+
+`require_weaviate_configured` runs in each consumer card's `observer()`, **before any actor is
+created**, so the team fails to build rather than starting up half-wired. This is deliberately not
+a degradation: a card that says `weaviate` has asked for durable, shared, tenant-isolated storage,
+and an in-memory index is the wrong answer to a question the deployment already settled — silently
+substituting it loses data that everything downstream assumes is persisted.
+
+A card that names *no* backend never reaches the guard: without a cluster the default already
+resolved to `inmemory`, so there is nothing to contradict.
+
+> **A catalog entry records the resolved value.** `CollectionConfig()` dumped on a machine with a
+> cluster writes `backend: weaviate`, and loading that entry where no URL is exported raises. That
+> is the intended behaviour — the entry is asking for a cluster — but it is why an environment
+> promoting catalogs between tiers must export the variable in every tier that runs them.
+
+| Helper | Purpose |
+|---|---|
+| `weaviate_url()` | Cluster URL, or `None`. Empty counts as unset. |
+| `weaviate_api_key()` | API key, or `None`. |
+| `default_backend()` | `"weaviate"` when a URL is set, else `"inmemory"`. |
+| `require_weaviate_configured(config, card_name)` | Raises `ValueError` when *config* names Weaviate and no URL is set. |
+
+---
+
+## Hybrid search lives here, not in the backends
+
+`akgentic.tool.vector_store.hybrid` owns the one rule that combines keyword and vector hits. Both
+`KnowledgeGraphActor` and `PlanActor` search through it, so they rank identically.
+
+```python
+from akgentic.tool.vector_store.hybrid import hybrid_search
+
+result = hybrid_search(
+    keyword_keys,            # ref_ids the caller's own keyword phase found
+    vs_proxy, "planning", "deployment plan",
+    top_k=10,
+    score_threshold=0.5,     # minimum *raw* cosine, before normalisation
+    alpha=0.7,
+)
+result.ranked          # [(ref_id, fused score)], best first, NOT cut to top_k
+result.vector_scores   # raw cosine per ref_id, for callers that render a score
+```
+
+### The rule
+
+Weaviate's `relativeScoreFusion` — the default behind `collection.query.hybrid()` — reproduced
+in Python:
+
+```
+score = alpha * norm(cosine) + (1 - alpha) * keyword
+```
+
+Each leg is min-max normalised onto `[0, 1]`. The keyword leg is an *indicator*, not a normalised
+score: the lexical match is a substring test, so every keyword hit is equally good and normalising
+a flat list yields `1.0` throughout. Three outcomes follow:
+
+| Hit found by | Score at `alpha = 0.7` |
+|---|---|
+| vector only | `0.7 × norm(cosine)` — `0.7` for the strongest hit in the set, `0.0` for the weakest |
+| keyword only | `0.3` |
+| both | the sum |
+
+`alpha` defaults to `0.7`, the value the Weaviate client sends. **This weights semantics above
+lexical matching:** a strong vector hit at `0.7` outranks a keyword-only hit at `0.3`. Set
+`hybrid_alpha` below `0.5` on `PlanningTool` or `KnowledgeGraphTool` to invert that, which is the
+right call when your lexical matches are the precise ones — exact ids, product names, error codes.
+
+### Two consequences worth knowing before you tune it
+
+**Normalisation is relative, so scores compare only within one query.** A result set whose cosines
+are `0.9 / 0.7 / 0.5` fuses exactly like one at `0.5 / 0.3 / 0.1`. The weakest vector hit always
+normalises to `0.0` however good its absolute cosine was — most visible on small result sets. This
+is Weaviate's behaviour, kept deliberately so a collection moved to a cluster does not reorder.
+
+**`score_threshold` gates the vector leg only, on the raw cosine, before normalisation.** That
+keeps its absolute meaning, and means a keyword hit can never be dropped by it. The two are on
+different scales by design.
+
+### Why not push it into the backend?
+
+Weaviate can do hybrid natively and the in-memory index cannot, so putting the rule behind the
+backend seam would make the same data rank differently on the two backends — dev on in-memory,
+production on Weaviate. It also could not reproduce today's recall: the embedded text is
+`f"{entity.name}: {entity.description}"`, which omits `entity_type`, and ingest is best-effort, so
+BM25 over the stored `text` would silently miss what the in-process scan finds. Revisit when the
+store is an authoritative index of the graph rather than a lossy projection of it.
 
 ---
 
@@ -100,7 +221,7 @@ PlanningTool(collection=CollectionConfig(backend="weaviate", tenant="team-42"))
 | `CollectionConfig` field | Type | Default | Meaning |
 |---|---|---|---|
 | `dimension` | `int` (≥1) | `1536` | Embedding vector dimensionality. Must match `embedding_model`. |
-| `backend` | `"inmemory" \| "weaviate"` | `"inmemory"` | `inmemory` is a numpy cosine index inside the actor; `weaviate` delegates to a cluster and requires `akgentic-tool[weaviate]`. |
+| `backend` | `"inmemory" \| "weaviate"` | **follows the environment** | `weaviate` when `AKGENTIC_WEAVIATE_URL` is set, else `inmemory`. `inmemory` is a numpy cosine index inside the actor; `weaviate` delegates to a cluster and requires `akgentic-tool[weaviate]`. See below. |
 | `persistence` | `"actor_state" \| "workspace"` | `"actor_state"` | **inmemory backend only.** `actor_state` keeps vectors in the actor's persisted state; `workspace` writes them to a file. |
 | `workspace_path` | `str \| None` | `None` | The file path used when `persistence="workspace"`. |
 | `tenant` | `str \| None` | `None` | Weaviate tenant id for multi-tenancy — normally the workspace or team id. |

@@ -39,8 +39,13 @@ from akgentic.tool.knowledge_graph.models import (
     SearchResult,
 )
 from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
+from akgentic.tool.vector_store.hybrid import (
+    DEFAULT_ALPHA,
+    OVERFETCH,
+    hybrid_search,
+    semantic_scores,
+)
 from akgentic.tool.vector_store.protocol import CollectionConfig
-from akgentic.tool.vector_store.protocol import SearchResult as VsSearchResult
 from akgentic.tool.vector_store.vector import VectorEntry
 
 logger = logging.getLogger(__name__)
@@ -87,6 +92,16 @@ class KnowledgeGraphConfig(BaseConfig):
         description=(
             "Default minimum cosine similarity score for vector/hybrid search. "
             "Hits below this threshold are filtered out."
+        ),
+    )
+
+    hybrid_alpha: float = Field(
+        default=DEFAULT_ALPHA,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Weight of the vector leg in hybrid search; the keyword leg gets "
+            "1 - alpha. Matches Weaviate's hybrid() alpha parameter."
         ),
     )
 
@@ -890,85 +905,74 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         Returns:
             ``SearchResult`` with hits ranked by cosine similarity score.
         """
-        if self._vs_proxy is None:
-            return SearchResult(hits=[])
-        try:
-            vectors = self._vs_proxy.embed([query_text])
-            if not vectors:
-                return SearchResult(hits=[])
-            query_vector = vectors[0]
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[%s] Vector search embedding failed: %s", self.config.name, exc)
-            return SearchResult(hits=[])
-
-        try:
-            vs_result: VsSearchResult = self._vs_proxy.search(
-                KG_COLLECTION, query_vector, top_k
-            )
-            pairs = [(hit.ref_id, hit.score) for hit in vs_result.hits]
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[%s] Vector search failed: %s", self.config.name, exc)
-            return SearchResult(hits=[])
-
+        scores = semantic_scores(self._vs_proxy, KG_COLLECTION, query_text, top_k)
         hits: list[SearchHit] = []
-        for ref_id, score in pairs:
-            obj = self._resolve_ref(ref_id)
-            if obj is None:
+        for ref_id, score in scores.items():
+            if score < score_threshold:
                 continue
-            if isinstance(obj, Entity):
-                hits.append(SearchHit(ref_type="entity", ref_id=ref_id, score=score, entity=obj))
-            else:
-                hits.append(
-                    SearchHit(ref_type="relation", ref_id=ref_id, score=score, relation=obj)
-                )
-        hits = [h for h in hits if h.score >= score_threshold]
+            hit = self._as_hit(ref_id, score)
+            if hit is not None:
+                hits.append(hit)
         return SearchResult(hits=hits)
+
+    def _as_hit(self, ref_id: str, score: float) -> SearchHit | None:
+        """Build a ``SearchHit`` for *ref_id*, or ``None`` when the ref is stale.
+
+        Args:
+            ref_id: UUID string from a vector store hit.
+            score: Score to carry on the resulting hit.
+
+        Returns:
+            The ``SearchHit``, or ``None`` when *ref_id* no longer resolves.
+        """
+        obj = self._resolve_ref(ref_id)
+        if obj is None:
+            return None
+        if isinstance(obj, Entity):
+            return SearchHit(ref_type="entity", ref_id=ref_id, score=score, entity=obj)
+        return SearchHit(ref_type="relation", ref_id=ref_id, score=score, relation=obj)
 
     def _hybrid_search(
         self, query_text: str, top_k: int, score_threshold: float = 0.0
     ) -> SearchResult:
-        """Merge keyword and vector search results with weighted scoring.
+        """Merge keyword and vector search results under the shared fusion rule.
 
-        Scoring rules:
-        - Keyword-only hit: ``score = 1.0``
-        - Vector-only hit: ``score = cosine_similarity``
-        - Hit in both: ``score = cosine_similarity + 0.5`` (keyword boost)
-
-        Falls back to keyword-only when the vector search returns no hits
-        (embedding service unavailable or index empty — AC-4).
-        Hits with score below ``score_threshold`` are filtered out after
-        merging and before the ``top_k`` slice.
+        Scoring is delegated to :func:`~akgentic.tool.vector_store.hybrid.fuse`.
+        Degrades to keyword-only when the semantic phase yields nothing
+        (embedding service unavailable or index empty — AC-4); no special case
+        is needed for it, since the keyword hits then tie and keep their order.
 
         Args:
             query_text: The query string.
             top_k: Maximum number of results to return.
-            score_threshold: Minimum score to include a hit.
+            score_threshold: Minimum raw cosine score for a semantic hit.
 
         Returns:
             ``SearchResult`` with merged hits ranked by combined score.
         """
-        keyword_result = self._keyword_search(query_text, top_k * 2)
-        vector_result = self._vector_search(query_text, top_k * 2)
+        keyword_hits = self._keyword_search(query_text, top_k * OVERFETCH).hits
+        by_ref_id = {hit.ref_id: hit for hit in keyword_hits}
+        result = hybrid_search(
+            by_ref_id.keys(),
+            self._vs_proxy,
+            KG_COLLECTION,
+            query_text,
+            top_k=top_k,
+            score_threshold=score_threshold,
+            alpha=self.config.hybrid_alpha,
+        )
 
-        if not vector_result.hits:
-            # Graceful fallback: no embeddings → keyword only (AC-4)
-            return SearchResult(hits=keyword_result.hits[:top_k])
-
-        merged: dict[str, SearchHit] = {}
-
-        for hit in vector_result.hits:
-            merged[hit.ref_id] = hit  # start with vector score
-
-        for kw_hit in keyword_result.hits:
-            if kw_hit.ref_id in merged:
-                existing = merged[kw_hit.ref_id]
-                merged[kw_hit.ref_id] = existing.model_copy(update={"score": existing.score + 0.5})
-            else:
-                merged[kw_hit.ref_id] = kw_hit  # keyword-only hit (score = 1.0)
-
-        ranked = sorted(merged.values(), key=lambda h: h.score, reverse=True)
-        ranked = [h for h in ranked if h.score >= score_threshold]
-        return SearchResult(hits=ranked[:top_k])
+        hits: list[SearchHit] = []
+        for ref_id, score in result.ranked:
+            hit = by_ref_id.get(ref_id)
+            if hit is None:
+                hit = self._as_hit(ref_id, score)
+            if hit is None:
+                continue  # stale index entry — must not consume a top_k slot
+            hits.append(hit.model_copy(update={"score": score}))
+            if len(hits) == top_k:
+                break
+        return SearchResult(hits=hits)
 
     def _keyword_search(self, query: str, top_k: int) -> SearchResult:
         """Case-insensitive substring search across entity and relation fields."""

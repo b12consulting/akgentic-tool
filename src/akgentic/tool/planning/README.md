@@ -172,8 +172,13 @@ search_planning(
 ) -> list[str]
 ```
 
-All filters are AND-combined; omitting everything returns the full list. Results are tagged with
-how they were found — `(keyword match)`, `(semantic: 0.85)`, `(hybrid: 0.90)`.
+All filters are AND-combined; omitting everything returns the full list. The field filters are
+applied **before** scoring, so `top_k` is never spent on tasks they would discard. Results are
+tagged with how they were found — `(keyword match)`, `(semantic: 0.85)`, `(hybrid: 0.90)`; the
+number is the raw cosine, not the fused score, since fusion is relative to the result set.
+
+`top_k` caps the returned list, defaulting to `search_top_k`. The vector store itself is queried
+for more than that, because fusion and the field filters both drop candidates.
 
 `mode="keyword"` performs **no embedding call at all**, which is the mode to use when the query is
 a known substring and you do not want to pay for an embedding.
@@ -213,13 +218,41 @@ PlanningTool(                                                # persistent, multi
     collection=CollectionConfig(backend="weaviate", tenant="team-42"),
     search_score_threshold=0.65,
 )
+
+PlanningTool(hybrid_alpha=0.3)                               # trust exact wording over similarity
 ```
+
+> **The environment picks the backend; you only override it.** The connection is read from the
+> environment at `observer()` time, never from the card — a catalog entry must not carry a cluster
+> URL and an API key as plain configuration:
+>
+> ```bash
+> export AKGENTIC_WEAVIATE_URL="https://your-cluster.weaviate.network"
+> export AKGENTIC_WEAVIATE_API_KEY="..."          # omit for an unauthenticated cluster
+> ```
+>
+> **Exporting the URL is what turns Weaviate on**, and a `CollectionConfig` that names no backend
+> then defaults to `weaviate` rather than to the in-memory index. An exported but empty variable
+> counts as unset. Requires `akgentic-tool[weaviate]`.
+>
+> Naming `backend="weaviate"` with no URL exported **raises at team creation** — the card asked for
+> durable, shared, tenant-isolated storage, and a process-local index is the wrong answer to a
+> question the deployment already settled, not a lesser one. Drop the setting to opt into memory.
 
 ### Semantic search
 
 With `[vector_search]` installed, task descriptions are embedded on create and update and stored
-in the `planning` collection of the bound `VectorStoreActor`. `mode="hybrid"` unions keyword and
-semantic hits; a task found by both scores `cosine + 0.5`, so exact matches outrank fuzzy ones.
+in the `planning` collection of the bound `VectorStoreActor`.
+
+`mode="hybrid"` fuses the keyword and semantic legs with the shared rule, Weaviate's
+`relativeScoreFusion` at `alpha = 0.7`: `alpha * norm(cosine) + (1 - alpha) * keyword`. A strong
+semantic hit therefore outranks a keyword-only one, and a task confirmed by both outranks either.
+Set `hybrid_alpha` below `0.5` to put exact wording first. The rule and its consequences are
+documented once in
+[the vector store README](../vector_store/README.md#hybrid-search-lives-here-not-in-the-backends).
+
+`score_threshold` gates the semantic leg only, on the raw cosine before fusion, so a keyword match
+is never dropped by it.
 
 Without the extra, or with `vector_store=False`, `search_planning` still answers — keyword and
 field filters only. There is no error and no warning at call time; the degradation is by design.

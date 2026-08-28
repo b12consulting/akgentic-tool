@@ -14,7 +14,6 @@ surface).
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from typing import Any, Literal
 
@@ -24,7 +23,11 @@ from akgentic.core.orchestrator import Orchestrator
 from akgentic.tool.core import ToolCard
 from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE, VectorStoreActor
-from akgentic.tool.vector_store.protocol import VectorStoreConfig
+from akgentic.tool.vector_store.protocol import (
+    VectorStoreConfig,
+    weaviate_api_key,
+    weaviate_url,
+)
 
 
 class VectorStoreTool(ToolCard):
@@ -100,8 +103,8 @@ class VectorStoreTool(ToolCard):
                 role=VS_ACTOR_ROLE,
                 embedding_model=self.embedding_model,
                 embedding_provider=self.embedding_provider,
-                weaviate_url=os.environ.get("AKGENTIC_WEAVIATE_URL") or None,
-                weaviate_api_key=os.environ.get("AKGENTIC_WEAVIATE_API_KEY") or None,
+                weaviate_url=weaviate_url(),
+                weaviate_api_key=weaviate_api_key(),
             ),
         )
 

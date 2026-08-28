@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Callable, ClassVar
 
 import pytest
+
 from akgentic.tool.core import (
     COMMAND,
     TOOL_CALL,
@@ -724,7 +725,9 @@ def test_factory_missing_vector_store_tool_raises_missing_dependency_error() -> 
 # ---------------------------------------------------------------------------
 
 
-def test_factory_propagates_per_consumer_collection_config() -> None:
+def test_factory_propagates_per_consumer_collection_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """AC-10: KG and Planning each get their own CollectionConfig through the factory.
 
     Constructs KnowledgeGraphTool and PlanningTool with distinct non-default
@@ -739,6 +742,7 @@ def test_factory_propagates_per_consumer_collection_config() -> None:
     from akgentic.tool.vector_store.protocol import CollectionConfig
     from akgentic.tool.vector_store.tool import VectorStoreTool
 
+    monkeypatch.setenv("AKGENTIC_WEAVIATE_URL", "http://localhost:8080")
     kg_collection = CollectionConfig(backend="weaviate", tenant="team-42")
     plan_collection = CollectionConfig(
         backend="inmemory", persistence="workspace", workspace_path="/tmp/plan"

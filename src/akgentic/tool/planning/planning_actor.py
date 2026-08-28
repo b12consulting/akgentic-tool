@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+from collections.abc import Mapping
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -14,12 +15,42 @@ from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
+from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA, hybrid_search
 from akgentic.tool.vector_store.protocol import CollectionConfig
 from akgentic.tool.vector_store.vector import VectorEntry
 
 logger = logging.getLogger(__name__)
 
 TaskStatus = Literal["pending", "started", "completed", "abort"]
+
+
+def _as_task_id(ref_id: str) -> int | None:
+    """Parse a vector-store ``ref_id`` back to a task id, or ``None`` when it is not one.
+
+    A ``planning`` collection outlives the actor that wrote it, and on a shared cluster
+    it can outlive the id format too. One foreign entry must not fail every search, so
+    it is skipped with a warning — matching how the knowledge graph drops a ``ref_id``
+    that no longer resolves.
+
+    Args:
+        ref_id: Reference id as the vector store returned it.
+
+    Returns:
+        The task id, or ``None`` when *ref_id* is not an integer.
+    """
+    try:
+        return int(ref_id)
+    except ValueError:
+        logger.warning("Skipping vector store entry with a non-numeric ref_id: %r", ref_id)
+        return None
+
+
+def _score_label(task_id: int, keyword_ids: set[int], vector_scores: Mapping[int, float]) -> str:
+    """Describe how *task_id* was found, for the rendered search line."""
+    if task_id in vector_scores:
+        prefix = "hybrid" if task_id in keyword_ids else "semantic"
+        return f"{prefix}: {vector_scores[task_id]:.2f}"
+    return "keyword match"
 
 
 class TaskCreate(SerializableBaseModel):
@@ -114,6 +145,16 @@ class PlanConfig(BaseConfig):
     search_score_threshold: float = Field(
         default=0.5,
         description="Default minimum cosine similarity score for semantic results.",
+    )
+
+    hybrid_alpha: float = Field(
+        default=DEFAULT_ALPHA,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Weight of the vector leg in hybrid search; the keyword leg gets "
+            "1 - alpha. Matches Weaviate's hybrid() alpha parameter."
+        ),
     )
 
 
@@ -309,20 +350,19 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
             for hits found by both keyword and semantic.
             When all parameters are None, returns the full task list (unscored).
         """
-        tasks: list[Task] = list(self.state.task_list)
-        scores: dict[int, tuple[float, str]] = {}
+        # Filter first, so the query phase only ever scores viable candidates and
+        # the top_k cut is never spent on tasks the AND filters would discard.
+        tasks = self._apply_task_filters(list(self.state.task_list), status, owner, creator)
 
-        # Query phase: build the candidate set, then intersect with the AND filters.
-        if query is not None:
-            scores = self._score_query_matches(tasks, query, mode, top_k, score_threshold)
-            tasks = [t for t in tasks if t.id in scores]
+        if query is None:
+            return [self._format_task_line(t, {}) for t in tasks]
 
-        tasks = self._apply_task_filters(tasks, status, owner, creator)
+        scores = self._score_query_matches(tasks, query, mode, top_k, score_threshold)
+        matched = [t for t in tasks if t.id in scores]
+        matched.sort(key=lambda t: scores[t.id][0], reverse=True)
 
-        if query is not None:
-            tasks.sort(key=lambda t: scores.get(t.id, (0.0, ""))[0], reverse=True)
-
-        return [self._format_task_line(t, scores) for t in tasks]
+        effective_top_k = top_k if top_k is not None else self.config.search_top_k
+        return [self._format_task_line(t, scores) for t in matched[:effective_top_k]]
 
     def _score_query_matches(
         self,
@@ -334,74 +374,47 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
     ) -> dict[int, tuple[float, str]]:
         """Return ``{task_id: (score, label)}`` for tasks matching *query*.
 
-        Runs the keyword phase, the semantic phase, or both per *mode*. Tasks hit
-        by both are merged under a ``hybrid`` label with the higher score.
+        Runs the keyword phase, the semantic phase, or both per *mode*, then
+        combines them with the shared fusion rule so that ranking matches every
+        other hybrid search in the framework.
         """
-        scores: dict[int, tuple[float, str]] = {}
-
+        keyword_ids: set[int] = set()
         if mode in ("hybrid", "keyword"):
             q_lower = query.lower()
-            for task in tasks:
-                if q_lower in task.description.lower():
-                    scores[task.id] = (1.0, "keyword match")
+            keyword_ids = {t.id for t in tasks if q_lower in t.description.lower()}
 
-        if mode in ("hybrid", "vector"):
-            self._merge_semantic_scores(scores, query, mode, top_k, score_threshold)
-
-        return scores
-
-    def _merge_semantic_scores(
-        self,
-        scores: dict[int, tuple[float, str]],
-        query: str,
-        mode: Literal["hybrid", "vector", "keyword"],
-        top_k: int | None,
-        score_threshold: float | None,
-    ) -> None:
-        """Merge vector-search hits for *query* into *scores* in place.
-
-        Degrades without raising: a missing vector store or a failing embed/search
-        leaves *scores* as the keyword phase produced it, with a warning.
-        """
-        if self._vs_proxy is None:
-            self._warn_vector_store_unavailable(mode)
-            return
-
-        effective_top_k = top_k if top_k is not None else self.config.search_top_k
-        effective_threshold = (
-            score_threshold if score_threshold is not None else self.config.search_score_threshold
+        result = hybrid_search(
+            [str(task_id) for task_id in sorted(keyword_ids)],
+            self._vs_proxy,
+            PLAN_COLLECTION,
+            query,
+            top_k=top_k if top_k is not None else self.config.search_top_k,
+            score_threshold=(
+                score_threshold
+                if score_threshold is not None
+                else self.config.search_score_threshold
+            ),
+            alpha=self.config.hybrid_alpha,
+            semantic=mode != "keyword",
         )
 
-        try:
-            vectors = self._vs_proxy.embed([query])
-            if vectors:
-                result = self._vs_proxy.search(PLAN_COLLECTION, vectors[0], effective_top_k)
-                for hit in result.hits:
-                    if hit.score >= effective_threshold:
-                        self._record_semantic_hit(scores, int(hit.ref_id), hit.score)
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "Semantic search failed for query — falling back to keyword only",
-                exc_info=True,
-            )
-
-    @staticmethod
-    def _record_semantic_hit(
-        scores: dict[int, tuple[float, str]], task_id: int, score: float
-    ) -> None:
-        """Record one semantic hit, promoting an existing keyword hit to ``hybrid``."""
-        if task_id in scores:
-            scores[task_id] = (max(scores[task_id][0], score), f"hybrid: {score:.2f}")
-        else:
-            scores[task_id] = (score, f"semantic: {score:.2f}")
-
-    @staticmethod
-    def _warn_vector_store_unavailable(mode: Literal["hybrid", "vector", "keyword"]) -> None:
-        """Warn that the semantic phase is skipped because no vector store is wired."""
-        if mode == "vector":
-            logger.warning("mode='vector' but _vs_proxy is None — returning empty results")
-        elif mode == "hybrid":
-            logger.warning("mode='hybrid' but _vs_proxy is None — falling back to keyword-only")
+        # The vector store keys by ref_id string; a plan keys by task id. A collection
+        # can outlive the id format that wrote it — a shared cluster especially — so a
+        # foreign entry is skipped rather than allowed to fail the whole search.
+        resolved = [
+            (task_id, ref_id, score)
+            for ref_id, score in result.ranked
+            if (task_id := _as_task_id(ref_id)) is not None
+        ]
+        vector_scores = {
+            task_id: result.vector_scores[ref_id]
+            for task_id, ref_id, _ in resolved
+            if ref_id in result.vector_scores
+        }
+        return {
+            task_id: (score, _score_label(task_id, keyword_ids, vector_scores))
+            for task_id, _, score in resolved
+        }
 
     @staticmethod
     def _apply_task_filters(

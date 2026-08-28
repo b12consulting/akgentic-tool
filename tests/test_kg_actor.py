@@ -19,8 +19,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from akgentic.core.actor_address import ActorAddress
 
-from akgentic.tool.errors import RetriableError
 from akgentic.tool.core.event import ToolStateEvent
+from akgentic.tool.errors import RetriableError
 from akgentic.tool.knowledge_graph.kg_actor import (
     KG_ACTOR_NAME,
     KG_ACTOR_ROLE,
@@ -38,6 +38,7 @@ from akgentic.tool.knowledge_graph.models import (
     RelationDelete,
     SearchQuery,
 )
+from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA
 from akgentic.tool.vector_store.protocol import CollectionConfig, CollectionStatus
 from akgentic.tool.vector_store.protocol import SearchHit as VsSearchHit
 from akgentic.tool.vector_store.protocol import SearchResult as VsSearchResult
@@ -1022,6 +1023,31 @@ class TestHybridSearch:
         assert len(alice_hits) == 1, "Alice should appear exactly once (deduplication)"
 
     def test_hybrid_combined_hits_rank_higher_than_vector_only(self) -> None:
+        """At equal cosine, confirmation by both legs wins — true for any alpha < 1."""
+        actor, mock_proxy = self._setup_actor_with_known_vectors()
+        entities = actor.get_graph().entities
+        alice_id = str(next(e for e in entities if e.name == "Alice").id)
+        bob_id = str(next(e for e in entities if e.name == "Bob").id)
+        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        mock_proxy.search.return_value = VsSearchResult(
+            hits=[
+                VsSearchHit(ref_type="entity", ref_id=alice_id, text="", score=0.85),
+                VsSearchHit(ref_type="entity", ref_id=bob_id, text="", score=0.85),
+            ],
+            status=CollectionStatus.READY,
+            indexing_pending=0,
+        )
+        result = actor.search(SearchQuery(query="login", top_k=5, mode="hybrid"))
+        ref_ids = [h.ref_id for h in result.hits]
+        assert ref_ids[0] == alice_id, "Alice (vector+keyword) should rank above Bob (vector-only)"
+
+    def test_hybrid_weakest_vector_hit_normalises_to_zero(self) -> None:
+        """relativeScoreFusion is relative: the floor of the vector leg scores 0.
+
+        A keyword match on that entity is then all it has, so a slightly stronger
+        vector-only hit can outrank it. This is Weaviate's behaviour, and it is
+        most visible on small result sets like this one.
+        """
         actor, mock_proxy = self._setup_actor_with_known_vectors()
         entities = actor.get_graph().entities
         alice_id = str(next(e for e in entities if e.name == "Alice").id)
@@ -1036,8 +1062,7 @@ class TestHybridSearch:
             indexing_pending=0,
         )
         result = actor.search(SearchQuery(query="login", top_k=5, mode="hybrid"))
-        ref_ids = [h.ref_id for h in result.hits]
-        assert ref_ids[0] == alice_id, "Alice (vector+keyword) should rank above Bob (vector-only)"
+        assert [h.ref_id for h in result.hits][0] == bob_id
 
     def test_hybrid_top_k_limits_results(self) -> None:
         actor, mock_proxy = _actor_with_mock_embed()
@@ -1851,8 +1876,12 @@ class TestHybridSearchThresholdFiltering:
         assert good_id in ref_ids
         assert bad_id not in ref_ids
 
-    def test_keyword_hits_above_threshold_survive(self) -> None:
-        """Keyword-only hits have score 1.0, always above threshold."""
+    def test_keyword_hits_are_never_dropped_by_the_threshold(self) -> None:
+        """The threshold gates the vector leg only, so a keyword hit cannot fail it.
+
+        It scores 1 - alpha, which is unrelated to score_threshold: the two are on
+        different scales now, and that is the point.
+        """
         actor = _actor()  # no vector proxy
         actor.update_graph(
             ManageGraph(
@@ -1861,10 +1890,10 @@ class TestHybridSearchThresholdFiltering:
                 ]
             )
         )
+        actor.config.search_score_threshold = 0.99
         result = actor.search(SearchQuery(query="Alice", mode="hybrid"))
-        # Keyword fallback: score 1.0, threshold 0.3 -> included
         assert len(result.hits) == 1
-        assert result.hits[0].score == 1.0
+        assert result.hits[0].score == pytest.approx(1.0 - DEFAULT_ALPHA)
 
     def test_hybrid_query_override_threshold(self) -> None:
         actor, mock_proxy = _actor_with_mock_embed()
