@@ -1157,3 +1157,53 @@ class TestWeaviateRouting:
 
         result = actor._get_backend_for_collection("unknown")
         assert result is backend
+
+
+# ---------------------------------------------------------------------------
+# Weaviate team_id propagation
+# ---------------------------------------------------------------------------
+
+
+class TestWeaviateTeamIdPropagation:
+    """The actor's own team_id reaches the WeaviateBackend it builds."""
+
+    def test_backend_built_with_actor_team_id(self) -> None:
+        """_get_or_create_weaviate_backend passes str(self.team_id)."""
+        actor = _make_actor()
+        actor.config = VectorStoreConfig(
+            name=VS_ACTOR_NAME,
+            role=VS_ACTOR_ROLE,
+            weaviate_url="http://localhost:8080",
+            weaviate_api_key="secret",
+        )
+
+        with patch(
+            "akgentic.tool.vector_store.weaviate.WeaviateBackend"
+        ) as mock_cls:
+            actor._get_or_create_weaviate_backend()
+
+        assert mock_cls.call_args[1]["team_id"] == str(actor.team_id)
+        assert mock_cls.call_args[1]["url"] == "http://localhost:8080"
+        assert mock_cls.call_args[1]["api_key"] == "secret"
+
+    def test_team_id_is_not_configuration(self) -> None:
+        """team_id is propagated by the actor system, never a VectorStoreConfig field."""
+        assert "team_id" not in VectorStoreConfig.model_fields
+
+    def test_two_actors_stamp_distinct_team_ids(self) -> None:
+        """Each team's actor builds a backend carrying its own id."""
+        first, second = _make_actor(), _make_actor()
+        for actor in (first, second):
+            actor.config = VectorStoreConfig(
+                name=VS_ACTOR_NAME,
+                role=VS_ACTOR_ROLE,
+                weaviate_url="http://localhost:8080",
+            )
+
+        with patch("akgentic.tool.vector_store.weaviate.WeaviateBackend") as mock_cls:
+            first._get_or_create_weaviate_backend()
+            second._get_or_create_weaviate_backend()
+
+        stamped = [c[1]["team_id"] for c in mock_cls.call_args_list]
+        assert stamped == [str(first.team_id), str(second.team_id)]
+        assert stamped[0] != stamped[1]

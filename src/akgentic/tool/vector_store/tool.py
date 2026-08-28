@@ -14,6 +14,7 @@ surface).
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from typing import Any, Literal
 
@@ -99,6 +100,8 @@ class VectorStoreTool(ToolCard):
                 role=VS_ACTOR_ROLE,
                 embedding_model=self.embedding_model,
                 embedding_provider=self.embedding_provider,
+                weaviate_url=os.environ.get("AKGENTIC_WEAVIATE_URL") or None,
+                weaviate_api_key=os.environ.get("AKGENTIC_WEAVIATE_API_KEY") or None,
             ),
         )
 

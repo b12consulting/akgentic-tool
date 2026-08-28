@@ -971,11 +971,18 @@ VectorStoreTool(vector_store_name="#VectorStore-RAG", embedding_provider="azure"
 ```
 
 Collections are configured on the *consumer* card (`collection: CollectionConfig`), and Weaviate
-connection settings are deliberately not fields on any card — they are infrastructure, injected by
-the deployment layer.
+connection settings are deliberately not fields on any card — they are infrastructure. The card
+reads them from `AKGENTIC_WEAVIATE_URL` / `AKGENTIC_WEAVIATE_API_KEY` when the observer attaches;
+exporting a URL is what turns the Weaviate backend on.
+
+Every object `WeaviateBackend` writes is stamped with the owning team's id (`team_id`, taken from
+the actor, never from a card), so `delete_by_team()` and `list_collections()` give a deployment the
+two primitives it needs to reap the vectors of a deleted team — otherwise unreachable, since
+nothing else on a Weaviate object says who produced it.
 
 **[Full reference → `src/akgentic/tool/vector_store/README.md`](src/akgentic/tool/vector_store/README.md)** —
-`CollectionConfig` in full, the service protocol, asynchronous embedding, and multi-store setups.
+`CollectionConfig` in full, the service protocol, asynchronous embedding, team-scoped cleanup, and
+multi-store setups.
 
 ### SearchTool
 
