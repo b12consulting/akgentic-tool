@@ -276,6 +276,57 @@ class TestVectorStoreToolObserver:
 
 
 # ===========================================================================
+# Weaviate activation through the environment
+# ===========================================================================
+
+
+class TestWeaviateEnvActivation:
+    """The card carries no connection settings; the deployment supplies them."""
+
+    def test_env_vars_reach_the_actor_config(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AKGENTIC_WEAVIATE_* are read at observer time into VectorStoreConfig."""
+        monkeypatch.setenv("AKGENTIC_WEAVIATE_URL", "https://cluster.example:443")
+        monkeypatch.setenv("AKGENTIC_WEAVIATE_API_KEY", "k-123")
+
+        observer = _MockActorToolObserver()
+        VectorStoreTool().observer(observer)
+
+        config = observer._orchestrator_proxy.getChildrenOrCreate.call_args.kwargs["config"]
+        assert config.weaviate_url == "https://cluster.example:443"
+        assert config.weaviate_api_key == "k-123"
+
+    def test_unset_env_leaves_weaviate_inactive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without the env vars the actor gets None, not an empty string."""
+        monkeypatch.delenv("AKGENTIC_WEAVIATE_URL", raising=False)
+        monkeypatch.delenv("AKGENTIC_WEAVIATE_API_KEY", raising=False)
+
+        observer = _MockActorToolObserver()
+        VectorStoreTool().observer(observer)
+
+        config = observer._orchestrator_proxy.getChildrenOrCreate.call_args.kwargs["config"]
+        assert config.weaviate_url is None
+        assert config.weaviate_api_key is None
+
+    def test_empty_env_value_is_treated_as_unset(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An exported-but-empty variable must not look like a configured cluster."""
+        monkeypatch.setenv("AKGENTIC_WEAVIATE_URL", "")
+        monkeypatch.setenv("AKGENTIC_WEAVIATE_API_KEY", "")
+
+        observer = _MockActorToolObserver()
+        VectorStoreTool().observer(observer)
+
+        config = observer._orchestrator_proxy.getChildrenOrCreate.call_args.kwargs["config"]
+        assert config.weaviate_url is None
+        assert config.weaviate_api_key is None
+
+
+# ===========================================================================
 # AC-2: configuration-only surface
 # ===========================================================================
 
