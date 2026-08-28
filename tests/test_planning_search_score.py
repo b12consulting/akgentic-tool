@@ -15,7 +15,7 @@ from akgentic.tool.planning.planning_actor import (
     PlanConfig,
     Task,
 )
-from akgentic.tool.vector_store.hybrid import OVERFETCH
+from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA, OVERFETCH
 
 
 def _extract_id(line: str) -> int:
@@ -194,6 +194,19 @@ class TestConfigPropagation:
 
         configs = self._run_observer(PlanningTool(search_score_threshold=0.6))
         assert configs[0].search_score_threshold == 0.6
+
+    def test_propagates_default_hybrid_alpha(self) -> None:
+        from akgentic.tool.planning.planning import PlanningTool
+
+        configs = self._run_observer(PlanningTool())
+        assert configs[0].hybrid_alpha == DEFAULT_ALPHA
+
+    def test_propagates_custom_hybrid_alpha(self) -> None:
+        """Without this the knob is unreachable from a catalog YAML."""
+        from akgentic.tool.planning.planning import PlanningTool
+
+        configs = self._run_observer(PlanningTool(hybrid_alpha=0.2))
+        assert configs[0].hybrid_alpha == 0.2
 
 
 # ---------------------------------------------------------------------------

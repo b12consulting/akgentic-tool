@@ -28,6 +28,7 @@ from akgentic.tool.planning.planning_actor import (
     UpdatePlan,
 )
 from akgentic.tool.planning.state import PlanningState, TaskRow
+from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA
 from akgentic.tool.vector_store.protocol import CollectionConfig
 
 logger = logging.getLogger(__name__)
@@ -153,6 +154,16 @@ class PlanningTool(ToolCard):
         default=0.5,
         description="Default minimum cosine similarity score for semantic results.",
     )
+    hybrid_alpha: float = Field(
+        default=DEFAULT_ALPHA,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Weight of the vector leg when fusing hybrid search results; the keyword leg "
+            "gets 1 - alpha. Matches Weaviate's hybrid() alpha parameter. Below 0.5 a "
+            "keyword match outranks a strong semantic hit."
+        ),
+    )
 
     @property
     def depends_on(self) -> list[str]:
@@ -207,6 +218,7 @@ class PlanningTool(ToolCard):
                 collection=self.collection,
                 search_top_k=self.search_top_k,
                 search_score_threshold=self.search_score_threshold,
+                hybrid_alpha=self.hybrid_alpha,
             ),
         )
 
