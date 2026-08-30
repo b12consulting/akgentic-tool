@@ -390,9 +390,13 @@ class MailboxCapability(AbstractCapability[Any]):
             card: The agent's ``MailboxTool`` — the config's own, or the
                 auto-inserted default. Required.
             absorbed_prefix: What an absorbed message is prefixed with when it is
-                injected mid-run. Defaults to :data:`ABSORBED_PREFIX`.
+                injected mid-run. Defaults to :data:`ABSORBED_PREFIX`. **A
+                replacement must keep saying the arrival is *additional* work** —
+                that clause exists because of an observed failure, and dropping it
+                is the one edit here that breaks delivery; see
+                :data:`ABSORBED_PREFIX`'s own documentation.
             arrival_closing: The arrival notice's closing line for a listing that
-                offers at least one id. Defaults to the shipped closing.
+                offers at least one id. Defaults to ``_CLOSING_WITH_IDS``.
                 ``_CLOSING_WITHOUT_IDS`` takes no parameter — a listing offering no
                 id may not promise a read whatever a caller configures.
 

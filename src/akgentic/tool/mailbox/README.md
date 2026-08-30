@@ -242,6 +242,19 @@ the notice announcing mail that landed while a run was in flight. Both are assig
 through, so an explicitly passed `""` is honoured as the caller's choice rather than replaced by
 the default.
 
+**Who can actually pass them: code, not a catalog.** `BaseAgent` builds the capability with two
+arguments and passes neither parameter, so every deployment runs the constants and improving a
+sentence is a change to `capability.py` that reaches every existing team on upgrade. That is the
+point of the move rather than a gap in it — the parameters exist so the wording has one home and a
+caller constructing the capability directly can still override it, not so an operator can tune
+prose per team.
+
+> **One clause is load-bearing, and an override can delete it.** `ABSORBED_PREFIX` opens with
+> *"It does NOT replace what you were already asked to do"*. It is there because of an observed
+> failure: an agent that had just finished a report took on a newer mid-run question, answered only
+> that, and the report reached nobody. Reword freely; keep something that says the arrival is
+> *additional* work.
+
 > **The wording briefly lived here, as two `str` card fields, and was moved back out.** The
 > argument for the card was about *reading* a catalog entry: a literal default shows an operator
 > what the agent is currently being told, where a `null` shows nothing. What it did not weigh is

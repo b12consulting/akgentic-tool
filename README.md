@@ -1236,8 +1236,9 @@ interrupts.
 
 **[Full reference → `src/akgentic/tool/mailbox/README.md`](src/akgentic/tool/mailbox/README.md)** —
 the two capability params, the absorption contract and why the id is not validated,
-`MailboxMessage` and why both its methods are required, where the injected prompt text lives and
-why it is not on the card, the `message_id` contract, where the cancel vocabulary lives, the
+`MailboxMessage` and why both its methods are required, where the injected prompt text lives, why
+it is not on the card and the clause an override must keep, the `message_id` contract, where the
+cancel vocabulary lives, the
 observer protocol, and the enforcement that stays `akgentic-agent`'s.
 
 ### MCPTool
