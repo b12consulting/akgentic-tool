@@ -23,6 +23,12 @@ class ToolState(SerializableBaseModel):
     Downstream delivery wiring relies on that convention to pair each provider
     with its persisted baseline.
 
+    ``active_model`` is the roster key of the model currently in force,
+    ``f"{provider}:{model}"``. ``None`` means the agent expresses no preference
+    and the config's declared active entry wins — which is also what a payload
+    persisted before this field existed restores to, so the recovery direction
+    stays harmless and needs no migration step.
+
     Never store a ``ToolState`` reference: the agent's state object is replaced
     wholesale on restore, so a cached reference goes silently stale. Reach the
     live slot through ``observer.state.tool_state`` at the moment of use.
@@ -30,3 +36,4 @@ class ToolState(SerializableBaseModel):
 
     context_baselines: dict[str, ContextState] = Field(default_factory=dict)
     context_update_seq: int = 0
+    active_model: str | None = None

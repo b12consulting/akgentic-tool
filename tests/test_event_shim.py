@@ -59,8 +59,10 @@ _EXPECTED_ROOT_ALL: list[str] = [
     "ActorToolObserver",
     "ToolStateCarrier",  # epic 35: how tools reach the slot — beside the observers
     "TeamManagementToolObserver",
+    "ModelSwitchToolObserver",  # epic 36: the model-switch contract joins the stable surface
     "ToolStateEvent",
     "KnowledgeGraphStateEvent",
+    "ModelRow",  # epic 36: the roster projection that contract speaks in
     "CommandArg",
     "CommandDescriptor",
     "CommandsAnnouncedEvent",

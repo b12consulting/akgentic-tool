@@ -34,6 +34,8 @@ from .core.observer import ActorToolObserver, ToolObserver, ToolStateCarrier  # 
 from .errors import CommandNotRecognized, RetriableError, ToolObserverGone  # noqa: F401
 from .mailbox.mailbox import MailboxTool  # noqa: F401
 from .metadata.tool import MetadataTool  # noqa: F401
+from .model.observer import ModelSwitchToolObserver  # noqa: F401
+from .model.state import ModelRow  # noqa: F401
 from .notification.tool import NotificationTool  # noqa: F401
 from .sandbox.bwrap import BwrapSandboxActor  # noqa: F401
 from .sandbox.seatbelt import SeatbeltSandboxActor  # noqa: F401
@@ -74,8 +76,11 @@ __all__ = [
     "ActorToolObserver",
     "ToolStateCarrier",
     "TeamManagementToolObserver",
+    "ModelSwitchToolObserver",
     "ToolStateEvent",
     "KnowledgeGraphStateEvent",
+    # Domain models
+    "ModelRow",
     # Command discovery models
     "CommandArg",
     "CommandDescriptor",
