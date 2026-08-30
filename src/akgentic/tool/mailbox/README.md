@@ -236,7 +236,9 @@ MailboxCapability(
 ```
 
 Two keyword-only constructor parameters on `MailboxCapability` (`capability.py`), each defaulting
-to the module constant beside it — `ABSORBED_PREFIX` and the shipped closing. `absorbed_prefix`
+to the module constant beside it — `ABSORBED_PREFIX` and `ARRIVAL_CLOSING`, both exported from
+`akgentic.tool.mailbox`, so a caller wanting *the shipped wording plus a sentence* has a public
+name to build on. `absorbed_prefix`
 frames a message the model took on through `read_mailbox`; `arrival_closing` is the last line of
 the notice announcing mail that landed while a run was in flight. Both are assigned straight
 through, so an explicitly passed `""` is honoured as the caller's choice rather than replaced by
@@ -248,6 +250,11 @@ sentence is a change to `capability.py` that reaches every existing team on upgr
 point of the move rather than a gap in it — the parameters exist so the wording has one home and a
 caller constructing the capability directly can still override it, not so an operator can tune
 prose per team.
+
+> **`_CLOSING_WITHOUT_IDS` is not exported, and that is the rule rather than an oversight.** The
+> closing for a listing that carries no offerable id reaches no parameter — a listing with no id may
+> not promise a read whatever anyone configures — so there is no caller to give a name to. A
+> constant is public here when it is the default of a public surface, and private when it is not.
 
 > **One clause is load-bearing, and an override can delete it.** `ABSORBED_PREFIX` opens with
 > *"It does NOT replace what you were already asked to do"*. It is there because of an observed

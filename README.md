@@ -1224,8 +1224,10 @@ extends `MailboxMessage` (`akgentic.tool.mailbox`) to declare it can travel thro
 which obliges it to answer both `rendering()` and `rendering_preview()`. A class that renders for
 the model but should never be absorbed simply does not extend it. The wording a mid-run arrival
 reads with is not on the card: it is `MailboxCapability`'s, two keyword-only constructor parameters
-defaulting to the constants beside them, so improving a sentence reaches every existing team on
-upgrade instead of only teams created afterwards. The card is still handed to the capability whole,
+defaulting to `ABSORBED_PREFIX` and `ARRIVAL_CLOSING` beside them — both exported from
+`akgentic.tool.mailbox`, so overriding one can build on the shipped wording rather than replace it
+blind — and improving a sentence reaches every existing team on upgrade instead of only teams
+created afterwards. The card is still handed to the capability whole,
 which reads `read_mailbox` off it to decide whether the doorbell rings.
 
 The `stop` command registers the `/stop` surface only — dispatched while the agent is idle it

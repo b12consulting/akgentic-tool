@@ -24,12 +24,14 @@ from akgentic.core.messages import Message
 from pydantic_ai.messages import ToolCallPart
 from pydantic_ai.tools import ToolDefinition
 
-from akgentic.tool.mailbox import MailboxCapability, MailboxMessage, MailboxTool
-from akgentic.tool.mailbox.capability import (
-    _CLOSING_WITH_IDS,
+from akgentic.tool.mailbox import (
     ABSORBED_PREFIX,
-    MailboxAccess,
+    ARRIVAL_CLOSING,
+    MailboxCapability,
+    MailboxMessage,
+    MailboxTool,
 )
+from akgentic.tool.mailbox.capability import MailboxAccess
 
 _SENTINEL_PREFIX = "SENTINEL-PREFIX-9f3c: only an injected prefix may carry this."
 _SENTINEL_CLOSING = "SENTINEL-CLOSING-4a71: only an injected closing may carry this."
@@ -160,7 +162,7 @@ def test_the_two_wording_parameters_are_keyword_only_and_default_to_the_constant
     assert parameters["absorbed_prefix"].kind is inspect.Parameter.KEYWORD_ONLY
     assert parameters["absorbed_prefix"].default == ABSORBED_PREFIX
     assert parameters["arrival_closing"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert parameters["arrival_closing"].default == _CLOSING_WITH_IDS
+    assert parameters["arrival_closing"].default == ARRIVAL_CLOSING
 
 
 def test_two_argument_construction_still_works_positionally_and_by_keyword() -> None:
@@ -174,7 +176,7 @@ def test_two_argument_construction_still_works_positionally_and_by_keyword() -> 
 
     for capability in (positional, by_keyword):
         assert capability._absorbed_prefix == ABSORBED_PREFIX
-        assert capability._arrival_closing == _CLOSING_WITH_IDS
+        assert capability._arrival_closing == ARRIVAL_CLOSING
 
 
 def test_the_card_still_decides_whether_the_doorbell_rings() -> None:
@@ -212,7 +214,7 @@ async def test_a_default_capability_injects_exactly_the_shipped_wording() -> Non
     notice = await _notice_for(capability, notice_ctx)
     injected = await _absorb(capability, absorb_ctx, errand)
 
-    assert notice.splitlines()[-1] == _CLOSING_WITH_IDS
+    assert notice.splitlines()[-1] == ARRIVAL_CLOSING
     assert injected == f"{ABSORBED_PREFIX}\n\n{errand.rendering()}"
 
 
@@ -237,7 +239,7 @@ async def test_an_overridden_prefix_reaches_the_absorbed_message_injection() -> 
 @pytest.mark.asyncio
 async def test_an_overridden_closing_reaches_the_arrival_notice() -> None:
     # The same mutation, on the other site: `render_arrival_notice`'s third
-    # argument defaults to `_CLOSING_WITH_IDS`, so passing the constant instead of
+    # argument defaults to `ARRIVAL_CLOSING`, so passing the constant instead of
     # the attribute renders identically on every default-path spec.
     errand = _Errand()
     capability, _mailbox = _capability(
@@ -248,5 +250,44 @@ async def test_an_overridden_closing_reaches_the_arrival_notice() -> None:
     notice = await _notice_for(capability, ctx)
 
     assert notice.splitlines()[-1] == _SENTINEL_CLOSING
-    assert _CLOSING_WITH_IDS not in notice
+    assert ARRIVAL_CLOSING not in notice
     assert f"(id: {errand.id})" in notice  # the id is what makes the closing honest
+
+
+# ── both wording defaults are public, because both are defaults of public surfaces ──
+
+
+def test_both_wording_constants_are_on_the_package_surface() -> None:
+    # `ARRIVAL_CLOSING` was `_CLOSING_WITH_IDS`, private, while `ABSORBED_PREFIX`
+    # beside it was public — an accident of authoring order, not a rule. Once both
+    # became defaults of a public constructor parameter the asymmetry had a cost: a
+    # caller wanting "the shipped closing plus one sentence" had no public name and
+    # had to import a private one, which three akgentic-agent test modules did.
+    import akgentic.tool.mailbox as mailbox_module
+
+    for name in ("ABSORBED_PREFIX", "ARRIVAL_CLOSING"):
+        assert name in mailbox_module.__all__
+        assert isinstance(getattr(mailbox_module, name), str)
+
+
+def test_the_no_id_closing_is_not_promoted_with_it() -> None:
+    # The pair split, and only one half had a caller. A listing that offers no id
+    # may not promise a read whatever anyone configures, so the no-id closing
+    # reaches no parameter — there is nobody to give a name to.
+    import akgentic.tool.mailbox as mailbox_module
+
+    assert "_CLOSING_WITHOUT_IDS" not in mailbox_module.__all__
+    assert not hasattr(mailbox_module, "_CLOSING_WITHOUT_IDS")
+
+
+def test_the_promoted_constant_is_the_default_of_both_public_surfaces() -> None:
+    # The reason it is public at all. If either default is ever inlined or
+    # re-privatised, the name stops earning its export and this goes red.
+    from inspect import signature
+
+    from akgentic.tool.mailbox import render_arrival_notice
+
+    assert (
+        signature(render_arrival_notice).parameters["closing_with_ids"].default == ARRIVAL_CLOSING
+    )
+    assert signature(MailboxCapability).parameters["arrival_closing"].default == ARRIVAL_CLOSING

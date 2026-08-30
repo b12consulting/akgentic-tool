@@ -166,20 +166,42 @@ message owning it.
 UNOFFERABLE_LINE = "- Message cannot be handled in the run"
 """What a message this run cannot take on renders as — no id, no content."""
 
-_CLOSING_WITH_IDS = (
+ARRIVAL_CLOSING = (
     "Call `read_mailbox` with one of the ids above to take that message on now — worth doing "
     "if it may add to or change what you are working on, since a correction only helps before "
     "the work is finished. Otherwise finish your current work first — you will get them just "
     "after."
 )
+"""The arrival notice's closing line, for a listing that offers at least one id.
+
+The default of two public surfaces — ``render_arrival_notice``'s
+``closing_with_ids`` parameter and :class:`MailboxCapability`'s
+``arrival_closing`` — which is why it carries a public name. It was private until
+a caller wanting *the shipped closing plus one sentence* found there was no
+public name to reach for and had to import a private one instead.
+
+It says the one thing that decides the timing: a message that may add to or
+change the work in flight is worth taking on before that work is finished, and
+is worth nothing after. Do not shorten it to the pointer alone — the reason is
+what makes the choice a judgement rather than an interruption.
+
+:data:`_CLOSING_WITHOUT_IDS` is deliberately **not** promoted alongside it. It is
+configurable from nowhere, so there is no caller to give a name to.
+"""
 
 _CLOSING_WITHOUT_IDS = "Finish your current work first — you will get them just after."
+"""What a listing carrying no offerable id closes with.
+
+Private, and it stays private: a listing that offers no id may not promise a
+read whatever anyone configures, so this reaches no parameter and nobody
+chooses it.
+"""
 
 
 def render_arrival_notice(
     new_messages: list[Message],
     offerable_ids: set[uuid.UUID],
-    closing_with_ids: str = _CLOSING_WITH_IDS,
+    closing_with_ids: str = ARRIVAL_CLOSING,
 ) -> str:
     """Doorbell for messages that arrived mid-run (ADR-010 §5, ADR-040 §5).
 
@@ -355,7 +377,7 @@ class MailboxCapability(AbstractCapability[Any]):
         card: MailboxTool,
         *,
         absorbed_prefix: str = ABSORBED_PREFIX,
-        arrival_closing: str = _CLOSING_WITH_IDS,
+        arrival_closing: str = ARRIVAL_CLOSING,
     ) -> None:
         """Wire the capability to one agent's mailbox, its card and its wording.
 
@@ -396,7 +418,7 @@ class MailboxCapability(AbstractCapability[Any]):
                 is the one edit here that breaks delivery; see
                 :data:`ABSORBED_PREFIX`'s own documentation.
             arrival_closing: The arrival notice's closing line for a listing that
-                offers at least one id. Defaults to ``_CLOSING_WITH_IDS``.
+                offers at least one id. Defaults to :data:`ARRIVAL_CLOSING`.
                 ``_CLOSING_WITHOUT_IDS`` takes no parameter — a listing offering no
                 id may not promise a read whatever a caller configures.
 
