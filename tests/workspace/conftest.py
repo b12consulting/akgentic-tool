@@ -542,6 +542,11 @@ class SandboxScript:
         raise_with: Raised instead of returning, for the failure path.
         timeouts: Every budget the backend was handed, in order.
         commands: Every ``(cmd, cwd)`` it was handed, in order.
+        ready_raise: Raised by ``ready()`` instead of answering it. A stand-in
+            for the ``pykka.Timeout`` a real ask proxy raises when the backend
+            has not finished starting: the harness hands the worker the actor
+            itself rather than a proxy, so the refusal has to come from inside.
+        ready_calls: How many times readiness was asked for.
     """
 
     started: threading.Event = field(default_factory=threading.Event)
@@ -553,6 +558,8 @@ class SandboxScript:
     raise_with: BaseException | None = None
     timeouts: list[float | None] = field(default_factory=list)
     commands: list[tuple[str, str]] = field(default_factory=list)
+    ready_raise: BaseException | None = None
+    ready_calls: int = 0
 
 
 class FakeSandboxActor(SandboxActor):
@@ -576,6 +583,13 @@ class FakeSandboxActor(SandboxActor):
 
     def _stop_sandbox(self) -> None:
         pass
+
+    def ready(self) -> bool:
+        script = type(self).script
+        script.ready_calls += 1
+        if script.ready_raise is not None:
+            raise script.ready_raise
+        return super().ready()
 
     def _exec(self, cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
         script = type(self).script
@@ -607,6 +621,25 @@ class DeadAddress(MockActorAddress):
         return False
 
 
+class WorkerAddress(MockActorAddress):
+    """A worker's address whose liveness follows the worker's own thread.
+
+    The lease records this address and ``#Workspace`` asks it whether the run
+    still has anybody to report it, so a stand-in that always claimed to be alive
+    would make the reclaim path untestable and one that always claimed to be dead
+    would make the refusal path untestable. Following the thread means a test
+    holding a run open has a genuinely live worker, and a test that has joined
+    the harness has a genuinely dead one.
+    """
+
+    def __init__(self, name: str, role: str) -> None:
+        super().__init__(name, role)
+        self.thread: threading.Thread | None = None
+
+    def is_alive(self) -> bool:
+        return self.thread is not None and self.thread.is_alive()
+
+
 class ExecHarness:
     """Runs ``#Workspace``'s exec worker on a real thread, with no actor system.
 
@@ -625,8 +658,16 @@ class ExecHarness:
         self.orchestrator_proxy = orchestrator_proxy
         self.threads: list[threading.Thread] = []
         self.worker_names: list[str] = []
+        self.addresses: list[WorkerAddress] = []
         self.payloads: list[DeferredPayload] = []
         self.spawn_error: BaseException | None = None
+        self.ask_timeouts: list[int | None] = []
+        """Every timeout the worker's asks carried, in order.
+
+        A worker holds the lease, the tree and its parent's teardown for as long
+        as it blocks, so an ask it makes without a timeout is unbounded on all
+        three. Recorded here so that property is asserted rather than assumed.
+        """
         self._orchestrator = DeadAddress("orchestrator")
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -645,7 +686,9 @@ class ExecHarness:
         assert config is not None
         assert issubclass(actor_class, ExecWorker)
         self.worker_names.append(config.name)
-        return MockActorAddress(config.name, config.role)
+        address = WorkerAddress(config.name, config.role)
+        self.addresses.append(address)
+        return address
 
     def _proxy_tell(self, address: ActorAddress, actor_type: Any = None) -> Any:
         return _WorkerLauncher(self)
@@ -658,7 +701,10 @@ class ExecHarness:
         worker._orchestrator = self._orchestrator
         worker.on_start()
 
-        def proxy_ask(target: ActorAddress, actor_type: Any = None) -> Any:
+        def proxy_ask(
+            target: ActorAddress, actor_type: Any = None, timeout: int | None = None
+        ) -> Any:
+            self.ask_timeouts.append(timeout)
             if target is self._orchestrator:
                 return self.orchestrator_proxy
             return self.orchestrator_proxy.actor_for(target)
@@ -689,6 +735,9 @@ class _WorkerLauncher:
         self.harness.payloads.append(payload)
         thread = threading.Thread(target=self.harness._run_worker, args=(payload,), daemon=True)
         self.harness.threads.append(thread)
+        # Attached before the thread starts, and before ``request`` returns: the
+        # lease reads this address the moment the spawn call comes back.
+        self.harness.addresses[-1].thread = thread
         thread.start()
 
 

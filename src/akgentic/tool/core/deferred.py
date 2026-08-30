@@ -53,6 +53,7 @@ from typing import Any
 
 from pydantic import Field
 
+from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
@@ -293,7 +294,7 @@ class DeferredResultActor[
         self._slots.move_to_end(key)
         return slot.value
 
-    def request(self, key: K, payload: DeferredPayload) -> None:
+    def request(self, key: K, payload: DeferredPayload) -> ActorAddress | None:
         """TELL. Spawn exactly one worker for *key*, or do nothing.
 
         A no-op when the key is already cached, already in flight, or holds a
@@ -307,12 +308,22 @@ class DeferredResultActor[
         leave this key in flight for the lifetime of the actor — silently, and
         for ever. Binding them here makes that unrepresentable.
 
+        **The return value does not make this an ask.** It is still tell-shaped
+        and every caller may ignore it; it hands back the address this method
+        already created so a caller that needs to know whether its worker is
+        still alive can hold it, rather than the base growing a second map beside
+        ``_in_flight`` for a fact only that caller cares about.
+
         Args:
             key: Cache key the worker will produce.
             payload: The unit of work; its ``deferred_key`` is set from *key*.
+
+        Returns:
+            The spawned worker's address, or ``None`` when nothing was spawned —
+            a de-duplicated key, or a spawn that failed.
         """
         if key in self._in_flight or self._is_known(key):
-            return
+            return None
         self._in_flight.add(key)
         payload = payload.model_copy(update={"deferred_key": key})
         # createActor, NOT getChildrenOrCreate: the singleton rule applies to the
@@ -331,6 +342,8 @@ class DeferredResultActor[
                 "[%s] Deferred worker spawn failed for %s: %s", self.config.name, key, exc
             )
             self.fail(key, f"worker spawn failed: {exc}")
+            return None
+        return worker
 
     def deliver(self, key: K, value: V) -> None:
         """TELL, from the worker. Cache *value* and clear the in-flight mark."""

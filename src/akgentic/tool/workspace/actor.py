@@ -64,6 +64,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from akgentic.core.actor_address import ActorAddress
 from akgentic.tool.core.deferred import (
     DEFAULT_WORKER_TIMEOUT_S,
     DeferredResultActor,
@@ -400,6 +401,7 @@ class WorkspaceActor(DeferredResultActor[WorkspaceConfig, WorkspaceState, str, E
         self._matcher = EditMatcher()
         self._exec_config: ExecConfig | None = None
         self._lease: ExecLease | None = None
+        self._reclaimed: OrderedDict[str, ExecLease] = OrderedDict()
         self._run_errors: OrderedDict[str, str] = OrderedDict()
         self._recent_runs: dict[str, OrderedDict[str, str]] = {}
         self._workspace: Filesystem = get_workspace(self.config.workspace_name)
@@ -508,12 +510,13 @@ class WorkspaceActor(DeferredResultActor[WorkspaceConfig, WorkspaceState, str, E
             agent_id=agent_id,
             cmd=cmd,
             started_at=now,
+            budget=budget,
             deadline=now + budget + LEASE_GRACE_S,
         )
         self._track_run(agent_id, run_id)
         # The lease is taken BEFORE request(), because a spawn failure reports
         # through fail() synchronously and must find a lease to release.
-        self.request(
+        worker = self.request(
             run_id,
             ExecPayload(
                 deferred_key=run_id,
@@ -525,7 +528,51 @@ class WorkspaceActor(DeferredResultActor[WorkspaceConfig, WorkspaceState, str, E
                 timeout_s=budget,
             ),
         )
+        self._attach_worker(run_id, worker)
         return ExecStart(run_id=run_id)
+
+    def _attach_worker(self, run_id: str, worker: ActorAddress | None) -> None:
+        """Record on the lease which worker is performing *run_id*.
+
+        Guarded on the lease still being this run's, because ``request`` can
+        release it before returning: a spawn that fails reports through ``fail``
+        synchronously, which reaches :meth:`_finish_run` and clears the lease
+        (29-5's ordering note). Attaching blindly would pin an address onto
+        whatever lease came next.
+
+        Args:
+            run_id: The run the address belongs to.
+            worker: The spawned worker, or ``None`` when nothing was spawned.
+        """
+        lease = self._lease
+        if worker is None or lease is None or lease.run_id != run_id:
+            return
+        lease.attach(worker)
+
+    def run_started(self, run_id: str) -> None:
+        """TELL, from the worker. Re-base *run_id*'s lease onto the moment it began.
+
+        The deadline is set when a run is *accepted*, and until this arrives that
+        is all it can mean. Anything slow ahead of the command therefore spends
+        it — a first run on a container backend builds the image, which is a
+        minute against a 20 s lease — and the tree is then handed to another
+        agent while a live run is still about to write into it. Re-basing here
+        makes the deadline mean what its name says: the run's budget, measured
+        from the run.
+
+        A ``run_started`` for a run that no longer holds the lease is ignored
+        rather than raised on. It is a tell from a worker whose lease was already
+        reclaimed, and there is nothing left for it to extend.
+
+        Args:
+            run_id: The run whose command is starting now.
+        """
+        lease = self._lease
+        if lease is None or lease.run_id != run_id:
+            return
+        self._lease = lease.model_copy(
+            update={"deadline": time.monotonic() + lease.budget + LEASE_GRACE_S}
+        )
 
     def exec_status(self, agent_id: str, run_id: str) -> ExecStatus:
         """Report where *run_id* stands, for *agent_id*.
@@ -598,19 +645,54 @@ class WorkspaceActor(DeferredResultActor[WorkspaceConfig, WorkspaceState, str, E
         """Commit what the run produced and release its lease.
 
         **Only a report from the lease's own run releases it.** A late report
-        from a run whose lease was already reclaimed on deadline must not clear a
-        newer agent's lease, and must not commit its tree either.
+        from a run whose lease was already reclaimed must not clear a newer
+        agent's lease — and must not commit as its own agent either, since by
+        then the tree may hold somebody else's accepted mutations. What it must
+        not do is what it used to: return in silence, leaving the files it
+        produced in the tree for a later agent's discovery to sweep into *that*
+        agent's commit.
         """
         lease = self._lease
         if lease is None or lease.run_id != run_id:
+            self._orphaned_report(run_id)
             return
         self._lease = None
         self._journal.commit_discovered(
             self._identity(lease.agent_id), EXEC_CAPABILITY, detail=lease.cmd
         )
 
+    def _orphaned_report(self, run_id: str) -> None:
+        """Record a run that reported after its lease was taken back.
+
+        Loud, because it is a real anomaly: a run outlived its budget, the tree
+        was handed to somebody else, and files arrived from a command nobody is
+        waiting for any more. And committed **out of band** rather than
+        discovered, because attributing them to the late run would put whatever
+        else is in the tree under its author — the mirror image of the silent
+        drop, written into the journal where it looks authoritative.
+
+        A report with nothing reclaimed under its id is a second report for a run
+        already closed out, which left nothing behind and needs no record.
+
+        Args:
+            run_id: The run that reported late.
+        """
+        lease = self._reclaimed.pop(run_id, None)
+        if lease is None:
+            return
+        logger.warning(
+            "Workspace %s: run %s reported after its lease was reclaimed (agent %s, command %r). "
+            "Whatever it wrote is committed as out-of-band — belonging to nobody — because the "
+            "tree may since have been changed by another agent.",
+            self.config.workspace_name,
+            run_id,
+            self._name_of(lease.agent_id),
+            lease.cmd,
+        )
+        self._journal.commit_out_of_band()
+
     def _busy_refusal(self) -> str | None:
-        """Refuse under a live lease, reclaim an expired one, or allow.
+        """Refuse under a live lease, reclaim a dead one, or allow.
 
         Fail fast, never stall. Ten seconds of silence inside a tool call is
         indistinguishable from a hang and gives the model nothing to react to; an
@@ -618,28 +700,55 @@ class WorkspaceActor(DeferredResultActor[WorkspaceConfig, WorkspaceState, str, E
         or ask the holder. That is only affordable because the actor's thread is
         free — the blocking call is in a worker.
 
+        **Past the deadline is not the same as gone.** A worker that is still
+        alive is still going to write into this tree, so a past-deadline lease
+        whose worker is alive is refused rather than reclaimed — with wording
+        that says which of the two it is. That is only safe because the worker is
+        mortal: its own budget bounds every ask it makes, so a lease cannot be
+        held open for ever by a wait nobody can see.
+
         Returns:
             The refusal text, or ``None`` when the tree is free.
         """
         lease = self._lease
         if lease is None:
             return None
-        if time.monotonic() > lease.deadline:
-            logger.warning(
-                "Workspace %s: reclaiming the lease of run %s (agent %s) — it passed its "
-                "deadline without reporting, which means its worker died with the team's "
-                "teardown. Anything it is still writing will land in a later commit.",
-                self.config.workspace_name,
-                lease.run_id,
-                self._name_of(lease.agent_id),
+        if time.monotonic() <= lease.deadline:
+            return (
+                f"{_BUSY_PREFIX} — exec run {lease.run_id} is in progress "
+                f"(agent '{self._name_of(lease.agent_id)}'). Reads still work; retry the change "
+                f"once the run has finished."
             )
-            self._lease = None
-            return None
-        return (
-            f"{_BUSY_PREFIX} — exec run {lease.run_id} is in progress "
-            f"(agent '{self._name_of(lease.agent_id)}'). Reads still work; retry the change "
-            f"once the run has finished."
+        if lease.worker_alive:
+            return (
+                f"{_BUSY_PREFIX} — exec run {lease.run_id} has passed its budget and is still "
+                f"being waited on (agent '{self._name_of(lease.agent_id)}'). Reads still work; "
+                f"retry the change once the run has finished."
+            )
+        logger.warning(
+            "Workspace %s: reclaiming the lease of run %s (agent %s) — it passed its deadline "
+            "and its worker is no longer alive, so nothing will ever report it. Anything it is "
+            "still writing will land in a later commit.",
+            self.config.workspace_name,
+            lease.run_id,
+            self._name_of(lease.agent_id),
         )
+        self._reclaim(lease)
+        return None
+
+    def _reclaim(self, lease: ExecLease) -> None:
+        """Take the tree back from *lease*, remembering the run it belonged to.
+
+        The run is kept — capped, like every other map on a team singleton —
+        because a reclaimed run may still report, and :meth:`_orphaned_report`
+        needs its agent and its command to say whose command left the files it is
+        about to commit as belonging to nobody.
+        """
+        self._lease = None
+        self._reclaimed[lease.run_id] = lease
+        self._reclaimed.move_to_end(lease.run_id)
+        while len(self._reclaimed) > MAX_TRACKED_RUNS:
+            self._reclaimed.popitem(last=False)
 
     def _track_run(self, agent_id: str, run_id: str) -> None:
         """Remember *run_id* as one of *agent_id*'s recent runs, LRU-capped.

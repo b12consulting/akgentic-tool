@@ -227,6 +227,27 @@ class SandboxActor(Akgent[SandboxConfig, SandboxState], ABC):
             )
         super().on_stop()
 
+    def ready(self) -> bool:
+        """Answer as soon as this actor can serve messages at all.
+
+        A **FIFO barrier, not a health check**. Its whole value is the mailbox's
+        own ordering: a message cannot be delivered before ``on_start`` has
+        returned, so an ask for this method is answered only once the backend has
+        finished provisioning — with no flag, no polling and no state. It says
+        the actor has finished starting and nothing whatever about whether docker
+        still works.
+
+        It exists so a caller can put a **timeout** on the wait for the backend
+        separately from the timeout on the command. Conflating the two is what
+        lets a slow cold start spend a run's whole budget before the command has
+        started (see ``ExecWorker.produce``).
+
+        Returns:
+            ``True``, always. The value carries no information; the fact that it
+            arrived does.
+        """
+        return True
+
     def exec(self, cmd: str, cwd: str = "", timeout: float | None = None) -> ExecResult:
         """Execute a command inside the sandbox after allowlist validation.
 

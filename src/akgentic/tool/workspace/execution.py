@@ -26,12 +26,14 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import time
 from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from pydantic import Field
+from pydantic import Field, PrivateAttr
 
+from akgentic.core.actor_address import ActorAddress
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.core.deferred import DeferredPayload, DeferredWorker
@@ -96,9 +98,14 @@ teardown, which reports nothing, and without a reclaim that wedges every mutatio
 in the team for the rest of its life. A deadline checked lazily by the next
 mutation closes it with no timer and no extra thread.
 
-The accepted cost, stated plainly: a run that somehow outlives its deadline may
-interleave with a mutation, and both changes end up in that run's discovered
-commit. Strictly better than a permanently wedged team.
+**The deadline is re-based when the run actually starts**, and the reclaim is
+gated on the worker being gone. Both matter for the same reason: a deadline that
+starts at *request* time is spent by anything slow ahead of the command — a
+container image being built, above all — so without either guard a live run is
+declared dead, the tree is handed to somebody else, and the run's report then
+finds no lease of its own and drops its write set. What remains is the one case
+the deadline was introduced for: a worker killed during teardown, which reports
+nothing and is not alive to be waited on.
 """
 
 RUN_ID_CHARS = 8
@@ -117,6 +124,37 @@ TIMED_OUT_EXIT_CODE = 124
 _UNCONFIGURED_MSG = (
     "This workspace has no execution backend configured — workspace_exec is not available here."
 )
+
+_NOT_READY_MSG = (
+    "The execution backend was not ready within {seconds}s, so the command never ran and "
+    "nothing was written. It is most likely still starting up — the first run on a container "
+    "backend builds its image — so retry in a moment; a run that keeps failing this way means "
+    "the backend cannot start on this host."
+)
+
+
+def ask_seconds(remaining: float) -> int:
+    """Whole seconds an ask inside a worker may block for, never past its deadline.
+
+    ``Akgent.proxy_ask`` takes an integer timeout, so a float budget has to land
+    on one. It is **truncated**, not rounded: the deadline is the whole point of
+    the budget, so an ask that outlived it would defeat the thing it is being
+    given. A remainder below a second becomes ``0`` — which fails the ask
+    immediately, and is the honest answer, since a backend does not start in the
+    time left.
+
+    Args:
+        remaining: Seconds left of the worker's budget, possibly negative.
+
+    Returns:
+        The timeout to hand ``proxy_ask``, never below zero.
+    """
+    return max(0, int(remaining))
+
+
+def backend_not_ready(seconds: int) -> str:
+    """Why a run never started, and what the agent should do about it."""
+    return _NOT_READY_MSG.format(seconds=seconds)
 
 
 class ExecOutcome(SerializableBaseModel):
@@ -147,15 +185,48 @@ class ExecLease(SerializableBaseModel):
         agent_id: Who requested the run. Named in every refusal it causes.
         cmd: The command, kept for the discovered commit's body.
         started_at: Monotonic clock at acquisition.
-        deadline: ``started_at`` + the effective budget + :data:`LEASE_GRACE_S`.
-            Checked lazily by the next mutation; nothing polls it.
+        budget: The run's effective wall-clock budget. Kept as a field rather
+            than re-derived from the two clocks below, because the deadline moves
+            when the run starts and a derivation would then have to un-do a grace
+            it cannot see.
+        deadline: When this lease may be reclaimed — the moment the run started
+            (acquisition, until ``run_started`` says otherwise) plus
+            :attr:`budget` plus :data:`LEASE_GRACE_S`. Checked lazily by the next
+            mutation; nothing polls it.
     """
 
     run_id: str
     agent_id: str
     cmd: str
     started_at: float
+    budget: float
     deadline: float
+
+    _worker: ActorAddress | None = PrivateAttr(default=None)
+    """The worker performing the run — runtime state, never serialized.
+
+    A ``PrivateAttr`` rather than a field: an address is live actor state, and
+    Golden Rule #1b keeps that out of a model's field set. Travelling *on the
+    lease* is what matters, because a second attribute beside ``_lease`` would
+    have to be cleared in every place the lease is, and the one that got missed
+    would pin a dead worker's address onto a live run's lease.
+    """
+
+    def attach(self, worker: ActorAddress) -> None:
+        """Record which worker is performing this run."""
+        self._worker = worker
+
+    @property
+    def worker_alive(self) -> bool:
+        """Whether the run still has a worker that could report it.
+
+        A lease with **no** recorded worker counts as not alive, and that is the
+        safe direction: a spawn that never happened leaves a lease nobody can
+        release, and refusing to reclaim it would wedge every mutation in the
+        team for the rest of its life.
+        """
+        worker = self._worker
+        return worker is not None and worker.is_alive()
 
 
 class ExecStart(SerializableBaseModel):
@@ -389,7 +460,20 @@ class ExecWorker(DeferredWorker):
     """
 
     def produce(self, payload: DeferredPayload) -> Any:
-        """Resolve the backend, run the command under the budget, report the outcome.
+        """Wait for the backend, then run the command — one budget, spent in order.
+
+        The two waits are **separate and both bounded**, which is the whole point.
+        A backend that has not finished starting answers nothing, and asking it to
+        run a command is a wait of unknown length on a thread that holds the
+        lease, the tree and its parent's teardown: the wait for the backend is not
+        the run, and a budget that cannot tell them apart lets a cold start spend
+        a run's whole lease before the command has started.
+
+        So: fix a deadline, resolve the sandbox, ask :meth:`SandboxActor.ready`
+        under what is left, tell the parent the run is starting, and only then
+        hand the command whatever remains. **No ask here is made without a
+        timeout** — that is what makes the worker mortal, which is in turn what
+        makes a liveness-gated reclaim safe.
 
         A command that exits — well or badly — and a command its budget killed
         both come back as an :class:`ExecOutcome`, because both are answers an
@@ -408,12 +492,17 @@ class ExecWorker(DeferredWorker):
         Raises:
             TypeError: If handed a payload that is not an :class:`ExecPayload`.
             RuntimeError: If the worker has no orchestrator to resolve the
-                sandbox through.
+                sandbox through, or if the backend never became ready.
         """
         if not isinstance(payload, ExecPayload):
             raise TypeError(f"ExecWorker requires an ExecPayload, got {type(payload)}")
-        sandbox = self._sandbox(payload)
-        budget = min(payload.timeout_s, self.timeout_s)
+        deadline = time.monotonic() + self.timeout_s
+        address = self._sandbox_address(payload, deadline)
+        self._await_ready(address, deadline)
+        self._run_started(payload.deferred_key)
+        remaining = deadline - time.monotonic()
+        budget = max(0.0, min(payload.timeout_s, remaining))
+        sandbox = self.proxy_ask(address, SandboxActor, timeout=ask_seconds(remaining))
         try:
             result = sandbox.exec(payload.cmd, payload.cwd, timeout=budget)
         except subprocess.TimeoutExpired:
@@ -429,13 +518,16 @@ class ExecWorker(DeferredWorker):
             exit_code=result.exit_code,
         )
 
-    def _sandbox(self, payload: ExecPayload) -> SandboxActor:
-        """Get-or-create the team's ``#SandboxActor`` and return an ask proxy to it.
+    def _sandbox_address(self, payload: ExecPayload, deadline: float) -> ActorAddress:
+        """Get-or-create the team's ``#SandboxActor`` and return its address.
 
         Idempotent by construction (ADR-025): the card already created it at
         wiring time, so this resolves the existing one. The class comes from
         ``SANDBOX_ACTOR_CLASSES`` at call time, never at import time, so a
         backend injected by a deployment package is still found.
+
+        The address rather than a proxy, because the two phases below need two
+        proxies carrying two different timeouts.
         """
         from akgentic.tool.sandbox.tool import SANDBOX_ACTOR_CLASSES  # noqa: PLC0415 — cycle
 
@@ -443,11 +535,54 @@ class ExecWorker(DeferredWorker):
         if orchestrator is None:
             raise RuntimeError("An exec worker cannot resolve its sandbox without an orchestrator.")
         actor_class = SANDBOX_ACTOR_CLASSES[payload.mode]
-        orchestrator_proxy = self.proxy_ask(orchestrator, Orchestrator)
-        address = orchestrator_proxy.getChildrenOrCreate(
+        orchestrator_proxy = self.proxy_ask(
+            orchestrator, Orchestrator, timeout=ask_seconds(deadline - time.monotonic())
+        )
+        address: ActorAddress = orchestrator_proxy.getChildrenOrCreate(
             actor_class, config=sandbox_config(payload)
         )
-        return self.proxy_ask(address, SandboxActor)
+        return address
+
+    def _await_ready(self, address: ActorAddress, deadline: float) -> None:
+        """Block until the backend can serve messages, or give up saying so.
+
+        ``ready()`` carries no information; being *answered* is the information.
+        Pykka's mailbox is FIFO, so it cannot come back before ``on_start`` has
+        returned — no flag, no polling, no state.
+
+        Every failure of this one ask means the same thing to the agent waiting
+        on it: the backend is not usable right now and the command did not run.
+        A timeout is the expected one (a container image still being built); a
+        dead actor is the other, and telling them apart would buy the model
+        nothing it could act on differently.
+
+        Args:
+            address: The sandbox actor.
+            deadline: The worker's own deadline, monotonic.
+
+        Raises:
+            RuntimeError: When the backend did not answer in time — reported to
+                the agent verbatim by ``receiveMsg_DeferredPayload``.
+        """
+        seconds = ask_seconds(deadline - time.monotonic())
+        try:
+            self.proxy_ask(address, SandboxActor, timeout=seconds).ready()
+        except Exception as exc:
+            raise RuntimeError(backend_not_ready(seconds)) from exc
+
+    def _run_started(self, run_id: str) -> None:
+        """Tell ``#Workspace`` that *run_id*'s command is starting now.
+
+        A **tell**, deliberately: the worker needs no answer, and an ask would be
+        one more unbounded wait on the very thread this budget exists to bound.
+        A parentless worker — the shape a few unit tests build — simply skips it.
+        """
+        parent = self._parent
+        if parent is None:
+            return
+        from akgentic.tool.workspace.actor import WorkspaceActor  # noqa: PLC0415 — cycle
+
+        self.proxy_tell(parent, WorkspaceActor).run_started(run_id)
 
 
 def format_outcome(outcome: ExecOutcome) -> str:

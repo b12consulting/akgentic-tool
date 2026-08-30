@@ -1044,6 +1044,17 @@ WorkspaceTool(git_journal=True)                      # + git history; the gate i
 WorkspaceTool(read_only=True, workspace_glob=False)  # fine-grained capability control
 ```
 
+**The exec lease covers a run, not the wait for a backend that has not started.** `workspace_exec`
+takes an exclusive lease over the tree, and its deadline is re-based the moment the command actually
+starts — so a cold start (a container backend building its image on the first run) is waited on
+*before* the run's budget begins, under a budget of its own. A backend that is not ready inside that
+budget produces a clear failure saying so, in about twenty seconds, and the tree is released; it does
+not make the run slow, and it does not make a starting backend look like a finished one. Past its
+deadline a lease is reclaimed **only** when the run's worker is genuinely gone — the killed-during-
+teardown case it exists for. A live run that has simply overrun is refused instead, saying that, and
+if a reclaimed run does report afterwards, whatever it wrote is committed as `out-of-band` — belonging
+to nobody — rather than dropped into the tree for the next agent's commit to sweep up.
+
 Binary reads (PDF, DOCX, XLSX, PPTX) need `akgentic-tool[docs]`; image resizing for
 `workspace_view` needs `akgentic-tool[vision]`; the journal needs `git` on `PATH`. All three degrade
 rather than fail.
