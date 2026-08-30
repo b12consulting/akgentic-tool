@@ -63,9 +63,9 @@ cannot cancel a thread, so a command still running past its worker's budget hold
 its parent's teardown open for the difference.
 """
 
-DEFAULT_EXEC_POLL_ATTEMPTS = 12
-DEFAULT_EXEC_POLL_DELAY_S = 0.4
-"""Caller-side poll: ~5 s of waiting inside the tool call before handing back a run id.
+DEFAULT_EXEC_POLL_ATTEMPTS = 20
+DEFAULT_EXEC_POLL_DELAY_S = 0.5
+"""Caller-side poll: ~10 s of waiting inside the tool call before handing back a run id.
 
 Deliberately longer than ``poll_deferred``'s own default of ~2 s, and the reason
 is worth stating because the instinct is to minimise it. At a 2 s poll *every*
