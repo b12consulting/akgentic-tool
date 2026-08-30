@@ -311,9 +311,10 @@ here, not a blob under a string key.
   agent/llm layer, not by this package* — nothing under `src/` here reads the slot back. It is
   stated here as the consumer contract because it is what makes writing the key safe.
 
-**They are a cache, never a record.** The durable record of what the model was told is the message
-history; the baselines only spare the engine from repeating it. This package therefore has **no save
-path** — no event, no retry, no write-ahead anything — because it needs none.
+**The baselines are a cache, never a record** — `active_model` above is the exception that proves
+it, and the only field here that is a record. The durable record of what the model was told is the
+message history; the baselines only spare the engine from repeating it. This package therefore has
+**no save path** — no event, no retry, no write-ahead anything — because it needs none.
 
 **The engine.** `ToolFactory.get_context_updater()` builds a `ContextUpdater` from the factory's
 observer and the same providers `get_context_states()` yields — so a duplicate provider `__name__`
@@ -522,8 +523,8 @@ observer.
 
 The observer is a `Protocol`. **Two** of them are package-global, one extending the other; below the
 second sit **sibling** domain protocols, each living beside its one consuming card. It is not a
-single chain, and looking for a fourth level below the third is looking for something that does not
-exist.
+single chain: below the second level there are only siblings at one depth, so there is no deeper
+level to look for.
 
 | Protocol | Where | What it adds | What that lets a tool do |
 |---|---|---|---|

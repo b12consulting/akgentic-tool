@@ -31,8 +31,10 @@ class ModelTool(ToolCard):
 
 Three capabilities, three params, all following the same `Param | bool` convention: `True` (the
 default) enables the capability with its param's defaults, a param instance may narrow the channels,
-and `False` removes **exactly that capability** and nothing else. No param carries a field beyond
-`expose` — configuration read at factory bind time, never tool-call schema.
+and `False` removes **exactly that capability** and nothing else. Beyond `expose`, a param carries
+only `instructions: str | None = None`, inherited from `BaseToolParam` and appended under a
+structured header to that capability's docstring — on the tool form and the command form alike. Both
+fields are configuration read at factory bind time, never tool-call schema.
 
 Two of the three share their channels, which is what distinguishes this card's shape from
 `MailboxTool`'s one-capability-per-channel layout: `list_models` and `switch_model` are each served
@@ -67,10 +69,12 @@ roster's decision, and re-sorting here would make the listing disagree with ever
 same configuration. The line grammar is fixed:
 
 ```
-{key} (context: {context_length|undeclared})[ ACTIVE]
+{key} (context: {context_length|undeclared})
+{key} (context: {context_length|undeclared}) [ACTIVE]
 ```
 
-`[ACTIVE]` marks the entry currently in force, and `undeclared` stands in for an entry whose
+The second form is the entry currently in force: the marker is a space followed by a literal
+`[ACTIVE]`, appended to the same line and nothing else. `undeclared` stands in for an entry whose
 `context_length` is `None`. Nothing turn-varying enters the text, so two calls against an unchanged
 roster are byte-identical.
 
@@ -218,7 +222,7 @@ both does the mapping. That is a general rule for card authors, written up in th
 ```python
 from akgentic.tool import ModelTool
 from akgentic.tool.core import COMMAND
-from akgentic.tool.model import ListModels, SwitchModel
+from akgentic.tool.model import SwitchModel
 
 ModelTool()                                                # all three capabilities on (the default)
 ModelTool(switch_model=False)                              # read-only: the roster, no switch
@@ -293,7 +297,7 @@ behaviour belongs to `akgentic-llm`, which owns the run loop; this card makes no
 ## Import paths
 
 ```python
-from akgentic.tool import ModelTool
+# All seven symbols live here.
 from akgentic.tool.model import (
     ActiveModel,
     ActiveModelState,
@@ -303,12 +307,20 @@ from akgentic.tool.model import (
     ModelTool,
     SwitchModel,
 )
+
+# Three of the seven are re-exported from the package root as well.
+from akgentic.tool import ModelRow, ModelSwitchToolObserver, ModelTool
 ```
 
-Only `ModelTool` is re-exported from the package root — the import a deployment writes. The params,
-the two state models and the observer protocol come from `akgentic.tool.model`;
-`ModelSwitchToolObserver` and `ModelRow` in particular are the two symbols the agent package imports
-from this path. A `from akgentic.tool import ModelRow` is wrong and will not resolve.
+`akgentic.tool.model` carries the whole surface. The package root re-exports **three** of it:
+`ModelTool` — the import a deployment writes — plus `ModelRow` and `ModelSwitchToolObserver`, the
+two contract symbols `akgentic-agent` needs to implement the protocol and project the roster. That
+is the same placement `TeamManagementToolObserver` has, and it is asserted rather than incidental:
+both are named in both `__all__` lists.
+
+The three capability params and `ActiveModelState` are **not** at the root — a
+`from akgentic.tool import ListModels` or `ActiveModelState` will not resolve. Reach for those
+through `akgentic.tool.model`.
 
 ---
 
