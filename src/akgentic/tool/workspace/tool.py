@@ -563,6 +563,14 @@ class WorkspaceTool(ToolCard):
     # Read-only gate (NEW)
     read_only: bool = False
 
+    # Write capability fields
+    workspace_write: WorkspaceWrite | bool = True
+    workspace_delete: WorkspaceDelete | bool = True
+    workspace_edit: WorkspaceEdit | bool = True
+    workspace_multi_edit: WorkspaceMultiEdit | bool = True
+    workspace_patch: WorkspacePatch | bool = True
+    workspace_mkdir: WorkspaceMkdir | bool = True
+
     git_journal: bool = False
     """Whether accepted mutations are recorded in a git journal.
 
@@ -584,14 +592,6 @@ class WorkspaceTool(ToolCard):
     turn off a journal that is already running, and a card arriving with it on
     does not start one on an actor already built without it.
     """
-
-    # Write capability fields
-    workspace_write: WorkspaceWrite | bool = True
-    workspace_delete: WorkspaceDelete | bool = True
-    workspace_edit: WorkspaceEdit | bool = True
-    workspace_multi_edit: WorkspaceMultiEdit | bool = True
-    workspace_patch: WorkspacePatch | bool = True
-    workspace_mkdir: WorkspaceMkdir | bool = True
 
     workspace_exec: WorkspaceExec | bool = False
     """Sandboxed shell execution — **off unless asked for**, and that is a security
