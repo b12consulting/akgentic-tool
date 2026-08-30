@@ -1310,7 +1310,6 @@ from akgentic.tool import MailboxTool
 MailboxTool()                     # both capabilities on (the default)
 MailboxTool(read_mailbox=False)   # /stop only — no on-demand signal
 MailboxTool(stop=False)           # no cancellation surface
-MailboxTool(arrival_closing="Read one now if it changes your work; otherwise finish first.")
 ```
 
 Reading absorbs: naming a message takes it on in the current run, so it will not also arrive as its
@@ -1323,10 +1322,13 @@ the signal and its delivery ship together.
 Which messages may be absorbed mid-run is decided by the **type**, not by a setting: a class
 extends `MailboxMessage` (`akgentic.tool.mailbox`) to declare it can travel through a mailbox,
 which obliges it to answer both `rendering()` and `rendering_preview()`. A class that renders for
-the model but should never be absorbed simply does not extend it. `absorbed_prefix` and
-`arrival_closing` carry the wording a mid-run arrival reads with, defaulting to the text that ships
-today so a catalog entry shows an operator what the agent is currently being told; the card never
-reads either — it is handed whole to the capability, which reads what it needs off it.
+the model but should never be absorbed simply does not extend it. The wording a mid-run arrival
+reads with is not on the card: it is `MailboxCapability`'s, two keyword-only constructor parameters
+defaulting to `ABSORBED_PREFIX` and `ARRIVAL_CLOSING` beside them — both exported from
+`akgentic.tool.mailbox`, so overriding one can build on the shipped wording rather than replace it
+blind — and improving a sentence reaches every existing team on upgrade instead of only teams
+created afterwards. The card is still handed to the capability whole,
+which reads `read_mailbox` off it to decide whether the doorbell rings.
 
 The `stop` command registers the `/stop` surface only — dispatched while the agent is idle it
 answers *"There is no run to cancel."* The mid-run *enforcement* stays `akgentic-agent`'s:
@@ -1336,8 +1338,9 @@ interrupts.
 
 **[Full reference → `src/akgentic/tool/mailbox/README.md`](src/akgentic/tool/mailbox/README.md)** —
 the two capability params, the absorption contract and why the id is not validated,
-`MailboxMessage` and why both its methods are required, the two injected-prompt-text fields and the
-clause an edit can delete, the `message_id` contract, where the cancel vocabulary lives, the
+`MailboxMessage` and why both its methods are required, where the injected prompt text lives, why
+it is not on the card and the clause an override must keep, the `message_id` contract, where the
+cancel vocabulary lives, the
 observer protocol, and the enforcement that stays `akgentic-agent`'s.
 
 ### ModelTool

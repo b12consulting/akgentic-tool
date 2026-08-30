@@ -18,6 +18,8 @@ an ``akgentic.agent.capabilities`` package: these names are imported from here.
 """
 
 from akgentic.tool.mailbox.capability import (
+    ABSORBED_PREFIX,
+    ARRIVAL_CLOSING,
     PREVIEW_LIMIT,
     MailboxAccess,
     MailboxCapability,
@@ -32,6 +34,8 @@ from akgentic.tool.mailbox.observer import MailboxToolObserver
 from akgentic.tool.mailbox.params import ReadMailbox, Stop
 
 __all__ = [
+    "ABSORBED_PREFIX",
+    "ARRIVAL_CLOSING",
     "PREVIEW_LIMIT",
     "MailboxAccess",
     "MailboxCapability",

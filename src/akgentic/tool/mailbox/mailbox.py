@@ -50,6 +50,15 @@ _NOTHING_TO_CANCEL = "There is no run to cancel."
 class MailboxTool(ToolCard):
     """The mailbox capability: an acknowledgement signal and a cancellation surface.
 
+    Two switches and nothing else. The wording the mailbox injects mid-run — the
+    absorbed-message prefix and the arrival notice's closing line — belongs to the
+    capability in ``akgentic.tool.mailbox.capability``, which takes both as
+    keyword-only constructor parameters defaulted from the constants beside them.
+    It briefly lived here as two string fields; because the catalog dumps a card
+    with no ``exclude_defaults``, every persisted team froze its own copy of prose
+    that is expected to keep changing, so an improvement reached only the teams
+    created after it.
+
     Attributes:
         read_mailbox: The ``read_mailbox`` signal on ``TOOL_CALL``. ``True``
             (the default) enables it with the param's defaults; a ``ReadMailbox``
@@ -61,18 +70,6 @@ class MailboxTool(ToolCard):
 
     read_mailbox: ReadMailbox | bool = True
     stop: Stop | bool = True
-    absorbed_prefix: str = (
-        "Additional work, taken on mid-run. It does NOT replace what you were already asked "
-        "to do. It may be a separate request, in which case answer both before this run ends, "
-        "one message each in your output; or it may add to or correct the request already in "
-        "flight, in which case one message answers both. When unsure, answer separately."
-    )
-    arrival_closing: str = (
-        "Call `read_mailbox` with one of the ids above to take that message on now — worth doing "
-        "if it may add to or change what you are working on, since a correction only helps before "
-        "the work is finished. Otherwise finish your current work first — you will get them just "
-        "after."
-    )
 
     def get_tools(self) -> list[Callable[..., Any]]:
         """Return ``read_mailbox`` when its capability serves ``TOOL_CALL``."""

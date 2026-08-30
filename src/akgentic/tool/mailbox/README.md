@@ -25,8 +25,6 @@ from akgentic.tool import MailboxTool
 class MailboxTool(ToolCard):
     read_mailbox: ReadMailbox | bool = True
     stop: Stop | bool = True
-    absorbed_prefix: str = "Additional work, taken on mid-run. It does NOT replace …"
-    arrival_closing: str = "Call `read_mailbox` with one of the ids above …"
 ```
 
 Two capabilities, one channel each by default, both fields following the same `Param | bool`
@@ -35,9 +33,9 @@ instance may narrow the channels, and `False` removes **exactly that capability*
 else. Neither param carries a field beyond `expose` — configuration read at factory bind time,
 never tool-call schema.
 
-The last two are deployment settings rather than capabilities — prompt text this card **carries and
-never reads**, documented under [The injected prompt text](#the-injected-prompt-text). Which
-messages may be absorbed mid-run is decided by the message *type*, not by a card field: see
+Two switches and nothing else. The wording a mid-run arrival reads with is not here — see
+[The injected prompt text](#the-injected-prompt-text) for where it went. Which messages may be
+absorbed mid-run is decided by the message *type*, not by a card field either: see
 [Which messages may be absorbed mid-run](#which-messages-may-be-absorbed-mid-run).
 
 ## ToolCard fields
@@ -46,8 +44,6 @@ messages may be absorbed mid-run is decided by the message *type*, not by a card
 |---|---|---|---|---|
 | `read_mailbox` | `ReadMailbox \| bool` | `True` | `{TOOL_CALL}` | The on-demand signal, exposed to the model. |
 | `stop` | `Stop \| bool` | `True` | `{COMMAND}` | The `stop` command — the `/stop` string surface. |
-| `absorbed_prefix` | `str` | the wording `akgentic-agent` injects today | — | What a message absorbed through `read_mailbox` is prefixed with when it is injected. See [The injected prompt text](#the-injected-prompt-text). |
-| `arrival_closing` | `str` | the wording `akgentic-agent` injects today | — | The mid-run arrival notice's closing line, for a listing that offers at least one id. See [The injected prompt text](#the-injected-prompt-text). |
 
 Every capability is gated twice: the param must resolve, **and** its `expose` set must contain the
 channel the serving hook covers (`get_tools()` for `TOOL_CALL`, `get_commands()` for `COMMAND`). A
@@ -228,46 +224,64 @@ message is answered in the shape its own handler would have produced), and it mu
 
 ### The injected prompt text
 
+**Not on this card. It is `MailboxCapability`'s, one module over in the same package.**
+
 ```python
-MailboxTool(
-    absorbed_prefix=(
-        "Additional work, taken on mid-run. It does NOT replace what you were already asked "
-        "to do. Answer both before this run ends, one message each, unless the new message "
-        "is plainly a correction of the one in flight."
-    )
+MailboxCapability(
+    observer,
+    card,
+    absorbed_prefix="Additional work, taken on mid-run. It does NOT replace …",
+    arrival_closing="Call `read_mailbox` with one of the ids above …",
 )
 ```
 
-Two `str` fields carrying the wording a mid-run mailbox arrival reads with: `absorbed_prefix`
-frames a message the model took on through `read_mailbox`, and `arrival_closing` is the last line
-of the notice announcing mail that landed while a run was in flight. Both **default to the wording
-`akgentic-agent` injects today** — the default is the text itself rather than `None`, so a catalog
-entry shows an operator what the agent is currently being told and can be judged before it is
-edited. Tuning a sentence is then a catalog edit rather than a code change, a release across two
-packages and a redeploy.
+Two keyword-only constructor parameters on `MailboxCapability` (`capability.py`), each defaulting
+to the module constant beside it — `ABSORBED_PREFIX` and `ARRIVAL_CLOSING`, both exported from
+`akgentic.tool.mailbox`, so a caller wanting *the shipped wording plus a sentence* has a public
+name to build on. `absorbed_prefix`
+frames a message the model took on through `read_mailbox`; `arrival_closing` is the last line of
+the notice announcing mail that landed while a run was in flight. Both are assigned straight
+through, so an explicitly passed `""` is honoured as the caller's choice rather than replaced by
+the default.
 
-> **The knob can break delivery, and it is worth knowing how.** `absorbed_prefix` opens with
-> *"It does NOT replace what you were already asked to do"*, and a deployment may delete that
-> clause. It is there because of an observed failure: an agent that had just finished a report
-> took on a newer mid-run question, answered only that, and the report reached nobody. Rewrite the
-> wording freely; keep something that says the arrival is *additional* work.
+**Who can actually pass them: code, not a catalog.** `BaseAgent` builds the capability with two
+arguments and passes neither parameter, so every deployment runs the constants and improving a
+sentence is a change to `capability.py` that reaches every existing team on upgrade. That is the
+point of the move rather than a gap in it — the parameters exist so the wording has one home and a
+caller constructing the capability directly can still override it, not so an operator can tune
+prose per team.
 
-**This card reads neither field.** It carries them, exactly as it carries
-any other field: nothing here renders prompt text, and a card constructed with either
-field set produces byte-identical tools, commands and context states to a default one.
-**The whole card is handed to `MailboxCapability`** (`capability.py`, same package), which reads
-these two fields — and `read_mailbox` — off it at construction.
-`BaseAgent` passes the card and unpacks nothing, holding no knowledge of which fields the mailbox
-needs. The card is a required argument, so a card predating these fields fails loudly rather than
-quietly running wording nobody can see in the catalog.
+> **`_CLOSING_WITHOUT_IDS` is not exported, and that is the rule rather than an oversight.** The
+> closing for a listing that carries no offerable id reaches no parameter — a listing with no id may
+> not promise a read whatever anyone configures — so there is no caller to give a name to. A
+> constant is public here when it is the default of a public surface, and private when it is not.
 
-An empty string is the one value that does not reach the model: it falls back to the capability's
-own constant, because honouring `""` would ship a mid-run injection with no framing at all — the
-failure the paragraph above describes.
+> **One clause is load-bearing, and an override can delete it.** `ABSORBED_PREFIX` opens with
+> *"It does NOT replace what you were already asked to do"*. It is there because of an observed
+> failure: an agent that had just finished a report took on a newer mid-run question, answered only
+> that, and the report reached nobody. Reword freely; keep something that says the arrival is
+> *additional* work.
 
-There is deliberately **no third field** for the closing line of a listing that offers no id. A
+> **The wording briefly lived here, as two `str` card fields, and was moved back out.** The
+> argument for the card was about *reading* a catalog entry: a literal default shows an operator
+> what the agent is currently being told, where a `null` shows nothing. What it did not weigh is
+> the *write* side — the catalog dumps a card with a plain `model_dump(mode="json")` and no
+> `exclude_defaults`, and `BaseAgent` auto-inserts a `MailboxTool()` when the config has none. So
+> every persisted team froze its own private copy of prose that is expected to keep improving, and
+> an improvement reached only teams created after it. No deployment ever turned the knob; every
+> one paid for the copy. An entry written while the fields existed still loads — `ToolCard` keeps
+> Pydantic's default `extra="ignore"`, so the two stale keys are dropped on validation and no
+> migration is owed.
+
+**This card carries no prompt text at all**, which is now true by construction rather than by
+discipline: it serves no `LLM_CONTEXT`, and its whole serialization is `read_mailbox`, `stop` and
+the model discriminator. **The whole card is still handed to `MailboxCapability`**, which reads
+`read_mailbox` off it to decide whether the doorbell rings at all; `BaseAgent` passes the card and
+unpacks nothing. That seam is unchanged — only the wording left it.
+
+There is deliberately **no parameter** for the closing line of a listing that offers no id. A
 listing carrying no id offers no read, so there is no timing to advise on and nothing to configure;
-that line stays a constant in `akgentic-agent`.
+that line stays the constant `_CLOSING_WITHOUT_IDS`.
 
 ### Failure modes worth knowing
 
