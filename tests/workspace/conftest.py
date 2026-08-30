@@ -476,14 +476,19 @@ def card_for(
     orchestrator_proxy: FakeOrchestratorProxy,
     name: str,
     workspace_id: str = WORKSPACE_NAME,
+    git_journal: bool = False,
 ) -> tuple[WorkspaceTool, FakeActorToolObserver]:
     """Wire a second (or third) agent's card onto the same workspace.
 
     The observer comes back with the card because the card holds it weakly — a
     test that drops it would collect the agent mid-assertion.
+
+    ``git_journal`` mirrors the card's own default, which is off. A test about
+    the journal opts in explicitly, so the suite never depends on a default it
+    is not asserting.
     """
     observer = FakeActorToolObserver(orchestrator_proxy, name=name)
-    card = WorkspaceTool(workspace_id=workspace_id)
+    card = WorkspaceTool(workspace_id=workspace_id, git_journal=git_journal)
     card.observer(observer)
     return card, observer
 

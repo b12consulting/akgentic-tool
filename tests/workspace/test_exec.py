@@ -1044,6 +1044,27 @@ class TestTheDeferredRules:
 
 @requires_git
 class TestTheDiscoveredWriteSet:
+    @pytest.fixture
+    def exec_setup(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        sandbox_script: SandboxScript,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> tuple[WorkspaceTool, WorkspaceActor, ExecHarness]:
+        """The module fixture with the journal on.
+
+        The card's default is off, and this class is about what the journal
+        discovered, so it opts in rather than depending on a default it is not
+        asserting.
+        """
+        card, _observer = exec_card_for(orchestrator_proxy, git_journal=True)
+        _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
+        assert isinstance(actor, WorkspaceActor)
+        harness = ExecHarness(actor, orchestrator_proxy)
+        harness.install(monkeypatch)
+        return card, actor, harness
+
     def test_a_nested_untracked_directory_is_discovered_file_by_file(
         self,
         exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
@@ -1258,7 +1279,7 @@ class TestTheJournalOff:
         sandbox_script: SandboxScript,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        card, _ = exec_card_for(orchestrator_proxy, workspace_git=False)
+        card, _ = exec_card_for(orchestrator_proxy, git_journal=False)
         _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
         assert isinstance(actor, WorkspaceActor)
         harness = ExecHarness(actor, orchestrator_proxy)
@@ -1344,7 +1365,9 @@ class TestTheShimAndTheCapabilityAgree:
         # The equivalence is asserted on what an agent and a repository can see:
         # the returned text, the files on disk, and the lease being taken and
         # released — not on which code path was taken to get there.
-        card, _ = exec_card_for(orchestrator_proxy, poll_attempts=50, poll_delay_seconds=0.01)
+        card, _ = exec_card_for(
+            orchestrator_proxy, poll_attempts=50, poll_delay_seconds=0.01, git_journal=True
+        )
         _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
         assert isinstance(actor, WorkspaceActor)
         harness = ExecHarness(actor, orchestrator_proxy)
@@ -1388,7 +1411,11 @@ class TestTheShimAndTheCapabilityAgree:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         card, observer = exec_card_for(
-            orchestrator_proxy, name="alice", poll_attempts=50, poll_delay_seconds=0.01
+            orchestrator_proxy,
+            name="alice",
+            poll_attempts=50,
+            poll_delay_seconds=0.01,
+            git_journal=True,
         )
         _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
         assert isinstance(actor, WorkspaceActor)

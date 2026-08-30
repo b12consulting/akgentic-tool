@@ -1030,17 +1030,17 @@ serialized. A refusal is a `RetriableError`, so it lands in the model's next tur
 what the write would have destroyed — the agent re-reads and redoes without anyone writing recovery
 logic. No digest, `expected` or `force` appears in any tool signature: the precondition is derived
 server-side from what the agent was observed to read, and there is deliberately no bypass. Accepted
-mutations are committed to a linear git history authored by the agent; that journal is optional and
-degrades off, the gate is not and does not.
+mutations can be committed to a linear git history authored by the agent; that journal is **off by
+default** and degrades off when `git` is absent, the gate is neither optional nor degradable.
 
 ```python
 from akgentic.tool import WorkspaceTool
 
-WorkspaceTool()                                      # full access (default), journal on, exec off
+WorkspaceTool()                                      # full access (default), journal off, exec off
 WorkspaceTool(read_only=True)                        # read tools only
 WorkspaceTool(workspace_id="shared")                 # shared workspace across teams
 WorkspaceTool(workspace_exec=True)                   # + sandboxed shell over the same tree
-WorkspaceTool(workspace_git=False)                   # no history; the gate is unaffected
+WorkspaceTool(git_journal=True)                      # + git history; the gate is unaffected either way
 WorkspaceTool(read_only=True, workspace_glob=False)  # fine-grained capability control
 ```
 
@@ -1478,8 +1478,8 @@ ToolFactory([WorkspaceTool(workspace_id="proj-42", workspace_exec=True)], observ
 `ExecTool` still resolves and `exec_command` still behaves identically — same lease, same worker,
 same discovery, same commit — because it is a shim over `workspace_exec` rather than a second
 implementation. It emits a `DeprecationWarning` when the card is **wired**, not at import. What it
-cannot express is `workspace_git`: its three fields are frozen, so an `ExecTool`-only agent always
-gets the journal's defaults.
+cannot express is `git_journal`: its three fields are frozen, so an `ExecTool`-only agent always
+gets the journal's default, which is off.
 
 **[Full reference → `src/akgentic/tool/sandbox/README.md`](src/akgentic/tool/sandbox/README.md)** —
 the migration table, the four backends compared (isolation, timeouts, rlimits, network), the

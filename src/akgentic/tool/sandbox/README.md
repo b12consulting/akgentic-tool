@@ -34,7 +34,7 @@ ToolFactory([WorkspaceTool(workspace_id="proj-42", workspace_exec=True)], observ
 | Mode | `ExecTool(mode=…)` | `WorkspaceExec(mode=…)` |
 | Budget | not configurable | `WorkspaceExec(timeout_s=…, poll_attempts=…, poll_delay_seconds=…)` |
 | Directory | `ExecTool(workspace_id=…)` | `WorkspaceTool(workspace_id=…)` |
-| Journal | always on, and **not reachable** by any `ExecTool` field | `WorkspaceTool(workspace_git=…)` |
+| Journal | off by default, and **not reachable** by any `ExecTool` field | `WorkspaceTool(git_journal=…)` |
 
 **What still works.** The class resolves, the field names are unchanged, and `exec_command` behaves
 identically — same lease, same worker, same discovery, same commit. It is a shim over
@@ -45,9 +45,11 @@ replacement. Deliberately not at import: an import-time warning fires for anybod
 the module in a dependency's `__init__`, which is nobody's decision to change.
 
 **What an `ExecTool`-only agent gives up.** It creates the `#Workspace-<workspace>` actor for its workspace, and
-the first card to create that actor decides the configuration — so it always gets the journal's
-defaults. `AC2` froze the shim's three fields, so there is no `workspace_git` on it and no way to
-reach one. Move to `WorkspaceTool` if you need that.
+the first card to create that actor decides the configuration — so it gets the journal's default,
+which is **off**. `AC2` froze the shim's three fields, so there is no `git_journal` on it and no way
+to reach one. An `ExecTool` agent sharing a workspace whose actor a `WorkspaceTool(git_journal=True)`
+created first does get a journal, by that same first-card-wins rule. Move to `WorkspaceTool` if you
+need to decide it yourself.
 
 ### What "a deprecated card" means here
 

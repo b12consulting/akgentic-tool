@@ -260,7 +260,7 @@ class WorkspaceConfig(BaseConfig):
         max_observations_per_agent: Cap on the per-agent observation map.
         max_tracked_writers: Cap on the path-keyed last-writer map, which the
             gate consults only to name the other writer in a refusal.
-        workspace_git: Whether to keep a git journal of accepted mutations. The
+        git_journal: Whether to keep a git journal of accepted mutations. The
             gate is unaffected either way — it is pure Python and independent.
         git_timeout_s: Wall-clock budget for one ``git`` invocation.
     """
@@ -268,7 +268,7 @@ class WorkspaceConfig(BaseConfig):
     workspace_name: str
     max_observations_per_agent: int = DEFAULT_MAX_OBSERVATIONS_PER_AGENT
     max_tracked_writers: int = DEFAULT_MAX_TRACKED_WRITERS
-    workspace_git: bool = True
+    git_journal: bool = False
     git_timeout_s: float = DEFAULT_GIT_TIMEOUT_S
 
 

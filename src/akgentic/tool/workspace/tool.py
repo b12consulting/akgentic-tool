@@ -563,18 +563,26 @@ class WorkspaceTool(ToolCard):
     # Read-only gate (NEW)
     read_only: bool = False
 
-    workspace_git: bool = True
+    git_journal: bool = False
     """Whether accepted mutations are recorded in a git journal.
 
     A plain field, not a capability param: it exposes no tool, appears in no
-    signature, and nothing about it is expressible by a model. Turning it off
-    loses history, attribution and out-of-band *detection* — it does not loosen
-    the gate by one row, because the gate is pure Python and independent.
+    signature, and nothing about it is expressible by a model.
+
+    **Off by default, because nothing in the system reads what it records.** The
+    gate re-hashes the live file at mutation time and never consults the journal,
+    and an agent's exec result carries ``exit_code``/``stdout``/``stderr`` and not
+    the discovered write set — so the record exists only for a human reading
+    ``git log`` afterwards. That is worth opting into, not worth three ``git``
+    forks on every mutation by default. Turning it on buys history, attribution
+    and out-of-band *detection*; leaving it off loosens the gate by nothing at
+    all, because the gate is pure Python and independent.
 
     Note what ``getChildrenOrCreate`` implies: the **first** card to create the
     actor for a workspace decides its configuration, exactly as the observation
-    caps already do. A second card arriving with ``workspace_git=False`` does not
-    turn off a journal that is already running.
+    caps already do. A second card arriving with ``git_journal=False`` does not
+    turn off a journal that is already running, and a card arriving with it on
+    does not start one on an actor already built without it.
     """
 
     # Write capability fields
@@ -763,7 +771,7 @@ class WorkspaceTool(ToolCard):
                 name=workspace_actor_name(workspace_name),
                 role=WORKSPACE_ACTOR_ROLE,
                 workspace_name=workspace_name,
-                workspace_git=self.workspace_git,
+                git_journal=self.git_journal,
             ),
         )
         self._workspace_proxy = observer.proxy_ask(workspace_addr, WorkspaceActor)

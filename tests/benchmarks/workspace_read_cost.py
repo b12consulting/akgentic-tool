@@ -656,7 +656,7 @@ class _BenchAgent(Akgent[BenchAgentConfig, BaseState]):
         """Wire the card and resolve its callables once, off the measured window."""
         card = WorkspaceTool(
             workspace_id=self.config.workspace_id,
-            workspace_git=self.config.journal,
+            git_journal=self.config.journal,
             workspace_view=False,
             # ``llm_client=None`` pins pass 2 off. A benchmark that reaches for
             # OpenAI on a short extraction would measure the network.
@@ -1058,7 +1058,7 @@ def _install_sampling_actor(
             name=workspace_actor_name(workspace_id),
             role=WORKSPACE_ACTOR_ROLE,
             workspace_name=workspace_id,
-            workspace_git=journal,
+            git_journal=journal,
         ),
     )
     workspace = system.proxy_ask(address, _SamplingWorkspaceActor)

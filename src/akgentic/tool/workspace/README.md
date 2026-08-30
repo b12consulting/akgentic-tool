@@ -27,7 +27,7 @@ way to get it wrong:
 | Feature | When it is on | What it costs you if it is off |
 |---|---|---|
 | **The write gate** | always — pure Python, no dependency, not configurable | nothing: it cannot be turned off |
-| **The journal** | when `git` is on `PATH` and `workspace_git=True` | history, attribution, and out-of-band *detection* — **not** the gate |
+| **The journal** | when `git` is on `PATH` and `git_journal=True` | history, attribution, and out-of-band *detection* — **not** the gate |
 | **Sandboxed exec** | only when the card asks for it (`workspace_exec=…`, default off) | the two exec callables; nothing else changes |
 
 The workspace does **not** need `git`. It does not need a sandbox backend. With neither, the gate
@@ -55,7 +55,7 @@ class WorkspaceTool(ToolCard):
     read_only: bool = False
 
     # The journal
-    workspace_git: bool = True
+    git_journal: bool = False
 
     # Write-side capabilities
     workspace_write: WorkspaceWrite | bool = True
@@ -191,7 +191,7 @@ announces itself; all four are caught, because the check consults the file.
 
 ## The journal
 
-When `git` is available and `workspace_git` is on, **every accepted mutation is one commit**,
+When `git` is available and `git_journal` is on, **every accepted mutation is one commit**,
 authored by the agent that made it.
 
 ```
@@ -225,7 +225,7 @@ in these situations:
 
 | Condition | Deliberate? |
 |---|---|
-| `workspace_git=False` on the card that created the actor | yes |
+| `git_journal=False` on the card that created the actor | yes |
 | `git` is not on `PATH` | yes — an environment fact |
 | The workspace is itself named `<name>.git`, colliding with workspace `<name>`'s journal | no — an operator mistake |
 | A sibling `<name>.git` exists and is **not** a repository (it is another workspace's tree) | no — refusing here costs one workspace's history; not refusing scatters git internals through another team's tree |
@@ -242,7 +242,7 @@ every one of the five cases** — no failure in the journal can fail a mutation,
 already on disk by the time a commit is attempted.
 
 Note also that the **first** card to create the actor for a workspace decides its configuration. A
-second card arriving with `workspace_git=False` does not turn off a journal that is already running.
+second card arriving with `git_journal=False` does not turn off a journal that is already running.
 
 ---
 
@@ -304,7 +304,7 @@ cannot argue with.
 |---|---|---|---|
 | `workspace_id` | `str \| None` | `None` | Directory name under the workspaces root, **and** the suffix of the actor's name. `None` ⇒ the team id, so each team gets its own tree. Set it to a fixed string to share one directory across teams (checked by the gate, not ordered by an actor), or to give two agents in one team two separate trees. |
 | `read_only` | `bool` | `False` | `True` removes every write-side callable from the tool list, `workspace_exec` included. The read side is unaffected. |
-| `workspace_git` | `bool` | `True` | Whether accepted mutations are recorded in the git journal. A plain field, not a capability param: it exposes no tool and nothing about it is expressible by a model. Turning it off loses history, attribution and out-of-band detection — it does **not** loosen the gate by one row. Read by the **first** card to create the actor for a workspace. |
+| `git_journal` | `bool` | `False` | Whether accepted mutations are recorded in the git journal. **Off by default**, because nothing in the system consumes the record: the gate re-hashes live and never consults it, and an agent's exec result carries only `exit_code`/`stdout`/`stderr`, so the journal is a human-facing audit trail you opt into. A plain field, not a capability param: it exposes no tool and nothing about it is expressible by a model. Turning it off loses history, attribution and out-of-band detection — it does **not** loosen the gate by one row. Read by the **first** card to create the actor for a workspace. |
 | `resources` | `list[Resource]` | `[]` | Files written into the workspace at `observer()` time, before the agent's first turn. Seeding is **idempotent**: a resource whose `file_name` already exists is skipped, so restoring a team never clobbers a file the agent has since edited. |
 | `workspace_read` | `WorkspaceRead \| bool` | `True` | Read a file with line-number pagination. |
 | `workspace_view` | `WorkspaceView \| bool` | `True` | Return an image as `BinaryContent` for the model's vision endpoint. |
@@ -556,7 +556,7 @@ WorkspaceTool(workspace_id="proj-42", workspace_exec=True)
 WorkspaceTool(workspace_id="proj-42"), WorkspaceTool(workspace_id="scratch")
 
 # No history: the gate still refuses every stale write
-WorkspaceTool(workspace_git=False)
+WorkspaceTool(git_journal=True)
 
 # Documents without the LLM fallback (no OpenAI credentials needed)
 WorkspaceTool(workspace_read=WorkspaceRead(document_reader=DocumentReader(llm_client=None)))
@@ -585,8 +585,9 @@ Measured on ten concurrent agents against a 27 MB tree (Apple M3 Max, Python 3.1
   the team.
 - **The mutation path** pays one full file read plus, with the journal on, three short `git` forks.
   That is roughly **50–66 ms per mutation**, and those forks are serialized on one actor thread: at
-  ten agents `workspace_write` measures **632 ms** at p50 against 7 ms with the journal off. If
-  write latency matters more to you than history, `workspace_git=False` is the lever.
+  ten agents `workspace_write` measures **632 ms** at p50 against 7 ms with the journal off. That
+  cost, against a record nothing in the system reads, is why the journal is off by default;
+  `git_journal=True` is the lever if you want the history and can pay for it.
 
 ### Failure modes worth knowing
 

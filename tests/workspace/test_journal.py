@@ -8,7 +8,7 @@ Three separable claims are tested here, and they fail independently:
 - **the history stays linear and the repository stays out of reach** — no branch
   is ever created, and ``.git`` is a sibling of the tree rather than a member of
   it, so no read capability can see it;
-- **none of it is required** — with ``git`` unresolvable or ``workspace_git``
+- **none of it is required** — with ``git`` unresolvable or ``git_journal``
   off, every gate behaviour from story 29-3 is identical, character for
   character, and one warning is logged rather than one per mutation.
 
@@ -68,6 +68,22 @@ from tests.workspace.test_workspace_actor import staging_name
 pytestmark = requires_git
 
 BODY = "alpha\nbravo\ncharlie\ndelta\n"
+
+
+@pytest.fixture
+def wired_card(
+    observer: FakeActorToolObserver,
+    workspace_tree: Path,
+) -> WorkspaceTool:
+    """The shared fixture, with the journal turned on.
+
+    The card's default is off, so a file about the journal has to opt in. The
+    override is module-level rather than per-test because every test here is
+    about journal behaviour; a test that wants it off says so explicitly.
+    """
+    card = WorkspaceTool(workspace_id=WORKSPACE_NAME, git_journal=True)
+    card.observer(observer)
+    return card
 
 
 @pytest.fixture
@@ -162,7 +178,7 @@ class TestTheRepository:
         tree = workspaces_root / "shared.git"
         tree.mkdir()
         (tree / "unseen.md").write_text("someone else's\n", encoding="utf-8")
-        card, _observer = card_for(orchestrator_proxy, "alice", workspace_id="shared.git")
+        card, _observer = card_for(orchestrator_proxy, "alice", workspace_id="shared.git", git_journal=True)
 
         # The journal is off — no second repository, no seeded ignore file …
         assert not (workspaces_root / "shared.git.git").exists()
@@ -191,7 +207,7 @@ class TestTheRepository:
         mine.mkdir()
         (mine / "unseen.md").write_text("already here\n", encoding="utf-8")
 
-        card, _observer = card_for(orchestrator_proxy, "alice", workspace_id="shared")
+        card, _observer = card_for(orchestrator_proxy, "alice", workspace_id="shared", git_journal=True)
 
         # The other team's tree is exactly as they left it …
         assert [entry.name for entry in victim.iterdir()] == ["theirs.md"]
@@ -214,6 +230,7 @@ class TestTheRepository:
                 name=workspace_actor_name(WORKSPACE_NAME),
                 role=WORKSPACE_ACTOR_ROLE,
                 workspace_name=WORKSPACE_NAME,
+                git_journal=True,
             )
         )
         second.on_start()
@@ -442,9 +459,9 @@ class TestHistoryIsLinear:
     def test_eight_mutations_from_three_agents_stay_on_one_line(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
-        alice, _a = card_for(orchestrator_proxy, "alice")
-        bob, _b = card_for(orchestrator_proxy, "bob")
-        carol, _c = card_for(orchestrator_proxy, "carol")
+        alice, _a = card_for(orchestrator_proxy, "alice", git_journal=True)
+        bob, _b = card_for(orchestrator_proxy, "bob", git_journal=True)
+        carol, _c = card_for(orchestrator_proxy, "carol", git_journal=True)
 
         mutate(alice, "workspace_write", "one.md", "1\n")
         mutate(bob, "workspace_write", "two.md", "2\n")
@@ -596,7 +613,7 @@ class TestTheSeededIgnoreFile:
         mine = tree / GITIGNORE_NAME
         mine.write_text("# mine, thanks\n", encoding="utf-8")
 
-        card_for(orchestrator_proxy, "alice", workspace_id="preexisting")
+        card_for(orchestrator_proxy, "alice", workspace_id="preexisting", git_journal=True)
 
         assert mine.read_text(encoding="utf-8") == "# mine, thanks\n"
 
@@ -610,6 +627,7 @@ class TestTheSeededIgnoreFile:
         observer = FakeActorToolObserver(orchestrator_proxy, name="alice")
         card = WorkspaceTool(
             workspace_id=WORKSPACE_NAME,
+            git_journal=True,
             workspace_read=WorkspaceRead(document_reader=_StubDocumentReader()),
         )
         card.observer(observer)
@@ -908,7 +926,7 @@ class TestNoJournalFailureFailsAMutation:
             return real_run(cmd, *args, **kwargs)
 
         monkeypatch.setattr(subprocess, "run", refuse_init)
-        card, _observer = card_for(orchestrator_proxy, "alice")
+        card, _observer = card_for(orchestrator_proxy, "alice", git_journal=True)
 
         assert mutate(card, "workspace_write", "fresh.md", "body\n") == "Written: fresh.md"
 
@@ -943,7 +961,7 @@ class TestNoJournalFailureFailsAMutation:
             return real_run(cmd, *args, **kwargs)
 
         monkeypatch.setattr(subprocess, "run", refuse_config)
-        card, _observer = card_for(orchestrator_proxy, "alice")
+        card, _observer = card_for(orchestrator_proxy, "alice", git_journal=True)
 
         assert mutate(card, "workspace_write", "fresh.md", "body\n") == "Written: fresh.md"
 
@@ -972,25 +990,25 @@ class TestNoJournalFailureFailsAMutation:
 
 
 # ---------------------------------------------------------------------------
-# AC17: workspace_git is a card field, not a tool
+# AC17: git_journal is a card field, not a tool
 # ---------------------------------------------------------------------------
 
 
 class TestTheCardField:
-    def test_it_defaults_to_on(self) -> None:
-        assert WorkspaceTool().workspace_git is True
+    def test_it_defaults_to_off(self) -> None:
+        assert WorkspaceTool().git_journal is False
 
     def test_it_appears_in_no_tool_signature(self, wired_card: WorkspaceTool) -> None:
         import inspect
 
         for tool in wired_card.get_tools():
-            assert "workspace_git" not in inspect.signature(tool).parameters
-        assert "workspace_git" not in [tool.__name__ for tool in wired_card.get_tools()]
+            assert "git_journal" not in inspect.signature(tool).parameters
+        assert "git_journal" not in [tool.__name__ for tool in wired_card.get_tools()]
 
     def test_the_card_round_trips_with_the_field_intact(self) -> None:
-        card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_git=False)
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME, git_journal=False)
         restored = WorkspaceTool.model_validate(card.model_dump())
-        assert restored.workspace_git is False
+        assert restored.git_journal is False
         assert restored == card
 
     def test_the_card_survives_a_json_round_trip(self) -> None:
@@ -998,9 +1016,9 @@ class TestTheCardField:
         # non-serializable type leaking into a field breaks here, whatever the
         # model config says. The journal itself is a plain actor attribute and
         # reaches no card field at all.
-        card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_git=False)
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME, git_journal=False)
         restored = WorkspaceTool.model_validate_json(card.model_dump_json())
-        assert restored.workspace_git is False
+        assert restored.git_journal is False
         assert restored == card
 
     def test_the_actor_config_round_trips_with_the_field(self) -> None:
@@ -1008,19 +1026,19 @@ class TestTheCardField:
             name=workspace_actor_name(WORKSPACE_NAME),
             role=WORKSPACE_ACTOR_ROLE,
             workspace_name=WORKSPACE_NAME,
-            workspace_git=False,
+            git_journal=False,
         )
-        assert WorkspaceConfig.model_validate(config.model_dump()).workspace_git is False
+        assert WorkspaceConfig.model_validate(config.model_dump()).git_journal is False
 
     def test_it_reaches_the_actor_config(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         observer = FakeActorToolObserver(orchestrator_proxy, name="alice")
-        card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_git=False)
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME, git_journal=False)
         card.observer(observer)
         _actor_class, config = orchestrator_proxy.create_calls[-1]
         assert isinstance(config, WorkspaceConfig)
-        assert config.workspace_git is False
+        assert config.git_journal is False
 
 
 # ---------------------------------------------------------------------------
@@ -1051,7 +1069,7 @@ def journal_off(
     observer = FakeActorToolObserver(orchestrator_proxy, name="alice")
     card = WorkspaceTool(
         workspace_id=WORKSPACE_NAME,
-        workspace_git=request.param != "card-disabled",
+        git_journal=request.param != "card-disabled",
     )
     card.observer(observer)
     return card
@@ -1109,7 +1127,7 @@ class TestTheGateSurvivesWithoutGit:
             observer = FakeActorToolObserver(orchestrator_proxy, name="alice")
             card = WorkspaceTool(
                 workspace_id=WORKSPACE_NAME,
-                workspace_git=mode != "card-disabled",
+                git_journal=mode != "card-disabled",
             )
             card.observer(observer)
             for index in range(5):
@@ -1196,7 +1214,7 @@ class TestTheGateSurvivesWithoutGit:
     def test_a_refusal_still_names_the_other_writer_by_name(
         self, journal_off: WorkspaceTool, orchestrator_proxy: FakeOrchestratorProxy, off_notes: Path
     ) -> None:
-        bob, _observer = card_for(orchestrator_proxy, "bob")
+        bob, _observer = card_for(orchestrator_proxy, "bob", git_journal=True)
         read(journal_off, "notes.md")
         read(bob, "notes.md")
         mutate(bob, "workspace_write", "notes.md", "bob's version\n")

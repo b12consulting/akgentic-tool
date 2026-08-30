@@ -23,7 +23,7 @@ turn off (ADR-036 §4).
    does not.
 
 3. **Git is optional; the gate is not.** With no ``git`` on ``PATH``, or
-   ``workspace_git=False``, the journal degrades off after **one** warning and
+   ``git_journal=False``, the journal degrades off after **one** warning and
    every gate behaviour stays identical. Losing git loses history, attribution
    and out-of-band *detection*; it does not lose correctness, because the gate
    detects out-of-band *writes* by hashing. No failure in this module can fail a
@@ -273,7 +273,7 @@ class GitJournal:
 
         Args:
             root: The workspace root, resolved absolute.
-            enabled: The card's ``workspace_git``. False turns the journal off
+            enabled: The card's ``git_journal``. False turns the journal off
                 before ``git`` is even looked for.
             timeout_s: Wall-clock budget for a single ``git`` invocation.
         """

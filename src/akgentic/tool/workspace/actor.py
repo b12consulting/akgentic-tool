@@ -406,7 +406,7 @@ class WorkspaceActor(DeferredResultActor[WorkspaceConfig, WorkspaceState, str, E
         self._sweep_staging_files()
         self._journal = GitJournal(
             self._workspace._root,
-            enabled=self.config.workspace_git,
+            enabled=self.config.git_journal,
             timeout_s=self.config.git_timeout_s,
         )
         if self._journal.initialise():
