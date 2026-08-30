@@ -442,6 +442,41 @@ def test_the_switch_reads_the_live_state_object_not_the_one_bound_at_build_time(
     assert observer.state is not stale_carrier
 
 
+def test_the_switch_dereferences_the_slot_after_the_call_not_before_it() -> None:
+    """The second forbidden form, which the bind-time guard above cannot see.
+
+    Task 6 forbids *a local computed before the observer call*, not only a
+    bind-time capture. The two are different defects: the guard above replaces
+    the carrier **between** calls, so a per-call hoist taken before
+    ``observer.switch_model(...)`` still lands correctly and stays green.
+
+    It is wrong all the same. ``observer.switch_model`` reaches the llm layer,
+    and a restore that replaces the agent's state object while that call is in
+    flight leaves the hoisted local pointing at the abandoned carrier — the write
+    then vanishes with no error. Here the observer performs that replacement
+    itself, which is the only way to put the swap inside the call.
+    """
+
+    class _SwappingObserver(_FakeObserver):
+        """Replaces its own state carrier mid-switch, as a restore would."""
+
+        def switch_model(self, key: str) -> str:
+            outcome = super().switch_model(key)
+            self.state = _Carrier()  # init_state() lands while the call is in flight
+            return outcome
+
+    observer = _SwappingObserver(_roster())
+    card = ModelTool()
+    card.observer(observer)
+    stale_carrier = observer.state
+
+    _switch_callable(card)("anthropic:claude-opus-5")
+
+    assert observer.state is not stale_carrier
+    assert observer.state.tool_state.active_model == "anthropic:claude-opus-5"
+    assert stale_carrier.tool_state.active_model is None
+
+
 def test_a_refused_switch_raises_retriable_and_names_the_key_and_the_reason() -> None:
     card, observer = _wired_card(_roster())
     observer.raise_on_switch = ValueError("unknown roster key")
