@@ -8,14 +8,22 @@ The conforming fake supplies the six members ``ActorToolObserver`` declares on
 this branch base — ``notify_event``, ``myAddress``, ``orchestrator``,
 ``team_id``, ``state``, ``proxy_ask`` — and nothing more, so the two negative
 cases isolate the two new members rather than an incidental omission.
+
+The module boundary is swept rather than eyeballed. It is the epic's blocking
+invariant, and the package already learned once that a hand-checked structural
+rule is only ever "someone remembered" — see the same reasoning in
+``test_core_domain_purity.test_every_subpackage_is_listed_as_a_domain``.
 """
 
 from __future__ import annotations
 
+import ast
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import AkgentType
 
@@ -191,3 +199,152 @@ def test_both_symbols_are_named_in_both_all_lists() -> None:
     assert "ModelSwitchToolObserver" in model_package.__all__
     assert "ModelRow" in tool_package.__all__
     assert "ModelSwitchToolObserver" in tool_package.__all__
+
+
+# ---------------------------------------------------------------------------
+# AC 1 — the module boundary, swept over the package rather than checked by eye
+# ---------------------------------------------------------------------------
+
+MODEL_DIR = Path(model_package.__file__).parent
+
+# Dotted parts of the package ``MODEL_DIR`` holds, for resolving relative imports.
+# ``from ...llm import ModelConfig`` reaches ``akgentic.llm`` from inside
+# ``akgentic.tool.model`` without ever writing the string, so the sweep resolves
+# levels instead of matching on absolute module text.
+_MODEL_PACKAGE_PARTS = ("akgentic", "tool", "model")
+
+_FORBIDDEN_ROOT = "akgentic.llm"
+
+# The one name this package must never bind. ``ModelRow`` exists precisely so that
+# ``ModelConfig`` — which lives in ``akgentic-llm`` — has no reason to appear here.
+_FORBIDDEN_NAME = "ModelConfig"
+
+
+def _model_package_modules() -> list[Path]:
+    """Every module in the model domain package, including any 36-2 adds."""
+    return sorted(MODEL_DIR.rglob("*.py"))
+
+
+def _imported_modules(tree: ast.Module, package_parts: tuple[str, ...]) -> set[str]:
+    """Every dotted module path *tree* imports, with relative imports resolved.
+
+    Each ``from`` clause contributes the module it names **and** that module plus
+    each imported name, so ``from akgentic import llm`` is reported as
+    ``akgentic.llm`` rather than as the bare ``akgentic`` the clause carries.
+    """
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.level == 0:
+                module = node.module or ""
+            else:
+                base = package_parts[: len(package_parts) - node.level + 1]
+                module = ".".join([*base, node.module] if node.module else list(base))
+            imported.add(module)
+            imported.update(f"{module}.{alias.name}" for alias in node.names)
+        elif isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+    return imported
+
+
+def _binds_forbidden_name(tree: ast.Module) -> bool:
+    """Whether *tree* binds or reads the identifier ``ModelConfig``.
+
+    Deliberately an identifier check and not a text search. The package names
+    ``ModelConfig`` in prose in two places already — ``team/activity.py`` and
+    ``team/README.md`` — precisely in order to forbid it, and a text ban would
+    outlaw the warning while catching nothing a reader could not already see.
+    What must not exist is a *use*.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == _FORBIDDEN_NAME:
+            return True
+        if isinstance(node, ast.Attribute) and node.attr == _FORBIDDEN_NAME:
+            return True
+        if isinstance(node, ast.ImportFrom | ast.Import) and any(
+            alias.name == _FORBIDDEN_NAME or alias.asname == _FORBIDDEN_NAME
+            for alias in node.names
+        ):
+            return True
+    return False
+
+
+def test_the_model_package_imports_no_akgentic_llm() -> None:
+    """Epic 36 invariant 1: this package may reach for ``akgentic-core`` only."""
+    violations: list[str] = []
+    for module_path in _model_package_modules():
+        tree = ast.parse(module_path.read_text(encoding="utf-8"))
+        parts = (*_MODEL_PACKAGE_PARTS, *module_path.relative_to(MODEL_DIR).parts[:-1])
+        for imported in sorted(_imported_modules(tree, parts)):
+            if imported == _FORBIDDEN_ROOT or imported.startswith(f"{_FORBIDDEN_ROOT}."):
+                violations.append(f"{module_path.relative_to(MODEL_DIR)} imports {imported}")
+    assert not violations, f"module boundary violated: {violations}"
+
+
+def test_the_model_package_never_names_model_config() -> None:
+    """``ModelRow`` is the projection that keeps ``ModelConfig`` out of this package."""
+    violations = [
+        module_path.relative_to(MODEL_DIR).as_posix()
+        for module_path in _model_package_modules()
+        if _binds_forbidden_name(ast.parse(module_path.read_text(encoding="utf-8")))
+    ]
+    assert not violations, f"{_FORBIDDEN_NAME} is used in: {violations}"
+
+
+def test_the_boundary_sweep_is_not_vacuous() -> None:
+    """Guard the guard: a mistyped glob would make both sweeps trivially green."""
+    swept = {path.relative_to(MODEL_DIR).as_posix() for path in _model_package_modules()}
+    assert {"__init__.py", "observer.py", "state.py"} <= swept, swept
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from akgentic.llm import ModelConfig",
+        "from akgentic.llm.models import ModelConfig",
+        "import akgentic.llm",
+        "import akgentic.llm as llm_package",
+        "from akgentic import llm",
+        "from ...llm import ModelConfig",
+        "def f():\n    from akgentic.llm import ModelConfig\n",
+    ],
+)
+def test_every_import_form_of_the_forbidden_package_is_reported(source: str) -> None:
+    """Guard the guard: the sweep matches module paths, so the parser must produce them.
+
+    Asking whether the sweep *would* go red is a question about the parser, not
+    about today's tree — a boundary breach will not be written in whichever form
+    happens to be absent now. The relative form reaches ``akgentic.llm`` without
+    the string appearing in the source at all.
+    """
+    reported = _imported_modules(ast.parse(source), _MODEL_PACKAGE_PARTS)
+    assert any(
+        name == _FORBIDDEN_ROOT or name.startswith(f"{_FORBIDDEN_ROOT}.") for name in reported
+    ), reported
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from akgentic.llm import ModelConfig",
+        "from akgentic.llm import ModelConfig as Cfg",
+        "from akgentic.llm import models as ModelConfig",
+        "row = ModelConfig(provider='openai')",
+        "def f(cfg: ModelConfig) -> None: ...",
+        "llm.ModelConfig",
+    ],
+)
+def test_every_use_form_of_the_forbidden_name_is_reported(source: str) -> None:
+    """Guard the guard: the name check must see bindings, aliases and reads alike."""
+    assert _binds_forbidden_name(ast.parse(source))
+
+
+def test_a_docstring_mentioning_the_forbidden_name_is_not_a_violation() -> None:
+    """The rule bans a use, not the prose that explains the rule.
+
+    ``team/activity.py`` and ``team/README.md`` both name ``ModelConfig`` in order
+    to forbid it. A text-matching guard would turn that documentation red.
+    """
+    assert not _binds_forbidden_name(
+        ast.parse('"""Never a ModelConfig here — see ModelRow."""\n# not a ModelConfig\n')
+    )
