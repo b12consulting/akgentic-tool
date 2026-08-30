@@ -489,8 +489,8 @@ class WorkspaceExec(BaseToolParam):
     thing:
 
     - ``-1`` (the default) — **wait out the run.** Resolved at wiring time to
-      the largest count fitting the *effective run budget*
-      (``min(timeout_s, DEFAULT_WORKER_TIMEOUT_S)``) plus
+      the count whose wait is the longest still fitting the *effective run
+      budget* (``min(timeout_s, DEFAULT_WORKER_TIMEOUT_S)``) plus
       :data:`~akgentic.tool.workspace.execution.EXEC_REPORT_MARGIN_S`, so the
       wait covers the worker's report and not merely the command. The common
       case then returns the command's own output and the model never sees a run

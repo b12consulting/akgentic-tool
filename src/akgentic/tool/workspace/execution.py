@@ -68,8 +68,8 @@ its parent's teardown open for the difference.
 DEFAULT_EXEC_POLL_ATTEMPTS = -1
 """Sentinel: wait out the whole run rather than hand back a run id part-way.
 
-Resolved once, at wiring time, by :func:`poll_attempts_within` into the largest
-attempt count that fits the run's effective budget plus
+Resolved once, at wiring time, by :func:`poll_attempts_within` into the attempt
+count whose *wait* is the longest that still fits the run's effective budget plus
 :data:`EXEC_REPORT_MARGIN_S`. Nothing downstream ever sees the ``-1``.
 
 It is the **default**, and the instinct that a long synchronous tool call is
@@ -417,9 +417,11 @@ def poll_attempts_within(attempts: int, delay: float, run_budget: float) -> int:
     requests, three meanings:
 
     - **negative** — :data:`DEFAULT_EXEC_POLL_ATTEMPTS`, "wait out the run":
-      resolved to the largest count fitting ``run_budget`` **plus**
-      :data:`EXEC_REPORT_MARGIN_S`, so the wait covers the worker's report and
-      not merely the command (see that constant).
+      resolved so that the **last look** falls as late as it can inside
+      ``run_budget`` **plus** :data:`EXEC_REPORT_MARGIN_S`, so the wait covers
+      the worker's report and not merely the command (see that constant). The
+      count is one higher than the wait divided by the delay, because
+      ``poll_deferred`` sleeps between looks and not after the last.
     - **zero** — returned unchanged. A caller that polls zero times takes the run
       id immediately, and that opt-out is load-bearing: it is the only way to get
       a run id without waiting at all.
@@ -449,7 +451,16 @@ def poll_attempts_within(attempts: int, delay: float, run_budget: float) -> int:
     if attempts < 0:
         if delay <= 0:
             return 1
-        return max(1, int((run_budget + EXEC_REPORT_MARGIN_S) // delay))
+        # ``poll_deferred`` sleeps *between* looks and never after the last, so
+        # N looks spend (N-1) delays of wall clock, not N. Resolving to the
+        # count whose *product* fits would therefore stop looking one whole
+        # delay early — at the shipped defaults that is 15.5 s against a 16 s
+        # target, and at any delay above the margin the margin is gone entirely
+        # and the poll ends at or before the run's own budget, which is the case
+        # this margin exists to cover. The +1 puts the *last look* at
+        # ``floor((run_budget + margin) / delay) * delay``: the largest multiple
+        # of the delay that still fits, and never past it.
+        return max(1, int((run_budget + EXEC_REPORT_MARGIN_S) // delay) + 1)
     if attempts == 0 or delay <= 0:
         return attempts
     if attempts * delay <= run_budget:

@@ -1388,13 +1388,18 @@ class TestTheBudgets:
         # AC1/AC3/AC9. The default is the sentinel, so the wait it resolves to is
         # the whole run plus the margin the worker needs to report it — and no
         # more, which is the half that keeps this a budget rather than a licence.
+        #
+        # The wait is (attempts - 1) delays, not attempts: poll_deferred sleeps
+        # between looks and never after the last. Asserting the product instead
+        # would overstate the real wait by one delay and hide a poll that stops
+        # short of the budget it claims to cover.
         params = WorkspaceExec()
         assert params.poll_attempts == -1
         run_budget = min(params.timeout_s, DEFAULT_WORKER_TIMEOUT_S)
         attempts = poll_attempts_within(
             params.poll_attempts, params.poll_delay_seconds, run_budget
         )
-        wait = attempts * params.poll_delay_seconds
+        wait = (attempts - 1) * params.poll_delay_seconds
         assert wait > run_budget
         assert wait <= run_budget + EXEC_REPORT_MARGIN_S
 
@@ -1445,10 +1450,16 @@ class TestTheBudgets:
     def test_the_sentinel_resolves_against_the_budget_plus_the_margin(self) -> None:
         # AC1/AC3. Arithmetic, not wall clock: the resolution is what the wiring
         # does once, so it is asserted where it happens rather than by sleeping.
-        for delay, budget in ((0.5, 15.0), (0.5, 20.0), (1.0, 15.0), (0.1, 2.0)):
+        # ``(attempts - 1) * delay`` is the wall clock poll_deferred actually
+        # spends — it sleeps between looks, never after the last one. The case
+        # that makes this worth spelling out is delay == margin: the product
+        # form passes there while the real wait ends exactly at the budget,
+        # reporting a timeout for a run that was about to answer.
+        for delay, budget in ((0.5, 15.0), (0.5, 20.0), (1.0, 15.0), (0.1, 2.0), (1.0, 3.0)):
             attempts = poll_attempts_within(-1, delay, budget)
-            assert attempts * delay > budget, (delay, budget)
-            assert attempts * delay <= budget + EXEC_REPORT_MARGIN_S, (delay, budget)
+            wait = (attempts - 1) * delay
+            assert wait > budget, (delay, budget)
+            assert wait <= budget + EXEC_REPORT_MARGIN_S, (delay, budget)
 
     def test_the_sentinel_never_resolves_below_one_look(self) -> None:
         assert poll_attempts_within(-1, 60.0, 1.0) == 1
@@ -1632,6 +1643,12 @@ class TestWaitingOutTheRun:
         # AC9: three budgets, still three things. A card asking to poll for a
         # thousand seconds hands the backend the same run budget as any other —
         # the poll buys more looking, never more running.
+        #
+        # This is the one card here whose poll delay is a whole second, so the
+        # sleep is stubbed: a look that lands before the run settles would
+        # otherwise cost real wall clock, and the assertions below are about the
+        # budgets handed to the backend, not about how long anything waited.
+        monkeypatch.setattr("akgentic.tool.core.deferred.time.sleep", lambda _: None)
         card, _ = exec_card_for(
             orchestrator_proxy, poll_attempts=1000, poll_delay_seconds=1.0, timeout_s=999.0
         )
