@@ -157,6 +157,25 @@ def backend_not_ready(seconds: int) -> str:
     return _NOT_READY_MSG.format(seconds=seconds)
 
 
+EXEC_REPLY_GRACE_S = 2
+"""How much longer the ask waiting on a command lives than the command's budget.
+
+A command killed by its budget is an **answer** — the backend raises, the worker
+turns it into ``ExecOutcome(timed_out=True)``, and the agent reads what happened.
+It stays one only while the ask waiting for that answer is still open, and the
+ask has to cover the kill and the output collection that follow the budget
+expiring. Cut to the truncated remainder instead, it expires *first* whenever the
+card's budget reaches the worker's — so the one configuration that can genuinely
+exhaust a run's budget was also the one that reported it as an opaque worker
+failure rather than a timeout.
+
+Whole seconds, because ``proxy_ask`` takes an int. Small, because the worker
+still has to die well inside :data:`LEASE_GRACE_S` of its own deadline — which is
+what keeps a liveness-gated reclaim from waiting on a worker that has outlived
+the lease it holds.
+"""
+
+
 class ExecOutcome(SerializableBaseModel):
     """What a finished run produced.
 
@@ -471,9 +490,11 @@ class ExecWorker(DeferredWorker):
 
         So: fix a deadline, resolve the sandbox, ask :meth:`SandboxActor.ready`
         under what is left, tell the parent the run is starting, and only then
-        hand the command whatever remains. **No ask here is made without a
-        timeout** — that is what makes the worker mortal, which is in turn what
-        makes a liveness-gated reclaim safe.
+        hand the command whatever remains — waiting on it for that budget plus
+        :data:`EXEC_REPLY_GRACE_S`, so a command the budget kills still comes back
+        as the answer it is. **No ask here is made without a timeout** — that is
+        what makes the worker mortal, which is in turn what makes a
+        liveness-gated reclaim safe.
 
         A command that exits — well or badly — and a command its budget killed
         both come back as an :class:`ExecOutcome`, because both are answers an
@@ -502,7 +523,9 @@ class ExecWorker(DeferredWorker):
         self._run_started(payload.deferred_key)
         remaining = deadline - time.monotonic()
         budget = max(0.0, min(payload.timeout_s, remaining))
-        sandbox = self.proxy_ask(address, SandboxActor, timeout=ask_seconds(remaining))
+        sandbox = self.proxy_ask(
+            address, SandboxActor, timeout=ask_seconds(budget) + EXEC_REPLY_GRACE_S
+        )
         try:
             result = sandbox.exec(payload.cmd, payload.cwd, timeout=budget)
         except subprocess.TimeoutExpired:
@@ -556,6 +579,12 @@ class ExecWorker(DeferredWorker):
         dead actor is the other, and telling them apart would buy the model
         nothing it could act on differently.
 
+        The original is **logged** as well as chained, because chaining alone
+        loses it: ``receiveMsg_DeferredPayload`` reports failures as ``str(exc)``,
+        which keeps the text above and drops the cause. Without this line a
+        backend that raises rather than hangs leaves no trace anywhere of what it
+        actually raised.
+
         Args:
             address: The sandbox actor.
             deadline: The worker's own deadline, monotonic.
@@ -568,6 +597,12 @@ class ExecWorker(DeferredWorker):
         try:
             self.proxy_ask(address, SandboxActor, timeout=seconds).ready()
         except Exception as exc:
+            logger.warning(
+                "[%s] The execution backend did not answer readiness within %ss: %r",
+                self.config.name,
+                seconds,
+                exc,
+            )
             raise RuntimeError(backend_not_ready(seconds)) from exc
 
     def _run_started(self, run_id: str) -> None:

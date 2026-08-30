@@ -41,6 +41,7 @@ from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
 from akgentic.tool.workspace.edit import EditItem
 from akgentic.tool.workspace.execution import (
     DEFAULT_EXEC_TIMEOUT_S,
+    EXEC_REPLY_GRACE_S,
     LEASE_GRACE_S,
     MAX_TRACKED_RUNS,
     RUN_ID_CHARS,
@@ -812,7 +813,11 @@ class TestTheWorkerSpendsOneBudget:
         assert len(harness.ask_timeouts) == 3  # the orchestrator, ready, the command
         for seconds in harness.ask_timeouts:
             assert seconds is not None, "an ask inside the worker carried no timeout"
-            assert 0 < seconds <= DEFAULT_WORKER_TIMEOUT_S
+            # The two waits before the command are capped by the worker's own
+            # budget; the ask waiting *on* the command deliberately outlives that
+            # command's budget by EXEC_REPLY_GRACE_S, so a command the budget
+            # kills is still an answer rather than a worker timeout.
+            assert 0 < seconds <= DEFAULT_WORKER_TIMEOUT_S + EXEC_REPLY_GRACE_S
 
     def test_a_backend_that_never_becomes_ready_fails_rather_than_hangs(
         self,
@@ -874,6 +879,35 @@ class TestTheDeadlineFollowsTheRun:
 
         with pytest.raises(RetriableError, match="workspace busy"):
             mutate(card, "workspace_mkdir", "src")
+
+    def test_a_rebased_lease_still_knows_its_worker(
+        self, exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness]
+    ) -> None:
+        # The re-base rewrites the lease, and the worker it carries is a
+        # PrivateAttr — so a rebuild that names every field it has (the shape
+        # CLAUDE.md #12 exists to forbid, and the shape someone reaches for the
+        # next time a field is added) drops it in silence and passes every other
+        # spec in this file. Losing it makes ``worker_alive`` False, and the
+        # first mutation past the new deadline then reclaims the tree from a run
+        # that is still going: AC5's defect, reintroduced on the one path that
+        # runs on every healthy run.
+        #
+        # Driven through the actor rather than a real run because the harness
+        # spawns the worker on its own thread, so whether ``run_started`` lands
+        # before or after ``_attach_worker`` is a race there. In production it
+        # cannot be: both arrive on ``#Workspace``'s own thread, and the tell
+        # queues behind the ``request_exec`` that attached the address.
+        card, actor, _harness = exec_setup
+        lease = lease_on(actor, worker=MockActorAddress("#defer-live"), expired=False)
+
+        actor.run_started(lease.run_id)
+        assert actor._lease is not None
+        assert actor._lease.worker_alive, "the re-base dropped the lease's worker"
+        actor._lease = actor._lease.model_copy(update={"deadline": time.monotonic() - 1.0})
+
+        with pytest.raises(RetriableError, match="passed its budget"):
+            mutate(card, "workspace_mkdir", "src")
+        assert actor._lease is not None
 
     def test_run_started_naming_another_run_changes_nothing(
         self, exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness]
@@ -1310,6 +1344,40 @@ class TestTheBudgets:
         assert budget is not None
         assert 0 < budget <= DEFAULT_WORKER_TIMEOUT_S
         assert budget == pytest.approx(DEFAULT_WORKER_TIMEOUT_S, abs=1.0)
+
+    def test_the_ask_waiting_on_the_command_outlives_the_commands_budget(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        sandbox_script: SandboxScript,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # A command killed by its budget is an ANSWER — ExecOutcome(timed_out) —
+        # and only stays one while the ask waiting for it is still open. Cut to
+        # the truncated remainder, that ask expired FIRST in exactly this
+        # configuration: the command may run for what is left of the worker's
+        # budget, and the truncation puts the ask a fraction of a second below
+        # it. The clamped run's timeout then came back as an opaque worker
+        # failure instead of the outcome the agent can read.
+        #
+        # The clamped card is what makes it visible: with the default 15 s card
+        # the command is nowhere near the remainder, so the two never cross.
+        card, _ = exec_card_for(orchestrator_proxy)
+        _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
+        assert isinstance(actor, WorkspaceActor)
+        harness = ExecHarness(actor, orchestrator_proxy)
+        harness.install(monkeypatch)
+        actor.configure_exec(
+            ExecConfig(mode="local", team_id=workspace_tree.name, timeout_s=999.0)
+        )
+
+        start_run(actor, sandbox_script)
+        finish_run(sandbox_script, harness)
+
+        command_budget = sandbox_script.timeouts[0]
+        assert command_budget is not None
+        assert harness.ask_timeouts[-1] is not None
+        assert harness.ask_timeouts[-1] > command_budget
 
     def test_the_poll_budget_defaults_below_the_run_budget(self) -> None:
         params = WorkspaceExec()
