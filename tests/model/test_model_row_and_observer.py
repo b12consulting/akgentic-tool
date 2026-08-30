@@ -294,7 +294,7 @@ def test_the_model_package_never_names_model_config() -> None:
 def test_the_boundary_sweep_is_not_vacuous() -> None:
     """Guard the guard: a mistyped glob would make both sweeps trivially green."""
     swept = {path.relative_to(MODEL_DIR).as_posix() for path in _model_package_modules()}
-    assert {"__init__.py", "observer.py", "state.py"} <= swept, swept
+    assert {"__init__.py", "observer.py", "state.py", "tool.py"} <= swept, swept
 
 
 @pytest.mark.parametrize(

@@ -76,6 +76,7 @@ _EXPECTED_ROOT_ALL: list[str] = [
     "ExecTool",
     "MailboxTool",  # epic 34: the mailbox card joins the stable surface
     "MetadataTool",
+    "ModelTool",  # epic 36: the model-switch card joins the stable surface
     "NotificationTool",
     "SeatbeltSandboxActor",
     "SkillTool",
