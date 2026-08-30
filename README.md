@@ -519,31 +519,38 @@ tool's **only** channel to the runtime — and because it arrives after construc
 field, the card stays serializable. Everything a tool does to the system, it does through the
 observer.
 
-### Two global levels, then a domain leaf — ask for the least you need
+### Two global levels, then domain leaves — ask for the least you need
 
-The observer is a `Protocol`. **Two** of them are package-global, one extending the other; below the
-second sit **sibling** domain protocols, each living beside its one consuming card. It is not a
-single chain: below the second level there are only siblings at one depth, so there is no deeper
-level to look for.
+The observer is a `Protocol`. **Two** of them are package-global, one extending the other; below them
+sit **three** domain protocols, each one card's own contract. It is not a single chain, and it is not
+one flat row either: a domain protocol extends **whichever global level it genuinely needs**, so the
+leaves do not all hang at the same depth.
 
-| Protocol | Where | What it adds | What that lets a tool do |
-|---|---|---|---|
-| `ToolObserver` | `core/` — global | `notify_event(event)` | Emit a domain event onto the orchestrator's stream. Nothing more. |
-| `ActorToolObserver` | `core/` — global | `myAddress`, `orchestrator`, `team_id`, `state`, `proxy_ask(...)` | Reach any actor by address — including a singleton tool actor. Reach the persisted tool-layer slot, `state.tool_state`, read live on every call. |
-| `TeamManagementToolObserver` | `team/` — one card | `createActor(...)`, `on_hire(...)`, `on_fire(...)` | Create actors, and change the team's membership. |
-| `ModelSwitchToolObserver` | `model/` — one card | `list_model_rows()`, `switch_model(key)` | Read the model roster as serializable rows, and make one entry the model in force. |
+| Protocol | Where | Extends | What it adds | What that lets a tool do |
+|---|---|---|---|---|
+| `ToolObserver` | `core/` — global | — | `notify_event(event)` | Emit a domain event onto the orchestrator's stream. Nothing more. |
+| `ActorToolObserver` | `core/` — global | `ToolObserver` | `myAddress`, `orchestrator`, `team_id`, `state`, `proxy_ask(...)` | Reach any actor by address — including a singleton tool actor. Reach the persisted tool-layer slot, `state.tool_state`, read live on every call. |
+| `MailboxToolObserver` | `mailbox/` — one card | `ToolObserver` | `get_mailbox()`, `consume_mailbox(ids)` | Peek at the owning agent's inbox, and absorb a named message into the current run. |
+| `TeamManagementToolObserver` | `team/` — one card | `ActorToolObserver` | `createActor(...)`, `on_hire(...)`, `on_fire(...)` | Create actors, and change the team's membership. |
+| `ModelSwitchToolObserver` | `model/` — one card | `ActorToolObserver` | `list_model_rows()`, `switch_model(key)` | Read the model roster as serializable rows, and make one entry the model in force. |
 
 The two global levels are gated one by the other: a tool that only emits events cannot reach an
-actor. The last two rows are **not** a further level and not each other's ancestors — they are
-siblings, both extending `ActorToolObserver`, and an observer satisfying one need not satisfy the
-other. Declare the narrowest protocol your tool genuinely uses.
+actor. The last three rows are **not** further levels and not each other's ancestors — they are
+siblings in role, each one card's contract, and an observer satisfying one need not satisfy any
+other. They do **not** all sit at one depth: `MailboxToolObserver` extends `ToolObserver` directly,
+because peeking at and consuming from the inbox needs no actor reach. Declare the narrowest protocol
+your tool genuinely uses — `MailboxToolObserver` is the shipped example of that rule being followed
+rather than merely stated.
 
-A domain protocol lives beside its card rather than on the core surface because it has exactly one
-consumer here: `TeamTool` for the first, `ModelTool` for the second. That is the audience rule —
-`core/` carries what more than one domain needs, and nothing else. Adding a domain protocol
-therefore widens nothing: every existing observer keeps satisfying `ActorToolObserver` unchanged,
-which is why `ModelSwitchToolObserver` shipped without a single existing implementation being
-touched.
+A domain protocol lives beside its card rather than on the core surface because it is that one
+card's contract: `MailboxTool`, `TeamTool` and `ModelTool` respectively. **"Beside its card" is
+about ownership, not about the call site** — `MailboxToolObserver`'s two methods are called by the
+agent's mailbox capability in `akgentic-agent`, not by `MailboxTool`, which reads and consumes
+nothing. The protocol still lives in `mailbox/` because it belongs to that card and to nothing else.
+That is the audience rule — `core/` carries what more than one domain needs, and nothing else.
+Adding a domain protocol therefore widens nothing: every existing observer keeps satisfying the
+global level it already satisfied, which is why `ModelSwitchToolObserver` shipped without a single
+existing implementation being touched.
 
 ### Narrow in an accessor, not in the signature
 
@@ -1356,12 +1363,19 @@ key, and the advertised parameter name is `model`:
 ```
 /switch_model openai:gpt-5.2              # binds — positional
 /switch_model model=openai:gpt-5.2        # binds — keyword
-/switch_model key=openai:gpt-5.2          # does NOT bind
+/switch_model key=openai:gpt-5.2          # binds the WHOLE token positionally — then fails downstream
 ```
 
 `key` is the *observer's* parameter name (`ModelSwitchToolObserver.switch_model(key)`); the card's
 callable is `switch_model(model: str) -> str`, and the command registry derives its schema from the
 callable. Two contracts, two names, deliberately.
+
+**The third line is not rejected as an unknown keyword.** A token counts as a keyword only when the
+text before its first `=` is a known parameter name — deliberately, so a value containing `=` is
+never silently swallowed. `key` is not a parameter of the callable, so the whole token
+`key=openai:gpt-5.2` is classified positional and binds to `model`, reaching the observer verbatim
+and being refused there as an unknown roster key. Don't write it — but expect the failure to arrive
+from the roster, not from the command registry.
 
 **The card is opt-in and never auto-injected.** `BaseAgent` auto-adds `TeamTool` and `MailboxTool`;
 it does not add this one. Granting every agent the standing power to change its own model is a cost

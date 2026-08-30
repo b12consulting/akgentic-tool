@@ -386,6 +386,25 @@ def test_switch_model_binds_by_the_declared_parameter_name() -> None:
     assert observer.switch_calls == ["openai:gpt-5.2"]
 
 
+def test_an_unrecognised_keyword_token_binds_positionally_and_reaches_the_observer() -> None:
+    """``key=…`` is NOT rejected as a keyword — the whole token binds to ``model``.
+
+    ``_classify_tokens`` counts a token as a keyword only when the text before its
+    first ``=`` is a known parameter name, so a value containing ``=`` is never
+    silently swallowed. ``key`` is the *observer's* name, not the callable's, so
+    the entire token is classified positional and arrives at the observer verbatim,
+    to be refused downstream as an unknown roster key. The registry's own
+    ``unknown keyword argument`` branch is unreachable from ``dispatch`` for it.
+    """
+    observer = _FakeObserver(_roster())
+    registry = ToolFactory([ModelTool()], observer=observer).get_command_registry()
+
+    dispatched = registry.dispatch("/switch_model key=openai:gpt-5.2")
+
+    assert observer.switch_calls == ["key=openai:gpt-5.2"]
+    assert "unknown keyword" not in dispatched
+
+
 def test_the_switch_model_callable_declares_model_as_its_only_parameter() -> None:
     card, observer = _wired_card(_roster())
     switch = next(tool for tool in card.get_tools() if tool.__name__ == "switch_model")

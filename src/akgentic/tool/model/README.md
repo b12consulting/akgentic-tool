@@ -36,6 +36,13 @@ only `instructions: str | None = None`, inherited from `BaseToolParam` and appen
 structured header to that capability's docstring — on the tool form and the command form alike. Both
 fields are configuration read at factory bind time, never tool-call schema.
 
+**`ActiveModel(instructions=…)` is accepted and has no effect.** `instructions` appends to a
+*docstring*, and an `LLM_CONTEXT` provider publishes a `ContextState`, not a docstring — there is
+nothing for it to append to. It constructs, round-trips and persists with no error and no outcome.
+This is the package's standing shape for `LLM_CONTEXT`-only capabilities rather than a quirk of this
+card (`TeamTool`'s roster and role-catalog params take it the same way), so it is documented rather
+than rejected. Put guidance for the model in the agent's own instructions instead.
+
 Two of the three share their channels, which is what distinguishes this card's shape from
 `MailboxTool`'s one-capability-per-channel layout: `list_models` and `switch_model` are each served
 on both `TOOL_CALL` and `COMMAND`, because the same act is meaningful pulled by the model and pushed
@@ -47,7 +54,7 @@ by a human.
 |---|---|---|---|---|
 | `list_models` | `ListModels \| bool` | `True` | `{TOOL_CALL, COMMAND}` | The roster listing — what this agent may switch within. |
 | `switch_model` | `SwitchModel \| bool` | `True` | `{TOOL_CALL, COMMAND}` | The switch itself, and the only writer of `ToolState.active_model`. |
-| `active_model` | `ActiveModel \| bool` | `True` | `{LLM_CONTEXT}` | The `active_model_state` provider publishing the model in force. |
+| `active_model` | `ActiveModel \| bool` | `True` | `{LLM_CONTEXT}` | The `active_model_state` provider publishing the model in force. Its inherited `instructions` is a silent no-op — see above. |
 
 Every capability is gated twice: the param must resolve, **and** its `expose` set must contain the
 channel the serving hook covers (`get_tools()` for `TOOL_CALL`, `get_commands()` for `COMMAND`,
@@ -101,12 +108,20 @@ contracts, two names. The command registry derives its schema from the **callabl
 ```
 /switch_model openai:gpt-5.2              # binds — positional
 /switch_model model=openai:gpt-5.2        # binds — keyword, the advertised name
-/switch_model key=openai:gpt-5.2          # does NOT bind — `key` is the observer's name, not the card's
+/switch_model key=openai:gpt-5.2          # binds the WHOLE token positionally, then fails downstream
 ```
 
 The positional form works because the colon survives `shlex` and the split-on-first-`=` keyword
-rule, so `openai:gpt-5.2` arrives as one token. If you are writing a frontend or a script, read the
-name off the announced `CommandDescriptor` rather than off the observer protocol.
+rule, so `openai:gpt-5.2` arrives as one token.
+
+**The third form is not caught by the registry, which is the part worth knowing.** A token counts as
+a keyword only when the text before its first `=` is a known parameter name — deliberately, so a
+value containing `=` is never silently swallowed. `key` is the observer's name, not the card's, so
+it is not a parameter here: the whole token `key=openai:gpt-5.2` is classified **positional** and
+binds to `model`, reaching the observer verbatim and being rejected downstream as an unknown roster
+key. Don't write it — but if you are writing a frontend or a script, expect the refusal to come back
+from the roster rather than as an unknown-keyword error, and read the parameter name off the
+announced `CommandDescriptor` rather than off the observer protocol.
 
 ### `LLM_CONTEXT` — the `active_model_state` provider
 
@@ -202,10 +217,13 @@ class ModelSwitchToolObserver(ActorToolObserver, Protocol):
 `list_model_rows()` projects the roster, one row per entry, rebuilt per call. `switch_model(key)`
 makes one entry the model in force and returns a human-readable confirmation.
 
-**The implementation lives in `akgentic-agent`**, which may import both this package and
-`akgentic-llm` and can therefore project the roster's own configuration model onto `ModelRow`.
-Conformance is a documented precondition rather than a runtime gate: observers are duck-typed, so a
-non-conforming one fails at first use, exactly as before.
+*Cross-package claim, not verifiable here:* **the implementation belongs in `akgentic-agent`**, the
+one package that may import both this one and `akgentic-llm` and can therefore project the roster's
+own configuration model onto `ModelRow`. It is **not there yet** — no `list_model_rows` or
+`ModelSwitchToolObserver` implementation ships in `akgentic-agent` as of this epic, so the card is
+inert until a later epic lands the agent-side observer. Conformance is a documented precondition
+rather than a runtime gate: observers are duck-typed, so a non-conforming one fails at first use,
+exactly as before.
 
 ### Why `ModelRow` exists at all
 

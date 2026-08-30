@@ -22,9 +22,14 @@ class ModelSwitchToolObserver(ActorToolObserver, Protocol):
 
     Extends ``ActorToolObserver`` with the two operations ``ModelTool`` needs:
     reading the roster as serializable rows, and making one entry the model in
-    force. The implementation lives in ``akgentic-agent``, which may import both
-    this package and ``akgentic-llm`` and so can project the roster's own
-    configuration model onto ``ModelRow``.
+    force.
+
+    Cross-package claim, not verifiable here: the implementation *belongs* in
+    ``akgentic-agent``, the one package that may import both this one and
+    ``akgentic-llm`` and so can project the roster's own configuration model onto
+    ``ModelRow``. It does not ship there yet — this protocol is the contract a
+    later epic implements, and until then no observer in the workspace satisfies
+    it.
     """
 
     def list_model_rows(self) -> list[ModelRow]:
