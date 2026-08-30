@@ -49,6 +49,7 @@ DOMAIN_PACKAGES: frozenset[str] = frozenset(
         "vector",
         "notification",
         "metadata",
+        "model",
         "skill",
     }
 )

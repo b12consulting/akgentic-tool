@@ -13,6 +13,7 @@ from typing import Any
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import AkgentType
+from akgentic.core.utils.serializer import serialize_type
 
 from akgentic.tool import ToolState as RootToolState
 from akgentic.tool import ToolStateCarrier as RootToolStateCarrier
@@ -137,3 +138,62 @@ def test_actor_tool_observer_requires_state() -> None:
     """``state`` is now part of the protocol: with it the check passes, without it it fails."""
     assert isinstance(_FullObserver(), ActorToolObserver)
     assert not isinstance(_StatelessObserver(), ActorToolObserver)
+
+
+# ---------------------------------------------------------------------------
+# Story 36-1 — the ``active_model`` slot
+# ---------------------------------------------------------------------------
+
+
+def test_default_tool_state_has_no_active_model() -> None:
+    """A fresh slot expresses no preference: the config's declared entry wins."""
+    assert ToolState().active_model is None
+
+
+def test_payload_written_before_the_field_existed_still_restores() -> None:
+    """A dump with no ``active_model`` key validates back, with the slot at ``None``.
+
+    Agents in the field carry ``ToolState`` payloads persisted before this field
+    existed. The restore must be harmless — no exception, no migration step.
+    """
+    legacy = {
+        "__model__": serialize_type(ToolState),
+        "context_baselines": {},
+        "context_update_seq": 3,
+    }
+
+    restored = ToolState.model_validate(legacy)
+
+    assert restored.active_model is None
+    assert restored.context_update_seq == 3
+    assert restored.context_baselines == {}
+
+
+def test_round_trip_preserves_active_model_alongside_concrete_baselines() -> None:
+    """The extended slot still round-trips polymorphically, and keeps the preference."""
+    roster = TeamRosterState(members=[TeamMemberRow(name="alice", role="dev", is_self=True)])
+    planning = PlanningState(
+        total=1,
+        owner_counts={"alice": 1},
+        tasks=[
+            TaskRow(
+                id=1, status="open", description="ship it", owner="alice", creator="bob", output=""
+            )
+        ],
+        agent_name="alice",
+        filter_by_agent=True,
+    )
+    state = ToolState(
+        context_baselines={"roster_provider": roster, "planning_provider": planning},
+        context_update_seq=2,
+        active_model="anthropic:claude-opus-5",
+    )
+
+    restored = ToolState.model_validate(state.model_dump())
+
+    assert isinstance(restored.context_baselines["roster_provider"], TeamRosterState)
+    assert isinstance(restored.context_baselines["planning_provider"], PlanningState)
+    assert restored.context_baselines["roster_provider"] == roster
+    assert restored.context_baselines["planning_provider"] == planning
+    assert restored.active_model == "anthropic:claude-opus-5"
+    assert restored.context_update_seq == 2

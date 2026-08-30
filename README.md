@@ -35,6 +35,7 @@ commands.
   - [NotificationTool](#notificationtool)
   - [SkillTool](#skilltool)
   - [MailboxTool](#mailboxtool)
+  - [ModelTool](#modeltool)
   - [MCPTool](#mcptool)
   - [ExecTool](#exectool)
 - [Error Handling](#error-handling)
@@ -53,17 +54,19 @@ running inside it. It provides:
   invokes it), a `SYSTEM_PROMPT` (rendered once into the frozen system block), an `LLM_CONTEXT`
   (structured context state appended into the context tail per turn, as a delta), or a `COMMAND`
   (programmatic call from another agent or the orchestrator)
-- **Observer protocols** — `ToolObserver`, `ActorToolObserver`, and `TeamManagementToolObserver`
-  give tools access to the actor system, event emission, and team lifecycle hooks.
+- **Observer protocols** — `ToolObserver` and `ActorToolObserver` are the two package-global levels,
+  giving tools event emission and access to the actor system; a domain protocol such as
+  `TeamManagementToolObserver` or `ModelSwitchToolObserver` adds what its own single card needs.
   > **Migration note (ADR-018):** `ToolCallEvent` has been removed from `akgentic-tool`. Tool call
   > observability is now handled by `akgentic-llm`. Import `ToolCallEvent` and `ToolReturnEvent`
   > from `akgentic.llm.event` instead.
 - **RetriableError** — tools signal recoverable failures; `ToolFactory` translates them to the
   framework-specific retry exception without coupling tool logic to pydantic-ai
-- **Domain tools** — twelve production-ready tool implementations covering workspace I/O, task
+- **Domain tools** — thirteen production-ready tool implementations covering workspace I/O, task
   planning, knowledge graph, web search, team management, the team's business context, on-demand
-  skill guidance, the agent's own mailbox and run-cancellation surface, vector-store configuration,
-  MCP server integration, sandboxed shell execution, and self-scheduled notifications
+  skill guidance, the agent's own mailbox and run-cancellation surface, runtime model switching,
+  vector-store configuration, MCP server integration, sandboxed shell execution, and self-scheduled
+  notifications
 
 ```
 ToolCard(s)
@@ -294,9 +297,24 @@ by the agent's own state object and written out by the agent's existing state ch
 package ships the slot, the engine and the contract; the state field that carries them is
 `akgentic-agent`'s half of the same decision, on the merge-order dependency noted above.
 
-**They are a cache, never a record.** The durable record of what the model was told is the message
-history; the baselines only spare the engine from repeating it. This package therefore has **no save
-path** — no event, no retry, no write-ahead anything — because it needs none.
+`ToolState` carries a **third** field, and it is not a baseline: `active_model` (`str | None`,
+default `None`) holds the roster key of the model currently in force, `f"{provider}:{model}"` —
+written by `ModelTool`'s switch and by nothing else. It is the worked demonstration that this slot
+is a **typed extension point**: the next tool-layer field that must survive a restart is a new field
+here, not a blob under a string key.
+
+- **`None` means the agent expresses no preference**, so the config's declared active entry wins.
+  That is also what a payload persisted *before* the field existed restores to, which is why no
+  migration step was needed when it landed.
+- **A persisted key that is no longer in the roster is dropped with a log line**, the declared entry
+  wins, and the restore never fails over a stale preference. *This degradation is performed by the
+  agent/llm layer, not by this package* — nothing under `src/` here reads the slot back. It is
+  stated here as the consumer contract because it is what makes writing the key safe.
+
+**The baselines are a cache, never a record** — `active_model` above is the exception that proves
+it, and the only field here that is a record. The durable record of what the model was told is the
+message history; the baselines only spare the engine from repeating it. This package therefore has
+**no save path** — no event, no retry, no write-ahead anything — because it needs none.
 
 **The engine.** `ToolFactory.get_context_updater()` builds a `ContextUpdater` from the factory's
 observer and the same providers `get_context_states()` yields — so a duplicate provider `__name__`
@@ -501,20 +519,38 @@ tool's **only** channel to the runtime — and because it arrives after construc
 field, the card stays serializable. Everything a tool does to the system, it does through the
 observer.
 
-### Three levels — ask for the least you need
+### Two global levels, then domain leaves — ask for the least you need
 
-The observer is a `Protocol`, and there are three, each extending the one above it:
+The observer is a `Protocol`. **Two** of them are package-global, one extending the other; below them
+sit **three** domain protocols, each one card's own contract. It is not a single chain, and it is not
+one flat row either: a domain protocol extends **whichever global level it genuinely needs**, so the
+leaves do not all hang at the same depth.
 
-| Protocol | What it adds | What that lets a tool do |
-|---|---|---|
-| `ToolObserver` | `notify_event(event)` | Emit a domain event onto the orchestrator's stream. Nothing more. |
-| `ActorToolObserver` | `myAddress`, `orchestrator`, `team_id`, `state`, `proxy_ask(...)` | Reach any actor by address — including a singleton tool actor. Reach the persisted tool-layer slot, `state.tool_state`, read live on every call. |
-| `TeamManagementToolObserver` | `createActor(...)`, `on_hire(...)`, `on_fire(...)` | Create actors, and change the team's membership. |
+| Protocol | Where | Extends | What it adds | What that lets a tool do |
+|---|---|---|---|---|
+| `ToolObserver` | `core/` — global | — | `notify_event(event)` | Emit a domain event onto the orchestrator's stream. Nothing more. |
+| `ActorToolObserver` | `core/` — global | `ToolObserver` | `myAddress`, `orchestrator`, `team_id`, `state`, `proxy_ask(...)` | Reach any actor by address — including a singleton tool actor. Reach the persisted tool-layer slot, `state.tool_state`, read live on every call. |
+| `MailboxToolObserver` | `mailbox/` — one card | `ToolObserver` | `get_mailbox()`, `consume_mailbox(ids)` | Peek at the owning agent's inbox, and absorb a named message into the current run. |
+| `TeamManagementToolObserver` | `team/` — one card | `ActorToolObserver` | `createActor(...)`, `on_hire(...)`, `on_fire(...)` | Create actors, and change the team's membership. |
+| `ModelSwitchToolObserver` | `model/` — one card | `ActorToolObserver` | `list_model_rows()`, `switch_model(key)` | Read the model roster as serializable rows, and make one entry the model in force. |
 
-Each capability is gated by the level above it: a tool that only emits events cannot reach an
-actor, and a tool that reaches actors cannot hire anyone. Declare the narrowest level your tool
-genuinely uses. The third level is domain-specific rather than general — `TeamTool` is its only
-consumer in this package — which is why it lives beside that tool instead of on the core surface.
+The two global levels are gated one by the other: a tool that only emits events cannot reach an
+actor. The last three rows are **not** further levels and not each other's ancestors — they are
+siblings in role, each one card's contract, and an observer satisfying one need not satisfy any
+other. They do **not** all sit at one depth: `MailboxToolObserver` extends `ToolObserver` directly,
+because peeking at and consuming from the inbox needs no actor reach. Declare the narrowest protocol
+your tool genuinely uses — `MailboxToolObserver` is the shipped example of that rule being followed
+rather than merely stated.
+
+A domain protocol lives beside its card rather than on the core surface because it is that one
+card's contract: `MailboxTool`, `TeamTool` and `ModelTool` respectively. **"Beside its card" is
+about ownership, not about the call site** — `MailboxToolObserver`'s two methods are called by the
+agent's mailbox capability in `akgentic-agent`, not by `MailboxTool`, which reads and consumes
+nothing. The protocol still lives in `mailbox/` because it belongs to that card and to nothing else.
+That is the audience rule — `core/` carries what more than one domain needs, and nothing else.
+Adding a domain protocol therefore widens nothing: every existing observer keeps satisfying the
+global level it already satisfied, which is why `ModelSwitchToolObserver` shipped without a single
+existing implementation being touched.
 
 ### Narrow in an accessor, not in the signature
 
@@ -863,9 +899,72 @@ the registration, the agent owns both the vocabulary and the enforcement** — r
 cancellation must work even on an agent configured without this card, which has no card to import
 a predicate from.
 
+### Contrasting shape: `ModelTool`, capabilities that share channels
+
+`MailboxTool` gives each capability its own channel. `ModelTool` (`akgentic.tool.model`) does the
+opposite and is worth reading beside it: `list_models` and `switch_model` are each served on **both**
+`TOOL_CALL` and `COMMAND`, from one param each.
+
+| Capability | Param (default) | Channels | Serving hooks |
+|---|---|---|---|
+| Roster listing | `list_models: ListModels \| bool = True` | `TOOL_CALL`, `COMMAND` | `get_tools()` **and** `get_commands()` |
+| The switch | `switch_model: SwitchModel \| bool = True` | `TOOL_CALL`, `COMMAND` | `get_tools()` **and** `get_commands()` |
+| Model in force | `active_model: ActiveModel \| bool = True` | `LLM_CONTEXT` | `get_context_states()` |
+
+Sharing is the right call when the *same act* is meaningful pulled by the model and pushed by a
+human — escalating to a stronger model is exactly that. What it costs you is one build per hook: the
+two serving hooks each call the same factory, so the callable is built twice and the two copies must
+stay behaviourally identical. Do not let a channel branch creep into the factory; if the command
+form and the tool form need to differ, they are two capabilities, not one.
+
+### A card declares its own projection of what it may not import
+
+**The rule.** When a card's contract must describe something owned by a package this one may not
+import, the card declares its **own serializable projection**, and the package that may import both
+does the mapping. Never reach for the foreign model, and never widen the dependency to get at it.
+
+`ModelRow` is the worked case. `akgentic-tool` imports `akgentic-core` **only**, so the roster's own
+configuration model — which lives in `akgentic-llm` — can never appear here, not even under
+`TYPE_CHECKING`. The observer contract is therefore written in `ModelRow`, five plain serializable
+fields, and `akgentic-agent` maps one onto the other because it is the package that may import both.
+No import edge is created in either direction, and the contract still says what it means.
+
+**A projection is not a persisted model, and the difference shows up in the defaults.** This is the
+consequence most likely to be "tidied" by a later reader, so it is stated as a rule:
+
+| | `ModelRow.context_length` | `ToolState.active_model` |
+|---|---|---|
+| Type | `int \| None` | `str \| None` |
+| Default | **none — required** | `None` |
+| Why | A row is rebuilt per call and never stored, so there is no legacy payload a default could protect. An omitted field is a construction bug and should fail loudly. | The field is persisted and re-read, so a payload written before it existed must still validate. The default is what makes the restore forward-compatible. |
+
+**Defaults protect stored payloads.** Give one to a field that will be read back off disk; withhold
+it from a field that is built fresh every time. The two fields above look inconsistent side by side
+and are not — adding a default to `context_length` would buy nothing and would convert a loud
+construction error into a silent `None`.
+
+### `@runtime_checkable` is inert on a derived protocol — mutate a member instead
+
+A `Protocol` deriving from an already-runtime-checkable base **inherits** `_is_runtime_protocol`;
+nothing resets it on a subclass. Deleting `@runtime_checkable` from the derived protocol therefore
+reddens **nothing** — `isinstance()` keeps working and every conformance test keeps passing.
+Confirmed by mutation three times while `ModelSwitchToolObserver` was built, and structural, so it
+holds identically for `TeamManagementToolObserver` and `MailboxToolObserver`.
+
+Two rules follow, and they apply to the next sibling observer protocol as much as to these:
+
+- **Keep the decorator.** It is the shipped convention on every protocol in this package, it costs
+  nothing, and it becomes load-bearing the day a base protocol stops carrying it. The only thing its
+  deletion actually trips is `ruff`'s `F401` on the now-unused import — a lint accident, not a
+  conformance check.
+- **Never cite its deletion as evidence a conformance guard works.** On this hierarchy it is not a
+  guard, and a story that reports "removed the decorator, tests went red" has measured the lint.
+  To prove a conformance guard, **mutate a protocol member**: deleting `list_model_rows` or
+  `switch_model` reddens exactly one negative test each, which is what the guard actually claims.
+
 ## Tool Catalog
 
-Twelve tool cards ship with the package. Each one has its own README next to the code, covering the
+Thirteen tool cards ship with the package. Each one has its own README next to the code, covering the
 `ToolCard` definition, every field and every nested capability parameter, and the full
 configuration surface — environment, extras, actor wiring and failure modes. The entries below
 are the index; the detail lives beside the module it documents.
@@ -882,6 +981,7 @@ are the index; the detail lives beside the module it documents.
 | `NotificationTool` | `akgentic.tool.notification` | Delayed messages an agent schedules to itself | [README](src/akgentic/tool/notification/README.md) |
 | `SkillTool` | `akgentic.tool.skill` | A library of skills: the menu in the prefix, the bodies on demand | [README](src/akgentic/tool/skill/README.md) |
 | `MailboxTool` | `akgentic.tool.mailbox` | A signal naming one message in the agent's own mailbox, and the `/stop` cancel surface | [README](src/akgentic/tool/mailbox/README.md) |
+| `ModelTool` | `akgentic.tool.model` | The model roster listed, the switch between its entries, and the resulting selection persisted | [README](src/akgentic/tool/model/README.md) |
 | `MCPTool` | `akgentic.tool.mcp` | External MCP servers as pydantic-ai toolsets | [README](src/akgentic/tool/mcp/README.md) |
 | `ExecTool` | `akgentic.tool.sandbox` | Sandboxed shell execution in the team workspace | [README](src/akgentic/tool/sandbox/README.md) |
 
@@ -1240,6 +1340,59 @@ the two capability params, the absorption contract and why the id is not validat
 clause an edit can delete, the `message_id` contract, where the cancel vocabulary lives, the
 observer protocol, and the enforcement that stays `akgentic-agent`'s.
 
+### ModelTool
+
+Runtime model switching, on three channels. `list_models` and `switch_model` are each served on
+**both** `TOOL_CALL` and `COMMAND` — the model can escalate itself mid-run and a human can move it
+back with the same act — while `active_model` publishes the model in force as `LLM_CONTEXT` state,
+never as a re-rendered system prefix. The card creates no actor and performs no proxy round trip.
+
+```python
+from akgentic.tool import ModelTool
+from akgentic.tool.core import COMMAND
+from akgentic.tool.model import SwitchModel
+
+ModelTool()                                            # all three capabilities on (the default)
+ModelTool(switch_model=False)                          # read-only: the roster, no switch
+ModelTool(switch_model=SwitchModel(expose={COMMAND}))  # humans may switch, the model may not
+```
+
+**The command grammar, exactly.** `/list_models` takes no argument. `/switch_model` takes the roster
+key, and the advertised parameter name is `model`:
+
+```
+/switch_model openai:gpt-5.2              # binds — positional
+/switch_model model=openai:gpt-5.2        # binds — keyword
+/switch_model key=openai:gpt-5.2          # binds the WHOLE token positionally — then fails downstream
+```
+
+`key` is the *observer's* parameter name (`ModelSwitchToolObserver.switch_model(key)`); the card's
+callable is `switch_model(model: str) -> str`, and the command registry derives its schema from the
+callable. Two contracts, two names, deliberately.
+
+**The third line is not rejected as an unknown keyword.** A token counts as a keyword only when the
+text before its first `=` is a known parameter name — deliberately, so a value containing `=` is
+never silently swallowed. `key` is not a parameter of the callable, so the whole token
+`key=openai:gpt-5.2` is classified positional and binds to `model`, reaching the observer verbatim
+and being refused there as an unknown roster key. Don't write it — but expect the failure to arrive
+from the roster, not from the command registry.
+
+**The card is opt-in and never auto-injected.** `BaseAgent` auto-adds `TeamTool` and `MailboxTool`;
+it does not add this one. Granting every agent the standing power to change its own model is a cost
+and governance decision that belongs to whoever writes the card list. Nothing in this package can
+enforce that either way — there is no default-card list here — so it is stated as the consumer
+contract that `akgentic-agent` honours.
+
+It requires an observer satisfying `ModelSwitchToolObserver` (`akgentic.tool.model`), whose
+implementation lives in `akgentic-agent` — the one package that may import both this one and the
+roster's own home, `akgentic-llm`. On an agent whose roster is empty the listing returns a fixed
+sentinel rather than an empty string, and the `LLM_CONTEXT` provider publishes nothing.
+
+**[Full reference → `src/akgentic/tool/model/README.md`](src/akgentic/tool/model/README.md)** —
+the three capability params, the line grammar of the listing, `ModelRow` as a projection and why
+`context_length` has no default, `ActiveModelState`'s two renderers, why the context provider reads
+the roster's `active` flag and never the persisted slot, and the failure surface.
+
 ### MCPTool
 
 Integrates external [Model Context Protocol](https://modelcontextprotocol.io) servers as native
@@ -1465,6 +1618,17 @@ src/akgentic/tool/
     │   params.py             # ReadMailbox, Stop
     │   └── mailbox.py        # MailboxTool ToolCard — read_mailbox signal, preview
     │                         #   whitelist, idle /stop; no actor, no proxy round trip
+    model/
+    │   README.md           # ModelTool reference — the three channels, command grammar,
+    │                         #   the projection rule and the persisted slot
+    │   __init__.py           # Public exports: the card, its params, the two state
+    │                         #   models, the observer protocol
+    │   state.py              # ModelRow (a projection, never stored) and
+    │                         #   ActiveModelState — the LLM_CONTEXT state + deltas
+    │   observer.py           # ModelSwitchToolObserver — ModelTool's own contract,
+    │                         #   a sibling of ActorToolObserver, not a widening
+    │   └── tool.py           # ModelTool ToolCard + ListModels, SwitchModel,
+    │                         #   ActiveModel; no actor, no proxy round trip
     mcp/
     │   README.md           # MCPTool reference — transports, timeouts, diagnostics
     │   mcp.py                # MCPTool, connection configs
