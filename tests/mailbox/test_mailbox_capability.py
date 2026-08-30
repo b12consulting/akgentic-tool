@@ -1,0 +1,252 @@
+"""Tests for ``MailboxCapability``'s injected wording (ADR-040 §5, ADR-044).
+
+The subject is narrow: where the two injected strings come from and that an
+override reaches both use sites. Cancellation, the offer filter, the withdrawal
+hook and the silent no-op paths are exercised by ``akgentic-agent``'s wiring
+suite and are not re-litigated here.
+
+**The sentinel specs are the only real guard.** A default-constructed
+capability's ``_absorbed_prefix`` *equals* ``ABSORBED_PREFIX``, so no
+default-path assertion can tell the instance attribute apart from the constant —
+which is exactly the edit a later "simplification" makes. Only a
+sentinel-valued construction can see it, and those two specs are mutation
+targets, not decoration.
+"""
+
+from __future__ import annotations
+
+import inspect
+import uuid
+from typing import Any
+
+import pytest
+from akgentic.core.messages import Message
+from pydantic_ai.messages import ToolCallPart
+from pydantic_ai.tools import ToolDefinition
+
+from akgentic.tool.mailbox import MailboxCapability, MailboxMessage, MailboxTool
+from akgentic.tool.mailbox.capability import (
+    _CLOSING_WITH_IDS,
+    ABSORBED_PREFIX,
+    MailboxAccess,
+)
+
+_SENTINEL_PREFIX = "SENTINEL-PREFIX-9f3c: only an injected prefix may carry this."
+_SENTINEL_CLOSING = "SENTINEL-CLOSING-4a71: only an injected closing may carry this."
+
+
+class _Errand(MailboxMessage):
+    """A deliverable message class: it renders, and it previews.
+
+    ``after_tool_execute`` returns early for anything that is not a
+    ``MailboxMessage`` (the message is left queued to arrive as its own turn), so
+    a prefix spec built on a plain ``Message`` would pass vacuously.
+    """
+
+    errand: str = "collect the report"
+
+    def rendering(self) -> str:
+        return f"You were asked to {self.errand}."
+
+    def rendering_preview(self) -> str:
+        return f"errand: {self.errand}"
+
+
+class _FakeMailbox:
+    """Structural ``MailboxAccess``: all three methods, backed by a real list.
+
+    ``test_mailbox_tool.py``'s ``_FakeObserver`` satisfies ``MailboxToolObserver``
+    but **not** this protocol — it has no ``current_message``. ``MailboxAccess``
+    is ``@runtime_checkable``, which checks member presence and not signatures, so
+    the missing method would surface as an ``AttributeError`` deep inside the
+    offer filter rather than at the isinstance below.
+    """
+
+    def __init__(self, pending: list[Message], current: Message | None) -> None:
+        self._pending = list(pending)
+        self._current = current
+        self.consumed: list[uuid.UUID] = []
+
+    def get_mailbox(self) -> list[Message]:
+        return list(self._pending)
+
+    def consume_mailbox(self, message_ids: list[uuid.UUID]) -> list[Message]:
+        wanted = set(message_ids)
+        self.consumed.extend(message_ids)
+        removed = [message for message in self._pending if message.id in wanted]
+        self._pending = [message for message in self._pending if message.id not in wanted]
+        return removed
+
+    def current_message(self) -> Message | None:
+        return self._current
+
+
+class _FakeRunContext:
+    """A ``RunContext`` stand-in exposing only what the two use sites touch.
+
+    ``enqueue`` returns an id, as the real one does when the queue accepts the
+    entry; ``after_node_run`` keys its withdrawal on that id, so returning
+    ``None`` here would quietly disable a path this module does not test but must
+    not misrepresent.
+    """
+
+    def __init__(self) -> None:
+        self.enqueued: list[tuple[str, str]] = []
+        self.pending_messages: list[Any] | None = None
+
+    def enqueue(self, content: str, *, priority: str = "normal") -> str:
+        self.enqueued.append((content, priority))
+        return f"enqueue-{len(self.enqueued)}"
+
+
+def _capability(
+    pending: list[Message],
+    current: Message | None,
+    **wording: str,
+) -> tuple[MailboxCapability, _FakeMailbox]:
+    """A capability over a fake mailbox; the mailbox is returned to be asserted on."""
+    mailbox = _FakeMailbox(pending, current)
+    assert isinstance(mailbox, MailboxAccess)  # structural conformance
+    capability = MailboxCapability(mailbox, MailboxTool(), **wording)
+    return capability, mailbox
+
+
+async def _notice_for(capability: MailboxCapability, ctx: _FakeRunContext) -> str:
+    """Drive one ``before_model_request`` and return the notice it enqueued."""
+    request_context = object()
+    returned = await capability.before_model_request(ctx, request_context)  # type: ignore[arg-type]
+
+    assert returned is request_context  # the hook returns it unchanged
+    assert len(ctx.enqueued) == 1
+    notice, priority = ctx.enqueued[0]
+    assert priority == "asap"
+    return notice
+
+
+async def _absorb(capability: MailboxCapability, ctx: _FakeRunContext, target: Message) -> str:
+    """Drive one completed ``read_mailbox`` call and return the injected content."""
+    result = await capability.after_tool_execute(
+        ctx,  # type: ignore[arg-type]
+        call=ToolCallPart(tool_name="read_mailbox", args={"message_id": str(target.id)}),
+        tool_def=ToolDefinition(name="read_mailbox"),
+        args={"message_id": str(target.id)},
+        result="acknowledged",
+    )
+
+    assert result == "acknowledged"  # the tool's own return passes through untouched
+    assert len(ctx.enqueued) == 1
+    injected, priority = ctx.enqueued[0]
+    assert priority == "asap"
+    return injected
+
+
+# ── AC 2: the wording arrives as keyword-only constructor parameters ─────────
+
+
+def test_the_two_wording_parameters_are_keyword_only_and_default_to_the_constants() -> None:
+    # The kinds are the assertion, not just the names. `akgentic-agent` calls
+    # `MailboxCapability(observer=self, card=mailbox_card)`, and dropping the `*`
+    # would leave that call compiling while quietly making the wording positional
+    # — a third positional argument then binds to a prefix nobody meant to pass.
+    signature = inspect.signature(MailboxCapability.__init__)
+    parameters = signature.parameters
+
+    assert list(parameters) == ["self", "observer", "card", "absorbed_prefix", "arrival_closing"]
+
+    for name in ("observer", "card"):
+        assert parameters[name].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+        assert parameters[name].default is inspect.Parameter.empty
+
+    assert parameters["absorbed_prefix"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["absorbed_prefix"].default == ABSORBED_PREFIX
+    assert parameters["arrival_closing"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["arrival_closing"].default == _CLOSING_WITH_IDS
+
+
+def test_two_argument_construction_still_works_positionally_and_by_keyword() -> None:
+    # `akgentic-agent` builds this with exactly two arguments and must keep
+    # compiling and behaving identically across this change.
+    mailbox = _FakeMailbox([], None)
+    card = MailboxTool()
+
+    positional = MailboxCapability(mailbox, card)
+    by_keyword = MailboxCapability(observer=mailbox, card=card)
+
+    for capability in (positional, by_keyword):
+        assert capability._absorbed_prefix == ABSORBED_PREFIX
+        assert capability._arrival_closing == _CLOSING_WITH_IDS
+
+
+def test_the_card_still_decides_whether_the_doorbell_rings() -> None:
+    # The half of the card seam that survives: the capability reads `read_mailbox`
+    # off the card whole, and `read_mailbox=False` suppresses the notice.
+    mailbox = _FakeMailbox([], None)
+
+    assert MailboxCapability(mailbox, MailboxTool())._arrival_notice is True
+    assert MailboxCapability(mailbox, MailboxTool(read_mailbox=False))._arrival_notice is False
+
+
+# ── AC 3: plain assignment, so an explicit empty string is honoured ──────────
+
+
+@pytest.mark.parametrize("wording", ["absorbed_prefix", "arrival_closing"])
+def test_an_explicitly_empty_string_is_kept_and_not_replaced_by_the_default(wording: str) -> None:
+    # The old `card.absorbed_prefix or ABSORBED_PREFIX` existed because an empty
+    # string could arrive from a catalog entry, where it was a mistake rather than
+    # a choice. With no catalog path there is only a caller, and a caller passing
+    # "" demonstrably did not ask for the shipped prose.
+    capability, _mailbox = _capability([], None, **{wording: ""})
+
+    assert getattr(capability, f"_{wording}") == ""
+
+
+# ── AC 4: both use sites read the instance attribute, not the constant ───────
+
+
+@pytest.mark.asyncio
+async def test_a_default_capability_injects_exactly_the_shipped_wording() -> None:
+    errand = _Errand()
+    capability, _mailbox = _capability([errand], _Errand())
+    notice_ctx, absorb_ctx = _FakeRunContext(), _FakeRunContext()
+
+    notice = await _notice_for(capability, notice_ctx)
+    injected = await _absorb(capability, absorb_ctx, errand)
+
+    assert notice.splitlines()[-1] == _CLOSING_WITH_IDS
+    assert injected == f"{ABSORBED_PREFIX}\n\n{errand.rendering()}"
+
+
+@pytest.mark.asyncio
+async def test_an_overridden_prefix_reaches_the_absorbed_message_injection() -> None:
+    # THE mutation target. Inlining `ABSORBED_PREFIX` at the enqueue site — the
+    # tempting "simplification", since the attribute usually holds exactly that —
+    # silently deletes the override, and no default-path spec can see it.
+    errand = _Errand()
+    capability, mailbox = _capability(
+        [errand], _Errand(), absorbed_prefix=_SENTINEL_PREFIX, arrival_closing=_SENTINEL_CLOSING
+    )
+    ctx = _FakeRunContext()
+
+    injected = await _absorb(capability, ctx, errand)
+
+    assert injected == f"{_SENTINEL_PREFIX}\n\n{errand.rendering()}"
+    assert ABSORBED_PREFIX not in injected
+    assert mailbox.consumed == [errand.id]  # the acknowledgement is made true here
+
+
+@pytest.mark.asyncio
+async def test_an_overridden_closing_reaches_the_arrival_notice() -> None:
+    # The same mutation, on the other site: `render_arrival_notice`'s third
+    # argument defaults to `_CLOSING_WITH_IDS`, so passing the constant instead of
+    # the attribute renders identically on every default-path spec.
+    errand = _Errand()
+    capability, _mailbox = _capability(
+        [errand], _Errand(), absorbed_prefix=_SENTINEL_PREFIX, arrival_closing=_SENTINEL_CLOSING
+    )
+    ctx = _FakeRunContext()
+
+    notice = await _notice_for(capability, ctx)
+
+    assert notice.splitlines()[-1] == _SENTINEL_CLOSING
+    assert _CLOSING_WITH_IDS not in notice
+    assert f"(id: {errand.id})" in notice  # the id is what makes the closing honest

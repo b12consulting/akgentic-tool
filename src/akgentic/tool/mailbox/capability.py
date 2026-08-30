@@ -349,36 +349,58 @@ class MailboxCapability(AbstractCapability[Any]):
     card at agent init and constant for the agent's life.
     """
 
-    def __init__(self, observer: MailboxAccess, card: MailboxTool) -> None:
-        """Wire the capability to one agent's mailbox and its configuration card.
+    def __init__(
+        self,
+        observer: MailboxAccess,
+        card: MailboxTool,
+        *,
+        absorbed_prefix: str = ABSORBED_PREFIX,
+        arrival_closing: str = _CLOSING_WITH_IDS,
+    ) -> None:
+        """Wire the capability to one agent's mailbox, its card and its wording.
 
-        **The card is the configuration, and this class reads it — the agent does
-        not unpack it.** ``BaseAgent`` hands the card over and inspects none of
-        it. The alternative shipped first and is the reason this signature
-        changed: passing ``absorbed_prefix`` / ``arrival_closing`` /
-        ``preview_handlers`` / ``arrival_notice`` as four separate arguments put
-        *which fields the mailbox needs, what each falls back to, and how to
-        tolerate an older card* into ``BaseAgent`` — none of it the agent's
-        business, and all of it to be re-edited on the next field added. The
-        consumer knows what it consumes; that knowledge belongs here.
+        **The card still crosses the boundary whole, and this class reads what it
+        needs off it.** ``BaseAgent`` hands the card over and inspects none of it.
+        Passing ``preview_handlers`` / ``arrival_notice`` as separate arguments
+        shipped first and is the reason that seam exists: it put *which fields the
+        mailbox needs and how to tolerate an older card* into ``BaseAgent`` — none
+        of it the agent's business, and all of it to be re-edited on the next field
+        added. The consumer knows what it consumes. ``read_mailbox`` is read here
+        for exactly that reason, and it is a switch: it decides whether the doorbell
+        rings at all.
 
-        **The card is required and its fields are read straight off it** — no
-        ``getattr``, no ``None``. The card's own defaults are the shipped
-        wording, so an older card missing a field fails loudly here rather than
-        quietly running text nobody can see in the catalog. ``BaseAgent``
-        auto-inserts a default ``MailboxTool()``, so a card always exists to
-        pass. The module constants survive only as the empty-string guard below.
+        **The wording is not the card's, and that half was reversed deliberately.**
+        The prefix and the closing line lived on the card as two string fields for
+        one story. The catalog dumps a card with a plain ``model_dump(mode="json")``
+        and no ``exclude_defaults``, so the literal default was written into every
+        persisted entry — each team frozen with its own private copy of prose that
+        is expected to keep improving, and an improvement reaching only teams
+        created afterwards. No deployment ever turned the knob; every one paid for
+        the copy. So the wording is a constructor parameter defaulting to the module
+        constant beside it, and an upgrade moves every existing team at once.
+
+        Both parameters are **keyword-only and defaulted**, so ``BaseAgent``'s
+        two-argument construction is untouched. They are assigned straight through:
+        an ``""`` passed here is a caller's explicit choice and is honoured as one,
+        where an ``""`` arriving from a catalog entry was a mistake worth
+        substituting a default for.
 
         Args:
             observer: The agent whose mailbox this reads.
             card: The agent's ``MailboxTool`` — the config's own, or the
                 auto-inserted default. Required.
+            absorbed_prefix: What an absorbed message is prefixed with when it is
+                injected mid-run. Defaults to :data:`ABSORBED_PREFIX`.
+            arrival_closing: The arrival notice's closing line for a listing that
+                offers at least one id. Defaults to the shipped closing.
+                ``_CLOSING_WITHOUT_IDS`` takes no parameter — a listing offering no
+                id may not promise a read whatever a caller configures.
 
-        **Cancellation consults nothing on the card.** The purge-and-raise in
-        ``before_model_request`` runs ahead of every value read here, so a
-        capability built from a card with ``read_mailbox=False`` and empty
-        strings is still interruptible. That is ADR-040 §5's rule and no card
-        field can de-configure it.
+        **Cancellation consults nothing here.** The purge-and-raise in
+        ``before_model_request`` runs ahead of every value read in this
+        constructor, so a capability built from a card with ``read_mailbox=False``
+        and empty strings is still interruptible. That is ADR-040 §5's rule and no
+        card field or parameter can de-configure it.
         """
         self._observer = observer
         self._announced_ids: set[uuid.UUID] = set()
@@ -388,11 +410,8 @@ class MailboxCapability(AbstractCapability[Any]):
         # ``read_mailbox=False`` suppresses the doorbell entirely, which is what a
         # run without that tool needs.
         self._arrival_notice = bool(card.read_mailbox)
-        # ``or``, NOT ``is None``: an empty string is a configuration mistake, not
-        # a choice. Honouring it would ship a mid-run injection with no framing at
-        # all, which is the failure the prefix exists to prevent.
-        self._absorbed_prefix = card.absorbed_prefix or ABSORBED_PREFIX
-        self._arrival_closing = card.arrival_closing or _CLOSING_WITH_IDS
+        self._absorbed_prefix = absorbed_prefix
+        self._arrival_closing = arrival_closing
 
     async def before_run(self, ctx: RunContext[Any]) -> None:
         """Forget which arrivals the previous run announced.
