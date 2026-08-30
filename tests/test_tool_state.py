@@ -112,6 +112,13 @@ class _FullObserver:
     ) -> Any:
         return None
 
+    def proxy_tell(
+        self,
+        actor: ActorAddress,
+        actor_type: type[AkgentType] | None = None,
+    ) -> Any:
+        return None
+
 
 class _StatelessObserver(_FullObserver):
     """The same observer with the ``state`` member deleted — must fail the check."""

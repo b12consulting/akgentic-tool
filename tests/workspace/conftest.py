@@ -22,6 +22,7 @@ import uuid
 from collections.abc import Generator
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, ClassVar
 
 import pytest
@@ -30,6 +31,7 @@ from akgentic.core.actor_address_impl import ActorAddressImpl
 from akgentic.core.agent import Akgent, AkgentType
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
+from akgentic.tool.core import ToolState
 from akgentic.tool.core.deferred import DeferredPayload
 from akgentic.tool.sandbox.actor import ExecResult, SandboxActor
 from akgentic.tool.sandbox.tool import SANDBOX_ACTOR_CLASSES
@@ -246,6 +248,7 @@ class FakeActorToolObserver:
         self._workspace_proxy = workspace_proxy
         self._workspace_tell_proxy = workspace_tell_proxy
         self._team_id = uuid.uuid4()
+        self._state_carrier = SimpleNamespace(tool_state=ToolState())
         self.events: list[object] = []
         self.ask_targets: list[ActorAddress] = []
         self.tell_targets: list[ActorAddress] = []
@@ -253,6 +256,10 @@ class FakeActorToolObserver:
     @property
     def myAddress(self) -> ActorAddress:  # noqa: N802
         return self._address
+
+    @property
+    def state(self) -> SimpleNamespace:
+        return self._state_carrier
 
     @property
     def orchestrator(self) -> ActorAddress | None:
