@@ -107,6 +107,7 @@ ALLOWED_COMMANDS: frozenset[str] = frozenset(
         "rm",
         "echo",
         "touch",
+        "git",
         "curl",
         "wget",
         "make",
