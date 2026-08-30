@@ -20,6 +20,7 @@ from typing import Any, ClassVar
 import pytest
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent_config import BaseConfig
+from pydantic import ValidationError
 
 from akgentic.tool.core.deferred import DEFAULT_WORKER_TIMEOUT_S, WORKER_NAME_PREFIX
 from akgentic.tool.errors import RetriableError
@@ -42,16 +43,20 @@ from akgentic.tool.workspace.edit import EditItem
 from akgentic.tool.workspace.execution import (
     DEFAULT_EXEC_TIMEOUT_S,
     EXEC_REPLY_GRACE_S,
+    EXEC_REPORT_MARGIN_S,
     LEASE_GRACE_S,
     MAX_TRACKED_RUNS,
     RUN_ID_CHARS,
+    TIMED_OUT_EXIT_CODE,
     ExecConfig,
     ExecLease,
     ExecOutcome,
     ExecPayload,
+    ExecStart,
     ExecState,
     ExecWorker,
     ask_seconds,
+    in_progress,
     new_run_id,
     poll_attempts_within,
 )
@@ -1379,9 +1384,19 @@ class TestTheBudgets:
         assert harness.ask_timeouts[-1] is not None
         assert harness.ask_timeouts[-1] > command_budget
 
-    def test_the_poll_budget_defaults_below_the_run_budget(self) -> None:
+    def test_the_default_poll_covers_the_run_budget_and_the_report_margin(self) -> None:
+        # AC1/AC3/AC9. The default is the sentinel, so the wait it resolves to is
+        # the whole run plus the margin the worker needs to report it — and no
+        # more, which is the half that keeps this a budget rather than a licence.
         params = WorkspaceExec()
-        assert params.poll_attempts * params.poll_delay_seconds < params.timeout_s
+        assert params.poll_attempts == -1
+        run_budget = min(params.timeout_s, DEFAULT_WORKER_TIMEOUT_S)
+        attempts = poll_attempts_within(
+            params.poll_attempts, params.poll_delay_seconds, run_budget
+        )
+        wait = attempts * params.poll_delay_seconds
+        assert wait > run_budget
+        assert wait <= run_budget + EXEC_REPORT_MARGIN_S
 
     def test_a_poll_longer_than_the_run_is_clamped(
         self,
@@ -1422,6 +1437,245 @@ class TestTheBudgets:
         assert poll_attempts_within(0, 0.4, 15.0) == 0  # opting out of polling stands
         assert poll_attempts_within(1000, 1.0, 15.0) == 15
         assert poll_attempts_within(1000, 60.0, 15.0) == 1  # never below one look
+        # An explicit positive count is clamped to the run budget ALONE — the
+        # report margin belongs to the sentinel, which is the only setting asking
+        # to wait for the whole thing.
+        assert poll_attempts_within(1000, 1.0, 15.0) * 1.0 <= 15.0
+
+    def test_the_sentinel_resolves_against_the_budget_plus_the_margin(self) -> None:
+        # AC1/AC3. Arithmetic, not wall clock: the resolution is what the wiring
+        # does once, so it is asserted where it happens rather than by sleeping.
+        for delay, budget in ((0.5, 15.0), (0.5, 20.0), (1.0, 15.0), (0.1, 2.0)):
+            attempts = poll_attempts_within(-1, delay, budget)
+            assert attempts * delay > budget, (delay, budget)
+            assert attempts * delay <= budget + EXEC_REPORT_MARGIN_S, (delay, budget)
+
+    def test_the_sentinel_never_resolves_below_one_look(self) -> None:
+        assert poll_attempts_within(-1, 60.0, 1.0) == 1
+        assert poll_attempts_within(-1, 0.0, 15.0) == 1  # no wall clock to divide
+
+    def test_the_zero_opt_out_survives_the_sentinel(self) -> None:
+        # AC2. Zero is not "a small sentinel": it is the only way to take a run
+        # id without looking once, and the sentinel must not have absorbed it.
+        assert poll_attempts_within(0, 0.5, 15.0) == 0
+        assert WorkspaceExec(poll_attempts=0).poll_attempts == 0
+
+    def test_below_the_sentinel_is_a_validation_error(self) -> None:
+        # AC2. Rejected by the card, not silently read as the sentinel — two
+        # spellings of one meaning is how the meaning drifts.
+        with pytest.raises(ValidationError):
+            WorkspaceExec(poll_attempts=-2)
+
+
+# ---------------------------------------------------------------------------
+# 29-9 — the default waits out the run, and says so honestly when it cannot
+# ---------------------------------------------------------------------------
+
+
+class TestWaitingOutTheRun:
+    """The sentinel's behaviour, end to end through the card's own callable.
+
+    Every test here drives completion by releasing the fake backend's gate, and
+    every budget is small enough that the poll's *failure* budget is a second or
+    two of wall clock that is never actually spent — ``poll_deferred`` returns on
+    the first settled look.
+    """
+
+    def test_a_command_that_completes_returns_its_output_and_no_run_id(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        sandbox_script: SandboxScript,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # AC7: the common case. Under the sentinel the model never sees a run id
+        # at all — which is the whole point, because a run id it cannot act on is
+        # what produced the busy-loop this default removes.
+        card, _ = exec_card_for(
+            orchestrator_proxy, poll_attempts=-1, poll_delay_seconds=0.01, timeout_s=1.0
+        )
+        _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
+        assert isinstance(actor, WorkspaceActor)
+        harness = ExecHarness(actor, orchestrator_proxy)
+        harness.install(monkeypatch)
+        sandbox_script.stdout = "hello from the run"
+        sandbox_script.gate.set()
+
+        answer = tool_named(card, "workspace_exec")(cmd="echo hi")
+        harness.join()
+
+        run_id = harness.payloads[0].deferred_key
+        assert "exit_code: 0 (OK)" in answer
+        assert "hello from the run" in answer
+        assert run_id not in answer
+
+    def test_the_two_exhaustion_messages_are_chosen_by_the_budget_in_force(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        sandbox_script: SandboxScript,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # AC4 and AC5, asserted together so the pair cannot drift apart. The two
+        # cards differ in exactly one setting and the run they start is
+        # identical, which is what makes "chosen by which budget was in force,
+        # not by anything about the run" a property rather than a claim.
+        #
+        # Exhaustion is produced by making the poll answer nothing, not by
+        # sleeping one out: the message is a pure function of having run out.
+        monkeypatch.setattr(
+            "akgentic.tool.workspace.tool.poll_deferred",
+            lambda fetch, attempts, delay: None,
+        )
+        waiting_card, _ = exec_card_for(
+            orchestrator_proxy,
+            name="sentinel",
+            poll_attempts=-1,
+            poll_delay_seconds=0.5,
+            timeout_s=2.0,
+        )
+        bounded_card, _ = exec_card_for(
+            orchestrator_proxy, name="bounded", poll_attempts=2, poll_delay_seconds=0.01
+        )
+        _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
+        assert isinstance(actor, WorkspaceActor)
+        harness = ExecHarness(actor, orchestrator_proxy)
+        harness.install(monkeypatch)
+        sandbox_script.gate.set()
+
+        waited = tool_named(waiting_card, "workspace_exec")(cmd="echo hi")
+        harness.join()
+        bounded = tool_named(bounded_card, "workspace_exec")(cmd="echo hi")
+        harness.join()
+
+        waited_run, bounded_run = (payload.deferred_key for payload in harness.payloads)
+        # The sentinel's answer: the budget was spent, and it says which budget.
+        assert waited_run in waited
+        assert "2s" in waited
+        assert "still holds the workspace" in waited
+        assert "workspace_exec_result" in waited
+        # The instruction that produced four polls in six seconds — an agent
+        # inside a tool call has no next turn to be told to wait for.
+        assert "next turn" not in waited
+        # The bounded card asked for a run id and still gets the handoff.
+        assert bounded == in_progress(bounded_run)
+        assert "next turn" in bounded
+
+    def test_a_command_killed_by_its_budget_comes_back_as_an_outcome(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        sandbox_script: SandboxScript,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # AC3, and the test that goes red if EXEC_REPORT_MARGIN_S is dropped.
+        # The command is killed AT its budget and the readable exit_code 124
+        # outcome lands a moment after — so a poll bounded at exactly the budget
+        # misses it by that moment and reports a timeout instead. Here the run
+        # budget and the poll delay are equal, which puts the whole difference
+        # between the two designs in the margin: with it, 21 looks; without it,
+        # exactly one.
+        card, _ = exec_card_for(
+            orchestrator_proxy, poll_attempts=-1, poll_delay_seconds=0.05, timeout_s=0.05
+        )
+        _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
+        assert isinstance(actor, WorkspaceActor)
+        harness = ExecHarness(actor, orchestrator_proxy)
+        harness.install(monkeypatch)
+        sandbox_script.raise_with = subprocess.TimeoutExpired(cmd="echo hi", timeout=0.05)
+
+        # The gate is released by the first look and not before, so the first
+        # look is guaranteed to find the run unsettled — which is what makes the
+        # margin, rather than a scheduling accident, the thing under test.
+        original = actor.exec_status
+        released = threading.Event()
+
+        def release_after_the_first_look(agent_id: str, run_id: str) -> Any:
+            status = original(agent_id, run_id)
+            if not released.is_set():
+                released.set()
+                sandbox_script.gate.set()
+            return status
+
+        monkeypatch.setattr(actor, "exec_status", release_after_the_first_look)
+
+        answer = tool_named(card, "workspace_exec")(cmd="echo hi")
+        harness.join()
+
+        assert released.is_set(), "the run was never looked at"
+        assert f"exit_code: {TIMED_OUT_EXIT_CODE}" in answer
+        assert "was killed" in answer
+        assert "without reporting" not in answer  # not the timeout message
+
+    def test_a_running_run_asked_about_directly_is_still_in_progress(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        # AC6: workspace_exec_result is untouched. That path has no budget of its
+        # own to have exhausted, so "still in progress" is the accurate answer.
+        card, actor, harness = exec_setup
+        run_id = start_run(actor, sandbox_script)
+
+        answer = tool_named(card, "workspace_exec_result")(run_id=run_id)
+
+        assert answer == in_progress(run_id)
+        finish_run(sandbox_script, harness)
+
+    def test_the_poll_budget_cannot_extend_the_run_budget(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        sandbox_script: SandboxScript,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # AC9: three budgets, still three things. A card asking to poll for a
+        # thousand seconds hands the backend the same run budget as any other —
+        # the poll buys more looking, never more running.
+        card, _ = exec_card_for(
+            orchestrator_proxy, poll_attempts=1000, poll_delay_seconds=1.0, timeout_s=999.0
+        )
+        _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
+        assert isinstance(actor, WorkspaceActor)
+        harness = ExecHarness(actor, orchestrator_proxy)
+        harness.install(monkeypatch)
+        sandbox_script.gate.set()
+
+        tool_named(card, "workspace_exec")(cmd="echo hi")
+        harness.join()
+
+        assert harness.payloads[0].timeout_s == DEFAULT_WORKER_TIMEOUT_S
+        command_budget = sandbox_script.timeouts[0]
+        assert command_budget is not None
+        assert command_budget <= DEFAULT_WORKER_TIMEOUT_S
+
+
+class TestTheStartAnswerIsExactlyOne:
+    """``ExecStart`` enforces its own invariant rather than documenting it.
+
+    Folded in from epic 29's deferred findings. Every caller branches on
+    ``if not start.run_id``, so an answer carrying neither field would reach the
+    agent as an empty refusal, and one carrying both would run a command the
+    actor had already decided to refuse.
+    """
+
+    def test_a_run_id_alone_is_accepted(self) -> None:
+        assert ExecStart(run_id="abc12345").run_id == "abc12345"
+
+    def test_a_refusal_alone_is_accepted(self) -> None:
+        assert ExecStart(refusal="busy").refusal == "busy"
+
+    def test_neither_is_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ExecStart()
+
+    def test_both_is_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ExecStart(run_id="abc12345", refusal="busy")
+
+    def test_it_still_round_trips(self) -> None:
+        start = ExecStart(run_id="abc12345")
+        assert ExecStart.model_validate(start.model_dump()) == start
 
 
 # ---------------------------------------------------------------------------

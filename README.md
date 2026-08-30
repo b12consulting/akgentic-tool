@@ -1055,6 +1055,22 @@ teardown case it exists for. A live run that has simply overrun is refused inste
 if a reclaimed run does report afterwards, whatever it wrote is committed as `out-of-band` — belonging
 to nobody — rather than dropped into the tree for the next agent's commit to sweep up.
 
+**`workspace_exec` waits for the command by default.** An agent inside a tool call has nothing else
+it can do — the call is synchronous from the model's point of view, and it cannot yield and be
+resumed — so a short poll does not save that latency, it converts it into LLM round-trips against an
+answer that cannot change. `poll_attempts` has three settings:
+
+| `poll_attempts` | What the agent gets |
+|---|---|
+| `-1` (default) | Waits out the run and returns the command's own output. The run id is the exception, not the normal path. |
+| a positive count | A bounded look of `count × poll_delay_seconds`, clamped to the run budget; exhausting it hands back a run id. |
+| `0` | No polling at all — the run id comes back immediately. |
+
+The wait covers the run's budget plus a small margin for the worker to report it, so a command
+killed at its own budget still comes back as a readable `exit_code: 124` rather than as a tool
+timeout. None of this can extend how long a command may run: `poll_attempts` buys more looking,
+never more running.
+
 Binary reads (PDF, DOCX, XLSX, PPTX) need `akgentic-tool[docs]`; image resizing for
 `workspace_view` needs `akgentic-tool[vision]`; the journal needs `git` on `PATH`. All three degrade
 rather than fail.

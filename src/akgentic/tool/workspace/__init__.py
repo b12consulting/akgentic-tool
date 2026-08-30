@@ -30,6 +30,7 @@ from akgentic.tool.workspace.execution import (
     DEFAULT_EXEC_POLL_ATTEMPTS,
     DEFAULT_EXEC_POLL_DELAY_S,
     DEFAULT_EXEC_TIMEOUT_S,
+    EXEC_REPORT_MARGIN_S,
     LEASE_GRACE_S,
     MAX_TRACKED_RUNS,
     RUN_ID_CHARS,
@@ -49,6 +50,7 @@ from akgentic.tool.workspace.execution import (
     poll_attempts_within,
     resolve_mode,
     sandbox_config,
+    timed_out,
 )
 from akgentic.tool.workspace.journal import (
     IDENTITY_DOMAIN,
@@ -124,6 +126,7 @@ __all__ = [
     "DEFAULT_GIT_TIMEOUT_S",
     "DEFAULT_MAX_OBSERVATIONS_PER_AGENT",
     "DEFAULT_MAX_TRACKED_WRITERS",
+    "EXEC_REPORT_MARGIN_S",
     "GITIGNORE_NAME",
     "GIT_DIR_SUFFIX",
     "IDENTITY_DOMAIN",
@@ -162,6 +165,7 @@ __all__ = [
     "resolve_mode",
     "sanitise_command",
     "sandbox_config",
+    "timed_out",
     "MutationOutcome",
     "MutationStatus",
     "Observation",

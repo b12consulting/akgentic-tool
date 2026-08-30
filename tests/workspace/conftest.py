@@ -36,7 +36,7 @@ from akgentic.tool.core.deferred import DeferredPayload
 from akgentic.tool.sandbox.actor import ExecResult, SandboxActor
 from akgentic.tool.sandbox.tool import SANDBOX_ACTOR_CLASSES
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
-from akgentic.tool.workspace.execution import ExecWorker
+from akgentic.tool.workspace.execution import DEFAULT_EXEC_TIMEOUT_S, ExecWorker
 from akgentic.tool.workspace.journal import git_dir_for
 from akgentic.tool.workspace.models import MutationOutcome, Observation
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
@@ -759,13 +759,18 @@ def exec_card_for(
     workspace_id: str = WORKSPACE_NAME,
     poll_attempts: int = 1,
     poll_delay_seconds: float = 0.0,
+    timeout_s: float = DEFAULT_EXEC_TIMEOUT_S,
     **card_kwargs: Any,
 ) -> tuple[WorkspaceTool, FakeActorToolObserver]:
     """Wire an exec-capable card onto *workspace_id*, with a tight poll by default.
 
     ``poll_attempts=1`` is what keeps the suite free of real sleeps: a test that
     wants the ``in progress`` handoff gets it in one attempt, and a test that
-    wants a completed run raises the count against a 10 ms delay instead.
+    wants a completed run raises the count against a 10 ms delay instead. It is
+    deliberately **not** the card's own default (the wait-out-the-run sentinel),
+    which resolves against the run budget and would give most of this suite a
+    poll measured in seconds for no assertion's benefit; a test about the
+    sentinel passes ``-1`` and a small ``timeout_s`` explicitly.
     """
     observer = FakeActorToolObserver(orchestrator_proxy, name=name)
     card = WorkspaceTool(
@@ -774,6 +779,7 @@ def exec_card_for(
             mode="local",
             poll_attempts=poll_attempts,
             poll_delay_seconds=poll_delay_seconds,
+            timeout_s=timeout_s,
         ),
         **card_kwargs,
     )

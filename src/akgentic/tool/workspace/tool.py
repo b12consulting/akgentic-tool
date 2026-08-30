@@ -33,7 +33,7 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
 
-from pydantic import PrivateAttr
+from pydantic import Field, PrivateAttr
 from pydantic_ai.messages import BinaryContent
 
 from akgentic.core.actor_address import ActorAddress
@@ -61,6 +61,7 @@ from akgentic.tool.workspace.execution import (
     poll_attempts_within,
     resolve_mode,
     sandbox_config,
+    timed_out,
 )
 from akgentic.tool.workspace.models import (
     PERM_ERR_MSG,
@@ -474,23 +475,42 @@ class WorkspaceExec(BaseToolParam):
     """Run a sandboxed shell command against the team workspace.
 
     Configuration only — nothing here duplicates an argument of the callables it
-    enables. The three budgets it carries are three different things and are
-    easy to conflate:
+    enables. The two budgets it carries are two different things and are easy to
+    conflate:
 
     - ``timeout_s`` bounds the **subprocess**, and reaches
       ``subprocess.run(timeout=...)`` in the backend. It is clamped to the
       worker's own budget, which sits below the orchestrator's stop backstop.
     - ``poll_attempts`` × ``poll_delay_seconds`` bounds how long the **agent's
-      own thread** waits inside the tool call before it is handed a run id.
+      own thread** waits inside the tool call. It cannot extend the first:
+      raising it buys more looking, never more running.
 
-    A run outlives the second and is collected on the next turn; it never
-    outlives the first.
+    ``poll_attempts`` has three settings, and each is bounded by a different
+    thing:
+
+    - ``-1`` (the default) — **wait out the run.** Resolved at wiring time to
+      the largest count fitting the *effective run budget*
+      (``min(timeout_s, DEFAULT_WORKER_TIMEOUT_S)``) plus
+      :data:`~akgentic.tool.workspace.execution.EXEC_REPORT_MARGIN_S`, so the
+      wait covers the worker's report and not merely the command. The common
+      case then returns the command's own output and the model never sees a run
+      id.
+    - a **positive count** — a bounded look of ``count × poll_delay_seconds``,
+      clamped to the effective run budget and **without** the margin. Exhausting
+      it hands back a run id.
+    - ``0`` — no polling at all: the run id comes back immediately.
+
+    Anything below ``-1`` is a validation error rather than a second spelling of
+    the sentinel.
+
+    A run that outlives the wait is collected with ``workspace_exec_result``; it
+    never outlives ``timeout_s``.
     """
 
     expose: set[Channels] = {TOOL_CALL}
     mode: CardMode = "auto"
     timeout_s: float = DEFAULT_EXEC_TIMEOUT_S
-    poll_attempts: int = DEFAULT_EXEC_POLL_ATTEMPTS
+    poll_attempts: int = Field(default=DEFAULT_EXEC_POLL_ATTEMPTS, ge=-1)
     poll_delay_seconds: float = DEFAULT_EXEC_POLL_DELAY_S
 
 
@@ -1566,25 +1586,30 @@ class WorkspaceTool(ToolCard):
         proxy = self._workspace_proxy
         agent_id = self._agent_id
         delay = params.poll_delay_seconds
-        # Clamped, not accepted: a poll outlasting the run is a sleep with no
-        # possible answer, because by then the run has reported or its own budget
-        # has killed it. Bounded by the *effective* run budget, which is what
-        # stops the run — a card asking for 999 s never gets more than the worker
-        # allows it either.
-        attempts = poll_attempts_within(
-            params.poll_attempts, delay, min(params.timeout_s, DEFAULT_WORKER_TIMEOUT_S)
-        )
+        # The effective run budget — the card's ask after the worker's ceiling —
+        # is what actually stops the run, so it is what both the sentinel and the
+        # clamp are measured against. A card asking for 999 s never gets more
+        # than the worker allows it either way.
+        run_budget = min(params.timeout_s, DEFAULT_WORKER_TIMEOUT_S)
+        # Resolved once, here, so nothing downstream knows the sentinel existed.
+        attempts = poll_attempts_within(params.poll_attempts, delay, run_budget)
+        # Which budget was in force decides which exhaustion message is honest,
+        # and it is a property of the card, not of the run — so it is computed
+        # here rather than re-derived on every call.
+        waits_out_the_run = params.poll_attempts < 0
 
         def workspace_exec(cmd: str, cwd: str = "") -> str:
             """Run a shell command in the team workspace, in a sandbox.
 
-            The workspace is held exclusively for the duration of the run: your
-            teammates can still read files, but every change they attempt is
-            refused until it finishes. Everything the command touched — files you
-            never named included — is recorded as one change attributed to you.
+            This waits for the command and gives you its output. The workspace is
+            held exclusively for the duration of the run: your teammates can still
+            read files, but every change they attempt is refused until it
+            finishes. Everything the command touched — files you never named
+            included — is recorded as one change attributed to you.
 
-            A command that outlives the wait returns a run id instead of output.
-            Call workspace_exec_result with that id on your next turn.
+            A run that outlives the wait is the exception, and then you get a run
+            id instead of output; workspace_exec_result collects that run's output
+            once it lands.
 
             Args:
                 cmd: Full command string. The binary (first token) must be in
@@ -1592,8 +1617,8 @@ class WorkspaceTool(ToolCard):
                 cwd: Subdirectory relative to workspace root. Defaults to root.
 
             Returns:
-                Combined stdout, stderr and exit code, or a message naming the
-                run id to collect later.
+                Combined stdout, stderr and exit code — or, for a run that
+                outlived the wait, a message naming the run id.
 
             Raises:
                 RetriableError: If another agent's run holds the workspace.
@@ -1607,7 +1632,11 @@ class WorkspaceTool(ToolCard):
                 attempts=attempts,
                 delay=delay,
             )
-            return format_status(settled) if settled is not None else in_progress(run_id)
+            if settled is not None:
+                return format_status(settled)
+            if waits_out_the_run:
+                return timed_out(run_id, run_budget)
+            return in_progress(run_id)
 
         workspace_exec.__doc__ = params.format_docstring(workspace_exec.__doc__)
         return workspace_exec

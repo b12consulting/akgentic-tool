@@ -31,7 +31,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from pydantic import Field, PrivateAttr
+from pydantic import Field, PrivateAttr, model_validator
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.orchestrator import Orchestrator
@@ -65,19 +65,54 @@ cannot cancel a thread, so a command still running past its worker's budget hold
 its parent's teardown open for the difference.
 """
 
-DEFAULT_EXEC_POLL_ATTEMPTS = 20
-DEFAULT_EXEC_POLL_DELAY_S = 0.5
-"""Caller-side poll: ~10 s of waiting inside the tool call before handing back a run id.
+DEFAULT_EXEC_POLL_ATTEMPTS = -1
+"""Sentinel: wait out the whole run rather than hand back a run id part-way.
 
-Deliberately longer than ``poll_deferred``'s own default of ~2 s, and the reason
-is worth stating because the instinct is to minimise it. At a 2 s poll *every*
-command slower than two seconds — every test run, every build — becomes a
-two-turn interaction, which is most real uses of a shell. An agent inside a tool
-call cannot do anything else anyway; the call is synchronous from the model's
-point of view. So a longer poll costs that agent latency it was going to spend
-regardless, and costs the team nothing, because the tree is leased either way.
-The invariant is "bounded, with a degraded answer always available" — never "as
-short as possible".
+Resolved once, at wiring time, by :func:`poll_attempts_within` into the largest
+attempt count that fits the run's effective budget plus
+:data:`EXEC_REPORT_MARGIN_S`. Nothing downstream ever sees the ``-1``.
+
+It is the **default**, and the instinct that a long synchronous tool call is
+expensive is wrong here. An agent inside a tool call cannot do anything else; the
+call is synchronous from the model's point of view, and it cannot yield and be
+resumed. A short poll therefore does not save that latency — it converts it into
+LLM round-trips against an answer that cannot change, and ends with the model
+holding a run id and no way to be woken. Waiting costs one thread doing nothing;
+not waiting cost four inferences in six seconds and a promise to a human that
+nothing would ever deliver.
+
+The tree is leased for the run's duration either way, so the *team* waits
+identically in both settings. Only the requesting agent's turn count differs.
+
+The other two settings still mean what they meant: a positive count is a bounded
+poll clamped to the run budget, and ``0`` opts out of polling entirely and takes
+the run id immediately.
+"""
+
+DEFAULT_EXEC_POLL_DELAY_S = 0.5
+"""Seconds between two looks for a result, on the agent's own thread.
+
+Only ever wall clock the agent was going to spend anyway (see above). It is the
+granularity of the wait, not its length: the length comes from
+:data:`DEFAULT_EXEC_POLL_ATTEMPTS` resolved against the run's budget.
+"""
+
+EXEC_REPORT_MARGIN_S = 1.0
+"""How far past the run's budget the sentinel's poll keeps looking.
+
+The run's budget bounds the **command**; the poll has to outlast it by the time
+the worker takes to report, or the most ordinary slow case breaks. A command
+killed at its 15 s budget produces a perfectly good ``exit_code: 124`` outcome a
+moment later — an answer the agent can read — and a poll bounded at exactly 15 s
+misses it by that moment and reports a timeout instead, turning a clean answer
+into a confusing one.
+
+**Only the sentinel gets it.** An explicit positive ``poll_attempts`` asked for a
+bounded look, not for the whole run, and is clamped to the run budget alone.
+
+A module constant rather than a card field: it describes how fast a worker
+reports, which is a property of this runtime, not of what a user wants. Promote
+it only if a deployment is ever observed where a report reliably takes longer.
 """
 
 MAX_TRACKED_RUNS = 32
@@ -251,9 +286,13 @@ class ExecLease(SerializableBaseModel):
 class ExecStart(SerializableBaseModel):
     """The answer to "may I run this, and under what id".
 
-    Exactly one of the two fields is non-empty. A model rather than
-    ``str | None`` because it crosses the actor boundary, and because a bare
-    string would leave the caller guessing which of the two it holds.
+    Exactly one of the two fields is non-empty, and that is **enforced** rather
+    than merely documented: every caller branches on ``if not start.run_id``, so
+    an instance carrying neither would be reported to the agent as an empty
+    refusal, and one carrying both would silently run a command the actor had
+    already decided to refuse. A model rather than ``str | None`` because it
+    crosses the actor boundary, and because a bare string would leave the caller
+    guessing which of the two it holds.
 
     Attributes:
         run_id: The issued id, when the run was accepted.
@@ -262,6 +301,15 @@ class ExecStart(SerializableBaseModel):
 
     run_id: str = ""
     refusal: str = ""
+
+    @model_validator(mode="after")
+    def _exactly_one(self) -> ExecStart:
+        """Reject an answer that is both, or neither."""
+        if bool(self.run_id) == bool(self.refusal):
+            raise ValueError(
+                "ExecStart carries exactly one of run_id or refusal — never both, never neither."
+            )
+        return self
 
 
 class ExecState(StrEnum):
@@ -361,14 +409,25 @@ def new_run_id() -> str:
 
 
 def poll_attempts_within(attempts: int, delay: float, run_budget: float) -> int:
-    """Return an attempt count whose poll cannot outlast the run it waits for.
+    """Turn a requested attempt count into a real one, bounded by the run itself.
 
-    A poll longer than the run budget parks the agent's thread inside the tool
-    call past the point where there is anything left to wait for: by then the run
-    has either reported or been killed by its own budget, so every further
-    attempt is a sleep with no possible answer. It is the one budget on this card
-    that can be misconfigured into costing the team real time and buying nobody
-    anything, so it is clamped rather than accepted.
+    The one place a card's ``poll_attempts`` becomes the number
+    ``poll_deferred`` is handed, which is what lets the sentinel be resolved
+    exactly once, at wiring, with nothing downstream knowing it existed. Three
+    requests, three meanings:
+
+    - **negative** — :data:`DEFAULT_EXEC_POLL_ATTEMPTS`, "wait out the run":
+      resolved to the largest count fitting ``run_budget`` **plus**
+      :data:`EXEC_REPORT_MARGIN_S`, so the wait covers the worker's report and
+      not merely the command (see that constant).
+    - **zero** — returned unchanged. A caller that polls zero times takes the run
+      id immediately, and that opt-out is load-bearing: it is the only way to get
+      a run id without waiting at all.
+    - **positive** — a bounded look, clamped to ``run_budget`` and **without** the
+      margin. A poll longer than the run parks the agent's thread past the point
+      where there is anything left to wait for: by then the run has reported or
+      its own budget has killed it, so every further attempt is a sleep with no
+      possible answer.
 
     The bound is the **effective** run budget — the card's ``timeout_s`` after
     the worker's own ceiling — because that is what actually stops the run.
@@ -376,17 +435,22 @@ def poll_attempts_within(attempts: int, delay: float, run_budget: float) -> int:
     polling long past the 20 s the worker allows it.
 
     Args:
-        attempts: What the card asked for.
+        attempts: What the card asked for; negative means the sentinel.
         delay: Seconds between attempts.
         run_budget: The effective wall-clock budget of the run being waited on.
 
     Returns:
-        *attempts* unchanged when the poll already fits, otherwise the largest
-        count that does — never below 1, because a caller that polls zero times
-        gets the handoff message without ever looking, which is worse than
-        looking once.
+        The count to poll with — never below 1 except for the zero opt-out,
+        because a caller that looks zero times gets an exhaustion message without
+        ever having looked, which is worse than looking once. A non-positive
+        *delay* leaves the sentinel with no wall clock to divide, so it too
+        resolves to a single look.
     """
-    if attempts <= 0 or delay <= 0:
+    if attempts < 0:
+        if delay <= 0:
+            return 1
+        return max(1, int((run_budget + EXEC_REPORT_MARGIN_S) // delay))
+    if attempts == 0 or delay <= 0:
         return attempts
     if attempts * delay <= run_budget:
         return attempts
@@ -656,10 +720,37 @@ def format_status(status: ExecStatus) -> str:
 
 
 def in_progress(run_id: str) -> str:
-    """The handoff message, with the run id echoed verbatim into the model's context."""
+    """The handoff message, with the run id echoed verbatim into the model's context.
+
+    The answer to a card that asked for a **bounded** poll, and to any direct
+    ``workspace_exec_result`` on a run still in flight. It is accurate in both:
+    a card with a positive ``poll_attempts`` asked for a run id, and a run asked
+    about directly has no budget of its own to have exhausted.
+    """
     return (
         f"Run {run_id} is still in progress. It holds the workspace until it finishes. "
         f"Call workspace_exec_result('{run_id}') on your next turn to collect the output."
+    )
+
+
+def timed_out(run_id: str, budget_s: float) -> str:
+    """The answer when a wait-out-the-run poll ran out — the run overran its budget.
+
+    A different message from :func:`in_progress`, and deliberately: the sentinel
+    already waited for everything there was to wait for, so a run still going is
+    no longer "in progress" in any ordinary sense — it is past the budget that
+    was supposed to stop it, and the workspace is still held by it.
+
+    It says so, names the budget and the id, and offers ``workspace_exec_result``
+    without instructing the model to call it "on your next turn". That
+    instruction is what produced the busy-loop this default exists to remove: an
+    agent inside a synchronous tool call has no next turn to wait for, so its
+    only available move is to call the tool again immediately.
+    """
+    return (
+        f"Run {run_id} passed its {budget_s:g}s budget without reporting, so there is no output "
+        f"yet. It still holds the workspace. Nothing is lost — workspace_exec_result('{run_id}') "
+        "collects the output whenever the run does report."
     )
 
 

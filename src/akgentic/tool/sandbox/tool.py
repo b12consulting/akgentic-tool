@@ -30,7 +30,7 @@ from pydantic import PrivateAttr
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.tool.core import TOOL_CALL, BaseToolParam, Channels, ToolCard, _resolve
-from akgentic.tool.core.deferred import poll_deferred
+from akgentic.tool.core.deferred import DEFAULT_WORKER_TIMEOUT_S, poll_deferred
 from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.sandbox.actor import (
     ALLOWED_COMMANDS,
@@ -266,12 +266,23 @@ class ExecTool(ToolCard):
         from akgentic.tool.workspace.execution import (  # noqa: PLC0415 — see the module note
             DEFAULT_EXEC_POLL_ATTEMPTS,
             DEFAULT_EXEC_POLL_DELAY_S,
+            DEFAULT_EXEC_TIMEOUT_S,
             format_status,
-            in_progress,
+            poll_attempts_within,
+            timed_out,
         )
 
         proxy = self._workspace_proxy
         agent_id = self._agent_id
+        # The shim carries the capability's defaults and no way to change them,
+        # so it resolves them the same way the capability does. Handing
+        # ``poll_deferred`` the raw default would pass it the wait-out-the-run
+        # sentinel, whose ``range(-1)`` is zero looks — the shim would take a run
+        # id without ever having looked for a result.
+        run_budget = min(DEFAULT_EXEC_TIMEOUT_S, DEFAULT_WORKER_TIMEOUT_S)
+        attempts = poll_attempts_within(
+            DEFAULT_EXEC_POLL_ATTEMPTS, DEFAULT_EXEC_POLL_DELAY_S, run_budget
+        )
 
         def exec_command(cmd: str, cwd: str = "") -> str:
             """Execute a sandboxed shell command in the team workspace.
@@ -293,10 +304,12 @@ class ExecTool(ToolCard):
                 run_id = start.run_id
                 settled = poll_deferred(
                     lambda: _settled(proxy.exec_status(agent_id, run_id)),
-                    attempts=DEFAULT_EXEC_POLL_ATTEMPTS,
+                    attempts=attempts,
                     delay=DEFAULT_EXEC_POLL_DELAY_S,
                 )
-                return format_status(settled) if settled is not None else in_progress(run_id)
+                if settled is not None:
+                    return format_status(settled)
+                return timed_out(run_id, run_budget)
             except CommandNotAllowedError as e:
                 return f"CommandNotAllowedError: {e}. Allowed commands: {sorted(ALLOWED_COMMANDS)}"
             except Exception as e:

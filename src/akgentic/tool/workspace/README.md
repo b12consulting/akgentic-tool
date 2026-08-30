@@ -276,20 +276,39 @@ commit attributed to the requesting agent, with the command in the body. That is
 atomicity comes from: a build touching nine files lands as one attributable unit. With the journal
 off, the run still works; nothing is recorded.
 
-**Long commands hand back a run id.** The agent's own thread waits about 5 s inside the call; a
-command still going then returns `Run <id> is still in progress …`, and the agent calls
-`workspace_exec_result('<id>')` on its next turn. An id nothing was issued under does not raise —
-it comes back with that agent's recent run ids, so a mistyped one is correctable.
+**The call waits for the command, and a run id is the exception.** The agent's own thread polls
+until the run reports, so an ordinary command returns its own output and the model never sees a run
+id at all. That is deliberate: an agent inside a tool call cannot do anything else — the call is
+synchronous from the model's point of view, and it cannot yield and be resumed — so a short poll
+does not save that latency, it converts it into LLM round-trips against an answer that cannot
+change, and ends by telling the model to come back on a next turn it does not have. The tree is
+leased for the run's duration either way, so the *team* waits identically; only the requesting
+agent's turn count differs.
+
+A run that outlives even that wait comes back saying it passed its budget and naming its id, and
+`workspace_exec_result('<id>')` collects the output whenever it does land. An id nothing was issued
+under does not raise — it comes back with that agent's recent run ids, so a mistyped one is
+correctable.
+
+**`poll_attempts` has three settings, each bounded by a different thing:**
+
+| Setting | Meaning | Bounded by |
+|---|---|---|
+| `-1` (default) | wait out the run | the effective run budget **plus** a report margin (~1 s), so a command killed at its budget still arrives as a readable `exit_code: 124` |
+| a positive count | a bounded look, then a run id | the effective run budget alone — no margin |
+| `0` | no polling; the run id comes back immediately | — |
+
+Anything below `-1` is a validation error rather than a second spelling of the sentinel.
 
 **Three budgets, and they are three different things:**
 
 | Budget | Bounds | Default |
 |---|---|---|
 | `timeout_s` | the **subprocess** — reaches `subprocess.run(timeout=…)` in the backend | 15 s, clamped to the worker's 20 s |
-| `poll_attempts` × `poll_delay_seconds` | how long the **agent's own thread** waits before being handed a run id | 12 × 0.4 s ≈ 5 s, clamped so it can never outlast the run |
+| `poll_attempts` × `poll_delay_seconds` | how long the **agent's own thread** waits inside the call | wait out the run, at 0.5 s granularity |
 | the backend's own default | a caller that passes no budget at all | 30 s |
 
-A run outlives the second and is collected next turn; it never outlives the first.
+Raising the second cannot raise the first: the poll buys more looking, never more running.
 
 **`git` is not in the command allowlist**, and `.git` is never inside a sandbox mount. The second is
 the guarantee — only the first token of a command is checked and `bash` is on the list, so
@@ -449,8 +468,8 @@ WorkspaceTool(
 | `expose` | `set[Channels]` | `{TOOL_CALL}` | Taking exec off this channel withholds both callables **and** skips the wiring entirely — no host probe, no sandbox actor. |
 | `mode` | `"local" \| "bwrap" \| "seatbelt" \| "docker" \| "auto"` | `"auto"` | The isolation backend. `"auto"` probes the host at wiring time (`bwrap` → `seatbelt` → `docker` → `local`) and warns when it falls through to `local`. A mode naming no registered backend raises `KeyError` at wiring time, deliberately. |
 | `timeout_s` | `float` | `15.0` | Budget for the **subprocess**, handed to the backend. Clamped to the worker's own 20 s, which sits below the orchestrator's 30 s stop backstop. |
-| `poll_attempts` | `int` | `12` | How many times the agent's own thread looks for a result before being handed a run id. |
-| `poll_delay_seconds` | `float` | `0.4` | Seconds between those looks. `poll_attempts × poll_delay_seconds` is clamped so the wait can never outlast the run it waits for — past that point there is nothing left to wait for. |
+| `poll_attempts` | `int` | `-1` | How many times the agent's own thread looks for a result. `-1` is the sentinel for "wait out the run", resolved once at wiring time against the effective run budget plus a report margin; a positive count is a bounded look clamped to that budget without the margin; `0` opts out of polling and takes the run id immediately. Below `-1` is a validation error. |
+| `poll_delay_seconds` | `float` | `0.5` | Seconds between those looks — the granularity of the wait, not its length. The length comes from `poll_attempts` resolved against the run budget, and can never outlast the run it waits for: past that point there is nothing left to wait for. |
 
 None of these reaches an LLM-facing signature: nothing lets a model name a mode, a timeout, or a
 git argument. See the [`ExecTool` reference](../sandbox/README.md) for what each backend actually

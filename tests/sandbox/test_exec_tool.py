@@ -942,15 +942,48 @@ def test_exec_command_returns_a_busy_refusal_rather_than_raising() -> None:
 
 
 def test_exec_command_hands_back_a_run_id_when_the_poll_runs_out() -> None:
-    """A run still going past the poll budget degrades to the run id, echoed verbatim."""
+    """A run outliving the shim's wait degrades to the run id, echoed verbatim.
+
+    The shim carries the capability's defaults, which since 29-9 means waiting
+    out the whole run — so exhausting the poll here means the run passed its
+    budget, and the message says that rather than telling the model to come back
+    on a next turn it does not have.
+    """
     observer = MockObserver(existing_actor=None)
     tool = ExecTool(mode="local")
     wire(tool, observer)
     running = ExecStatus(state=ExecState.RUNNING, run_id="abc12345")
-    tool._workspace_proxy = FakeWorkspaceProxy(running)  # type: ignore[assignment]
+    fake = FakeWorkspaceProxy(running)
+    tool._workspace_proxy = fake  # type: ignore[assignment]
 
     with patch("akgentic.tool.core.deferred.time.sleep"):
         result = tool.get_tools()[0](cmd="pytest")
 
     assert "abc12345" in result
-    assert "in progress" in result
+    assert "without reporting" in result
+    assert "next turn" not in result
+
+
+def test_exec_command_polls_rather_than_taking_the_sentinel_literally() -> None:
+    """The shim resolves the wait-out-the-run default instead of forwarding it.
+
+    ``DEFAULT_EXEC_POLL_ATTEMPTS`` is a sentinel, and ``range(-1)`` is zero
+    iterations — a shim that handed it straight to ``poll_deferred`` would take a
+    run id without ever having looked for a result.
+    """
+    observer = MockObserver(existing_actor=None)
+    tool = ExecTool(mode="local")
+    wire(tool, observer)
+    looks: list[str] = []
+
+    class CountingProxy(FakeWorkspaceProxy):
+        def exec_status(self, agent_id: str, run_id: str) -> ExecStatus:
+            looks.append(run_id)
+            return ExecStatus(state=ExecState.RUNNING, run_id=run_id)
+
+    tool._workspace_proxy = CountingProxy()  # type: ignore[assignment]
+
+    with patch("akgentic.tool.core.deferred.time.sleep"):
+        tool.get_tools()[0](cmd="pytest")
+
+    assert len(looks) > 1
