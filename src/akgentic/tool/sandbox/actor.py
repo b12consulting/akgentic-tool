@@ -81,12 +81,19 @@ Callers that own a tighter budget pass it to :meth:`SandboxActor.exec`.
 
 ##
 ## Only the FIRST token of a command is checked against this set, and both
-## ``bash`` and ``sh`` are in it — so ``bash -c "git reset --hard"`` walks
-## straight past it.  Nothing may rely on this allowlist for safety.  The real
-## guarantee that a sandboxed run cannot reach the workspace journal is a
-## filesystem fact: the repository lives at the sibling ``<root>.git``, outside
-## every backend's mount, so it is not there to be reached.  ``git`` is absent
-## below as defence in depth, not as the boundary.
+## ``bash`` and ``sh`` are in it — so ``bash -c "<anything>"`` walks straight
+## past it.  Nothing may rely on this allowlist for safety: it is a usability
+## filter that keeps an obvious mistake from running, and a way to tell an agent
+## what the sandbox offers.
+##
+## ``git`` is on the list.  It was briefly removed, to stop a ``git reset
+## --hard`` from destroying the workspace journal — but the bypass above meant
+## that stopped nobody, while costing an agent the use of git in a directory
+## that *is* a git repository.  The real guarantee is a filesystem fact: the
+## journal lives at the sibling ``<root>.git``, outside the mount of every
+## backend that constructs one, so it is not there to be reached.  Note that
+## ``LocalSandboxActor`` constructs no mount, so that guarantee does not cover
+## it — use an isolating backend where it matters.
 ##
 ALLOWED_COMMANDS: frozenset[str] = frozenset(
     {

@@ -179,22 +179,31 @@ the tool description rather than discovering it by failing.
 
 ### The allowlist
 
-`ALLOWED_COMMANDS` is a module-level `frozenset` of 25 binaries:
+`ALLOWED_COMMANDS` is a module-level `frozenset` of 32 binaries:
 
-`python`, `python3`, `pytest`, `ruff`, `mypy`, `uv`, `pip`, `cat`, `ls`, `find`, `grep`,
-`mkdir`, `cp`, `mv`, `rm`, `echo`, `touch`, `curl`, `wget`, `make`, `bash`, `sh`, `node`, `npm`,
-`npx`
+`python`, `python3`, `pytest`, `ruff`, `mypy`, `uv`, `pip`, `node`, `npm`, `npx`, `sh`, `bash`,
+`cat`, `echo`, `ls`, `cp`, `mv`, `rm`, `mkdir`, `find`, `grep`, `sed`, `awk`, `jq`, `wc`, `xargs`,
+`touch`, `make`, `git`, `kill`, `curl`, `wget`
 
-**`git` is not on it.** With a repository under the workspace root, `git reset --hard` or
-`git checkout` from inside the sandbox would destroy the journal. The real guarantee is not this
-list, though: the repository lives at the sibling `<root>.git`, **outside every backend's mount**,
-so it is not there to be reached. Removing `git` from the list is defence in depth.
+**`git` is on it**, and that is deliberate. It was briefly removed, on the reasoning that a
+`git reset --hard` from inside the sandbox would destroy the journal beside the workspace. The
+reasoning does not survive the next paragraph: the check is first-token-only and `bash` is on the
+list, so the removal stopped nobody while costing an agent the use of git in a directory that *is* a
+git repository. The guarantee that a sandboxed run cannot reach the journal was never this list —
+the repository lives at the sibling `<root>.git`, **outside the mount of every backend that
+constructs one**, so it is not there to be reached.
 
 **Only the first whitespace-delimited token is checked.** Argument-level filtering is explicitly
-out of scope, and `bash` and `sh` are on the list — so `bash -c "git reset --hard"` walks straight
-past it. The allowlist bounds *which interpreters start*, not what they subsequently do. **Nothing
-may rely on it for safety.** That is why the filesystem backend matters: on `local` the allowlist is
-all there is, on `bwrap` / `seatbelt` / `docker` it is one layer of two.
+out of scope, and `bash` and `sh` are on the list — so `bash -c "<anything>"` walks straight past
+it. The allowlist bounds *which interpreters start*, not what they subsequently do; treat it as a
+usability filter that keeps an obvious mistake from running, and as a way to tell an agent what the
+sandbox offers. **Nothing may rely on it for safety.**
+
+That is why the backend matters, and why one of the four is different: on `bwrap` / `seatbelt` /
+`docker` the mount is a real boundary and the journal sits outside it. On **`local` there is no
+mount at all** — it runs a plain subprocess with a cwd, so the journal beside the tree is reachable
+exactly as any other host path is, with or without a git binary. `local` is `auto`'s final fallback.
+Use an isolating backend where that matters.
 
 An empty `cmd`, or a first token outside the set, raises `CommandNotAllowedError` — **on the
 worker's thread**, where the allowlist check now runs. It therefore reaches the agent as a reported
