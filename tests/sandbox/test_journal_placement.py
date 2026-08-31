@@ -158,8 +158,14 @@ class TestTheJournalIsOutsideEveryMount:
 
 
 class TestTheAllowlistIsNotTheBoundary:
-    def test_git_is_refused(self) -> None:
-        assert "git" not in ALLOWED_COMMANDS
+    def test_git_is_on_the_list_and_the_mount_is_what_protects_the_journal(self) -> None:
+        # git was briefly taken off this list as defence in depth, and put back
+        # when the allowlist was widened for real work. Nothing was lost, which
+        # is the point of this class: the guarantee that holds is asserted by the
+        # tests above — the journal lives at the sibling <root>.git, outside
+        # every isolating backend's mount, so a `git reset --hard` from inside
+        # the sandbox cannot reach it whether or not the binary is reachable.
+        assert "git" in ALLOWED_COMMANDS
 
     def test_but_bash_walks_straight_past_it(self) -> None:
         # Only the first token is checked, and bash is on the list. Nothing in

@@ -572,19 +572,22 @@ class TestADisallowedCommand:
     ) -> None:
         card, actor, harness = exec_setup
         # The fake backend is a real SandboxActor subclass, so exec() runs the
-        # real allowlist — the command never reaches _exec at all.
-        start = actor.request_exec(AGENT, "git status")
+        # real allowlist — the command never reaches _exec at all. `ssh` is the
+        # exemplar because it has to stay off the list for this to mean
+        # anything; a binary the sandbox might plausibly want would eventually be
+        # added and turn this into a test of nothing.
+        start = actor.request_exec(AGENT, "ssh nowhere")
         assert start.run_id, start.refusal
         harness.join()
 
         status = actor.exec_status(AGENT, start.run_id)
         assert status.state is ExecState.FAILED
-        assert "git" in status.reason
+        assert "ssh" in status.reason
         assert "pytest" in status.reason  # the allowed list travels with it
         assert not sandbox_script.commands  # it was refused before the backend
 
         answer = mutate(card, "workspace_exec_result", start.run_id)
-        assert "git" in answer
+        assert "ssh" in answer
 
     def test_it_does_not_leave_the_tree_leased(
         self,
@@ -594,7 +597,7 @@ class TestADisallowedCommand:
         # The lease is taken before the worker is spawned, so a command the
         # backend refuses is one more exit that has to release it.
         card, actor, harness = exec_setup
-        actor.request_exec(AGENT, "git status")
+        actor.request_exec(AGENT, "ssh nowhere")
         harness.join()
 
         assert actor._lease is None

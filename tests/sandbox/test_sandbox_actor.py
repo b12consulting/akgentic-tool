@@ -197,9 +197,15 @@ def test_allowed_commands_is_frozenset() -> None:
 
 
 def test_allowed_commands_exact_set() -> None:
-    """AC2: ALLOWED_COMMANDS contains exactly the FR-SB-5 binaries, minus ``git``."""
+    """AC2: ALLOWED_COMMANDS contains exactly the binaries the sandbox offers.
+
+    Pinned as an exact set on purpose: every entry widens what an agent can run
+    inside the sandbox, so adding one is a decision that has to be made twice —
+    once in the source and once here.
+    """
     expected = frozenset(
         {
+            # Python
             "python",
             "python3",
             "pytest",
@@ -207,49 +213,68 @@ def test_allowed_commands_exact_set() -> None:
             "mypy",
             "uv",
             "pip",
-            "cat",
-            "ls",
-            "find",
-            "grep",
-            "mkdir",
-            "cp",
-            "mv",
-            "rm",
-            "echo",
-            "touch",
-            "curl",
-            "wget",
-            "make",
-            "bash",
-            "sh",
+            # Web
             "node",
             "npm",
             "npx",
+            # bash
+            "sh",
+            "bash",
+            "cat",
+            "echo",
+            "ls",
+            "cp",
+            "mv",
+            "rm",
+            "mkdir",
+            "find",
+            "grep",
+            "sed",
+            "awk",
+            "jq",
+            "wc",
+            "xargs",
+            "touch",
+            "make",
+            "git",
+            "kill",
+            # Network
+            "curl",
+            "wget",
         }
     )
     assert ALLOWED_COMMANDS == expected
-    assert len(ALLOWED_COMMANDS) == 25
+    assert len(ALLOWED_COMMANDS) == 32
 
 
-def test_git_is_not_allowed() -> None:
-    """``git`` is off the list, because the workspace now keeps a repository.
+def test_git_is_allowed_and_the_journal_is_protected_by_the_mount() -> None:
+    """``git`` is on the list, and taking it off would not have protected anything.
 
-    Defence in depth only, and the test says so: ``bash`` and ``sh`` are still on
-    the list and only the first token is checked, so ``bash -c "git ..."`` walks
-    straight past this. What actually protects the journal is that it lives at
-    the sibling ``<root>.git``, outside every backend's mount — see
+    It was briefly removed as defence in depth. That was never the boundary, and
+    the test says why: ``bash`` and ``sh`` are on the list and only the first
+    token is checked, so ``bash -c "git ..."`` walks straight past it. What
+    actually protects the journal is that it lives at the sibling ``<root>.git``,
+    outside every isolating backend's mount — see
     ``tests/sandbox/test_journal_placement.py``.
     """
-    assert "git" not in ALLOWED_COMMANDS
+    assert "git" in ALLOWED_COMMANDS
+    assert "bash" in ALLOWED_COMMANDS
 
 
-def test_a_git_command_is_refused_with_the_existing_error() -> None:
-    """The removal surfaces through the wording exec has always used."""
+def test_a_disallowed_command_is_refused_with_the_existing_error() -> None:
+    """A binary off the list surfaces through the wording exec has always used.
+
+    ``ssh`` is the exemplar rather than anything the sandbox plausibly wants: it
+    has to stay off the list for this test to mean anything, and a command an
+    agent might reasonably need would eventually be added and quietly turn this
+    into a test of nothing.
+    """
     actor = ConcreteSandboxActor()
     actor.on_start()
 
-    with pytest.raises(CommandNotAllowedError, match="git"):
-        actor.exec("git status")
+    assert "ssh" not in ALLOWED_COMMANDS
+    with pytest.raises(CommandNotAllowedError, match="ssh"):
+        actor.exec("ssh nowhere")
 
 
 # ---------------------------------------------------------------------------
