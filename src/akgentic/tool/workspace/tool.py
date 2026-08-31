@@ -5,16 +5,26 @@ Pass ``read_only=True`` to restrict to read-side callables only (``workspace_rea
 ``workspace_list``, ``workspace_glob``, ``workspace_grep``, ``workspace_view``).
 The default ``read_only=False`` also includes write-side callables (``workspace_write``,
 ``workspace_delete``, ``workspace_edit``, ``workspace_multi_edit``, ``workspace_patch``,
-``workspace_mkdir``).  All operations are anchored to a team-scoped
-:class:`~akgentic.tool.workspace.workspace.Filesystem` backend obtained via
-:func:`~akgentic.tool.workspace.workspace.get_workspace`.
+``workspace_mkdir``).
+
+**Reads and mutations take different routes.** A read runs on the calling agent's
+own thread against its own
+:class:`~akgentic.tool.workspace.workspace.Filesystem`, exactly as it always has,
+and reports what it saw to ``#Workspace`` through a fire-and-forget ``tell``. A
+mutation is an ``ask`` to ``#Workspace``, which checks the live file against that
+observation and performs the write itself, in one mailbox turn (ADR-036 §1, §3).
+
+Nothing about the gate is visible in an LLM-facing signature: the six mutation
+callables take exactly what they always took, and the precondition is derived
+server-side from what the actor observed. There is no digest, no ``expected``,
+and no ``force``.
 """
 
 from __future__ import annotations
 
 import base64
-import difflib
 import io
+import logging
 import re as _re
 import shutil
 import subprocess
@@ -23,26 +33,54 @@ from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
 
-from pydantic import PrivateAttr
+from pydantic import Field, PrivateAttr
 from pydantic_ai.messages import BinaryContent
 
+from akgentic.core.actor_address import ActorAddress
+from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.utils import SerializableBaseModel
 from akgentic.tool.core import COMMAND, TOOL_CALL, BaseToolParam, Channels, ToolCard, _resolve
+from akgentic.tool.core.deferred import DEFAULT_WORKER_TIMEOUT_S, poll_deferred
 from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.workspace.edit import (
-    EditItem,
-    EditMatcher,
-    FilePatch,
-    apply_file_patch,
-    detect_line_ending,
-    normalise_endings,
-    parse_patch,
+from akgentic.tool.sandbox.actor import CardMode
+from akgentic.tool.workspace.actor import (
+    WORKSPACE_ACTOR_ROLE,
+    WorkspaceActor,
+    workspace_actor_name,
+)
+from akgentic.tool.workspace.edit import EditItem
+from akgentic.tool.workspace.execution import (
+    DEFAULT_EXEC_POLL_ATTEMPTS,
+    DEFAULT_EXEC_POLL_DELAY_S,
+    DEFAULT_EXEC_TIMEOUT_S,
+    ExecConfig,
+    ExecStatus,
+    format_status,
+    in_progress,
+    poll_attempts_within,
+    resolve_mode,
+    sandbox_config,
+    timed_out,
+)
+from akgentic.tool.workspace.models import (
+    PERM_ERR_MSG,
+    MutationOutcome,
+    MutationStatus,
+    Observation,
+    WorkspaceConfig,
+    content_sha,
 )
 from akgentic.tool.workspace.readers import _MIME_MAP, DocumentReader, MediaContent
 from akgentic.tool.workspace.workspace import Filesystem, get_workspace
 
-_PERM_ERR_MSG = "Path escapes workspace root — use a path relative to the workspace"
+logger = logging.getLogger(__name__)
+
+_PERM_ERR_MSG = PERM_ERR_MSG
+_UNBOUND_MSG = (
+    "The workspace actor is not bound — a mutating WorkspaceTool must be wired "
+    "through observer() with a live orchestrator."
+)
 _REF_RE = _re.compile(r'!!"([^"]+)"|!!(\S+)')
 _PILLOW_FMT: dict[str, str] = {
     ".png": "PNG",
@@ -152,101 +190,70 @@ def _maybe_resize(data: bytes, suffix: str, max_dim: int, root: Path, path: str)
     return resized
 
 
-def _read_text_for_edit(backend: Filesystem, path: str) -> str:
-    """Read a workspace file as UTF-8 text for editing.
-
-    Raises:
-        RetriableError: If the file does not exist — the LLM can retry with a
-            corrected path.
-    """
-    try:
-        return backend.read(path).decode("utf-8")
-    except FileNotFoundError:
-        raise RetriableError(f"File not found: {path}") from None
-
-
-def _substitute_edit(matcher: EditMatcher, content: str, item: EditItem) -> str | None:
-    """Apply one edit's substitution to *content*.
+def _paginate(raw: str, offset: int, limit: int) -> tuple[str, bool]:
+    """Number *raw*'s lines within the requested window.
 
     Returns:
-        The edited content, or ``None`` when ``old_string`` was not found — for
-        ``replace_all`` that means not found even once.
+        The numbered text — with a truncation notice when the window stops short
+        — and whether the window covered the **whole** file. The flag is derived
+        from the same clamped bounds the text is, so what a read records about
+        itself can never disagree with what the agent was shown.
     """
-    if not item.replace_all:
-        match = matcher.find(content, item.old_string)
-        if match is None:
-            return None
-        return content[: match.start] + item.new_string + content[match.end :]
-
-    result = content
-    found_any = False
-    while (match := matcher.find(result, item.old_string)) is not None:
-        found_any = True
-        result = result[: match.start] + item.new_string + result[match.end :]
-    return result if found_any else None
+    lines = raw.splitlines()
+    total = len(lines)
+    start = max(0, offset - 1)
+    end = min(start + limit, total)
+    numbered = "\n".join(f"{start + i + 1:<6}{line}" for i, line in enumerate(lines[start:end]))
+    if end < total:
+        numbered += f"\n[... truncated: {total} lines total, showing {start + 1}-{end} ...]"
+    return numbered, start == 0 and end == total
 
 
-def _write_and_diff(backend: Filesystem, path: str, raw: str, edited: str) -> str:
-    """Write *edited* back to *path* with *raw*'s line endings; return the unified diff.
+def _resolve_outcome(outcome: MutationOutcome) -> str:
+    """Turn the actor's verdict into what the tool callable does.
 
-    Returns an empty string when the edit changed nothing.
+    A refusal is raised as a :class:`RetriableError` — the package's declared
+    "recoverable, retry with corrected input" signal — because that is what
+    carries the rejection, and its diff, into the model's next turn. A returned
+    string is easy for a model to ignore, and the entire point of the gate is
+    that the write must not land.
+
+    Args:
+        outcome: What ``#Workspace`` decided.
+
+    Returns:
+        The message, for the accepted and failed statuses alike.
+
+    Raises:
+        RetriableError: When the mutation was rejected.
     """
-    normalised = normalise_endings(edited, detect_line_ending(raw))
-    backend.write(path, normalised.encode("utf-8"))
-    return "\n".join(
-        difflib.unified_diff(
-            raw.splitlines(),
-            normalised.splitlines(),
-            fromfile=f"a/{path}",
-            tofile=f"b/{path}",
-            lineterm="",
-        )
-    )
+    if outcome.status is MutationStatus.REJECTED:
+        raise RetriableError(outcome.message)
+    return outcome.message
 
 
-def _deleted_paths(patch_text: str) -> set[str]:
-    """Return the paths a patch deletes, read from the raw diff text.
+def _settled_status(status: ExecStatus) -> ExecStatus | None:
+    """Answer the poll only once there is something final to say.
 
-    ``parse_patch`` derives each path from the ``+++`` line, which is ``/dev/null``
-    for a deletion — so the real path must come from the preceding ``--- a/<path>``
-    line here.
+    ``poll_deferred`` stops at the first non-``None``, so a fetch that answered
+    with a *running* status would end the poll on its first attempt and hand the
+    agent a run id it did not need. A failure, by contrast, is final — it is
+    collected as a failure with its reason, never reported as still running.
     """
-    delete_paths: set[str] = set()
-    lines = patch_text.splitlines()
-    for i, line in enumerate(lines):
-        if not (line.startswith("+++ /dev/null") or line.startswith("+++ b//dev/null")):
-            continue
-        for j in range(i - 1, max(i - 5, -1), -1):
-            if lines[j].startswith("--- "):
-                raw_del = lines[j][4:].strip()
-                del_path = raw_del[2:] if raw_del.startswith("a/") else raw_del
-                if del_path != "/dev/null":
-                    delete_paths.add(del_path)
-                break
-    return delete_paths
+    return status if status.settled else None
 
 
-def _apply_one_file_patch(
-    backend: Filesystem, file_patch: FilePatch, delete_paths: set[str]
-) -> list[str]:
-    """Apply a single file patch and return its summary lines.
+def _bound(proxy: WorkspaceActor | None) -> WorkspaceActor:
+    """Return the mutation proxy, refusing to fall back to an ungated write.
 
-    A ``/dev/null`` target is a deletion batch: every path in *delete_paths* is
-    removed. Otherwise the patch is applied and labelled ``created`` when all its
-    hunk lines are additions, ``updated`` when not.
+    Raises:
+        RuntimeError: When the card was never wired to an orchestrator. There is
+            deliberately no ungated path to fall back to: one would be a bypass
+            of the gate reachable from any harness that skipped the binding.
     """
-    if file_patch.path == "/dev/null":
-        results = []
-        for del_path in delete_paths:
-            backend.delete(del_path)
-            results.append(f"deleted: {del_path}")
-        return results
-
-    apply_file_patch(backend, file_patch)
-    is_add = bool(file_patch.hunks) and all(
-        all(pl.startswith("+") for pl in hunk.lines if pl) for hunk in file_patch.hunks
-    )
-    return [f"{'created' if is_add else 'updated'}: {file_patch.path}"]
+    if proxy is None:
+        raise RuntimeError(_UNBOUND_MSG)
+    return proxy
 
 
 def _grep_python(
@@ -464,6 +471,49 @@ class WorkspaceMkdir(BaseToolParam):
     expose: set[Channels] = {TOOL_CALL}
 
 
+class WorkspaceExec(BaseToolParam):
+    """Run a sandboxed shell command against the team workspace.
+
+    Configuration only — nothing here duplicates an argument of the callables it
+    enables. The two budgets it carries are two different things and are easy to
+    conflate:
+
+    - ``timeout_s`` bounds the **subprocess**, and reaches
+      ``subprocess.run(timeout=...)`` in the backend. It is clamped to the
+      worker's own budget, which sits below the orchestrator's stop backstop.
+    - ``poll_attempts`` × ``poll_delay_seconds`` bounds how long the **agent's
+      own thread** waits inside the tool call. It cannot extend the first:
+      raising it buys more looking, never more running.
+
+    ``poll_attempts`` has three settings, and each is bounded by a different
+    thing:
+
+    - ``-1`` (the default) — **wait out the run.** Resolved at wiring time to
+      the count whose wait is the longest still fitting the *effective run
+      budget* (``min(timeout_s, DEFAULT_WORKER_TIMEOUT_S)``) plus
+      :data:`~akgentic.tool.workspace.execution.EXEC_REPORT_MARGIN_S`, so the
+      wait covers the worker's report and not merely the command. The common
+      case then returns the command's own output and the model never sees a run
+      id.
+    - a **positive count** — a bounded look of ``count × poll_delay_seconds``,
+      clamped to the effective run budget and **without** the margin. Exhausting
+      it hands back a run id.
+    - ``0`` — no polling at all: the run id comes back immediately.
+
+    Anything below ``-1`` is a validation error rather than a second spelling of
+    the sentinel.
+
+    A run that outlives the wait is collected with ``workspace_exec_result``; it
+    never outlives ``timeout_s``.
+    """
+
+    expose: set[Channels] = {TOOL_CALL}
+    mode: CardMode = "auto"
+    timeout_s: float = DEFAULT_EXEC_TIMEOUT_S
+    poll_attempts: int = Field(default=DEFAULT_EXEC_POLL_ATTEMPTS, ge=-1)
+    poll_delay_seconds: float = DEFAULT_EXEC_POLL_DELAY_S
+
+
 class ResourceType(StrEnum):
     """Encoding of a seeded resource's ``content`` field.
 
@@ -541,6 +591,50 @@ class WorkspaceTool(ToolCard):
     workspace_patch: WorkspacePatch | bool = True
     workspace_mkdir: WorkspaceMkdir | bool = True
 
+    git_journal: bool = False
+    """Whether accepted mutations are recorded in a git journal.
+
+    A plain field, not a capability param: it exposes no tool, appears in no
+    signature, and nothing about it is expressible by a model.
+
+    **Off by default, because nothing in the system reads what it records.** The
+    gate re-hashes the live file at mutation time and never consults the journal,
+    and an agent's exec result carries ``exit_code``/``stdout``/``stderr`` and not
+    the discovered write set — so the record exists only for a human reading
+    ``git log`` afterwards. That is worth opting into, not worth three ``git``
+    forks on every mutation by default. Turning it on buys history, attribution
+    and out-of-band *detection*; leaving it off loosens the gate by nothing at
+    all, because the gate is pure Python and independent.
+
+    Note what ``getChildrenOrCreate`` implies: the **first** card to create the
+    actor for a workspace decides its configuration, exactly as the observation
+    caps already do. A second card arriving with ``git_journal=False`` does not
+    turn off a journal that is already running, and a card arriving with it on
+    does not start one on an actor already built without it.
+    """
+
+    workspace_exec: WorkspaceExec | bool = False
+    """Sandboxed shell execution — **off unless asked for**, and that is a security
+    decision rather than a style one.
+
+    Every other capability on this card defaults to on because every other one is
+    a file operation the card already implies. Exec is not: defaulting it to
+    ``True`` would give every ``WorkspaceTool()`` in existence sandboxed shell
+    execution through a dependency bump, probe the host for docker at wiring
+    time, and bring a ``#SandboxActor`` into teams that never asked for one.
+    Capability escalation must be opt-in.
+
+    It is also the one field that registers **two** callables — ``workspace_exec``
+    and ``workspace_exec_result`` — breaking the card's otherwise strict
+    one-field-one-callable convention. Deliberate: the result collector is
+    meaningless without the runner, and separate fields would let a team enable
+    the half that cannot do anything.
+
+    Both live on the write side of ``read_only``: exec mutates the tree, whatever
+    the command happens to be, so ``WorkspaceTool(read_only=True,
+    workspace_exec=True)`` registers neither.
+    """
+
     resources: list[Resource] = []
     """Files seeded into the team workspace at observer() time, before the
     agent's first turn. Each resource is written only if its path does not
@@ -551,10 +645,24 @@ class WorkspaceTool(ToolCard):
     # reliably under both normal execution and coverage instrumentation.
     _workspace: Filesystem | None = PrivateAttr(default=None)
 
+    # Two proxies over the one ``#Workspace-<workspace>`` singleton, and the owning
+    # agent's identity as a plain string.  All three are PrivateAttr: a proxy in a
+    # Pydantic field breaks the card's serialisation contract, and the id is
+    # captured as a string so no closure below holds an edge back to the agent
+    # (ADR-030).  The proxies point at a *different* actor, so holding them
+    # strongly roots nothing.
+    #
+    # The split is not stylistic.  Mutations must ask — the closure needs the
+    # verdict.  Observations must tell — the reader needs nothing back, and an
+    # ask would let a slow actor stall a read instead of refusing a write.
+    _workspace_proxy: WorkspaceActor | None = PrivateAttr(default=None)
+    _workspace_tell: WorkspaceActor | None = PrivateAttr(default=None)
+    _agent_id: str = PrivateAttr(default="")
+
     def observer(  # type: ignore[override]
         self, observer: ActorToolObserver
     ) -> WorkspaceTool:
-        """Attach observer and initialise the workspace backend.
+        """Attach observer, initialise the backend, and bind the workspace singleton.
 
         Args:
             observer: Actor tool observer; must have a non-None orchestrator.
@@ -571,7 +679,180 @@ class WorkspaceTool(ToolCard):
         ws_name = self.workspace_id or str(observer.team_id)
         self._workspace = get_workspace(ws_name)
         self._seed_resources()
+        self._bind_workspace_actor(observer, observer.orchestrator, ws_name)
+        self._bind_sandbox(observer, observer.orchestrator)
         return self
+
+    def _enabled_exec(self) -> WorkspaceExec | None:
+        """Return the exec configuration only when it will register callables.
+
+        One predicate, because the two halves of this capability have to agree on
+        what "on" means. They did not: the wiring looked at the field and
+        ``read_only``, while ``_exec_tools`` also required the ``TOOL_CALL``
+        channel — so a card that put exec off the tool channel still resolved the
+        backend, still emitted the ``auto`` fallback warning, and still brought up
+        a ``#SandboxActor`` (a running container, on the docker backend) to serve
+        two callables it then never registered.
+
+        Returns:
+            The parameters, or ``None`` when nothing exec-related should happen.
+        """
+        params = _resolve(self.workspace_exec, WorkspaceExec)
+        if params is None or self.read_only or TOOL_CALL not in params.expose:
+            return None
+        return params
+
+    def _bind_sandbox(self, observer: ActorToolObserver, orchestrator: ActorAddress) -> None:
+        """Bring up the team's ``#SandboxActor`` and tell ``#Workspace`` about it.
+
+        **Nothing happens here when the capability is off** — no host probe, no
+        actor, no message. That is the whole of what ``workspace_exec=False``
+        buys, and it is why the check is at the top rather than inside.
+
+        The order matters: this runs *after* ``_bind_workspace_actor``, because
+        ``configure_exec`` travels over the tell proxy that method binds, and
+        after ``register_agent``, so the actor can already name this agent in a
+        refusal the first run causes.
+
+        Args:
+            observer: The owning agent, live at bind time.
+            orchestrator: Address of the orchestrator.
+
+        Raises:
+            KeyError: If the configured mode names no registered backend —
+                fail-fast at wiring time rather than at the first command.
+        """
+        params = self._enabled_exec()
+        if params is None:
+            return
+        mode, actor_class = resolve_mode(params.mode)
+        config = ExecConfig(
+            mode=mode,
+            team_id=str(observer.team_id),
+            workspace_id=self.workspace_id,
+            timeout_s=params.timeout_s,
+        )
+        orchestrator_proxy = observer.proxy_ask(orchestrator, Orchestrator)
+        orchestrator_proxy.getChildrenOrCreate(actor_class, config=sandbox_config(config))
+        self._announce_exec(config)
+
+    def _announce_exec(self, config: ExecConfig) -> None:
+        """Tell the actor which backend to run commands on — fire and forget.
+
+        Guarded exactly as :meth:`_register_agent_name` is, and for the same
+        reason: a stand-in proxy that does not carry the method, or an actor that
+        died between the get-or-create and this line, must not take the whole card
+        down. Unguarded, this one line was the harsher of two adjacent messages on
+        one binding path — the registration a line earlier already degrades.
+
+        The degradation is an exec request refused for want of a backend: visible,
+        and recoverable by rebinding. A raise at wiring time is neither.
+        """
+        tell = self._workspace_tell
+        if tell is None:
+            return
+        try:
+            tell.configure_exec(config)
+        except Exception:
+            logger.debug("Could not announce the exec backend to #Workspace", exc_info=True)
+
+    def _bind_workspace_actor(
+        self, observer: ActorToolObserver, orchestrator: ActorAddress, workspace_name: str
+    ) -> None:
+        """Bind the ``#Workspace-<workspace_name>`` singleton that owns this tree.
+
+        Get-or-create in one message (ADR-025): a check-then-create pair is a
+        TOCTOU window that produces two singletons over one tree, which is the
+        exact failure the pattern exists to prevent.
+
+        The actor's name carries the workspace, so two cards with different
+        ``workspace_id`` values in one team get two actors, each owning its own
+        tree — the unicity domain of the actor equals the resource it owns.
+
+        Two proxies are bound over the one address: an ask proxy for mutations,
+        which need the verdict, and a tell proxy for observations, which need
+        nothing back.
+
+        The agent's **name** is registered here, once, over the tell proxy. What
+        the card can capture without an edge back to the agent is
+        ``agent_id`` — a UUID — and a journal authored by UUID, or a refusal
+        naming one, is a record nobody can read. This is the only new message the
+        journal adds, and it is O(1), once per card, never on the mutation path.
+
+        Args:
+            observer: The owning agent, live at bind time.
+            orchestrator: Address of the orchestrator.
+            workspace_name: The resolved workspace this card is anchored to.
+        """
+        orchestrator_proxy = observer.proxy_ask(orchestrator, Orchestrator)
+        workspace_addr = orchestrator_proxy.getChildrenOrCreate(
+            WorkspaceActor,
+            config=WorkspaceConfig(
+                name=workspace_actor_name(workspace_name),
+                role=WORKSPACE_ACTOR_ROLE,
+                workspace_name=workspace_name,
+                git_journal=self.git_journal,
+            ),
+        )
+        self._workspace_proxy = observer.proxy_ask(workspace_addr, WorkspaceActor)
+        self._workspace_tell = observer.proxy_tell(workspace_addr, WorkspaceActor)
+        self._agent_id = str(observer.myAddress.agent_id)
+        self._register_agent_name(observer)
+
+    def _register_agent_name(self, observer: ActorToolObserver) -> None:
+        """Tell the actor this agent's display name — fire and forget.
+
+        Never raises: a harness that hands back a stand-in proxy without the
+        method, or an actor that is already gone, must not stop a card binding.
+        The consequence of a lost registration is that the journal and the
+        refusals fall back to the agent id, which is degraded and not broken.
+        """
+        proxy = self._workspace_tell
+        if proxy is None:
+            return
+        try:
+            proxy.register_agent(self._agent_id, str(observer.myAddress.name))
+        except Exception:
+            logger.debug("Could not register the agent's name with #Workspace", exc_info=True)
+
+    def _observation_recorder(self) -> Callable[[str, bytes, bool], None]:
+        """Build the closure a read closure uses to report what it saw.
+
+        The **tell** proxy and the agent id are captured **here**, at
+        ``get_tools`` time, as a proxy to a different actor and a plain string.
+        Neither is an edge back to the owning agent, which is what keeps the read
+        closures free of the retention ADR-030 forbids.
+
+        The tell is what makes "a read never waits on the actor" a property
+        rather than a hope. From this story the actor hashes files on its ask
+        path, so a read that asked would queue behind another agent's mutation
+        hashing a large file; the ``except`` below would not save it, because a
+        fail-open guard covers a raising actor and a dead one, never a hung one.
+
+        Returns:
+            A callable taking the path, the file's raw bytes and whether the read
+            covered the whole file. It never raises: a lost observation is a lost
+            precondition, which the gate turns into a *refused* write — it must
+            never turn into a failed read.
+        """
+        proxy = self._workspace_tell
+        agent_id = self._agent_id
+
+        def record(path: str, data: bytes, full: bool) -> None:
+            if proxy is None:
+                return  # harness shapes that wire a bare observer never bind one
+            try:
+                proxy.record_observation(
+                    agent_id, path, Observation(sha=content_sha(data), full=full)
+                )
+            except Exception:
+                # Deliberately blind: a lost precondition, never a lost read. The
+                # gate reads a missing observation as "you have not read this" and
+                # refuses the overwrite, so every failure here degrades towards
+                # refusing a write rather than accepting a stale one.
+                logger.debug("Could not record an observation for %s", path, exc_info=True)
+
+        return record
 
     def _seed_resources(self) -> None:
         """Write each configured resource that is not already present.
@@ -622,7 +903,12 @@ class WorkspaceTool(ToolCard):
         return [tool for tool in candidates if tool is not None]
 
     def _write_tools(self) -> list[Callable[..., Any]]:
-        """Return enabled write-side callables — omitted entirely when ``read_only``."""
+        """Return enabled write-side callables — omitted entirely when ``read_only``.
+
+        Exec lands here rather than beside the reads because a command mutates
+        the tree whatever it happens to be, so it belongs on the write side of
+        the ``read_only`` gate.
+        """
         candidates = [
             self._tool_if_enabled(self.workspace_write, WorkspaceWrite, self._write_factory),
             self._tool_if_enabled(self.workspace_delete, WorkspaceDelete, self._delete_factory),
@@ -633,7 +919,24 @@ class WorkspaceTool(ToolCard):
             self._tool_if_enabled(self.workspace_patch, WorkspacePatch, self._patch_factory),
             self._tool_if_enabled(self.workspace_mkdir, WorkspaceMkdir, self._mkdir_factory),
         ]
-        return [tool for tool in candidates if tool is not None]
+        tools = [tool for tool in candidates if tool is not None]
+        return tools + self._exec_tools()
+
+    def _exec_tools(self) -> list[Callable[..., Any]]:
+        """Return both exec callables, or neither.
+
+        The one place in this card where a single capability field yields two
+        callables. ``_tool_if_enabled`` encodes the 1:1 shape and is deliberately
+        not used here — ``workspace_exec_result`` can do nothing without
+        ``workspace_exec``, so the pair is enabled or absent as a unit.
+
+        Shares :meth:`_enabled_exec` with the wiring, so the callables and the
+        actor they need can never disagree about whether the capability is on.
+        """
+        params = self._enabled_exec()
+        if params is None:
+            return []
+        return [self._exec_factory(params), self._exec_result_factory(params)]
 
     @staticmethod
     def _tool_if_enabled(
@@ -741,6 +1044,7 @@ class WorkspaceTool(ToolCard):
             Callable that reads a workspace file with pagination.
         """
         backend = self.workspace
+        record = self._observation_recorder()
         _dr_cfg = params.document_reader
         if _dr_cfg is True:
             document_reader: DocumentReader | None = DocumentReader()
@@ -788,6 +1092,11 @@ class WorkspaceTool(ToolCard):
                 )
 
             try:
+                # Raw source bytes, and only on the branch that actually read them.
+                # A document read shows extracted Markdown rather than the file, and
+                # on a sidecar cache hit the source is never opened at all — hashing
+                # it would put a full file read back onto the path NFR1 keeps free.
+                observed: bytes | None = None
                 if (
                     not is_sidecar
                     and document_reader is not None
@@ -803,19 +1112,13 @@ class WorkspaceTool(ToolCard):
                         sidecar.write_text(raw, encoding="utf-8")
                 else:
                     # Text path (existing logic)
-                    raw = backend.read(path).decode("utf-8")
+                    observed = backend.read(path)
+                    raw = observed.decode("utf-8")
 
-                lines = raw.splitlines()
-                total = len(lines)
-                start = max(0, offset - 1)
-                end = min(start + limit, total)
-                numbered = "\n".join(
-                    f"{start + i + 1:<6}{line}" for i, line in enumerate(lines[start:end])
-                )
-                if end < total:
-                    numbered += (
-                        f"\n[... truncated: {total} lines total, showing {start + 1}-{end} ...]"
-                    )
+                numbered, full = _paginate(raw, offset, limit)
+                if observed is not None:
+                    # One recording call per invocation, whatever the file's size.
+                    record(path, observed, full)
                 return numbered
             except FileNotFoundError:
                 raise RetriableError(f"File not found: {path}")
@@ -1065,12 +1368,18 @@ class WorkspaceTool(ToolCard):
             params: Write capability configuration.
 
         Returns:
-            Callable that writes content to a workspace file.
+            Callable that writes content to a workspace file, through the actor.
         """
-        backend = self.workspace
+        proxy = self._workspace_proxy
+        agent_id = self._agent_id
 
         def workspace_write(path: str, content: str) -> str:
             """Write content to a file in the team workspace.
+
+            Refused if another writer has changed the file since you last read
+            it, or if you have not read it at all — the refusal shows you what
+            your content would have replaced. Read the file again and redo the
+            change against what is now there.
 
             Args:
                 path: Relative path from workspace root (e.g. "src/main.py").
@@ -1080,19 +1389,10 @@ class WorkspaceTool(ToolCard):
                 Confirmation string "Written: <path>".
 
             Raises:
-                RetriableError: If the path escapes the workspace root.
+                RetriableError: If the write is refused, or the path escapes the
+                    workspace root.
             """
-            try:
-                try:
-                    existing = backend.read(path).decode("utf-8")
-                    line_ending = detect_line_ending(existing)
-                    normalised = normalise_endings(content, line_ending)
-                except (FileNotFoundError, UnicodeDecodeError):
-                    normalised = content  # new file or non-UTF-8 — use content as-is
-                backend.write(path, normalised.encode("utf-8"))
-                return f"Written: {path}"
-            except PermissionError:
-                raise RetriableError(_PERM_ERR_MSG)
+            return _resolve_outcome(_bound(proxy).apply_write(agent_id, path, content))
 
         workspace_write.__doc__ = params.format_docstring(workspace_write.__doc__)
         return workspace_write
@@ -1104,12 +1404,17 @@ class WorkspaceTool(ToolCard):
             params: Delete capability configuration.
 
         Returns:
-            Callable that deletes a file from the workspace.
+            Callable that deletes a file from the workspace, through the actor.
         """
-        backend = self.workspace
+        proxy = self._workspace_proxy
+        agent_id = self._agent_id
 
         def workspace_delete(path: str) -> str:
             """Delete a file from the team workspace.
+
+            Refused unless you have read the whole file and it has not changed
+            since — deleting a file someone else has just rewritten destroys
+            work you never saw.
 
             Args:
                 path: Relative path from workspace root (e.g. "src/old.py").
@@ -1118,15 +1423,10 @@ class WorkspaceTool(ToolCard):
                 Confirmation string "Deleted: <path>".
 
             Raises:
-                RetriableError: If the path does not exist or escapes the workspace root.
+                RetriableError: If the delete is refused, the path does not
+                    exist, or it escapes the workspace root.
             """
-            try:
-                backend.delete(path)
-                return f"Deleted: {path}"
-            except FileNotFoundError:
-                raise RetriableError(f"File not found: {path}")
-            except PermissionError:
-                raise RetriableError(_PERM_ERR_MSG)
+            return _resolve_outcome(_bound(proxy).apply_delete(agent_id, path))
 
         workspace_delete.__doc__ = params.format_docstring(workspace_delete.__doc__)
         return workspace_delete
@@ -1138,10 +1438,10 @@ class WorkspaceTool(ToolCard):
             params: Edit capability configuration.
 
         Returns:
-            Callable that applies a surgical find-and-replace edit to a workspace file.
+            Callable that applies a surgical find-and-replace edit, through the actor.
         """
-        backend = self.workspace
-        matcher = EditMatcher()
+        proxy = self._workspace_proxy
+        agent_id = self._agent_id
 
         def workspace_edit(
             path: str,
@@ -1150,6 +1450,11 @@ class WorkspaceTool(ToolCard):
             replace_all: bool = False,
         ) -> str:
             """Apply a surgical find-and-replace edit to a workspace file.
+
+            Preferred over workspace_write for changing part of a file: an edit
+            survives a concurrent change to an unrelated region, where replacing
+            the whole file cannot. On a file that changed since you read it,
+            old_string must match exactly.
 
             Args:
                 path: Relative path from workspace root.
@@ -1161,50 +1466,12 @@ class WorkspaceTool(ToolCard):
                 Unified diff string of the change, or "[ERROR] ..." on failure.
 
             Raises:
-                RetriableError: If path does not exist or escapes the workspace root.
+                RetriableError: If the edit is refused, the path does not exist,
+                    or it escapes the workspace root.
             """
-            try:
-                raw = backend.read(path).decode("utf-8")
-                line_ending = detect_line_ending(raw)
-                content = raw
-
-                if replace_all:
-                    new_content = content
-                    found_any = False
-                    while True:
-                        match = matcher.find(new_content, old_string)
-                        if match is None:
-                            break
-                        found_any = True
-                        new_content = (
-                            new_content[: match.start] + new_string + new_content[match.end :]
-                        )
-                    if not found_any:
-                        return f"[ERROR] old_string not found in {path}"
-                    content = new_content
-                else:
-                    match = matcher.find(content, old_string)
-                    if match is None:
-                        return f"[ERROR] old_string not found in {path}"
-                    content = content[: match.start] + new_string + content[match.end :]
-
-                normalised = normalise_endings(content, line_ending)
-                backend.write(path, normalised.encode("utf-8"))
-
-                diff_lines = list(
-                    difflib.unified_diff(
-                        raw.splitlines(),
-                        normalised.splitlines(),
-                        fromfile=f"a/{path}",
-                        tofile=f"b/{path}",
-                        lineterm="",
-                    )
-                )
-                return "\n".join(diff_lines) if diff_lines else f"(no change) {path}"
-            except FileNotFoundError:
-                raise RetriableError(f"File not found: {path}")
-            except PermissionError:
-                raise RetriableError(_PERM_ERR_MSG)
+            return _resolve_outcome(
+                _bound(proxy).apply_edit(agent_id, path, old_string, new_string, replace_all)
+            )
 
         workspace_edit.__doc__ = params.format_docstring(workspace_edit.__doc__)
         return workspace_edit
@@ -1216,40 +1483,29 @@ class WorkspaceTool(ToolCard):
             params: Multi-edit capability configuration.
 
         Returns:
-            Callable that applies a sequence of find-and-replace edits to workspace files.
+            Callable that applies a batch of find-and-replace edits, through the actor.
         """
-        backend = self.workspace
-        matcher = EditMatcher()
+        proxy = self._workspace_proxy
+        agent_id = self._agent_id
 
         def workspace_multi_edit(edits: list[EditItem]) -> str:
             """Apply a sequence of find-and-replace edits to workspace files.
 
+            All-or-nothing: if any edit is refused or its old_string is not
+            found, no file in the batch is changed on disk.
+
             Args:
                 edits: Ordered list of EditItem objects. Each edit is applied
                     sequentially; each sees the result of the previous one.
-                    Stops on first failure — no rollback.
 
             Returns:
                 Combined unified diff of all applied edits, or "[ERROR] ..." on failure.
 
             Raises:
-                RetriableError: If a target file does not exist or a path escapes
-                    the workspace root.
+                RetriableError: If any edit is refused, a target file does not
+                    exist, or a path escapes the workspace root.
             """
-            try:
-                all_diffs: list[str] = []
-                for item in edits:
-                    raw = _read_text_for_edit(backend, item.path)
-                    edited = _substitute_edit(matcher, raw, item)
-                    if edited is None:
-                        return f"[ERROR] old_string not found in {item.path}"
-                    diff = _write_and_diff(backend, item.path, raw, edited)
-                    if diff:
-                        all_diffs.append(diff)
-
-                return "\n".join(all_diffs) if all_diffs else "(no changes applied)"
-            except PermissionError:
-                raise RetriableError(_PERM_ERR_MSG)
+            return _resolve_outcome(_bound(proxy).apply_multi_edit(agent_id, edits))
 
         workspace_multi_edit.__doc__ = params.format_docstring(workspace_multi_edit.__doc__)
         return workspace_multi_edit
@@ -1261,14 +1517,17 @@ class WorkspaceTool(ToolCard):
             params: Patch capability configuration.
 
         Returns:
-            Callable that applies a unified diff patch to the team workspace.
+            Callable that applies a unified diff patch, through the actor.
         """
-        backend = self.workspace
+        proxy = self._workspace_proxy
+        agent_id = self._agent_id
 
         def workspace_patch(patch_text: str) -> str:
             """Apply a unified diff patch to the team workspace.
 
             Supports add (--- /dev/null), update, and delete (+++ /dev/null).
+            Every file the patch touches is checked against what you last read
+            of it. Application stops at the first file that fails.
 
             Args:
                 patch_text: GNU unified diff string.
@@ -1278,21 +1537,10 @@ class WorkspaceTool(ToolCard):
                 "deleted: ...". Returns "[ERROR] ..." on failure.
 
             Raises:
-                RetriableError: If any path escapes the workspace root.
+                RetriableError: If a file's change is refused, or any path
+                    escapes the workspace root.
             """
-            try:
-                delete_paths = _deleted_paths(patch_text)
-                results: list[str] = []
-
-                for fp in parse_patch(patch_text):
-                    try:
-                        results += _apply_one_file_patch(backend, fp, delete_paths)
-                    except Exception as exc:
-                        return f"[ERROR] {fp.path}: {exc}"
-
-                return "\n".join(results) if results else "(no patches applied)"
-            except PermissionError:
-                raise RetriableError(_PERM_ERR_MSG)
+            return _resolve_outcome(_bound(proxy).apply_patch(agent_id, patch_text))
 
         workspace_patch.__doc__ = params.format_docstring(workspace_patch.__doc__)
         return workspace_patch
@@ -1304,9 +1552,10 @@ class WorkspaceTool(ToolCard):
             params: Mkdir capability configuration.
 
         Returns:
-            Callable that creates a directory in the workspace.
+            Callable that creates a directory in the workspace, through the actor.
         """
-        backend = self.workspace
+        proxy = self._workspace_proxy
+        agent_id = self._agent_id
 
         def workspace_mkdir(path: str) -> str:
             """Create a directory and all missing parents in the team workspace.
@@ -1320,11 +1569,102 @@ class WorkspaceTool(ToolCard):
             Raises:
                 RetriableError: If the path escapes the workspace root.
             """
-            try:
-                backend.mkdir(path)
-                return f"Created: {path}"
-            except PermissionError:
-                raise RetriableError(_PERM_ERR_MSG)
+            return _resolve_outcome(_bound(proxy).apply_mkdir(agent_id, path))
 
         workspace_mkdir.__doc__ = params.format_docstring(workspace_mkdir.__doc__)
         return workspace_mkdir
+
+    def _exec_factory(self, params: WorkspaceExec) -> Callable[..., Any]:
+        """Create the ``workspace_exec`` tool callable.
+
+        Args:
+            params: Exec capability configuration.
+
+        Returns:
+            Callable that runs a sandboxed command, through the actor.
+        """
+        proxy = self._workspace_proxy
+        agent_id = self._agent_id
+        delay = params.poll_delay_seconds
+        # The effective run budget — the card's ask after the worker's ceiling —
+        # is what actually stops the run, so it is what both the sentinel and the
+        # clamp are measured against. A card asking for 999 s never gets more
+        # than the worker allows it either way.
+        run_budget = min(params.timeout_s, DEFAULT_WORKER_TIMEOUT_S)
+        # Resolved once, here, so nothing downstream knows the sentinel existed.
+        attempts = poll_attempts_within(params.poll_attempts, delay, run_budget)
+        # Which budget was in force decides which exhaustion message is honest,
+        # and it is a property of the card, not of the run — so it is computed
+        # here rather than re-derived on every call.
+        waits_out_the_run = params.poll_attempts < 0
+
+        def workspace_exec(cmd: str, cwd: str = "") -> str:
+            """Run a shell command in the team workspace, in a sandbox.
+
+            This waits for the command and gives you its output. The workspace is
+            held exclusively for the duration of the run: your teammates can still
+            read files, but every change they attempt is refused until it
+            finishes. Everything the command touched — files you never named
+            included — is recorded as one change attributed to you.
+
+            A run that outlives the wait is the exception, and then you get a run
+            id instead of output; workspace_exec_result collects that run's output
+            once it lands.
+
+            Args:
+                cmd: Full command string. The binary (first token) must be in
+                    the allow-list.
+                cwd: Subdirectory relative to workspace root. Defaults to root.
+
+            Returns:
+                Combined stdout, stderr and exit code — or, for a run that
+                outlived the wait, a message naming the run id.
+
+            Raises:
+                RetriableError: If another agent's run holds the workspace.
+            """
+            start = _bound(proxy).request_exec(agent_id, cmd, cwd)
+            if not start.run_id:
+                raise RetriableError(start.refusal)
+            run_id = start.run_id
+            settled = poll_deferred(
+                lambda: _settled_status(_bound(proxy).exec_status(agent_id, run_id)),
+                attempts=attempts,
+                delay=delay,
+            )
+            if settled is not None:
+                return format_status(settled)
+            if waits_out_the_run:
+                return timed_out(run_id, run_budget)
+            return in_progress(run_id)
+
+        workspace_exec.__doc__ = params.format_docstring(workspace_exec.__doc__)
+        return workspace_exec
+
+    def _exec_result_factory(self, params: WorkspaceExec) -> Callable[..., Any]:
+        """Create the ``workspace_exec_result`` tool callable.
+
+        Args:
+            params: Exec capability configuration.
+
+        Returns:
+            Callable that collects a finished run's output, through the actor.
+        """
+        proxy = self._workspace_proxy
+        agent_id = self._agent_id
+
+        def workspace_exec_result(run_id: str) -> str:
+            """Collect the output of a command started by workspace_exec.
+
+            Args:
+                run_id: The id workspace_exec handed back.
+
+            Returns:
+                The command's output if it has finished, a note that it is still
+                running, why it failed, or — for an id nothing was issued under —
+                your recent run ids so you can retry with the right one.
+            """
+            return format_status(_bound(proxy).exec_status(agent_id, run_id))
+
+        workspace_exec_result.__doc__ = params.format_docstring(workspace_exec_result.__doc__)
+        return workspace_exec_result

@@ -163,6 +163,13 @@ class FakeActorToolObserver:
             return self._orchestrator_proxy
         return self._orchestrator_proxy.actor_for(actor)
 
+    def proxy_tell(
+        self,
+        actor: ActorAddress,
+        actor_type: type[AkgentType] | None = None,
+    ) -> Any:
+        return self._orchestrator_proxy.actor_for(actor)
+
 
 @pytest.fixture
 def orchestrator_proxy() -> Generator[FakeOrchestratorProxy, None, None]:

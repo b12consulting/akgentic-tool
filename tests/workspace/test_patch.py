@@ -4,7 +4,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from akgentic.tool.workspace.edit import FilePatch, Hunk, apply_file_patch, parse_patch
+import pytest
+
+from akgentic.tool.workspace.edit import (
+    FilePatch,
+    Hunk,
+    HunkContextError,
+    apply_file_patch,
+    parse_patch,
+    render_file_patch,
+)
 from akgentic.tool.workspace.workspace import Filesystem
 
 # ---------------------------------------------------------------------------
@@ -159,9 +168,9 @@ def test_parse_patch_hunk_header_missing_count_defaults_to_one() -> None:
     assert len(patches) == 1
     hunk = patches[0].hunks[0]
     assert hunk.old_start == 1
-    assert hunk.old_count == 1   # defaulted from missing count
+    assert hunk.old_count == 1  # defaulted from missing count
     assert hunk.new_start == 1
-    assert hunk.new_count == 1   # defaulted from missing count
+    assert hunk.new_count == 1  # defaulted from missing count
 
 
 # ---------------------------------------------------------------------------
@@ -310,3 +319,101 @@ def test_apply_file_patch_multi_hunk(tmp_path: Path) -> None:
     assert "line1" in result
     assert "line3" in result
     assert "line7" in result
+
+
+# ---------------------------------------------------------------------------
+# render_file_patch — a hunk is applied only where its context matches
+# ---------------------------------------------------------------------------
+
+
+def _hunk(old_start: int, old_count: int, *lines: str) -> Hunk:
+    """A hunk at *old_start* carrying *lines*, with a plausible new-side header."""
+    added = len([line for line in lines if line[:1] in ("+", " ")])
+    return Hunk(
+        old_start=old_start,
+        old_count=old_count,
+        new_start=old_start,
+        new_count=added,
+        lines=list(lines),
+    )
+
+
+class TestHunkContextVerification:
+    """``render_file_patch`` used to splice at ``old_start`` and check nothing.
+
+    That is the defect: a diff cut against an older revision rewrote whichever
+    lines now sat at those numbers and reported success — silent corruption, and
+    strictly worse than a refusal, because the file afterwards looks plausible.
+
+    ``apply_file_patch`` is public and this changes it for every caller: a patch
+    whose hunks never matched their context used to apply positionally and now
+    raises.
+    """
+
+    def test_matching_context_applies_where_the_diff_says(self) -> None:
+        raw = "line1\nold\nline3\n"
+        patch = FilePatch(path="f.py", hunks=[_hunk(2, 1, "-old", "+new")])
+        assert render_file_patch(raw, patch) == "line1\nnew\nline3\n"
+
+    def test_a_block_that_moved_is_relocated_by_offset(self) -> None:
+        # The lines moved; the patch is still anchored to text that exists
+        # exactly once. This is FR6's degradation — a surgical change surviving a
+        # concurrent change to an unrelated region of the same file.
+        raw = "# banner\nline1\nold\nline3\n"
+        patch = FilePatch(path="f.py", hunks=[_hunk(2, 1, "-old", "+new")])
+        assert render_file_patch(raw, patch) == "# banner\nline1\nnew\nline3\n"
+
+    def test_absent_context_raises_and_names_the_hunk(self) -> None:
+        raw = "wholly different\n"
+        patch = FilePatch(path="f.py", hunks=[_hunk(2, 1, "-old", "+new")])
+        with pytest.raises(HunkContextError) as failure:
+            render_file_patch(raw, patch)
+        assert failure.value.path == "f.py"
+        assert failure.value.header == "@@ -2,1 +2,1 @@"
+        assert failure.value.occurrences == 0
+
+    def test_ambiguous_context_raises_rather_than_guessing(self) -> None:
+        raw = "marker\nx\nmarker\n"
+        patch = FilePatch(path="f.py", hunks=[_hunk(9, 1, "-marker", "+MARKER")])
+        with pytest.raises(HunkContextError) as failure:
+            render_file_patch(raw, patch)
+        assert failure.value.occurrences == 2
+
+    def test_no_fuzzy_fallback(self) -> None:
+        # An approximate anchor is not an anchor. Whitespace that a fuzzy matcher
+        # would forgive is a mismatch here, on purpose.
+        raw = "def  foo():\n    pass\n"
+        patch = FilePatch(path="f.py", hunks=[_hunk(1, 1, "-def foo():", "+def bar():")])
+        with pytest.raises(HunkContextError):
+            render_file_patch(raw, patch)
+
+    def test_an_insertion_only_hunk_has_nothing_to_verify(self) -> None:
+        # An empty old block is a position, not an anchor, so it goes in at
+        # old_start as it always did. (A patch whose *every* line is an addition
+        # is a file creation — `is_pure_add` — which is why this one carries a
+        # second, ordinary hunk.)
+        raw = "line1\nline2\nlast\n"
+        patch = FilePatch(
+            path="f.py",
+            hunks=[_hunk(2, 0, "+inserted"), _hunk(3, 1, "-last", "+LAST")],
+        )
+        assert render_file_patch(raw, patch) == "line1\ninserted\nline2\nLAST\n"
+
+    def test_a_relocated_hunk_moves_the_frame_for_the_ones_after_it(self) -> None:
+        # Carrying the *position* forward rather than only the length delta is
+        # what keeps a multi-hunk patch coherent once the first hunk relocates.
+        raw = "pad\npad\nfirst\nmiddle\nsecond\n"
+        patch = FilePatch(
+            path="f.py",
+            hunks=[_hunk(1, 1, "-first", "+FIRST"), _hunk(3, 1, "-second", "+SECOND")],
+        )
+        assert render_file_patch(raw, patch) == "pad\npad\nFIRST\nmiddle\nSECOND\n"
+
+    def test_apply_file_patch_propagates_the_failure(self, tmp_path: Path) -> None:
+        fs = Filesystem(str(tmp_path), "ws")
+        fs.write("foo.py", b"nothing like the patch\n")
+        patch = FilePatch(path="foo.py", hunks=[_hunk(1, 1, "-old", "+new")])
+        with pytest.raises(HunkContextError):
+            apply_file_patch(fs, patch)
+        # Nothing was written: the check happens before the splice.
+        assert fs.read("foo.py") == b"nothing like the patch\n"

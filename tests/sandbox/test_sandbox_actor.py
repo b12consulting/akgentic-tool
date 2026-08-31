@@ -22,6 +22,7 @@ from akgentic.tool.sandbox.actor import (
     SandboxActor,
     SandboxConfig,
     SandboxState,
+    sandbox_actor_name,
 )
 
 # ---------------------------------------------------------------------------
@@ -38,7 +39,7 @@ class ConcreteSandboxActor(SandboxActor):
     def _stop_sandbox(self) -> None:
         pass  # no-op for testing
 
-    def _exec(self, cmd: str, cwd: str) -> ExecResult:
+    def _exec(self, cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
         return ExecResult(stdout="ok", stderr="", exit_code=0)
 
 
@@ -55,8 +56,20 @@ class FailingStopSandboxActor(ConcreteSandboxActor):
 
 
 def test_sandbox_actor_name_constant() -> None:
-    """AC3: SANDBOX_ACTOR_NAME is the expected string."""
+    """AC3: SANDBOX_ACTOR_NAME is the expected string.
+
+    It is the **prefix**, not the actor's name — the live name appends the
+    workspace, see ``sandbox_actor_name`` below.
+    """
     assert SANDBOX_ACTOR_NAME == "#SandboxActor"
+
+
+def test_sandbox_actor_name_carries_the_workspace() -> None:
+    """One actor per tree: the name is what ``getChildrenOrCreate`` keys on."""
+    assert sandbox_actor_name("proj-42") == "#SandboxActor-proj-42"
+    assert sandbox_actor_name("a") != sandbox_actor_name("b")
+    # The teardown invariant survives the suffix: a tool actor is one by prefix.
+    assert sandbox_actor_name("proj-42").startswith("#")
 
 
 def test_sandbox_actor_role_constant() -> None:
@@ -184,38 +197,84 @@ def test_allowed_commands_is_frozenset() -> None:
 
 
 def test_allowed_commands_exact_set() -> None:
-    """AC2: ALLOWED_COMMANDS contains exactly the FR-SB-5 binaries."""
+    """AC2: ALLOWED_COMMANDS contains exactly the binaries the sandbox offers.
+
+    Pinned as an exact set on purpose: every entry widens what an agent can run
+    inside the sandbox, so adding one is a decision that has to be made twice —
+    once in the source and once here.
+    """
     expected = frozenset(
         {
+            # Python
             "python",
             "python3",
             "pytest",
             "ruff",
             "mypy",
-            "git",
             "uv",
             "pip",
-            "cat",
-            "ls",
-            "find",
-            "grep",
-            "mkdir",
-            "cp",
-            "mv",
-            "rm",
-            "echo",
-            "touch",
-            "curl",
-            "wget",
-            "make",
-            "bash",
-            "sh",
+            # Web
             "node",
             "npm",
             "npx",
+            # bash
+            "sh",
+            "bash",
+            "cat",
+            "echo",
+            "ls",
+            "cp",
+            "mv",
+            "rm",
+            "mkdir",
+            "find",
+            "grep",
+            "sed",
+            "awk",
+            "jq",
+            "wc",
+            "xargs",
+            "touch",
+            "make",
+            "git",
+            "kill",
+            # Network
+            "curl",
+            "wget",
         }
     )
     assert ALLOWED_COMMANDS == expected
+    assert len(ALLOWED_COMMANDS) == 32
+
+
+def test_git_is_allowed_and_the_journal_is_protected_by_the_mount() -> None:
+    """``git`` is on the list, and taking it off would not have protected anything.
+
+    It was briefly removed as defence in depth. That was never the boundary, and
+    the test says why: ``bash`` and ``sh`` are on the list and only the first
+    token is checked, so ``bash -c "git ..."`` walks straight past it. What
+    actually protects the journal is that it lives at the sibling ``<root>.git``,
+    outside every isolating backend's mount — see
+    ``tests/sandbox/test_journal_placement.py``.
+    """
+    assert "git" in ALLOWED_COMMANDS
+    assert "bash" in ALLOWED_COMMANDS
+
+
+def test_a_disallowed_command_is_refused_with_the_existing_error() -> None:
+    """A binary off the list surfaces through the wording exec has always used.
+
+    ``ssh`` is the exemplar rather than anything the sandbox plausibly wants: it
+    has to stay off the list for this test to mean anything, and a command an
+    agent might reasonably need would eventually be added and quietly turn this
+    into a test of nothing.
+    """
+    actor = ConcreteSandboxActor()
+    actor.on_start()
+
+    assert "ssh" not in ALLOWED_COMMANDS
+    with pytest.raises(CommandNotAllowedError, match="ssh"):
+        actor.exec("ssh nowhere")
 
 
 # ---------------------------------------------------------------------------
@@ -236,23 +295,32 @@ def test_exec_allowed_command_delegates_to_exec_impl() -> None:
 
 
 def test_exec_allowed_command_passes_cmd_and_cwd() -> None:
-    """exec() passes cmd and cwd to _exec unmodified."""
+    """exec() passes cmd, cwd and the timeout to _exec unmodified.
+
+    The timeout joined this tuple in 29-5: a worker owning a budget has to be
+    able to hand it to the subprocess, and a budget that stops at the proxy is
+    decoration — a Python thread cannot be cancelled.
+    """
     actor = ConcreteSandboxActor()
     actor.on_start()
 
-    received: list[tuple[str, str]] = []
+    received: list[tuple[str, str, float | None]] = []
 
     original_exec = actor._exec
 
-    def capturing_exec(cmd: str, cwd: str) -> ExecResult:
-        received.append((cmd, cwd))
-        return original_exec(cmd, cwd)
+    def capturing_exec(cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
+        received.append((cmd, cwd, timeout))
+        return original_exec(cmd, cwd, timeout)
 
     actor._exec = capturing_exec  # type: ignore[method-assign]
 
     actor.exec("python main.py", "/workspace")
+    actor.exec("python main.py", "/workspace", timeout=7.5)
 
-    assert received == [("python main.py", "/workspace")]
+    assert received == [
+        ("python main.py", "/workspace", None),
+        ("python main.py", "/workspace", 7.5),
+    ]
 
 
 # ---------------------------------------------------------------------------

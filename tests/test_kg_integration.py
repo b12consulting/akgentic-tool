@@ -142,6 +142,13 @@ class IntegrationObserver:
             return MagicMock()  # mock VectorStoreActor proxy
         return self._kg_actor
 
+    def proxy_tell(
+        self,
+        actor: ActorAddress,
+        actor_type: type[AkgentType] | None = None,
+    ) -> Any:
+        return self.proxy_ask(actor, actor_type)
+
 
 def test_integration_observer_conforms_to_protocol() -> None:
     """Story 35-1 sweep: the fake satisfies the widened ``ActorToolObserver``."""

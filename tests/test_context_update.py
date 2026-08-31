@@ -95,6 +95,13 @@ class _Observer:
     ) -> Any:
         return None
 
+    def proxy_tell(
+        self,
+        actor: ActorAddress,
+        actor_type: type[AkgentType] | None = None,
+    ) -> Any:
+        return None
+
 
 def _user(content: str | list[str]) -> ModelRequest:
     return ModelRequest(parts=[UserPromptPart(content=content)])

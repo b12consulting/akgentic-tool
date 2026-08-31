@@ -10,11 +10,67 @@ variable (default: ``./workspaces``).
 
 from __future__ import annotations
 
+import contextlib
 import os
+import re
+import shutil
 from pathlib import Path
 from typing import Protocol, runtime_checkable
+from uuid import uuid4
 
 from pydantic import BaseModel
+
+# Creation mode for a newly written file, before the process umask is applied by
+# the kernel.  Matching what a plain ``open(path, "wb")`` would request keeps the
+# staged file's mode identical to an unstaged write's — see Filesystem.write.
+_DEFAULT_FILE_MODE = 0o666
+
+# Budget in bytes for the target's own name inside a staging file's name.  The
+# affixes around it cost 38 bytes (two dots, 32 hex digits, ".tmp"), and a name
+# over the usual 255-byte limit is rejected outright by ``os.open`` — so copying
+# a long target name whole would fail writes that used to succeed.
+_STAGED_NAME_BUDGET = 255 - 38
+
+# The staging name ``write`` publishes from, and the predicate that recognises
+# one afterwards.  They sit together because they are two halves of one shape:
+# ``#Workspace`` sweeps orphaned staging files at start, and a reader-side
+# pattern that drifted from the writer would either miss them or delete a
+# legitimate file.
+_STAGED_NAME_TEMPLATE = ".{stem}.{token}.tmp"
+_STAGED_NAME_RE = re.compile(r"^\..+\.[0-9a-f]{32}\.tmp$")
+
+
+def is_staging_name(name: str) -> bool:
+    """Whether *name* is a staging file :meth:`Filesystem.write` left behind.
+
+    The 32 hex digits are load-bearing rather than decoration: they are what
+    keeps an agent's own ``.notes.tmp`` — or any hand-written ``.tmp`` file — out
+    of a sweep that would otherwise delete it.
+
+    Args:
+        name: A single path component, not a path.
+
+    Returns:
+        True for the ``.<name>.<32 hex digits>.tmp`` shape, False otherwise.
+    """
+    return _STAGED_NAME_RE.match(name) is not None
+
+
+class PathEscapeError(PermissionError):
+    """A path that resolved outside the workspace root.
+
+    A subclass rather than a new exception so that every existing
+    ``except PermissionError`` keeps catching it and nothing outside changes by
+    accident. What it buys is the one distinction the workspace could not make
+    before: an *escaping path* and an *OS-denied write* both arrive as
+    ``PermissionError``, and telling an agent its path escaped the workspace
+    when the path is fine and the file is simply not replaceable sends it
+    rewriting a correct path for ever.
+
+    The second case stopped being hypothetical with ``workspace_exec``: a run in
+    a container writes as another uid, and publication by rename means the host
+    process must be able to replace that inode on the next write.
+    """
 
 
 class FileEntry(BaseModel):
@@ -23,6 +79,22 @@ class FileEntry(BaseModel):
     name: str
     is_dir: bool
     size: int  # bytes; 0 for directories
+
+
+class WriteEntry(BaseModel):
+    """One file's contribution to a batch write.
+
+    A model rather than a tuple because it crosses a boundary: the actor builds
+    the batch from what a ``multi_edit`` or a ``patch`` computed in memory, and
+    hands it to the backend to publish as a unit.
+
+    Attributes:
+        path: Workspace-relative path.
+        data: The exact bytes to publish there.
+    """
+
+    path: str
+    data: bytes
 
 
 @runtime_checkable
@@ -64,11 +136,14 @@ class Filesystem:
         begins with the same characters (e.g. ``team-1`` vs ``team-11``).
 
         Raises:
-            PermissionError: if the resolved path escapes the workspace root.
+            PathEscapeError: if the resolved path escapes the workspace root. It
+                is a ``PermissionError``, so existing handlers are unaffected —
+                but it lets a caller tell an escaping path apart from an
+                OS-level denial on a path that is perfectly legal.
         """
         resolved = (self._root / path).resolve()
         if not resolved.is_relative_to(self._root):
-            raise PermissionError(f"Path '{path}' escapes workspace root")
+            raise PathEscapeError(f"Path '{path}' escapes workspace root")
         return resolved
 
     def read(self, path: str) -> bytes:
@@ -92,14 +167,123 @@ class Filesystem:
         return resolved.read_bytes()
 
     def write(self, path: str, data: bytes) -> None:
-        """Write *data* to *path*, creating missing parent directories.
+        """Atomically write *data* to *path*, creating missing parent directories.
+
+        The bytes are staged in a temporary file and published with
+        :func:`os.replace`, so a concurrent reader resolves the path to either the
+        complete previous file or the complete new one — never to a truncated
+        prefix.  Agents each hold their own :class:`Filesystem` and run workspace
+        calls on their own thread, so nothing else serializes a writer against a
+        reader (see ADR-036, *Filesystem.write becomes atomic*).
+
+        The staging file is created **in the target's own directory**, which is
+        load-bearing rather than cosmetic: ``os.replace`` is atomic only within a
+        single filesystem, and staging under the default temp directory would
+        silently degrade to copy-then-unlink wherever that is a separate mount.
+
+        Permission bits are preserved: an existing target keeps its own mode, and
+        a new file gets the mode a plain write would have produced under the
+        current umask.  ``os.replace`` publishes the staged inode, so its mode
+        becomes the target's — left unset, every written file would become 0600.
+        Nothing else the old inode carried survives the swap: ownership reverts to
+        the writing process, extended attributes are dropped, and a hardlink to
+        the old file detaches.  That is inherent to publishing by rename, and it
+        matters where the workspace is bind-mounted into a sandbox container
+        running as another uid.
+
+        No ``fsync`` is performed.  The guarantee offered here is atomicity for
+        concurrent readers on one machine, not durability across a crash.
+
+        Raises:
+            PermissionError: if *path* escapes the workspace root.
+        """
+        staged, resolved = self._stage(path, data)
+        try:
+            os.replace(staged, resolved)
+        except BaseException:
+            # Cleanup must not mask the failure that caused it — whatever made the
+            # publish fail will often make the unlink fail in the same way.
+            with contextlib.suppress(OSError):
+                staged.unlink(missing_ok=True)
+            raise
+
+    def write_many(self, entries: list[WriteEntry]) -> None:
+        """Stage **every** entry, then publish every entry.
+
+        This is the one publication mechanism for a batch — ``multi_edit`` and
+        ``patch`` both use it, because two publication paths that differ is how
+        one of them drifts.  Staging everything first moves the failures that
+        actually happen — a permission error, ENOSPC, a path that escapes the
+        root — to a point where **nothing** is visible yet: a batch that fails on
+        its second file leaves the first file's previous bytes untouched, and
+        every staged file is removed on the way out.
+
+        **What this does not offer, stated plainly.**  N renames are not one
+        atomic operation, and nothing on POSIX makes them so.  A rename that
+        fails *after* an earlier rename in the same batch succeeded leaves that
+        earlier file published, and there is no way to take it back from here:
+        the previous inode is already gone.  The remaining staged files are
+        cleaned up and the exception is re-raised, so the caller — which still
+        holds the original bytes it read — is the only party able to attempt a
+        restore.  The window is small and the failure mode is rare; a claim of
+        atomicity a reader could disprove would be worse than this note.
+
+        Args:
+            entries: The files to publish, in order.  An empty list is a no-op.
+
+        Raises:
+            PermissionError: if any entry's path escapes the workspace root.
+            OSError: whatever staging or publishing raised.
+        """
+        staged: list[tuple[Path, Path]] = []
+        try:
+            for entry in entries:
+                staged.append(self._stage(entry.path, entry.data))
+        except BaseException:
+            for pending, _ in staged:
+                with contextlib.suppress(OSError):
+                    pending.unlink(missing_ok=True)
+            raise
+        for index, (source, target) in enumerate(staged):
+            try:
+                os.replace(source, target)
+            except BaseException:
+                for pending, _ in staged[index:]:
+                    with contextlib.suppress(OSError):
+                        pending.unlink(missing_ok=True)
+                raise
+
+    def _stage(self, path: str, data: bytes) -> tuple[Path, Path]:
+        """Write *data* to a staging file beside *path*, ready to be published.
+
+        Shared by :meth:`write` and :meth:`write_many` so the two cannot drift on
+        the details that matter: the staging name ``#Workspace`` sweeps, the
+        same-directory placement ``os.replace`` needs, and the mode the target
+        keeps.
+
+        Returns:
+            The staging file and the resolved target, in that order.
 
         Raises:
             PermissionError: if *path* escapes the workspace root.
         """
         resolved = self._validate_path(path)
         resolved.parent.mkdir(parents=True, exist_ok=True)
-        resolved.write_bytes(data)
+        # A ".tmp" suffix keeps the staging file out of the read path's sidecar
+        # rule, which claims names that both start with "." and end with ".md".
+        stem = resolved.name.encode()[:_STAGED_NAME_BUDGET].decode(errors="ignore")
+        staged = resolved.parent / _STAGED_NAME_TEMPLATE.format(stem=stem, token=uuid4().hex)
+        try:
+            fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _DEFAULT_FILE_MODE)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            if resolved.exists():
+                shutil.copymode(resolved, staged)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                staged.unlink(missing_ok=True)
+            raise
+        return staged, resolved
 
     def delete(self, path: str) -> None:
         """Delete the file at *path*.

@@ -57,6 +57,13 @@ class _ObserverBase:
     ) -> Any:
         return None
 
+    def proxy_tell(
+        self,
+        actor: ActorAddress,
+        actor_type: type[AkgentType] | None = None,
+    ) -> Any:
+        return None
+
 
 class _FakeObserver(_ObserverBase):
     """The base plus both model-switch members, recording and controllable.

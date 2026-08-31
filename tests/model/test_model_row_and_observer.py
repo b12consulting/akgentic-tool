@@ -123,6 +123,13 @@ class _ObserverBase:
     ) -> Any:
         return None
 
+    def proxy_tell(
+        self,
+        actor: ActorAddress,
+        actor_type: type[AkgentType] | None = None,
+    ) -> Any:
+        return None
+
 
 class _ModelSwitchObserver(_ObserverBase):
     """The base plus both new members — the conforming case."""
