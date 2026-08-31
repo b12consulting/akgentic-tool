@@ -90,6 +90,7 @@ Callers that own a tighter budget pass it to :meth:`SandboxActor.exec`.
 ##
 ALLOWED_COMMANDS: frozenset[str] = frozenset(
     {
+        ## Python
         "python",
         "python3",
         "pytest",
@@ -97,25 +98,34 @@ ALLOWED_COMMANDS: frozenset[str] = frozenset(
         "mypy",
         "uv",
         "pip",
-        "cat",
-        "ls",
-        "find",
-        "grep",
-        "mkdir",
-        "cp",
-        "mv",
-        "rm",
-        "echo",
-        "touch",
-        "git",
-        "curl",
-        "wget",
-        "make",
-        "bash",
-        "sh",
+        ## Web
         "node",
         "npm",
         "npx",
+        ## bash
+        "sh",
+        "bash",
+        "cat",
+        "echo",
+        "ls",
+        "cp",
+        "mv",
+        "rm",
+        "mkdir",
+        "find",
+        "grep",
+        "sed",
+        "awk",
+        "jq",
+        "wc",
+        "xargs",
+        "touch",
+        "make",
+        "git",
+        "kill",
+        ## Network
+        "curl",
+        "wget",
     }
 )
 
