@@ -161,7 +161,11 @@ class ActivitySummarizer(SerializableBaseModel):
 
     Attributes:
         model: pydantic-ai model spec string, never a ``ModelConfig`` — this
-            package must not import ``akgentic-llm``.
+            package must not import ``akgentic-llm``. A base install serves
+            ``openai:`` specs only: the package declares
+            ``pydantic-ai-slim[mcp,openai]``, so any other provider prefix
+            resolves through an extra it does not carry and raises ImportError
+            in :meth:`SummarizerWorker.produce` rather than at configuration time.
         poll_attempts: Attempts spent waiting for in-flight summaries.
         poll_delay_seconds: Seconds slept between attempts.
     """

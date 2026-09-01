@@ -47,9 +47,11 @@ def _init_timeout_of(toolset: Any) -> float:
 def _seconds(value: timedelta | float | None) -> float | None:
     """Normalize a timeout to seconds, whichever way fastmcp chose to store it.
 
-    fastmcp stored these as `timedelta` up to 3.x and as a plain `float` from 4.0.0.
-    `src/` passes a float either way, so the representation is upstream's business and
-    the tests assert the *value in seconds* rather than the container it arrives in.
+    Not one convention: fastmcp 4.0.0 normalizes the *session* read timeout to a plain
+    `float` (it was a `timedelta` up to 3.x) while `SSETransport` still stores
+    `sse_read_timeout` as a `timedelta`. Both branches below are therefore live, and
+    neither is dead code on any version in range. `src/` passes a float throughout, so
+    the container is upstream's business and the tests assert the *value in seconds*.
     """
     return value.total_seconds() if isinstance(value, timedelta) else value
 
@@ -422,16 +424,21 @@ def test_sse_still_honours_the_kwarg_that_streamable_http_already_discards() -> 
     The streamable-HTTP half is the positive control, proving the divergence is real in
     this environment rather than merely unobserved. Upstream has escalated how it refuses
     the kwarg — fastmcp 3.x warned and ignored it, fastmcp 4.0.0 removed it outright — so
-    the control accepts either refusal: a deprecation warning, or a `TypeError`. What must
-    not happen is streamable-HTTP accepting it silently, which would make the control
-    vacuous and this test meaningless.
+    the control accepts either refusal: a deprecation warning, or a `TypeError` naming
+    that kwarg. What must not happen is streamable-HTTP accepting it silently, which
+    would make the control vacuous and this test meaningless.
     """
     try:
         discarded: list[str] | None = _sse_read_timeout_deprecations(
             lambda: StreamableHttpTransport(url=ACME_URL, sse_read_timeout=900.0)
         )
-    except TypeError:
-        discarded = None  # fastmcp >= 4.0.0 removed the kwarg: refusal, escalated.
+    except TypeError as exc:
+        # fastmcp >= 4.0.0 removed the kwarg: refusal, escalated. The message check keeps
+        # the catch narrow — an unrelated signature change (a renamed `url`, a new
+        # required argument) also raises TypeError here, and would otherwise read as a
+        # refusal and quietly satisfy the control.
+        assert "sse_read_timeout" in str(exc), f"TypeError is not about the kwarg: {exc}"
+        discarded = None
 
     honoured = _sse_read_timeout_deprecations(
         lambda: _build_mcp_toolset(
