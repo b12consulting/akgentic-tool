@@ -128,9 +128,11 @@ def _load_mcp_toolset_class() -> type[Any]:
     """Lazy-load the pydantic-ai MCP toolset class.
 
     The import stays lazy so `pydantic_ai` remains an implementation detail of this
-    module. It is deliberately NOT wrapped in a try/except: `mcp` ships unconditionally
-    with pydantic-ai, so a genuine ImportError must surface with its real cause instead
-    of being rewritten into misleading installation advice.
+    module. It is deliberately NOT wrapped in a try/except: this package declares the
+    `mcp` extra itself (`pydantic-ai-slim[mcp]` in `pyproject.toml`), so the module is
+    present in every correct install and a genuine ImportError must surface with its
+    real cause instead of being rewritten into misleading installation advice. Dropping
+    that extra would make this import optional — and this docstring wrong.
 
     Returns:
         The `MCPToolset` class.

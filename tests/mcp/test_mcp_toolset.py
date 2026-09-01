@@ -44,19 +44,35 @@ def _init_timeout_of(toolset: Any) -> float:
     return toolset.client._init_timeout
 
 
-def _read_timeout_of(toolset: Any) -> timedelta:
-    """Return the resolved session read timeout."""
-    return toolset.client._session_kwargs["read_timeout_seconds"]
+def _seconds(value: timedelta | float | None) -> float | None:
+    """Normalize a timeout to seconds, whichever way fastmcp chose to store it.
+
+    Not one convention: fastmcp 4.0.0 normalizes the *session* read timeout to a plain
+    `float` (it was a `timedelta` up to 3.x) while `SSETransport` still stores
+    `sse_read_timeout` as a `timedelta`. Both branches below are therefore live, and
+    neither is dead code on any version in range. `src/` passes a float throughout, so
+    the container is upstream's business and the tests assert the *value in seconds*.
+    """
+    return value.total_seconds() if isinstance(value, timedelta) else value
 
 
-def _sse_read_timeout_of(toolset: Any) -> timedelta | None:
-    """Return the long-lived SSE event-stream timeout, read off the transport itself.
+def _read_timeout_of(toolset: Any) -> float | None:
+    """Return the resolved session read timeout, in seconds."""
+    return _seconds(toolset.client._session_kwargs["read_timeout_seconds"])
+
+
+def _sse_read_timeout_of(toolset: Any) -> float | None:
+    """Return the long-lived SSE event-stream timeout in seconds, off the transport itself.
 
     Deliberately not the session kwargs: `MCPToolset(read_timeout=)` reaches only
     `ClientSession.read_timeout_seconds`, the *per-request* timeout. The stream timeout
     lives on the transport, so a session-level assertion is blind to it.
+
+    `getattr` because `StreamableHttpTransport` dropped the attribute in fastmcp 4.0.0:
+    absent and `None` both mean "this transport carries no stream timeout", which is
+    exactly what the streamable-HTTP branch asserts.
     """
-    return _transport_of(toolset).sse_read_timeout
+    return _seconds(getattr(_transport_of(toolset), "sse_read_timeout", None))
 
 
 class _RecordingToolset:
@@ -333,7 +349,7 @@ def test_timeout_maps_to_init_timeout_and_read_timeout_passes_through(
     toolset = _build_mcp_toolset(connection)
 
     assert _init_timeout_of(toolset) == 12.5
-    assert _read_timeout_of(toolset) == timedelta(seconds=77.0)
+    assert _read_timeout_of(toolset) == 77.0
 
 
 def test_config_defaults_win_over_pydantic_ai_defaults() -> None:
@@ -341,7 +357,7 @@ def test_config_defaults_win_over_pydantic_ai_defaults() -> None:
     toolset = _build_mcp_toolset(MCPHTTPConnectionConfig(url=ACME_URL))
 
     assert _init_timeout_of(toolset) == 10.0
-    assert _read_timeout_of(toolset) == timedelta(seconds=300.0)
+    assert _read_timeout_of(toolset) == 300.0
 
 
 def test_timeouts_are_passed_as_explicit_keywords(
@@ -373,7 +389,7 @@ def test_sse_stream_timeout_comes_from_the_config(read_timeout: float) -> None:
 
     toolset = _build_mcp_toolset(connection)
 
-    assert _sse_read_timeout_of(toolset) == timedelta(seconds=read_timeout)
+    assert _sse_read_timeout_of(toolset) == read_timeout
 
 
 def test_streamable_http_keeps_its_session_timeout_and_gains_no_stream_timeout() -> None:
@@ -387,7 +403,7 @@ def test_streamable_http_keeps_its_session_timeout_and_gains_no_stream_timeout()
 
     assert isinstance(_transport_of(toolset), StreamableHttpTransport)
     assert _sse_read_timeout_of(toolset) is None
-    assert _read_timeout_of(toolset) == timedelta(seconds=77.0)
+    assert _read_timeout_of(toolset) == 77.0
 
 
 def _sse_read_timeout_deprecations(build: Any) -> list[str]:
@@ -401,24 +417,38 @@ def _sse_read_timeout_deprecations(build: Any) -> list[str]:
 def test_sse_still_honours_the_kwarg_that_streamable_http_already_discards() -> None:
     """Reading the value back off the transport is not enough on its own.
 
-    `StreamableHttpTransport` still *stores* `sse_read_timeout` after deprecating it —
-    it warns and then ignores it — so an attribute assertion would stay green there
-    while the value did nothing. If SSE is deprecated the same way, the assertion above
-    would go on passing and the 5-minute default would silently return.
+    If SSE ever stops honouring `sse_read_timeout` the way streamable-HTTP already does,
+    the attribute assertion above would go on passing while `mcp.client.sse`'s 5-minute
+    default silently returned. So this asserts the *signal*, not the stored value.
 
-    The streamable-HTTP half is the positive control: it proves the deprecation signal
-    is live in this environment, so the SSE half failing to fire means something.
+    The streamable-HTTP half is the positive control, proving the divergence is real in
+    this environment rather than merely unobserved. Upstream has escalated how it refuses
+    the kwarg — fastmcp 3.x warned and ignored it, fastmcp 4.0.0 removed it outright — so
+    the control accepts either refusal: a deprecation warning, or a `TypeError` naming
+    that kwarg. What must not happen is streamable-HTTP accepting it silently, which
+    would make the control vacuous and this test meaningless.
     """
-    discarded = _sse_read_timeout_deprecations(
-        lambda: StreamableHttpTransport(url=ACME_URL, sse_read_timeout=900.0)
-    )
+    try:
+        discarded: list[str] | None = _sse_read_timeout_deprecations(
+            lambda: StreamableHttpTransport(url=ACME_URL, sse_read_timeout=900.0)
+        )
+    except TypeError as exc:
+        # fastmcp >= 4.0.0 removed the kwarg: refusal, escalated. The message check keeps
+        # the catch narrow — an unrelated signature change (a renamed `url`, a new
+        # required argument) also raises TypeError here, and would otherwise read as a
+        # refusal and quietly satisfy the control.
+        assert "sse_read_timeout" in str(exc), f"TypeError is not about the kwarg: {exc}"
+        discarded = None
+
     honoured = _sse_read_timeout_deprecations(
         lambda: _build_mcp_toolset(
             MCPHTTPConnectionConfig(url=ACME_URL, transport="sse", read_timeout=900.0)
         )
     )
 
-    assert discarded, "upstream stopped signalling the deprecation; the control is now vacuous"
+    assert discarded is None or discarded, (
+        "streamable-HTTP now accepts sse_read_timeout silently; the control is vacuous"
+    )
     assert honoured == []
 
 
@@ -472,7 +502,7 @@ def test_get_toolsets_preserves_transport_config_under_a_prefix() -> None:
     assert transport.command == "npx"
     assert transport.args == ["@acme/mcp"]
     assert _init_timeout_of(toolset.wrapped) == 4.0
-    assert _read_timeout_of(toolset.wrapped) == timedelta(seconds=8.0)
+    assert _read_timeout_of(toolset.wrapped) == 8.0
 
 
 def test_get_tools_is_empty_because_mcp_exposes_toolsets() -> None:

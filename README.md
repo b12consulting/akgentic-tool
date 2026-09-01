@@ -99,9 +99,11 @@ uv add akgentic-tool
 pip install akgentic-tool
 ```
 
-That is the whole install. `akgentic-core`, `pydantic-ai`, `tavily-python` and
-`httpx` come with it as ordinary dependencies — no workspace checkout, no
-submodules.
+That is the whole install. `akgentic-core`, `pydantic-ai-slim[mcp,openai]`,
+`tavily-python` and `httpx` come with it as ordinary dependencies — no workspace
+checkout, no submodules. The slim distribution carries only the extras this
+package uses, so a model spec for any provider other than `openai:` needs that
+provider's own pydantic-ai extra installed alongside.
 
 ### Installing Extras
 

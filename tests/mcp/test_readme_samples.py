@@ -20,8 +20,6 @@ Python; asserting on markdown content would test the document instead of the beh
 
 from __future__ import annotations
 
-from datetime import timedelta
-
 import pytest
 from pydantic import ValidationError
 from pydantic_ai.mcp import MCPToolset, SSETransport, StdioTransport, StreamableHttpTransport
@@ -63,7 +61,7 @@ def test_readme_streamable_http_sample_builds_its_documented_toolset() -> None:
 
     # The documented defaults, which the sample relies on by omitting them.
     assert _init_timeout_of(toolset) == 10.0
-    assert _read_timeout_of(toolset) == timedelta(seconds=300.0)
+    assert _read_timeout_of(toolset) == 300.0
 
 
 # --------------------------------------------------------------------------------------
@@ -94,8 +92,8 @@ def test_readme_sse_sample_builds_its_documented_toolset() -> None:
     assert transport.headers == {"Authorization": "Bearer ..."}
 
     # "also governs how long the event stream tolerates silence" — both timeouts, not one.
-    assert _read_timeout_of(toolset) == timedelta(seconds=900.0)
-    assert _sse_read_timeout_of(toolset) == timedelta(seconds=900.0)
+    assert _read_timeout_of(toolset) == 900.0
+    assert _sse_read_timeout_of(toolset) == 900.0
 
 
 # --------------------------------------------------------------------------------------
@@ -126,7 +124,7 @@ def test_readme_stdio_sample_builds_its_documented_toolset() -> None:
     assert transport.args == ["acme-mcp-server"]
 
     assert _init_timeout_of(toolset.wrapped) == 10.0
-    assert _read_timeout_of(toolset.wrapped) == timedelta(seconds=300.0)
+    assert _read_timeout_of(toolset.wrapped) == 300.0
 
 
 # --------------------------------------------------------------------------------------
