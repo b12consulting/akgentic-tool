@@ -127,6 +127,34 @@ class TestNoMixinShadowsTheDeferredBase:
             dir(DeferredResultActor)
         )
 
+    def test_a_sibling_declaration_never_reaches_the_class_dict(self) -> None:
+        """A mixin declares a sibling's method under ``if TYPE_CHECKING:``, never for real.
+
+        Each mixin declares the sibling methods it calls so mypy can check the
+        calls. Those blocks are guarded by ``if TYPE_CHECKING:``, which is
+        ``if False:`` at runtime, so they contribute nothing here. Written
+        *without* the guard they would still type-check and still import — and
+        would shadow the sibling's real method, because ``GateMixin`` precedes
+        ``ObservationMixin`` in the MRO and declares seven of its names.
+
+        The intersection above cannot catch that: ``_accept``, ``_writer_of`` and
+        the rest are absent from ``DeferredResultActor``, so they are outside the
+        base surface it measures. Only the behavioural suite would notice, and
+        only by failing in bulk somewhere else entirely.
+        """
+        owners: dict[str, str] = {}
+        for mixin in (ExecMixin, GateMixin, ObservationMixin):
+            for name in vars(mixin):
+                if name.startswith("__"):
+                    continue
+                owner = owners.setdefault(name, mixin.__name__)
+                assert owner == mixin.__name__, (
+                    f"{name} is a real definition on both {owner} and "
+                    f"{mixin.__name__} — one of them means it as a declaration and "
+                    f"must guard it with ``if TYPE_CHECKING:``, or the MRO picks a "
+                    f"winner in silence"
+                )
+
     def test_the_mixins_declare_no_state_fields(self) -> None:
         """Every runtime map is initialised in ``on_start`` and nowhere else.
 
