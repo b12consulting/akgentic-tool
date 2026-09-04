@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import math
-from pathlib import Path
 
 import pytest
 
-from akgentic.tool.vector_store.vector import VectorEntry
 from akgentic.tool.vector_store.inmemory import InMemoryBackend
 from akgentic.tool.vector_store.protocol import CollectionConfig, CollectionStatus
+from akgentic.tool.vector_store.vector import VectorEntry
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -188,7 +187,7 @@ class TestSearch:
 
 
 # ---------------------------------------------------------------------------
-# actor_state persistence
+# actor_state snapshot
 # ---------------------------------------------------------------------------
 
 
@@ -219,70 +218,12 @@ class TestActorStatePersistence:
         self, backend: InMemoryBackend
     ) -> None:
         """get_state includes collection config."""
-        cfg = CollectionConfig(dimension=768, persistence="workspace")
+        cfg = CollectionConfig(dimension=768, tenant="team-42")
         backend.create_collection("col1", cfg)
 
         state = backend.get_state()
         assert state["collections"]["col1"]["config"]["dimension"] == 768
-        assert state["collections"]["col1"]["config"]["persistence"] == "workspace"
-
-
-# ---------------------------------------------------------------------------
-# workspace persistence
-# ---------------------------------------------------------------------------
-
-
-class TestWorkspacePersistence:
-    """Tests for save_collection / load_collection."""
-
-    def test_round_trip(
-        self, backend: InMemoryBackend, config: CollectionConfig, tmp_path: Path
-    ) -> None:
-        """AC9: save_collection / load_collection round-trip."""
-        backend.create_collection("col1", config)
-        backend.add("col1", [
-            _make_entry("e1", [1.0, 0.0, 0.0], text="saved"),
-            _make_entry("e2", [0.0, 1.0, 0.0], text="also saved"),
-        ])
-        backend.save_collection("col1", str(tmp_path))
-
-        restored = InMemoryBackend()
-        restored.load_collection("col1", config, str(tmp_path))
-
-        result = restored.search("col1", [1.0, 0.0, 0.0], top_k=5)
-        assert len(result.hits) == 2
-        assert result.hits[0].ref_id == "e1"
-        assert result.hits[0].text == "saved"
-
-    def test_creates_vector_store_directory(
-        self, backend: InMemoryBackend, config: CollectionConfig, tmp_path: Path
-    ) -> None:
-        """AC9: save_collection creates .vector_store/ directory."""
-        backend.create_collection("col1", config)
-        backend.add("col1", [_make_entry("e1", [1.0, 0.0])])
-        backend.save_collection("col1", str(tmp_path))
-
-        assert (tmp_path / ".vector_store").is_dir()
-        assert (tmp_path / ".vector_store" / "col1.npz").exists()
-        assert (tmp_path / ".vector_store" / "col1.json").exists()
-
-    def test_missing_file_starts_empty(
-        self, config: CollectionConfig, tmp_path: Path
-    ) -> None:
-        """AC9: loading from missing file starts empty collection."""
-        backend = InMemoryBackend()
-        backend.load_collection("col1", config, str(tmp_path))
-
-        result = backend.search("col1", [1.0, 0.0], top_k=5)
-        assert result.hits == []
-        assert result.status == CollectionStatus.READY
-
-    def test_save_nonexistent_collection_raises(
-        self, backend: InMemoryBackend, tmp_path: Path
-    ) -> None:
-        """save_collection on non-existent collection raises ValueError."""
-        with pytest.raises(ValueError, match="does not exist"):
-            backend.save_collection("missing", str(tmp_path))
+        assert state["collections"]["col1"]["config"]["tenant"] == "team-42"
 
 
 # ---------------------------------------------------------------------------
@@ -373,3 +314,139 @@ class TestCosineCorrectness:
         backend.add("col1", [_make_entry("e1", [0.0, 1.0, 0.0])])
         result = backend.search("col1", [1.0, 0.0, 0.0], top_k=1)
         assert math.isclose(result.hits[0].score, 0.0, abs_tol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# scope / path / ordinal predicates
+# ---------------------------------------------------------------------------
+
+
+def _scoped(
+    ref_id: str,
+    vector: list[float],
+    scope: str | None = None,
+    path: str | None = None,
+    ordinal: int | None = None,
+) -> VectorEntry:
+    """Build an entry carrying the workspace metadata dimension."""
+    return VectorEntry(
+        ref_type="chunk",
+        ref_id=ref_id,
+        text=f"text-{ref_id}",
+        vector=vector,
+        scope=scope,
+        path=path,
+        ordinal=ordinal,
+    )
+
+
+class TestScopeAndPathFilters:
+    """Both predicates narrow search and remove, and both default to no filter."""
+
+    @pytest.fixture()
+    def two_scopes(self, backend: InMemoryBackend, config: CollectionConfig) -> InMemoryBackend:
+        """A collection holding three entries in scope A and three in scope B."""
+        backend.create_collection("ws", config)
+        backend.add(
+            "ws",
+            [
+                _scoped("a1", [1.0, 0.0], scope="A", path="docs/one.md", ordinal=0),
+                _scoped("a2", [0.99, 0.01], scope="A", path="docs/two.md", ordinal=1),
+                _scoped("a3", [0.98, 0.02], scope="A", path="notes/three.md", ordinal=2),
+                _scoped("b1", [1.0, 0.0], scope="B", path="docs/one.md", ordinal=0),
+                _scoped("b2", [0.99, 0.01], scope="B", path="docs/two.md", ordinal=1),
+                _scoped("b3", [0.98, 0.02], scope="B", path="docs/three.md", ordinal=2),
+            ],
+        )
+        return backend
+
+    def test_search_returns_only_the_requested_scope(
+        self, two_scopes: InMemoryBackend
+    ) -> None:
+        """Every hit belongs to the scope that was asked for."""
+        result = two_scopes.search("ws", [1.0, 0.0], top_k=10, scope="A")
+        assert {h.ref_id for h in result.hits} == {"a1", "a2", "a3"}
+
+    def test_scoped_search_returns_a_full_top_k_of_its_own(
+        self, two_scopes: InMemoryBackend
+    ) -> None:
+        """The predicate is applied before the cut, not after it.
+
+        The two scopes interleave by score, so filtering an already-cut top-3 would
+        return two of scope A's entries; filtering first returns three.
+        """
+        result = two_scopes.search("ws", [1.0, 0.0], top_k=3, scope="A")
+        assert len(result.hits) == 3
+        assert {h.ref_id for h in result.hits} == {"a1", "a2", "a3"}
+
+    def test_path_prefix_filters(self, two_scopes: InMemoryBackend) -> None:
+        """path_prefix keeps only entries under that prefix."""
+        result = two_scopes.search("ws", [1.0, 0.0], top_k=10, path_prefix="docs/")
+        assert {h.ref_id for h in result.hits} == {"a1", "a2", "b1", "b2", "b3"}
+
+    def test_both_predicates_conjoin(self, two_scopes: InMemoryBackend) -> None:
+        """scope and path_prefix narrow together, not separately."""
+        result = two_scopes.search("ws", [1.0, 0.0], top_k=10, scope="A", path_prefix="docs/")
+        assert {h.ref_id for h in result.hits} == {"a1", "a2"}
+
+    def test_no_predicate_returns_everything(self, two_scopes: InMemoryBackend) -> None:
+        """The default is exactly the behaviour that existed before the fields."""
+        result = two_scopes.search("ws", [1.0, 0.0], top_k=10)
+        assert len(result.hits) == 6
+
+    def test_entry_without_a_path_never_matches_a_prefix(
+        self, backend: InMemoryBackend, config: CollectionConfig
+    ) -> None:
+        """A planning entry sets no path and must not answer a path-scoped search."""
+        backend.create_collection("mixed", config)
+        backend.add("mixed", [_make_entry("plain", [1.0, 0.0])])
+
+        result = backend.search("mixed", [1.0, 0.0], top_k=5, path_prefix="docs/")
+        assert result.hits == []
+
+    def test_hits_carry_the_three_fields_back(self, two_scopes: InMemoryBackend) -> None:
+        """_map_search_hits copies scope, path and ordinal onto the hit."""
+        result = two_scopes.search("ws", [1.0, 0.0], top_k=1, scope="B", path_prefix="docs/th")
+        assert len(result.hits) == 1
+        hit = result.hits[0]
+        assert hit.ref_id == "b3"
+        assert hit.scope == "B"
+        assert hit.path == "docs/three.md"
+        assert hit.ordinal == 2
+
+    def test_hits_carry_none_when_the_entry_sets_nothing(
+        self, backend: InMemoryBackend, config: CollectionConfig
+    ) -> None:
+        """An entry from planning or the knowledge graph reads back unchanged."""
+        backend.create_collection("plain", config)
+        backend.add("plain", [_make_entry("e1", [1.0, 0.0])])
+
+        hit = backend.search("plain", [1.0, 0.0], top_k=1).hits[0]
+        assert hit.scope is None
+        assert hit.path is None
+        assert hit.ordinal is None
+
+    def test_remove_by_scope_spares_the_other_scope(
+        self, two_scopes: InMemoryBackend
+    ) -> None:
+        """remove(scope=...) is a scalpel: scope B survives intact and searchable."""
+        two_scopes.remove("ws", ["a1", "a2", "a3", "b1", "b2", "b3"], scope="A")
+
+        result = two_scopes.search("ws", [1.0, 0.0], top_k=10)
+        assert {h.ref_id for h in result.hits} == {"b1", "b2", "b3"}
+
+    def test_remove_by_path_prefix(self, two_scopes: InMemoryBackend) -> None:
+        """path_prefix narrows a removal the same way it narrows a search."""
+        two_scopes.remove("ws", ["a1", "a2", "a3"], path_prefix="docs/")
+
+        result = two_scopes.search("ws", [1.0, 0.0], top_k=10, scope="A")
+        assert {h.ref_id for h in result.hits} == {"a3"}
+
+    def test_remove_without_predicates_removes_every_listed_id(
+        self, two_scopes: InMemoryBackend
+    ) -> None:
+        """The default removal is exactly what it was before the fields."""
+        two_scopes.remove("ws", ["a1", "b1"])
+
+        result = two_scopes.search("ws", [1.0, 0.0], top_k=10)
+        assert {h.ref_id for h in result.hits} == {"a2", "a3", "b2", "b3"}

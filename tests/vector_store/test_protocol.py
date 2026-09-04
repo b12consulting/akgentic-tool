@@ -55,8 +55,7 @@ class TestCollectionConfig:
         cfg = CollectionConfig()
         assert cfg.dimension == 1536
         assert cfg.backend == "inmemory"
-        assert cfg.persistence == "actor_state"
-        assert cfg.workspace_path is None
+        assert cfg.tenant is None
 
     def test_round_trip_serialization_defaults(self) -> None:
         cfg = CollectionConfig()
@@ -68,20 +67,17 @@ class TestCollectionConfig:
         cfg = CollectionConfig(
             dimension=768,
             backend="weaviate",
-            persistence="workspace",
-            workspace_path="/tmp/vectors",
+            tenant="team-42",
         )
         assert cfg.dimension == 768
         assert cfg.backend == "weaviate"
-        assert cfg.persistence == "workspace"
-        assert cfg.workspace_path == "/tmp/vectors"
+        assert cfg.tenant == "team-42"
 
     def test_round_trip_serialization_non_defaults(self) -> None:
         cfg = CollectionConfig(
             dimension=768,
             backend="weaviate",
-            persistence="workspace",
-            workspace_path="/tmp/vectors",
+            tenant="team-42",
         )
         data = cfg.model_dump()
         restored = CollectionConfig.model_validate(data)
@@ -116,6 +112,30 @@ class TestSearchHit:
         data = hit.model_dump()
         restored = SearchHit.model_validate(data)
         assert restored == hit
+
+    def test_scope_path_and_ordinal_default_to_none(self) -> None:
+        """The three workspace fields are additive: an existing construction is valid."""
+        hit = SearchHit(ref_type="entity", ref_id="abc-123", text="hello world", score=0.95)
+        assert hit.scope is None
+        assert hit.path is None
+        assert hit.ordinal is None
+
+    def test_scope_path_and_ordinal_round_trip(self) -> None:
+        """All three survive serialisation."""
+        hit = SearchHit(
+            ref_type="chunk",
+            ref_id="abc-123",
+            text="hello world",
+            score=0.95,
+            scope="ws-1",
+            path="docs/report.md",
+            ordinal=7,
+        )
+        restored = SearchHit.model_validate(hit.model_dump())
+        assert restored == hit
+        assert restored.scope == "ws-1"
+        assert restored.path == "docs/report.md"
+        assert restored.ordinal == 7
 
 
 # ---------------------------------------------------------------------------

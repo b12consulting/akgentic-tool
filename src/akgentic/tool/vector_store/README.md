@@ -222,8 +222,6 @@ PlanningTool(collection=CollectionConfig(backend="weaviate", tenant="team-42"))
 |---|---|---|---|
 | `dimension` | `int` (≥1) | `1536` | Embedding vector dimensionality. Must match `embedding_model`. |
 | `backend` | `"inmemory" \| "weaviate"` | **follows the environment** | `weaviate` when `AKGENTIC_WEAVIATE_URL` is set, else `inmemory`. `inmemory` is a numpy cosine index inside the actor; `weaviate` delegates to a cluster and requires `akgentic-tool[weaviate]`. See below. |
-| `persistence` | `"actor_state" \| "workspace"` | `"actor_state"` | **inmemory backend only.** `actor_state` keeps vectors in the actor's persisted state; `workspace` writes them to a file. |
-| `workspace_path` | `str \| None` | `None` | The file path used when `persistence="workspace"`. |
 | `tenant` | `str \| None` | `None` | Weaviate tenant id for multi-tenancy — normally the workspace or team id. |
 
 ---

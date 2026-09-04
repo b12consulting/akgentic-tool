@@ -10,12 +10,10 @@ same approach as test_actor.py.
 
 from __future__ import annotations
 
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
-from akgentic.tool.vector_store.vector import VectorEntry
 from akgentic.tool.vector_store.actor import (
     VS_ACTOR_NAME,
     VS_ACTOR_ROLE,
@@ -27,6 +25,7 @@ from akgentic.tool.vector_store.protocol import (
     CollectionStatus,
     VectorStoreConfig,
 )
+from akgentic.tool.vector_store.vector import VectorEntry
 
 # Resolve forward reference for VectorEntry in EmbeddingResult
 EmbeddingResult.model_rebuild()
@@ -135,6 +134,7 @@ class TestIndexingToReady:
             actor.state.collection_statuses["async_col"] == CollectionStatus.INDEXING
         )
         assert actor.state.indexing_pending["async_col"] == 2
+        request_id = next(iter(actor.state.pending_requests))
 
         # Deliver EmbeddingResult manually
         embedded_entries = [
@@ -146,7 +146,7 @@ class TestIndexingToReady:
             ),
         ]
         result_msg = EmbeddingResult(
-            collection="async_col", entries=embedded_entries, request_id="req-1"
+            collection="async_col", entries=embedded_entries, request_id=request_id
         )
         actor.receiveMsg_EmbeddingResult(result_msg)
 
@@ -272,132 +272,3 @@ class TestRemoveEntries:
         assert len(result.hits) == 1
         assert result.hits[0].ref_id == "e2"
         assert result.hits[0].text == "beta"
-
-
-# ---------------------------------------------------------------------------
-# AC9: Integration Test — Workspace npz Save/Load
-# ---------------------------------------------------------------------------
-
-
-class TestWorkspacePersistenceSaveLoad:
-    """AC9: Workspace persistence round-trip via npz/json on disk."""
-
-    def test_workspace_persistence_save_load(
-        self, tmp_path: Path
-    ) -> None:
-        """Create workspace collection, add entries, verify disk files, reload."""
-        actor = _make_actor()
-        config = CollectionConfig(
-            dimension=3,
-            persistence="workspace",
-            workspace_path=str(tmp_path),
-        )
-        actor.create_collection("ws_col", config)
-
-        # Add pre-embedded entries
-        entries = [
-            _entry("e1", text="hello", vector=[1.0, 0.0, 0.0]),
-            _entry("e2", text="world", vector=[0.0, 1.0, 0.0]),
-        ]
-        actor.add("ws_col", entries)
-
-        # Verify files on disk
-        vs_dir = tmp_path / ".vector_store"
-        assert (vs_dir / "ws_col.npz").exists()
-        assert (vs_dir / "ws_col.json").exists()
-
-        # Search original actor to confirm data
-        result1 = actor.search("ws_col", [1.0, 0.0, 0.0], top_k=5)
-        assert len(result1.hits) == 2
-        assert result1.hits[0].ref_id == "e1"
-
-        # Create a new actor and load from disk
-        actor2 = _make_actor()
-        config2 = CollectionConfig(
-            dimension=3,
-            persistence="workspace",
-            workspace_path=str(tmp_path),
-        )
-        actor2.create_collection("ws_col", config2)
-
-        # Search restored actor — all entries should be present
-        result2 = actor2.search("ws_col", [1.0, 0.0, 0.0], top_k=5)
-        assert len(result2.hits) == 2
-        assert result2.hits[0].ref_id == "e1"
-        assert result2.hits[0].text == "hello"
-        assert result2.hits[0].score > 0.0
-
-        # Verify scores match
-        assert abs(result1.hits[0].score - result2.hits[0].score) < 1e-6
-
-    def test_workspace_save_triggered_on_remove(
-        self, tmp_path: Path
-    ) -> None:
-        """Remove triggers save — verify updated files on disk."""
-        actor = _make_actor()
-        config = CollectionConfig(
-            dimension=3,
-            persistence="workspace",
-            workspace_path=str(tmp_path),
-        )
-        actor.create_collection("ws_rm", config)
-
-        entries = [
-            _entry("e1", text="hello", vector=[1.0, 0.0, 0.0]),
-            _entry("e2", text="world", vector=[0.0, 1.0, 0.0]),
-        ]
-        actor.add("ws_rm", entries)
-
-        # Remove one entry
-        actor.remove("ws_rm", ["e1"])
-
-        # Load from disk in new actor — only e2 should be present
-        actor2 = _make_actor()
-        config2 = CollectionConfig(
-            dimension=3,
-            persistence="workspace",
-            workspace_path=str(tmp_path),
-        )
-        actor2.create_collection("ws_rm", config2)
-
-        result = actor2.search("ws_rm", [0.0, 1.0, 0.0], top_k=5)
-        assert len(result.hits) == 1
-        assert result.hits[0].ref_id == "e2"
-
-    def test_workspace_save_on_embedding_result(
-        self, tmp_path: Path
-    ) -> None:
-        """EmbeddingResult delivery triggers workspace save."""
-        actor = _make_actor()
-        config = CollectionConfig(
-            dimension=3,
-            persistence="workspace",
-            workspace_path=str(tmp_path),
-        )
-        actor.create_collection("ws_embed", config)
-
-        # Simulate async add (needs embedding)
-        entries = [_entry("e1", text="hello")]
-        actor.add("ws_embed", entries)
-
-        # Deliver embedding result
-        embedded = [
-            VectorEntry(
-                ref_type="entity", ref_id="e1", text="hello", vector=[1.0, 0.0, 0.0]
-            ),
-        ]
-        result_msg = EmbeddingResult(
-            collection="ws_embed", entries=embedded, request_id="req-1"
-        )
-        actor.receiveMsg_EmbeddingResult(result_msg)
-
-        # Verify files exist
-        vs_dir = tmp_path / ".vector_store"
-        assert (vs_dir / "ws_embed.npz").exists()
-
-        # Load in new actor
-        actor2 = _make_actor()
-        actor2.create_collection("ws_embed", config)
-        result = actor2.search("ws_embed", [1.0, 0.0, 0.0], top_k=5)
-        assert len(result.hits) == 1
-        assert result.hits[0].ref_id == "e1"

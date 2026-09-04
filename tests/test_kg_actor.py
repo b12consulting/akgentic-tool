@@ -1539,8 +1539,6 @@ class TestKnowledgeGraphConfigCollectionField:
         # Structural defaults — AC-11 backward-compat guard.
         assert cfg.collection.dimension == 1536
         assert cfg.collection.backend == "inmemory"
-        assert cfg.collection.persistence == "actor_state"
-        assert cfg.collection.workspace_path is None
         assert cfg.collection.tenant is None
 
     def test_collection_accepts_custom_value(self) -> None:
@@ -1670,8 +1668,6 @@ class TestKnowledgeGraphActorAcquireVsProxyCollectionPropagation:
         assert args[1] == CollectionConfig()
         assert args[1].dimension == 1536
         assert args[1].backend == "inmemory"
-        assert args[1].persistence == "actor_state"
-        assert args[1].workspace_path is None
         assert args[1].tenant is None
 
 

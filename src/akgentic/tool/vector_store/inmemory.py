@@ -1,17 +1,13 @@
 """In-memory vector store backend with per-collection VectorIndex management.
 
-Implements the ``VectorStoreService`` protocol using numpy-backed
-``VectorIndex`` instances. Supports two persistence modes:
-
-- **actor_state**: serialisable snapshot for orchestrator-driven persistence.
-- **workspace**: numpy/JSON persistence to the filesystem.
+Implements the ``VectorStoreService`` protocol using numpy-backed ``VectorIndex``
+instances. Collections live in the actor's serialisable state, reached through
+``get_state()`` / ``restore_state()``.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-from pathlib import Path
 from typing import Any
 
 from akgentic.tool.vector_store.protocol import (
@@ -27,6 +23,29 @@ from akgentic.tool.vector_store.vector import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _entry_matches(
+    entry: VectorEntry, scope: str | None, path_prefix: str | None
+) -> bool:
+    """Return whether *entry* satisfies both optional predicates.
+
+    A predicate left at ``None`` matches everything. An entry that carries no
+    ``path`` never matches a non-empty ``path_prefix``.
+
+    Args:
+        entry: The stored entry to test.
+        scope: Required ``scope`` value, or ``None`` to ignore scope.
+        path_prefix: Required ``path`` prefix, or ``None`` to ignore path.
+
+    Returns:
+        ``True`` when the entry satisfies every predicate given.
+    """
+    if scope is not None and entry.scope != scope:
+        return False
+    if path_prefix is not None and not (entry.path or "").startswith(path_prefix):
+        return False
+    return True
 
 
 class InMemoryBackend:
@@ -76,28 +95,62 @@ class InMemoryBackend:
         for entry in entries:
             index.add(entry)
 
-    def remove(self, collection: str, ref_ids: list[str]) -> None:
+    def remove(
+        self,
+        collection: str,
+        ref_ids: list[str],
+        scope: str | None = None,
+        path_prefix: str | None = None,
+    ) -> None:
         """Remove entries from a collection by reference ID.
+
+        An entry is removed only when its ``ref_id`` is listed **and** it satisfies
+        every predicate given, so ``remove(scope=...)`` is a scalpel: another scope's
+        entries survive even when a ref-id collides across scopes.
 
         Args:
             collection: Target collection name.
             ref_ids: List of reference IDs to remove.
+            scope: Restrict removal to entries carrying this ``scope``.
+            path_prefix: Restrict removal to entries whose ``path`` starts with this.
 
         Raises:
             ValueError: If the collection does not exist.
         """
         index = self._get_index(collection)
-        index.remove(set(ref_ids))
+        if scope is None and path_prefix is None:
+            index.remove(set(ref_ids))
+            return
+        listed = set(ref_ids)
+        index.remove(
+            {
+                e.ref_id
+                for e in index._entries
+                if e.ref_id in listed and _entry_matches(e, scope, path_prefix)
+            }
+        )
 
     def search(
-        self, collection: str, query_vector: list[float], top_k: int
+        self,
+        collection: str,
+        query_vector: list[float],
+        top_k: int,
+        scope: str | None = None,
+        path_prefix: str | None = None,
     ) -> SearchResult:
         """Search a collection by cosine similarity.
+
+        The predicates are applied to the **scored** candidates before ``top_k`` is
+        taken, so a scoped search returns a full ``top_k`` of its own entries rather
+        than filtering an already-cut set down to a handful. Scoring every entry costs
+        nothing extra: ``search_cosine`` already sorts the whole index and slices.
 
         Args:
             collection: Target collection name.
             query_vector: Query embedding vector.
             top_k: Maximum number of results to return.
+            scope: Restrict the search to entries carrying this ``scope``.
+            path_prefix: Restrict the search to entries whose ``path`` starts with this.
 
         Returns:
             Search results with hits ranked by cosine similarity, collection
@@ -107,7 +160,14 @@ class InMemoryBackend:
             ValueError: If the collection does not exist.
         """
         index = self._get_index(collection)
-        results = index.search_cosine(query_vector, top_k)
+        if scope is None and path_prefix is None:
+            results = index.search_cosine(query_vector, top_k)
+        else:
+            allowed = {
+                e.ref_id for e in index._entries if _entry_matches(e, scope, path_prefix)
+            }
+            scored = index.search_cosine(query_vector, len(index))
+            results = [(rid, s) for rid, s in scored if rid in allowed][:top_k]
         hits = self._map_search_hits(index, results)
         return SearchResult(
             hits=hits,
@@ -116,7 +176,7 @@ class InMemoryBackend:
         )
 
     # ------------------------------------------------------------------
-    # actor_state persistence
+    # actor_state snapshot
     # ------------------------------------------------------------------
 
     def get_state(self) -> dict[str, Any]:
@@ -155,84 +215,6 @@ class InMemoryBackend:
             for entry_data in col_data["entries"]:
                 index.add(VectorEntry.model_validate(entry_data))
             self._collections[name] = index
-
-    # ------------------------------------------------------------------
-    # workspace persistence
-    # ------------------------------------------------------------------
-
-    def save_collection(self, name: str, workspace_path: str) -> None:
-        """Persist a single collection to the filesystem.
-
-        Writes vectors as a compressed numpy array and metadata as a JSON
-        sidecar to ``{workspace_path}/.vector_store/{name}.npz`` and
-        ``{workspace_path}/.vector_store/{name}.json``.
-
-        Args:
-            name: Collection to save.
-            workspace_path: Root workspace directory.
-
-        Raises:
-            ValueError: If the collection does not exist.
-        """
-        import numpy as np
-
-        index = self._get_index(name)
-        base = Path(workspace_path) / ".vector_store"
-        base.mkdir(parents=True, exist_ok=True)
-
-        # Save vectors
-        if len(index) > 0:
-            vectors = index._buf[: index._count].copy()
-        else:
-            vectors = np.empty((0, 0), dtype=np.float64)
-        np.savez_compressed(str(base / f"{name}.npz"), vectors=vectors)
-
-        # Save metadata (entries + config) as JSON
-        meta = {
-            "config": self._configs[name].model_dump(),
-            "entries": [
-                {"ref_type": e.ref_type, "ref_id": e.ref_id, "text": e.text}
-                for e in index._entries
-            ],
-        }
-        (base / f"{name}.json").write_text(json.dumps(meta), encoding="utf-8")
-
-    def load_collection(self, name: str, config: CollectionConfig, workspace_path: str) -> None:
-        """Restore a collection from workspace persistence files.
-
-        If no persisted data exists on disk the collection starts empty.
-
-        Args:
-            name: Collection name.
-            config: Collection configuration.
-            workspace_path: Root workspace directory.
-        """
-        import numpy as np
-
-        base = Path(workspace_path) / ".vector_store"
-        npz_path = base / f"{name}.npz"
-        json_path = base / f"{name}.json"
-
-        self._configs[name] = config
-        index = VectorIndex()
-
-        if npz_path.exists() and json_path.exists():
-            data = np.load(str(npz_path))
-            vectors = data["vectors"]
-            meta = json.loads(json_path.read_text(encoding="utf-8"))
-            entries_meta = meta.get("entries", [])
-
-            for i, em in enumerate(entries_meta):
-                if i < len(vectors):
-                    entry = VectorEntry(
-                        ref_type=em["ref_type"],
-                        ref_id=em["ref_id"],
-                        text=em["text"],
-                        vector=vectors[i].tolist(),
-                    )
-                    index.add(entry)
-
-        self._collections[name] = index
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -285,6 +267,9 @@ class InMemoryBackend:
                     ref_id=entry.ref_id,
                     text=entry.text,
                     score=score,
+                    scope=entry.scope,
+                    path=entry.path,
+                    ordinal=entry.ordinal,
                 )
             )
         return hits
