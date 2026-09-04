@@ -63,6 +63,8 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "WORKSPACE_ACTOR_NAME",
         "WORKSPACE_ACTOR_ROLE",
         "WRITE_DENIED_MSG",
+        # Added by story 45-3, deliberately — see the constants above.
+        "DocumentExtract",
         "ExecConfig",
         "ExecLease",
         "ExecOutcome",
@@ -71,7 +73,6 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "ExecState",
         "ExecStatus",
         "ExecWorker",
-        "DocumentExtract",
         "GitJournal",
         "HunkContextError",
         "Identity",

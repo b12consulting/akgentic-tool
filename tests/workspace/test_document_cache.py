@@ -40,8 +40,6 @@ from akgentic.tool.workspace.tool import WorkspaceTool
 
 from tests.workspace.conftest import WORKSPACE_NAME, read
 
-ALICE = "alice-id"
-
 
 def start_actor(
     max_documents: int = DEFAULT_MAX_DOCUMENTS,
@@ -157,6 +155,14 @@ class TestDocumentExtract:
         entry = an_extract("notes.docx", None)
         assert DocumentExtract.model_validate(entry.model_dump()).markdown is None
 
+    def test_it_round_trips_through_json_which_is_the_persisted_encoding(self) -> None:
+        # ``model_dump()`` above hands back a live ``datetime``; the snapshot
+        # that ``notify_state_change()`` emits is ``model_dump_json()``, where
+        # ``extracted_at`` becomes an ISO string. Only this asserts the form
+        # that is actually persisted survives the trip back.
+        entry = an_extract("notes.docx", "# Notes")
+        assert DocumentExtract.model_validate_json(entry.model_dump_json()) == entry
+
 
 # ---------------------------------------------------------------------------
 # AC2: the state field
@@ -172,6 +178,17 @@ class TestWorkspaceStateDocuments:
         fill(actor, "notes.docx", body="# Notes")
         restored = WorkspaceState.model_validate(actor.state.model_dump())
         assert restored.documents["notes.docx"].markdown == "# Notes"
+
+    def test_a_filled_cache_survives_the_json_snapshot_the_notify_emits(
+        self, workspaces_root: Path
+    ) -> None:
+        # ``notify_state_change()`` serialises the whole state through
+        # ``model_dump_json()``, so that — not the python-mode dump — is the
+        # shape a resume reads back, nested ``DocumentExtract`` and all.
+        actor = start_actor()
+        fill(actor, "notes.docx", body="# Notes")
+        restored = WorkspaceState.model_validate_json(actor.state.model_dump_json())
+        assert restored.documents["notes.docx"] == actor.state.documents["notes.docx"]
 
 
 # ---------------------------------------------------------------------------
