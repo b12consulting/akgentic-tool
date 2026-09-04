@@ -24,6 +24,12 @@ from akgentic.tool.workspace.card import (
     WorkspaceView,
     WorkspaceWrite,
 )
+from akgentic.tool.workspace.documents import (
+    DEFAULT_MAX_DOCUMENT_CHARS,
+    DEFAULT_MAX_DOCUMENTS,
+    EXTRACTOR_VERSION,
+    DocumentExtract,
+)
 from akgentic.tool.workspace.edit import (
     EditItem,
     EditMatcher,
@@ -124,9 +130,12 @@ __all__ = [
     "DEFAULT_EXEC_POLL_DELAY_S",
     "DEFAULT_EXEC_TIMEOUT_S",
     "DEFAULT_GIT_TIMEOUT_S",
+    "DEFAULT_MAX_DOCUMENTS",
+    "DEFAULT_MAX_DOCUMENT_CHARS",
     "DEFAULT_MAX_OBSERVATIONS_PER_AGENT",
     "DEFAULT_MAX_TRACKED_WRITERS",
     "EXEC_REPORT_MARGIN_S",
+    "EXTRACTOR_VERSION",
     "GITIGNORE_NAME",
     "GIT_DIR_SUFFIX",
     "IDENTITY_DOMAIN",
@@ -152,6 +161,7 @@ __all__ = [
     "ExecState",
     "ExecStatus",
     "ExecWorker",
+    "DocumentExtract",
     "GitJournal",
     "HunkContextError",
     "Identity",

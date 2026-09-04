@@ -54,7 +54,8 @@ worker, never on this thread. Everything the ask path still does is bounded — 
 file read, one write, a few short-lived ``git`` forks under an explicit timeout —
 and never external.
 
-**The class is assembled from three per-concern mixins** (ADR-045 §1): the
+**The class is assembled from four per-concern mixins** (ADR-045 §1): the
+extraction cache in :mod:`~akgentic.tool.workspace.actor.documents`, the
 observation and last-writer maps in :mod:`~akgentic.tool.workspace.actor.observation`,
 the gate and the six mutations in :mod:`~akgentic.tool.workspace.actor.gate`, and
 the lease and the deferred surface in :mod:`~akgentic.tool.workspace.actor.execution`.
@@ -71,6 +72,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 from akgentic.tool.core.deferred import DeferredResultActor, DeferredWorker
+from akgentic.tool.workspace.actor.documents import DocumentsMixin
 from akgentic.tool.workspace.actor.execution import EXEC_CAPABILITY, ExecMixin
 from akgentic.tool.workspace.actor.gate import GateMixin
 from akgentic.tool.workspace.actor.observation import ObservationMixin
@@ -145,15 +147,21 @@ def _is_sweepable_orphan(entry: Path, cutoff: float) -> bool:
 
 
 class WorkspaceActor(
+    DocumentsMixin,
     ExecMixin,
     GateMixin,
     ObservationMixin,
     DeferredResultActor[WorkspaceConfig, WorkspaceState, str, ExecOutcome],
 ):
-    """Team singleton owning one workspace tree, the observations, the gate, and the lease.
+    """Team singleton owning one tree, the extraction cache, the observations, the gate.
 
-    Neither map is a state field: recording is not persisted state (see
-    :class:`WorkspaceState`). The observation map is keyed
+    ``DocumentsMixin`` sits ahead of ``ExecMixin`` in the MRO, so anything it
+    named ``deliver`` or ``fail`` would silently take over the deferred delivery
+    path. It defines neither, and the public-API guard asserts that.
+
+    Neither observation map is a state field: recording is not persisted state,
+    while the extraction cache is (see :class:`WorkspaceState`). The observation
+    map is keyed
     ``agent_id -> path -> Observation`` and each inner map is an
     :class:`~collections.OrderedDict`, which is the whole of the LRU — recording
     moves an entry to the end, eviction pops from the front. The last-writer map

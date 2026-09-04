@@ -28,17 +28,24 @@ import akgentic.tool
 import akgentic.tool.workspace as ws
 
 # Captured verbatim from ``akgentic/tool/workspace/__init__.py``'s ``__all__``
-# before the move. 102 names; the package ships on PyPI, so every one of them is
-# a public import path somebody may already depend on.
+# before the move: 102 names, plus the four story 45-3 added. The package ships
+# on PyPI, so every one of them is a public import path somebody may already
+# depend on.
 _WORKSPACE_ALL: frozenset[str] = frozenset(
     {
         "DEFAULT_EXEC_POLL_ATTEMPTS",
         "DEFAULT_EXEC_POLL_DELAY_S",
         "DEFAULT_EXEC_TIMEOUT_S",
         "DEFAULT_GIT_TIMEOUT_S",
+        # Added by story 45-3, deliberately: the extraction cache's four public
+        # names. This frozen set exists so a name is never added by accident,
+        # not so it can never grow.
+        "DEFAULT_MAX_DOCUMENTS",
+        "DEFAULT_MAX_DOCUMENT_CHARS",
         "DEFAULT_MAX_OBSERVATIONS_PER_AGENT",
         "DEFAULT_MAX_TRACKED_WRITERS",
         "EXEC_REPORT_MARGIN_S",
+        "EXTRACTOR_VERSION",
         "GITIGNORE_NAME",
         "GIT_DIR_SUFFIX",
         "IDENTITY_DOMAIN",
@@ -64,6 +71,7 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "ExecState",
         "ExecStatus",
         "ExecWorker",
+        "DocumentExtract",
         "GitJournal",
         "HunkContextError",
         "Identity",

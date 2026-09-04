@@ -19,6 +19,11 @@ from typing import Literal
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.core.utils.serializer import SerializableBaseModel
+from akgentic.tool.workspace.documents.models import (
+    DEFAULT_MAX_DOCUMENT_CHARS,
+    DEFAULT_MAX_DOCUMENTS,
+    DocumentExtract,
+)
 
 DEFAULT_MAX_OBSERVATIONS_PER_AGENT = 256
 """Per-agent bound on the observation map.
@@ -260,6 +265,14 @@ class WorkspaceConfig(BaseConfig):
         max_observations_per_agent: Cap on the per-agent observation map.
         max_tracked_writers: Cap on the path-keyed last-writer map, which the
             gate consults only to name the other writer in a refusal.
+        max_documents: Cap on the number of rows in
+            :attr:`WorkspaceState.documents`. Over it, the least recently used
+            entry is removed outright.
+        max_document_chars: Cap on the characters held across the cached
+            extracts that still have a body. Over it, the least recently used
+            body is dropped and its metadata kept — a different remedy from the
+            row cap because it answers a different pressure
+            (:func:`~akgentic.tool.workspace.documents.models.evict_document_bodies`).
         git_journal: Whether to keep a git journal of accepted mutations. The
             gate is unaffected either way — it is pure Python and independent.
         git_timeout_s: Wall-clock budget for one ``git`` invocation.
@@ -268,17 +281,40 @@ class WorkspaceConfig(BaseConfig):
     workspace_name: str
     max_observations_per_agent: int = DEFAULT_MAX_OBSERVATIONS_PER_AGENT
     max_tracked_writers: int = DEFAULT_MAX_TRACKED_WRITERS
+    max_documents: int = DEFAULT_MAX_DOCUMENTS
+    max_document_chars: int = DEFAULT_MAX_DOCUMENT_CHARS
     git_journal: bool = False
     git_timeout_s: float = DEFAULT_GIT_TIMEOUT_S
 
 
 class WorkspaceState(BaseState):
-    """Persisted actor state — deliberately empty of observation data.
+    """Persisted actor state — the derived cache, and no observation data.
 
-    ``Akgent`` is generic over a state type, so the actor needs one. What it must
-    not carry is the observation map: reads are the majority of workspace
-    traffic, and a snapshot per recorded read would put an event-store write on
-    the read path that ADR-036's NFR1 exists to keep free. Observations live as a
-    plain actor instance attribute and do not survive a resume, which degrades
-    towards *refusing* a later write rather than accepting a stale one.
+    What this state must **not** carry is the observation map: reads are the
+    majority of workspace traffic, and a snapshot per recorded read would put an
+    event-store write on the read path that ADR-036's NFR1 exists to keep free.
+    Observations live as a plain actor instance attribute and do not survive a
+    resume, which degrades towards *refusing* a later write rather than
+    accepting a stale one.
+
+    What it does carry is *derived* data: the extracted-document cache, every
+    byte of which is regenerable from the tree. NFR1 is a property of the **read
+    path**, not of an empty state, and the rule the whole design rests on is
+    therefore about who notifies rather than about what is stored:
+
+    - a text read never notifies,
+    - a document-cache **hit** never notifies — it reorders the LRU in memory,
+      so persisted recency lags live recency until the next fill, which is
+      deliberate and harmless,
+    - a cache **fill** notifies exactly once, after the insert *and* the
+      eviction, amortised against the seconds of extraction that preceded it.
+
+    Attributes:
+        documents: Workspace-relative path to its extracted Markdown, in
+            least-recently-used order — a plain ``dict`` preserves insertion
+            order, so the fill site's re-insert and the lookup's move-to-end are
+            the whole of the LRU. Bounded by ``max_documents`` and
+            ``max_document_chars`` on :class:`WorkspaceConfig`.
     """
+
+    documents: dict[str, DocumentExtract] = {}

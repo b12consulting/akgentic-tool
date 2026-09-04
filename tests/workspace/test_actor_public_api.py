@@ -32,6 +32,7 @@ import importlib
 import akgentic.tool.workspace as ws
 from akgentic.tool.core.deferred import DeferredResultActor
 from akgentic.tool.workspace.actor import WorkspaceActor
+from akgentic.tool.workspace.actor.documents import DocumentsMixin
 from akgentic.tool.workspace.actor.execution import ExecMixin
 from akgentic.tool.workspace.actor.gate import GateMixin
 from akgentic.tool.workspace.actor.observation import ObservationMixin
@@ -93,9 +94,11 @@ class TestActorMro:
     """The base order is frozen, because ``super()`` walks it."""
 
     def test_mro_is_exactly_the_four_mixins_then_the_deferred_base(self) -> None:
-        """``ExecMixin`` first: its ``deliver``/``fail`` must reach the base."""
-        assert WorkspaceActor.__mro__[:5] == (
+        """``DocumentsMixin`` first, ``ExecMixin`` next: its ``deliver``/``fail``
+        must still reach the base."""
+        assert WorkspaceActor.__mro__[:6] == (
             WorkspaceActor,
+            DocumentsMixin,
             ExecMixin,
             GateMixin,
             ObservationMixin,
@@ -103,8 +106,13 @@ class TestActorMro:
         )
 
     def test_super_from_exec_mixin_reaches_the_deferred_base(self) -> None:
-        """The two middle mixins define neither name, so the chain passes through."""
-        for mixin in (GateMixin, ObservationMixin):
+        """The other three mixins define neither name, so the chain passes through.
+
+        ``DocumentsMixin`` sits *ahead* of ``ExecMixin``, so a ``deliver`` or
+        ``fail`` on it would not merely break the chain — it would take over the
+        deferred delivery path outright.
+        """
+        for mixin in (DocumentsMixin, GateMixin, ObservationMixin):
             assert not _DELIBERATE_OVERRIDES & set(vars(mixin))
 
 
@@ -114,14 +122,14 @@ class TestNoMixinShadowsTheDeferredBase:
     def test_mixins_shadow_exactly_the_two_deliberate_overrides(self) -> None:
         """A mixin defining ``cache_capacity`` would resize the LRU with no error."""
         declared: set[str] = set()
-        for mixin in (ExecMixin, GateMixin, ObservationMixin):
+        for mixin in (DocumentsMixin, ExecMixin, GateMixin, ObservationMixin):
             declared |= {name for name in vars(mixin) if not name.startswith("__")}
         base_surface = set(dir(DeferredResultActor)) | set(_BASE_INSTANCE_ATTRS)
         assert declared & base_surface == set(_DELIBERATE_OVERRIDES)
 
     def test_the_guard_is_not_vacuous(self) -> None:
         """The intersection above is only meaningful if both sides are populated."""
-        for mixin in (ExecMixin, GateMixin, ObservationMixin):
+        for mixin in (DocumentsMixin, ExecMixin, GateMixin, ObservationMixin):
             assert {name for name in vars(mixin) if not name.startswith("__")}
         assert {"cache_capacity", "negative_ttl_s", "get", "request"} <= set(
             dir(DeferredResultActor)
@@ -143,7 +151,7 @@ class TestNoMixinShadowsTheDeferredBase:
         only by failing in bulk somewhere else entirely.
         """
         owners: dict[str, str] = {}
-        for mixin in (ExecMixin, GateMixin, ObservationMixin):
+        for mixin in (DocumentsMixin, ExecMixin, GateMixin, ObservationMixin):
             for name in vars(mixin):
                 if name.startswith("__"):
                     continue
@@ -163,7 +171,7 @@ class TestNoMixinShadowsTheDeferredBase:
         *default* would land in both — and would then be the value every actor
         starts from, shared across the class.
         """
-        for mixin in (ExecMixin, GateMixin, ObservationMixin):
+        for mixin in (DocumentsMixin, ExecMixin, GateMixin, ObservationMixin):
             for name in getattr(mixin, "__annotations__", {}):
                 assert name not in vars(mixin), (
                     f"{mixin.__name__}.{name} is annotated *and* assigned — a mixin "
