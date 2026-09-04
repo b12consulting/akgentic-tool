@@ -120,7 +120,9 @@ class NotificationTool(ToolCard):
             ``instructions``.
         pending_notification: The listing capability, same shape. It reports the
             caller's own entries, and every member's when asked.
-        cancel_notification: The cancellation capability, same shape.
+        cancel_notification: The cancellation capability, same shape. It is the
+            paired half of ``register_notification``: a reminder whose subject
+            resolved early must be cancelled, or it fires for work already done.
     """
 
     message_class: str = Field(
@@ -259,6 +261,10 @@ class NotificationTool(ToolCard):
             must be between 1 and {max_delay} seconds; larger values are
             rejected.
 
+            Keep the returned id. As soon as what you were waiting for arrives,
+            cancel the reminder with cancel_notification: one left standing
+            still fires and wakes you for work already done.
+
             Args:
                 content: The text you want to receive.
                 delay_seconds: Delay before delivery, from 1 to {max_delay}
@@ -331,6 +337,9 @@ class NotificationTool(ToolCard):
 
         def cancel_notification(notification_id: int) -> str:
             """Cancel one of your own pending notifications by id.
+
+            Call it as soon as what the reminder was waiting for arrives, so it
+            does not fire for work already done.
 
             Args:
                 notification_id: Id of the notification to cancel, as reported by
