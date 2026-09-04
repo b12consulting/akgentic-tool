@@ -63,6 +63,7 @@ from akgentic.tool.workspace.card.params import (
 )
 from akgentic.tool.workspace.card.read import ReadFactories
 from akgentic.tool.workspace.card.write import WriteFactories
+from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION
 from akgentic.tool.workspace.execution import (
     ExecConfig,
     resolve_mode,
@@ -371,10 +372,16 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, ToolCard):
         closures free of the retention ADR-030 forbids.
 
         The tell is what makes "a read never waits on the actor" a property
-        rather than a hope. From this story the actor hashes files on its ask
-        path, so a read that asked would queue behind another agent's mutation
-        hashing a large file; the ``except`` below would not save it, because a
-        fail-open guard covers a raising actor and a dead one, never a hung one.
+        rather than a hope — of a **text** read, which is what this recorder
+        serves. From epic 29 the actor hashes files on its ask path, so a read
+        that asked would queue behind another agent's mutation hashing a large
+        file; the ``except`` below would not save it, because a fail-open guard
+        covers a raising actor and a dead one, never a hung one.
+
+        A **document** read is the one exception, and it is deliberate: it makes
+        one bounded ask through :meth:`_extract_lookup` (ADR-045 §3), against
+        O(1) dict work with no I/O behind it. It records no observation at all,
+        so it never reaches this closure.
 
         Returns:
             A callable taking the path, the file's raw bytes and whether the read
@@ -400,6 +407,69 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, ToolCard):
                 logger.debug("Could not record an observation for %s", path, exc_info=True)
 
         return record
+
+    def _extract_lookup(self) -> Callable[[str, str], str | None]:
+        """Build the closure a document read uses to ask for a cached extraction.
+
+        An **ask**, because the answer is the whole point: the caller extracts
+        when there is nothing to serve. It is the one place a read waits on the
+        actor, and what makes that acceptable is what is behind it — a dict
+        lookup and an LRU reorder, no I/O, and no notify.
+
+        :data:`EXTRACTOR_VERSION` is captured **here**, at ``get_tools`` time,
+        exactly as the agent id is above. The extractor a miss would run is a
+        property of the code, never of the call, so it is not a parameter of the
+        tool callable and no agent can choose it. Bumping the constant therefore
+        invalidates every stored entry on the next read, with no sweep.
+
+        Returns:
+            A callable taking the path and the digest of the source bytes the
+            caller just read, and returning the cached Markdown or ``None``. It
+            never raises: every failure degrades to a miss, which costs one
+            extraction and can never be a wrong answer.
+        """
+        proxy = self._workspace_proxy
+        version = EXTRACTOR_VERSION
+
+        def lookup(path: str, source_sha: str) -> str | None:
+            if proxy is None:
+                return None  # harness shapes that wire a bare observer never bind one
+            try:
+                return proxy.document_extract(path, source_sha, version)
+            except Exception:
+                # Fail open, towards the pre-cache behaviour: a miss re-extracts
+                # from the tree, which is where every byte came from anyway.
+                logger.debug("Could not read the document cache for %s", path, exc_info=True)
+                return None
+
+        return lookup
+
+    def _extract_recorder(self) -> Callable[[str, str, str], None]:
+        """Build the closure a document read uses to fill the extraction cache.
+
+        A **tell**, because nothing comes back and a slow actor must not hold a
+        read that has already produced its answer. The split against
+        :meth:`_extract_lookup` is a correctness requirement, not a style
+        choice: collapsing both onto one proxy either makes a fill blocking or
+        makes a lookup answerless.
+
+        Returns:
+            A callable taking the path, the digest of the source bytes and the
+            extracted Markdown. It never raises: a lost fill is a cache that did
+            not grow, never a failed read.
+        """
+        proxy = self._workspace_tell
+        version = EXTRACTOR_VERSION
+
+        def remember(path: str, source_sha: str, markdown: str) -> None:
+            if proxy is None:
+                return  # harness shapes that wire a bare observer never bind one
+            try:
+                proxy.cache_document(path, source_sha, version, markdown)
+            except Exception:
+                logger.debug("Could not fill the document cache for %s", path, exc_info=True)
+
+        return remember
 
     def _seed_resources(self) -> None:
         """Write each configured resource that is not already present.

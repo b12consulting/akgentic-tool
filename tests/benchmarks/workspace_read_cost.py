@@ -159,7 +159,8 @@ RECORDING_FREE_OPS = (OP_GLOB, OP_GREP, OP_DOCUMENT)
 
 ``workspace_glob`` never opens a file; ``workspace_grep`` reads content the agent
 is never shown in full; and the document branch of ``workspace_read`` leaves the
-observed bytes unset, on the extraction branch and on the sidecar cache hit alike.
+observed bytes unset, on the extraction and on the cache hit alike — the agent is
+shown derived Markdown either way, never the source bytes.
 The recorder is therefore not called for any of them, whichever arm is running, so
 their ``off`` -> ``on`` p95 delta has **no true effect in it at all**: it is a
 direct measurement of this harness's own noise on the statistic every verdict is
@@ -904,9 +905,9 @@ def _write_documents(tree: Path, spec: RunSpec) -> tuple[list[str], str]:
     """Write one small PDF per agent, or record why the leg was skipped.
 
     The document leg contributes CPU contention and agent-thread occupancy and
-    **no observations at all**: neither the extraction branch nor the sidecar
-    cache-hit branch ever sets the observed bytes, because in both cases the
-    agent sees derived text rather than the source.
+    **no observations at all**: neither the extraction branch nor the cache-hit
+    branch ever sets the observed bytes, because in both cases the agent sees
+    derived text rather than the source.
     """
     if not spec.document:
         return [""] * spec.agents, "skipped: not requested"
@@ -919,7 +920,7 @@ def _write_documents(tree: Path, spec: RunSpec) -> tuple[list[str], str]:
         relative = f"docs/doc-{slot}.pdf"
         (tree / relative).write_bytes(minimal_pdf(_document_text(slot)))
         paths.append(relative)
-    return paths, "ran: a one-page PDF per agent, served from its sidecar after the first read"
+    return paths, "ran: a one-page PDF per agent, cached in #Workspace after the first read"
 
 
 def _document_text(slot: int) -> str:

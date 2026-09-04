@@ -1,8 +1,10 @@
 """The extraction cache: hit/miss, LRU, the two caps, and the no-notify guard (story 45-3).
 
-Nothing consumes this cache yet — ``workspace_read`` still uses the on-disk
-sidecar, and that switch is 45-4. What is asserted here is the shape 45-4 will
-call into and the one rule the whole design rests on: **the read path never
+These specs address the actor **directly**, which is what keeps them a guard on
+the cache itself rather than on whoever calls it. ``workspace_read`` became that
+caller in 45-4; the read path's own guards live in
+``test_document_read_path.py``. What is asserted here is the shape the read path
+calls into and the one rule the whole design rests on: **the read path never
 snapshots state**.
 
 ``notify_state_change()`` serialises the *whole* state through

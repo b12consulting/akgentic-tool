@@ -2,8 +2,14 @@
 
 A read runs on the calling agent's own thread against its own
 :class:`~akgentic.tool.workspace.workspace.Filesystem` and reports what it saw
-to ``#Workspace`` through a fire-and-forget ``tell`` (ADR-036 §1). Nothing here
-asks the actor for anything, so no read can queue behind another agent's write.
+to ``#Workspace`` through a fire-and-forget ``tell`` (ADR-036 §1).
+
+A **text** read asks the actor for nothing at all, so it can never queue behind
+another agent's write. A **document** read makes exactly one bounded ask — the
+extraction-cache lookup — and that is the one new hop ADR-045 §3 accepts, in
+exchange for a cache keyed on the source *bytes* rather than on a filename. What
+is behind that ask is a dict lookup with no I/O and no notify; the fill that
+follows a miss is a ``tell`` and waits on nothing.
 
 :class:`ReadFactories` is a **mixin**: it declares no Pydantic field, and the
 two names it consumes off ``self`` are declared under ``if TYPE_CHECKING:`` so
@@ -30,7 +36,7 @@ from akgentic.tool.workspace.card.params import (
     WorkspaceRead,
     WorkspaceView,
 )
-from akgentic.tool.workspace.models import PERM_ERR_MSG
+from akgentic.tool.workspace.models import PERM_ERR_MSG, content_sha
 from akgentic.tool.workspace.readers import _MIME_MAP, DocumentReader, MediaContent
 
 if TYPE_CHECKING:
@@ -312,6 +318,10 @@ class ReadFactories:
 
         def _observation_recorder(self) -> Callable[[str, bytes, bool], None]: ...
 
+        def _extract_lookup(self) -> Callable[[str, str], str | None]: ...
+
+        def _extract_recorder(self) -> Callable[[str, str, str], None]: ...
+
     def _expand_media_refs(self, prompt: str) -> list[str | MediaContent]:
         """Expand ``!!glob_pattern`` tokens in a prompt into binary image content.
 
@@ -391,6 +401,8 @@ class ReadFactories:
         """
         backend = self.workspace
         record = self._observation_recorder()
+        lookup = self._extract_lookup()
+        remember = self._extract_recorder()
         _dr_cfg = params.document_reader
         if _dr_cfg is True:
             document_reader: DocumentReader | None = DocumentReader()
@@ -411,8 +423,9 @@ class ReadFactories:
                 path: Relative path from workspace root (e.g. "src/main.py").
                 offset: First line to return, 1-indexed. Defaults to 1.
                 limit: Maximum lines to return. Defaults to 2000.
-                force_document_regeneration: If True, re-extract binary files
-                    even if a cached sidecar exists. Defaults to False.
+                force_document_regeneration: If True, ignore a valid cached
+                    extraction and re-extract the document, replacing the cached
+                    entry with the result. Defaults to False.
 
             Returns:
                 File contents with 1-indexed line numbers prefixed.
@@ -425,13 +438,9 @@ class ReadFactories:
                     ``document_reader`` is not configured.
             """
             ext = Path(path).suffix.lower()
-            p = Path(path)
-
-            # Sidecar self-read guard: .report.pdf.md -> plain text
-            is_sidecar = p.name.startswith(".") and p.name.endswith(".md")
 
             # ValueError check outside try -- configuration error, not retryable
-            if not is_sidecar and document_reader is None and ext in DocumentReader.extensions:
+            if document_reader is None and ext in DocumentReader.extensions:
                 raise ValueError(
                     "Binary file reading requires document_reader. "
                     'Install: pip install "akgentic-tool[docs]"'
@@ -439,23 +448,23 @@ class ReadFactories:
 
             try:
                 # Raw source bytes, and only on the branch that actually read them.
-                # A document read shows extracted Markdown rather than the file, and
-                # on a sidecar cache hit the source is never opened at all — hashing
-                # it would put a full file read back onto the path NFR1 keeps free.
+                # A document read shows extracted Markdown rather than the file, so
+                # a digest of bytes the agent never saw would be a false observation
+                # — the cache's own digest below is a different thing entirely.
                 observed: bytes | None = None
-                if (
-                    not is_sidecar
-                    and document_reader is not None
-                    and ext in document_reader.extensions
-                ):
-                    # Binary path: sidecar cache or extraction
-                    sidecar = backend._root / p.parent / f".{p.name}.md"
-                    if sidecar.exists() and not force_document_regeneration:
-                        raw = sidecar.read_text(encoding="utf-8")
+                if document_reader is not None and ext in document_reader.extensions:
+                    # Document path: the cache is keyed on the source bytes, so the
+                    # source is read on a hit as well. That read is milliseconds
+                    # against an extraction measured in seconds, and it is what
+                    # makes a replaced file read as the replacement.
+                    content_bytes = backend.read(path)
+                    source_sha = content_sha(content_bytes)
+                    cached = None if force_document_regeneration else lookup(path, source_sha)
+                    if cached is not None:
+                        raw = cached
                     else:
-                        content_bytes = backend.read(path)
                         raw = document_reader.extract_text(content_bytes, path)
-                        sidecar.write_text(raw, encoding="utf-8")
+                        remember(path, source_sha, raw)
                 else:
                     # Text path (existing logic)
                     observed = backend.read(path)
