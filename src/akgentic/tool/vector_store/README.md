@@ -282,7 +282,41 @@ A backend built without a `team_id` still writes the property, as the empty stri
 is uniform and a sweep never has to reason about objects that predate the field or come from an
 unattributed writer.
 
-`team_id` is written, never read back: `SearchHit` does not expose it and search is unaffected.
+**And read back on every query.** Collection names are module constants — `knowledge_graph`,
+`planning` — so every team on a cluster shares the same two collections, and multi-tenancy is off
+unless a deployment turns it on. `team_id` is therefore also the predicate:
+
+| Method | Filter |
+|---|---|
+| `add` | stamps `team_id` |
+| `search` | `team_id == <backend's own>`, passed to the cluster as `filters=` so it applies **before** `limit` |
+| `remove` | `ref_id IN (...)` **AND** `team_id == <backend's own>` |
+| `delete_by_team(collection, team_id)` | `team_id == <argument>` — the backend's own is deliberately *not* anded on |
+| `list_collections()` | none; a collection name identifies no team |
+
+`remove` needs both legs. `ref_id` alone deletes the matching object of every team on the cluster,
+and reference ids collide across teams by construction — planning ids are small integers, so
+completing task `3` would reach every team's task `3`. The team leg alone deletes the collection.
+
+**A backend with no `team_id` cannot query at all** — `search` and `remove` raise `ValueError`
+rather than filtering on something. Filtering on `""` would not be a safe default: `""` is a real
+value in the data, written by `add` for a team-less writer, so a query filtering on it would answer
+*as* the unattributed team — an identity the caller never claimed. There is no safe guess here, so
+the backend refuses instead of making one. `team_id=""` is refused on the same grounds.
+
+Writing without a team is still allowed, and the asymmetry is deliberate: `""` on a stored object is
+a value a sweeper can find and act on, whereas `""` in a *query* is an invented identity.
+
+A sweeper is the one script that legitimately has no `team_id`, and the example under *Reaping a
+deleted team* below builds one without: `list_collections` and `delete_by_team` are the two methods
+that carry no team predicate, so neither is affected by the rule above.
+
+In a running deployment the raise is unreachable — `VectorStoreActor` always passes
+`str(self.team_id)`, and an actor's `team_id` is a UUID defaulted at construction. It guards
+hand-built backends.
+
+`SearchHit` still does not expose `team_id`; the boundary is applied in the query, not reported in
+the result.
 
 ### Reaping a deleted team
 

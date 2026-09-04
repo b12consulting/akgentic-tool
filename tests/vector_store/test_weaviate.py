@@ -7,11 +7,58 @@ and close().
 
 from __future__ import annotations
 
+import inspect
 import sys
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+# ---------------------------------------------------------------------------
+# Recording Filter double
+# ---------------------------------------------------------------------------
+
+
+class _RecordedFilter:
+    """A predicate the backend built, kept as the legs it is made of.
+
+    The real ``Filter`` returns an opaque object, and a double that collapses
+    every predicate to one sentinel string cannot tell ``ref_id`` from
+    ``team_id``, cannot represent a conjunction, and passes just as happily
+    against a query carrying no team predicate at all.
+    """
+
+    def __init__(self, legs: list[tuple[str, str, Any]]) -> None:
+        self.legs = list(legs)
+
+    def __and__(self, other: _RecordedFilter) -> _RecordedFilter:
+        """Conjoin two predicates, keeping every leg in the order written."""
+        return _RecordedFilter([*self.legs, *other.legs])
+
+    def __repr__(self) -> str:
+        return f"_RecordedFilter({self.legs!r})"
+
+
+class _RecordedProperty:
+    """Builder bound to one property name, as ``Filter.by_property`` returns."""
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def equal(self, value: Any) -> _RecordedFilter:
+        """Record an equality leg on this property."""
+        return _RecordedFilter([(self._name, "equal", value)])
+
+    def contains_any(self, values: list[str]) -> _RecordedFilter:
+        """Record a membership leg on this property."""
+        return _RecordedFilter([(self._name, "contains_any", list(values))])
+
+
+def _legs(predicate: Any) -> list[tuple[str, str, Any]]:
+    """Flatten what was sent to the cluster into its recorded legs."""
+    assert isinstance(predicate, _RecordedFilter), f"not a recorded predicate: {predicate!r}"
+    return predicate.legs
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -48,8 +95,7 @@ def _make_mock_weaviate_module() -> MagicMock:
     mock_query_mod = MagicMock()
     mock_query_mod.MetadataQuery.return_value = "metadata_query"
     mock_filter = MagicMock()
-    mock_filter.by_property.return_value.contains_any.return_value = "filter_expr"
-    mock_filter.by_property.return_value.equal.return_value = "equal_filter_expr"
+    mock_filter.by_property = MagicMock(side_effect=_RecordedProperty)
     mock_query_mod.Filter = mock_filter
     mock_weaviate.classes.query = mock_query_mod
 
@@ -243,7 +289,7 @@ class TestRemove:
     """AC5: remove deletes entries by ref_id filter."""
 
     def test_remove_by_ref_ids(self) -> None:
-        """delete_many called with correct filter."""
+        """delete_many is called once, with a membership leg on the given ref_ids."""
         _mock_weaviate, mock_client = _install_mock_weaviate()
         mock_client.collections.exists.return_value = False
 
@@ -253,11 +299,34 @@ class TestRemove:
         from akgentic.tool.vector_store.protocol import CollectionConfig
         from akgentic.tool.vector_store.weaviate import WeaviateBackend
 
-        backend = WeaviateBackend(url="http://localhost:8080")
+        backend = WeaviateBackend(url="http://localhost:8080", team_id="team-42")
         backend.create_collection("col1", CollectionConfig())
         backend.remove("col1", ["id1", "id2"])
 
         mock_collection.data.delete_many.assert_called_once()
+        where = mock_collection.data.delete_many.call_args[1]["where"]
+        assert ("ref_id", "contains_any", ["id1", "id2"]) in _legs(where)
+
+    def test_remove_is_scoped_to_the_backends_team(self) -> None:
+        """delete_many carries the conjunction: the ref_ids AND the owning team."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+
+        mock_collection = MagicMock()
+        mock_client.collections.get.return_value = mock_collection
+
+        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+
+        backend = WeaviateBackend(url="http://localhost:8080", team_id="team-42")
+        backend.create_collection("col1", CollectionConfig())
+        backend.remove("col1", ["id1", "id2"])
+
+        where = mock_collection.data.delete_many.call_args[1]["where"]
+        assert _legs(where) == [
+            ("ref_id", "contains_any", ["id1", "id2"]),
+            ("team_id", "equal", "team-42"),
+        ]
 
     def test_remove_raises_on_unknown_collection(self) -> None:
         """remove raises ValueError for non-existent collection."""
@@ -297,7 +366,7 @@ class TestSearch:
         from akgentic.tool.vector_store.protocol import CollectionConfig
         from akgentic.tool.vector_store.weaviate import WeaviateBackend
 
-        backend = WeaviateBackend(url="http://localhost:8080")
+        backend = WeaviateBackend(url="http://localhost:8080", team_id="team-42")
         backend.create_collection("col1", CollectionConfig())
         result = backend.search("col1", [0.1, 0.2, 0.3], top_k=5)
 
@@ -324,11 +393,30 @@ class TestSearch:
         from akgentic.tool.vector_store.protocol import CollectionConfig
         from akgentic.tool.vector_store.weaviate import WeaviateBackend
 
-        backend = WeaviateBackend(url="http://localhost:8080")
+        backend = WeaviateBackend(url="http://localhost:8080", team_id="team-42")
         backend.create_collection("col1", CollectionConfig())
         result = backend.search("col1", [0.1, 0.2], top_k=5)
 
         assert result.hits[0].score == 0.0
+
+    def test_search_is_scoped_to_the_backends_team(self) -> None:
+        """near_vector carries the team predicate, so the cluster applies it before limit."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+
+        mock_collection = MagicMock()
+        mock_client.collections.get.return_value = mock_collection
+        mock_collection.query.near_vector.return_value = MagicMock(objects=[])
+
+        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+
+        backend = WeaviateBackend(url="http://localhost:8080", team_id="team-42")
+        backend.create_collection("col1", CollectionConfig())
+        backend.search("col1", [0.1, 0.2], top_k=5)
+
+        filters = mock_collection.query.near_vector.call_args[1]["filters"]
+        assert _legs(filters) == [("team_id", "equal", "team-42")]
 
     def test_search_raises_on_unknown_collection(self) -> None:
         """search raises ValueError for non-existent collection."""
@@ -515,6 +603,88 @@ class TestTeamIdMetadata:
         assert mock_batch.add_object.call_args[1]["properties"]["team_id"] == "team-42"
 
 
+class TestProtocolCarriesNoTeam:
+    """The isolation boundary lives in the backend, so no caller can omit it."""
+
+    def test_protocol_search_and_remove_take_no_team_argument(self) -> None:
+        """VectorStoreService gains no argument; a team is never passed in."""
+        from akgentic.tool.vector_store.protocol import VectorStoreService
+
+        search = inspect.signature(VectorStoreService.search)
+        remove = inspect.signature(VectorStoreService.remove)
+
+        assert list(search.parameters) == ["self", "collection", "query_vector", "top_k"]
+        assert list(remove.parameters) == ["self", "collection", "ref_ids"]
+
+
+class TestTeamlessBackendCannotQuery:
+    """A backend that does not know its team refuses to query, rather than guessing one.
+
+    Filtering on ``""`` would not be a safe default: ``""`` is a real value in the
+    data — ``add`` stamps it for a writer with no team — so a team-less query would
+    silently answer *as* the unattributed team, an identity the caller never claimed.
+    """
+
+    def test_search_and_remove_refuse_without_a_team(self) -> None:
+        """Both query paths raise rather than filtering on the empty team."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+
+        mock_collection = MagicMock()
+        mock_client.collections.get.return_value = mock_collection
+        mock_collection.query.near_vector.return_value = MagicMock(objects=[])
+
+        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+
+        backend = WeaviateBackend(url="http://localhost:8080")  # no team_id
+        backend.create_collection("col1", CollectionConfig())
+
+        with pytest.raises(ValueError, match="without a team_id"):
+            backend.search("col1", [0.1, 0.2], top_k=5)
+        with pytest.raises(ValueError, match="without a team_id"):
+            backend.remove("col1", ["id1"])
+
+        mock_collection.query.near_vector.assert_not_called()
+        mock_collection.data.delete_many.assert_not_called()
+
+    def test_an_empty_string_team_is_refused_too(self) -> None:
+        """`team_id=""` is not an identity; it must not slip past the guard."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        mock_client.collections.get.return_value = MagicMock()
+
+        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+
+        backend = WeaviateBackend(url="http://localhost:8080", team_id="")
+        backend.create_collection("col1", CollectionConfig())
+
+        with pytest.raises(ValueError, match="without a team_id"):
+            backend.search("col1", [0.1], top_k=5)
+
+    def test_cluster_administration_still_works_without_a_team(self) -> None:
+        """list_collections and delete_by_team need no team, and must stay usable.
+
+        This is what the guard must not break: a sweeper reaping a deleted team is
+        built with no team of its own.
+        """
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = True
+        mock_client.collections.list_all.return_value = {"planning": object()}
+
+        mock_collection = MagicMock()
+        mock_collection.data.delete_many.return_value = MagicMock(successful=4)
+        mock_client.collections.get.return_value = mock_collection
+
+        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+
+        backend = WeaviateBackend(url="http://localhost:8080")  # no team_id
+
+        assert backend.list_collections() == ["planning"]
+        assert backend.delete_by_team("planning", "team-gone") == 4
+
+
 class TestDeleteByTeam:
     """delete_by_team removes exactly the objects of one team."""
 
@@ -533,11 +703,26 @@ class TestDeleteByTeam:
         deleted = backend.delete_by_team("col1", "team-42")
 
         mock_weaviate.classes.query.Filter.by_property.assert_called_with("team_id")
-        mock_weaviate.classes.query.Filter.by_property.return_value.equal.assert_called_with(
-            "team-42"
-        )
-        assert mock_collection.data.delete_many.call_args[1]["where"] == "equal_filter_expr"
+        where = mock_collection.data.delete_many.call_args[1]["where"]
+        assert _legs(where) == [("team_id", "equal", "team-42")]
         assert deleted == 7
+
+    def test_reaps_the_named_team_not_the_backends_own(self) -> None:
+        """A sweeper deletes the team in its argument — one leg, and it is not its own."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = True
+
+        mock_collection = MagicMock()
+        mock_collection.data.delete_many.return_value = MagicMock(successful=4)
+        mock_client.collections.get.return_value = mock_collection
+
+        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+
+        backend = WeaviateBackend(url="http://localhost:8080", team_id="team-sweeper")
+        assert backend.delete_by_team("col1", "team-gone") == 4
+
+        where = mock_collection.data.delete_many.call_args[1]["where"]
+        assert _legs(where) == [("team_id", "equal", "team-gone")]
 
     def test_works_without_having_created_the_collection(self) -> None:
         """A sweeper never created the collection — cluster existence is what counts."""
