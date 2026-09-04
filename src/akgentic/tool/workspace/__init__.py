@@ -162,6 +162,7 @@ __all__ = [
     "WORKSPACE_ACTOR_NAME",
     "WORKSPACE_ACTOR_ROLE",
     "WRITE_DENIED_MSG",
+    "DocumentExtract",
     "ExecConfig",
     "ExecOutcome",
     "ExecStart",
