@@ -44,6 +44,22 @@ class VectorEntry(SerializableBaseModel):
     ref_id: str = Field(..., description="UUID string of the referenced object.")
     text: str = Field(..., description="The text that was embedded.")
     vector: list[float] = Field(..., description="Embedding values (one float per dimension).")
+    scope: str | None = Field(
+        default=None,
+        description=(
+            "Partition this entry belongs to within its collection — for the workspace, "
+            "the workspace id. None for a producer that does not partition, which is what "
+            "planning and the knowledge graph do."
+        ),
+    )
+    path: str | None = Field(
+        default=None,
+        description="Source path within the scope, filterable by prefix. None when there is none.",
+    )
+    ordinal: int | None = Field(
+        default=None,
+        description="Position of this chunk within its source, for ordering reassembly.",
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -777,8 +777,6 @@ class TestKnowledgeGraphToolCollectionField:
         # Default values explicitly (guards against AC-11 regressions).
         assert tool.collection.dimension == 1536
         assert tool.collection.backend == "inmemory"
-        assert tool.collection.persistence == "actor_state"
-        assert tool.collection.workspace_path is None
         assert tool.collection.tenant is None
 
     def test_collection_field_present_in_model_fields(self) -> None:
@@ -809,7 +807,6 @@ class TestKnowledgeGraphToolCollectionField:
         assert reloaded.collection.tenant == "team-123"
         # Non-touched fields preserved at CollectionConfig defaults.
         assert reloaded.collection.dimension == 1536
-        assert reloaded.collection.persistence == "actor_state"
 
     def test_independent_tools_do_not_alias_collection(self) -> None:
         """`default_factory=CollectionConfig` gives each instance a fresh object."""

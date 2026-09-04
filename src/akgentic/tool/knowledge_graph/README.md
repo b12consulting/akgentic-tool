@@ -72,8 +72,6 @@ it by name during `on_start`.
 |---|---|---|---|
 | `dimension` | `int` | `1536` | Embedding dimensionality. |
 | `backend` | `"inmemory" \| "weaviate"` | `"inmemory"` | `weaviate` requires `akgentic-tool[weaviate]`. |
-| `persistence` | `"actor_state" \| "workspace"` | `"actor_state"` | inmemory backend only. |
-| `workspace_path` | `str \| None` | `None` | Path when `persistence="workspace"`. |
 | `tenant` | `str \| None` | `None` | Weaviate tenant id. |
 
 ### `search_top_k` / `search_score_threshold` / `hybrid_alpha`
