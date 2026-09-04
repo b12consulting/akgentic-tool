@@ -21,11 +21,11 @@ from akgentic.tool.workspace.actor import (
 )
 from akgentic.tool.workspace.edit import EditItem
 from akgentic.tool.workspace.models import WorkspaceConfig
+from akgentic.tool.workspace.card.read import _normalize_glob_pattern
 from akgentic.tool.workspace.tool import (
     Resource,
     ResourceType,
     WorkspaceTool,
-    _normalize_glob_pattern,
 )
 from akgentic.tool.workspace.workspace import Filesystem, PathEscapeError, Workspace
 
@@ -62,7 +62,7 @@ def make_wired_tool(tmp_path: Path) -> tuple[WorkspaceTool, Filesystem]:
     """
     observer, fs = make_observer(tmp_path)
     with (
-        patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs),
+        patch("akgentic.tool.workspace.card.get_workspace", return_value=fs),
         patch("akgentic.tool.workspace.actor.get_workspace", return_value=fs),
     ):
         actor = WorkspaceActor(
@@ -112,7 +112,7 @@ class TestObserverDelegation:
     def test_observer_returns_self(self, tmp_path: Path) -> None:
         """observer() returns self typed as WorkspaceTool."""
         observer, fs = make_observer(tmp_path)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool = WorkspaceTool()
             result = tool.observer(observer)
         assert result is tool
@@ -287,7 +287,7 @@ class TestCapabilityToggling:
     def test_workspace_delete_disabled_returns_ten_tools(self, tmp_path: Path) -> None:
         """WorkspaceTool(workspace_delete=False) exposes 10 tools."""
         observer, fs = make_observer(tmp_path)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool = WorkspaceTool(workspace_delete=False)
             tool.observer(observer)
         tools = tool.get_tools()
@@ -299,7 +299,7 @@ class TestCapabilityToggling:
     def test_workspace_write_disabled_returns_ten_tools(self, tmp_path: Path) -> None:
         """WorkspaceTool(workspace_write=False) exposes 10 tools."""
         observer, fs = make_observer(tmp_path)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool = WorkspaceTool(workspace_write=False)
             tool.observer(observer)
         tools = tool.get_tools()
@@ -311,7 +311,7 @@ class TestCapabilityToggling:
     def test_both_write_and_delete_disabled_returns_nine_tools(self, tmp_path: Path) -> None:
         """WorkspaceTool(workspace_write=False, workspace_delete=False) returns 9 tools."""
         observer, fs = make_observer(tmp_path)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool = WorkspaceTool(workspace_write=False, workspace_delete=False)
             tool.observer(observer)
         tools = tool.get_tools()
@@ -324,7 +324,7 @@ class TestCapabilityToggling:
     def test_workspace_delete_false_count(self, tmp_path: Path) -> None:
         """Repeated get_tools() call count is stable."""
         observer, fs = make_observer(tmp_path)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool = WorkspaceTool(workspace_delete=False)
             tool.observer(observer)
         assert len(tool.get_tools()) == 10
@@ -418,7 +418,7 @@ class TestWorkspaceEdit:
     def test_edit_disabled_not_in_get_tools(self, tmp_path: Path) -> None:
         """WorkspaceTool(workspace_edit=False) excludes workspace_edit from get_tools()."""
         observer, fs = make_observer(tmp_path)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool = WorkspaceTool(workspace_edit=False)
             tool.observer(observer)
         names = [t.__name__ for t in tool.get_tools()]
@@ -523,7 +523,7 @@ class TestWorkspaceMultiEdit:
     def test_multi_edit_disabled_not_in_get_tools(self, tmp_path: Path) -> None:
         """WorkspaceTool(workspace_multi_edit=False) excludes workspace_multi_edit."""
         observer, fs = make_observer(tmp_path)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool = WorkspaceTool(workspace_multi_edit=False)
             tool.observer(observer)
         names = [t.__name__ for t in tool.get_tools()]
@@ -594,7 +594,7 @@ class TestWorkspacePatch:
     def test_patch_disabled_not_in_get_tools(self, tmp_path: Path) -> None:
         """WorkspaceTool(workspace_patch=False) excludes workspace_patch from get_tools()."""
         observer, fs = make_observer(tmp_path)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool = WorkspaceTool(workspace_patch=False)
             tool.observer(observer)
         names = [t.__name__ for t in tool.get_tools()]
@@ -616,7 +616,7 @@ class TestCapabilityTogglingStory55:
     def test_edit_disabled_count_is_ten(self, tmp_path: Path) -> None:
         """WorkspaceTool(workspace_edit=False) returns 10 tools."""
         observer, fs = make_observer(tmp_path)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool = WorkspaceTool(workspace_edit=False)
             tool.observer(observer)
         assert len(tool.get_tools()) == 10
@@ -624,7 +624,7 @@ class TestCapabilityTogglingStory55:
     def test_multi_edit_disabled_count_is_ten(self, tmp_path: Path) -> None:
         """WorkspaceTool(workspace_multi_edit=False) returns 10 tools."""
         observer, fs = make_observer(tmp_path)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool = WorkspaceTool(workspace_multi_edit=False)
             tool.observer(observer)
         assert len(tool.get_tools()) == 10
@@ -632,7 +632,7 @@ class TestCapabilityTogglingStory55:
     def test_patch_disabled_count_is_ten(self, tmp_path: Path) -> None:
         """WorkspaceTool(workspace_patch=False) returns 10 tools."""
         observer, fs = make_observer(tmp_path)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool = WorkspaceTool(workspace_patch=False)
             tool.observer(observer)
         assert len(tool.get_tools()) == 10
@@ -725,7 +725,7 @@ class TestWorkspaceMkdir:
 
     def test_mkdir_disabled_not_in_get_tools(self, tmp_path: Path) -> None:
         observer, fs = make_observer(tmp_path)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool = WorkspaceTool(workspace_mkdir=False)
             tool.observer(observer)
         names = [t.__name__ for t in tool.get_tools()]
@@ -840,7 +840,7 @@ class TestReadOnlyParameter:
         """AC 3: read_only=True → 5 read tools: read, list, glob, grep, view."""
         observer, fs = make_observer(tmp_path)
         tool = WorkspaceTool(read_only=True)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool.observer(observer)
         tools = tool.get_tools()
         assert len(tools) == 5
@@ -923,7 +923,7 @@ class TestReadOnlyParameter:
             workspace_delete=True,  # explicitly enabled
             workspace_edit=True,  # explicitly enabled
         )
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool.observer(observer)
         names = [t.__name__ for t in tool.get_tools()]
         # read_only gate must override individual capability fields
@@ -1192,7 +1192,7 @@ def _seed_tool(
 ) -> tuple[WorkspaceTool, Filesystem]:
     """Wire a WorkspaceTool carrying *resources* to a real tmp Filesystem."""
     observer, fs = make_observer(tmp_path)
-    with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+    with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
         tool = WorkspaceTool(resources=resources)
         tool.observer(observer)
     return tool, fs
@@ -1250,7 +1250,7 @@ class TestWorkspaceToolSeedResources:
         observer, fs = make_observer(tmp_path)
         fs.write("notes.md", b"original content")
         resources = [Resource(file_name="notes.md", content="seeded content")]
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool = WorkspaceTool(resources=resources)
             tool.observer(observer)
         assert fs.read("notes.md") == b"original content"
@@ -1270,7 +1270,7 @@ class TestWorkspaceToolSeedResources:
         """A root-escaping file_name raises PermissionError out of observer() (AC #6)."""
         observer, fs = make_observer(tmp_path)
         resources = [Resource(file_name="../escape.txt", content="evil")]
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool = WorkspaceTool(resources=resources)
             with pytest.raises(PermissionError):
                 tool.observer(observer)
@@ -1281,7 +1281,7 @@ class TestWorkspaceToolSeedResources:
         resources = [
             Resource(file_name="logo.png", file_type=ResourceType.IMAGE, content="not!base64!")
         ]
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool = WorkspaceTool(resources=resources)
             with pytest.raises(binascii.Error):
                 tool.observer(observer)
@@ -1293,13 +1293,13 @@ class TestWorkspaceToolSeedResources:
             Resource(file_name="kept.md", content="seeded once"),
             Resource(file_name="later.md", content="later body"),
         ]
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool = WorkspaceTool(resources=resources)
             tool.observer(observer)
         # An agent/human edits the seeded file between team restores.
         fs.write("kept.md", b"edited by agent")
         # A team restore builds a fresh WorkspaceTool and re-runs observer().
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             restored_tool = WorkspaceTool(resources=resources)
             restored_tool.observer(observer)
         assert fs.read("kept.md") == b"edited by agent"

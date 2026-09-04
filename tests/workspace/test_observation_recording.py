@@ -18,7 +18,8 @@ from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
 from akgentic.tool.workspace.models import Observation, WorkspaceConfig, content_sha
-from akgentic.tool.workspace.tool import WorkspaceTool, _paginate
+from akgentic.tool.workspace.card.read import _paginate
+from akgentic.tool.workspace.tool import WorkspaceTool
 from akgentic.tool.workspace.workspace import Filesystem
 
 from tests.workspace.conftest import (
