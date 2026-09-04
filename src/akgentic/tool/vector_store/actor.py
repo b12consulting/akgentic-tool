@@ -513,13 +513,16 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
                 collection, query_vector, top_k, scope=scope, path_prefix=path_prefix
             )
             # Status and pending count come from the open-request map, never from the
-            # backend: the backend has no idea a batch is still being embedded.
+            # backend: the backend has no idea a batch is still being embedded. Only
+            # the two derived fields are overridden — a field added to SearchResult
+            # later must survive the override rather than be silently dropped.
             actor_status = self.state.collection_statuses.get(collection)
             if actor_status is not None:
-                result = SearchResult(
-                    hits=result.hits,
-                    status=actor_status,
-                    indexing_pending=self.state.indexing_pending.get(collection, 0),
+                result = result.model_copy(
+                    update={
+                        "status": actor_status,
+                        "indexing_pending": self.state.indexing_pending.get(collection, 0),
+                    }
                 )
             return result
         except ValueError as exc:

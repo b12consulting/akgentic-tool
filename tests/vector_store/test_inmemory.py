@@ -450,3 +450,28 @@ class TestScopeAndPathFilters:
 
         result = two_scopes.search("ws", [1.0, 0.0], top_k=10)
         assert {h.ref_id for h in result.hits} == {"a2", "a3", "b2", "b3"}
+
+    def test_remove_by_scope_spares_a_colliding_ref_id_in_another_scope(
+        self, backend: InMemoryBackend, config: CollectionConfig
+    ) -> None:
+        """Two scopes, one shared ref_id: only the named scope's entry goes.
+
+        The case the scalpel exists for. Resolving the predicate to a set of ref_ids
+        and handing that to the index removes both entries, because the index can only
+        match on the id — the surviving scope loses a chunk it never named. Weaviate
+        conjoins the predicates in the cluster and has always been precise here; this
+        is what makes the in-memory backend agree with it.
+        """
+        backend.create_collection("ws", config)
+        backend.add(
+            "ws",
+            [
+                _scoped("shared", [1.0, 0.0], scope="A", path="docs/one.md", ordinal=0),
+                _scoped("shared", [0.99, 0.01], scope="B", path="docs/one.md", ordinal=0),
+            ],
+        )
+
+        backend.remove("ws", ["shared"], scope="A")
+
+        hits = backend.search("ws", [1.0, 0.0], top_k=10).hits
+        assert [h.scope for h in hits] == ["B"]

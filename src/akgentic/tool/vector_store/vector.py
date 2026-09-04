@@ -18,6 +18,8 @@ from pydantic import Field
 from akgentic.core.utils.serializer import SerializableBaseModel
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import numpy as np
     import openai as _openai_typing
 
@@ -193,17 +195,30 @@ class VectorIndex:
         self._count += 1
         self._entries.append(entry)
 
-    def remove(self, ref_ids: set[str]) -> None:
-        """Remove all entries whose ``ref_id`` is in ``ref_ids``.
+    def remove(
+        self, ref_ids: set[str], matches: Callable[[VectorEntry], bool] | None = None
+    ) -> None:
+        """Remove entries whose ``ref_id`` is listed and which satisfy *matches*.
 
         Compacts the backing buffers to retain only surviving rows.
 
+        ``matches`` makes the removal entry-precise rather than id-precise: two
+        entries may share a ``ref_id`` while differing in ``scope`` or ``path``, and a
+        scoped removal must take only the one it names. Without it a caller can only
+        say *which ids*, and every entry carrying such an id goes.
+
         Args:
             ref_ids: Set of UUID strings to remove. Unknown IDs are silently ignored.
+            matches: Optional extra predicate an entry must satisfy to be removed.
+                ``None`` removes every entry whose id is listed.
         """
         import numpy as np
 
-        keep = [i for i, e in enumerate(self._entries) if e.ref_id not in ref_ids]
+        keep = [
+            i
+            for i, e in enumerate(self._entries)
+            if e.ref_id not in ref_ids or (matches is not None and not matches(e))
+        ]
         if len(keep) == self._count:
             return  # Nothing removed — fast path
         new_count = len(keep)
