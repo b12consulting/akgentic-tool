@@ -282,7 +282,29 @@ A backend built without a `team_id` still writes the property, as the empty stri
 is uniform and a sweep never has to reason about objects that predate the field or come from an
 unattributed writer.
 
-`team_id` is written, never read back: `SearchHit` does not expose it and search is unaffected.
+**And read back on every query.** Collection names are module constants — `knowledge_graph`,
+`planning` — so every team on a cluster shares the same two collections, and multi-tenancy is off
+unless a deployment turns it on. `team_id` is therefore also the predicate:
+
+| Method | Filter |
+|---|---|
+| `add` | stamps `team_id` |
+| `search` | `team_id == <backend's own>`, passed to the cluster as `filters=` so it applies **before** `limit` |
+| `remove` | `ref_id IN (...)` **AND** `team_id == <backend's own>` |
+| `delete_by_team(collection, team_id)` | `team_id == <argument>` — the backend's own is deliberately *not* anded on |
+| `list_collections()` | none; a collection name identifies no team |
+
+`remove` needs both legs. `ref_id` alone deletes the matching object of every team on the cluster,
+and reference ids collide across teams by construction — planning ids are small integers, so
+completing task `3` would reach every team's task `3`. The team leg alone deletes the collection.
+
+The predicate is unconditional and fails closed: a backend built without a `team_id` filters on
+`""` and so reads and removes only what another team-less backend wrote. It does not see
+everything. A hand-built `WeaviateBackend(url=...)` in a script therefore finds nothing in a
+populated cluster — the correct answer to a query that never said whose data it wanted.
+
+`SearchHit` still does not expose `team_id`; the boundary is applied in the query, not reported in
+the result.
 
 ### Reaping a deleted team
 

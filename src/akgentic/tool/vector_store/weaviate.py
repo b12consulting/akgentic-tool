@@ -21,6 +21,7 @@ from akgentic.tool.vector_store.protocol import (
 if TYPE_CHECKING:
     import weaviate
     import weaviate.collections
+    from weaviate.collections.classes.filters import FilterReturn
 
     from akgentic.tool.vector_store.vector import VectorEntry
 
@@ -29,9 +30,14 @@ logger = logging.getLogger(__name__)
 TEAM_ID_PROPERTY: str = "team_id"
 """Schema property carrying the owning team's id on every stored object.
 
-Written on ingest and never read back into a ``SearchHit`` — it exists so that a
-sweeper can find and delete the vectors of a team that no longer exists, which is
-otherwise impossible: nothing else on a Weaviate object says who produced it.
+Stamped on ingest and read back as a predicate on every query this backend
+issues: ``search`` and ``remove`` are restricted to the objects of their own
+team, and ``delete_by_team`` reaps another team's on request. It is never
+surfaced on a ``SearchHit``.
+
+Collection names are module constants, so every team on a cluster shares the
+same collections — this property is the only thing on a Weaviate object that
+says who produced it, and therefore the only thing a query can be scoped by.
 """
 
 
@@ -73,12 +79,22 @@ class WeaviateBackend:
     non-serialisable runtime state (the Weaviate client connection).
     It satisfies the ``VectorStoreService`` protocol structurally.
 
+    **The backend is team-scoped by construction.** Every query it issues
+    carries a predicate on ``team_id``: ``search`` sees only its own team's
+    objects, and ``remove`` deletes only its own team's. The boundary lives
+    here rather than on ``VectorStoreService`` precisely so that no caller has
+    to pass a team and no caller can forget one (ADR-046 §D1). The two cleanup
+    primitives — ``delete_by_team`` and ``list_collections`` — cross the
+    boundary deliberately and say so in their signatures.
+
     Args:
         url: Weaviate cluster URL (e.g. ``http://localhost:8080``).
         api_key: Optional API key for authentication.
         tenant: Optional default tenant ID for multi-tenancy.
-        team_id: Owning team id, stamped onto every object written through
-            this backend so a later sweep can delete a deleted team's vectors.
+        team_id: Owning team id. Stamped onto every object written through this
+            backend and used as the filter on every object it reads or removes.
+            Absent, it is the empty string on both halves: such a backend sees
+            only what another team-less backend wrote, never everything.
     """
 
     def __init__(
@@ -178,7 +194,8 @@ class WeaviateBackend:
 
         Uses batch insertion with pre-populated vectors. Every object is stamped
         with the backend's ``team_id`` (empty string when the backend was built
-        without one) so ``delete_by_team`` can find it later.
+        without one) — the handle by which ``search``, ``remove`` and
+        ``delete_by_team`` later find it.
 
         Args:
             collection: Target collection name.
@@ -203,9 +220,13 @@ class WeaviateBackend:
                 )
 
     def remove(self, collection: str, ref_ids: list[str]) -> None:
-        """Remove entries from a Weaviate collection by ref_id.
+        """Remove this team's entries from a Weaviate collection by ref_id.
 
-        Uses ``delete_many`` with a property filter on ``ref_id``.
+        Uses ``delete_many`` with the **conjunction** of a membership filter on
+        ``ref_id`` and this backend's team predicate. Both legs are required:
+        ``ref_id`` alone deletes the matching object of every team on the
+        cluster — and reference ids collide across teams, since planning ids
+        are small integers — while the team leg alone deletes the collection.
 
         Args:
             collection: Target collection name.
@@ -219,13 +240,18 @@ class WeaviateBackend:
         self._check_collection(collection)
         col = self._get_collection(collection)
         col.data.delete_many(
-            where=Filter.by_property("ref_id").contains_any(ref_ids),
+            where=Filter.by_property("ref_id").contains_any(ref_ids) & self._team_filter(),
         )
 
     def search(
         self, collection: str, query_vector: list[float], top_k: int
     ) -> SearchResult:
-        """Search a Weaviate collection by cosine similarity.
+        """Search this team's objects in a Weaviate collection by cosine similarity.
+
+        The team predicate is passed to the cluster as ``filters=``, so it is
+        applied **before** ``limit``. Filtering the returned objects here
+        instead would leave the caller with a short result set reporting itself
+        complete, its budget already spent on other teams' objects.
 
         Args:
             collection: Target collection name.
@@ -246,6 +272,7 @@ class WeaviateBackend:
         result = col.query.near_vector(
             near_vector=query_vector,
             limit=top_k,
+            filters=self._team_filter(),
             return_metadata=MetadataQuery(distance=True),
         )
 
@@ -292,6 +319,11 @@ class WeaviateBackend:
         the caller is typically a sweeper reaping a team that no longer exists,
         so it never created the collection through this backend.
 
+        The filter is on the **argument** alone. Unlike ``search`` and
+        ``remove`` this method does not add the backend's own team predicate —
+        anding it on would leave a sweeper able to reap only itself, which is
+        the one team that is never being reaped.
+
         Args:
             collection: Target collection name.
             team_id: The team whose objects are to be removed.
@@ -334,6 +366,23 @@ class WeaviateBackend:
         if collection not in self._collections_created:
             msg = f"Collection '{collection}' does not exist"
             raise ValueError(msg)
+
+    def _team_filter(self) -> FilterReturn:
+        """Return the predicate restricting a query to this backend's own team.
+
+        The single place the team predicate is built, so ``search`` and
+        ``remove`` cannot drift apart. A backend constructed without a
+        ``team_id`` filters on ``""``, and therefore reads and removes only
+        what another team-less backend wrote — it does not see everything
+        (ADR-046 §D2, the same fail-closed rule ``add`` already applies when
+        stamping).
+
+        Returns:
+            An equality predicate on the ``team_id`` property.
+        """
+        from weaviate.classes.query import Filter
+
+        return Filter.by_property(TEAM_ID_PROPERTY).equal(self._team_id or "")
 
     def _get_collection(self, name: str) -> weaviate.collections.Collection:
         """Return the Weaviate collection handle, with tenant if applicable.
