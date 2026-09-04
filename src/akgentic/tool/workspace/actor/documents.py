@@ -123,9 +123,12 @@ class DocumentsMixin:
             # "evicted" covers both remedies deliberately: the return is a flat
             # list of paths and cannot say whether a path lost its whole entry
             # or only its body (45-3's frozen shape).
+            # The paths are passed through rather than joined here: at either cap
+            # this line runs on every fill, and an eager join would build the
+            # string even with DEBUG off. ``%s`` over the list defers all of it.
             logger.debug(
                 "Filling the document cache for %s evicted (entry removed or body dropped): %s",
                 path,
-                ", ".join(evicted),
+                evicted,
             )
         self.state.notify_state_change()

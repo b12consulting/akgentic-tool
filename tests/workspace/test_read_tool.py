@@ -842,9 +842,9 @@ class TestBinaryFileReading:
     def test_pass1_empty_no_llm_returns_placeholder(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
-        """AC 5: Pass 1 empty + no LLM -> placeholder returned."""
+        """AC 5: Pass 1 empty + no LLM -> placeholder returned, and cached."""
         reader = DocumentReader(llm_client=None)
-        tool, fs, _actor = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
+        tool, fs, actor = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
         pdf_path = fs._root / "scan.pdf"
         pdf_path.write_bytes(b"%PDF image only")
 
@@ -854,6 +854,12 @@ class TestBinaryFileReading:
             result = read_fn("scan.pdf")
 
         assert "markitdown: no text extracted" in result
+        # The fill does not discriminate on what came back, and must not: a scan
+        # that extracts to nothing is the most expensive thing to re-extract,
+        # because it is the case that reaches the LLM vision fallback. The
+        # sidecar carried this property by writing the placeholder to disk; it
+        # would otherwise have been dropped with the sidecar assertions.
+        assert actor.state.documents["scan.pdf"].markdown == placeholder
 
     def test_pass1_empty_pass2_with_llm_returns_content(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
