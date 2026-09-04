@@ -17,10 +17,13 @@ propagates.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 
 from akgentic.tool.workspace.documents.models import DocumentExtract, evict_document_bodies
 from akgentic.tool.workspace.models import WorkspaceConfig, WorkspaceState
+
+logger = logging.getLogger(__name__)
 
 
 class DocumentsMixin:
@@ -104,9 +107,25 @@ class DocumentsMixin:
             char_count=len(markdown),
             extracted_at=datetime.now(UTC),
         )
-        evict_document_bodies(
+        evicted = evict_document_bodies(
             self.state.documents,
             max_documents=self.config.max_documents,
             max_document_chars=self.config.max_document_chars,
         )
+        if evicted:
+            # One line per fill, never one per path, and DEBUG rather than INFO:
+            # on a workspace sitting at either cap this fires on every fill, and
+            # the question it answers — "why does this document keep
+            # re-extracting?" — is a debugging question. It is also the only
+            # evidence an entry-cap eviction ever happened, since the row is
+            # gone by the time anything else could look.
+            #
+            # "evicted" covers both remedies deliberately: the return is a flat
+            # list of paths and cannot say whether a path lost its whole entry
+            # or only its body (45-3's frozen shape).
+            logger.debug(
+                "Filling the document cache for %s evicted (entry removed or body dropped): %s",
+                path,
+                ", ".join(evicted),
+            )
         self.state.notify_state_change()

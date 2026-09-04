@@ -32,7 +32,20 @@ class WorkspaceRead(BaseToolParam):
 
     expose: set[Channels] = {TOOL_CALL}
     default_limit: int = 2000
+
     force_document_regeneration: bool = False
+    """Default for the callable's parameter of the same name: ignore a **valid**
+    cached extraction and re-extract the document.
+
+    A forced read still fills the cache with what it extracted, so it costs one
+    extraction rather than turning caching off for that path.
+
+    The meaning is new in ADR-045. It used to mean "ignore a file that happens to
+    sit beside the source", which no notion of validity governed at all — the
+    thing it bypassed could never say whether it described the current bytes.
+    A cache entry can, so forcing now means overriding a *correct* answer, which
+    is a coherent thing to ask for and a rare thing to need."""
+
     document_reader: DocumentReader | bool = True
 
 

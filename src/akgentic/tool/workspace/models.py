@@ -130,9 +130,11 @@ def gitignore_seed() -> str:
     Every pattern is anchor-free so it matches at **every** depth: sidecars are
     written beside their source file, wherever that is.
 
-    Without this the tree is dirty continuously — read paths write sidecars, so
-    a document read or an image view dirties the tree, and every agent's commit
-    would then be preceded by an ``out-of-band`` commit of regenerable noise.
+    Without this the tree is dirty continuously — an **image view** writes a
+    resized sidecar beside its source, so a view dirties the tree, and every
+    agent's commit would then be preceded by an ``out-of-band`` commit of
+    regenerable noise. A document read no longer writes anything at all: its
+    extraction lives in ``#Workspace``'s state (ADR-045 §3).
 
     Returns:
         The file's full text, ending in a newline.
@@ -146,7 +148,8 @@ def gitignore_seed() -> str:
         "# Atomic-write staging files: .<name>.<32 hex>.tmp",
         ".*.tmp",
         "",
-        "# Extracted-document sidecars: .<name>.md",
+        "# Extracted-document sidecars: .<name>.md — vestigial, written by nothing",
+        "# since ADR-045; kept for the leftovers in trees that predate it.",
         ".*.md",
         "",
         "# Resized-image sidecars: .<stem>.<ext>.<max_dim>.<ext>",
