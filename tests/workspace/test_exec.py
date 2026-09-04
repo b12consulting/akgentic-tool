@@ -1122,7 +1122,7 @@ class TestTheBudgets:
             seen.append((attempts, delay))
             return None
 
-        monkeypatch.setattr("akgentic.tool.workspace.tool.poll_deferred", capture)
+        monkeypatch.setattr("akgentic.tool.workspace.card.execution.poll_deferred", capture)
         _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
         assert isinstance(actor, WorkspaceActor)
         harness = SandboxHarness(actor, orchestrator_proxy)
@@ -1243,7 +1243,7 @@ class TestWaitingOutTheRun:
         # real, rather than being handed the message directly.
         monkeypatch.setattr("akgentic.tool.workspace.execution.EXEC_REPORT_MARGIN_S", 0.0)
         monkeypatch.setattr(
-            "akgentic.tool.workspace.tool.poll_deferred",
+            "akgentic.tool.workspace.card.execution.poll_deferred",
             lambda fetch, attempts, delay: None,
         )
         waiting_card, _ = exec_card_for(

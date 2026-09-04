@@ -84,7 +84,7 @@ class TestEveryMutationRunsOnTheActor:
         # write into the decoy — nothing else can tell the two apart.
         decoy = Filesystem(str(workspaces_root), "decoy")
         observer = FakeActorToolObserver(orchestrator_proxy)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=decoy):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=decoy):
             card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
             card.observer(observer)
 

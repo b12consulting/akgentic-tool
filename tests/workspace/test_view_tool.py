@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import akgentic.tool.workspace.tool as _tool_mod
+import akgentic.tool.workspace.card.read as _tool_mod
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.tool import WorkspaceTool, WorkspaceView
 from akgentic.tool.workspace.workspace import Filesystem
@@ -35,7 +35,7 @@ def make_wired_read_tool(tmp_path: Path) -> tuple[WorkspaceTool, Filesystem]:
     fs = Filesystem(str(tmp_path), str(tid))
     observer = make_observer(team_id=tid)
     tool = WorkspaceTool(read_only=True)
-    with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+    with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
         tool.observer(observer)
     return tool, fs
 
@@ -159,7 +159,7 @@ class TestWorkspaceViewTool:
         fs = Filesystem(str(tmp_path), str(tid))
         observer = make_observer(team_id=tid)
         tool = WorkspaceTool(read_only=True, workspace_view=False)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool.observer(observer)
         names = [t.__name__ for t in tool.get_tools()]
         assert "workspace_view" not in names
@@ -259,7 +259,7 @@ class TestWorkspaceViewResize:
         fs2 = Filesystem(str(tmp_path), str(tid))
         obs2 = make_observer(team_id=tid)
         tool2 = WorkspaceTool(read_only=True, workspace_view=WorkspaceView(max_dimension=1568))
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs2):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs2):
             tool2.observer(obs2)
         (fs2._root / "big.png").write_bytes(raw)
         fn2 = next(t for t in tool2.get_tools() if t.__name__ == "workspace_view")
@@ -270,7 +270,7 @@ class TestWorkspaceViewResize:
         fs3 = Filesystem(str(tmp_path), str(tid3))
         obs3 = make_observer(team_id=tid3)
         tool3 = WorkspaceTool(read_only=True, workspace_view=WorkspaceView(max_dimension=800))
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs3):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs3):
             tool3.observer(obs3)
         (fs3._root / "big.png").write_bytes(raw)
         fn3 = next(t for t in tool3.get_tools() if t.__name__ == "workspace_view")
@@ -399,7 +399,7 @@ class TestWorkspaceViewPillowAbsent:
 
         with (
             patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}),
-            patch.object(logging.getLogger("akgentic.tool.workspace.tool"), "warning") as mock_warn,
+            patch.object(logging.getLogger("akgentic.tool.workspace.card.read"), "warning") as mock_warn,
         ):
             fn("image.png")
             fn("image.png")  # second call — warning must NOT be repeated

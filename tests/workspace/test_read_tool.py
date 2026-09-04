@@ -12,6 +12,11 @@ import pytest
 
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.readers import DocumentReader, MediaContent
+from akgentic.tool.workspace.card.read import (
+    _expand_braces,
+    _grep_python,
+    _grep_rg,
+)
 from akgentic.tool.workspace.tool import (
     ExpandMediaRefs,
     WorkspaceGlob,
@@ -19,9 +24,6 @@ from akgentic.tool.workspace.tool import (
     WorkspaceList,
     WorkspaceRead,
     WorkspaceTool,
-    _expand_braces,
-    _grep_python,
-    _grep_rg,
 )
 from akgentic.tool.workspace.workspace import Filesystem
 
@@ -47,7 +49,7 @@ def make_tool(tmp_path: Path, team_id: uuid.UUID | None = None) -> WorkspaceTool
     fs = Filesystem(str(tmp_path), str(tid))
     observer = make_observer(team_id=tid)
     tool = WorkspaceTool(read_only=True)
-    with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+    with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
         tool.observer(observer)
     return tool
 
@@ -99,7 +101,7 @@ class TestObserverWiring:
         observer = make_observer(team_id=team_id)
         fs = Filesystem(str(tmp_path), str(team_id))
         tool = WorkspaceTool(read_only=True)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs) as mock_gw:
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs) as mock_gw:
             result = tool.observer(observer)
             mock_gw.assert_called_once_with(str(team_id))
             assert tool.workspace is fs
@@ -109,7 +111,7 @@ class TestObserverWiring:
         observer = make_observer()
         fs = Filesystem(str(tmp_path), "explicit-ws")
         tool = WorkspaceTool(read_only=True, workspace_id="explicit-ws")
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs) as mock_gw:
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs) as mock_gw:
             tool.observer(observer)
             mock_gw.assert_called_once_with("explicit-ws")
 
@@ -118,7 +120,7 @@ class TestObserverWiring:
         observer = make_observer(team_id=team_id)
         fs = Filesystem(str(tmp_path), str(team_id))
         tool = WorkspaceTool(read_only=True)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             result = tool.observer(observer)
         assert result is tool
 
@@ -157,7 +159,7 @@ class TestWorkspaceRead:
         self._make_file(root, "big.txt", 3500)
         tool = WorkspaceTool(read_only=True)
         observer = make_observer(team_id=team_id)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool.observer(observer)
         fn = tool.get_tools()[0]  # workspace_read
         result = fn("big.txt")
@@ -175,7 +177,7 @@ class TestWorkspaceRead:
         self._make_file(root, "file.txt", 200)
         tool = WorkspaceTool(read_only=True)
         observer = make_observer(team_id=team_id)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool.observer(observer)
         fn = tool.get_tools()[0]
         result = fn("file.txt", offset=100, limit=50)
@@ -191,7 +193,7 @@ class TestWorkspaceRead:
         self._make_file(root, "small.txt", 10)
         tool = WorkspaceTool(read_only=True)
         observer = make_observer(team_id=team_id)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool.observer(observer)
         fn = tool.get_tools()[0]
         result = fn("small.txt")
@@ -204,7 +206,7 @@ class TestWorkspaceRead:
         (fs._root / "abc.txt").write_text("alpha\nbeta\ngamma", encoding="utf-8")
         tool = WorkspaceTool(read_only=True)
         observer = make_observer(team_id=team_id)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool.observer(observer)
         fn = tool.get_tools()[0]
         result = fn("abc.txt")
@@ -293,7 +295,7 @@ class TestWorkspaceGlob:
         for i in range(5):
             (root / f"f{i}.py").write_bytes(b"x")
         observer = make_observer(team_id=team_id)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool.observer(observer)
         fn = tool.get_tools()[2]
         result = fn("**/*.py")
@@ -462,7 +464,7 @@ class TestWorkspaceGrep:
         root = tool.workspace._root
         (root / "main.py").write_text("import os\npass\n", encoding="utf-8")
         fn = tool.get_tools()[3]  # workspace_grep
-        with patch("akgentic.tool.workspace.tool._grep_rg", return_value=None):
+        with patch("akgentic.tool.workspace.card.read._grep_rg", return_value=None):
             result = fn("import os")
         assert "main.py" in result
         assert "import os" in result
@@ -472,7 +474,7 @@ class TestWorkspaceGrep:
         root = tool.workspace._root
         (root / "x.py").write_text("nothing\n", encoding="utf-8")
         fn = tool.get_tools()[3]
-        with patch("akgentic.tool.workspace.tool._grep_rg", return_value=None):
+        with patch("akgentic.tool.workspace.card.read._grep_rg", return_value=None):
             result = fn("xyzzy_not_found")
         assert result == "No matches found."
 
@@ -482,7 +484,7 @@ class TestWorkspaceGrep:
         (root / "a.py").write_text("needle\n", encoding="utf-8")
         (root / "b.txt").write_text("needle\n", encoding="utf-8")
         fn = tool.get_tools()[3]
-        with patch("akgentic.tool.workspace.tool._grep_rg", return_value=None):
+        with patch("akgentic.tool.workspace.card.read._grep_rg", return_value=None):
             result = fn("needle", include="*.py")
         assert "a.py" in result
         assert "b.txt" not in result
@@ -500,8 +502,8 @@ class TestWorkspaceGrep:
         fake_match = (root / "x.py", 1, "import os")
         fn = tool.get_tools()[3]
         with (
-            patch("akgentic.tool.workspace.tool._grep_rg", return_value=[fake_match]) as mock_rg,
-            patch("akgentic.tool.workspace.tool._grep_python") as mock_py,
+            patch("akgentic.tool.workspace.card.read._grep_rg", return_value=[fake_match]) as mock_rg,
+            patch("akgentic.tool.workspace.card.read._grep_python") as mock_py,
         ):
             result = fn("import os")
         mock_rg.assert_called_once()
@@ -524,7 +526,7 @@ class TestCapabilityToggling:
         fs = Filesystem(str(tmp_path), str(team_id))
         observer = make_observer(team_id=team_id)
         tool = WorkspaceTool(read_only=True, workspace_glob=False, workspace_grep=False)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool.observer(observer)
         tools = tool.get_tools()
         assert len(tools) == 3  # read, list, view
@@ -544,7 +546,7 @@ class TestCapabilityToggling:
             workspace_grep=False,
             workspace_view=False,
         )
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool.observer(observer)
         assert tool.get_tools() == []
 
@@ -560,7 +562,7 @@ class TestCapabilityToggling:
             workspace_grep=False,
             workspace_view=False,
         )
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool.observer(observer)
         tools = tool.get_tools()
         assert len(tools) == 1
@@ -691,7 +693,7 @@ class TestRetriableErrorReadTool:
         # Write a file so grep actually tries to match
         (tool.workspace._root / "test.txt").write_text("hello", encoding="utf-8")
         grep_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_grep")
-        with patch("akgentic.tool.workspace.tool._grep_rg", return_value=None):
+        with patch("akgentic.tool.workspace.card.read._grep_rg", return_value=None):
             with pytest.raises(RetriableError, match="Invalid regex pattern"):
                 grep_fn("[invalid")  # unclosed bracket — invalid regex
 
@@ -719,7 +721,7 @@ def make_wired_tool(
     tool = WorkspaceTool(
         read_only=True, workspace_read=WorkspaceRead(document_reader=document_reader)
     )
-    with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+    with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
         tool.observer(observer)
     return tool, fs
 
@@ -1116,7 +1118,7 @@ class TestWorkspaceGlobBraceExpansion:
         for i in range(110):
             (root / f"f{i:03d}.py").write_bytes(b"x")
         observer = make_observer(team_id=team_id)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool.observer(observer)
         glob_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_glob")
         result = glob_fn("**/*.{py,js}")
@@ -1306,7 +1308,7 @@ class TestExpandMediaRefs:
         fs = Filesystem(str(tmp_path), str(tid))
         observer = make_observer(team_id=tid)
         tool = WorkspaceTool(read_only=True, expand_media_refs=False)
-        with patch("akgentic.tool.workspace.tool.get_workspace", return_value=fs):
+        with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs):
             tool.observer(observer)
         commands = tool.get_commands()
         assert ExpandMediaRefs not in commands
