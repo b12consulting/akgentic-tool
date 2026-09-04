@@ -106,7 +106,10 @@ class InMemoryBackend:
 
         An entry is removed only when its ``ref_id`` is listed **and** it satisfies
         every predicate given, so ``remove(scope=...)`` is a scalpel: another scope's
-        entries survive even when a ref-id collides across scopes.
+        entries survive even when a ref-id collides across scopes. The predicate goes
+        to ``VectorIndex.remove`` rather than being resolved to a set of ids here —
+        an id-precise removal cannot tell two colliding entries apart, which is the
+        one case the scalpel exists for.
 
         Args:
             collection: Target collection name.
@@ -121,13 +124,9 @@ class InMemoryBackend:
         if scope is None and path_prefix is None:
             index.remove(set(ref_ids))
             return
-        listed = set(ref_ids)
         index.remove(
-            {
-                e.ref_id
-                for e in index._entries
-                if e.ref_id in listed and _entry_matches(e, scope, path_prefix)
-            }
+            set(ref_ids),
+            matches=lambda entry: _entry_matches(entry, scope, path_prefix),
         )
 
     def search(

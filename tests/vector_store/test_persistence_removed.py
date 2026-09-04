@@ -15,12 +15,17 @@ from akgentic.tool.vector_store.actor import VectorStoreState
 from akgentic.tool.vector_store.inmemory import InMemoryBackend
 from akgentic.tool.vector_store.protocol import CollectionConfig
 
-# The three packages the deleted mode reached. ``sandbox/`` is deliberately excluded:
-# its ``SandboxState.workspace_path`` is an unrelated field that means a sandbox
-# directory on the host, and has nothing to do with vector persistence.
-SWEPT_PACKAGES = ("vector_store", "knowledge_graph", "planning")
+# Three of the four retired names belong to nothing else in the package, so they are
+# swept across the whole tree — which is what catches a reintroduction in a package the
+# deleted mode never reached.
+GLOBALLY_RETIRED_NAMES = ("persistence", "save_collection", "load_collection")
 
-RETIRED_NAMES = ("persistence", "workspace_path", "save_collection", "load_collection")
+# ``workspace_path`` cannot be swept that widely: ``sandbox/`` declares
+# ``SandboxState.workspace_path`` (``sandbox/actor.py``), an unrelated field meaning a
+# sandbox directory on the host, and uses it in ``seatbelt.py`` / ``bwrap.py`` /
+# ``local.py``. It is swept only in the three packages the deleted mode reached.
+SCOPED_PACKAGES = ("vector_store", "knowledge_graph", "planning")
+SCOPED_RETIRED_NAMES = ("workspace_path",)
 
 
 def _executable_source(path: Path) -> str:
@@ -48,33 +53,50 @@ def _executable_source(path: Path) -> str:
     return " ".join(kept)
 
 
-def _swept_files() -> list[Path]:
+def _tool_src() -> Path:
+    """Return the root of the package's source tree."""
+    return Path(__file__).resolve().parents[2] / "src" / "akgentic" / "tool"
+
+
+def _all_files() -> list[Path]:
+    """Return every Python module in the package."""
+    return sorted(_tool_src().rglob("*.py"))
+
+
+def _scoped_files() -> list[Path]:
     """Return every Python module in the three packages the deleted mode touched."""
-    src = Path(__file__).resolve().parents[2] / "src" / "akgentic" / "tool"
     files: list[Path] = []
-    for package in SWEPT_PACKAGES:
-        files.extend(sorted((src / package).rglob("*.py")))
+    for package in SCOPED_PACKAGES:
+        files.extend(sorted((_tool_src() / package).rglob("*.py")))
     return files
 
 
 class TestNoReferenceSurvivesInSource:
-    """No executable reference to the deleted mode is left in the three packages."""
+    """No executable reference to the deleted mode is left anywhere it could be."""
 
     def test_the_sweep_actually_reads_something(self) -> None:
         """Non-vacuity: a sweep that reads nothing would pass every assertion below."""
-        files = _swept_files()
-        assert len(files) >= 15, f"sweep found only {len(files)} modules"
-        joined = " ".join(_executable_source(f) for f in files)
+        scoped = _scoped_files()
+        every = _all_files()
+        assert len(scoped) >= 15, f"scoped sweep found only {len(scoped)} modules"
+        assert len(every) > len(scoped), "the wide sweep must read more than the scoped one"
+        joined = " ".join(_executable_source(f) for f in every)
         # Stripping strings must not have emptied the source of real code.
         assert "create_collection" in joined
         assert "CollectionConfig" in joined
+        # And the wide sweep really does reach outside the three packages.
+        assert "SandboxState" in joined
 
-    @pytest.mark.parametrize("name", RETIRED_NAMES)
-    def test_retired_name_is_absent(self, name: str) -> None:
-        """Each deleted name appears in no module's executable source."""
-        offenders = [
-            str(path) for path in _swept_files() if name in _executable_source(path)
-        ]
+    @pytest.mark.parametrize("name", GLOBALLY_RETIRED_NAMES)
+    def test_globally_retired_name_is_absent_from_the_whole_package(self, name: str) -> None:
+        """These three names belong to nothing else, so nothing anywhere may use them."""
+        offenders = [str(path) for path in _all_files() if name in _executable_source(path)]
+        assert offenders == [], f"'{name}' still referenced in: {offenders}"
+
+    @pytest.mark.parametrize("name", SCOPED_RETIRED_NAMES)
+    def test_scoped_retired_name_is_absent_from_the_three_packages(self, name: str) -> None:
+        """``workspace_path`` is gone from every package the deleted mode reached."""
+        offenders = [str(path) for path in _scoped_files() if name in _executable_source(path)]
         assert offenders == [], f"'{name}' still referenced in: {offenders}"
 
     def test_the_backend_no_longer_offers_the_two_methods(self) -> None:

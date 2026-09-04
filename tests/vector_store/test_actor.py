@@ -729,6 +729,44 @@ class TestEmbeddingCompleted:
         assert message.request_ref == "docs/a.md"
         assert message.count == 2
 
+    def test_told_when_the_backend_insert_fails(self) -> None:
+        """A failed insert is reported to the caller, not just swallowed into a settle.
+
+        This is the path that replaced the collection-wide ERROR: the failure has to
+        reach somebody, and the requester is the only one left who can act on it.
+        """
+        actor = _make_actor()
+        backend = _mock_backend()
+        backend.add.side_effect = RuntimeError("disk full")
+        actor._backend = backend
+        requester = MagicMock()
+        _open_request(actor, "req-1", count=2, request_ref="docs/a.md")
+        actor._request_requesters["req-1"] = requester
+
+        with patch.object(actor, "send") as mock_send:
+            actor.receiveMsg_EmbeddingResult(_result_for("req-1"))
+
+        _, message = mock_send.call_args.args
+        assert message.error == "disk full"
+        assert message.request_ref == "docs/a.md"
+
+    def test_told_when_no_backend_is_available(self) -> None:
+        """An unavailable backend settles the request AND says why."""
+        actor = _make_actor()
+        requester = MagicMock()
+        _open_request(actor, "req-1", request_ref="docs/b.md")
+        actor._request_requesters["req-1"] = requester
+
+        with (
+            patch.object(actor, "_get_backend_for_collection", return_value=None),
+            patch.object(actor, "send") as mock_send,
+        ):
+            actor.receiveMsg_EmbeddingResult(_result_for("req-1"))
+
+        _, message = mock_send.call_args.args
+        assert message.error == "Backend unavailable"
+        assert message.request_ref == "docs/b.md"
+
     def test_no_requester_means_no_message(self) -> None:
         """The three existing call sites pass no requester and get no delivery."""
         actor = _make_actor()
@@ -982,6 +1020,33 @@ class TestScopePassThrough:
         backend.remove.assert_called_once_with(
             "col1", ["id1"], scope="ws-1", path_prefix="docs/"
         )
+
+    def test_status_override_preserves_a_field_the_actor_never_heard_of(self) -> None:
+        """search() overrides two fields by copy, never by rebuilding the result.
+
+        An enumerated rebuild is correct on the day it is written and drops the next
+        field added to ``SearchResult`` in silence. A whole-model comparison cannot
+        catch that — only a field the write path has never seen can.
+        """
+
+        class _SearchResultWithExtra(SearchResult):
+            extra_field: str = "sentinel"
+
+        actor = _make_actor()
+        backend = _mock_backend()
+        backend.search.return_value = _SearchResultWithExtra(
+            hits=[], status=CollectionStatus.READY, indexing_pending=0
+        )
+        actor._backend = backend
+        actor.state.collection_statuses["col1"] = CollectionStatus.INDEXING
+        actor.state.indexing_pending["col1"] = 4
+
+        result = actor.search("col1", [0.1], 5)
+
+        assert result.status == CollectionStatus.INDEXING
+        assert result.indexing_pending == 4
+        assert isinstance(result, _SearchResultWithExtra)
+        assert result.extra_field == "sentinel"
 
     def test_add_does_not_forward_correlation_arguments_to_the_backend(self) -> None:
         """requester and request_ref are actor-level, never a backend concern."""
