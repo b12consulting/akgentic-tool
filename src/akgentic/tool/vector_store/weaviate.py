@@ -93,8 +93,11 @@ class WeaviateBackend:
         tenant: Optional default tenant ID for multi-tenancy.
         team_id: Owning team id. Stamped onto every object written through this
             backend and used as the filter on every object it reads or removes.
-            Absent, it is the empty string on both halves: such a backend sees
-            only what another team-less backend wrote, never everything.
+            **Required to query:** ``search`` and ``remove`` raise ``ValueError``
+            without one, rather than inventing an identity for the caller. It may
+            be omitted only to build an administrative backend for
+            ``list_collections`` and ``delete_by_team``, neither of which needs a
+            team.
     """
 
     def __init__(
@@ -193,9 +196,15 @@ class WeaviateBackend:
         """Ingest embedding entries into a Weaviate collection.
 
         Uses batch insertion with pre-populated vectors. Every object is stamped
-        with the backend's ``team_id`` (empty string when the backend was built
-        without one) — the handle by which ``search``, ``remove`` and
-        ``delete_by_team`` later find it.
+        with the backend's ``team_id`` — the handle by which ``search``, ``remove``
+        and ``delete_by_team`` later find it.
+
+        A backend with no ``team_id`` stamps ``""`` rather than omitting the
+        property, so that the schema stays uniform and a sweep never meets an object
+        where it is absent. Writing is therefore still possible without a team where
+        querying is not: the asymmetry is deliberate, since ``""`` is a value a
+        sweeper can find and act on, whereas a *query* filtering on ``""`` would be
+        answering as an identity the caller never claimed.
 
         Args:
             collection: Target collection name.
@@ -233,7 +242,8 @@ class WeaviateBackend:
             ref_ids: List of reference IDs to remove.
 
         Raises:
-            ValueError: If the collection has not been created.
+            ValueError: If the collection has not been created, or if this backend
+                was built without a ``team_id``.
         """
         from weaviate.classes.query import Filter
 
@@ -262,7 +272,8 @@ class WeaviateBackend:
             Search results with hits ranked by distance (converted to score).
 
         Raises:
-            ValueError: If the collection has not been created.
+            ValueError: If the collection has not been created, or if this backend
+                was built without a ``team_id``.
         """
         from weaviate.classes.query import MetadataQuery
 
@@ -370,19 +381,37 @@ class WeaviateBackend:
     def _team_filter(self) -> FilterReturn:
         """Return the predicate restricting a query to this backend's own team.
 
-        The single place the team predicate is built, so ``search`` and
-        ``remove`` cannot drift apart. A backend constructed without a
-        ``team_id`` filters on ``""``, and therefore reads and removes only
-        what another team-less backend wrote — it does not see everything
-        (ADR-046 §D2, the same fail-closed rule ``add`` already applies when
-        stamping).
+        The single place the team predicate is built, so ``search`` and ``remove``
+        cannot drift apart.
+
+        A backend with no ``team_id`` **cannot query at all**. Filtering on ``""``
+        instead would conflate two different things: ``""`` is a real value in the
+        data — ``add`` stamps it for a writer that has no team — so a backend that
+        does not know who it is would silently issue a query that looks valid and
+        answers as the unattributed team. Refusing is the only reading that does not
+        invent an identity for the caller (ADR-046 §D2).
+
+        Unreachable in a running deployment: ``VectorStoreActor`` always passes
+        ``str(self.team_id)``, and an actor's ``team_id`` is a UUID defaulted at
+        construction. This guards hand-built backends — scripts and tests.
 
         Returns:
             An equality predicate on the ``team_id`` property.
+
+        Raises:
+            ValueError: When the backend was built without a ``team_id``.
         """
         from weaviate.classes.query import Filter
 
-        return Filter.by_property(TEAM_ID_PROPERTY).equal(self._team_id or "")
+        if not self._team_id:
+            msg = (
+                "This backend was built without a team_id, so it cannot search or "
+                "remove — those are scoped to the owning team. Pass team_id to the "
+                "constructor. Cluster administration (list_collections, "
+                "delete_by_team) needs no team and is unaffected."
+            )
+            raise ValueError(msg)
+        return Filter.by_property(TEAM_ID_PROPERTY).equal(self._team_id)
 
     def _get_collection(self, name: str) -> weaviate.collections.Collection:
         """Return the Weaviate collection handle, with tenant if applicable.

@@ -299,7 +299,7 @@ class TestRemove:
         from akgentic.tool.vector_store.protocol import CollectionConfig
         from akgentic.tool.vector_store.weaviate import WeaviateBackend
 
-        backend = WeaviateBackend(url="http://localhost:8080")
+        backend = WeaviateBackend(url="http://localhost:8080", team_id="team-42")
         backend.create_collection("col1", CollectionConfig())
         backend.remove("col1", ["id1", "id2"])
 
@@ -366,7 +366,7 @@ class TestSearch:
         from akgentic.tool.vector_store.protocol import CollectionConfig
         from akgentic.tool.vector_store.weaviate import WeaviateBackend
 
-        backend = WeaviateBackend(url="http://localhost:8080")
+        backend = WeaviateBackend(url="http://localhost:8080", team_id="team-42")
         backend.create_collection("col1", CollectionConfig())
         result = backend.search("col1", [0.1, 0.2, 0.3], top_k=5)
 
@@ -393,7 +393,7 @@ class TestSearch:
         from akgentic.tool.vector_store.protocol import CollectionConfig
         from akgentic.tool.vector_store.weaviate import WeaviateBackend
 
-        backend = WeaviateBackend(url="http://localhost:8080")
+        backend = WeaviateBackend(url="http://localhost:8080", team_id="team-42")
         backend.create_collection("col1", CollectionConfig())
         result = backend.search("col1", [0.1, 0.2], top_k=5)
 
@@ -617,11 +617,16 @@ class TestProtocolCarriesNoTeam:
         assert list(remove.parameters) == ["self", "collection", "ref_ids"]
 
 
-class TestTeamlessBackendFailsClosed:
-    """A backend built without a team_id is the empty team, not every team."""
+class TestTeamlessBackendCannotQuery:
+    """A backend that does not know its team refuses to query, rather than guessing one.
 
-    def test_no_team_means_the_empty_team_on_both_paths(self) -> None:
-        """search and remove both filter on "", so a team-less backend sees only its own."""
+    Filtering on ``""`` would not be a safe default: ``""`` is a real value in the
+    data — ``add`` stamps it for a writer with no team — so a team-less query would
+    silently answer *as* the unattributed team, an identity the caller never claimed.
+    """
+
+    def test_search_and_remove_refuse_without_a_team(self) -> None:
+        """Both query paths raise rather than filtering on the empty team."""
         _mock_weaviate, mock_client = _install_mock_weaviate()
         mock_client.collections.exists.return_value = False
 
@@ -635,13 +640,49 @@ class TestTeamlessBackendFailsClosed:
         backend = WeaviateBackend(url="http://localhost:8080")  # no team_id
         backend.create_collection("col1", CollectionConfig())
 
-        backend.search("col1", [0.1, 0.2], top_k=5)
-        filters = mock_collection.query.near_vector.call_args[1]["filters"]
-        assert ("team_id", "equal", "") in _legs(filters)
+        with pytest.raises(ValueError, match="without a team_id"):
+            backend.search("col1", [0.1, 0.2], top_k=5)
+        with pytest.raises(ValueError, match="without a team_id"):
+            backend.remove("col1", ["id1"])
 
-        backend.remove("col1", ["id1"])
-        where = mock_collection.data.delete_many.call_args[1]["where"]
-        assert ("team_id", "equal", "") in _legs(where)
+        mock_collection.query.near_vector.assert_not_called()
+        mock_collection.data.delete_many.assert_not_called()
+
+    def test_an_empty_string_team_is_refused_too(self) -> None:
+        """`team_id=""` is not an identity; it must not slip past the guard."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        mock_client.collections.get.return_value = MagicMock()
+
+        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+
+        backend = WeaviateBackend(url="http://localhost:8080", team_id="")
+        backend.create_collection("col1", CollectionConfig())
+
+        with pytest.raises(ValueError, match="without a team_id"):
+            backend.search("col1", [0.1], top_k=5)
+
+    def test_cluster_administration_still_works_without_a_team(self) -> None:
+        """list_collections and delete_by_team need no team, and must stay usable.
+
+        This is what the guard must not break: a sweeper reaping a deleted team is
+        built with no team of its own.
+        """
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = True
+        mock_client.collections.list_all.return_value = {"planning": object()}
+
+        mock_collection = MagicMock()
+        mock_collection.data.delete_many.return_value = MagicMock(successful=4)
+        mock_client.collections.get.return_value = mock_collection
+
+        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+
+        backend = WeaviateBackend(url="http://localhost:8080")  # no team_id
+
+        assert backend.list_collections() == ["planning"]
+        assert backend.delete_by_team("planning", "team-gone") == 4
 
 
 class TestDeleteByTeam:

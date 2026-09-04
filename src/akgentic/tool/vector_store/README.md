@@ -298,14 +298,22 @@ unless a deployment turns it on. `team_id` is therefore also the predicate:
 and reference ids collide across teams by construction — planning ids are small integers, so
 completing task `3` would reach every team's task `3`. The team leg alone deletes the collection.
 
-The predicate is unconditional and fails closed: a backend built without a `team_id` filters on
-`""` and so reads and removes only what another team-less backend wrote. It does not see
-everything. A hand-built `WeaviateBackend(url=...)` in a script therefore finds nothing in a
-populated cluster — the correct answer to a query that never said whose data it wanted.
+**A backend with no `team_id` cannot query at all** — `search` and `remove` raise `ValueError`
+rather than filtering on something. Filtering on `""` would not be a safe default: `""` is a real
+value in the data, written by `add` for a team-less writer, so a query filtering on it would answer
+*as* the unattributed team — an identity the caller never claimed. There is no safe guess here, so
+the backend refuses instead of making one. `team_id=""` is refused on the same grounds.
 
-A sweeper is the one script that needs no `team_id`, and the example under *Reaping a deleted team*
-below builds one without: `list_collections` and `delete_by_team` are the two methods that carry no
-team predicate, so neither is affected by the rule above.
+Writing without a team is still allowed, and the asymmetry is deliberate: `""` on a stored object is
+a value a sweeper can find and act on, whereas `""` in a *query* is an invented identity.
+
+A sweeper is the one script that legitimately has no `team_id`, and the example under *Reaping a
+deleted team* below builds one without: `list_collections` and `delete_by_team` are the two methods
+that carry no team predicate, so neither is affected by the rule above.
+
+In a running deployment the raise is unreachable — `VectorStoreActor` always passes
+`str(self.team_id)`, and an actor's `team_id` is a UUID defaulted at construction. It guards
+hand-built backends.
 
 `SearchHit` still does not expose `team_id`; the boundary is applied in the query, not reported in
 the result.
