@@ -303,6 +303,10 @@ The predicate is unconditional and fails closed: a backend built without a `team
 everything. A hand-built `WeaviateBackend(url=...)` in a script therefore finds nothing in a
 populated cluster — the correct answer to a query that never said whose data it wanted.
 
+A sweeper is the one script that needs no `team_id`, and the example under *Reaping a deleted team*
+below builds one without: `list_collections` and `delete_by_team` are the two methods that carry no
+team predicate, so neither is affected by the rule above.
+
 `SearchHit` still does not expose `team_id`; the boundary is applied in the query, not reported in
 the result.
 
