@@ -292,7 +292,11 @@ class DocumentsMixin(_DocumentsBase):
         actor that owns the write gate on another actor's mailbox.
 
         Any failure drops to degraded mode — ``_vs_proxy`` stays ``None`` and
-        ``workspace_rag_index`` answers a sentence.
+        ``workspace_rag_index`` answers a sentence. **Both proxies are bound
+        together or neither is**: ``index_paths`` gates on ``_vs_proxy`` alone, so
+        a half-bound actor would accept work whose ``add()`` calls go nowhere,
+        leaving every file at ``EMBEDDING`` until the reaper queues it again — and
+        again, every ten minutes, for ever.
         """
         from akgentic.core.orchestrator import Orchestrator  # noqa: PLC0415 — cycle
         from akgentic.tool.vector_store.actor import (  # noqa: PLC0415 — optional extra
@@ -327,8 +331,9 @@ class DocumentsMixin(_DocumentsBase):
                 exc,
             )
             return
+        tell = self.proxy_tell(vs_addr, VectorStoreActor)
         self._vs_proxy = proxy
-        self._vs_tell = self.proxy_tell(vs_addr, VectorStoreActor)
+        self._vs_tell = tell
 
     ##
     ## workspace_rag_index — the spawn side
@@ -399,9 +404,13 @@ class DocumentsMixin(_DocumentsBase):
             )
             return
         superseded = list(entry.superseded_chunk_ids)
-        superseded.extend(
-            chunk.chunk_id for chunk in entry.chunks if chunk.chunk_id not in set(superseded)
-        )
+        # The membership set is built once. Rebuilding it per chunk is O(n²) on
+        # the actor's mailbox turn, and an 800-page document is ~1,900 chunks.
+        seen = set(superseded)
+        for chunk in entry.chunks:
+            if chunk.chunk_id not in seen:
+                superseded.append(chunk.chunk_id)
+                seen.add(chunk.chunk_id)
         self.state.rag_index[path] = entry.model_copy(
             update={
                 "status": RagStatus.PENDING,
