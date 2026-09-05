@@ -17,6 +17,7 @@ from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
 from akgentic.tool.workspace.card.params import (
     WorkspaceRagIndex,
     WorkspaceRagList,
+    WorkspaceRagSearch,
     WorkspaceRead,
 )
 from akgentic.tool.workspace.card.rag import RagFactories
@@ -114,6 +115,190 @@ class TestTheCardsRetrievalFields:
         again = WorkspaceTool.model_validate(card.model_dump())
 
         assert again == card
+
+
+class TestTheSearchCapability:
+    """Story 45-8's field, its channel, and the third term it adds to enablement."""
+
+    def test_it_is_off_by_default_like_its_two_siblings(self) -> None:
+        """It reaches the vector store and spends an embedding call per query."""
+        assert WorkspaceTool().workspace_rag_search is False
+
+    def test_it_is_a_tool_call_and_nothing_else(self) -> None:
+        """ADR-045 §5 gives the three capabilities three different channel sets."""
+        assert WorkspaceRagSearch().expose == {TOOL_CALL}
+
+    def test_it_is_a_read_side_tool_and_survives_read_only(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """Retrieval derives from the tree and writes nothing into it."""
+        card, _ = bind(orchestrator_proxy, workspace_rag_search=True, read_only=True)
+
+        assert "workspace_rag_search" in {tool.__name__ for tool in card.get_tools()}
+
+    def test_it_is_absent_when_the_capability_is_off(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        card, _ = bind(orchestrator_proxy)
+
+        assert "workspace_rag_search" not in {tool.__name__ for tool in card.get_tools()}
+
+    def test_it_reaches_no_other_channel(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """A search is something the model does, not something it is shown."""
+        card, _ = bind(orchestrator_proxy, workspace_rag_search=True)
+
+        assert WorkspaceRagSearch not in card.get_commands()
+        assert card.get_context_states() == []
+
+    def test_a_search_only_card_still_enables_retrieval_on_the_actor(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """The AC most likely to be missed, driven end to end.
+
+        Without the third term in ``_rag_enabled`` there is no ``enable_rag``, so
+        no proxy, no collection and no chunking parameters — and every search
+        answers that retrieval is unavailable with nothing anywhere saying why.
+        """
+        tell = RecordingTell()
+
+        bind(
+            orchestrator_proxy,
+            tell_proxy=tell,
+            workspace_rag_index=False,
+            workspace_rag_list=False,
+            workspace_rag_search=True,
+        )
+
+        [(_, announced, _, _)] = tell.enable_calls
+        assert announced == WorkspaceRagIndex()
+
+    def test_a_search_only_card_also_derives_the_small_caps(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """The second of the three sites that read the predicate."""
+        bind(
+            orchestrator_proxy,
+            workspace_rag_search=True,
+            rag_collection=CollectionConfig(backend="inmemory"),
+        )
+
+        assert workspace_config_of(orchestrator_proxy).max_documents == IN_MEMORY_MAX_DOCUMENTS
+
+    def test_a_search_only_card_naming_weaviate_with_no_cluster_fails_at_wiring(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """The third site — a card that asked for shared storage must not get a local index."""
+        with pytest.raises(ValueError, match="AKGENTIC_WEAVIATE_URL"):
+            bind(
+                orchestrator_proxy,
+                workspace_rag_search=True,
+                rag_collection=CollectionConfig(backend="weaviate"),
+            )
+
+    def test_a_payload_carrying_the_search_capability_round_trips(self) -> None:
+        """Compare the models, never two dumps — ``expose`` is a ``set``."""
+        card = WorkspaceTool.model_validate(
+            {"workspace_rag_search": {"top_k": 3, "alpha": 0.4, "score_threshold": 0.2}}
+        )
+
+        assert WorkspaceTool.model_validate(card.model_dump()) == card
+
+
+class TestTheSearchCallable:
+    """A thin ask, and the card's configured values travel with it."""
+
+    def test_it_forwards_the_cards_knobs_to_the_actor(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """The whole search runs on the actor; the card supplies configuration."""
+        seen: list[dict[str, Any]] = []
+
+        class Recording:
+            def rag_search(self, query: str, **kwargs: Any) -> str:
+                seen.append({"query": query, **kwargs})
+                return "ok"
+
+        observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=Recording())
+        card = WorkspaceTool(
+            workspace_id=WORKSPACE_NAME,
+            workspace_rag_search=WorkspaceRagSearch(top_k=3, alpha=0.4, score_threshold=0.2),
+        )
+        card.observer(observer)
+
+        assert self._tool(card, "workspace_rag_search")("terms", path_prefix="docs/") == "ok"
+        assert seen == [
+            {
+                "query": "terms",
+                "top_k": 3,
+                "path_prefix": "docs/",
+                "alpha": 0.4,
+                "score_threshold": 0.2,
+            }
+        ]
+
+    def test_the_callables_own_top_k_overrides_the_cards(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """The budget is the one knob the model may set per call."""
+        seen: list[int] = []
+
+        class Recording:
+            def rag_search(self, query: str, **kwargs: Any) -> str:
+                seen.append(int(kwargs["top_k"]))
+                return "ok"
+
+        observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=Recording())
+        card = WorkspaceTool(
+            workspace_id=WORKSPACE_NAME, workspace_rag_search=WorkspaceRagSearch(top_k=3)
+        )
+        card.observer(observer)
+
+        self._tool(card, "workspace_rag_search")("terms", top_k=9)
+
+        assert seen == [9]
+
+    def test_it_degrades_to_a_sentence_when_the_actor_raises(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """It is an LLM-facing callable; a traceback is not an answer it can use."""
+
+        class Gone:
+            def rag_search(self, query: str, **kwargs: Any) -> str:
+                raise RuntimeError("actor is dead")
+
+        observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=Gone())
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_rag_search=True)
+        card.observer(observer)
+
+        assert self._tool(card, "workspace_rag_search")("terms") == (
+            "Retrieval indexing is not available for this workspace."
+        )
+
+    def test_an_unbound_card_answers_the_sentence_rather_than_raising(self) -> None:
+        """A harness that wires a bare observer binds no proxy at all."""
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_rag_search=True)
+
+        assert card._rag_search_factory(WorkspaceRagSearch())("terms") == (
+            "Retrieval indexing is not available for this workspace."
+        )
+
+    def test_the_docstring_carries_the_cards_extra_instructions(self) -> None:
+        """``format_docstring`` is what puts a team's configuration in front of the model."""
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+        params = WorkspaceRagSearch(instructions="Prefer the reports/ directory.")
+
+        assert "Prefer the reports/ directory." in (
+            card._rag_search_factory(params).__doc__ or ""
+        )
+
+    @staticmethod
+    def _tool(card: WorkspaceTool, name: str) -> Any:
+        for tool in card.get_tools():
+            if tool.__name__ == name:
+                return tool
+        raise AssertionError(f"{name} is not exposed by this card")
 
 
 class TestTheDerivedCaps:

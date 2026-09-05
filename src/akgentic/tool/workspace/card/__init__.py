@@ -68,6 +68,7 @@ from akgentic.tool.workspace.card.params import (
     WorkspacePatch,
     WorkspaceRagIndex,
     WorkspaceRagList,
+    WorkspaceRagSearch,
     WorkspaceRead,
     WorkspaceView,
     WorkspaceWrite,
@@ -108,6 +109,7 @@ __all__ = [
     "WorkspacePatch",
     "WorkspaceRagIndex",
     "WorkspaceRagList",
+    "WorkspaceRagSearch",
     "WorkspaceRead",
     "WorkspaceTool",
     "WorkspaceView",
@@ -204,17 +206,20 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
 
     workspace_rag_index: WorkspaceRagIndex | bool = False
     workspace_rag_list: WorkspaceRagList | bool = False
-    """Retrieval over the workspace tree — **both off unless asked for**.
+    workspace_rag_search: WorkspaceRagSearch | bool = False
+    """Retrieval over the workspace tree — **all three off unless asked for**.
 
     This is ``workspace_exec``'s rationale one notch weaker. Every file capability
     on this card defaults to on because the card already implies file access;
-    these two do not, because they reach the vector store and can spend embedding
-    credits on a whole tree. A capability that costs money on somebody else's
-    account is opt-in.
+    these three do not, because they reach the vector store and can spend
+    embedding credits — a whole tree for the indexer, one query embed per call for
+    the search. A capability that costs money on somebody else's account is
+    opt-in.
 
-    They are on the **read** side of ``read_only``: indexing derives from the tree
-    and writes nothing into it (ADR-045 §5), so ``WorkspaceTool(read_only=True,
-    workspace_rag_index=True)`` registers the indexer.
+    They are on the **read** side of ``read_only``: indexing and retrieval both
+    derive from the tree and write nothing into it (ADR-045 §5), so
+    ``WorkspaceTool(read_only=True, workspace_rag_index=True)`` registers the
+    indexer and ``read_only=True, workspace_rag_search=True`` registers the search.
     """
 
     rag_collection: CollectionConfig = Field(default_factory=CollectionConfig)
@@ -598,6 +603,9 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
             # of retrieval lives on the read side of ``read_only`` (ADR-045 §5).
             self._tool_if_enabled(
                 self.workspace_rag_index, WorkspaceRagIndex, self._rag_index_factory
+            ),
+            self._tool_if_enabled(
+                self.workspace_rag_search, WorkspaceRagSearch, self._rag_search_factory
             ),
         ]
         return [tool for tool in candidates if tool is not None]

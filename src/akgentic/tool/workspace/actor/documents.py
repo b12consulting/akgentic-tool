@@ -12,6 +12,9 @@ move it notify. The call sites are now, and only:
   seconds of extraction that preceded it.
 - :meth:`DocumentsMixin.index_paths` — a queueing pass that actually queued
   something, or a drain that actually spawned.
+- :meth:`DocumentsMixin.receiveMsg_NewFileMessage` — the same, for an upload. It
+  is the *queueing* that notifies, so a notification that named no usable path
+  costs nothing.
 - :meth:`DocumentsMixin.receiveMsg_IndexResult` / :meth:`DocumentsMixin.receiveMsg_IndexError`
   — one per file, at its transition.
 - :meth:`DocumentsMixin.receiveMsg_EmbeddingCompleted` — **only** at the file's
@@ -29,7 +32,13 @@ A new notify on a *read* path — of any kind, in any of these methods — is a
 defect until a decision says otherwise.
 
 Everything on the ask path here is O(1)/O(n) dict work on the actor thread, plus
-bounded file reads while queueing and bounded proxy calls to ``#VectorStore``. The
+bounded file reads while queueing and bounded proxy calls to ``#VectorStore`` —
+including, on :meth:`DocumentsMixin.rag_search`, **one query embed per call**.
+That is the one external round trip this package puts on the gate's own thread.
+It is bounded (one call, not thirty — which is why the indexing path issues its
+``add()`` batches as a *tell*) and every one of its failure modes degrades to the
+keyword leg, which is what makes it acceptable rather than a defect. Do not add a
+second network call to that turn. The
 slow half — extraction and splitting — happens in a ``#index-`` worker and never
 here. Nothing here raises: an exception in a document handler would kill the actor
 that owns the write gate, so a document path degrades — a miss, a file left
@@ -43,7 +52,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from math import ceil
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from akgentic.core.agent_config import BaseConfig
 from akgentic.tool.workspace.documents.context import RagFileRow, RagIndexState
@@ -52,6 +61,8 @@ from akgentic.tool.workspace.documents.models import (
     EXTRACTOR_VERSION,
     RAG_COLLECTION,
     DocumentExtract,
+    NewFileMessage,
+    RagChunk,
     RagFile,
     RagStatus,
     evict_document_bodies,
@@ -64,7 +75,7 @@ if TYPE_CHECKING:
     from akgentic.core.agent import Akgent
     from akgentic.tool.vector_store.actor import VectorStoreActor
     from akgentic.tool.vector_store.embedding_actor import EmbeddingCompleted
-    from akgentic.tool.vector_store.protocol import CollectionConfig
+    from akgentic.tool.vector_store.protocol import CollectionConfig, SearchHit
     from akgentic.tool.workspace.card.params import WorkspaceRagIndex
     from akgentic.tool.workspace.documents.worker import IndexError, IndexResult
 
@@ -101,6 +112,50 @@ take the gate down with it.
 
 _CHUNK_REF_TYPE = "workspace_chunk"
 """``VectorEntry.ref_type`` for every chunk this package stores."""
+
+_NO_HITS = (
+    "Nothing in the retrieval index matched that query. "
+    "Use workspace_rag_list to see which files are indexed."
+)
+"""What a search answers when retrieval works and nothing matched.
+
+Deliberately **not** :data:`_UNAVAILABLE`: "nothing matched" and "nothing is
+indexed" are different problems with different next steps, and an agent handed
+one sentence for both would retry the query when it should have indexed the tree.
+"""
+
+_PREFIX_WILDCARDS = "*?"
+"""Characters a ``path_prefix`` may not contain, on either backend.
+
+Both are legal in a POSIX filename and both are wildcards in Weaviate's ``Like``
+operator, which is what ``WeaviateBackend`` builds a prefix filter from; the
+in-memory backend uses ``str.startswith`` and treats them literally. The v4
+filter API offers no escape, so the same query would mean two different things
+depending on where the collection happens to live. Rejecting them at the
+parameter boundary is the only answer under which the two backends agree, and it
+costs nothing real: a prefix is a filter rather than a filename, so a shorter
+wildcard-free prefix still reaches the file.
+"""
+
+_REJECTED_PREFIX = (
+    "A path_prefix cannot contain '*' or '?': they are wildcards on one vector "
+    "backend and literal characters on the other, so the same filter would mean "
+    "two different things. Use a shorter prefix without them."
+)
+"""The sentence a rejected prefix answers with, identical on both backends."""
+
+
+class _KeywordMatch(NamedTuple):
+    """One chunk the keyword leg hit, with everything its render needs.
+
+    Carried because a keyword-only hit has no ``SearchHit`` behind it and would
+    otherwise have no text at all — which would make a keyword-only search, the
+    degraded mode this whole design turns on, render nothing.
+    """
+
+    path: str
+    chunk: RagChunk
+    text: str
 
 
 class DocumentsMixin(_DocumentsBase):
@@ -910,6 +965,345 @@ class DocumentsMixin(_DocumentsBase):
                 )
             )
         return RagIndexState(rows=rows, pending_hidden=hidden)
+
+    ##
+    ## workspace_rag_search — two legs, fused, and every failure degrades
+    ##
+    def rag_search(
+        self,
+        query: str,
+        top_k: int = 5,
+        path_prefix: str = "",
+        alpha: float | None = None,
+        score_threshold: float = 0.0,
+    ) -> str:
+        """Search the indexed chunks and render the best *top_k*.
+
+        Two legs, combined by the one fusion rule the package shares: a **scoped**
+        similarity search against ``workspace_chunks``, and a case-insensitive term
+        match over the extraction bodies this actor already holds.
+
+        **The vector leg is run here rather than through**
+        :func:`~akgentic.tool.vector_store.hybrid.semantic_scores`, and that is a
+        correctness requirement rather than a preference. That helper takes no
+        ``scope`` and no ``path_prefix``, and one ``workspace_chunks`` class holds
+        every workspace of every team — a search through it would return another
+        workspace's chunks. It also reduces its result to ``{ref_id: score}``,
+        discarding the ``SearchHit`` that carries the text a hit renders and the
+        ``path`` / ``ordinal`` its heading path is looked up by. ``fuse`` and the
+        two constants are what this module reuses; only the leg that needs a
+        filter is local.
+
+        **Every failure degrades and none of them raises.** No proxy, an ``embed``
+        that raises or returns nothing, a ``search`` that raises: each yields an
+        empty vector mapping, one warning, and the keyword leg alone. This actor
+        owns the write gate, and a retrieval capability that raised would be a way
+        for a misconfigured deployment to take it down.
+
+        Args:
+            query: What to look for, in natural language.
+            top_k: How many hits to render, applied **after** filtering.
+            path_prefix: Restrict the search to paths starting with this. Must not
+                contain ``*`` or ``?`` — see :data:`_PREFIX_WILDCARDS`.
+            alpha: Weight of the vector leg. ``None`` takes the fusion module's
+                own default, which is the value the Weaviate client sends.
+            score_threshold: Minimum **raw** cosine score for a vector hit,
+                applied before normalisation so it keeps its absolute meaning.
+
+        Returns:
+            The rendered hits, or one of the three sentences: retrieval
+            unavailable, the prefix refused, or nothing matched.
+        """
+        from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA, fuse
+
+        if self._vs_proxy is None or self._rag_params is None:
+            return _UNAVAILABLE
+        if any(character in path_prefix for character in _PREFIX_WILDCARDS):
+            return _REJECTED_PREFIX
+        budget = max(top_k, 1)
+        hits = self._vector_leg(query, budget, path_prefix, score_threshold)
+        matches = self._keyword_leg(query, path_prefix)
+        fused = fuse(
+            list(matches),
+            {ref_id: hit.score for ref_id, hit in hits.items()},
+            alpha=DEFAULT_ALPHA if alpha is None else alpha,
+        )
+        rendered: list[str] = []
+        for ref_id, score in sorted(fused.items(), key=lambda item: item[1], reverse=True):
+            line = self._render_hit(score, hits.get(ref_id), matches.get(ref_id))
+            if line is not None:
+                rendered.append(line)
+            if len(rendered) >= budget:
+                break
+        return "\n\n".join(rendered) if rendered else _NO_HITS
+
+    def _vector_leg(
+        self, query: str, top_k: int, path_prefix: str, score_threshold: float
+    ) -> dict[str, SearchHit]:
+        """Embed *query* and search the collection **within this workspace only**.
+
+        The ``scope`` predicate is mandatory on every workspace query (ADR-045 §5,
+        §7) and both predicates go to the backend, so the ``top_k`` budget is never
+        spent on another scope's objects. The call over-fetches by ``OVERFETCH``
+        because fusion reorders and the caller drops what it cannot resolve.
+
+        Returns:
+            ``{ref_id: hit}`` for the hits at or above *score_threshold*, or an
+            empty mapping on any failure.
+        """
+        from akgentic.tool.vector_store.hybrid import OVERFETCH
+
+        proxy = self._vs_proxy
+        if proxy is None:
+            logger.warning(
+                "Workspace %s: no vector store — searching on the keyword leg alone",
+                self.config.workspace_name,
+            )
+            return {}
+        try:
+            vectors = proxy.embed([query])
+            if not vectors:
+                logger.warning(
+                    "Workspace %s: embedding a search query returned nothing — keyword only",
+                    self.config.workspace_name,
+                )
+                return {}
+            result = proxy.search(
+                RAG_COLLECTION,
+                vectors[0],
+                top_k * OVERFETCH,
+                scope=self.config.workspace_name,
+                path_prefix=path_prefix or None,
+            )
+        except Exception:
+            logger.warning(
+                "Workspace %s: the vector leg of a search failed — keyword only",
+                self.config.workspace_name,
+                exc_info=True,
+            )
+            return {}
+        return {hit.ref_id: hit for hit in result.hits if hit.score >= score_threshold}
+
+    def _keyword_leg(self, query: str, path_prefix: str) -> dict[str, _KeywordMatch]:
+        """Return the chunks whose own slice of their document carries a query term.
+
+        Case-insensitive, over the bodies this actor already holds — no file is
+        read and no chunk text is stored anywhere, because a chunk is a pair of
+        offsets into an extraction and never a copy of one.
+
+        **An evicted body contributes nothing and is never sliced** (ADR-045 §3,
+        §4). The search degrades toward vector-only for that file and is never
+        wrong; the file stays ``EMBEDDED`` and its vector hits still render from
+        the store's own copy of the text. This is what makes ``max_documents`` a
+        bound on the size of the actor's state rather than on the searchable
+        corpus.
+
+        **A body that is not the one the offsets were cut from is skipped too.**
+        The two maps have different lifetimes: a file re-read after a change holds
+        a new body while its row still describes the old chunk boundaries, and
+        slicing one with the other yields text that belongs to neither. The
+        offsets of such a row are provenance, exactly as an evicted file's are.
+
+        The keys are ``chunk_id``s — the key space ``fuse`` combines on, and what
+        ``SearchHit.ref_id`` carries. It is an **indicator** and not a score: a
+        flat substring match is equally good everywhere, which is why ``fuse``
+        does not normalise this leg.
+        """
+        terms = query.lower().split()
+        matches: dict[str, _KeywordMatch] = {}
+        if not terms:
+            return matches
+        for path, extract in self.state.documents.items():
+            body = extract.markdown
+            if body is None or (path_prefix and not path.startswith(path_prefix)):
+                continue
+            entry = self.state.rag_index.get(path)
+            if entry is None or entry.indexed_sha != extract.source_sha:
+                continue
+            lowered = body.lower()
+            for chunk in entry.chunks:
+                if any(term in lowered[chunk.start : chunk.end] for term in terms):
+                    matches[chunk.chunk_id] = _KeywordMatch(
+                        path=path, chunk=chunk, text=body[chunk.start : chunk.end]
+                    )
+        return matches
+
+    def _render_hit(
+        self, score: float, hit: SearchHit | None, match: _KeywordMatch | None
+    ) -> str | None:
+        """Render one fused hit — path, heading path, score label, and the text.
+
+        **The text comes from** ``SearchHit.text`` **whenever there is a hit**,
+        never from a slice of the cached body: that is what keeps a file whose
+        body was evicted searchable and renderable. A keyword-only hit has no
+        ``SearchHit`` behind it, and its text is its own slice — which is present
+        by construction, since matching it is what put it here.
+
+        Args:
+            score: The fused score, unused in the label and kept for the caller's
+                ordering. See :func:`_score_label` for what is actually shown.
+            hit: The vector hit, or ``None`` for a keyword-only match.
+            match: The keyword match, or ``None`` for a vector-only hit.
+
+        Returns:
+            The rendered block, or ``None`` when neither leg supplied anything —
+            which the caller skips without spending a result slot.
+        """
+        chunk: RagChunk | None
+        if match is not None:
+            path, chunk = match.path, match.chunk
+            text = hit.text if hit is not None else match.text
+        elif hit is not None:
+            path = hit.path or ""
+            chunk = self._chunk_at(path, hit.ordinal)
+            text = hit.text
+        else:
+            return None
+        heading = " > ".join(chunk.heading_path) if chunk is not None else ""
+        location = f"{path} > {heading}" if heading else (path or "(unknown file)")
+        return f"{location} ({_score_label(hit, match)})\n{text.strip()}"
+
+    def _chunk_at(self, path: str, ordinal: int | None) -> RagChunk | None:
+        """Return *path*'s chunk at *ordinal* — one dict lookup, and no reverse map.
+
+        Story 45-6 put ``path`` and ``ordinal`` on ``SearchHit`` precisely so that
+        this is O(1). A hit whose ``path`` or ``ordinal`` is missing, or whose
+        ordinal is out of range, resolves to ``None`` and renders with an empty
+        heading path rather than being dropped — the chunk text is still the
+        answer.
+        """
+        if not path or ordinal is None:
+            return None
+        entry = self.state.rag_index.get(path)
+        if entry is None or not 0 <= ordinal < len(entry.chunks):
+            return None
+        chunk = entry.chunks[ordinal]
+        return chunk if chunk.ordinal == ordinal else None
+
+    ##
+    ## The upload handler — reachable from outside the framework
+    ##
+    def receiveMsg_NewFileMessage(self, msg: NewFileMessage) -> None:  # noqa: N802
+        """TELL, from whatever accepted an upload. Index the paths it names.
+
+        **It never raises, and that is the most load-bearing property here**
+        (ADR-045 §5, §2). This handler is reachable from *outside* the framework,
+        and an exception on this turn would kill the actor that owns the write
+        gate for the whole team. Same contract and same shape as
+        :meth:`receiveMsg_IndexResult`: the body is a private method, this wraps
+        it, and a failure logs and leaves the actor alive.
+
+        It returns ``None`` and the sender does not wait. The frontend's upload
+        must not block on extraction, and a 500-page PDF must not hold an HTTP
+        request open; progress is observed through ``workspace_rag_list``.
+        """
+        try:
+            self._on_new_files(msg)
+        except Exception:
+            logger.warning(
+                "Workspace %s: could not accept a new-file notification",
+                self.config.workspace_name,
+                exc_info=True,
+            )
+
+    def _on_new_files(self, msg: NewFileMessage) -> None:
+        """Validate, hash, queue and spawn — O(n) over the path list, and no more.
+
+        **An upload indexes where a gate write only marks ``STALE``, and the
+        asymmetry is the decision rather than an omission** (ADR-045 §4, §5). An
+        upload is one deliberate human act; an agent write is a stream of them,
+        and auto-indexing each would spend embedding credits on content that is
+        about to change again.
+
+        **With no retrieval capability enabled it records and does not spawn.**
+        The handler has no capability flag of its own — it is a message handler,
+        not a tool — so the actor's test is the state ``enable_rag`` left behind.
+        Writing the rows ``PENDING`` means enabling retrieval later picks the
+        files up; spawning would spend embedding credits in a team that never
+        opted in.
+        """
+        candidates = self._uploaded_candidates(msg.paths)
+        if not candidates:
+            return
+        if self._rag_params is None or self._vs_proxy is None:
+            for path, sha in candidates:
+                self._enqueue(path, sha)
+            logger.info(
+                "Workspace %s: recorded %d new file(s) from %s as pending — "
+                "retrieval is not enabled on this tree",
+                self.config.workspace_name,
+                len(candidates),
+                msg.source,
+            )
+            self.state.notify_state_change()
+            return
+        queued = 0
+        for path, sha in candidates:
+            if self._is_accounted_for(path, sha, msg.force):
+                continue
+            self._enqueue(path, sha)
+            queued += 1
+        logger.info(
+            "Workspace %s: %d of %d new file(s) from %s were queued for indexing",
+            self.config.workspace_name,
+            queued,
+            len(candidates),
+            msg.source,
+        )
+        if self._drain() or queued > 0:
+            self.state.notify_state_change()
+
+    def _uploaded_candidates(self, paths: list[str]) -> list[tuple[str, str]]:
+        """Return ``(path, digest)`` for every named path that can be indexed.
+
+        **Every path goes through** :class:`~akgentic.tool.workspace.workspace.Filesystem`,
+        which validates internally — never ``backend._root / path``. An upload
+        handler taking caller-supplied paths is the most escape-prone surface this
+        decision adds, and joining onto the private root is the traversal bypass
+        this package has already had to close once.
+
+        Every rejection is a **log line and a skip**, never an error, and the four
+        that matter are all ordinary: a path that escapes the root, one that does
+        not exist because the message raced the upload's own write, one whose type
+        cannot be indexed, and one that is not a usable path at all.
+        """
+        found: list[tuple[str, str]] = []
+        for path in paths:
+            try:
+                if Path(path).suffix.lower() not in _INDEXABLE_EXTENSIONS:
+                    logger.info(
+                        "Workspace %s: %r is not an indexable type — skipped",
+                        self.config.workspace_name,
+                        path,
+                    )
+                    continue
+                # ``_digest`` reads through ``Filesystem``, whose ``_validate_path``
+                # raises ``PathEscapeError`` — a ``PermissionError``, and therefore
+                # an ``OSError`` the digest already absorbs alongside a missing file.
+                sha = self._digest(path)
+            except Exception:
+                logger.info(
+                    "Workspace %s: skipping an unusable entry in a new-file notification",
+                    self.config.workspace_name,
+                    exc_info=True,
+                )
+                continue
+            if sha is not None:
+                found.append((path, sha))
+        return found
+
+
+def _score_label(hit: SearchHit | None, match: _KeywordMatch | None) -> str:
+    """Describe how one chunk was found, for its rendered line.
+
+    The shape ``PlanningTool`` established and the house convention records: the
+    number shown is the **raw** cosine score, which is the only absolute one — a
+    fused score is normalised against the rest of one result set and means nothing
+    outside it.
+    """
+    if hit is None:
+        return "keyword match"
+    return f"{'hybrid' if match is not None else 'semantic'}: {hit.score:.2f}"
 
 
 _IN_FLIGHT = frozenset(

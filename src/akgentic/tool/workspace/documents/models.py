@@ -37,6 +37,7 @@ __all__ = [
     "IN_MEMORY_MAX_DOCUMENT_CHARS",
     "RAG_COLLECTION",
     "DocumentExtract",
+    "NewFileMessage",
     "RagChunk",
     "RagFile",
     "RagStatus",
@@ -332,6 +333,41 @@ class DocumentExtract(SerializableBaseModel):
     markdown: str | None
     char_count: int
     extracted_at: datetime
+
+
+class NewFileMessage(SerializableBaseModel):
+    """Files have appeared in the tree from outside — index them (ADR-045 §5).
+
+    Addressed to ``#Workspace-<workspace>`` as a **tell**, by whatever accepted
+    the upload. The sender does not wait: extraction of a 500-page PDF must not
+    hold an HTTP request open, and progress is observed through
+    ``workspace_rag_list`` and its per-turn context delta instead.
+
+    A plain :class:`SerializableBaseModel` rather than a ``Message`` subclass, and
+    deliberately: ``Akgent.on_receive`` emits the ``ReceivedMessage`` /
+    ``ProcessedMessage`` telemetry sandwich only for ``Message`` instances, and an
+    upload notification is plumbing rather than conversation.
+
+    **This module is its final home**, for the reason recorded at the top of the
+    file: ``serialize()`` stamps ``__model__ = "<module>.<name>"`` into every
+    nested ``SerializableBaseModel``, so the module path is pinned in deployments
+    this repository cannot see the moment one is persisted.
+
+    Attributes:
+        paths: Workspace-relative paths that have just appeared. Every one of them
+            is validated through :class:`~akgentic.tool.workspace.workspace.Filesystem`
+            on arrival — this message is reachable from **outside** the framework,
+            so a caller-supplied path is never joined onto the backend's root.
+        source: Where the files came from, for the log line and for future
+            triggers. Free-form; ``"upload"`` is the case that exists today.
+        force: Re-index a path already indexed at its current content. Without it
+            the handler is idempotent at the live digest, so a retried upload
+            costs nothing.
+    """
+
+    paths: list[str]
+    source: str = "upload"
+    force: bool = False
 
 
 def _bodied_chars(documents: dict[str, DocumentExtract]) -> int:
