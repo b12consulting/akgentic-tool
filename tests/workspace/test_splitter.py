@@ -157,6 +157,50 @@ DEEP_ROOT = "## A\n\nAlpha.\n\n## B\n\nBeta.\n\n## C\n\nGamma.\n"
 # in the path, not stack on top of it.
 JUMPED_SIBLINGS = "# A\n\nAlpha.\n\n### C\n\nGamma.\n\n### D\n\nDelta.\n"
 
+# A slide-deck extraction in the shape MarkItDown produces from a ``.pptx``: one
+# HTML comment per slide, a title, a body, and a ``### Notes:`` heading whose
+# text repeats on every slide. The vertical tabs are the point — ``python-pptx``
+# renders a soft line break (``<a:br>``) as one, so a deck with a wrapped title
+# carries several, and ``str.splitlines`` counts each as a line that
+# ``markdown-it`` does not.
+SLIDES = (
+    "<!-- Slide number: 1 -->\n"
+    "\n"
+    "# The Acme Platform\vAn introduction\n"
+    "\n"
+    "### Notes:\n"
+    "\n"
+    "Acme builds tooling for contoso teams.\n"
+    "\n"
+    "<!-- Slide number: 2 -->\n"
+    "\n"
+    "## Capabilities\vand what they cost\n"
+    "\n"
+    "| Capability             | Status |\n"
+    "|------------------------|--------|\n"
+    "| Multi party routing    | Ready  |\n"
+    "| Workflow orchestration | Ready  |\n"
+    "\n"
+    "### Notes:\n"
+    "\n"
+    "Every capability ships behind the same address.\n"
+    "\n"
+    "<!-- Slide number: 3 -->\n"
+    "\n"
+    "## Roadmap\n"
+    "\n"
+    "![Roadmap diagram](roadmap.png)\n"
+    "\n"
+    "### Notes:\n"
+    "\n"
+    "The second half of the year is reserved for retrieval.\n"
+)
+
+# Every character ``str.splitlines`` breaks a line on that ``markdown-it`` does
+# not. The vertical tab is the one that arrives in practice; the rest fail the
+# same way and cost nothing to pin.
+LONE_PYTHON_BREAKS = ["\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]
+
 EMPTY = ""
 
 BLANK = "\n\n   \n"
@@ -183,6 +227,7 @@ FIXTURES: dict[str, str] = {
     "TINY_TWINS": TINY_TWINS,
     "DEEP_ROOT": DEEP_ROOT,
     "JUMPED_SIBLINGS": JUMPED_SIBLINGS,
+    "SLIDES": SLIDES,
     "EMPTY": EMPTY,
     "BLANK": BLANK,
 }
@@ -217,6 +262,28 @@ def _composed(markdown: str, span: Span) -> str:
 def _covering(chunks: list[Span], offset: int) -> bool:
     """Whether any chunk covers *offset*."""
     return any(chunk.start <= offset < chunk.end for chunk in chunks)
+
+
+def _outside_a_heading_line(markdown: str) -> list[int]:
+    """Every non-whitespace offset of *markdown* that a heading line does not claim.
+
+    The whole of the source a chunk is obliged to carry. It is computed here by
+    scanning for ``\\n`` and nothing else, deliberately: reusing the module's own
+    line arithmetic would make the expectation drift in lockstep with the bug
+    this guards against, and the test would pass while the data was lost.
+
+    Only sound for a fixture with no thematic break and no setext underline,
+    which are the other two things no block covers.
+    """
+    offsets: list[int] = []
+    position = 0
+    for line in markdown.split("\n"):
+        if not line.lstrip().startswith("#"):
+            offsets.extend(
+                i for i, character in enumerate(line, position) if not character.isspace()
+            )
+        position += len(line) + 1
+    return offsets
 
 
 def _touching(blocks: list[Span], chunk: Span) -> list[Span]:
@@ -323,6 +390,32 @@ class TestCoverage:
                 if markdown[offset].isspace():
                     continue
                 assert _covering(chunks, offset), f"{name}: offset {offset} is in no chunk"
+
+    @pytest.mark.parametrize("character", LONE_PYTHON_BREAKS)
+    @pytest.mark.parametrize("params_name", sorted(ALL_PARAMS))
+    def test_a_break_only_python_sees_costs_the_document_nothing(
+        self, character: str, params_name: str
+    ) -> None:
+        """Coverage measured against the **source**, not against the blocks.
+
+        The guard above compares the chunks to ``parse_blocks``' own output, so
+        it is blind by construction to anything ``parse_blocks`` never emitted in
+        the first place — which is where a whole class of loss lives. This one
+        starts from the document.
+
+        ``markdown-it`` starts a line at ``\\r\\n``, ``\\r`` or ``\\n`` and at
+        nothing else; ``str.splitlines`` starts one at eight further characters.
+        One of those in the document and the line counts diverge, so every token
+        map past it names the wrong line and every offset after it is wrong —
+        chunks land on heading lines, begin mid-word, and whole sections fall
+        into the gaps between them. A real deck lost 47% of itself this way.
+        """
+        markdown = SLIDES.replace("\v", character)
+        chunks = BlockSplitter().split(markdown, ALL_PARAMS[params_name])
+        for offset in _outside_a_heading_line(markdown):
+            assert _covering(chunks, offset), (
+                f"{character!r}: offset {offset} ({markdown[offset]!r}) is in no chunk"
+            )
 
     @pytest.mark.parametrize("name", sorted(FIXTURES))
     @pytest.mark.parametrize("params_name", sorted(ALL_PARAMS))

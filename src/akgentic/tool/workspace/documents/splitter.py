@@ -59,6 +59,20 @@ the whitespace fallback catches everything this misses."""
 
 _WHITESPACE = re.compile(r"\s+")
 
+_LINE_BREAK = re.compile(r"\r\n?|\n")
+"""A line break **as the parser counts them** — its own ``NEWLINES_RE``.
+
+Deliberately not ``str.splitlines``, which is the wider definition: it also
+breaks on ``\\v``, ``\\f``, ``\\x1c``-``\\x1e``, ``\\x85``, ``\\u2028`` and
+``\\u2029``, none of which start a line for ``markdown-it``. One of those in the
+document and the two disagree about how many lines there are, so every token map
+past it indexes the wrong line and every offset after it is silently wrong.
+
+It is not a theoretical hazard: ``python-pptx`` renders a soft line break
+(``<a:br>``) as a vertical tab, so every extracted deck with a wrapped title
+carries several.
+"""
+
 _NON_BLOCK_TYPES = frozenset({"heading_open", "hr"})
 """Level-0 mapped tokens that are **not** blocks.
 
@@ -143,16 +157,20 @@ def _parser() -> MarkdownIt:
 def _line_starts(text: str) -> list[int]:
     """Character offset of the start of every line, plus ``len(text)``.
 
-    ``keepends=True`` is the whole of it: without it every offset past the first
-    line is short by the number of preceding newlines, which is the classic
-    offset bug this module exists to avoid. The result has ``n_lines + 1``
-    entries and ends at ``len(text)``, so a token's exclusive ``map[1]`` always
+    Lines are counted with :data:`_LINE_BREAK` — the parser's own definition —
+    because this list is indexed by *the parser's* line numbers. Any wider
+    definition puts the two out of step and every offset after the first extra
+    break is wrong; see :data:`_LINE_BREAK` for which characters do that and
+    where they come from.
+
+    The result ends at ``len(text)``, so a token's exclusive ``map[1]`` always
     indexes in range — including for a document with no trailing newline. No
     clamp, which would hide a real indexing bug.
     """
     starts = [0]
-    for line in text.splitlines(keepends=True):
-        starts.append(starts[-1] + len(line))
+    starts.extend(match.end() for match in _LINE_BREAK.finditer(text))
+    if starts[-1] != len(text):
+        starts.append(len(text))
     return starts
 
 
