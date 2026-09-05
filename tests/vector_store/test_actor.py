@@ -1472,3 +1472,167 @@ class TestWeaviateTeamIdPropagation:
         stamped = [c[1]["team_id"] for c in mock_cls.call_args_list]
         assert stamped == [str(first.team_id), str(second.team_id)]
         assert stamped[0] != stamped[1]
+
+
+# ---------------------------------------------------------------------------
+# A request that cannot be started, and the metadata that must survive the trip
+# ---------------------------------------------------------------------------
+
+
+class TestASpawnFailureSettlesItsOwnRequest:
+    """The record is written before the child exists, so a failure must close it.
+
+    Latent until story 45-7: the record's requester was never told, so nothing
+    waited on the signal and a collection pinned at ``INDEXING`` for ever was
+    invisible. The workspace indexer is the first caller that waits.
+    """
+
+    def test_a_failing_spawn_leaves_no_open_request(self) -> None:
+        """Otherwise the collection reports ``INDEXING`` with nothing in flight."""
+        actor = _make_actor()
+        actor._backend = _mock_backend()
+
+        with patch.object(actor, "createActor", side_effect=RuntimeError("no thread")):
+            actor.add("col1", [_mock_entry(vector=[])])
+
+        assert actor.state.pending_requests == {}
+        assert actor.state.collection_statuses["col1"] == CollectionStatus.READY
+        assert actor.state.indexing_pending.get("col1") is None
+
+    def test_the_requester_is_told_the_failure(self) -> None:
+        """A caller that waits on ``EmbeddingCompleted`` must never wait for ever."""
+        actor = _make_actor()
+        actor._backend = _mock_backend()
+        requester = MagicMock()
+        delivered: list[Any] = []
+
+        with (
+            patch.object(actor, "createActor", side_effect=RuntimeError("no thread")),
+            patch.object(actor, "send", side_effect=lambda to, msg: delivered.append(msg)),
+        ):
+            actor.add("col1", [_mock_entry(vector=[])], requester=requester, request_ref="a.md")
+
+        [completed] = delivered
+        assert isinstance(completed, EmbeddingCompleted)
+        assert completed.request_ref == "a.md"
+        assert completed.error is not None and "no thread" in completed.error
+
+    def test_a_failing_tell_settles_the_request_too(self) -> None:
+        """The child exists but never got its payload, so nothing will report it."""
+        actor = _make_actor()
+        actor._backend = _mock_backend()
+
+        with (
+            patch.object(actor, "createActor", return_value=MagicMock()),
+            patch.object(actor, "proxy_tell", side_effect=RuntimeError("proxy gone")),
+        ):
+            actor.add("col1", [_mock_entry(vector=[])])
+
+        assert actor.state.pending_requests == {}
+
+    def test_a_successful_spawn_leaves_the_request_open(self) -> None:
+        """The guard above must not settle the healthy path."""
+        actor = _make_actor()
+        actor._backend = _mock_backend()
+
+        with (
+            patch.object(actor, "createActor", return_value=MagicMock()),
+            patch.object(actor, "proxy_tell", return_value=MagicMock()),
+        ):
+            actor.add("col1", [_mock_entry(vector=[])])
+
+        assert len(actor.state.pending_requests) == 1
+        assert actor.state.collection_statuses["col1"] == CollectionStatus.INDEXING
+
+
+class TestScopeSurvivesTheEmbeddingRoundTrip:
+    """``EmbeddingRequest`` carries three of ``VectorEntry``'s seven fields.
+
+    The result is rebuilt from exactly those three, so ``scope``, ``path`` and
+    ``ordinal`` arrive back as ``None`` — and those are the three every scoped
+    removal and every scoped search filters on. An entry stored without them is
+    findable by nobody and removable by nobody.
+    """
+
+    def _round_trip(self, actor: VectorStoreActor, backend: MagicMock) -> list[Any]:
+        """Issue one scoped ``add`` and deliver its embedded result back."""
+        from akgentic.tool.vector_store.vector import VectorEntry
+
+        original = VectorEntry(
+            ref_type="workspace_chunk",
+            ref_id="chunk-1",
+            text="hello",
+            vector=[],
+            scope="team-7",
+            path="docs/a.md",
+            ordinal=3,
+        )
+        with (
+            patch.object(actor, "createActor", return_value=MagicMock()),
+            patch.object(actor, "proxy_tell", return_value=MagicMock()),
+        ):
+            actor.add("col1", [original], request_ref="docs/a.md")
+        request_id = next(iter(actor.state.pending_requests))
+
+        actor.receiveMsg_EmbeddingResult(
+            EmbeddingResult(
+                collection="col1",
+                # Exactly what ``EmbeddingActor`` rebuilds: the three carried
+                # fields plus the vector it produced.
+                entries=[
+                    VectorEntry(
+                        ref_type="workspace_chunk",
+                        ref_id="chunk-1",
+                        text="hello",
+                        vector=[0.1, 0.2],
+                    )
+                ],
+                request_id=request_id,
+            )
+        )
+        return list(backend.add.call_args[0][1])
+
+    def test_scope_path_and_ordinal_reach_the_backend(self) -> None:
+        """Without this the workspace's scoped removal would match nothing."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+
+        [stored] = self._round_trip(actor, backend)
+
+        assert (stored.scope, stored.path, stored.ordinal) == ("team-7", "docs/a.md", 3)
+        assert stored.vector == [0.1, 0.2]
+
+    def test_the_originals_are_dropped_when_the_request_settles(self) -> None:
+        """They are held for one round trip, not for the life of the team."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+
+        self._round_trip(actor, backend)
+
+        assert actor._request_entries == {}
+
+    def test_a_result_that_does_not_line_up_is_passed_through_untouched(self) -> None:
+        """Mis-attributing metadata would be worse than not restoring it."""
+        from akgentic.tool.vector_store.vector import VectorEntry
+
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+        actor._request_entries["req-1"] = [
+            VectorEntry(ref_type="t", ref_id="a", text="a", vector=[], scope="team-7"),
+            VectorEntry(ref_type="t", ref_id="b", text="b", vector=[], scope="team-7"),
+        ]
+        _open_request(actor, "req-1", count=2)
+
+        actor.receiveMsg_EmbeddingResult(
+            EmbeddingResult(
+                collection="col1",
+                entries=[VectorEntry(ref_type="t", ref_id="a", text="a", vector=[0.1])],
+                request_id="req-1",
+            )
+        )
+
+        [stored] = backend.add.call_args[0][1]
+        assert stored.scope is None

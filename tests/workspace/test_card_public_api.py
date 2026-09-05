@@ -44,12 +44,16 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "DEFAULT_MAX_DOCUMENT_CHARS",
         "DEFAULT_MAX_OBSERVATIONS_PER_AGENT",
         "DEFAULT_MAX_TRACKED_WRITERS",
+        # Added by story 45-7, deliberately: the retrieval index's constants.
+        "EMBEDDING_STALE_AFTER_S",
         "EXEC_REPORT_MARGIN_S",
         "EXTRACTOR_VERSION",
         "GITIGNORE_NAME",
         "GIT_DIR_SUFFIX",
         "IDENTITY_DOMAIN",
         "IDENTITY_FALLBACK",
+        "IN_MEMORY_MAX_DOCUMENTS",
+        "IN_MEMORY_MAX_DOCUMENT_CHARS",
         "LEASE_GRACE_S",
         "MAX_COMMIT_BODY_CHARS",
         "MAX_REJECTION_DIFF_LINES",
@@ -57,6 +61,7 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "OUT_OF_BAND_AUTHOR",
         "PERM_ERR_MSG",
         "PUBLISH_LOST_MSG",
+        "RAG_COLLECTION",
         "RUN_ID_CHARS",
         "STAGING_SWEEP_GRACE_S",
         "TIMED_OUT_EXIT_CODE",
@@ -70,6 +75,16 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "BlockSplitter",
         "Span",
         "TextSplitter",
+        # Added by story 45-7, deliberately: the retrieval index's public models
+        # and the one function a deployment reasons about. ``chunk_id`` and
+        # ``CHUNK_ID_NAMESPACE`` are the package's own minting rule and stay
+        # module-public only, as ``parse_blocks`` and ``pack_blocks`` do.
+        "RagChunk",
+        "RagFile",
+        "RagFileRow",
+        "RagIndexState",
+        "RagStatus",
+        "derived_document_caps",
         # Added by story 45-3, deliberately — see the constants above.
         "DocumentExtract",
         "ExecConfig",
@@ -153,6 +168,10 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         # class. Defining it surfaces no capability — ``_WORKSPACE_TOOL_FIELDS``
         # below must not grow, because no field of this type is declared.
         "WorkspaceRagIndex",
+        # Added by story 45-7, deliberately: the second retrieval capability's
+        # parameter class. Unlike 45-5's, these two DO surface capabilities —
+        # ``_WORKSPACE_TOOL_FIELDS`` below grows with them.
+        "WorkspaceRagList",
         "WorkspaceTool",
     }
 )
@@ -204,6 +223,16 @@ _WORKSPACE_TOOL_FIELDS: frozenset[str] = frozenset(
         "git_journal",
         "workspace_exec",
         "resources",
+        # Added by story 45-7, deliberately: the two retrieval capabilities, the
+        # collection they share, and the two explicit overrides of the caps that
+        # otherwise follow the vector backend. Seventeen names became
+        # twenty-two; the set exists so a field is never added by accident, not
+        # so it can never grow.
+        "workspace_rag_index",
+        "workspace_rag_list",
+        "rag_collection",
+        "max_documents",
+        "max_document_chars",
     }
 )
 
