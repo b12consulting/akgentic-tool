@@ -15,6 +15,7 @@ from akgentic.tool.vector_store.protocol import (
     CollectionStatus,
     SearchHit,
     SearchResult,
+    check_path_prefix,
 )
 from akgentic.tool.vector_store.vector import (
     VectorEntry,
@@ -118,8 +119,10 @@ class InMemoryBackend:
             path_prefix: Restrict removal to entries whose ``path`` starts with this.
 
         Raises:
-            ValueError: If the collection does not exist.
+            ValueError: If the collection does not exist, or if ``path_prefix``
+                contains ``*`` or ``?``.
         """
+        check_path_prefix(path_prefix)
         index = self._get_index(collection)
         if scope is None and path_prefix is None:
             index.remove(set(ref_ids))
@@ -156,8 +159,10 @@ class InMemoryBackend:
             status ``READY``, and ``indexing_pending=0``.
 
         Raises:
-            ValueError: If the collection does not exist.
+            ValueError: If the collection does not exist, or if ``path_prefix``
+                contains ``*`` or ``?``.
         """
+        check_path_prefix(path_prefix)
         index = self._get_index(collection)
         if scope is None and path_prefix is None:
             results = index.search_cosine(query_vector, top_k)

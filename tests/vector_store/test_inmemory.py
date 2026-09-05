@@ -6,8 +6,12 @@ import math
 
 import pytest
 
-from akgentic.tool.vector_store.inmemory import InMemoryBackend
-from akgentic.tool.vector_store.protocol import CollectionConfig, CollectionStatus
+from akgentic.tool.vector_store.inmemory import InMemoryBackend, _entry_matches
+from akgentic.tool.vector_store.protocol import (
+    PATH_PREFIX_REJECTED,
+    CollectionConfig,
+    CollectionStatus,
+)
 from akgentic.tool.vector_store.vector import VectorEntry
 
 # ---------------------------------------------------------------------------
@@ -475,3 +479,78 @@ class TestScopeAndPathFilters:
 
         hits = backend.search("ws", [1.0, 0.0], top_k=10).hits
         assert [h.scope for h in hits] == ["B"]
+
+
+class TestPathPrefixWildcardsAreRefused:
+    """A ``path_prefix`` carrying ``*`` or ``?`` is refused, not interpreted.
+
+    Both characters are legal in a POSIX filename, both are wildcards in Weaviate's
+    ``Like`` and neither is one to ``str.startswith``. The rejection lives on both
+    backends so the two cannot answer the same query differently — and ``remove()``
+    is the sharp case: a ``*`` widens a deletion on Weaviate and narrows it to
+    nothing here.
+    """
+
+    @pytest.fixture()
+    def one_doc(self, backend: InMemoryBackend, config: CollectionConfig) -> InMemoryBackend:
+        """A collection holding a single entry under ``docs/``."""
+        backend.create_collection("ws", config)
+        backend.add(
+            "ws", [_scoped("a1", [1.0, 0.0], scope="A", path="docs/one.md", ordinal=0)]
+        )
+        return backend
+
+    @pytest.mark.parametrize("prefix", ["docs/*", "docs/?ne.md", "*", "?"])
+    def test_search_refuses_a_wildcard_prefix(
+        self, one_doc: InMemoryBackend, prefix: str
+    ) -> None:
+        """search() raises rather than silently reading the wildcard literally."""
+        with pytest.raises(ValueError, match="path_prefix cannot contain"):
+            one_doc.search("ws", [1.0, 0.0], top_k=10, path_prefix=prefix)
+
+    @pytest.mark.parametrize("prefix", ["docs/*", "docs/?ne.md", "*", "?"])
+    def test_remove_refuses_a_wildcard_prefix(
+        self, one_doc: InMemoryBackend, prefix: str
+    ) -> None:
+        """remove() raises rather than silently deleting nothing."""
+        with pytest.raises(ValueError, match="path_prefix cannot contain"):
+            one_doc.remove("ws", ["a1"], path_prefix=prefix)
+
+    def test_the_refused_query_leaves_the_collection_untouched(
+        self, one_doc: InMemoryBackend
+    ) -> None:
+        """The guard runs before the index is reached, so a refusal removes nothing."""
+        with pytest.raises(ValueError, match="path_prefix cannot contain"):
+            one_doc.remove("ws", ["a1"], path_prefix="docs/*")
+
+        assert [h.ref_id for h in one_doc.search("ws", [1.0, 0.0], top_k=10).hits] == ["a1"]
+
+    def test_the_message_is_the_one_both_backends_share(
+        self, one_doc: InMemoryBackend
+    ) -> None:
+        """Identical wording wherever a prefix is refused — ADR-045 §5's ask."""
+        with pytest.raises(ValueError) as excinfo:
+            one_doc.search("ws", [1.0, 0.0], top_k=10, path_prefix="docs/*")
+        assert str(excinfo.value) == PATH_PREFIX_REJECTED
+
+    def test_the_real_matcher_reads_a_wildcard_literally(self) -> None:
+        """Why the rejection exists, asserted against the matcher itself.
+
+        ``_entry_matches`` is what a search and a removal actually filter with. It
+        is ``str.startswith``, so ``docs/*`` matches a file *named* ``docs/*…`` and
+        nothing else — while the same prefix on Weaviate's ``like('docs/**')``
+        matches every file under ``docs/``. Unguarded, one query means two things.
+        """
+        under_docs = _scoped("a1", [1.0, 0.0], scope="A", path="docs/one.md", ordinal=0)
+        literal_star = _scoped("a2", [1.0, 0.0], scope="A", path="docs/*.md", ordinal=1)
+
+        assert _entry_matches(under_docs, None, "docs/") is True
+        assert _entry_matches(under_docs, None, "docs/*") is False
+        assert _entry_matches(literal_star, None, "docs/*") is True
+
+    @pytest.mark.parametrize("prefix", [None, "", "docs/"])
+    def test_a_clean_prefix_is_untouched(
+        self, one_doc: InMemoryBackend, prefix: str | None
+    ) -> None:
+        """The guard refuses two characters and nothing else, including the empty one."""
+        assert one_doc.search("ws", [1.0, 0.0], top_k=10, path_prefix=prefix).hits

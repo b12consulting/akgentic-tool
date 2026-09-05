@@ -149,6 +149,53 @@ def require_weaviate_configured(config: CollectionConfig, card_name: str) -> Non
 
 
 # ---------------------------------------------------------------------------
+# path_prefix validation — one constant, one sentence, both backends
+# ---------------------------------------------------------------------------
+
+PATH_PREFIX_WILDCARDS: Final[str] = "*?"
+"""Characters a ``path_prefix`` may not contain, on either backend.
+
+Both are legal in a POSIX filename and both are wildcards in Weaviate's ``Like``
+operator, which is what ``WeaviateBackend`` builds a prefix filter from; the
+in-memory backend uses ``str.startswith`` and treats them literally. The v4
+filter API offers no escape, so the same query would mean two different things
+depending on where the collection happens to live — and on ``remove()`` that is
+sharp rather than academic: a ``*`` widens a deletion on Weaviate and narrows it
+to nothing in memory.
+
+They live here, next to the protocol both backends implement, so the two cannot
+drift apart (ADR-045 §5).
+"""
+
+PATH_PREFIX_REJECTED: Final[str] = (
+    "A path_prefix cannot contain '*' or '?': they are wildcards on one vector "
+    "backend and literal characters on the other, so the same filter would mean "
+    "two different things. Use a shorter prefix without them."
+)
+"""The one sentence a rejected prefix is refused with, wherever it is refused."""
+
+
+def check_path_prefix(path_prefix: str | None) -> None:
+    """Raise when *path_prefix* carries a character the two backends read differently.
+
+    Called at the top of ``search()`` and ``remove()`` on **both** backends, which
+    is where the divergence physically lives. Callers that answer an agent rather
+    than a program — ``workspace_rag_search`` — check the same constant and return
+    :data:`PATH_PREFIX_REJECTED` as a sentence instead of raising; the message is
+    the same either way.
+
+    Args:
+        path_prefix: The prefix to validate. ``None`` and ``""`` filter nothing
+            and are always accepted.
+
+    Raises:
+        ValueError: When the prefix contains ``*`` or ``?``.
+    """
+    if path_prefix and any(character in path_prefix for character in PATH_PREFIX_WILDCARDS):
+        raise ValueError(PATH_PREFIX_REJECTED)
+
+
+# ---------------------------------------------------------------------------
 # SearchHit
 # ---------------------------------------------------------------------------
 
@@ -272,6 +319,10 @@ class VectorStoreService(Protocol):
             ref_ids: List of reference IDs to remove.
             scope: Restrict removal to entries carrying this ``scope``.
             path_prefix: Restrict removal to entries whose ``path`` starts with this.
+
+        Raises:
+            ValueError: When ``path_prefix`` contains ``*`` or ``?`` — see
+                :func:`check_path_prefix`.
         """
         ...
 
@@ -298,6 +349,10 @@ class VectorStoreService(Protocol):
 
         Returns:
             Search results with hits and collection status.
+
+        Raises:
+            ValueError: When ``path_prefix`` contains ``*`` or ``?`` — see
+                :func:`check_path_prefix`.
         """
         ...
 

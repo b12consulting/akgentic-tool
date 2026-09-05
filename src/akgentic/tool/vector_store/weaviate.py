@@ -16,6 +16,7 @@ from akgentic.tool.vector_store.protocol import (
     CollectionStatus,
     SearchHit,
     SearchResult,
+    check_path_prefix,
 )
 
 if TYPE_CHECKING:
@@ -323,11 +324,13 @@ class WeaviateBackend:
             path_prefix: Restrict removal to objects whose ``path`` starts with this.
 
         Raises:
-            ValueError: If the collection has not been created, or if this backend
-                was built without a ``team_id``.
+            ValueError: If the collection has not been created, if this backend
+                was built without a ``team_id``, or if ``path_prefix`` contains
+                ``*`` or ``?``.
         """
         from weaviate.classes.query import Filter
 
+        check_path_prefix(path_prefix)
         self._check_collection(collection)
         col = self._get_collection(collection)
         col.data.delete_many(
@@ -361,11 +364,13 @@ class WeaviateBackend:
             Search results with hits ranked by distance (converted to score).
 
         Raises:
-            ValueError: If the collection has not been created, or if this backend
-                was built without a ``team_id``.
+            ValueError: If the collection has not been created, if this backend
+                was built without a ``team_id``, or if ``path_prefix`` contains
+                ``*`` or ``?``.
         """
         from weaviate.classes.query import MetadataQuery
 
+        check_path_prefix(path_prefix)
         self._check_collection(collection)
         col = self._get_collection(collection)
 

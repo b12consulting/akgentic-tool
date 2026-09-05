@@ -15,7 +15,7 @@ move it notify. The call sites are now, and only:
 - :meth:`DocumentsMixin.receiveMsg_NewFileMessage` — the same, for an upload. It
   is the *queueing* that notifies, so a notification that named no usable path
   costs nothing.
-- :meth:`DocumentsMixin.receiveMsg_IndexResult` / :meth:`DocumentsMixin.receiveMsg_IndexError`
+- :meth:`DocumentsMixin.receiveMsg_IndexResult` / :meth:`DocumentsMixin.receiveMsg_IndexFailure`
   — one per file, at its transition.
 - :meth:`DocumentsMixin.receiveMsg_EmbeddingCompleted` — **only** at the file's
   final transition. A batch that lands without settling the file mutates
@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 from akgentic.core.agent_config import BaseConfig
+from akgentic.tool.vector_store.protocol import PATH_PREFIX_REJECTED, PATH_PREFIX_WILDCARDS
 from akgentic.tool.workspace.documents.context import RagFileRow, RagIndexState
 from akgentic.tool.workspace.documents.models import (
     EMBEDDING_STALE_AFTER_S,
@@ -77,7 +78,7 @@ if TYPE_CHECKING:
     from akgentic.tool.vector_store.embedding_actor import EmbeddingCompleted
     from akgentic.tool.vector_store.protocol import CollectionConfig, SearchHit
     from akgentic.tool.workspace.card.params import WorkspaceRagIndex
-    from akgentic.tool.workspace.documents.worker import IndexError, IndexResult
+    from akgentic.tool.workspace.documents.worker import IndexFailure, IndexResult
 
     # The mixin consumes the actor's own surface — ``createActor``, the two proxy
     # builders, ``myAddress``, ``orchestrator``, ``config`` and ``state``. Naming
@@ -124,25 +125,17 @@ indexed" are different problems with different next steps, and an agent handed
 one sentence for both would retry the query when it should have indexed the tree.
 """
 
-_PREFIX_WILDCARDS = "*?"
-"""Characters a ``path_prefix`` may not contain, on either backend.
+_REJECTED_PREFIX = PATH_PREFIX_REJECTED
+"""The sentence a rejected prefix answers with, identical to what a backend raises.
 
-Both are legal in a POSIX filename and both are wildcards in Weaviate's ``Like``
-operator, which is what ``WeaviateBackend`` builds a prefix filter from; the
-in-memory backend uses ``str.startswith`` and treats them literally. The v4
-filter API offers no escape, so the same query would mean two different things
-depending on where the collection happens to live. Rejecting them at the
-parameter boundary is the only answer under which the two backends agree, and it
-costs nothing real: a prefix is a filter rather than a filename, so a shorter
-wildcard-free prefix still reaches the file.
+The characters and the sentence both live in ``vector_store/protocol.py``, beside
+the two backends that read a prefix differently, so this capability and the guard
+underneath it cannot drift apart. This layer **returns** the sentence rather than
+raising it: nothing in a document handler raises, and a wildcard is a mistake the
+agent can correct from the answer alone. Rejecting here as well as at the backend
+is deliberate defence in depth — the actor's answer is a sentence, the backend's
+is a ``ValueError``, and a caller that bypasses one still meets the other.
 """
-
-_REJECTED_PREFIX = (
-    "A path_prefix cannot contain '*' or '?': they are wildcards on one vector "
-    "backend and literal characters on the other, so the same filter would mean "
-    "two different things. Use a shorter prefix without them."
-)
-"""The sentence a rejected prefix answers with, identical on both backends."""
 
 
 class _KeywordMatch(NamedTuple):
@@ -715,7 +708,7 @@ class DocumentsMixin(_DocumentsBase):
                 request_ref=msg.path,
             )
 
-    def receiveMsg_IndexError(self, msg: IndexError) -> None:  # noqa: N802
+    def receiveMsg_IndexFailure(self, msg: IndexFailure) -> None:  # noqa: N802
         """TELL, from a worker. Mark the file ``FAILED`` and free its slot."""
         try:
             self._index_active.discard(msg.path)
@@ -1004,7 +997,8 @@ class DocumentsMixin(_DocumentsBase):
             query: What to look for, in natural language.
             top_k: How many hits to render, applied **after** filtering.
             path_prefix: Restrict the search to paths starting with this. Must not
-                contain ``*`` or ``?`` — see :data:`_PREFIX_WILDCARDS`.
+                contain ``*`` or ``?`` — see
+                :data:`~akgentic.tool.vector_store.protocol.PATH_PREFIX_WILDCARDS`.
             alpha: Weight of the vector leg. ``None`` takes the fusion module's
                 own default, which is the value the Weaviate client sends.
             score_threshold: Minimum **raw** cosine score for a vector hit,
@@ -1018,7 +1012,7 @@ class DocumentsMixin(_DocumentsBase):
 
         if self._vs_proxy is None or self._rag_params is None:
             return _UNAVAILABLE
-        if any(character in path_prefix for character in _PREFIX_WILDCARDS):
+        if any(character in path_prefix for character in PATH_PREFIX_WILDCARDS):
             return _REJECTED_PREFIX
         budget = max(top_k, 1)
         hits = self._vector_leg(query, budget, path_prefix, score_threshold)

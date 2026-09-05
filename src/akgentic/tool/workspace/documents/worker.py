@@ -53,7 +53,7 @@ from akgentic.core.agent_state import BaseState
 from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.workspace.card.params import WorkspaceRagIndex
 from akgentic.tool.workspace.documents.models import RagChunk, chunk_id
-from akgentic.tool.workspace.documents.splitter import BlockSplitter
+from akgentic.tool.workspace.documents.splitter import BlockSplitter, TextSplitter
 from akgentic.tool.workspace.readers import DocumentReader
 from akgentic.tool.workspace.workspace import get_workspace
 
@@ -61,7 +61,7 @@ __all__ = [
     "EMBED_BATCH_SIZE",
     "INDEX_WORKER_NAME_PREFIX",
     "MAX_CONCURRENT_INDEX_WORKERS",
-    "IndexError",
+    "IndexFailure",
     "IndexRequest",
     "IndexResult",
     "IndexWorker",
@@ -234,12 +234,17 @@ class IndexResult(SerializableBaseModel):
     texts: list[str]
 
 
-class IndexError(SerializableBaseModel):
+class IndexFailure(SerializableBaseModel):
     """What an :class:`IndexWorker` reports when it could not produce chunks.
 
-    Deliberately not an exception and deliberately not named ``…Error`` for the
-    sake of it: it mirrors ``EmbeddingError``, the payload the vector store's
-    worker reports failure with.
+    Deliberately not an exception: it mirrors ``EmbeddingError``, the payload the
+    vector store's worker reports failure with. **Named ``…Failure`` rather than
+    ``…Error`` because ``IndexError`` is a builtin**, and a payload by that name
+    would shadow it from its definition to the end of this module and throughout
+    ``actor/documents.py``, which imports it — so a later ``except IndexError:``
+    beside an ordinal lookup would raise ``TypeError`` instead of catching, with
+    no complaint from mypy. ``EmbeddingError``, the model this mirrors, shadows
+    nothing; the mirror is in the shape, not in the letter of the name.
 
     Attributes:
         path: Workspace-relative path of the source file.
@@ -275,7 +280,7 @@ class IndexWorker(Akgent[BaseConfig, BaseState]):
         """Produce *msg*'s chunks and report exactly once, then stop.
 
         Every failure — a path that escaped, a file that vanished, an extractor
-        that raised, bytes that are not UTF-8 — becomes an :class:`IndexError`
+        that raised, bytes that are not UTF-8 — becomes an :class:`IndexFailure`
         rather than an exception out of this actor. The workspace actor is the
         only party that can record it against the file, and it must be told.
 
@@ -298,7 +303,7 @@ class IndexWorker(Akgent[BaseConfig, BaseState]):
             )
         except Exception as exc:
             self._report(
-                IndexError(
+                IndexFailure(
                     path=msg.path,
                     scope=msg.scope,
                     source_sha=msg.source_sha,
@@ -341,7 +346,19 @@ class IndexWorker(Akgent[BaseConfig, BaseState]):
         Returns:
             The chunks and their composed texts, index-aligned.
         """
-        spans = BlockSplitter().split(markdown, msg.params)
+        # Annotated, and annotated **here**: this is the package's only
+        # ``TextSplitter`` annotation site inside ``src/``, and CI runs mypy over
+        # ``src/`` alone. The same assignment in a test file is never evaluated by
+        # the run that gates a merge, so a ``split`` that drifts from the Protocol
+        # would ship green — ``isinstance`` against a Protocol checks member
+        # presence, not signatures (splitter.py's own note). Do not narrow this
+        # back to ``BlockSplitter``. What it catches, verified by mutation: a
+        # changed arity, parameter type or return type. What it does not: a
+        # renamed parameter, which mypy ignores for protocol compatibility — so
+        # that one is still on the reader.
+
+        splitter: TextSplitter = BlockSplitter()
+        spans = splitter.split(markdown, msg.params)
         chunks = [
             RagChunk(
                 chunk_id=chunk_id(msg.scope, msg.path, msg.source_sha, ordinal),
@@ -359,7 +376,7 @@ class IndexWorker(Akgent[BaseConfig, BaseState]):
         ]
         return chunks, texts
 
-    def _report(self, payload: IndexResult | IndexError) -> None:
+    def _report(self, payload: IndexResult | IndexFailure) -> None:
         """Tell the parent what happened — fire and forget, and never raising.
 
         A parent that has stopped between the spawn and this line must not turn a
@@ -380,7 +397,7 @@ class IndexWorker(Akgent[BaseConfig, BaseState]):
             if isinstance(payload, IndexResult):
                 proxy.receiveMsg_IndexResult(payload)
             else:
-                proxy.receiveMsg_IndexError(payload)
+                proxy.receiveMsg_IndexFailure(payload)
         except Exception:
             logger.warning(
                 "[%s] could not report the index outcome for %s",

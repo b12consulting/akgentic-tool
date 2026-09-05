@@ -1156,3 +1156,67 @@ class TestScopeReadBackOntoHits:
         assert hit.scope is None
         assert hit.path is None
         assert hit.ordinal is None
+
+
+class TestPathPrefixWildcardsAreRefused:
+    """A ``path_prefix`` carrying ``*`` or ``?`` never reaches the cluster.
+
+    ``_query_filter`` builds ``like(f"{path_prefix}*")``, and ``*`` and ``?`` are
+    both wildcards to ``Like`` with no escape in the v4 filter API — while the
+    in-memory backend reads them literally through ``str.startswith``. The same
+    query would mean two different things depending on where the collection lives,
+    so both backends refuse them with the same sentence (ADR-045 §5). On
+    ``remove()`` that is the sharp case: unguarded, a ``*`` widens the deletion
+    here and narrows it to nothing there.
+    """
+
+    def _backend_and_collection(self) -> tuple[Any, MagicMock]:
+        """Return (team-scoped backend, mock collection) with ``col1`` created."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        mock_collection = MagicMock()
+        mock_client.collections.get.return_value = mock_collection
+        mock_collection.query.near_vector.return_value = MagicMock(objects=[])
+        return _scoped_backend(mock_client), mock_collection
+
+    @pytest.mark.parametrize("prefix", ["docs/*", "docs/?ne.md", "*", "?"])
+    def test_search_refuses_a_wildcard_prefix(self, prefix: str) -> None:
+        """The refusal happens before ``near_vector`` is called at all."""
+        backend, mock_collection = self._backend_and_collection()
+
+        with pytest.raises(ValueError, match="path_prefix cannot contain"):
+            backend.search("col1", [0.1, 0.2], top_k=5, path_prefix=prefix)
+
+        mock_collection.query.near_vector.assert_not_called()
+
+    @pytest.mark.parametrize("prefix", ["docs/*", "docs/?ne.md", "*", "?"])
+    def test_remove_refuses_a_wildcard_prefix(self, prefix: str) -> None:
+        """No ``delete_many`` is issued, so nothing is widened on the cluster."""
+        backend, mock_collection = self._backend_and_collection()
+
+        with pytest.raises(ValueError, match="path_prefix cannot contain"):
+            backend.remove("col1", ["r1"], path_prefix=prefix)
+
+        mock_collection.data.delete_many.assert_not_called()
+
+    def test_the_message_is_the_one_both_backends_share(self) -> None:
+        """Identical wording to the in-memory backend and to the workspace answer."""
+        from akgentic.tool.vector_store.protocol import PATH_PREFIX_REJECTED
+
+        backend, _mock_collection = self._backend_and_collection()
+
+        with pytest.raises(ValueError) as excinfo:
+            backend.remove("col1", ["r1"], path_prefix="docs/*")
+        assert str(excinfo.value) == PATH_PREFIX_REJECTED
+
+    def test_a_clean_prefix_still_builds_its_like_leg(self) -> None:
+        """The guard refuses two characters and changes nothing else."""
+        backend, mock_collection = self._backend_and_collection()
+
+        backend.search("col1", [0.1, 0.2], top_k=5, path_prefix="docs/")
+
+        sent = mock_collection.query.near_vector.call_args[1]["filters"]
+        assert _legs(sent) == [
+            ("team_id", "equal", "team-42"),
+            ("path", "like", "docs/*"),
+        ]
