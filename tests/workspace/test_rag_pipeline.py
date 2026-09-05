@@ -354,6 +354,34 @@ class TestEnableRag:
 
         assert harness.actor._vs_proxy is None
 
+    def test_a_failing_tell_proxy_leaves_neither_proxy_bound(
+        self, harness: RagHarness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Both proxies bind together or neither does, and a half-bind livelocks.
+
+        ``index_paths`` gates on ``_vs_proxy`` alone. With the ask proxy bound and
+        the tell proxy missing it would accept work, spawn a worker, write the row
+        to ``EMBEDDING`` — and issue no ``add()`` at all, because ``_issue_batches``
+        returns silently on a missing tell. Ten minutes later the reaper reverts
+        the row to ``PENDING`` and the whole cycle repeats, re-extracting every
+        document for ever. Degrading is the only safe answer.
+        """
+        original = harness._tell
+
+        def tell(address: Any, actor_type: Any = None) -> Any:
+            if address is harness.vs_address:
+                raise RuntimeError("tell proxy is gone")
+            return original(address, actor_type)
+
+        monkeypatch.setattr(harness.actor, "proxy_tell", tell)
+
+        harness.enable()  # must not raise
+
+        assert (harness.actor._vs_proxy, harness.actor._vs_tell) == (None, None)
+        assert harness.actor.index_paths("") == (
+            "Retrieval indexing is not available for this workspace."
+        )
+
     def test_the_first_enable_fixes_the_parameters_for_the_tree(self, harness: RagHarness) -> None:
         """Two agents on one team must not make one file chunk two ways."""
         first = WorkspaceRagIndex(chunk_chars=800)
@@ -1206,9 +1234,7 @@ class TestRagSnapshot:
 
         assert actor.state.rag_index["a.md"].status is RagStatus.EMBEDDING
 
-    def test_a_restored_snapshot_is_reaped_on_the_way_in(
-        self, actor: WorkspaceActor
-    ) -> None:
+    def test_a_restored_snapshot_is_reaped_on_the_way_in(self, actor: WorkspaceActor) -> None:
         """``on_start`` cannot do it: it assigns a fresh state before any restore.
 
         The resume hook is ``init_state`` — what ``akgentic-team``'s restorer

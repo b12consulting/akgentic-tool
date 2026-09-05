@@ -617,7 +617,9 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         sides already keep: ``EmbeddingService.embed`` returns one vector per input
         in the same order, and ``EmbeddingActor`` zips them back in that order. A
         batch that does not line up is passed through untouched rather than
-        mis-attributed.
+        mis-attributed — **with a WARNING**, because the pass-through stores
+        entries that no scoped removal and no scoped search can ever match, and
+        that is the one failure here nothing downstream can see.
 
         Args:
             msg: The result whose entries carry vectors and nothing else.
@@ -627,6 +629,14 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         """
         originals = self._request_entries.get(msg.request_id)
         if originals is None or len(originals) != len(msg.entries):
+            logger.warning(
+                "[%s] Request '%s' came back with %d entr(ies) against %s held: "
+                "scope, path and ordinal are stored empty and nothing scoped will match them",
+                self.config.name,
+                msg.request_id,
+                len(msg.entries),
+                "none" if originals is None else str(len(originals)),
+            )
             return msg.entries
         return [
             # Golden Rule #12: copy and override the one field that was produced.
