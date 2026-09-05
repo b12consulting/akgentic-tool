@@ -31,6 +31,13 @@ dependencies = [
     "pydantic-graph", # mailbox capability imports `End`
     "tavily-python>=0.7.12",
     "httpx>=0.27.0",
+    # The workspace document splitter parses Markdown into structural blocks.
+    # Base, not an extra: two pure-Python packages (it brings `mdurl`), no HTTP
+    # client and no telemetry — small enough that gating it would cost more in
+    # guard code than it saves, and the optional-dependency guard shape stays
+    # reserved for the heavyweight ones (markitdown, Pillow, openai/numpy,
+    # weaviate-client). No ceiling, for the reason Golden Rule #13 gives.
+    "markdown-it-py>=3",
 ]
 
 [project.optional-dependencies]

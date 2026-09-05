@@ -19,6 +19,7 @@ from akgentic.tool.workspace.card import (
     WorkspaceMkdir,
     WorkspaceMultiEdit,
     WorkspacePatch,
+    WorkspaceRagIndex,
     WorkspaceRead,
     WorkspaceTool,
     WorkspaceView,
@@ -28,7 +29,10 @@ from akgentic.tool.workspace.documents import (
     DEFAULT_MAX_DOCUMENT_CHARS,
     DEFAULT_MAX_DOCUMENTS,
     EXTRACTOR_VERSION,
+    BlockSplitter,
     DocumentExtract,
+    Span,
+    TextSplitter,
 )
 from akgentic.tool.workspace.edit import (
     EditItem,
@@ -162,7 +166,10 @@ __all__ = [
     "WORKSPACE_ACTOR_NAME",
     "WORKSPACE_ACTOR_ROLE",
     "WRITE_DENIED_MSG",
+    "BlockSplitter",
     "DocumentExtract",
+    "Span",
+    "TextSplitter",
     "ExecConfig",
     "ExecOutcome",
     "ExecStart",
@@ -244,5 +251,6 @@ __all__ = [
     "WorkspaceMultiEdit",
     "WorkspacePatch",
     "WorkspaceMkdir",
+    "WorkspaceRagIndex",
     "WorkspaceTool",
 ]
