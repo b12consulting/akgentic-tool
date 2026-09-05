@@ -172,6 +172,13 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         # parameter class. Unlike 45-5's, these two DO surface capabilities —
         # ``_WORKSPACE_TOOL_FIELDS`` below grows with them.
         "WorkspaceRagList",
+        # Added by story 45-8, deliberately: the third retrieval capability's
+        # parameter class, and the message an upload addresses to the actor.
+        # ``NewFileMessage`` surfaces no capability — it is a handler's payload,
+        # not a card field — so only ``WorkspaceRagSearch`` grows the field set
+        # below.
+        "NewFileMessage",
+        "WorkspaceRagSearch",
         "WorkspaceTool",
     }
 )
@@ -233,6 +240,9 @@ _WORKSPACE_TOOL_FIELDS: frozenset[str] = frozenset(
         "rag_collection",
         "max_documents",
         "max_document_chars",
+        # Added by story 45-8, deliberately: the search capability. Twenty-two
+        # names became twenty-three.
+        "workspace_rag_search",
     }
 )
 

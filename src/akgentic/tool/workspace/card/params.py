@@ -288,6 +288,49 @@ class WorkspaceRagList(BaseToolParam):
     """
 
 
+class WorkspaceRagSearch(BaseToolParam):
+    """Hybrid retrieval over the workspace's indexed chunks.
+
+    Configuration only, as every class in this module is: the query, the result
+    budget and the path filter are arguments of the callable, never fields here
+    (ADR-020).
+
+    **``TOOL_CALL`` only, and deliberately.** The three retrieval capabilities
+    carry three different channel sets (ADR-045 §5): indexing is
+    ``{TOOL_CALL, COMMAND}``, listing is ``{COMMAND, LLM_CONTEXT}``, and search is
+    ``{TOOL_CALL}`` alone. A search is something the model *does* with a question
+    it has just formed, not something it is *shown* on every turn.
+    """
+
+    expose: set[Channels] = {TOOL_CALL}
+
+    top_k: int = 5
+    """How many fused hits the render may carry.
+
+    The backend is asked for more than this — fusion reorders, and a hit whose
+    chunk no longer resolves consumes no result slot — but the render is cut
+    here."""
+
+    alpha: float = 0.7
+    """Weight of the vector leg in the fused score; the keyword leg gets ``1 - alpha``.
+
+    The literal mirrors :data:`~akgentic.tool.vector_store.hybrid.DEFAULT_ALPHA`,
+    which is the value ``weaviate-client`` sends for ``hybrid(alpha=...)``.
+    **Written out rather than imported**: this module imports from no sibling and
+    from no other subpackage, and reaching into ``vector_store/hybrid.py`` for a
+    float would open a new edge on the package's longest-lived import chain. The
+    two values are pinned together by a spec instead.
+
+    ``1.0`` is pure vector search, ``0.0`` pure keyword."""
+
+    score_threshold: float = 0.0
+    """Minimum **raw** cosine score for a vector hit, applied before fusion.
+
+    Raw and not fused, so the number keeps its absolute meaning: a fused score is
+    normalised against the rest of one result set and is comparable only within
+    it. ``0.0`` keeps everything the backend returned."""
+
+
 class ResourceType(StrEnum):
     """Encoding of a seeded resource's ``content`` field.
 

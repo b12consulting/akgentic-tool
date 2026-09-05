@@ -1,4 +1,4 @@
-"""The retrieval capabilities' wiring: the two factories, the provider, the announcement.
+"""The retrieval capabilities' wiring: the three factories, the provider, the announcement.
 
 :class:`RagFactories` declares **no Pydantic field**. Every field stays on
 :class:`~akgentic.tool.workspace.card.WorkspaceTool` in ``card/__init__.py``,
@@ -24,6 +24,7 @@ from akgentic.tool.core import ContextState, _resolve
 from akgentic.tool.workspace.card.params import (
     WorkspaceRagIndex,
     WorkspaceRagList,
+    WorkspaceRagSearch,
     WorkspaceRead,
 )
 from akgentic.tool.workspace.readers import DocumentReader
@@ -37,7 +38,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _UNAVAILABLE = "Retrieval indexing is not available for this workspace."
-"""What both callables answer when the actor cannot be reached.
+"""What all three callables answer when the actor cannot be reached.
 
 Deliberately the same sentence the actor itself returns in degraded mode: an
 agent should not have to tell "no vector store is wired" apart from "the proxy is
@@ -46,15 +47,16 @@ gone", because its next step is the same in both.
 
 
 class RagFactories:
-    """The ``workspace_rag_index`` / ``workspace_rag_list`` factories and their binding.
+    """The three retrieval factories and their binding.
 
-    Declares no Pydantic field: the four names below are what the card supplies,
+    Declares no Pydantic field: the five names below are what the card supplies,
     declared under ``if TYPE_CHECKING:`` so mypy sees them and Pydantic does not.
     """
 
     if TYPE_CHECKING:
         workspace_rag_index: WorkspaceRagIndex | bool
         workspace_rag_list: WorkspaceRagList | bool
+        workspace_rag_search: WorkspaceRagSearch | bool
         workspace_read: WorkspaceRead | bool
         rag_collection: CollectionConfig
 
@@ -72,10 +74,17 @@ class RagFactories:
         caps, the Weaviate configuration check, and the bind-time announcement. A
         card with retrieval off must create no collection, impose no Weaviate
         requirement, and shrink no cache.
+
+        **All three capabilities are terms, and the third is the one that is easy
+        to forget.** A card enabling only ``workspace_rag_search`` would otherwise
+        send no ``enable_rag``, so the actor would acquire no proxy, create no
+        collection and hold no chunking parameters — and every search would answer
+        that retrieval is unavailable with nothing anywhere explaining why.
         """
         return (
             _resolve(self.workspace_rag_index, WorkspaceRagIndex) is not None
             or _resolve(self.workspace_rag_list, WorkspaceRagList) is not None
+            or _resolve(self.workspace_rag_search, WorkspaceRagSearch) is not None
         )
 
     def _rag_params(self) -> WorkspaceRagIndex:
@@ -131,8 +140,64 @@ class RagFactories:
             logger.debug("Could not enable retrieval on #Workspace", exc_info=True)
 
     ##
-    ## The two callables
+    ## The three callables
     ##
+    def _rag_search_factory(self, params: WorkspaceRagSearch) -> Callable[..., Any]:
+        """Create the ``workspace_rag_search`` callable.
+
+        A thin **ask**, and the whole of the search runs on the actor — every one
+        of its four inputs lives there and none of them lives here. The extraction
+        bodies the keyword leg scans, the chunk offsets it maps them through, the
+        vector-store proxy and the workspace name that scopes every query are all
+        actor state; a card holds a proxy and a configuration.
+
+        Args:
+            params: The result budget and the two fusion knobs, captured here so
+                a team's configured values travel with the call.
+
+        Returns:
+            The callable, which never raises.
+        """
+        proxy = self._workspace_proxy
+        top_k, alpha, threshold = params.top_k, params.alpha, params.score_threshold
+
+        def workspace_rag_search(query: str, top_k: int = top_k, path_prefix: str = "") -> str:
+            """Search the indexed workspace documents for passages about *query*.
+
+            Combines meaning-based and word-based matching over the files that
+            ``workspace_rag_index`` has indexed. Use it to find *where* something
+            is said before reading a whole document.
+
+            Args:
+                query: What to look for, in natural language.
+                path_prefix: Restrict the search to paths starting with this, e.g.
+                    "reports/". Wildcards are not accepted. Defaults to the whole
+                    workspace.
+                top_k: How many passages to return.
+
+            Returns:
+                The matching passages with their file, heading path and score, or
+                a sentence saying that nothing matched.
+            """
+            if proxy is None:
+                return _UNAVAILABLE
+            try:
+                return str(
+                    proxy.rag_search(
+                        query,
+                        top_k=top_k,
+                        path_prefix=path_prefix,
+                        alpha=alpha,
+                        score_threshold=threshold,
+                    )
+                )
+            except Exception:
+                logger.debug("Could not search the retrieval index", exc_info=True)
+                return _UNAVAILABLE
+
+        workspace_rag_search.__doc__ = params.format_docstring(workspace_rag_search.__doc__)
+        return workspace_rag_search
+
     def _rag_index_factory(self, params: WorkspaceRagIndex) -> Callable[..., Any]:
         """Create the ``workspace_rag_index`` callable.
 

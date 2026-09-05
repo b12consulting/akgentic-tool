@@ -269,8 +269,15 @@ class Filesystem:
         """
         resolved = self._validate_path(path)
         resolved.parent.mkdir(parents=True, exist_ok=True)
-        # A ".tmp" suffix keeps the staging file out of the read path's sidecar
-        # rule, which claims names that both start with "." and end with ".md".
+        # The ".tmp" suffix is part of the shape three other things match on, and
+        # the shape is what makes a staging file recognisable as one: the startup
+        # sweep only unlinks a name carrying the full ".<name>.<32 hex>.tmp" form,
+        # so a user's own ".notes.tmp" survives; `is_staging_name` is the one
+        # definition of it; and the retrieval index's tree walk skips it along
+        # with every other dot-prefixed name, so a half-written file is never
+        # embedded. (It also kept the file out of the read path's old sidecar
+        # rule, which claimed names both starting with "." and ending ".md" —
+        # that rule is gone since ADR-045, and the three reasons above are not.)
         stem = resolved.name.encode()[:_STAGED_NAME_BUDGET].decode(errors="ignore")
         staged = resolved.parent / _STAGED_NAME_TEMPLATE.format(stem=stem, token=uuid4().hex)
         try:

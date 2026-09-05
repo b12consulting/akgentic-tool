@@ -19,7 +19,7 @@ from akgentic.tool import WorkspaceTool
 
 ---
 
-## Three features, degrading independently
+## Four features, degrading independently
 
 Everything below hangs off one distinction, and reading the card as a single feature is the usual
 way to get it wrong:
@@ -29,10 +29,16 @@ way to get it wrong:
 | **The write gate** | always — pure Python, no dependency, not configurable | nothing: it cannot be turned off |
 | **The journal** | when `git` is on `PATH` and `git_journal=True` | history, attribution, and out-of-band *detection* — **not** the gate |
 | **Sandboxed exec** | only when the card asks for it (`workspace_exec=…`, default off) | the two exec callables; nothing else changes |
+| **Retrieval** | only when the card asks for it (any `workspace_rag_*`, all default off) | the three retrieval callables and the upload handler's indexing; nothing else changes |
 
-The workspace does **not** need `git`. It does not need a sandbox backend. With neither, the gate
-still refuses every stale write, because the gate hashes the file rather than consulting a record
-of who wrote it.
+The workspace does **not** need `git`. It does not need a sandbox backend. It does not need a
+vector store. With none of them, the gate still refuses every stale write, because the gate hashes
+the file rather than consulting a record of who wrote it.
+
+Retrieval degrades further **within** itself: with the capability on and no `#VectorStore` reachable,
+every retrieval callable answers one sentence rather than raising, and a search whose embedding call
+fails falls back to its keyword leg. That is deliberate rather than defensive — this actor owns the
+write gate, and a misconfigured vector store must not be a way to take the gate down with it.
 
 ---
 
@@ -212,11 +218,14 @@ a77e214 edit: src/main.py      (reviewer)
   it.
 - **A dirty tree is committed first, as `out-of-band`**, before the next agent's mutation touches
   disk. An upload or a previously timed-out run is never misattributed to whoever writes next.
-- **Read paths dirty the tree.** A document read writes a `.report.pdf.md` sidecar; an image view
-  writes a resized one; an atomic write stages a `.spec.md.<hex>.tmp` beside its target. A
-  `.gitignore` covering all three is seeded once at init, and it is **not** optional hygiene —
-  without it every agent's commit would be preceded by an `out-of-band` commit of regenerable noise.
-  An existing `.gitignore` is never overwritten.
+- **One read path still dirties the tree.** An **image view** writes a resized sidecar beside its
+  source, and an atomic write stages a `.spec.md.<hex>.tmp` beside its target. A **document read
+  writes nothing at all** since ADR-045: its extraction is cached in `#Workspace`'s own state, which
+  is why the cache is bounded and why an eviction costs one re-extraction rather than a file. A
+  `.gitignore` covering both live patterns is seeded once at init — plus `.*.md`, kept for the
+  vestigial extraction sidecars in trees that predate the change — and it is **not** optional
+  hygiene: without it every agent's commit would be preceded by an `out-of-band` commit of
+  regenerable noise. An existing `.gitignore` is never overwritten.
 
 ### When the journal is off
 
@@ -337,7 +346,25 @@ cannot argue with.
 | `workspace_multi_edit` | `WorkspaceMultiEdit \| bool` | `True` | Ordered sequence of find-and-replace edits. |
 | `workspace_patch` | `WorkspacePatch \| bool` | `True` | Apply a unified diff. |
 | `workspace_mkdir` | `WorkspaceMkdir \| bool` | `True` | Create a directory tree. |
-| `workspace_exec` | `WorkspaceExec \| bool` | **`False`** | Run a sandboxed shell command. The one capability that is off by default, and the one field that registers **two** callables. |
+| `workspace_exec` | `WorkspaceExec \| bool` | **`False`** | Run a sandboxed shell command. Off by default, and the one field that registers **two** callables. |
+| `workspace_rag_index` | `WorkspaceRagIndex \| bool` | **`False`** | Queue workspace files for retrieval indexing. On the **read** side of `read_only`: indexing derives from the tree and writes nothing into it. |
+| `workspace_rag_list` | `WorkspaceRagList \| bool` | **`False`** | Where every file stands in the index. `COMMAND` + `LLM_CONTEXT`, never `TOOL_CALL` — it is pushed into the context tail as a per-turn delta, so a tool call for it would be a round trip for what the model already has. |
+| `workspace_rag_search` | `WorkspaceRagSearch \| bool` | **`False`** | Hybrid search over the indexed chunks. `TOOL_CALL` only — a search is something the model *does*, not something it is *shown*. Read side, like its two siblings. |
+| `rag_collection` | `CollectionConfig` | `CollectionConfig()` | Backend, dimension and tenant of the one `workspace_chunks` collection. Named `rag_collection` rather than the house's bare `collection`: on a card whose other twenty fields are workspace operations, a bare `collection` reads as "the workspace's collection of files". |
+| `max_documents` | `int \| None` | `None` | Row cap on the extraction cache. `None` is **not** zero and not "use the default" — it means *derive it* from the vector backend and whether retrieval is on. An explicit value always wins. |
+| `max_document_chars` | `int \| None` | `None` | Character cap on the bodies the cache holds. Same three-way meaning. |
+
+**The three retrieval capabilities are off by default for the reason `workspace_exec` is, one notch
+weaker.** Every file capability defaults to on because the card already implies file access; these
+three do not, because they reach the vector store and can spend embedding credits — a whole tree for
+the indexer, one query embed per call for the search. A capability that costs money on somebody
+else's account is opt-in.
+
+**Enabling any one of them turns retrieval on for the tree.** The three are read by one predicate,
+which three sites consult and must never disagree about: the backend-derived document caps, the
+Weaviate configuration check, and the bind-time announcement to the actor. A card enabling only
+`workspace_rag_search` therefore still creates the collection and still shrinks the cache on an
+in-memory backend.
 
 Every capability field follows the package-wide `ParamModel | bool` convention: `True` enables it
 with defaults, `False` removes it from every channel, and an instance enables it with custom
@@ -354,7 +381,7 @@ docstring the model sees) and `expose: set[Channels]` from `BaseToolParam`.
 |---|---|---|---|
 | `expose` | `set[Channels]` | `{TOOL_CALL}` | Channels the capability reaches. |
 | `default_limit` | `int` | `2000` | Maximum lines returned per call. Becomes the **default value of the `limit` argument in the tool signature**, so the model can still ask for fewer or more; it is a budget, not a hard cap. |
-| `force_document_regeneration` | `bool` | `False` | Default for the same-named argument: re-extract a binary file even when a cached sidecar exists. |
+| `force_document_regeneration` | `bool` | `False` | Default for the same-named argument: **ignore a valid cache entry** and re-extract. The meaning is new in ADR-045 — it used to mean "ignore a file that happens to sit beside the source", which no notion of validity governed at all. A cache entry knows whether it describes the current bytes, so forcing now means overriding a *correct* answer: coherent, and rarely needed. A forced read still fills the cache with what it extracted. |
 | `document_reader` | `DocumentReader \| bool` | `True` | Binary extraction policy. `True` ⇒ a default `DocumentReader()` (MarkItDown, Pass 1, no LLM). `False` ⇒ reading a binary extension raises `ValueError` with an install hint. An instance ⇒ custom extraction, including the LLM fallback. |
 
 The callable returns file contents with 1-indexed line numbers prefixed and a trailing notice when
@@ -362,9 +389,19 @@ truncated. A missing path or a path escaping the root surfaces as `RetriableErro
 can correct itself.
 
 **Binary reads** (`.pdf`, `.docx`, `.xlsx`, `.xls`, `.pptx`, `.msg`, `.epub`, and image
-extensions) go through the `DocumentReader` and are cached in a sidecar next to the source. A
-sidecar is a dotfile ending in `.md` and reading one directly returns it as plain text rather than
-re-extracting it.
+extensions) go through the `DocumentReader`, and the extracted Markdown is cached **in
+`#Workspace`'s state** — not in a file beside the source (ADR-045 §3). The sidecar it replaced is
+gone, and so is the read-path rule that used to return a dotfile ending in `.md` as plain text.
+
+The cache is keyed by path and hits only when the entry was produced from *these* source bytes by
+*this* extractor version, so it can never serve a stale body: a changed file misses and re-extracts.
+It is bounded on two dimensions — a row count and a character total — because it is re-serialised
+into the team's event store on every fill. Over the character cap the least-recently-used entry
+keeps its metadata and **drops its body**; over the row cap the entry goes entirely. Every byte is
+regenerable from the tree, so an eviction costs one re-extraction and never a wrong answer.
+
+An evicted body does **not** de-index its file: index membership lives in its own map and is never
+inferred from this one.
 
 #### `DocumentReader`
 
@@ -477,6 +514,100 @@ isolates, the bundled Docker image, and how to register a backend of your own.
 
 ---
 
+### `WorkspaceRagIndex` — `workspace_rag_index(path="", force=False)`
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `expose` | `set[Channels]` | `{TOOL_CALL, COMMAND}` | |
+| `chunk_chars` | `int` | `1200` | **Target** chunk size in characters. Soft: packing stops at the first block that would take the chunk past it, so a chunk lands near this size from below. |
+| `chunk_overlap_chars` | `int` | `150` | Overlap **budget**, honoured in whole blocks, so a chunk never starts mid-sentence. `0` disables overlap. |
+| `max_chunk_chars` | `int` | `4000` | **Hard ceiling**, and the only point at which an atomic block — a table, a fenced code block, a list — is ever cut. It is what keeps a chunk inside the embedding model's input limit. |
+| `min_chunk_chars` | `int` | `200` | Below this a chunk merges **forward**, and only under the same heading path. A chunk never crosses a heading boundary, which outranks this. |
+| `prepend_heading_path` | `bool` | `True` | Embed `"Invoice > Payment terms > Late fees"` ahead of the chunk's slice. Read by the **embedder**, never by the splitter: the heading context is composed at embed time and never stored, which is what keeps a stored chunk a pair of offsets rather than a copy of the document. |
+
+Sizes are in characters rather than tokens so the splitter stays uncoupled from any one model, at
+roughly four characters per token. A configuration the splitter could not honour — a target outside
+its own bounds, or an overlap at or above the target — is a validation error at configuration time
+rather than a surprise at index time.
+
+The callable **returns immediately** with three counts: queued, already current, and unsupported.
+Everything behind it is bounded work on the actor's thread — a tree walk through the backend, one
+read per candidate to hash it, and up to four worker spawns. No extraction, split or embedding
+happens on the calling agent's thread or on the actor's. Watch `workspace_rag_list` for progress.
+
+`force` re-indexes a file that is already current at its own bytes; without it, a file already
+indexed at its live digest — or one whose run over those same bytes is still in flight — is a no-op.
+
+### `WorkspaceRagList` — `workspace_rag_list()`
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `expose` | `set[Channels]` | `{COMMAND, LLM_CONTEXT}` | **Deliberately not `TOOL_CALL`.** |
+| `max_pending_shown` | `int` | `20` | How many `pending` rows the render may carry. Everything that is **not** pending is always shown, because each of those rows says something different; pending rows all say the same thing, so past this count they collapse into one `…and N more pending` line. |
+
+A file moves `pending` → `extraction` or `splitting` → `embedding` → `embedded`, and can reach
+`failed` or `stale` from anywhere. `failed` keeps whatever chunks the file already had, so a
+previously indexed file stays searchable at its previous content — a failure is a degradation, not a
+loss. `stale` means the tree changed underneath an indexed file.
+
+### `WorkspaceRagSearch` — `workspace_rag_search(query, top_k=…, path_prefix="")`
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `expose` | `set[Channels]` | `{TOOL_CALL}` | |
+| `top_k` | `int` | `5` | How many passages to render. Applied **after** filtering — the scope and prefix predicates go to the backend, so the budget is never spent on another workspace's chunks. |
+| `alpha` | `float` | `0.7` | Weight of the vector leg; the keyword leg gets `1 - alpha`. `1.0` is pure vector, `0.0` pure keyword. Mirrors the value `weaviate-client` sends for `hybrid(alpha=…)`. |
+| `score_threshold` | `float` | `0.0` | Minimum **raw** cosine for a vector hit, applied before normalisation so the number keeps its absolute meaning. |
+
+Two legs, combined by the fusion rule the whole package shares: a scoped similarity search against
+`workspace_chunks`, and a case-insensitive term match over the extraction bodies the actor already
+holds. Each hit renders its path, its heading path, a score label — `(hybrid: 0.90)`,
+`(semantic: 0.85)` or `(keyword match)` — and the chunk's text.
+
+**A hit's text comes from the vector store, not from the cache**, which is what keeps a file whose
+extraction body was evicted both searchable and renderable. That file loses only its lexical leg:
+the keyword search skips an evicted body rather than slicing it, and its stored offsets degrade to
+provenance. The consequence is worth stating plainly — `max_documents` bounds the size of the
+actor's state, **not** the size of the searchable corpus.
+
+**`path_prefix` must not contain `*` or `?`, and a prefix carrying either is refused with a
+sentence.** Both are legal in a POSIX filename; both are wildcards in Weaviate's `Like` operator,
+which is what a prefix filter compiles to there, while the in-memory backend uses `startswith` and
+treats them literally. The v4 filter API offers no escape, so the same query would otherwise mean
+two different things depending on where the collection happens to live. A prefix is a filter rather
+than a filename, so a shorter wildcard-free prefix still reaches the file.
+
+**Every failure degrades and none raises.** No vector store, an embedding call that fails or returns
+nothing, a search that fails: each yields one warning and the keyword leg alone. With retrieval off
+entirely the callable answers the same sentence its two siblings do.
+
+### `NewFileMessage` — the handler an upload addresses
+
+Not a capability and not a callable: a message that whatever accepted an upload **tells**
+`#Workspace-<workspace>`, carrying `paths`, a free-form `source` (`"upload"` today) and `force`.
+
+```python
+tell.receiveMsg_NewFileMessage(NewFileMessage(paths=["reports/q3.pdf"]))
+```
+
+Seven properties, each of them load-bearing:
+
+- **Tell, never ask.** The handler returns `None` and the sender does not wait — a 500-page PDF must
+  not hold an HTTP request open. Progress is observed through `workspace_rag_list`.
+- **It never raises.** It is reachable from *outside* the framework, and an exception on this
+  mailbox turn would kill the actor that owns the write gate for the whole team.
+- **Every path is validated** through `Filesystem`, never joined onto the backend's root. An upload
+  handler taking caller-supplied paths is the most escape-prone surface the card has.
+- **A path that escapes, is missing, or is of an unsupported type is skipped with a log line**, not
+  an error. Missing means "not yet": the message routinely races the upload's own write.
+- **It is idempotent** at the live content digest, unless `force=True`.
+- **It indexes, where a gate write only marks `stale`.** The asymmetry is the decision, not an
+  omission: an upload is one deliberate human act, while an agent write is a stream of them, and
+  auto-indexing each would spend embedding credits on content about to change again.
+- **With no `workspace_rag_*` capability enabled it records the paths as `pending` and spawns
+  nothing**, so enabling retrieval later picks them up and an upload never spends embedding credits
+  in a team that never opted in.
+
 ## The callables
 
 | Callable | Signature | Notes |
@@ -494,6 +625,9 @@ isolates, the bundled Docker image, and how to register a backend of your own.
 | `workspace_mkdir` | `(path)` | routed but not gated; creates parents, idempotent |
 | `workspace_exec` | `(cmd, cwd="")` | only when `workspace_exec` is on; takes the tree lease |
 | `workspace_exec_result` | `(run_id)` | only when `workspace_exec` is on; collects a run started earlier |
+| `workspace_rag_index` | `(path="", force=False)` | returns immediately with counts; extraction, splitting and embedding happen in `#index-` workers |
+| `workspace_rag_search` | `(query, top_k=…, path_prefix="")` | hybrid over the indexed chunks; degrades to keyword-only, never raises |
+| `workspace_rag_list` | `()` | `COMMAND` only — the full table. The per-turn delta is a `ContextState`, not a callable |
 
 The read side runs on the calling agent's own thread against its own `Filesystem`, exactly as it
 always has. The mutations run on the `#Workspace-<workspace>` actor, which checks and writes in one
@@ -582,6 +716,28 @@ WorkspaceTool(workspace_read=WorkspaceRead(document_reader=DocumentReader(llm_cl
 
 # Ship full-resolution images to the model
 WorkspaceTool(workspace_view=WorkspaceView(max_dimension=0))
+
+# Retrieval over a shared document corpus. Needs a #VectorStore on the team;
+# without one every retrieval callable answers a sentence and nothing raises.
+WorkspaceTool(
+    workspace_id="corpus",
+    read_only=True,
+    workspace_rag_index=True,
+    workspace_rag_list=True,
+    workspace_rag_search=True,
+)
+
+# Search only — the model queries an index somebody else fills. Enabling any one
+# of the three still turns retrieval on for the tree, so this creates the
+# collection and shrinks the extraction cache exactly as the indexer would.
+WorkspaceTool(workspace_id="corpus", workspace_rag_search=True)
+
+# A durable shared index. Fails at wiring time if AKGENTIC_WEAVIATE_URL is unset,
+# rather than silently giving a card that asked for a cluster a local index.
+WorkspaceTool(
+    workspace_rag_index=True,
+    rag_collection=CollectionConfig(backend="weaviate", tenant="acme"),
+)
 ```
 
 ### Degradation without extras
@@ -592,8 +748,19 @@ WorkspaceTool(workspace_view=WorkspaceView(max_dimension=0))
 | `[vision]` (Pillow) | `workspace_view` logs one warning and returns unresized bytes. Nothing fails. |
 | `git` off `PATH` | The journal degrades off with one warning. The gate is unaffected. |
 | No isolation backend | `mode="auto"` falls through to `local` with a `DeprecationWarning`: commands run as a plain subprocess with no filesystem isolation. |
+| No `#VectorStore` on the team | Every retrieval callable answers *"Retrieval indexing is not available for this workspace."* — one warning at bind time, nothing raised. Add `VectorStoreTool` to the team configuration. |
+| `[vector_search]` (numpy) | The in-memory vector backend cannot be built. Retrieval degrades as above; nothing else on the card changes. |
 
 ### What it costs
+
+Retrieval adds three things worth knowing before you turn it on. **Indexing spends embedding credits
+per file**, which is why all three capabilities are opt-in. **The in-memory vector backend keeps
+every vector inside the store's own state**, re-serialised on every notify, which is why enabling
+retrieval on that backend shrinks the extraction cache from 32 documents / 2 MB to 8 / 200 KB —
+2 MB of Markdown is roughly 1,900 chunks, and 1536 floats rendered as JSON is about 23 KB each.
+Weaviate keeps the vectors in the cluster and keeps the large caps. And **`workspace_rag_search`
+makes one embedding round trip on the mailbox turn of the actor that owns the write gate**: bounded
+to a single call, fully degrading, but it is the one external call this card puts on that thread.
 
 Measured on ten concurrent agents against a 27 MB tree (Apple M3 Max, Python 3.12):
 
@@ -615,9 +782,11 @@ Measured on ten concurrent agents against a 27 MB tree (Apple M3 Max, Python 3.1
   there is no ungated fallback path to take.
 - `document_reader=False` turns a binary read into `ValueError`, raised **outside** the retry
   wrapper: it is a configuration error, not something the model can fix by trying another path.
-- Sidecars (`.report.pdf.md`, `.diagram.png.1568.png`) live beside their sources and show up in
+- **Resized-image sidecars** (`.diagram.png.1568.png`) live beside their sources and show up in
   `workspace_list` and `workspace_glob` results — and they dirty the tree, which is what the seeded
-  `.gitignore` is for.
+  `.gitignore` is for. **Extraction sidecars (`.report.pdf.md`) are no longer written by anything**
+  since ADR-045; a tree that predates it still holds its own, still ignored, and the retrieval index
+  skips every dot-prefixed name so neither family is ever indexed.
 - **Two `PermissionError`s that mean opposite things** are told apart on the write path. *"Path
   escapes workspace root"* means the path is illegal. *"The change was not published: the operating
   system refused this process permission to replace the file … it did not escape it"* means the path
