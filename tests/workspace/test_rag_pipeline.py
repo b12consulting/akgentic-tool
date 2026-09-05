@@ -40,7 +40,7 @@ from akgentic.tool.workspace.documents.models import (
 from akgentic.tool.workspace.documents.worker import (
     EMBED_BATCH_SIZE,
     MAX_CONCURRENT_INDEX_WORKERS,
-    IndexError,
+    IndexFailure,
     IndexRequest,
     IndexResult,
     IndexWorker,
@@ -197,9 +197,9 @@ class RagHarness:
         )
 
     def fail(self, path: str, reason: str = "boom", source_sha: str | None = None) -> None:
-        """Deliver an ``IndexError`` for *path*, as its worker would."""
-        self.actor.receiveMsg_IndexError(
-            IndexError(
+        """Deliver an ``IndexFailure`` for *path*, as its worker would."""
+        self.actor.receiveMsg_IndexFailure(
+            IndexFailure(
                 path=path,
                 scope=WORKSPACE_NAME,
                 source_sha=source_sha if source_sha is not None else self._sha_of(path),

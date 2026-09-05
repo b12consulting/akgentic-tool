@@ -25,7 +25,7 @@ from akgentic.tool.workspace.documents.models import RagChunk, chunk_id
 from akgentic.tool.workspace.documents.splitter import _parser
 from akgentic.tool.workspace.documents.worker import (
     INDEX_WORKER_NAME_PREFIX,
-    IndexError,
+    IndexFailure,
     IndexRequest,
     IndexResult,
     IndexWorker,
@@ -48,12 +48,12 @@ class _Reporter:
 
     def __init__(self) -> None:
         self.results: list[IndexResult] = []
-        self.errors: list[IndexError] = []
+        self.errors: list[IndexFailure] = []
 
     def receiveMsg_IndexResult(self, msg: IndexResult) -> None:  # noqa: N802
         self.results.append(msg)
 
-    def receiveMsg_IndexError(self, msg: IndexError) -> None:  # noqa: N802
+    def receiveMsg_IndexFailure(self, msg: IndexFailure) -> None:  # noqa: N802
         self.errors.append(msg)
 
 
@@ -127,8 +127,25 @@ class TestWhatTheWorkerIs:
         """A ``Message`` payload surfaces every transient worker as a busy member."""
         from akgentic.core.messages import Message
 
-        for model in (IndexRequest, IndexResult, IndexError):
+        for model in (IndexRequest, IndexResult, IndexFailure):
             assert not issubclass(model, Message)
+
+    def test_nothing_this_module_exports_shadows_a_builtin(self) -> None:
+        """Why the failure payload is ``IndexFailure`` and not ``IndexError``.
+
+        A module-level ``IndexError`` hides the builtin from its definition to the
+        end of the module and everywhere it is imported — including
+        ``actor/documents.py``, whose ``_chunk_at`` is an ordinal lookup. A later
+        ``except IndexError:`` there would raise ``TypeError`` at runtime instead
+        of catching, and mypy would not complain. Ruff's ``A`` rules are not
+        selected in this package, so this spec is the gate.
+        """
+        import builtins
+
+        from akgentic.tool.workspace.documents import worker
+
+        shadowed = [name for name in worker.__all__ if hasattr(builtins, name)]
+        assert shadowed == []
 
 
 class TestTheBodyItSplits:
