@@ -20,10 +20,12 @@ from akgentic.tool.errors import RetriableError
 from akgentic.tool.vector_store.actor import (
     VS_ACTOR_NAME,
     VS_ACTOR_ROLE,
+    PendingRequest,
     VectorStoreActor,
     VectorStoreState,
 )
 from akgentic.tool.vector_store.embedding_actor import (
+    EmbeddingCompleted,
     EmbeddingError,
     EmbeddingResult,
 )
@@ -107,16 +109,15 @@ class TestVectorStoreState:
             collection_configs={
                 "c1": {
                     "dimension": 128,
-                    "backend": "inmemory",
-                    "persistence": "workspace",
-                    "workspace_path": "/tmp/ws",
+                    "backend": "weaviate",
+                    "tenant": "team-42",
                 }
             },
         )
         data = state.model_dump()
         restored = VectorStoreState.model_validate(data)
         assert restored.collection_configs == state.collection_configs
-        assert restored.collection_configs["c1"]["persistence"] == "workspace"
+        assert restored.collection_configs["c1"]["tenant"] == "team-42"
 
     def test_collection_configs_defaults_empty(self) -> None:
         """collection_configs defaults to empty dict."""
@@ -189,14 +190,16 @@ class TestCreateCollection:
         backend = _mock_backend()
         actor._backend = backend
 
-        config = CollectionConfig(dimension=128, persistence="workspace", workspace_path="/ws")
+        config = CollectionConfig(dimension=128, tenant="team-42")
         actor.create_collection("test_col", config)
         assert "test_col" in actor.state.collection_configs
         cfg = actor.state.collection_configs["test_col"]
         assert cfg["dimension"] == 128
-        assert cfg["persistence"] == "workspace"
-        assert cfg["workspace_path"] == "/ws"
+        assert cfg["tenant"] == "team-42"
         assert cfg["backend"] == "inmemory"
+        # The deleted workspace-persistence mode leaves no trace in the serialised config.
+        assert "persistence" not in cfg
+        assert "workspace_path" not in cfg
 
     def test_notifies_state_change(self) -> None:
         """AC12: state.notify_state_change() called after creation."""
@@ -360,8 +363,8 @@ class TestAddNeedsEmbedding:
 
         assert actor.state.indexing_pending["col1"] == 2
 
-    def test_stores_pending_entries(self) -> None:
-        """Pending entry metadata stored in state."""
+    def test_stores_pending_request(self) -> None:
+        """One open request records its own collection, count and raw entries."""
         actor = _make_actor()
         backend = _mock_backend()
         actor._backend = backend
@@ -371,10 +374,14 @@ class TestAddNeedsEmbedding:
             patch.object(actor, "createActor", return_value=MagicMock()),
             patch.object(actor, "proxy_tell", return_value=MagicMock()),
         ):
-            actor.add("col1", [entry])
+            actor.add("col1", [entry], request_ref="docs/a.md")
 
-        assert len(actor.state.pending_entries["col1"]) == 1
-        assert actor.state.pending_entries["col1"][0]["ref_id"] == "e1"
+        assert len(actor.state.pending_requests) == 1
+        record = next(iter(actor.state.pending_requests.values()))
+        assert record.collection == "col1"
+        assert record.count == 1
+        assert record.request_ref == "docs/a.md"
+        assert record.entries == [{"ref_type": "entity", "ref_id": "e1", "text": "hello"}]
 
     def test_does_not_call_backend_add(self) -> None:
         """AC2: Vectorless entries do NOT call backend.add() directly."""
@@ -429,161 +436,366 @@ class TestAddNeedsEmbedding:
 
 
 # ---------------------------------------------------------------------------
-# receiveMsg_EmbeddingResult (AC5)
+# receiveMsg_EmbeddingResult / receiveMsg_EmbeddingError — per-request settle
 # ---------------------------------------------------------------------------
 
 
+def _open_request(
+    actor: VectorStoreActor,
+    request_id: str,
+    collection: str = "col1",
+    count: int = 2,
+    request_ref: str | None = None,
+) -> None:
+    """Open one embedding request on *actor* the way ``_add_needs_embedding`` would."""
+    actor.state.pending_requests[request_id] = PendingRequest(
+        request_id=request_id,
+        collection=collection,
+        request_ref=request_ref,
+        count=count,
+        entries=[
+            {"ref_type": "entity", "ref_id": f"{request_id}-{i}", "text": f"t{i}"}
+            for i in range(count)
+        ],
+    )
+    actor._refresh_derived(collection)
+
+
+def _result_for(request_id: str, collection: str = "col1") -> EmbeddingResult:
+    """Build a two-entry EmbeddingResult carrying *request_id*."""
+    from akgentic.tool.vector_store.vector import VectorEntry
+
+    entries = [
+        VectorEntry(ref_type="entity", ref_id="e1", text="hi", vector=[0.1]),
+        VectorEntry(ref_type="entity", ref_id="e2", text="bye", vector=[0.2]),
+    ]
+    return EmbeddingResult(
+        collection=collection, entries=entries, request_id=request_id
+    )
+
+
 class TestReceiveEmbeddingResult:
-    """AC5: VectorStoreActor handles embedding results."""
-
-    def _make_result(self, collection: str = "col1") -> EmbeddingResult:
-        """Create a mock EmbeddingResult with VectorEntry objects."""
-        from akgentic.tool.vector_store.vector import VectorEntry
-
-        entries = [
-            VectorEntry(ref_type="entity", ref_id="e1", text="hi", vector=[0.1]),
-            VectorEntry(ref_type="entity", ref_id="e2", text="bye", vector=[0.2]),
-        ]
-        return EmbeddingResult(
-            collection=collection, entries=entries, request_id="req-1"
-        )
+    """VectorStoreActor settles the request its result names, and no other."""
 
     def test_inserts_into_backend(self) -> None:
-        """AC5: Entries are inserted into backend on result delivery."""
+        """Entries are inserted into the backend on result delivery."""
         actor = _make_actor()
         backend = _mock_backend()
         actor._backend = backend
-        actor.state.collection_statuses["col1"] = CollectionStatus.INDEXING
-        actor.state.indexing_pending["col1"] = 2
-        actor.state.pending_entries["col1"] = [
-            {"ref_type": "entity", "ref_id": "e1", "text": "hi"},
-            {"ref_type": "entity", "ref_id": "e2", "text": "bye"},
-        ]
+        _open_request(actor, "req-1")
 
-        result = self._make_result()
+        result = _result_for("req-1")
         actor.receiveMsg_EmbeddingResult(result)
 
         backend.add.assert_called_once_with("col1", result.entries)
 
     def test_transitions_to_ready(self) -> None:
-        """AC5: Status returns to READY when all pending complete."""
+        """Status returns to READY when the last open request settles."""
         actor = _make_actor()
-        backend = _mock_backend()
-        actor._backend = backend
-        actor.state.collection_statuses["col1"] = CollectionStatus.INDEXING
-        actor.state.indexing_pending["col1"] = 2
-        actor.state.pending_entries["col1"] = [
-            {"ref_type": "entity", "ref_id": "e1", "text": "hi"},
-            {"ref_type": "entity", "ref_id": "e2", "text": "bye"},
-        ]
+        actor._backend = _mock_backend()
+        _open_request(actor, "req-1")
 
-        actor.receiveMsg_EmbeddingResult(self._make_result())
+        actor.receiveMsg_EmbeddingResult(_result_for("req-1"))
 
         assert actor.state.collection_statuses["col1"] == CollectionStatus.READY
         assert actor.state.indexing_pending.get("col1") is None
+        assert actor.state.pending_requests == {}
 
-    def test_decrements_pending_count(self) -> None:
-        """AC5: indexing_pending decremented by result entry count."""
+    def test_stays_indexing_while_another_request_is_open(self) -> None:
+        """A second open request keeps the collection INDEXING at its own count."""
         actor = _make_actor()
-        backend = _mock_backend()
-        actor._backend = backend
-        # Simulate 4 pending, result delivers 2
-        actor.state.collection_statuses["col1"] = CollectionStatus.INDEXING
-        actor.state.indexing_pending["col1"] = 4
-        actor.state.pending_entries["col1"] = [
-            {"ref_type": "entity", "ref_id": f"e{i}", "text": f"t{i}"}
-            for i in range(4)
-        ]
+        actor._backend = _mock_backend()
+        _open_request(actor, "req-1", count=2)
+        _open_request(actor, "req-2", count=3)
 
-        actor.receiveMsg_EmbeddingResult(self._make_result())
+        actor.receiveMsg_EmbeddingResult(_result_for("req-1"))
 
+        assert actor.state.collection_statuses["col1"] == CollectionStatus.INDEXING
+        assert actor.state.indexing_pending["col1"] == 3
+        assert set(actor.state.pending_requests) == {"req-2"}
+
+    def test_unknown_request_id_settles_nothing(self) -> None:
+        """A result naming no open request must not disturb another's bookkeeping."""
+        actor = _make_actor()
+        actor._backend = _mock_backend()
+        _open_request(actor, "req-1", count=2)
+
+        actor.receiveMsg_EmbeddingResult(_result_for("req-unknown"))
+
+        assert set(actor.state.pending_requests) == {"req-1"}
         assert actor.state.indexing_pending["col1"] == 2
         assert actor.state.collection_statuses["col1"] == CollectionStatus.INDEXING
 
     def test_notifies_state_change(self) -> None:
         """state.notify_state_change() called after result delivery."""
         actor = _make_actor()
-        backend = _mock_backend()
-        actor._backend = backend
-        actor.state.collection_statuses["col1"] = CollectionStatus.INDEXING
-        actor.state.indexing_pending["col1"] = 2
-        actor.state.pending_entries["col1"] = [
-            {"ref_type": "entity", "ref_id": "e1", "text": "hi"},
-            {"ref_type": "entity", "ref_id": "e2", "text": "bye"},
-        ]
+        actor._backend = _mock_backend()
+        _open_request(actor, "req-1")
 
         with patch.object(VectorStoreState, "notify_state_change") as mock_notify:
-            actor.receiveMsg_EmbeddingResult(self._make_result())
+            actor.receiveMsg_EmbeddingResult(_result_for("req-1"))
             assert mock_notify.call_count >= 1
 
-    def test_backend_add_failure_transitions_to_error(self) -> None:
-        """When backend.add() fails, collection moves to ERROR (not stuck in INDEXING)."""
+    def test_backend_add_failure_settles_without_erroring_collection(self) -> None:
+        """A failed insert closes its own request; the collection never goes ERROR."""
         actor = _make_actor()
         backend = _mock_backend()
         backend.add.side_effect = RuntimeError("disk full")
         actor._backend = backend
-        actor.state.collection_statuses["col1"] = CollectionStatus.INDEXING
-        actor.state.indexing_pending["col1"] = 2
-        actor.state.pending_entries["col1"] = [
-            {"ref_type": "entity", "ref_id": "e1", "text": "hi"},
-            {"ref_type": "entity", "ref_id": "e2", "text": "bye"},
-        ]
+        _open_request(actor, "req-1", count=2)
+        _open_request(actor, "req-2", count=3)
 
-        actor.receiveMsg_EmbeddingResult(self._make_result())
+        actor.receiveMsg_EmbeddingResult(_result_for("req-1"))
 
-        assert actor.state.collection_statuses["col1"] == CollectionStatus.ERROR
-        assert actor.state.indexing_pending["col1"] == 0
-        assert "col1" not in actor.state.pending_entries
+        assert actor.state.collection_statuses["col1"] == CollectionStatus.INDEXING
+        assert actor.state.indexing_pending["col1"] == 3
+        assert set(actor.state.pending_requests) == {"req-2"}
 
+    def test_out_of_order_results_attribute_to_their_own_request(self) -> None:
+        """Two requests into one collection, settled in reverse order."""
+        actor = _make_actor()
+        actor._backend = _mock_backend()
+        _open_request(actor, "req-1", count=2)
+        _open_request(actor, "req-2", count=3)
+        assert actor.state.indexing_pending["col1"] == 5
 
-# ---------------------------------------------------------------------------
-# receiveMsg_EmbeddingError (AC7)
-# ---------------------------------------------------------------------------
+        # The SECOND request settles first.
+        actor.receiveMsg_EmbeddingResult(_result_for("req-2"))
+        assert set(actor.state.pending_requests) == {"req-1"}
+        assert actor.state.pending_requests["req-1"].count == 2
+        assert len(actor.state.pending_requests["req-1"].entries) == 2
+        assert actor.state.indexing_pending["col1"] == 2
+        assert actor.state.collection_statuses["col1"] == CollectionStatus.INDEXING
+
+        actor.receiveMsg_EmbeddingResult(_result_for("req-1"))
+        assert actor.state.pending_requests == {}
+        assert actor.state.collection_statuses["col1"] == CollectionStatus.READY
+
+    def test_resolves_backend_for_the_collection_not_the_inmemory_one(self) -> None:
+        """A Weaviate-backed collection's async batch reaches Weaviate, not memory."""
+        actor = _make_actor()
+        inmemory = _mock_backend()
+        weaviate = MagicMock()
+        actor._backend = inmemory
+        actor._weaviate_backend = weaviate
+        actor.state.collection_configs["wv_col"] = {"backend": "weaviate"}
+        _open_request(actor, "req-1", collection="wv_col")
+
+        result = _result_for("req-1", collection="wv_col")
+        actor.receiveMsg_EmbeddingResult(result)
+
+        weaviate.add.assert_called_once_with("wv_col", result.entries)
+        inmemory.add.assert_not_called()
+        # The in-memory snapshot is not taken for a Weaviate collection either.
+        inmemory.get_state.assert_not_called()
+        assert actor.state.backend_state == {}
+
+    def test_backend_unavailable_still_settles_the_request(self) -> None:
+        """No backend must not leave the request open for ever."""
+        actor = _make_actor()
+        _open_request(actor, "req-1")
+
+        with patch.object(actor, "_get_backend_for_collection", return_value=None):
+            actor.receiveMsg_EmbeddingResult(_result_for("req-1"))
+
+        assert actor.state.pending_requests == {}
+        assert actor.state.collection_statuses["col1"] == CollectionStatus.READY
 
 
 class TestReceiveEmbeddingError:
-    """AC7: VectorStoreActor handles embedding errors."""
+    """An embedding failure fails one request, not the collection."""
 
-    def test_sets_error_status(self) -> None:
-        """AC7: Collection status set to ERROR."""
+    def test_settles_only_the_failed_request(self) -> None:
+        """The other request's record, count and the status are untouched."""
         actor = _make_actor()
-        actor.state.collection_statuses["col1"] = CollectionStatus.INDEXING
-        actor.state.indexing_pending["col1"] = 2
-        actor.state.pending_entries["col1"] = [
-            {"ref_type": "entity", "ref_id": "e1", "text": "hi"},
-        ]
+        _open_request(actor, "req-a", count=2)
+        _open_request(actor, "req-b", count=3)
 
-        err = EmbeddingError(collection="col1", error="API failed", request_id="r1")
-        actor.receiveMsg_EmbeddingError(err)
+        actor.receiveMsg_EmbeddingError(
+            EmbeddingError(collection="col1", error="API failed", request_id="req-a")
+        )
 
-        assert actor.state.collection_statuses["col1"] == CollectionStatus.ERROR
+        assert set(actor.state.pending_requests) == {"req-b"}
+        assert actor.state.pending_requests["req-b"].count == 3
+        assert len(actor.state.pending_requests["req-b"].entries) == 3
+        assert actor.state.indexing_pending["col1"] == 3
+        assert actor.state.collection_statuses["col1"] == CollectionStatus.INDEXING
 
-    def test_discards_pending_entries(self) -> None:
-        """AC7: Pending entries discarded on error."""
+    def test_collection_never_reaches_error_status(self) -> None:
+        """A single failed batch no longer blanks the collection."""
         actor = _make_actor()
-        actor.state.collection_statuses["col1"] = CollectionStatus.INDEXING
-        actor.state.indexing_pending["col1"] = 2
-        actor.state.pending_entries["col1"] = [
-            {"ref_type": "entity", "ref_id": "e1", "text": "hi"},
-        ]
+        _open_request(actor, "req-a", count=2)
 
-        err = EmbeddingError(collection="col1", error="API failed", request_id="r1")
-        actor.receiveMsg_EmbeddingError(err)
+        actor.receiveMsg_EmbeddingError(
+            EmbeddingError(collection="col1", error="API failed", request_id="req-a")
+        )
 
-        assert actor.state.indexing_pending["col1"] == 0
-        assert "col1" not in actor.state.pending_entries
+        assert actor.state.collection_statuses["col1"] != CollectionStatus.ERROR
+        assert actor.state.collection_statuses["col1"] == CollectionStatus.READY
+
+    def test_survivor_settles_the_collection_to_ready(self) -> None:
+        """After A fails, B succeeding is what returns the collection to READY."""
+        actor = _make_actor()
+        actor._backend = _mock_backend()
+        _open_request(actor, "req-a", count=2)
+        _open_request(actor, "req-b", count=3)
+
+        actor.receiveMsg_EmbeddingError(
+            EmbeddingError(collection="col1", error="API failed", request_id="req-a")
+        )
+        assert actor.state.collection_statuses["col1"] == CollectionStatus.INDEXING
+
+        actor.receiveMsg_EmbeddingResult(_result_for("req-b"))
+        assert actor.state.collection_statuses["col1"] == CollectionStatus.READY
+        assert actor.state.pending_requests == {}
+
+    def test_unknown_request_id_settles_nothing(self) -> None:
+        """An error naming no open request leaves every record in place."""
+        actor = _make_actor()
+        _open_request(actor, "req-a", count=2)
+
+        actor.receiveMsg_EmbeddingError(
+            EmbeddingError(collection="col1", error="boom", request_id="ghost")
+        )
+
+        assert set(actor.state.pending_requests) == {"req-a"}
+        assert actor.state.indexing_pending["col1"] == 2
 
     def test_notifies_state_change(self) -> None:
         """state.notify_state_change() called after error."""
         actor = _make_actor()
-        actor.state.collection_statuses["col1"] = CollectionStatus.INDEXING
+        _open_request(actor, "req-a")
 
         with patch.object(VectorStoreState, "notify_state_change") as mock_notify:
-            err = EmbeddingError(
-                collection="col1", error="fail", request_id="r1"
+            actor.receiveMsg_EmbeddingError(
+                EmbeddingError(collection="col1", error="fail", request_id="req-a")
             )
-            actor.receiveMsg_EmbeddingError(err)
             assert mock_notify.call_count >= 1
+
+
+# ---------------------------------------------------------------------------
+# EmbeddingCompleted — the completion signal told back to the requester
+# ---------------------------------------------------------------------------
+
+
+class TestEmbeddingCompleted:
+    """The requester is told how its request ended, either way."""
+
+    def test_told_on_success_with_request_ref_echoed(self) -> None:
+        """Success delivers EmbeddingCompleted with error=None and the caller's ref."""
+        actor = _make_actor()
+        actor._backend = _mock_backend()
+        requester = MagicMock()
+
+        with (
+            patch.object(actor, "createActor", return_value=MagicMock()),
+            patch.object(actor, "proxy_tell", return_value=MagicMock()),
+        ):
+            actor.add(
+                "col1",
+                [_mock_entry(ref_id="e1")],
+                requester=requester,
+                request_ref="docs/report.md",
+            )
+        request_id = next(iter(actor.state.pending_requests))
+
+        with patch.object(actor, "send") as mock_send:
+            actor.receiveMsg_EmbeddingResult(_result_for(request_id))
+
+        mock_send.assert_called_once()
+        target, message = mock_send.call_args.args
+        assert target is requester
+        assert isinstance(message, EmbeddingCompleted)
+        assert message.request_id == request_id
+        assert message.request_ref == "docs/report.md"
+        assert message.collection == "col1"
+        assert message.count == 1
+        assert message.error is None
+
+    def test_told_on_failure_with_the_error(self) -> None:
+        """Failure delivers the same message with error populated."""
+        actor = _make_actor()
+        requester = MagicMock()
+        _open_request(actor, "req-1", count=2, request_ref="docs/a.md")
+        actor._request_requesters["req-1"] = requester
+
+        with patch.object(actor, "send") as mock_send:
+            actor.receiveMsg_EmbeddingError(
+                EmbeddingError(collection="col1", error="API down", request_id="req-1")
+            )
+
+        _, message = mock_send.call_args.args
+        assert message.error == "API down"
+        assert message.request_ref == "docs/a.md"
+        assert message.count == 2
+
+    def test_told_when_the_backend_insert_fails(self) -> None:
+        """A failed insert is reported to the caller, not just swallowed into a settle.
+
+        This is the path that replaced the collection-wide ERROR: the failure has to
+        reach somebody, and the requester is the only one left who can act on it.
+        """
+        actor = _make_actor()
+        backend = _mock_backend()
+        backend.add.side_effect = RuntimeError("disk full")
+        actor._backend = backend
+        requester = MagicMock()
+        _open_request(actor, "req-1", count=2, request_ref="docs/a.md")
+        actor._request_requesters["req-1"] = requester
+
+        with patch.object(actor, "send") as mock_send:
+            actor.receiveMsg_EmbeddingResult(_result_for("req-1"))
+
+        _, message = mock_send.call_args.args
+        assert message.error == "disk full"
+        assert message.request_ref == "docs/a.md"
+
+    def test_told_when_no_backend_is_available(self) -> None:
+        """An unavailable backend settles the request AND says why."""
+        actor = _make_actor()
+        requester = MagicMock()
+        _open_request(actor, "req-1", request_ref="docs/b.md")
+        actor._request_requesters["req-1"] = requester
+
+        with (
+            patch.object(actor, "_get_backend_for_collection", return_value=None),
+            patch.object(actor, "send") as mock_send,
+        ):
+            actor.receiveMsg_EmbeddingResult(_result_for("req-1"))
+
+        _, message = mock_send.call_args.args
+        assert message.error == "Backend unavailable"
+        assert message.request_ref == "docs/b.md"
+
+    def test_no_requester_means_no_message(self) -> None:
+        """The three existing call sites pass no requester and get no delivery."""
+        actor = _make_actor()
+        actor._backend = _mock_backend()
+        _open_request(actor, "req-1")
+
+        with patch.object(actor, "send") as mock_send:
+            actor.receiveMsg_EmbeddingResult(_result_for("req-1"))
+
+        mock_send.assert_not_called()
+
+    def test_delivery_failure_does_not_break_the_settle(self) -> None:
+        """A stopped requester must not take the settle down with it."""
+        actor = _make_actor()
+        actor._backend = _mock_backend()
+        _open_request(actor, "req-1")
+        actor._request_requesters["req-1"] = MagicMock()
+
+        with patch.object(actor, "send", side_effect=RuntimeError("actor gone")):
+            actor.receiveMsg_EmbeddingResult(_result_for("req-1"))
+
+        assert actor.state.pending_requests == {}
+        assert actor.state.collection_statuses["col1"] == CollectionStatus.READY
+
+    def test_requester_map_is_not_state(self) -> None:
+        """The requester lives outside BaseState — an address there breaks snapshots."""
+        actor = _make_actor()
+        assert "_request_requesters" not in VectorStoreState.model_fields
+        assert actor._request_requesters == {}
 
 
 # ---------------------------------------------------------------------------
@@ -630,24 +842,45 @@ class TestSearchDuringIndexing:
 
 
 class TestVectorStoreStateNewFields:
-    """Pending entries and indexing_pending serialise correctly."""
+    """Open requests and derived counts serialise correctly."""
 
-    def test_pending_entries_round_trip(self) -> None:
-        """pending_entries survives serialisation."""
+    def test_pending_requests_round_trip(self) -> None:
+        """pending_requests survives serialisation."""
         state = VectorStoreState(
-            pending_entries={"c1": [{"ref_type": "t", "ref_id": "1", "text": "hi"}]},
+            pending_requests={
+                "r1": PendingRequest(
+                    request_id="r1",
+                    collection="c1",
+                    request_ref="docs/a.md",
+                    count=1,
+                    entries=[{"ref_type": "t", "ref_id": "1", "text": "hi"}],
+                )
+            },
             indexing_pending={"c1": 1},
         )
         data = state.model_dump()
         restored = VectorStoreState.model_validate(data)
-        assert restored.pending_entries == state.pending_entries
+        assert restored.pending_requests == state.pending_requests
         assert restored.indexing_pending == state.indexing_pending
 
     def test_defaults_empty(self) -> None:
         """New fields default to empty dicts."""
         state = VectorStoreState()
-        assert state.pending_entries == {}
+        assert state.pending_requests == {}
         assert state.indexing_pending == {}
+
+    def test_legacy_pending_entries_payload_still_validates(self) -> None:
+        """A snapshot written before the rename loads, dropping the retired key."""
+        legacy = {
+            "backend_state": {},
+            "collection_statuses": {},
+            "pending_entries": {"c1": [{"ref_type": "t", "ref_id": "1", "text": "hi"}]},
+            "indexing_pending": {"c1": 1},
+            "collection_configs": {},
+        }
+        restored = VectorStoreState.model_validate(legacy)
+        assert restored.pending_requests == {}
+        assert not hasattr(restored, "pending_entries")
 
 
 # ---------------------------------------------------------------------------
@@ -665,7 +898,9 @@ class TestRemove:
         actor._backend = backend
 
         actor.remove("col1", ["id1", "id2"])
-        backend.remove.assert_called_once_with("col1", ["id1", "id2"])
+        backend.remove.assert_called_once_with(
+            "col1", ["id1", "id2"], scope=None, path_prefix=None
+        )
 
     def test_notifies_state_change(self) -> None:
         """AC12: state.notify_state_change() called after remove."""
@@ -718,7 +953,9 @@ class TestSearch:
         actor._backend = backend
 
         result = actor.search("col1", [0.1, 0.2], 5)
-        backend.search.assert_called_once_with("col1", [0.1, 0.2], 5)
+        backend.search.assert_called_once_with(
+            "col1", [0.1, 0.2], 5, scope=None, path_prefix=None
+        )
         assert result == expected
 
     def test_nonexistent_collection_raises_retriable(self) -> None:
@@ -747,6 +984,80 @@ class TestSearch:
         with patch.object(actor, "_get_or_create_backend", return_value=None):
             result = actor.search("col1", [0.1], 5)
             assert result.hits == []
+
+
+# ---------------------------------------------------------------------------
+# scope / path_prefix pass-through
+# ---------------------------------------------------------------------------
+
+
+class TestScopePassThrough:
+    """The actor forwards both predicates to the backend, unchanged."""
+
+    def test_search_forwards_both_predicates(self) -> None:
+        """search(scope=..., path_prefix=...) reaches the backend as given."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        backend.search.return_value = SearchResult(
+            hits=[], status=CollectionStatus.READY, indexing_pending=0
+        )
+        actor._backend = backend
+
+        actor.search("col1", [0.1], 5, scope="ws-1", path_prefix="docs/")
+
+        backend.search.assert_called_once_with(
+            "col1", [0.1], 5, scope="ws-1", path_prefix="docs/"
+        )
+
+    def test_remove_forwards_both_predicates(self) -> None:
+        """remove(scope=..., path_prefix=...) reaches the backend as given."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+
+        actor.remove("col1", ["id1"], scope="ws-1", path_prefix="docs/")
+
+        backend.remove.assert_called_once_with(
+            "col1", ["id1"], scope="ws-1", path_prefix="docs/"
+        )
+
+    def test_status_override_preserves_a_field_the_actor_never_heard_of(self) -> None:
+        """search() overrides two fields by copy, never by rebuilding the result.
+
+        An enumerated rebuild is correct on the day it is written and drops the next
+        field added to ``SearchResult`` in silence. A whole-model comparison cannot
+        catch that — only a field the write path has never seen can.
+        """
+
+        class _SearchResultWithExtra(SearchResult):
+            extra_field: str = "sentinel"
+
+        actor = _make_actor()
+        backend = _mock_backend()
+        backend.search.return_value = _SearchResultWithExtra(
+            hits=[], status=CollectionStatus.READY, indexing_pending=0
+        )
+        actor._backend = backend
+        actor.state.collection_statuses["col1"] = CollectionStatus.INDEXING
+        actor.state.indexing_pending["col1"] = 4
+
+        result = actor.search("col1", [0.1], 5)
+
+        assert result.status == CollectionStatus.INDEXING
+        assert result.indexing_pending == 4
+        assert isinstance(result, _SearchResultWithExtra)
+        assert result.extra_field == "sentinel"
+
+    def test_add_does_not_forward_correlation_arguments_to_the_backend(self) -> None:
+        """requester and request_ref are actor-level, never a backend concern."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+        entry = _mock_entry(vector=[0.1, 0.2])
+
+        actor.add("col1", [entry], requester=MagicMock(), request_ref="docs/a.md")
+
+        backend.add.assert_called_once_with("col1", [entry])
 
 
 # ---------------------------------------------------------------------------
@@ -938,56 +1249,6 @@ class TestLazyBackend:
 
 
 # ---------------------------------------------------------------------------
-# _save_workspace_collection error handling
-# ---------------------------------------------------------------------------
-
-
-class TestSaveWorkspaceCollection:
-    """Workspace save error handling: logs warning and does not raise."""
-
-    def test_save_logs_warning_on_backend_error(self) -> None:
-        """_save_workspace_collection catches and logs backend save failure."""
-        actor = _make_actor()
-        backend = _mock_backend()
-        backend.save_collection.side_effect = OSError("disk full")
-        actor._backend = backend
-        actor.state.collection_configs["col1"] = {
-            "dimension": 3,
-            "backend": "inmemory",
-            "persistence": "workspace",
-            "workspace_path": "/tmp/ws",
-        }
-        # Should not raise
-        actor._save_workspace_collection("col1")
-        backend.save_collection.assert_called_once_with("col1", "/tmp/ws")
-
-    def test_save_skipped_for_actor_state_persistence(self) -> None:
-        """_save_workspace_collection is a no-op for actor_state persistence."""
-        actor = _make_actor()
-        backend = _mock_backend()
-        actor._backend = backend
-        actor.state.collection_configs["col1"] = {
-            "dimension": 3,
-            "backend": "inmemory",
-            "persistence": "actor_state",
-            "workspace_path": None,
-        }
-        actor._save_workspace_collection("col1")
-        backend.save_collection.assert_not_called()
-
-    def test_save_skipped_for_unknown_collection(self) -> None:
-        """_save_workspace_collection is a no-op for unknown collection."""
-        actor = _make_actor()
-        backend = _mock_backend()
-        actor._backend = backend
-        # No collection_configs entry
-        actor._save_workspace_collection("unknown_col")
-        backend.save_collection.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# Public API exports (AC13)
-# ---------------------------------------------------------------------------
 
 
 class TestPublicApiExports:
@@ -1089,7 +1350,9 @@ class TestWeaviateRouting:
 
         actor.remove("wv_col", ["id1"])
 
-        mock_wb.remove.assert_called_once_with("wv_col", ["id1"])
+        mock_wb.remove.assert_called_once_with(
+            "wv_col", ["id1"], scope=None, path_prefix=None
+        )
 
     def test_search_routes_to_weaviate_backend(self) -> None:
         """search() for a weaviate collection routes to WeaviateBackend."""
@@ -1102,7 +1365,9 @@ class TestWeaviateRouting:
 
         result = actor.search("wv_col", [0.1], 5)
 
-        mock_wb.search.assert_called_once_with("wv_col", [0.1], 5)
+        mock_wb.search.assert_called_once_with(
+            "wv_col", [0.1], 5, scope=None, path_prefix=None
+        )
         assert result == expected
 
     def test_inmemory_collection_not_routed_to_weaviate(self) -> None:
@@ -1207,3 +1472,167 @@ class TestWeaviateTeamIdPropagation:
         stamped = [c[1]["team_id"] for c in mock_cls.call_args_list]
         assert stamped == [str(first.team_id), str(second.team_id)]
         assert stamped[0] != stamped[1]
+
+
+# ---------------------------------------------------------------------------
+# A request that cannot be started, and the metadata that must survive the trip
+# ---------------------------------------------------------------------------
+
+
+class TestASpawnFailureSettlesItsOwnRequest:
+    """The record is written before the child exists, so a failure must close it.
+
+    Latent until story 45-7: the record's requester was never told, so nothing
+    waited on the signal and a collection pinned at ``INDEXING`` for ever was
+    invisible. The workspace indexer is the first caller that waits.
+    """
+
+    def test_a_failing_spawn_leaves_no_open_request(self) -> None:
+        """Otherwise the collection reports ``INDEXING`` with nothing in flight."""
+        actor = _make_actor()
+        actor._backend = _mock_backend()
+
+        with patch.object(actor, "createActor", side_effect=RuntimeError("no thread")):
+            actor.add("col1", [_mock_entry(vector=[])])
+
+        assert actor.state.pending_requests == {}
+        assert actor.state.collection_statuses["col1"] == CollectionStatus.READY
+        assert actor.state.indexing_pending.get("col1") is None
+
+    def test_the_requester_is_told_the_failure(self) -> None:
+        """A caller that waits on ``EmbeddingCompleted`` must never wait for ever."""
+        actor = _make_actor()
+        actor._backend = _mock_backend()
+        requester = MagicMock()
+        delivered: list[Any] = []
+
+        with (
+            patch.object(actor, "createActor", side_effect=RuntimeError("no thread")),
+            patch.object(actor, "send", side_effect=lambda to, msg: delivered.append(msg)),
+        ):
+            actor.add("col1", [_mock_entry(vector=[])], requester=requester, request_ref="a.md")
+
+        [completed] = delivered
+        assert isinstance(completed, EmbeddingCompleted)
+        assert completed.request_ref == "a.md"
+        assert completed.error is not None and "no thread" in completed.error
+
+    def test_a_failing_tell_settles_the_request_too(self) -> None:
+        """The child exists but never got its payload, so nothing will report it."""
+        actor = _make_actor()
+        actor._backend = _mock_backend()
+
+        with (
+            patch.object(actor, "createActor", return_value=MagicMock()),
+            patch.object(actor, "proxy_tell", side_effect=RuntimeError("proxy gone")),
+        ):
+            actor.add("col1", [_mock_entry(vector=[])])
+
+        assert actor.state.pending_requests == {}
+
+    def test_a_successful_spawn_leaves_the_request_open(self) -> None:
+        """The guard above must not settle the healthy path."""
+        actor = _make_actor()
+        actor._backend = _mock_backend()
+
+        with (
+            patch.object(actor, "createActor", return_value=MagicMock()),
+            patch.object(actor, "proxy_tell", return_value=MagicMock()),
+        ):
+            actor.add("col1", [_mock_entry(vector=[])])
+
+        assert len(actor.state.pending_requests) == 1
+        assert actor.state.collection_statuses["col1"] == CollectionStatus.INDEXING
+
+
+class TestScopeSurvivesTheEmbeddingRoundTrip:
+    """``EmbeddingRequest`` carries three of ``VectorEntry``'s seven fields.
+
+    The result is rebuilt from exactly those three, so ``scope``, ``path`` and
+    ``ordinal`` arrive back as ``None`` — and those are the three every scoped
+    removal and every scoped search filters on. An entry stored without them is
+    findable by nobody and removable by nobody.
+    """
+
+    def _round_trip(self, actor: VectorStoreActor, backend: MagicMock) -> list[Any]:
+        """Issue one scoped ``add`` and deliver its embedded result back."""
+        from akgentic.tool.vector_store.vector import VectorEntry
+
+        original = VectorEntry(
+            ref_type="workspace_chunk",
+            ref_id="chunk-1",
+            text="hello",
+            vector=[],
+            scope="team-7",
+            path="docs/a.md",
+            ordinal=3,
+        )
+        with (
+            patch.object(actor, "createActor", return_value=MagicMock()),
+            patch.object(actor, "proxy_tell", return_value=MagicMock()),
+        ):
+            actor.add("col1", [original], request_ref="docs/a.md")
+        request_id = next(iter(actor.state.pending_requests))
+
+        actor.receiveMsg_EmbeddingResult(
+            EmbeddingResult(
+                collection="col1",
+                # Exactly what ``EmbeddingActor`` rebuilds: the three carried
+                # fields plus the vector it produced.
+                entries=[
+                    VectorEntry(
+                        ref_type="workspace_chunk",
+                        ref_id="chunk-1",
+                        text="hello",
+                        vector=[0.1, 0.2],
+                    )
+                ],
+                request_id=request_id,
+            )
+        )
+        return list(backend.add.call_args[0][1])
+
+    def test_scope_path_and_ordinal_reach_the_backend(self) -> None:
+        """Without this the workspace's scoped removal would match nothing."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+
+        [stored] = self._round_trip(actor, backend)
+
+        assert (stored.scope, stored.path, stored.ordinal) == ("team-7", "docs/a.md", 3)
+        assert stored.vector == [0.1, 0.2]
+
+    def test_the_originals_are_dropped_when_the_request_settles(self) -> None:
+        """They are held for one round trip, not for the life of the team."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+
+        self._round_trip(actor, backend)
+
+        assert actor._request_entries == {}
+
+    def test_a_result_that_does_not_line_up_is_passed_through_untouched(self) -> None:
+        """Mis-attributing metadata would be worse than not restoring it."""
+        from akgentic.tool.vector_store.vector import VectorEntry
+
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+        actor._request_entries["req-1"] = [
+            VectorEntry(ref_type="t", ref_id="a", text="a", vector=[], scope="team-7"),
+            VectorEntry(ref_type="t", ref_id="b", text="b", vector=[], scope="team-7"),
+        ]
+        _open_request(actor, "req-1", count=2)
+
+        actor.receiveMsg_EmbeddingResult(
+            EmbeddingResult(
+                collection="col1",
+                entries=[VectorEntry(ref_type="t", ref_id="a", text="a", vector=[0.1])],
+                request_id="req-1",
+            )
+        )
+
+        [stored] = backend.add.call_args[0][1]
+        assert stored.scope is None

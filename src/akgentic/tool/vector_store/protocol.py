@@ -70,7 +70,20 @@ def default_backend() -> Literal["inmemory", "weaviate"]:
 
 
 class CollectionStatus(StrEnum):
-    """Lifecycle state of a vector collection."""
+    """Lifecycle state of a vector collection.
+
+    ``INDEXING`` is derived, not assigned: a collection is ``INDEXING`` exactly while
+    at least one embedding request is open against it, and returns to ``READY`` when
+    the last one settles — whether that request succeeded or failed.
+
+    **``ERROR`` is no longer reachable from a single failed batch.** It used to be:
+    one failing ``EmbeddingActor`` marked the whole collection ``ERROR`` and discarded
+    every other request's pending entries with it. A failure is now reported to the
+    caller that asked for the batch, through ``EmbeddingCompleted.error``, and leaves
+    every concurrent request untouched. Nothing in this package assigns ``ERROR``
+    today; the member remains for a backend-level fault that really does invalidate a
+    whole collection.
+    """
 
     READY = "ready"
     INDEXING = "indexing"
@@ -85,8 +98,12 @@ class CollectionStatus(StrEnum):
 class CollectionConfig(SerializableBaseModel):
     """Configuration for a single vector collection.
 
-    Controls the embedding dimensionality, storage backend, and persistence
-    strategy for the collection.
+    Controls the embedding dimensionality and storage backend for the collection.
+
+    A payload persisted before the workspace-persistence mode was deleted may still
+    carry ``persistence`` and ``workspace_path``. Neither is a field any more; this
+    model declares no ``extra="forbid"``, so Pydantic's default ``extra="ignore"``
+    drops them on validation. No migration is needed.
     """
 
     dimension: int = Field(default=1536, ge=1, description="Embedding vector dimensionality")
@@ -96,12 +113,6 @@ class CollectionConfig(SerializableBaseModel):
             "Storage backend for this collection. Defaults to 'weaviate' when "
             f"{WEAVIATE_URL_ENV} names a cluster, otherwise 'inmemory'."
         ),
-    )
-    persistence: Literal["actor_state", "workspace"] = Field(
-        default="actor_state", description="Persistence mode (inmemory backend only)"
-    )
-    workspace_path: str | None = Field(
-        default=None, description="Filesystem path when persistence is workspace"
     )
     tenant: str | None = Field(
         default=None,
@@ -138,6 +149,53 @@ def require_weaviate_configured(config: CollectionConfig, card_name: str) -> Non
 
 
 # ---------------------------------------------------------------------------
+# path_prefix validation — one constant, one sentence, both backends
+# ---------------------------------------------------------------------------
+
+PATH_PREFIX_WILDCARDS: Final[str] = "*?"
+"""Characters a ``path_prefix`` may not contain, on either backend.
+
+Both are legal in a POSIX filename and both are wildcards in Weaviate's ``Like``
+operator, which is what ``WeaviateBackend`` builds a prefix filter from; the
+in-memory backend uses ``str.startswith`` and treats them literally. The v4
+filter API offers no escape, so the same query would mean two different things
+depending on where the collection happens to live — and on ``remove()`` that is
+sharp rather than academic: a ``*`` widens a deletion on Weaviate and narrows it
+to nothing in memory.
+
+They live here, next to the protocol both backends implement, so the two cannot
+drift apart (ADR-045 §5).
+"""
+
+PATH_PREFIX_REJECTED: Final[str] = (
+    "A path_prefix cannot contain '*' or '?': they are wildcards on one vector "
+    "backend and literal characters on the other, so the same filter would mean "
+    "two different things. Use a shorter prefix without them."
+)
+"""The one sentence a rejected prefix is refused with, wherever it is refused."""
+
+
+def check_path_prefix(path_prefix: str | None) -> None:
+    """Raise when *path_prefix* carries a character the two backends read differently.
+
+    Called at the top of ``search()`` and ``remove()`` on **both** backends, which
+    is where the divergence physically lives. Callers that answer an agent rather
+    than a program — ``workspace_rag_search`` — check the same constant and return
+    :data:`PATH_PREFIX_REJECTED` as a sentence instead of raising; the message is
+    the same either way.
+
+    Args:
+        path_prefix: The prefix to validate. ``None`` and ``""`` filter nothing
+            and are always accepted.
+
+    Raises:
+        ValueError: When the prefix contains ``*`` or ``?``.
+    """
+    if path_prefix and any(character in path_prefix for character in PATH_PREFIX_WILDCARDS):
+        raise ValueError(PATH_PREFIX_REJECTED)
+
+
+# ---------------------------------------------------------------------------
 # SearchHit
 # ---------------------------------------------------------------------------
 
@@ -153,6 +211,21 @@ class SearchHit(SerializableBaseModel):
     ref_id: str = Field(description="Identifier of the referenced object")
     text: str = Field(description="The text that was embedded")
     score: float = Field(description="Cosine similarity score")
+    scope: str | None = Field(
+        default=None,
+        description=(
+            "Partition the entry belongs to within the collection — for the workspace, "
+            "the workspace id. None for a producer that does not partition."
+        ),
+    )
+    path: str | None = Field(
+        default=None,
+        description="Source path within the scope, filterable by prefix. None when there is none.",
+    )
+    ordinal: int | None = Field(
+        default=None,
+        description="Position of this chunk within its source, for ordering reassembly.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -228,27 +301,58 @@ class VectorStoreService(Protocol):
         """
         ...
 
-    def remove(self, collection: str, ref_ids: list[str]) -> None:
+    def remove(
+        self,
+        collection: str,
+        ref_ids: list[str],
+        scope: str | None = None,
+        path_prefix: str | None = None,
+    ) -> None:
         """Remove entries from a collection by reference ID.
+
+        ``scope`` and ``path_prefix`` narrow the removal further: an entry is removed
+        only when it matches the ref-id list **and** every predicate given. Both
+        default to ``None``, which filters nothing.
 
         Args:
             collection: Target collection name.
             ref_ids: List of reference IDs to remove.
+            scope: Restrict removal to entries carrying this ``scope``.
+            path_prefix: Restrict removal to entries whose ``path`` starts with this.
+
+        Raises:
+            ValueError: When ``path_prefix`` contains ``*`` or ``?`` — see
+                :func:`check_path_prefix`.
         """
         ...
 
     def search(
-        self, collection: str, query_vector: list[float], top_k: int
+        self,
+        collection: str,
+        query_vector: list[float],
+        top_k: int,
+        scope: str | None = None,
+        path_prefix: str | None = None,
     ) -> SearchResult:
         """Search a collection by cosine similarity.
+
+        Both predicates are applied **before** ``top_k`` is taken, so a scoped search
+        returns a full ``top_k`` of its own entries rather than a short set whose
+        budget was spent on entries belonging to another scope.
 
         Args:
             collection: Target collection name.
             query_vector: Query embedding vector.
             top_k: Maximum number of results to return.
+            scope: Restrict the search to entries carrying this ``scope``.
+            path_prefix: Restrict the search to entries whose ``path`` starts with this.
 
         Returns:
             Search results with hits and collection status.
+
+        Raises:
+            ValueError: When ``path_prefix`` contains ``*`` or ``?`` — see
+                :func:`check_path_prefix`.
         """
         ...
 

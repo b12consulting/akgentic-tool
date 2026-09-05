@@ -16,6 +16,7 @@ from akgentic.tool.vector_store.protocol import (
     CollectionStatus,
     SearchHit,
     SearchResult,
+    check_path_prefix,
 )
 
 if TYPE_CHECKING:
@@ -40,6 +41,30 @@ same collections — this property is the only thing on a Weaviate object that
 says who produced it, and therefore the only thing a query can be scoped by.
 """
 
+SCOPE_PROPERTY: str = "scope"
+"""Schema property partitioning a collection *within* one team.
+
+The second dimension beside :data:`TEAM_ID_PROPERTY`, and the same mechanism: one
+class for the whole deployment, narrowed by a property predicate rather than by a
+class per producer. A team's workspace vectors and its planning vectors can therefore
+share a collection without ever meeting in a result set.
+
+Stamped only when the entry sets it, so an entry from planning or the knowledge graph
+writes exactly the properties it wrote before this existed — and provokes no
+auto-schema change on the ``Planning`` and ``Knowledge_graph`` classes, which were
+created before the property and are never backfilled.
+"""
+
+PATH_PROPERTY: str = "path"
+"""Schema property carrying an entry's source path, filtered by prefix.
+
+Like :data:`SCOPE_PROPERTY`, stamped only when set."""
+
+ORDINAL_PROPERTY: str = "ordinal"
+"""Schema property carrying a chunk's position within its source.
+
+Returned on a hit for ordering reassembly; never filtered on. Stamped only when set."""
+
 
 # ---------------------------------------------------------------------------
 # Dependency guard
@@ -51,6 +76,21 @@ except ImportError:
     _WEAVIATE_AVAILABLE = False
 else:
     _WEAVIATE_AVAILABLE = True
+
+
+def _optional_str(value: object) -> str | None:
+    """Return *value* as a string, or ``None`` when the property is absent.
+
+    A class created before ``scope`` and ``path`` existed returns them as ``None``,
+    which must stay ``None`` on the hit rather than becoming ``"None"``.
+
+    Args:
+        value: Raw property value read back from Weaviate.
+
+    Returns:
+        The value as a string, or ``None``.
+    """
+    return None if value is None else str(value)
 
 
 def _check_weaviate_dependencies() -> None:
@@ -175,6 +215,9 @@ class WeaviateBackend:
             Property(name="ref_id", data_type=DataType.TEXT),
             Property(name="text", data_type=DataType.TEXT),
             Property(name=TEAM_ID_PROPERTY, data_type=DataType.TEXT),
+            Property(name=SCOPE_PROPERTY, data_type=DataType.TEXT),
+            Property(name=PATH_PROPERTY, data_type=DataType.TEXT),
+            Property(name=ORDINAL_PROPERTY, data_type=DataType.INT),
         ]
         mt_config = Configure.multi_tenancy(enabled=True) if tenant else None
 
@@ -206,6 +249,14 @@ class WeaviateBackend:
         sweeper can find and act on, whereas a *query* filtering on ``""`` would be
         answering as an identity the caller never claimed.
 
+        ``scope``, ``path`` and ``ordinal`` follow the opposite rule and are written
+        **only when the entry sets them**. A Weaviate class created before a property
+        existed never gains it, so the live ``Planning`` and ``Knowledge_graph``
+        classes have no such properties; stamping a default would ask the cluster to
+        auto-extend a schema those producers never asked for. Omitting them keeps an
+        entry from planning or the knowledge graph byte-identical to what it was
+        before this dimension existed.
+
         Args:
             collection: Target collection name.
             entries: List of vector entries to store.
@@ -219,71 +270,114 @@ class WeaviateBackend:
         with col.batch.dynamic() as batch:
             for entry in entries:
                 batch.add_object(
-                    properties={
-                        "ref_type": entry.ref_type,
-                        "ref_id": entry.ref_id,
-                        "text": entry.text,
-                        TEAM_ID_PROPERTY: self._team_id or "",
-                    },
+                    properties=self._object_properties(entry),
                     vector=entry.vector,
                 )
 
-    def remove(self, collection: str, ref_ids: list[str]) -> None:
+    def _object_properties(self, entry: VectorEntry) -> dict[str, str | int]:
+        """Build the Weaviate property payload for one entry.
+
+        Args:
+            entry: The entry being written.
+
+        Returns:
+            The four always-present properties, plus each of ``scope`` / ``path`` /
+            ``ordinal`` that the entry actually sets.
+        """
+        props: dict[str, str | int] = {
+            "ref_type": entry.ref_type,
+            "ref_id": entry.ref_id,
+            "text": entry.text,
+            TEAM_ID_PROPERTY: self._team_id or "",
+        }
+        if entry.scope is not None:
+            props[SCOPE_PROPERTY] = entry.scope
+        if entry.path is not None:
+            props[PATH_PROPERTY] = entry.path
+        if entry.ordinal is not None:
+            props[ORDINAL_PROPERTY] = entry.ordinal
+        return props
+
+    def remove(
+        self,
+        collection: str,
+        ref_ids: list[str],
+        scope: str | None = None,
+        path_prefix: str | None = None,
+    ) -> None:
         """Remove this team's entries from a Weaviate collection by ref_id.
 
         Uses ``delete_many`` with the **conjunction** of a membership filter on
-        ``ref_id`` and this backend's team predicate. Both legs are required:
+        ``ref_id`` and this backend's query predicate. Both legs are required:
         ``ref_id`` alone deletes the matching object of every team on the
         cluster — and reference ids collide across teams, since planning ids
         are small integers — while the team leg alone deletes the collection.
 
+        ``scope`` and ``path_prefix`` conjoin further legs onto the same ``where=``,
+        so a scoped removal is one round trip and cannot touch another scope's
+        objects even where a ref-id collides.
+
         Args:
             collection: Target collection name.
             ref_ids: List of reference IDs to remove.
+            scope: Restrict removal to objects carrying this ``scope``.
+            path_prefix: Restrict removal to objects whose ``path`` starts with this.
 
         Raises:
-            ValueError: If the collection has not been created, or if this backend
-                was built without a ``team_id``.
+            ValueError: If the collection has not been created, if this backend
+                was built without a ``team_id``, or if ``path_prefix`` contains
+                ``*`` or ``?``.
         """
         from weaviate.classes.query import Filter
 
+        check_path_prefix(path_prefix)
         self._check_collection(collection)
         col = self._get_collection(collection)
         col.data.delete_many(
-            where=Filter.by_property("ref_id").contains_any(ref_ids) & self._team_filter(),
+            where=Filter.by_property("ref_id").contains_any(ref_ids)
+            & self._query_filter(scope, path_prefix),
         )
 
     def search(
-        self, collection: str, query_vector: list[float], top_k: int
+        self,
+        collection: str,
+        query_vector: list[float],
+        top_k: int,
+        scope: str | None = None,
+        path_prefix: str | None = None,
     ) -> SearchResult:
         """Search this team's objects in a Weaviate collection by cosine similarity.
 
-        The team predicate is passed to the cluster as ``filters=``, so it is
-        applied **before** ``limit``. Filtering the returned objects here
-        instead would leave the caller with a short result set reporting itself
-        complete, its budget already spent on other teams' objects.
+        Every predicate is passed to the cluster as ``filters=``, so all of them are
+        applied **before** ``limit``. Filtering the returned objects here instead
+        would leave the caller with a short result set reporting itself complete, its
+        budget already spent on other teams' or other scopes' objects.
 
         Args:
             collection: Target collection name.
             query_vector: Query embedding vector.
             top_k: Maximum number of results to return.
+            scope: Restrict the search to objects carrying this ``scope``.
+            path_prefix: Restrict the search to objects whose ``path`` starts with this.
 
         Returns:
             Search results with hits ranked by distance (converted to score).
 
         Raises:
-            ValueError: If the collection has not been created, or if this backend
-                was built without a ``team_id``.
+            ValueError: If the collection has not been created, if this backend
+                was built without a ``team_id``, or if ``path_prefix`` contains
+                ``*`` or ``?``.
         """
         from weaviate.classes.query import MetadataQuery
 
+        check_path_prefix(path_prefix)
         self._check_collection(collection)
         col = self._get_collection(collection)
 
         result = col.query.near_vector(
             near_vector=query_vector,
             limit=top_k,
-            filters=self._team_filter(),
+            filters=self._query_filter(scope, path_prefix),
             return_metadata=MetadataQuery(distance=True),
         )
 
@@ -292,12 +386,16 @@ class WeaviateBackend:
             props = obj.properties
             distance = obj.metadata.distance if obj.metadata and obj.metadata.distance else 0.0
             score = max(0.0, 1.0 - distance)
+            ordinal = props.get(ORDINAL_PROPERTY)
             hits.append(
                 SearchHit(
                     ref_type=str(props.get("ref_type", "")),
                     ref_id=str(props.get("ref_id", "")),
                     text=str(props.get("text", "")),
                     score=score,
+                    scope=_optional_str(props.get(SCOPE_PROPERTY)),
+                    path=_optional_str(props.get(PATH_PROPERTY)),
+                    ordinal=int(ordinal) if isinstance(ordinal, (int, float)) else None,
                 )
             )
 
@@ -412,6 +510,35 @@ class WeaviateBackend:
             )
             raise ValueError(msg)
         return Filter.by_property(TEAM_ID_PROPERTY).equal(self._team_id)
+
+    def _query_filter(
+        self, scope: str | None, path_prefix: str | None
+    ) -> FilterReturn:
+        """Return the full predicate for a query: the team leg plus what was asked.
+
+        Built **around** :meth:`_team_filter`, never instead of it — a scoped query is
+        still a team's query, and no argument can widen it past its own team. A
+        predicate left at ``None`` contributes no leg, so the default is exactly the
+        team filter this backend has always applied.
+
+        Args:
+            scope: Restrict to objects carrying this ``scope``, or ``None``.
+            path_prefix: Restrict to objects whose ``path`` starts with this, or ``None``.
+
+        Returns:
+            The conjunction of every applicable predicate.
+
+        Raises:
+            ValueError: When the backend was built without a ``team_id``.
+        """
+        from weaviate.classes.query import Filter
+
+        predicate = self._team_filter()
+        if scope is not None:
+            predicate = predicate & Filter.by_property(SCOPE_PROPERTY).equal(scope)
+        if path_prefix is not None:
+            predicate = predicate & Filter.by_property(PATH_PROPERTY).like(f"{path_prefix}*")
+        return predicate
 
     def _get_collection(self, name: str) -> weaviate.collections.Collection:
         """Return the Weaviate collection handle, with tenant if applicable.

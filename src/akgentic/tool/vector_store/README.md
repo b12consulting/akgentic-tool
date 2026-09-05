@@ -222,8 +222,6 @@ PlanningTool(collection=CollectionConfig(backend="weaviate", tenant="team-42"))
 |---|---|---|---|
 | `dimension` | `int` (≥1) | `1536` | Embedding vector dimensionality. Must match `embedding_model`. |
 | `backend` | `"inmemory" \| "weaviate"` | **follows the environment** | `weaviate` when `AKGENTIC_WEAVIATE_URL` is set, else `inmemory`. `inmemory` is a numpy cosine index inside the actor; `weaviate` delegates to a cluster and requires `akgentic-tool[weaviate]`. See below. |
-| `persistence` | `"actor_state" \| "workspace"` | `"actor_state"` | **inmemory backend only.** `actor_state` keeps vectors in the actor's persisted state; `workspace` writes them to a file. |
-| `workspace_path` | `str \| None` | `None` | The file path used when `persistence="workspace"`. |
 | `tenant` | `str \| None` | `None` | Weaviate tenant id for multi-tenancy — normally the workspace or team id. |
 
 ---
@@ -237,18 +235,31 @@ PlanningTool(collection=CollectionConfig(backend="weaviate", tenant="team-42"))
 | Method | Purpose |
 |---|---|
 | `create_collection(name, config)` | Create or reconfigure a named collection. Called by each consumer's actor on start. |
-| `add(collection, entries)` | Ingest `VectorEntry` records. Entries arriving without a vector are embedded asynchronously. |
-| `remove(collection, ref_ids)` | Drop entries by reference id. |
-| `search(collection, query_vector, top_k)` | Cosine search, returning a `SearchResult`. |
+| `add(collection, entries, requester=None, request_ref=None)` | Ingest `VectorEntry` records. Entries arriving without a vector are embedded asynchronously. |
+| `remove(collection, ref_ids, scope=None, path_prefix=None)` | Drop entries by reference id, narrowed by the predicates. |
+| `search(collection, query_vector, top_k, scope=None, path_prefix=None)` | Cosine search, returning a `SearchResult`. |
 | `embed(texts)` | Embed a batch directly. |
 
-`SearchResult` carries `hits: list[SearchHit]` (`ref_type`, `ref_id`, `text`, `score`), a
-`status` of `ready` / `indexing` / `error`, and `indexing_pending` — the number of entries still
-being embedded. A non-zero `indexing_pending` is why a just-written task can be missing from a
-semantic search a moment later and present a moment after.
+`SearchResult` carries `hits: list[SearchHit]` (`ref_type`, `ref_id`, `text`, `score`, plus
+`scope` / `path` / `ordinal` when the entry set them), a `status` of `ready` / `indexing`, and
+`indexing_pending` — the number of entries still being embedded. A non-zero `indexing_pending` is
+why a just-written task can be missing from a semantic search a moment later and present a moment
+after. `error` remains in the enum for a backend-level fault, but no single failed batch reaches
+it: a failure is reported to the caller that asked for the batch and leaves the collection alone.
 
 `VectorEntry` links an embedding back to its source: `ref_type` (a free-form domain label —
-`"entity"`, `"relation"`, a planning label), `ref_id` (a UUID string), `text`, `vector`.
+`"entity"`, `"relation"`, a planning label), `ref_id` (a UUID string), `text`, `vector`, and the
+optional `scope` / `path` / `ordinal` a chunking producer sets.
+
+### One collection, partitioned by `scope` and `path`
+
+`scope` partitions a collection *within* one team, the same way `team_id` partitions it across
+teams — one class for the whole deployment, narrowed by a property predicate rather than by a
+class per producer. `path` is the entry's source path, filtered by prefix; `ordinal` is a chunk's
+position within its source, returned on a hit for reassembly and never filtered on. All three
+default to `None`, and an entry that sets none of them is written exactly as it was before they
+existed. Both predicates are applied **before** `top_k`, in the cluster on Weaviate and before the
+cut in memory, so a scoped search returns a full `top_k` of its own entries.
 
 ### Embedding happens off the actor thread
 
@@ -256,6 +267,12 @@ Entries needing an embedding are handed to an `EmbeddingActor`, which answers wi
 `EmbeddingResult` or an `EmbeddingError`. The store actor never blocks on the OpenAI call, so a
 slow or failing embedding endpoint degrades search freshness rather than freezing every tool call
 routed through the store.
+
+Each asynchronous `add` opens its own request, and a result or an error settles only that
+request: two concurrent adds into one collection never settle each other, and a failure fails one
+batch. A caller that passes a `requester` is told `EmbeddingCompleted` when its request settles —
+either way, with `error` set on failure — carrying back the `request_ref` it gave, since `add` is
+reached by `tell` and cannot return the id the store mints internally.
 
 ### The in-memory index
 
@@ -265,9 +282,11 @@ sub-millisecond for 10 000 entries at 1536 dimensions. `remove` compacts the buf
 
 ### Every Weaviate object carries its team
 
-`WeaviateBackend` declares a fourth schema property, `team_id`, alongside `ref_type` / `ref_id` /
-`text`, and stamps it onto every object it writes. The value is the owning `VectorStoreActor`'s
-`team_id` — propagated by the actor system, never configured, never on a card:
+`WeaviateBackend` declares a `team_id` schema property alongside `ref_type` / `ref_id` / `text`
+(and, since the workspace dimension, `scope` / `path` / `ordinal`), and stamps it onto every
+object it writes. Unlike those three, `team_id` is always stamped. The value is the owning
+`VectorStoreActor`'s `team_id` — propagated by the actor system, never configured, never on a
+card:
 
 ```python
 WeaviateBackend(url=..., api_key=..., team_id=str(actor.team_id))

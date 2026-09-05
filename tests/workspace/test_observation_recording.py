@@ -17,8 +17,10 @@ import pytest
 from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
+from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION
 from akgentic.tool.workspace.models import Observation, WorkspaceConfig, content_sha
-from akgentic.tool.workspace.tool import WorkspaceTool, _paginate
+from akgentic.tool.workspace.card.read import _paginate
+from akgentic.tool.workspace.tool import WorkspaceTool
 from akgentic.tool.workspace.workspace import Filesystem
 
 from tests.workspace.conftest import (
@@ -290,10 +292,14 @@ class TestSilentCapabilities:
         workspace_actor: WorkspaceActor,
         workspace_tree: Path,
     ) -> None:
-        # On a sidecar cache hit the source bytes are never read, so hashing them
-        # would put a full file read back onto the path NFR1 keeps free.
-        (workspace_tree / "report.pdf").write_bytes(b"%PDF-1.4 not really a pdf")
-        (workspace_tree / ".report.pdf.md").write_text("extracted", encoding="utf-8")
+        # A document read hashes the source for the *cache*, and records nothing:
+        # the agent is shown derived Markdown, so a digest of bytes it never saw
+        # would be a false observation, whatever the read cost to produce.
+        source = b"%PDF-1.4 not really a pdf"
+        (workspace_tree / "report.pdf").write_bytes(source)
+        workspace_actor.cache_document(
+            "report.pdf", content_sha(source), EXTRACTOR_VERSION, "extracted"
+        )
 
         counting = CountingProxy(workspace_actor)
         card = WorkspaceTool(workspace_id=WORKSPACE_NAME)

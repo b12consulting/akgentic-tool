@@ -268,8 +268,6 @@ class TestPlanningToolCollectionField:
         assert tool.collection == CollectionConfig()
         assert tool.collection.dimension == 1536
         assert tool.collection.backend == "inmemory"
-        assert tool.collection.persistence == "actor_state"
-        assert tool.collection.workspace_path is None
         assert tool.collection.tenant is None
 
     def test_collection_field_present_in_model_fields(self) -> None:
@@ -287,13 +285,11 @@ class TestPlanningToolCollectionField:
         from akgentic.tool.planning.planning import PlanningTool
         from akgentic.tool.vector_store.protocol import CollectionConfig
 
-        custom = CollectionConfig(
-            backend="inmemory", persistence="workspace", workspace_path="/tmp/plan"
-        )
+        custom = CollectionConfig(backend="inmemory", tenant="plan-tenant")
         tool = PlanningTool(collection=custom)
         assert tool.collection is custom
-        assert tool.collection.persistence == "workspace"
-        assert tool.collection.workspace_path == "/tmp/plan"
+        assert tool.collection.backend == "inmemory"
+        assert tool.collection.tenant == "plan-tenant"
 
     def test_collection_roundtrip_default(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
@@ -308,18 +304,12 @@ class TestPlanningToolCollectionField:
         from akgentic.tool.vector_store.protocol import CollectionConfig
 
         tool = PlanningTool(
-            collection=CollectionConfig(
-                backend="inmemory",
-                persistence="workspace",
-                workspace_path="/tmp/plan",
-            )
+            collection=CollectionConfig(backend="inmemory", tenant="plan-tenant")
         )
         reloaded = PlanningTool.model_validate(tool.model_dump())
         assert reloaded.collection.backend == "inmemory"
-        assert reloaded.collection.persistence == "workspace"
-        assert reloaded.collection.workspace_path == "/tmp/plan"
+        assert reloaded.collection.tenant == "plan-tenant"
         assert reloaded.collection.dimension == 1536  # default preserved
-        assert reloaded.collection.tenant is None  # default preserved
 
     def test_independent_tools_do_not_alias_collection(self) -> None:
         """`default_factory=CollectionConfig` gives each instance a fresh object."""
@@ -354,9 +344,7 @@ class TestPlanningToolObserverCollection:
         from akgentic.tool.planning.planning import PlanningTool
         from akgentic.tool.vector_store.protocol import CollectionConfig
 
-        custom = CollectionConfig(
-            backend="inmemory", persistence="workspace", workspace_path="/tmp/plan"
-        )
+        custom = CollectionConfig(backend="inmemory", tenant="plan-tenant")
         tool = PlanningTool(collection=custom)
 
         captured = self._run_observer(tool)
@@ -382,9 +370,7 @@ class TestPlanningToolObserverCollection:
         from akgentic.tool.planning.planning import PlanningTool
         from akgentic.tool.vector_store.protocol import CollectionConfig
 
-        custom = CollectionConfig(
-            backend="inmemory", persistence="workspace", workspace_path="/tmp/x"
-        )
+        custom = CollectionConfig(backend="inmemory", tenant="plan-tenant-x")
         tool = PlanningTool(collection=custom)
         before_dump = tool.collection.model_dump()
 

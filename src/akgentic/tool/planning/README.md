@@ -74,8 +74,6 @@ A `CollectionConfig` forwarded to `VectorStoreActor.create_collection("planning"
 |---|---|---|---|
 | `dimension` | `int` | `1536` | Embedding dimensionality; must match the embedding model. |
 | `backend` | `"inmemory" \| "weaviate"` | `"inmemory"` | `weaviate` requires `akgentic-tool[weaviate]`. |
-| `persistence` | `"actor_state" \| "workspace"` | `"actor_state"` | inmemory backend only. |
-| `workspace_path` | `str \| None` | `None` | Filesystem path when `persistence="workspace"`. |
 | `tenant` | `str \| None` | `None` | Weaviate tenant id for multi-tenancy — usually the team id. |
 
 ### `search_top_k` / `search_score_threshold`

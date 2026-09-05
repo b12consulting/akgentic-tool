@@ -69,6 +69,31 @@ class EmbeddingError(SerializableBaseModel):
     request_id: str = Field(description="Matching request identifier")
 
 
+class EmbeddingCompleted(SerializableBaseModel):
+    """Told by ``VectorStoreActor`` to the requester when one ``add()`` settles.
+
+    Sent from **both** embedding handlers — ``error`` is ``None`` on success and
+    populated on failure — so a caller waiting on a batch is told either way and never
+    has to time out to learn the outcome.
+
+    ``request_ref`` is the caller's own correlation key, echoed back unchanged.
+    ``add()`` is reached by ``tell`` and returns nothing, so a caller can never learn
+    the ``request_id`` the actor mints internally; ``request_ref`` is how it recognises
+    its own request. For the workspace indexer it is a file path.
+    """
+
+    request_id: str = Field(description="The vector store's own identifier for the batch")
+    request_ref: str | None = Field(
+        description="The caller's correlation key, returned exactly as it was given"
+    )
+    collection: str = Field(description="Target collection name")
+    count: int = Field(description="Number of entries the request carried")
+    error: str | None = Field(
+        default=None,
+        description="None on success; the failure description otherwise",
+    )
+
+
 # ---------------------------------------------------------------------------
 # EmbeddingActor
 # ---------------------------------------------------------------------------

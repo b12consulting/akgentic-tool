@@ -140,7 +140,7 @@ class PlanningTool(ToolCard):
     collection: CollectionConfig = Field(
         default_factory=CollectionConfig,
         description=(
-            "Vector collection configuration (backend, persistence, dimension, tenant). "
+            "Vector collection configuration (backend, dimension, tenant). "
             "Propagated to PlanConfig and used by PlanActor._acquire_vs_proxy when calling "
             "create_collection on the VectorStoreActor."
         ),

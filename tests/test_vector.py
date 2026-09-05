@@ -98,6 +98,29 @@ class TestVectorEntry:
         with pytest.raises(ValidationError):
             VectorEntry(ref_type="entity", ref_id="x", text="t")  # type: ignore[call-arg]
 
+    def test_scope_path_and_ordinal_default_to_none(self) -> None:
+        """The three workspace fields are additive: an existing construction is valid."""
+        entry = VectorEntry(ref_type="entity", ref_id="x", text="t", vector=[1.0])
+        assert entry.scope is None
+        assert entry.path is None
+        assert entry.ordinal is None
+
+    def test_scope_path_and_ordinal_round_trip(self) -> None:
+        """All three survive serialisation."""
+        entry = VectorEntry(
+            ref_type="chunk",
+            ref_id="x",
+            text="t",
+            vector=[1.0],
+            scope="ws-1",
+            path="docs/report.md",
+            ordinal=7,
+        )
+        restored = VectorEntry.model_validate(entry.model_dump())
+        assert restored.scope == "ws-1"
+        assert restored.path == "docs/report.md"
+        assert restored.ordinal == 7
+
 
 # ---------------------------------------------------------------------------
 # AC #4 — EmbeddingService with mocked OpenAI client
