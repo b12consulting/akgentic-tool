@@ -142,6 +142,21 @@ TINY_SAME = "## S\n\nTiny.\n\nA slightly longer paragraph.\n"
 
 TINY_OTHER = "## S\n\nTiny.\n\n## T\n\nA slightly longer paragraph.\n"
 
+# Two sections whose heading text is identical, which makes their heading paths
+# identical too. A path is not an identity, so path equality alone would pack
+# them together and the chunk would swallow the second heading line.
+SIBLINGS = "# A\n\nOne paragraph here.\n\n# A\n\nTwo paragraph here.\n"
+
+TINY_TWINS = "## S\n\nTiny.\n\n## S\n\nAlso tiny.\n"
+
+# A document whose top level is ``##``, which is what an extractor routinely
+# produces. The three sections are siblings; none is inside another.
+DEEP_ROOT = "## A\n\nAlpha.\n\n## B\n\nBeta.\n\n## C\n\nGamma.\n"
+
+# Two ``###`` siblings after a skipped level. The second must replace the first
+# in the path, not stack on top of it.
+JUMPED_SIBLINGS = "# A\n\nAlpha.\n\n### C\n\nGamma.\n\n### D\n\nDelta.\n"
+
 EMPTY = ""
 
 BLANK = "\n\n   \n"
@@ -164,6 +179,10 @@ FIXTURES: dict[str, str] = {
     "MANY": MANY,
     "TINY_SAME": TINY_SAME,
     "TINY_OTHER": TINY_OTHER,
+    "SIBLINGS": SIBLINGS,
+    "TINY_TWINS": TINY_TWINS,
+    "DEEP_ROOT": DEEP_ROOT,
+    "JUMPED_SIBLINGS": JUMPED_SIBLINGS,
     "EMPTY": EMPTY,
     "BLANK": BLANK,
 }
@@ -305,6 +324,30 @@ class TestCoverage:
                     continue
                 assert _covering(chunks, offset), f"{name}: offset {offset} is in no chunk"
 
+    @pytest.mark.parametrize("name", sorted(FIXTURES))
+    @pytest.mark.parametrize("params_name", sorted(ALL_PARAMS))
+    def test_no_chunk_reaches_beyond_the_blocks_it_packs(self, name: str, params_name: str) -> None:
+        """The converse, and the general form of "a chunk carries no heading".
+
+        A block covers every piece of level-0 content there is, so the only
+        source text no block covers is whitespace, a heading line and a thematic
+        break. A chunk holding a non-whitespace offset that no block holds is
+        therefore a chunk that has reached across a section boundary and
+        swallowed the marker — which is exactly what rule 2 forbids, and what
+        comparing heading *paths* alone does not prevent when two sibling
+        sections happen to be named the same.
+        """
+        markdown = FIXTURES[name]
+        blocks = parse_blocks(markdown)
+        for chunk in BlockSplitter().split(markdown, ALL_PARAMS[params_name]):
+            for offset in range(chunk.start, chunk.end):
+                if markdown[offset].isspace():
+                    continue
+                assert _covering(blocks, offset), (
+                    f"{name}: chunk {chunk.start}:{chunk.end} covers offset "
+                    f"{offset} ({markdown[offset]!r}), which is in no block"
+                )
+
 
 class TestBlocks:
     """What counts as a block, and what deliberately does not."""
@@ -415,6 +458,29 @@ class TestHeadingBoundary:
                     f"{name}: chunk {chunk.start}:{chunk.end} under "
                     f"{chunk.heading_path} reaches a block under {block.heading_path}"
                 )
+
+    def test_two_sections_with_the_same_heading_text_are_not_fused(self) -> None:
+        """A heading path is not a section identity.
+
+        Both paragraphs sit under ``["A"]`` because both headings read ``A``, so
+        a packer comparing paths alone emits one chunk spanning the second
+        heading. They are two sections and must be two chunks.
+        """
+        assert [span.heading_path for span in parse_blocks(SIBLINGS)] == [["A"], ["A"]]
+        chunks = BlockSplitter().split(SIBLINGS, SMALL)
+        assert len(chunks) == 2
+        assert _slice(SIBLINGS, chunks[0]) == "One paragraph here."
+        assert _slice(SIBLINGS, chunks[1]) == "Two paragraph here."
+
+    def test_a_thematic_break_also_ends_a_chunk(self) -> None:
+        """It falls out of the same test, and is right for a thematic break.
+
+        ``MISC``'s ``hr`` is covered by no block, so a chunk spanning it would
+        carry text nothing packed — the blockquote before it and the code after
+        it belong to separate chunks.
+        """
+        for chunk in BlockSplitter().split(MISC, SMALL):
+            assert "---" not in _slice(MISC, chunk)
 
 
 class TestOverlap:
@@ -544,6 +610,18 @@ class TestShortChunkMerging:
         assert len(chunks) == 2
         assert _slice(TINY_SAME, chunks[0]) == "Tiny."
 
+    def test_a_short_chunk_does_not_merge_across_an_identically_named_heading(self) -> None:
+        """The merge is the second door two same-named sections could fuse through.
+
+        Both chunks are under the minimum and both carry ``["S"]``, so the path
+        test and the ceiling test both pass — only the adjacency test stops the
+        merge from spanning the second ``## S``.
+        """
+        chunks = BlockSplitter().split(TINY_TWINS, MERGING)
+        assert len(chunks) == 2
+        assert _slice(TINY_TWINS, chunks[0]) == "Tiny."
+        assert _slice(TINY_TWINS, chunks[1]) == "Also tiny."
+
 
 class TestHeadingPaths:
     """The stack, at every depth and across a skipped level."""
@@ -573,6 +651,30 @@ class TestHeadingPaths:
         blocks = parse_blocks(SETEXT)
         assert [span.heading_path for span in blocks] == [["Title"]]
         assert _slice(SETEXT, blocks[0]) == "Body paragraph."
+
+    def test_a_document_that_starts_below_h1_does_not_deepen_with_every_section(self) -> None:
+        """Three ``##`` siblings are three paths of one, not one path of three.
+
+        An extractor routinely produces a document whose top level is ``##``. A
+        stack keyed by list position rather than by heading depth leaves the
+        first entry in place and yields ``["A"]``, ``["A", "B"]``,
+        ``["A", "B", "C"]`` — a hierarchy the document does not have, embedded
+        ahead of every chunk by ``prepend_heading_path``.
+        """
+        assert [span.heading_path for span in parse_blocks(DEEP_ROOT)] == [["A"], ["B"], ["C"]]
+
+    def test_siblings_after_a_skipped_level_replace_rather_than_accumulate(self) -> None:
+        """``#`` then ``###`` then ``###``: the second ``###`` replaces the first.
+
+        After the skip, the entry holding ``C`` was pushed at depth three while
+        sitting at index one, so only a depth-keyed stack knows that ``D`` closes
+        it. The skipped level is still not padded — both paths are length two.
+        """
+        assert [span.heading_path for span in parse_blocks(JUMPED_SIBLINGS)] == [
+            ["A"],
+            ["A", "C"],
+            ["A", "D"],
+        ]
 
     def test_the_heading_text_comes_from_the_token_and_not_from_a_slice(self) -> None:
         """Slicing the source would keep the ``#`` markers in the path."""
@@ -642,10 +744,20 @@ class TestDefaults:
         assert WorkspaceRagIndex().expose == {TOOL_CALL, COMMAND}
 
     def test_it_round_trips_through_dump_and_validate(self) -> None:
-        """Fully serialisable: primitives only, no runtime state."""
+        """Fully serialisable: primitives only, no runtime state.
+
+        Compared as **models**, never as two dumps. ``expose`` is a ``set``, and
+        ``serialize()`` renders a set as a *list* in whichever order that set
+        happens to iterate — an order Python's per-process hash randomisation
+        can flip when the two members collide in the table. Comparing the dumps
+        therefore fails on roughly one interpreter seed in twelve
+        (``PYTHONHASHSEED=2`` reproduces it), for no behavioural reason. The
+        model comparison is both stable and stronger: it checks what came back,
+        not how it was written down.
+        """
         params = WorkspaceRagIndex(chunk_chars=800, chunk_overlap_chars=100)
         again = WorkspaceRagIndex.model_validate(params.model_dump())
-        assert again.model_dump() == params.model_dump()
+        assert again == params
 
     def test_the_splitter_never_reads_prepend_heading_path(self) -> None:
         """It is the embedder's flag; flipping it must change nothing here."""

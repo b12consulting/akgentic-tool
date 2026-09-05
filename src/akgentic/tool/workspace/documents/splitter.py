@@ -210,6 +210,39 @@ def _block_map(token: Token) -> list[int] | None:
     return token.map
 
 
+def _push_heading(path: list[str], depths: list[int], depth: int, text: str) -> None:
+    """Open a heading of *depth*, closing every section it ends.
+
+    The stack is keyed by the **depth each entry was pushed at**, never by its
+    position in the list, and that distinction is the whole of the function. A
+    position-keyed truncation (``del path[depth - 1:]``) is right only for a
+    document that starts at ``#`` and skips no level; anywhere else it silently
+    nests siblings inside each other. Two shapes make it wrong, and both are
+    ordinary in extracted documents:
+
+    - **A document that starts below ``#``.** ``## A`` then ``## B`` are
+      siblings, but position-keyed truncation leaves ``A`` in place and yields
+      ``["A", "B"]``, then ``["A", "B", "C"]`` — a path that deepens forever and
+      claims a hierarchy the document does not have.
+    - **Siblings after a skipped level.** After ``#`` then ``###``, the entry at
+      index 1 holds a depth-3 heading, so a following ``###`` appends rather than
+      replaces.
+
+    It matters beyond tidiness: ``prepend_heading_path`` embeds this path ahead
+    of every chunk, so a wrong path is wrong text in the vector, and rule 2 packs
+    by path equality, so it is also wrong chunk boundaries.
+
+    A heading closes every open section at or below its own depth, which is what
+    the ``>=`` says. A skipped level is still not padded: nothing is invented for
+    the depth that never appeared, so ``#`` then ``###`` remains a path of two.
+    """
+    while depths and depths[-1] >= depth:
+        depths.pop()
+        path.pop()
+    depths.append(depth)
+    path.append(text)
+
+
 def parse_blocks(markdown: str) -> list[Span]:
     """Phase 1 — parse *markdown* into structural blocks with exact offsets.
 
@@ -218,10 +251,10 @@ def parse_blocks(markdown: str) -> list[Span]:
     set. :class:`BlockSplitter` is what a caller outside this package names.
 
     The heading stack is maintained over ``heading_open`` and the ``inline``
-    token that follows it. The text comes from ``inline.content`` rather than
-    from slicing the source, which would keep the ``#`` markers.
-    ``del path[depth - 1:]`` truncates to the new depth, which is why a skipped
-    level yields a shorter path rather than a padded one.
+    token that follows it — see :func:`_push_heading` for how, and why the depth
+    each entry was pushed at has to be remembered. The text comes from
+    ``inline.content`` rather than from slicing the source, which would keep the
+    ``#`` markers.
 
     Args:
         markdown: The document body. Empty and whitespace-only inputs produce no
@@ -234,13 +267,13 @@ def parse_blocks(markdown: str) -> list[Span]:
     starts = _line_starts(markdown)
     blocks: list[Span] = []
     path: list[str] = []
+    depths: list[int] = []
     depth: int | None = None
     for token in _parser().parse(markdown):
         if token.type == "heading_open":
             depth = int(token.tag[1])
         elif depth is not None and token.type == "inline":
-            del path[depth - 1 :]
-            path.append(token.content)
+            _push_heading(path, depths, depth, token.content)
             depth = None
         lines = _block_map(token)
         if lines is None:
@@ -398,16 +431,39 @@ def _split_oversized(span: Span, markdown: str, params: WorkspaceRagIndex) -> li
     return [span]
 
 
-def _heading_groups(units: list[Span]) -> list[list[Span]]:
-    """Split *units* into runs sharing one heading path — rule 2's whole of it.
+def _adjacent(previous: Span, following: Span, markdown: str) -> bool:
+    """Whether nothing but whitespace separates the two spans in the source.
 
-    Packing then happens inside a run and never across one, so a chunk belongs to
-    exactly one heading path by construction. Under-full chunks are the price and
-    are accepted: packing efficiency loses to retrieval precision every time.
+    Rule 2 needs more than path equality, because a path is not an identity: two
+    sibling sections can carry the *same* heading text — ``## Notes`` twice in one
+    document is ordinary — and comparing paths alone would pack them together,
+    producing a chunk that spans both and swallows the second heading line.
+
+    The test is exact rather than heuristic. Every level-0 block is covered by a
+    span, so the only source text a block never covers is whitespace, a heading
+    line and a thematic break: anything non-blank between two blocks is therefore
+    a boundary the packer must respect. An ``hr`` breaking a chunk falls out of
+    the same test, which is the right answer for a thematic break anyway.
+    """
+    return not markdown[previous.end : following.start].strip()
+
+
+def _heading_groups(units: list[Span], markdown: str) -> list[list[Span]]:
+    """Split *units* into runs under one heading — rule 2's whole of it.
+
+    A run is units that share a heading path **and** are adjacent in the source;
+    see :func:`_adjacent` for why the second half is not redundant. Packing then
+    happens inside a run and never across one, so a chunk belongs to exactly one
+    section by construction. Under-full chunks are the price and are accepted:
+    packing efficiency loses to retrieval precision every time.
     """
     groups: list[list[Span]] = []
     for unit in units:
-        if groups and groups[-1][0].heading_path == unit.heading_path:
+        if (
+            groups
+            and groups[-1][0].heading_path == unit.heading_path
+            and _adjacent(groups[-1][-1], unit, markdown)
+        ):
             groups[-1].append(unit)
         else:
             groups.append([unit])
@@ -486,13 +542,15 @@ def _pack_group(group: list[Span], params: WorkspaceRagIndex) -> list[Span]:
     return chunks
 
 
-def _merge_short_chunks(chunks: list[Span], params: WorkspaceRagIndex) -> list[Span]:
+def _merge_short_chunks(chunks: list[Span], markdown: str, params: WorkspaceRagIndex) -> list[Span]:
     """Merge a chunk below ``min_chunk_chars`` into the next one — twice guarded.
 
-    **Forward only, and only under the same heading path.** A chunk below the
-    minimum whose next sibling sits under a *different* heading stays small: rule
-    2 outranks this, and a reader would otherwise take the merge for
-    unconditional.
+    **Forward only, and only into the next sibling in the same section.** A chunk
+    below the minimum whose neighbour sits under a different heading stays small:
+    rule 2 outranks this, and a reader would otherwise take the merge for
+    unconditional. The section test is :func:`_adjacent` as well as path
+    equality, for the reason given there — otherwise the merge is the second door
+    through which two identically-named sections fuse.
 
     **A merge may exceed ``chunk_chars`` and may never exceed
     ``max_chunk_chars``.** The target is soft and the ceiling is hard; a merge
@@ -507,6 +565,7 @@ def _merge_short_chunks(chunks: list[Span], params: WorkspaceRagIndex) -> list[S
             previous is not None
             and previous.end - previous.start < params.min_chunk_chars
             and previous.heading_path == chunk.heading_path
+            and _adjacent(previous, chunk, markdown)
             and chunk.end - previous.start <= params.max_chunk_chars
         ):
             update: dict[str, int | None] = {"end": max(previous.end, chunk.end)}
@@ -527,8 +586,8 @@ def pack_blocks(blocks: list[Span], markdown: str, params: WorkspaceRagIndex) ->
 
     Three passes, one per concern, so no rule is buried inside another's loop:
     every block is first cut if and only if it passes the ceiling, the result is
-    grouped by heading path and packed with overlap, and chunks still under the
-    minimum merge forward.
+    grouped by section and packed with overlap, and chunks still under the
+    minimum merge forward into their own section.
 
     Args:
         blocks: The output of :func:`parse_blocks`, in document order.
@@ -544,9 +603,9 @@ def pack_blocks(blocks: list[Span], markdown: str, params: WorkspaceRagIndex) ->
     for block in blocks:
         units.extend(_split_oversized(block, markdown, params))
     chunks: list[Span] = []
-    for group in _heading_groups(units):
+    for group in _heading_groups(units, markdown):
         chunks.extend(_pack_group(group, params))
-    return _merge_short_chunks(chunks, params)
+    return _merge_short_chunks(chunks, markdown, params)
 
 
 class BlockSplitter:
