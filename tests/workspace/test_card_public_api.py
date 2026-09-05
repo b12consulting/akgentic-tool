@@ -63,6 +63,13 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "WORKSPACE_ACTOR_NAME",
         "WORKSPACE_ACTOR_ROLE",
         "WRITE_DENIED_MSG",
+        # Added by story 45-5, deliberately: the splitter's three public names.
+        # Same reasoning as 45-3's four above — the set exists so a name is never
+        # added by accident, not so it can never grow. ``parse_blocks`` and
+        # ``pack_blocks`` are module-public and deliberately absent.
+        "BlockSplitter",
+        "Span",
+        "TextSplitter",
         # Added by story 45-3, deliberately — see the constants above.
         "DocumentExtract",
         "ExecConfig",
@@ -142,6 +149,10 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "WorkspaceMultiEdit",
         "WorkspacePatch",
         "WorkspaceMkdir",
+        # Added by story 45-5, deliberately: the RAG-index capability's parameter
+        # class. Defining it surfaces no capability — ``_WORKSPACE_TOOL_FIELDS``
+        # below must not grow, because no field of this type is declared.
+        "WorkspaceRagIndex",
         "WorkspaceTool",
     }
 )

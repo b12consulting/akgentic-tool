@@ -14,7 +14,7 @@ from __future__ import annotations
 import base64
 from enum import StrEnum
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from akgentic.core.utils import SerializableBaseModel
 from akgentic.tool.core import COMMAND, TOOL_CALL, BaseToolParam, Channels
@@ -166,6 +166,101 @@ class WorkspaceExec(BaseToolParam):
     timeout_s: float = DEFAULT_EXEC_TIMEOUT_S
     poll_attempts: int = Field(default=DEFAULT_EXEC_POLL_ATTEMPTS, ge=-1)
     poll_delay_seconds: float = DEFAULT_EXEC_POLL_DELAY_S
+
+
+class WorkspaceRagIndex(BaseToolParam):
+    """Chunking configuration for indexing a workspace document for retrieval.
+
+    Configuration only, as every class in this module is: the *path* to index and
+    whether to force a re-index are arguments of the callable, never fields here
+    (ADR-020).
+
+    The five numbers describe how a document's extracted Markdown is cut into
+    chunks. Four of them bound the splitter; the fifth is read by the embedder
+    and never by the splitter — see :attr:`prepend_heading_path`.
+
+    Nothing consumes this class yet. Declaring it surfaces **no capability**: a
+    capability exists only when :class:`~akgentic.tool.workspace.card.WorkspaceTool`
+    declares a field of this type, and no field is declared. It lives in this
+    module from the first day rather than beside the splitter because it is a
+    ``SerializableBaseModel``, so ``serialize_type()`` will stamp this module path
+    into every persisted ``__model__`` marker the moment a card carries one —
+    and nothing may move afterwards.
+    """
+
+    expose: set[Channels] = {TOOL_CALL, COMMAND}
+
+    chunk_chars: int = 1200
+    """**Target** chunk size, in characters. Soft: packing stops at the first
+    block that would take the chunk past it, so a chunk lands near this size from
+    below and a single block larger than it is emitted whole."""
+
+    chunk_overlap_chars: int = 150
+    """Overlap **budget**, in characters, honoured in whole blocks.
+
+    A chunk begins with as many of the previous chunk's trailing blocks as fit
+    inside this budget, so a chunk never starts mid-sentence. It is not a cut
+    point: the number is in characters because that is the familiar unit, but the
+    unit of carriage is a block. ``0`` disables overlap."""
+
+    max_chunk_chars: int = 4000
+    """**Hard ceiling**, in characters, and the only point at which an atomic
+    block — a table, a fenced or indented code block, an html block, a list — is
+    ever cut. It is what keeps a chunk inside the embedding model's input limit;
+    sizes are in characters rather than tokens so the splitter stays uncoupled
+    from any one model, at roughly four characters per token."""
+
+    min_chunk_chars: int = 200
+    """Below this, a chunk merges **forward** with the next sibling, and only
+    under the same heading path — a chunk whose next sibling sits under a
+    different heading stays small, because "a chunk never crosses a heading
+    boundary" outranks this. A merge that would breach :attr:`max_chunk_chars`
+    also does not happen. Without both exceptions, a document of many tiny
+    sections merges into one oversized chunk the embedding model then rejects."""
+
+    prepend_heading_path: bool = True
+    """Embed ``"Invoice > Payment terms > Late fees"`` ahead of a chunk's slice.
+
+    Read by the **embedder**, never by the splitter, and that is deliberate: the
+    heading context is composed at embed time from ``Span.heading_path`` and is
+    never stored, which is what keeps a stored chunk a pair of offsets rather
+    than a copy of the document. Nothing branches on this field inside
+    ``documents/splitter.py``, and a reader should not read it as dangling."""
+
+    @model_validator(mode="after")
+    def _check_chunk_bounds(self) -> WorkspaceRagIndex:
+        """Reject a configuration the splitter could not honour.
+
+        Two inequalities, checked here so an operator reads the message at
+        configuration time rather than meeting the consequence at index time:
+
+        - ``min_chunk_chars <= chunk_chars <= max_chunk_chars`` — a target
+          outside its own bounds has no meaning.
+        - ``chunk_overlap_chars < chunk_chars`` — an overlap at or above the
+          target does not converge. Every chunk would begin with the whole of the
+          previous one, which is the classic way a splitter emits the same text
+          for ever.
+
+        Raises:
+            ValueError: If either inequality fails, naming both offending values.
+        """
+        if self.min_chunk_chars > self.chunk_chars:
+            raise ValueError(
+                f"min_chunk_chars ({self.min_chunk_chars}) must not exceed "
+                f"chunk_chars ({self.chunk_chars})"
+            )
+        if self.chunk_chars > self.max_chunk_chars:
+            raise ValueError(
+                f"chunk_chars ({self.chunk_chars}) must not exceed "
+                f"max_chunk_chars ({self.max_chunk_chars})"
+            )
+        if self.chunk_overlap_chars >= self.chunk_chars:
+            raise ValueError(
+                f"chunk_overlap_chars ({self.chunk_overlap_chars}) must be below "
+                f"chunk_chars ({self.chunk_chars}); an overlap at or above the "
+                f"target does not converge"
+            )
+        return self
 
 
 class ResourceType(StrEnum):
