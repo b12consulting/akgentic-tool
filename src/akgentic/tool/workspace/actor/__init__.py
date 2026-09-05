@@ -60,7 +60,8 @@ observation and last-writer maps in :mod:`~akgentic.tool.workspace.actor.observa
 the gate and the six mutations in :mod:`~akgentic.tool.workspace.actor.gate`, and
 the lease and the deferred surface in :mod:`~akgentic.tool.workspace.actor.execution`.
 Each body is the same code with the same ``self``; what stays here is the class
-itself, ``on_start``, ``worker_class`` and the startup sweep ``on_start`` calls.
+itself, ``on_start``, ``init_state``, ``worker_class`` and the startup sweep
+``on_start`` calls.
 """
 
 from __future__ import annotations
@@ -70,6 +71,7 @@ import logging
 import time
 from collections import OrderedDict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from akgentic.tool.core.deferred import DeferredResultActor, DeferredWorker
 from akgentic.tool.workspace.actor.documents import DocumentsMixin
@@ -92,6 +94,16 @@ from akgentic.tool.workspace.models import (
     WorkspaceState,
 )
 from akgentic.tool.workspace.workspace import Filesystem, get_workspace, is_staging_name
+
+if TYPE_CHECKING:
+    # Runtime slots the retrieval pipeline fills. Under ``TYPE_CHECKING`` because
+    # the vector store lives behind an optional extra and ``card.params`` closes
+    # an import cycle through this very module — neither is needed to annotate a
+    # ``None`` at start.
+    from akgentic.tool.vector_store.actor import VectorStoreActor
+    from akgentic.tool.vector_store.protocol import CollectionConfig
+    from akgentic.tool.workspace.card.params import WorkspaceRagIndex
+    from akgentic.tool.workspace.readers import DocumentReader
 
 __all__ = [
     "EXEC_CAPABILITY",
@@ -213,6 +225,12 @@ class WorkspaceActor(
         self._reclaimed: OrderedDict[str, ExecLease] = OrderedDict()
         self._run_errors: OrderedDict[str, str] = OrderedDict()
         self._recent_runs: dict[str, OrderedDict[str, str]] = {}
+        self._rag_params: WorkspaceRagIndex | None = None
+        self._rag_reader: DocumentReader | None = None
+        self._rag_collection: CollectionConfig | None = None
+        self._vs_proxy: VectorStoreActor | None = None
+        self._vs_tell: VectorStoreActor | None = None
+        self._index_active: set[str] = set()
         self._workspace: Filesystem = get_workspace(self.config.workspace_name)
         self._sweep_staging_files()
         self._journal = GitJournal(
@@ -223,6 +241,31 @@ class WorkspaceActor(
         if self._journal.initialise():
             self._journal.seed_gitignore(self._workspace.write)
             self._journal.commit_out_of_band()
+
+    def init_state(self, state: WorkspaceState) -> None:
+        """Take a restored snapshot, then free anything left mid-embed (ADR-045 §7).
+
+        **This is the resume hook, and ``on_start`` is not.** Story 45-7's
+        acceptance criterion says the ``EMBEDDING`` reaper runs "on ``on_start``
+        (resume)", and against this core it would run on an empty index: the first
+        line of ``on_start`` assigns a fresh :class:`WorkspaceState`, and a
+        restored snapshot arrives *afterwards* through this method — the one
+        ``akgentic-team``'s restorer calls. Reaping in ``on_start`` is therefore
+        provably a no-op, and the criterion's intent lands here instead.
+
+        What it frees is a file whose ``EMBEDDING`` signal is never coming.
+        ``VectorStoreActor`` keeps the map from an open request to its requester in
+        a private attribute — correctly, because an ``ActorAddress`` inside a
+        ``BaseState`` breaks ``notify_state_change()`` — so a restart drops the
+        pending requests with it and the store's own status truthfully reads
+        ``READY``. Nothing there knows a workspace file is still waiting. Reverting
+        it to ``PENDING`` costs one re-index and never a wrong answer.
+
+        Args:
+            state: The snapshot to adopt.
+        """
+        super().init_state(state)
+        self.reap_stale_embedding()
 
     def worker_class(self) -> type[DeferredWorker]:
         """Return :class:`~akgentic.tool.workspace.execution.ExecWorker`."""

@@ -257,6 +257,8 @@ class GateMixin:
 
         def _forget(self, agent_id: str, path: str) -> None: ...
 
+        def mark_paths_stale(self, paths: list[str]) -> None: ...
+
     ##
     ## The six mutations — ask path.  Each gates, then writes, in one turn, with
     ## the journal wrapped around it.  The public methods are thin on purpose:
@@ -282,6 +284,15 @@ class GateMixin:
         gate's file read too. A refusal that first opens a file is doing work it
         is about to throw away, once per refused mutation on a busy tree.
 
+        **The retrieval index is told last, and it is a direct call on ``self``**
+        (ADR-045 §4) — not a cross-actor tell, so there is no message to drop, no
+        ordering question and no chance of arriving after the target stopped.
+        ``_touched`` already holds exactly the paths this mutation changed,
+        deletes included, so a seventh mutation gets the signal for free. It
+        **marks stale and does not re-index**: an agent mid-task rewrites the same
+        file repeatedly, and indexing each accepted write would spend embedding
+        credits on every save.
+
         Args:
             agent_id: Identity of the mutating agent, as a string.
             capability: The mutation's short name, which becomes the commit
@@ -300,6 +311,7 @@ class GateMixin:
         outcome = run()
         if outcome.status is MutationStatus.ACCEPTED and self._touched:
             self._journal.commit_paths(self._touched, self._identity(agent_id), capability)
+            self.mark_paths_stale(self._touched)
         return outcome
 
     def apply_write(self, agent_id: str, path: str, content: str) -> MutationOutcome:

@@ -19,11 +19,11 @@ callables take exactly what they always took, and the precondition is derived
 server-side from what the actor observed. There is no digest, no ``expected``,
 and no ``force``.
 
-The twenty factory bodies live in the three sibling mixins — ``card/read.py``,
-``card/write.py``, ``card/execution.py`` — and the capability parameters in
-``card/params.py``. What stays here is the card itself: its fields, ``observer()``
-with its private binding helpers, and the ``get_tools`` / ``get_commands``
-registration (ADR-045 §1).
+The factory bodies live in the four sibling mixins — ``card/read.py``,
+``card/write.py``, ``card/execution.py``, ``card/rag.py`` — and the capability
+parameters in ``card/params.py``. What stays here is the card itself: its fields,
+``observer()`` with its private binding helpers, and the ``get_tools`` /
+``get_commands`` / ``get_context_states`` registration (ADR-045 §1).
 """
 
 from __future__ import annotations
@@ -32,12 +32,21 @@ import logging
 from collections.abc import Callable
 from typing import Any, TypeVar
 
-from pydantic import PrivateAttr
+from pydantic import Field, PrivateAttr
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.orchestrator import Orchestrator
-from akgentic.tool.core import TOOL_CALL, BaseToolParam, ToolCard, _resolve
+from akgentic.tool.core import (
+    COMMAND,
+    LLM_CONTEXT,
+    TOOL_CALL,
+    BaseToolParam,
+    ContextState,
+    ToolCard,
+    _resolve,
+)
 from akgentic.tool.core.observer import ActorToolObserver
+from akgentic.tool.vector_store.protocol import CollectionConfig, require_weaviate_configured
 from akgentic.tool.workspace.actor import (
     WORKSPACE_ACTOR_ROLE,
     WorkspaceActor,
@@ -58,13 +67,15 @@ from akgentic.tool.workspace.card.params import (
     WorkspaceMultiEdit,
     WorkspacePatch,
     WorkspaceRagIndex,
+    WorkspaceRagList,
     WorkspaceRead,
     WorkspaceView,
     WorkspaceWrite,
 )
+from akgentic.tool.workspace.card.rag import RagFactories
 from akgentic.tool.workspace.card.read import ReadFactories
 from akgentic.tool.workspace.card.write import WriteFactories
-from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION
+from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION, derived_document_caps
 from akgentic.tool.workspace.execution import (
     ExecConfig,
     resolve_mode,
@@ -96,6 +107,7 @@ __all__ = [
     "WorkspaceMultiEdit",
     "WorkspacePatch",
     "WorkspaceRagIndex",
+    "WorkspaceRagList",
     "WorkspaceRead",
     "WorkspaceTool",
     "WorkspaceView",
@@ -103,7 +115,7 @@ __all__ = [
 ]
 
 
-class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, ToolCard):
+class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, ToolCard):
     """Workspace access with configurable read-only or full read/write/delete/edit mode.
 
     Pass ``read_only=True`` to restrict to read-side tools only.  The default
@@ -117,7 +129,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, ToolCard):
     - ``False``: binary reads raise ``ValueError`` with install hint.
     - ``DocumentReader(...)`` instance: custom extraction config (e.g. with LLM).
 
-    The three mixins carry the factory bodies and declare no Pydantic field, so
+    The four mixins carry the factory bodies and declare no Pydantic field, so
     every field of this card is declared right here.
     """
 
@@ -190,6 +202,51 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, ToolCard):
     agent's first turn. Each resource is written only if its path does not
     already exist — restoring a team never clobbers edited files."""
 
+    workspace_rag_index: WorkspaceRagIndex | bool = False
+    workspace_rag_list: WorkspaceRagList | bool = False
+    """Retrieval over the workspace tree — **both off unless asked for**.
+
+    This is ``workspace_exec``'s rationale one notch weaker. Every file capability
+    on this card defaults to on because the card already implies file access;
+    these two do not, because they reach the vector store and can spend embedding
+    credits on a whole tree. A capability that costs money on somebody else's
+    account is opt-in.
+
+    They are on the **read** side of ``read_only``: indexing derives from the tree
+    and writes nothing into it (ADR-045 §5), so ``WorkspaceTool(read_only=True,
+    workspace_rag_index=True)`` registers the indexer.
+    """
+
+    rag_collection: CollectionConfig = Field(default_factory=CollectionConfig)
+    """Backend, dimension and tenant of the one ``workspace_chunks`` collection.
+
+    **``rag_collection`` rather than the house's bare ``collection``.**
+    ``PlanningTool`` and ``KnowledgeGraphTool`` both declare ``collection``, and
+    that is the house name — but on a card whose other twenty fields are all
+    workspace operations, a bare ``collection`` reads as "the workspace's
+    collection of files". This is the one departure and it is deliberate.
+
+    Two things read it besides the collection itself: it decides the
+    backend-derived document caps below, and it is what
+    ``require_weaviate_configured`` checks — but only when a retrieval capability
+    is actually enabled.
+    """
+
+    max_documents: int | None = None
+    max_document_chars: int | None = None
+    """Explicit overrides of the extraction cache's two caps.
+
+    ``None`` is **not** zero and not "unset-so-use-the-default": it means *derive
+    it*, from the vector backend and whether retrieval is on
+    (:func:`~akgentic.tool.workspace.documents.models.derived_document_caps`). An
+    explicit catalog value always wins (ADR-045 §7), which is what these two
+    fields exist for.
+
+    Note what ``getChildrenOrCreate`` implies, exactly as ``git_journal`` records:
+    the **first** card to create the actor for a workspace decides its
+    configuration, so a second card arriving with different caps changes nothing.
+    """
+
     # Private runtime state — not part of the serialised config.
     # Default None sentinel lets the workspace property detect uninitialized state
     # reliably under both normal execution and coverage instrumentation.
@@ -225,12 +282,20 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, ToolCard):
         """
         if observer.orchestrator is None:
             raise ValueError("WorkspaceTool requires access to the orchestrator.")
+        if self._rag_enabled():
+            # Only when retrieval is on. ``protocol.py`` raises when a card names
+            # Weaviate and the environment has no cluster, which is correct for a
+            # card that asked for durable shared storage and wrong to impose on
+            # the overwhelming majority of ``WorkspaceTool()`` instances that
+            # never enable retrieval at all.
+            require_weaviate_configured(self.rag_collection, "WorkspaceTool")
         super().observer(observer)  # store the observer weakly via the base setter
         ws_name = self.workspace_id or str(observer.team_id)
         self._workspace = get_workspace(ws_name)
         self._seed_resources()
         self._bind_workspace_actor(observer, observer.orchestrator, ws_name)
         self._bind_sandbox(observer, observer.orchestrator)
+        self._announce_rag()
         return self
 
     def _enabled_exec(self) -> WorkspaceExec | None:
@@ -335,6 +400,9 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, ToolCard):
             workspace_name: The resolved workspace this card is anchored to.
         """
         orchestrator_proxy = observer.proxy_ask(orchestrator, Orchestrator)
+        derived_documents, derived_chars = derived_document_caps(
+            self.rag_collection.backend, self._rag_enabled()
+        )
         workspace_addr = orchestrator_proxy.getChildrenOrCreate(
             WorkspaceActor,
             config=WorkspaceConfig(
@@ -342,6 +410,14 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, ToolCard):
                 role=WORKSPACE_ACTOR_ROLE,
                 workspace_name=workspace_name,
                 git_journal=self.git_journal,
+                max_documents=(
+                    self.max_documents if self.max_documents is not None else derived_documents
+                ),
+                max_document_chars=(
+                    self.max_document_chars
+                    if self.max_document_chars is not None
+                    else derived_chars
+                ),
             ),
         )
         self._workspace_proxy = observer.proxy_ask(workspace_addr, WorkspaceActor)
@@ -518,6 +594,11 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, ToolCard):
             self._tool_if_enabled(self.workspace_glob, WorkspaceGlob, self._glob_factory),
             self._tool_if_enabled(self.workspace_grep, WorkspaceGrep, self._grep_factory),
             self._tool_if_enabled(self.workspace_view, WorkspaceView, self._view_factory),
+            # Indexing derives from the tree and writes nothing into it, so all
+            # of retrieval lives on the read side of ``read_only`` (ADR-045 §5).
+            self._tool_if_enabled(
+                self.workspace_rag_index, WorkspaceRagIndex, self._rag_index_factory
+            ),
         ]
         return [tool for tool in candidates if tool is not None]
 
@@ -577,10 +658,33 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, ToolCard):
         """Return COMMAND-channel capabilities for this tool.
 
         Returns:
-            Dict mapping ``ExpandMediaRefs`` to ``_expand_media_refs`` when enabled.
+            Dict mapping each enabled COMMAND capability to its callable —
+            ``ExpandMediaRefs``, and the two retrieval capabilities.
         """
         commands: dict[type[BaseToolParam], Callable[..., Any]] = {}
         pr = _resolve(self.expand_media_refs, ExpandMediaRefs)
         if pr is not None:
             commands[ExpandMediaRefs] = self._expand_media_refs
+        index = _resolve(self.workspace_rag_index, WorkspaceRagIndex)
+        if index is not None and COMMAND in index.expose:
+            commands[WorkspaceRagIndex] = self._rag_index_factory(index)
+        listing = _resolve(self.workspace_rag_list, WorkspaceRagList)
+        if listing is not None and COMMAND in listing.expose:
+            commands[WorkspaceRagList] = self._rag_list_factory(listing)
         return commands
+
+    def get_context_states(self) -> list[Callable[[], ContextState | None]]:
+        """Return the retrieval-index provider, or nothing.
+
+        The index is pushed into the context tail as a per-turn delta rather than
+        re-rendered into the system prompt, which would invalidate the cached
+        prefix every time one file changed status (ADR-037 §3).
+
+        Returns:
+            A single-element list when ``workspace_rag_list`` is enabled and
+            exposed on ``LLM_CONTEXT``, otherwise an empty one.
+        """
+        listing = _resolve(self.workspace_rag_list, WorkspaceRagList)
+        if listing is not None and LLM_CONTEXT in listing.expose:
+            return [self._rag_list_state_factory(listing)]
+        return []

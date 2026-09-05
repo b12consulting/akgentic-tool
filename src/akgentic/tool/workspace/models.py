@@ -23,6 +23,7 @@ from akgentic.tool.workspace.documents.models import (
     DEFAULT_MAX_DOCUMENT_CHARS,
     DEFAULT_MAX_DOCUMENTS,
     DocumentExtract,
+    RagFile,
 )
 
 DEFAULT_MAX_OBSERVATIONS_PER_AGENT = 256
@@ -318,6 +319,19 @@ class WorkspaceState(BaseState):
             order, so the fill site's re-insert and the lookup's move-to-end are
             the whole of the LRU. Bounded by ``max_documents`` and
             ``max_document_chars`` on :class:`WorkspaceConfig`.
+        rag_index: Workspace-relative path to where that file stands in the
+            retrieval pipeline.
+
+            **This map is deliberately not governed by ``max_documents`` /
+            ``max_document_chars``.** Those two bound the *extraction cache*, and
+            an evicted body must not de-index its file: a search hit renders from
+            what the vector store holds, so an indexed file stays searchable with
+            no body in ``documents`` at all. Governing the index by the cache
+            caps would make ``max_documents`` a ceiling on the searchable corpus,
+            which is the opposite of what it is for. The index is bounded by the
+            tree — one row per candidate file, each a few hundred bytes plus its
+            offsets.
     """
 
     documents: dict[str, DocumentExtract] = {}
+    rag_index: dict[str, RagFile] = {}

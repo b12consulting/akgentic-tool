@@ -138,6 +138,14 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         restored request could not be settled anyway — the ``EmbeddingActor`` children
         that would deliver its result are gone. Losing the map on resume therefore
         loses nothing that was still live.
+
+        ``_request_entries`` holds the **whole** ``VectorEntry`` of every open
+        request, and it exists because the round trip through ``EmbeddingActor``
+        is lossy: ``EmbeddingRequest`` carries ``{ref_type, ref_id, text}`` and
+        the result is rebuilt from exactly those three, so ``scope``, ``path`` and
+        ``ordinal`` — the three fields every scoped removal and every scoped search
+        filters on — would arrive back as ``None``. It is private for the same two
+        reasons the map above is, and it is dropped by the same settle.
         """
         self.state = VectorStoreState()
         self.state.observer(self)
@@ -145,6 +153,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         self._weaviate_backend: WeaviateBackend | None = None
         self._embedding_svc: EmbeddingService | None = None
         self._request_requesters: dict[str, ActorAddress] = {}
+        self._request_entries: dict[str, list[VectorEntry]] = {}
 
     # ------------------------------------------------------------------
     # Lazy initialisation
@@ -406,6 +415,13 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         status and pending count from the open requests, and fires the batch
         asynchronously.
 
+        **The spawn and the tell are wrapped, and a failure settles the request it
+        just opened.** The record is written before the child exists, so an
+        unwrapped spawn failure would pin the collection at ``INDEXING`` for ever
+        with no result and no error to close it. Pre-existing shape, unreachable
+        while no caller waited on the signal; the workspace indexer is the first
+        that does.
+
         Args:
             collection: Target collection name.
             entries: Entries with empty vector fields.
@@ -431,21 +447,33 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         )
         if requester is not None:
             self._request_requesters[request_id] = requester
+        # The full entries, kept because the round trip through EmbeddingActor
+        # carries only three of their seven fields.
+        self._request_entries[request_id] = list(entries)
         self._refresh_derived(collection)
 
-        # Spawn EmbeddingActor child
-        embed_config = BaseConfig(name=f"#embed-{collection}-{request_id}")
-        embed_addr = self.createActor(EmbeddingActor, config=embed_config)
+        try:
+            # Spawn EmbeddingActor child
+            embed_config = BaseConfig(name=f"#embed-{collection}-{request_id}")
+            embed_addr = self.createActor(EmbeddingActor, config=embed_config)
 
-        request = EmbeddingRequest(
-            collection=collection,
-            entries=raw_entries,
-            request_id=request_id,
-            embedding_model=self.config.embedding_model,
-            embedding_provider=self.config.embedding_provider,
-        )
-        embed_proxy = self.proxy_tell(embed_addr, EmbeddingActor)
-        embed_proxy.receiveMsg_EmbeddingRequest(request)
+            request = EmbeddingRequest(
+                collection=collection,
+                entries=raw_entries,
+                request_id=request_id,
+                embedding_model=self.config.embedding_model,
+                embedding_provider=self.config.embedding_provider,
+            )
+            embed_proxy = self.proxy_tell(embed_addr, EmbeddingActor)
+            embed_proxy.receiveMsg_EmbeddingRequest(request)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[%s] Could not start embedding for '%s': %s",
+                self.config.name,
+                request_id,
+                exc,
+            )
+            self._settle_request(request_id, str(exc))
 
         self.state.notify_state_change()
 
@@ -562,7 +590,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
 
         error: str | None = None
         try:
-            backend.add(msg.collection, msg.entries)
+            backend.add(msg.collection, self._restore_metadata(msg))
             if not self._is_weaviate(msg.collection):
                 self._sync_backend_state()
         except Exception as exc:  # noqa: BLE001
@@ -575,6 +603,36 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
 
         self._settle_request(msg.request_id, error)
         self.state.notify_state_change()
+
+    def _restore_metadata(self, msg: EmbeddingResult) -> list[VectorEntry]:
+        """Put ``scope``, ``path`` and ``ordinal`` back onto an embedded batch.
+
+        ``EmbeddingRequest`` carries ``{ref_type, ref_id, text}`` and the result is
+        rebuilt from exactly those three, so four of ``VectorEntry``'s seven fields
+        do not survive the round trip. Three of them are the ones every scoped
+        removal and every scoped search filters on — an entry stored without them
+        is findable by nobody and removable by nobody.
+
+        The originals are re-paired **by position**, which is the contract the two
+        sides already keep: ``EmbeddingService.embed`` returns one vector per input
+        in the same order, and ``EmbeddingActor`` zips them back in that order. A
+        batch that does not line up is passed through untouched rather than
+        mis-attributed.
+
+        Args:
+            msg: The result whose entries carry vectors and nothing else.
+
+        Returns:
+            The entries to store — the originals with their vectors filled in.
+        """
+        originals = self._request_entries.get(msg.request_id)
+        if originals is None or len(originals) != len(msg.entries):
+            return msg.entries
+        return [
+            # Golden Rule #12: copy and override the one field that was produced.
+            original.model_copy(update={"vector": embedded.vector})
+            for original, embedded in zip(originals, msg.entries)
+        ]
 
     def receiveMsg_EmbeddingError(self, msg: EmbeddingError) -> None:  # noqa: N802
         """Handle embedding failure from EmbeddingActor.
@@ -609,6 +667,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         """
         record = self.state.pending_requests.pop(request_id, None)
         requester = self._request_requesters.pop(request_id, None)
+        self._request_entries.pop(request_id, None)
         if record is None:
             return
         self._refresh_derived(record.collection)

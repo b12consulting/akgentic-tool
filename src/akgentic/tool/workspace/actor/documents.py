@@ -1,43 +1,129 @@
-"""The extraction cache's lookup and fill, and the actor's one notify (ADR-045 §1).
+"""The extraction cache, the retrieval index, and every notify this package makes.
 
-**``notify_state_change()`` is called in exactly one place in the whole
-``workspace/`` package, and it is :meth:`DocumentsMixin.cache_document`.** Every
-other tool actor calls it freely; this one did not call it at all before this
-module existed, which is how epic 29 kept the event-store write off the read
-path (ADR-036 §NFR1). A second call site added anywhere under ``workspace/`` is
-a defect until a decision says otherwise — most of all on a lookup, which a read
-performs and which therefore must stay free.
+**Before story 45-7 ``notify_state_change()`` was called in exactly one place in
+the whole ``workspace/`` package, and it was :meth:`DocumentsMixin.cache_document`.**
+Every other tool actor calls it freely; this one did not call it at all before
+this module existed, which is how epic 29 kept the event-store write off the read
+path (ADR-036 §NFR1). ADR-045 §4 is the decision that adds more: the retrieval
+index is persisted state that has to survive a resume, so the transitions that
+move it notify. The call sites are now, and only:
 
-Both methods are O(1)/O(n) dict work on the actor thread with no I/O, so the
-mailbox is the lock and there is nothing here to serialise. Neither raises: an
-exception in a document handler would kill the actor that owns the write gate,
-so a document path degrades — a miss, or a cache that did not grow — and never
-propagates.
+- :meth:`DocumentsMixin.cache_document` — a cache **fill**, amortised against the
+  seconds of extraction that preceded it.
+- :meth:`DocumentsMixin.index_paths` — a queueing pass that actually queued
+  something, or a drain that actually spawned.
+- :meth:`DocumentsMixin.receiveMsg_IndexResult` / :meth:`DocumentsMixin.receiveMsg_IndexError`
+  — one per file, at its transition.
+- :meth:`DocumentsMixin.receiveMsg_EmbeddingCompleted` — **only** at the file's
+  final transition. A batch that lands without settling the file mutates
+  ``batches_landed`` in memory and notifies nothing, so a 1,900-chunk document
+  costs one event rather than thirty.
+- :meth:`DocumentsMixin.mark_paths_stale` — only when it actually changed a
+  status, so a tree that has never been indexed pays nothing on the mutation path.
+- :meth:`DocumentsMixin.reap_stale_embedding` — only when it actually reverted a
+  row.
+
+**The rule that survives, unchanged and load-bearing: no notify on a text read,
+and none on a document-cache hit.** Reads are the majority of workspace traffic.
+A new notify on a *read* path — of any kind, in any of these methods — is a
+defect until a decision says otherwise.
+
+Everything on the ask path here is O(1)/O(n) dict work on the actor thread, plus
+bounded file reads while queueing and bounded proxy calls to ``#VectorStore``. The
+slow half — extraction and splitting — happens in a ``#index-`` worker and never
+here. Nothing here raises: an exception in a document handler would kill the actor
+that owns the write gate, so a document path degrades — a miss, a file left
+``FAILED``, a cache that did not grow — and never propagates.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from math import ceil
+from pathlib import Path
+from typing import TYPE_CHECKING
 
-from akgentic.tool.workspace.documents.models import DocumentExtract, evict_document_bodies
-from akgentic.tool.workspace.models import WorkspaceConfig, WorkspaceState
+from akgentic.core.agent_config import BaseConfig
+from akgentic.tool.workspace.documents.context import RagFileRow, RagIndexState
+from akgentic.tool.workspace.documents.models import (
+    EMBEDDING_STALE_AFTER_S,
+    EXTRACTOR_VERSION,
+    RAG_COLLECTION,
+    DocumentExtract,
+    RagFile,
+    RagStatus,
+    evict_document_bodies,
+)
+from akgentic.tool.workspace.models import WorkspaceConfig, WorkspaceState, content_sha
+from akgentic.tool.workspace.readers import _MIME_MAP, TEXT_EXTENSIONS, DocumentReader
+from akgentic.tool.workspace.workspace import Filesystem
+
+if TYPE_CHECKING:
+    from akgentic.core.agent import Akgent
+    from akgentic.tool.vector_store.actor import VectorStoreActor
+    from akgentic.tool.vector_store.embedding_actor import EmbeddingCompleted
+    from akgentic.tool.vector_store.protocol import CollectionConfig
+    from akgentic.tool.workspace.card.params import WorkspaceRagIndex
+    from akgentic.tool.workspace.documents.worker import IndexError, IndexResult
+
+    # The mixin consumes the actor's own surface — ``createActor``, the two proxy
+    # builders, ``myAddress``, ``orchestrator``, ``config`` and ``state``. Naming
+    # the base under ``if TYPE_CHECKING:`` is how ``ExecMixin`` already reaches
+    # its own; at runtime the mixin contributes only ``object``, so the MRO the
+    # actor declares is unchanged and nothing here shadows a sibling.
+    _DocumentsBase = Akgent[WorkspaceConfig, WorkspaceState]
+else:
+    _DocumentsBase = object
 
 logger = logging.getLogger(__name__)
 
+_INDEXABLE_EXTENSIONS: frozenset[str] = TEXT_EXTENSIONS | (
+    DocumentReader.extensions - frozenset(_MIME_MAP)
+)
+"""What ``workspace_rag_index`` will accept — the set the read path already draws.
 
-class DocumentsMixin:
-    """The cached-extract lookup and fill over ``WorkspaceState.documents``.
+Not invented here and deliberately not re-listed: it is exactly the extensions a
+read can already turn into text, minus the image formats. An OCR'd photograph is
+not what this index is for, and ``_MIME_MAP`` is already the set that names them.
+``card/read.py`` draws the same line for ``expand_media_refs``; a second copy of
+either extension list would drift.
+"""
 
-    Declares no Pydantic field, no state field and no sibling method: it
-    consumes the two attributes below, which the actor owns.
+_UNAVAILABLE = "Retrieval indexing is not available for this workspace."
+"""What ``workspace_rag_index`` answers with no vector store wired.
+
+A sentence rather than an exception: this actor owns the write gate, and a
+retrieval capability that raises would be a way for a misconfigured deployment to
+take the gate down with it.
+"""
+
+_CHUNK_REF_TYPE = "workspace_chunk"
+"""``VectorEntry.ref_type`` for every chunk this package stores."""
+
+
+class DocumentsMixin(_DocumentsBase):
+    """The extraction cache and the retrieval index over ``WorkspaceState``.
+
+    Declares no Pydantic field and no state field: every map it uses is owned by
+    the actor and initialised in its ``on_start``. It defines no sibling's method
+    either — in particular not ``deliver``, ``fail`` or ``cache_capacity``, any of
+    which would silently take over the deferred delivery path or resize the exec
+    LRU, because this mixin precedes ``ExecMixin`` and ``DeferredResultActor`` in
+    the MRO.
     """
 
-    config: WorkspaceConfig
-    state: WorkspaceState
+    _workspace: Filesystem
+    _rag_params: WorkspaceRagIndex | None
+    _rag_reader: DocumentReader | None
+    _rag_collection: CollectionConfig | None
+    _vs_proxy: VectorStoreActor | None
+    _vs_tell: VectorStoreActor | None
+    _index_active: set[str]
 
     ##
-    ## The lookup — reached through the card's **ask** proxy
+    ## The extraction cache — lookup (ask) and fill (tell)
     ##
     def document_extract(self, path: str, source_sha: str, extractor_version: int) -> str | None:
         """Return the cached Markdown for *path*, or ``None`` on any miss.
@@ -74,9 +160,6 @@ class DocumentsMixin:
         self.state.documents[path] = self.state.documents.pop(path)
         return entry.markdown
 
-    ##
-    ## The fill — reached through the card's **tell** proxy
-    ##
     def cache_document(
         self, path: str, source_sha: str, extractor_version: int, markdown: str
     ) -> None:
@@ -84,13 +167,16 @@ class DocumentsMixin:
 
         The notify follows the insert **and** the eviction, so one fill is one
         event however many entries it displaced — never twice, never once per
-        evicted entry. It is the one write this package puts on the actor's
-        state, and it is amortised against the seconds of extraction that
+        evicted entry. It is amortised against the seconds of extraction that
         preceded it.
 
         ``char_count`` is computed here rather than taken as a parameter, so it
         cannot disagree with the body it describes. Re-filling a known path
         refreshes its recency instead of leaving it where it was.
+
+        **An eviction here must never de-index a file.** Nothing anywhere may
+        infer index membership from ``state.documents``; the two maps are
+        independent and only one of them is capped.
 
         Args:
             path: Workspace-relative path of the source file.
@@ -132,3 +218,704 @@ class DocumentsMixin:
                 evicted,
             )
         self.state.notify_state_change()
+
+    ##
+    ## Retrieval — enabling it, and the collection that is created lazily
+    ##
+    def enable_rag(
+        self,
+        agent_id: str,
+        params: WorkspaceRagIndex,
+        reader: DocumentReader,
+        collection: CollectionConfig,
+    ) -> None:
+        """Turn retrieval on for this tree — **tell** path, once per card.
+
+        The actor cannot take any of this from :class:`WorkspaceConfig`, because
+        ``getChildrenOrCreate`` fixes that at creation and the card that creates
+        the actor for a workspace is routinely one with no retrieval capability at
+        all. So a retrieval-capable card announces itself here instead, at bind
+        time, exactly as ``configure_exec`` and ``register_agent`` do. **The actor
+        never inspects a card**; it has no handle on one.
+
+        **First call wins.** Two agents on one team must not make one file chunk
+        two ways, so a second call carrying different parameters emits one INFO
+        line naming both and changes nothing. A second call carrying equal
+        parameters is silent.
+
+        This is also where the collection is created — **lazily, and never in
+        ``on_start``**: a workspace with retrieval off must never create one. It
+        follows ``PlanActor._acquire_vs_proxy`` with one deliberate divergence:
+        where that actor *raises* when ``#VectorStore`` is absent, this one logs
+        and degrades. A missing vector store is a configuration error for a
+        planning tool, whose whole purpose it is; here it must never be fatal,
+        because this actor also owns the write gate.
+
+        Args:
+            agent_id: The announcing agent, for the log line only.
+            params: The chunking configuration the whole tree will use.
+            reader: The extraction configuration, which lives on the card.
+            collection: The vector collection's backend, dimension and tenant.
+        """
+        try:
+            if self._rag_params is not None:
+                if self._rag_params != params:
+                    logger.info(
+                        "Workspace %s: retrieval is already configured by an earlier card; "
+                        "agent %s asked for %s and keeps %s",
+                        self.config.workspace_name,
+                        agent_id,
+                        params,
+                        self._rag_params,
+                    )
+                return
+            self._rag_params = params
+            self._rag_reader = reader
+            self._rag_collection = collection
+            self._acquire_vs_proxy()
+        except Exception:
+            logger.warning(
+                "Workspace %s: could not enable retrieval — it stays off",
+                self.config.workspace_name,
+                exc_info=True,
+            )
+
+    def _acquire_vs_proxy(self) -> None:
+        """Resolve ``#VectorStore``, bind both proxies, and create the collection.
+
+        **Two proxies over one address, and the split is a correctness choice.**
+        ``create_collection`` and ``remove`` are **asks**: the first has to be
+        known to have worked before anything is added, and the second re-raises a
+        missing collection as a ``RetriableError`` that this actor must see to
+        keep the superseded ids for a later retry. ``add`` is a **tell**: a
+        1,900-chunk document is thirty of them, and thirty asks would park the
+        actor that owns the write gate on another actor's mailbox.
+
+        Any failure drops to degraded mode — ``_vs_proxy`` stays ``None`` and
+        ``workspace_rag_index`` answers a sentence.
+        """
+        from akgentic.core.orchestrator import Orchestrator  # noqa: PLC0415 — cycle
+        from akgentic.tool.vector_store.actor import (  # noqa: PLC0415 — optional extra
+            VS_ACTOR_NAME,
+            VectorStoreActor,
+        )
+
+        if self.orchestrator is None or self._rag_collection is None:
+            logger.warning(
+                "Workspace %s: no orchestrator — retrieval stays in degraded mode",
+                self.config.workspace_name,
+            )
+            return
+        orch_proxy = self.proxy_ask(self.orchestrator, Orchestrator)
+        vs_addr = orch_proxy.get_team_member(VS_ACTOR_NAME)
+        if vs_addr is None:
+            logger.warning(
+                "Workspace %s: %s was not found — retrieval stays in degraded mode. "
+                "Add VectorStoreTool to the team configuration.",
+                self.config.workspace_name,
+                VS_ACTOR_NAME,
+            )
+            return
+        proxy = self.proxy_ask(vs_addr, VectorStoreActor)
+        try:
+            proxy.create_collection(RAG_COLLECTION, self._rag_collection)
+        except Exception as exc:
+            logger.warning(
+                "Workspace %s: create_collection(%s) failed: %s — degraded mode",
+                self.config.workspace_name,
+                RAG_COLLECTION,
+                exc,
+            )
+            return
+        self._vs_proxy = proxy
+        self._vs_tell = self.proxy_tell(vs_addr, VectorStoreActor)
+
+    ##
+    ## workspace_rag_index — the spawn side
+    ##
+    def index_paths(self, path: str = "", force: bool = False) -> str:
+        """Queue every candidate under *path* and return what was accepted.
+
+        Returns **immediately**. Everything here is O(n) over the candidate list
+        on the actor thread — validate, read-and-hash, set ``PENDING``, spawn up
+        to the concurrency cap — and no extraction, split or embedding happens on
+        this turn.
+
+        Args:
+            path: A file, a directory, or ``""`` for the whole tree.
+            force: Re-index a file that is already current at these bytes.
+
+        Returns:
+            The counts, or the degraded-mode sentence.
+        """
+        if self._vs_proxy is None or self._rag_params is None:
+            return _UNAVAILABLE
+        changed = self.reap_stale_embedding()
+        candidates, unsupported = self._candidates(path)
+        queued = current = 0
+        for candidate in candidates:
+            sha = self._digest(candidate)
+            if sha is None:
+                unsupported += 1
+                continue
+            if self._is_accounted_for(candidate, sha, force):
+                current += 1
+                continue
+            self._enqueue(candidate, sha)
+            queued += 1
+        changed = self._drain() or queued > 0 or changed
+        if changed:
+            self.state.notify_state_change()
+        return f"{queued} file(s) queued, {current} already current, {unsupported} unsupported"
+
+    def _is_accounted_for(self, path: str, sha: str, force: bool) -> bool:
+        """Whether *path* at *sha* needs no new work.
+
+        True for a file already ``EMBEDDED`` at these bytes, and for one whose run
+        over these same bytes is still in flight — re-queueing the latter would
+        reset a live run and spawn a second worker for it. ``force`` overrides
+        both, which is the whole of what ``force`` means.
+        """
+        if force:
+            return False
+        entry = self.state.rag_index.get(path)
+        if entry is None or entry.indexed_sha != sha:
+            return False
+        return entry.status in _IN_FLIGHT or entry.status is RagStatus.EMBEDDED
+
+    def _enqueue(self, path: str, sha: str) -> None:
+        """Put *path* at ``PENDING`` for *sha*, keeping the old ids to supersede.
+
+        The previous chunk set's ids move to ``superseded_chunk_ids`` **before**
+        ``chunks`` is cleared, because re-index is add-then-remove and the old ids
+        have to survive somewhere for the duration. Ids left over from a removal
+        that previously failed are kept, so a later re-index retries them.
+        """
+        now = datetime.now(UTC)
+        entry = self.state.rag_index.get(path)
+        if entry is None:
+            self.state.rag_index[path] = RagFile(
+                path=path, status=RagStatus.PENDING, indexed_sha=sha, updated_at=now
+            )
+            return
+        superseded = list(entry.superseded_chunk_ids)
+        superseded.extend(
+            chunk.chunk_id for chunk in entry.chunks if chunk.chunk_id not in set(superseded)
+        )
+        self.state.rag_index[path] = entry.model_copy(
+            update={
+                "status": RagStatus.PENDING,
+                "indexed_sha": sha,
+                "chunks": [],
+                "chunk_count": 0,
+                "batches_expected": 0,
+                "batches_landed": 0,
+                "superseded_chunk_ids": superseded,
+                "reason": None,
+                "updated_at": now,
+            }
+        )
+
+    def _drain(self) -> bool:
+        """Spawn workers for ``PENDING`` files up to the concurrency cap.
+
+        Returns:
+            Whether anything moved, so the caller can make one notify.
+        """
+        from akgentic.tool.workspace.documents.worker import (  # noqa: PLC0415 — cycle
+            MAX_CONCURRENT_INDEX_WORKERS,
+        )
+
+        changed = False
+        while len(self._index_active) < MAX_CONCURRENT_INDEX_WORKERS:
+            waiting = next(
+                (
+                    candidate
+                    for candidate, entry in self.state.rag_index.items()
+                    if entry.status is RagStatus.PENDING and candidate not in self._index_active
+                ),
+                None,
+            )
+            if waiting is None or not self._spawn(waiting):
+                return changed
+            changed = True
+        return changed
+
+    def _spawn(self, path: str) -> bool:
+        """Start one ``#index-`` worker for *path*, or record why it could not start.
+
+        The worker is spawned with ``createActor`` and handed everything it needs
+        in one payload, including the card's extraction configuration. It is
+        **not** a ``DeferredWorker`` and is deliberately not routed through
+        ``DeferredResultActor.request()``: that mechanism's reports land in this
+        actor's exec result cache.
+
+        The status it moves to says which half of the work the worker actually
+        has to do — ``EXTRACTION`` when the body has to be produced,
+        ``SPLITTING`` when the cache could supply one.
+
+        Returns:
+            Whether a worker is now running for *path*.
+        """
+        from akgentic.tool.workspace.documents.worker import (  # noqa: PLC0415 — cycle
+            IndexRequest,
+            IndexWorker,
+            index_worker_name,
+        )
+
+        entry = self.state.rag_index[path]
+        params, reader = self._rag_params, self._rag_reader
+        if params is None or reader is None or entry.indexed_sha is None:
+            return False
+        scope = self.config.workspace_name
+        markdown = self.document_extract(path, entry.indexed_sha, EXTRACTOR_VERSION)
+        try:
+            address = self.createActor(
+                IndexWorker, config=BaseConfig(name=index_worker_name(scope, path))
+            )
+            self.proxy_tell(address, IndexWorker).receiveMsg_IndexRequest(
+                IndexRequest(
+                    path=path,
+                    scope=scope,
+                    source_sha=entry.indexed_sha,
+                    markdown=markdown,
+                    params=params,
+                    reader=reader,
+                )
+            )
+        except Exception as exc:
+            logger.warning("Workspace %s: could not spawn an index worker for %s", scope, path)
+            self._fail(path, entry.indexed_sha, f"{type(exc).__name__}: {exc}")
+            return False
+        self._index_active.add(path)
+        self.state.rag_index[path] = entry.model_copy(
+            update={
+                "status": RagStatus.SPLITTING if markdown is not None else RagStatus.EXTRACTION,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        return True
+
+    ##
+    ## Candidate discovery — every path through ``Filesystem``, never its root
+    ##
+    def _candidates(self, path: str) -> tuple[list[str], int]:
+        """Return the indexable files under *path*, and how many were unsupported.
+
+        Every path goes through :class:`~akgentic.tool.workspace.workspace.Filesystem`,
+        whose every entry point validates internally. Joining onto its private
+        root instead is the traversal bypass this package has already had to close
+        once.
+
+        A path that escapes, does not exist, or cannot be listed is **skipped with
+        a log line**, never an error: ``workspace_rag_index`` is reachable from a
+        model, and a raise here would land in the agent's next turn as a failure it
+        cannot act on.
+        """
+        try:
+            found = self._walk(path)
+        except NotADirectoryError:
+            found = [path]  # a single file, which is a legal argument
+        except OSError as exc:
+            logger.info(
+                "Workspace %s: %r is not indexable: %s",
+                self.config.workspace_name,
+                path,
+                exc,
+            )
+            return [], 0
+        supported = [
+            candidate
+            for candidate in found
+            if Path(candidate).suffix.lower() in _INDEXABLE_EXTENSIONS
+        ]
+        return supported, len(found) - len(supported)
+
+    def _walk(self, root: str) -> list[str]:
+        """List every file under *root*, depth-first, through the backend only.
+
+        Dot-prefixed names are skipped whole. That covers the atomic-write staging
+        files (``.<name>.<32 hex>.tmp``) and the vestigial extraction sidecars
+        (``.<name>.md``) — indexing either would put a temporary file or a stale
+        copy of a document into the corpus.
+        """
+        found: list[str] = []
+        for entry in self._workspace.list(root):
+            if entry.name.startswith("."):
+                continue
+            relative = f"{root}/{entry.name}" if root else entry.name
+            if entry.is_dir:
+                with contextlib.suppress(OSError):
+                    found.extend(self._walk(relative))
+            else:
+                found.append(relative)
+        return found
+
+    def _digest(self, path: str) -> str | None:
+        """Return the digest of *path*'s current bytes, or ``None`` if unreadable."""
+        try:
+            return content_sha(self._workspace.read(path))
+        except OSError as exc:
+            logger.info(
+                "Workspace %s: skipping %r while indexing: %s",
+                self.config.workspace_name,
+                path,
+                exc,
+            )
+            return None
+
+    ##
+    ## The settle side
+    ##
+    def receiveMsg_IndexResult(self, msg: IndexResult) -> None:  # noqa: N802
+        """TELL, from a worker. Take its chunks and issue the embedding batches."""
+        try:
+            self._on_index_result(msg)
+        except Exception:
+            logger.warning(
+                "Workspace %s: could not record the index result for %s",
+                self.config.workspace_name,
+                msg.path,
+                exc_info=True,
+            )
+
+    def _on_index_result(self, msg: IndexResult) -> None:
+        """Record *msg*, issue its ``add()`` batches, and notify once."""
+        self._index_active.discard(msg.path)
+        entry = self._live_entry(msg.path, msg.source_sha)
+        if entry is None:
+            self._drain()
+            return
+        if msg.extracted:
+            # The worker did the extraction, so the cache learns from it. This is
+            # the one notify in this method that is not the file's own transition,
+            # and it is a fill like any other.
+            self.cache_document(msg.path, msg.source_sha, EXTRACTOR_VERSION, msg.markdown)
+        if len(msg.texts) != len(msg.chunks):
+            self._fail(msg.path, msg.source_sha, "the worker returned mismatched chunks and texts")
+            self._drain()
+            self.state.notify_state_change()
+            return
+        batches = ceil(len(msg.chunks) / _batch_size())
+        self.state.rag_index[msg.path] = entry.model_copy(
+            update={
+                "status": RagStatus.EMBEDDING if msg.chunks else RagStatus.EMBEDDED,
+                "chunks": msg.chunks,
+                "chunk_count": len(msg.chunks),
+                "batches_expected": batches,
+                "batches_landed": 0,
+                "reason": None,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        if msg.chunks:
+            self._issue_batches(msg)
+        else:
+            # An empty document is indexed the moment it is split: there is
+            # nothing to embed and nothing to wait for.
+            self._drop_superseded(msg.path)
+        self._drain()
+        self.state.notify_state_change()
+
+    def _issue_batches(self, msg: IndexResult) -> None:
+        """Send one ``add()`` per ``EMBED_BATCH_SIZE`` chunks, correlated by path.
+
+        ``requester`` is this actor and ``request_ref`` is the file's path, which
+        is what lets :meth:`receiveMsg_EmbeddingCompleted` attribute a completion
+        to the row that is counting it. ``batches_expected`` is already written by
+        the caller, before the first call goes out.
+        """
+        from akgentic.tool.vector_store.vector import VectorEntry  # noqa: PLC0415 — optional extra
+
+        tell = self._vs_tell
+        if tell is None:
+            return
+        entries = [
+            VectorEntry(
+                ref_type=_CHUNK_REF_TYPE,
+                ref_id=chunk.chunk_id,
+                text=text,
+                vector=[],
+                scope=self.config.workspace_name,
+                path=msg.path,
+                ordinal=chunk.ordinal,
+            )
+            for chunk, text in zip(msg.chunks, msg.texts, strict=True)
+        ]
+        size = _batch_size()
+        for start in range(0, len(entries), size):
+            tell.add(
+                RAG_COLLECTION,
+                entries[start : start + size],
+                requester=self.myAddress,
+                request_ref=msg.path,
+            )
+
+    def receiveMsg_IndexError(self, msg: IndexError) -> None:  # noqa: N802
+        """TELL, from a worker. Mark the file ``FAILED`` and free its slot."""
+        try:
+            self._index_active.discard(msg.path)
+            if self._live_entry(msg.path, msg.source_sha) is not None:
+                self._fail(msg.path, msg.source_sha, msg.reason)
+            self._drain()
+            self.state.notify_state_change()
+        except Exception:
+            logger.warning(
+                "Workspace %s: could not record the index failure for %s",
+                self.config.workspace_name,
+                msg.path,
+                exc_info=True,
+            )
+
+    def receiveMsg_EmbeddingCompleted(self, msg: EmbeddingCompleted) -> None:  # noqa: N802
+        """TELL, from ``#VectorStore``. Count one batch, and settle the file at the last.
+
+        Only the **final** transition notifies. A batch that lands without
+        settling its file mutates ``batches_landed`` in memory and says nothing,
+        so a 1,900-chunk document costs one event rather than thirty.
+
+        The **first** completion carrying an error marks the file ``FAILED``, and
+        every later completion for the same path is dropped without a second
+        transition — the status guard below is what does it.
+        """
+        try:
+            self._on_embedding_completed(msg)
+        except Exception:
+            logger.warning(
+                "Workspace %s: could not record an embedding completion",
+                self.config.workspace_name,
+                exc_info=True,
+            )
+
+    def _on_embedding_completed(self, msg: EmbeddingCompleted) -> None:
+        """Apply one settled batch to the row that is counting it."""
+        path = msg.request_ref
+        if msg.collection != RAG_COLLECTION or path is None:
+            return
+        entry = self.state.rag_index.get(path)
+        if entry is None or entry.status is not RagStatus.EMBEDDING:
+            return
+        if msg.error is not None:
+            self._fail(path, entry.indexed_sha, msg.error)
+            self.state.notify_state_change()
+            return
+        landed = entry.batches_landed + 1
+        if landed < entry.batches_expected:
+            # In memory only: the file has not moved, so nothing is worth an event.
+            self.state.rag_index[path] = entry.model_copy(update={"batches_landed": landed})
+            return
+        self.state.rag_index[path] = entry.model_copy(
+            update={
+                "status": RagStatus.EMBEDDED,
+                "batches_landed": landed,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        self._drop_superseded(path)
+        self.state.notify_state_change()
+
+    def _drop_superseded(self, path: str) -> None:
+        """Remove the previous chunk set, now that the new one has landed.
+
+        **Add-then-remove, and never the other way round.** ``chunk_id`` includes
+        the source digest, so the new ids cannot collide with the old ones — which
+        is what makes this ordering safe, and what makes the other ordering leave a
+        file absent from search for minutes while the list still calls it stale.
+
+        The call is wrapped, because ``VectorStoreActor.remove`` re-raises a
+        missing collection as a ``RetriableError``. A failure leaves
+        ``superseded_chunk_ids`` populated so a later re-index retries it, and
+        never fails the file: the worst case is a few orphaned vectors, and the
+        alternative is a file that is ``FAILED`` because of a cleanup.
+        """
+        entry = self.state.rag_index.get(path)
+        proxy = self._vs_proxy
+        if entry is None or proxy is None or not entry.superseded_chunk_ids:
+            return
+        try:
+            proxy.remove(
+                RAG_COLLECTION,
+                entry.superseded_chunk_ids,
+                scope=self.config.workspace_name,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Workspace %s: could not remove %d superseded chunk(s) of %s: %s — "
+                "they are kept for the next re-index to retry",
+                self.config.workspace_name,
+                len(entry.superseded_chunk_ids),
+                path,
+                exc,
+            )
+            return
+        current = self.state.rag_index[path]
+        self.state.rag_index[path] = current.model_copy(update={"superseded_chunk_ids": []})
+
+    def _live_entry(self, path: str, source_sha: str) -> RagFile | None:
+        """Return *path*'s row when it is still the one *source_sha* was indexing.
+
+        A report whose file has since been re-indexed at other bytes belongs to a
+        run nobody is waiting for, and applying it would overwrite the live run's
+        chunk set with a stale one.
+        """
+        entry = self.state.rag_index.get(path)
+        if entry is None or entry.indexed_sha != source_sha:
+            logger.debug(
+                "Workspace %s: dropping an index report for %s — the row has moved on",
+                self.config.workspace_name,
+                path,
+            )
+            return None
+        return entry
+
+    def _fail(self, path: str, source_sha: str | None, reason: str) -> None:
+        """Mark *path* ``FAILED``, keeping whatever chunks it already had.
+
+        The chunk set is deliberately not cleared: a previously indexed file stays
+        searchable at its previous content, which is what makes a failure a
+        degradation rather than a loss.
+        """
+        entry = self.state.rag_index.get(path)
+        if entry is None or (source_sha is not None and entry.indexed_sha != source_sha):
+            return
+        self.state.rag_index[path] = entry.model_copy(
+            update={"status": RagStatus.FAILED, "reason": reason, "updated_at": datetime.now(UTC)}
+        )
+
+    ##
+    ## The ``EMBEDDING`` bound, and the gate's staleness signal
+    ##
+    def reap_stale_embedding(self) -> bool:
+        """Revert files stuck at ``EMBEDDING`` past the bound, and say if any moved.
+
+        **Runs on resume and at the top of ``index_paths``, and never on a turn
+        path** — not in the context-state provider, not in ``rag_snapshot``, not in
+        the gate. It is a state mutation, and one that fired on every turn of every
+        agent carrying the card would be both wasteful and a write from a render.
+
+        The resume call site is ``WorkspaceActor.init_state``, not ``on_start``:
+        ``on_start`` assigns a fresh :class:`WorkspaceState` on its first line and a
+        restored snapshot arrives afterwards, so reaping there would run against an
+        empty index. See that method for the whole of it.
+
+        It is also the only thing that will ever free such a file. ``#VectorStore``
+        keeps the map from an open request to its requester in a private attribute,
+        so a resume drops it along with the pending requests themselves, and the
+        store's own status then truthfully reads ``READY``. Nothing there knows a
+        workspace file is still waiting.
+
+        Returns:
+            Whether any row was reverted, so the caller can make one notify.
+        """
+        cutoff = datetime.now(UTC) - timedelta(seconds=EMBEDDING_STALE_AFTER_S)
+        reverted = 0
+        for path, entry in list(self.state.rag_index.items()):
+            if entry.status is not RagStatus.EMBEDDING or entry.updated_at >= cutoff:
+                continue
+            self.state.rag_index[path] = entry.model_copy(
+                update={
+                    "status": RagStatus.PENDING,
+                    "batches_expected": 0,
+                    "batches_landed": 0,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+            reverted += 1
+        if reverted:
+            logger.info(
+                "Workspace %s: %d file(s) left embedding past %.0fs are queued again",
+                self.config.workspace_name,
+                reverted,
+                EMBEDDING_STALE_AFTER_S,
+            )
+        return reverted > 0
+
+    def mark_paths_stale(self, paths: list[str]) -> None:
+        """Mark every indexed path in *paths* ``STALE`` — and re-index none of them.
+
+        Called **directly on ``self``** from the one point the six mutations
+        converge on, never as a cross-actor tell: there is no message to drop, no
+        ordering question, and no chance of arriving after the target stopped.
+
+        **It marks and returns.** An agent mid-task rewrites the same file
+        repeatedly, and auto-indexing every accepted write would spend embedding
+        credits on every save and queue workers behind a file that is about to
+        change again. Gate writes mark stale; uploads index.
+
+        It notifies **only when it actually changed a status**, so a tree that has
+        never been indexed pays nothing on the mutation path — which is the common
+        case, and must stay free.
+
+        Args:
+            paths: The mutation's own write set.
+        """
+        now = datetime.now(UTC)
+        changed = False
+        for path in paths:
+            entry = self.state.rag_index.get(path)
+            if entry is None or entry.status is RagStatus.STALE:
+                continue
+            self.state.rag_index[path] = entry.model_copy(
+                update={"status": RagStatus.STALE, "updated_at": now}
+            )
+            changed = True
+        if changed:
+            self.state.notify_state_change()
+
+    ##
+    ## workspace_rag_list — a render, and therefore free
+    ##
+    def rag_snapshot(self, max_pending_shown: int) -> RagIndexState:
+        """Return the index as rows, capped on ``PENDING`` only.
+
+        **No file access of any kind**, and no tree sweep: this is asked once per
+        turn by every agent carrying the card, and a ``stat`` per candidate would
+        put a tree walk on the hot path for a display. It is O(n) dict work over
+        rows that already exist.
+
+        Everything that is not ``PENDING`` is always shown — those rows each say
+        something different. ``PENDING`` rows all say the same thing, so a
+        10,000-file tree would otherwise flood the context window with them.
+
+        Args:
+            max_pending_shown: How many ``PENDING`` rows to render.
+
+        Returns:
+            The state, never ``None`` and never raising.
+        """
+        rows: list[RagFileRow] = []
+        hidden = 0
+        pending_shown = 0
+        for path, entry in self.state.rag_index.items():
+            if entry.status is RagStatus.PENDING:
+                if pending_shown >= max_pending_shown:
+                    hidden += 1
+                    continue
+                pending_shown += 1
+            rows.append(
+                RagFileRow(
+                    path=path,
+                    status=entry.status.value,
+                    chunk_count=entry.chunk_count,
+                    reason=entry.reason or "",
+                )
+            )
+        return RagIndexState(rows=rows, pending_hidden=hidden)
+
+
+_IN_FLIGHT = frozenset(
+    {RagStatus.PENDING, RagStatus.EXTRACTION, RagStatus.SPLITTING, RagStatus.EMBEDDING}
+)
+"""Statuses meaning "a run over these bytes has not finished yet"."""
+
+
+def _batch_size() -> int:
+    """Return ``EMBED_BATCH_SIZE``, imported where the cycle cannot bite.
+
+    ``documents/worker.py`` imports ``card.params`` at runtime, and ``card`` imports
+    this actor package — so the constant cannot be reached from this module's
+    import block. It is read here rather than duplicated, so there is one value.
+    """
+    from akgentic.tool.workspace.documents.worker import EMBED_BATCH_SIZE  # noqa: PLC0415 — cycle
+
+    return EMBED_BATCH_SIZE

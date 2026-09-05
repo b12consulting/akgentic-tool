@@ -17,7 +17,7 @@ from enum import StrEnum
 from pydantic import Field, model_validator
 
 from akgentic.core.utils import SerializableBaseModel
-from akgentic.tool.core import COMMAND, TOOL_CALL, BaseToolParam, Channels
+from akgentic.tool.core import COMMAND, LLM_CONTEXT, TOOL_CALL, BaseToolParam, Channels
 from akgentic.tool.sandbox.actor import CardMode
 from akgentic.tool.workspace.execution import (
     DEFAULT_EXEC_POLL_ATTEMPTS,
@@ -261,6 +261,31 @@ class WorkspaceRagIndex(BaseToolParam):
                 f"target does not converge"
             )
         return self
+
+
+class WorkspaceRagList(BaseToolParam):
+    """Render where every workspace file stands in the retrieval index.
+
+    Configuration only, as every class in this module is: the render cap is the
+    one field, and there is nothing to pass at the call.
+
+    **Deliberately not on ``TOOL_CALL``** (ADR-045 §5). The index is something the
+    model should *see*, not something it should decide to look up: it is pushed
+    into the context tail as a delta on every turn — one line per file that
+    actually moved — and a tool call for it would be a round trip for information
+    the model already has.
+    """
+
+    expose: set[Channels] = {COMMAND, LLM_CONTEXT}
+
+    max_pending_shown: int = 20
+    """How many ``pending`` rows the render may carry.
+
+    Everything that is **not** pending is always shown, because each of those rows
+    says something different. Pending rows all say the same thing, so a
+    10,000-file tree would otherwise flood the context window with them; past this
+    count they collapse into a single ``…and N more pending`` line.
+    """
 
 
 class ResourceType(StrEnum):
