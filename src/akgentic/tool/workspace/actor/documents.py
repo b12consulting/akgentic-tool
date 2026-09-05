@@ -1220,22 +1220,34 @@ class DocumentsMixin(_DocumentsBase):
         not a tool — so the actor's test is the state ``enable_rag`` left behind.
         Writing the rows ``PENDING`` means enabling retrieval later picks the
         files up; spawning would spend embedding credits in a team that never
-        opted in.
+        opted in. **That path is idempotent at the live digest too**, and for a
+        stronger reason than tidiness: ``WorkspaceState`` is persisted, so a
+        resume whose ``#VectorStore`` is missing restores ``EMBEDDED`` rows onto
+        a tree with no proxy. Re-queueing such a row would clear its chunk set
+        into ``superseded_chunk_ids`` that no proxy will ever remove — losing the
+        heading paths a search renders, and buying a re-embedding of content that
+        was already embedded.
         """
         candidates = self._uploaded_candidates(msg.paths)
         if not candidates:
             return
         if self._rag_params is None or self._vs_proxy is None:
+            recorded = 0
             for path, sha in candidates:
+                if self._is_accounted_for(path, sha, msg.force):
+                    continue
                 self._enqueue(path, sha)
+                recorded += 1
             logger.info(
-                "Workspace %s: recorded %d new file(s) from %s as pending — "
+                "Workspace %s: recorded %d of %d new file(s) from %s as pending — "
                 "retrieval is not enabled on this tree",
                 self.config.workspace_name,
+                recorded,
                 len(candidates),
                 msg.source,
             )
-            self.state.notify_state_change()
+            if recorded > 0:
+                self.state.notify_state_change()
             return
         queued = 0
         for path, sha in candidates:

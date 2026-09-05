@@ -21,6 +21,7 @@ from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.workspace.actor import WorkspaceActor
 from akgentic.tool.workspace.documents.models import (
     NewFileMessage,
+    RagChunk,
     RagFile,
     RagStatus,
 )
@@ -44,9 +45,7 @@ def upload(workspace_tree: Path, monkeypatch: pytest.MonkeyPatch) -> RagHarness:
 
 
 @pytest.fixture
-def upload_without_retrieval(
-    workspace_tree: Path, monkeypatch: pytest.MonkeyPatch
-) -> RagHarness:
+def upload_without_retrieval(workspace_tree: Path, monkeypatch: pytest.MonkeyPatch) -> RagHarness:
     """The same harness with no ``enable_rag`` — retrieval was never turned on."""
     built = RagHarness(build_actor())
     built.install(monkeypatch)
@@ -122,9 +121,7 @@ class TestItIsATellThatNeverRaises:
         (workspace_tree / "archive.zip").write_bytes(b"PK\x03\x04")
         (workspace_tree / "photo.png").write_bytes(b"\x89PNG")
 
-        upload.actor.receiveMsg_NewFileMessage(
-            NewFileMessage(paths=["archive.zip", "photo.png"])
-        )
+        upload.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["archive.zip", "photo.png"]))
 
         assert upload.actor.state.rag_index == {}
         assert gate_still_works(upload.actor, "after-unsupported.md")
@@ -408,6 +405,54 @@ class TestTheCapabilityRefusal:
         upload_without_retrieval.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["a.md"]))
 
         assert upload_without_retrieval.actor.state.rag_index["a.md"].indexed_sha == sha
+
+    def test_a_row_already_current_survives_a_second_notification(
+        self, upload_without_retrieval: RagHarness, workspace_tree: Path
+    ) -> None:
+        """AC18's idempotence covers this path too, and here it protects data.
+
+        ``WorkspaceState`` is persisted, so a resume whose ``#VectorStore`` is
+        missing restores ``EMBEDDED`` rows onto a tree with no proxy. Re-queueing
+        one would move its chunk ids into ``superseded_chunk_ids`` that no proxy
+        will ever remove, drop the heading paths a search renders, and buy a
+        re-embedding of content that was already embedded.
+        """
+        harness = upload_without_retrieval
+        sha = write(workspace_tree, "a.md")
+        harness.actor.state.rag_index["a.md"] = _embedded_row("a.md", sha)
+
+        harness.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["a.md"]))
+
+        row = harness.actor.state.rag_index["a.md"]
+        assert row.status is RagStatus.EMBEDDED
+        assert [chunk.chunk_id for chunk in row.chunks] == ["chunk-0"]
+        assert row.superseded_chunk_ids == []
+
+    def test_force_re_records_a_row_that_is_already_current(
+        self, upload_without_retrieval: RagHarness, workspace_tree: Path
+    ) -> None:
+        """``force`` means the same thing on both sides of the capability check."""
+        harness = upload_without_retrieval
+        sha = write(workspace_tree, "a.md")
+        harness.actor.state.rag_index["a.md"] = _embedded_row("a.md", sha)
+
+        harness.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["a.md"], force=True))
+
+        row = harness.actor.state.rag_index["a.md"]
+        assert row.status is RagStatus.PENDING
+        assert row.superseded_chunk_ids == ["chunk-0"]
+
+
+def _embedded_row(path: str, sha: str) -> RagFile:
+    """A row as a resume restores it: ``EMBEDDED``, at *sha*, carrying its chunks."""
+    return RagFile(
+        path=path,
+        status=RagStatus.EMBEDDED,
+        indexed_sha=sha,
+        chunks=[RagChunk(chunk_id="chunk-0", ordinal=0, start=0, end=8, heading_path=["Title"])],
+        chunk_count=1,
+        updated_at=datetime.now(UTC),
+    )
 
 
 class _RagFileWithExtraField(RagFile):
