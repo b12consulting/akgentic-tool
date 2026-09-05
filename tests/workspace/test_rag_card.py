@@ -289,9 +289,7 @@ class TestTheSearchCallable:
         card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
         params = WorkspaceRagSearch(instructions="Prefer the reports/ directory.")
 
-        assert "Prefer the reports/ directory." in (
-            card._rag_search_factory(params).__doc__ or ""
-        )
+        assert "Prefer the reports/ directory." in (card._rag_search_factory(params).__doc__ or "")
 
     @staticmethod
     def _tool(card: WorkspaceTool, name: str) -> Any:

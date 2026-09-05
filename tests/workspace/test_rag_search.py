@@ -345,7 +345,7 @@ class TestDegradation:
     def test_no_hits_is_a_sentence_that_is_not_the_unavailable_one(
         self, search: SearchHarness
     ) -> None:
-        """"Nothing matched" and "nothing is indexed" have different next steps."""
+        """ "Nothing matched" and "nothing is indexed" have different next steps."""
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND], embedded=False)
 
         answer = search.actor.rag_search("bicycles")
@@ -358,9 +358,7 @@ class TestDegradation:
 class TestTheVectorLeg:
     """It is scoped, over-fetched, and thresholded on the raw cosine."""
 
-    def test_every_query_carries_the_workspace_as_its_scope(
-        self, search: SearchHarness
-    ) -> None:
+    def test_every_query_carries_the_workspace_as_its_scope(self, search: SearchHarness) -> None:
         """One ``workspace_chunks`` class holds every workspace of every team."""
         search.index("invoice.md", _INVOICE, [_FIRST])
 
@@ -500,9 +498,7 @@ class TestTheKeywordLeg:
         assert "reports/invoice.md" in answer
         assert "notes/invoice.md" not in answer
 
-    def test_an_empty_query_hits_nothing_on_the_keyword_leg(
-        self, search: SearchHarness
-    ) -> None:
+    def test_an_empty_query_hits_nothing_on_the_keyword_leg(self, search: SearchHarness) -> None:
         """A blank query must not match every chunk in the workspace."""
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
         search.store.embed_error = RuntimeError("vector leg off")
@@ -539,9 +535,7 @@ class TestTheRender:
 
         assert "(semantic: 0.71)" in search.actor.rag_search("payment")
 
-    def test_a_hit_confirmed_by_both_legs_is_labelled_hybrid(
-        self, search: SearchHarness
-    ) -> None:
+    def test_a_hit_confirmed_by_both_legs_is_labelled_hybrid(self, search: SearchHarness) -> None:
         search.index("invoice.md", _INVOICE, [_FIRST])
 
         assert "(hybrid: " in search.actor.rag_search("payment", top_k=1)
@@ -755,9 +749,7 @@ class TestTheFusionKnobs:
             "payment", alpha=DEFAULT_ALPHA
         )
 
-    def test_pure_keyword_fusion_still_returns_the_keyword_hit(
-        self, search: SearchHarness
-    ) -> None:
+    def test_pure_keyword_fusion_still_returns_the_keyword_hit(self, search: SearchHarness) -> None:
         """``alpha=0.0`` is pure keyword, and a vector-only hit then scores zero."""
         search.index("invoice.md", _INVOICE, [_FIRST])
 
