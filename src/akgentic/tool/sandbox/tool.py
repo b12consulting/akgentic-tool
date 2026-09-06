@@ -268,8 +268,10 @@ class ExecTool(ToolCard):
             DEFAULT_EXEC_POLL_ATTEMPTS,
             DEFAULT_EXEC_POLL_DELAY_S,
             DEFAULT_EXEC_TIMEOUT_S,
+            ExecState,
             format_status,
             poll_attempts_within,
+            queued,
             timed_out,
         )
 
@@ -313,6 +315,17 @@ class ExecTool(ToolCard):
                 )
                 if settled is not None:
                     return format_status(settled)
+                # "Passed its budget" is false for a run that never started. The
+                # shim shares one #Workspace, and therefore one exec queue, with
+                # the capability, so a command here can be waiting its turn
+                # rather than overrunning — and telling the model it overran
+                # sends it looking for a timeout that did not happen. One extra
+                # ask separates the two, exactly as the capability's bounded look
+                # does. The shim still degrades to a run id either way; only the
+                # message it degrades with is corrected here.
+                status = proxy.exec_status(agent_id, run_id)
+                if status.state is ExecState.QUEUED:
+                    return queued(run_id, status.queue_position)
                 return timed_out(run_id, run_budget)
             except CommandParseError as e:
                 # No allowlist dump: the binary was never the problem, and

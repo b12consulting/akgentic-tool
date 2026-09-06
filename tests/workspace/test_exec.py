@@ -3015,6 +3015,12 @@ class TestAQueuedCallerWaitsOutItsTurn:
         assert "is queued at position" not in answer  # not a handoff
         assert "workspace_exec_result" not in answer
 
+    # This guard's regression mode is an unbounded loop, not a wrong value: drop
+    # the ceiling and the deadline re-arms for ever, so the call never returns.
+    # Without an explicit bound that wedges the run instead of failing it, and a
+    # wedged pipeline reads as "still going" rather than as a defect. The budget
+    # here is a failure budget — the spec's own ceiling is 0.34 s — never a delay.
+    @pytest.mark.timeout(30)
     def test_a_position_that_never_decreases_still_hits_the_absolute_ceiling(
         self,
         orchestrator_proxy: FakeOrchestratorProxy,

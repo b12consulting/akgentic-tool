@@ -372,9 +372,15 @@ What bounds it is a separate **ceiling fixed on entry and never re-armed**,
 re-start the clock for ever. The `+ 1` is the caller's own run, the same arithmetic as the 1-based
 position — at the deepest legal slot you wait for the 16 ahead of you *and then for yourself*.
 
-The thread parked by that wait is the **caller's own tool thread**, never the actor's — `exec_status`
-is O(1) and the mailbox goes on draining — so reads, mutations and other agents' polls are
-unaffected. Two costs come with it and are accepted: latency is serial (three 15 s commands mean the
+The thread parked by that wait is the **caller's own tool thread**, never the actor's, and the
+mailbox goes on draining — so reads, mutations and other agents' polls are unaffected. On the
+ordinary path a poll costs **one clock read**: the liveness predicate short-circuits on
+`now <= lease.deadline` before it ever consults `worker_alive`. It is not unconditionally O(1),
+and the difference is worth stating rather than glossing — a poll *can* fork git and spawn a
+worker, but only when a lease is **both** past its deadline **and** has a dead worker. That is the
+anomaly path, not the poll path, and the work is what the tree needs done by whoever arrives
+first: nothing reclaims on a timer, so the queued caller's own poll is the message guaranteed to
+arrive. Two costs come with it and are accepted: latency is serial (three 15 s commands mean the
 third result lands ~45 s in, which is the point), and a parked thread can outlive the orchestrator's
 30 s stop backstop during teardown — the same exposure one long run already has, not a new one.
 

@@ -1601,22 +1601,22 @@ class WorkspaceTool(ToolCard):
         waits_out_the_run = params.poll_attempts < 0
 
         def workspace_exec(cmd: str, cwd: str = "") -> str:
-            """Run a command in the team workspace, in a sandbox. No shell runs it.
+            """Run ONE binary in the team workspace sandbox. There is NO shell: `&&` fails.
 
-            The workspace is held exclusively for the duration of the run: your
-            teammates can still read files, but every change they attempt is refused until
-            it finishes. A second command never refuses yours — it waits its turn and still
-            returns its own output. Everything the command touched — files you never named
-            included — is recorded as one change attributed to you.
+            To chain, pipe, redirect or expand, wrap it yourself — `bash` is allow-listed:
+                WRONG:  git -C repo status && git -C repo log -1
+                RIGHT:  bash -c 'git -C repo status && git -C repo log -1'
+            Unwrapped, `&&` `||` `;` `|` `>` `$VAR` `$(...)` are literal arguments and fail.
 
-            If the wait runs long you get a run id instead; workspace_exec_result collects it.
+            The workspace is held for the run: teammates still read, their changes wait. A
+            second command never refuses yours — it waits its turn and returns its own
+            output. Everything touched is recorded as one change attributed to you; if the
+            wait runs long you get a run id instead, which workspace_exec_result collects.
 
             Args:
-                cmd: One binary plus its arguments. Tokenised POSIX-style, so
-                    quoting groups: `echo "hello world"` is two tokens. `&&`, `||`,
-                    `;`, `|`, `>`, `$VAR` and `$(...)` are NOT interpreted — for
-                    shell syntax run `bash -c '...'`. The binary (first token) must
-                    be in the allow-list.
+                cmd: One binary plus its arguments, tokenised POSIX-style so quoting
+                    groups: `echo "hello world"` is two tokens. The binary (first token)
+                    must be in the allow-list.
                 cwd: Subdirectory relative to workspace root. Defaults to root.
 
             Returns:
