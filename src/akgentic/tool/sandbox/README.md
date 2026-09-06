@@ -37,7 +37,7 @@ ToolFactory([WorkspaceTool(workspace_id="proj-42", workspace_exec=True)], observ
 | Journal | off by default, and **not reachable** by any `ExecTool` field | `WorkspaceTool(git_journal=…)` |
 
 **What still works.** The class resolves, the field names are unchanged, and `exec_command` behaves
-identically — same lease, same worker, same discovery, same commit. It is a shim over
+identically — same hold on the tree, same sandbox, same discovery, same commit. It is a shim over
 `workspace_exec`, not a second implementation, so the two cannot drift.
 
 **What warns.** A `DeprecationWarning` when the card is **wired** — at `observer()` — naming its
@@ -206,9 +206,9 @@ exactly as any other host path is, with or without a git binary. `local` is `aut
 Use an isolating backend where that matters.
 
 An empty `cmd`, or a first token outside the set, raises `CommandNotAllowedError` — **on the
-worker's thread**, where the allowlist check now runs. It therefore reaches the agent as a reported
-run *failure* rather than as an exception out of the tool call, and it still lists the allowed
-commands:
+sandbox's own thread**, where the allowlist check runs. The tell handler catches it and reports it,
+so it reaches the agent as a reported run *failure* rather than as an exception out of the tool
+call, and it still lists the allowed commands:
 
 ```
 Run 3f2ac91d failed: Command 'psql' is not in the allowed commands list.
@@ -252,11 +252,11 @@ CPU-time and file-size limits are applied on all POSIX platforms for `local` and
 
 **These four are per-backend *defaults*, not the budget a run actually gets.** Every real caller
 passes one: `WorkspaceExec.timeout_s` (15 s by default) travels to `subprocess.run(timeout=…)` after
-being clamped to the deferred worker's own 20 s, which sits below the orchestrator's 30 s stop
-backstop. A budget that stopped at the proxy would be decoration — a Python thread cannot be
-cancelled, so a subprocess still running past its worker's budget holds its parent's teardown open
-for the difference. The 30 s above applies only to a caller that names no budget at all, such as a
-harness starting a backend directly.
+being capped at `MAX_EXEC_BUDGET_S` (20 s), which sits below the orchestrator's 30 s stop backstop.
+A budget that stopped at the proxy would be decoration — a Python thread cannot be cancelled, so a
+subprocess still running past its budget holds its parent's teardown open for the difference. The
+30 s above applies only to a caller that names no budget at all, such as a harness starting a
+backend directly.
 
 **`.git` is never inside a mount.** `bwrap` binds only the workspace root; `docker` mounts only
 `<root>:/workspace`; `seatbelt` confines *writes* to the workspace and the tmpdir. The journal lives
@@ -303,6 +303,18 @@ A backend is a `SandboxActor` subclass implementing three methods: `_start_sandb
 `_stop_sandbox()` and `_exec(cmd, cwd) -> ExecResult`. The base class owns state initialisation,
 the allowlist check, and swallowing exceptions raised during teardown so a broken backend cannot
 leave a Pykka actor wedged.
+
+**The base has two entry points, and a backend implements neither.**
+
+| Entry point | Shape | Who uses it |
+|---|---|---|
+| `exec(cmd, cwd="", timeout=None)` | an **ask**: a validated command in, an `ExecResult` out, raising `CommandParseError` / `CommandNotAllowedError` / whatever the backend raises | a harness, or any direct caller that wants the exception |
+| `receiveMsg_ExecRequest(request)` | a **tell**: it calls `exec()` and reports the outcome to `request.reply_to` — and it is the only thing that reports | `#Workspace`, for every `workspace_exec` |
+
+The tell handler lives on the base and wraps the ask, so implementing `_exec` implements both. It
+**never raises**: an exception out of a tell handler stops the actor, and a stopped sandbox reports
+nothing at all. A command that ran, one the budget killed, a backend that raised and a binary the
+allowlist refused therefore all come back as an `ExecReport`.
 
 `_exec` receives the command **string**, so a new backend must tokenise it with `shlex.split(cmd)` —
 the same call `exec()` made to derive the binary it validated.

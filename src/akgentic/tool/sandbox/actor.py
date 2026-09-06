@@ -3,21 +3,31 @@
 Defines models, the command allowlist, module constants, and the lifecycle/exec
 contract. Concrete subclasses (LocalSandboxActor, DockerSandboxActor) provide
 the execution backend by implementing _start_sandbox, _stop_sandbox, and _exec.
+
+The base has **two** entry points and a backend implements neither. ``exec()``
+is the ask: a validated command in, an ``ExecResult`` out, raising on anything
+else — what a harness or a direct caller uses. ``receiveMsg_ExecRequest`` is the
+tell: what ``#Workspace`` uses, and the only one that reports. The tell handler
+wraps the ask, so a backend that implements ``_exec`` has already implemented
+both.
 """
 
 from __future__ import annotations
 
 import logging
 import shlex
+import subprocess
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
+from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
+from akgentic.core.utils.serializer import SerializableBaseModel
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +200,79 @@ class ExecResult(BaseModel):
     exit_code: int
 
 
+class ExecRequest(SerializableBaseModel):
+    """One command handed to the sandbox, and where to report it.
+
+    **Not a** ``Message``. ``Akgent.on_receive`` emits the ``ReceivedMessage`` /
+    ``ProcessedMessage`` telemetry sandwich only for ``Message`` instances, and
+    anything built on those two types derives "who is working" from them — so a
+    ``Message`` here would surface the sandbox as a busy team member every time
+    an agent ran a command. It is the same reason ``DeferredPayload`` is not one.
+
+    A model rather than five arguments because it crosses an actor boundary
+    (Golden Rule #1): a positional tell is where a cwd and a command get
+    swapped.
+
+    Attributes:
+        run_id: The requester's id for this run, echoed back in the report. It
+            is what lets a report be matched against the run that is actually
+            holding the tree, so a late one cannot close out a newer run.
+        cmd: The command string, exactly as the agent gave it.
+        cwd: Working directory below the workspace root.
+        timeout_s: Wall-clock budget for the command, already clamped by the
+            requester. The sandbox does not clamp it again — one owner, one
+            budget.
+        reply_to: Where the :class:`ExecReport` goes. An address rather than a
+            proxy so the sandbox imports nothing from ``workspace/``: the edge
+            is one-directional and stays that way.
+    """
+
+    run_id: str
+    cmd: str
+    cwd: str = ""
+    timeout_s: float
+    reply_to: ActorAddress
+
+
+class ExecReport(SerializableBaseModel):
+    """What the sandbox tells back when a run is over — however it ended.
+
+    Exactly one of the three outcomes is carried, and it is **enforced**: the
+    receiving actor branches on them in order, so a report carrying none would
+    close a run out with no answer at all and one carrying two would deliver an
+    outcome for a run it had also failed.
+
+    It lives here rather than beside ``ExecOutcome`` because ``sandbox/`` cannot
+    import ``workspace/`` — the edge runs the other way — and the report has to
+    be constructible on this side.
+
+    Attributes:
+        run_id: The run being reported, verbatim from the request.
+        result: What the command produced, when it ran to completion — well or
+            badly. A non-zero exit code is a **result**, not a failure.
+        timed_out: True when the budget killed the command. Also an answer an
+            agent can read, which is why it is not folded into *error*.
+        error: Why there is no result — the backend raised, the allowlist
+            refused the binary, the quoting would not parse.
+    """
+
+    run_id: str
+    result: ExecResult | None = None
+    timed_out: bool = False
+    error: str = ""
+
+    @model_validator(mode="after")
+    def _exactly_one(self) -> ExecReport:
+        """Reject a report that carries no outcome, or more than one."""
+        carried = sum((self.result is not None, self.timed_out, bool(self.error)))
+        if carried != 1:
+            raise ValueError(
+                "ExecReport carries exactly one of result, timed_out or error — "
+                f"got {carried}."
+            )
+        return self
+
+
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
@@ -258,26 +341,64 @@ class SandboxActor(Akgent[SandboxConfig, SandboxState], ABC):
             )
         super().on_stop()
 
-    def ready(self) -> bool:
-        """Answer as soon as this actor can serve messages at all.
+    def receiveMsg_ExecRequest(self, request: ExecRequest) -> None:
+        """TELL, from ``#Workspace``. Run the command and **always** report it.
 
-        A **FIFO barrier, not a health check**. Its whole value is the mailbox's
-        own ordering: a message cannot be delivered before ``on_start`` has
-        returned, so an ask for this method is answered only once the backend has
-        finished provisioning — with no flag, no polling and no state. It says
-        the actor has finished starting and nothing whatever about whether docker
-        still works.
+        The base's second entry point, beside :meth:`exec`, and the only one
+        that reports. ``#Workspace`` sends here and goes back to draining its
+        mailbox; the subprocess blocks this actor's own thread, which is what
+        this actor is for. No ask travels in either direction, so neither side
+        can be parked waiting on the other.
 
-        It exists so a caller can put a **timeout** on the wait for the backend
-        separately from the timeout on the command. Conflating the two is what
-        lets a slow cold start spend a run's whole budget before the command has
-        started (see ``ExecWorker.produce``).
+        Dispatched by name: ``Akgent.on_receive`` routes a non-``Message``
+        payload to ``receiveMsg_<Type>``, which is why the request is not a
+        ``Message`` and why ``N802`` is suppressed for this convention.
 
-        Returns:
-            ``True``, always. The value carries no information; the fact that it
-            arrived does.
+        **Nothing escapes this method, and that is the whole contract.** An
+        exception out of a tell handler stops the actor, and a stopped sandbox
+        reports nothing — which is the exact failure the retired worker had,
+        moved one actor over, except that there is no longer anything holding a
+        budget that could time it out. So every exit builds a report, the
+        ``finally`` covers the exits nothing else thought of, and the send
+        itself is guarded: a dead ``#Workspace`` is nobody to report to, not a
+        reason to take this actor down with it.
+
+        The three outcomes are three different things to the agent waiting:
+        a command that ran is a result whatever it exited with; a command the
+        budget killed is an answer that says so; anything else — the backend
+        raised, the allowlist refused the binary, the quotes would not balance —
+        is a failure with the reason in it.
+
+        Args:
+            request: The command, its budget, and where to report.
         """
-        return True
+        report: ExecReport | None = None
+        try:
+            result = self.exec(request.cmd, request.cwd, timeout=request.timeout_s)
+            report = ExecReport(run_id=request.run_id, result=result)
+        except subprocess.TimeoutExpired:
+            report = ExecReport(run_id=request.run_id, timed_out=True)
+        except Exception as exc:  # noqa: BLE001 — every failure is an answer, never a crash
+            report = ExecReport(run_id=request.run_id, error=str(exc))
+        finally:
+            if report is None:
+                # Unreachable through the branches above, and deliberately still
+                # here: a run whose report is dropped holds the tree until the
+                # gate's grace releases it, so "no exit path reports nothing" is
+                # worth one branch rather than an argument.
+                report = ExecReport(
+                    run_id=request.run_id,
+                    error="The sandbox produced no report for this run.",
+                )
+            try:
+                request.reply_to.tell(report)
+            except Exception:
+                logger.warning(
+                    "SandboxActor could not report run %s to %s — swallowing",
+                    request.run_id,
+                    request.reply_to.name,
+                    exc_info=True,
+                )
 
     def exec(self, cmd: str, cwd: str = "", timeout: float | None = None) -> ExecResult:
         """Execute a command inside the sandbox after allowlist validation.
@@ -302,11 +423,12 @@ class SandboxActor(Akgent[SandboxConfig, SandboxState], ABC):
             cwd: Working directory inside the sandbox. Defaults to "".
             timeout: Wall-clock budget for the command, in seconds. ``None``
                 keeps the backend's own default, so no existing caller changes
-                behaviour. A caller that owns a budget — a ``DeferredWorker``
-                above all — must pass it: a budget that stops at the proxy is
-                decoration, because a Python thread cannot be cancelled and the
-                worker holds its parent's teardown open until the subprocess
-                returns.
+                behaviour. A caller that owns a budget must pass it: a budget
+                that stops at the proxy is decoration, because a Python thread
+                cannot be cancelled. ``#Workspace`` is that caller, and it
+                passes the budget on :attr:`ExecRequest.timeout_s` — the
+                subprocess is what actually stops, and this actor's thread holds
+                the orchestrator's blocking stop open until it returns.
 
         Returns:
             ExecResult with stdout, stderr, and exit_code from the backend.

@@ -193,11 +193,8 @@ class TestTheHashIsRead:
         #
         # Four of the seven arrived with exec and none of them holds file content
         # either: ``_slots`` is the deferred base's result cache, keyed by run id
-        # and holding an ``ExecOutcome``; ``_run_errors`` and ``_recent_runs``
-        # are keyed by run id and agent id respectively and hold strings; and
-        # ``_reclaimed`` holds the ``ExecLease`` of a run whose tree was taken
-        # back, so a late report can still say whose command left the files it is
-        # committing to nobody.
+        # and holding an ``ExecOutcome``, and ``_run_errors`` and ``_recent_runs``
+        # are keyed by run id and agent id respectively and hold strings.
         read(wired_card, "notes.md")
         mutate(wired_card, "workspace_write", "notes.md", "mine\n")
 
@@ -211,7 +208,6 @@ class TestTheHashIsRead:
             "_slots",
             "_run_errors",
             "_recent_runs",
-            "_reclaimed",
         }
 
 

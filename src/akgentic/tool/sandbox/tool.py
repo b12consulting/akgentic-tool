@@ -30,7 +30,7 @@ from pydantic import PrivateAttr
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.tool.core import TOOL_CALL, BaseToolParam, Channels, ToolCard, _resolve
-from akgentic.tool.core.deferred import DEFAULT_WORKER_TIMEOUT_S, poll_deferred
+from akgentic.tool.core.deferred import poll_deferred
 from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.sandbox.actor import (
     ALLOWED_COMMANDS,
@@ -269,6 +269,7 @@ class ExecTool(ToolCard):
             DEFAULT_EXEC_POLL_DELAY_S,
             DEFAULT_EXEC_TIMEOUT_S,
             ExecState,
+            effective_budget,
             format_status,
             poll_attempts_within,
             queued,
@@ -282,7 +283,7 @@ class ExecTool(ToolCard):
         # ``poll_deferred`` the raw default would pass it the wait-out-the-run
         # sentinel, whose ``range(-1)`` is zero looks — the shim would take a run
         # id without ever having looked for a result.
-        run_budget = min(DEFAULT_EXEC_TIMEOUT_S, DEFAULT_WORKER_TIMEOUT_S)
+        run_budget = effective_budget(DEFAULT_EXEC_TIMEOUT_S)
         attempts = poll_attempts_within(
             DEFAULT_EXEC_POLL_ATTEMPTS, DEFAULT_EXEC_POLL_DELAY_S, run_budget
         )

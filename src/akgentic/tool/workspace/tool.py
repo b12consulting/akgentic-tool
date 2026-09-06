@@ -40,7 +40,7 @@ from akgentic.core.actor_address import ActorAddress
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.utils import SerializableBaseModel
 from akgentic.tool.core import COMMAND, TOOL_CALL, BaseToolParam, Channels, ToolCard, _resolve
-from akgentic.tool.core.deferred import DEFAULT_WORKER_TIMEOUT_S, poll_deferred
+from akgentic.tool.core.deferred import poll_deferred
 from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.sandbox.actor import CardMode
@@ -57,6 +57,7 @@ from akgentic.tool.workspace.execution import (
     ExecConfig,
     ExecState,
     ExecStatus,
+    effective_budget,
     format_status,
     in_progress,
     poll_attempts_within,
@@ -481,8 +482,9 @@ class WorkspaceExec(BaseToolParam):
     conflate:
 
     - ``timeout_s`` bounds the **subprocess**, and reaches
-      ``subprocess.run(timeout=...)`` in the backend. It is clamped to the
-      worker's own budget, which sits below the orchestrator's stop backstop.
+      ``subprocess.run(timeout=...)`` in the backend. It is clamped to
+      :data:`~akgentic.tool.workspace.execution.MAX_EXEC_BUDGET_S`, which sits
+      below the orchestrator's stop backstop.
     - ``poll_attempts`` × ``poll_delay_seconds`` bounds how long the **agent's
       own thread** waits inside the tool call. It cannot extend the first:
       raising it buys more looking, never more running.
@@ -492,9 +494,9 @@ class WorkspaceExec(BaseToolParam):
 
     - ``-1`` (the default) — **wait out the run.** Resolved at wiring time to
       the count whose wait is the longest still fitting the *effective run
-      budget* (``min(timeout_s, DEFAULT_WORKER_TIMEOUT_S)``) plus
+      budget* (``effective_budget(timeout_s)``) plus
       :data:`~akgentic.tool.workspace.execution.EXEC_REPORT_MARGIN_S`, so the
-      wait covers the worker's report and not merely the command. The common
+      wait covers the sandbox's report and not merely the command. The common
       case then returns the command's own output and the model never sees a run
       id.
     - a **positive count** — a bounded look of ``count × poll_delay_seconds``,
@@ -1588,11 +1590,11 @@ class WorkspaceTool(ToolCard):
         proxy = self._workspace_proxy
         agent_id = self._agent_id
         delay = params.poll_delay_seconds
-        # The effective run budget — the card's ask after the worker's ceiling —
+        # The effective run budget — the card's ask after MAX_EXEC_BUDGET_S —
         # is what actually stops the run, so it is what both the sentinel and the
         # clamp are measured against. A card asking for 999 s never gets more
-        # than the worker allows it either way.
-        run_budget = min(params.timeout_s, DEFAULT_WORKER_TIMEOUT_S)
+        # than the ceiling allows it either way.
+        run_budget = effective_budget(params.timeout_s)
         # Resolved once, here, so nothing downstream knows the sentinel existed.
         attempts = poll_attempts_within(params.poll_attempts, delay, run_budget)
         # Which budget was in force decides which exhaustion message is honest,

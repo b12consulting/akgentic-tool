@@ -26,17 +26,18 @@ from types import SimpleNamespace
 from typing import Any, ClassVar
 
 import pytest
+from pykka import ActorDeadError
+
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.actor_address_impl import ActorAddressImpl
 from akgentic.core.agent import Akgent, AkgentType
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.tool.core import ToolState
-from akgentic.tool.core.deferred import DeferredPayload
-from akgentic.tool.sandbox.actor import ExecResult, SandboxActor
+from akgentic.tool.sandbox.actor import ExecRequest, ExecResult, SandboxActor
 from akgentic.tool.sandbox.tool import SANDBOX_ACTOR_CLASSES
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
-from akgentic.tool.workspace.execution import DEFAULT_EXEC_TIMEOUT_S, ExecWorker
+from akgentic.tool.workspace.execution import DEFAULT_EXEC_TIMEOUT_S
 from akgentic.tool.workspace.journal import git_dir_for
 from akgentic.tool.workspace.models import MutationOutcome, Observation
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
@@ -182,13 +183,31 @@ class FakeOrchestratorProxy:
         self.create_calls: list[tuple[type[Akgent[Any, Any]], BaseConfig]] = []
         self.live = live
         self._refs: list[Any] = []
+        self.sandbox_sink: Any = None
+        """Where a :class:`SandboxAddress` hands the requests it is told.
+
+        Set by :class:`SandboxHarness` when it installs itself, and ``None``
+        otherwise — the wiring suites resolve sandbox actors without ever
+        sending them anything.
+        """
+        self.sandbox_born_dead = False
+        """Hand out sandbox addresses that are already dead.
+
+        The one way to reach "the sandbox is gone at the moment the request is
+        sent": flipping an *existing* address dead does not do it, because the
+        next resolve skips a dead child and creates a live replacement — which
+        is the production behaviour and the point of the skip.
+        """
 
     def getChildrenOrCreate(  # noqa: N802 — mirrors the orchestrator's method name
         self, actor_class: type[Akgent[Any, Any]], config: BaseConfig
     ) -> ActorAddress:
         self.create_calls.append((actor_class, config))
         existing = self.children.get(config.name)
-        if existing is not None:
+        # A child that is no longer alive is skipped and replaced, exactly as
+        # the real orchestrator does — which is what makes "the next admission
+        # recreates the sandbox" observable through ``create_calls``.
+        if existing is not None and existing[0].is_alive():
             return existing[0]
         if self.live:
             ref = actor_class.start(config=config)
@@ -198,7 +217,12 @@ class FakeOrchestratorProxy:
             return address
         actor = actor_class(config=config)
         actor.on_start()
-        address = MockActorAddress(config.name, config.role)
+        if issubclass(actor_class, SandboxActor):
+            sandbox_address = SandboxAddress(config.name, config.role, self)
+            sandbox_address.alive = not self.sandbox_born_dead
+            address = sandbox_address
+        else:
+            address = MockActorAddress(config.name, config.role)
         self.children[config.name] = (address, actor)
         return address
 
@@ -538,6 +562,12 @@ class SandboxScript:
         files: ``(relative path, content)`` written before the run returns —
             including nested paths, which is how the ``-uall`` property is
             exercised.
+        files_by_cmd: Per-command files, consulted before :attr:`files`. One
+            fake backend serves every run in a test, so without this two runs
+            write byte-identical trees and "run A's commit contains only run A's
+            files" cannot be asserted at all. A command absent from the map falls
+            back to :attr:`files`, so every existing test is unaffected — the
+            same shape as :attr:`stdout_by_cmd`.
         stdout, stderr, exit_code: What the run reports.
         stdout_by_cmd: Per-command stdout, consulted before :attr:`stdout`. One
             fake backend serves every run in a test, so without this two runs
@@ -547,16 +577,12 @@ class SandboxScript:
         raise_with: Raised instead of returning, for the failure path.
         timeouts: Every budget the backend was handed, in order.
         commands: Every ``(cmd, cwd)`` it was handed, in order.
-        ready_raise: Raised by ``ready()`` instead of answering it. A stand-in
-            for the ``pykka.Timeout`` a real ask proxy raises when the backend
-            has not finished starting: the harness hands the worker the actor
-            itself rather than a proxy, so the refusal has to come from inside.
-        ready_calls: How many times readiness was asked for.
     """
 
     started: threading.Event = field(default_factory=threading.Event)
     gate: threading.Event = field(default_factory=threading.Event)
     files: list[tuple[str, str]] = field(default_factory=list)
+    files_by_cmd: dict[str, list[tuple[str, str]]] = field(default_factory=dict)
     stdout: str = "ok"
     stderr: str = ""
     exit_code: int = 0
@@ -564,8 +590,6 @@ class SandboxScript:
     raise_with: BaseException | None = None
     timeouts: list[float | None] = field(default_factory=list)
     commands: list[tuple[str, str]] = field(default_factory=list)
-    ready_raise: BaseException | None = None
-    ready_calls: int = 0
 
 
 class FakeSandboxActor(SandboxActor):
@@ -590,13 +614,6 @@ class FakeSandboxActor(SandboxActor):
     def _stop_sandbox(self) -> None:
         pass
 
-    def ready(self) -> bool:
-        script = type(self).script
-        script.ready_calls += 1
-        if script.ready_raise is not None:
-            raise script.ready_raise
-        return super().ready()
-
     def _exec(self, cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
         script = type(self).script
         script.commands.append((cmd, cwd))
@@ -604,7 +621,7 @@ class FakeSandboxActor(SandboxActor):
         script.started.set()
         assert script.gate.wait(timeout=HANDSHAKE_TIMEOUT_S), "the run was never released"
         assert self.state.workspace_path is not None
-        for relative, body in script.files:
+        for relative, body in script.files_by_cmd.get(cmd, script.files):
             target = self.state.workspace_path / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(body, encoding="utf-8")
@@ -628,124 +645,141 @@ class DeadAddress(MockActorAddress):
         return False
 
 
-class WorkerAddress(MockActorAddress):
-    """A worker's address whose liveness follows the worker's own thread.
+class SandboxAddress(MockActorAddress):
+    """The address ``#Workspace`` resolves for a sandbox, and tells its requests to.
 
-    The lease records this address and ``#Workspace`` asks it whether the run
-    still has anybody to report it, so a stand-in that always claimed to be alive
-    would make the reclaim path untestable and one that always claimed to be dead
-    would make the refusal path untestable. Following the thread means a test
-    holding a run open has a genuinely live worker, and a test that has joined
-    the harness has a genuinely dead one.
+    Two things a stand-in has to get right, because the actor now decides on
+    both:
+
+    - ``is_alive()`` follows a flag a test flips. ``exec_status`` consults it to
+      notice a sandbox that died mid-run, so an address that always claimed to be
+      alive would make that path untestable and one that always claimed to be
+      dead would make every other path untestable.
+    - ``tell()`` **raises** ``ActorDeadError`` when the flag is down, exactly as
+      ``ActorAddressImpl.tell`` does. That is the whole reason ``_start_run``
+      sends through the address rather than a tell proxy, so a stand-in that
+      swallowed it would guard nothing.
+
+    A live tell hands the request to the harness, which runs the **real**
+    base-class handler against the fake backend on its own thread.
     """
 
-    def __init__(self, name: str, role: str) -> None:
+    def __init__(self, name: str, role: str, proxy: FakeOrchestratorProxy) -> None:
         super().__init__(name, role)
-        self.thread: threading.Thread | None = None
+        self.alive = True
+        self._proxy = proxy
 
     def is_alive(self) -> bool:
-        return self.thread is not None and self.thread.is_alive()
+        return self.alive
+
+    def tell(self, message: Any) -> None:
+        if not self.alive:
+            raise ActorDeadError(f"{self.name} not found")
+        sink = self._proxy.sandbox_sink
+        if sink is None:
+            raise RuntimeError(f"{self.name} was told {message!r} with no harness installed")
+        sink(self, message)
 
 
-class ExecHarness:
-    """Runs ``#Workspace``'s exec worker on a real thread, with no actor system.
+class WorkspaceAddress(MockActorAddress):
+    """``#Workspace``'s own address, as the sandbox sees it — the reply stand-in.
 
-    The actor itself stays inert — the tests call its methods directly, exactly
-    as the other workspace suites do — but the worker genuinely runs elsewhere,
-    which is the only way a lease can be observed *while it is held*. Follows the
-    ``createActor`` / ``proxy_tell`` patching in ``tests/test_core_deferred.py``
-    rather than starting a second actor system.
+    The actor under test is inert: the suite calls its methods directly, so its
+    real ``myAddress`` names an inbox nobody drains and a report told to it would
+    simply vanish (a never-started Pykka actor even reports ``is_alive()`` as
+    ``True``). So the harness rewrites ``reply_to`` to this, which calls the
+    handler directly — on the sandbox's thread, exactly where the worker's
+    ``deliver`` and ``fail`` used to land.
 
-    The base's ``request`` is untouched, so its in-flight de-duplication and its
-    spawn-failure path are the real ones.
+    Do not "fix" this by starting the workspace actor for real: the point of the
+    inert actor is that a test can read ``_running`` and ``_queue`` while a run
+    is held open.
+    """
+
+    def __init__(self, name: str, role: str, actor: WorkspaceActor) -> None:
+        super().__init__(name, role)
+        self._actor = actor
+
+    def tell(self, message: Any) -> None:
+        self._actor.receiveMsg_ExecReport(message)
+
+
+class SandboxHarness:
+    """Runs the sandbox's real tell handler on a real thread, with no actor system.
+
+    The workspace actor stays inert — the tests call its methods directly,
+    exactly as the other workspace suites do — but the command genuinely runs
+    elsewhere, which is the only way the tree's hold can be observed *while it is
+    held*.
+
+    Nothing about the actor's exec path is stubbed: it resolves the sandbox
+    through the fake orchestrator exactly as production resolves it through the
+    real one, and it sends the request with ``ActorAddress.tell``. What the
+    harness supplies is the two ends — an orchestrator to ask and an address to
+    reply to.
     """
 
     def __init__(self, actor: WorkspaceActor, orchestrator_proxy: FakeOrchestratorProxy) -> None:
         self.actor = actor
         self.orchestrator_proxy = orchestrator_proxy
         self.threads: list[threading.Thread] = []
-        self.worker_names: list[str] = []
-        self.addresses: list[WorkerAddress] = []
-        self.payloads: list[DeferredPayload] = []
-        self.spawn_error: BaseException | None = None
+        self.requests: list[ExecRequest] = []
+        """Every request the actor told a sandbox, in order — one per started run."""
         self.ask_timeouts: list[int | None] = []
-        """Every timeout the worker's asks carried, in order.
+        """Every timeout the actor's asks carried, in order.
 
-        A worker holds the lease, the tree and its parent's teardown for as long
-        as it blocks, so an ask it makes without a timeout is unbounded on all
-        three. Recorded here so that property is asserted rather than assumed.
+        The sandbox resolve is an ask on the team singleton's own thread, so an
+        untimed one parks every read, mutation and poll behind it. Recorded here
+        so that property is asserted rather than assumed.
         """
+        self.workspace_address = WorkspaceAddress("#Workspace", "ToolActor", actor)
         self._orchestrator = DeadAddress("orchestrator")
 
+    @property
+    def sandbox_addresses(self) -> list[SandboxAddress]:
+        """Every sandbox address handed out so far, in creation order."""
+        return [
+            address
+            for address, _actor in self.orchestrator_proxy.children.values()
+            if isinstance(address, SandboxAddress)
+        ]
+
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Point the actor's spawn path at this harness."""
-        monkeypatch.setattr(self.actor, "createActor", self._create_actor)
-        monkeypatch.setattr(self.actor, "proxy_tell", self._proxy_tell)
+        """Give the actor an orchestrator to resolve through, and a reply address."""
+        monkeypatch.setattr(self.actor, "_orchestrator", self._orchestrator)
+        monkeypatch.setattr(self.actor, "proxy_ask", self._proxy_ask)
+        monkeypatch.setattr(self.orchestrator_proxy, "sandbox_sink", self._deliver)
 
-    def _create_actor(
-        self,
-        actor_class: type[Akgent[Any, Any]],
-        agent_id: uuid.UUID | None = None,
-        config: BaseConfig | None = None,
-    ) -> ActorAddress:
-        if self.spawn_error is not None:
-            raise self.spawn_error
-        assert config is not None
-        assert issubclass(actor_class, ExecWorker)
-        self.worker_names.append(config.name)
-        address = WorkerAddress(config.name, config.role)
-        self.addresses.append(address)
-        return address
+    def _proxy_ask(
+        self, target: ActorAddress, actor_type: Any = None, timeout: int | None = None
+    ) -> Any:
+        self.ask_timeouts.append(timeout)
+        if target is self._orchestrator:
+            return self.orchestrator_proxy
+        return self.orchestrator_proxy.actor_for(target)
 
-    def _proxy_tell(self, address: ActorAddress, actor_type: Any = None) -> Any:
-        return _WorkerLauncher(self)
-
-    def _run_worker(self, payload: DeferredPayload) -> None:
-        """Build a worker, wire its two proxies to this harness, and let it produce."""
-        worker = ExecWorker()
-        worker.config = BaseConfig(name=self.worker_names[-1], role="ToolActor")
-        worker._parent = DeadAddress("#Workspace")
-        worker._orchestrator = self._orchestrator
-        worker.on_start()
-
-        def proxy_ask(
-            target: ActorAddress, actor_type: Any = None, timeout: int | None = None
-        ) -> Any:
-            self.ask_timeouts.append(timeout)
-            if target is self._orchestrator:
-                return self.orchestrator_proxy
-            return self.orchestrator_proxy.actor_for(target)
-
-        def proxy_tell(target: ActorAddress, actor_type: Any = None) -> Any:
-            return self.actor  # deliver() / fail() land on the real actor
-
-        worker.proxy_ask = proxy_ask  # type: ignore[method-assign]
-        worker.proxy_tell = proxy_tell  # type: ignore[method-assign]
-        worker.stop = lambda *args, **kwargs: None  # type: ignore[method-assign,assignment]
-        worker.receiveMsg_DeferredPayload(payload)
+    def _deliver(self, address: SandboxAddress, request: ExecRequest) -> None:
+        """Run the real ``receiveMsg_ExecRequest`` for *request*, off this thread."""
+        self.requests.append(request)
+        sandbox = self.orchestrator_proxy.actor_for(address)
+        assert isinstance(sandbox, SandboxActor)
+        # The actor's own ``myAddress`` names an inbox nobody drains, so the
+        # reply is redirected here. model_copy(update=...) rather than a
+        # rebuild: a field added to ExecRequest later must survive the rewrite
+        # (Golden Rule #12).
+        routed = request.model_copy(update={"reply_to": self.workspace_address})
+        thread = threading.Thread(
+            target=sandbox.receiveMsg_ExecRequest, args=(routed,), daemon=True
+        )
+        self.threads.append(thread)
+        thread.start()
 
     def join(self) -> None:
-        """Wait for every spawned worker, bounded — a hang is a failure, not a wait."""
+        """Wait for every started run, bounded — a hang is a failure, not a wait."""
         for thread in self.threads:
             thread.join(timeout=HANDSHAKE_TIMEOUT_S)
-            assert not thread.is_alive(), "an exec worker never finished"
+            assert not thread.is_alive(), "a sandbox run never finished"
         self.threads.clear()
-
-
-class _WorkerLauncher:
-    """The tell proxy ``request`` hands its payload to — starts the worker's thread."""
-
-    def __init__(self, harness: ExecHarness) -> None:
-        self.harness = harness
-
-    def receiveMsg_DeferredPayload(self, payload: DeferredPayload) -> None:  # noqa: N802
-        self.harness.payloads.append(payload)
-        thread = threading.Thread(target=self.harness._run_worker, args=(payload,), daemon=True)
-        self.harness.threads.append(thread)
-        # Attached before the thread starts, and before ``request`` returns: the
-        # lease reads this address the moment the spawn call comes back.
-        self.harness.addresses[-1].thread = thread
-        thread.start()
 
 
 @pytest.fixture
