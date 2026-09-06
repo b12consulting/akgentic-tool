@@ -14,7 +14,7 @@ from akgentic.core.agent_config import BaseConfig
 from akgentic.core.orchestrator import Orchestrator
 
 from akgentic.tool.core import TOOL_CALL
-from akgentic.tool.errors import RetriableError
+from akgentic.tool.errors import RetriableError, RoleNotHireableError
 from akgentic.tool.team.observer import TeamManagementToolObserver
 from akgentic.tool.team import (
     FireTeamMember,
@@ -119,6 +119,7 @@ def test_hire_members_tool_execution():
     agent_card = Mock(spec=AgentCard)
     agent_card.role = "Developer"
     agent_card.agent_class = Mock  # Dynamic agent class (type)
+    agent_card.can_be_hired = True  # the hire guard reads this (Story 30.1)
 
     config_mock = Mock(spec=BaseConfig)
     agent_card.get_config_copy.return_value = config_mock
@@ -191,6 +192,7 @@ def test_hire_members_string_agent_class():
     # Mock AgentCard with get_agent_class returning a string
     agent_card = Mock(spec=AgentCard)
     agent_card.role = "Developer"
+    agent_card.can_be_hired = True  # the hire guard reads this (Story 30.1)
     agent_card.get_agent_class.return_value = "some.module.Agent"  # String instead of type
 
     orchestrator_mock = Mock(spec=Orchestrator)
@@ -342,16 +344,21 @@ def test_team_members_empty():
 
 
 def test_team_roles():
-    """team_roles returns role descriptions + skills from agent catalog."""
-    card1 = Mock(spec=AgentCard)
-    card1.role = "Developer"
-    card1.description = "Writes code"
-    card1.skills = ["python", "testing"]
-
-    card2 = Mock(spec=AgentCard)
-    card2.role = "Tester"
-    card2.description = "Tests code"
-    card2.skills = ["selenium", "pytest"]
+    """team_roles lists every role with its skills and its hireability marker."""
+    card1 = AgentCard(
+        agent_class=Mock,
+        description="Writes code",
+        skills=["python", "testing"],
+        config=BaseConfig(name="Developer", role="Developer"),
+        can_be_hired=True,
+    )
+    card2 = AgentCard(
+        agent_class=Mock,
+        description="Tests code",
+        skills=["selenium", "pytest"],
+        config=BaseConfig(name="Tester", role="Tester"),
+        can_be_hired=False,
+    )
 
     orchestrator_mock = Mock(spec=Orchestrator)
     orchestrator_mock.get_agent_catalog.return_value = [card1, card2]
@@ -366,9 +373,9 @@ def test_team_roles():
 
     result = profiles_command()
 
-    assert "Here is the available team role list (for hiring):" in result
-    assert "Developer: Writes code (Skills: python, testing)" in result
-    assert "Tester: Tests code (Skills: selenium, pytest)" in result
+    assert "Here is the team role list:" in result
+    assert "Developer: Writes code (Skills: python, testing) [hireable]" in result
+    assert "Tester: Tests code (Skills: selenium, pytest) [not hireable]" in result
 
 
 def test_team_roles_empty():
@@ -443,6 +450,7 @@ def test_hire_members_batch_partial_success():
     agent_card = Mock(spec=AgentCard)
     agent_card.role = "Developer"
     agent_card.agent_class = Mock
+    agent_card.can_be_hired = True  # the hire guard reads this (Story 30.1)
     agent_card.get_config_copy.return_value = Mock(spec=BaseConfig)
 
     orchestrator_mock = Mock(spec=Orchestrator)
@@ -596,6 +604,7 @@ def test_hire_member_command_execution():
     agent_card = Mock(spec=AgentCard)
     agent_card.role = "Developer"
     agent_card.agent_class = Mock
+    agent_card.can_be_hired = True  # the hire guard reads this (Story 30.1)
 
     config_mock = Mock(spec=BaseConfig)
     agent_card.get_config_copy.return_value = config_mock
@@ -629,6 +638,7 @@ def test_hire_member_command_with_name():
     agent_card = Mock(spec=AgentCard)
     agent_card.role = "Developer"
     agent_card.agent_class = Mock
+    agent_card.can_be_hired = True  # the hire guard reads this (Story 30.1)
 
     config_mock = Mock(spec=BaseConfig)
     agent_card.get_config_copy.return_value = config_mock
@@ -726,3 +736,345 @@ def test_fire_member_command_not_found():
 
     with pytest.raises(RetriableError, match="Fire error"):
         fire_member("@Developer123")
+
+
+# --- Hire guard: can_be_hired (Story 30.1) --------------------------------------------
+#
+# These specs build REAL AgentCard instances rather than Mock(spec=AgentCard): the guard
+# reads can_be_hired, and a mock's attribute policy — not the model's semantics — would
+# decide whether the guard fires at all.
+
+
+def hireable_card(role: str, *, can_be_hired: bool) -> AgentCard:
+    """Build a real AgentCard for the hire-guard specs."""
+    return AgentCard(
+        agent_class=Mock,
+        description=f"{role} profile",
+        config=BaseConfig(name=role, role=role),
+        can_be_hired=can_be_hired,
+    )
+
+
+def hire_guard_observer(catalog: list[AgentCard]) -> Mock:
+    """Observer whose orchestrator serves *catalog* and an empty team."""
+    orchestrator_mock = Mock(spec=Orchestrator)
+    orchestrator_mock.get_available_roles.return_value = [card.role for card in catalog]
+    orchestrator_mock.get_agent_catalog.return_value = catalog
+    orchestrator_mock.get_team.return_value = []
+
+    observer_mock = Mock(spec=TeamManagementToolObserver)
+    observer_mock.orchestrator = create_test_address("@Orchestrator", "Orchestrator")
+    observer_mock.myAddress = create_test_address("@Manager", "Manager")
+    observer_mock.proxy_ask.return_value = orchestrator_mock
+    observer_mock.createActor.return_value = create_test_address("@Developer123", "Developer")
+    return observer_mock
+
+
+def test_hire_members_refuses_non_hireable_role():
+    """A card with can_be_hired=False is refused before any actor is created (AC #1, #2)."""
+    catalog = [
+        hireable_card("Developer", can_be_hired=True),
+        hireable_card("Manager", can_be_hired=False),
+    ]
+    observer_mock = hire_guard_observer(catalog)
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_members = tool.get_tools()[0]
+
+    with pytest.raises(RoleNotHireableError) as exc_info:
+        hire_members(["Manager"])
+
+    message = str(exc_info.value)
+    assert "Manager" in message
+    assert "Developer" in message  # the hireable roles are advertised
+    observer_mock.createActor.assert_not_called()
+    observer_mock.on_hire.assert_not_called()
+    # No orchestrator round trip: get_available_roles() is the unfiltered key list
+    # and no longer reaches ANY hire message. See the invariant spec below, which
+    # covers the miss branch this one cannot reach.
+    observer_mock.proxy_ask.return_value.get_available_roles.assert_not_called()
+
+
+def test_hire_members_refusal_lists_only_hireable_roles():
+    """The refusal advertises the hireable roles, not the whole roster (AC #2)."""
+    catalog = [
+        hireable_card("Developer", can_be_hired=True),
+        hireable_card("Manager", can_be_hired=False),
+        hireable_card("Reviewer", can_be_hired=False),
+    ]
+    observer_mock = hire_guard_observer(catalog)
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_members = tool.get_tools()[0]
+
+    with pytest.raises(RoleNotHireableError) as exc_info:
+        hire_members(["Manager"])
+
+    message = str(exc_info.value)
+    assert "['Developer']" in message
+    assert "Reviewer" not in message
+
+
+def test_hire_members_refusal_and_miss_read_differently():
+    """A refusal is not described as a missing agent card (AC #3)."""
+    catalog = [
+        hireable_card("Developer", can_be_hired=True),
+        hireable_card("Manager", can_be_hired=False),
+    ]
+    tool = TeamTool()
+    tool.observer(hire_guard_observer(catalog))
+    hire_members = tool.get_tools()[0]
+
+    with pytest.raises(RoleNotHireableError) as refused:
+        hire_members(["Manager"])
+    with pytest.raises(RetriableError) as missed:
+        hire_members(["Nonexistent"])
+
+    assert "cannot find agent card" not in str(refused.value)
+    assert "cannot find agent card" in str(missed.value)
+    assert not isinstance(missed.value, RoleNotHireableError)
+
+
+# --- The miss message advertises the hireable roles (Story 30.2, AC #10) ----------------
+#
+# Five older specs assert only the sentence stem of this message, so they stay green
+# whichever list it carries. These three are what pin the list, the label, and the
+# absence of the orchestrator round trip.
+
+
+def test_hire_members_miss_lists_only_hireable_roles():
+    """A missing card advertises the hireable roles, never the unfiltered roster."""
+    catalog = [
+        hireable_card("Developer", can_be_hired=True),
+        hireable_card("Manager", can_be_hired=False),
+    ]
+    observer_mock = hire_guard_observer(catalog)
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_members = tool.get_tools()[0]
+
+    with pytest.raises(RetriableError) as exc_info:
+        hire_members(["Nonexistent"])
+
+    message = str(exc_info.value)
+    assert "cannot find agent card(s) for role 'Nonexistent'" in message
+    assert "Hireable roles: ['Developer']" in message
+    assert "Available roles:" not in message
+    assert "Manager" not in message  # exists in the catalog, but cannot be hired
+
+
+def test_hire_member_command_miss_lists_only_hireable_roles():
+    """The command path's miss message narrows identically — it is the other entry point."""
+    catalog = [
+        hireable_card("Developer", can_be_hired=True),
+        hireable_card("Manager", can_be_hired=False),
+    ]
+    observer_mock = hire_guard_observer(catalog)
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_member = tool.get_commands()[HireTeamMember]
+
+    with pytest.raises(RetriableError) as exc_info:
+        hire_member("Nonexistent")
+
+    message = str(exc_info.value)
+    assert "cannot find agent card for role 'Nonexistent'" in message
+    assert "Hireable roles: ['Developer']" in message
+    assert "Available roles:" not in message
+    assert "Manager" not in message
+
+
+def test_hire_path_never_calls_get_available_roles():
+    """The invariant behind both messages: no hire failure round-trips the orchestrator."""
+    catalog = [
+        hireable_card("Developer", can_be_hired=True),
+        hireable_card("Manager", can_be_hired=False),
+    ]
+    observer_mock = hire_guard_observer(catalog)
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_members = tool.get_tools()[0]
+    hire_member = tool.get_commands()[HireTeamMember]
+
+    with pytest.raises(RetriableError):
+        hire_members(["Nonexistent", "Manager"])  # a miss and a refusal in one batch
+    with pytest.raises(RetriableError):
+        hire_member("Nonexistent")
+    with pytest.raises(RoleNotHireableError):
+        hire_member("Manager")
+
+    observer_mock.proxy_ask.return_value.get_available_roles.assert_not_called()
+
+
+def test_role_not_hireable_error_is_retriable():
+    """The refusal stays inside the RetriableError hierarchy ToolFactory wraps (AC #3)."""
+    assert issubclass(RoleNotHireableError, RetriableError)
+
+
+def test_hire_member_command_refuses_non_hireable_role():
+    """The command call path refuses identically — it is the second entry point (AC #5)."""
+    catalog = [
+        hireable_card("Developer", can_be_hired=True),
+        hireable_card("Manager", can_be_hired=False),
+    ]
+    observer_mock = hire_guard_observer(catalog)
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_member = tool.get_commands()[HireTeamMember]
+
+    with pytest.raises(RoleNotHireableError) as exc_info:
+        hire_member("Manager")
+
+    message = str(exc_info.value)
+    assert "Manager" in message
+    assert "['Developer']" in message
+    observer_mock.createActor.assert_not_called()
+    observer_mock.on_hire.assert_not_called()
+
+
+def test_hire_members_still_hires_a_hireable_role():
+    """can_be_hired=True hires exactly as before (AC #4)."""
+    observer_mock = hire_guard_observer([hireable_card("Developer", can_be_hired=True)])
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_members = tool.get_tools()[0]
+
+    result = hire_members(["Developer"])
+
+    assert "Members hired:" in result
+    assert "@Developer123" in result
+    observer_mock.createActor.assert_called_once()
+    observer_mock.on_hire.assert_called_once()
+
+
+def test_hire_member_command_still_hires_a_hireable_role():
+    """The command path still hires a hireable role, name and hooks unchanged (AC #4)."""
+    observer_mock = hire_guard_observer([hireable_card("Developer", can_be_hired=True)])
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_member = tool.get_commands()[HireTeamMember]
+
+    result = hire_member("Developer", "@MyDev")
+
+    assert result.name == "@Developer123"  # the observer's stubbed address
+    config = observer_mock.createActor.call_args.kwargs["config"]
+    assert config.name == "@MyDev"
+    assert config.role == "Developer"
+    observer_mock.on_hire.assert_called_once()
+
+
+def test_hire_members_partial_success_reports_a_refusal_as_a_refusal():
+    """One hired, one refused: partial success, and the refusal is not a missing card (AC #6)."""
+    catalog = [
+        hireable_card("Developer", can_be_hired=True),
+        hireable_card("Manager", can_be_hired=False),
+    ]
+    observer_mock = hire_guard_observer(catalog)
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_members = tool.get_tools()[0]
+
+    # Every failure here is a refusal, so the aggregate keeps the typed error even
+    # though one role was hired.
+    with pytest.raises(RoleNotHireableError) as exc_info:
+        hire_members(["Developer", "Manager"])
+
+    message = str(exc_info.value)
+    assert "Partial success - Members hired: ['@Developer123']" in message
+    assert "Manager" in message
+    assert "cannot find agent card" not in message
+    assert observer_mock.createActor.call_count == 1
+
+
+def test_hire_members_reports_missing_and_refused_separately():
+    """A miss and a refusal in one call are reported in their own terms (AC #7)."""
+    catalog = [
+        hireable_card("Developer", can_be_hired=True),
+        hireable_card("Manager", can_be_hired=False),
+    ]
+    tool = TeamTool()
+    tool.observer(hire_guard_observer(catalog))
+    hire_members = tool.get_tools()[0]
+
+    with pytest.raises(RetriableError) as exc_info:
+        hire_members(["Nonexistent", "Manager"])
+
+    message = str(exc_info.value)
+    assert "cannot find agent card(s) for role 'Nonexistent'" in message
+    assert "cannot find agent card(s) for role 'Manager'" not in message
+    assert "role 'Manager' cannot be hired" in message
+    # A mixed batch is NOT a pure refusal: flattening it to RoleNotHireableError would
+    # tell a caller every failure was a policy refusal when one was a genuine miss.
+    assert not isinstance(exc_info.value, RoleNotHireableError)
+
+
+def test_hire_members_bumps_the_suffix_when_the_generated_name_is_taken(monkeypatch):
+    """The auto-name uniqueness bump still runs on the success path (AC #4)."""
+    monkeypatch.setattr("akgentic.tool.team.team.random.randint", lambda _low, _high: 500)
+    observer_mock = hire_guard_observer([hireable_card("Developer", can_be_hired=True)])
+    observer_mock.proxy_ask.return_value.get_team.return_value = [
+        create_test_address("@Developer500", "Developer")
+    ]
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_members = tool.get_tools()[0]
+
+    hire_members(["Developer"])
+
+    config = observer_mock.createActor.call_args.kwargs["config"]
+    assert config.name == "@Developer501"
+
+
+def test_hire_member_command_rejects_a_non_string_name():
+    """Explicit-name validation is unchanged: a non-string name is refused (AC #4)."""
+    observer_mock = hire_guard_observer([hireable_card("Developer", can_be_hired=True)])
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_member = tool.get_commands()[HireTeamMember]
+
+    with pytest.raises(RetriableError, match="member name must be a string"):
+        hire_member("Developer", 42)
+
+    observer_mock.createActor.assert_not_called()
+
+
+def test_hire_member_command_rejects_an_empty_name():
+    """Explicit-name validation is unchanged: a blank name is refused (AC #4)."""
+    observer_mock = hire_guard_observer([hireable_card("Developer", can_be_hired=True)])
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_member = tool.get_commands()[HireTeamMember]
+
+    with pytest.raises(RetriableError, match="member name cannot be empty"):
+        hire_member("Developer", "   ")
+
+    observer_mock.createActor.assert_not_called()
+
+
+def test_hire_member_command_rejects_an_already_taken_name():
+    """Explicit-name validation is unchanged: a taken name is refused (AC #4)."""
+    observer_mock = hire_guard_observer([hireable_card("Developer", can_be_hired=True)])
+    observer_mock.proxy_ask.return_value.get_team.return_value = [
+        create_test_address("@Taken", "Developer")
+    ]
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_member = tool.get_commands()[HireTeamMember]
+
+    with pytest.raises(RetriableError, match="already exists"):
+        hire_member("Developer", "@Taken")
+
+    observer_mock.createActor.assert_not_called()

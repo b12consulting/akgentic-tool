@@ -20,7 +20,7 @@ authors = [
 keywords = ["agents", "ai", "akgentic"]
 
 dependencies = [
-    "akgentic-core>=1.5.11",
+    "akgentic-core>=1.5.13",
     "pydantic>=2.0.0",
     # slim, not the metapackage: `pydantic-ai` pins `pydantic-ai-slim[web]`, whose
     # starlette>=1.3.1 collides with akgentic-infra's deliberate starlette<1.1.

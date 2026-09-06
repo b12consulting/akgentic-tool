@@ -53,6 +53,7 @@ _EXPECTED_ROOT_ALL: list[str] = [
     "TOOL_CALL",
     "Channels",
     "RetriableError",
+    "RoleNotHireableError",  # epic 30: the hire refusal joins the stable error surface
     "CommandNotRecognized",
     "ToolObserverGone",
     "ToolObserver",

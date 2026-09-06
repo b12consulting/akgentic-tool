@@ -1209,8 +1209,9 @@ response, and how `crawl_instructions` differs from the inherited `instructions`
 ### TeamTool
 
 Exposes team management capabilities (hire/fire agents, roster, role profiles) to the LLM, and
-answers *who is working right now, and on what*. The roster and the hireable-role catalog are
-exposed as structured context state on `LLM_CONTEXT`, delivered into the context tail as deltas.
+answers *who is working right now, and on what*. The roster and the role catalog — every role,
+each marked hireable or not — are exposed as structured context state on `LLM_CONTEXT`, delivered
+into the context tail as deltas.
 Used by `BaseAgent` in `akgentic-agent` to let orchestrator-level agents extend the team at
 runtime. Requires a `TeamManagementToolObserver`.
 

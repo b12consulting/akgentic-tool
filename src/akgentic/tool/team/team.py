@@ -28,7 +28,7 @@ from akgentic.tool.core import (
     normalize_system_prompt_to_llm_context,
 )
 from akgentic.tool.core.observer import ToolObserver
-from akgentic.tool.errors import RetriableError
+from akgentic.tool.errors import RetriableError, RoleNotHireableError
 from akgentic.tool.team.activity import (
     TEAM_ACTIVITY_ACTOR_NAME,
     TEAM_ACTIVITY_ACTOR_ROLE,
@@ -75,13 +75,71 @@ class GetTeamRoster(BaseToolParam):
 
 
 class GetRoleProfiles(BaseToolParam):
-    """Get available role profiles as structured context state."""
+    """Get every role profile, marked hireable or not, as structured context state."""
 
     expose: set[Channels] = {LLM_CONTEXT, COMMAND}
 
     _normalize_expose = field_validator("expose", mode="after")(
         normalize_system_prompt_to_llm_context
     )
+
+
+def _hireable_roles(agent_catalog: list[AgentCard]) -> list[str]:
+    """The roles the catalog permits hiring, sorted.
+
+    This is the only list any hire failure advertises, miss or refusal. It is
+    derived from the catalog the caller already holds rather than from
+    ``Orchestrator.get_available_roles()``, which returns the unfiltered key list
+    and would therefore advertise roles a hire is bound to decline.
+
+    Args:
+        agent_catalog: The agent cards to filter.
+
+    Returns:
+        Sorted role names whose card carries ``can_be_hired``.
+    """
+    return sorted(card.role for card in agent_catalog if card.can_be_hired)
+
+
+def _compose_hire_error(
+    hired_members: list[str],
+    missing_roles: list[str],
+    refused_roles: list[str],
+    hireable_roles: list[str],
+) -> str:
+    """Compose the aggregate ``hire_members`` failure message.
+
+    A missing card and a refused role are two different failures and each gets
+    its own sentence: telling the model a live colleague's card "cannot be found"
+    would send it hunting for a role that is right there in the catalog.
+
+    Both sentences advertise the same list. Every hire failure can prompt only
+    one action — another hire — so a list the model may not hire from would
+    invite a refused retry, and the two failures would disagree about what it may
+    do next. The roles it cannot hire are in its prompt, marked.
+
+    Args:
+        hired_members: Names hired before the failures, if any.
+        missing_roles: Roles with no card in the catalog.
+        refused_roles: Roles whose card forbids hiring.
+        hireable_roles: The hireable roles, for both sentences.
+
+    Returns:
+        The full message, with the partial-success prefix when anything was hired.
+    """
+    parts: list[str] = []
+    if hired_members:
+        parts.append(f"Partial success - Members hired: {hired_members}.")
+    if missing_roles:
+        details = "; ".join([f"role '{role}'" for role in missing_roles])
+        parts.append(
+            f"Hire errors - cannot find agent card(s) for {details}. "
+            f"Hireable roles: {hireable_roles}"
+        )
+    if refused_roles:
+        details = "; ".join([f"role '{role}'" for role in refused_roles])
+        parts.append(f"Hire errors - {details} cannot be hired. Hireable roles: {hireable_roles}")
+    return " ".join(parts)
 
 
 def _hire_single_member(
@@ -106,17 +164,29 @@ def _hire_single_member(
         ActorAddress: Address of the newly hired child actor.
 
     Raises:
-        RetriableError: If no agent card found for the role.
+        RetriableError: If no agent card found for the role, or the requested
+            name is not a non-empty unused string.
+        RoleNotHireableError: If the card exists but its ``can_be_hired`` is
+            ``False`` — the team does not permit hiring that role.
         ValueError: If agent class is a string (configuration error).
     """
     if agent_catalog is None:
         agent_catalog = orchestrator_proxy.get_agent_catalog()
     agent_card = next((card for card in agent_catalog if card.role == role), None)
     if agent_card is None:
-        available_roles = orchestrator_proxy.get_available_roles()
         raise RetriableError(
             f"Hire error - cannot find agent card for role '{role}'. "
-            f"Available roles: {available_roles}"
+            f"Hireable roles: {_hireable_roles(agent_catalog)}"
+        )
+
+    # The single hire guard. Both call paths funnel through here, so one check
+    # covers them both — and it sits above createActor, so a refused role costs
+    # no actor. The flag defaults to False, making the guard fail-closed: a card
+    # nobody marked hireable is refused.
+    if not agent_card.can_be_hired:
+        raise RoleNotHireableError(
+            f"Hire error - role '{role}' cannot be hired. "
+            f"Hireable roles: {_hireable_roles(agent_catalog)}"
         )
 
     actor_class = agent_card.get_agent_class()
@@ -211,7 +281,11 @@ def _build_roster_state(orchestrator_proxy: Orchestrator, self_name: str) -> Tea
 
 
 def _build_role_catalog_state(orchestrator_proxy: Orchestrator) -> RoleCatalogState:
-    """Snapshot the hireable-role catalog (ADR-037 §5).
+    """Snapshot the whole role catalog, each row carrying its hireability (ADR-037 §5).
+
+    ``can_be_hired`` is read straight off the card. A defaulted ``getattr`` shim
+    would render an entire team non-hireable against a core older than the
+    declared floor instead of failing where the mismatch is.
 
     Args:
         orchestrator_proxy: Proxy to the orchestrator actor.
@@ -220,7 +294,12 @@ def _build_role_catalog_state(orchestrator_proxy: Orchestrator) -> RoleCatalogSt
         The catalog state; empty ``roles`` when the catalog is empty.
     """
     roles = [
-        RoleRow(role=card.role, description=card.description, skills=list(card.skills))
+        RoleRow(
+            role=card.role,
+            description=card.description,
+            skills=list(card.skills),
+            can_be_hired=card.can_be_hired,
+        )
         for card in orchestrator_proxy.get_agent_catalog()
     ]
     return RoleCatalogState(roles=roles)
@@ -234,7 +313,8 @@ class TeamTool(ToolCard):
     - fire_members(names: list[str]) -> str: Fire team members
     - team_activity() -> TeamActivityReport: Who is mid-handler (on by default, no summarizer)
     - Team roster context state: Current team composition, delivered as deltas
-    - Role catalog context state: Available roles and descriptions, delivered as deltas
+    - Role catalog context state: Every role and description, each marked hireable
+      or not, delivered as deltas
     """
 
     hire_team_members: HireTeamMember | bool = Field(
@@ -418,13 +498,14 @@ class TeamTool(ToolCard):
             """Hire multiple new team members with the given roles.
 
             Creates new agent actors with specified roles. Names are auto-generated
-            as @<Role><RandomNumber>. Validates roles against available roles.
+            as @<Role><RandomNumber>. Only roles the team marks hireable can be
+            hired; the role list states which those are.
 
             Note: Should only be used when explicitly requested by user to prevent
             unnecessary agent proliferation. Do not contact him just to greet.
 
             Args:
-                roles: List of roles to hire (each must be in available_roles)
+                roles: List of roles to hire (each must be marked hireable)
 
             Returns:
                 Confirmation message with hired member names
@@ -436,8 +517,9 @@ class TeamTool(ToolCard):
             if not roles:
                 raise RetriableError("No roles provided. Specify at least one role to hire.")
 
-            hired_members = []
-            errors = []
+            hired_members: list[str] = []
+            missing_roles: list[str] = []
+            refused_roles: list[str] = []
             existing_names = {member.name for member in orchestrator_proxy.get_team()}
             agent_catalog = orchestrator_proxy.get_agent_catalog()
 
@@ -453,21 +535,26 @@ class TeamTool(ToolCard):
                     )
                     existing_names.add(child_address.name)
                     hired_members.append(child_address.name)
+                # The subclass clause must precede the base one, or it is unreachable.
+                except RoleNotHireableError:
+                    refused_roles.append(role)
+                # A miss-only bucket on this path: it always passes name=None, so
+                # the explicit-name validations _hire_single_member documents cannot
+                # fire here and the miss is the only RetriableError left.
                 except RetriableError:
-                    errors.append(role)
+                    missing_roles.append(role)
 
-            if errors:
-                available_roles = orchestrator_proxy.get_available_roles()
-                error_details = "; ".join([f"role '{e}'" for e in errors])
-                error_message = f"Hire errors - cannot find agent card(s) for {error_details}. "
-                error_message += f"Available roles: {available_roles}"
-                if hired_members:
-                    error_message = (
-                        f"Partial success - Members hired: {hired_members}. " + error_message
-                    )
-                raise RetriableError(error_message)
+            if not missing_roles and not refused_roles:
+                return f"Members hired: {hired_members}"
 
-            return f"Members hired: {hired_members}"
+            message = _compose_hire_error(
+                hired_members, missing_roles, refused_roles, _hireable_roles(agent_catalog)
+            )
+            # Only refusals: keep the typed error, so a caller can still tell the
+            # two failures apart on this path without parsing the message.
+            if refused_roles and not missing_roles:
+                raise RoleNotHireableError(message)
+            raise RetriableError(message)
 
         hire_members.__doc__ = params.format_docstring(hire_members.__doc__)
         return hire_members
@@ -491,7 +578,7 @@ class TeamTool(ToolCard):
             provided, one is auto-generated as @<Role><RandomNumber>.
 
             Args:
-                role: Role to hire (must be in available_roles)
+                role: Role to hire (must be marked hireable)
                 name: Optional specific name for the member
 
             Returns:
@@ -691,10 +778,11 @@ class TeamTool(ToolCard):
         orchestrator_proxy = self._orchestrator_proxy
 
         def team_roles() -> str:
-            """Get available team roles and their descriptions.
+            """Get every team role, its description, and whether it can be hired.
 
-            Returns formatted list of roles with descriptions and skills from the
-            agent catalog.
+            Returns a formatted list of the roles in the agent catalog, each with
+            its description, its skills, and a ``[hireable]`` / ``[not hireable]``
+            marker. When no role is hireable, the list closes with a line saying so.
 
             Returns:
                 Formatted role profiles or empty string if no roles
