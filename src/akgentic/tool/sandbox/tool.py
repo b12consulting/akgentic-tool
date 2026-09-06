@@ -36,6 +36,7 @@ from akgentic.tool.sandbox.actor import (
     ALLOWED_COMMANDS,
     CardMode,
     CommandNotAllowedError,
+    CommandParseError,
     SandboxActor,
 )
 from akgentic.tool.sandbox.bwrap import BwrapSandboxActor
@@ -310,6 +311,11 @@ class ExecTool(ToolCard):
                 if settled is not None:
                     return format_status(settled)
                 return timed_out(run_id, run_budget)
+            except CommandParseError as e:
+                # No allowlist dump: the binary was never the problem, and
+                # appending 32 names to a quoting mistake sends the model
+                # looking for a command it already has.
+                return f"CommandParseError: {e}"
             except CommandNotAllowedError as e:
                 return f"CommandNotAllowedError: {e}. Allowed commands: {sorted(ALLOWED_COMMANDS)}"
             except Exception as e:

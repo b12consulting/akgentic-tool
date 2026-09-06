@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -157,7 +158,7 @@ class SeatbeltSandboxActor(SandboxActor):
             policy_path = policy_file.name
         try:
             result = subprocess.run(
-                ["sandbox-exec", "-f", policy_path] + cmd.split(),
+                ["sandbox-exec", "-f", policy_path] + shlex.split(cmd),
                 capture_output=True,
                 text=True,
                 timeout=DEFAULT_BACKEND_TIMEOUT_S if timeout is None else timeout,

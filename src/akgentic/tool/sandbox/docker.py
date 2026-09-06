@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.resources
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -150,7 +151,7 @@ class DockerSandboxActor(SandboxActor):
             "-w",
             effective_workdir,
             self.state.container_name,
-        ] + cmd.split()
+        ] + shlex.split(cmd)
         result = subprocess.run(
             docker_cmd,
             capture_output=True,

@@ -8,6 +8,7 @@ the execution backend by implementing _start_sandbox, _stop_sandbox, and _exec.
 from __future__ import annotations
 
 import logging
+import shlex
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Literal
@@ -202,6 +203,19 @@ class CommandNotAllowedError(Exception):
     """
 
 
+class CommandParseError(Exception):
+    """Raised when the command string cannot be tokenised at all.
+
+    A quoting mistake — an unbalanced ``"`` or ``'`` — not a binary outside the
+    allowlist. The distinction is deliberate and visible in the output: the tool
+    surface appends ``Allowed commands: [...]`` to a
+    :class:`CommandNotAllowedError`, which is the wrong answer to a quoting
+    mistake and sends the caller hunting for a binary it already has. Kept a
+    sibling of that class rather than a subclass, so an existing
+    ``except CommandNotAllowedError`` cannot swallow one.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Abstract actor
 # ---------------------------------------------------------------------------
@@ -268,9 +282,20 @@ class SandboxActor(Akgent[SandboxConfig, SandboxState], ABC):
     def exec(self, cmd: str, cwd: str = "", timeout: float | None = None) -> ExecResult:
         """Execute a command inside the sandbox after allowlist validation.
 
-        Only the first whitespace-delimited token (the binary name) is checked
-        against ALLOWED_COMMANDS. Argument-level filtering is out of scope, and
-        so is the allowlist as a security boundary — see the note above the set.
+        The string is tokenised the way a shell tokenises one — quotes group,
+        backslashes escape — and only the first token (the binary name) is
+        checked against ALLOWED_COMMANDS. Argument-level filtering is out of
+        scope, and so is the allowlist as a security boundary — see the note
+        above the set.
+
+        **No shell interprets the string.** Every backend hands the same
+        ``shlex.split(cmd)`` tokens straight to the binary, so ``&&``, ``|``,
+        ``>``, ``$VAR`` and globs arrive as literal arguments. Wrap anything
+        needing shell syntax in ``bash -c '…'``.
+
+        Tokenising here with the same function the backends use is what keeps
+        the validated binary and the executed one the same string: a check that
+        split on whitespace would validate ``"my`` and run something else.
 
         Args:
             cmd: Full command string to execute (e.g. "python main.py").
@@ -287,9 +312,17 @@ class SandboxActor(Akgent[SandboxConfig, SandboxState], ABC):
             ExecResult with stdout, stderr, and exit_code from the backend.
 
         Raises:
+            CommandParseError: If the command string cannot be tokenised —
+                an unbalanced quote. Raised before the backend is reached.
             CommandNotAllowedError: If the command binary is not in ALLOWED_COMMANDS.
         """
-        tokens = cmd.split()
+        try:
+            tokens = shlex.split(cmd)
+        except ValueError as exc:
+            raise CommandParseError(
+                f"Command could not be parsed ({exc}): {cmd!r}. "
+                "Balance the quotes, or wrap shell syntax in bash -c '...'."
+            ) from exc
         if not tokens:
             raise CommandNotAllowedError(
                 "Command string is empty — no binary to validate against the allowlist."

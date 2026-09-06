@@ -729,3 +729,24 @@ def test_ensure_image_build_failure_raises_runtime_error(
     message = str(exc_info.value)
     assert SANDBOX_IMAGE in message
     assert "AKGENTIC_SANDBOX_IMAGE" in message
+
+
+# ---------------------------------------------------------------------------
+# Story 46.1 — argument tokenisation (AC1)
+# ---------------------------------------------------------------------------
+
+
+@patch("akgentic.tool.sandbox.docker.subprocess.run")
+def test_exec_keeps_a_quoted_argument_whole_after_the_docker_prefix(
+    mock_run: MagicMock,
+) -> None:
+    """AC1: shlex tokens follow ``docker exec -w <workdir> <container>``, unchanged."""
+    actor = make_actor(team_id="team-1")
+    actor.state.container_name = "sandbox-team-1"
+    mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+
+    actor._exec('echo "hello world"', "src")
+
+    docker_cmd: list[str] = mock_run.call_args[0][0]
+    assert docker_cmd[:5] == ["docker", "exec", "-w", "/workspace/src", "sandbox-team-1"]
+    assert docker_cmd[5:] == ["echo", "hello world"]

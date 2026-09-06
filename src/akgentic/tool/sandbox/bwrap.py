@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -105,7 +106,7 @@ class BwrapSandboxActor(SandboxActor):
             "--die-with-parent",
             "--new-session",
             "--chdir", effective_cwd,
-        ] + cmd.split()
+        ] + shlex.split(cmd)
         result = subprocess.run(
             bwrap_cmd,
             capture_output=True,

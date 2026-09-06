@@ -1,7 +1,7 @@
 # The sandbox backend — and `ExecTool`, deprecated
 
-Sandboxed shell execution inside the team workspace: one `SandboxActor` per workspace tree, an
-allow-listed binary set, and four interchangeable isolation backends selected by a single `mode`.
+Sandboxed execution of one binary plus arguments inside the team workspace: one `SandboxActor` per
+workspace tree, an allow-listed binary set, and four isolation backends selected by a single `mode`.
 
 | | |
 |---|---|
@@ -157,7 +157,7 @@ workspace_exec(cmd: str, cwd: str = "") -> str        # the replacement — same
 
 | Argument | Meaning |
 |---|---|
-| `cmd` | Full command string. The **first token** must be in `ALLOWED_COMMANDS`. |
+| `cmd` | One binary plus arguments — tokenised POSIX-style so quoting groups, **first token** in `ALLOWED_COMMANDS`. `&&`, `\|\|`, `;`, `\|`, `>`, `$VAR` and `$(…)` are **not** interpreted; use `bash -c '…'` for shell syntax. |
 | `cwd` | Subdirectory relative to the workspace root. Empty ⇒ the root. |
 
 Both render a finished run through one formatter, so the two surfaces cannot drift:
@@ -193,11 +193,11 @@ git repository. The guarantee that a sandboxed run cannot reach the journal was 
 the repository lives at the sibling `<root>.git`, **outside the mount of every backend that
 constructs one**, so it is not there to be reached.
 
-**Only the first whitespace-delimited token is checked.** Argument-level filtering is explicitly
-out of scope, and `bash` and `sh` are on the list — so `bash -c "<anything>"` walks straight past
-it. The allowlist bounds *which interpreters start*, not what they subsequently do; treat it as a
-usability filter that keeps an obvious mistake from running, and as a way to tell an agent what the
-sandbox offers. **Nothing may rely on it for safety.**
+**Only the first shlex token is checked** — the same call each backend makes, so check and run
+agree. Argument-level filtering is explicitly out of scope, and `bash` and `sh` are on the list — so
+`bash -c "<anything>"` walks straight past it. The allowlist bounds *which interpreters start*, not
+what they subsequently do; treat it as a usability filter that keeps an obvious mistake from
+running, and as a way to tell an agent what the sandbox offers. **Nothing may rely on it for safety.**
 
 That is why the backend matters, and why one of the four is different: on `bwrap` / `seatbelt` /
 `docker` the mount is a real boundary and the journal sits outside it. On **`local` there is no
@@ -214,6 +214,10 @@ commands:
 Run 3f2ac91d failed: Command 'psql' is not in the allowed commands list.
  Allowed: ['bash', 'cat', 'cp', ...]
 ```
+
+A command string that cannot be tokenised at all — an unbalanced quote — comes back the same way,
+as a reported run failure, but carrying `CommandParseError`'s message and no allowlist: the binary
+was never the problem.
 
 A command its budget killed is an **outcome**, not a failure — "too slow" is the ordinary case for
 a shell, so it comes back collectible, with exit code 124 and a stderr saying so. Nothing
@@ -300,6 +304,9 @@ A backend is a `SandboxActor` subclass implementing three methods: `_start_sandb
 the allowlist check, and swallowing exceptions raised during teardown so a broken backend cannot
 leave a Pykka actor wedged.
 
+`_exec` receives the command **string**, so a new backend must tokenise it with `shlex.split(cmd)` —
+the same call `exec()` made to derive the binary it validated.
+
 ### Recipes
 
 Written on `WorkspaceTool`, which is where the card now lives. Every line has an `ExecTool`
@@ -321,7 +328,7 @@ WorkspaceTool()                                                 # exec withheld 
 from akgentic.tool import ExecTool, WorkspaceTool          # ExecTool: deprecated, still resolves
 from akgentic.tool.workspace import WorkspaceExec
 from akgentic.tool.sandbox import (
-    ALLOWED_COMMANDS, SANDBOX_ACTOR_NAME, CommandNotAllowedError, ExecResult,
+    ALLOWED_COMMANDS, SANDBOX_ACTOR_NAME, CommandNotAllowedError, CommandParseError, ExecResult,
     SandboxActor, SandboxConfig, SandboxState, sandbox_actor_name,
     LocalSandboxActor, BwrapSandboxActor, SeatbeltSandboxActor, DockerSandboxActor,
 )

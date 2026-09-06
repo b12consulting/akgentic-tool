@@ -42,6 +42,7 @@ from akgentic.tool.core import ToolState
 from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.sandbox.actor import (
     CommandNotAllowedError,
+    CommandParseError,
     SandboxActor,
     SandboxConfig,
     sandbox_actor_name,
@@ -426,6 +427,30 @@ def test_exec_command_catches_command_not_allowed_error() -> None:
 
     assert "CommandNotAllowedError" in result
     assert not result.startswith("Traceback")  # must not have raised
+
+
+def test_exec_command_catches_command_parse_error_without_the_allowlist() -> None:
+    """A quoting mistake comes back as its own message, with no allowlist appended.
+
+    Same defensive branch as its neighbour above — the live route reports it as a
+    run failure — but the *rendering* is the point: appending 32 binary names to
+    "you left a quote open" sends the model hunting for a command it already has.
+    """
+    observer = MockObserver(existing_actor=None)
+    tool = ExecTool(mode="local")
+    wire(tool, observer)
+
+    tool._workspace_proxy = RaisingWorkspaceProxy(  # type: ignore[assignment]
+        CommandParseError("Command could not be parsed (No closing quotation)")
+    )
+
+    tools = tool.get_tools()
+    result = tools[0](cmd='echo "unbalanced')
+
+    assert result.startswith("CommandParseError: ")  # its own branch, not the catch-all
+    assert "No closing quotation" in result
+    assert "Allowed commands" not in result
+    assert not result.startswith("Traceback")
 
 
 def test_exec_command_catches_subprocess_error() -> None:
