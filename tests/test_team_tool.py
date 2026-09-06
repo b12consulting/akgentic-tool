@@ -785,6 +785,9 @@ def test_hire_members_refuses_non_hireable_role():
     assert "Developer" in message  # the hireable roles are advertised
     observer_mock.createActor.assert_not_called()
     observer_mock.on_hire.assert_not_called()
+    # A pure refusal makes no orchestrator round trip: get_available_roles() is the
+    # unfiltered key list and must never reach a refusal message.
+    observer_mock.proxy_ask.return_value.get_available_roles.assert_not_called()
 
 
 def test_hire_members_refusal_lists_only_hireable_roles():
@@ -900,7 +903,9 @@ def test_hire_members_partial_success_reports_a_refusal_as_a_refusal():
     tool.observer(observer_mock)
     hire_members = tool.get_tools()[0]
 
-    with pytest.raises(RetriableError) as exc_info:
+    # Every failure here is a refusal, so the aggregate keeps the typed error even
+    # though one role was hired.
+    with pytest.raises(RoleNotHireableError) as exc_info:
         hire_members(["Developer", "Manager"])
 
     message = str(exc_info.value)
@@ -927,3 +932,69 @@ def test_hire_members_reports_missing_and_refused_separately():
     assert "cannot find agent card(s) for role 'Nonexistent'" in message
     assert "cannot find agent card(s) for role 'Manager'" not in message
     assert "role 'Manager' cannot be hired" in message
+    # A mixed batch is NOT a pure refusal: flattening it to RoleNotHireableError would
+    # tell a caller every failure was a policy refusal when one was a genuine miss.
+    assert not isinstance(exc_info.value, RoleNotHireableError)
+
+
+def test_hire_members_bumps_the_suffix_when_the_generated_name_is_taken(monkeypatch):
+    """The auto-name uniqueness bump still runs on the success path (AC #4)."""
+    monkeypatch.setattr("akgentic.tool.team.team.random.randint", lambda _low, _high: 500)
+    observer_mock = hire_guard_observer([hireable_card("Developer", can_be_hired=True)])
+    observer_mock.proxy_ask.return_value.get_team.return_value = [
+        create_test_address("@Developer500", "Developer")
+    ]
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_members = tool.get_tools()[0]
+
+    hire_members(["Developer"])
+
+    config = observer_mock.createActor.call_args.kwargs["config"]
+    assert config.name == "@Developer501"
+
+
+def test_hire_member_command_rejects_a_non_string_name():
+    """Explicit-name validation is unchanged: a non-string name is refused (AC #4)."""
+    observer_mock = hire_guard_observer([hireable_card("Developer", can_be_hired=True)])
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_member = tool.get_commands()[HireTeamMember]
+
+    with pytest.raises(RetriableError, match="member name must be a string"):
+        hire_member("Developer", 42)
+
+    observer_mock.createActor.assert_not_called()
+
+
+def test_hire_member_command_rejects_an_empty_name():
+    """Explicit-name validation is unchanged: a blank name is refused (AC #4)."""
+    observer_mock = hire_guard_observer([hireable_card("Developer", can_be_hired=True)])
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_member = tool.get_commands()[HireTeamMember]
+
+    with pytest.raises(RetriableError, match="member name cannot be empty"):
+        hire_member("Developer", "   ")
+
+    observer_mock.createActor.assert_not_called()
+
+
+def test_hire_member_command_rejects_an_already_taken_name():
+    """Explicit-name validation is unchanged: a taken name is refused (AC #4)."""
+    observer_mock = hire_guard_observer([hireable_card("Developer", can_be_hired=True)])
+    observer_mock.proxy_ask.return_value.get_team.return_value = [
+        create_test_address("@Taken", "Developer")
+    ]
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_member = tool.get_commands()[HireTeamMember]
+
+    with pytest.raises(RetriableError, match="already exists"):
+        hire_member("Developer", "@Taken")
+
+    observer_mock.createActor.assert_not_called()
