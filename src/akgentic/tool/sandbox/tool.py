@@ -286,15 +286,18 @@ class ExecTool(ToolCard):
         )
 
         def exec_command(cmd: str, cwd: str = "") -> str:
-            """Execute a sandboxed shell command in the team workspace.
+            """Execute a command in the team workspace, in a sandbox. No shell runs it.
 
             Args:
-                cmd: Full command string. The binary (first token) must be in the allow-list.
+                cmd: One binary plus its arguments. Tokenised POSIX-style, so
+                    quoting groups: `echo "hello world"` is two tokens. `&&`, `||`,
+                    `;`, `|`, `>`, `$VAR` and `$(...)` are NOT interpreted — for
+                    shell syntax run `bash -c '...'`. The binary (first token) must
+                    be in the allow-list.
                 cwd: Subdirectory relative to workspace root. Defaults to workspace root.
 
             Returns:
-                Combined stdout, stderr, and exit code summary as a string.
-                On disallowed command: error string listing allowed commands.
+                Combined stdout, stderr and exit code — or an error string.
             """
             if proxy is None:
                 return "SandboxError: RuntimeError: ExecTool was not wired to an orchestrator"

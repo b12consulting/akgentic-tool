@@ -395,7 +395,7 @@ def test_unbalanced_quote_raises_command_parse_error_and_never_reaches_exec() ->
     assert calls == []
     message = str(excinfo.value)
     assert 'echo "unbalanced' in message  # the command is quoted back
-    assert "quote" in message.lower()  # names the failure
+    assert "No closing quotation" in message  # the wrapped cause, not the boilerplate
     assert "bash -c" in message  # states the remedy
 
 
