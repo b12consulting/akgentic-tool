@@ -75,7 +75,7 @@ class GetTeamRoster(BaseToolParam):
 
 
 class GetRoleProfiles(BaseToolParam):
-    """Get available role profiles as structured context state."""
+    """Get every role profile, marked hireable or not, as structured context state."""
 
     expose: set[Channels] = {LLM_CONTEXT, COMMAND}
 
@@ -87,9 +87,10 @@ class GetRoleProfiles(BaseToolParam):
 def _hireable_roles(agent_catalog: list[AgentCard]) -> list[str]:
     """The roles the catalog permits hiring, sorted.
 
-    Derived from the catalog the caller already holds rather than from
+    This is the only list any hire failure advertises, miss or refusal. It is
+    derived from the catalog the caller already holds rather than from
     ``Orchestrator.get_available_roles()``, which returns the unfiltered key list
-    and would therefore advertise the very roles a refusal has just declined.
+    and would therefore advertise roles a hire is bound to decline.
 
     Args:
         agent_catalog: The agent cards to filter.
@@ -104,7 +105,6 @@ def _compose_hire_error(
     hired_members: list[str],
     missing_roles: list[str],
     refused_roles: list[str],
-    available_roles: list[str],
     hireable_roles: list[str],
 ) -> str:
     """Compose the aggregate ``hire_members`` failure message.
@@ -113,12 +113,16 @@ def _compose_hire_error(
     its own sentence: telling the model a live colleague's card "cannot be found"
     would send it hunting for a role that is right there in the catalog.
 
+    Both sentences advertise the same list. Every hire failure can prompt only
+    one action — another hire — so a list the model may not hire from would
+    invite a refused retry, and the two failures would disagree about what it may
+    do next. The roles it cannot hire are in its prompt, marked.
+
     Args:
         hired_members: Names hired before the failures, if any.
         missing_roles: Roles with no card in the catalog.
         refused_roles: Roles whose card forbids hiring.
-        available_roles: Every registered role, for the missing-role sentence.
-        hireable_roles: Only the hireable roles, for the refusal sentence.
+        hireable_roles: The hireable roles, for both sentences.
 
     Returns:
         The full message, with the partial-success prefix when anything was hired.
@@ -130,7 +134,7 @@ def _compose_hire_error(
         details = "; ".join([f"role '{role}'" for role in missing_roles])
         parts.append(
             f"Hire errors - cannot find agent card(s) for {details}. "
-            f"Available roles: {available_roles}"
+            f"Hireable roles: {hireable_roles}"
         )
     if refused_roles:
         details = "; ".join([f"role '{role}'" for role in refused_roles])
@@ -170,10 +174,9 @@ def _hire_single_member(
         agent_catalog = orchestrator_proxy.get_agent_catalog()
     agent_card = next((card for card in agent_catalog if card.role == role), None)
     if agent_card is None:
-        available_roles = orchestrator_proxy.get_available_roles()
         raise RetriableError(
             f"Hire error - cannot find agent card for role '{role}'. "
-            f"Available roles: {available_roles}"
+            f"Hireable roles: {_hireable_roles(agent_catalog)}"
         )
 
     # The single hire guard. Both call paths funnel through here, so one check
@@ -278,7 +281,11 @@ def _build_roster_state(orchestrator_proxy: Orchestrator, self_name: str) -> Tea
 
 
 def _build_role_catalog_state(orchestrator_proxy: Orchestrator) -> RoleCatalogState:
-    """Snapshot the hireable-role catalog (ADR-037 §5).
+    """Snapshot the whole role catalog, each row carrying its hireability (ADR-037 §5).
+
+    ``can_be_hired`` is read straight off the card. A defaulted ``getattr`` shim
+    would render an entire team non-hireable against a core older than the
+    declared floor instead of failing where the mismatch is.
 
     Args:
         orchestrator_proxy: Proxy to the orchestrator actor.
@@ -287,7 +294,12 @@ def _build_role_catalog_state(orchestrator_proxy: Orchestrator) -> RoleCatalogSt
         The catalog state; empty ``roles`` when the catalog is empty.
     """
     roles = [
-        RoleRow(role=card.role, description=card.description, skills=list(card.skills))
+        RoleRow(
+            role=card.role,
+            description=card.description,
+            skills=list(card.skills),
+            can_be_hired=card.can_be_hired,
+        )
         for card in orchestrator_proxy.get_agent_catalog()
     ]
     return RoleCatalogState(roles=roles)
@@ -301,7 +313,8 @@ class TeamTool(ToolCard):
     - fire_members(names: list[str]) -> str: Fire team members
     - team_activity() -> TeamActivityReport: Who is mid-handler (on by default, no summarizer)
     - Team roster context state: Current team composition, delivered as deltas
-    - Role catalog context state: Available roles and descriptions, delivered as deltas
+    - Role catalog context state: Every role and description, each marked hireable
+      or not, delivered as deltas
     """
 
     hire_team_members: HireTeamMember | bool = Field(
@@ -485,13 +498,14 @@ class TeamTool(ToolCard):
             """Hire multiple new team members with the given roles.
 
             Creates new agent actors with specified roles. Names are auto-generated
-            as @<Role><RandomNumber>. Validates roles against available roles.
+            as @<Role><RandomNumber>. Only roles the team marks hireable can be
+            hired; the role list states which those are.
 
             Note: Should only be used when explicitly requested by user to prevent
             unnecessary agent proliferation. Do not contact him just to greet.
 
             Args:
-                roles: List of roles to hire (each must be in available_roles)
+                roles: List of roles to hire (each must be marked hireable)
 
             Returns:
                 Confirmation message with hired member names
@@ -524,6 +538,9 @@ class TeamTool(ToolCard):
                 # The subclass clause must precede the base one, or it is unreachable.
                 except RoleNotHireableError:
                     refused_roles.append(role)
+                # A miss-only bucket on this path: it always passes name=None, so
+                # the explicit-name validations _hire_single_member documents cannot
+                # fire here and the miss is the only RetriableError left.
                 except RetriableError:
                     missing_roles.append(role)
 
@@ -531,11 +548,7 @@ class TeamTool(ToolCard):
                 return f"Members hired: {hired_members}"
 
             message = _compose_hire_error(
-                hired_members,
-                missing_roles,
-                refused_roles,
-                orchestrator_proxy.get_available_roles() if missing_roles else [],
-                _hireable_roles(agent_catalog),
+                hired_members, missing_roles, refused_roles, _hireable_roles(agent_catalog)
             )
             # Only refusals: keep the typed error, so a caller can still tell the
             # two failures apart on this path without parsing the message.
@@ -565,7 +578,7 @@ class TeamTool(ToolCard):
             provided, one is auto-generated as @<Role><RandomNumber>.
 
             Args:
-                role: Role to hire (must be in available_roles)
+                role: Role to hire (must be marked hireable)
                 name: Optional specific name for the member
 
             Returns:
@@ -765,10 +778,11 @@ class TeamTool(ToolCard):
         orchestrator_proxy = self._orchestrator_proxy
 
         def team_roles() -> str:
-            """Get available team roles and their descriptions.
+            """Get every team role, its description, and whether it can be hired.
 
-            Returns formatted list of roles with descriptions and skills from the
-            agent catalog.
+            Returns a formatted list of the roles in the agent catalog, each with
+            its description, its skills, and a ``[hireable]`` / ``[not hireable]``
+            marker. When no role is hireable, the list closes with a line saying so.
 
             Returns:
                 Formatted role profiles or empty string if no roles

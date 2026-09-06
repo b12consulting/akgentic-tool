@@ -51,7 +51,7 @@ know about.
 | `hire_team_members` | `HireTeamMember \| bool` | `True` | `hire_members(roles)` on `TOOL_CALL`, `hire_member(role, name=None)` on `COMMAND`. |
 | `fire_team_members` | `FireTeamMember \| bool` | `True` | `fire_members(names)` on `TOOL_CALL`, `fire_member(name)` on `COMMAND`. |
 | `get_team_roster` | `GetTeamRoster \| bool` | `True` | The current roster as structured context state on `LLM_CONTEXT`, delivered as per-turn deltas. |
-| `get_role_profiles` | `GetRoleProfiles \| bool` | `True` | The hireable role catalog as structured context state on `LLM_CONTEXT`, delivered as per-turn deltas. |
+| `get_role_profiles` | `GetRoleProfiles \| bool` | `True` | The role catalog as structured context state on `LLM_CONTEXT`, delivered as per-turn deltas. |
 | `get_team_activity` | `GetTeamActivity \| bool` | `True` | `team_activity()` — who is mid-handler. Free by default. |
 
 ---
@@ -74,13 +74,22 @@ orchestration and for the human `/`-command surface, where naming the new member
 
 **Naming.** With no explicit name, a hire is named `@<Role><random 100–999>`, retried upward until
 unique. An explicit name is stripped, must be non-empty, and must not collide — each failure is a
-`RetriableError` the model can correct. The role must exist in the orchestrator's agent catalog;
-otherwise the error lists the available roles.
+`RetriableError` the model can correct. The role must exist in the orchestrator's agent catalog
+**and** its card must carry `can_be_hired`; those are two different failures with two different
+sentences and two different exception types, and both advertise the same list — the hireable roles.
+A role that exists but is not hireable is therefore absent from the error, and present in the role
+catalog the agent already carries, marked `[not hireable]`.
 
-**Partial success is reported, not hidden.** `hire_members(["Dev", "Nonexistent"])` hires the Dev,
-then raises `RetriableError` whose message begins `Partial success - Members hired: [...]` and
-goes on to list the failures and the available roles. `fire_members` behaves the same way. The
-model therefore learns both what happened and what to fix.
+**Partial success is reported, not hidden.** `hire_members(["Dev", "Nonexistent", "Boss"])` hires
+the Dev, then raises a `RetriableError` whose message begins `Partial success - Members hired:
+[...]` and goes on to
+name the missing card (`cannot find agent card(s) for role 'Nonexistent'`) and the refusal
+(`role 'Boss' cannot be hired`) in their own terms, each followed by `Hireable roles: [...]`.
+`fire_members` behaves the same way. The model therefore learns both what happened and what to fix.
+
+The aggregate keeps the typed `RoleNotHireableError` only when *every* failure was a refusal;
+a batch mixing a miss with a refusal raises the plain `RetriableError`, since flattening it would
+tell the caller a genuine miss was a policy decision.
 
 Both tool docstrings carry an explicit note that these should only be used when the user asks —
 hiring is the one capability in the package with an unbounded blast radius.
@@ -156,10 +165,22 @@ revalidated onto `LLM_CONTEXT` by the attached `normalize_system_prompt_to_llm_c
 | `expose` | `set[Channels]` | `{LLM_CONTEXT, COMMAND}` | |
 
 On `LLM_CONTEXT` the capability yields a `RoleCatalogState` whose `render_full()` renders
-`role: description (Skills: a, b)` for every `AgentCard` in the orchestrator's catalog — the menu
-`hire_members` draws from — and whose deltas report roles added, removed, or re-described, keyed
-on the role name. Same soft-failure behaviour as the roster, and the same persisted-payload
-normalizer.
+`role: description (Skills: a, b) [hireable]` — or `[not hireable]` — for every `AgentCard` in the
+orchestrator's catalog, and whose deltas report roles added, removed, or re-described, keyed on the
+role name. Same soft-failure behaviour as the roster, and the same persisted-payload normalizer.
+
+**The marker is stated in both directions, on every line.** A line with no marker would be
+indistinguishable from a renderer that forgot one, so `render_full()` and both describing delta
+verbs go through a single line renderer — a flag surfaced only in the full render would be present
+on an agent's first turn and gone from every turn after it.
+
+**A catalog in which nothing is hireable renders in full**, closing with `No role in this list can
+be hired.` — that is a legitimate configuration, not a reason to truncate the section. The sentence
+is omitted as soon as one role is hireable, where the per-line markers carry it instead.
+
+`can_be_hired` comes straight off `AgentCard` and defaults to `False`, so what the catalog reports
+is only as informative as what populated those cards: against a catalog that leaves the default
+alone, every entry renders `[not hireable]` and the sentence appears.
 
 ### `GetTeamActivity` — `team_activity()`
 

@@ -1,7 +1,8 @@
 """Structured context states for the team domain (ADR-037 §5).
 
-``TeamRosterState`` and ``RoleCatalogState`` carry the roster and role-catalog
-content that used to be re-rendered into the system prompt. Per-agent shaping is
+``TeamRosterState`` and ``RoleCatalogState`` carry the roster and the role
+catalog — every role the orchestrator holds a card for, each marked with whether
+it may be hired — that used to be re-rendered into the system prompt. Per-agent shaping is
 baked in at production time: rows never contain ``#``-prefixed tool actors, and
 ``is_self`` is set by the provider — the renderers take no agent argument.
 """
@@ -54,32 +55,43 @@ class TeamRosterState(ContextState):
 
 
 class RoleRow(SerializableBaseModel):
-    """One hireable role as the catalog state carries it."""
+    """One role as the catalog state carries it, with whether it may be hired.
+
+    ``can_be_hired`` mirrors ``AgentCard.can_be_hired`` in name and in its
+    fail-closed default: a row nobody marked hireable renders as not hireable.
+    """
 
     role: str
     description: str
     skills: list[str]
+    can_be_hired: bool = False
 
 
 class RoleCatalogState(ContextState):
-    """The hireable-role catalog at one point in time, diffable role by role."""
+    """The team role catalog at one point in time, diffable role by role."""
 
     roles: list[RoleRow]
 
     def render_full(self) -> str:
-        """The whole catalog, byte-identical to the historical ``team_roles`` prompt."""
+        """The whole catalog, one line per role, each marked hireable or not.
+
+        A catalog in which nothing is hireable is a legitimate configuration, so
+        it renders in full and closes with a sentence saying so rather than
+        being truncated away.
+        """
         if not self.roles:
             return ""
-        lines = [
-            f"{row.role}: {row.description} (Skills: {_skills_str(row)})" for row in self.roles
-        ]
-        return "**Here is the available team role list (for hiring):**\n" + "\n".join(lines)
+        lines = [_role_line(row) for row in self.roles]
+        if not any(row.can_be_hired for row in self.roles):
+            lines.append("No role in this list can be hired.")
+        return "**Here is the team role list:**\n" + "\n".join(lines)
 
     def render_delta(self, previous: Self) -> str | None:
         """Roles added, removed, or re-described since ``previous``, keyed on role name.
 
-        A role present on both sides with a changed description or skills list is
-        re-described. Unchanged roles are never re-listed.
+        A role present on both sides whose row changed in any field — description,
+        skills, or hireability — is re-described, through the same line renderer
+        ``render_full`` uses. Unchanged roles are never re-listed.
         """
         previous_by_role = {row.role: row for row in previous.roles}
         current_by_role = {row.role: row for row in self.roles}
@@ -92,16 +104,21 @@ class RoleCatalogState(ContextState):
         ]
         if not added and not removed and not redescribed:
             return None
-        lines = [
-            f"Role added — {row.role}: {row.description} (Skills: {_skills_str(row)})."
-            for row in added
-        ]
+        lines = [f"Role added — {_role_line(row)}." for row in added]
         lines += [f"Role removed — {row.role}." for row in removed]
-        lines += [
-            f"Role re-described — {row.role}: {row.description} (Skills: {_skills_str(row)})."
-            for row in redescribed
-        ]
+        lines += [f"Role re-described — {_role_line(row)}." for row in redescribed]
         return "\n".join(lines)
+
+
+def _role_line(row: RoleRow) -> str:
+    """One described role: name, description, skills, and hireability.
+
+    Both renderings go through here. A hireability marker present in
+    ``render_full`` alone would be visible on an agent's first turn and gone
+    from every turn after it, which is the delivery path that actually runs.
+    """
+    marker = "[hireable]" if row.can_be_hired else "[not hireable]"
+    return f"{row.role}: {row.description} (Skills: {_skills_str(row)}) {marker}"
 
 
 def _skills_str(row: RoleRow) -> str:

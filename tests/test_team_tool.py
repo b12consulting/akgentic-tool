@@ -344,16 +344,21 @@ def test_team_members_empty():
 
 
 def test_team_roles():
-    """team_roles returns role descriptions + skills from agent catalog."""
-    card1 = Mock(spec=AgentCard)
-    card1.role = "Developer"
-    card1.description = "Writes code"
-    card1.skills = ["python", "testing"]
-
-    card2 = Mock(spec=AgentCard)
-    card2.role = "Tester"
-    card2.description = "Tests code"
-    card2.skills = ["selenium", "pytest"]
+    """team_roles lists every role with its skills and its hireability marker."""
+    card1 = AgentCard(
+        agent_class=Mock,
+        description="Writes code",
+        skills=["python", "testing"],
+        config=BaseConfig(name="Developer", role="Developer"),
+        can_be_hired=True,
+    )
+    card2 = AgentCard(
+        agent_class=Mock,
+        description="Tests code",
+        skills=["selenium", "pytest"],
+        config=BaseConfig(name="Tester", role="Tester"),
+        can_be_hired=False,
+    )
 
     orchestrator_mock = Mock(spec=Orchestrator)
     orchestrator_mock.get_agent_catalog.return_value = [card1, card2]
@@ -368,9 +373,9 @@ def test_team_roles():
 
     result = profiles_command()
 
-    assert "Here is the available team role list (for hiring):" in result
-    assert "Developer: Writes code (Skills: python, testing)" in result
-    assert "Tester: Tests code (Skills: selenium, pytest)" in result
+    assert "Here is the team role list:" in result
+    assert "Developer: Writes code (Skills: python, testing) [hireable]" in result
+    assert "Tester: Tests code (Skills: selenium, pytest) [not hireable]" in result
 
 
 def test_team_roles_empty():
@@ -785,8 +790,9 @@ def test_hire_members_refuses_non_hireable_role():
     assert "Developer" in message  # the hireable roles are advertised
     observer_mock.createActor.assert_not_called()
     observer_mock.on_hire.assert_not_called()
-    # A pure refusal makes no orchestrator round trip: get_available_roles() is the
-    # unfiltered key list and must never reach a refusal message.
+    # No orchestrator round trip: get_available_roles() is the unfiltered key list
+    # and no longer reaches ANY hire message. See the invariant spec below, which
+    # covers the miss branch this one cannot reach.
     observer_mock.proxy_ask.return_value.get_available_roles.assert_not_called()
 
 
@@ -829,6 +835,80 @@ def test_hire_members_refusal_and_miss_read_differently():
     assert "cannot find agent card" not in str(refused.value)
     assert "cannot find agent card" in str(missed.value)
     assert not isinstance(missed.value, RoleNotHireableError)
+
+
+# --- The miss message advertises the hireable roles (Story 30.2, AC #10) ----------------
+#
+# Five older specs assert only the sentence stem of this message, so they stay green
+# whichever list it carries. These three are what pin the list, the label, and the
+# absence of the orchestrator round trip.
+
+
+def test_hire_members_miss_lists_only_hireable_roles():
+    """A missing card advertises the hireable roles, never the unfiltered roster."""
+    catalog = [
+        hireable_card("Developer", can_be_hired=True),
+        hireable_card("Manager", can_be_hired=False),
+    ]
+    observer_mock = hire_guard_observer(catalog)
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_members = tool.get_tools()[0]
+
+    with pytest.raises(RetriableError) as exc_info:
+        hire_members(["Nonexistent"])
+
+    message = str(exc_info.value)
+    assert "cannot find agent card(s) for role 'Nonexistent'" in message
+    assert "Hireable roles: ['Developer']" in message
+    assert "Available roles:" not in message
+    assert "Manager" not in message  # exists in the catalog, but cannot be hired
+
+
+def test_hire_member_command_miss_lists_only_hireable_roles():
+    """The command path's miss message narrows identically — it is the other entry point."""
+    catalog = [
+        hireable_card("Developer", can_be_hired=True),
+        hireable_card("Manager", can_be_hired=False),
+    ]
+    observer_mock = hire_guard_observer(catalog)
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_member = tool.get_commands()[HireTeamMember]
+
+    with pytest.raises(RetriableError) as exc_info:
+        hire_member("Nonexistent")
+
+    message = str(exc_info.value)
+    assert "cannot find agent card for role 'Nonexistent'" in message
+    assert "Hireable roles: ['Developer']" in message
+    assert "Available roles:" not in message
+    assert "Manager" not in message
+
+
+def test_hire_path_never_calls_get_available_roles():
+    """The invariant behind both messages: no hire failure round-trips the orchestrator."""
+    catalog = [
+        hireable_card("Developer", can_be_hired=True),
+        hireable_card("Manager", can_be_hired=False),
+    ]
+    observer_mock = hire_guard_observer(catalog)
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hire_members = tool.get_tools()[0]
+    hire_member = tool.get_commands()[HireTeamMember]
+
+    with pytest.raises(RetriableError):
+        hire_members(["Nonexistent", "Manager"])  # a miss and a refusal in one batch
+    with pytest.raises(RetriableError):
+        hire_member("Nonexistent")
+    with pytest.raises(RoleNotHireableError):
+        hire_member("Manager")
+
+    observer_mock.proxy_ask.return_value.get_available_roles.assert_not_called()
 
 
 def test_role_not_hireable_error_is_retriable():
