@@ -18,6 +18,7 @@ from akgentic.tool.sandbox.actor import (
     SANDBOX_ACTOR_NAME,
     SANDBOX_ACTOR_ROLE,
     CommandNotAllowedError,
+    CommandParseError,
     ExecResult,
     SandboxActor,
     SandboxConfig,
@@ -353,6 +354,107 @@ def test_exec_empty_command_raises_error() -> None:
 
     with pytest.raises(CommandNotAllowedError, match="empty"):
         actor.exec("")
+
+
+# ---------------------------------------------------------------------------
+# exec() tokenises with shlex (Story 46.1 — AC3, AC4, AC6, AC7)
+# ---------------------------------------------------------------------------
+
+
+def _instrumented(actor: ConcreteSandboxActor) -> list[tuple[str, str, float | None]]:
+    """Replace *actor*'s backend with a recorder and return the list it fills.
+
+    Returning ``[]`` after a raise is the assertion that matters here: the
+    exception has to be raised *instead of* the run, not alongside it.
+    """
+    calls: list[tuple[str, str, float | None]] = []
+
+    def recording_exec(cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
+        calls.append((cmd, cwd, timeout))
+        return ExecResult(stdout="", stderr="", exit_code=0)
+
+    actor._exec = recording_exec  # type: ignore[method-assign]
+    return calls
+
+
+def test_unbalanced_quote_raises_command_parse_error_and_never_reaches_exec() -> None:
+    """AC3: a quoting mistake is refused before the backend, with an actionable message.
+
+    ``shlex.split`` raises a bare ``ValueError`` on an unbalanced quote. Left
+    alone it would either surface as a traceback or — worse — the old
+    ``cmd.split()`` would hand the quote characters to the inner binary, which
+    then reports something about a file named ``"unbalanced``.
+    """
+    actor = ConcreteSandboxActor()
+    actor.on_start()
+    calls = _instrumented(actor)
+
+    with pytest.raises(CommandParseError) as excinfo:
+        actor.exec('echo "unbalanced')
+
+    assert calls == []
+    message = str(excinfo.value)
+    assert 'echo "unbalanced' in message  # the command is quoted back
+    assert "No closing quotation" in message  # the wrapped cause, not the boilerplate
+    assert "bash -c" in message  # states the remedy
+
+
+def test_command_parse_error_is_not_a_command_not_allowed_error() -> None:
+    """AC3: the two are siblings, so an allowlist handler cannot swallow a parse error.
+
+    ``sandbox/tool.py`` renders ``CommandNotAllowedError`` with the allowed
+    command list appended. That is the wrong answer to a quoting mistake — it
+    sends the model hunting for a binary it already has.
+    """
+    assert not issubclass(CommandParseError, CommandNotAllowedError)
+    assert not issubclass(CommandNotAllowedError, CommandParseError)
+
+
+def test_allowlist_and_execution_derive_the_same_tokens() -> None:
+    """AC4: the validated binary is the shlex token, not a whitespace fragment.
+
+    This is the spec that catches a check and an execution that tokenise
+    differently: under ``cmd.split()`` the allowlist would validate ``"my`` while
+    the backend ran something else. Both sides call ``shlex.split`` on the same
+    string, so they cannot disagree — and the error message proves which one ran.
+    """
+    actor = ConcreteSandboxActor()
+    actor.on_start()
+    calls = _instrumented(actor)
+
+    with pytest.raises(CommandNotAllowedError) as excinfo:
+        actor.exec('"my binary" --flag')
+
+    assert calls == []
+    message = str(excinfo.value)
+    assert "'my binary'" in message  # one token, quotes consumed
+    assert '"my' not in message  # never the whitespace fragment
+
+
+def test_empty_and_blank_commands_keep_the_existing_error() -> None:
+    """AC6: ``shlex.split`` returns ``[]`` for both, so the empty branch is unchanged.
+
+    A blank command must not become a *parse* failure: nothing about it is
+    unparseable, there is simply no binary in it.
+    """
+    actor = ConcreteSandboxActor()
+    actor.on_start()
+    calls = _instrumented(actor)
+
+    for blank in ("", "   "):
+        with pytest.raises(CommandNotAllowedError, match="empty") as excinfo:
+            actor.exec(blank)
+        assert not isinstance(excinfo.value, CommandParseError)
+
+    assert calls == []
+
+
+def test_command_parse_error_is_exported_from_the_sandbox_package() -> None:
+    """AC7: importable from ``akgentic.tool.sandbox`` and listed in its ``__all__``."""
+    import akgentic.tool.sandbox as sandbox_pkg
+
+    assert sandbox_pkg.CommandParseError is CommandParseError
+    assert "CommandParseError" in sandbox_pkg.__all__
 
 
 # ---------------------------------------------------------------------------

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import resource
+import shlex
 import subprocess
 import sys
 from collections.abc import Callable
@@ -127,7 +128,7 @@ class LocalSandboxActor(SandboxActor):
         logger.debug("LocalSandboxActor exec: cmd=%r cwd=%s", cmd, effective_cwd)
         try:
             result = subprocess.run(
-                cmd.split(),
+                shlex.split(cmd),
                 cwd=str(effective_cwd),
                 capture_output=True,
                 text=True,

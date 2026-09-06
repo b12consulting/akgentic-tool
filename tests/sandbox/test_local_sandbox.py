@@ -640,3 +640,59 @@ def test_make_preexec_sets_rlimit_as_on_linux() -> None:
     mock_setrlimit.assert_has_calls(expected_calls, any_order=False)
     assert mock_setrlimit.call_count == 3
     mock_setpgrp.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Story 46.1 — argument tokenisation (AC1, AC2, AC5)
+# ---------------------------------------------------------------------------
+
+
+@patch("akgentic.tool.sandbox.local.subprocess.run")
+def test_exec_keeps_a_quoted_argument_whole(mock_run: MagicMock, tmp_path: Path) -> None:
+    """AC1: ``echo "hello world"`` reaches the binary as two tokens, quotes consumed.
+
+    Under ``cmd.split()`` this arrived as ``['echo', '"hello', 'world"']`` — no
+    command could ever receive an argument containing a space.
+    """
+    actor = make_actor(team_id="team-1")
+    actor.state.workspace_path = tmp_path
+    mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+
+    actor._exec('echo "hello world"', "")
+
+    assert mock_run.call_args.args[0] == ["echo", "hello world"]
+
+
+@patch("akgentic.tool.sandbox.local.subprocess.run")
+def test_exec_strips_backslash_escapes_posix_style(mock_run: MagicMock, tmp_path: Path) -> None:
+    """AC5: POSIX mode — ``echo a\\ b`` is two tokens, the escape consumed.
+
+    Guards against a later ``posix=False``, which would keep the backslash
+    literal and split ``a\\`` from ``b`` — the old behaviour wearing a new call.
+    """
+    actor = make_actor(team_id="team-1")
+    actor.state.workspace_path = tmp_path
+    mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+
+    actor._exec("echo a\\ b", "")
+
+    assert mock_run.call_args.args[0] == ["echo", "a b"]
+
+
+def test_bash_dash_c_runs_the_whole_script_for_real(tmp_path: Path) -> None:
+    """AC2: the documented escape hatch actually works — no mock.
+
+    ``bash -c 'echo first && echo second'`` used to split into
+    ``['bash', '-c', "'echo", 'first', '&&', ...]``, so bash received ``'echo``
+    as its script and the rest as positional parameters. The allowlist check
+    passed and the execution was nonsense. An argv assertion cannot show that;
+    only running it can.
+    """
+    actor = make_actor(team_id="team-1")
+    actor.state.workspace_path = tmp_path
+
+    result = actor._exec("bash -c 'echo first && echo second'", "")
+
+    assert result.exit_code == 0, result.stderr
+    assert "first" in result.stdout
+    assert "second" in result.stdout

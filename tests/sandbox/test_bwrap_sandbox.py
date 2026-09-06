@@ -283,3 +283,28 @@ def test_exec_returns_exec_result_nonzero_exit(actor: BwrapSandboxActor) -> None
 
     assert result.exit_code == 1
     assert result.stderr == "error output"
+
+
+# ---------------------------------------------------------------------------
+# Story 46.1 — argument tokenisation (AC1)
+# ---------------------------------------------------------------------------
+
+
+def test_exec_keeps_a_quoted_argument_whole_after_the_bwrap_prefix(
+    actor: BwrapSandboxActor,
+) -> None:
+    """AC1: the tokens are shlex tokens and the whole bwrap flag list still precedes them.
+
+    The trap this guards is a fix landing in ``local.py`` only: bwrap builds its
+    own argv, so it has its own ``split`` call to forget.
+    """
+    with patch("akgentic.tool.sandbox.bwrap.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+        actor._exec('echo "hello world"', "")
+
+        cmd_list: list[str] = mock_run.call_args[0][0]
+
+    assert cmd_list[-2:] == ["echo", "hello world"]
+    assert cmd_list[-4:-2] == ["--chdir", "/workspace"]  # prefix intact, still first
+    assert cmd_list[0] == "bwrap"
+    assert "--unshare-net" in cmd_list

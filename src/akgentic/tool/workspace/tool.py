@@ -1599,26 +1599,26 @@ class WorkspaceTool(ToolCard):
         waits_out_the_run = params.poll_attempts < 0
 
         def workspace_exec(cmd: str, cwd: str = "") -> str:
-            """Run a shell command in the team workspace, in a sandbox.
+            """Run a command in the team workspace, in a sandbox. No shell runs it.
 
-            This waits for the command and gives you its output. The workspace is
-            held exclusively for the duration of the run: your teammates can still
-            read files, but every change they attempt is refused until it
-            finishes. Everything the command touched — files you never named
+            The workspace is held exclusively for the duration of the run: your
+            teammates can still read files, but every change they attempt is refused
+            until it finishes. Everything the command touched — files you never named
             included — is recorded as one change attributed to you.
 
-            A run that outlives the wait is the exception, and then you get a run
-            id instead of output; workspace_exec_result collects that run's output
-            once it lands.
+            A run that outlives the wait gives you a run id instead of output;
+            workspace_exec_result collects it once it lands.
 
             Args:
-                cmd: Full command string. The binary (first token) must be in
-                    the allow-list.
+                cmd: One binary plus its arguments. Tokenised POSIX-style, so
+                    quoting groups: `echo "hello world"` is two tokens. `&&`, `||`,
+                    `;`, `|`, `>`, `$VAR` and `$(...)` are NOT interpreted — for
+                    shell syntax run `bash -c '...'`. The binary (first token) must
+                    be in the allow-list.
                 cwd: Subdirectory relative to workspace root. Defaults to root.
 
             Returns:
-                Combined stdout, stderr and exit code — or, for a run that
-                outlived the wait, a message naming the run id.
+                Combined stdout, stderr and exit code — or a run id, if it outlived the wait.
 
             Raises:
                 RetriableError: If another agent's run holds the workspace.

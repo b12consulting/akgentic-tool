@@ -384,3 +384,23 @@ def test_exec_no_preexec_fn_passed(actor: SeatbeltSandboxActor) -> None:
 
     assert mock_run.call_args is not None
     assert "preexec_fn" not in mock_run.call_args.kwargs
+
+
+# ---------------------------------------------------------------------------
+# Story 46.1 — argument tokenisation (AC1)
+# ---------------------------------------------------------------------------
+
+
+def test_exec_keeps_a_quoted_argument_whole_after_the_policy_flags(
+    actor: SeatbeltSandboxActor,
+) -> None:
+    """AC1: shlex tokens follow ``sandbox-exec -f <policy>``, which is unchanged."""
+    with patch("akgentic.tool.sandbox.seatbelt.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+        actor._exec('echo "hello world"', "")
+
+        argv: list[str] = mock_run.call_args[0][0]
+
+    assert argv[:2] == ["sandbox-exec", "-f"]
+    assert argv[2].endswith(".sb")
+    assert argv[3:] == ["echo", "hello world"]
