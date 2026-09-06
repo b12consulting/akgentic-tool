@@ -336,12 +336,43 @@ def test_roster_state_round_trip() -> None:
 
 
 def test_catalog_state_round_trip() -> None:
-    """RoleCatalogState round-trips through model_dump / model_validate."""
-    state = RoleCatalogState(roles=[_role("Developer", "Writes code", ["python"])])
+    """RoleCatalogState round-trips through model_dump / model_validate.
+
+    One row of each kind. A flag lost in serialization raises nothing — it comes
+    back at the ``False`` default and renders a whole team ``[not hireable]``,
+    which is indistinguishable from a team nobody marked.
+    """
+    state = RoleCatalogState(
+        roles=[
+            _role("Developer", "Writes code", ["python"], can_be_hired=True),
+            _role("Intern", "Learns", []),
+        ]
+    )
     restored = RoleCatalogState.model_validate(state.model_dump())
 
     assert restored == state
+    assert restored.roles[0].can_be_hired is True
     assert restored.render_full() == state.render_full()
+    assert "[hireable]" in restored.render_full()
+
+
+def test_catalog_state_loads_a_payload_written_before_hireability() -> None:
+    """A persisted row with no ``can_be_hired`` key loads, fail-closed.
+
+    This is what the field's default buys: a ``RoleCatalogState`` written before
+    the flag existed stays loadable, and reads as not hireable rather than
+    silently permitting a hire the team never granted.
+    """
+    restored = RoleCatalogState.model_validate(
+        {"roles": [{"role": "Developer", "description": "Writes code", "skills": ["python"]}]}
+    )
+
+    assert restored.roles[0].can_be_hired is False
+    assert restored.render_full() == (
+        "**Here is the team role list:**\n"
+        "Developer: Writes code (Skills: python) [not hireable]\n"
+        "No role in this list can be hired."
+    )
 
 
 # ── provider gating on TeamTool.get_context_states() ─────────────────────────
