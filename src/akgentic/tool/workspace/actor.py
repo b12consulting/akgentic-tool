@@ -59,7 +59,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -88,6 +88,7 @@ from akgentic.tool.workspace.edit import (
 )
 from akgentic.tool.workspace.execution import (
     LEASE_GRACE_S,
+    MAX_QUEUED_RUNS,
     MAX_TRACKED_RUNS,
     ExecConfig,
     ExecLease,
@@ -97,7 +98,9 @@ from akgentic.tool.workspace.execution import (
     ExecState,
     ExecStatus,
     ExecWorker,
+    QueuedExec,
     new_run_id,
+    queue_full,
     unconfigured,
 )
 from akgentic.tool.workspace.journal import GitJournal, Identity
@@ -401,6 +404,7 @@ class WorkspaceActor(DeferredResultActor[WorkspaceConfig, WorkspaceState, str, E
         self._matcher = EditMatcher()
         self._exec_config: ExecConfig | None = None
         self._lease: ExecLease | None = None
+        self._queue: deque[QueuedExec] = deque()
         self._reclaimed: OrderedDict[str, ExecLease] = OrderedDict()
         self._run_errors: OrderedDict[str, str] = OrderedDict()
         self._recent_runs: dict[str, OrderedDict[str, str]] = {}
@@ -418,6 +422,31 @@ class WorkspaceActor(DeferredResultActor[WorkspaceConfig, WorkspaceState, str, E
     def worker_class(self) -> type[DeferredWorker]:
         """Return :class:`~akgentic.tool.workspace.execution.ExecWorker`."""
         return ExecWorker
+
+    def on_stop(self) -> None:
+        """Drop everything still waiting for the tree, then chain to the base.
+
+        A queued entry never ran, holds no worker and produced nothing, so there
+        is nothing to report and nothing to wait for — dropping it is free. The
+        running head is a different matter and is deliberately left alone: it has
+        a worker, that worker is mortal within its own budget, and it is the only
+        thing that can hold teardown open. That is what bounds stop no matter how
+        deep the queue got — three queued fifteen-second runs are forty-five
+        seconds of work but never more than one run's worth of liveness.
+
+        Nothing here may raise past ``super()``: leaving a Pykka actor part-way
+        stopped is worse than any error this could report, which is why the clear
+        is wrapped exactly as ``SandboxActor.on_stop`` wraps its own teardown.
+        """
+        try:
+            self._queue.clear()
+        except Exception:
+            logger.warning(
+                "Workspace %s: clearing the exec queue raised during on_stop — swallowing",
+                self.config.workspace_name,
+                exc_info=True,
+            )
+        super().on_stop()
 
     ##
     ## Identity — reached through the card's **tell** proxy, once, at bind time
@@ -477,12 +506,26 @@ class WorkspaceActor(DeferredResultActor[WorkspaceConfig, WorkspaceState, str, E
         self._exec_config = config
 
     def request_exec(self, agent_id: str, cmd: str, cwd: str = "") -> ExecStart:
-        """Take the lease and spawn the worker, or refuse — in one mailbox turn.
+        """Start the run, or queue it — in one mailbox turn, under the caller's own id.
+
+        Admission has three answers and **the run id is issued in two of them**,
+        which is the load-bearing detail. A caller leaves here holding a handle
+        to its *own* work whether the tree was free or not, so no message this
+        path produces can name a run belonging to another agent — the defect a
+        model's parallel batch of ``workspace_exec`` calls used to reproduce
+        every time, by reading a sibling call's id out of a refusal and
+        collecting it.
 
         Everything here is O(1) plus the journal's bounded git calls. **No
         sandbox call happens on this thread**: that is what keeps the actor's
         mailbox draining, which is what makes reads work during a run and a
         refused mutation cost one turn instead of the run's whole duration.
+
+        The lease decision comes from :meth:`_held_lease` rather than from
+        ``self._lease``, so a past-deadline lease whose worker is gone is
+        reclaimed here exactly as it is on the mutation path. Reading the
+        attribute directly would park every subsequent run behind a lease nobody
+        will ever release, for the life of the team.
 
         Args:
             agent_id: Identity of the requesting agent, as a string.
@@ -490,46 +533,93 @@ class WorkspaceActor(DeferredResultActor[WorkspaceConfig, WorkspaceState, str, E
             cwd: Working directory below the workspace root.
 
         Returns:
-            The issued run id, or the refusal that stopped it.
+            The issued run id — for an accepted run and a queued one alike — or
+            the one refusal left, which names nobody.
         """
-        busy = self._busy_refusal()
-        if busy is not None:
-            return ExecStart(refusal=busy)
         config = self._exec_config
         if config is None:
             return ExecStart(refusal=unconfigured())
+        entry = QueuedExec(run_id=new_run_id(), agent_id=agent_id, cmd=cmd, cwd=cwd)
+        if self._held_lease() is not None:
+            if len(self._queue) >= MAX_QUEUED_RUNS:
+                return ExecStart(refusal=queue_full())
+            self._queue.append(entry)
+            self._track_run(agent_id, entry.run_id, cmd)
+            return ExecStart(run_id=entry.run_id)
+        self._track_run(agent_id, entry.run_id, cmd)
+        self._start_run(entry, config)
+        return ExecStart(run_id=entry.run_id)
+
+    def _start_run(self, entry: QueuedExec, config: ExecConfig) -> None:
+        """Take the tree for *entry* and spawn its worker — the one accept path.
+
+        Reached from :meth:`request_exec` over a free tree and from
+        :meth:`_start_next` when the head releases it, and there is deliberately
+        only one of it: the out-of-band commit, the lease and the spawn have to
+        happen together and in this order, and a second copy is where the two
+        paths would drift.
+
+        **The out-of-band commit matters on the dequeue path too**, which is the
+        non-obvious half. A dequeue that follows a *reclaim* reaches a tree
+        nobody committed, so anything already lying in it would be swept into
+        this run's discovered commit and attributed to an agent that never wrote
+        it.
+
+        The lease and the deadline are built **here**, not when the entry was
+        queued, so ``budget + LEASE_GRACE_S`` measures the run rather than the
+        wait in front of it.
+
+        Args:
+            entry: The run to start.
+            config: The backend to start it on.
+        """
         # The tree's existing dirt belongs to nobody, and must not end up inside
         # this run's discovered commit — which is exactly what would happen,
         # since that commit takes whatever the tree shows afterwards.
         self._journal.commit_out_of_band()
-        run_id = new_run_id()
         budget = min(config.timeout_s, DEFAULT_WORKER_TIMEOUT_S)
         now = time.monotonic()
         self._lease = ExecLease(
-            run_id=run_id,
-            agent_id=agent_id,
-            cmd=cmd,
+            run_id=entry.run_id,
+            agent_id=entry.agent_id,
+            cmd=entry.cmd,
             started_at=now,
             budget=budget,
             deadline=now + budget + LEASE_GRACE_S,
         )
-        self._track_run(agent_id, run_id)
         # The lease is taken BEFORE request(), because a spawn failure reports
         # through fail() synchronously and must find a lease to release.
         worker = self.request(
-            run_id,
+            entry.run_id,
             ExecPayload(
-                deferred_key=run_id,
-                cmd=cmd,
-                cwd=cwd,
+                deferred_key=entry.run_id,
+                cmd=entry.cmd,
+                cwd=entry.cwd,
                 mode=config.mode,
                 team_id=config.team_id,
                 workspace_id=config.workspace_id,
                 timeout_s=budget,
             ),
         )
-        self._attach_worker(run_id, worker)
-        return ExecStart(run_id=run_id)
+        self._attach_worker(entry.run_id, worker)
+
+    def _start_next(self) -> None:
+        """Hand the freed tree to the queue head, if anything is waiting.
+
+        Called from :meth:`_finish_run` and nowhere else, because that is the
+        only place a lease is released on a report — and both exits reach it,
+        ``deliver`` and ``fail`` alike, so a run that failed drains the queue
+        exactly as a run that succeeded does.
+
+        A workspace whose exec configuration was never announced cannot start
+        anything; the entries stay queued rather than being silently dropped,
+        and :meth:`on_stop` clears them. In practice the state is unreachable —
+        nothing can be queued before an exec-capable card has bound.
+        """
+        config = self._exec_config
+        if not self._queue or config is None:
+            return
+        self._start_run(self._queue.popleft(), config)
 
     def _attach_worker(self, run_id: str, worker: ActorAddress | None) -> None:
         """Record on the lease which worker is performing *run_id*.
@@ -598,27 +688,70 @@ class WorkspaceActor(DeferredResultActor[WorkspaceConfig, WorkspaceState, str, E
         alternative was a fourth state meaning "finished, result no longer held",
         which invents semantics for the agent to reason about.
 
+        **The ownership gate is first, ahead of every other branch**, and that
+        ordering is the whole of it: a run absent from the asker's own tracking
+        map is answered ``UNKNOWN`` whether it is queued, running, done or failed
+        for somebody else, because a later branch reached first would answer a
+        foreign run with a foreign result. It is defence in depth — with the
+        queue in place nothing publishes another agent's id any more — and no
+        new state is introduced, for the reason this method's own docstring
+        gives about evicted results.
+
+        The tracking map is capped at ``MAX_TRACKED_RUNS`` per agent, so making
+        collection depend on it means an agent past its 33rd run can no longer
+        collect its own oldest. That is accepted: a 33-runs-ago id is not
+        something a model holds, and the answer is a recoverable ``UNKNOWN``
+        rather than an error. A second, uncapped map keyed by run would leak for
+        the life of the team.
+
         Args:
             agent_id: Identity of the asking agent, as a string.
             run_id: The run to report on.
 
         Returns:
-            Done with the outcome, failed with the reason, running, or unknown
-            with this agent's recent run ids.
+            Done with the outcome and the command, failed with the reason,
+            queued with its place in the FIFO, running, or unknown with this
+            agent's recent run ids.
         """
+        # Housekeeping first, ahead of even the ownership gate, and it is what
+        # makes the reclaim reachable at all: this actor is passive, nothing
+        # reclaims on a timer, and a dead head with entries behind it would
+        # otherwise wait for some unrelated later message. The message that is
+        # *guaranteed* to arrive is this one — every queued caller polls its own
+        # run by construction. O(1) on the actor's own thread in the ordinary
+        # case (one clock read against a live lease), and the spawn it can
+        # trigger is the same one ``request_exec`` performs on the same thread.
+        self._held_lease()
+        runs: OrderedDict[str, str] = self._recent_runs.get(agent_id, OrderedDict())
+        if run_id not in runs:
+            return ExecStatus(state=ExecState.UNKNOWN, run_id=run_id, recent_run_ids=list(runs))
         outcome = self.get(run_id)
         if outcome is not None:
-            return ExecStatus(state=ExecState.DONE, run_id=run_id, outcome=outcome)
+            return ExecStatus(
+                state=ExecState.DONE, run_id=run_id, outcome=outcome, command=runs[run_id]
+            )
         error = self._run_errors.get(run_id)
         if error is not None:
             return ExecStatus(state=ExecState.FAILED, run_id=run_id, reason=error)
+        position = self._queue_position(run_id)
+        if position:
+            return ExecStatus(state=ExecState.QUEUED, run_id=run_id, queue_position=position)
         if run_id in self._in_flight:
             return ExecStatus(state=ExecState.RUNNING, run_id=run_id)
-        return ExecStatus(
-            state=ExecState.UNKNOWN,
-            run_id=run_id,
-            recent_run_ids=list(self._recent_runs.get(agent_id, {})),
-        )
+        return ExecStatus(state=ExecState.UNKNOWN, run_id=run_id, recent_run_ids=list(runs))
+
+    def _queue_position(self, run_id: str) -> int:
+        """Return *run_id*'s 1-based place in the FIFO, or ``0`` if it is not in it.
+
+        1-based rather than 0-based so the number reads as an answer: position
+        ``1`` is "next to run when the head finishes". The head itself holds the
+        lease and is not in the queue, which is what leaves ``0`` free to mean
+        "not queued at all".
+        """
+        for index, entry in enumerate(self._queue, start=1):
+            if entry.run_id == run_id:
+                return index
+        return 0
 
     def deliver(self, key: str, value: ExecOutcome) -> None:
         """TELL, from the worker. Cache the outcome, then close the run out."""
@@ -651,6 +784,11 @@ class WorkspaceActor(DeferredResultActor[WorkspaceConfig, WorkspaceState, str, E
         not do is what it used to: return in silence, leaving the files it
         produced in the tree for a later agent's discovery to sweep into *that*
         agent's commit.
+
+        **The dequeue happens last, after the commit.** A queued run started
+        before this run's write set was committed would have its own discovery
+        sweep up the head's files, which is the same misattribution the
+        out-of-band commit exists to prevent — one step further along.
         """
         lease = self._lease
         if lease is None or lease.run_id != run_id:
@@ -660,6 +798,7 @@ class WorkspaceActor(DeferredResultActor[WorkspaceConfig, WorkspaceState, str, E
         self._journal.commit_discovered(
             self._identity(lease.agent_id), EXEC_CAPABILITY, detail=lease.cmd
         )
+        self._start_next()
 
     def _orphaned_report(self, run_id: str) -> None:
         """Record a run that reported after its lease was taken back.
@@ -691,40 +830,43 @@ class WorkspaceActor(DeferredResultActor[WorkspaceConfig, WorkspaceState, str, E
         )
         self._journal.commit_out_of_band()
 
-    def _busy_refusal(self) -> str | None:
-        """Refuse under a live lease, reclaim a dead one, or allow.
+    def _held_lease(self) -> ExecLease | None:
+        """Return the lease that is genuinely holding the tree, reclaiming a dead one.
 
-        Fail fast, never stall. Ten seconds of silence inside a tool call is
-        indistinguishable from a hang and gives the model nothing to react to; an
-        immediate refusal naming the holder lets it read a file, answer the user,
-        or ask the holder. That is only affordable because the actor's thread is
-        free — the blocking call is in a worker.
+        **The one place that decides whether the tree is taken**, and it is a
+        predicate rather than a message because both callers need the decision
+        and only one of them needs words: a mutation renders it as a refusal, an
+        exec request queues behind it. Splitting them is what keeps the two from
+        diverging — an exec path that tested ``self._lease is not None`` would
+        never reclaim, so one dead lease would park every subsequent run in the
+        queue for the life of the team.
 
         **Past the deadline is not the same as gone.** A worker that is still
         alive is still going to write into this tree, so a past-deadline lease
-        whose worker is alive is refused rather than reclaimed — with wording
-        that says which of the two it is. That is only safe because the worker is
-        mortal: its own budget bounds every ask it makes, so a lease cannot be
-        held open for ever by a wait nobody can see.
+        whose worker is alive is still holding — it is reported, never reclaimed.
+        That is only safe because the worker is mortal: its own budget bounds
+        every ask it makes, so a lease cannot be held open for ever by a wait
+        nobody can see.
+
+        **A reclaim drains the queue, and that is what stops a newcomer
+        overtaking.** Releasing the tree without starting the head would leave
+        the queued entries with nothing scheduled to run them — they would wait
+        for some unrelated later request — and worse, that later request would
+        find the tree free and start *itself*, jumping ahead of everything
+        already waiting. FIFO would break on exactly the path the reclaim
+        created. So the head is started here and this method answers with the
+        lease **it** now holds; only a genuinely empty queue answers ``None``.
 
         Returns:
-            The refusal text, or ``None`` when the tree is free.
+            The lease holding the tree — the original one, or the queue head's
+            after a reclaim drained into it — or ``None`` when the tree is free
+            and nothing was waiting for it.
         """
         lease = self._lease
         if lease is None:
             return None
-        if time.monotonic() <= lease.deadline:
-            return (
-                f"{_BUSY_PREFIX} — exec run {lease.run_id} is in progress "
-                f"(agent '{self._name_of(lease.agent_id)}'). Reads still work; retry the change "
-                f"once the run has finished."
-            )
-        if lease.worker_alive:
-            return (
-                f"{_BUSY_PREFIX} — exec run {lease.run_id} has passed its budget and is still "
-                f"being waited on (agent '{self._name_of(lease.agent_id)}'). Reads still work; "
-                f"retry the change once the run has finished."
-            )
+        if time.monotonic() <= lease.deadline or lease.worker_alive:
+            return lease
         logger.warning(
             "Workspace %s: reclaiming the lease of run %s (agent %s) — it passed its deadline "
             "and its worker is no longer alive, so nothing will ever report it. Anything it is "
@@ -734,7 +876,48 @@ class WorkspaceActor(DeferredResultActor[WorkspaceConfig, WorkspaceState, str, E
             self._name_of(lease.agent_id),
         )
         self._reclaim(lease)
-        return None
+        self._start_next()
+        return self._lease
+
+    def _busy_refusal(self) -> str | None:
+        """Refuse a **mutation** under a live lease, reclaim a dead one, or allow.
+
+        Fail fast, never stall. Ten seconds of silence inside a tool call is
+        indistinguishable from a hang and gives the model nothing to react to; an
+        immediate refusal naming the holder lets it read a file, answer the user,
+        or ask the holder. That is only affordable because the actor's thread is
+        free — the blocking call is in a worker.
+
+        **This is a mutation message and no longer an exec one**, and the
+        asymmetry is deliberate: mutations are *gated*, so their refusal is a
+        precondition failure that is cheap to re-issue, while exec is *fenced*
+        and its work would be thrown away. So exec queues and mutations still
+        refuse — which is also why naming the holder's run id here is safe.
+        That id is uncollectable by anyone but its owner (see
+        :meth:`exec_status`), so it informs a human reading the transcript
+        without handing the model something to mis-collect.
+
+        The wording distinguishes a run inside its budget from one past it and
+        still being waited on, because those tell an agent different things about
+        how long to expect to wait.
+
+        Returns:
+            The refusal text, or ``None`` when the tree is free.
+        """
+        lease = self._held_lease()
+        if lease is None:
+            return None
+        if time.monotonic() <= lease.deadline:
+            return (
+                f"{_BUSY_PREFIX} — exec run {lease.run_id} is in progress "
+                f"(agent '{self._name_of(lease.agent_id)}'). Reads still work; retry the change "
+                f"once the run has finished."
+            )
+        return (
+            f"{_BUSY_PREFIX} — exec run {lease.run_id} has passed its budget and is still "
+            f"being waited on (agent '{self._name_of(lease.agent_id)}'). Reads still work; "
+            f"retry the change once the run has finished."
+        )
 
     def _reclaim(self, lease: ExecLease) -> None:
         """Take the tree back from *lease*, remembering the run it belonged to.
@@ -750,16 +933,29 @@ class WorkspaceActor(DeferredResultActor[WorkspaceConfig, WorkspaceState, str, E
         while len(self._reclaimed) > MAX_TRACKED_RUNS:
             self._reclaimed.popitem(last=False)
 
-    def _track_run(self, agent_id: str, run_id: str) -> None:
-        """Remember *run_id* as one of *agent_id*'s recent runs, LRU-capped.
+    def _track_run(self, agent_id: str, run_id: str, cmd: str) -> None:
+        """Remember *run_id* as one of *agent_id*'s recent runs, with its command.
+
+        The map does two jobs, which is why the value slot stopped repeating the
+        key: it is the **ownership record** :meth:`exec_status` gates on, and the
+        source of the command a ``DONE`` result names itself with.
+
+        Called in both admission branches — accepted and queued — because a run
+        is owned from the moment its id is issued, and an id issued but untracked
+        would be one its own requester could not collect.
 
         Capped for the reason every map on a team singleton is: an uncapped one
-        leaks for the life of the team. Losing the oldest id is safe — a finished
-        run is still answered from the result cache, and the list exists only to
-        make a mistyped id correctable.
+        leaks for the life of the team. Losing the oldest entry now costs the
+        ability to collect that run as well as the ability to correct a mistyped
+        id, and that is accepted — the answer is a recoverable ``UNKNOWN``.
+
+        Args:
+            agent_id: Identity of the requesting agent, as a string.
+            run_id: The issued id.
+            cmd: The command string, exactly as the agent gave it.
         """
         runs = self._recent_runs.setdefault(agent_id, OrderedDict())
-        runs[run_id] = run_id
+        runs[run_id] = cmd
         runs.move_to_end(run_id)
         while len(runs) > MAX_TRACKED_RUNS:
             runs.popitem(last=False)

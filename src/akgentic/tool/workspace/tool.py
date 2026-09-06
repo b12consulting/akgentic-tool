@@ -55,13 +55,15 @@ from akgentic.tool.workspace.execution import (
     DEFAULT_EXEC_POLL_DELAY_S,
     DEFAULT_EXEC_TIMEOUT_S,
     ExecConfig,
+    ExecState,
     ExecStatus,
     format_status,
     in_progress,
     poll_attempts_within,
+    queued,
     resolve_mode,
     sandbox_config,
-    timed_out,
+    wait_out_the_turn,
 )
 from akgentic.tool.workspace.models import (
     PERM_ERR_MSG,
@@ -1602,12 +1604,12 @@ class WorkspaceTool(ToolCard):
             """Run a command in the team workspace, in a sandbox. No shell runs it.
 
             The workspace is held exclusively for the duration of the run: your
-            teammates can still read files, but every change they attempt is refused
-            until it finishes. Everything the command touched — files you never named
+            teammates can still read files, but every change they attempt is refused until
+            it finishes. A second command never refuses yours — it waits its turn and still
+            returns its own output. Everything the command touched — files you never named
             included — is recorded as one change attributed to you.
 
-            A run that outlives the wait gives you a run id instead of output;
-            workspace_exec_result collects it once it lands.
+            If the wait runs long you get a run id instead; workspace_exec_result collects it.
 
             Args:
                 cmd: One binary plus its arguments. Tokenised POSIX-style, so
@@ -1618,24 +1620,37 @@ class WorkspaceTool(ToolCard):
                 cwd: Subdirectory relative to workspace root. Defaults to root.
 
             Returns:
-                Combined stdout, stderr and exit code — or a run id, if it outlived the wait.
+                Combined stdout, stderr and exit code — or a run id, if the wait ran long.
 
             Raises:
-                RetriableError: If another agent's run holds the workspace.
+                RetriableError: If too many runs are already queued on this workspace.
             """
             start = _bound(proxy).request_exec(agent_id, cmd, cwd)
             if not start.run_id:
                 raise RetriableError(start.refusal)
             run_id = start.run_id
+
+            def fetch() -> ExecStatus:
+                return _bound(proxy).exec_status(agent_id, run_id)
+
+            if waits_out_the_run:
+                # "Wait out the run" now reaches the queue in front of it too, so
+                # a command that had to wait its turn still answers with its own
+                # output rather than a run id somebody has to collect.
+                return wait_out_the_turn(fetch, run_id, run_budget, delay)
             settled = poll_deferred(
-                lambda: _settled_status(_bound(proxy).exec_status(agent_id, run_id)),
-                attempts=attempts,
-                delay=delay,
+                lambda: _settled_status(fetch()), attempts=attempts, delay=delay
             )
             if settled is not None:
                 return format_status(settled)
-            if waits_out_the_run:
-                return timed_out(run_id, run_budget)
+            # An explicitly bounded look is unchanged: it asked for a run id after
+            # N attempts and gets one. ``poll_deferred`` answers None without
+            # saying WHY it stopped, so one more ask tells the two honest messages
+            # apart — "queued" says the work has not begun and nothing is lost,
+            # where "in progress" says it is running and will land.
+            status = fetch()
+            if status.state is ExecState.QUEUED:
+                return queued(run_id, status.queue_position)
             return in_progress(run_id)
 
         workspace_exec.__doc__ = params.format_docstring(workspace_exec.__doc__)
@@ -1656,13 +1671,16 @@ class WorkspaceTool(ToolCard):
         def workspace_exec_result(run_id: str) -> str:
             """Collect the output of a command started by workspace_exec.
 
+            Only runs you started yourself: an id from another agent is not yours
+            to collect and comes back as unknown.
+
             Args:
                 run_id: The id workspace_exec handed back.
 
             Returns:
                 The command's output if it has finished, a note that it is still
-                running, why it failed, or — for an id nothing was issued under —
-                your recent run ids so you can retry with the right one.
+                queued or running, why it failed, or — for an id that is not one of
+                yours — your recent run ids so you can retry with the right one.
             """
             return format_status(_bound(proxy).exec_status(agent_id, run_id))
 

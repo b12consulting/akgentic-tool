@@ -539,6 +539,11 @@ class SandboxScript:
             including nested paths, which is how the ``-uall`` property is
             exercised.
         stdout, stderr, exit_code: What the run reports.
+        stdout_by_cmd: Per-command stdout, consulted before :attr:`stdout`. One
+            fake backend serves every run in a test, so without this two runs
+            report byte-identical output and "a run returns its OWN command's
+            output" cannot be asserted at all. A command absent from the map
+            falls back to :attr:`stdout`, so every existing test is unaffected.
         raise_with: Raised instead of returning, for the failure path.
         timeouts: Every budget the backend was handed, in order.
         commands: Every ``(cmd, cwd)`` it was handed, in order.
@@ -555,6 +560,7 @@ class SandboxScript:
     stdout: str = "ok"
     stderr: str = ""
     exit_code: int = 0
+    stdout_by_cmd: dict[str, str] = field(default_factory=dict)
     raise_with: BaseException | None = None
     timeouts: list[float | None] = field(default_factory=list)
     commands: list[tuple[str, str]] = field(default_factory=list)
@@ -604,7 +610,8 @@ class FakeSandboxActor(SandboxActor):
             target.write_text(body, encoding="utf-8")
         if script.raise_with is not None:
             raise script.raise_with
-        return ExecResult(stdout=script.stdout, stderr=script.stderr, exit_code=script.exit_code)
+        stdout = script.stdout_by_cmd.get(cmd, script.stdout)
+        return ExecResult(stdout=stdout, stderr=script.stderr, exit_code=script.exit_code)
 
 
 class DeadAddress(MockActorAddress):

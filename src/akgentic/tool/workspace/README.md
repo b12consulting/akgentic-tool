@@ -269,32 +269,130 @@ the duration of a run the tree is held under an **exclusive lease**:
   nothing to react to, whereas a refusal naming the holder lets it read a file or answer the user;
 - every **read** keeps working, throughout. The price of that is honest: a read during a run may see
   a half-written build artefact;
-- a second `workspace_exec` is refused the same way.
+- a second `workspace_exec` is **queued, never refused**. It is handed a run id of its own and takes
+  the tree when the head releases it.
+
+**Commands never refuse each other, and that is the whole of the queue.** A model emits several
+`workspace_exec` calls in one response and pydantic-ai runs them **concurrently**, so they race for
+the lease. Refusing the losers threw the work away and — worse — published the *winner's* run id in
+the refusal, which the model could then collect: an answer to a question it never asked, and one
+that was byte-indistinguishable from its own. So admission has a third answer:
+
+| At `request_exec` | Answer | What exists for it |
+|---|---|---|
+| tree free | run id, `RUNNING` | lease, worker, deadline |
+| tree held | run id, `QUEUED` | **nothing** — the entry is inert bookkeeping |
+| queue full (`MAX_QUEUED_RUNS`) | a refusal naming **nobody** | — |
+
+Three properties hold this together and none of them is optional:
+
+- **The run id is issued at enqueue time, in every branch.** A caller leaves `request_exec` holding
+  a handle to its *own* work whether or not the tree was free, so no message on this path can name
+  another agent's run.
+- **The worker, the lease and the deadline are created at dequeue.** Spawning at enqueue would have
+  a queued run burn its own budget waiting for the head and reach the sandbox with nothing left;
+  `deadline = now + budget + LEASE_GRACE_S` measures the run rather than the wait in front of it.
+- **Only the head holds a worker**, which is what bounds teardown **on the actor side**: three
+  queued 15 s runs are 45 s of work but never more than one run's worth of liveness, comfortably
+  inside the orchestrator's 30 s stop backstop. `WorkspaceActor.on_stop` drops every queued entry —
+  they never ran and produced nothing to report. It says nothing about the **caller's** thread,
+  which waits out its turn on the agent's side of the boundary; see the accepted costs below.
+
+**A reclaim drains the queue, and nothing overtakes it.** When a past-deadline lease whose worker is
+gone is taken back, the queue **head** is started — not whichever request happened to notice. Only
+an empty queue lets the arriving request run immediately. Without that, the entries would sit with
+nothing scheduled to run them, and the next request to arrive would find the tree free and start
+itself, breaking FIFO on exactly the path the reclaim created.
+
+Because the actor is passive — nothing reclaims on a timer — the check also runs on
+`workspace_exec_result`'s read path. That is the one message guaranteed to arrive, since every
+queued caller is polling its own run by construction; without it a dead head strands the work behind
+it until some unrelated request happens along. It costs one clock read against a live lease.
+
+The queue is FIFO and nothing else. No priorities, no fairness weighting: a team singleton's queue
+that needs a scheduling policy is a design smell, not a feature. A queued entry belonging to an
+agent that has since stopped still **runs** — the actor holds no liveness signal it could ask, and
+guessing from an evicted display name would discard live work. Its output is simply never
+collected, which costs one command and loses nothing.
+
+**A run belongs to the agent that started it.** `workspace_exec_result` answers only the asking
+agent's runs: an id from somebody else comes back as the existing recoverable `UNKNOWN`, carrying
+the *asker's* own recent ids. No new state was introduced for it — "exists but is not yours" is a
+distinction a model cannot act on differently. This is defence in depth rather than the fix: with
+the queue in place nothing publishes a foreign id any more. Ownership is read from a map capped at
+`MAX_TRACKED_RUNS = 32` **per agent**, so an agent past its 33rd run can no longer collect its
+oldest; the answer is a recoverable `UNKNOWN`, and the alternative — a second map keyed by run —
+would leak for the life of the team.
+
+A collected result now **names its run and its command**:
+
+```
+Run 60e4db01 (`git rev-parse HEAD`):
+exit_code: 0 (OK)
+stdout: acf1942f5389dd…
+```
+
+The provenance line is added by `format_status`, not by `format_outcome`: the outcome body is
+shared with the deprecated `exec_command` shim, and the caller that knows the run is the one that
+names it.
+
+**Mutations still refuse under an exec lease, and that asymmetry is deliberate.** `workspace_write`,
+`_edit`, `_patch`, `_delete` and `_mkdir` are *gated*, not fenced: they declare their write set, so
+a refusal is a precondition failure that costs nothing to re-issue and that the agent can act on
+immediately (read the file, answer the user, ask the holder). Exec is the only operation whose write
+set is discovered after the fact, which is why it is the only one whose work would be *lost* by a
+refusal and therefore the only one worth a slot in a queue. Queuing mutations would buy nothing and
+would put a stale precondition in a deque. The busy refusal still names the holder's run id, which
+is safe precisely because that id is now uncollectable by anyone but its owner.
 
 Afterwards the write set is **discovered** — `git status --porcelain -uall` — and committed as one
 commit attributed to the requesting agent, with the command in the body. That is where multi-file
 atomicity comes from: a build touching nine files lands as one attributable unit. With the journal
 off, the run still works; nothing is recorded.
 
-**The call waits for the command, and a run id is the exception.** The agent's own thread polls
-until the run reports, so an ordinary command returns its own output and the model never sees a run
-id at all. That is deliberate: an agent inside a tool call cannot do anything else — the call is
+**The call waits for the command, and a run id to collect later is the exception.** The agent's own
+thread polls until the run reports, so an ordinary command returns its own output and the model is
+never left holding a handle it has to redeem. That is deliberate: an agent inside a tool call cannot
+do anything else — the call is
 synchronous from the model's point of view, and it cannot yield and be resumed — so a short poll
 does not save that latency, it converts it into LLM round-trips against an answer that cannot
 change, and ends by telling the model to come back on a next turn it does not have. The tree is
 leased for the run's duration either way, so the *team* waits identically; only the requesting
 agent's turn count differs.
 
-A run that outlives even that wait comes back saying it passed its budget and naming its id, and
-`workspace_exec_result('<id>')` collects the output whenever it does land. An id nothing was issued
-under does not raise — it comes back with that agent's recent run ids, so a mistyped one is
-correctable.
+**Under the default the wait covers your turn as well as your run**, so a command that had to queue
+still returns its own output on the call that asked for it — a batch behaves as if it had been
+issued one command at a time. That makes the poll **deadline-driven** rather than attempt-driven: a
+run at queue position `p` has at most `p + 1` run budgets left to wait, so that is the deadline, and
+it **re-arms on every queued look**, so a caller that is still advancing up the queue is never
+abandoned mid-climb — a run ahead costs its budget *plus* the lease grace and the spawn, so a
+deadline pinned to the position first seen gives a caller less time than its wait honestly takes.
+What bounds it is a separate **ceiling fixed on entry and never re-armed**,
+`(MAX_QUEUED_RUNS + 1) × run_budget + margin`: without it, a position that stopped decreasing would
+re-start the clock for ever. The `+ 1` is the caller's own run, the same arithmetic as the 1-based
+position — at the deepest legal slot you wait for the 16 ahead of you *and then for yourself*.
+
+The thread parked by that wait is the **caller's own tool thread**, never the actor's — `exec_status`
+is O(1) and the mailbox goes on draining — so reads, mutations and other agents' polls are
+unaffected. Two costs come with it and are accepted: latency is serial (three 15 s commands mean the
+third result lands ~45 s in, which is the point), and a parked thread can outlive the orchestrator's
+30 s stop backstop during teardown — the same exposure one long run already has, not a new one.
+
+A run that outlives even that deadline comes back saying it passed its budget and naming its id, and
+`workspace_exec_result('<id>')` collects the output whenever it does land; a run still queued at the
+deadline says so instead. That degraded path stops being the normal outcome but does not disappear —
+it is what answers a head that hangs past its budget. An id nothing was issued under, or one
+belonging to another agent, does not raise — it comes back with that agent's own recent run ids, so
+a mistyped one is correctable.
+
+A **positive** `poll_attempts` is unchanged: it asked for an explicitly bounded look and still gets
+a run id when the count runs out.
 
 **`poll_attempts` has three settings, each bounded by a different thing:**
 
 | Setting | Meaning | Bounded by |
 |---|---|---|
-| `-1` (default) | wait out the run | the effective run budget **plus** a report margin (~1 s), so a command killed at its budget still arrives as a readable `exit_code: 124` |
+| `-1` (default) | wait out your **turn and** your run | a deadline, not a count: the effective run budget **plus** a report margin (~1 s), re-armed to `(p + 1)` budgets on every look while queued at position `p`, and clamped by a ceiling of `(MAX_QUEUED_RUNS + 1) × run_budget + margin` fixed on entry. So a command killed at its budget still arrives as a readable `exit_code: 124`, and one that had to queue still returns its own output |
 | a positive count | a bounded look, then a run id | the effective run budget alone — no margin |
 | `0` | no polling; the run id comes back immediately | — |
 
@@ -305,7 +403,7 @@ Anything below `-1` is a validation error rather than a second spelling of the s
 | Budget | Bounds | Default |
 |---|---|---|
 | `timeout_s` | the **subprocess** — reaches `subprocess.run(timeout=…)` in the backend | 15 s, clamped to the worker's 20 s |
-| `poll_attempts` × `poll_delay_seconds` | how long the **agent's own thread** waits inside the call | wait out the run, at 0.5 s granularity |
+| `poll_attempts` × `poll_delay_seconds` | how long the **agent's own thread** waits inside the call | wait out the turn and the run, at 0.5 s granularity |
 | the backend's own default | a caller that passes no budget at all | 30 s |
 
 Raising the second cannot raise the first: the poll buys more looking, never more running.
@@ -468,7 +566,7 @@ WorkspaceTool(
 | `expose` | `set[Channels]` | `{TOOL_CALL}` | Taking exec off this channel withholds both callables **and** skips the wiring entirely — no host probe, no sandbox actor. |
 | `mode` | `"local" \| "bwrap" \| "seatbelt" \| "docker" \| "auto"` | `"auto"` | The isolation backend. `"auto"` probes the host at wiring time (`bwrap` → `seatbelt` → `docker` → `local`) and warns when it falls through to `local`. A mode naming no registered backend raises `KeyError` at wiring time, deliberately. |
 | `timeout_s` | `float` | `15.0` | Budget for the **subprocess**, handed to the backend. Clamped to the worker's own 20 s, which sits below the orchestrator's 30 s stop backstop. |
-| `poll_attempts` | `int` | `-1` | How many times the agent's own thread looks for a result. `-1` is the sentinel for "wait out the run", resolved once at wiring time against the effective run budget plus a report margin; a positive count is a bounded look clamped to that budget without the margin; `0` opts out of polling and takes the run id immediately. Below `-1` is a validation error. |
+| `poll_attempts` | `int` | `-1` | How many times the agent's own thread looks for a result. `-1` is the sentinel for "wait out my turn **and** my run" — a deadline of the effective run budget plus a report margin, re-armed from the queue position on every look and clamped by a ceiling fixed on entry, so a queued command still returns its own output; a positive count is a bounded look clamped to that budget without the margin, and is unaffected by the queue; `0` opts out of polling and takes the run id immediately. Below `-1` is a validation error. |
 | `poll_delay_seconds` | `float` | `0.5` | Seconds between those looks — the granularity of the wait, not its length. The length comes from `poll_attempts` resolved against the run budget, and can never outlast the run it waits for: past that point there is nothing left to wait for. |
 
 None of these reaches an LLM-facing signature: nothing lets a model name a mode, a timeout, or a
