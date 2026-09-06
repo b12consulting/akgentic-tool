@@ -31,7 +31,12 @@ from .core.event import (  # noqa: F401
     ToolStateEvent,
 )
 from .core.observer import ActorToolObserver, ToolObserver, ToolStateCarrier  # noqa: F401
-from .errors import CommandNotRecognized, RetriableError, ToolObserverGone  # noqa: F401
+from .errors import (  # noqa: F401
+    CommandNotRecognized,
+    RetriableError,
+    RoleNotHireableError,
+    ToolObserverGone,
+)
 from .mailbox.mailbox import MailboxTool  # noqa: F401
 from .metadata.tool import MetadataTool  # noqa: F401
 from .model.observer import ModelSwitchToolObserver  # noqa: F401
@@ -70,6 +75,7 @@ __all__ = [
     "Channels",
     # Errors
     "RetriableError",
+    "RoleNotHireableError",
     "CommandNotRecognized",
     "ToolObserverGone",
     # Events and observers
