@@ -70,6 +70,7 @@ def sandbox_actor_name(workspace_name: str) -> str:
     """
     return f"{SANDBOX_ACTOR_NAME}-{workspace_name}"
 
+
 SandboxMode = Literal["local", "bwrap", "seatbelt", "docker"]
 """A backend that has been resolved. ``"auto"`` is not one of these."""
 
@@ -267,8 +268,7 @@ class ExecReport(SerializableBaseModel):
         carried = sum((self.result is not None, self.timed_out, bool(self.error)))
         if carried != 1:
             raise ValueError(
-                "ExecReport carries exactly one of result, timed_out or error — "
-                f"got {carried}."
+                f"ExecReport carries exactly one of result, timed_out or error — got {carried}."
             )
         return self
 
@@ -379,13 +379,21 @@ class SandboxActor(Akgent[SandboxConfig, SandboxState], ABC):
         except subprocess.TimeoutExpired:
             report = ExecReport(run_id=request.run_id, timed_out=True)
         except Exception as exc:  # noqa: BLE001 — every failure is an answer, never a crash
-            report = ExecReport(run_id=request.run_id, error=str(exc))
+            # ``or repr(exc)`` is load-bearing, not defensive. ``str(exc)`` is
+            # the empty string for any exception raised with no message —
+            # ``raise RuntimeError()`` — and an empty ``error`` fails
+            # ``ExecReport``'s exactly-one validator, so the report that was
+            # meant to carry the failure raises *inside this except clause* and
+            # propagates out of the handler, stopping the actor: the one thing
+            # this method exists to prevent. ``repr`` always names the type.
+            report = ExecReport(run_id=request.run_id, error=str(exc) or repr(exc))
         finally:
             if report is None:
-                # Unreachable through the branches above, and deliberately still
-                # here: a run whose report is dropped holds the tree until the
-                # gate's grace releases it, so "no exit path reports nothing" is
-                # worth one branch rather than an argument.
+                # Reachable only if building one of the reports above raises,
+                # which the ``or repr(exc)`` overhead is there to stop — so this
+                # is the branch for the exit nothing thought of. Kept rather
+                # than argued: a run whose report is dropped holds the tree
+                # until the gate's grace releases it.
                 report = ExecReport(
                     run_id=request.run_id,
                     error="The sandbox produced no report for this run.",

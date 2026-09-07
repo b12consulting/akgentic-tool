@@ -952,6 +952,45 @@ class TestCollectingARun:
         thread.join(timeout=HANDSHAKE_TIMEOUT_S)
         finish_run(sandbox_script, harness)
 
+    def test_the_actors_own_methods_perform_no_sandbox_call(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        # The property the whole design rests on: #Workspace's own methods stay
+        # O(1) and never reach the sandbox, which is what keeps its mailbox
+        # draining while a run is held. It needs asserting more since the worker
+        # went, not less — exec_status now runs two release checks, and either
+        # can reach _start_next() and a real send.
+        _card, actor, harness = exec_setup
+        run_id = start_run(actor, sandbox_script)
+        commands_so_far = len(sandbox_script.commands)
+        requests_so_far = len(harness.requests)
+        asks_so_far = len(harness.ask_timeouts)
+
+        actor.exec_status(AGENT, run_id)
+        actor.apply_mkdir(AGENT, "src")
+        actor.get(run_id)
+
+        assert len(sandbox_script.commands) == commands_so_far
+        assert len(harness.requests) == requests_so_far
+        # The ask counts too: a resolve on the poll path is an orchestrator
+        # round trip on the team singleton's own thread, which is the cost this
+        # design pays once per run and must not pay once per look.
+        assert len(harness.ask_timeouts) == asks_so_far
+        finish_run(sandbox_script, harness)
+
+    def test_the_result_cache_is_lru_capped(
+        self, exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness]
+    ) -> None:
+        # The deferred base's cache half is the half this actor uses, and an
+        # uncapped map on a team singleton leaks for the life of the team.
+        _card, actor, _harness = exec_setup
+        for index in range(actor.cache_capacity + 5):
+            actor.deliver(f"run{index}", ExecOutcome(stdout="", stderr="", exit_code=0))
+
+        assert len(actor._slots) == actor.cache_capacity
+
 
 # ---------------------------------------------------------------------------
 # AC8 — the budgets
@@ -2637,6 +2676,38 @@ class TestTheHandlerAlwaysReports:
         assert status.state is ExecState.FAILED
         assert "quotes" in status.reason
         assert not sandbox_script.commands
+        assert actor._running is None
+
+    def test_an_exception_with_no_message_names_its_type_instead_of_escaping(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        # ``str(RuntimeError())`` is the empty string, and an empty ``error``
+        # fails ExecReport's exactly-one validator — so building the failure
+        # report raises INSIDE the except clause and propagates out of the tell
+        # handler, which stops the sandbox actor. That is the exact failure this
+        # handler exists to prevent, reached through the handler's own answer.
+        #
+        # The handler is called directly here rather than through the harness's
+        # thread: an escape on a thread is a warning nobody fails on, while an
+        # escape on this one is the raise it would be inside Pykka's actor loop.
+        _card, actor, harness = exec_setup
+        sandbox_script.raise_with = RuntimeError()
+        sandbox_script.gate.set()
+        start = actor.request_exec(AGENT, "echo hi")
+        assert start.run_id, start.refusal
+        harness.join()
+        request = harness.requests[0]
+        sandbox = harness.orchestrator_proxy.actor_for(harness.sandbox_addresses[0])
+        assert isinstance(sandbox, SandboxActor)
+        routed = request.model_copy(update={"reply_to": harness.workspace_address})
+
+        sandbox.receiveMsg_ExecRequest(routed)  # must not raise
+
+        status = actor.exec_status(AGENT, start.run_id)
+        assert status.state is ExecState.FAILED
+        assert "RuntimeError" in status.reason  # the type, since there is no message
         assert actor._running is None
 
     def test_one_request_per_run_carries_the_clamped_budget_and_a_reply_address(

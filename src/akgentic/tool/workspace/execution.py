@@ -103,6 +103,7 @@ def effective_budget(timeout_s: float) -> float:
     """
     return min(timeout_s, MAX_EXEC_BUDGET_S)
 
+
 DEFAULT_EXEC_POLL_ATTEMPTS = -1
 """Sentinel: wait out the whole run rather than hand back a run id part-way.
 
