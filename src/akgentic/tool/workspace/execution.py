@@ -657,19 +657,39 @@ def sandbox_config(config: ExecConfig) -> SandboxConfig:
     )
 
 
-def format_outcome(outcome: ExecOutcome) -> str:
-    """Render a finished run the way ``exec_command`` has always rendered one.
+def format_outcome(outcome: ExecOutcome, run_id: str = "") -> str:
+    """Render a finished run: one header line, then only the streams that spoke.
 
-    Deliberately the existing shape rather than a second one: a model already
-    reads this, and two formats for one thing is how the pair drifts.
+    One shape for both surfaces — the capability and the ``exec_command`` shim —
+    because two formats for one thing is how the pair drifts.
+
+    **An empty stream is omitted rather than labelled.** The previous shape
+    printed ``stdout:`` and ``stderr:`` unconditionally, so a silent success
+    spent four lines saying nothing twice, and a model reading a failure had to
+    scan past an empty ``stdout:`` to reach the error. A heading that appears
+    only when there is something under it means its presence is information.
+
+    ``run_id`` joins the header rather than taking a line of its own: an answer
+    that names no run is what let a collected result be mistaken for a sibling
+    call's. The shim passes it too, now that it issues runs through the queue.
+
+    Args:
+        outcome: The finished run.
+        run_id: The run this outcome belongs to. Omitted from the header when
+            empty, which is the caller saying it has no run to name.
+
+    Returns:
+        The rendered answer, with ``stdout`` and ``stderr`` sections present
+        only when the corresponding stream is non-empty.
     """
     status = "OK" if outcome.exit_code == 0 else "FAILED"
-    return (
-        f"exit_code: {outcome.exit_code} ({status})"
-        f"\nstdout:\n{outcome.stdout}"
-        f"\nstderr (note: many tools write progress to stderr"
-        f" even on success):\n{outcome.stderr}"
-    )
+    head = f"Run {run_id} - " if run_id else ""
+    parts = [f"{head}exit_code: {outcome.exit_code} ({status})"]
+    if outcome.stdout.strip():
+        parts.append(f"**stdout**\n{outcome.stdout}")
+    if outcome.stderr.strip():
+        parts.append(f"**stderr**\n{outcome.stderr}")
+    return "\n\n".join(parts)
 
 
 def format_status(status: ExecStatus) -> str:
@@ -679,14 +699,12 @@ def format_status(status: ExecStatus) -> str:
     result. An unknown run id in particular does **not** raise: it lists the
     agent's recent runs, so a model that mistyped one reads the right one back.
 
-    **The ``DONE`` branch names the run and the command**, and that provenance
-    line is added here rather than inside :func:`format_outcome`: the outcome
-    body is shared with the ``exec_command`` shim, which renders the same bytes
-    and has nothing to say about which run produced them. An answer that names
-    neither is what let a collected result be mistaken for a sibling call's.
+    **The ``DONE`` branch names the run**, by handing its id to
+    :func:`format_outcome` for the header line. An answer that names no run is
+    what let a collected result be mistaken for a sibling call's.
     """
     if status.state is ExecState.DONE and status.outcome is not None:
-        return f"Run {status.run_id} (`{status.command}`):\n" + format_outcome(status.outcome)
+        return format_outcome(status.outcome, run_id=status.run_id)
     if status.state is ExecState.FAILED:
         return f"Run {status.run_id} failed: {status.reason}"
     if status.state is ExecState.QUEUED:

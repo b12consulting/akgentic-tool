@@ -1219,7 +1219,7 @@ class TestWaitingOutTheRun:
         run_id = harness.requests[0].run_id
         assert "exit_code: 0 (OK)" in answer
         assert "hello from the run" in answer
-        assert answer.startswith(f"Run {run_id} (`echo hi`):")
+        assert answer.startswith(f"Run {run_id} - exit_code:")
         assert "workspace_exec_result" not in answer  # no handoff, only the result
 
     def test_the_two_exhaustion_messages_are_chosen_by_the_budget_in_force(
@@ -1778,10 +1778,13 @@ class TestTheShimAndTheCapabilityAgree:
         )
 
         capability_run, shim_run = (request.run_id for request in harness.requests)
-        assert through_capability.startswith(f"Run {capability_run} (`make build`):\n")
-        assert through_shim.startswith(f"Run {shim_run} (`make build`):\n")
+        assert through_capability.startswith(f"Run {capability_run} - exit_code:")
+        assert through_shim.startswith(f"Run {shim_run} - exit_code:")
         assert self._body(through_capability) == self._body(through_shim)
-        assert "exit_code: 0 (OK)" in self._body(through_shim)
+        # The exit code now rides the header beside the run id, so each surface
+        # states its own; what must match byte for byte is everything below it.
+        assert through_capability.startswith(f"Run {capability_run} - exit_code: 0 (OK)")
+        assert through_shim.startswith(f"Run {shim_run} - exit_code: 0 (OK)")
         assert "done" in self._body(through_shim)
         assert (workspace_tree / "built.txt").read_text(encoding="utf-8") == "x\n"
         assert actor._running is None
@@ -1987,7 +1990,7 @@ class TestAQueuedRunRuns:
         head_status = actor.exec_status(AGENT, head)
         assert head_status.outcome is not None
         assert head_status.outcome.stdout == "HEAD OUTPUT"
-        assert format_status(collected).startswith(f"Run {tail.run_id} (`echo tail`):")
+        assert format_status(collected).startswith(f"Run {tail.run_id} - exit_code:")
 
     def test_a_queued_run_still_runs_when_the_head_fails(
         self,
@@ -2166,7 +2169,7 @@ class TestADoneResultNamesItsRunAndItsCommand:
         assert status.run_id == run_id
         assert status.command == "pytest -q"
         collected = mutate(card, "workspace_exec_result", run_id)
-        assert collected.startswith(f"Run {run_id} (`pytest -q`):\n")
+        assert collected.startswith(f"Run {run_id} - exit_code:")
         assert "exit_code: 0 (OK)" in collected
         assert "5 passed" in collected
 
@@ -2351,7 +2354,7 @@ class TestTheCardAnswersAQueuedCaller:
         finish_run(sandbox_script, harness)
 
         collected = mutate(card, "workspace_exec_result", mine)
-        assert collected.startswith(f"Run {mine} (`echo mine`):\n")
+        assert collected.startswith(f"Run {mine} - exit_code:")
         assert "MINE" in collected
 
     def test_collecting_a_queued_run_renders_the_queued_message(
@@ -2501,7 +2504,7 @@ class TestAQueuedCallerWaitsOutItsTurn:
         assert sandbox_script.commands == [("echo head", ""), ("echo mine", "")]
         assert len(answers) == 1
         answer = answers[0]
-        assert answer.startswith(f"Run {mine} (`echo mine`):")
+        assert answer.startswith(f"Run {mine} - exit_code:")
         assert "MINE OUTPUT" in answer
         assert "HEAD OUTPUT" not in answer  # never the head's, which is the incident
         assert "is queued at position" not in answer  # not a handoff
@@ -2595,7 +2598,7 @@ class TestAQueuedCallerWaitsOutItsTurn:
         # ~0.25 s of looks, so a pinned deadline gives up around look 16.
         assert len(looks) >= 25, "the poll abandoned a caller that was still advancing"
         run_id = harness.requests[0].run_id
-        assert answer.startswith(f"Run {run_id} (`echo mine`):")
+        assert answer.startswith(f"Run {run_id} - exit_code:")
         assert "CLIMBED" in answer
         assert "is queued at position" not in answer
 

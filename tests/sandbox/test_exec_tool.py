@@ -380,8 +380,11 @@ def test_exec_command_returns_formatted_output() -> None:
 
     assert "exit_code: 0 (OK)" in result
     assert "5 passed" in result
-    assert "stdout:" in result
-    assert "stderr" in result
+    assert "**stdout**" in result
+    # An empty stream is omitted rather than labelled: the heading's presence is
+    # the information. This script writes nothing to stderr, so there is no
+    # stderr section — asserting its ABSENCE is what guards that.
+    assert "**stderr**" not in result
 
 
 def test_exec_command_includes_stderr_in_output() -> None:
