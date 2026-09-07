@@ -18,6 +18,8 @@ from pydantic import Field
 from akgentic.core.utils.serializer import SerializableBaseModel
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import numpy as np
     import openai as _openai_typing
 
@@ -44,6 +46,22 @@ class VectorEntry(SerializableBaseModel):
     ref_id: str = Field(..., description="UUID string of the referenced object.")
     text: str = Field(..., description="The text that was embedded.")
     vector: list[float] = Field(..., description="Embedding values (one float per dimension).")
+    scope: str | None = Field(
+        default=None,
+        description=(
+            "Partition this entry belongs to within its collection — for the workspace, "
+            "the workspace id. None for a producer that does not partition, which is what "
+            "planning and the knowledge graph do."
+        ),
+    )
+    path: str | None = Field(
+        default=None,
+        description="Source path within the scope, filterable by prefix. None when there is none.",
+    )
+    ordinal: int | None = Field(
+        default=None,
+        description="Position of this chunk within its source, for ordering reassembly.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -177,17 +195,30 @@ class VectorIndex:
         self._count += 1
         self._entries.append(entry)
 
-    def remove(self, ref_ids: set[str]) -> None:
-        """Remove all entries whose ``ref_id`` is in ``ref_ids``.
+    def remove(
+        self, ref_ids: set[str], matches: Callable[[VectorEntry], bool] | None = None
+    ) -> None:
+        """Remove entries whose ``ref_id`` is listed and which satisfy *matches*.
 
         Compacts the backing buffers to retain only surviving rows.
 
+        ``matches`` makes the removal entry-precise rather than id-precise: two
+        entries may share a ``ref_id`` while differing in ``scope`` or ``path``, and a
+        scoped removal must take only the one it names. Without it a caller can only
+        say *which ids*, and every entry carrying such an id goes.
+
         Args:
             ref_ids: Set of UUID strings to remove. Unknown IDs are silently ignored.
+            matches: Optional extra predicate an entry must satisfy to be removed.
+                ``None`` removes every entry whose id is listed.
         """
         import numpy as np
 
-        keep = [i for i, e in enumerate(self._entries) if e.ref_id not in ref_ids]
+        keep = [
+            i
+            for i, e in enumerate(self._entries)
+            if e.ref_id not in ref_ids or (matches is not None and not matches(e))
+        ]
         if len(keep) == self._count:
             return  # Nothing removed — fast path
         new_count = len(keep)

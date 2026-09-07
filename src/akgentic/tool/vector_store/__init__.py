@@ -9,11 +9,13 @@ from __future__ import annotations
 from akgentic.tool.vector_store.actor import (
     VS_ACTOR_NAME,
     VS_ACTOR_ROLE,
+    PendingRequest,
     VectorStoreActor,
     VectorStoreState,
 )
 from akgentic.tool.vector_store.embedding_actor import (
     EmbeddingActor,
+    EmbeddingCompleted,
     EmbeddingError,
     EmbeddingRequest,
     EmbeddingResult,
@@ -56,12 +58,14 @@ __all__ = [
     "CollectionConfig",
     "CollectionStatus",
     "EmbeddingActor",
+    "EmbeddingCompleted",
     "EmbeddingError",
     "EmbeddingProvider",
     "EmbeddingRequest",
     "EmbeddingResult",
     "EmbeddingService",
     "InMemoryBackend",
+    "PendingRequest",
     "WeaviateBackend",
     "SearchHit",
     "SearchResult",

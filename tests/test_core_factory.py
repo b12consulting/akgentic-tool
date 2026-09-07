@@ -744,9 +744,7 @@ def test_factory_propagates_per_consumer_collection_config(
 
     monkeypatch.setenv("AKGENTIC_WEAVIATE_URL", "http://localhost:8080")
     kg_collection = CollectionConfig(backend="weaviate", tenant="team-42")
-    plan_collection = CollectionConfig(
-        backend="inmemory", persistence="workspace", workspace_path="/tmp/plan"
-    )
+    plan_collection = CollectionConfig(backend="inmemory", tenant="plan-tenant")
 
     observer, calls = _build_recording_observer()
     ToolFactory(
@@ -770,8 +768,7 @@ def test_factory_propagates_per_consumer_collection_config(
     assert kg_cfg.collection.backend == "weaviate"
     assert kg_cfg.collection.tenant == "team-42"
     assert plan_cfg.collection.backend == "inmemory"
-    assert plan_cfg.collection.persistence == "workspace"
-    assert plan_cfg.collection.workspace_path == "/tmp/plan"
+    assert plan_cfg.collection.tenant == "plan-tenant"
 
     # The two collections are distinct — per-consumer backend divergence.
     assert kg_cfg.collection != plan_cfg.collection

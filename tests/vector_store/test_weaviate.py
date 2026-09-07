@@ -53,6 +53,10 @@ class _RecordedProperty:
         """Record a membership leg on this property."""
         return _RecordedFilter([(self._name, "contains_any", list(values))])
 
+    def like(self, pattern: str) -> _RecordedFilter:
+        """Record a wildcard leg on this property, as a path-prefix filter uses."""
+        return _RecordedFilter([(self._name, "like", pattern)])
+
 
 def _legs(predicate: Any) -> list[tuple[str, str, Any]]:
     """Flatten what was sent to the cluster into its recorded legs."""
@@ -82,6 +86,7 @@ def _make_mock_weaviate_module() -> MagicMock:
     mock_config.Configure.Vectorizer.none.return_value = "none_vectorizer"
     mock_config.Configure.multi_tenancy.return_value = "multi_tenancy_config"
     mock_config.DataType.TEXT = "TEXT"
+    mock_config.DataType.INT = "INT"
     mock_config.Property = MagicMock(side_effect=lambda **kw: kw)
     mock_weaviate.classes = MagicMock()
     mock_weaviate.classes.config = mock_config
@@ -559,7 +564,15 @@ class TestTeamIdMetadata:
         backend.create_collection("col1", CollectionConfig())
 
         properties = mock_client.collections.create.call_args[1]["properties"]
-        assert {p["name"] for p in properties} == {"ref_type", "ref_id", "text", "team_id"}
+        assert {p["name"] for p in properties} == {
+            "ref_type",
+            "ref_id",
+            "text",
+            "team_id",
+            "scope",
+            "path",
+            "ordinal",
+        }
 
     def test_add_stamps_team_id_on_every_object(self) -> None:
         """Each batched object carries the backend's team_id."""
@@ -607,14 +620,34 @@ class TestProtocolCarriesNoTeam:
     """The isolation boundary lives in the backend, so no caller can omit it."""
 
     def test_protocol_search_and_remove_take_no_team_argument(self) -> None:
-        """VectorStoreService gains no argument; a team is never passed in."""
+        """VectorStoreService takes no team; the boundary stays inside the backend.
+
+        The scope and path predicates added for workspace retrieval are ordinary
+        query arguments and narrow *within* a team — they are deliberately not the
+        team leg, which no caller may pass and none may omit.
+        """
         from akgentic.tool.vector_store.protocol import VectorStoreService
 
         search = inspect.signature(VectorStoreService.search)
         remove = inspect.signature(VectorStoreService.remove)
 
-        assert list(search.parameters) == ["self", "collection", "query_vector", "top_k"]
-        assert list(remove.parameters) == ["self", "collection", "ref_ids"]
+        assert list(search.parameters) == [
+            "self",
+            "collection",
+            "query_vector",
+            "top_k",
+            "scope",
+            "path_prefix",
+        ]
+        assert list(remove.parameters) == [
+            "self",
+            "collection",
+            "ref_ids",
+            "scope",
+            "path_prefix",
+        ]
+        assert not any("team" in name for name in search.parameters)
+        assert not any("team" in name for name in remove.parameters)
 
 
 class TestTeamlessBackendCannotQuery:
@@ -867,3 +900,323 @@ class TestConnectionConfig:
         assert call_kwargs["http_secure"] is True
         assert call_kwargs["grpc_secure"] is True
         assert call_kwargs["http_port"] == 443
+
+
+# ---------------------------------------------------------------------------
+# scope / path / ordinal — the second predicate dimension
+# ---------------------------------------------------------------------------
+
+
+def _entry_with(
+    ref_id: str = "e1",
+    scope: str | None = None,
+    path: str | None = None,
+    ordinal: int | None = None,
+) -> MagicMock:
+    """Return a mock VectorEntry carrying the workspace metadata dimension."""
+    entry = _make_entry(ref_id=ref_id)
+    entry.scope = scope
+    entry.path = path
+    entry.ordinal = ordinal
+    return entry
+
+
+def _scoped_backend(mock_client: MagicMock) -> Any:
+    """Build a team-scoped backend with ``col1`` already created."""
+    from akgentic.tool.vector_store.protocol import CollectionConfig
+    from akgentic.tool.vector_store.weaviate import WeaviateBackend
+
+    backend = WeaviateBackend(url="http://localhost:8080", team_id="team-42")
+    backend.create_collection("col1", CollectionConfig())
+    return backend
+
+
+class TestScopeSchemaAndStamping:
+    """The schema carries the three properties; add stamps only what is set."""
+
+    def test_schema_declares_scope_path_and_ordinal(self) -> None:
+        """create_collection declares the three new properties with their data types."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+
+        _scoped_backend(mock_client)
+
+        properties = mock_client.collections.create.call_args[1]["properties"]
+        by_name = {p["name"]: p["data_type"] for p in properties}
+        assert by_name["scope"] == "TEXT"
+        assert by_name["path"] == "TEXT"
+        assert by_name["ordinal"] == "INT"
+
+    def test_add_stamps_the_three_when_set(self) -> None:
+        """A workspace chunk writes scope, path and ordinal."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        mock_batch = _batch_for(mock_client)
+
+        backend = _scoped_backend(mock_client)
+        backend.add(
+            "col1", [_entry_with(scope="ws-1", path="docs/report.md", ordinal=3)]
+        )
+
+        props = mock_batch.add_object.call_args[1]["properties"]
+        assert props["scope"] == "ws-1"
+        assert props["path"] == "docs/report.md"
+        assert props["ordinal"] == 3
+
+    def test_add_omits_the_three_when_unset(self) -> None:
+        """A planning or knowledge-graph entry writes exactly what it always wrote.
+
+        A Weaviate class created before a property exists never gains it, so stamping
+        a default here would ask the cluster to auto-extend the live ``Planning`` and
+        ``Knowledge_graph`` schemas.
+        """
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        mock_batch = _batch_for(mock_client)
+
+        backend = _scoped_backend(mock_client)
+        backend.add("col1", [_entry_with()])
+
+        props = mock_batch.add_object.call_args[1]["properties"]
+        assert set(props) == {"ref_type", "ref_id", "text", "team_id"}
+
+    def test_add_stamps_each_field_independently(self) -> None:
+        """Setting only ``scope`` writes only ``scope``."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        mock_batch = _batch_for(mock_client)
+
+        backend = _scoped_backend(mock_client)
+        backend.add("col1", [_entry_with(scope="ws-1")])
+
+        props = mock_batch.add_object.call_args[1]["properties"]
+        assert props["scope"] == "ws-1"
+        assert "path" not in props
+        assert "ordinal" not in props
+
+
+class TestScopeAndPathPredicatesReachTheCluster:
+    """Both predicates go to the cluster, conjoined with the team leg."""
+
+    def _empty_search_backend(self) -> tuple[Any, MagicMock]:
+        """Return (backend, mock_collection) with an empty near_vector result."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        mock_collection = MagicMock()
+        mock_client.collections.get.return_value = mock_collection
+        mock_collection.query.near_vector.return_value = MagicMock(objects=[])
+        return _scoped_backend(mock_client), mock_collection
+
+    def test_search_conjoins_scope_with_the_team_leg(self) -> None:
+        """The scope leg is added to the team predicate, never instead of it."""
+        backend, mock_collection = self._empty_search_backend()
+
+        backend.search("col1", [0.1, 0.2], top_k=5, scope="ws-1")
+
+        sent = mock_collection.query.near_vector.call_args[1]["filters"]
+        assert _legs(sent) == [
+            ("team_id", "equal", "team-42"),
+            ("scope", "equal", "ws-1"),
+        ]
+
+    def test_search_path_prefix_is_a_wildcard_leg(self) -> None:
+        """path_prefix becomes a like('prefix*') leg on the path property."""
+        backend, mock_collection = self._empty_search_backend()
+
+        backend.search("col1", [0.1, 0.2], top_k=5, path_prefix="docs/")
+
+        sent = mock_collection.query.near_vector.call_args[1]["filters"]
+        assert _legs(sent) == [
+            ("team_id", "equal", "team-42"),
+            ("path", "like", "docs/*"),
+        ]
+
+    def test_search_conjoins_both_predicates(self) -> None:
+        """scope and path_prefix are both applied, together with the team leg."""
+        backend, mock_collection = self._empty_search_backend()
+
+        backend.search("col1", [0.1, 0.2], top_k=5, scope="ws-1", path_prefix="docs/")
+
+        sent = mock_collection.query.near_vector.call_args[1]["filters"]
+        assert _legs(sent) == [
+            ("team_id", "equal", "team-42"),
+            ("scope", "equal", "ws-1"),
+            ("path", "like", "docs/*"),
+        ]
+
+    def test_predicates_go_as_filters_so_top_k_is_honoured_after_filtering(self) -> None:
+        """They travel as ``filters=`` beside ``limit``, so the cluster applies them first."""
+        backend, mock_collection = self._empty_search_backend()
+
+        backend.search("col1", [0.1, 0.2], top_k=7, scope="ws-1")
+
+        kwargs = mock_collection.query.near_vector.call_args[1]
+        assert kwargs["limit"] == 7
+        assert "filters" in kwargs
+
+    def test_search_without_predicates_sends_only_the_team_leg(self) -> None:
+        """The default is exactly the predicate this backend has always applied."""
+        backend, mock_collection = self._empty_search_backend()
+
+        backend.search("col1", [0.1, 0.2], top_k=5)
+
+        sent = mock_collection.query.near_vector.call_args[1]["filters"]
+        assert _legs(sent) == [("team_id", "equal", "team-42")]
+
+    def test_remove_by_scope_is_one_conjoined_delete_many(self) -> None:
+        """ref-ids, the team predicate and the scope predicate travel together."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        mock_collection = MagicMock()
+        mock_client.collections.get.return_value = mock_collection
+
+        backend = _scoped_backend(mock_client)
+        backend.remove("col1", ["r1", "r2"], scope="ws-1")
+
+        mock_collection.data.delete_many.assert_called_once()
+        sent = mock_collection.data.delete_many.call_args[1]["where"]
+        assert _legs(sent) == [
+            ("ref_id", "contains_any", ["r1", "r2"]),
+            ("team_id", "equal", "team-42"),
+            ("scope", "equal", "ws-1"),
+        ]
+
+    def test_remove_without_predicates_is_unchanged(self) -> None:
+        """The existing two-leg removal is exactly what it was."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        mock_collection = MagicMock()
+        mock_client.collections.get.return_value = mock_collection
+
+        backend = _scoped_backend(mock_client)
+        backend.remove("col1", ["r1"])
+
+        sent = mock_collection.data.delete_many.call_args[1]["where"]
+        assert _legs(sent) == [
+            ("ref_id", "contains_any", ["r1"]),
+            ("team_id", "equal", "team-42"),
+        ]
+
+    def test_a_teamless_backend_still_cannot_query_with_a_scope(self) -> None:
+        """A scope argument never substitutes for the team leg."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+
+        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+
+        backend = WeaviateBackend(url="http://localhost:8080")
+        backend.create_collection("col1", CollectionConfig())
+
+        with pytest.raises(ValueError, match="without a team_id"):
+            backend.search("col1", [0.1], top_k=5, scope="ws-1")
+
+
+class TestScopeReadBackOntoHits:
+    """search reads the three properties back onto the SearchHit when present."""
+
+    def _search_returning(self, properties: dict[str, Any]) -> Any:
+        """Run a search against a single object carrying *properties*."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        mock_collection = MagicMock()
+        mock_client.collections.get.return_value = mock_collection
+
+        mock_obj = MagicMock()
+        mock_obj.properties = properties
+        mock_obj.metadata.distance = 0.2
+        mock_collection.query.near_vector.return_value = MagicMock(objects=[mock_obj])
+
+        backend = _scoped_backend(mock_client)
+        return backend.search("col1", [0.1, 0.2], top_k=5)
+
+    def test_hit_carries_the_three_fields(self) -> None:
+        """A workspace chunk comes back with its scope, path and ordinal."""
+        result = self._search_returning(
+            {
+                "ref_type": "chunk",
+                "ref_id": "r1",
+                "text": "hello",
+                "scope": "ws-1",
+                "path": "docs/report.md",
+                "ordinal": 3,
+            }
+        )
+        hit = result.hits[0]
+        assert hit.scope == "ws-1"
+        assert hit.path == "docs/report.md"
+        assert hit.ordinal == 3
+
+    def test_hit_carries_none_when_the_class_has_no_such_property(self) -> None:
+        """A pre-existing Planning object reads back as three Nones, not 'None'."""
+        result = self._search_returning(
+            {"ref_type": "entity", "ref_id": "r1", "text": "hello"}
+        )
+        hit = result.hits[0]
+        assert hit.scope is None
+        assert hit.path is None
+        assert hit.ordinal is None
+
+
+class TestPathPrefixWildcardsAreRefused:
+    """A ``path_prefix`` carrying ``*`` or ``?`` never reaches the cluster.
+
+    ``_query_filter`` builds ``like(f"{path_prefix}*")``, and ``*`` and ``?`` are
+    both wildcards to ``Like`` with no escape in the v4 filter API — while the
+    in-memory backend reads them literally through ``str.startswith``. The same
+    query would mean two different things depending on where the collection lives,
+    so both backends refuse them with the same sentence (ADR-045 §5). On
+    ``remove()`` that is the sharp case: unguarded, a ``*`` widens the deletion
+    here and narrows it to nothing there.
+    """
+
+    def _backend_and_collection(self) -> tuple[Any, MagicMock]:
+        """Return (team-scoped backend, mock collection) with ``col1`` created."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        mock_collection = MagicMock()
+        mock_client.collections.get.return_value = mock_collection
+        mock_collection.query.near_vector.return_value = MagicMock(objects=[])
+        return _scoped_backend(mock_client), mock_collection
+
+    @pytest.mark.parametrize("prefix", ["docs/*", "docs/?ne.md", "*", "?"])
+    def test_search_refuses_a_wildcard_prefix(self, prefix: str) -> None:
+        """The refusal happens before ``near_vector`` is called at all."""
+        backend, mock_collection = self._backend_and_collection()
+
+        with pytest.raises(ValueError, match="path_prefix cannot contain"):
+            backend.search("col1", [0.1, 0.2], top_k=5, path_prefix=prefix)
+
+        mock_collection.query.near_vector.assert_not_called()
+
+    @pytest.mark.parametrize("prefix", ["docs/*", "docs/?ne.md", "*", "?"])
+    def test_remove_refuses_a_wildcard_prefix(self, prefix: str) -> None:
+        """No ``delete_many`` is issued, so nothing is widened on the cluster."""
+        backend, mock_collection = self._backend_and_collection()
+
+        with pytest.raises(ValueError, match="path_prefix cannot contain"):
+            backend.remove("col1", ["r1"], path_prefix=prefix)
+
+        mock_collection.data.delete_many.assert_not_called()
+
+    def test_the_message_is_the_one_both_backends_share(self) -> None:
+        """Identical wording to the in-memory backend and to the workspace answer."""
+        from akgentic.tool.vector_store.protocol import PATH_PREFIX_REJECTED
+
+        backend, _mock_collection = self._backend_and_collection()
+
+        with pytest.raises(ValueError) as excinfo:
+            backend.remove("col1", ["r1"], path_prefix="docs/*")
+        assert str(excinfo.value) == PATH_PREFIX_REJECTED
+
+    def test_a_clean_prefix_still_builds_its_like_leg(self) -> None:
+        """The guard refuses two characters and changes nothing else."""
+        backend, mock_collection = self._backend_and_collection()
+
+        backend.search("col1", [0.1, 0.2], top_k=5, path_prefix="docs/")
+
+        sent = mock_collection.query.near_vector.call_args[1]["filters"]
+        assert _legs(sent) == [
+            ("team_id", "equal", "team-42"),
+            ("path", "like", "docs/*"),
+        ]

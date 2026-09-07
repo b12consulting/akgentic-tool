@@ -47,7 +47,7 @@ from akgentic.tool.workspace.models import (
     WorkspaceConfig,
 )
 from akgentic.tool.workspace.readers import DocumentReader
-from akgentic.tool.workspace.tool import WorkspaceRead, WorkspaceTool
+from akgentic.tool.workspace.tool import WorkspaceRead, WorkspaceTool, WorkspaceView
 
 from tests.workspace.conftest import (
     WORKSPACE_NAME,
@@ -61,6 +61,7 @@ from tests.workspace.conftest import (
     outcome_of,
     read,
     requires_git,
+    tool_named,
     working_tree_is_clean,
 )
 from tests.workspace.test_workspace_actor import staging_name
@@ -617,12 +618,13 @@ class TestTheSeededIgnoreFile:
 
         assert mine.read_text(encoding="utf-8") == "# mine, thanks\n"
 
-    def test_a_document_sidecar_leaves_the_tree_clean(
+    def test_a_document_read_leaves_the_tree_clean(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
-        # Reads write sidecars, so reads dirty the tree — which is why the ignore
-        # file is not optional hygiene. Without it every agent's commit would be
-        # preceded by an out-of-band commit of regenerable noise.
+        # Since 45-4 a document read writes nothing at all — its extraction lives
+        # in ``#Workspace``'s state — so the tree is clean for a stronger reason
+        # than "the sidecar is ignored". The ignore file still earns its place on
+        # the image-view path below.
         (workspace_tree / "report.pdf").write_bytes(b"%PDF-1.4 fake")
         observer = FakeActorToolObserver(orchestrator_proxy, name="alice")
         card = WorkspaceTool(
@@ -632,16 +634,48 @@ class TestTheSeededIgnoreFile:
         )
         card.observer(observer)
         mutate(card, "workspace_write", "seed.md", "x\n")  # absorb the pre-existing pdf
+        before_files = sorted(p.name for p in workspace_tree.iterdir())
 
         read(card, "report.pdf")
 
-        assert (workspace_tree / ".report.pdf.md").exists()
+        assert sorted(p.name for p in workspace_tree.iterdir()) == before_files
+        assert not (workspace_tree / ".report.pdf.md").exists()
+        assert working_tree_is_clean(workspace_tree)
+        before = len(journal_log(workspace_tree))
+        mutate(card, "workspace_write", "after.md", "y\n")
+        log = journal_log(workspace_tree)
+        assert len(log) == before + 1  # no out-of-band commit provoked by the read
+        assert all(".report.pdf.md" not in commit.files for commit in log)
+
+    def test_an_image_view_sidecar_leaves_the_tree_clean(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        # The ignore file's remaining purpose: ``workspace_view`` still writes a
+        # resized sidecar beside its source, so a view dirties the tree and every
+        # agent's commit would be preceded by an out-of-band commit of
+        # regenerable noise. That sidecar is out of scope for 45-4.
+        pytest.importorskip("PIL")
+        from PIL import Image
+
+        Image.new("RGB", (64, 64), "red").save(workspace_tree / "photo.png")
+        observer = FakeActorToolObserver(orchestrator_proxy, name="alice")
+        card = WorkspaceTool(
+            workspace_id=WORKSPACE_NAME,
+            git_journal=True,
+            workspace_view=WorkspaceView(max_dimension=16),
+        )
+        card.observer(observer)
+        mutate(card, "workspace_write", "seed.md", "x\n")  # absorb the pre-existing image
+
+        tool_named(card, "workspace_view")("photo.png")
+
+        assert (workspace_tree / ".photo.png.16.png").exists()
         assert working_tree_is_clean(workspace_tree)
         before = len(journal_log(workspace_tree))
         mutate(card, "workspace_write", "after.md", "y\n")
         log = journal_log(workspace_tree)
         assert len(log) == before + 1  # no out-of-band commit for the sidecar
-        assert all(".report.pdf.md" not in commit.files for commit in log)
+        assert all(".photo.png.16.png" not in commit.files for commit in log)
 
     def test_a_live_staging_file_leaves_the_tree_clean(
         self, wired_card: WorkspaceTool, workspace_tree: Path

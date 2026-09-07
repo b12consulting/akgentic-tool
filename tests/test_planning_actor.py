@@ -444,8 +444,6 @@ class TestPlanConfigCollectionField:
         # Structural defaults — AC-11 backward-compat guard.
         assert cfg.collection.dimension == 1536
         assert cfg.collection.backend == "inmemory"
-        assert cfg.collection.persistence == "actor_state"
-        assert cfg.collection.workspace_path is None
         assert cfg.collection.tenant is None
 
     def test_collection_accepts_custom_value(self) -> None:
@@ -455,14 +453,10 @@ class TestPlanConfigCollectionField:
         cfg = PlanConfig(
             name="#PlanningTool",
             role="ToolActor",
-            collection=CollectionConfig(
-                backend="inmemory",
-                persistence="workspace",
-                workspace_path="/tmp/plan",
-            ),
+            collection=CollectionConfig(backend="inmemory", tenant="plan-tenant"),
         )
-        assert cfg.collection.persistence == "workspace"
-        assert cfg.collection.workspace_path == "/tmp/plan"
+        assert cfg.collection.backend == "inmemory"
+        assert cfg.collection.tenant == "plan-tenant"
 
     def test_collection_roundtrip_default(self) -> None:
         from akgentic.tool.planning.planning_actor import PlanConfig
@@ -479,16 +473,11 @@ class TestPlanConfigCollectionField:
         cfg = PlanConfig(
             name="#PlanningTool",
             role="ToolActor",
-            collection=CollectionConfig(
-                backend="inmemory",
-                persistence="workspace",
-                workspace_path="/tmp/plan",
-            ),
+            collection=CollectionConfig(backend="inmemory", tenant="plan-tenant"),
         )
         reloaded = PlanConfig.model_validate(cfg.model_dump())
         assert reloaded.collection.backend == "inmemory"
-        assert reloaded.collection.persistence == "workspace"
-        assert reloaded.collection.workspace_path == "/tmp/plan"
+        assert reloaded.collection.tenant == "plan-tenant"
         assert reloaded.collection.dimension == 1536  # default preserved
 
     def test_base_config_coercion_yields_default_collection(self) -> None:
@@ -573,9 +562,7 @@ class TestPlanActorAcquireVsProxyCollectionPropagation:
         from akgentic.tool.planning.planning_actor import PLAN_COLLECTION
         from akgentic.tool.vector_store.protocol import CollectionConfig
 
-        custom = CollectionConfig(
-            backend="inmemory", persistence="workspace", workspace_path="/tmp/plan"
-        )
+        custom = CollectionConfig(backend="inmemory", tenant="plan-tenant")
         actor, vs_proxy = _plan_actor_with_vs_proxy(collection=custom)
 
         actor._acquire_vs_proxy()
@@ -600,8 +587,6 @@ class TestPlanActorAcquireVsProxyCollectionPropagation:
         assert args[1] == CollectionConfig()
         assert args[1].dimension == 1536
         assert args[1].backend == "inmemory"
-        assert args[1].persistence == "actor_state"
-        assert args[1].workspace_path is None
         assert args[1].tenant is None
 
     def test_vector_store_false_short_circuits_before_collection_examined(self) -> None:
