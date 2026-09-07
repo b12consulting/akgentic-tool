@@ -24,8 +24,10 @@ from akgentic.tool.workspace.tool import WorkspaceTool
 from akgentic.tool.workspace.workspace import Filesystem
 
 from tests.workspace.conftest import (
+    workspace_path_for,
     HANDSHAKE_TIMEOUT_S,
     WORKSPACE_NAME,
+    WORKSPACE_PATH,
     AskOnlyProxy,
     BusyProxy,
     CountingProxy,
@@ -109,8 +111,8 @@ class TestSingleton:
         shared_card = WorkspaceTool(workspace_id="shared")
         shared_card.observer(shared_observer)
 
-        assert workspace_actor_name("shared") in orchestrator_proxy.children
-        assert workspace_actor_name(WORKSPACE_NAME) in orchestrator_proxy.children
+        assert workspace_actor_name(workspace_path_for("shared")) in orchestrator_proxy.children
+        assert workspace_actor_name(WORKSPACE_PATH) in orchestrator_proxy.children
         assert shared_card._workspace_proxy is not wired_card._workspace_proxy
 
     def test_the_actor_owns_the_tree_its_card_is_anchored_to(
@@ -118,7 +120,7 @@ class TestSingleton:
         workspace_actor: WorkspaceActor,
         workspace_tree: Path,
     ) -> None:
-        assert workspace_actor.config.workspace_name == WORKSPACE_NAME
+        assert workspace_actor.config.workspace_path == WORKSPACE_PATH
         assert workspace_actor._workspace._root == workspace_tree.resolve()
 
 
@@ -593,5 +595,5 @@ class TestTheObservationIsATell:
 
 
 def test_the_actor_config_is_fully_serialisable(workspaces_root: Path) -> None:
-    config = WorkspaceConfig(name="#Workspace-x", role="ToolActor", workspace_name="x")
+    config = WorkspaceConfig(name="#Workspace-x", role="ToolActor", workspace_path="x")
     assert WorkspaceConfig.model_validate(config.model_dump()) == config

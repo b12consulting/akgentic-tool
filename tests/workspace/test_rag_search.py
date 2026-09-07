@@ -42,7 +42,7 @@ from akgentic.tool.workspace.models import WorkspaceConfig, WorkspaceState, cont
 from akgentic.tool.workspace.readers import DocumentReader
 
 from tests.conftest import MockActorAddress
-from tests.workspace.conftest import WORKSPACE_NAME, DeadAddress
+from tests.workspace.conftest import WORKSPACE_PATH, DeadAddress
 
 _UNAVAILABLE = "Retrieval indexing is not available for this workspace."
 _NO_HITS = (
@@ -186,7 +186,7 @@ class SearchHarness:
         Returns:
             The digest both maps agree on.
         """
-        owner = scope or self.actor.config.workspace_name
+        owner = scope or self.actor.config.workspace_path
         sha = content_sha(body.encode("utf-8"))
         chunks: list[RagChunk] = []
         for ordinal, (start, end, heading) in enumerate(spans):
@@ -202,7 +202,7 @@ class SearchHarness:
             )
             if embedded:
                 self.store.store_chunk(identity, owner, path, ordinal, body[start:end])
-        if owner == self.actor.config.workspace_name:
+        if owner == self.actor.config.workspace_path:
             self.actor.state.rag_index[path] = RagFile(
                 path=path,
                 status=RagStatus.EMBEDDED,
@@ -232,13 +232,17 @@ class SearchHarness:
         return self.store
 
 
-def build_actor(workspace_name: str = WORKSPACE_NAME) -> WorkspaceActor:
-    """A started actor over *workspace_name*, with no actor thread."""
+def build_actor(workspace_path: str = WORKSPACE_PATH) -> WorkspaceActor:
+    """A started actor over *workspace_path*, with no actor thread.
+
+    Takes the **resolved** two-segment path, which is what an actor is
+    configured with — the leaf alone would put it on a tree no card reaches.
+    """
     started = WorkspaceActor(
         config=WorkspaceConfig(
-            name=workspace_actor_name(workspace_name),
+            name=workspace_actor_name(workspace_path),
             role=WORKSPACE_ACTOR_ROLE,
-            workspace_name=workspace_name,
+            workspace_path=workspace_path,
         )
     )
     started.on_start()
@@ -365,7 +369,7 @@ class TestTheVectorLeg:
         search.actor.rag_search("payment")
 
         [(collection, _, scope, _prefix)] = search.store.searches
-        assert (collection, scope) == (RAG_COLLECTION, WORKSPACE_NAME)
+        assert (collection, scope) == (RAG_COLLECTION, WORKSPACE_PATH)
 
     def test_an_empty_prefix_reaches_the_backend_as_none_rather_than_as_a_string(
         self, search: SearchHarness
@@ -656,7 +660,7 @@ class TestScopeIsolation:
         self, search: SearchHarness
     ) -> None:
         """Without this the predicate would be filtering entries that had collided."""
-        assert chunk_id(WORKSPACE_NAME, "a.md", "sha", 0) != chunk_id(
+        assert chunk_id(WORKSPACE_PATH, "a.md", "sha", 0) != chunk_id(
             "other-workspace", "a.md", "sha", 0
         )
 

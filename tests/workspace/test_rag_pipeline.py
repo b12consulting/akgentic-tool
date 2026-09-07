@@ -49,7 +49,7 @@ from akgentic.tool.workspace.models import WorkspaceConfig, WorkspaceState, cont
 from akgentic.tool.workspace.readers import DocumentReader
 
 from tests.conftest import MockActorAddress
-from tests.workspace.conftest import WORKSPACE_NAME, DeadAddress
+from tests.workspace.conftest import DeadAddress, WORKSPACE_PATH
 
 ##
 ## Doubles
@@ -177,7 +177,7 @@ class RagHarness:
         sha = source_sha if source_sha is not None else self._sha_of(path)
         built = [
             RagChunk(
-                chunk_id=chunk_id(WORKSPACE_NAME, path, sha, ordinal),
+                chunk_id=chunk_id(WORKSPACE_PATH, path, sha, ordinal),
                 ordinal=ordinal,
                 start=0,
                 end=len(markdown),
@@ -187,7 +187,7 @@ class RagHarness:
         self.actor.receiveMsg_IndexResult(
             IndexResult(
                 path=path,
-                scope=WORKSPACE_NAME,
+                scope=WORKSPACE_PATH,
                 source_sha=sha,
                 markdown=markdown,
                 extracted=extracted,
@@ -201,7 +201,7 @@ class RagHarness:
         self.actor.receiveMsg_IndexFailure(
             IndexFailure(
                 path=path,
-                scope=WORKSPACE_NAME,
+                scope=WORKSPACE_PATH,
                 source_sha=source_sha if source_sha is not None else self._sha_of(path),
                 reason=reason,
             )
@@ -256,9 +256,9 @@ def actor(workspace_tree: Path) -> WorkspaceActor:
     """A started actor over the test workspace, with no actor thread."""
     started = WorkspaceActor(
         config=WorkspaceConfig(
-            name=workspace_actor_name(WORKSPACE_NAME),
+            name=workspace_actor_name(WORKSPACE_PATH),
             role=WORKSPACE_ACTOR_ROLE,
-            workspace_name=WORKSPACE_NAME,
+            workspace_path=WORKSPACE_PATH,
         )
     )
     started.on_start()
@@ -577,7 +577,7 @@ class TestTheSpawnSide:
 
         [request] = harness.requests
         assert request.path == "notes.md"
-        assert request.scope == WORKSPACE_NAME
+        assert request.scope == WORKSPACE_PATH
         assert request.source_sha == sha
         assert request.markdown is None
         assert request.params == params
@@ -729,7 +729,7 @@ class TestBatching:
         harness.report("notes.md", chunks=2, texts=["first", "second"])
 
         [(_, entries, _, _)] = harness.vs.of("add")
-        assert [entry.scope for entry in entries] == [WORKSPACE_NAME, WORKSPACE_NAME]
+        assert [entry.scope for entry in entries] == [WORKSPACE_PATH, WORKSPACE_PATH]
         assert [entry.path for entry in entries] == ["notes.md", "notes.md"]
         assert [entry.ordinal for entry in entries] == [0, 1]
         assert [entry.text for entry in entries] == ["first", "second"]
@@ -861,7 +861,7 @@ class TestReIndexOrdering:
         [(collection, ref_ids, scope)] = harness.vs.of("remove")
         assert collection == RAG_COLLECTION
         assert ref_ids == old_ids
-        assert scope == WORKSPACE_NAME
+        assert scope == WORKSPACE_PATH
 
     def test_a_successful_removal_clears_the_superseded_ids(
         self, harness: RagHarness, workspace_tree: Path
@@ -925,7 +925,7 @@ class TestReportAttribution:
         harness.actor.receiveMsg_IndexResult(
             IndexResult(
                 path="never-queued.md",
-                scope=WORKSPACE_NAME,
+                scope=WORKSPACE_PATH,
                 source_sha="x",
                 markdown="body",
                 extracted=True,

@@ -32,11 +32,12 @@ class DockerSandboxActor(SandboxActor):
 
     Manages a single Docker container named ``sandbox-{team_id}``.
     Container is started (or reused) on on_start(), stopped (not removed)
-    on on_stop(). The host-side volume mount path uses
-    ``{AKGENTIC_WORKSPACES_ROOT}/{workspace_id or team_id}`` so that when
-    ``SandboxConfig.workspace_id`` is set, the mounted directory matches the
-    one used by ``WorkspaceTool(workspace_id=...)``. The container name always
-    uses ``team_id`` — containers are per-team execution resources.
+    on on_stop(). The host-side volume mount is
+    ``{AKGENTIC_WORKSPACES_ROOT}/{config.workspace_path}`` — the path the card
+    already resolved, joined and never re-derived, so the mounted directory is
+    by construction the one the write gate and the journal are working on. The
+    container name always uses ``team_id``: containers are per-team execution
+    resources, and that is the only thing ``team_id`` decides here.
     """
 
     def _resolved_image(self) -> str:
@@ -79,8 +80,7 @@ class DockerSandboxActor(SandboxActor):
             )
         self._ensure_image()
         base = os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
-        ws_name = self.config.workspace_id or self.config.team_id
-        volume = f"{(Path(base) / ws_name).resolve()}:/workspace"
+        volume = f"{(Path(base) / self.config.workspace_path).resolve()}:/workspace"
         # Check if container already exists (any state)
         check = subprocess.run(
             [

@@ -129,8 +129,10 @@ def workspace_actor_name(workspace_name: str) -> str:
     """Return the singleton actor name owning *workspace_name*.
 
     Args:
-        workspace_name: The resolved workspace — a card's ``workspace_id``, or
-            the team id when it has none.
+        workspace_name: The **resolved** two-segment workspace path, exactly as
+            the card derived it and as ``Filesystem`` receives it. Its slash is
+            carried verbatim — nothing parses an actor name, and the path is
+            injective by construction.
 
     Returns:
         ``#Workspace-<workspace_name>``.
@@ -231,7 +233,7 @@ class WorkspaceActor(
         self._vs_proxy: VectorStoreActor | None = None
         self._vs_tell: VectorStoreActor | None = None
         self._index_active: set[str] = set()
-        self._workspace: Filesystem = get_workspace(self.config.workspace_name)
+        self._workspace: Filesystem = get_workspace(self.config.workspace_path)
         self._sweep_staging_files()
         self._journal = GitJournal(
             self._workspace._root,
@@ -309,7 +311,7 @@ class WorkspaceActor(
         except Exception:
             logger.warning(
                 "Workspace %s: clearing the exec queue raised during on_stop — swallowing",
-                self.config.workspace_name,
+                self.config.workspace_path,
                 exc_info=True,
             )
         super().on_stop()
@@ -351,6 +353,6 @@ class WorkspaceActor(
         if removed:
             logger.info(
                 "Workspace %s: swept %d orphaned staging file(s) at start",
-                self.config.workspace_name,
+                self.config.workspace_path,
                 removed,
             )

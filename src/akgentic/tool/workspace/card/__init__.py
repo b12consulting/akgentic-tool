@@ -30,9 +30,10 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from pathlib import PurePosixPath
 from typing import Any, TypeVar
 
-from pydantic import Field, PrivateAttr
+from pydantic import Field, PrivateAttr, model_validator
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.orchestrator import Orchestrator
@@ -87,7 +88,11 @@ from akgentic.tool.workspace.models import (
     WorkspaceConfig,
     content_sha,
 )
-from akgentic.tool.workspace.workspace import Filesystem, get_workspace
+from akgentic.tool.workspace.workspace import (
+    Filesystem,
+    get_workspace,
+    resolve_workspace_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +142,20 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
 
     # Read capability fields (formerly in WorkspaceReadTool)
     workspace_id: str | None = None
+    workspace_metadata_keys: list[str] = []
+    """Metadata fields whose values key a workspace **shared** across teams and users.
+
+    The third of three layouts (ADR-048 Decision 2). Declaring
+    ``["customer_id", "case_id"]`` on a team whose metadata carries ``ACME`` and
+    ``42`` resolves to ``_meta/case_id-42__customer_id-ACME`` — under a reserved
+    scope rather than under anybody's principal, because sharing is the point.
+
+    **Keys are a set, not a sequence:** they are sorted before joining, so two
+    cards naming the same keys in either order reach the same tree. Values are
+    percent-encoded, which is what keeps the join unforgeable.
+
+    Mutually exclusive with :attr:`workspace_id` — see :meth:`_one_layout`.
+    """
     workspace_read: WorkspaceRead | bool = True
     workspace_view: WorkspaceView | bool = True
     workspace_list: WorkspaceList | bool = True
@@ -271,10 +290,38 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
     _workspace_tell: WorkspaceActor | None = PrivateAttr(default=None)
     _agent_id: str = PrivateAttr(default="")
 
+    @model_validator(mode="after")
+    def _one_layout(self) -> WorkspaceTool:
+        """Refuse a card that names its workspace twice.
+
+        A **validation error**, not a precedence rule. "Metadata wins" would be a
+        silent answer to a question the author got wrong, and two ways to name
+        one tree on one card is a mistake worth surfacing at declaration time —
+        where the person who wrote it is looking (ADR-048 Decision 2).
+
+        Raises:
+            ValueError: If both ``workspace_id`` and ``workspace_metadata_keys``
+                are set.
+        """
+        if self.workspace_id is not None and self.workspace_metadata_keys:
+            raise ValueError(
+                "workspace_id and workspace_metadata_keys are mutually exclusive: "
+                f"got workspace_id={self.workspace_id!r} and "
+                f"workspace_metadata_keys={self.workspace_metadata_keys!r}"
+            )
+        return self
+
     def observer(  # type: ignore[override]
         self, observer: ActorToolObserver
     ) -> WorkspaceTool:
         """Attach observer, initialise the backend, and bind the workspace singleton.
+
+        The workspace path is derived **once**, here, by the one resolver, and
+        handed to everything downstream as an already-resolved value: the
+        ``Filesystem``, the ``#Workspace`` actor's name and config, and the
+        ``ExecConfig`` the sandbox is built from. Nothing below re-derives it,
+        which is what makes it impossible for a backend to open a different
+        directory from the one the gate and the journal are guarding.
 
         Args:
             observer: Actor tool observer; must have a non-None orchestrator.
@@ -283,7 +330,13 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
             Self, enabling method chaining.
 
         Raises:
-            ValueError: If ``observer.orchestrator`` is None.
+            ValueError: If ``observer.orchestrator`` is None, or if the workspace
+                path cannot be derived — an unusable ``user_id``, an unusable
+                ``workspace_id``, or any of the metadata conditions. That raise
+                fails card binding and therefore team creation, **deliberately**:
+                it surfaces in front of the admin who caused it, rather than
+                silently collapsing several principals into one tree. It must
+                never be caught and turned into a fallback.
         """
         if observer.orchestrator is None:
             raise ValueError("WorkspaceTool requires access to the orchestrator.")
@@ -295,13 +348,38 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
             # never enable retrieval at all.
             require_weaviate_configured(self.rag_collection, "WorkspaceTool")
         super().observer(observer)  # store the observer weakly via the base setter
-        ws_name = self.workspace_id or str(observer.team_id)
-        self._workspace = get_workspace(ws_name)
+        ws_path = str(self._resolve_path(observer))
+        self._workspace = get_workspace(ws_path)
         self._seed_resources()
-        self._bind_workspace_actor(observer, observer.orchestrator, ws_name)
-        self._bind_sandbox(observer, observer.orchestrator)
+        self._bind_workspace_actor(observer, observer.orchestrator, ws_path)
+        self._bind_sandbox(observer, observer.orchestrator, ws_path)
         self._announce_rag()
         return self
+
+    def _resolve_path(self, observer: ActorToolObserver) -> PurePosixPath:
+        """Derive this card's two-segment workspace path, through the one resolver.
+
+        ``observer.user_id`` is read as a **typed attribute**. A defaulted
+        ``getattr`` would turn an observer that never received the identity into
+        a silent fall-back to the anonymous scope — every user's tree quietly
+        merged into one, with nothing raised and nothing logged.
+
+        The team's metadata is fetched **only** when this card declares keys, so
+        a bare ``WorkspaceTool()`` gains no bind-time round trip. It is the same
+        call ``MetadataTool`` already makes at bind time.
+        """
+        metadata = (
+            observer.proxy_ask(observer.orchestrator, Orchestrator).get_metadata()
+            if self.workspace_metadata_keys and observer.orchestrator is not None
+            else None
+        )
+        return resolve_workspace_path(
+            workspace_id=self.workspace_id,
+            workspace_metadata_keys=self.workspace_metadata_keys,
+            team_id=str(observer.team_id),
+            user_id=observer.user_id,
+            metadata=metadata,
+        )
 
     def _enabled_exec(self) -> WorkspaceExec | None:
         """Return the exec configuration only when it will register callables.
@@ -322,7 +400,9 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
             return None
         return params
 
-    def _bind_sandbox(self, observer: ActorToolObserver, orchestrator: ActorAddress) -> None:
+    def _bind_sandbox(
+        self, observer: ActorToolObserver, orchestrator: ActorAddress, workspace_path: str
+    ) -> None:
         """Bring up the team's ``#SandboxActor`` and tell ``#Workspace`` about it.
 
         **Nothing happens here when the capability is off** — no host probe, no
@@ -337,6 +417,9 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
         Args:
             observer: The owning agent, live at bind time.
             orchestrator: Address of the orchestrator.
+            workspace_path: The already-resolved two-segment path this card is
+                anchored to. Passed down rather than re-derived, so the sandbox
+                cannot open a directory other than the one being gated.
 
         Raises:
             KeyError: If the configured mode names no registered backend —
@@ -349,7 +432,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
         config = ExecConfig(
             mode=mode,
             team_id=str(observer.team_id),
-            workspace_id=self.workspace_id,
+            workspace_path=workspace_path,
             timeout_s=params.timeout_s,
         )
         orchestrator_proxy = observer.proxy_ask(orchestrator, Orchestrator)
@@ -377,17 +460,19 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
             logger.debug("Could not announce the exec backend to #Workspace", exc_info=True)
 
     def _bind_workspace_actor(
-        self, observer: ActorToolObserver, orchestrator: ActorAddress, workspace_name: str
+        self, observer: ActorToolObserver, orchestrator: ActorAddress, workspace_path: str
     ) -> None:
-        """Bind the ``#Workspace-<workspace_name>`` singleton that owns this tree.
+        """Bind the ``#Workspace-<workspace_path>`` singleton that owns this tree.
 
         Get-or-create in one message (ADR-025): a check-then-create pair is a
         TOCTOU window that produces two singletons over one tree, which is the
         exact failure the pattern exists to prevent.
 
-        The actor's name carries the workspace, so two cards with different
-        ``workspace_id`` values in one team get two actors, each owning its own
-        tree — the unicity domain of the actor equals the resource it owns.
+        The actor's name carries the resolved path, so two cards on different
+        workspaces in one team get two actors, each owning its own tree — the
+        unicity domain of the actor equals the resource it owns. Two principals
+        declaring the same ``workspace_id`` likewise get two actors, because
+        their paths differ in the scope segment.
 
         Two proxies are bound over the one address: an ask proxy for mutations,
         which need the verdict, and a tell proxy for observations, which need
@@ -402,7 +487,11 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
         Args:
             observer: The owning agent, live at bind time.
             orchestrator: Address of the orchestrator.
-            workspace_name: The resolved workspace this card is anchored to.
+            workspace_path: The resolved two-segment path this card is anchored
+                to, carried into the actor's name verbatim — slash included.
+                Nothing parses an actor name, and the path is injective by
+                construction, so carrying it whole avoids a second encoding
+                whose injectivity would have to be proved separately.
         """
         orchestrator_proxy = observer.proxy_ask(orchestrator, Orchestrator)
         derived_documents, derived_chars = derived_document_caps(
@@ -411,9 +500,9 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
         workspace_addr = orchestrator_proxy.getChildrenOrCreate(
             WorkspaceActor,
             config=WorkspaceConfig(
-                name=workspace_actor_name(workspace_name),
+                name=workspace_actor_name(workspace_path),
                 role=WORKSPACE_ACTOR_ROLE,
-                workspace_name=workspace_name,
+                workspace_path=workspace_path,
                 git_journal=self.git_journal,
                 max_documents=(
                     self.max_documents if self.max_documents is not None else derived_documents

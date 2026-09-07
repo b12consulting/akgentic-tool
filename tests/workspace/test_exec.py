@@ -72,8 +72,9 @@ from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
 
 from tests.conftest import MockActorAddress
 from tests.workspace.conftest import (
+    workspace_path_for,
     HANDSHAKE_TIMEOUT_S,
-    WORKSPACE_NAME,
+    WORKSPACE_PATH,
     FakeActorToolObserver,
     FakeOrchestratorProxy,
     SandboxHarness,
@@ -126,7 +127,7 @@ def exec_setup(
 ) -> tuple[WorkspaceTool, WorkspaceActor, SandboxHarness]:
     """An exec-capable card, the singleton behind it, and the sandbox harness."""
     card, _observer = exec_card_for(orchestrator_proxy)
-    _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
+    _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
     assert isinstance(actor, WorkspaceActor)
     harness = SandboxHarness(actor, orchestrator_proxy)
     harness.install(monkeypatch)
@@ -220,7 +221,7 @@ class TestTheCapability:
         orchestrator_proxy: FakeOrchestratorProxy,
     ) -> None:
         created = [config.name for _cls, config in orchestrator_proxy.create_calls]
-        assert sandbox_actor_name(WORKSPACE_NAME) in created
+        assert sandbox_actor_name(WORKSPACE_PATH) in created
 
     def test_two_workspaces_in_one_team_get_two_sandbox_actors(
         self,
@@ -236,17 +237,23 @@ class TestTheCapability:
         #
         # Asserted on where each backend actually ended up, not only on the
         # names: the name is the mechanism, the directory is the consequence.
-        for name in ("alpha", "beta"):
-            (workspaces_root / name).mkdir(parents=True, exist_ok=True)
+        for leaf in ("alpha", "beta"):
+            (workspaces_root / workspace_path_for(leaf)).mkdir(parents=True, exist_ok=True)
         exec_card_for(orchestrator_proxy, name="a", workspace_id="alpha")
         exec_card_for(orchestrator_proxy, name="b", workspace_id="beta")
 
-        alpha = orchestrator_proxy.children[sandbox_actor_name("alpha")][1]
-        beta = orchestrator_proxy.children[sandbox_actor_name("beta")][1]
+        alpha = orchestrator_proxy.children[sandbox_actor_name(workspace_path_for("alpha"))][1]
+        beta = orchestrator_proxy.children[sandbox_actor_name(workspace_path_for("beta"))][1]
 
         assert alpha is not beta
-        assert alpha.state.workspace_path == (workspaces_root / "alpha").resolve()
-        assert beta.state.workspace_path == (workspaces_root / "beta").resolve()
+        assert (
+            alpha.state.workspace_path
+            == (workspaces_root / workspace_path_for("alpha")).resolve()
+        )
+        assert (
+            beta.state.workspace_path
+            == (workspaces_root / workspace_path_for("beta")).resolve()
+        )
 
     def test_two_cards_on_one_workspace_still_share_one_sandbox_actor(
         self,
@@ -265,7 +272,7 @@ class TestTheCapability:
             for _cls, config in orchestrator_proxy.create_calls
             if config.name.startswith(SANDBOX_ACTOR_NAME)
         ]
-        assert set(created) == {sandbox_actor_name(WORKSPACE_NAME)}
+        assert set(created) == {sandbox_actor_name(WORKSPACE_PATH)}
 
     def test_off_the_tool_channel_creates_no_sandbox_actor_and_probes_nothing(
         self,
@@ -729,7 +736,12 @@ class TestTheTwoSpikes:
 
         address = threaded_orchestrator_proxy.getChildrenOrCreate(
             _BlockedSandbox,
-            config=SandboxConfig(name="#SandboxActor-spike-a", role="ToolActor", team_id="t1"),
+            config=SandboxConfig(
+                name="#SandboxActor-spike-a",
+                role="ToolActor",
+                team_id="t1",
+                workspace_path="t1",
+            ),
         )
 
         assert address is not None
@@ -1017,7 +1029,12 @@ class TestTheBudgets:
         # binary has to be present. A budget that stops at the proxy is
         # decoration, so this asserts it reaches subprocess.run in all four.
         actor = REAL_BACKENDS[mode]()
-        actor.config = SandboxConfig(name="#SandboxActor", role="ToolActor", team_id="t1")
+        actor.config = SandboxConfig(
+            name="#SandboxActor",
+            role="ToolActor",
+            team_id="t1",
+            workspace_path="t1",
+        )
         actor.state = SandboxState()
         actor.state.observer(actor)
         actor.state.workspace_path = tmp_path
@@ -1041,7 +1058,12 @@ class TestTheBudgets:
         # ``None`` keeps each backend's default, so no existing caller changed
         # behaviour when the parameter arrived.
         actor = REAL_BACKENDS[mode]()
-        actor.config = SandboxConfig(name="#SandboxActor", role="ToolActor", team_id="t1")
+        actor.config = SandboxConfig(
+            name="#SandboxActor",
+            role="ToolActor",
+            team_id="t1",
+            workspace_path="t1",
+        )
         actor.state = SandboxState()
         actor.state.observer(actor)
         actor.state.workspace_path = tmp_path
@@ -1066,12 +1088,17 @@ class TestTheBudgets:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         card, _ = exec_card_for(orchestrator_proxy)
-        _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = SandboxHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
         actor.configure_exec(
-            ExecConfig(mode="local", team_id=workspace_tree.name, timeout_s=999.0)
+            ExecConfig(
+                mode="local",
+                team_id=workspace_tree.name,
+                workspace_path=WORKSPACE_PATH,
+                timeout_s=999.0,
+            )
         )
 
         start_run(actor, sandbox_script)
@@ -1123,7 +1150,7 @@ class TestTheBudgets:
             return None
 
         monkeypatch.setattr("akgentic.tool.workspace.card.execution.poll_deferred", capture)
-        _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = SandboxHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
@@ -1206,7 +1233,7 @@ class TestWaitingOutTheRun:
         card, _ = exec_card_for(
             orchestrator_proxy, poll_attempts=-1, poll_delay_seconds=0.01, timeout_s=1.0
         )
-        _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = SandboxHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
@@ -1256,7 +1283,7 @@ class TestWaitingOutTheRun:
         bounded_card, _ = exec_card_for(
             orchestrator_proxy, name="bounded", poll_attempts=2, poll_delay_seconds=0.01
         )
-        _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = SandboxHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
@@ -1309,7 +1336,7 @@ class TestWaitingOutTheRun:
         card, _ = exec_card_for(
             orchestrator_proxy, poll_attempts=-1, poll_delay_seconds=0.05, timeout_s=0.05
         )
-        _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = SandboxHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
@@ -1372,7 +1399,7 @@ class TestWaitingOutTheRun:
         card, _ = exec_card_for(
             orchestrator_proxy, poll_attempts=1000, poll_delay_seconds=1.0, timeout_s=999.0
         )
-        _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = SandboxHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
@@ -1437,7 +1464,7 @@ class TestTheDiscoveredWriteSet:
         asserting.
         """
         card, _observer = exec_card_for(orchestrator_proxy, git_journal=True)
-        _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = SandboxHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
@@ -1658,7 +1685,7 @@ class TestTheJournalOff:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         card, _ = exec_card_for(orchestrator_proxy, git_journal=False)
-        _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = SandboxHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
@@ -1754,7 +1781,7 @@ class TestTheShimAndTheCapabilityAgree:
         card, _ = exec_card_for(
             orchestrator_proxy, poll_attempts=50, poll_delay_seconds=0.01, git_journal=True
         )
-        _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = SandboxHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
@@ -1816,7 +1843,7 @@ class TestTheShimAndTheCapabilityAgree:
             poll_delay_seconds=0.01,
             git_journal=True,
         )
-        _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = SandboxHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
@@ -2432,7 +2459,7 @@ class TestAQueuedCallerWaitsOutItsTurn:
             poll_delay_seconds=0.01,
             timeout_s=timeout_s,
         )
-        _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = SandboxHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
@@ -2580,7 +2607,7 @@ class TestAQueuedCallerWaitsOutItsTurn:
         card, _actor, harness = self._sentinel_card(
             orchestrator_proxy, workspace_tree, monkeypatch, name="climber", timeout_s=run_budget
         )
-        _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         sandbox_script.gate.set()
         looks: list[int] = []
@@ -2760,7 +2787,7 @@ class TestACommitPrecedesTheNextStart:
         monkeypatch: pytest.MonkeyPatch,
     ) -> tuple[WorkspaceActor, SandboxHarness]:
         exec_card_for(orchestrator_proxy, git_journal=True)
-        _, actor = orchestrator_proxy.children[workspace_actor_name(workspace_tree.name)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = SandboxHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)

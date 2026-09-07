@@ -49,8 +49,8 @@ def sandbox_actor_name(workspace_name: str) -> str:
     """Return the sandbox actor name owning *workspace_name*'s tree.
 
     ``getChildrenOrCreate`` resolves purely on ``config.name``, so a fixed
-    ``#SandboxActor`` collapses two exec-capable cards carrying different
-    ``workspace_id`` values onto the **first** actor — whose directory is the
+    ``#SandboxActor`` collapses two exec-capable cards on different
+    workspaces onto the **first** actor — whose directory is the
     *other* card's tree. The second agent's commands then run in tree ``a`` while
     ``#Workspace-b`` gates, discovers and commits tree ``b``: tree ``a`` is
     mutated entirely outside the gate, with nothing raised and nothing logged.
@@ -60,10 +60,11 @@ def sandbox_actor_name(workspace_name: str) -> str:
     is a tree.
 
     Args:
-        workspace_name: The resolved workspace — a card's ``workspace_id``, or
-            the team id when it has none. It must be derived exactly as
-            ``Filesystem`` resolution derives it, or the actor's name and the
-            directory it opens would disagree.
+        workspace_name: The **resolved** two-segment workspace path, exactly as
+            the card derived it and as ``Filesystem`` receives it. The slash it
+            contains is carried verbatim: nothing parses an actor name, and the
+            path is injective by construction, so a second encoding here would
+            only add an injectivity proof nobody needs.
 
     Returns:
         ``#SandboxActor-<workspace_name>``.
@@ -158,11 +159,15 @@ class SandboxConfig(BaseConfig):
     """Configuration for a SandboxActor.
 
     Attributes:
-        team_id: Identifier of the team that owns this sandbox.
-        workspace_id: Optional workspace directory name override.  When ``None``
-            (default), the workspace directory is named after ``team_id``.  When
-            set, the named directory is used instead.  Docker container name
-            always uses ``team_id`` — containers are per-team, not per-workspace.
+        team_id: Identifier of the team that owns this sandbox.  It names the
+            docker **container** — containers are per-team execution resources —
+            and nothing else: no directory is derived from it.
+        workspace_path: The already-resolved two-segment path of the tree this
+            sandbox mounts, relative to ``AKGENTIC_WORKSPACES_ROOT``.  It
+            replaces the raw ``workspace_id`` override this config used to
+            carry: a backend that joins a path it was handed cannot open a
+            different directory from the one the card, the write gate and the
+            journal are working on.
         mode: Execution backend — ``"local"`` (subprocess), ``"bwrap"``
             (Linux bubblewrap), ``"seatbelt"`` (macOS Apple Seatbelt),
             ``"docker"`` (persistent container), or ``"auto"`` (automatic
@@ -170,7 +175,7 @@ class SandboxConfig(BaseConfig):
     """
 
     team_id: str
-    workspace_id: str | None = None
+    workspace_path: str
     mode: CardMode = "local"
 
 

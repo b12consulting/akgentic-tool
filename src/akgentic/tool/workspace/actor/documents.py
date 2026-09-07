@@ -311,7 +311,7 @@ class DocumentsMixin(_DocumentsBase):
                     logger.info(
                         "Workspace %s: retrieval is already configured by an earlier card; "
                         "agent %s asked for %s and keeps %s",
-                        self.config.workspace_name,
+                        self.config.workspace_path,
                         agent_id,
                         params,
                         self._rag_params,
@@ -324,7 +324,7 @@ class DocumentsMixin(_DocumentsBase):
         except Exception:
             logger.warning(
                 "Workspace %s: could not enable retrieval — it stays off",
-                self.config.workspace_name,
+                self.config.workspace_path,
                 exc_info=True,
             )
 
@@ -355,7 +355,7 @@ class DocumentsMixin(_DocumentsBase):
         if self.orchestrator is None or self._rag_collection is None:
             logger.warning(
                 "Workspace %s: no orchestrator — retrieval stays in degraded mode",
-                self.config.workspace_name,
+                self.config.workspace_path,
             )
             return
         orch_proxy = self.proxy_ask(self.orchestrator, Orchestrator)
@@ -364,7 +364,7 @@ class DocumentsMixin(_DocumentsBase):
             logger.warning(
                 "Workspace %s: %s was not found — retrieval stays in degraded mode. "
                 "Add VectorStoreTool to the team configuration.",
-                self.config.workspace_name,
+                self.config.workspace_path,
                 VS_ACTOR_NAME,
             )
             return
@@ -374,7 +374,7 @@ class DocumentsMixin(_DocumentsBase):
         except Exception as exc:
             logger.warning(
                 "Workspace %s: create_collection(%s) failed: %s — degraded mode",
-                self.config.workspace_name,
+                self.config.workspace_path,
                 RAG_COLLECTION,
                 exc,
             )
@@ -524,7 +524,7 @@ class DocumentsMixin(_DocumentsBase):
         params, reader = self._rag_params, self._rag_reader
         if params is None or reader is None or entry.indexed_sha is None:
             return False
-        scope = self.config.workspace_name
+        scope = self.config.workspace_path
         markdown = self.document_extract(path, entry.indexed_sha, EXTRACTOR_VERSION)
         try:
             address = self.createActor(
@@ -576,7 +576,7 @@ class DocumentsMixin(_DocumentsBase):
         except OSError as exc:
             logger.info(
                 "Workspace %s: %r is not indexable: %s",
-                self.config.workspace_name,
+                self.config.workspace_path,
                 path,
                 exc,
             )
@@ -615,7 +615,7 @@ class DocumentsMixin(_DocumentsBase):
         except OSError as exc:
             logger.info(
                 "Workspace %s: skipping %r while indexing: %s",
-                self.config.workspace_name,
+                self.config.workspace_path,
                 path,
                 exc,
             )
@@ -631,7 +631,7 @@ class DocumentsMixin(_DocumentsBase):
         except Exception:
             logger.warning(
                 "Workspace %s: could not record the index result for %s",
-                self.config.workspace_name,
+                self.config.workspace_path,
                 msg.path,
                 exc_info=True,
             )
@@ -693,7 +693,7 @@ class DocumentsMixin(_DocumentsBase):
                 ref_id=chunk.chunk_id,
                 text=text,
                 vector=[],
-                scope=self.config.workspace_name,
+                scope=self.config.workspace_path,
                 path=msg.path,
                 ordinal=chunk.ordinal,
             )
@@ -719,7 +719,7 @@ class DocumentsMixin(_DocumentsBase):
         except Exception:
             logger.warning(
                 "Workspace %s: could not record the index failure for %s",
-                self.config.workspace_name,
+                self.config.workspace_path,
                 msg.path,
                 exc_info=True,
             )
@@ -740,7 +740,7 @@ class DocumentsMixin(_DocumentsBase):
         except Exception:
             logger.warning(
                 "Workspace %s: could not record an embedding completion",
-                self.config.workspace_name,
+                self.config.workspace_path,
                 exc_info=True,
             )
 
@@ -793,13 +793,13 @@ class DocumentsMixin(_DocumentsBase):
             proxy.remove(
                 RAG_COLLECTION,
                 entry.superseded_chunk_ids,
-                scope=self.config.workspace_name,
+                scope=self.config.workspace_path,
             )
         except Exception as exc:
             logger.warning(
                 "Workspace %s: could not remove %d superseded chunk(s) of %s: %s — "
                 "they are kept for the next re-index to retry",
-                self.config.workspace_name,
+                self.config.workspace_path,
                 len(entry.superseded_chunk_ids),
                 path,
                 exc,
@@ -819,7 +819,7 @@ class DocumentsMixin(_DocumentsBase):
         if entry is None or entry.indexed_sha != source_sha:
             logger.debug(
                 "Workspace %s: dropping an index report for %s — the row has moved on",
-                self.config.workspace_name,
+                self.config.workspace_path,
                 path,
             )
             return None
@@ -881,7 +881,7 @@ class DocumentsMixin(_DocumentsBase):
         if reverted:
             logger.info(
                 "Workspace %s: %d file(s) left embedding past %.0fs are queued again",
-                self.config.workspace_name,
+                self.config.workspace_path,
                 reverted,
                 EMBEDDING_STALE_AFTER_S,
             )
@@ -1051,7 +1051,7 @@ class DocumentsMixin(_DocumentsBase):
         if proxy is None:
             logger.warning(
                 "Workspace %s: no vector store — searching on the keyword leg alone",
-                self.config.workspace_name,
+                self.config.workspace_path,
             )
             return {}
         try:
@@ -1059,20 +1059,20 @@ class DocumentsMixin(_DocumentsBase):
             if not vectors:
                 logger.warning(
                     "Workspace %s: embedding a search query returned nothing — keyword only",
-                    self.config.workspace_name,
+                    self.config.workspace_path,
                 )
                 return {}
             result = proxy.search(
                 RAG_COLLECTION,
                 vectors[0],
                 top_k * OVERFETCH,
-                scope=self.config.workspace_name,
+                scope=self.config.workspace_path,
                 path_prefix=path_prefix or None,
             )
         except Exception:
             logger.warning(
                 "Workspace %s: the vector leg of a search failed — keyword only",
-                self.config.workspace_name,
+                self.config.workspace_path,
                 exc_info=True,
             )
             return {}
@@ -1196,7 +1196,7 @@ class DocumentsMixin(_DocumentsBase):
         except Exception:
             logger.warning(
                 "Workspace %s: could not accept a new-file notification",
-                self.config.workspace_name,
+                self.config.workspace_path,
                 exc_info=True,
             )
 
@@ -1235,7 +1235,7 @@ class DocumentsMixin(_DocumentsBase):
             logger.info(
                 "Workspace %s: recorded %d of %d new file(s) from %s as pending — "
                 "retrieval is not enabled on this tree",
-                self.config.workspace_name,
+                self.config.workspace_path,
                 recorded,
                 len(candidates),
                 msg.source,
@@ -1251,7 +1251,7 @@ class DocumentsMixin(_DocumentsBase):
             queued += 1
         logger.info(
             "Workspace %s: %d of %d new file(s) from %s were queued for indexing",
-            self.config.workspace_name,
+            self.config.workspace_path,
             queued,
             len(candidates),
             msg.source,
@@ -1279,7 +1279,7 @@ class DocumentsMixin(_DocumentsBase):
                 if Path(path).suffix.lower() not in _INDEXABLE_EXTENSIONS:
                     logger.info(
                         "Workspace %s: %r is not an indexable type — skipped",
-                        self.config.workspace_name,
+                        self.config.workspace_path,
                         path,
                     )
                     continue
@@ -1290,7 +1290,7 @@ class DocumentsMixin(_DocumentsBase):
             except Exception:
                 logger.info(
                     "Workspace %s: skipping an unusable entry in a new-file notification",
-                    self.config.workspace_name,
+                    self.config.workspace_path,
                     exc_info=True,
                 )
                 continue

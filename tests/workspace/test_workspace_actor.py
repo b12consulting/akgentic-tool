@@ -30,19 +30,23 @@ from akgentic.tool.workspace.models import (
 )
 from akgentic.tool.workspace.workspace import Filesystem, is_staging_name
 
-from tests.workspace.conftest import WORKSPACE_NAME
+from tests.workspace.conftest import WORKSPACE_PATH
 
 ALICE = "alice-id"
 BOB = "bob-id"
 
 
-def start_actor(workspace_name: str = WORKSPACE_NAME, cap: int = 256) -> WorkspaceActor:
-    """Build and start an actor over *workspace_name*, without an actor thread."""
+def start_actor(workspace_path: str = WORKSPACE_PATH, cap: int = 256) -> WorkspaceActor:
+    """Build and start an actor over *workspace_path*, without an actor thread.
+
+    Takes the **resolved** two-segment path — what a card hands the actor — so
+    the actor opens the tree the ``workspace_tree`` fixture created.
+    """
     actor = WorkspaceActor(
         config=WorkspaceConfig(
-            name=workspace_actor_name(workspace_name),
+            name=workspace_actor_name(workspace_path),
             role=WORKSPACE_ACTOR_ROLE,
-            workspace_name=workspace_name,
+            workspace_path=workspace_path,
             max_observations_per_agent=cap,
         )
     )

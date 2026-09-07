@@ -74,6 +74,7 @@ class MockObserver:
         existing_actor: ActorAddress | None = None,
     ) -> None:
         self.team_id = "team-test"
+        self.user_id: str | None = "test-principal"
         self.myAddress = MagicMock(spec=ActorAddress)
         self.orchestrator = MagicMock(spec=ActorAddress) if has_orchestrator else None
         self.state = SimpleNamespace(tool_state=ToolState())
@@ -269,9 +270,10 @@ def test_observer_creates_actor_with_correct_config() -> None:
     wire(tool, observer)
 
     config = sandbox_config_of(observer)
-    # No workspace_id on this card, so the workspace — and therefore the actor's
-    # name — falls back to the team id, exactly as Filesystem resolution does.
-    assert config.name == sandbox_actor_name("team-test")
+    # No workspace_id on this card, so the leaf is the team id — but the leaf is
+    # not the path: the actor's name carries the full resolved two segments,
+    # scope included.
+    assert config.name == sandbox_actor_name("test-principal/team-test")
     assert config.role == "ToolActor"
     assert config.team_id == "team-test"
     assert config.mode == "local"
@@ -597,28 +599,33 @@ def test_exec_tool_workspace_id_can_be_set() -> None:
     assert tool.workspace_id == "test"
 
 
-def test_observer_passes_workspace_id_to_sandbox_config() -> None:
-    """FR-SB-32: ExecTool.observer() passes workspace_id through to SandboxConfig."""
+def test_a_named_workspace_reaches_the_callers_own_principal_not_the_bare_name() -> None:
+    """The deprecated card resolves like every other consumer, and derives nothing.
+
+    Deprecated or not, a card that derived its own directory would put a shell on
+    the **unscoped** tree — the flat namespace this layout exists to remove — so
+    ``workspace_id="test"`` must reach ``<principal>/test`` and never ``test``.
+    """
     observer = MockObserver(existing_actor=None)
     tool = ExecTool(workspace_id="test")
 
     wire(tool, observer)
 
-    assert sandbox_config_of(observer).workspace_id == "test"
+    assert sandbox_config_of(observer).workspace_path == "test-principal/test"
 
 
-def test_observer_passes_workspace_id_none_to_sandbox_config() -> None:
-    """FR-SB-32: ExecTool() (no workspace_id) passes workspace_id=None to SandboxConfig."""
+def test_a_card_with_no_name_reaches_the_principals_own_team_tree() -> None:
+    """With no ``workspace_id``, the leaf is the team id — under the principal."""
     observer = MockObserver(existing_actor=None)
     tool = ExecTool()
 
     wire(tool, observer)
 
-    assert sandbox_config_of(observer).workspace_id is None
+    assert sandbox_config_of(observer).workspace_path == "test-principal/team-test"
 
 
-def test_observer_config_has_team_id_and_workspace_id_independently() -> None:
-    """FR-SB-32: SandboxConfig gets both team_id and workspace_id, independently set."""
+def test_the_sandbox_config_carries_the_path_and_the_team_independently() -> None:
+    """``team_id`` names the container; ``workspace_path`` names the tree."""
     observer = MockObserver(existing_actor=None)
     observer.team_id = "t1"
     tool = ExecTool(workspace_id="my-ws")
@@ -627,7 +634,41 @@ def test_observer_config_has_team_id_and_workspace_id_independently() -> None:
 
     config = sandbox_config_of(observer)
     assert config.team_id == "t1"
-    assert config.workspace_id == "my-ws"
+    assert config.workspace_path == "test-principal/my-ws"
+
+
+def test_two_principals_naming_one_workspace_reach_two_trees() -> None:
+    """The isolation property, at the deprecated card's surface too.
+
+    Two users declaring the same ``workspace_id`` used to share one directory —
+    the whole exposure. They now differ in the scope segment, and the sandbox
+    actor names differ with them, so neither can reach the other by naming it.
+    """
+    paths: list[str] = []
+    names: list[str] = []
+    for principal in ("alice", "bob"):
+        observer = MockObserver(existing_actor=None)
+        observer.user_id = principal
+        wire(ExecTool(workspace_id="notes"), observer)
+        paths.append(sandbox_config_of(observer).workspace_path)
+        names.append(sandbox_config_of(observer).name)
+
+    assert paths == ["alice/notes", "bob/notes"]
+    assert names[0] != names[1]
+
+
+def test_an_unusable_principal_raises_at_bind_rather_than_falling_back() -> None:
+    """An empty ``user_id`` — an OIDC token carrying no ``sub`` — must raise.
+
+    Not a fallback: a hidden directory shared by every affected user is a silent
+    isolation failure, where the raise fails team creation in front of whoever
+    misconfigured it.
+    """
+    observer = MockObserver(existing_actor=None)
+    observer.user_id = ""
+
+    with pytest.raises(ValueError, match="not usable as a workspace directory name"):
+        wire(ExecTool(workspace_id="notes"), observer)
 
 
 # ---------------------------------------------------------------------------
@@ -676,20 +717,32 @@ def test_exec_tool_mode_can_be_set_to_auto() -> None:
 
 
 def test_sandbox_config_mode_accepts_bwrap() -> None:
-    """AC2 (8.4): SandboxConfig(team_id='t', mode='bwrap') validates without error."""
-    config = SandboxConfig(team_id="t", mode="bwrap")
+    """AC2 (8.4): SandboxConfig(
+        team_id='t',
+        workspace_path='t',
+        mode='bwrap',
+    ) validates without error."""
+    config = SandboxConfig(team_id="t", workspace_path="t", mode="bwrap")
     assert config.mode == "bwrap"
 
 
 def test_sandbox_config_mode_accepts_seatbelt() -> None:
-    """AC2 (8.4): SandboxConfig(team_id='t', mode='seatbelt') validates without error."""
-    config = SandboxConfig(team_id="t", mode="seatbelt")
+    """AC2 (8.4): SandboxConfig(
+        team_id='t',
+        workspace_path='t',
+        mode='seatbelt',
+    ) validates without error."""
+    config = SandboxConfig(team_id="t", workspace_path="t", mode="seatbelt")
     assert config.mode == "seatbelt"
 
 
 def test_sandbox_config_mode_accepts_auto() -> None:
-    """AC3 (8.4): SandboxConfig(team_id='t', mode='auto') validates without error."""
-    config = SandboxConfig(team_id="t", mode="auto")
+    """AC3 (8.4): SandboxConfig(
+        team_id='t',
+        workspace_path='t',
+        mode='auto',
+    ) validates without error."""
+    config = SandboxConfig(team_id="t", workspace_path="t", mode="auto")
     assert config.mode == "auto"
 
 
@@ -921,8 +974,8 @@ def test_wiring_creates_the_workspace_actor_as_well() -> None:
         call[1]["config"].name
         for call in observer._orch_proxy.getChildrenOrCreate.call_args_list
     ]
-    assert sandbox_actor_name("shared") in names
-    assert "#Workspace-shared" in names
+    assert sandbox_actor_name("test-principal/shared") in names
+    assert "#Workspace-test-principal/shared" in names
 
 
 def test_the_sandbox_actor_is_named_per_workspace_like_the_workspace_actor() -> None:
@@ -939,7 +992,10 @@ def test_the_sandbox_actor_is_named_per_workspace_like_the_workspace_actor() -> 
         wire(ExecTool(mode="local", workspace_id=workspace), observer)
         names.append(sandbox_config_of(observer).name)
 
-    assert names == [sandbox_actor_name("alpha"), sandbox_actor_name("beta")]
+    assert names == [
+        sandbox_actor_name("test-principal/alpha"),
+        sandbox_actor_name("test-principal/beta"),
+    ]
     assert names[0] != names[1]
 
 

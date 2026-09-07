@@ -422,15 +422,20 @@ class ExecConfig(SerializableBaseModel):
 
     Attributes:
         mode: The resolved backend.
-        team_id: The team, which names the container.
-        workspace_id: The card's ``workspace_id``, forwarded verbatim so the
-            backend's directory resolution matches the card's.
+        team_id: The team, which names the container. Kept because containers
+            are per-team execution resources, never because a directory is
+            derived from it.
+        workspace_path: The card's **already-resolved** two-segment path, the
+            only thing a backend needs to open the right tree. It replaces the
+            raw ``workspace_id`` this model used to forward: a backend that
+            cannot re-derive the path cannot derive a different one, which is
+            what removes the failure mode rather than making it less likely.
         timeout_s: The run budget this card asks for, before clamping.
     """
 
     mode: SandboxMode
     team_id: str
-    workspace_id: str | None = None
+    workspace_path: str
     timeout_s: float = DEFAULT_EXEC_TIMEOUT_S
 
 
@@ -628,7 +633,7 @@ def sandbox_config(config: ExecConfig) -> SandboxConfig:
 
     ``getChildrenOrCreate`` keys on the actor **name**, so a config that differs
     in name creates a *second* actor per run instead of resolving the existing
-    one; a config that differs in ``workspace_id`` would point the reused actor
+    one; a config that differs in ``workspace_path`` would point the reused actor
     at the wrong directory. The card builds one at wiring time and ``#Workspace``
     builds one per run, and the two must be identical — so they are built here
     rather than twice by hand.
@@ -637,22 +642,22 @@ def sandbox_config(config: ExecConfig) -> SandboxConfig:
     does. A constant name resolved two exec-capable cards on two workspaces onto
     the first actor, so one agent's commands ran in the other's tree while its
     own ``#Workspace`` gated an untouched one — see :func:`sandbox_actor_name`.
-    The workspace is resolved as ``workspace_id or team_id``, which is what
-    ``Filesystem`` and every backend's ``_start_sandbox`` already do, so the name
-    and the directory cannot disagree.
+
+    **Nothing is derived here.** The path arrives already resolved from the card
+    that built the ``ExecConfig``, and both the name and the directory are taken
+    from that one value, so the two cannot disagree.
 
     Args:
-        config: The card's resolved backend and ids.
+        config: The card's resolved backend, team and workspace path.
 
     Returns:
         The configuration for ``#SandboxActor-<workspace>``.
     """
-    workspace_name = config.workspace_id or config.team_id
     return SandboxConfig(
-        name=sandbox_actor_name(workspace_name),
+        name=sandbox_actor_name(config.workspace_path),
         role=SANDBOX_ACTOR_ROLE,
         team_id=config.team_id,
-        workspace_id=config.workspace_id,
+        workspace_path=config.workspace_path,
         mode=config.mode,
     )
 

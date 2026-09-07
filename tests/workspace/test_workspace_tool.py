@@ -27,11 +27,31 @@ from akgentic.tool.workspace.tool import (
     ResourceType,
     WorkspaceTool,
 )
+from akgentic.tool.sandbox.actor import sandbox_actor_name
+from akgentic.tool.workspace.card.params import WorkspaceExec
 from akgentic.tool.workspace.workspace import Filesystem, PathEscapeError, Workspace
+
+from tests.workspace.conftest import FakeActorToolObserver, FakeOrchestratorProxy
+
+
+class _CaseMetadata(SerializableBaseModel):
+    """A team-metadata stand-in — the resolver never learns the real type."""
+
+    customer_id: str | None = None
+    case_id: str | None = None
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+TEST_PRINCIPAL = "u-alice"
+"""The owning principal these mock observers carry.
+
+Every workspace resolves under its owner now, so a mock observer must carry a
+usable ``user_id``: the resolver reads it as a typed attribute and refuses a
+value that cannot be a directory name — which a bare ``MagicMock`` attribute is.
+"""
 
 
 def make_observer(
@@ -43,6 +63,7 @@ def make_observer(
     observer = MagicMock()
     observer.orchestrator = MagicMock()
     observer.team_id = tid
+    observer.user_id = TEST_PRINCIPAL
     fs = Filesystem(str(tmp_path), str(tid))
     return observer, fs
 
@@ -67,9 +88,9 @@ def make_wired_tool(tmp_path: Path) -> tuple[WorkspaceTool, Filesystem]:
     ):
         actor = WorkspaceActor(
             config=WorkspaceConfig(
-                name=workspace_actor_name(str(observer.team_id)),
+                name=workspace_actor_name(f"{TEST_PRINCIPAL}/{observer.team_id}"),
                 role=WORKSPACE_ACTOR_ROLE,
-                workspace_name=str(observer.team_id),
+                workspace_path=f"{TEST_PRINCIPAL}/{observer.team_id}",
             )
         )
         actor.on_start()
@@ -1304,3 +1325,165 @@ class TestWorkspaceToolSeedResources:
             restored_tool.observer(observer)
         assert fs.read("kept.md") == b"edited by agent"
         assert fs.read("later.md") == b"later body"
+
+
+# ---------------------------------------------------------------------------
+# The two-segment layout at the card's own surface (ADR-048)
+# ---------------------------------------------------------------------------
+
+
+class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
+    """What the card hands the actors, and what the actor names therefore become.
+
+    These use the fake orchestrator rather than a ``MagicMock``, because the
+    property under test is which **actor** each card resolves to —
+    ``getChildrenOrCreate`` keys on ``config.name`` alone, so a stand-in that
+    handed back one address for every name would make the whole suite pass
+    having exercised nothing.
+    """
+
+    def test_a_bare_card_anchors_the_team_tree_under_its_owner(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        observer = FakeActorToolObserver(orchestrator_proxy, user_id="alice")
+        card = WorkspaceTool()
+        card.observer(observer)
+
+        expected = workspaces_root / "alice" / str(observer.team_id)
+        assert card.workspace._root == expected.resolve()
+
+    def test_a_named_card_anchors_that_name_under_its_owner(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        observer = FakeActorToolObserver(orchestrator_proxy, user_id="alice")
+        card = WorkspaceTool(workspace_id="notes")
+        card.observer(observer)
+
+        assert card.workspace._root == (workspaces_root / "alice" / "notes").resolve()
+
+    def test_two_principals_naming_one_workspace_get_two_trees_and_two_actors(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        """The exposure this layout exists to close, at the card's own surface.
+
+        Two users declaring ``notes`` used to reach one directory through one
+        ``#Workspace`` actor. They now differ in the scope segment, so neither
+        can reach the other's tree by naming it.
+        """
+        alice_card = WorkspaceTool(workspace_id="notes")
+        alice_card.observer(FakeActorToolObserver(orchestrator_proxy, "alice", user_id="alice"))
+        bob_card = WorkspaceTool(workspace_id="notes")
+        bob_card.observer(FakeActorToolObserver(orchestrator_proxy, "bob", user_id="bob"))
+
+        assert alice_card.workspace._root != bob_card.workspace._root
+        assert workspace_actor_name("alice/notes") in orchestrator_proxy.children
+        assert workspace_actor_name("bob/notes") in orchestrator_proxy.children
+
+    def test_two_cards_on_two_workspaces_get_two_workspace_and_two_sandbox_actors(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        """AC 14: both actor names carry the full two-segment path, slash included.
+
+        Nothing parses an actor name and the path is injective by construction,
+        so it is carried whole rather than flattened through a second encoding
+        whose injectivity would have to be proved separately.
+        """
+        for leaf in ("alpha", "beta"):
+            (workspaces_root / "alice" / leaf).mkdir(parents=True, exist_ok=True)
+            card = WorkspaceTool(
+                workspace_id=leaf,
+                workspace_exec=WorkspaceExec(mode="local", poll_attempts=0),
+            )
+            card.observer(
+                FakeActorToolObserver(orchestrator_proxy, name=leaf, user_id="alice")
+            )
+
+        names = set(orchestrator_proxy.children)
+        assert {
+            workspace_actor_name("alice/alpha"),
+            workspace_actor_name("alice/beta"),
+            sandbox_actor_name("alice/alpha"),
+            sandbox_actor_name("alice/beta"),
+        } <= names
+        # The slash survives into the name verbatim — it is not escaped away.
+        assert "#Workspace-alice/alpha" in names
+        assert "#SandboxActor-alice/beta" in names
+
+    def test_a_bare_card_never_asks_the_orchestrator_for_metadata(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        """The fetch is conditional on the card declaring keys, and only then.
+
+        A round trip added to every ``WorkspaceTool()`` in existence would be
+        paid by the overwhelming majority of cards that never share anything.
+        """
+        WorkspaceTool().observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
+
+        assert orchestrator_proxy.metadata_calls == 0
+
+    def test_a_metadata_card_asks_once_and_lands_under_the_reserved_scope(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        orchestrator_proxy.metadata = _CaseMetadata(customer_id="ACME", case_id="42")
+        card = WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])
+        card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
+
+        assert orchestrator_proxy.metadata_calls == 1
+        assert (
+            card.workspace._root
+            == (workspaces_root / "_meta" / "case_id-42__customer_id-ACME").resolve()
+        )
+
+    def test_a_metadata_card_on_a_team_without_metadata_fails_binding(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        """``observer()`` can now raise where it never did, and that is the decision.
+
+        It fails team creation in front of the admin who caused it, rather than
+        silently un-sharing a workspace that was declared to be shared.
+        """
+        card = WorkspaceTool(workspace_metadata_keys=["customer_id"])
+
+        with pytest.raises(ValueError, match="carries no metadata"):
+            card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
+
+    def test_an_unusable_principal_fails_binding_rather_than_falling_back(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        card = WorkspaceTool(workspace_id="notes")
+
+        with pytest.raises(ValueError, match="not usable as a workspace directory name"):
+            card.observer(FakeActorToolObserver(orchestrator_proxy, user_id=""))
+
+
+class TestTheIdentityIsReadAsATypedAttribute:
+    """A wiring regression must be loud, which is what ``getattr`` would take away."""
+
+    def test_an_observer_that_never_received_an_identity_raises(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        """``getattr(observer, "user_id", None)`` would silently reach ``anonymous``.
+
+        That is every user's tree quietly merged into one, with nothing raised
+        and nothing logged — the exact failure per-user scoping exists to remove,
+        reintroduced by a defaulted read. An observer with no ``user_id`` at all
+        is a broken observer, and it must say so.
+        """
+        observer = FakeActorToolObserver(orchestrator_proxy, user_id="alice")
+        del observer.user_id
+
+        with pytest.raises(AttributeError):
+            WorkspaceTool(workspace_id="notes").observer(observer)
+
+    def test_a_deliberate_none_is_the_anonymous_scope_and_not_an_error(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        """The distinction the typed read preserves: *absent* differs from *None*.
+
+        A deployment with no auth configured supplies ``None`` on purpose and
+        gets exactly one scope; an observer that lost the attribute is a bug.
+        """
+        card = WorkspaceTool(workspace_id="notes")
+        card.observer(FakeActorToolObserver(orchestrator_proxy, user_id=None))
+
+        assert card.workspace._root == (workspaces_root / "anonymous" / "notes").resolve()

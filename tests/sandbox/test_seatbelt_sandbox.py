@@ -43,7 +43,12 @@ def actor(tmp_path: Path) -> SeatbeltSandboxActor:
     ``test_bwrap_sandbox.py``.
     """
     a: SeatbeltSandboxActor = SeatbeltSandboxActor.__new__(SeatbeltSandboxActor)
-    a.config = SandboxConfig(name="sandbox", role="ToolActor", team_id="test-team")
+    a.config = SandboxConfig(
+        name="sandbox",
+        role="ToolActor",
+        team_id="test-team",
+        workspace_path="test-team",
+    )
     a.state = SandboxState()
     a.state.workspace_path = tmp_path
     return a
@@ -57,7 +62,12 @@ def actor(tmp_path: Path) -> SeatbeltSandboxActor:
 def test_start_sandbox_sandbox_exec_not_on_path_raises_runtime_error() -> None:
     """AC2: RuntimeError raised before DeprecationWarning when sandbox-exec is missing."""
     a: SeatbeltSandboxActor = SeatbeltSandboxActor.__new__(SeatbeltSandboxActor)
-    a.config = SandboxConfig(name="sandbox", role="ToolActor", team_id="test-team")
+    a.config = SandboxConfig(
+        name="sandbox",
+        role="ToolActor",
+        team_id="test-team",
+        workspace_path="test-team",
+    )
     a.state = SandboxState()
 
     with patch("akgentic.tool.sandbox.seatbelt.shutil.which", return_value=None):
@@ -73,7 +83,12 @@ def test_start_sandbox_sandbox_exec_not_on_path_raises_runtime_error() -> None:
 def test_start_sandbox_raises_runtime_error_when_probe_fails() -> None:
     """_start_sandbox() raises RuntimeError when sandbox_apply is blocked (macOS 15+)."""
     a: SeatbeltSandboxActor = SeatbeltSandboxActor.__new__(SeatbeltSandboxActor)
-    a.config = SandboxConfig(name="sandbox", role="ToolActor", team_id="test-team")
+    a.config = SandboxConfig(
+        name="sandbox",
+        role="ToolActor",
+        team_id="test-team",
+        workspace_path="test-team",
+    )
     a.state = SandboxState()
 
     mock_probe = MagicMock(returncode=71)
@@ -89,7 +104,12 @@ def test_start_sandbox_raises_runtime_error_when_probe_fails() -> None:
 def test_start_sandbox_emits_deprecation_warning() -> None:
     """AC1: _start_sandbox() emits DeprecationWarning with correct message."""
     a: SeatbeltSandboxActor = SeatbeltSandboxActor.__new__(SeatbeltSandboxActor)
-    a.config = SandboxConfig(name="sandbox", role="ToolActor", team_id="test-team")
+    a.config = SandboxConfig(
+        name="sandbox",
+        role="ToolActor",
+        team_id="test-team",
+        workspace_path="test-team",
+    )
     a.state = SandboxState()
 
     mock_probe = MagicMock(returncode=0)
@@ -117,7 +137,12 @@ def test_start_sandbox_creates_workspace_directory(
     monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
 
     a: SeatbeltSandboxActor = SeatbeltSandboxActor.__new__(SeatbeltSandboxActor)
-    a.config = SandboxConfig(name="sandbox", role="ToolActor", team_id="test-team")
+    a.config = SandboxConfig(
+        name="sandbox",
+        role="ToolActor",
+        team_id="test-team",
+        workspace_path="test-team",
+    )
     a.state = SandboxState()
 
     mock_probe = MagicMock(returncode=0)
@@ -149,7 +174,12 @@ def test_start_sandbox_idempotent_existing_workspace(
     monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
 
     a: SeatbeltSandboxActor = SeatbeltSandboxActor.__new__(SeatbeltSandboxActor)
-    a.config = SandboxConfig(name="sandbox", role="ToolActor", team_id="test-team")
+    a.config = SandboxConfig(
+        name="sandbox",
+        role="ToolActor",
+        team_id="test-team",
+        workspace_path="test-team",
+    )
     a.state = SandboxState()
 
     mock_probe = MagicMock(returncode=0)

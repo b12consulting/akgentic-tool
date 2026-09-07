@@ -63,9 +63,9 @@ class SeatbeltSandboxActor(SandboxActor):
 
         Checks that ``sandbox-exec`` is available on PATH **and** that
         ``sandbox_apply`` actually works at runtime (macOS 15+ blocks it),
-        then resolves the workspace directory (using ``workspace_id or
-        team_id``) under ``AKGENTIC_WORKSPACES_ROOT`` (defaulting to
-        ``./workspaces``) and creates it if it does not yet exist. Emits a
+        then joins the card's already-resolved ``config.workspace_path`` to
+        ``AKGENTIC_WORKSPACES_ROOT`` (defaulting to ``./workspaces``) and creates
+        the directory if it does not yet exist — deriving nothing itself. Emits a
         ``DeprecationWarning`` noting that ``sandbox-exec`` is deprecated
         since macOS 10.15 Catalina.
 
@@ -93,8 +93,7 @@ class SeatbeltSandboxActor(SandboxActor):
                     "Use mode='docker' or mode='local' instead."
                 )
         base = os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
-        ws_name = self.config.workspace_id or self.config.team_id
-        workspace_path = Path(base) / ws_name
+        workspace_path = Path(base) / self.config.workspace_path
         workspace_path.mkdir(parents=True, exist_ok=True)
         self.state.workspace_path = workspace_path.resolve()
         self.state.notify_state_change()

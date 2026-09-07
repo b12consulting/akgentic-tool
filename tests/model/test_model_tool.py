@@ -44,6 +44,7 @@ class _ObserverBase:
         self.myAddress = SimpleNamespace(name="@Alice")  # noqa: N815 — protocol member name
         self.orchestrator = None
         self.team_id = uuid.uuid4()
+        self.user_id: str | None = "test-principal"
         self.state = _Carrier()
 
     def notify_event(self, event: object) -> None:

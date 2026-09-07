@@ -28,7 +28,7 @@ from akgentic.tool.workspace.documents.models import (
 from akgentic.tool.workspace.models import MutationStatus
 from akgentic.tool.workspace.workspace import PathEscapeError
 
-from tests.workspace.conftest import WORKSPACE_NAME
+from tests.workspace.conftest import WORKSPACE_PATH
 from tests.workspace.test_rag_pipeline import RagHarness, write
 from tests.workspace.test_rag_search import build_actor
 
@@ -326,7 +326,7 @@ class TestTheSpawnPathIsReused:
 
         upload.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["a.md"]))
 
-        assert upload.requests[0].scope == WORKSPACE_NAME
+        assert upload.requests[0].scope == WORKSPACE_PATH
 
     def test_queueing_notifies_once_and_a_message_that_queued_nothing_notifies_not_at_all(
         self, upload: RagHarness, workspace_tree: Path

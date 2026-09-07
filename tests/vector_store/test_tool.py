@@ -98,6 +98,7 @@ class _MockActorToolObserver:
             )
         )
         self._team_id = uuid.uuid4()
+        self._user_id: str | None = "test-principal"
         self._state_carrier = SimpleNamespace(tool_state=ToolState())
 
     @property
@@ -111,6 +112,10 @@ class _MockActorToolObserver:
     @property
     def team_id(self) -> uuid.UUID:
         return self._team_id
+
+    @property
+    def user_id(self) -> str | None:
+        return self._user_id
 
     @property
     def state(self) -> SimpleNamespace:

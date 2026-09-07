@@ -216,7 +216,7 @@ class ExecMixin(_ExecBase):
         except Exception as exc:  # noqa: BLE001 — every failure here is the run's answer
             logger.warning(
                 "Workspace %s: run %s never reached the sandbox: %r",
-                self.config.workspace_name,
+                self.config.workspace_path,
                 entry.run_id,
                 exc,
                 exc_info=True,
@@ -497,7 +497,7 @@ class ExecMixin(_ExecBase):
                 "Workspace %s: run %s reported after the workspace was handed on. Its outcome "
                 "is still collectable by its owner; anything it wrote belongs to nobody and is "
                 "committed out of band by the next mutation or run.",
-                self.config.workspace_name,
+                self.config.workspace_path,
                 run_id,
             )
             return
@@ -552,7 +552,7 @@ class ExecMixin(_ExecBase):
             "Workspace %s: releasing the workspace from run %s (agent %s, command %r) — it is "
             "past its budget and the grace with nothing reported, so its command is not going "
             "to answer. Anything it is still writing will land in a later commit.",
-            self.config.workspace_name,
+            self.config.workspace_path,
             running.run_id,
             self._name_of(running.agent_id),
             running.cmd,
@@ -592,7 +592,7 @@ class ExecMixin(_ExecBase):
         )
         logger.warning(
             "Workspace %s: %s (agent %s, command %r)",
-            self.config.workspace_name,
+            self.config.workspace_path,
             reason,
             self._name_of(running.agent_id),
             running.cmd,

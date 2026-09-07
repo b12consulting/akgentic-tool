@@ -258,14 +258,16 @@ class LastWrite(SerializableBaseModel):
 
 
 class WorkspaceConfig(BaseConfig):
-    """Configuration of the ``#Workspace-<workspace_name>`` singleton.
+    """Configuration of the ``#Workspace-<workspace_path>`` singleton.
 
     Attributes:
-        workspace_name: The resolved workspace, i.e. the card's ``workspace_id``
-            or the team id. It names the tree the actor owns, and it is also the
-            suffix of the actor's name — ``getChildrenOrCreate`` keys on that
-            name, so the two must be derived from one value or two cards with
-            different workspaces would collapse onto one actor owning one tree.
+        workspace_path: The **already-resolved** two-segment path of the tree
+            this actor owns — ``<scope>/<leaf>``, relative to the workspaces
+            root — and also the suffix of the actor's name.
+            ``getChildrenOrCreate`` keys on that name, so both come from this
+            one value; two cards on different workspaces cannot collapse onto
+            one actor owning one tree, and nothing here re-derives a directory
+            from a ``workspace_id`` or a team id.
         max_observations_per_agent: Cap on the per-agent observation map.
         max_tracked_writers: Cap on the path-keyed last-writer map, which the
             gate consults only to name the other writer in a refusal.
@@ -282,7 +284,7 @@ class WorkspaceConfig(BaseConfig):
         git_timeout_s: Wall-clock budget for one ``git`` invocation.
     """
 
-    workspace_name: str
+    workspace_path: str
     max_observations_per_agent: int = DEFAULT_MAX_OBSERVATIONS_PER_AGENT
     max_tracked_writers: int = DEFAULT_MAX_TRACKED_WRITERS
     max_documents: int = DEFAULT_MAX_DOCUMENTS

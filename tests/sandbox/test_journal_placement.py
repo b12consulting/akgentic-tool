@@ -45,7 +45,12 @@ def captured_argv(
 ) -> list[str]:
     """Run one command through *actor_class* and return the argv it built."""
     actor = actor_class()
-    actor.config = SandboxConfig(name="#SandboxActor", role="ToolActor", team_id="team-1")
+    actor.config = SandboxConfig(
+        name="#SandboxActor",
+        role="ToolActor",
+        team_id="team-1",
+        workspace_path="team-1",
+    )
     actor.state = SandboxState()
     actor.state.observer(actor)
     actor.state.workspace_path = root
@@ -81,7 +86,10 @@ class TestTheJournalIsOutsideEveryMount:
         # than on the exec argv.
         actor = DockerSandboxActor()
         actor.config = SandboxConfig(
-            name="#SandboxActor", role="ToolActor", team_id=tree_with_journal.name
+            name="#SandboxActor",
+            role="ToolActor",
+            team_id=tree_with_journal.name,
+            workspace_path=tree_with_journal.name,
         )
         actor.state = SandboxState()
         actor.state.observer(actor)
@@ -110,7 +118,12 @@ class TestTheJournalIsOutsideEveryMount:
     ) -> None:
         rendered: list[str] = []
         actor = SeatbeltSandboxActor()
-        actor.config = SandboxConfig(name="#SandboxActor", role="ToolActor", team_id="team-1")
+        actor.config = SandboxConfig(
+            name="#SandboxActor",
+            role="ToolActor",
+            team_id="team-1",
+            workspace_path="team-1",
+        )
         actor.state = SandboxState()
         actor.state.observer(actor)
         actor.state.workspace_path = tree_with_journal

@@ -40,7 +40,7 @@ from akgentic.tool.workspace.documents.models import (
 from akgentic.tool.workspace.models import WorkspaceConfig, WorkspaceState, content_sha
 from akgentic.tool.workspace.tool import WorkspaceTool
 
-from tests.workspace.conftest import WORKSPACE_NAME, read
+from tests.workspace.conftest import WORKSPACE_PATH, read
 
 
 def start_actor(
@@ -50,9 +50,9 @@ def start_actor(
     """Build and start an actor over the test workspace, without an actor thread."""
     actor = WorkspaceActor(
         config=WorkspaceConfig(
-            name=workspace_actor_name(WORKSPACE_NAME),
+            name=workspace_actor_name(WORKSPACE_PATH),
             role=WORKSPACE_ACTOR_ROLE,
-            workspace_name=WORKSPACE_NAME,
+            workspace_path=WORKSPACE_PATH,
             max_documents=max_documents,
             max_document_chars=max_document_chars,
         )
