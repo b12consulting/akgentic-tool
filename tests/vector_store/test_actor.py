@@ -90,6 +90,7 @@ class TestVectorStoreState:
         """State has empty defaults."""
         state = VectorStoreState()
         assert state.backend_state == {}
+        assert state.backend_states == {}
         assert state.collection_statuses == {}
 
     def test_serialisation_round_trip(self) -> None:
@@ -1636,3 +1637,185 @@ class TestScopeSurvivesTheEmbeddingRoundTrip:
 
         [stored] = backend.add.call_args[0][1]
         assert stored.scope is None
+
+
+# ---------------------------------------------------------------------------
+# Registry-driven routing and query passthrough
+# ---------------------------------------------------------------------------
+
+
+class TestQueryPassthrough:
+    """The optional VectorQuery reaches the backend only when supplied."""
+
+    def test_none_query_forwards_none_to_backend(self) -> None:
+        """No query still routes through the scoped call with ``query=None``."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        expected = SearchResult(hits=[], status=CollectionStatus.READY, indexing_pending=0)
+        backend.search.return_value = expected
+        actor._backend = backend
+
+        actor.search("col1", [0.1], 5)
+
+        backend.search.assert_called_once_with(
+            "col1", [0.1], 5, scope=None, path_prefix=None
+        )
+
+    def test_query_is_forwarded_when_supplied(self) -> None:
+        from akgentic.tool.vector_store.protocol import VectorQuery
+
+        actor = _make_actor()
+        backend = _mock_backend()
+        backend.search.return_value = SearchResult(
+            hits=[], status=CollectionStatus.READY, indexing_pending=0
+        )
+        actor._backend = backend
+        query = VectorQuery(filters={"ref_type": "entity"})
+
+        actor.search("col1", [0.1], 5, query=query)
+
+        backend.search.assert_called_once_with(
+            "col1", [0.1], 5, scope=None, path_prefix=None, query=query
+        )
+
+
+class TestRegistryRouting:
+    """A registered third-party backend routes without any actor edits."""
+
+    def test_routes_to_registered_custom_backend_and_skips_state_sync(self) -> None:
+        from akgentic.tool.vector_store.registry import (
+            BackendSpec,
+            register_backend,
+            unregister_backend,
+        )
+
+        actor = _make_actor()
+        custom = MagicMock()
+        register_backend(
+            BackendSpec(
+                name="custom",
+                factory=lambda _ctx: custom,
+                persists_in_actor_state=False,
+            )
+        )
+        try:
+            config = CollectionConfig(backend="custom")
+            actor.create_collection("cc", config)
+
+            custom.create_collection.assert_called_once_with("cc", config)
+            assert actor.state.collection_configs["cc"]["backend"] == "custom"
+            # External backend: nothing snapshotted into actor state.
+            assert actor.state.backend_state == {}
+
+            entry = _mock_entry(vector=[0.1])
+            actor.add("cc", [entry])
+            custom.add.assert_called_once_with("cc", [entry])
+        finally:
+            unregister_backend("custom")
+
+    def test_stateful_custom_backend_is_snapshotted_and_restored(self) -> None:
+        from akgentic.tool.vector_store.registry import (
+            BackendSpec,
+            register_backend,
+            unregister_backend,
+        )
+
+        first = _mock_backend()
+        first.get_state.return_value = {"value": "saved"}
+        second = _mock_backend()
+        backends = iter([first, second])
+        register_backend(
+            BackendSpec(
+                name="stateful",
+                factory=lambda _ctx: next(backends),
+                persists_in_actor_state=True,
+            )
+        )
+        try:
+            actor = _make_actor()
+            config = CollectionConfig(backend="stateful")
+            actor.create_collection("cc", config)
+            assert actor.state.backend_states["stateful"] == {"value": "saved"}
+
+            restored = _make_actor()
+            restored.state.backend_states = actor.state.backend_states
+            assert restored._get_backend("stateful") is second
+            second.restore_state.assert_called_once_with({"value": "saved"})
+        finally:
+            unregister_backend("stateful")
+
+    def test_stateful_custom_backend_restores_empty_snapshot(self) -> None:
+        from akgentic.tool.vector_store.registry import (
+            BackendSpec,
+            register_backend,
+            unregister_backend,
+        )
+
+        backend = _mock_backend()
+        register_backend(
+            BackendSpec(
+                name="empty_state",
+                factory=lambda _ctx: backend,
+                persists_in_actor_state=True,
+            )
+        )
+        try:
+            actor = _make_actor()
+            actor.state.backend_states["empty_state"] = {}
+            assert actor._get_backend("empty_state") is backend
+            backend.restore_state.assert_called_once_with({})
+        finally:
+            unregister_backend("empty_state")
+
+    def test_replacing_builtin_name_routes_to_replacement_factory(self) -> None:
+        from akgentic.tool.vector_store.registry import (
+            BackendSpec,
+            get_backend_spec,
+            register_backend,
+        )
+
+        original = get_backend_spec("inmemory")
+        replacement = _mock_backend()
+        register_backend(
+            BackendSpec(name="inmemory", factory=lambda _ctx: replacement),
+            replace=True,
+        )
+        try:
+            actor = _make_actor()
+            assert actor._get_backend("inmemory") is replacement
+        finally:
+            register_backend(original, replace=True)
+
+    def test_stateful_inmemory_replacement_uses_named_snapshot(self) -> None:
+        from akgentic.tool.vector_store.registry import (
+            BackendSpec,
+            get_backend_spec,
+            register_backend,
+        )
+
+        original = get_backend_spec("inmemory")
+        first = _mock_backend()
+        first.get_state.return_value = {"value": "replacement"}
+        second = _mock_backend()
+        backends = iter([first, second])
+        register_backend(
+            BackendSpec(
+                name="inmemory",
+                factory=lambda _ctx: next(backends),
+                persists_in_actor_state=True,
+                selectable_as_default=False,
+            ),
+            replace=True,
+        )
+        try:
+            actor = _make_actor()
+            actor.create_collection("cc", CollectionConfig(backend="inmemory"))
+            assert actor.state.backend_state == {}
+            assert actor.state.backend_states["inmemory"] == {"value": "replacement"}
+
+            restored = _make_actor()
+            restored.state.backend_states = actor.state.backend_states
+            assert restored._get_backend("inmemory") is second
+            second.restore_state.assert_called_once_with({"value": "replacement"})
+        finally:
+            register_backend(original, replace=True)

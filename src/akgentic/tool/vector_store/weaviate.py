@@ -8,7 +8,7 @@ Vectors are provided externally (no Weaviate-side vectoriser).
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from akgentic.tool.vector_store.protocol import (
@@ -16,8 +16,10 @@ from akgentic.tool.vector_store.protocol import (
     CollectionStatus,
     SearchHit,
     SearchResult,
+    VectorQuery,
     check_path_prefix,
 )
+from akgentic.tool.vector_store.registry import BackendContext, BackendSpec, register_backend
 
 if TYPE_CHECKING:
     import weaviate
@@ -345,6 +347,7 @@ class WeaviateBackend:
         top_k: int,
         scope: str | None = None,
         path_prefix: str | None = None,
+        query: VectorQuery | None = None,
     ) -> SearchResult:
         """Search this team's objects in a Weaviate collection by cosine similarity.
 
@@ -353,12 +356,18 @@ class WeaviateBackend:
         would leave the caller with a short result set reporting itself complete, its
         budget already spent on other teams' or other scopes' objects.
 
+        When ``query`` is supplied, its ``filters`` are AND-combined with the
+        team predicate (see :meth:`_build_filter`), its ``params`` are forwarded
+        to ``near_vector`` (see :meth:`_near_vector_kwargs`), and its
+        ``score_threshold`` drops low-scoring hits after distance conversion.
+
         Args:
             collection: Target collection name.
             query_vector: Query embedding vector.
             top_k: Maximum number of results to return.
             scope: Restrict the search to objects carrying this ``scope``.
             path_prefix: Restrict the search to objects whose ``path`` starts with this.
+            query: Optional filters / score threshold / native ``near_vector`` params.
 
         Returns:
             Search results with hits ranked by distance (converted to score).
@@ -377,15 +386,19 @@ class WeaviateBackend:
         result = col.query.near_vector(
             near_vector=query_vector,
             limit=top_k,
-            filters=self._query_filter(scope, path_prefix),
+            filters=self._build_filter(query, scope=scope, path_prefix=path_prefix),
             return_metadata=MetadataQuery(distance=True),
+            **self._near_vector_kwargs(query),
         )
 
+        threshold = query.score_threshold if query else None
         hits: list[SearchHit] = []
         for obj in result.objects:
             props = obj.properties
             distance = obj.metadata.distance if obj.metadata and obj.metadata.distance else 0.0
             score = max(0.0, 1.0 - distance)
+            if threshold is not None and score < threshold:
+                continue
             ordinal = props.get(ORDINAL_PROPERTY)
             hits.append(
                 SearchHit(
@@ -404,6 +417,65 @@ class WeaviateBackend:
             status=CollectionStatus.READY,
             indexing_pending=0,
         )
+
+    # ------------------------------------------------------------------
+    # Query construction hooks (override in a subclass for bespoke behaviour)
+    # ------------------------------------------------------------------
+
+    def _build_filter(
+        self,
+        query: VectorQuery | None,
+        *,
+        scope: str | None = None,
+        path_prefix: str | None = None,
+    ) -> FilterReturn:
+        """Combine the team/scope/path predicate with ``query.filters``.
+
+        The team predicate (optionally narrowed by ``scope`` / ``path_prefix``
+        via :meth:`_query_filter`) is always present; each entry in
+        ``query.filters`` is AND-ed onto it as an equality (scalar) or
+        ``contains_any`` (list) condition. Override to support richer operators.
+
+        Args:
+            query: The active query, or ``None``.
+            scope: Restrict to objects carrying this ``scope``.
+            path_prefix: Restrict to objects whose ``path`` starts with this.
+
+        Returns:
+            A combined Weaviate ``Filter`` always scoped to this team.
+        """
+        base = self._query_filter(scope, path_prefix)
+        if query is None or not query.filters:
+            return base
+        from weaviate.classes.query import Filter
+
+        combined = base
+        for key, value in query.filters.items():
+            prop = Filter.by_property(key)
+            condition = (
+                prop.contains_any(list(value))
+                if isinstance(value, (list, tuple, set))
+                else prop.equal(value)
+            )
+            combined = combined & condition
+        return combined
+
+    def _near_vector_kwargs(self, query: VectorQuery | None) -> dict[str, Any]:
+        """Return extra keyword arguments forwarded to ``near_vector``.
+
+        Passes ``query.params`` through untouched, so a caller can set native
+        knobs such as ``certainty`` or ``distance``. Override to whitelist or
+        remap parameters.
+
+        Args:
+            query: The active query, or ``None``.
+
+        Returns:
+            Keyword arguments for ``collection.query.near_vector``.
+        """
+        if query is None or not query.params:
+            return {}
+        return dict(query.params)
 
     # ------------------------------------------------------------------
     # Team-scoped cleanup (not part of VectorStoreService)
@@ -557,3 +629,64 @@ class WeaviateBackend:
         if tenant:
             col = col.with_tenant(tenant)
         return col
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
+
+def _weaviate_is_configured() -> bool:
+    """Return whether a Weaviate cluster URL is exported."""
+    from akgentic.tool.vector_store.protocol import weaviate_url
+
+    return weaviate_url() is not None
+
+
+def _require_weaviate(card_name: str) -> None:
+    """Raise when Weaviate is named but no cluster URL is exported."""
+    from akgentic.tool.vector_store.protocol import (
+        WEAVIATE_API_KEY_ENV,
+        WEAVIATE_URL_ENV,
+        weaviate_url,
+    )
+
+    if weaviate_url():
+        return
+    raise ValueError(
+        f"{card_name} configures backend='weaviate' but {WEAVIATE_URL_ENV} is not set. "
+        f"Export {WEAVIATE_URL_ENV} (and {WEAVIATE_API_KEY_ENV} for an authenticated "
+        f"cluster), or drop the backend setting to use the in-memory index."
+    )
+
+
+def _make_weaviate_backend(context: BackendContext) -> WeaviateBackend:
+    """Build a :class:`WeaviateBackend` from the actor config / environment.
+
+    Prefers connection settings already present on the ``VectorStoreConfig``
+    (injected by the tool card from the environment), falling back to reading the
+    environment directly so a hand-built context still resolves a cluster.
+    """
+    from akgentic.tool.vector_store.protocol import weaviate_api_key, weaviate_url
+
+    cfg = context.config
+    url = getattr(cfg, "weaviate_url", None) or weaviate_url()
+    if not url:
+        msg = "weaviate_url is not configured; cannot build WeaviateBackend."
+        raise ValueError(msg)
+    api_key = getattr(cfg, "weaviate_api_key", None) or weaviate_api_key()
+    return WeaviateBackend(url=url, api_key=api_key, team_id=context.team_id)
+
+
+register_backend(
+    BackendSpec(
+        name="weaviate",
+        factory=_make_weaviate_backend,
+        persists_in_actor_state=False,
+        selectable_as_default=True,
+        is_configured=_weaviate_is_configured,
+        require_configured=_require_weaviate,
+        legacy_actor_accessor="_get_or_create_weaviate_backend",
+    ),
+    replace=True,
+)

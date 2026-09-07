@@ -622,9 +622,10 @@ class TestProtocolCarriesNoTeam:
     def test_protocol_search_and_remove_take_no_team_argument(self) -> None:
         """VectorStoreService takes no team; the boundary stays inside the backend.
 
-        The scope and path predicates added for workspace retrieval are ordinary
-        query arguments and narrow *within* a team — they are deliberately not the
-        team leg, which no caller may pass and none may omit.
+        The scope and path predicates added for workspace retrieval, and the
+        optional ``query`` refinement, are ordinary query arguments and narrow
+        *within* a team — they are deliberately not the team leg, which no caller
+        may pass and none may omit.
         """
         from akgentic.tool.vector_store.protocol import VectorStoreService
 
@@ -638,6 +639,7 @@ class TestProtocolCarriesNoTeam:
             "top_k",
             "scope",
             "path_prefix",
+            "query",
         ]
         assert list(remove.parameters) == [
             "self",

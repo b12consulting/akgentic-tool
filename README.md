@@ -118,6 +118,9 @@ uv add "akgentic-tool[vector_search]"
 # Weaviate backend for the vector store (weaviate-client)
 uv add "akgentic-tool[weaviate]"
 
+# Qdrant backend for the vector store (qdrant-client)
+uv add "akgentic-tool[qdrant]"
+
 # Binary file reading for workspace_read (PDF, DOCX, XLSX, PPTX via MarkItDown)
 uv add "akgentic-tool[docs]"
 
@@ -125,7 +128,7 @@ uv add "akgentic-tool[docs]"
 uv add "akgentic-tool[vision]"
 
 # Everything
-uv add "akgentic-tool[vector_search,weaviate,docs,vision]"
+uv add "akgentic-tool[vector_search,weaviate,qdrant,docs,vision]"
 ```
 
 ### As part of the framework bundle
@@ -1576,14 +1579,15 @@ what must not happen when the point is that the write does not land.
 |---|---|---|
 | `vector_search` | `openai>=1.0.0`, `numpy>=1.26.0` | Semantic search in `PlanningTool` and `KnowledgeGraphTool` |
 | `weaviate` | `weaviate-client>=4.9.0` | Weaviate backend for the vector store |
+| `qdrant` | `qdrant-client>=1.10.0` | Qdrant backend for the vector store |
 | `docs` | `markitdown[pdf,docx,xlsx,xls,pptx,outlook]>=0.1` | Binary file reading in `workspace_read` |
 | `vision` | `Pillow>=10.0` | Image resizing + sidecar cache in `workspace_view` |
 
 No extra is required at import time. When one is absent the affected feature either falls
 back or fails with an actionable message: planning falls back to keyword-only search, image
 resizing is skipped with a one-time warning, workspace binary reads raise `ValueError` with
-an install hint, and selecting the Weaviate backend raises `ImportError` with install
-instructions.
+an install hint, Qdrant validates its client dependency at card build time, and constructing a
+Weaviate backend without its client raises `ImportError` with installation instructions.
 
 ## Development
 

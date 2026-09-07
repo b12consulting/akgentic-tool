@@ -15,8 +15,10 @@ from akgentic.tool.vector_store.protocol import (
     CollectionStatus,
     SearchHit,
     SearchResult,
+    VectorQuery,
     check_path_prefix,
 )
+from akgentic.tool.vector_store.registry import BackendContext, BackendSpec, register_backend
 from akgentic.tool.vector_store.vector import (
     VectorEntry,
     VectorIndex,
@@ -139,13 +141,19 @@ class InMemoryBackend:
         top_k: int,
         scope: str | None = None,
         path_prefix: str | None = None,
+        query: VectorQuery | None = None,
     ) -> SearchResult:
         """Search a collection by cosine similarity.
 
-        The predicates are applied to the **scored** candidates before ``top_k`` is
-        taken, so a scoped search returns a full ``top_k`` of its own entries rather
-        than filtering an already-cut set down to a handful. Scoring every entry costs
-        nothing extra: ``search_cosine`` already sorts the whole index and slices.
+        The ``scope`` / ``path_prefix`` predicates are applied to the **scored**
+        candidates before ``top_k`` is taken, so a scoped search returns a full
+        ``top_k`` of its own entries rather than filtering an already-cut set down
+        to a handful. Scoring every entry costs nothing extra: ``search_cosine``
+        already sorts the whole index and slices.
+
+        A ``query`` refines the same pass: its ``filters`` and ``score_threshold``
+        are applied client-side alongside the predicates before the result is cut
+        back to ``top_k``. ``query.params`` has no in-memory meaning and is ignored.
 
         Args:
             collection: Target collection name.
@@ -153,6 +161,7 @@ class InMemoryBackend:
             top_k: Maximum number of results to return.
             scope: Restrict the search to entries carrying this ``scope``.
             path_prefix: Restrict the search to entries whose ``path`` starts with this.
+            query: Optional filters / score threshold.
 
         Returns:
             Search results with hits ranked by cosine similarity, collection
@@ -164,15 +173,15 @@ class InMemoryBackend:
         """
         check_path_prefix(path_prefix)
         index = self._get_index(collection)
-        if scope is None and path_prefix is None:
+        scoped = scope is not None or path_prefix is not None
+        refined = query is not None and (bool(query.filters) or query.score_threshold is not None)
+        if not scoped and not refined:
             results = index.search_cosine(query_vector, top_k)
+            hits = self._map_search_hits(index, results)
         else:
-            allowed = {
-                e.ref_id for e in index._entries if _entry_matches(e, scope, path_prefix)
-            }
-            scored = index.search_cosine(query_vector, len(index))
-            results = [(rid, s) for rid, s in scored if rid in allowed][:top_k]
-        hits = self._map_search_hits(index, results)
+            hits = self._filtered_search(
+                index, query_vector, top_k, query, scope=scope, path_prefix=path_prefix
+            )
         return SearchResult(
             hits=hits,
             status=CollectionStatus.READY,
@@ -242,6 +251,77 @@ class InMemoryBackend:
             msg = f"Collection '{collection}' does not exist"
             raise ValueError(msg) from None
 
+    def _filtered_search(
+        self,
+        index: VectorIndex,
+        query_vector: list[float],
+        top_k: int,
+        query: VectorQuery | None = None,
+        *,
+        scope: str | None = None,
+        path_prefix: str | None = None,
+    ) -> list[SearchHit]:
+        """Apply predicates / ``filters`` / ``score_threshold``, then cut to ``top_k``.
+
+        Over-fetches the whole index (cheap at in-memory scale) so that
+        constraints never starve the result the way filtering a pre-cut top-k
+        would. The ``scope`` / ``path_prefix`` predicates and the ``query``
+        refinements are ANDed together.
+
+        Args:
+            index: The VectorIndex to search.
+            query_vector: Query embedding vector.
+            top_k: Maximum number of results to return after filtering.
+            query: Optional refinement carrying filters and/or a score threshold.
+            scope: Restrict to entries carrying this ``scope``.
+            path_prefix: Restrict to entries whose ``path`` starts with this.
+
+        Returns:
+            Up to ``top_k`` matching ``SearchHit`` models, best score first.
+        """
+        candidates = index.search_cosine(query_vector, len(index) or top_k)
+        entries_by_id: dict[str, VectorEntry] = {e.ref_id: e for e in index._entries}
+        threshold = query.score_threshold if query is not None else None
+        filters = query.filters if query is not None else None
+        kept: list[tuple[str, float]] = []
+        for ref_id, score in candidates:
+            if threshold is not None and score < threshold:
+                continue
+            entry = entries_by_id.get(ref_id)
+            if entry is None:
+                continue
+            if not _entry_matches(entry, scope, path_prefix):
+                continue
+            if filters and not self._matches(entry, filters):
+                continue
+            kept.append((ref_id, score))
+            if len(kept) >= top_k:
+                break
+        return self._map_search_hits(index, kept)
+
+    @staticmethod
+    def _matches(entry: VectorEntry, filters: dict[str, Any]) -> bool:
+        """Return whether *entry* satisfies every exact-match *filter*.
+
+        A filter value may be a scalar (equality) or a list/tuple/set
+        (match-any). Keys that name no field on ``VectorEntry`` never match.
+
+        Args:
+            entry: The candidate entry.
+            filters: Field-name to expected-value(s) mapping.
+
+        Returns:
+            ``True`` when every filter is satisfied.
+        """
+        for key, expected in filters.items():
+            actual = getattr(entry, key, None)
+            if isinstance(expected, (list, tuple, set)):
+                if actual not in expected:
+                    return False
+            elif actual != expected:
+                return False
+        return True
+
     @staticmethod
     def _map_search_hits(
         index: VectorIndex, results: list[tuple[str, float]]
@@ -277,3 +357,25 @@ class InMemoryBackend:
                 )
             )
         return hits
+
+
+# ---------------------------------------------------------------------------
+# Registration
+# ---------------------------------------------------------------------------
+
+
+def _make_inmemory_backend(context: BackendContext) -> InMemoryBackend:
+    """Build an :class:`InMemoryBackend`. The context carries nothing it needs."""
+    return InMemoryBackend()
+
+
+register_backend(
+    BackendSpec(
+        name="inmemory",
+        factory=_make_inmemory_backend,
+        persists_in_actor_state=True,
+        selectable_as_default=False,
+        legacy_actor_accessor="_get_or_create_backend",
+    ),
+    replace=True,
+)
