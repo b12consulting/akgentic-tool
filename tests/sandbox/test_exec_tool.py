@@ -57,6 +57,7 @@ from akgentic.tool.workspace.execution import (
     ExecStart,
     ExecState,
     ExecStatus,
+    queued,
 )
 
 # ---------------------------------------------------------------------------
@@ -379,8 +380,11 @@ def test_exec_command_returns_formatted_output() -> None:
 
     assert "exit_code: 0 (OK)" in result
     assert "5 passed" in result
-    assert "stdout:" in result
-    assert "stderr" in result
+    assert "**stdout**" in result
+    # An empty stream is omitted rather than labelled: the heading's presence is
+    # the information. This script writes nothing to stderr, so there is no
+    # stderr section — asserting its ABSENCE is what guards that.
+    assert "**stderr**" not in result
 
 
 def test_exec_command_includes_stderr_in_output() -> None:
@@ -987,6 +991,31 @@ def test_exec_command_hands_back_a_run_id_when_the_poll_runs_out() -> None:
     assert "abc12345" in result
     assert "without reporting" in result
     assert "next turn" not in result
+
+
+def test_exec_command_says_queued_not_timed_out_for_a_run_that_never_started() -> None:
+    """A queued run did not overrun its budget — it has not begun, and the shim says so.
+
+    The shim shares one ``#Workspace``, and therefore one exec queue, with the
+    capability, so exhausting its poll no longer implies the run overran: it may
+    simply still be waiting its turn. Answering ``timed_out`` there tells the
+    model a timeout happened that did not, and sends it looking for a partial
+    result that does not exist. The degradation to a run id is unchanged and
+    deliberate; only the message is corrected.
+    """
+    observer = MockObserver(existing_actor=None)
+    tool = ExecTool(mode="local")
+    wire(tool, observer)
+    waiting = ExecStatus(state=ExecState.QUEUED, run_id="abc12345", queue_position=2)
+    tool._workspace_proxy = FakeWorkspaceProxy(waiting)  # type: ignore[assignment]
+
+    with patch("akgentic.tool.core.deferred.time.sleep"):
+        result = tool.get_tools()[0](cmd="pytest")
+
+    assert result == queued("abc12345", 2)
+    assert "abc12345" in result
+    assert "has not started yet" in result
+    assert "without reporting" not in result  # the timed_out wording, which would be false
 
 
 def test_exec_command_polls_rather_than_taking_the_sentinel_literally() -> None:

@@ -40,7 +40,7 @@ from akgentic.core.actor_address import ActorAddress
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.utils import SerializableBaseModel
 from akgentic.tool.core import COMMAND, TOOL_CALL, BaseToolParam, Channels, ToolCard, _resolve
-from akgentic.tool.core.deferred import DEFAULT_WORKER_TIMEOUT_S, poll_deferred
+from akgentic.tool.core.deferred import poll_deferred
 from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.sandbox.actor import CardMode
@@ -55,13 +55,16 @@ from akgentic.tool.workspace.execution import (
     DEFAULT_EXEC_POLL_DELAY_S,
     DEFAULT_EXEC_TIMEOUT_S,
     ExecConfig,
+    ExecState,
     ExecStatus,
+    effective_budget,
     format_status,
     in_progress,
     poll_attempts_within,
+    queued,
     resolve_mode,
     sandbox_config,
-    timed_out,
+    wait_out_the_turn,
 )
 from akgentic.tool.workspace.models import (
     PERM_ERR_MSG,
@@ -479,8 +482,9 @@ class WorkspaceExec(BaseToolParam):
     conflate:
 
     - ``timeout_s`` bounds the **subprocess**, and reaches
-      ``subprocess.run(timeout=...)`` in the backend. It is clamped to the
-      worker's own budget, which sits below the orchestrator's stop backstop.
+      ``subprocess.run(timeout=...)`` in the backend. It is clamped to
+      :data:`~akgentic.tool.workspace.execution.MAX_EXEC_BUDGET_S`, which sits
+      below the orchestrator's stop backstop.
     - ``poll_attempts`` × ``poll_delay_seconds`` bounds how long the **agent's
       own thread** waits inside the tool call. It cannot extend the first:
       raising it buys more looking, never more running.
@@ -490,9 +494,9 @@ class WorkspaceExec(BaseToolParam):
 
     - ``-1`` (the default) — **wait out the run.** Resolved at wiring time to
       the count whose wait is the longest still fitting the *effective run
-      budget* (``min(timeout_s, DEFAULT_WORKER_TIMEOUT_S)``) plus
+      budget* (``effective_budget(timeout_s)``) plus
       :data:`~akgentic.tool.workspace.execution.EXEC_REPORT_MARGIN_S`, so the
-      wait covers the worker's report and not merely the command. The common
+      wait covers the sandbox's report and not merely the command. The common
       case then returns the command's own output and the model never sees a run
       id.
     - a **positive count** — a bounded look of ``count × poll_delay_seconds``,
@@ -1586,11 +1590,11 @@ class WorkspaceTool(ToolCard):
         proxy = self._workspace_proxy
         agent_id = self._agent_id
         delay = params.poll_delay_seconds
-        # The effective run budget — the card's ask after the worker's ceiling —
+        # The effective run budget — the card's ask after MAX_EXEC_BUDGET_S —
         # is what actually stops the run, so it is what both the sentinel and the
         # clamp are measured against. A card asking for 999 s never gets more
-        # than the worker allows it either way.
-        run_budget = min(params.timeout_s, DEFAULT_WORKER_TIMEOUT_S)
+        # than the ceiling allows it either way.
+        run_budget = effective_budget(params.timeout_s)
         # Resolved once, here, so nothing downstream knows the sentinel existed.
         attempts = poll_attempts_within(params.poll_attempts, delay, run_budget)
         # Which budget was in force decides which exhaustion message is honest,
@@ -1599,43 +1603,56 @@ class WorkspaceTool(ToolCard):
         waits_out_the_run = params.poll_attempts < 0
 
         def workspace_exec(cmd: str, cwd: str = "") -> str:
-            """Run a command in the team workspace, in a sandbox. No shell runs it.
+            """Run ONE binary in the team workspace sandbox. There is NO shell: `&&` fails.
 
-            The workspace is held exclusively for the duration of the run: your
-            teammates can still read files, but every change they attempt is refused
-            until it finishes. Everything the command touched — files you never named
-            included — is recorded as one change attributed to you.
+            To chain, pipe, redirect or expand, wrap it yourself — `bash` is allow-listed:
+                WRONG:  git -C repo status && git -C repo log -1
+                RIGHT:  bash -c 'git -C repo status && git -C repo log -1'
+            Unwrapped, `&&` `||` `;` `|` `>` `$VAR` `$(...)` are literal arguments and fail.
 
-            A run that outlives the wait gives you a run id instead of output;
-            workspace_exec_result collects it once it lands.
+            The workspace is held for the run: teammates still read, their changes wait. A
+            second command never refuses yours — it waits its turn and returns its own
+            output. Everything touched is recorded as one change attributed to you; if the
+            wait runs long you get a run id instead, which workspace_exec_result collects.
 
             Args:
-                cmd: One binary plus its arguments. Tokenised POSIX-style, so
-                    quoting groups: `echo "hello world"` is two tokens. `&&`, `||`,
-                    `;`, `|`, `>`, `$VAR` and `$(...)` are NOT interpreted — for
-                    shell syntax run `bash -c '...'`. The binary (first token) must
-                    be in the allow-list.
+                cmd: One binary plus its arguments, tokenised POSIX-style so quoting
+                    groups: `echo "hello world"` is two tokens. The binary (first token)
+                    must be in the allow-list.
                 cwd: Subdirectory relative to workspace root. Defaults to root.
 
             Returns:
-                Combined stdout, stderr and exit code — or a run id, if it outlived the wait.
+                Combined stdout, stderr and exit code — or a run id, if the wait ran long.
 
             Raises:
-                RetriableError: If another agent's run holds the workspace.
+                RetriableError: If too many runs are already queued on this workspace.
             """
             start = _bound(proxy).request_exec(agent_id, cmd, cwd)
             if not start.run_id:
                 raise RetriableError(start.refusal)
             run_id = start.run_id
+
+            def fetch() -> ExecStatus:
+                return _bound(proxy).exec_status(agent_id, run_id)
+
+            if waits_out_the_run:
+                # "Wait out the run" now reaches the queue in front of it too, so
+                # a command that had to wait its turn still answers with its own
+                # output rather than a run id somebody has to collect.
+                return wait_out_the_turn(fetch, run_id, run_budget, delay)
             settled = poll_deferred(
-                lambda: _settled_status(_bound(proxy).exec_status(agent_id, run_id)),
-                attempts=attempts,
-                delay=delay,
+                lambda: _settled_status(fetch()), attempts=attempts, delay=delay
             )
             if settled is not None:
                 return format_status(settled)
-            if waits_out_the_run:
-                return timed_out(run_id, run_budget)
+            # An explicitly bounded look is unchanged: it asked for a run id after
+            # N attempts and gets one. ``poll_deferred`` answers None without
+            # saying WHY it stopped, so one more ask tells the two honest messages
+            # apart — "queued" says the work has not begun and nothing is lost,
+            # where "in progress" says it is running and will land.
+            status = fetch()
+            if status.state is ExecState.QUEUED:
+                return queued(run_id, status.queue_position)
             return in_progress(run_id)
 
         workspace_exec.__doc__ = params.format_docstring(workspace_exec.__doc__)
@@ -1656,13 +1673,16 @@ class WorkspaceTool(ToolCard):
         def workspace_exec_result(run_id: str) -> str:
             """Collect the output of a command started by workspace_exec.
 
+            Only runs you started yourself: an id from another agent is not yours
+            to collect and comes back as unknown.
+
             Args:
                 run_id: The id workspace_exec handed back.
 
             Returns:
                 The command's output if it has finished, a note that it is still
-                running, why it failed, or — for an id nothing was issued under —
-                your recent run ids so you can retry with the right one.
+                queued or running, why it failed, or — for an id that is not one of
+                yours — your recent run ids so you can retry with the right one.
             """
             return format_status(_bound(proxy).exec_status(agent_id, run_id))
 

@@ -6,37 +6,41 @@ set is unknowable before it runs and only partly guessable after. So exec is
 **fenced** rather than gated — an exclusive lease over the tree for the duration
 of the run — and git is what tells us afterwards what it did (ADR-036 §5).
 
-This module holds everything exec needs that is not the lease itself: the models
-crossing the actor boundary, the budgets, the worker that performs the blocking
-sandbox call off the actor's thread, and the one formatter both the
+This module holds everything exec needs that is not the gate itself: the models
+crossing the actor boundary, the budgets, and the one formatter both the
 ``workspace_exec`` capability and the deprecated ``ExecTool`` shim render through.
+
+**The blocking call happens on ``#SandboxActor``'s own thread**, which is the
+thread it was always going to happen on. ``#Workspace`` hands the sandbox one
+command at a time and goes back to draining its mailbox; the sandbox tells the
+answer back. There is no worker in between — a worker only ever sat in an ``ask``
+waiting for that same subprocess, and the cost of it was two lifetimes and three
+clocks to keep in agreement.
 
 **The module is named ``execution``, not ``exec``.** ``exec`` is a builtin, and a
 module of that name shadows it at every import site in the package.
 
-**This is where ``workspace/`` starts importing ``sandbox/``.** The two have been
-independent since the sandbox arrived; merging the card surface necessarily
-creates the edge, because the worker needs ``SANDBOX_ACTOR_CLASSES`` and
-``SandboxConfig``. It is one-directional — ``workspace`` → ``sandbox``, never
-back — and inside one package. Keep it that way: an import in the other
-direction makes the pair a cycle.
+**This is where ``workspace/`` starts importing ``sandbox/``.** The two were
+independent until the card surfaces merged, and the edge is now structural:
+``#Workspace`` builds the sandbox's config here and sends it an ``ExecRequest``
+defined there. It is one-directional — ``workspace`` → ``sandbox``, never back —
+and inside one package. Keep it that way: an import in the other direction makes
+the pair a cycle, which is also why the request and the report models live on
+the sandbox side.
 """
 
 from __future__ import annotations
 
 import logging
-import subprocess
 import time
+from collections.abc import Callable
 from enum import StrEnum
-from typing import Any
 from uuid import uuid4
 
-from pydantic import Field, PrivateAttr, model_validator
+from pydantic import PrivateAttr, model_validator
 
 from akgentic.core.actor_address import ActorAddress
-from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.utils.serializer import SerializableBaseModel
-from akgentic.tool.core.deferred import DeferredPayload, DeferredWorker
 from akgentic.tool.sandbox.actor import (
     SANDBOX_ACTOR_ROLE,
     CardMode,
@@ -58,12 +62,47 @@ logger = logging.getLogger(__name__)
 DEFAULT_EXEC_TIMEOUT_S = 15.0
 """Wall-clock budget for the sandboxed command itself.
 
-Below ``DEFAULT_WORKER_TIMEOUT_S`` (20 s), which is below the orchestrator's 30 s
+Below :data:`MAX_EXEC_BUDGET_S` (20 s), which is below the orchestrator's 30 s
 stop backstop. The old ``ExecTool`` default of 30 s sat *at* the backstop and
-docker's sat above it, which is why exec could not simply keep it: a worker
-cannot cancel a thread, so a command still running past its worker's budget holds
-its parent's teardown open for the difference.
+docker's sat above it, which is why exec could not simply keep it: a Python
+thread cannot be cancelled, so a command still running past its budget holds its
+parent's teardown open for the difference.
 """
+
+MAX_EXEC_BUDGET_S = 20.0
+"""The ceiling every run budget is clamped to, whatever a card asks for.
+
+**What it bounds is a teardown, not a command.** The subprocess runs on
+``#SandboxActor``'s own thread, and a Python thread cannot be cancelled — so the
+orchestrator's ``stop_children(blocking=True)`` is held open for as long as the
+command runs. The backstop on that stop is 30 s, so a run allowed past 20 s is a
+team that cannot be shut down inside its own backstop.
+
+The number is the one the retired ``#defer-`` worker used, and it is unchanged on
+purpose: the constraint never belonged to the worker. A thread that cannot be
+cancelled holds the blocking stop open whether it is a worker's thread or the
+sandbox's, so the ceiling below the backstop is still owed and only its owner has
+changed. Every budget arithmetic, README figure and existing spec therefore reads
+the same.
+"""
+
+
+def effective_budget(timeout_s: float) -> float:
+    """Return the budget a run will actually get — the card's ask, capped.
+
+    Three sites need this number and each of them used to compute the ``min``
+    by hand: the actor building the request, the capability resolving its poll,
+    and the deprecated shim resolving its own. Three copies of a clamp is three
+    places for a ceiling change to be applied twice and missed once.
+
+    Args:
+        timeout_s: What the card asked for.
+
+    Returns:
+        ``min(timeout_s, MAX_EXEC_BUDGET_S)``.
+    """
+    return min(timeout_s, MAX_EXEC_BUDGET_S)
+
 
 DEFAULT_EXEC_POLL_ATTEMPTS = -1
 """Sentinel: wait out the whole run rather than hand back a run id part-way.
@@ -101,7 +140,7 @@ EXEC_REPORT_MARGIN_S = 1.0
 """How far past the run's budget the sentinel's poll keeps looking.
 
 The run's budget bounds the **command**; the poll has to outlast it by the time
-the worker takes to report, or the most ordinary slow case breaks. A command
+the sandbox takes to report, or the most ordinary slow case breaks. A command
 killed at its 15 s budget produces a perfectly good ``exit_code: 124`` outcome a
 moment later — an answer the agent can read — and a poll bounded at exactly 15 s
 misses it by that moment and reports a timeout instead, turning a clean answer
@@ -110,7 +149,7 @@ into a confusing one.
 **Only the sentinel gets it.** An explicit positive ``poll_attempts`` asked for a
 bounded look, not for the whole run, and is clamped to the run budget alone.
 
-A module constant rather than a card field: it describes how fast a worker
+A module constant rather than a card field: it describes how fast the sandbox
 reports, which is a property of this runtime, not of what a user wants. Promote
 it only if a deployment is ever observed where a report reliably takes longer.
 """
@@ -124,23 +163,56 @@ run id *helpful* — a model that mistyped one reads the right one back — so t
 cap only has to cover a conversation's worth of runs, not a team's.
 """
 
+MAX_QUEUED_RUNS = 16
+"""How many runs may wait for the tree behind the one holding it.
+
+Bounded for the reason every other collection on ``#Workspace`` is: a team
+singleton's deque with no ceiling grows with whatever a model emits, and a model
+that has decided to emit commands in a loop will fill it faster than the head
+drains it. The refusal over the cap is the only exec refusal left, and it names
+nobody — which is what keeps it from reproducing the defect the queue removes.
+
+Generous rather than tight: the workload that produced the queue is a parallel
+batch of two or three probes, and a cap that a healthy batch could reach would
+turn an ordinary response into a retry.
+"""
+
 LEASE_GRACE_S = 5.0
-"""How far past its budget a run's lease survives before a mutation reclaims it.
+"""How long past its budget a run keeps the mutation gate with nothing reported.
 
-The lease is released on every exit a worker can report — success, failure,
-timeout, even a spawn that never happened. The one gap is a worker killed during
-teardown, which reports nothing, and without a reclaim that wedges every mutation
-in the team for the rest of its life. A deadline checked lazily by the next
-mutation closes it with no timer and no extra thread.
+One use, and it covers one case: a child that ignores the kill. Every ordinary
+exit reports — a command that ran, a command the budget killed, a backend that
+raised, an allowlist refusal — because the sandbox's handler reports in a
+``finally``. What no report can cover is a subprocess still alive after its
+budget, since the thread waiting on it is not free to say so.
 
-**The deadline is re-based when the run actually starts**, and the reclaim is
-gated on the worker being gone. Both matter for the same reason: a deadline that
-starts at *request* time is spent by anything slow ahead of the command — a
-container image being built, above all — so without either guard a live run is
-declared dead, the tree is handed to somebody else, and the run's report then
-finds no lease of its own and drops its write set. What remains is the one case
-the deadline was introduced for: a worker killed during teardown, which reports
-nothing and is not alive to be waited on.
+So the gate is released **without** a report once the run is this far past its
+budget, checked lazily by the next mutation: no timer, no extra thread. By then
+the backend has killed the child, so the release is not a race against a live
+writer — and the late report that may still arrive commits nothing and clears
+nothing, because by then the tree may hold somebody else's work.
+
+Measured from the moment the run actually started, which is the moment the
+request was sent: resolving the sandbox is one orchestrator turn and a thread
+start, so nothing slow sits between admission and the command any more. A cold
+container backend spends its provisioning inside the sandbox's own ``on_start``,
+where the request waits in the mailbox rather than against this clock.
+"""
+
+SANDBOX_RESOLVE_TIMEOUT_S = 5
+"""Seconds ``#Workspace`` will wait for the orchestrator to hand back the sandbox.
+
+An ask made **on the team singleton's own thread**, which is the shape that must
+never be untimed: everything else queued behind it — every read, every mutation,
+every other agent's poll — waits for it. Five is generous rather than tight, since
+what is being waited on is one O(1) orchestrator turn plus a thread start;
+``getChildrenOrCreate`` returns before a cold backend's ``on_start`` has finished,
+so a slow provision is not what this bounds.
+
+On expiry the run **fails with a reason** rather than parking the singleton, which
+is what keeps a wedged orchestrator from taking the workspace with it.
+
+Whole seconds because ``proxy_ask`` takes an ``int``.
 """
 
 RUN_ID_CHARS = 8
@@ -159,56 +231,6 @@ TIMED_OUT_EXIT_CODE = 124
 _UNCONFIGURED_MSG = (
     "This workspace has no execution backend configured — workspace_exec is not available here."
 )
-
-_NOT_READY_MSG = (
-    "The execution backend was not ready within {seconds}s, so the command never ran and "
-    "nothing was written. It is most likely still starting up — the first run on a container "
-    "backend builds its image — so retry in a moment; a run that keeps failing this way means "
-    "the backend cannot start on this host."
-)
-
-
-def ask_seconds(remaining: float) -> int:
-    """Whole seconds an ask inside a worker may block for, never past its deadline.
-
-    ``Akgent.proxy_ask`` takes an integer timeout, so a float budget has to land
-    on one. It is **truncated**, not rounded: the deadline is the whole point of
-    the budget, so an ask that outlived it would defeat the thing it is being
-    given. A remainder below a second becomes ``0`` — which fails the ask
-    immediately, and is the honest answer, since a backend does not start in the
-    time left.
-
-    Args:
-        remaining: Seconds left of the worker's budget, possibly negative.
-
-    Returns:
-        The timeout to hand ``proxy_ask``, never below zero.
-    """
-    return max(0, int(remaining))
-
-
-def backend_not_ready(seconds: int) -> str:
-    """Why a run never started, and what the agent should do about it."""
-    return _NOT_READY_MSG.format(seconds=seconds)
-
-
-EXEC_REPLY_GRACE_S = 2
-"""How much longer the ask waiting on a command lives than the command's budget.
-
-A command killed by its budget is an **answer** — the backend raises, the worker
-turns it into ``ExecOutcome(timed_out=True)``, and the agent reads what happened.
-It stays one only while the ask waiting for that answer is still open, and the
-ask has to cover the kill and the output collection that follow the budget
-expiring. Cut to the truncated remainder instead, it expires *first* whenever the
-card's budget reaches the worker's — so the one configuration that can genuinely
-exhaust a run's budget was also the one that reported it as an opaque worker
-failure rather than a timeout.
-
-Whole seconds, because ``proxy_ask`` takes an int. Small, because the worker
-still has to die well inside :data:`LEASE_GRACE_S` of its own deadline — which is
-what keeps a liveness-gated reclaim from waiting on a worker that has outlived
-the lease it holds.
-"""
 
 
 class ExecOutcome(SerializableBaseModel):
@@ -229,58 +251,52 @@ class ExecOutcome(SerializableBaseModel):
     timed_out: bool = False
 
 
-class ExecLease(SerializableBaseModel):
-    """The exclusive hold one run has on the tree.
+class RunningExec(SerializableBaseModel):
+    """The run that is holding the tree right now — the one mutation gate.
+
+    ``#Workspace`` holds at most one of these at a time, in ``self._running``, and
+    its presence *is* the answer to "is the tree taken". There is no second flag
+    and no separate deadline: a report clears it, and a run wedged past
+    ``budget + LEASE_GRACE_S`` is released by the shared predicate that both the
+    mutation path and the admission path decide over.
 
     Attributes:
-        run_id: The run holding it. A report is only allowed to release the
-            lease when its run id matches — a late report from a reclaimed run
-            must not clear a newer lease.
-        agent_id: Who requested the run. Named in every refusal it causes.
+        run_id: The run holding it. A report is only allowed to clear the gate
+            when its run id matches — a late report from a released run must not
+            close out a newer one.
+        agent_id: Who requested the run. Named in every refusal it causes, and
+            who the discovered commit is attributed to.
         cmd: The command, kept for the discovered commit's body.
-        started_at: Monotonic clock at acquisition.
-        budget: The run's effective wall-clock budget. Kept as a field rather
-            than re-derived from the two clocks below, because the deadline moves
-            when the run starts and a derivation would then have to un-do a grace
-            it cannot see.
-        deadline: When this lease may be reclaimed — the moment the run started
-            (acquisition, until ``run_started`` says otherwise) plus
-            :attr:`budget` plus :data:`LEASE_GRACE_S`. Checked lazily by the next
-            mutation; nothing polls it.
+        started_at: Monotonic clock at the moment the request was sent. The
+            budget and the grace are both measured from here, and nothing
+            re-bases it: resolving the sandbox costs one orchestrator turn and a
+            thread start, so there is nothing slow left between admission and the
+            command for a fixed clock to mis-measure.
     """
 
     run_id: str
     agent_id: str
     cmd: str
     started_at: float
-    budget: float
-    deadline: float
 
-    _worker: ActorAddress | None = PrivateAttr(default=None)
-    """The worker performing the run — runtime state, never serialized.
+    _sandbox: ActorAddress | None = PrivateAttr(default=None)
+    """The sandbox performing the run — runtime state, never serialized.
 
     A ``PrivateAttr`` rather than a field: an address is live actor state, and
     Golden Rule #1b keeps that out of a model's field set. Travelling *on the
-    lease* is what matters, because a second attribute beside ``_lease`` would
-    have to be cleared in every place the lease is, and the one that got missed
-    would pin a dead worker's address onto a live run's lease.
+    run* is what matters, because a second attribute beside ``_running`` would
+    have to be cleared in every place the run is, and the one that got missed
+    would pin a dead sandbox's address onto a live run.
     """
 
-    def attach(self, worker: ActorAddress) -> None:
-        """Record which worker is performing this run."""
-        self._worker = worker
+    def attach(self, sandbox: ActorAddress) -> None:
+        """Record which sandbox is performing this run."""
+        self._sandbox = sandbox
 
     @property
-    def worker_alive(self) -> bool:
-        """Whether the run still has a worker that could report it.
-
-        A lease with **no** recorded worker counts as not alive, and that is the
-        safe direction: a spawn that never happened leaves a lease nobody can
-        release, and refusing to reclaim it would wedge every mutation in the
-        team for the rest of its life.
-        """
-        worker = self._worker
-        return worker is not None and worker.is_alive()
+    def sandbox(self) -> ActorAddress | None:
+        """The sandbox performing this run, or ``None`` if none was attached."""
+        return self._sandbox
 
 
 class ExecStart(SerializableBaseModel):
@@ -316,16 +332,48 @@ class ExecState(StrEnum):
     """Where a run is, from the point of view of an agent asking about it.
 
     ``DONE`` and ``FAILED`` are both *settled*: a caller polling for a result
-    stops on either. ``RUNNING`` and ``UNKNOWN`` are not, and they are
-    deliberately distinct — the cache's ``get`` returns ``None`` for an unknown
-    key, an in-flight one and a negatively-cached one alike, so telling a model
-    "still running" about an id it invented would be a lie it cannot recover from.
+    stops on either. ``QUEUED``, ``RUNNING`` and ``UNKNOWN`` are not, and they
+    are deliberately distinct — the cache's ``get`` returns ``None`` for an
+    unknown key, an in-flight one and a negatively-cached one alike, so telling a
+    model "still running" about an id it invented would be a lie it cannot
+    recover from.
+
+    ``QUEUED`` is admission's third answer: the tree is held by somebody else, so
+    the command has not started and will. It must **not** be settled — a poller
+    that stopped on it would hand back a run id the caller never needed, on the
+    ordinary path where the head finishes in milliseconds.
     """
 
     DONE = "done"
     FAILED = "failed"
+    QUEUED = "queued"
     RUNNING = "running"
     UNKNOWN = "unknown"
+
+
+class QueuedExec(SerializableBaseModel):
+    """One run waiting for the tree — inert bookkeeping, and nothing else.
+
+    **Nothing is sent and no clock is started for a queued entry**, and the
+    absence is the design rather than an omission: a request handed to the
+    sandbox at enqueue would run out of order, and a clock started at enqueue
+    would measure the wait instead of the run. Both happen at the dequeue, in
+    ``_start_run``, which is why this model carries neither.
+
+    Attributes:
+        run_id: The id issued to the requester at enqueue time. Its owner holds a
+            handle to its **own** work from the moment it asks, which is what
+            stops any message naming somebody else's run.
+        agent_id: Who asked, as a string. What the discovered commit is
+            attributed to once the entry runs.
+        cmd: The command string, exactly as the agent gave it.
+        cwd: Working directory below the workspace root.
+    """
+
+    run_id: str
+    agent_id: str
+    cmd: str
+    cwd: str = ""
 
 
 class ExecStatus(SerializableBaseModel):
@@ -336,6 +384,15 @@ class ExecStatus(SerializableBaseModel):
         run_id: The id that was asked about.
         outcome: The result, on :attr:`ExecState.DONE` only.
         reason: Why the run failed, on :attr:`ExecState.FAILED` only.
+        command: The command this run was started with, on
+            :attr:`ExecState.DONE` only — read from the asking agent's own
+            tracking map, which is why it can only be filled for a run the asker
+            owns. It is what makes a collected outcome nameable: without it the
+            answer is byte-indistinguishable from any other run's.
+        queue_position: The run's 1-based place in the FIFO, on
+            :attr:`ExecState.QUEUED` only. ``1`` means "next to run when the head
+            finishes"; the running head is not in the queue and is never
+            position 0.
         recent_run_ids: This agent's recent runs, on :attr:`ExecState.UNKNOWN`
             only — what turns a mistyped id into a correctable one.
     """
@@ -344,6 +401,8 @@ class ExecStatus(SerializableBaseModel):
     run_id: str
     outcome: ExecOutcome | None = None
     reason: str = ""
+    command: str = ""
+    queue_position: int = 0
     recent_run_ids: list[str] = []
 
     @property
@@ -375,34 +434,6 @@ class ExecConfig(SerializableBaseModel):
     timeout_s: float = DEFAULT_EXEC_TIMEOUT_S
 
 
-class ExecPayload(DeferredPayload):
-    """One command handed across to a worker — plain data, and nothing else.
-
-    No ``ActorAddress``, no proxy, no ``Filesystem``: the worker resolves the
-    sandbox for itself from the ids below. ``deferred_key`` narrows the base's
-    ``Any`` to the run id. Never set it independently of the ``request()`` key —
-    ``request`` rebinds it, and a caller that let the two drift would clear a
-    different in-flight mark and strand this one for the actor's lifetime.
-
-    Attributes:
-        deferred_key: The run id; also the cache key.
-        cmd: The command string, exactly as the agent gave it.
-        cwd: Working directory, relative to the workspace root.
-        mode: The resolved backend.
-        team_id: The team that owns the sandbox.
-        workspace_id: The card's ``workspace_id``, or ``None``.
-        timeout_s: The budget, already clamped to the worker's own.
-    """
-
-    deferred_key: str = Field(..., description="Run id; also the cache key.")
-    cmd: str = Field(..., description="Command string as the agent supplied it.")
-    cwd: str = Field(default="", description="Working directory below the workspace root.")
-    mode: SandboxMode = Field(..., description="Resolved sandbox backend.")
-    team_id: str = Field(..., description="Team that owns the sandbox actor.")
-    workspace_id: str | None = Field(default=None, description="Card's workspace_id, verbatim.")
-    timeout_s: float = Field(..., description="Wall-clock budget for the command.")
-
-
 def new_run_id() -> str:
     """Return a fresh run id — short, and never reused."""
     return uuid4().hex[:RUN_ID_CHARS]
@@ -419,7 +450,7 @@ def poll_attempts_within(attempts: int, delay: float, run_budget: float) -> int:
     - **negative** — :data:`DEFAULT_EXEC_POLL_ATTEMPTS`, "wait out the run":
       resolved so that the **last look** falls as late as it can inside
       ``run_budget`` **plus** :data:`EXEC_REPORT_MARGIN_S`, so the wait covers
-      the worker's report and not merely the command (see that constant). The
+      the sandbox's report and not merely the command (see that constant). The
       count is one higher than the wait divided by the delay, because
       ``poll_deferred`` sleeps between looks and not after the last.
     - **zero** — returned unchanged. A caller that polls zero times takes the run
@@ -432,9 +463,9 @@ def poll_attempts_within(attempts: int, delay: float, run_budget: float) -> int:
       possible answer.
 
     The bound is the **effective** run budget — the card's ``timeout_s`` after
-    the worker's own ceiling — because that is what actually stops the run.
+    :data:`MAX_EXEC_BUDGET_S` — because that is what actually stops the run.
     Clamping against the requested value would leave a card asking for 999 s
-    polling long past the 20 s the worker allows it.
+    polling long past the 20 s the ceiling allows it.
 
     Args:
         attempts: What the card asked for; negative means the sentinel.
@@ -466,6 +497,94 @@ def poll_attempts_within(attempts: int, delay: float, run_budget: float) -> int:
     if attempts * delay <= run_budget:
         return attempts
     return max(1, int(run_budget // delay))
+
+
+def wait_out_the_turn(
+    fetch: Callable[[], ExecStatus],
+    run_id: str,
+    run_budget: float,
+    delay: float,
+) -> str:
+    """Poll until the run settles, waiting out the **queue in front of it** as well.
+
+    The wait-out sentinel's loop, and the reason a batch of commands behaves as
+    if it had been issued one at a time: each call returns *its own* output.
+    Handing a queued caller a run id instead would be barely better than the
+    refusal the queue replaced — the model would still be left managing results
+    it never asked to manage.
+
+    **Deadline-driven, not attempt-driven**, because the wait is no longer a
+    property of the card alone: it depends on how many runs are ahead of this
+    one, which is only knowable per look. A run at queue position ``p`` has at
+    most ``p + 1`` run budgets left to wait — the ``p`` ahead of it, then its
+    own — so that is what the deadline is re-armed to on every queued look.
+
+    **The deadline re-arms on every queued look, and a separate ceiling fixed on
+    entry is what bounds it.** The two do different jobs and neither is
+    sufficient alone:
+
+    - **Re-arming keeps a caller that is still advancing alive.** A run ahead
+      costs its budget *plus* :data:`LEASE_GRACE_S` and the sandbox resolve, so
+      a deadline
+      fixed at the first look gives a caller at position 5 six budgets for work
+      that honestly takes more — and abandons it **while it is still moving up
+      the queue**, degrading to handoffs under exactly the load the queue exists
+      for. Re-arming from the current position cannot do that: each look buys
+      the time that position actually warrants.
+    - **The ceiling bounds the case re-arming cannot.** A position that never
+      decreases would otherwise re-start the clock for ever — reachable, because
+      a head whose child ignores the kill keeps the gate until something arrives
+      to release it. So ``(MAX_QUEUED_RUNS + 1) * run_budget +
+      EXEC_REPORT_MARGIN_S`` is computed **once, on entry, and never re-armed**,
+      and every deadline is clamped to it. That is what makes the worst case a
+      property of the code rather than of the happy path.
+
+    The ``+ 1`` is the caller's own run, and it is the same arithmetic as the
+    1-based ``queue_position``: at the deepest legal position the caller waits
+    for the :data:`MAX_QUEUED_RUNS` ahead of it **and then for itself**. A
+    ceiling of exactly ``MAX_QUEUED_RUNS * run_budget`` would abandon a
+    max-depth caller one budget before its own command finished.
+
+    **The thread parked here is the caller's own tool thread, never the actor's.**
+    ``exec_status`` is O(1) and the mailbox goes on draining, so nothing here
+    blocks reads, mutations, or another agent's poll. It does **not** bound
+    teardown: "only the head is on the sandbox" is a property of the actor side
+    and says nothing about a caller parked in this loop.
+
+    **Only the negative sentinel comes here.** A positive ``poll_attempts`` asked
+    for an explicitly bounded look and keeps ``poll_deferred``; ``0`` opts out of
+    polling entirely. ``poll_deferred`` is attempt-count-driven by construction
+    and shared with other cards, so it is left alone rather than widened for this
+    one caller.
+
+    Args:
+        fetch: Asks the actor where this run stands. Called once per look.
+        run_id: The caller's own run — never another agent's.
+        run_budget: The effective wall-clock budget of one run.
+        delay: Seconds between looks. Non-positive means a single look.
+
+    Returns:
+        The rendered outcome once the run settles, or — when the deadline goes
+        without one — the degraded handoff: :func:`queued` if it never started,
+        :func:`timed_out` if it did and overran.
+    """
+    start = time.monotonic()
+    ceiling = start + (MAX_QUEUED_RUNS + 1) * run_budget + EXEC_REPORT_MARGIN_S
+    deadline = start + run_budget + EXEC_REPORT_MARGIN_S
+    while True:
+        status = fetch()
+        if status.settled:
+            return format_status(status)
+        if status.state is ExecState.QUEUED:
+            turn = time.monotonic() + (status.queue_position + 1) * run_budget
+            deadline = min(turn + EXEC_REPORT_MARGIN_S, ceiling)
+        if delay <= 0 or time.monotonic() > deadline:
+            # A non-positive delay leaves no wall clock to divide, so it is one
+            # look and out — the reading ``poll_attempts_within`` already gives it.
+            if status.state is ExecState.QUEUED:
+                return queued(run_id, status.queue_position)
+            return timed_out(run_id, run_budget)
+        time.sleep(delay)
 
 
 def resolve_mode(mode: CardMode) -> tuple[SandboxMode, type[SandboxActor]]:
@@ -504,13 +623,13 @@ def resolve_mode(mode: CardMode) -> tuple[SandboxMode, type[SandboxActor]]:
     return resolved, SANDBOX_ACTOR_CLASSES[resolved]
 
 
-def sandbox_config(payload_or_config: ExecPayload | ExecConfig) -> SandboxConfig:
+def sandbox_config(config: ExecConfig) -> SandboxConfig:
     """Build the sandbox actor's configuration — in one place, for both callers.
 
     ``getChildrenOrCreate`` keys on the actor **name**, so a config that differs
     in name creates a *second* actor per run instead of resolving the existing
     one; a config that differs in ``workspace_id`` would point the reused actor
-    at the wrong directory. The card builds one at wiring time and the worker
+    at the wrong directory. The card builds one at wiring time and ``#Workspace``
     builds one per run, and the two must be identical — so they are built here
     rather than twice by hand.
 
@@ -523,191 +642,54 @@ def sandbox_config(payload_or_config: ExecPayload | ExecConfig) -> SandboxConfig
     and the directory cannot disagree.
 
     Args:
-        payload_or_config: Either side's carrier of the same four values.
+        config: The card's resolved backend and ids.
 
     Returns:
         The configuration for ``#SandboxActor-<workspace>``.
     """
-    workspace_name = payload_or_config.workspace_id or payload_or_config.team_id
+    workspace_name = config.workspace_id or config.team_id
     return SandboxConfig(
         name=sandbox_actor_name(workspace_name),
         role=SANDBOX_ACTOR_ROLE,
-        team_id=payload_or_config.team_id,
-        workspace_id=payload_or_config.workspace_id,
-        mode=payload_or_config.mode,
+        team_id=config.team_id,
+        workspace_id=config.workspace_id,
+        mode=config.mode,
     )
 
 
-class ExecWorker(DeferredWorker):
-    """Runs one sandboxed command on its own thread, reports it, and stops.
+def format_outcome(outcome: ExecOutcome, run_id: str = "") -> str:
+    """Render a finished run: one header line, then only the streams that spoke.
 
-    The worker is not redundant with the lease, which already excludes a second
-    run. If ``#Workspace`` made the blocking call itself its one thread would be
-    occupied for the run's duration, and two things follow immediately: every
-    ``workspace_exec_result`` poll would queue behind it — collapsing the bounded
-    poll into one unbounded ask, the shape the deferred rules exist to forbid —
-    and nothing could reclaim the lease of a sandbox that hung past its budget,
-    because the thread that would do the reclaiming is the one that is stuck.
+    One shape for both surfaces — the capability and the ``exec_command`` shim —
+    because two formats for one thing is how the pair drifts.
 
-    It is also what keeps reads working during a run: the actor's mailbox goes on
-    draining, and a read's observation ``tell`` lands on that same mailbox.
-    """
+    **An empty stream is omitted rather than labelled.** The previous shape
+    printed ``stdout:`` and ``stderr:`` unconditionally, so a silent success
+    spent four lines saying nothing twice, and a model reading a failure had to
+    scan past an empty ``stdout:`` to reach the error. A heading that appears
+    only when there is something under it means its presence is information.
 
-    def produce(self, payload: DeferredPayload) -> Any:
-        """Wait for the backend, then run the command — one budget, spent in order.
+    ``run_id`` joins the header rather than taking a line of its own: an answer
+    that names no run is what let a collected result be mistaken for a sibling
+    call's. The shim passes it too, now that it issues runs through the queue.
 
-        The two waits are **separate and both bounded**, which is the whole point.
-        A backend that has not finished starting answers nothing, and asking it to
-        run a command is a wait of unknown length on a thread that holds the
-        lease, the tree and its parent's teardown: the wait for the backend is not
-        the run, and a budget that cannot tell them apart lets a cold start spend
-        a run's whole lease before the command has started.
+    Args:
+        outcome: The finished run.
+        run_id: The run this outcome belongs to. Omitted from the header when
+            empty, which is the caller saying it has no run to name.
 
-        So: fix a deadline, resolve the sandbox, ask :meth:`SandboxActor.ready`
-        under what is left, tell the parent the run is starting, and only then
-        hand the command whatever remains — waiting on it for that budget plus
-        :data:`EXEC_REPLY_GRACE_S`, so a command the budget kills still comes back
-        as the answer it is. **No ask here is made without a timeout** — that is
-        what makes the worker mortal, which is in turn what makes a
-        liveness-gated reclaim safe.
-
-        A command that exits — well or badly — and a command its budget killed
-        both come back as an :class:`ExecOutcome`, because both are answers an
-        agent can read and act on. Anything else raises and is reported as a
-        failure.
-
-        ``None`` is never returned: the base treats it as a failure, and a
-        command that legitimately produced no output is not a failure.
-
-        Args:
-            payload: An :class:`ExecPayload`.
-
-        Returns:
-            The :class:`ExecOutcome`.
-
-        Raises:
-            TypeError: If handed a payload that is not an :class:`ExecPayload`.
-            RuntimeError: If the worker has no orchestrator to resolve the
-                sandbox through, or if the backend never became ready.
-        """
-        if not isinstance(payload, ExecPayload):
-            raise TypeError(f"ExecWorker requires an ExecPayload, got {type(payload)}")
-        deadline = time.monotonic() + self.timeout_s
-        address = self._sandbox_address(payload, deadline)
-        self._await_ready(address, deadline)
-        self._run_started(payload.deferred_key)
-        remaining = deadline - time.monotonic()
-        budget = max(0.0, min(payload.timeout_s, remaining))
-        sandbox = self.proxy_ask(
-            address, SandboxActor, timeout=ask_seconds(budget) + EXEC_REPLY_GRACE_S
-        )
-        try:
-            result = sandbox.exec(payload.cmd, payload.cwd, timeout=budget)
-        except subprocess.TimeoutExpired:
-            return ExecOutcome(
-                stdout="",
-                stderr=f"Command exceeded its {budget:g}s budget and was killed.",
-                exit_code=TIMED_OUT_EXIT_CODE,
-                timed_out=True,
-            )
-        return ExecOutcome(
-            stdout=result.stdout,
-            stderr=result.stderr,
-            exit_code=result.exit_code,
-        )
-
-    def _sandbox_address(self, payload: ExecPayload, deadline: float) -> ActorAddress:
-        """Get-or-create the team's ``#SandboxActor`` and return its address.
-
-        Idempotent by construction (ADR-025): the card already created it at
-        wiring time, so this resolves the existing one. The class comes from
-        ``SANDBOX_ACTOR_CLASSES`` at call time, never at import time, so a
-        backend injected by a deployment package is still found.
-
-        The address rather than a proxy, because the two phases below need two
-        proxies carrying two different timeouts.
-        """
-        from akgentic.tool.sandbox.tool import SANDBOX_ACTOR_CLASSES  # noqa: PLC0415 — cycle
-
-        orchestrator = self.orchestrator
-        if orchestrator is None:
-            raise RuntimeError("An exec worker cannot resolve its sandbox without an orchestrator.")
-        actor_class = SANDBOX_ACTOR_CLASSES[payload.mode]
-        orchestrator_proxy = self.proxy_ask(
-            orchestrator, Orchestrator, timeout=ask_seconds(deadline - time.monotonic())
-        )
-        address: ActorAddress = orchestrator_proxy.getChildrenOrCreate(
-            actor_class, config=sandbox_config(payload)
-        )
-        return address
-
-    def _await_ready(self, address: ActorAddress, deadline: float) -> None:
-        """Block until the backend can serve messages, or give up saying so.
-
-        ``ready()`` carries no information; being *answered* is the information.
-        Pykka's mailbox is FIFO, so it cannot come back before ``on_start`` has
-        returned — no flag, no polling, no state.
-
-        Every failure of this one ask means the same thing to the agent waiting
-        on it: the backend is not usable right now and the command did not run.
-        A timeout is the expected one (a container image still being built); a
-        dead actor is the other, and telling them apart would buy the model
-        nothing it could act on differently.
-
-        The original is **logged** as well as chained, because chaining alone
-        loses it: ``receiveMsg_DeferredPayload`` reports failures as ``str(exc)``,
-        which keeps the text above and drops the cause. Without this line a
-        backend that raises rather than hangs leaves no trace anywhere of what it
-        actually raised.
-
-        Args:
-            address: The sandbox actor.
-            deadline: The worker's own deadline, monotonic.
-
-        Raises:
-            RuntimeError: When the backend did not answer in time — reported to
-                the agent verbatim by ``receiveMsg_DeferredPayload``.
-        """
-        seconds = ask_seconds(deadline - time.monotonic())
-        try:
-            self.proxy_ask(address, SandboxActor, timeout=seconds).ready()
-        except Exception as exc:
-            logger.warning(
-                "[%s] The execution backend did not answer readiness within %ss: %r",
-                self.config.name,
-                seconds,
-                exc,
-            )
-            raise RuntimeError(backend_not_ready(seconds)) from exc
-
-    def _run_started(self, run_id: str) -> None:
-        """Tell ``#Workspace`` that *run_id*'s command is starting now.
-
-        A **tell**, deliberately: the worker needs no answer, and an ask would be
-        one more unbounded wait on the very thread this budget exists to bound.
-        A parentless worker — the shape a few unit tests build — simply skips it.
-        """
-        parent = self._parent
-        if parent is None:
-            return
-        from akgentic.tool.workspace.actor import WorkspaceActor  # noqa: PLC0415 — cycle
-
-        self.proxy_tell(parent, WorkspaceActor).run_started(run_id)
-
-
-def format_outcome(outcome: ExecOutcome) -> str:
-    """Render a finished run the way ``exec_command`` has always rendered one.
-
-    Deliberately the existing shape rather than a second one: a model already
-    reads this, and two formats for one thing is how the pair drifts.
+    Returns:
+        The rendered answer, with ``stdout`` and ``stderr`` sections present
+        only when the corresponding stream is non-empty.
     """
     status = "OK" if outcome.exit_code == 0 else "FAILED"
-    return (
-        f"exit_code: {outcome.exit_code} ({status})"
-        f"\nstdout:\n{outcome.stdout}"
-        f"\nstderr (note: many tools write progress to stderr"
-        f" even on success):\n{outcome.stderr}"
-    )
+    head = f"Run {run_id} - " if run_id else ""
+    parts = [f"{head}exit_code: {outcome.exit_code} ({status})"]
+    if outcome.stdout.strip():
+        parts.append(f"**stdout**\n{outcome.stdout}")
+    if outcome.stderr.strip():
+        parts.append(f"**stderr**\n{outcome.stderr}")
+    return "\n\n".join(parts)
 
 
 def format_status(status: ExecStatus) -> str:
@@ -716,11 +698,17 @@ def format_status(status: ExecStatus) -> str:
     Every state produces a returned string, including the ones that are not a
     result. An unknown run id in particular does **not** raise: it lists the
     agent's recent runs, so a model that mistyped one reads the right one back.
+
+    **The ``DONE`` branch names the run**, by handing its id to
+    :func:`format_outcome` for the header line. An answer that names no run is
+    what let a collected result be mistaken for a sibling call's.
     """
     if status.state is ExecState.DONE and status.outcome is not None:
-        return format_outcome(status.outcome)
+        return format_outcome(status.outcome, run_id=status.run_id)
     if status.state is ExecState.FAILED:
         return f"Run {status.run_id} failed: {status.reason}"
+    if status.state is ExecState.QUEUED:
+        return queued(status.run_id, status.queue_position)
     if status.state is ExecState.RUNNING:
         return in_progress(status.run_id)
     known = ", ".join(status.recent_run_ids) or "none"
@@ -741,6 +729,48 @@ def in_progress(run_id: str) -> str:
     return (
         f"Run {run_id} is still in progress. It holds the workspace until it finishes. "
         f"Call workspace_exec_result('{run_id}') on your next turn to collect the output."
+    )
+
+
+def queued(run_id: str, position: int) -> str:
+    """The handoff for a run that has not started, because the tree is held.
+
+    Shaped like :func:`in_progress` deliberately: same id echoed verbatim, same
+    pointer at ``workspace_exec_result``, so a model that already knows how to
+    act on one acts on this without learning a second protocol. What it adds is
+    the one fact the other cannot carry — the work has **not begun**, so nothing
+    has been lost and nothing needs re-issuing.
+
+    ``position`` is the **1-based place in the FIFO**: ``1`` means "next to run
+    when the head finishes". The running head is not in the queue, so a position
+    of ``0`` is never rendered for a queued run.
+
+    Args:
+        run_id: The queued run's id — the caller's own, in every branch.
+        position: Its 1-based place in the queue.
+
+    Returns:
+        What the agent reads back.
+    """
+    return (
+        f"Run {run_id} is queued at position {position}: another command holds the workspace, so "
+        f"yours has not started yet. Nothing is lost — call workspace_exec_result('{run_id}') to "
+        "collect the output once it runs."
+    )
+
+
+def queue_full() -> str:
+    """Refusal for a run the queue has no room for — naming nobody.
+
+    The one exec refusal left, and the only message on this path that hands back
+    no run id at all. It names **no run and no agent** on purpose: a refusal that
+    quoted the holder's id is exactly the defect the queue exists to remove, and
+    a refusal is the one place an agent has no id of its own to be given instead.
+    """
+    return (
+        f"Too many commands are already waiting for this workspace (the queue holds "
+        f"{MAX_QUEUED_RUNS}). Nothing was started. Retry once some of them have finished, or "
+        "collect the runs you already started first."
     )
 
 
