@@ -199,7 +199,6 @@ __all__ = [
     "ExecStart",
     "ExecState",
     "ExecStatus",
-    "DocumentExtract",
     "GitJournal",
     "HunkContextError",
     "Identity",

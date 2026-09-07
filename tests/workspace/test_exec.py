@@ -2232,9 +2232,16 @@ class TestTeardownDropsTheQueue:
         # which is silent and permanent.
         _card, actor, _harness = exec_setup
         chained: list[bool] = []
-        monkeypatch.setattr(
-            type(actor).__mro__[1], "on_stop", lambda _self: chained.append(True)
+        # Find the class that actually supplies ``on_stop`` above the actor rather
+        # than assuming a position: the workspace actor is assembled from mixins,
+        # so ``__mro__[1]`` is whichever mixin happens to be listed first and is
+        # not the base whose teardown this guards.
+        base = next(
+            klass
+            for klass in type(actor).__mro__[1:]
+            if "on_stop" in vars(klass)
         )
+        monkeypatch.setattr(base, "on_stop", lambda _self: chained.append(True))
 
         actor.on_stop()
 

@@ -32,7 +32,6 @@ from akgentic.tool.workspace.documents.worker import (
     compose_chunk_text,
     index_worker_name,
 )
-from akgentic.tool.workspace.execution import ExecWorker
 from akgentic.tool.workspace.readers import DocumentReader
 
 from tests.workspace.conftest import WORKSPACE_NAME, DeadAddress
@@ -108,9 +107,17 @@ class TestWhatTheWorkerIs:
         assert issubclass(IndexWorker, Akgent)
         assert not issubclass(IndexWorker, DeferredWorker)
 
-    def test_the_actors_deferred_worker_is_still_the_exec_worker(self) -> None:
-        """The index worker is spawned directly and joins no deferred mechanism."""
-        assert WorkspaceActor.worker_class(WorkspaceActor) is ExecWorker  # type: ignore[arg-type]
+    def test_the_actor_spawns_no_deferred_worker_at_all(self) -> None:
+        """The index worker is spawned directly and joins no deferred mechanism.
+
+        This asserted ``worker_class() is ExecWorker`` until the sandbox began
+        reporting its own runs back. ``#Workspace`` now spawns nothing — it uses
+        only the cache half of the deferred base — so ``worker_class`` raises,
+        which is a stronger statement of the same property: there is no deferred
+        worker for the index worker to be confused with.
+        """
+        with pytest.raises(NotImplementedError):
+            WorkspaceActor.worker_class(WorkspaceActor)  # type: ignore[arg-type]
 
     def test_the_worker_name_starts_with_the_teardown_marker(self) -> None:
         """Only the leading ``#`` is load-bearing — it classifies a tool actor."""
