@@ -526,6 +526,21 @@ class TestMetadataFailuresAlwaysRaise:
         with pytest.raises(ValueError, match="carries no metadata"):
             resolve(keys=["customer_id"], metadata=None)
 
+    def test_the_refusal_names_the_keys_as_the_card_declared_them(self) -> None:
+        """The message reads the same ordered list the join does — nothing re-derives.
+
+        Two spellings of one rule is what this branch removed: the raise and the
+        join each said ``sorted(set(keys))``, and they can only stay in step
+        because one local now feeds both. Nothing guarded that half — reverting
+        the *message* alone to a sorted set left the whole suite green, which is
+        the same silent drift one scale down. Asserting the declared, deduped
+        order here reddens a sort restored in either place.
+        """
+        with pytest.raises(ValueError) as excinfo:
+            resolve(keys=["customer_id", "case_id", "customer_id"], metadata=None)
+
+        assert "['customer_id', 'case_id']" in str(excinfo.value)
+
     def test_a_key_that_is_not_a_field_of_the_model_raises(self) -> None:
         """The card names a field that does not exist; a typo must not reach a tree."""
         with pytest.raises(ValueError, match="not a field"):
