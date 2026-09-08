@@ -44,6 +44,7 @@ from akgentic.tool.workspace.journal import (
 from akgentic.tool.workspace.models import (
     GITIGNORE_NAME,
     OUT_OF_BAND_AUTHOR,
+    MutationStatus,
     WorkspaceConfig,
 )
 from akgentic.tool.workspace.readers import DocumentReader
@@ -170,33 +171,47 @@ class TestTheRepository:
         assert journal_branches(workspace_tree) == ["master"]
 
     def test_a_workspace_named_like_a_journal_refuses_and_degrades_off(
-        self, workspaces_root: Path, orchestrator_proxy: FakeOrchestratorProxy
+        self, workspaces_root: Path
     ) -> None:
         """``<name>.git`` would share a directory with workspace ``<name>``'s journal.
 
-        Operator-set rather than agent-set, so not reachable by anything the LLM
-        does — but destructive and confusing when it happens, so it takes the
-        cheap guard: refuse at init and degrade the journal off, which is the
-        degradation FR9 already specifies. The gate must stay fully working.
+        **Reached here through the layer the resolver cannot see.** A *card* can
+        no longer name this workspace at all — ``leaf_segment`` refuses a leaf
+        ending in ``.git`` at bind time. This guard covers the other door:
+        ``Filesystem`` and ``get_workspace`` take a workspace path that never
+        passes through the resolver, which is how ``akgentic-infra`` reaches a
+        tree today, so the actor is built here the way that layer builds it.
+
+        The two guards are complementary and neither makes the other redundant.
+        Deleting this one as "now covered upstream" would reopen the hole from
+        the side the resolver never sees.
         """
-        tree = workspaces_root / workspace_path_for("shared.git")
+        path = workspace_path_for("shared.git")
+        tree = workspaces_root / path
         tree.parent.mkdir(parents=True, exist_ok=True)
         tree.mkdir()
         (tree / "unseen.md").write_text("someone else's\n", encoding="utf-8")
-        card, _observer = card_for(
-            orchestrator_proxy,
-            "alice",
-            workspace_id="shared.git",
-            git_journal=True,
+
+        actor = WorkspaceActor(
+            config=WorkspaceConfig(
+                name=workspace_actor_name(path),
+                role=WORKSPACE_ACTOR_ROLE,
+                workspace_path=path,
+                git_journal=True,
+            )
         )
+        actor.on_start()
 
         # The journal is off — no second repository, no seeded ignore file …
+        assert not actor._journal.enabled
         assert not (workspaces_root / workspace_path_for("shared.git.git")).exists()
         assert not (tree / GITIGNORE_NAME).exists()
         # … and the gate is untouched: creates land, unread overwrites do not.
-        assert mutate(card, "workspace_write", "fresh.md", "body\n") == "Written: fresh.md"
-        with pytest.raises(RetriableError, match="read it before overwriting"):
-            mutate(card, "workspace_write", "unseen.md", "mine\n")
+        created = outcome_of(actor, "apply_write", "solo", "fresh.md", "body\n")
+        assert created.status is MutationStatus.ACCEPTED
+        refused = outcome_of(actor, "apply_write", "solo", "unseen.md", "mine\n")
+        assert refused.status is MutationStatus.REJECTED
+        assert "read it before overwriting" in refused.message
 
     def test_a_journal_never_initialises_inside_another_workspaces_tree(
         self, workspaces_root: Path, orchestrator_proxy: FakeOrchestratorProxy

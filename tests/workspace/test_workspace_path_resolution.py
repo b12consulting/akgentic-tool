@@ -20,6 +20,7 @@ import pytest
 from akgentic.core.utils.serializer import SerializableBaseModel
 from pydantic import ValidationError
 
+from akgentic.tool.workspace.models import GIT_DIR_SUFFIX
 from akgentic.tool.workspace.tool import WorkspaceTool
 from akgentic.tool.workspace.workspace import (
     ANONYMOUS,
@@ -170,6 +171,106 @@ class TestLeafSegment:
         assert leaf_segment(METADATA_SCOPE) == METADATA_SCOPE
         assert resolve(workspace_id=METADATA_SCOPE) == PurePosixPath("u-alice/_meta")
 
+    def test_a_leaf_ending_in_the_journal_suffix_is_refused(self) -> None:
+        """``notes.git`` **is** workspace ``notes``'s repository, not a name near it.
+
+        The journal is a sibling of the tree in the same directory, so a card
+        declaring this roots its own ``Filesystem`` at another workspace's
+        history and reads, writes and deletes inside it as ordinary in-tree
+        activity. Nothing downstream raises: ``_validate_path`` refuses only what
+        resolves *outside* the root, and that root is a real directory.
+        """
+        with pytest.raises(ValueError, match="journal directory"):
+            leaf_segment(f"notes{GIT_DIR_SUFFIX}")
+
+    def test_the_suffix_match_is_case_insensitive(self) -> None:
+        """``git_dir_for`` emits lowercase, and that is not what decides this.
+
+        macOS and Windows filesystems are case-insensitive by default, so
+        ``notes.GIT`` and ``notes.git`` are one directory there — an exact-match
+        guard would pass the collision straight through on the platform most of
+        this is developed on.
+        """
+        for spelling in ("notes.GIT", "notes.Git", "notes.gIt"):
+            with pytest.raises(ValueError, match="journal directory"):
+                leaf_segment(spelling)
+
+    def test_the_bare_suffix_is_refused_too(self) -> None:
+        """``.git`` alone is already refused as a dot-directory, and must stay refused."""
+        with pytest.raises(ValueError):
+            leaf_segment(GIT_DIR_SUFFIX)
+
+    @pytest.mark.parametrize(
+        "accepted",
+        [
+            "gitnotes",  # the four characters, in the wrong place
+            "notes.github",  # a longer suffix that merely starts the same way
+            "notes.git.txt",  # the suffix mid-name, which names no repository
+            "notesgit",
+            "git",
+            "notes",
+        ],
+    )
+    def test_only_the_suffix_is_refused_never_the_substring(self, accepted: str) -> None:
+        """The guard is a suffix rule, and over-refusing costs a real workspace its name."""
+        assert leaf_segment(accepted) == accepted
+
+    def test_the_rule_is_spelled_once_against_the_journals_own_constant(self) -> None:
+        """One rule, one spelling — the defect 48-1's review caught, one scale down.
+
+        ``git_dir_for`` builds the directory from ``GIT_DIR_SUFFIX``; this guard
+        refuses the same constant. A second ``".git"`` literal here is a rule
+        that has to agree with another one, and the two would drift silently.
+        """
+        assert leaf_segment(f"notes{GIT_DIR_SUFFIX}x") == f"notes{GIT_DIR_SUFFIX}x"
+        with pytest.raises(ValueError):
+            leaf_segment(f"x{GIT_DIR_SUFFIX}")
+
+    def test_it_refuses_rather_than_renaming(self) -> None:
+        """No suffix-stripping, no relocate-and-log: a raise, and no path back.
+
+        A deployment that genuinely has a workspace named ``foo.git`` must be
+        told at team creation, in front of the admin who caused it. Silently
+        moving the tree is the failure this guard exists to prevent, not a
+        gentler form of it.
+        """
+        with pytest.raises(ValueError) as excinfo:
+            resolve(workspace_id="notes.git", user_id="alice")
+
+        # The refused value appears verbatim, so the admin can see what to rename.
+        assert "notes.git" in str(excinfo.value)
+
+
+##
+## AC 5 — the scope needs no equivalent guard, and that must stay pinned
+##
+
+
+class TestTheScopeGuardIsNotSymmetric:
+    """A *scope* ending in ``.git`` collides with nothing, and must be accepted."""
+
+    @pytest.mark.parametrize("principal", ["alice.git", "alice.GIT", "git", "_meta.git"])
+    def test_a_principal_whose_id_ends_in_the_journal_suffix_is_accepted(
+        self, principal: str
+    ) -> None:
+        """Journals hang off the **leaf**, so there is no journal beside a scope.
+
+        ``git_dir_for(root)`` returns ``root.parent / f"{root.name}.git"`` — a
+        sibling of the *tree*. A scope named ``alice.git`` would be a sibling of
+        a hypothetical ``alice`` scope's nothing, because scopes have no
+        journals. Adding the guard symmetrically is the obvious next edit for
+        anyone reading the diff, and an Azure AD ``sub`` or an admin-typed
+        ``owner_id`` could plausibly end in those four characters — so this spec
+        exists to break instead of a real principal being refused at team
+        creation.
+        """
+        assert user_segment(principal) == principal
+
+    def test_a_principal_ending_in_the_suffix_resolves_a_whole_path(self) -> None:
+        assert resolve(workspace_id="notes", user_id="alice.git") == PurePosixPath(
+            "alice.git/notes"
+        )
+
 
 ##
 ## AC 5 — the two per-user layouts
@@ -314,6 +415,52 @@ class TestMetadataLayout:
         )
 
         assert forged != genuine
+
+    def test_a_metadata_value_ending_in_the_journal_suffix_raises(self) -> None:
+        """The same collision, reached from business data rather than a card field.
+
+        ``.`` is inside the encoder's safe set, so a ``customer_id`` of ``x.git``
+        survives encoding whole and the joined leaf is ``customer_id-x.git`` —
+        which **is** the journal directory of ``_meta/customer_id-x``, a
+        perfectly ordinary metadata workspace. Nobody typed it; a business record
+        did, which is what makes it likelier than the hand-typed case.
+        """
+        with pytest.raises(ValueError, match="journal directory") as excinfo:
+            resolve(keys=["customer_id"], metadata=Metadata(customer_id="x.git"))
+
+        # The joined leaf, not the raw value: the refusal names the directory
+        # that would have been opened, which is what an admin has to act on.
+        assert "customer_id-x.git" in str(excinfo.value)
+
+    def test_the_suffix_is_refused_from_the_last_key_of_a_join(self) -> None:
+        """Only the *joined* leaf's ending matters — a mid-join ``.git`` is harmless.
+
+        ``case_id`` sorts first, so a ``customer_id`` of ``ACME.git`` lands at the
+        end of the join and collides; the same value in ``case_id`` does not,
+        because ``customer_id-…`` follows it.
+        """
+        metadata = Metadata(customer_id="ACME.git", case_id="42")
+        with pytest.raises(ValueError, match="journal directory"):
+            resolve(keys=["customer_id", "case_id"], metadata=metadata)
+
+        harmless = Metadata(customer_id="ACME", case_id="42.git")
+        assert resolve(keys=["customer_id", "case_id"], metadata=harmless) == PurePosixPath(
+            "_meta/case_id-42.git__customer_id-ACME"
+        )
+
+    def test_the_metadata_branch_newly_rejects_nothing_but_the_suffix(self) -> None:
+        """Routing through ``leaf_segment`` must not narrow a branch that accepted everything.
+
+        The joined leaf is percent-encoded, so it holds no ``/``, ``\\`` or NUL;
+        it starts with a sorted pydantic field name, which can be neither empty
+        nor a leading ``.``; and the keys list is non-empty on this branch by
+        construction. The characters below are exactly the ones the encoder lets
+        through or escapes, and every one of them still resolves.
+        """
+        for value in ["a-b", "a_b", "a/b", "a%b", "a~b", "a b", "é", "a.b", ".hidden", "_x"]:
+            path = resolve(keys=["customer_id"], metadata=Metadata(customer_id=value))
+            assert path.parts[0] == METADATA_SCOPE
+            assert len(path.parts) == 2
 
 
 ##

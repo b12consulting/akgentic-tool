@@ -26,6 +26,7 @@ from uuid import uuid4
 from pydantic import BaseModel
 
 from akgentic.core.utils.serializer import SerializableBaseModel
+from akgentic.tool.workspace.models import GIT_DIR_SUFFIX
 
 # Creation mode for a newly written file, before the process umask is applied by
 # the kernel.  Matching what a plain ``open(path, "wb")`` would request keeps the
@@ -469,15 +470,44 @@ def user_segment(user_id: str | None) -> str:
 def leaf_segment(value: str) -> str:
     """The ``<leaf>`` segment — a ``workspace_id``, a team id, or a joined metadata key.
 
-    Identical to :func:`user_segment` except that ``_meta`` is **not** reserved:
-    ``_meta`` is a scope, and a workspace legitimately named ``_meta`` under some
-    principal collides with nothing.
+    Like :func:`user_segment` except in two places: ``_meta`` is **not** reserved
+    here — ``_meta`` is a scope, and a workspace legitimately named ``_meta``
+    under some principal collides with nothing — and a leaf may not end in
+    ``.git``.
 
-    A team id is a UUID and a joined metadata leaf is percent-encoded, so both
-    pass by construction. The guard exists for the one value an author types by
-    hand: without it a ``workspace_id`` of ``../x`` yields ``<user>/../x`` — one
-    segment, outside the principal's directory — and ``Filesystem`` validates the
-    name it is given not at all.
+    A team id is a UUID, so it passes by construction. The two guards exist for
+    the values that do not: a ``workspace_id`` an author types by hand, and a
+    joined metadata leaf built out of business data.
+
+    **Why the ``.git`` suffix is a containment failure and not a name clash.**
+    The journal is a *sibling of the tree, in the same directory*:
+    ``git_dir_for`` returns ``<root>.git``, so ``workspace_id="notes"`` owns both
+    ``<scope>/notes`` and ``<scope>/notes.git``. A second card declaring
+    ``workspace_id="notes.git"`` therefore roots its **tree** at the first
+    workspace's **git repository**, and its agent lists, reads, writes and
+    deletes inside another workspace's history as ordinary in-tree activity —
+    ``Filesystem._validate_path`` rejects only what resolves *outside* the root,
+    and that root is a perfectly real directory. From the other side, the first
+    workspace's commits surface as files in the second's tree. Nothing raises.
+    It is the same failure the fixed two-segment depth removes, arriving through
+    a suffix instead of through a slash.
+
+    **Rejecting beats renaming.** No suffix-stripping and no relocate-and-log: a
+    deployment that genuinely has a workspace named ``foo.git`` must be told, at
+    team creation, in front of the admin who caused it. Silently moving somebody
+    else's tree is the failure, not the remedy.
+
+    **The match is case-insensitive** although ``git_dir_for`` only ever emits
+    lowercase, because macOS and Windows filesystems are case-insensitive by
+    default: ``<scope>/notes.GIT`` and ``<scope>/notes.git`` are one directory
+    there, so an exact-match guard would pass the collision straight through on
+    the platform most of this is developed on.
+
+    **This does not make the journal's own guard redundant.** ``GitJournal``
+    refuses to initialise when the root it was handed ends in ``.git``, and that
+    covers the layer this function cannot see: ``Filesystem`` and
+    :func:`get_workspace` take a name that never passes through here — which is
+    how ``akgentic-infra`` calls them today.
 
     Args:
         value: The candidate leaf.
@@ -486,10 +516,16 @@ def leaf_segment(value: str) -> str:
         The leaf segment, unchanged.
 
     Raises:
-        ValueError: If the value cannot be a single directory segment.
+        ValueError: If the value cannot be a single directory segment, or if it
+            ends in ``.git``.
     """
     if _unusable_as_segment(value):
         raise ValueError(f"workspace leaf is not usable as a directory name: {value!r}")
+    if value.lower().endswith(GIT_DIR_SUFFIX):
+        raise ValueError(
+            f"workspace leaf may not end in {GIT_DIR_SUFFIX!r}, which is another "
+            f"workspace's journal directory: {value!r}"
+        )
     return value
 
 
@@ -622,7 +658,17 @@ def resolve_workspace_path(
             would silently collapse several principals into one tree.
     """
     if workspace_metadata_keys:
-        return PurePosixPath(METADATA_SCOPE) / _metadata_leaf(workspace_metadata_keys, metadata)
+        # Through ``leaf_segment`` like any other leaf, rather than a second
+        # suffix check beside it — duplicating a rule is the defect this module
+        # exists to remove. ``.`` is inside the encoder's safe set, so a
+        # ``customer_id`` of ``x.git`` survives encoding whole and yields the leaf
+        # ``customer_id-x.git``, which *is* the journal directory of
+        # ``_meta/customer_id-x``. The same collision as the hand-typed
+        # ``workspace_id="notes.git"``, reached from business data rather than
+        # from a card field anybody chose.
+        return PurePosixPath(METADATA_SCOPE) / leaf_segment(
+            _metadata_leaf(workspace_metadata_keys, metadata)
+        )
     # Tested against ``None`` rather than for truthiness: a card carrying
     # ``workspace_id=""`` named a workspace and got the name wrong, and falling
     # through to the team id would answer that mistake silently.

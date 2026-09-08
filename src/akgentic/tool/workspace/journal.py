@@ -311,8 +311,14 @@ class GitJournal:
             return False
         if self._root.name.endswith(GIT_DIR_SUFFIX):
             # A workspace literally named "<name>.git" has the same directory as
-            # workspace "<name>"'s journal. Operator-set, not agent-set — but the
-            # failure is destructive and confusing, so refuse rather than explain.
+            # workspace "<name>"'s journal. This comment used to call the case
+            # "operator-set, not agent-set"; that is wrong. The metadata layout
+            # reaches it from business data — a ``customer_id`` of "x.git" joins
+            # to the leaf "customer_id-x.git" — so nobody has to type it.
+            # ``leaf_segment`` now refuses both shapes at resolution time, and
+            # this guard still earns its place: ``Filesystem`` and
+            # ``get_workspace`` take a name that never passes through the
+            # resolver, which is how ``akgentic-infra`` calls them today.
             logger.warning(
                 "Workspace %s: name collides with a sibling journal directory — git "
                 "journal disabled. Rename the workspace to record history.",

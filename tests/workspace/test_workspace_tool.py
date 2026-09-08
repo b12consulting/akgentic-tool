@@ -1455,6 +1455,31 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
         with pytest.raises(ValueError, match="not usable as a workspace directory name"):
             card.observer(FakeActorToolObserver(orchestrator_proxy, user_id=""))
 
+    def test_a_workspace_named_after_a_journal_directory_fails_binding(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        """The refusal reaches the admin at team creation, not at the first write.
+
+        ``notes.git`` is workspace ``notes``'s repository. Binding it would root
+        this card's ``Filesystem`` at another workspace's history, and every read,
+        write and delete after that is ordinary in-tree activity that raises
+        nothing — so the refusal has to happen here, where somebody is watching.
+        """
+        card = WorkspaceTool(workspace_id="notes.git")
+
+        with pytest.raises(ValueError, match="journal directory"):
+            card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
+
+    def test_a_metadata_value_naming_a_journal_directory_fails_binding(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        """The same refusal, reached from business data rather than a card field."""
+        orchestrator_proxy.metadata = _CaseMetadata(customer_id="ACME.git", case_id="42")
+        card = WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])
+
+        with pytest.raises(ValueError, match="journal directory"):
+            card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
+
 
 class TestTheIdentityIsReadAsATypedAttribute:
     """A wiring regression must be loud, which is what ``getattr`` would take away."""
