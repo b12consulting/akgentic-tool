@@ -717,31 +717,19 @@ def test_exec_tool_mode_can_be_set_to_auto() -> None:
 
 
 def test_sandbox_config_mode_accepts_bwrap() -> None:
-    """AC2 (8.4): SandboxConfig(
-        team_id='t',
-        workspace_path='t',
-        mode='bwrap',
-    ) validates without error."""
+    """AC2 (8.4): SandboxConfig validates with mode='bwrap' and a workspace path."""
     config = SandboxConfig(team_id="t", workspace_path="t", mode="bwrap")
     assert config.mode == "bwrap"
 
 
 def test_sandbox_config_mode_accepts_seatbelt() -> None:
-    """AC2 (8.4): SandboxConfig(
-        team_id='t',
-        workspace_path='t',
-        mode='seatbelt',
-    ) validates without error."""
+    """AC2 (8.4): SandboxConfig validates with mode='seatbelt' and a workspace path."""
     config = SandboxConfig(team_id="t", workspace_path="t", mode="seatbelt")
     assert config.mode == "seatbelt"
 
 
 def test_sandbox_config_mode_accepts_auto() -> None:
-    """AC3 (8.4): SandboxConfig(
-        team_id='t',
-        workspace_path='t',
-        mode='auto',
-    ) validates without error."""
+    """AC3 (8.4): SandboxConfig validates with mode='auto' and a workspace path."""
     config = SandboxConfig(team_id="t", workspace_path="t", mode="auto")
     assert config.mode == "auto"
 

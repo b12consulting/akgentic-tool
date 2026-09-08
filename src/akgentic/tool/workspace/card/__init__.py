@@ -348,7 +348,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
             # never enable retrieval at all.
             require_weaviate_configured(self.rag_collection, "WorkspaceTool")
         super().observer(observer)  # store the observer weakly via the base setter
-        ws_path = str(self._resolve_path(observer))
+        ws_path = str(self._resolve_path(observer, observer.orchestrator))
         self._workspace = get_workspace(ws_path)
         self._seed_resources()
         self._bind_workspace_actor(observer, observer.orchestrator, ws_path)
@@ -356,7 +356,9 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
         self._announce_rag()
         return self
 
-    def _resolve_path(self, observer: ActorToolObserver) -> PurePosixPath:
+    def _resolve_path(
+        self, observer: ActorToolObserver, orchestrator: ActorAddress
+    ) -> PurePosixPath:
         """Derive this card's two-segment workspace path, through the one resolver.
 
         ``observer.user_id`` is read as a **typed attribute**. A defaulted
@@ -367,10 +369,19 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
         The team's metadata is fetched **only** when this card declares keys, so
         a bare ``WorkspaceTool()`` gains no bind-time round trip. It is the same
         call ``MetadataTool`` already makes at bind time.
+
+        Args:
+            observer: The owning agent, live at bind time.
+            orchestrator: Address of the orchestrator, taken as a parameter
+                already narrowed by the caller rather than re-tested here. A
+                second ``is not None`` test inside the fetch condition would
+                collapse "declares no keys" and "has no orchestrator" into the
+                same ``None``, so a wiring failure would surface as the
+                unrelated "the team carries no metadata".
         """
         metadata = (
-            observer.proxy_ask(observer.orchestrator, Orchestrator).get_metadata()
-            if self.workspace_metadata_keys and observer.orchestrator is not None
+            observer.proxy_ask(orchestrator, Orchestrator).get_metadata()
+            if self.workspace_metadata_keys
             else None
         )
         return resolve_workspace_path(

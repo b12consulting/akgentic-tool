@@ -1472,7 +1472,10 @@ class TestTheIdentityIsReadAsATypedAttribute:
         observer = FakeActorToolObserver(orchestrator_proxy, user_id="alice")
         del observer.user_id
 
-        with pytest.raises(AttributeError):
+        # Matched on the attribute name: a bare ``raises(AttributeError)`` would
+        # also be satisfied by an unrelated one raised anywhere in ``observer()``,
+        # and a guard that can pass for the wrong reason is not a guard.
+        with pytest.raises(AttributeError, match="user_id"):
             WorkspaceTool(workspace_id="notes").observer(observer)
 
     def test_a_deliberate_none_is_the_anonymous_scope_and_not_an_error(

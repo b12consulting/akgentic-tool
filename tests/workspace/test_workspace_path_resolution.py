@@ -118,7 +118,11 @@ class TestUserSegment:
             user_segment(unusable)
 
     def test_the_reserved_scope_is_refused(self) -> None:
-        assert RESERVED_SCOPES == frozenset({METADATA_SCOPE})
+        # Pinned against the literal, not against ``METADATA_SCOPE``: the module
+        # derives one from the other, so comparing them would be a tautology and
+        # a rename of both at once would slip through unnoticed.
+        assert METADATA_SCOPE == "_meta"
+        assert RESERVED_SCOPES == frozenset({"_meta"})
         with pytest.raises(ValueError, match="reserved scope"):
             user_segment(METADATA_SCOPE)
 

@@ -381,20 +381,25 @@ Not a gap to close: where there is no principal there is no isolation, by
 construction. A deployment that supplies no user id gets exactly one scope.
 """
 
-RESERVED_SCOPES = frozenset({"_meta"})
-"""Scopes no principal may occupy — reserved for the metadata layout.
-
-Matched **exactly**, never as a ``_`` prefix. The Azure AD ``sub`` is base64url
-and its alphabet includes ``_``, so reserving the whole underscore namespace
-would refuse roughly one user in sixty-four at team creation; a 43-character
-``sub`` never equals ``_meta``.
-"""
-
 METADATA_SCOPE = "_meta"
 """The ``<scope>`` a metadata-keyed workspace lives under.
 
 Shared across teams and across users — that is its purpose — so it sits under a
 reserved scope rather than under anybody's principal.
+"""
+
+RESERVED_SCOPES = frozenset({METADATA_SCOPE})
+"""Scopes no principal may occupy — reserved for the metadata layout.
+
+**Derived from :data:`METADATA_SCOPE`, never spelled again.** Two literals that
+have to agree is the defect this whole module removes, one scale down: a scope
+renamed in one of them and not the other would leave the metadata namespace
+open to a principal, which is a silent isolation failure.
+
+Matched **exactly**, never as a ``_`` prefix. The Azure AD ``sub`` is base64url
+and its alphabet includes ``_``, so reserving the whole underscore namespace
+would refuse roughly one user in sixty-four at team creation; a 43-character
+``sub`` never equals ``_meta``.
 """
 
 # The only shapes that are not a directory name. Everything else — emails, dots
