@@ -902,10 +902,10 @@ What the plan says about each directory:
 | Verdict | Meaning |
 |---|---|
 | `MOVE` | a team id in the mapping — tree and journal move together |
-| `ALREADY_MIGRATED` | the source is gone and the destination is there: a previous run did it. Not a conflict, and it does not fail the run |
+| `ALREADY_MIGRATED` | the source is gone and the destination is there: a previous run did it. Not a conflict, and it does not fail the run. If the tree moved but its journal is still at the root — a hand-migration, or a run killed between the two moves — the row says so, and that journal must be moved beside its tree by hand |
 | `CONFLICT` | the destination already exists. **The whole plan refuses**: nothing moves and the exit code is non-zero |
 | `UNMAPPED` | a team id absent from the mapping. Never moved; the run exits non-zero |
-| `MANUAL` | a named workspace, or a `.git` with no tree beside it. Never touched — see below |
+| `MANUAL` | a named workspace, or a `.git` the mapping did not account for. Never touched — see below. The row distinguishes the two: a journal whose tree is beside it moves **with** that tree, while one standing alone cannot be placed at all |
 | `SKIPPED` | already a scope directory, not a workspace |
 
 The whole plan is validated before anything moves, so a collision is found while the root is still

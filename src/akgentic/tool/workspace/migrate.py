@@ -83,11 +83,13 @@ class Verdict(StrEnum):
     """A team id absent from the mapping.  Never moved, and the run exits non-zero."""
 
     MANUAL = "MANUAL"
-    """A named workspace, or a ``.git`` with no tree beside it.
+    """A named workspace, or any ``.git`` the mapping did not account for.
 
-    Neither can be placed without human judgement: the mapping from a *name* to a
-    principal exists nowhere on disk, and a ``.git`` sibling standing alone has
-    nothing to prove which workspace it belonged to.
+    None of them can be placed without human judgement: the mapping from a *name*
+    to a principal exists nowhere on disk, and a ``.git`` sibling standing alone
+    has nothing to prove which workspace it belonged to.  A ``.git`` whose tree
+    *is* beside it is equally manual — it moves with that tree — and the entry's
+    ``detail`` says which of the two cases this row is.
     """
 
     SKIPPED = "SKIPPED"
@@ -225,15 +227,33 @@ def _mapped_entry(root: Path, team_id: str, user_id: str) -> MigrationEntry | No
     }
 
     if not source.is_dir():
-        if destination.is_dir():
+        if not destination.is_dir():
+            return None
+        if has_journal:
+            # The tree is at its destination while its journal is still at the
+            # root — a hand-migration that moved one of the pair, or a run killed
+            # between the two moves.  Nothing else in the plan would mention it:
+            # the leftover scan skips ``<team>.git`` precisely because the mapping
+            # named this team, so without this row the operator is told the root
+            # is clean while that workspace's history sits orphaned.
             return MigrationEntry(
                 name=team_id,
                 verdict=Verdict.ALREADY_MIGRATED,
                 source=source,
                 destination=destination,
-                detail=f"already at {user_id}/{team_id}",
+                detail=(
+                    f"already at {user_id}/{team_id}, but its journal is still at "
+                    f"{team_id}{GIT_DIR_SUFFIX} — move it beside the tree by hand"
+                ),
+                **pair,
             )
-        return None
+        return MigrationEntry(
+            name=team_id,
+            verdict=Verdict.ALREADY_MIGRATED,
+            source=source,
+            destination=destination,
+            detail=f"already at {user_id}/{team_id}",
+        )
 
     if destination.exists():
         return MigrationEntry(
@@ -289,12 +309,24 @@ def _leftover_entry(root: Path, name: str, scopes: set[str]) -> MigrationEntry:
             detail="already a scope (holds team workspaces)",
         )
     if name.endswith(GIT_DIR_SUFFIX):
+        # Whether the tree is beside it decides what to tell the operator, and the
+        # two answers are opposite instructions. A journal standing alone cannot be
+        # placed at all; one whose tree is right here — a named workspace, or an
+        # unmapped team — must move *with* that tree, which is what the README's
+        # manual path says. Asserting the orphan case without looking would
+        # contradict that instruction on the very rows it applies to.
+        tree = root / name[: -len(GIT_DIR_SUFFIX)]
+        detail = (
+            f"the journal of {tree.name} — move it with its tree, never alone"
+            if tree.is_dir()
+            else "a journal with no tree beside it — nothing proves whose it is"
+        )
         return MigrationEntry(
             name=name,
             verdict=Verdict.MANUAL,
             source=source,
             destination=source,
-            detail="a journal with no tree beside it — nothing proves whose it is",
+            detail=detail,
         )
     if _is_team_id(name):
         return MigrationEntry(

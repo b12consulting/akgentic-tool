@@ -108,6 +108,22 @@ class TestPlan:
 
         assert _verdicts(tmp_path, {}) == {"orphan.git": Verdict.MANUAL}
 
+    def test_only_a_genuinely_orphaned_journal_is_called_orphaned(self, tmp_path: Path) -> None:
+        """The two cases carry opposite instructions, so the row must tell them apart.
+
+        A journal whose tree is right beside it moves *with* that tree — the
+        README's manual path. Saying "no tree beside it" on that row contradicts
+        the instruction on exactly the rows it governs.
+        """
+        _workspace(tmp_path, "notes")
+        (tmp_path / "orphan.git").mkdir()
+
+        details = {entry.name: entry.detail for entry in plan(tmp_path, {}).entries}
+
+        assert "no tree beside it" in details["orphan.git"]
+        assert "no tree beside it" not in details["notes.git"]
+        assert "with its tree" in details["notes.git"]
+
     def test_an_existing_scope_directory_is_skipped(self, tmp_path: Path, team_id: str) -> None:
         _workspace(tmp_path / ALICE, team_id)
 
@@ -157,6 +173,37 @@ class TestPlan:
 
         assert entry.verdict is Verdict.ALREADY_MIGRATED
         assert entry.verdict is not Verdict.CONFLICT
+
+    def test_a_tree_migrated_without_its_journal_is_reported(
+        self, tmp_path: Path, team_id: str
+    ) -> None:
+        """The half-moved pair a hand-migration or a killed run leaves behind.
+
+        The leftover scan cannot catch it: it skips ``<team>.git`` precisely
+        because the mapping named this team. Without a row here the plan renders
+        clean and exits zero while that workspace's history sits orphaned at the
+        root — AC 9's silent-history-loss, surviving a run that reported success.
+        """
+        _workspace(tmp_path / ALICE, team_id, journal=False)
+        (tmp_path / f"{team_id}.git").mkdir()
+
+        entry = next(e for e in plan(tmp_path, {team_id: ALICE}).entries if e.name == team_id)
+
+        assert entry.verdict is Verdict.ALREADY_MIGRATED
+        assert entry.journal_source == tmp_path / f"{team_id}.git"
+        assert "journal is still at" in entry.detail
+
+    def test_a_fully_migrated_pair_is_reported_as_plainly_done(
+        self, tmp_path: Path, team_id: str
+    ) -> None:
+        """The ordinary idempotent case must not acquire the stranded-journal note."""
+        _workspace(tmp_path / ALICE, team_id)
+
+        entry = next(e for e in plan(tmp_path, {team_id: ALICE}).entries if e.name == team_id)
+
+        assert entry.verdict is Verdict.ALREADY_MIGRATED
+        assert entry.journal_source is None
+        assert "journal is still at" not in entry.detail
 
     def test_a_mapped_team_with_no_directory_anywhere_produces_no_entry(
         self, tmp_path: Path, team_id: str
@@ -325,6 +372,52 @@ class TestJournalRollback:
             apply(computed)
 
         assert [Path(d).name for d in destinations] == [team_id, f"{team_id}.git", team_id]
+
+
+class TestDestinationAppearsAfterThePlan:
+    """The apply-time re-check: a destination that arrives *between* plan and apply.
+
+    No monkeypatch here, deliberately. The rollback specs above simulate the
+    failure; these two produce it, and they are the only cover for the one guard
+    the plan cannot provide — the plan was computed at an earlier moment, so a
+    concurrent writer is exactly what it cannot foresee.
+
+    What makes the guard load-bearing is the shape of the failure without it:
+    ``shutil.move`` onto an existing directory moves the source **inside** it, so
+    the run *succeeds*, prints ``moved 1 workspace(s)``, exits zero — and leaves
+    the tree at ``<scope>/<team>/<team>``, one level below where the resolver will
+    ever look. Silent, and reported as success.
+    """
+
+    def test_a_tree_destination_that_appears_after_the_plan_refuses(
+        self, tmp_path: Path, team_id: str
+    ) -> None:
+        _workspace(tmp_path, team_id, marker="raced")
+        computed = plan(tmp_path, {team_id: ALICE})
+
+        (tmp_path / ALICE / team_id).mkdir(parents=True)  # the concurrent writer
+
+        with pytest.raises(MigrationConflictError, match="appeared since the plan"):
+            apply(computed)
+
+        assert (tmp_path / team_id / "note.md").read_text(encoding="utf-8") == "raced"
+        assert not (tmp_path / ALICE / team_id / team_id).exists()
+
+    def test_a_journal_destination_that_appears_after_the_plan_puts_the_tree_back(
+        self, tmp_path: Path, team_id: str
+    ) -> None:
+        """The tree has already moved when this one is caught, so the rollback runs."""
+        _workspace(tmp_path, team_id, marker="raced")
+        computed = plan(tmp_path, {team_id: ALICE})
+
+        (tmp_path / ALICE / f"{team_id}.git").mkdir(parents=True)  # the concurrent writer
+
+        with pytest.raises(MigrationConflictError, match="appeared since the plan"):
+            apply(computed)
+
+        assert (tmp_path / team_id / "note.md").read_text(encoding="utf-8") == "raced"
+        assert (tmp_path / f"{team_id}.git" / "HEAD").exists()
+        assert not (tmp_path / ALICE / team_id).exists()
 
 
 class TestCli:
