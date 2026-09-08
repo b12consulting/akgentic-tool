@@ -142,7 +142,7 @@ class TestPlan:
         assert _verdicts(tmp_path, {team_id: principal})[principal] is Verdict.SKIPPED
 
     def test_the_reserved_metadata_scope_is_skipped(self, tmp_path: Path) -> None:
-        _workspace(tmp_path / "_meta", "case_id-42__customer_id-ACME")
+        _workspace(tmp_path / "_meta", "customer_id-ACME__case_id-42")
 
         assert _verdicts(tmp_path, {})["_meta"] is Verdict.SKIPPED
 

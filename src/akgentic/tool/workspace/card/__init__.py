@@ -147,12 +147,20 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
 
     The third of three layouts (ADR-048 Decision 2). Declaring
     ``["customer_id", "case_id"]`` on a team whose metadata carries ``ACME`` and
-    ``42`` resolves to ``_meta/case_id-42__customer_id-ACME`` — under a reserved
+    ``42`` resolves to ``_meta/customer_id-ACME__case_id-42`` — under a reserved
     scope rather than under anybody's principal, because sharing is the point.
 
-    **Keys are a set, not a sequence:** they are sorted before joining, so two
-    cards naming the same keys in either order reach the same tree. Values are
-    percent-encoded, which is what keeps the join unforgeable.
+    **Keys are a sequence, not a set:** they are joined in declaration order, so
+    the list reads as a refinement path from the coarsest scope down and
+    ``ls _meta/`` groups a customer's workspaces together. Two cards naming the
+    same keys in different orders therefore address different workspaces —
+    honest under the sequence model, and visible in the directory name. Values
+    are percent-encoded, which is what keeps the join unforgeable.
+
+    The list travels onto the wire as
+    :attr:`~akgentic.tool.workspace.models.WorkspaceConfig.metadata_keys`, so a
+    client attributes an agent to a workspace by plain list equality against
+    this value, with nothing to normalise on either side.
 
     Mutually exclusive with :attr:`workspace_id` — see :meth:`_one_layout`.
     """
@@ -514,6 +522,11 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
                 name=workspace_actor_name(workspace_path),
                 role=WORKSPACE_ACTOR_ROLE,
                 workspace_path=workspace_path,
+                # The declared list, verbatim — not deduped, not sorted. The
+                # client joins on plain list equality against the agent card's
+                # own ``workspace_metadata_keys``, so normalising this side and
+                # not that one is how the join starts missing silently.
+                metadata_keys=self.workspace_metadata_keys,
                 git_journal=self.git_journal,
                 max_documents=(
                     self.max_documents if self.max_documents is not None else derived_documents

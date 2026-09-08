@@ -463,7 +463,7 @@ cannot argue with.
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `workspace_id` | `str \| None` | `None` | The `<leaf>` — a directory name **under the caller's own principal**, not under the workspaces root, and the second half of the actor's name. `None` ⇒ the team id, so each team gets its own tree. A fixed string names a **second tree of your own**: two agents in one team can hold two separate trees, and two teams of the *same* principal reach one tree (checked by the gate, not ordered by an actor). It does **not** share across principals — two users declaring `notes` get `<alice>/notes` and `<bob>/notes`. For sharing that actually shares, use `workspace_metadata_keys`. |
-| `workspace_metadata_keys` | `list[str]` | `[]` | The `<leaf>` derived from the team's own metadata, under the reserved `_meta` scope: `["customer_id", "case_id"]` over `ACME` and `42` resolves to `_meta/case_id-42__customer_id-ACME`. This is the layout that is **shared across teams and across users** — which is why it sits under a reserved scope rather than under anybody's principal. Keys are a **set**: sorted before joining, so either declaration order reaches the same tree; values are percent-encoded, which is what keeps the join unforgeable. **Mutually exclusive with `workspace_id`** — declaring both is a `ValidationError` at card construction, not a precedence rule. Every failure is a hard error at bind time, never a fallback to a user path: no metadata on the team, a key that is not a field of the metadata model, a value that is `None` or empty, or a joined leaf over 255 bytes. |
+| `workspace_metadata_keys` | `list[str]` | `[]` | The `<leaf>` derived from the team's own metadata, under the reserved `_meta` scope: `["customer_id", "case_id"]` over `ACME` and `42` resolves to `_meta/customer_id-ACME__case_id-42`. This is the layout that is **shared across teams and across users** — which is why it sits under a reserved scope rather than under anybody's principal. Keys are a **sequence**: joined in declaration order, so the list reads as a refinement path from the coarsest scope down and `ls _meta/` groups a customer's trees together — the trade being that two cards naming the same keys in different orders address different workspaces, which is visible in the directory name rather than silent. Values are percent-encoded, which is what keeps the join unforgeable. The declared list also travels on the wire as `WorkspaceConfig.metadata_keys`, so a client attributes an agent to a workspace by plain list equality against this field, with nothing to normalise on either side. **Mutually exclusive with `workspace_id`** — declaring both is a `ValidationError` at card construction, not a precedence rule. Every failure is a hard error at bind time, never a fallback to a user path: no metadata on the team, a key that is not a field of the metadata model, a value that is `None` or empty, or a joined leaf over 255 bytes. |
 | `read_only` | `bool` | `False` | `True` removes every write-side callable from the tool list, `workspace_exec` included. The read side is unaffected. |
 | `git_journal` | `bool` | `False` | Whether accepted mutations are recorded in the git journal. **Off by default**, because nothing in the system consumes the record: the gate re-hashes live and never consults it, and an agent's exec result carries only `exit_code`/`stdout`/`stderr`, so the journal is a human-facing audit trail you opt into. A plain field, not a capability param: it exposes no tool and nothing about it is expressible by a model. Turning it off loses history, attribution and out-of-band detection — it does **not** loosen the gate by one row. Read by the **first** card to create the actor for a workspace. |
 | `resources` | `list[Resource]` | `[]` | Files written into the workspace at `observer()` time, before the agent's first turn. Seeding is **idempotent**: a resource whose `file_name` already exists is skipped, so restoring a team never clobbers a file the agent has since edited. |
@@ -796,7 +796,7 @@ three layouts and no fourth:
 |---|---|
 | `WorkspaceTool()` | `<user_id>/<team_id>` |
 | `WorkspaceTool(workspace_id="notes")` | `<user_id>/notes` |
-| `WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])` | `_meta/case_id-42__customer_id-ACME` |
+| `WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])` | `_meta/customer_id-ACME__case_id-42` |
 
 ```
 $AKGENTIC_WORKSPACES_ROOT/                # default ./workspaces
@@ -806,8 +806,8 @@ $AKGENTIC_WORKSPACES_ROOT/                # default ./workspaces
 │   ├── notes/                            # a named workspace: a second tree of your OWN
 │   └── notes.git/
 └── _meta/                                # reserved: the shared, metadata-keyed layout
-    ├── case_id-42__customer_id-ACME/
-    └── case_id-42__customer_id-ACME.git/
+    ├── customer_id-ACME__case_id-42/
+    └── customer_id-ACME__case_id-42.git/
 ```
 
 **Depth is fixed at two, and what that buys is that no workspace path is a prefix of another.**
@@ -931,7 +931,7 @@ that genuinely needs sharing should move to `workspace_metadata_keys` instead of
 because copies diverge from the moment they are made. Replace
 `WorkspaceTool(workspace_id="acme-case-42")` with
 `WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])` on a team whose metadata carries
-those fields, and put the directory at `workspaces/_meta/case_id-42__customer_id-ACME`. The sharing
+those fields, and put the directory at `workspaces/_meta/customer_id-ACME__case_id-42`. The sharing
 is then declared rather than implied by everyone happening to type the same string.
 
 #### The RAG index must be rebuilt, and there is no script for it
@@ -972,7 +972,8 @@ WorkspaceTool(read_only=True, workspace_glob=False)  # drop one capability
 
 # Shared across teams AND across users, because the sharing is DECLARED: the leaf
 # is derived from the team's own metadata and lands under the reserved _meta scope,
-# e.g. _meta/case_id-42__customer_id-ACME. Mutually exclusive with workspace_id.
+# e.g. _meta/customer_id-ACME__case_id-42 — declaration order, so `ls _meta/` groups
+# a customer's trees. Mutually exclusive with workspace_id.
 WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])
 
 # A coding agent: file tools and a shell over ONE tree, ONE gate, ONE history.

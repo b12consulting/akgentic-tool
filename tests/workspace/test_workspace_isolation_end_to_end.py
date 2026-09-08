@@ -388,7 +388,7 @@ class TestTheMetadataCardSharesDeliberately:
         second_card, second_path = bound(second)
 
         assert first_path == second_path
-        assert first_path == PurePosixPath("_meta/case_id-42__customer_id-ACME")
+        assert first_path == PurePosixPath("_meta/customer_id-ACME__case_id-42")
 
         # One tree, reached from two teams: what one writes, the other reads.
         tool_named(first_card, "workspace_write")("shared.txt", "case-42\n")
@@ -490,7 +490,7 @@ class TestCreateAndResumeResolveTheSamePath:
         _, resumed_path = bound(resumed)
 
         assert created_path == resumed_path
-        assert created_path == PurePosixPath("_meta/case_id-42__customer_id-ACME")
+        assert created_path == PurePosixPath("_meta/customer_id-ACME__case_id-42")
 
     def test_the_files_written_before_a_restart_are_there_after_it(
         self, system: ActorSystem, workspaces_root: Path

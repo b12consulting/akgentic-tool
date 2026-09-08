@@ -552,11 +552,26 @@ def _encode_metadata_value(value: str) -> str:
 def _metadata_leaf(keys: list[str], metadata: SerializableBaseModel | None) -> str:
     """Join the declared keys into one segment: ``<key>-<enc(value)>__<key>-<enc(value)>``.
 
-    **Keys are sorted, not declaration-ordered.** The declaration is a *set*: two
-    cards naming the same keys in either order must reach the same workspace.
-    ``case_id`` sorting before ``customer_id`` reads less naturally than an
-    author would write it, and canonical beats readable — a readable form that
-    yields two ids for one key set is the failure being removed here.
+    **Keys stay in declaration order** (ADR-048 Decision 3). The declaration is a
+    *sequence*, not a set: it is an ordered refinement path whose first key is the
+    coarsest scope, so ``["customer_id", "case_id"]`` yields
+    ``customer_id-ACME__case_id-42`` and ``ls _meta/`` groups a customer's
+    workspaces beside each other instead of scattering them under whichever key
+    happened to sort first.
+
+    The trade, stated so nobody reads it as a defect: two cards naming the same
+    keys in **different orders** address **different** workspaces. Under the
+    sequence model that is honest — they declared different scopes — and unlike a
+    silent collision it is visible in the directory name.
+
+    The prefix this creates is a **string** prefix between two *siblings*, never a
+    path prefix: ``_meta/customer_id-ACME`` and
+    ``_meta/customer_id-ACME__case_id-42`` are two leaves under one scope, and a
+    sibling cannot contain a sibling. Decision 1's antichain is about one path
+    *containing* another and is untouched here.
+
+    Duplicates are removed keeping the **first** occurrence, so a repeated key
+    adds no scope and names the tree it named once.
 
     Every failure below is a hard error, never a fallback to a user path. The
     reasons differ but the shape does not: each fallback would be a *silent*
@@ -580,14 +595,19 @@ def _metadata_leaf(keys: list[str], metadata: SerializableBaseModel | None) -> s
             exceeds 255 bytes (truncating collides, and a collision here is an
             isolation failure that looks like success).
     """
+    # One ordered, deduped list, computed once and used by both the raise below
+    # and the join: two spellings of one rule is this module's own recurring
+    # defect one scale down. ``dict.fromkeys`` keeps the first occurrence, which
+    # is what makes the dedupe stable — ``set`` is what must not appear.
+    ordered = list(dict.fromkeys(keys))
     if metadata is None:
         raise ValueError(
-            f"workspace_metadata_keys {sorted(set(keys))!r} were declared, but the team "
+            f"workspace_metadata_keys {ordered!r} were declared, but the team "
             "carries no metadata"
         )
     declared = type(metadata).model_fields
     pairs: list[str] = []
-    for key in sorted(set(keys)):
+    for key in ordered:
         if key not in declared:
             raise ValueError(
                 f"workspace_metadata_keys names {key!r}, which is not a field of "
@@ -624,7 +644,7 @@ def resolve_workspace_path(
     ==========================================  ==================================
     ``WorkspaceTool()``                         ``<user_segment(user_id)>/<team_id>``
     ``WorkspaceTool(workspace_id="notes")``     ``<user_segment(user_id)>/notes``
-    ``WorkspaceTool(workspace_metadata_keys=…)``  ``_meta/case_id-42__customer_id-ACME``
+    ``WorkspaceTool(workspace_metadata_keys=…)``  ``_meta/customer_id-ACME__case_id-42``
     ==========================================  ==================================
 
     **Depth is fixed at two, and the invariant that buys is that no workspace

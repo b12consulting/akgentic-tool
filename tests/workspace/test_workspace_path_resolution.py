@@ -152,7 +152,7 @@ class TestLeafSegment:
         [
             "notes",
             "11111111-2222-3333-4444-555555555555",
-            "case_id-42__customer_id-ACME",
+            "customer_id-ACME__case_id-42",
             "a.b.c",
         ],
     )
@@ -339,7 +339,7 @@ class TestMetadataLayout:
             keys=["customer_id", "case_id"],
             metadata=Metadata(customer_id="ACME", case_id="42"),
         )
-        assert path == PurePosixPath("_meta/case_id-42__customer_id-ACME")
+        assert path == PurePosixPath("_meta/customer_id-ACME__case_id-42")
 
     def test_it_is_shared_across_principals_by_design(self) -> None:
         """The one layout that must *not* differ per user — that is its purpose."""
@@ -350,28 +350,74 @@ class TestMetadataLayout:
         assert alice == bob
         assert alice.parts[0] == METADATA_SCOPE
 
-    def test_the_declaration_is_a_set_so_key_order_cannot_split_a_tree(self) -> None:
+    def test_the_declaration_is_a_sequence_so_the_order_names_the_scope(self) -> None:
+        """Two orders address two workspaces, and that is the decision, not a defect.
+
+        The list is an ordered refinement path — first key coarsest — so the
+        order is part of what was declared. Two cards naming the same keys
+        differently declared different scopes, and unlike a silent collision the
+        difference is **visible in the directory name**.
+
+        Both exact strings are asserted rather than mere inequality: a spec that
+        only checked ``forwards != backwards`` would stay green under a sort
+        applied to one side.
+        """
         metadata = Metadata(customer_id="ACME", case_id="42")
         forwards = resolve(keys=["customer_id", "case_id"], metadata=metadata)
         backwards = resolve(keys=["case_id", "customer_id"], metadata=metadata)
 
-        assert forwards == backwards
+        assert forwards == PurePosixPath("_meta/customer_id-ACME__case_id-42")
+        assert backwards == PurePosixPath("_meta/case_id-42__customer_id-ACME")
+        assert forwards != backwards
+
+    def test_refining_a_key_list_extends_the_name_so_ls_groups_the_family(self) -> None:
+        """The property change A exists for: ``ls _meta/`` groups a customer's trees.
+
+        Sorted, ``["customer_id"]`` and ``["customer_id", "case_id"]`` produced two
+        unrelated names. In declaration order the second **string-**extends the
+        first, so a customer's workspaces sit beside each other in a listing.
+        """
+        metadata = Metadata(customer_id="ACME", case_id="42")
+        coarse = resolve(keys=["customer_id"], metadata=metadata)
+        refined = resolve(keys=["customer_id", "case_id"], metadata=metadata)
+
+        assert coarse == PurePosixPath("_meta/customer_id-ACME")
+        assert refined == PurePosixPath("_meta/customer_id-ACME__case_id-42")
+        assert refined.name.startswith(coarse.name)
 
     def test_a_different_key_set_reaches_a_different_tree(self) -> None:
-        """And a *sibling* one, never a parent — Decision 1's antichain."""
+        """And a *sibling* one, never a parent — Decision 1's antichain.
+
+        One leaf name is now a **string** prefix of the other, which is the point
+        of declaration order. It is not a **path** prefix: both are single leaves
+        under one ``_meta`` scope, and a sibling cannot contain a sibling.
+        Containment is what the antichain guards, so nothing here weakens it —
+        and a reader who "fixes" the shared string prefix breaks this spec.
+        """
         metadata = Metadata(customer_id="ACME", case_id="42")
         one = resolve(keys=["customer_id"], metadata=metadata)
         both = resolve(keys=["customer_id", "case_id"], metadata=metadata)
 
         assert one != both
-        assert not str(both).startswith(f"{one}/")
+        assert str(both.name).startswith(str(one.name))  # string prefix: deliberate
+        assert not str(both).startswith(f"{one}/")  # path prefix: never
         assert not str(one).startswith(f"{both}/")
+        assert one.parent == both.parent  # siblings under the one scope
 
     def test_a_repeated_key_names_the_same_tree_as_naming_it_once(self) -> None:
-        metadata = Metadata(customer_id="ACME")
+        """First-occurrence dedupe, not set semantics — a repeated key adds no scope.
+
+        With the sort gone the dedupe has to be explicit *and* stable:
+        ``["a", "b", "a"]`` would otherwise either double ``a`` in the leaf or
+        move ``b`` ahead of it, depending on how it was written.
+        """
+        metadata = Metadata(customer_id="ACME", case_id="42")
         assert resolve(keys=["customer_id", "customer_id"], metadata=metadata) == resolve(
             keys=["customer_id"], metadata=metadata
         )
+        assert resolve(
+            keys=["customer_id", "case_id", "customer_id"], metadata=metadata
+        ) == PurePosixPath("_meta/customer_id-ACME__case_id-42")
 
     @pytest.mark.parametrize(
         ("value", "encoded"),
@@ -437,24 +483,25 @@ class TestMetadataLayout:
     def test_the_suffix_is_refused_from_the_last_key_of_a_join(self) -> None:
         """Only the *joined* leaf's ending matters — a mid-join ``.git`` is harmless.
 
-        ``case_id`` sorts first, so a ``customer_id`` of ``ACME.git`` lands at the
-        end of the join and collides; the same value in ``case_id`` does not,
-        because ``customer_id-…`` follows it.
+        Which key lands last is now the card's own declaration order: under
+        ``["customer_id", "case_id"]`` a ``case_id`` of ``42.git`` ends the join
+        and collides, while the same value in ``customer_id`` does not, because
+        ``case_id-…`` follows it.
         """
-        metadata = Metadata(customer_id="ACME.git", case_id="42")
+        metadata = Metadata(customer_id="ACME", case_id="42.git")
         with pytest.raises(ValueError, match="journal directory"):
             resolve(keys=["customer_id", "case_id"], metadata=metadata)
 
-        harmless = Metadata(customer_id="ACME", case_id="42.git")
+        harmless = Metadata(customer_id="ACME.git", case_id="42")
         assert resolve(keys=["customer_id", "case_id"], metadata=harmless) == PurePosixPath(
-            "_meta/case_id-42.git__customer_id-ACME"
+            "_meta/customer_id-ACME.git__case_id-42"
         )
 
     def test_the_metadata_branch_newly_rejects_nothing_but_the_suffix(self) -> None:
         """Routing through ``leaf_segment`` must not narrow a branch that accepted everything.
 
         The joined leaf is percent-encoded, so it holds no ``/``, ``\\`` or NUL;
-        it starts with a sorted pydantic field name, which can be neither empty
+        it starts with a declared pydantic field name, which can be neither empty
         nor a leading ``.``; and the keys list is non-empty on this branch by
         construction. The characters below are exactly the ones the encoder lets
         through or escapes, and every one of them still resolves.
