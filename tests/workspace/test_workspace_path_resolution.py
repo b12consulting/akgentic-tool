@@ -242,7 +242,9 @@ class TestLeafSegment:
 
 
 ##
-## AC 5 — the scope needs no equivalent guard, and that must stay pinned
+## The journal-suffix guard is asymmetric: the scope needs no equivalent, and
+## that must stay pinned.  (Numbered banners in this file cite *epic* ACs; this
+## one has no epic AC of its own, so it is named after the behaviour instead.)
 ##
 
 

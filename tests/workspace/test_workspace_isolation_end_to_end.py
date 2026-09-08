@@ -19,6 +19,9 @@ evidence that the team package is correct.**
 
 ``FakeActorToolObserver`` is deliberately absent. It is the right tool almost
 everywhere else in this suite and the wrong one here, for the one reason above.
+The shared ``tool_named`` helper is imported rather than re-spelled: it carries
+no identity, and a second copy of it would be the same one-rule-two-spellings
+defect this epic exists to remove.
 """
 
 from __future__ import annotations
@@ -29,7 +32,6 @@ import uuid
 from collections.abc import Generator
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any
 
 import pytest
 from akgentic.core import ActorRegistry
@@ -42,6 +44,7 @@ from akgentic.core.utils.serializer import SerializableBaseModel
 
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.tool import WorkspaceTool
+from tests.workspace.conftest import tool_named
 
 SPAWN_TIMEOUT_S = 15.0
 """Upper bound on a member's spawn — never a delay, only a failure budget.
@@ -111,12 +114,18 @@ class RecordingMember(Akgent[MemberConfig, BaseState]):
     ``createActor`` returns is satisfied by an ordering in which the team's
     identity and metadata arrive *after* the agents that depend on them — which
     is precisely the regression the create/resume guard exists to catch.
+
+    ``super().on_start()`` runs **inside** the ``try``. A propagation regression
+    can raise there rather than at the bind, and outside the ``try`` that leaves
+    ``done`` unset — so the guard would report a fifteen-second timeout instead
+    of the exception that caused it. A guard that goes red for the wrong reason
+    is the failure mode this whole file is built to avoid.
     """
 
     def on_start(self) -> None:
-        super().on_start()
         record = _BINDS[self.config.bind_key]
         try:
+            super().on_start()
             card = WorkspaceTool(
                 workspace_id=self.config.workspace_id,
                 workspace_metadata_keys=list(self.config.workspace_metadata_keys),
@@ -205,11 +214,6 @@ def bound(record: Bind) -> tuple[WorkspaceTool, PurePosixPath]:
     assert record.card is not None
     assert record.path is not None
     return record.card, record.path
-
-
-def tool_named(card: WorkspaceTool, name: str) -> Any:
-    """The card's callable for *name* — the surface an agent actually holds."""
-    return next(fn for fn in card.get_tools() if fn.__name__ == name)
 
 
 @pytest.fixture
