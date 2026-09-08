@@ -6,7 +6,7 @@ workspace tree, an allow-listed binary set, and four isolation backends selected
 | | |
 |---|---|
 | Module | `akgentic.tool.sandbox` |
-| Actor | a `SandboxActor` subclass, singleton named `#SandboxActor-<workspace_id or team_id>` |
+| Actor | a `SandboxActor` subclass, singleton named `#SandboxActor-<scope>/<leaf>` — the workspace's resolved two-segment path |
 | Channels used | `TOOL_CALL`, through `WorkspaceTool` |
 | Optional extras | none — `bwrap` / `sandbox-exec` / `docker` are host tools, not Python packages |
 | Environment | `AKGENTIC_WORKSPACES_ROOT`, `AKGENTIC_SANDBOX_IMAGE` |
@@ -33,7 +33,7 @@ ToolFactory([WorkspaceTool(workspace_id="proj-42", workspace_exec=True)], observ
 | Callable | `exec_command(cmd, cwd="")` | `workspace_exec(cmd, cwd="")` + `workspace_exec_result(run_id)` |
 | Mode | `ExecTool(mode=…)` | `WorkspaceExec(mode=…)` |
 | Budget | not configurable | `WorkspaceExec(timeout_s=…, poll_attempts=…, poll_delay_seconds=…)` |
-| Directory | `ExecTool(workspace_id=…)` | `WorkspaceTool(workspace_id=…)` |
+| Directory | `ExecTool(workspace_id=…)` — the `<leaf>` only | `WorkspaceTool(workspace_id=…)`, **or** `workspace_metadata_keys=[…]` for the shared layout, which `ExecTool` does not have and will not get |
 | Journal | off by default, and **not reachable** by any `ExecTool` field | `WorkspaceTool(git_journal=…)` |
 
 **What still works.** The class resolves, the field names are unchanged, and `exec_command` behaves
@@ -44,7 +44,7 @@ identically — same hold on the tree, same sandbox, same discovery, same commit
 replacement. Deliberately not at import: an import-time warning fires for anybody who merely has
 the module in a dependency's `__init__`, which is nobody's decision to change.
 
-**What an `ExecTool`-only agent gives up.** It creates the `#Workspace-<workspace>` actor for its workspace, and
+**What an `ExecTool`-only agent gives up.** It creates the `#Workspace-<scope>/<leaf>` actor for its workspace, and
 the first card to create that actor decides the configuration — so it gets the journal's default,
 which is **off**. `AC2` froze the shim's three fields, so there is no `git_journal` on it and no way
 to reach one. An `ExecTool` agent sharing a workspace whose actor a `WorkspaceTool(git_journal=True)`
@@ -85,8 +85,8 @@ deliberately fail-fast, at team creation.
 
 **One actor per tree, many callers.** `getChildrenOrCreate(actor_class, config=SandboxConfig(...))`
 is idempotent and keys on the actor **name**, so every agent whose card resolves to one workspace
-shares one `#SandboxActor-<workspace>`. The name carries the workspace for the same reason
-`#Workspace-<workspace>` does: a constant name would resolve two exec-capable cards on two
+shares one `#SandboxActor-<scope>/<leaf>`. The name carries the resolved path for the same reason
+`#Workspace-<scope>/<leaf>` does: a constant name would resolve two exec-capable cards on two
 workspaces onto the *first* actor, and the second agent's commands would then run in the first
 agent's tree while its own workspace actor gated an untouched one. With `mode="docker"`, note that
 the **container** is still named per team (`sandbox-{team_id}`), so two workspaces in one team on
@@ -117,14 +117,21 @@ anything the host user can read; the **command allowlist is the primary boundary
 
 ### `workspace_id`
 
+A workspace is a relative path of **exactly two segments**, `<scope>/<leaf>`, and this field supplies
+the `<leaf>` only. The `<scope>` is the owning principal, and the card never chooses it.
+
 | Value | Effect |
 |---|---|
-| `None` *(default)* | The workspace directory is named after the team id. |
-| any `str` | That directory is used instead. |
+| `None` *(default)* | `<user_id>/<team_id>` — the team's own tree, under its owner. |
+| any `str` | `<user_id>/<that string>` — a second tree of the **same** principal, not a tree shared with other principals. |
 
-Forwarded to `SandboxConfig.workspace_id`, and to the sandbox actor's own **name**, so a card
-resolving to one workspace gets one backend over one directory. On `WorkspaceTool` the same value
-also names the tree the file tools use and the workspace actor that gates it — one field, one tree.
+The card resolves that path **once**, at bind time, and hands the result to
+`SandboxConfig.workspace_path` — the already-resolved value, which replaced the raw `workspace_id`
+override this config used to carry. A backend that joins a path it was handed cannot open a different
+directory from the one the card, the write gate and the journal are working on. The same resolved
+path is also the sandbox actor's own **name**, so a card resolving to one workspace gets one backend
+over one directory. On `WorkspaceTool` it likewise names the tree the file tools use and the workspace
+actor that gates it — one derivation, one tree.
 
 The Docker **container** name still derives from the team id (`sandbox-{team_id}`): containers are
 per-team execution resources. Two workspaces in one team therefore get two sandbox *actors* but one
@@ -230,13 +237,18 @@ propagates as an exception from either surface: a tool call must always yield a 
 ### Where commands run
 
 ```
-$AKGENTIC_WORKSPACES_ROOT/          # default ./workspaces
-├── <workspace_id or team_id>/      # created on actor start; cwd is resolved under it
-└── <workspace_id or team_id>.git/  # the journal — outside every mount, deliberately
+$AKGENTIC_WORKSPACES_ROOT/            # default ./workspaces
+└── <scope>/                          # the owning principal, or _meta for the shared layout
+    ├── <leaf>/                       # created on actor start; cwd is resolved under it
+    └── <leaf>.git/                   # the journal — outside every mount, deliberately
 ```
 
+`<scope>/<leaf>` is the two-segment path the card resolved: `<user_id>/<team_id>` for a default card,
+`<user_id>/<workspace_id>` for a named one, `_meta/<joined keys>` for a metadata-shared one. The
+backend receives it already resolved and derives nothing.
+
 The directory is created by `_start_sandbox()` and recorded in `SandboxState.workspace_path`. Only
-the first line is ever mounted.
+the tree is ever mounted — never the `.git` sibling.
 
 ### Backend specifics
 

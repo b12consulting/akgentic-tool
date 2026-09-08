@@ -712,13 +712,15 @@ any single tool call**, and the framework gives that state a home — a **tool a
 that every agent carrying the card talks to.
 
 Seven ship in this package today: `#VectorStore`, `#PlanningTool`, `#KnowledgeGraphTool`,
-`#SandboxActor-<workspace>`, `#TeamActivity`, `#NotificationTool` and
-`#Workspace-<workspace_id or team_id>`.
+`#SandboxActor-<scope>/<leaf>`, `#TeamActivity`, `#NotificationTool` and
+`#Workspace-<scope>/<leaf>`.
 
 **Note the two names that carry a suffix.** Five of the seven are one per *team*, and their name is
 a constant. The workspace actor and the sandbox actor are one per *workspace tree*, so their names
-are **built** from the workspace rather than being literals — which means two of them can coexist in
-one team, each owning its own directory. `getChildrenOrCreate` keys on the name, so this is not
+are **built** from the workspace's resolved two-segment path — slash included — rather than being
+literals. Two of them can coexist in one team, each owning its own directory, and two *principals*
+whose cards both say `workspace_id="notes"` get two actors over two trees because the name carries
+the scope as well as the leaf. `getChildrenOrCreate` keys on the name, so this is not
 cosmetic: a fixed name would collapse two trees onto one actor, silently. The unicity domain of an
 actor must equal the resource it owns.
 
@@ -1027,9 +1029,11 @@ Read/write access to a shared team filesystem — `workspace_read`, `workspace_l
 `workspace_edit`, `workspace_multi_edit`, `workspace_patch`, `workspace_delete`,
 `workspace_mkdir` and (opt-in) `workspace_exec` / `workspace_exec_result` on the write side. One
 class covers both modes via a `read_only: bool` gate. All paths are anchored to
-`<AKGENTIC_WORKSPACES_ROOT>/<workspace_id or team_id>` and traversal out of that root is rejected.
+`<AKGENTIC_WORKSPACES_ROOT>/<scope>/<leaf>` — a workspace is a two-segment path, scoped to its owner:
+`<user_id>/<team_id>` by default, `<user_id>/<workspace_id>` for a named one, and `_meta/<joined
+keys>` for the metadata-shared layout. Traversal out of that root is rejected.
 
-**A `#Workspace-<workspace>` singleton owns the tree, and every mutation is refused unless the file
+**A `#Workspace-<scope>/<leaf>` singleton owns the tree, and every mutation is refused unless the file
 is still what the writing agent last read.** Reads stay on the agent's own thread and are never
 serialized. A refusal is a `RetriableError`, so it lands in the model's next turn carrying a diff of
 what the write would have destroyed — the agent re-reads and redoes without anyone writing recovery
@@ -1043,7 +1047,8 @@ from akgentic.tool import WorkspaceTool
 
 WorkspaceTool()                                      # full access (default), journal off, exec off
 WorkspaceTool(read_only=True)                        # read tools only
-WorkspaceTool(workspace_id="shared")                 # shared workspace across teams
+WorkspaceTool(workspace_id="scratch")                # a second tree of YOUR OWN: <user_id>/scratch
+WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])  # shared across teams AND users
 WorkspaceTool(workspace_exec=True)                   # + sandboxed shell over the same tree
 WorkspaceTool(git_journal=True)                      # + git history; the gate is unaffected either way
 WorkspaceTool(read_only=True, workspace_glob=False)  # fine-grained capability control
@@ -1745,8 +1750,12 @@ src/akgentic/tool/
         README.md           # WorkspaceTool reference — the gate, the journal, exec, every param
         __init__.py           # Public exports: the card, its params, the actor, the models
         workspace.py          # Workspace Protocol, Filesystem (atomic write / write_many),
-        │                     #   PathEscapeError, WriteEntry, get_workspace(), is_staging_name
-        actor.py              # WorkspaceActor "#Workspace-<workspace>" — the six gated
+        │                     #   PathEscapeError, WriteEntry, get_workspace(), is_staging_name,
+        │                     #   resolve_workspace_path() / user_segment() / leaf_segment() —
+        │                     #   the one place a two-segment workspace path is derived
+        migrate.py            # Operator script: move a pre-two-segment workspaces root under
+        │                     #   its owners. Not exported; run as a module, never imported
+        actor.py              # WorkspaceActor "#Workspace-<scope>/<leaf>" — the six gated
         │                     #   mutations, the live-hash check, the lease, the staging sweep
         models.py             # Observation, MutationOutcome, LastWrite, WorkspaceConfig,
         │                     #   content_sha, the refusal texts and every cap
