@@ -227,7 +227,7 @@ _WORKSPACE_TOOL_FIELDS: frozenset[str] = frozenset(
         # so it can never grow.
         "workspace_rag_index",
         "workspace_rag_list",
-        "rag_collection",
+        "vector_store",
         "max_documents",
         "max_document_chars",
         # Added by story 45-8, deliberately: the search capability. Twenty-two

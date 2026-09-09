@@ -26,6 +26,7 @@ import logging
 import uuid
 from typing import TYPE_CHECKING, Any
 
+from akgentic.tool.vector_store.client import ClusterKey, get_client
 from akgentic.tool.vector_store.protocol import (
     CollectionStatus,
     SearchHit,
@@ -178,12 +179,21 @@ def _check_qdrant_dependencies() -> None:
 class QdrantBackend:
     """Qdrant-backed vector store implementing ``VectorStoreService``.
 
-    A plain class (not a Pydantic model) because it holds a live client
-    connection. It satisfies the ``VectorStoreService`` protocol structurally.
+    A plain class (not a Pydantic model) because it holds non-serialisable
+    runtime state: a handle to the process's **shared** Qdrant client, not a
+    connection of its own. It satisfies the ``VectorStoreService`` protocol
+    structurally.
+
+    **It takes a client and never closes one**, exactly as ``WeaviateBackend``
+    does. The client comes from
+    :func:`akgentic.tool.vector_store.client.get_client` — one per cluster per
+    process, keyed on the backend name as well as the connection — and is closed
+    only by ``close_all()`` at process exit. What a backend owns is its scope
+    (``tenant``, ``team_id``) and its created-collections bookkeeping.
 
     Args:
-        url: Qdrant cluster URL (e.g. ``http://localhost:6333``).
-        api_key: Optional API key for authentication.
+        client: The connected ``qdrant_client.QdrantClient`` for the cluster.
+            The backend never connects and never closes it.
         tenant: Optional tenant id, stored on every point and folded into the
             team scope for search/remove.
         team_id: Owning team id, stamped onto every point so a later sweep can
@@ -192,17 +202,15 @@ class QdrantBackend:
 
     def __init__(
         self,
-        url: str,
-        api_key: str | None = None,
+        client: QdrantClient,
         tenant: str | None = None,
         team_id: str | None = None,
     ) -> None:
         _check_qdrant_dependencies()
-        from qdrant_client import QdrantClient
 
         self._tenant = tenant
         self._team_id = team_id
-        self._client: QdrantClient = QdrantClient(url=url, api_key=api_key)
+        self._client: QdrantClient = client
         self._collections_created: set[str] = set()
         self._collection_tenants: dict[str, str] = {}
 
@@ -527,10 +535,6 @@ class QdrantBackend:
             ),
         )
 
-    def close(self) -> None:
-        """Close the Qdrant client connection."""
-        self._client.close()
-
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
@@ -642,23 +646,54 @@ class QdrantBackend:
 # ---------------------------------------------------------------------------
 
 
+def _connect_qdrant(key: ClusterKey) -> QdrantClient:
+    """Open the cluster connection *key* names — the callable ``get_client`` calls.
+
+    The one place in this package that constructs a ``QdrantClient``, which is
+    what keeps ``client.py`` free of any vendor name. It builds the **remote**
+    client only: the embedded implementation is reached exclusively through
+    ``location=":memory:"`` or ``path=``, neither of which anything here passes,
+    so a shared client is always the thread-safe remote one.
+
+    Args:
+        key: The cluster to connect to.
+
+    Returns:
+        A connected client.
+
+    Raises:
+        ImportError: When ``qdrant-client`` is not installed.
+    """
+    _check_qdrant_dependencies()
+    from qdrant_client import QdrantClient as _QdrantClient
+
+    scheme = "https" if key.secure else "http"
+    return _QdrantClient(url=f"{scheme}://{key.host}:{key.port}", api_key=key.api_key)
+
+
 def _make_qdrant_backend(context: BackendContext) -> QdrantBackend:
     """Build a :class:`QdrantBackend` from the environment.
 
     Unlike Weaviate, connection settings are read straight from the environment
     (``VectorStoreConfig`` carries no Qdrant fields), so a Qdrant deployment
-    needs only the ``AKGENTIC_QDRANT_*`` variables and no card changes.
+    needs only the ``AKGENTIC_QDRANT_*`` variables and no card changes. The
+    resolved pair goes through the shared cache, so every backend built for one
+    Qdrant cluster in this process holds one client — and none of them closes it.
+
+    ``default_port=6333`` is a keying concern: it collapses ``http://host`` and
+    ``http://host:6333`` onto one key rather than opening two clients against
+    one server.
     """
     url = qdrant_url()
     if not url:
         msg = "qdrant_url is not configured; cannot build QdrantBackend."
         raise ValueError(msg)
+    key = ClusterKey.from_url("qdrant", url, qdrant_api_key(), default_port=6333)
     # Tenancy is per-collection (VectorStoreParam.tenant), not per-actor, so the
     # actor-level factory leaves it unset; a hand-built backend or subclass may
     # still pass tenant= directly.
     return QdrantBackend(
-        url=url,
-        api_key=qdrant_api_key(),
+        client=get_client(key, _connect_qdrant),
         tenant=None,
         team_id=context.team_id,
     )

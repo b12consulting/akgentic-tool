@@ -167,14 +167,14 @@ class TestCardsFailAtWiring:
     def test_planning_tool_refuses_to_wire(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
 
-        tool = PlanningTool(collection=VectorStoreParam(backend="weaviate"))
+        tool = PlanningTool(vector_store=VectorStoreParam(backend="weaviate"))
         with pytest.raises(ValueError, match="PlanningTool"):
             tool.observer(self._observer())  # type: ignore[arg-type]
 
     def test_knowledge_graph_tool_refuses_to_wire(self) -> None:
         from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
 
-        tool = KnowledgeGraphTool(collection=VectorStoreParam(backend="weaviate"))
+        tool = KnowledgeGraphTool(vector_store=VectorStoreParam(backend="weaviate"))
         with pytest.raises(ValueError, match="KnowledgeGraphTool"):
             tool.observer(self._observer())  # type: ignore[arg-type]
 
@@ -183,7 +183,7 @@ class TestCardsFailAtWiring:
         from akgentic.tool.planning.planning import PlanningTool
 
         observer = self._observer()
-        tool = PlanningTool(collection=VectorStoreParam(backend="weaviate"))
+        tool = PlanningTool(vector_store=VectorStoreParam(backend="weaviate"))
         with pytest.raises(ValueError):
             tool.observer(observer)  # type: ignore[arg-type]
         observer.proxy_ask.assert_not_called()  # type: ignore[attr-defined]
@@ -193,7 +193,7 @@ class TestCardsFailAtWiring:
         from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
 
         observer = self._observer()
-        tool = KnowledgeGraphTool(collection=VectorStoreParam(backend="weaviate"))
+        tool = KnowledgeGraphTool(vector_store=VectorStoreParam(backend="weaviate"))
         with pytest.raises(ValueError):
             tool.observer(observer)  # type: ignore[arg-type]
         observer.proxy_ask.assert_not_called()  # type: ignore[attr-defined]
@@ -204,7 +204,7 @@ class TestCardsFailAtWiring:
         from akgentic.tool.planning.planning import PlanningTool
 
         monkeypatch.setenv(WEAVIATE_URL_ENV, CLUSTER)
-        tool = PlanningTool(collection=VectorStoreParam(backend="weaviate"))
+        tool = PlanningTool(vector_store=VectorStoreParam(backend="weaviate"))
         tool.observer(self._observer())  # type: ignore[arg-type]
 
 
@@ -229,7 +229,7 @@ class TestCardsRefuseAMismatchedDimension:
         from akgentic.tool.planning.planning import PlanningTool
 
         observer = self._observer()
-        tool = PlanningTool(collection=VectorStoreParam(dimension=3072))
+        tool = PlanningTool(vector_store=VectorStoreParam(dimension=3072))
         with pytest.raises(ValueError, match="PlanningTool.*dimension=3072"):
             tool.observer(observer)  # type: ignore[arg-type]
         observer.proxy_ask.return_value.getChildrenOrCreate.assert_not_called()  # type: ignore[attr-defined]
@@ -238,7 +238,7 @@ class TestCardsRefuseAMismatchedDimension:
         from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
 
         observer = self._observer()
-        tool = KnowledgeGraphTool(collection=VectorStoreParam(dimension=3072))
+        tool = KnowledgeGraphTool(vector_store=VectorStoreParam(dimension=3072))
         with pytest.raises(ValueError, match="KnowledgeGraphTool.*dimension=3072"):
             tool.observer(observer)  # type: ignore[arg-type]
         observer.proxy_ask.return_value.getChildrenOrCreate.assert_not_called()  # type: ignore[attr-defined]
@@ -247,7 +247,7 @@ class TestCardsRefuseAMismatchedDimension:
         """A card wrong both ways reports the backend first, as it did before."""
         from akgentic.tool.planning.planning import PlanningTool
 
-        tool = PlanningTool(collection=VectorStoreParam(backend="weaviate", dimension=3072))
+        tool = PlanningTool(vector_store=VectorStoreParam(backend="weaviate", dimension=3072))
         with pytest.raises(ValueError, match=WEAVIATE_URL_ENV):
             tool.observer(self._observer())  # type: ignore[arg-type]
 
@@ -255,6 +255,6 @@ class TestCardsRefuseAMismatchedDimension:
         from akgentic.tool.planning.planning import PlanningTool
 
         tool = PlanningTool(
-            collection=VectorStoreParam(dimension=3072, embedding_model="my-deployment")
+            vector_store=VectorStoreParam(dimension=3072, embedding_model="my-deployment")
         )
         tool.observer(self._observer())  # type: ignore[arg-type]

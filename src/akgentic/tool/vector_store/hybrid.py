@@ -31,8 +31,7 @@ from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Final, NamedTuple
 
 if TYPE_CHECKING:
-    from akgentic.tool.vector_store.actor import VectorStoreActor
-    from akgentic.tool.vector_store.protocol import EmbeddingProvider
+    from akgentic.tool.vector_store.protocol import EmbeddingProvider, VectorStoreService
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +53,7 @@ leave the final result short.
 
 
 def semantic_scores(
-    proxy: VectorStoreActor | None,
+    store: VectorStoreService | None,
     embedder: EmbeddingProvider | None,
     collection: str,
     query_text: str,
@@ -64,13 +63,15 @@ def semantic_scores(
 
     Embeds the query through *embedder* — the caller's own, built from the same
     ``VectorStoreParam`` that embedded what it is searching — and searches
-    *collection* through *proxy*. Every failure mode — no proxy wired, no embedder
+    *collection* through *store*. Every failure mode — no store wired, no embedder
     wired, an embedding call that raises or returns nothing, a search that raises —
     yields an empty mapping and a warning rather than an exception, so a caller
     running a hybrid search degrades to keyword-only.
 
     Args:
-        proxy: Vector store actor proxy, or ``None`` when none is wired.
+        store: The storage engine — the store actor's proxy on an actor-state
+            backend, a backend instance on a cluster one — or ``None`` when none
+            is wired.
         embedder: The caller's embedding service, or ``None`` when none is wired.
         collection: Collection to search.
         query_text: Natural-language query to embed.
@@ -80,8 +81,8 @@ def semantic_scores(
         Mapping of reference ID to cosine similarity score. Empty when the
         semantic phase is unavailable.
     """
-    if proxy is None:
-        logger.warning("No vector store proxy — semantic search skipped")
+    if store is None:
+        logger.warning("No vector store wired — semantic search skipped")
         return {}
     if embedder is None:
         logger.warning("No embedder — semantic search skipped")
@@ -91,7 +92,7 @@ def semantic_scores(
         if not vectors:
             logger.warning("Embedding returned nothing for collection '%s'", collection)
             return {}
-        result = proxy.search(collection, vectors[0], top_k)
+        result = store.search(collection, vectors[0], top_k)
     except Exception:  # noqa: BLE001
         logger.warning("Semantic search failed for collection '%s'", collection, exc_info=True)
         return {}
@@ -180,7 +181,7 @@ class HybridResult(NamedTuple):
 
 def hybrid_search(
     keyword_keys: Iterable[str],
-    proxy: VectorStoreActor | None,
+    store: VectorStoreService | None,
     embedder: EmbeddingProvider | None,
     collection: str,
     query_text: str,
@@ -202,7 +203,7 @@ def hybrid_search(
 
     Args:
         keyword_keys: Keys hit by the caller's keyword phase, best-first.
-        proxy: Vector store actor proxy, or ``None`` for keyword-only.
+        store: The storage engine, or ``None`` for keyword-only.
         embedder: The caller's embedding service, or ``None`` for keyword-only.
         collection: Collection to search.
         query_text: Natural-language query.
@@ -213,7 +214,7 @@ def hybrid_search(
             Applied before normalisation, so it keeps its absolute meaning.
         alpha: Weight of the vector leg. See :data:`DEFAULT_ALPHA`.
         semantic: ``False`` skips the semantic leg outright, for a caller running a
-            keyword-only search. Distinct from passing ``proxy=None``, which means the
+            keyword-only search. Distinct from passing ``store=None``, which means the
             leg was wanted and no vector store was wired — and says so in the log.
 
     Returns:
@@ -225,7 +226,7 @@ def hybrid_search(
         {
             key: score
             for key, score in semantic_scores(
-                proxy, embedder, collection, query_text, top_k * OVERFETCH
+                store, embedder, collection, query_text, top_k * OVERFETCH
             ).items()
             if score >= score_threshold
         }

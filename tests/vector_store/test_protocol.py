@@ -306,10 +306,33 @@ class TestVectorStoreConfig:
 
     def test_default_values(self) -> None:
         cfg = VectorStoreConfig()
-        assert cfg.embedding_model == "text-embedding-3-small"
-        assert cfg.embedding_provider == "openai"
         assert cfg.weaviate_url is None
         assert cfg.weaviate_api_key is None
+
+    def test_the_two_embedding_fields_are_gone(self) -> None:
+        """They were inert once the consumers took over embedding, and their
+        only writer was the deleted card."""
+        assert "embedding_model" not in VectorStoreConfig.model_fields
+        assert "embedding_provider" not in VectorStoreConfig.model_fields
+
+    def test_a_checkpoint_carrying_the_removed_keys_still_loads(self) -> None:
+        """A removed FIELD is dropped by ``extra='ignore'``; every survivor is intact."""
+        cfg = VectorStoreConfig.model_validate(
+            {
+                "name": "#VectorStore",
+                "role": "ToolActor",
+                "embedding_model": "text-embedding-ada-002",
+                "embedding_provider": "azure",
+                "weaviate_url": "http://localhost:8080",
+                "weaviate_api_key": "secret-key-123",
+            }
+        )
+        assert not hasattr(cfg, "embedding_model")
+        assert not hasattr(cfg, "embedding_provider")
+        assert cfg.name == "#VectorStore"
+        assert cfg.role == "ToolActor"
+        assert cfg.weaviate_url == "http://localhost:8080"
+        assert cfg.weaviate_api_key == "secret-key-123"
 
     def test_round_trip_serialization_defaults(self) -> None:
         cfg = VectorStoreConfig()
@@ -319,20 +342,14 @@ class TestVectorStoreConfig:
 
     def test_all_optional_fields_populated(self) -> None:
         cfg = VectorStoreConfig(
-            embedding_model="text-embedding-ada-002",
-            embedding_provider="azure",
             weaviate_url="http://localhost:8080",
             weaviate_api_key="secret-key-123",
         )
-        assert cfg.embedding_model == "text-embedding-ada-002"
-        assert cfg.embedding_provider == "azure"
         assert cfg.weaviate_url == "http://localhost:8080"
         assert cfg.weaviate_api_key == "secret-key-123"
 
     def test_round_trip_serialization_all_fields(self) -> None:
         cfg = VectorStoreConfig(
-            embedding_model="text-embedding-ada-002",
-            embedding_provider="azure",
             weaviate_url="http://localhost:8080",
             weaviate_api_key="secret-key-123",
         )

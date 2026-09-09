@@ -1,71 +1,79 @@
-# VectorStoreTool
+# The vector store
 
-The configuration card for the team's shared embedding store. It exposes **no LLM tools at all** —
-its only job is to make sure the `VectorStoreActor` singleton exists before the cards that use it
-are wired.
+The package's storage engine and the two helpers that decide who needs one. **There is no
+configuration card any more**: each consumer — `PlanningTool`, `KnowledgeGraphTool`,
+`WorkspaceTool` — carries its own `VectorStoreParam` and resolves its own engine, so a store's
+settings live on the card that uses it rather than in a singleton someone had to remember to add.
 
 ```python
-from akgentic.tool.vector_store import VectorStoreTool
+from akgentic.tool.vector_store import ensure_store_actor, needs_store_actor
 ```
 
 | | |
 |---|---|
-| Module | `akgentic.tool.vector_store.tool` |
-| Actor | `VectorStoreActor`, singleton named `#VectorStore` by default |
-| Channels used | **none** — `get_tools()`, `get_system_prompts()`, `get_commands()` and `get_toolsets()` all return empty |
-| Consumers | `PlanningTool`, `KnowledgeGraphTool` |
+| Module | `akgentic.tool.vector_store` |
+| Actor | `VectorStoreActor`, singleton named `#VectorStore` — **created only for an actor-state backend** |
+| Consumers | `PlanningTool`, `KnowledgeGraphTool`, `WorkspaceTool` |
 | Optional extras | `[vector_search]` (numpy + openai), `[weaviate]`, `[qdrant]` |
 
 ---
 
-## The ToolCard
+## Who gets an actor
+
+`BackendSpec.persists_in_actor_state` answers one question: **does this backend need an actor at
+all.** In memory the actor's state *is* the database, so the actor is what holds the data and one
+must exist. On a cluster the data lives elsewhere and an actor would hold nothing but a socket, so
+the consumer calls the backend's client directly.
+
+Two helpers read that flag, and both halves of the wiring must agree:
 
 ```python
-class VectorStoreTool(ToolCard):
-    vector_store_name: str = "#VectorStore"
-    embedding_model: str = "text-embedding-3-small"
-    embedding_provider: Literal["openai", "azure"] = "openai"
+def needs_store_actor(param: VectorStoreParam) -> bool:
+    """Whether this backend keeps its data inside an actor."""
 
-    def observer(self, observer: ActorToolObserver) -> None:
-        super().observer(observer)
-        if observer.orchestrator is None:
-            raise ValueError("VectorStoreTool requires access to the orchestrator.")
-        orchestrator_proxy = observer.proxy_ask(observer.orchestrator, Orchestrator)
-        orchestrator_proxy.getChildrenOrCreate(
-            VectorStoreActor,
-            config=VectorStoreConfig(
-                name=self.vector_store_name,
-                role=VS_ACTOR_ROLE,
-                embedding_model=self.embedding_model,
-                embedding_provider=self.embedding_provider,
-                weaviate_url=os.environ.get("AKGENTIC_WEAVIATE_URL") or None,
-                weaviate_api_key=os.environ.get("AKGENTIC_WEAVIATE_API_KEY") or None,
-            ),
-        )
+
+def ensure_store_actor(param: VectorStoreParam, orchestrator_proxy: Orchestrator) -> None:
+    """Create the store actor for *param*, if that backend needs one."""
 ```
 
-**Why a card with no tools.** Two cards need the same actor and neither should own it. Putting
-creation in a third card and having the consumers declare `depends_on: ["VectorStoreTool"]` makes
-the ordering explicit and checkable: `ToolFactory` topologically sorts the cards, wires this one
-first, and raises `ValueError` at team-creation time if a consumer asks for a store nobody
-provides. Consumers then look the actor up by name during their own `on_start` — they never call
-`getChildrenOrCreate` themselves.
+A consumer card calls `ensure_store_actor` in its `observer()`, **before** it creates its own
+consumer actor, because that actor resolves the store during its `on_start`:
 
-`getChildrenOrCreate` is idempotent, so attaching several observers, or wiring several consumers,
-resolves to the same actor rather than racing to create duplicates.
+```python
+require_backend_configured(self.vector_store, "PlanningTool")
+require_dimension_matches(self.vector_store, "PlanningTool")
+ensure_store_actor(self.vector_store, orchestrator_proxy)      # nothing, on a cluster
+orchestrator_proxy.getChildrenOrCreate(PlanActor, config=PlanConfig(...))
+```
+
+The consumer actor then resolves an **engine**, not a proxy. The four methods it calls —
+`create_collection`, `add`, `remove`, `search` — are exactly `VectorStoreService`, which the store
+actor and every backend satisfy with identical signatures, so nothing below the branch can tell
+them apart:
+
+```python
+if needs_store_actor(param):
+    addr = orch_proxy.get_team_member(VS_ACTOR_NAME)
+    store = self.proxy_ask(addr, VectorStoreActor)
+else:
+    store = get_backend_spec(param.backend).factory(BackendContext(...))
+store.create_collection(PLAN_COLLECTION, param)
+```
+
+**The ordering the deleted card's `depends_on` edge enforced is now intra-card.** No `ToolCard` in
+this package overrides `depends_on`, and a consumer alone is a complete team.
+
+**An unknown backend name raises**, out of `get_backend_spec`. A card naming a backend nobody
+registered fails the build rather than silently taking one branch.
 
 ---
 
-## ToolCard fields
+## Where the settings live
 
-| Field | Type | Default | Meaning |
-|---|---|---|---|
-| `vector_store_name` | `str` | `"#VectorStore"` | Singleton actor name. Several named stores can coexist in one team — give each a distinct name and point each consumer at the one it wants with `vector_store="#VectorStore-RAG"`. The `#` prefix is the package's tool-actor convention and is load-bearing for teardown; keep it. |
-| `embedding_model` | `str` | `"text-embedding-3-small"` | Embedding model identifier. The consumer's `VectorStoreParam` declares both `embedding_model` and `dimension`, and a known model whose native width disagrees with the declared dimension is refused at bind (`text-embedding-3-small` ⇒ 1536). This store still embeds every collection with its own model; a consumer declaring a different one is warned once at `create_collection`. |
-| `embedding_provider` | `Literal["openai", "azure"]` | `"openai"` | Selects `openai.OpenAI()` or `openai.AzureOpenAI()`. The client is constructed lazily on the first `embed()` call, so a team that never searches never needs credentials. Both read their configuration from the standard `OPENAI_*` / `AZURE_OPENAI_*` environment variables. |
-
-That is the whole card. Three primitives, no nested param models, no capability toggles — there is
-nothing to expose on a channel.
+Every setting a store needs is on `VectorStoreParam`, carried by the consumer as its
+`vector_store` field: `backend`, `dimension`, `tenant`, `params`, `embedding_model` and
+`embedding_provider`. **The consumer's `embedding_model` is the one that embeds** — the store
+writes vectors and produces none.
 
 ### What is deliberately *not* here
 
@@ -121,18 +129,22 @@ An exported but *empty* variable counts as unset, so a deployment template that 
 name does not read as a cluster at `""`. Resolution happens per instantiation, not at import, so a
 process that exports the variable late still sees it.
 
-**One client per cluster per process.** Every consumer that resolves the same cluster is handed the
-same `weaviate.WeaviateClient`, from `get_client(url, api_key)` in `vector_store/client.py`. The
-cache is keyed on the parsed connection — host, port, scheme and API key, so `http://localhost:8080`
-and `http://LOCALHOST:8080/` are one cluster and two API keys are two — guarded by a lock so that two
-actor threads resolving one cluster at once open one connection, and emptied by `close_all()`, which
-is registered with `atexit` on the first successful connect. A `WeaviateBackend` takes that client;
-it never connects and never closes.
+**One client per cluster per process, for every cluster backend.** `vector_store/client.py` holds
+one cache, one lock and one `atexit` registration, shared by Weaviate and Qdrant alike. The key is
+`ClusterKey(backend, host, port, secure, api_key)` — the backend name leads, so two backends
+answering on one host:port are two clients and never one; `http://localhost:8080` and
+`http://LOCALHOST:8080/` are one cluster, and two API keys are two. Qdrant passes
+`default_port=6333` so `http://h` and `http://h:6333` collapse onto one key.
+
+**The cache names no vendor.** `get_client(key, connect)` takes the connect callable from the
+backend, which is the only place a client library is constructed, so adding a third cluster backend
+adds no branch there. Both `WeaviateBackend` and `QdrantBackend` take a connected client; neither
+connects and neither closes one. `close_all()` at process exit is the only closer.
 
 ### Naming a cluster that is not there is an error
 
 ```python
-PlanningTool(collection=VectorStoreParam(backend="weaviate"))   # with no URL exported
+PlanningTool(vector_store=VectorStoreParam(backend="weaviate"))  # with no URL exported
 # ValueError: PlanningTool configures backend='weaviate' but AKGENTIC_WEAVIATE_URL is not set.
 #   Export AKGENTIC_WEAVIATE_URL (and AKGENTIC_WEAVIATE_API_KEY for an authenticated cluster),
 #   or drop the backend setting to use the in-memory index.
@@ -331,7 +343,7 @@ store is an authoritative index of the graph rather than a lossy projection of i
 ## Collection configuration (on the consumer card)
 
 ```python
-PlanningTool(collection=VectorStoreParam(backend="weaviate", tenant="team-42"))
+PlanningTool(vector_store=VectorStoreParam(backend="weaviate", tenant="team-42"))
 ```
 
 | `VectorStoreParam` field | Type | Default | Meaning |
@@ -411,7 +423,7 @@ object it writes. Unlike those three, `team_id` is always stamped. The value is 
 card:
 
 ```python
-WeaviateBackend(client=get_client(url, api_key), team_id=str(actor.team_id))
+WeaviateBackend(client=_weaviate_client(url, api_key), team_id=str(actor.team_id))
 ```
 
 **Why it is there.** An in-memory collection dies with its actor; a Weaviate collection does not.
@@ -473,10 +485,10 @@ Both work on a backend that created nothing — which is the point, since the sw
 the team and its actors are gone:
 
 ```python
-from akgentic.tool.vector_store import close_all, get_client
-from akgentic.tool.vector_store.weaviate import WeaviateBackend
+from akgentic.tool.vector_store import close_all
+from akgentic.tool.vector_store.weaviate import WeaviateBackend, _weaviate_client
 
-backend = WeaviateBackend(client=get_client(WEAVIATE_URL, WEAVIATE_API_KEY))
+backend = WeaviateBackend(client=_weaviate_client(WEAVIATE_URL, WEAVIATE_API_KEY))
 try:
     for team_id in deleted_team_ids:
         for collection in backend.list_collections():
@@ -520,33 +532,32 @@ card construction with an actionable installation or configuration message.
 ### Recipes
 
 ```python
-VectorStoreTool()                                        # "#VectorStore", OpenAI embeddings
+# In memory: the consumer's own observer() creates the store actor.
+PlanningTool()
 
-VectorStoreTool(embedding_provider="azure")              # Azure OpenAI deployment
+# A cluster: no actor at all, and a URL is required at bind time.
+KnowledgeGraphTool(vector_store=VectorStoreParam(backend="weaviate"))
 
-VectorStoreTool(                                         # a second, independent store
-    vector_store_name="#VectorStore-RAG",
-    embedding_model="text-embedding-3-large",
-)
-
-# Point one consumer at the named store, leave the other on the default
+# Two consumers, two different stores, no card to add and no ordering to declare.
 ToolFactory([
-    VectorStoreTool(),
-    VectorStoreTool(vector_store_name="#VectorStore-RAG"),
-    PlanningTool(),                                       # -> "#VectorStore"
-    KnowledgeGraphTool(vector_store="#VectorStore-RAG"),   # -> the large-embedding store
+    PlanningTool(vector_store=VectorStoreParam(backend="inmemory")),
+    KnowledgeGraphTool(
+        vector_store=VectorStoreParam(
+            backend="weaviate", dimension=3072, embedding_model="text-embedding-3-large"
+        )
+    ),
 ], observer=agent)
 ```
 
-**The consumer's `embedding_model` is the one that embeds.** `VectorStoreTool`'s own
-`embedding_model` / `embedding_provider` are inert — the store writes vectors and produces none —
-and are kept only until the card drops them. Declare the model on the consumer's collection, beside
-the `dimension` it pins; `dimension=3072` with the default model is refused at bind:
+**Naming a second store is gone with the card that made it possible.** A named
+`#VectorStore-RAG` singleton was how two consumers reached two different stores; they now do it by
+carrying two different `VectorStoreParam`s, which is the same capability with one fewer indirection.
+
+`dimension=3072` with the default model is refused at bind:
 
 ```python
 KnowledgeGraphTool(
-    vector_store="#VectorStore-RAG",
-    collection=VectorStoreParam(dimension=3072, embedding_model="text-embedding-3-large"),
+    vector_store=VectorStoreParam(dimension=3072, embedding_model="text-embedding-3-large"),
 )
 ```
 
@@ -554,7 +565,8 @@ KnowledgeGraphTool(
 
 ```python
 from akgentic.tool.vector_store import (
-    VectorStoreTool, VectorStoreActor, VectorStoreConfig, VS_ACTOR_NAME,
+    VectorStoreActor, VectorStoreConfig, VS_ACTOR_NAME,
+    ensure_store_actor, needs_store_actor,
     VectorStoreParam, CollectionStatus, SearchHit, SearchResult, VectorQuery,
     VectorEntry, VectorIndex, EmbeddingService,
     EmbeddingWorker, build_embedding_service, embedding_worker_name,

@@ -14,10 +14,21 @@ from akgentic.core.agent_state import BaseState
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
+from akgentic.tool.vector_store.actor import (
+    VS_ACTOR_NAME,
+    VS_ACTOR_ROLE,
+    VectorStoreActor,
+)
 from akgentic.tool.vector_store.embedding_actor import build_embedding_service
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA, hybrid_search
-from akgentic.tool.vector_store.protocol import EmbeddingProvider, VectorStoreParam
+from akgentic.tool.vector_store.protocol import (
+    EmbeddingProvider,
+    VectorStoreConfig,
+    VectorStoreParam,
+    VectorStoreService,
+    needs_store_actor,
+)
+from akgentic.tool.vector_store.registry import BackendContext, get_backend_spec
 from akgentic.tool.vector_store.vector import VectorEntry
 
 logger = logging.getLogger(__name__)
@@ -123,20 +134,20 @@ PLAN_COLLECTION: str = "planning"
 
 
 class PlanConfig(BaseConfig):
-    """Configuration for PlanActor with optional vector-backed semantic search."""
+    """Configuration for PlanActor with vector-backed semantic search.
 
-    vector_store: bool | str = Field(
-        default=True,
-        description=(
-            "Binding to a VectorStoreActor: True=default #VectorStore, "
-            "str=named instance, False=degraded mode (no vector search)."
-        ),
-    )
-    collection: VectorStoreParam = Field(
+    The binding-to-an-actor field is gone: ``vector_store`` now carries the
+    storage configuration itself, and the backend it names is what decides
+    whether an actor is involved at all.
+    """
+
+    vector_store: VectorStoreParam = Field(
         default_factory=VectorStoreParam,
         description=(
-            "Vector collection configuration forwarded to "
-            "VectorStoreActor.create_collection."
+            "Vector store configuration for the planning collection: backend, "
+            "dimension, tenant, embedding model and provider. The backend decides "
+            "how the actor resolves its storage engine — an actor-state backend "
+            "through the store actor, a cluster one through the backend's own client."
         ),
     )
     search_top_k: int = Field(
@@ -183,71 +194,103 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
                 name=self.config.name,
                 role=self.config.role,
             )
-        self._vs_proxy: VectorStoreActor | None = None
+        self._vs_proxy: VectorStoreService | None = None
         self._embedder: EmbeddingProvider | None = None
-        if self.config.vector_store is not False:
-            self._acquire_vs_proxy()
+        self._acquire_vs_proxy()
 
     def _acquire_vs_proxy(self) -> None:
-        """Look up the VectorStoreActor proxy and create the planning collection.
+        """Resolve this actor's storage engine and create the planning collection.
 
-        The VectorStoreActor is owned by ``VectorStoreTool``; this actor
-        only resolves it by name. Behaviour:
+        **The slot holds a ``VectorStoreService``, not necessarily a proxy.** The
+        four methods this actor calls — ``create_collection``, ``add``,
+        ``remove``, ``search`` — are exactly that protocol, and the store actor
+        and every backend satisfy it with identical signatures, so which one is
+        behind the slot changes nothing below this method. (The attribute keeps
+        the name ``_vs_proxy``: renaming it to ``_store`` is ~200 mechanical
+        private sites and is routed to its own follow-up.)
 
-        - ``config.vector_store is False`` → stay in degraded mode (no
-          lookup, ``_vs_proxy`` remains ``None``).
-        - ``self.orchestrator is None`` (test harness) → log WARNING and
-          return — existing behaviour preserved.
-        - Otherwise look up the target actor name (``config.vector_store``
-          when a ``str``, else ``VS_ACTOR_NAME``) via
-          ``orch_proxy.get_team_member``. Raise ``RuntimeError`` when it
-          is missing — a missing VectorStoreTool is a **configuration**
-          error, not a runtime degradation.
-        - A transient backend error during ``create_collection`` drops
-          back to degraded mode with a WARNING (matches existing
-          behaviour for embedding failures).
+        Which one it is comes from the param's backend:
+
+        - **An actor-state backend** — the in-memory index, whose data *is* the
+          actor's state — is reached through the store actor, looked up by name.
+          A missing one is still a ``RuntimeError``: for a planning tool whose
+          whole purpose is the vector store, that is a configuration error.
+        - **A cluster backend** builds its own engine through the registered
+          factory. There is no lookup to fail, so nothing here can raise
+          ``RuntimeError``; what can fail is the connect, and that degrades
+          exactly as a failed ``create_collection`` does — one WARNING and
+          ``_vs_proxy`` left ``None``.
+
+        ``self.orchestrator is None`` (a test harness) still logs a WARNING and
+        returns, and only the actor path needs one at all.
 
         The embedder is built here too, from **this actor's own**
-        ``config.collection``: the vector store embeds nothing, so the model this
+        ``config.vector_store``: the store embeds nothing, so the model this
         actor's ``VectorStoreParam`` names is the model that embeds its tasks.
         """
-        if self.config.vector_store is False:
-            return  # degraded mode by design
-
-        if self.orchestrator is None:
-            logger.warning(
-                "[%s] No orchestrator; operating in degraded mode",
-                self.config.name,
-            )
+        param = self.config.vector_store
+        store = self._resolve_store(param)
+        if store is None:
             return
-
-        vs_name = (
-            self.config.vector_store
-            if isinstance(self.config.vector_store, str)
-            else VS_ACTOR_NAME
-        )
-        orch_proxy = self.proxy_ask(self.orchestrator, Orchestrator)
-        vs_addr = orch_proxy.get_team_member(vs_name)
-        if vs_addr is None:
-            raise RuntimeError(
-                f"{self.config.name} requires VectorStoreActor '{vs_name}' "
-                f"but it was not found. Ensure VectorStoreTool is in the team config."
-            )
-        self._vs_proxy = self.proxy_ask(vs_addr, VectorStoreActor)
         try:
-            self._vs_proxy.create_collection(PLAN_COLLECTION, self.config.collection)
+            store.create_collection(PLAN_COLLECTION, param)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "[%s] create_collection on VectorStoreActor failed: %s — degraded mode",
+                "[%s] create_collection on the vector store failed: %s — degraded mode",
                 self.config.name,
                 exc,
             )
-            self._vs_proxy = None
             return
+        self._vs_proxy = store
         self._embedder = build_embedding_service(
-            self.config.collection.embedding_model,
-            self.config.collection.embedding_provider,
+            param.embedding_model,
+            param.embedding_provider,
         )
+
+    def _resolve_store(self, param: VectorStoreParam) -> VectorStoreService | None:
+        """Return the storage engine *param* names, or ``None`` to stay degraded.
+
+        Args:
+            param: This actor's vector store configuration.
+
+        Returns:
+            The store actor's proxy, a freshly built backend, or ``None`` when
+            retrieval must stay off.
+
+        Raises:
+            RuntimeError: When the backend needs a store actor and none is
+                registered with the team.
+        """
+        if needs_store_actor(param):
+            if self.orchestrator is None:
+                logger.warning(
+                    "[%s] No orchestrator; operating in degraded mode",
+                    self.config.name,
+                )
+                return None
+            orch_proxy = self.proxy_ask(self.orchestrator, Orchestrator)
+            vs_addr = orch_proxy.get_team_member(VS_ACTOR_NAME)
+            if vs_addr is None:
+                raise RuntimeError(
+                    f"{self.config.name} requires the vector store actor "
+                    f"'{VS_ACTOR_NAME}' but it was not found."
+                )
+            return self.proxy_ask(vs_addr, VectorStoreActor)
+        try:
+            return get_backend_spec(param.backend).factory(
+                BackendContext(
+                    config=VectorStoreConfig(name=self.config.name, role=VS_ACTOR_ROLE),
+                    team_id=str(self.team_id),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[%s] could not build the '%s' vector store backend: %s — degraded mode",
+                self.config.name,
+                param.backend,
+                exc,
+            )
+            return None
 
     def _embed_task(self, task: Task) -> None:
         """Embed a task's description and store the resulting VectorEntry.

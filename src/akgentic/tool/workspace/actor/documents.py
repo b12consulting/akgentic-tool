@@ -77,12 +77,12 @@ from akgentic.tool.workspace.workspace import Filesystem
 
 if TYPE_CHECKING:
     from akgentic.core.agent import Akgent
-    from akgentic.tool.vector_store.actor import VectorStoreActor
     from akgentic.tool.vector_store.embedding_actor import EmbeddingError, EmbeddingResult
     from akgentic.tool.vector_store.protocol import (
         EmbeddingProvider,
         SearchHit,
         VectorStoreParam,
+        VectorStoreService,
     )
     from akgentic.tool.vector_store.vector import VectorEntry
     from akgentic.tool.workspace.card.params import WorkspaceRagIndex
@@ -174,7 +174,7 @@ class DocumentsMixin(_DocumentsBase):
     _rag_params: WorkspaceRagIndex | None
     _rag_reader: DocumentReader | None
     _rag_collection: VectorStoreParam | None
-    _vs_proxy: VectorStoreActor | None
+    _vs_proxy: VectorStoreService | None
     _embedder: EmbeddingProvider | None
     _index_active: set[str]
 
@@ -337,56 +337,54 @@ class DocumentsMixin(_DocumentsBase):
             )
 
     def _acquire_vs_proxy(self) -> None:
-        """Resolve ``#VectorStore``, bind one ask proxy and the embedder, create the collection.
+        """Resolve the storage engine, bind it and the embedder, create the collection.
 
-        **One proxy, and every call through it is an ask.** ``create_collection``
-        has to be known to have worked before anything is added; ``remove``
-        re-raises a missing collection as a ``RetriableError`` this actor must see
-        to keep the superseded ids for a later retry; and ``add`` is now one ask
-        per batch **on its own mailbox turn**, when that batch's worker reports —
-        not thirty in a row on one turn, which is what made it a tell before the
-        embedding pipeline moved to this actor.
+        **The slot holds a ``VectorStoreService``, not necessarily a proxy.** An
+        actor-state backend — the in-memory index, whose data *is* the store
+        actor's state — is reached through that actor, looked up by name; a
+        cluster backend is built here through the registered factory, because
+        there is no actor to hold anything. The four methods this actor calls are
+        exactly that protocol, so nothing below this line can tell the two apart.
+        (The attribute keeps the name ``_vs_proxy``: renaming it to ``_store`` is
+        ~200 mechanical private sites, routed to its own follow-up.)
+
+        **Every call through it is an ask.** ``create_collection`` has to be known
+        to have worked before anything is added; ``remove`` re-raises a missing
+        collection as a ``RetriableError`` this actor must see to keep the
+        superseded ids for a later retry; and ``add`` is one ask per batch **on
+        its own mailbox turn**, when that batch's worker reports — not thirty in a
+        row on one turn, which is what made it a tell before the embedding
+        pipeline moved to this actor.
 
         The embedder is built here too, from the card's own ``VectorStoreParam``:
         it is what the query leg embeds through, and every worker this actor spawns
         is handed the same param's model and provider.
 
-        Any failure drops to degraded mode — ``_vs_proxy`` stays ``None`` and
-        ``workspace_rag_index`` answers a sentence. **The up-front gate is no
-        longer what protects a file from parking at ``EMBEDDING``**: the write
-        happens on this actor's own turn inside a ``try``, so an ask that raises
-        settles the file ``FAILED`` with the reason there and then. A stale handle
-        can no longer accept work whose writes go nowhere; it accepts work whose
-        write fails visibly.
+        **Any failure drops to degraded mode — never raises.** A missing store
+        actor, a factory that cannot reach its cluster, a ``create_collection``
+        that fails: each logs one WARNING and leaves ``_vs_proxy`` ``None``, so
+        ``workspace_rag_index`` answers a sentence. This actor also owns the write
+        gate, so a missing store must never be fatal here the way it is for
+        planning. **The up-front gate is no longer what protects a file from
+        parking at ``EMBEDDING``**: the write happens on this actor's own turn
+        inside a ``try``, so an ask that raises settles the file ``FAILED`` with
+        the reason there and then.
         """
-        from akgentic.core.orchestrator import Orchestrator  # noqa: PLC0415 — cycle
-        from akgentic.tool.vector_store.actor import (  # noqa: PLC0415 — optional extra
-            VS_ACTOR_NAME,
-            VectorStoreActor,
-        )
         from akgentic.tool.vector_store.embedding_actor import (  # noqa: PLC0415 — optional extra
             build_embedding_service,
         )
 
-        if self.orchestrator is None or self._rag_collection is None:
+        if self._rag_collection is None:
             logger.warning(
-                "Workspace %s: no orchestrator — retrieval stays in degraded mode",
+                "Workspace %s: no collection configured — retrieval stays in degraded mode",
                 self.config.workspace_path,
             )
             return
-        orch_proxy = self.proxy_ask(self.orchestrator, Orchestrator)
-        vs_addr = orch_proxy.get_team_member(VS_ACTOR_NAME)
-        if vs_addr is None:
-            logger.warning(
-                "Workspace %s: %s was not found — retrieval stays in degraded mode. "
-                "Add VectorStoreTool to the team configuration.",
-                self.config.workspace_path,
-                VS_ACTOR_NAME,
-            )
+        store = self._resolve_store(self._rag_collection)
+        if store is None:
             return
-        proxy = self.proxy_ask(vs_addr, VectorStoreActor)
         try:
-            proxy.create_collection(RAG_COLLECTION, self._rag_collection)
+            store.create_collection(RAG_COLLECTION, self._rag_collection)
         except Exception as exc:
             logger.warning(
                 "Workspace %s: create_collection(%s) failed: %s — degraded mode",
@@ -398,7 +396,70 @@ class DocumentsMixin(_DocumentsBase):
         self._embedder = build_embedding_service(
             self._rag_collection.embedding_model, self._rag_collection.embedding_provider
         )
-        self._vs_proxy = proxy
+        self._vs_proxy = store
+
+    def _resolve_store(self, param: VectorStoreParam) -> VectorStoreService | None:
+        """Return the storage engine *param* names, or ``None`` to stay degraded.
+
+        Unlike the planning and knowledge-graph actors, a missing store actor is
+        a WARNING here rather than a ``RuntimeError`` — this actor owns the write
+        gate for a whole workspace, and retrieval is one capability on a card
+        whose other twenty are file operations.
+
+        Args:
+            param: The collection configuration the card announced.
+
+        Returns:
+            The store actor's proxy, a freshly built backend, or ``None``.
+        """
+        from akgentic.core.orchestrator import Orchestrator  # noqa: PLC0415 — cycle
+        from akgentic.tool.vector_store.actor import (  # noqa: PLC0415 — optional extra
+            VS_ACTOR_NAME,
+            VS_ACTOR_ROLE,
+            VectorStoreActor,
+        )
+        from akgentic.tool.vector_store.protocol import (  # noqa: PLC0415 — optional extra
+            VectorStoreConfig,
+            needs_store_actor,
+        )
+        from akgentic.tool.vector_store.registry import (  # noqa: PLC0415 — optional extra
+            BackendContext,
+            get_backend_spec,
+        )
+
+        if needs_store_actor(param):
+            if self.orchestrator is None:
+                logger.warning(
+                    "Workspace %s: no orchestrator — retrieval stays in degraded mode",
+                    self.config.workspace_path,
+                )
+                return None
+            orch_proxy = self.proxy_ask(self.orchestrator, Orchestrator)
+            vs_addr = orch_proxy.get_team_member(VS_ACTOR_NAME)
+            if vs_addr is None:
+                logger.warning(
+                    "Workspace %s: %s was not found — retrieval stays in degraded mode.",
+                    self.config.workspace_path,
+                    VS_ACTOR_NAME,
+                )
+                return None
+            return self.proxy_ask(vs_addr, VectorStoreActor)
+        try:
+            return get_backend_spec(param.backend).factory(
+                BackendContext(
+                    config=VectorStoreConfig(name=self.config.name, role=VS_ACTOR_ROLE),
+                    team_id=str(self.team_id),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Workspace %s: could not build the '%s' vector store backend: %s "
+                "— degraded mode",
+                self.config.workspace_path,
+                param.backend,
+                exc,
+            )
+            return None
 
     ##
     ## workspace_rag_index — the spawn side
@@ -898,7 +959,7 @@ class DocumentsMixin(_DocumentsBase):
         is what makes this ordering safe, and what makes the other ordering leave a
         file absent from search for minutes while the list still calls it stale.
 
-        The call is wrapped, because ``VectorStoreActor.remove`` re-raises a
+        The call is wrapped, because the store's ``remove`` re-raises a
         missing collection as a ``RetriableError``. A failure leaves
         ``superseded_chunk_ids`` populated so a later re-index retries it, and
         never fails the file: the worst case is a few orphaned vectors, and the

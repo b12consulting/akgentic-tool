@@ -100,8 +100,11 @@ if TYPE_CHECKING:
     # the vector store lives behind an optional extra and ``card.params`` closes
     # an import cycle through this very module — neither is needed to annotate a
     # ``None`` at start.
-    from akgentic.tool.vector_store.actor import VectorStoreActor
-    from akgentic.tool.vector_store.protocol import EmbeddingProvider, VectorStoreParam
+    from akgentic.tool.vector_store.protocol import (
+        EmbeddingProvider,
+        VectorStoreParam,
+        VectorStoreService,
+    )
     from akgentic.tool.workspace.card.params import WorkspaceRagIndex
     from akgentic.tool.workspace.readers import DocumentReader
 
@@ -230,7 +233,7 @@ class WorkspaceActor(
         self._rag_params: WorkspaceRagIndex | None = None
         self._rag_reader: DocumentReader | None = None
         self._rag_collection: VectorStoreParam | None = None
-        self._vs_proxy: VectorStoreActor | None = None
+        self._vs_proxy: VectorStoreService | None = None
         self._embedder: EmbeddingProvider | None = None
         self._index_active: set[str] = set()
         self._workspace: Filesystem = get_workspace(self.config.workspace_path)

@@ -42,6 +42,7 @@ from akgentic.tool.knowledge_graph.models import (
     SearchResult,
 )
 from akgentic.tool.knowledge_graph.state import KnowledgeGraphSummaryState, RootRow
+from akgentic.tool.vector_store.actor import ensure_store_actor
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA
 from akgentic.tool.vector_store.protocol import (
     VectorStoreParam,
@@ -129,27 +130,23 @@ class KnowledgeGraphTool(ToolCard):
     """Knowledge graph tool exposing graph operations through configurable channels.
 
     Follows the same actor-based pattern as ``PlanningTool``: a singleton
-    ``KnowledgeGraphActor`` is created/retrieved via the orchestrator,
-    and tool factories delegate to the actor proxy. The ``VectorStoreActor``
-    singleton is owned by ``VectorStoreTool`` (declared via ``depends_on``);
-    this tool only looks it up at actor-start time.
+    ``KnowledgeGraphActor`` is created/retrieved via the orchestrator, and tool
+    factories delegate to the actor proxy.
+
+    **This card configures its own storage**, exactly as ``PlanningTool`` does.
+    ``vector_store`` says where the graph's vectors live; an in-memory backend
+    gets a store actor created here, before the ``KnowledgeGraphActor`` that
+    looks it up, and a cluster backend gets none.
     """
 
-    vector_store: bool | str = Field(
-        default=True,
-        description=(
-            "False disables vector store wiring; True uses the default VectorStoreActor; "
-            "str names a specific VectorStoreActor to look up."
-        ),
-    )
-
-    collection: VectorStoreParam = Field(
+    vector_store: VectorStoreParam = Field(
         default_factory=VectorStoreParam,
         description=(
             "Vector store configuration (backend, dimension, tenant, embedding model and "
-            "provider). Propagated to KnowledgeGraphConfig and used by "
-            "KnowledgeGraphActor._acquire_vs_proxy when calling create_collection on the "
-            "VectorStoreActor."
+            "provider) for the knowledge graph collection. Propagated to "
+            "KnowledgeGraphConfig, which is what KnowledgeGraphActor resolves its storage "
+            "engine from. The name that used to mean 'which VectorStoreActor to look up' "
+            "now means 'which store, configured how'."
         ),
     )
 
@@ -179,18 +176,6 @@ class KnowledgeGraphTool(ToolCard):
         ),
     )
 
-    @property
-    def depends_on(self) -> list[str]:
-        """Runtime dependency on VectorStoreTool, conditional on vector_store.
-
-        When ``vector_store`` is ``False`` this tool is in degraded mode and
-        does not need VectorStoreActor — the factory must not require a
-        ``VectorStoreTool`` in the team config. Any other value (``True`` or a
-        name ``str``) requires VectorStoreTool to be wired first so the
-        KG actor can look up the VectorStoreActor during ``on_start``.
-        """
-        return ["VectorStoreTool"] if self.vector_store is not False else []
-
     get_graph: GetGraph | bool = Field(
         default=True,
         description=(
@@ -213,19 +198,24 @@ class KnowledgeGraphTool(ToolCard):
     # ------------------------------------------------------------------
 
     def observer(self, observer: ActorToolObserver) -> None:  # type: ignore[override]
-        """Attach observer and set up the KG actor proxy.
+        """Attach observer, ensure the store exists, and set up the KG actor proxy.
 
-        Assumes ``VectorStoreTool.observer()`` has already created the
-        ``VectorStoreActor`` singleton (ordering enforced by
-        ``ToolFactory`` topological sort via ``depends_on``). The
-        ``KnowledgeGraphActor`` looks that actor up by name during its own
-        ``on_start``.
+        **The ordering that ``depends_on`` used to enforce between two cards is
+        now two lines in one method.** ``ensure_store_actor`` runs before
+        ``getChildrenOrCreate(KnowledgeGraphActor, …)``, because that actor
+        resolves its store during its own ``on_start``; and it creates nothing
+        when the param names a cluster backend.
+
+        Raises:
+            ValueError: If observer.orchestrator is None, if the named backend is
+                unknown or unprovisioned, or if the declared dimension
+                contradicts the embedding model.
         """
         from akgentic.tool.knowledge_graph import _check_kg_dependencies
 
         _check_kg_dependencies()
-        require_backend_configured(self.collection, "KnowledgeGraphTool")
-        require_dimension_matches(self.collection, "KnowledgeGraphTool")
+        require_backend_configured(self.vector_store, "KnowledgeGraphTool")
+        require_dimension_matches(self.vector_store, "KnowledgeGraphTool")
         super().observer(observer)  # store the observer weakly via the base setter
 
         if observer.orchestrator is None:
@@ -233,15 +223,13 @@ class KnowledgeGraphTool(ToolCard):
 
         orchestrator_proxy = observer.proxy_ask(observer.orchestrator, Orchestrator)
 
-        # Create/retrieve KnowledgeGraphActor singleton. VectorStoreActor creation
-        # is owned by VectorStoreTool (depends_on enforces ordering).
+        ensure_store_actor(self.vector_store, orchestrator_proxy)
         kg_addr = orchestrator_proxy.getChildrenOrCreate(
             KnowledgeGraphActor,
             config=KnowledgeGraphConfig(
                 name=KG_ACTOR_NAME,
                 role=KG_ACTOR_ROLE,
                 vector_store=self.vector_store,
-                collection=self.collection,
                 search_top_k=self.search_top_k,
                 search_score_threshold=self.search_score_threshold,
                 hybrid_alpha=self.hybrid_alpha,

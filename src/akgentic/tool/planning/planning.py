@@ -28,6 +28,7 @@ from akgentic.tool.planning.planning_actor import (
     UpdatePlan,
 )
 from akgentic.tool.planning.state import PlanningState, TaskRow
+from akgentic.tool.vector_store.actor import ensure_store_actor
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA
 from akgentic.tool.vector_store.protocol import (
     VectorStoreParam,
@@ -128,25 +129,21 @@ def _build_planning_state(
 class PlanningTool(ToolCard):
     """Team planning management via actor-based plan store.
 
-    The ``VectorStoreActor`` singleton is owned by ``VectorStoreTool`` and
-    declared as a dependency here; this tool only looks it up at actor-start
-    time.
+    **This card configures its own storage.** ``vector_store`` is the one object
+    that says where the plan's vectors live, and there is no second card to add
+    to the team and no dependency edge to order against: an in-memory backend
+    gets a store actor created here, before the ``PlanActor`` that will look it
+    up; a cluster backend gets none, because there is nothing for an actor to
+    hold and the ``PlanActor`` talks to the shared client directly.
     """
 
-    vector_store: bool | str = Field(
-        default=True,
-        description=(
-            "False disables vector store wiring; True uses the default VectorStoreActor; "
-            "str names a specific VectorStoreActor to look up."
-        ),
-    )
-
-    collection: VectorStoreParam = Field(
+    vector_store: VectorStoreParam = Field(
         default_factory=VectorStoreParam,
         description=(
             "Vector store configuration (backend, dimension, tenant, embedding model and "
-            "provider). Propagated to PlanConfig and used by PlanActor._acquire_vs_proxy "
-            "when calling create_collection on the VectorStoreActor."
+            "provider) for the planning collection. Propagated to PlanConfig, which is "
+            "what PlanActor resolves its storage engine from. The name that used to mean "
+            "'which VectorStoreActor to look up' now means 'which store, configured how'."
         ),
     )
 
@@ -169,18 +166,6 @@ class PlanningTool(ToolCard):
         ),
     )
 
-    @property
-    def depends_on(self) -> list[str]:
-        """Runtime dependency on VectorStoreTool, conditional on vector_store.
-
-        When ``vector_store`` is ``False`` this tool is in degraded mode and
-        does not need VectorStoreActor — the factory must not require a
-        ``VectorStoreTool`` in the team config. Any other value (``True`` or a
-        name ``str``) requires VectorStoreTool to be wired first so the
-        PlanActor can look up the VectorStoreActor during ``on_start``.
-        """
-        return ["VectorStoreTool"] if self.vector_store is not False else []
-
     get_planning: GetPlanning | bool = Field(
         default=True,
         description="By default the plan is exposed as structured context state and as a command",
@@ -190,22 +175,26 @@ class PlanningTool(ToolCard):
     search_planning: SearchPlanning | bool = True
 
     def observer(self, observer: ToolObserver) -> PlanningTool:
-        """Attach observer and set up the planning actor proxy.
+        """Attach observer, ensure the store exists, and set up the plan actor proxy.
 
-        Assumes ``VectorStoreTool.observer()`` has already created the
-        ``VectorStoreActor`` singleton (ordering enforced by
-        ``ToolFactory`` topological sort via ``depends_on``). The
-        ``PlanActor`` looks that actor up by name during its own ``on_start``.
+        **The ordering that ``depends_on`` used to enforce between two cards is
+        now two lines in one method.** ``ensure_store_actor`` runs before
+        ``getChildrenOrCreate(PlanActor, …)``, because the ``PlanActor`` resolves
+        its store during its own ``on_start``; and it creates nothing at all when
+        the param names a cluster backend, which is the whole of what the second
+        card and the dependency edge existed for.
 
         Requires an ActorToolObserver for actor system access; the parameter keeps
         the base ``ToolObserver`` type so the override stays substitutable, and
         :meth:`_actor_observer` applies the narrower type.
 
         Raises:
-            ValueError: If observer.orchestrator is None.
+            ValueError: If observer.orchestrator is None, if the named backend is
+                unknown or unprovisioned, or if the declared dimension
+                contradicts the embedding model.
         """
-        require_backend_configured(self.collection, "PlanningTool")
-        require_dimension_matches(self.collection, "PlanningTool")
+        require_backend_configured(self.vector_store, "PlanningTool")
+        require_dimension_matches(self.vector_store, "PlanningTool")
         super().observer(observer)  # store the observer weakly via the base setter
         actor_observer = self._actor_observer()
         if actor_observer.orchestrator is None:
@@ -213,15 +202,13 @@ class PlanningTool(ToolCard):
 
         orchestrator_proxy = actor_observer.proxy_ask(actor_observer.orchestrator, Orchestrator)
 
-        # Create/retrieve PlanActor singleton. VectorStoreActor creation is owned
-        # by VectorStoreTool (depends_on enforces ordering).
+        ensure_store_actor(self.vector_store, orchestrator_proxy)
         planning_tool_addr = orchestrator_proxy.getChildrenOrCreate(
             PlanActor,
             config=PlanConfig(
                 name=PLANNING_ACTOR_NAME,
                 role=PLANNING_ACTOR_ROLE,
                 vector_store=self.vector_store,
-                collection=self.collection,
                 search_top_k=self.search_top_k,
                 search_score_threshold=self.search_score_threshold,
                 hybrid_alpha=self.hybrid_alpha,

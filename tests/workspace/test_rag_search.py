@@ -704,16 +704,28 @@ class TestThePathPrefixDecision:
         backend: str,
     ) -> None:
         """The refusal is at the caller, so the two backends cannot disagree."""
+        from dataclasses import replace
+
+        from akgentic.tool.vector_store import registry
+
         harness = SearchHarness(build_actor(), store)
         harness.install(monkeypatch)
-        harness.actor.enable_rag(
-            "alice",
-            WorkspaceRagIndex(),
-            DocumentReader(llm_client=None),
-            VectorStoreParam(backend=backend),
-        )
+        original = registry.get_backend_spec(backend)
+        # A cluster param resolves through the factory rather than the store
+        # actor, so the same double is installed there. ``BackendSpec`` is frozen,
+        # so the seam is a re-registration.
+        registry.register_backend(replace(original, factory=lambda _ctx: store), replace=True)
+        try:
+            harness.actor.enable_rag(
+                "alice",
+                WorkspaceRagIndex(),
+                DocumentReader(llm_client=None),
+                VectorStoreParam(backend=backend),
+            )
 
-        answers = {harness.actor.rag_search("payment", path_prefix="report?.md")}
+            answers = {harness.actor.rag_search("payment", path_prefix="report?.md")}
+        finally:
+            registry.register_backend(original, replace=True)
 
         assert len(answers) == 1
         assert "cannot contain" in answers.pop()

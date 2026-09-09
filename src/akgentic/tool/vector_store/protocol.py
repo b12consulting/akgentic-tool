@@ -256,6 +256,40 @@ def require_backend_configured(config: VectorStoreParam, card_name: str) -> None
     spec.require_configured(card_name)
 
 
+def needs_store_actor(param: VectorStoreParam) -> bool:
+    """Return whether this param's backend keeps its data inside an actor.
+
+    ``persists_in_actor_state`` answers a larger question than its name once
+    suggested: not "should a mutation be snapshotted into actor state" but
+    **does this backend need an actor at all** (ADR-049 Decision 1). In memory
+    the actor's state *is* the database, so a store actor is what holds the
+    data and one must exist. On a cluster the data lives elsewhere and an actor
+    would hold nothing but a socket — there is nothing to name, look up, host,
+    checkpoint or reap — so the consumer calls the backend's client directly.
+
+    Both halves of the wiring ask this and must get the same answer: a consumer
+    card at ``observer()`` time, deciding whether to create the store actor
+    (:func:`~akgentic.tool.vector_store.actor.ensure_store_actor`), and that
+    consumer's actor at ``on_start`` time, deciding whether to resolve a proxy
+    or build a backend.
+
+    Nothing in the registry changes shape for this: a third-party backend gets
+    the actor-or-no-actor behaviour for free from the flag it already declares.
+
+    Args:
+        param: The vector store configuration carried by a consumer.
+
+    Returns:
+        ``True`` when the named backend stores its data in actor state.
+
+    Raises:
+        ValueError: When ``param.backend`` names no registered backend. A card
+            naming a backend nobody registered must fail the build rather than
+            silently taking one of the two branches.
+    """
+    return registry.get_backend_spec(param.backend).persists_in_actor_state
+
+
 # ---------------------------------------------------------------------------
 # path_prefix validation — one constant, one sentence, both backends
 # ---------------------------------------------------------------------------
@@ -530,25 +564,24 @@ class ActorStateBackend(Protocol):
 class VectorStoreConfig(BaseConfig):
     """Configuration for the vector store actor.
 
-    Specifies the embedding model, provider, and optional Weaviate connection
-    details.
+    The two embedding fields are gone. They had been inert since the embedding
+    pipeline moved to the consumers, and their only writer was the deleted
+    ``VectorStoreTool``. A persisted config that still carries them loads
+    unchanged: Pydantic's default ``extra="ignore"`` drops an undeclared key, so
+    a removed *field* costs nothing (unlike a removed *class*, which the
+    ``SerializableBaseModel`` before-validator cannot resolve — see
+    :class:`~akgentic.tool.vector_store.actor.PendingRequest`).
+
+    The two Weaviate connection fields stay, and now have **no writer in
+    ``src/``**: the card that set them is gone, and
+    :func:`~akgentic.tool.vector_store.actor.ensure_store_actor` builds an
+    in-memory store by construction, which needs neither.
+    ``_make_weaviate_backend`` falls back to the environment, so the backstop
+    path — a caller who reaches the actor with a cluster collection by hand —
+    still resolves. Deleting them is a separate decision, recorded as a
+    deferred finding rather than taken here.
     """
 
-    embedding_model: str = Field(
-        default="text-embedding-3-small",
-        description=(
-            "Inert. The actor embeds nothing; the consumer's VectorStoreParam names "
-            "the model that embeds. Still forwarded by VectorStoreTool and stored by "
-            "the catalog, and removed with the card."
-        ),
-    )
-    embedding_provider: Literal["openai", "azure"] = Field(
-        default="openai",
-        description=(
-            "Inert. The consumer's VectorStoreParam names the provider that embeds. "
-            "Removed with the card."
-        ),
-    )
     weaviate_url: str | None = Field(
         default=None, description="Weaviate cluster URL"
     )

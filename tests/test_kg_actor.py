@@ -1379,37 +1379,30 @@ class TestToolStateEventEmission:
 # ---------------------------------------------------------------------------
 
 
-class TestKnowledgeGraphConfigVectorStoreField:
-    """AC-3: KnowledgeGraphConfig carries a fully-serialisable vector_store field."""
+class TestKnowledgeGraphConfigRefusesTheOldBinding:
+    """The lookup field is gone: the old catalog shapes fail loudly, not silently."""
 
-    def test_vector_store_default_true(self) -> None:
-        cfg = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
-        assert cfg.vector_store is True
+    def test_a_boolean_binding_is_a_validation_error(self) -> None:
+        from pydantic import ValidationError
 
-    def test_vector_store_accepts_false(self) -> None:
-        cfg = KnowledgeGraphConfig(
-            name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store=False
-        )
-        assert cfg.vector_store is False
+        for value in (True, False):
+            with pytest.raises(ValidationError):
+                KnowledgeGraphConfig(
+                    name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store=value
+                )
 
-    def test_vector_store_accepts_string(self) -> None:
-        cfg = KnowledgeGraphConfig(
-            name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store="#VectorStore-RAG"
-        )
-        assert cfg.vector_store == "#VectorStore-RAG"
+    def test_a_named_actor_string_is_a_validation_error(self) -> None:
+        from pydantic import ValidationError
 
-    def test_vector_store_roundtrip(self) -> None:
-        for value in (True, False, "#VectorStore-RAG"):
-            cfg = KnowledgeGraphConfig(
-                name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store=value
+        with pytest.raises(ValidationError):
+            KnowledgeGraphConfig(
+                name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store="#VectorStore-RAG"
             )
-            reloaded = KnowledgeGraphConfig.model_validate(cfg.model_dump())
-            assert reloaded.vector_store == value
 
 
-def _actor_with_orchestrator(
-    vector_store_value: object = True,
-) -> tuple[KnowledgeGraphActor, MagicMock, MockActorAddress | None]:
+def _actor_with_orchestrator() -> tuple[
+    KnowledgeGraphActor, MagicMock, MockActorAddress | None
+]:
     """Build a KG actor with a stubbed orchestrator + proxy_ask recorder.
 
     Returns (actor, orch_proxy_mock, orch_addr). Does NOT call on_start.
@@ -1419,9 +1412,7 @@ def _actor_with_orchestrator(
     from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
 
     actor = KnowledgeGraphActor()
-    actor.config = KnowledgeGraphConfig(
-        name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store=vector_store_value  # type: ignore[arg-type]
-    )
+    actor.config = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
     actor.state = KnowledgeGraphState()
     actor.state.observer(actor)
     actor._vs_proxy = None
@@ -1451,7 +1442,7 @@ class TestKnowledgeGraphActorAcquireVsProxy:
     def test_acquire_vs_proxy_uses_get_team_member_not_get_children_or_create(self) -> None:
         from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
 
-        actor, orch_proxy, _ = _actor_with_orchestrator(vector_store_value=True)
+        actor, orch_proxy, _ = _actor_with_orchestrator()
         orch_proxy.get_team_member.return_value = MockActorAddress(VS_ACTOR_NAME, "ToolActor")
 
         actor._acquire_vs_proxy()
@@ -1465,10 +1456,10 @@ class TestKnowledgeGraphActorAcquireVsProxy:
         from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
         from akgentic.tool.vector_store.embedding_actor import EmbeddingWorker
 
-        actor, orch_proxy, _ = _actor_with_orchestrator(vector_store_value=True)
+        actor, orch_proxy, _ = _actor_with_orchestrator()
         actor.config = actor.config.model_copy(
             update={
-                "collection": VectorStoreParam(
+                "vector_store": VectorStoreParam(
                     embedding_model="custom-model", embedding_provider="azure"
                 )
             }
@@ -1506,32 +1497,23 @@ class TestKnowledgeGraphActorAcquireVsProxy:
         assert mock_proxy.add.call_args.kwargs == {}
         assert entries[0].vector == _FAKE_VECTOR
 
-    def test_acquire_vs_proxy_named_instance(self) -> None:
-        """AC-10: when vector_store is a string, the named actor is looked up."""
-        named = "#VectorStore-RAG"
-        actor, orch_proxy, _ = _actor_with_orchestrator(vector_store_value=named)
-        orch_proxy.get_team_member.return_value = MockActorAddress(named, "ToolActor")
-
-        actor._acquire_vs_proxy()
-
-        orch_proxy.get_team_member.assert_called_once_with(named)
-        assert actor._vs_proxy is not None
-
-    def test_acquire_vs_proxy_false_skips_all_wiring(self) -> None:
-        """AC-7: vector_store=False → no orchestrator lookup, degraded mode."""
-        actor, orch_proxy, _ = _actor_with_orchestrator(vector_store_value=False)
-
-        actor._acquire_vs_proxy()
-
-        assert actor._vs_proxy is None
-        orch_proxy.get_team_member.assert_not_called()
-        orch_proxy.getChildrenOrCreate.assert_not_called()
-
-    def test_acquire_vs_proxy_missing_raises_runtime_error(self) -> None:
-        """AC-7: missing VectorStoreActor → RuntimeError naming actor + VS + VectorStoreTool."""
+    def test_acquire_vs_proxy_looks_the_store_up_under_its_one_name(self) -> None:
+        """A named-instance binding is gone: there is one store actor name."""
         from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
 
-        actor, orch_proxy, _ = _actor_with_orchestrator(vector_store_value=True)
+        actor, orch_proxy, _ = _actor_with_orchestrator()
+        orch_proxy.get_team_member.return_value = MockActorAddress(VS_ACTOR_NAME, "ToolActor")
+
+        actor._acquire_vs_proxy()
+
+        orch_proxy.get_team_member.assert_called_once_with(VS_ACTOR_NAME)
+        assert actor._vs_proxy is not None
+
+    def test_acquire_vs_proxy_missing_raises_runtime_error(self) -> None:
+        """A missing store actor is still a RuntimeError, naming the actor and the store."""
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
+
+        actor, orch_proxy, _ = _actor_with_orchestrator()
         orch_proxy.get_team_member.return_value = None
 
         with pytest.raises(RuntimeError) as exc_info:
@@ -1540,7 +1522,7 @@ class TestKnowledgeGraphActorAcquireVsProxy:
         msg = str(exc_info.value)
         assert KG_ACTOR_NAME in msg
         assert VS_ACTOR_NAME in msg
-        assert "VectorStoreTool" in msg
+        assert "VectorStoreTool" not in msg
         # No silent fallback — proxy remains None
         assert actor._vs_proxy is None
 
@@ -1549,9 +1531,7 @@ class TestKnowledgeGraphActorAcquireVsProxy:
         from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
 
         actor = KnowledgeGraphActor()
-        actor.config = KnowledgeGraphConfig(
-            name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store=True
-        )
+        actor.config = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
         actor.state = KnowledgeGraphState()
         actor.state.observer(actor)
         actor._vs_proxy = None
@@ -1567,7 +1547,7 @@ class TestKnowledgeGraphActorAcquireVsProxy:
         """Transient create_collection failure → degraded mode (not raised)."""
         from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
 
-        actor, orch_proxy, orch_addr = _actor_with_orchestrator(vector_store_value=True)
+        actor, orch_proxy, orch_addr = _actor_with_orchestrator()
         orch_proxy.get_team_member.return_value = MockActorAddress(
             VS_ACTOR_NAME, "ToolActor"
         )
@@ -1592,7 +1572,7 @@ class TestKnowledgeGraphActorAcquireVsProxy:
 
 
 # ---------------------------------------------------------------------------
-# Story 10-10 — KnowledgeGraphConfig.collection + _acquire_vs_proxy identity
+# Story 10-10 — KnowledgeGraphConfig.vector_store + _acquire_vs_proxy identity
 # ---------------------------------------------------------------------------
 
 
@@ -1601,36 +1581,36 @@ class TestKnowledgeGraphConfigCollectionField:
 
     def test_collection_default_is_default_collection_config(self) -> None:
         cfg = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
-        assert cfg.collection == VectorStoreParam()
+        assert cfg.vector_store == VectorStoreParam()
         # Structural defaults — AC-11 backward-compat guard.
-        assert cfg.collection.dimension == 1536
-        assert cfg.collection.backend == "inmemory"
-        assert cfg.collection.tenant is None
+        assert cfg.vector_store.dimension == 1536
+        assert cfg.vector_store.backend == "inmemory"
+        assert cfg.vector_store.tenant is None
 
     def test_collection_accepts_custom_value(self) -> None:
         cfg = KnowledgeGraphConfig(
             name=KG_ACTOR_NAME,
             role=KG_ACTOR_ROLE,
-            collection=VectorStoreParam(backend="weaviate", tenant="t1"),
+            vector_store=VectorStoreParam(backend="weaviate", tenant="t1"),
         )
-        assert cfg.collection.backend == "weaviate"
-        assert cfg.collection.tenant == "t1"
+        assert cfg.vector_store.backend == "weaviate"
+        assert cfg.vector_store.tenant == "t1"
 
     def test_collection_roundtrip_default(self) -> None:
         cfg = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
         reloaded = KnowledgeGraphConfig.model_validate(cfg.model_dump())
-        assert reloaded.collection == VectorStoreParam()
+        assert reloaded.vector_store == VectorStoreParam()
 
     def test_collection_roundtrip_custom(self) -> None:
         cfg = KnowledgeGraphConfig(
             name=KG_ACTOR_NAME,
             role=KG_ACTOR_ROLE,
-            collection=VectorStoreParam(backend="weaviate", tenant="team-abc"),
+            vector_store=VectorStoreParam(backend="weaviate", tenant="team-abc"),
         )
         reloaded = KnowledgeGraphConfig.model_validate(cfg.model_dump())
-        assert reloaded.collection.backend == "weaviate"
-        assert reloaded.collection.tenant == "team-abc"
-        assert reloaded.collection.dimension == 1536  # default preserved
+        assert reloaded.vector_store.backend == "weaviate"
+        assert reloaded.vector_store.tenant == "team-abc"
+        assert reloaded.vector_store.dimension == 1536  # default preserved
 
     def test_base_config_coercion_yields_default_collection(self) -> None:
         """AC-8: BaseConfig → KnowledgeGraphConfig coercion keeps default collection."""
@@ -1654,17 +1634,15 @@ class TestKnowledgeGraphConfigCollectionField:
                 role=actor.config.role,
             )
         assert isinstance(actor.config, KnowledgeGraphConfig)
-        assert actor.config.collection == VectorStoreParam()
-        assert actor.config.vector_store is True  # 10-9 invariant
+        assert actor.config.vector_store == VectorStoreParam()
 
 
 class TestKnowledgeGraphActorAcquireVsProxyCollectionPropagation:
-    """AC-6 / AC-11: _acquire_vs_proxy forwards config.collection to create_collection."""
+    """AC-6 / AC-11: _acquire_vs_proxy forwards config.vector_store to create_collection."""
 
     def _build_actor_with_vs_proxy(
         self,
-        collection: VectorStoreParam,
-        vector_store_value: object = True,
+        vector_store: VectorStoreParam,
     ) -> tuple[KnowledgeGraphActor, MagicMock]:
         """Return (actor, vs_proxy_mock) with everything wired so _acquire_vs_proxy
         reaches the create_collection branch without raising.
@@ -1676,8 +1654,7 @@ class TestKnowledgeGraphActorAcquireVsProxyCollectionPropagation:
         actor.config = KnowledgeGraphConfig(
             name=KG_ACTOR_NAME,
             role=KG_ACTOR_ROLE,
-            vector_store=vector_store_value,  # type: ignore[arg-type]
-            collection=collection,
+            vector_store=vector_store,
         )
         actor.state = KnowledgeGraphState()
         actor.state.observer(actor)
@@ -1705,9 +1682,13 @@ class TestKnowledgeGraphActorAcquireVsProxyCollectionPropagation:
         return actor, vs_proxy
 
     def test_create_collection_receives_same_instance_as_config_collection(self) -> None:
-        """AC-6: the VectorStoreParam passed to create_collection is the config's instance."""
-        custom = VectorStoreParam(backend="weaviate", tenant="t1")
-        actor, vs_proxy = self._build_actor_with_vs_proxy(collection=custom)
+        """AC-6: the VectorStoreParam passed to create_collection is the config's instance.
+
+        An actor-state backend, because that is the path the store-actor proxy
+        this helper wires is on; the cluster path is specified separately.
+        """
+        custom = VectorStoreParam(backend="inmemory", tenant="t1")
+        actor, vs_proxy = self._build_actor_with_vs_proxy(vector_store=custom)
 
         actor._acquire_vs_proxy()
 
@@ -1716,9 +1697,9 @@ class TestKnowledgeGraphActorAcquireVsProxyCollectionPropagation:
         assert args[0] == KG_COLLECTION
         # Identity assertion — proves the same object is threaded through,
         # rather than a freshly-constructed VectorStoreParam().
-        assert args[1] is actor.config.collection
+        assert args[1] is actor.config.vector_store
         assert args[1] is custom
-        assert args[1].backend == "weaviate"
+        assert args[1].backend == "inmemory"
         assert args[1].tenant == "t1"
 
     def test_default_config_collection_is_structurally_default(self) -> None:
@@ -1726,7 +1707,7 @@ class TestKnowledgeGraphActorAcquireVsProxyCollectionPropagation:
         structurally equal to the pre-10-10 hardcoded default.
         """
         default_collection = VectorStoreParam()
-        actor, vs_proxy = self._build_actor_with_vs_proxy(collection=default_collection)
+        actor, vs_proxy = self._build_actor_with_vs_proxy(vector_store=default_collection)
 
         actor._acquire_vs_proxy()
 

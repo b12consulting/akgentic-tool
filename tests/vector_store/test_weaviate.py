@@ -966,7 +966,7 @@ class TestFactoryResolution:
         from akgentic.tool.vector_store.registry import BackendContext
 
         config = _config(weaviate_url="http://from-config:8080", weaviate_api_key="config-key")
-        with patch.object(weaviate_module, "get_client") as get_client:
+        with patch.object(weaviate_module, "_weaviate_client") as get_client:
             backend = weaviate_module._make_weaviate_backend(
                 BackendContext(config=config, team_id="team-42")
             )
@@ -984,7 +984,7 @@ class TestFactoryResolution:
         import akgentic.tool.vector_store.weaviate as weaviate_module
         from akgentic.tool.vector_store.registry import BackendContext
 
-        with patch.object(weaviate_module, "get_client") as get_client:
+        with patch.object(weaviate_module, "_weaviate_client") as get_client:
             weaviate_module._make_weaviate_backend(BackendContext(config=_config()))
 
         get_client.assert_called_once_with("http://from-env:8080", "env-key")
@@ -997,7 +997,7 @@ class TestFactoryResolution:
         from akgentic.tool.vector_store.registry import BackendContext
 
         with (
-            patch.object(weaviate_module, "get_client") as get_client,
+            patch.object(weaviate_module, "_weaviate_client") as get_client,
             pytest.raises(ValueError, match="weaviate_url"),
         ):
             weaviate_module._make_weaviate_backend(BackendContext(config=_config()))
@@ -1039,17 +1039,19 @@ class TestBatchContextPerCall:
     """Invariant 1 of the thread-safety answer: a batch context never escapes ``add()``."""
 
     def test_two_adds_open_two_contexts_and_store_none(self) -> None:
-        """Each add fetches its handle, opens its context, and leaves it before returning."""
+        """Each add opens its own context and leaves it before returning.
+
+        The **handle** is reused across the two adds (see the handle-cache specs);
+        the **batch context** is not, and that is the invariant this pins.
+        """
         _mock_weaviate, mock_client = _install_mock_weaviate()
         mock_client.collections.exists.return_value = False
         mock_collection, contexts = _recording_batch_contexts(mock_client)
 
         backend = _scoped_backend(mock_client)
-        mock_client.collections.get.reset_mock()
         backend.add("col1", [_make_entry(ref_id="r1")])
         backend.add("col1", [_make_entry(ref_id="r2")])
 
-        assert mock_client.collections.get.call_count == 2
         assert mock_collection.batch.dynamic.call_count == 2
         assert len(contexts) == 2
         assert contexts[0] is not contexts[1]
@@ -1057,8 +1059,9 @@ class TestBatchContextPerCall:
             context.__enter__.assert_called_once()
             context.__exit__.assert_called_once()
 
-        held = [value for value in vars(backend).values() if isinstance(value, MagicMock)]
-        assert held == [mock_client]
+        # No batch object survives the call: what the backend holds is the
+        # client and its cached handles, never a batch.
+        assert not any(context is value for value in vars(backend).values() for context in contexts)
 
     def test_concurrent_adds_each_enter_their_own_context(self) -> None:
         """Two threads inside add() at once hold two distinct contexts, never one."""
@@ -1404,3 +1407,181 @@ class TestPathPrefixWildcardsAreRefused:
             ("team_id", "equal", "team-42"),
             ("path", "like", "docs/*"),
         ]
+
+
+# ---------------------------------------------------------------------------
+# The connect callable and the dependency guard came back from client.py
+# ---------------------------------------------------------------------------
+
+
+class TestTheConnectCallable:
+    """``client.py`` names no vendor; this module owns the keyword set."""
+
+    def test_connects_with_the_pinned_keyword_set(self) -> None:
+        """The whole keyword set, including the fixed gRPC port."""
+        mock_weaviate, _client = _install_mock_weaviate()
+
+        from akgentic.tool.vector_store.client import ClusterKey
+        from akgentic.tool.vector_store.weaviate import _connect_weaviate
+
+        _connect_weaviate(ClusterKey.from_url("weaviate", "http://localhost:8080"))
+
+        assert mock_weaviate.connect_to_custom.call_args[1] == {
+            "http_host": "localhost",
+            "http_port": 8080,
+            "http_secure": False,
+            "grpc_host": "localhost",
+            "grpc_port": 50051,
+            "grpc_secure": False,
+            "auth_credentials": None,
+        }
+
+    def test_https_is_secure_on_both_transports(self) -> None:
+        mock_weaviate, _client = _install_mock_weaviate()
+
+        from akgentic.tool.vector_store.client import ClusterKey
+        from akgentic.tool.vector_store.weaviate import _connect_weaviate
+
+        _connect_weaviate(ClusterKey.from_url("weaviate", "https://my-cluster.weaviate.cloud"))
+
+        kwargs = mock_weaviate.connect_to_custom.call_args[1]
+        assert kwargs["http_secure"] is True
+        assert kwargs["grpc_secure"] is True
+        assert kwargs["http_port"] == 443
+
+    def test_an_api_key_becomes_auth_api_key(self) -> None:
+        mock_weaviate, _client = _install_mock_weaviate()
+
+        from akgentic.tool.vector_store.client import ClusterKey
+        from akgentic.tool.vector_store.weaviate import _connect_weaviate
+
+        _connect_weaviate(ClusterKey.from_url("weaviate", "http://localhost:8080", "test-key"))
+
+        mock_weaviate.auth.AuthApiKey.assert_called_once_with("test-key")
+        kwargs = mock_weaviate.connect_to_custom.call_args[1]
+        assert kwargs["auth_credentials"] is mock_weaviate.auth.AuthApiKey.return_value
+
+    def test_no_api_key_means_no_auth(self) -> None:
+        """An empty key is unauthenticated, not authenticated with ``''``."""
+        mock_weaviate, _client = _install_mock_weaviate()
+
+        from akgentic.tool.vector_store.client import ClusterKey
+        from akgentic.tool.vector_store.weaviate import _connect_weaviate
+
+        _connect_weaviate(ClusterKey.from_url("weaviate", "http://localhost:8080", ""))
+
+        assert mock_weaviate.connect_to_custom.call_args[1]["auth_credentials"] is None
+        mock_weaviate.auth.AuthApiKey.assert_not_called()
+
+    def test_the_shared_client_is_keyed_on_the_weaviate_backend_name(self) -> None:
+        """``_weaviate_client`` builds a ``weaviate``-keyed ClusterKey and caches on it."""
+        mock_weaviate, _client = _install_mock_weaviate()
+
+        import akgentic.tool.vector_store.client as client_module
+        from akgentic.tool.vector_store.weaviate import _weaviate_client
+
+        first = _weaviate_client("http://localhost:8080", "k")
+        second = _weaviate_client("http://LOCALHOST:8080/", "k")
+
+        assert second is first
+        assert mock_weaviate.connect_to_custom.call_count == 1
+        assert [key.backend for key in client_module._clients] == ["weaviate"]
+
+
+class TestTheDependencyGuard:
+    """``_check_weaviate_dependencies`` and its message live here, beside qdrant's."""
+
+    def test_both_names_resolve_from_this_module(self) -> None:
+        from akgentic.tool.vector_store import weaviate as weaviate_module
+
+        assert callable(weaviate_module._check_weaviate_dependencies)
+        assert "akgentic-tool[weaviate]" in weaviate_module.WEAVIATE_MISSING_MESSAGE
+
+    def test_import_error_when_weaviate_missing(self) -> None:
+        """The connect raises ImportError naming the extra to install."""
+        from akgentic.tool.vector_store.client import ClusterKey
+        from akgentic.tool.vector_store.weaviate import _connect_weaviate
+
+        with (
+            patch.dict(sys.modules, {"weaviate": None}),
+            pytest.raises(ImportError, match=r"akgentic-tool\[weaviate\]"),
+        ):
+            _connect_weaviate(ClusterKey.from_url("weaviate", "http://localhost:8080"))
+
+    def test_client_py_imports_no_vendor_module(self) -> None:
+        """The cache is backend-agnostic: it names neither vendor at module scope."""
+        import akgentic.tool.vector_store.client as client_module
+
+        assert not hasattr(client_module, "_check_weaviate_dependencies")
+        assert not hasattr(client_module, "WEAVIATE_MISSING_MESSAGE")
+        assert not hasattr(client_module, "GRPC_PORT")
+
+
+# ---------------------------------------------------------------------------
+# The collection-handle cache
+# ---------------------------------------------------------------------------
+
+
+class TestCollectionHandleCache:
+    """One ``Collection`` per (name, tenant): the vendor mints a new one per call."""
+
+    def test_two_operations_on_one_collection_fetch_one_handle(self) -> None:
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        _recording_batch_contexts(mock_client)
+
+        backend = _scoped_backend(mock_client)
+        mock_client.collections.get.reset_mock()
+
+        backend.add("col1", [_make_entry(ref_id="r1")])
+        backend.add("col1", [_make_entry(ref_id="r2")])
+
+        assert mock_client.collections.get.call_count == 1
+
+    def test_a_second_collection_fetches_its_own_handle(self) -> None:
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        _recording_batch_contexts(mock_client)
+
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
+
+        backend = _scoped_backend(mock_client)
+        backend.create_collection("col2", VectorStoreParam())
+        mock_client.collections.get.reset_mock()
+
+        backend.add("col1", [_make_entry(ref_id="r1")])
+        backend.add("col2", [_make_entry(ref_id="r2")])
+
+        assert mock_client.collections.get.call_count == 2
+
+    def test_the_same_collection_under_a_different_tenant_fetches_again(self) -> None:
+        """``with_tenant()`` returns a different Collection, so the tenant is in the key."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        _recording_batch_contexts(mock_client)
+
+        backend = _scoped_backend(mock_client)
+        mock_client.collections.get.reset_mock()
+
+        backend.add("col1", [_make_entry(ref_id="r1")])
+        backend._collection_tenants["col1"] = "tenant-b"
+        backend.add("col1", [_make_entry(ref_id="r2")])
+
+        assert mock_client.collections.get.call_count == 2
+        assert set(backend._collection_handles) == {("col1", None), ("col1", "tenant-b")}
+
+    def test_the_cache_belongs_to_the_instance_not_the_class(self) -> None:
+        """One backend instance per actor is the invariant the cache rests on."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        _recording_batch_contexts(mock_client)
+
+        first = _scoped_backend(mock_client)
+        second = _scoped_backend(mock_client)
+        mock_client.collections.get.reset_mock()
+
+        first.add("col1", [_make_entry(ref_id="r1")])
+        second.add("col1", [_make_entry(ref_id="r2")])
+
+        assert mock_client.collections.get.call_count == 2
+        assert first._collection_handles is not second._collection_handles

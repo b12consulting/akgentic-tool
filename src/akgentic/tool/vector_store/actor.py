@@ -20,6 +20,7 @@ from pydantic import Field
 
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_state import BaseState
+from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.vector_store.protocol import (
@@ -30,6 +31,7 @@ from akgentic.tool.vector_store.protocol import (
     VectorStoreConfig,
     VectorStoreParam,
     VectorStoreService,
+    needs_store_actor,
     require_dimension_matches,
 )
 from akgentic.tool.vector_store.registry import BackendContext, get_backend_spec
@@ -52,6 +54,47 @@ def _supports_actor_state(backend: object) -> TypeGuard[ActorStateBackend]:
     """Return whether *backend* provides the actor-state persistence contract."""
     return callable(getattr(backend, "get_state", None)) and callable(
         getattr(backend, "restore_state", None)
+    )
+
+
+def ensure_store_actor(param: VectorStoreParam, orchestrator_proxy: Orchestrator) -> None:
+    """Create the store actor for *param*, if that backend needs one.
+
+    Called by a consumer card at ``observer()`` time, **before** it creates its
+    own consumer actor: that actor looks the store up during its ``on_start``,
+    so the store has to exist first. This is where ``VectorStoreTool.observer``'s
+    ``getChildrenOrCreate`` call went when the card was deleted — the three
+    consumers each call it now, so a store's existence is decided by the
+    consumer that needs it rather than by a singleton card someone had to
+    remember to add.
+
+    **A cluster backend returns without creating anything.** There is nothing
+    for an actor to hold: the data is on the cluster and the consumer talks to
+    the shared client directly (:func:`~akgentic.tool.vector_store.protocol.needs_store_actor`).
+
+    **Idempotent, but not by anything here.** ``getChildrenOrCreate`` is
+    idempotent per ADR-025, so three cards in one team each calling this resolve
+    to the same actor and this helper keeps no bookkeeping of its own.
+
+    The config it builds sets **neither connection field**. The deleted card was
+    their only writer, and the actor this helper creates is the in-memory one by
+    construction — it needs no URL and no key. A caller who reaches the actor
+    with a cluster collection by hand still resolves, because
+    ``_make_weaviate_backend`` falls back to the environment.
+
+    Args:
+        param: The consumer's vector store configuration.
+        orchestrator_proxy: An ask proxy over the team's orchestrator.
+
+    Raises:
+        ValueError: When ``param.backend`` names no registered backend, out of
+            :func:`~akgentic.tool.vector_store.protocol.needs_store_actor`.
+    """
+    if not needs_store_actor(param):
+        return
+    orchestrator_proxy.getChildrenOrCreate(
+        VectorStoreActor,
+        config=VectorStoreConfig(name=VS_ACTOR_NAME, role=VS_ACTOR_ROLE),
     )
 
 
@@ -191,11 +234,22 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
     def _get_or_create_weaviate_backend(self) -> WeaviateBackend | None:
         """Return the ``WeaviateBackend``, creating it lazily on first call.
 
+        **A backstop, not a wired path.** After the store became a backend, no
+        consumer routes a cluster collection through this actor: a card whose
+        param names Weaviate creates no store actor at all and its consumer
+        talks to the backend directly. What remains is the caller who reaches
+        this actor with a cluster collection by hand, and for them this accessor
+        is what makes that a misconfiguration rather than a crash.
+
         Obtains the process's shared client for ``self.config.weaviate_url`` and
-        ``self.config.weaviate_api_key`` through ``get_client`` — one client per
-        cluster per process, never one per actor — and wraps it in a backend
-        scoped to this team. Returns ``None`` when ``weaviate-client`` is missing
-        or the first connect to the cluster fails.
+        ``self.config.weaviate_api_key`` through the same cache the registered
+        factory uses — one client per cluster per process, never one per actor —
+        and wraps it in a backend scoped to this team. Returns ``None`` when
+        ``weaviate-client`` is missing or the first connect to the cluster fails.
+
+        Neither connection field has a writer in ``src/`` any more, so a config
+        that carries one was built by hand; the factory's own environment
+        fallback covers the rest.
 
         The owning team's id is taken from ``self.team_id`` — propagated by the
         actor system, never configured — and stamped onto every object the
@@ -208,8 +262,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         if self._weaviate_backend is not None:
             return self._weaviate_backend
         try:
-            from akgentic.tool.vector_store.client import get_client
-            from akgentic.tool.vector_store.weaviate import WeaviateBackend
+            from akgentic.tool.vector_store.weaviate import WeaviateBackend, _weaviate_client
 
             url = self.config.weaviate_url
             if not url:
@@ -219,7 +272,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
                 )
                 return None
             self._weaviate_backend = WeaviateBackend(
-                client=get_client(url, self.config.weaviate_api_key),
+                client=_weaviate_client(url, self.config.weaviate_api_key),
                 team_id=str(self.team_id),
             )
         except Exception as exc:  # noqa: BLE001
@@ -373,6 +426,17 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         - ``"inmemory"``: delegates to ``InMemoryBackend``
         - ``"weaviate"``: delegates to ``WeaviateBackend``
 
+        **A backend that could not be built raises, rather than being logged
+        and skipped.** Skipping it was the *cause* whose consequence ``add``
+        already refuses to hide: the caller's ``create_collection`` returned
+        normally, so a consumer kept its optimistic binding and every later
+        write went nowhere until ``add`` raised with no explanation of why. The
+        raise happens outside the error handling below, so it reaches the
+        caller, where each consumer's existing ``try`` around this call turns it
+        into the same one-WARNING degraded mode a cluster consumer enters when
+        its factory raises. Both paths now answer an unbuildable backend the
+        same way, and neither leaves a binding behind that cannot work.
+
         Args:
             name: Unique collection identifier.
             config: Vector store configuration for the collection.
@@ -380,17 +444,21 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         Raises:
             ValueError: When ``config.dimension`` is not the native width of a
                 known ``config.embedding_model``.
+            RetriableError: When no backend could be built for
+                ``config.backend`` — a missing dependency, a misconfiguration,
+                an unregistered name. Retriable for the same reason it is on
+                ``add``: the fault is usually the environment, not the call.
         """
         require_dimension_matches(config, f"{self.config.name} collection '{name}'")
+        backend = self._get_backend(config.backend)
+        if backend is None:
+            msg = (
+                f"[{self.config.name}] no '{config.backend}' backend could be built; "
+                f"collection '{name}' was not created."
+            )
+            logger.warning(msg)
+            raise RetriableError(msg)
         try:
-            backend = self._get_backend(config.backend)
-            if backend is None:
-                logger.warning(
-                    "[%s] '%s' backend unavailable, skipping create_collection",
-                    self.config.name,
-                    config.backend,
-                )
-                return
             backend.create_collection(name, config)
 
             record = config.model_dump()

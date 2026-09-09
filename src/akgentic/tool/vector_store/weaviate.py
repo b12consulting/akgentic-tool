@@ -8,9 +8,9 @@ Vectors are provided externally (no Weaviate-side vectoriser).
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
-from akgentic.tool.vector_store.client import _check_weaviate_dependencies, get_client
+from akgentic.tool.vector_store.client import ClusterKey, get_client
 from akgentic.tool.vector_store.protocol import (
     CollectionStatus,
     SearchHit,
@@ -29,6 +29,88 @@ if TYPE_CHECKING:
     from akgentic.tool.vector_store.vector import VectorEntry
 
 logger = logging.getLogger(__name__)
+
+GRPC_PORT: Final[int] = 50051
+"""gRPC port used for every cluster. Fixed, and therefore not part of ``ClusterKey``.
+
+It lives here rather than in ``client.py`` for the same reason the dependency
+check does: a gRPC port is a Weaviate connection detail, and the cache is shared
+with backends that have none.
+"""
+
+WEAVIATE_MISSING_MESSAGE: Final[str] = (
+    "Weaviate backend requires the 'weaviate-client' package. "
+    "Install with: pip install akgentic-tool[weaviate]"
+)
+"""The ``ImportError`` text raised when ``weaviate-client`` is not installed."""
+
+
+def _check_weaviate_dependencies() -> None:
+    """Validate that ``weaviate-client`` is importable, at call time.
+
+    Lives beside ``qdrant.py``'s ``_check_qdrant_dependencies``, which is what
+    "generalised, not twinned" means for the client cache: each backend owns its
+    own dependency guard, and ``client.py`` owns neither.
+
+    Raises:
+        ImportError: With install instructions when ``weaviate-client`` is missing.
+    """
+    try:
+        import weaviate  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(WEAVIATE_MISSING_MESSAGE) from exc
+
+
+def _connect_weaviate(key: ClusterKey) -> weaviate.WeaviateClient:
+    """Open the cluster connection *key* names — the callable ``get_client`` calls.
+
+    The one place in this package that names ``weaviate.connect_to_custom``, and
+    the reason ``client.py`` names no vendor at all. The keyword set is fixed:
+    HTTP and gRPC share the host and the ``secure`` flag, the gRPC port is
+    :data:`GRPC_PORT` for every cluster, and the credential is an ``AuthApiKey``
+    or nothing — never an ``AuthCredentials`` object, which is the module
+    docstring's invariant 2 in ``client.py``.
+
+    Args:
+        key: The cluster to connect to.
+
+    Returns:
+        A connected client.
+
+    Raises:
+        ImportError: When ``weaviate-client`` is not installed.
+    """
+    _check_weaviate_dependencies()
+    import weaviate as _weaviate
+    from weaviate.auth import AuthApiKey
+
+    return _weaviate.connect_to_custom(
+        http_host=key.host,
+        http_port=key.port,
+        http_secure=key.secure,
+        grpc_host=key.host,
+        grpc_port=GRPC_PORT,
+        grpc_secure=key.secure,
+        auth_credentials=AuthApiKey(key.api_key) if key.api_key else None,
+    )
+
+
+def _weaviate_client(url: str, api_key: str | None = None) -> weaviate.WeaviateClient:
+    """Return the process's shared client for the cluster *url* names.
+
+    The one entry point both callers use — the registered factory and the
+    actor's backstop accessor — so the key's shape and the connect keyword set
+    are written once.
+
+    Args:
+        url: Cluster URL, e.g. ``http://localhost:8080``.
+        api_key: API key, or ``None`` for an unauthenticated cluster.
+
+    Returns:
+        The shared, connected client.
+    """
+    return get_client(ClusterKey.from_url("weaviate", url, api_key), _connect_weaviate)
+
 
 TEAM_ID_PROPERTY: str = "team_id"
 """Schema property carrying the owning team's id on every stored object.
@@ -135,6 +217,7 @@ class WeaviateBackend:
         self._team_id = team_id
         self._collections_created: set[str] = set()
         self._collection_tenants: dict[str, str] = {}
+        self._collection_handles: dict[tuple[str, str | None], weaviate.collections.Collection] = {}
 
     # ------------------------------------------------------------------
     # VectorStoreService protocol methods
@@ -579,16 +662,45 @@ class WeaviateBackend:
         Resolves the effective tenant from the per-collection mapping first,
         falling back to the backend-level default tenant.
 
+        **The handle is cached per ``(name, tenant)``, and it has to be.**
+        ``client.collections.get`` builds a *new* ``Collection`` on every call
+        (``weaviate/collections/collections/executor.py:85-91``), and each one
+        constructs a ``_BatchCollectionWrapper`` whose ``__init__`` creates a
+        ``ThreadPoolExecutor`` (``weaviate/collections/batch/collection.py:127-128``)
+        that nothing ever shuts down. Uncached, every ``add()`` leaked one idle
+        pool for the lifetime of the process. ``with_tenant()`` returns a
+        different ``Collection``, so the tenant is part of the key.
+
+        **The invariant that makes a cached handle safe: a backend instance
+        belongs to exactly one actor.** The vendor's "not thread-safe" caveat is
+        about the batching algorithm, and the batch wrapper is per-``Collection``
+        object: ``dynamic()`` assigns ``self._batch_mode`` and replaces
+        ``self._batch_data`` on that shared wrapper before handing back the
+        context (``weaviate/collections/batch/collection.py:151-170``), so one
+        ``Collection`` reached from two threads is precisely the unsafe case.
+        It is not reached from two threads here, because each consumer builds its
+        own backend through ``BackendSpec.factory`` at bind time and every
+        ``add`` / ``remove`` / ``search`` runs on that consumer's own mailbox
+        turn. What is shared across threads is the **client**, which is verified
+        safe; what is cached here is a **handle**, which is not.
+
+        **If that invariant ever stops holding — one backend instance handed to
+        a second actor — this cache is the first thing to undo.**
+
         Args:
             name: Collection name.
 
         Returns:
             Weaviate collection object (optionally scoped to tenant).
         """
-        col = self._client.collections.get(name)
         tenant = self._collection_tenants.get(name) or self._tenant
+        cached = self._collection_handles.get((name, tenant))
+        if cached is not None:
+            return cached
+        col = self._client.collections.get(name)
         if tenant:
             col = col.with_tenant(tenant)
+        self._collection_handles[(name, tenant)] = col
         return col
 
 
@@ -638,7 +750,7 @@ def _make_weaviate_backend(context: BackendContext) -> WeaviateBackend:
         msg = "weaviate_url is not configured; cannot build WeaviateBackend."
         raise ValueError(msg)
     api_key = getattr(cfg, "weaviate_api_key", None) or weaviate_api_key()
-    return WeaviateBackend(client=get_client(url, api_key), team_id=context.team_id)
+    return WeaviateBackend(client=_weaviate_client(url, api_key), team_id=context.team_id)
 
 
 register_backend(

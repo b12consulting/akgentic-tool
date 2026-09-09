@@ -277,7 +277,7 @@ class TestSemanticScores:
     def test_a_missing_proxy_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.WARNING):
             semantic_scores(None, _embedder(), "c", "query", 5)
-        assert "No vector store proxy" in caplog.text
+        assert "No vector store wired" in caplog.text
 
     def test_a_missing_embedder_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.WARNING):
@@ -317,4 +317,4 @@ class TestSemanticOptOut:
     ) -> None:
         with caplog.at_level(logging.WARNING):
             hybrid_search(["b"], None, _embedder(), "c", "query", top_k=5)
-        assert "No vector store proxy" in caplog.text
+        assert "No vector store wired" in caplog.text

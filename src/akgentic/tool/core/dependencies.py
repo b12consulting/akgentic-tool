@@ -1,4 +1,26 @@
-"""Topological ordering of ``ToolCard`` instances by their ``depends_on`` declarations."""
+"""Topological ordering of ``ToolCard`` instances by their ``depends_on`` declarations.
+
+**No card in this package declares an edge any more.** The one that did — a
+consumer tool naming the singleton card that owned the vector store — is gone:
+each consumer now creates its own store, in its own ``observer()``, before the
+actor that looks it up, so the ordering constraint became intra-card and the
+edge had nothing left to express.
+
+Be exact about what that leaves, because the obvious sentence is wrong on all
+three counts:
+
+- :func:`_topological_sort` **still has a caller** — ``ToolFactory.__init__``
+  runs it unconditionally over every team's card list.
+- What it no longer has is **any edge to sort**: the base ``depends_on`` returns
+  ``[]`` for every card here, so the sort is an order-preserving identity.
+- It is **still covered**, by ``tests/test_core_factory.py``, which declares its
+  own stub cards with ``depends_on`` class attributes. Those specs are the
+  machinery's only exercise now.
+
+It is kept rather than deleted because it remains the mechanism a third-party
+card would use, and because deleting a public seam is a decision rather than a
+tidy-up. ADR-049 open item 4 owes that decision.
+"""
 
 from collections import deque
 
@@ -12,10 +34,10 @@ def _topological_sort(cards: list[ToolCard]) -> list[ToolCard]:
     Kahn's algorithm with a FIFO queue seeded in input order, which produces a
     deterministic ordering: independent nodes retain their relative input order.
 
-    Duplicate class names in ``cards`` (e.g. two ``VectorStoreTool`` instances
-    with different configuration) are permitted — later entries overwrite
-    earlier entries in the internal name→card map. Dependency relationships
-    are at the class level, not per-instance.
+    Duplicate class names in ``cards`` (two instances of one card class with
+    different configuration) are permitted — later entries overwrite earlier
+    entries in the internal name→card map. Dependency relationships are at the
+    class level, not per-instance.
 
     Args:
         cards: Tool cards to sort. Input order is preserved for independent

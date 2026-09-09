@@ -13,6 +13,8 @@ so.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -123,6 +125,25 @@ class StateSpy:
     def notify_state_change(self, state: BaseState) -> None:
         self.notifications.append(state)
 
+
+@contextmanager
+def _factory_for(backend: str, factory: object) -> Iterator[None]:
+    """Swap one registered backend's factory for the duration of a spec.
+
+    ``BackendSpec`` is a frozen dataclass, so the seam is a re-registration
+    rather than an attribute patch — the shape ``tests/vector_store/test_registry.py``
+    already uses.
+    """
+    from dataclasses import replace
+
+    from akgentic.tool.vector_store import registry
+
+    original = registry.get_backend_spec(backend)
+    registry.register_backend(replace(original, factory=factory), replace=True)
+    try:
+        yield
+    finally:
+        registry.register_backend(original, replace=True)
 
 class RagHarness:
     """Wires an inert actor to a fake vector store and a fake spawn path.
@@ -346,11 +367,56 @@ class TestEnableRag:
         assert config.tenant == "acme"
 
     def test_the_card_collection_reaches_create_collection(self, harness: RagHarness) -> None:
-        """``rag_collection`` is the card's only lever on the backend and the tenant."""
-        harness.enable(collection=VectorStoreParam(backend="weaviate", dimension=3072))
+        """``vector_store`` is the card's only lever on the backend and the tenant."""
+        harness.enable(collection=VectorStoreParam(backend="inmemory", dimension=3072))
 
         [(_, config)] = harness.vs.of("create")
+        assert (config.backend, config.dimension) == ("inmemory", 3072)
+
+    def test_a_cluster_param_builds_a_backend_instead_of_looking_the_actor_up(
+        self, harness: RagHarness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No lookup happens at all: the engine comes from the registered factory."""
+        built: list[object] = []
+        double = FakeVectorStore()
+
+        def _factory(context: object) -> object:
+            built.append(context)
+            return double
+
+        harness.vs_address = None  # a lookup would degrade; the factory must not
+
+        with _factory_for("weaviate", _factory):
+            harness.enable(collection=VectorStoreParam(backend="weaviate", dimension=3072))
+
+        assert len(built) == 1
+        assert built[0].team_id == str(harness.actor.team_id)
+        assert harness.actor._vs_proxy is double
+        [(name, config)] = double.of("create")
+        assert name == RAG_COLLECTION
         assert (config.backend, config.dimension) == ("weaviate", 3072)
+
+    def test_a_cluster_factory_that_raises_degrades_without_raising(
+        self, harness: RagHarness, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A failed connect is the cluster path's version of a failed create_collection."""
+        import logging
+
+        def _factory(_context: object) -> object:
+            raise ValueError("unreachable")
+
+        with (
+            _factory_for("weaviate", _factory),
+            caplog.at_level(logging.WARNING, logger="akgentic.tool.workspace.actor.documents"),
+        ):
+            harness.enable(collection=VectorStoreParam(backend="weaviate"))
+
+        assert harness.actor._vs_proxy is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "unreachable" in warnings[0].getMessage()
+        assert harness.actor.index_paths("").startswith("Retrieval indexing is not available")
 
     def test_indexing_is_unavailable_until_retrieval_is_enabled(
         self, harness: RagHarness, workspace_tree: Path

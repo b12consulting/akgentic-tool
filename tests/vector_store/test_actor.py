@@ -334,13 +334,21 @@ class TestCreateCollection:
         assert backend.create_collection.call_count == 2
         # Backend itself handles idempotency (no-op on existing collection)
 
-    def test_graceful_when_backend_unavailable(self) -> None:
-        """AC9: Logs warning when backend cannot be created."""
+    def test_a_backend_that_cannot_be_built_raises_rather_than_skipping(self) -> None:
+        """The cause is now as loud as the consequence ``add`` already refuses to hide.
+
+        Skipping it silently was what let a consumer keep an optimistic binding
+        whose every later write went nowhere. The caller's own ``try`` turns this
+        into the same one-WARNING degraded mode a cluster consumer enters when
+        its factory raises.
+        """
+        from akgentic.tool.errors import RetriableError
+
         actor = _make_actor()
         with patch.object(actor, "_get_or_create_backend", return_value=None):
-            # Should not raise
-            actor.create_collection("test_col", VectorStoreParam())
-            assert "test_col" not in actor.state.collection_statuses
+            with pytest.raises(RetriableError, match="inmemory"):
+                actor.create_collection("test_col", VectorStoreParam())
+        assert "test_col" not in actor.state.collection_statuses
 
 
 # ---------------------------------------------------------------------------
@@ -979,16 +987,18 @@ class TestWeaviateRouting:
         backend.add.assert_called_once()
         mock_wb.add.assert_not_called()
 
-    def test_weaviate_backend_unavailable_logs_warning(self) -> None:
-        """create_collection logs warning when weaviate backend is unavailable."""
+    def test_weaviate_backend_unavailable_raises_and_creates_nothing(self) -> None:
+        """No cluster URL anywhere means no backend, and that is not skipped quietly."""
+        from akgentic.tool.errors import RetriableError
+
         actor = _make_actor()
         actor.config = VectorStoreConfig(name=VS_ACTOR_NAME, role=VS_ACTOR_ROLE)
         # No weaviate_url => _get_or_create_weaviate_backend returns None
 
         config = VectorStoreParam(backend="weaviate")
-        actor.create_collection("wv_col", config)
+        with pytest.raises(RetriableError, match="weaviate"):
+            actor.create_collection("wv_col", config)
 
-        # Should not crash, just skip
         assert "wv_col" not in actor.state.collection_statuses
 
     def test_weaviate_no_sync_backend_state(self) -> None:
@@ -1037,7 +1047,7 @@ class TestWeaviateTeamIdPropagation:
         )
 
         with (
-            patch("akgentic.tool.vector_store.client.get_client") as get_client,
+            patch("akgentic.tool.vector_store.weaviate._weaviate_client") as get_client,
             patch("akgentic.tool.vector_store.weaviate.WeaviateBackend") as mock_cls,
         ):
             actor._get_or_create_weaviate_backend()
@@ -1063,7 +1073,7 @@ class TestWeaviateTeamIdPropagation:
             )
 
         with (
-            patch("akgentic.tool.vector_store.client.get_client") as get_client,
+            patch("akgentic.tool.vector_store.weaviate._weaviate_client") as get_client,
             patch("akgentic.tool.vector_store.weaviate.WeaviateBackend") as mock_cls,
         ):
             first._get_or_create_weaviate_backend()

@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import akgentic.tool.vector_store.qdrant as qdrant_module
 from akgentic.tool.vector_store.protocol import VectorQuery, VectorStoreParam
 from akgentic.tool.vector_store.qdrant import (
     QDRANT_URL_ENV,
@@ -23,11 +24,14 @@ from akgentic.tool.vector_store.vector import VectorEntry
 
 
 def _make_backend(team_id: str | None = "team-42") -> tuple[QdrantBackend, MagicMock]:
-    """Build a QdrantBackend whose client is a MagicMock."""
+    """Build a QdrantBackend over an injected client double.
+
+    The backend takes a connected client and never builds one, so every spec
+    here drives it through a double rather than patching the vendor module.
+    """
     client = MagicMock()
     client.collection_exists.return_value = False
-    with patch("qdrant_client.QdrantClient", return_value=client):
-        backend = QdrantBackend(url="http://localhost:6333", team_id=team_id)
+    backend = QdrantBackend(client=client, team_id=team_id)
     return backend, client
 
 
@@ -264,6 +268,79 @@ class TestRegistry:
         with patch("qdrant_client.QdrantClient", return_value=MagicMock()):
             backend = spec.factory(BackendContext(config=config, team_id="team-42"))
         assert isinstance(backend, QdrantBackend)
+
+    def test_the_backend_takes_a_client_and_closes_none(self) -> None:
+        """It holds a shared client, so it has no ``close`` at all."""
+        assert not hasattr(QdrantBackend, "close")
+
+    def test_the_factory_shares_one_client_per_cluster(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two backends for one cluster hold one client, obtained through the cache."""
+        # The cache ``qdrant.py`` actually writes into. Reached through the bound
+        # function's globals rather than a fresh import: another spec file evicts
+        # ``client`` from ``sys.modules``, so importing it again would hand back a
+        # *different* module object with an empty cache.
+        cache = qdrant_module.get_client.__globals__
+
+        monkeypatch.setenv(QDRANT_URL_ENV, "http://localhost:6333")
+        spec = get_backend_spec("qdrant")
+        cache["close_all"]()
+        made: list[MagicMock] = []
+
+        def _new_client(**_kwargs: object) -> MagicMock:
+            client = MagicMock()
+            made.append(client)
+            return client
+
+        try:
+            with patch("qdrant_client.QdrantClient", side_effect=_new_client):
+                first = spec.factory(BackendContext(config=MagicMock(), team_id="t1"))
+                second = spec.factory(BackendContext(config=MagicMock(), team_id="t2"))
+            assert len(made) == 1
+            assert first._client is second._client is made[0]
+            assert [key.backend for key in cache["_clients"]] == ["qdrant"]
+        finally:
+            cache["close_all"]()
+
+    def test_the_factory_keys_a_portless_url_on_6333(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``http://h`` and ``http://h:6333`` are one cluster, not two clients."""
+        cache = qdrant_module.get_client.__globals__
+
+        spec = get_backend_spec("qdrant")
+        cache["close_all"]()
+        made: list[MagicMock] = []
+
+        def _new_client(**_kwargs: object) -> MagicMock:
+            client = MagicMock()
+            made.append(client)
+            return client
+
+        try:
+            with patch("qdrant_client.QdrantClient", side_effect=_new_client):
+                monkeypatch.setenv(QDRANT_URL_ENV, "http://qhost")
+                first = spec.factory(BackendContext(config=MagicMock(), team_id="t1"))
+                monkeypatch.setenv(QDRANT_URL_ENV, "http://qhost:6333")
+                second = spec.factory(BackendContext(config=MagicMock(), team_id="t2"))
+            assert len(made) == 1
+            assert first._client is second._client
+        finally:
+            cache["close_all"]()
+
+    def test_the_connect_builds_a_remote_client_only(self) -> None:
+        """``url=`` is the remote path; the embedded modes are never reachable."""
+        from akgentic.tool.vector_store.client import ClusterKey
+        from akgentic.tool.vector_store.qdrant import _connect_qdrant
+
+        with patch("qdrant_client.QdrantClient") as client_cls:
+            _connect_qdrant(ClusterKey.from_url("qdrant", "https://q:6333", "k"))
+
+        client_cls.assert_called_once_with(url="https://q:6333", api_key="k")
+        kwargs = client_cls.call_args.kwargs
+        assert "path" not in kwargs
+        assert kwargs["url"] != ":memory:"
 
     def test_factory_raises_without_url(self) -> None:
         spec = get_backend_spec("qdrant")

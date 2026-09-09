@@ -31,12 +31,17 @@ class ToolCard(SerializableBaseModel, ABC):
     def depends_on(self) -> list[str]:
         """Class-name list of ToolCards that MUST be wired before this one.
 
-        Default: no dependencies. Subclasses may override as a property
-        whose return value depends on instance fields (e.g. the value of
-        a ``vector_store`` field on consumer tools). The string is matched
-        against ``type(card).__name__`` by ``ToolFactory``'s topological
-        sort. Not a Pydantic field — does not appear in ``model_dump`` and
-        cannot be set via ``model_validate``.
+        Default: no dependencies, and **no card in this package overrides it**.
+        The edge exists for a card that genuinely cannot be wired until another
+        card's ``observer()`` has run — a resource one card creates and another
+        looks up by name. A card that owns its own resource, as every card here
+        now does, declares nothing.
+
+        Subclasses may override as a property whose return value depends on
+        instance fields, so a capability that is switched off can drop its
+        prerequisite. The string is matched against ``type(card).__name__`` by
+        ``ToolFactory``'s topological sort. Not a Pydantic field — does not
+        appear in ``model_dump`` and cannot be set via ``model_validate``.
         """
         return []
 

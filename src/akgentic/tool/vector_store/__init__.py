@@ -11,6 +11,7 @@ from akgentic.tool.vector_store.actor import (
     VS_ACTOR_ROLE,
     VectorStoreActor,
     VectorStoreState,
+    ensure_store_actor,
 )
 from akgentic.tool.vector_store.client import ClusterKey, close_all, get_client
 from akgentic.tool.vector_store.embedding_actor import (
@@ -45,6 +46,7 @@ from akgentic.tool.vector_store.protocol import (
     VectorStoreParam,
     VectorStoreService,
     default_backend,
+    needs_store_actor,
     require_backend_configured,
     require_dimension_matches,
     require_weaviate_configured,
@@ -61,7 +63,6 @@ from akgentic.tool.vector_store.registry import (
     resolve_default_backend,
     unregister_backend,
 )
-from akgentic.tool.vector_store.tool import VectorStoreTool
 from akgentic.tool.vector_store.vector import EmbeddingService, VectorEntry, VectorIndex
 
 # ``_check_vector_search_dependencies`` is private but imported by name from six modules
@@ -102,15 +103,16 @@ __all__ = [
     "VectorStoreParam",
     "VectorStoreService",
     "VectorStoreState",
-    "VectorStoreTool",
     "available_backends",
     "build_embedding_service",
     "close_all",
     "default_backend",
     "embedding_worker_name",
+    "ensure_store_actor",
     "get_backend_spec",
     "get_client",
     "is_registered",
+    "needs_store_actor",
     "register_backend",
     "require_backend_configured",
     "require_dimension_matches",
