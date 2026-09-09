@@ -23,8 +23,7 @@ from akgentic.tool.planning import PlanningTool
 ```python
 class PlanningTool(ToolCard):
     # Vector-search wiring
-    vector_store: bool | str = True
-    collection: VectorStoreParam = VectorStoreParam()
+    vector_store: VectorStoreParam = VectorStoreParam()
     search_top_k: int = 10
     search_score_threshold: float = 0.5
 
@@ -212,13 +211,11 @@ PlanningTool(get_planning=GetPlanning(filter_by_agent=False))  # everyone sees e
 PlanningTool(get_planning=GetPlanning(expose={LLM_CONTEXT, TOOL_CALL, COMMAND}))
                                                              # also fetchable on demand
 
-PlanningTool(vector_store=False)                             # keyword-only, no vector store needed
-
 PlanningTool(update_planning=False)                          # read-only board for an observer agent
 
-PlanningTool(                                                # persistent, multi-tenant board
-    collection=VectorStoreParam(backend="weaviate", tenant="team-42"),
-    search_score_threshold=0.65,
+PlanningTool(                                                # persistent, multi-tenant board;
+    vector_store=VectorStoreParam(backend="weaviate", tenant="team-42"),
+    search_score_threshold=0.65,                             # no store actor is created for it
 )
 
 PlanningTool(hybrid_alpha=0.3)                               # trust exact wording over similarity
@@ -244,7 +241,8 @@ PlanningTool(hybrid_alpha=0.3)                               # trust exact wordi
 ### Semantic search
 
 With `[vector_search]` installed, task descriptions are embedded on create and update and stored
-in the `planning` collection of the bound `VectorStoreActor`.
+in the `planning` collection of whatever storage engine the card's `vector_store` resolves — the
+store actor on an actor-state backend, the backend itself on a cluster one.
 
 `mode="hybrid"` fuses the keyword and semantic legs with the shared rule, Weaviate's
 `relativeScoreFusion` at `alpha = 0.7`: `alpha * norm(cosine) + (1 - alpha) * keyword`. A strong
@@ -256,8 +254,12 @@ documented once in
 `score_threshold` gates the semantic leg only, on the raw cosine before fusion, so a keyword match
 is never dropped by it.
 
-Without the extra, or with `vector_store=False`, `search_planning` still answers — keyword and
-field filters only. There is no error and no warning at call time; the degradation is by design.
+Without the extra, or whenever the store cannot be resolved or its collection cannot be created,
+`search_planning` still answers — keyword and field filters only. There is no error and no warning
+at call time; the degradation is by design. **There is no longer a way to switch the vector store
+off on this card:** `vector_store` is a `VectorStoreParam`, not a `bool`, so a card that passes
+`False` fails validation. A team that wants keyword-only search simply omits the
+`[vector_search]` extra.
 
 ### Import paths
 

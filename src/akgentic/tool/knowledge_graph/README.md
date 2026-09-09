@@ -23,8 +23,7 @@ from akgentic.tool.knowledge_graph import KnowledgeGraphTool
 ```python
 class KnowledgeGraphTool(ToolCard):
     # Vector-search wiring
-    vector_store: bool | str = True
-    collection: VectorStoreParam = VectorStoreParam()
+    vector_store: VectorStoreParam = VectorStoreParam()
     search_top_k: int = 10
     search_score_threshold: float = 0.3
     hybrid_alpha: float = 0.7
@@ -243,15 +242,17 @@ KnowledgeGraphTool(get_graph=GetGraph(                # also fetchable on demand
     expose={LLM_CONTEXT, TOOL_CALL, COMMAND},
 ))
 
-KnowledgeGraphTool(                                   # persistent, tenant-isolated
-    collection=VectorStoreParam(backend="weaviate", tenant="team-42"),
-    search_score_threshold=0.45,
+KnowledgeGraphTool(                                   # persistent, tenant-isolated;
+    vector_store=VectorStoreParam(backend="weaviate", tenant="team-42"),
+    search_score_threshold=0.45,                      # no store actor is created for it
     search_top_k=25,
     hybrid_alpha=0.3,                                 # trust exact names over similarity
 )
-
-KnowledgeGraphTool(vector_store=False)                # keyword-only search
 ```
+
+**There is no way to switch the vector store off on this card.** `vector_store` is a
+`VectorStoreParam`, not a `bool`, so a card passing `False` fails validation. This card requires
+the `[vector_search]` extra unconditionally in any case.
 
 > **The environment picks the backend; you only override it.** The connection is read from the
 > environment at `observer()` time, never from the card — a catalog entry must not carry a cluster

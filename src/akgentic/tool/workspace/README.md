@@ -482,7 +482,7 @@ cannot argue with.
 | `workspace_rag_index` | `WorkspaceRagIndex \| bool` | **`False`** | Queue workspace files for retrieval indexing. On the **read** side of `read_only`: indexing derives from the tree and writes nothing into it. |
 | `workspace_rag_list` | `WorkspaceRagList \| bool` | **`False`** | Where every file stands in the index. `COMMAND` + `LLM_CONTEXT`, never `TOOL_CALL` — it is pushed into the context tail as a per-turn delta, so a tool call for it would be a round trip for what the model already has. |
 | `workspace_rag_search` | `WorkspaceRagSearch \| bool` | **`False`** | Hybrid search over the indexed chunks. `TOOL_CALL` only — a search is something the model *does*, not something it is *shown*. Read side, like its two siblings. |
-| `rag_collection` | `VectorStoreParam` | `VectorStoreParam()` | Backend, dimension, tenant, embedding model and provider of the one `workspace_chunks` collection. Named `rag_collection` rather than the house's bare `collection`: on a card whose other twenty fields are workspace operations, a bare `collection` reads as "the workspace's collection of files". |
+| `vector_store` | `VectorStoreParam` | `VectorStoreParam()` | Backend, dimension, tenant, embedding model and provider of the one `workspace_chunks` collection. The house name, shared with `PlanningTool` and `KnowledgeGraphTool`. It was once `rag_collection`, because a bare `collection` reads as "the workspace's collection of files" on a card whose other twenty fields are file operations — `vector_store` answers that objection rather than working around it. The backend it names also decides whether a store actor is created at all, and it is what the backend-configuration check reads. All of that only when a retrieval capability is on. |
 | `max_documents` | `int \| None` | `None` | Row cap on the extraction cache. `None` is **not** zero and not "use the default" — it means *derive it* from the vector backend and whether retrieval is on. An explicit value always wins. |
 | `max_document_chars` | `int \| None` | `None` | Character cap on the bodies the cache holds. Same three-way meaning. |
 
@@ -1014,7 +1014,7 @@ WorkspaceTool(workspace_id="corpus", workspace_rag_search=True)
 # rather than silently giving a card that asked for a cluster a local index.
 WorkspaceTool(
     workspace_rag_index=True,
-    rag_collection=VectorStoreParam(backend="weaviate", tenant="acme"),
+    vector_store=VectorStoreParam(backend="weaviate", tenant="acme"),
 )
 ```
 
