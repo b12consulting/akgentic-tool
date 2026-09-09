@@ -11,7 +11,7 @@ from akgentic.tool import WorkspaceTool
 | | |
 |---|---|
 | Module | `akgentic.tool.workspace.tool` |
-| Actor | `#Workspace-<workspace_id or team_id>` — one singleton per **tree**, not per team. Plus `#SandboxActor-<workspace>` when `workspace_exec` is on |
+| Actor | `#Workspace-<scope>/<leaf>` — the **resolved two-segment path**, slash included, so two principals' `notes` are two actors over two trees. One singleton per **tree**, not per team. Plus `#SandboxActor-<scope>/<leaf>` when `workspace_exec` is on |
 | Channels used | `TOOL_CALL` (11 callables, 13 with `workspace_exec`), `COMMAND` (`expand_media_refs`) |
 | Optional extras | `[docs]` for binary reads, `[vision]` for image resizing |
 | Environment | `AKGENTIC_WORKSPACES_ROOT` (default `./workspaces`) |
@@ -46,8 +46,9 @@ write gate, and a misconfigured vector store must not be a way to take the gate 
 
 ```python
 class WorkspaceTool(ToolCard):
-    # Where the files live
+    # Where the files live — two mutually exclusive ways to name the <leaf>
     workspace_id: str | None = None
+    workspace_metadata_keys: list[str] = []
 
     # Read-side capabilities
     workspace_read: WorkspaceRead | bool = True
@@ -89,23 +90,32 @@ card is therefore not a contradiction — it simply never reaches the model. `wo
 the **write** side: a command mutates the tree whatever it happens to be, so
 `WorkspaceTool(read_only=True, workspace_exec=True)` registers neither exec callable.
 
-**The backend and the actor are both bound in `observer()`, not in `__init__`.** `observer()`
-resolves the workspace name (`workspace_id or str(observer.team_id)`), calls `get_workspace(name)`
-to build a `Filesystem` rooted at `<AKGENTIC_WORKSPACES_ROOT>/<name>`, seeds `resources`, then
-binds the `#Workspace-<name>` singleton that owns the tree and — only if exec is enabled — the
-sandbox backend. Reading `card.workspace` before that raises `RuntimeError`; calling a mutation
-before it raises `RuntimeError` too, because there is deliberately no ungated path to fall back to.
-Every runtime handle lives in a `PrivateAttr`, so none appears in `model_dump()` and the card stays
-catalog-serializable.
+**The backend and the actor are both bound in `observer()`, not in `__init__`.** `observer()` makes
+**one** call to `resolve_workspace_path(...)` — the single place a workspace directory is derived —
+and hands the result down as an already-resolved value: a `Filesystem` rooted at
+`<AKGENTIC_WORKSPACES_ROOT>/<scope>/<leaf>`, the `#Workspace-<scope>/<leaf>` singleton that owns the
+tree, and — only if exec is enabled — the sandbox backend. Nothing below re-derives it, which is what
+makes it impossible for a backend to open a different directory from the one the gate and the journal
+are guarding. `resources` are seeded in between. Reading `card.workspace` before that raises
+`RuntimeError`; calling a mutation before it raises `RuntimeError` too, because there is deliberately
+no ungated path to fall back to. Every runtime handle lives in a `PrivateAttr`, so none appears in
+`model_dump()` and the card stays catalog-serializable.
 
-**The actor's name carries the workspace, and that is load-bearing.** Two cards with different
-`workspace_id` values in one team get **two** actors, each owning its own tree. A fixed name would
-collapse them onto one actor owning one of the two trees, silently. The same rule names the sandbox
-actor `#SandboxActor-<workspace>`.
+**A card declaring `workspace_metadata_keys` makes one bind-time `get_metadata()` ask; a bare card
+makes none.** The team's metadata is fetched only when this card names keys, so the overwhelming
+majority of `WorkspaceTool()` instances gain no round trip at wiring time.
 
-**Two teams sharing one `workspace_id` get two actors over one tree**, and their writes are
-therefore *not* ordered. They are still *checked*: the gate hashes the live file, so a cross-team
-collision is detected and refused rather than lost. This is a stated limit, not an oversight.
+**The actor's name carries the resolved path, and that is load-bearing.** Two cards with different
+`workspace_id` values in one team get **two** actors, each owning its own tree — and so do two
+*principals* whose cards both say `workspace_id="notes"`, because the name carries the scope as well
+as the leaf. A fixed name would collapse them onto one actor owning one of the trees, silently. The
+same rule names the sandbox actor `#SandboxActor-<scope>/<leaf>`.
+
+**Two teams of the same principal sharing one `workspace_id` get two actors over one tree**, and
+their writes are therefore *not* ordered. They are still *checked*: the gate hashes the live file, so
+the collision is detected and refused rather than lost. This is a stated limit, not an oversight.
+Two teams of **different** principals do not share a tree at all: `notes` resolves under each owner's
+own scope. Sharing across principals is `workspace_metadata_keys`, and nothing else.
 
 ---
 
@@ -190,8 +200,10 @@ way around the gate.
 
 The hash is read from disk on **every** check and never cached. That is what makes the gate correct
 against writers that never pass through the card at all: a frontend upload, a sandboxed command,
-ADR-026 resource seeding, and a second team sharing the same `workspace_id`. None of the four
-announces itself; all four are caught, because the check consults the file.
+ADR-026 resource seeding, and a second team of the same principal sharing the same `workspace_id`.
+None of the four announces itself; all four are caught, because the check consults the file. The
+narrowing of the fourth is a fact about the *layout*, not about the gate: the gate never knew which
+team wrote, and does not need to.
 
 ---
 
@@ -201,7 +213,7 @@ When `git` is available and `git_journal` is on, **every accepted mutation is on
 authored by the agent that made it.
 
 ```
-$ git --git-dir workspaces/proj-42.git --work-tree workspaces/proj-42 log --oneline
+$ git --git-dir workspaces/$SCOPE/proj-42.git --work-tree workspaces/$SCOPE/proj-42 log --oneline
 9c1f0aa exec: 3 files          (builder)
 41b0d3e out-of-band: changes from outside the tools   (out-of-band)
 a77e214 edit: src/main.py      (reviewer)
@@ -450,7 +462,8 @@ cannot argue with.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `workspace_id` | `str \| None` | `None` | Directory name under the workspaces root, **and** the suffix of the actor's name. `None` ⇒ the team id, so each team gets its own tree. Set it to a fixed string to share one directory across teams (checked by the gate, not ordered by an actor), or to give two agents in one team two separate trees. |
+| `workspace_id` | `str \| None` | `None` | The `<leaf>` — a directory name **under the caller's own principal**, not under the workspaces root, and the second half of the actor's name. `None` ⇒ the team id, so each team gets its own tree. A fixed string names a **second tree of your own**: two agents in one team can hold two separate trees, and two teams of the *same* principal reach one tree (checked by the gate, not ordered by an actor). It does **not** share across principals — two users declaring `notes` get `<alice>/notes` and `<bob>/notes`. For sharing that actually shares, use `workspace_metadata_keys`. |
+| `workspace_metadata_keys` | `list[str]` | `[]` | The `<leaf>` derived from the team's own metadata, under the reserved `_meta` scope: `["customer_id", "case_id"]` over `ACME` and `42` resolves to `_meta/customer_id-ACME__case_id-42`. This is the layout that is **shared across teams and across users** — which is why it sits under a reserved scope rather than under anybody's principal. Keys are a **sequence**: joined in declaration order, so the list reads as a refinement path from the coarsest scope down and `ls _meta/` groups a customer's trees together — the trade being that two cards naming the same keys in different orders address different workspaces, which is visible in the directory name rather than silent. Values are percent-encoded, which is what keeps the join unforgeable. The declared list also travels on the wire as `WorkspaceConfig.metadata_keys`, so a client attributes an agent to a workspace by plain list equality against this field, with nothing to normalise on either side. **Mutually exclusive with `workspace_id`** — declaring both is a `ValidationError` at card construction, not a precedence rule. Every failure is a hard error at bind time, never a fallback to a user path: no metadata on the team, a key that is not a field of the metadata model, a value that is `None` or empty, or a joined leaf over 255 bytes. |
 | `read_only` | `bool` | `False` | `True` removes every write-side callable from the tool list, `workspace_exec` included. The read side is unaffected. |
 | `git_journal` | `bool` | `False` | Whether accepted mutations are recorded in the git journal. **Off by default**, because nothing in the system consumes the record: the gate re-hashes live and never consults it, and an agent's exec result carries only `exit_code`/`stdout`/`stderr`, so the journal is a human-facing audit trail you opt into. A plain field, not a capability param: it exposes no tool and nothing about it is expressible by a model. Turning it off loses history, attribution and out-of-band detection — it does **not** loosen the gate by one row. Read by the **first** card to create the actor for a workspace. |
 | `resources` | `list[Resource]` | `[]` | Files written into the workspace at `observer()` time, before the agent's first turn. Seeding is **idempotent**: a resource whose `file_name` already exists is skipped, so restoring a team never clobbers a file the agent has since edited. |
@@ -774,11 +787,46 @@ now returns only the failure — nothing was applied, so there is nothing to rep
 
 ### Where the files live
 
+**A workspace is a relative path of exactly two segments** — `<scope>/<leaf>`. `<scope>` answers
+*whose is this*, `<leaf>` answers *which of theirs*, and the leaf is always a discriminator unique to
+one workspace: a team id, a `workspace_id`, or a joined metadata key, never a category. There are
+three layouts and no fourth:
+
+| Card | Resolved path |
+|---|---|
+| `WorkspaceTool()` | `<user_id>/<team_id>` |
+| `WorkspaceTool(workspace_id="notes")` | `<user_id>/notes` |
+| `WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])` | `_meta/customer_id-ACME__case_id-42` |
+
 ```
-$AKGENTIC_WORKSPACES_ROOT/          # default ./workspaces
-├── <workspace_id or team_id>/      # the root every path is anchored to
-└── <workspace_id or team_id>.git/  # the journal — a SIBLING, never inside the root
+$AKGENTIC_WORKSPACES_ROOT/                # default ./workspaces
+├── <user_id>/
+│   ├── <team_id>/                        # the root every path is anchored to
+│   ├── <team_id>.git/                    # the journal — a SIBLING, never inside the root
+│   ├── notes/                            # a named workspace: a second tree of your OWN
+│   └── notes.git/
+└── _meta/                                # reserved: the shared, metadata-keyed layout
+    ├── customer_id-ACME__case_id-42/
+    └── customer_id-ACME__case_id-42.git/
 ```
+
+**Depth is fixed at two, and what that buys is that no workspace path is a prefix of another.**
+`Filesystem._validate_path` rejects only paths resolving *outside* the root, so a workspace at
+`ACME/` would read and write everything under `ACME/42/` as ordinary in-tree activity, with the
+per-path write gate none the wiser. That is containment rather than a name collision, and it is
+worse. At depth two with a unique leaf the property holds by construction.
+
+**Where there is no principal there is no isolation, by construction.** A team created through the
+SDK carries `user_id="cli"` and an HTTP deployment with no authentication configured carries
+`anonymous`, so every such team on one host shares that one scope. Team trees stay distinct anyway —
+`cli/<team_id>`, and a team id is unique — but a **named** workspace does not: `cli/notes` is one
+tree for every SDK-created team on that host. On a developer machine that is the desired behaviour;
+on a shared host reached without authentication it is the old flat namespace again, narrowed to one
+scope. Supplying a principal is the deployment's job.
+
+The `<scope>` never reaches a client. The frontend sends and labels the **leaf** it read from the
+tool row — `notes`, a team id, or the joined metadata key — and the server recomputes the scope from
+the team's own card.
 
 `Filesystem._validate_path` resolves each path against that root and rejects anything landing
 outside it with `PermissionError`, which the tools surface as `RetriableError`. The check is
@@ -794,6 +842,107 @@ load-bearing — `os.replace` is atomic only within one filesystem. Permission b
 ownership, extended attributes and hardlinks are not, because publishing by rename replaces the
 inode. That matters where the workspace is bind-mounted into a container running as another uid.
 Orphaned staging files left by a hard kill are swept once, at actor start.
+
+### Migrating a pre-48 workspaces root
+
+A root written before the two-segment layout holds every workspace at the top level. Every one of
+them moves:
+
+| Before | After |
+|---|---|
+| `workspaces/<team_id>/` | `workspaces/<user_id>/<team_id>/` |
+| `workspaces/<team_id>.git/` | `workspaces/<user_id>/<team_id>.git/` |
+| `workspaces/<name>/` | `workspaces/<user_id>/<name>/`, **manually**, once per owning principal |
+| `workspaces/<name>.git/` | `workspaces/<user_id>/<name>.git/`, with its tree |
+
+**The journal moves with its tree — both directories or neither.** The repository is the sibling
+`<name>.git` in the same directory as the tree, so a move that relocates only the tree loses that
+workspace's history *silently*: nothing raises, and the actor initialises an empty repository at the
+new sibling on next start.
+
+#### Team workspaces — the script
+
+```bash
+# Dry run is the default: it prints the plan and changes nothing.
+python -m akgentic.tool.workspace.migrate --root ./workspaces --owners owners.json
+
+# Then apply it.
+python -m akgentic.tool.workspace.migrate --root ./workspaces --owners owners.json --apply
+```
+
+`owners.json` is a flat object mapping team id to the owning user id:
+
+```json
+{
+  "3f2b1c8e-0a4d-4c9a-9f3e-2b6d7c8a1e55": "2R0bQV8j9zX8CEsBl6APi7MXgAn4_laOa8vd9ZoIHIQ",
+  "b7c4e2a1-55d9-4f30-8a1b-9c0e6d4f2a77": "geoffroy.piroux@example.com"
+}
+```
+
+For a deployment with one principal for the whole root — the community and CLI tiers, where every
+team carries `cli` or `anonymous` — `--owner <user_id>` covers it in one flag and no file is needed:
+
+```bash
+python -m akgentic.tool.workspace.migrate --root ./workspaces --owner anonymous --apply
+```
+
+**Where the mapping comes from.** Each team's owner is the `user_id` stored on that team's team
+record — one owner per team, no judgement involved. The script does **not** read those records:
+`akgentic-tool` may not import `akgentic-team`, so the lookup happens outside this package and its
+result is handed in. On an `akgentic-infra` server, `GET /teams` returns `team_id` and `user_id` for
+each team, but only for **the calling user's own** teams — so a root with several principals is
+built from the deployment's team store directly, one entry per team, rather than from one call.
+
+**An unmapped team id is refused, never guessed.** The run reports it and exits non-zero without
+moving it. Defaulting to `anonymous` would file one user's tree under the shared anonymous scope,
+which is exactly the exposure the two-segment layout exists to close.
+
+What the plan says about each directory:
+
+| Verdict | Meaning |
+|---|---|
+| `MOVE` | a team id in the mapping — tree and journal move together |
+| `ALREADY_MIGRATED` | the source is gone and the destination is there: a previous run did it. Not a conflict, and it does not fail the run. If the tree moved but its journal is still at the root — a hand-migration, or a run killed between the two moves — the row says so, and that journal must be moved beside its tree by hand |
+| `CONFLICT` | the destination already exists. **The whole plan refuses**: nothing moves and the exit code is non-zero |
+| `UNMAPPED` | a team id absent from the mapping. Never moved; the run exits non-zero |
+| `MANUAL` | a named workspace, or a `.git` the mapping did not account for. Never touched — see below. The row distinguishes the two: a journal whose tree is beside it moves **with** that tree, while one standing alone cannot be placed at all |
+| `SKIPPED` | already a scope directory, not a workspace |
+
+The whole plan is validated before anything moves, so a collision is found while the root is still
+untouched rather than halfway through. Running the script twice over the same root is a clean no-op
+the second time.
+
+#### Named workspaces — the manual path
+
+The script never touches them, and that is deliberate: the mapping from a *name* to a principal
+exists nowhere on disk, and a wrong guess hands one user's files to another.
+
+For each named workspace, decide who owns it and move both directories:
+
+```bash
+mkdir -p workspaces/<user_id>
+mv workspaces/<name>      workspaces/<user_id>/<name>
+mv workspaces/<name>.git  workspaces/<user_id>/<name>.git   # if it exists
+```
+
+`<user_id>` is literally the value on that user's teams' records. Where a tree really was being
+shared by several principals, **copy** it once per principal — and treat that as a signal: a tree
+that genuinely needs sharing should move to `workspace_metadata_keys` instead of being copied,
+because copies diverge from the moment they are made. Replace
+`WorkspaceTool(workspace_id="acme-case-42")` with
+`WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])` on a team whose metadata carries
+those fields, and put the directory at `workspaces/_meta/customer_id-ACME__case_id-42`. The sharing
+is then declared rather than implied by everyone happening to type the same string.
+
+#### The RAG index must be rebuilt, and there is no script for it
+
+The retrieval index is scoped by the workspace path, so a moved workspace's chunks are still filed
+under the old scope. Re-index the tree after the move — `workspace_rag_index(force=True)` — and the
+old scope's chunks stay where they are until a scope-wide purge primitive exists.
+
+That costs re-embedding and no information: the index is derived data, and every chunk is recoverable
+from the tree. The stranded chunks are inert rather than cross-readable — no query ever issues a
+bare-leaf scope any more — so they leak storage and nothing else.
 
 ### Seeding files
 
@@ -815,10 +964,17 @@ Both fields are primitives, so a seeded resource round-trips through a catalog e
 ### Recipes
 
 ```python
-WorkspaceTool()                                   # full read/write, per-team directory
+WorkspaceTool()                                   # <user_id>/<team_id>: this team's own tree
 WorkspaceTool(read_only=True)                     # analyst: reads only
-WorkspaceTool(workspace_id="shared-corpus")       # one directory shared across teams
+WorkspaceTool(workspace_id="scratch")             # <user_id>/scratch: a second tree of YOUR OWN,
+                                                  # not a tree shared with other principals
 WorkspaceTool(read_only=True, workspace_glob=False)  # drop one capability
+
+# Shared across teams AND across users, because the sharing is DECLARED: the leaf
+# is derived from the team's own metadata and lands under the reserved _meta scope,
+# e.g. _meta/customer_id-ACME__case_id-42 — declaration order, so `ls _meta/` groups
+# a customer's trees. Mutually exclusive with workspace_id.
+WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])
 
 # A coding agent: file tools and a shell over ONE tree, ONE gate, ONE history.
 # Exec used to be a second card sharing a workspace_id; it is a capability now,
@@ -837,7 +993,8 @@ WorkspaceTool(workspace_read=WorkspaceRead(document_reader=DocumentReader(llm_cl
 # Ship full-resolution images to the model
 WorkspaceTool(workspace_view=WorkspaceView(max_dimension=0))
 
-# Retrieval over a shared document corpus. Needs a #VectorStore on the team;
+# Retrieval over a document corpus at <user_id>/corpus — reachable by this
+# principal's other teams, and by nobody else's. Needs a #VectorStore on the team;
 # without one every retrieval callable answers a sentence and nothing raises.
 WorkspaceTool(
     workspace_id="corpus",
@@ -847,9 +1004,11 @@ WorkspaceTool(
     workspace_rag_search=True,
 )
 
-# Search only — the model queries an index somebody else fills. Enabling any one
-# of the three still turns retrieval on for the tree, so this creates the
-# collection and shrinks the extraction cache exactly as the indexer would.
+# Search only — the model queries an index another card of the SAME principal
+# fills. Enabling any one of the three still turns retrieval on for the tree, so
+# this creates the collection and shrinks the extraction cache exactly as the
+# indexer would. Use workspace_metadata_keys instead to index a corpus that
+# several principals must share.
 WorkspaceTool(workspace_id="corpus", workspace_rag_search=True)
 
 # A durable shared index. Fails at wiring time if AKGENTIC_WEAVIATE_URL is unset,

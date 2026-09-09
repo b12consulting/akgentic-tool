@@ -47,6 +47,34 @@ from tests.conftest import MockActorAddress
 WORKSPACE_NAME = "test-workspace"
 """The ``workspace_id`` the wired cards below share."""
 
+DEFAULT_TEST_PRINCIPAL = "u-alice"
+"""The ``user_id`` the fake observer carries unless a test names another.
+
+Every workspace now resolves under its owner, so the trees the suite writes to
+live at ``<root>/u-alice/<leaf>``. :func:`workspace_root_for` builds that path so
+no test has to spell the layout out twice.
+"""
+
+
+WORKSPACE_PATH = f"{DEFAULT_TEST_PRINCIPAL}/{WORKSPACE_NAME}"
+"""What ``WORKSPACE_NAME`` **resolves** to — the two-segment path, not the leaf.
+
+The distinction is the whole of ADR-048 in one line: ``WORKSPACE_NAME`` is what
+a card declares, and this is the directory and the actor-name suffix it reaches.
+Assertions about a tree or an actor name use this one; assertions about what an
+author wrote use the other.
+"""
+
+
+def workspace_path_for(leaf: str, user_id: str = DEFAULT_TEST_PRINCIPAL) -> str:
+    """The two-segment path *leaf* resolves to for *user_id*."""
+    return f"{user_id}/{leaf}"
+
+
+def workspace_root_for(base: Path, leaf: str, user_id: str = DEFAULT_TEST_PRINCIPAL) -> Path:
+    """The on-disk root of the workspace *leaf* belonging to *user_id*."""
+    return base / user_id / leaf
+
 HANDSHAKE_TIMEOUT_S = 5.0
 """Upper bound on a thread handshake — never a delay, only a failure budget."""
 
@@ -190,6 +218,15 @@ class FakeOrchestratorProxy:
         otherwise — the wiring suites resolve sandbox actors without ever
         sending them anything.
         """
+        self.metadata: Any = None
+        """What :meth:`get_metadata` answers — the team's metadata, or ``None``.
+
+        A card only asks when it declares ``workspace_metadata_keys``, so the
+        default of ``None`` is also the assertion that a bare ``WorkspaceTool()``
+        gained no bind-time round trip: :attr:`metadata_calls` stays at zero.
+        """
+        self.metadata_calls = 0
+
         self.sandbox_born_dead = False
         """Hand out sandbox addresses that are already dead.
 
@@ -225,6 +262,11 @@ class FakeOrchestratorProxy:
             address = MockActorAddress(config.name, config.role)
         self.children[config.name] = (address, actor)
         return address
+
+    def get_metadata(self) -> Any:
+        """Return the team's metadata, exactly as the orchestrator does."""
+        self.metadata_calls += 1
+        return self.metadata
 
     def actor_for(self, address: ActorAddress) -> Any:
         """Return the actor behind *address*, or ``None`` when it is unknown."""
@@ -264,6 +306,7 @@ class FakeActorToolObserver:
         name: str = "alice",
         workspace_proxy: object | None = None,
         workspace_tell_proxy: object | None = None,
+        user_id: str | None = DEFAULT_TEST_PRINCIPAL,
     ) -> None:
         self._agent = SilentAgent(config=BaseConfig(name=name, role="tester"))
         self._address: ActorAddress = ActorAddressImpl(self._agent.actor_ref)
@@ -272,6 +315,10 @@ class FakeActorToolObserver:
         self._workspace_proxy = workspace_proxy
         self._workspace_tell_proxy = workspace_tell_proxy
         self._team_id = uuid.uuid4()
+        self.user_id = user_id
+        """The owning principal — a plain attribute, so a test can hand two
+        cards two different principals and watch them reach two trees. The
+        Protocol declares a property; an attribute satisfies it structurally."""
         self._state_carrier = SimpleNamespace(tool_state=ToolState())
         self.events: list[object] = []
         self.ask_targets: list[ActorAddress] = []
@@ -446,8 +493,8 @@ def workspaces_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 @pytest.fixture
 def workspace_tree(workspaces_root: Path) -> Path:
-    """The tree ``WORKSPACE_NAME`` resolves to."""
-    tree = workspaces_root / WORKSPACE_NAME
+    """The tree ``WORKSPACE_NAME`` resolves to — under its owner, not at the root."""
+    tree = workspaces_root / WORKSPACE_PATH
     tree.mkdir(parents=True, exist_ok=True)
     return tree
 
@@ -483,7 +530,7 @@ def workspace_actor(
     wired_card: WorkspaceTool,
 ) -> WorkspaceActor:
     """The live singleton actor behind :func:`wired_card`."""
-    _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_NAME)]
+    _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
     assert isinstance(actor, WorkspaceActor)
     return actor
 
@@ -605,9 +652,11 @@ class FakeSandboxActor(SandboxActor):
     script: ClassVar[SandboxScript] = SandboxScript()
 
     def _start_sandbox(self) -> None:
+        # Joins the path it was handed and derives nothing, exactly as the four
+        # shipped backends do — a fake that still resolved would hide the very
+        # thing the shipped ones stopped doing.
         base = os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
-        name = self.config.workspace_id or self.config.team_id
-        root = Path(base) / name
+        root = Path(base) / self.config.workspace_path
         root.mkdir(parents=True, exist_ok=True)
         self.state.workspace_path = root.resolve()
 

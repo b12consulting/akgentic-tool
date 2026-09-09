@@ -39,7 +39,7 @@ from akgentic.tool.workspace.documents.models import (
 )
 from akgentic.tool.workspace.models import WorkspaceConfig
 
-from tests.workspace.conftest import WORKSPACE_NAME
+from tests.workspace.conftest import WORKSPACE_PATH
 
 # Recorded once, from a call made in a *different* process. A second call made
 # here would agree with a namespace minted per process, which is exactly the
@@ -53,9 +53,9 @@ def _actor() -> WorkspaceActor:
     """A started actor over the test workspace, with no actor thread."""
     actor = WorkspaceActor(
         config=WorkspaceConfig(
-            name=workspace_actor_name(WORKSPACE_NAME),
+            name=workspace_actor_name(WORKSPACE_PATH),
             role=WORKSPACE_ACTOR_ROLE,
-            workspace_name=WORKSPACE_NAME,
+            workspace_path=WORKSPACE_PATH,
         )
     )
     actor.on_start()

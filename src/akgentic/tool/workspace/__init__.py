@@ -139,6 +139,9 @@ from akgentic.tool.workspace.readers import (
     MediaContent,
 )
 from akgentic.tool.workspace.workspace import (
+    ANONYMOUS,
+    METADATA_SCOPE,
+    RESERVED_SCOPES,
     FileEntry,
     Filesystem,
     PathEscapeError,
@@ -146,9 +149,15 @@ from akgentic.tool.workspace.workspace import (
     WriteEntry,
     get_workspace,
     is_staging_name,
+    leaf_segment,
+    resolve_workspace_path,
+    user_segment,
 )
 
 __all__ = [
+    "ANONYMOUS",
+    "METADATA_SCOPE",
+    "RESERVED_SCOPES",
     "DEFAULT_EXEC_POLL_ATTEMPTS",
     "DEFAULT_EXEC_POLL_DELAY_S",
     "DEFAULT_EXEC_TIMEOUT_S",
@@ -259,6 +268,9 @@ __all__ = [
     "Workspace",
     "WriteEntry",
     "get_workspace",
+    "leaf_segment",
+    "resolve_workspace_path",
+    "user_segment",
     "ExpandMediaRefs",
     "Resource",
     "ResourceType",

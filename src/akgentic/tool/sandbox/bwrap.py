@@ -32,9 +32,12 @@ class BwrapSandboxActor(SandboxActor):
     def _start_sandbox(self) -> None:
         """Start the bubblewrap sandbox.
 
-        Checks that ``bwrap`` is available on PATH, then resolves the workspace
-        directory (using ``workspace_id or team_id``) under ``AKGENTIC_WORKSPACES_ROOT``
-        (defaulting to ``./workspaces``) and creates it if it does not yet exist.
+        Checks that ``bwrap`` is available on PATH, then joins the card's
+        already-resolved ``config.workspace_path`` to ``AKGENTIC_WORKSPACES_ROOT``
+        (defaulting to ``./workspaces``) and creates the directory if it does not
+        yet exist. Nothing is derived here: this backend has no notion of users,
+        teams, sharing or metadata, which is what makes it unable to open a tree
+        other than the one it was handed.
 
         Raises:
             RuntimeError: If ``bwrap`` is not found on PATH.
@@ -46,8 +49,7 @@ class BwrapSandboxActor(SandboxActor):
                 "  dnf install bubblewrap   (Fedora/RHEL)"
             )
         base = os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
-        ws_name = self.config.workspace_id or self.config.team_id
-        workspace_path = Path(base) / ws_name
+        workspace_path = Path(base) / self.config.workspace_path
         workspace_path.mkdir(parents=True, exist_ok=True)
         self.state.workspace_path = workspace_path.resolve()
         self.state.notify_state_change()

@@ -18,6 +18,15 @@ from akgentic.tool.workspace.workspace import Filesystem
 # ---------------------------------------------------------------------------
 
 
+TEST_PRINCIPAL = "u-alice"
+"""The owning principal these mock observers carry.
+
+Every workspace resolves under its owner now, so a mock observer must carry a
+usable ``user_id``: the resolver reads it as a typed attribute and refuses a
+value that cannot be a directory name — which a bare ``MagicMock`` attribute is.
+"""
+
+
 def make_observer(
     orchestrator_is_none: bool = False,
     team_id: uuid.UUID | None = None,
@@ -26,6 +35,7 @@ def make_observer(
     observer = MagicMock()
     observer.orchestrator = None if orchestrator_is_none else MagicMock()
     observer.team_id = team_id or uuid.uuid4()
+    observer.user_id = TEST_PRINCIPAL
     return observer
 
 

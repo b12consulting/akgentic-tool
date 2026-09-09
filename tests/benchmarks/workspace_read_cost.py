@@ -101,6 +101,7 @@ from akgentic.tool.workspace.models import (
 )
 from akgentic.tool.workspace.readers import DocumentReader
 from akgentic.tool.workspace.tool import WorkspaceRead, WorkspaceTool
+from akgentic.tool.workspace.workspace import ANONYMOUS
 
 ##
 ## Arms
@@ -982,7 +983,11 @@ def run_arm(spec: RunSpec, arm: str, base: Path) -> ArmRun:
     """Run one arm once, on a fresh actor system and a fresh tree."""
     workspace_id = f"bench-{uuid.uuid4().hex[:8]}"
     root = base / workspace_id
-    tree = root / workspace_id
+    # The benchmark's agents are created with no principal, so their cards
+    # resolve under the anonymous scope. The corpus has to be built where the
+    # cards will actually look, which is the resolved path and not the leaf.
+    workspace_path = f"{ANONYMOUS}/{workspace_id}"
+    tree = root / workspace_path
     tree.mkdir(parents=True)
     previous_root = os.environ.get("AKGENTIC_WORKSPACES_ROOT")
     os.environ["AKGENTIC_WORKSPACES_ROOT"] = str(root)
@@ -991,7 +996,9 @@ def run_arm(spec: RunSpec, arm: str, base: Path) -> ArmRun:
     gate = _Gate(threading.Barrier(spec.agents + 1), threading.Event())
     try:
         with _arm_patch(arm), _gate_installed(gate):
-            return _drive(system, spec, arm, workspace_id, corpus, gate, tree)
+            return _drive(
+                system, spec, arm, workspace_id, workspace_path, corpus, gate, tree
+            )
     finally:
         gate.go.set()
         system.shutdown(timeout=SHUTDOWN_TIMEOUT_S)
@@ -1013,6 +1020,7 @@ def _drive(
     spec: RunSpec,
     arm: str,
     workspace_id: str,
+    workspace_path: str,
     corpus: Corpus,
     gate: _Gate,
     tree: Path,
@@ -1023,7 +1031,7 @@ def _drive(
         Orchestrator, config=BaseConfig(name="@Orchestrator", role="Orchestrator")
     )
     orch = system.proxy_ask(orch_addr, Orchestrator)
-    workspace = _install_sampling_actor(system, orch, workspace_id, journal)
+    workspace = _install_sampling_actor(system, orch, workspace_path, journal)
     members = [
         _spawn_agent(orch, spec, arm, workspace_id, corpus, slot) for slot in range(spec.agents)
     ]
@@ -1044,7 +1052,7 @@ def _drive(
 
 
 def _install_sampling_actor(
-    system: ActorSystem, orch: Orchestrator, workspace_id: str, journal: bool
+    system: ActorSystem, orch: Orchestrator, workspace_path: str, journal: bool
 ) -> _SamplingWorkspaceActor:
     """Create ``#Workspace-<id>`` as the instrumented subclass, before any card wires.
 
@@ -1056,9 +1064,9 @@ def _install_sampling_actor(
     address = orch.createActor(
         _SamplingWorkspaceActor,
         config=WorkspaceConfig(
-            name=workspace_actor_name(workspace_id),
+            name=workspace_actor_name(workspace_path),
             role=WORKSPACE_ACTOR_ROLE,
-            workspace_name=workspace_id,
+            workspace_path=workspace_path,
             git_journal=journal,
         ),
     )

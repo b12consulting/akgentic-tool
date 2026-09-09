@@ -93,7 +93,12 @@ def test_sandbox_config_requires_team_id() -> None:
 
 def test_sandbox_config_valid() -> None:
     """SandboxConfig accepts name, role, and team_id."""
-    config = SandboxConfig(name="sandbox", role="ToolActor", team_id="team-42")
+    config = SandboxConfig(
+        name="sandbox",
+        role="ToolActor",
+        team_id="team-42",
+        workspace_path="team-42",
+    )
     assert config.team_id == "team-42"
     assert config.name == "sandbox"
     assert config.role == "ToolActor"
@@ -101,43 +106,81 @@ def test_sandbox_config_valid() -> None:
 
 def test_sandbox_config_mode_defaults_to_local() -> None:
     """SandboxConfig.mode defaults to 'local' when not provided."""
-    config = SandboxConfig(name="sandbox", role="ToolActor", team_id="team-1")
+    config = SandboxConfig(
+        name="sandbox",
+        role="ToolActor",
+        team_id="team-1",
+        workspace_path="team-1",
+    )
     assert config.mode == "local"
 
 
 def test_sandbox_config_mode_docker() -> None:
     """SandboxConfig accepts mode='docker'."""
-    config = SandboxConfig(name="sandbox", role="ToolActor", team_id="team-1", mode="docker")
+    config = SandboxConfig(
+        name="sandbox",
+        role="ToolActor",
+        team_id="team-1",
+        workspace_path="team-1",
+        mode="docker",
+    )
     assert config.mode == "docker"
 
 
 def test_sandbox_config_mode_local_explicit() -> None:
     """SandboxConfig accepts mode='local' explicitly."""
-    config = SandboxConfig(name="sandbox", role="ToolActor", team_id="team-1", mode="local")
+    config = SandboxConfig(
+        name="sandbox",
+        role="ToolActor",
+        team_id="team-1",
+        workspace_path="team-1",
+        mode="local",
+    )
     assert config.mode == "local"
 
 
-def test_sandbox_config_workspace_id_defaults_to_none() -> None:
-    """FR-SB-31: SandboxConfig.workspace_id defaults to None."""
-    config = SandboxConfig(name="sandbox", role="ToolActor", team_id="team-1")
-    assert config.workspace_id is None
+def test_sandbox_config_carries_the_resolved_path_and_no_workspace_id() -> None:
+    """The config carries an already-resolved path, and ``workspace_id`` is gone.
 
-
-def test_sandbox_config_workspace_id_can_be_set() -> None:
-    """FR-SB-31: SandboxConfig.workspace_id can be set to a string value."""
+    Replaced, not supplemented: two fields where one is authoritative is the
+    same defect with an extra step, and a backend that can re-derive a path can
+    derive a different one.
+    """
     config = SandboxConfig(
-        name="sandbox", role="ToolActor", team_id="team-1", workspace_id="my-workspace"
+        name="sandbox", role="ToolActor", team_id="t1", workspace_path="u-alice/test"
     )
-    assert config.workspace_id == "my-workspace"
+    assert config.workspace_path == "u-alice/test"
+    assert not hasattr(config, "workspace_id")
 
 
-def test_sandbox_config_has_both_team_id_and_workspace_id() -> None:
-    """FR-SB-31: SandboxConfig stores both team_id and workspace_id independently."""
+def test_sandbox_config_refuses_a_workspace_id_keyword() -> None:
+    """Constructing with the retired keyword fails rather than being ignored."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        SandboxConfig(
+            name="sandbox",
+            role="ToolActor",
+            team_id="team-1",
+            workspace_id="my-workspace",  # type: ignore[call-arg]
+        )
+
+
+def test_sandbox_config_requires_a_workspace_path() -> None:
+    """The path is required: there is no default for a backend to fall back to."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        SandboxConfig(name="sandbox", role="ToolActor", team_id="t1")  # type: ignore[call-arg]
+
+
+def test_sandbox_config_keeps_team_id_for_the_container_only() -> None:
+    """``team_id`` survives — it names the container — and decides no directory."""
     config = SandboxConfig(
-        name="sandbox", role="ToolActor", team_id="t1", workspace_id="test"
+        name="sandbox", role="ToolActor", team_id="t1", workspace_path="u-alice/test"
     )
     assert config.team_id == "t1"
-    assert config.workspace_id == "test"
+    assert config.workspace_path == "u-alice/test"
 
 
 # ---------------------------------------------------------------------------

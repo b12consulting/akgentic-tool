@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from akgentic.core.messages.orchestrator import StartMessage
 from akgentic.core.utils import SerializableBaseModel
 
 from akgentic.tool.errors import RetriableError
@@ -27,11 +28,31 @@ from akgentic.tool.workspace.tool import (
     ResourceType,
     WorkspaceTool,
 )
+from akgentic.tool.sandbox.actor import sandbox_actor_name
+from akgentic.tool.workspace.card.params import WorkspaceExec
 from akgentic.tool.workspace.workspace import Filesystem, PathEscapeError, Workspace
+
+from tests.workspace.conftest import FakeActorToolObserver, FakeOrchestratorProxy
+
+
+class _CaseMetadata(SerializableBaseModel):
+    """A team-metadata stand-in — the resolver never learns the real type."""
+
+    customer_id: str | None = None
+    case_id: str | None = None
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+TEST_PRINCIPAL = "u-alice"
+"""The owning principal these mock observers carry.
+
+Every workspace resolves under its owner now, so a mock observer must carry a
+usable ``user_id``: the resolver reads it as a typed attribute and refuses a
+value that cannot be a directory name — which a bare ``MagicMock`` attribute is.
+"""
 
 
 def make_observer(
@@ -43,6 +64,7 @@ def make_observer(
     observer = MagicMock()
     observer.orchestrator = MagicMock()
     observer.team_id = tid
+    observer.user_id = TEST_PRINCIPAL
     fs = Filesystem(str(tmp_path), str(tid))
     return observer, fs
 
@@ -67,9 +89,9 @@ def make_wired_tool(tmp_path: Path) -> tuple[WorkspaceTool, Filesystem]:
     ):
         actor = WorkspaceActor(
             config=WorkspaceConfig(
-                name=workspace_actor_name(str(observer.team_id)),
+                name=workspace_actor_name(f"{TEST_PRINCIPAL}/{observer.team_id}"),
                 role=WORKSPACE_ACTOR_ROLE,
-                workspace_name=str(observer.team_id),
+                workspace_path=f"{TEST_PRINCIPAL}/{observer.team_id}",
             )
         )
         actor.on_start()
@@ -1304,3 +1326,331 @@ class TestWorkspaceToolSeedResources:
             restored_tool.observer(observer)
         assert fs.read("kept.md") == b"edited by agent"
         assert fs.read("later.md") == b"later body"
+
+
+# ---------------------------------------------------------------------------
+# The two-segment layout at the card's own surface (ADR-048)
+# ---------------------------------------------------------------------------
+
+
+class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
+    """What the card hands the actors, and what the actor names therefore become.
+
+    These use the fake orchestrator rather than a ``MagicMock``, because the
+    property under test is which **actor** each card resolves to —
+    ``getChildrenOrCreate`` keys on ``config.name`` alone, so a stand-in that
+    handed back one address for every name would make the whole suite pass
+    having exercised nothing.
+    """
+
+    def test_a_bare_card_anchors_the_team_tree_under_its_owner(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        observer = FakeActorToolObserver(orchestrator_proxy, user_id="alice")
+        card = WorkspaceTool()
+        card.observer(observer)
+
+        expected = workspaces_root / "alice" / str(observer.team_id)
+        assert card.workspace._root == expected.resolve()
+
+    def test_a_named_card_anchors_that_name_under_its_owner(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        observer = FakeActorToolObserver(orchestrator_proxy, user_id="alice")
+        card = WorkspaceTool(workspace_id="notes")
+        card.observer(observer)
+
+        assert card.workspace._root == (workspaces_root / "alice" / "notes").resolve()
+
+    def test_two_principals_naming_one_workspace_get_two_trees_and_two_actors(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        """The exposure this layout exists to close, at the card's own surface.
+
+        Two users declaring ``notes`` used to reach one directory through one
+        ``#Workspace`` actor. They now differ in the scope segment, so neither
+        can reach the other's tree by naming it.
+        """
+        alice_card = WorkspaceTool(workspace_id="notes")
+        alice_card.observer(FakeActorToolObserver(orchestrator_proxy, "alice", user_id="alice"))
+        bob_card = WorkspaceTool(workspace_id="notes")
+        bob_card.observer(FakeActorToolObserver(orchestrator_proxy, "bob", user_id="bob"))
+
+        assert alice_card.workspace._root != bob_card.workspace._root
+        assert workspace_actor_name("alice/notes") in orchestrator_proxy.children
+        assert workspace_actor_name("bob/notes") in orchestrator_proxy.children
+
+    def test_two_cards_on_two_workspaces_get_two_workspace_and_two_sandbox_actors(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        """AC 14: both actor names carry the full two-segment path, slash included.
+
+        Nothing parses an actor name and the path is injective by construction,
+        so it is carried whole rather than flattened through a second encoding
+        whose injectivity would have to be proved separately.
+        """
+        for leaf in ("alpha", "beta"):
+            (workspaces_root / "alice" / leaf).mkdir(parents=True, exist_ok=True)
+            card = WorkspaceTool(
+                workspace_id=leaf,
+                workspace_exec=WorkspaceExec(mode="local", poll_attempts=0),
+            )
+            card.observer(
+                FakeActorToolObserver(orchestrator_proxy, name=leaf, user_id="alice")
+            )
+
+        names = set(orchestrator_proxy.children)
+        assert {
+            workspace_actor_name("alice/alpha"),
+            workspace_actor_name("alice/beta"),
+            sandbox_actor_name("alice/alpha"),
+            sandbox_actor_name("alice/beta"),
+        } <= names
+        # The slash survives into the name verbatim — it is not escaped away.
+        assert "#Workspace-alice/alpha" in names
+        assert "#SandboxActor-alice/beta" in names
+
+    def test_a_bare_card_never_asks_the_orchestrator_for_metadata(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        """The fetch is conditional on the card declaring keys, and only then.
+
+        A round trip added to every ``WorkspaceTool()`` in existence would be
+        paid by the overwhelming majority of cards that never share anything.
+        """
+        WorkspaceTool().observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
+
+        assert orchestrator_proxy.metadata_calls == 0
+
+    def test_a_metadata_card_asks_once_and_lands_under_the_reserved_scope(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        orchestrator_proxy.metadata = _CaseMetadata(customer_id="ACME", case_id="42")
+        card = WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])
+        card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
+
+        assert orchestrator_proxy.metadata_calls == 1
+        assert (
+            card.workspace._root
+            == (workspaces_root / "_meta" / "customer_id-ACME__case_id-42").resolve()
+        )
+
+    def test_a_metadata_card_on_a_team_without_metadata_fails_binding(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        """``observer()`` can now raise where it never did, and that is the decision.
+
+        It fails team creation in front of the admin who caused it, rather than
+        silently un-sharing a workspace that was declared to be shared.
+        """
+        card = WorkspaceTool(workspace_metadata_keys=["customer_id"])
+
+        with pytest.raises(ValueError, match="carries no metadata"):
+            card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
+
+    def test_an_unusable_principal_fails_binding_rather_than_falling_back(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        card = WorkspaceTool(workspace_id="notes")
+
+        with pytest.raises(ValueError, match="not usable as a workspace directory name"):
+            card.observer(FakeActorToolObserver(orchestrator_proxy, user_id=""))
+
+    def test_a_workspace_named_after_a_journal_directory_fails_binding(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        """The refusal reaches the admin at team creation, not at the first write.
+
+        ``notes.git`` is workspace ``notes``'s repository. Binding it would root
+        this card's ``Filesystem`` at another workspace's history, and every read,
+        write and delete after that is ordinary in-tree activity that raises
+        nothing — so the refusal has to happen here, where somebody is watching.
+        """
+        card = WorkspaceTool(workspace_id="notes.git")
+
+        with pytest.raises(ValueError, match="journal directory"):
+            card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
+
+    def test_a_metadata_value_naming_a_journal_directory_fails_binding(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        """The same refusal, reached from business data rather than a card field.
+
+        The value has to sit on the key the card declared **last**, because only
+        the joined leaf's ending names a journal directory.
+        """
+        orchestrator_proxy.metadata = _CaseMetadata(customer_id="ACME", case_id="42.git")
+        card = WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])
+
+        with pytest.raises(ValueError, match="journal directory"):
+            card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
+
+
+class TestTheDeclaredKeyListTravelsOnTheConfig:
+    """``WorkspaceConfig.metadata_keys`` — the join key a client attributes on.
+
+    The consumer is **another repo**: it compares this list against the agent
+    card's own ``workspace_metadata_keys`` by plain list equality. So the
+    assertions here are on the **wire**, never on the attribute — a field that
+    silently stopped being emitted would be invisible inside this package, and
+    an attribute read stays green with the field excluded from serialisation.
+    """
+
+    @staticmethod
+    def _emitted_config(proxy: FakeOrchestratorProxy) -> WorkspaceConfig:
+        """The one ``WorkspaceConfig`` the card handed ``getChildrenOrCreate``."""
+        configs = [
+            config for actor_class, config in proxy.create_calls if actor_class is WorkspaceActor
+        ]
+        assert len(configs) == 1
+        config = configs[0]
+        assert isinstance(config, WorkspaceConfig)
+        return config
+
+    def test_a_metadata_card_carries_its_declared_list_in_declaration_order(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        orchestrator_proxy.metadata = _CaseMetadata(customer_id="ACME", case_id="42")
+        card = WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])
+        card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
+
+        assert self._emitted_config(orchestrator_proxy).metadata_keys == [
+            "customer_id",
+            "case_id",
+        ]
+
+    def test_the_reversed_declaration_travels_reversed(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        """Nothing normalises this side, so the other side has nothing to normalise."""
+        orchestrator_proxy.metadata = _CaseMetadata(customer_id="ACME", case_id="42")
+        card = WorkspaceTool(workspace_metadata_keys=["case_id", "customer_id"])
+        card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
+
+        assert self._emitted_config(orchestrator_proxy).metadata_keys == [
+            "case_id",
+            "customer_id",
+        ]
+
+    def test_the_config_carries_the_declared_list_not_the_leafs_deduped_one(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        """The asymmetry is deliberate, and it is what keeps the join exact.
+
+        The **leaf** must be a canonical directory name, so it dedupes. The
+        **config field** is compared against the agent card's own
+        ``workspace_metadata_keys``, which is the un-deduped declared list.
+        Normalising one side of a join and not the other is how a join starts
+        missing silently.
+        """
+        orchestrator_proxy.metadata = _CaseMetadata(customer_id="ACME")
+        card = WorkspaceTool(workspace_metadata_keys=["customer_id", "customer_id"])
+        card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
+
+        config = self._emitted_config(orchestrator_proxy)
+        assert config.metadata_keys == ["customer_id", "customer_id"]
+        # The path deduped; the join key did not.
+        assert config.workspace_path == "_meta/customer_id-ACME"
+
+    @pytest.mark.parametrize("card", [WorkspaceTool(), WorkspaceTool(workspace_id="notes")])
+    def test_a_card_declaring_no_keys_carries_an_empty_list(
+        self,
+        card: WorkspaceTool,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspaces_root: Path,
+    ) -> None:
+        card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
+
+        assert self._emitted_config(orchestrator_proxy).metadata_keys == []
+
+    def test_the_list_survives_the_round_trip_the_wire_performs(self) -> None:
+        """``model_dump`` → validate back, in order — not ``config.metadata_keys``.
+
+        ``WorkspaceConfig`` is a ``BaseConfig`` and therefore serialises through
+        ``serialize_base_model``, which **skips any field carrying**
+        ``field_info.exclude``. An assertion on the attribute would stay green
+        with the field excluded, and the consumer in the other repo would see
+        nothing at all.
+        """
+        config = WorkspaceConfig(
+            name=workspace_actor_name("_meta/customer_id-ACME__case_id-42"),
+            role=WORKSPACE_ACTOR_ROLE,
+            workspace_path="_meta/customer_id-ACME__case_id-42",
+            metadata_keys=["customer_id", "case_id"],
+        )
+
+        dumped = config.model_dump()
+        assert dumped["metadata_keys"] == ["customer_id", "case_id"]
+
+        restored = WorkspaceConfig.model_validate(dumped)
+        assert restored.metadata_keys == ["customer_id", "case_id"]
+
+    def test_the_list_survives_the_message_that_carries_a_config_onto_the_stream(
+        self,
+    ) -> None:
+        """``StartMessage`` is the path a config actually takes to a client."""
+        config = WorkspaceConfig(
+            name=workspace_actor_name("_meta/customer_id-ACME__case_id-42"),
+            role=WORKSPACE_ACTOR_ROLE,
+            workspace_path="_meta/customer_id-ACME__case_id-42",
+            metadata_keys=["customer_id", "case_id"],
+        )
+
+        dumped = StartMessage(config=config).model_dump()
+        assert dumped["config"]["metadata_keys"] == ["customer_id", "case_id"]
+
+        restored = StartMessage.model_validate(dumped)
+        assert isinstance(restored.config, WorkspaceConfig)
+        assert restored.config.metadata_keys == ["customer_id", "case_id"]
+
+    def test_a_record_written_before_this_field_existed_still_loads(self) -> None:
+        """An **optional** field with a default breaks no persisted record.
+
+        The deliberate contrast with the ``workspace_name`` → ``workspace_path``
+        rename, which was *required* and made every event already written
+        undeserialisable. Nothing to shim here — and this pins that nobody later
+        "helps" by making the field required.
+        """
+        stored = {
+            "name": "#Workspace-u-alice/notes",
+            "role": WORKSPACE_ACTOR_ROLE,
+            "workspace_path": "u-alice/notes",
+        }
+
+        assert WorkspaceConfig.model_validate(stored).metadata_keys == []
+
+
+class TestTheIdentityIsReadAsATypedAttribute:
+    """A wiring regression must be loud, which is what ``getattr`` would take away."""
+
+    def test_an_observer_that_never_received_an_identity_raises(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        """``getattr(observer, "user_id", None)`` would silently reach ``anonymous``.
+
+        That is every user's tree quietly merged into one, with nothing raised
+        and nothing logged — the exact failure per-user scoping exists to remove,
+        reintroduced by a defaulted read. An observer with no ``user_id`` at all
+        is a broken observer, and it must say so.
+        """
+        observer = FakeActorToolObserver(orchestrator_proxy, user_id="alice")
+        del observer.user_id
+
+        # Matched on the attribute name: a bare ``raises(AttributeError)`` would
+        # also be satisfied by an unrelated one raised anywhere in ``observer()``,
+        # and a guard that can pass for the wrong reason is not a guard.
+        with pytest.raises(AttributeError, match="user_id"):
+            WorkspaceTool(workspace_id="notes").observer(observer)
+
+    def test_a_deliberate_none_is_the_anonymous_scope_and_not_an_error(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        """The distinction the typed read preserves: *absent* differs from *None*.
+
+        A deployment with no auth configured supplies ``None`` on purpose and
+        gets exactly one scope; an observer that lost the attribute is a bug.
+        """
+        card = WorkspaceTool(workspace_id="notes")
+        card.observer(FakeActorToolObserver(orchestrator_proxy, user_id=None))
+
+        assert card.workspace._root == (workspaces_root / "anonymous" / "notes").resolve()

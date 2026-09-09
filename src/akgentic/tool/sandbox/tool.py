@@ -168,9 +168,9 @@ class ExecTool(ToolCard):
 
         The mode is resolved at call time, not import time, so a backend injected
         by a deployment package before any card is constructed is still found.
-        ``self.workspace_id`` is forwarded to both actors, so the sandbox's
-        directory and the workspace the runs are journalled into are the same
-        one.
+        The workspace path is derived **once**, by the one resolver, and handed
+        to both actors — so the sandbox's directory and the workspace the runs
+        are journalled into cannot be two different trees.
 
         Args:
             observer: Actor-aware observer providing orchestrator access.
@@ -179,7 +179,8 @@ class ExecTool(ToolCard):
             Self, for method chaining.
 
         Raises:
-            ValueError: If observer.orchestrator is None.
+            ValueError: If observer.orchestrator is None, or if the workspace
+                path cannot be derived from this card and this observer.
             KeyError: If ``self.mode`` names an unregistered backend.
         """
         super().observer(observer)  # store the observer weakly via the base setter
@@ -209,15 +210,32 @@ class ExecTool(ToolCard):
             sandbox_config,
         )
         from akgentic.tool.workspace.models import WorkspaceConfig  # noqa: PLC0415
+        from akgentic.tool.workspace.workspace import (  # noqa: PLC0415
+            resolve_workspace_path,
+        )
 
         mode, actor_class = resolve_mode(self.mode)
+        # Deprecated or not, this card does not derive its own directory: one
+        # that did would put a shell on the unscoped tree, which is the whole
+        # failure per-user scoping removes. It declares no metadata keys and
+        # gains none — a card scheduled for deletion must not ship a capability
+        # that then has to be deleted again — so it never fetches metadata, and
+        # ``workspace_metadata_keys`` is empty by construction here.
+        workspace_path = str(
+            resolve_workspace_path(
+                workspace_id=self.workspace_id,
+                workspace_metadata_keys=[],
+                team_id=str(observer.team_id),
+                user_id=observer.user_id,
+                metadata=None,
+            )
+        )
         config = ExecConfig(
             mode=mode,
             team_id=str(observer.team_id),
-            workspace_id=self.workspace_id,
+            workspace_path=workspace_path,
             timeout_s=DEFAULT_EXEC_TIMEOUT_S,
         )
-        workspace_name = self.workspace_id or str(observer.team_id)
         orchestrator_proxy = observer.proxy_ask(orchestrator, Orchestrator)
         sandbox_addr = orchestrator_proxy.getChildrenOrCreate(
             actor_class, config=sandbox_config(config)
@@ -225,9 +243,9 @@ class ExecTool(ToolCard):
         workspace_addr = orchestrator_proxy.getChildrenOrCreate(
             WorkspaceActor,
             config=WorkspaceConfig(
-                name=workspace_actor_name(workspace_name),
+                name=workspace_actor_name(workspace_path),
                 role=WORKSPACE_ACTOR_ROLE,
-                workspace_name=workspace_name,
+                workspace_path=workspace_path,
             ),
         )
         self._sandbox_proxy = observer.proxy_ask(sandbox_addr, SandboxActor)

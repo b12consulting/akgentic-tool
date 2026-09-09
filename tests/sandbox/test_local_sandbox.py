@@ -39,11 +39,17 @@ from akgentic.tool.sandbox.local import _SAFE_ENV_KEYS, LocalSandboxActor
 # ---------------------------------------------------------------------------
 
 
-def make_actor(team_id: str = "team-test", workspace_id: str | None = None) -> LocalSandboxActor:
+def make_actor(team_id: str = "team-test", workspace_path: str | None = None) -> LocalSandboxActor:
     """Create a LocalSandboxActor with config and state pre-initialized (no Pykka runtime)."""
     actor = LocalSandboxActor()
     actor.config = SandboxConfig(
-        name="sandbox", role="ToolActor", team_id=team_id, workspace_id=workspace_id
+        name="sandbox",
+        role="ToolActor",
+        team_id=team_id,
+        # The card resolves the path and the backend joins it. The harness
+        # stands in for the card, so it supplies the path rather than
+        # letting the actor derive one — which it no longer can.
+        workspace_path=team_id if workspace_path is None else workspace_path,
     )
     actor.state = SandboxState()
     actor.state.observer(actor)
@@ -384,17 +390,23 @@ def test_workspace_tool_and_local_sandbox_actor_resolve_same_path_custom_root(
 
 
 # ---------------------------------------------------------------------------
-# Story 6.6: workspace_id overrides team_id for workspace directory name
+# The backend joins the path it was handed, and derives nothing (ADR-048)
 # ---------------------------------------------------------------------------
 
 
-def test_start_sandbox_workspace_id_overrides_team_id(
+def test_start_sandbox_opens_exactly_the_path_it_was_handed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """FR-SB-33: When workspace_id is set, workspace path uses workspace_id, not team_id."""
+    """The directory comes from ``config.workspace_path`` and from nothing else.
+
+    Not "workspace_id overrides team_id" any more: there is no override, because
+    there is no derivation. A backend that cannot re-derive the path cannot
+    derive a *different* one from the card, the write gate and the journal —
+    which is what removes the failure mode rather than making it less likely.
+    """
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
-    actor = make_actor(team_id="team-1", workspace_id="test")
+    actor = make_actor(team_id="team-1", workspace_path="test")
 
     actor._start_sandbox()
 
@@ -404,13 +416,37 @@ def test_start_sandbox_workspace_id_overrides_team_id(
     assert actor.state.workspace_path == expected.resolve()
 
 
-def test_start_sandbox_workspace_id_none_falls_back_to_team_id(
+def test_start_sandbox_opens_a_two_segment_path_whole(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """FR-SB-33: When workspace_id is None, workspace path uses team_id (unchanged default)."""
+    """The shape a card actually hands it: ``<scope>/<leaf>``, created in full.
+
+    ``team-1`` appears nowhere in the result — the backend has no notion of who
+    owns the tree, and that is the point.
+    """
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
-    actor = make_actor(team_id="team-1", workspace_id=None)
+    actor = make_actor(team_id="team-1", workspace_path="u-alice/notes")
+
+    actor._start_sandbox()
+
+    expected = tmp_path / "workspaces" / "u-alice" / "notes"
+    assert expected.is_dir()
+    assert actor.state.workspace_path == expected.resolve()
+    assert not (tmp_path / "workspaces" / "team-1").exists()
+
+
+def test_start_sandbox_uses_the_harness_default_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no path named, the *harness* supplies the team id — the actor still joins it.
+
+    The fallback moved out of the backend and into the test factory standing in
+    for the card, which is exactly the relocation this change is.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
+    actor = make_actor(team_id="team-1", workspace_path=None)
 
     actor._start_sandbox()
 
@@ -419,11 +455,13 @@ def test_start_sandbox_workspace_id_none_falls_back_to_team_id(
     assert actor.state.workspace_path == expected.resolve()
 
 
-def test_exec_tool_and_workspace_tool_resolve_same_path_via_workspace_id(
+def test_the_sandbox_and_the_workspace_open_one_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """FR-SB-35: ExecTool(workspace_id='test') and WorkspaceTool(workspace_id='test')
-    resolve to the same absolute directory when AKGENTIC_WORKSPACES_ROOT is set.
+    """One resolved path in, one directory out, on both sides of the mount.
+
+    The agreement used to rest on two copies of ``workspace_id or team_id``
+    staying in step. It now rests on there being one value.
     """
     from akgentic.tool.workspace.workspace import get_workspace
 
@@ -433,8 +471,8 @@ def test_exec_tool_and_workspace_tool_resolve_same_path_via_workspace_id(
     workspace = get_workspace("test")
     workspace_tool_root = workspace._root.resolve()
 
-    # LocalSandboxActor path with workspace_id="test"
-    actor = make_actor(team_id="team-1", workspace_id="test")
+    # LocalSandboxActor path with workspace_path="test"
+    actor = make_actor(team_id="team-1", workspace_path="test")
     actor._start_sandbox()
     sandbox_root = actor.state.workspace_path
 

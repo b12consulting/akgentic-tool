@@ -34,7 +34,7 @@ from akgentic.tool.workspace.documents.worker import (
 )
 from akgentic.tool.workspace.readers import DocumentReader
 
-from tests.workspace.conftest import WORKSPACE_NAME, DeadAddress
+from tests.workspace.conftest import DeadAddress, WORKSPACE_PATH
 
 _TABLE_PARAMS = WorkspaceRagIndex(
     chunk_chars=60, max_chunk_chars=120, min_chunk_chars=1, chunk_overlap_chars=0
@@ -79,7 +79,7 @@ def a_request(
     """One request, with the actor's cached body supplied unless told otherwise."""
     return IndexRequest(
         path=path,
-        scope=WORKSPACE_NAME,
+        scope=WORKSPACE_PATH,
         source_sha=source_sha,
         markdown=markdown,
         params=params or WorkspaceRagIndex(),
@@ -246,7 +246,7 @@ class TestTheChunksItMints:
         assert len(result.chunks) >= 2
         for ordinal, chunk in enumerate(result.chunks):
             assert chunk.ordinal == ordinal
-            assert chunk.chunk_id == chunk_id(WORKSPACE_NAME, "notes.md", "sha-1", ordinal)
+            assert chunk.chunk_id == chunk_id(WORKSPACE_PATH, "notes.md", "sha-1", ordinal)
 
     def test_texts_are_index_aligned_with_chunks(self) -> None:
         """The actor zips the two lists into ``VectorEntry`` records, strictly."""

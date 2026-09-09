@@ -28,11 +28,13 @@ import akgentic.tool
 import akgentic.tool.workspace as ws
 
 # Captured verbatim from ``akgentic/tool/workspace/__init__.py``'s ``__all__``
-# before the move: 102 names, plus the four story 45-3 added. The package ships
+# before the move: 102 names, plus the four story 45-3 added and the six the
+# workspace path resolver adds (ADR-048 Decision 5). The package ships
 # on PyPI, so every one of them is a public import path somebody may already
 # depend on.
 _WORKSPACE_ALL: frozenset[str] = frozenset(
     {
+        "ANONYMOUS",
         "BlockSplitter",
         "DEFAULT_EXEC_POLL_ATTEMPTS",
         "DEFAULT_EXEC_POLL_DELAY_S",
@@ -136,7 +138,12 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "effective_budget",
         "format_outcome",
         "format_status",
+        "METADATA_SCOPE",
+        "RESERVED_SCOPES",
         "get_workspace",
+        "leaf_segment",
+        "resolve_workspace_path",
+        "user_segment",
         "git_dir_for",
         "gitignore_seed",
         "hunk_header",
@@ -196,6 +203,7 @@ _SHIM_NAMES: frozenset[str] = frozenset(
 _WORKSPACE_TOOL_FIELDS: frozenset[str] = frozenset(
     {
         "workspace_id",
+        "workspace_metadata_keys",
         "workspace_read",
         "workspace_view",
         "workspace_list",

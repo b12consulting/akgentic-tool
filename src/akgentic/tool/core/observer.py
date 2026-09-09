@@ -75,6 +75,23 @@ class ActorToolObserver(ToolObserver, Protocol):
         ...
 
     @property
+    def user_id(self) -> str | None:
+        """The principal that owns the team, or ``None`` where there is none.
+
+        A ``str`` rather than a ``uuid.UUID``: what the server boundary actually
+        carries is an OIDC ``sub``, a service principal's client id, an
+        admin-supplied ``owner_id``, or the literal ``anonymous``.
+
+        Read it as a **typed attribute**, never through ``getattr(observer,
+        "user_id", None)``. A defaulted read turns a wiring regression — an
+        observer that never received the identity — into a silent fall-back to
+        the anonymous scope, which merges every user's tree into one with
+        nothing raised and nothing logged. That is the exact failure per-user
+        workspace scoping exists to remove (ADR-048 Decision 6).
+        """
+        ...
+
+    @property
     def state(self) -> ToolStateCarrier:
         """The agent's live state object, as a carrier of the tool layer's slot.
 

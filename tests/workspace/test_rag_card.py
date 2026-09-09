@@ -35,6 +35,7 @@ from akgentic.tool.workspace.tool import WorkspaceTool
 
 from tests.workspace.conftest import (
     WORKSPACE_NAME,
+    WORKSPACE_PATH,
     FakeActorToolObserver,
     FakeOrchestratorProxy,
 )
@@ -574,7 +575,7 @@ class TestTheProvider:
     """It never raises, and it is what the model actually sees each turn."""
 
     def _actor(self, orchestrator_proxy: FakeOrchestratorProxy) -> WorkspaceActor:
-        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_NAME)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         return actor
 
@@ -728,7 +729,7 @@ class TestTheCallablesThemselves:
         from datetime import UTC, datetime
 
         card, _ = bind(orchestrator_proxy, workspace_rag_list=True)
-        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_NAME)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         actor.state.rag_index["notes.md"] = RagFile(
             path="notes.md",

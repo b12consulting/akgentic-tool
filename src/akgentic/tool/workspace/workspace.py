@@ -6,6 +6,10 @@ to prevent directory traversal attacks.
 
 The workspace root is derived from the ``AKGENTIC_WORKSPACES_ROOT`` environment
 variable (default: ``./workspaces``).
+
+:func:`resolve_workspace_path` also lives here — the **one** place a workspace
+directory is derived (ADR-048 Decision 5). It sits beside :func:`get_workspace`
+because that is the only other function that turns a name into a tree.
 """
 
 from __future__ import annotations
@@ -14,11 +18,15 @@ import contextlib
 import os
 import re
 import shutil
-from pathlib import Path
+import string
+from pathlib import Path, PurePosixPath
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
 
 from pydantic import BaseModel
+
+from akgentic.core.utils.serializer import SerializableBaseModel
+from akgentic.tool.workspace.models import GIT_DIR_SUFFIX
 
 # Creation mode for a newly written file, before the process umask is applied by
 # the kernel.  Matching what a plain ``open(path, "wb")`` would request keeps the
@@ -361,3 +369,328 @@ def get_workspace(workspace_name: str) -> Filesystem:
     """
     base_path = os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
     return Filesystem(base_path=base_path, workspace_name=workspace_name)
+
+
+# ---------------------------------------------------------------------------
+# The one place a workspace path is derived (ADR-048)
+# ---------------------------------------------------------------------------
+
+ANONYMOUS = "anonymous"
+"""The ``<scope>`` a principal-less caller lands in.
+
+Not a gap to close: where there is no principal there is no isolation, by
+construction. A deployment that supplies no user id gets exactly one scope.
+"""
+
+METADATA_SCOPE = "_meta"
+"""The ``<scope>`` a metadata-keyed workspace lives under.
+
+Shared across teams and across users — that is its purpose — so it sits under a
+reserved scope rather than under anybody's principal.
+"""
+
+RESERVED_SCOPES = frozenset({METADATA_SCOPE})
+"""Scopes no principal may occupy — reserved for the metadata layout.
+
+**Derived from :data:`METADATA_SCOPE`, never spelled again.** Two literals that
+have to agree is the defect this whole module removes, one scale down: a scope
+renamed in one of them and not the other would leave the metadata namespace
+open to a principal, which is a silent isolation failure.
+
+Matched **exactly**, never as a ``_`` prefix. The Azure AD ``sub`` is base64url
+and its alphabet includes ``_``, so reserving the whole underscore namespace
+would refuse roughly one user in sixty-four at team creation; a 43-character
+``sub`` never equals ``_meta``.
+"""
+
+# The only shapes that are not a directory name. Everything else — emails, dots
+# mid-name, ``+``, ``=``, unicode — is a legal filename and goes in verbatim.
+_UNSAFE = re.compile(r"[/\\\x00]")
+
+# The metadata identifier's two separators, and the safe set that keeps them
+# unforgeable. Every character outside the set is percent-encoded, so neither
+# separator can occur inside a value.
+_META_PAIR_SEP = "-"
+_META_JOIN_SEP = "__"
+_META_SAFE = frozenset(string.ascii_letters + string.digits + ".")
+
+# The usual filesystem limit for a single name, in **bytes** rather than
+# characters: a multibyte value blows it well before 255 characters.
+_MAX_LEAF_BYTES = 255
+
+
+def _unusable_as_segment(value: str) -> bool:
+    """Whether *value* cannot be a single directory segment.
+
+    The four shapes a scope and a leaf both reject, in one predicate rather than
+    two hand-copied guards that must agree except in one detail — which is the
+    defect this whole change removes, one scale down.
+
+    ``.`` and ``..`` are covered by the leading-dot test, which also keeps a
+    workspace out of the hidden-directory namespace.
+    """
+    return not value or value.startswith(".") or _UNSAFE.search(value) is not None
+
+
+def user_segment(user_id: str | None) -> str:
+    """The ``<scope>`` segment for a principal — the user id itself (ADR-048 Decision 4).
+
+    No encoding, no digest, no inverse function: every configured producer
+    already emits a directory name. The Azure AD ``sub`` is base64url, an
+    unauthenticated deployment yields the literal ``anonymous``, a service
+    principal's id is a dashed UUID, and the one free-form producer is an
+    admin-supplied ``owner_id`` — typically an email, which is a perfectly legal
+    filename. Keeping the raw value is also what makes reading the tree back
+    against a team's stored ``user_id`` work with no decoding step.
+
+    Args:
+        user_id: The owning principal, or ``None`` for an unauthenticated one.
+
+    Returns:
+        The scope segment.
+
+    Raises:
+        ValueError: If the value cannot be a directory name (empty, leading
+            ``.``, or containing ``/``, ``\\`` or NUL), or if it is a reserved
+            scope. Both are silent isolation failures if allowed through: the
+            empty string yields a hidden directory every affected user shares,
+            a ``/`` yields a nested path where two distinct ids alias, and
+            ``_meta`` lands a principal in the shared metadata namespace. The
+            empty case is reachable from an OIDC token carrying no ``sub``
+            without anyone misbehaving, and it must still raise.
+    """
+    principal = ANONYMOUS if user_id is None else user_id
+    if _unusable_as_segment(principal):
+        raise ValueError(f"user_id is not usable as a workspace directory name: {principal!r}")
+    if principal in RESERVED_SCOPES:
+        raise ValueError(f"user_id may not be a reserved scope: {principal!r}")
+    return principal
+
+
+def leaf_segment(value: str) -> str:
+    """The ``<leaf>`` segment — a ``workspace_id``, a team id, or a joined metadata key.
+
+    Like :func:`user_segment` except in two places: ``_meta`` is **not** reserved
+    here — ``_meta`` is a scope, and a workspace legitimately named ``_meta``
+    under some principal collides with nothing — and a leaf may not end in
+    ``.git``.
+
+    A team id is a UUID, so it passes by construction. The two guards exist for
+    the values that do not: a ``workspace_id`` an author types by hand, and a
+    joined metadata leaf built out of business data.
+
+    **Why the ``.git`` suffix is a containment failure and not a name clash.**
+    The journal is a *sibling of the tree, in the same directory*:
+    ``git_dir_for`` returns ``<root>.git``, so ``workspace_id="notes"`` owns both
+    ``<scope>/notes`` and ``<scope>/notes.git``. A second card declaring
+    ``workspace_id="notes.git"`` therefore roots its **tree** at the first
+    workspace's **git repository**, and its agent lists, reads, writes and
+    deletes inside another workspace's history as ordinary in-tree activity —
+    ``Filesystem._validate_path`` rejects only what resolves *outside* the root,
+    and that root is a perfectly real directory. From the other side, the first
+    workspace's commits surface as files in the second's tree. Nothing raises.
+    It is the same failure the fixed two-segment depth removes, arriving through
+    a suffix instead of through a slash.
+
+    **Rejecting beats renaming.** No suffix-stripping and no relocate-and-log: a
+    deployment that genuinely has a workspace named ``foo.git`` must be told, at
+    team creation, in front of the admin who caused it. Silently moving somebody
+    else's tree is the failure, not the remedy.
+
+    **The match is case-insensitive** although ``git_dir_for`` only ever emits
+    lowercase, because macOS and Windows filesystems are case-insensitive by
+    default: ``<scope>/notes.GIT`` and ``<scope>/notes.git`` are one directory
+    there, so an exact-match guard would pass the collision straight through on
+    the platform most of this is developed on.
+
+    **This does not make the journal's own guard redundant.** ``GitJournal``
+    refuses to initialise when the root it was handed ends in ``.git``, and that
+    covers the layer this function cannot see: ``Filesystem`` and
+    :func:`get_workspace` take a name that never passes through here — which is
+    how ``akgentic-infra`` calls them today.
+
+    Args:
+        value: The candidate leaf.
+
+    Returns:
+        The leaf segment, unchanged.
+
+    Raises:
+        ValueError: If the value cannot be a single directory segment, or if it
+            ends in ``.git``.
+    """
+    if _unusable_as_segment(value):
+        raise ValueError(f"workspace leaf is not usable as a directory name: {value!r}")
+    if value.lower().endswith(GIT_DIR_SUFFIX):
+        raise ValueError(
+            f"workspace leaf may not end in {GIT_DIR_SUFFIX!r}, which is another "
+            f"workspace's journal directory: {value!r}"
+        )
+    return value
+
+
+def _encode_metadata_value(value: str) -> str:
+    """Percent-encode everything outside ``[A-Za-z0-9.]`` (ADR-048 Decision 3).
+
+    Hand-rolled, and it has to be. ``urllib.parse.quote`` cannot implement this:
+    its always-safe set is hard-coded as ``ascii_letters + digits + "_.-~"`` and
+    **no** argument — ``safe=""`` included — forces ``_``, ``-`` or ``~`` to
+    encode. Those are exactly the characters the separators are built from, so
+    ``quote`` would leave the join forgeable while looking like it solved the
+    problem: a ``customer_id`` of ``ACME__case_id-42`` under ``["customer_id"]``
+    would yield the same string as ``["customer_id", "case_id"]`` over ``ACME``
+    and ``42``, and two key sets would silently address one tree.
+    """
+    return "".join(
+        char
+        if char in _META_SAFE
+        else "".join(f"%{byte:02X}" for byte in char.encode("utf-8"))
+        for char in value
+    )
+
+
+def _metadata_leaf(keys: list[str], metadata: SerializableBaseModel | None) -> str:
+    """Join the declared keys into one segment: ``<key>-<enc(value)>__<key>-<enc(value)>``.
+
+    **Keys stay in declaration order** (ADR-048 Decision 3). The declaration is a
+    *sequence*, not a set: it is an ordered refinement path whose first key is the
+    coarsest scope, so ``["customer_id", "case_id"]`` yields
+    ``customer_id-ACME__case_id-42`` and ``ls _meta/`` groups a customer's
+    workspaces beside each other instead of scattering them under whichever key
+    happened to sort first.
+
+    The trade, stated so nobody reads it as a defect: two cards naming the same
+    keys in **different orders** address **different** workspaces. Under the
+    sequence model that is honest — they declared different scopes — and unlike a
+    silent collision it is visible in the directory name.
+
+    The prefix this creates is a **string** prefix between two *siblings*, never a
+    path prefix: ``_meta/customer_id-ACME`` and
+    ``_meta/customer_id-ACME__case_id-42`` are two leaves under one scope, and a
+    sibling cannot contain a sibling. Decision 1's antichain is about one path
+    *containing* another and is untouched here.
+
+    Duplicates are removed keeping the **first** occurrence, so a repeated key
+    adds no scope and names the tree it named once.
+
+    Every failure below is a hard error, never a fallback to a user path. The
+    reasons differ but the shape does not: each fallback would be a *silent*
+    isolation failure, and the raise happens at team creation in front of the
+    admin who caused it.
+
+    Args:
+        keys: The metadata fields the card declared. Non-empty.
+        metadata: The team's metadata — plain data, whose type this package
+            never learns.
+
+    Returns:
+        The joined leaf.
+
+    Raises:
+        ValueError: If the team carries no metadata (falling back would silently
+            *un-share* a workspace declared to be shared), if a declared key is
+            not a field of the model (a typo must not resolve to a tree), if a
+            value is ``None`` or empty (``case_id-`` would be a real directory
+            shared by every team that left it blank), or if the joined leaf
+            exceeds 255 bytes (truncating collides, and a collision here is an
+            isolation failure that looks like success).
+    """
+    # One ordered, deduped list, computed once and used by both the raise below
+    # and the join: two spellings of one rule is this module's own recurring
+    # defect one scale down. ``dict.fromkeys`` keeps the first occurrence, which
+    # is what makes the dedupe stable — ``set`` is what must not appear.
+    ordered = list(dict.fromkeys(keys))
+    if metadata is None:
+        raise ValueError(
+            f"workspace_metadata_keys {ordered!r} were declared, but the team "
+            "carries no metadata"
+        )
+    declared = type(metadata).model_fields
+    pairs: list[str] = []
+    for key in ordered:
+        if key not in declared:
+            raise ValueError(
+                f"workspace_metadata_keys names {key!r}, which is not a field of "
+                f"{type(metadata).__name__}"
+            )
+        value = getattr(metadata, key)
+        if value is None or str(value) == "":
+            raise ValueError(f"the team's metadata carries no value for {key!r}")
+        pairs.append(f"{key}{_META_PAIR_SEP}{_encode_metadata_value(str(value))}")
+    leaf = _META_JOIN_SEP.join(pairs)
+    if len(leaf.encode("utf-8")) > _MAX_LEAF_BYTES:
+        raise ValueError(
+            f"the metadata workspace name exceeds {_MAX_LEAF_BYTES} bytes: {leaf!r}"
+        )
+    return leaf
+
+
+def resolve_workspace_path(
+    *,
+    workspace_id: str | None,
+    workspace_metadata_keys: list[str],
+    team_id: str,
+    user_id: str | None,
+    metadata: SerializableBaseModel | None,
+) -> PurePosixPath:
+    """The workspace's two-segment path. The only place a path is derived.
+
+    ``<scope>`` answers *whose is this*, ``<leaf>`` answers *which of theirs*,
+    and the leaf is always a discriminator unique to one workspace — a team id,
+    a ``workspace_id``, or a joined metadata key, never a category:
+
+    ==========================================  ==================================
+    Card                                        Path
+    ==========================================  ==================================
+    ``WorkspaceTool()``                         ``<user_segment(user_id)>/<team_id>``
+    ``WorkspaceTool(workspace_id="notes")``     ``<user_segment(user_id)>/notes``
+    ``WorkspaceTool(workspace_metadata_keys=…)``  ``_meta/customer_id-ACME__case_id-42``
+    ==========================================  ==================================
+
+    **Depth is fixed at two, and the invariant that buys is that no workspace
+    path is a prefix of another.** ``Filesystem._validate_path`` rejects only
+    paths resolving *outside* the root, so a workspace at ``ACME/`` would read
+    and write everything under ``ACME/42/`` as ordinary in-tree activity, with
+    the per-path write gate none the wiser. That is containment rather than a
+    name collision, and it is worse. At depth two with a unique leaf the
+    antichain holds by construction; an N-segment layout could be proved one
+    only by knowing every other workspace in the deployment.
+
+    The two card fields are mutually exclusive, enforced at card construction
+    rather than by precedence here (ADR-048 Decision 2).
+
+    Args:
+        workspace_id: The card's named workspace, or ``None`` for the team's own.
+        workspace_metadata_keys: The metadata fields keying a shared workspace.
+            Empty for the two per-user layouts.
+        team_id: The owning team, used as the leaf when no name is declared.
+        user_id: The owning principal, or ``None`` for an unauthenticated one.
+        metadata: The team's metadata, consulted only when keys are declared.
+
+    Returns:
+        A relative two-segment path, to be joined to the workspaces root.
+
+    Raises:
+        ValueError: On any input that cannot yield a safe two-segment path — see
+            :func:`user_segment`, :func:`leaf_segment` and the metadata
+            conditions. **Never** a fallback: a raise out of card binding fails
+            team creation in front of the admin who caused it, where a fallback
+            would silently collapse several principals into one tree.
+    """
+    if workspace_metadata_keys:
+        # Through ``leaf_segment`` like any other leaf, rather than a second
+        # suffix check beside it — duplicating a rule is the defect this module
+        # exists to remove. ``.`` is inside the encoder's safe set, so a
+        # ``customer_id`` of ``x.git`` survives encoding whole and yields the leaf
+        # ``customer_id-x.git``, which *is* the journal directory of
+        # ``_meta/customer_id-x``. The same collision as the hand-typed
+        # ``workspace_id="notes.git"``, reached from business data rather than
+        # from a card field anybody chose.
+        return PurePosixPath(METADATA_SCOPE) / leaf_segment(
+            _metadata_leaf(workspace_metadata_keys, metadata)
+        )
+    # Tested against ``None`` rather than for truthiness: a card carrying
+    # ``workspace_id=""`` named a workspace and got the name wrong, and falling
+    # through to the team id would answer that mistake silently.
+    named = team_id if workspace_id is None else workspace_id
+    return PurePosixPath(user_segment(user_id)) / leaf_segment(named)

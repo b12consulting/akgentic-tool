@@ -31,6 +31,7 @@ from akgentic.tool.workspace.tool import WorkspaceRead, WorkspaceTool
 from tests.workspace.conftest import (
     HANDSHAKE_TIMEOUT_S,
     WORKSPACE_NAME,
+    WORKSPACE_PATH,
     FakeActorToolObserver,
     FakeOrchestratorProxy,
     read,
@@ -125,7 +126,7 @@ def document_card(
         workspace_read=WorkspaceRead(document_reader=reader),
     )
     card.observer(observer)
-    entry = orchestrator_proxy.children.get(workspace_actor_name(WORKSPACE_NAME))
+    entry = orchestrator_proxy.children.get(workspace_actor_name(WORKSPACE_PATH))
     actor = entry[1] if entry is not None else None
     return card, actor if isinstance(actor, WorkspaceActor) else None
 
@@ -311,7 +312,7 @@ class TestTheReadPathStaysFree:
         # The attribute fetch is itself a mailbox turn, so it lands after both
         # fills: reaching the state at all proves they have been applied.
         pykka_proxy = threaded_orchestrator_proxy.children[
-            workspace_actor_name(WORKSPACE_NAME)
+            workspace_actor_name(WORKSPACE_PATH)
         ][1]
         state = pykka_proxy.state.get(timeout=HANDSHAKE_TIMEOUT_S)
         assert list(state.documents) == ["a.pdf", "b.pdf"]

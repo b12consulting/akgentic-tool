@@ -36,7 +36,12 @@ def actor(tmp_path: Path) -> BwrapSandboxActor:
     Config and state are set directly, mirroring the pattern in test_local_sandbox.py.
     """
     a: BwrapSandboxActor = BwrapSandboxActor.__new__(BwrapSandboxActor)
-    a.config = SandboxConfig(name="sandbox", role="ToolActor", team_id="test-team")
+    a.config = SandboxConfig(
+        name="sandbox",
+        role="ToolActor",
+        team_id="test-team",
+        workspace_path="test-team",
+    )
     a.state = SandboxState()
     a.state.workspace_path = tmp_path
     return a
@@ -50,7 +55,12 @@ def actor(tmp_path: Path) -> BwrapSandboxActor:
 def test_start_sandbox_bwrap_not_on_path_raises_runtime_error() -> None:
     """AC2: _start_sandbox() raises RuntimeError with install hints when bwrap missing."""
     a: BwrapSandboxActor = BwrapSandboxActor.__new__(BwrapSandboxActor)
-    a.config = SandboxConfig(name="sandbox", role="ToolActor", team_id="test-team")
+    a.config = SandboxConfig(
+        name="sandbox",
+        role="ToolActor",
+        team_id="test-team",
+        workspace_path="test-team",
+    )
     a.state = SandboxState()
 
     with patch("akgentic.tool.sandbox.bwrap.shutil.which", return_value=None):
@@ -61,7 +71,12 @@ def test_start_sandbox_bwrap_not_on_path_raises_runtime_error() -> None:
 def test_start_sandbox_bwrap_not_on_path_error_contains_apt_hint() -> None:
     """AC2: RuntimeError message includes 'apt install bubblewrap'."""
     a: BwrapSandboxActor = BwrapSandboxActor.__new__(BwrapSandboxActor)
-    a.config = SandboxConfig(name="sandbox", role="ToolActor", team_id="test-team")
+    a.config = SandboxConfig(
+        name="sandbox",
+        role="ToolActor",
+        team_id="test-team",
+        workspace_path="test-team",
+    )
     a.state = SandboxState()
 
     with patch("akgentic.tool.sandbox.bwrap.shutil.which", return_value=None):
@@ -72,7 +87,12 @@ def test_start_sandbox_bwrap_not_on_path_error_contains_apt_hint() -> None:
 def test_start_sandbox_bwrap_not_on_path_error_contains_dnf_hint() -> None:
     """AC2: RuntimeError message includes 'dnf install bubblewrap'."""
     a: BwrapSandboxActor = BwrapSandboxActor.__new__(BwrapSandboxActor)
-    a.config = SandboxConfig(name="sandbox", role="ToolActor", team_id="test-team")
+    a.config = SandboxConfig(
+        name="sandbox",
+        role="ToolActor",
+        team_id="test-team",
+        workspace_path="test-team",
+    )
     a.state = SandboxState()
 
     with patch("akgentic.tool.sandbox.bwrap.shutil.which", return_value=None):
@@ -93,7 +113,12 @@ def test_start_sandbox_creates_workspace_directory(
     monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
 
     a: BwrapSandboxActor = BwrapSandboxActor.__new__(BwrapSandboxActor)
-    a.config = SandboxConfig(name="sandbox", role="ToolActor", team_id="test-team")
+    a.config = SandboxConfig(
+        name="sandbox",
+        role="ToolActor",
+        team_id="test-team",
+        workspace_path="test-team",
+    )
     a.state = SandboxState()
 
     with (
@@ -115,7 +140,12 @@ def test_start_sandbox_stores_resolved_absolute_path(
     monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
 
     a: BwrapSandboxActor = BwrapSandboxActor.__new__(BwrapSandboxActor)
-    a.config = SandboxConfig(name="sandbox", role="ToolActor", team_id="test-team")
+    a.config = SandboxConfig(
+        name="sandbox",
+        role="ToolActor",
+        team_id="test-team",
+        workspace_path="test-team",
+    )
     a.state = SandboxState()
 
     with (
@@ -142,7 +172,12 @@ def test_start_sandbox_idempotent_existing_workspace(
     monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
 
     a: BwrapSandboxActor = BwrapSandboxActor.__new__(BwrapSandboxActor)
-    a.config = SandboxConfig(name="sandbox", role="ToolActor", team_id="test-team")
+    a.config = SandboxConfig(
+        name="sandbox",
+        role="ToolActor",
+        team_id="test-team",
+        workspace_path="test-team",
+    )
     a.state = SandboxState()
 
     with (

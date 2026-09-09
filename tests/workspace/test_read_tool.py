@@ -32,6 +32,7 @@ from akgentic.tool.workspace.workspace import Filesystem
 
 from tests.workspace.conftest import (
     WORKSPACE_NAME,
+    WORKSPACE_PATH,
     FakeActorToolObserver,
     FakeOrchestratorProxy,
 )
@@ -39,6 +40,15 @@ from tests.workspace.conftest import (
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+TEST_PRINCIPAL = "u-alice"
+"""The owning principal these mock observers carry.
+
+Every workspace resolves under its owner now, so a mock observer must carry a
+usable ``user_id``: the resolver reads it as a typed attribute and refuses a
+value that cannot be a directory name — which a bare ``MagicMock`` attribute is.
+"""
 
 
 def make_observer(
@@ -49,6 +59,7 @@ def make_observer(
     observer = MagicMock()
     observer.orchestrator = None if orchestrator_is_none else MagicMock()
     observer.team_id = team_id or uuid.uuid4()
+    observer.user_id = TEST_PRINCIPAL
     return observer
 
 
@@ -105,24 +116,32 @@ class TestObserverWiring:
         with pytest.raises(ValueError, match="orchestrator"):
             tool.observer(observer)
 
-    def test_observer_sets_workspace_from_team_id(self, tmp_path: Path) -> None:
+    def test_observer_sets_workspace_under_the_owning_principal(self, tmp_path: Path) -> None:
+        """With no ``workspace_id`` the leaf is the team id — nested under its owner."""
         team_id = uuid.uuid4()
         observer = make_observer(team_id=team_id)
         fs = Filesystem(str(tmp_path), str(team_id))
         tool = WorkspaceTool(read_only=True)
         with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs) as mock_gw:
             result = tool.observer(observer)
-            mock_gw.assert_called_once_with(str(team_id))
+            mock_gw.assert_called_once_with(f"{TEST_PRINCIPAL}/{team_id}")
             assert tool.workspace is fs
             assert result is tool
 
-    def test_observer_uses_explicit_workspace_id(self, tmp_path: Path) -> None:
+    def test_observer_nests_an_explicit_workspace_id_under_its_owner(
+        self, tmp_path: Path
+    ) -> None:
+        """A named workspace is one of *this* principal's trees, not a global key.
+
+        ``explicit-ws`` alone is what every user used to share; the scope segment
+        is what makes it unreachable by naming it.
+        """
         observer = make_observer()
         fs = Filesystem(str(tmp_path), "explicit-ws")
         tool = WorkspaceTool(read_only=True, workspace_id="explicit-ws")
         with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs) as mock_gw:
             tool.observer(observer)
-            mock_gw.assert_called_once_with("explicit-ws")
+            mock_gw.assert_called_once_with(f"{TEST_PRINCIPAL}/explicit-ws")
 
     def test_observer_returns_self(self, tmp_path: Path) -> None:
         team_id = uuid.uuid4()
@@ -748,7 +767,7 @@ def make_wired_tool(
         workspace_read=WorkspaceRead(document_reader=document_reader),
     )
     tool.observer(observer)
-    _address, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_NAME)]
+    _address, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
     assert isinstance(actor, WorkspaceActor)
     assert tool.workspace._root == workspace_tree.resolve()
     return tool, tool.workspace, actor

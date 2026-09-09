@@ -42,12 +42,18 @@ from akgentic.tool.sandbox.docker import (
 
 
 def make_actor(
-    team_id: str = "team-test", workspace_id: str | None = None
+    team_id: str = "team-test", workspace_path: str | None = None
 ) -> DockerSandboxActor:
     """Create a DockerSandboxActor with config and state pre-initialized (no Pykka runtime)."""
     actor = DockerSandboxActor()
     actor.config = SandboxConfig(
-        name="sandbox", role="ToolActor", team_id=team_id, workspace_id=workspace_id
+        name="sandbox",
+        role="ToolActor",
+        team_id=team_id,
+        # The card resolves the path and the backend joins it. The harness
+        # stands in for the card, so it supplies the path rather than
+        # letting the actor derive one — which it no longer can.
+        workspace_path=team_id if workspace_path is None else workspace_path,
     )
     actor.state = SandboxState()
     actor.state.observer(actor)
@@ -531,26 +537,26 @@ def test_start_sandbox_calls_notify_state_change(
 
 
 # ---------------------------------------------------------------------------
-# Story 6.6: workspace_id overrides team_id for volume mount; container name unchanged
+# The volume is the path the card resolved; the container is still per-team (ADR-048)
 # ---------------------------------------------------------------------------
 
 
 @patch.object(DockerSandboxActor, "_ensure_image")
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
 @patch("akgentic.tool.sandbox.docker.subprocess.run")
-def test_start_sandbox_workspace_id_overrides_volume_mount(
+def test_the_volume_mount_is_exactly_the_path_it_was_handed(
     mock_run: MagicMock,
     mock_which: MagicMock,
     mock_ensure: MagicMock,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """FR-SB-34: workspace_id='test' makes volume mount use 'test', not team_id."""
+    """The mount comes from ``config.workspace_path``, derived from nothing here."""
     monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
     mock_run.side_effect = [
         MagicMock(stdout="", returncode=0),  # docker ps -a
         MagicMock(stdout="abc123", returncode=0),  # docker run
     ]
-    actor = make_actor(team_id="t1", workspace_id="test")
+    actor = make_actor(team_id="t1", workspace_path="test")
     actor._start_sandbox()
 
     run_call_args = mock_run.call_args_list[1][0][0]
@@ -561,18 +567,46 @@ def test_start_sandbox_workspace_id_overrides_volume_mount(
 @patch.object(DockerSandboxActor, "_ensure_image")
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
 @patch("akgentic.tool.sandbox.docker.subprocess.run")
-def test_start_sandbox_container_name_uses_team_id_not_workspace_id(
-    mock_run: MagicMock, mock_which: MagicMock, mock_ensure: MagicMock
+def test_the_volume_mount_carries_a_two_segment_path_whole(
+    mock_run: MagicMock,
+    mock_which: MagicMock,
+    mock_ensure: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """FR-SB-34: container name is sandbox-{team_id}, NOT sandbox-{workspace_id}."""
+    """The shape a card actually hands it — and ``t1`` is nowhere in the mount."""
+    monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
     mock_run.side_effect = [
         MagicMock(stdout="", returncode=0),  # docker ps -a
         MagicMock(stdout="abc123", returncode=0),  # docker run
     ]
-    actor = make_actor(team_id="t1", workspace_id="test")
+    actor = make_actor(team_id="t1", workspace_path="u-alice/notes")
     actor._start_sandbox()
 
-    # Container name must be based on team_id, not workspace_id
+    run_call_args = mock_run.call_args_list[1][0][0]
+    volume = run_call_args[run_call_args.index("-v") + 1]
+    assert volume == f"{Path('./workspaces/u-alice/notes').resolve()}:/workspace"
+    # The container is still the team's, which is the one thing team_id decides.
+    assert actor.state.container_name == "sandbox-t1"
+
+
+@patch.object(DockerSandboxActor, "_ensure_image")
+@patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
+@patch("akgentic.tool.sandbox.docker.subprocess.run")
+def test_the_container_is_named_per_team_while_its_tree_is_per_workspace(
+    mock_run: MagicMock, mock_which: MagicMock, mock_ensure: MagicMock
+) -> None:
+    """``team_id`` still names the container — that is the one thing it decides.
+
+    Containers are per-team execution resources and trees are per-workspace, so
+    the two identifiers are deliberately not the same one.
+    """
+    mock_run.side_effect = [
+        MagicMock(stdout="", returncode=0),  # docker ps -a
+        MagicMock(stdout="abc123", returncode=0),  # docker run
+    ]
+    actor = make_actor(team_id="t1", workspace_path="test")
+    actor._start_sandbox()
+
     assert actor.state.container_name == "sandbox-t1"
     run_call_args = mock_run.call_args_list[1][0][0]
     name_idx = run_call_args.index("--name") + 1
@@ -582,19 +616,23 @@ def test_start_sandbox_container_name_uses_team_id_not_workspace_id(
 @patch.object(DockerSandboxActor, "_ensure_image")
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
 @patch("akgentic.tool.sandbox.docker.subprocess.run")
-def test_start_sandbox_workspace_id_none_uses_team_id_for_volume(
+def test_the_volume_uses_the_harness_default_path(
     mock_run: MagicMock,
     mock_which: MagicMock,
     mock_ensure: MagicMock,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """FR-SB-34: workspace_id=None falls back to team_id for volume mount (unchanged default)."""
+    """With no path named, the *harness* supplies the team id — the actor still joins it.
+
+    The fallback moved out of the backend and into the test factory standing in
+    for the card, which is exactly the relocation this change is.
+    """
     monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
     mock_run.side_effect = [
         MagicMock(stdout="", returncode=0),  # docker ps -a
         MagicMock(stdout="abc123", returncode=0),  # docker run
     ]
-    actor = make_actor(team_id="team-1", workspace_id=None)
+    actor = make_actor(team_id="team-1", workspace_path=None)
     actor._start_sandbox()
 
     run_call_args = mock_run.call_args_list[1][0][0]

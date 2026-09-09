@@ -152,6 +152,7 @@ class _FakeObserver:
         self.orchestrator: ActorAddress | None = _address("@Orchestrator", "Orchestrator")
         self.myAddress = my_address  # noqa: N815 — protocol member name
         self.team_id = uuid.uuid4()
+        self.user_id: str | None = "test-principal"
         self.state = SimpleNamespace(tool_state=ToolState())
         self.proxy_ask_calls: list[type | None] = []
         self._orchestrator_actor = orchestrator_actor
