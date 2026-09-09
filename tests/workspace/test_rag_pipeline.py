@@ -798,6 +798,26 @@ class TestBatching:
         assert "no thread" in (entry.reason or "")
         assert harness.embed_requests == []
 
+    def test_a_lost_collection_param_fails_the_file_rather_than_parking_it(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        """Every exit from the spawn helper either starts a worker or settles the row.
+
+        ``batches_expected`` is written before the first spawn, so an exit that
+        does neither leaves the file at ``EMBEDDING`` waiting on a report nobody
+        will send — the reaper livelock the write-side gate exists to remove.
+        """
+        harness.enable()
+        write(workspace_tree, "big.md")
+        harness.actor.index_paths("")
+        harness.actor._rag_collection = None
+
+        harness.report("big.md", chunks=EMBED_BATCH_SIZE + 1)
+
+        entry = harness.actor.state.rag_index["big.md"]
+        assert entry.status is RagStatus.FAILED
+        assert harness.embed_requests == []
+
     def test_embedded_is_reached_only_after_the_last_batch(
         self, harness: RagHarness, workspace_tree: Path
     ) -> None:

@@ -19,7 +19,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Generator
-from typing import Any
+from typing import Any, NoReturn
 from unittest.mock import patch
 
 import pytest
@@ -211,7 +211,7 @@ class _Requester(Akgent):
         )
 
 
-def _slow_embedding_service(model: str, provider: str) -> Any:
+def _slow_embedding_service(model: str, provider: str) -> NoReturn:
     """Stand-in for the embedding call: slow, then fails.
 
     Raising sends the worker down its ``EmbeddingError`` path, so the test needs

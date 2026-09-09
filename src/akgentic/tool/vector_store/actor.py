@@ -425,8 +425,12 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
             ValueError: When any entry carries an empty vector. Not a
                 ``RetriableError``: a retry cannot produce a vector the caller
                 never supplied, so this is a programming error at the call site.
-            RetriableError: When the backend refuses or fails the write —
-                a missing collection, a dead cluster, a full disk.
+            RetriableError: When the write cannot land — a backend that could not
+                be built, a missing collection, a dead cluster, a full disk. An
+                unavailable backend raises here rather than degrading, unlike
+                ``remove`` and ``search`` above it: a read that answers empty
+                costs a miss, but a write that answers nothing while storing
+                nothing is the swallow this method exists not to do.
         """
         empty = [entry.ref_id for entry in entries if len(entry.vector) == 0]
         if empty:
@@ -439,8 +443,12 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
 
         backend = self._get_backend_for_collection(collection)
         if backend is None:
-            logger.warning("[%s] Backend unavailable, skipping add", self.config.name)
-            return
+            msg = (
+                f"[{self.config.name}] no backend could be built for collection "
+                f"'{collection}'; {len(entries)} entries were not written."
+            )
+            logger.warning(msg)
+            raise RetriableError(msg)
         try:
             backend.add(collection, entries)
             backend_name = self.state.collection_configs.get(collection, {}).get(

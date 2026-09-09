@@ -736,6 +736,12 @@ class DocumentsMixin(_DocumentsBase):
         spawned with ``createActor`` and handed the batch in one payload, the shape
         :meth:`_spawn` uses for an index worker.
 
+        **Every exit either spawns or fails the file.** ``batches_expected`` is
+        already written when this is called, so a return that neither starts a
+        worker nor settles the row leaves the file at ``EMBEDDING`` waiting for a
+        report that nobody will send, until the reaper reverts it ten minutes
+        later and the whole extraction repeats.
+
         Returns:
             Whether a worker is now embedding *batch*.
         """
@@ -748,6 +754,7 @@ class DocumentsMixin(_DocumentsBase):
 
         collection = self._rag_collection
         if collection is None:
+            self._fail(path, source_sha, "retrieval has no collection parameters")
             return False
         request_id = str(uuid4())
         try:
@@ -769,9 +776,10 @@ class DocumentsMixin(_DocumentsBase):
             )
         except Exception as exc:
             logger.warning(
-                "Workspace %s: could not spawn an embedding worker for %s",
+                "Workspace %s: could not spawn an embedding worker for %s: %s",
                 self.config.workspace_path,
                 path,
+                exc,
             )
             self._fail(path, source_sha, f"{type(exc).__name__}: {exc}")
             return False

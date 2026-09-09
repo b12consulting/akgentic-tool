@@ -450,11 +450,37 @@ class TestAdd:
         actor.add("col1", [])
         backend.add.assert_called_once_with("col1", [])
 
-    def test_backend_unavailable_skips(self) -> None:
-        """When backend is None, add() logs and returns."""
+    def test_a_backend_that_cannot_be_built_is_a_failure_not_a_silent_skip(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The last way a write could still land nowhere and report success.
+
+        ``create_collection`` degrades on an unbuildable backend, so a consumer
+        can bind a proxy over a store that has no collection. If ``add`` then
+        returned quietly, the workspace would count the batch and take the file to
+        ``EMBEDDED`` with nothing behind it — the swallow this method exists not
+        to do.
+        """
+        actor = _make_actor()
+        caplog.clear()
+
+        with (
+            patch.object(actor, "_get_or_create_backend", return_value=None),
+            patch.object(VectorStoreState, "notify_state_change") as mock_notify,
+            caplog.at_level(logging.WARNING, logger=_ACTOR_LOGGER),
+            pytest.raises(RetriableError, match="col1"),
+        ):
+            actor.add("col1", [_mock_entry(vector=[0.1])])
+
+        assert len(_warnings(caplog)) == 1
+        mock_notify.assert_not_called()
+
+    def test_an_unavailable_backend_still_degrades_on_the_read_paths(self) -> None:
+        """Only the write raises: a miss costs a read, a lost write costs the truth."""
         actor = _make_actor()
         with patch.object(actor, "_get_or_create_backend", return_value=None):
-            actor.add("col1", [_mock_entry(vector=[0.1])])
+            actor.remove("col1", ["e1"])  # must not raise
+            assert actor.search("col1", [0.1], 5).hits == []
 
 
 # ---------------------------------------------------------------------------
