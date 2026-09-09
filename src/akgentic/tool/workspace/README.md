@@ -1026,7 +1026,7 @@ WorkspaceTool(
 | `[vision]` (Pillow) | `workspace_view` logs one warning and returns unresized bytes. Nothing fails. |
 | `git` off `PATH` | The journal degrades off with one warning. The gate is unaffected. |
 | No isolation backend | `mode="auto"` falls through to `local` with a `DeprecationWarning`: commands run as a plain subprocess with no filesystem isolation. |
-| No `#VectorStore` on the team | Every retrieval callable answers *"Retrieval indexing is not available for this workspace."* — one warning at bind time, nothing raised. Add `VectorStoreTool` to the team configuration. |
+| The store cannot be resolved | Every retrieval callable answers *"Retrieval indexing is not available for this workspace."* — one warning at bind time, nothing raised. The card creates its own store when the backend needs one, so this is an unreachable cluster or a collection that could not be created, not a missing card. |
 | `[vector_search]` (numpy) | The in-memory vector backend cannot be built. Retrieval degrades as above; nothing else on the card changes. |
 
 ### What it costs

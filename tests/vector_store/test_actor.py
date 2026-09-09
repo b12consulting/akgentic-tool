@@ -463,11 +463,11 @@ class TestAdd:
     ) -> None:
         """The last way a write could still land nowhere and report success.
 
-        ``create_collection`` degrades on an unbuildable backend, so a consumer
-        can bind a proxy over a store that has no collection. If ``add`` then
-        returned quietly, the workspace would count the batch and take the file to
-        ``EMBEDDED`` with nothing behind it — the swallow this method exists not
-        to do.
+        ``create_collection`` now refuses an unbuildable backend too, so a
+        consumer no longer binds over a store that has no collection. This is the
+        other half of the same contract: if ``add`` returned quietly, the
+        workspace would count the batch and take the file to ``EMBEDDED`` with
+        nothing behind it — the swallow this method exists not to do.
         """
         actor = _make_actor()
         caplog.clear()

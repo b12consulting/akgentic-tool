@@ -13,7 +13,7 @@ from akgentic.tool.knowledge_graph import KnowledgeGraphTool
 | Module | `akgentic.tool.knowledge_graph.kg_tool` |
 | Actor | `KnowledgeGraphActor`, singleton named `#KnowledgeGraphTool` |
 | Channels used | `LLM_CONTEXT`, `TOOL_CALL`, `COMMAND` |
-| Depends on | `VectorStoreTool` — conditionally, see [`vector_store`](#vector_store) |
+| Depends on | nothing — the card creates its own store, see [`vector_store`](#vector_store) |
 | Required extra | `[vector_search]` — checked at `observer()` time, see [below](#the-dependency-check-is-unconditional) |
 
 ---
@@ -36,10 +36,6 @@ class KnowledgeGraphTool(ToolCard):
 
     # Write gate
     read_only: bool = False
-
-    @property
-    def depends_on(self) -> list[str]:
-        return ["VectorStoreTool"] if self.vector_store is not False else []
 ```
 
 **Same shape as `PlanningTool`, different domain.** `observer()` calls
@@ -55,18 +51,22 @@ holds no graph state; its methods are formatting helpers over the actor's ask pr
 
 ### `vector_store`
 
-| Value | Effect |
-|---|---|
-| `True` *(default)* | Bind to the default `#VectorStore` actor; `depends_on` requires a `VectorStoreTool`. |
-| `"#VectorStore-RAG"` (any `str`) | Bind to that named singleton. |
-| `False` | Degraded mode: no vector wiring, no `depends_on`, search is keyword-only. |
+A `VectorStoreParam`: the one object saying where the graph's vectors live and how they are
+embedded. It is forwarded to `KnowledgeGraphConfig` and is what `KnowledgeGraphActor` resolves its
+storage engine from at `on_start`, calling `create_collection("knowledge_graph", …)` on whatever it
+resolves.
 
-`VectorStoreTool` owns the actor; this card only points at it, and `KnowledgeGraphActor` resolves
-it by name during `on_start`.
+**The backend decides whether an actor is involved at all.** An actor-state backend — the in-memory
+index, whose data *is* the store actor's state — gets a store actor, created by this card's
+`observer()` before the `KnowledgeGraphActor` that looks it up. A cluster backend gets none: the
+data lives on the cluster, so the actor builds the backend through the registered factory and talks
+to the process's shared client directly. This card declares no `depends_on`; the ordering a
+dependency edge used to enforce between two cards is now two lines in one method.
 
-### `collection`
-
-`VectorStoreParam` forwarded to `VectorStoreActor.create_collection("knowledge_graph", …)`.
+**This field used to mean something else.** Before epic 49 it was a `bool | str` naming *which*
+`VectorStoreActor` to look up, and the configuration lived on a separate `collection` field. Both
+are gone: a persisted card carrying `vector_store: true` now fails validation rather than being
+ignored, and one carrying `collection:` silently takes the default.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
@@ -205,27 +205,27 @@ time. The rule, and the reasons behind it, are documented once in
 
 `observer()` calls `_check_kg_dependencies()` **before** anything else. That check requires
 `numpy` and `openai` — the `[vector_search]` extra — and raises `ImportError` with the install
-command when either is missing. It runs even with `vector_store=False`, so unlike `PlanningTool`
-this card cannot be used at all without the extra:
+command when either is missing. It runs whatever the card's `vector_store` names, so unlike
+`PlanningTool` this card cannot be used at all without the extra:
 
 ```bash
 uv add "akgentic-tool[vector_search]"
 ```
 
-`vector_store=False` disables the *vector store binding*, not the dependency requirement.
+The check is on the card, not on the storage: a cluster backend does not exempt it.
 
 ### Wiring order
 
 ```python
 from akgentic.tool.knowledge_graph import KnowledgeGraphTool
-from akgentic.tool.vector_store import VectorStoreTool
 
-ToolFactory([KnowledgeGraphTool(), VectorStoreTool()], observer=agent)
-# -> sorted to [VectorStoreTool, KnowledgeGraphTool]
+ToolFactory([KnowledgeGraphTool()], observer=agent)
+# -> no ordering to arrange: the card creates its own store inside observer()
 ```
 
-Omitting `VectorStoreTool` while `vector_store` is truthy raises `ValueError` at factory
-construction.
+There is no second card to list and no order to get wrong. What still fails fast at team creation
+is a card naming a backend the environment has not provisioned, which `observer()` refuses with a
+`ValueError`.
 
 ### Recipes
 

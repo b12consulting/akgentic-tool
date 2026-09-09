@@ -13,7 +13,7 @@ from akgentic.tool.planning import PlanningTool
 | Module | `akgentic.tool.planning.planning` |
 | Actor | `PlanActor`, singleton named `#PlanningTool` |
 | Channels used | `LLM_CONTEXT`, `TOOL_CALL`, `COMMAND` |
-| Depends on | `VectorStoreTool` — conditionally, see [`vector_store`](#vector_store) |
+| Depends on | nothing — the card creates its own store, see [`vector_store`](#vector_store) |
 | Optional extras | `[vector_search]` for semantic search |
 
 ---
@@ -33,10 +33,6 @@ class PlanningTool(ToolCard):
     get_planning_task: GetPlanningTask | bool = True
     update_planning: UpdatePlanning | bool = True
     search_planning: SearchPlanning | bool = True
-
-    @property
-    def depends_on(self) -> list[str]:
-        return ["VectorStoreTool"] if self.vector_store is not False else []
 ```
 
 **The card is a thin proxy; the plan lives in an actor.** `observer()` asks the orchestrator for
@@ -44,10 +40,11 @@ class PlanningTool(ToolCard):
 a `PlanningTool` binds to the *same* `#PlanningTool` singleton and sees the same task list. All
 four capabilities are closures over that actor's ask proxy.
 
-**`depends_on` is a property, not a field.** It returns `["VectorStoreTool"]` only when
-`vector_store` is not `False`, so `ToolFactory`'s topological sort wires `VectorStoreTool` first
-when it is needed and does not demand one when the tool runs keyword-only. Because it is a
-property it never appears in `model_dump()` and cannot be set through `model_validate`.
+**This card declares no `depends_on`, because it owns its own storage.** `observer()` creates the
+store actor itself — when the backend needs one — immediately before it creates the `PlanActor`
+that will look it up, so the ordering that a dependency edge between two cards used to enforce is
+now two lines in one method. There is no second card to add to the team and nothing for
+`ToolFactory`'s topological sort to order.
 
 ---
 
@@ -55,20 +52,24 @@ property it never appears in `model_dump()` and cannot be set through `model_val
 
 ### `vector_store`
 
-| Value | Effect |
-|---|---|
-| `True` *(default)* | Bind to the default `#VectorStore` actor. `depends_on` requires a `VectorStoreTool` in the team. |
-| `"#VectorStore-RAG"` (any `str`) | Bind to that named singleton, created by `VectorStoreTool(vector_store_name=...)`. |
-| `False` | Degraded mode: no vector wiring, no `depends_on`, `search_planning` runs keyword-only. |
+A `VectorStoreParam`: the one object saying where the plan's vectors live and how they are
+embedded. It is forwarded to `PlanConfig` and is what `PlanActor` resolves its storage engine from
+at `on_start`, calling `create_collection("planning", …)` on whatever it resolves.
 
-The card never creates the vector store actor — `VectorStoreTool` owns it. `PlanActor` looks it up
-by name during its own `on_start`. If the lookup fails, or `[vector_search]` is not installed, the
-tool degrades to keyword-only search rather than failing.
+**The backend decides whether an actor is involved at all.** An actor-state backend — the in-memory
+index, whose data *is* the store actor's state — gets a store actor, created by this card's
+`observer()` before the `PlanActor` that looks it up. A cluster backend gets none: the data lives on
+the cluster, so `PlanActor` builds the backend through the registered factory and talks to the
+process's shared client directly.
 
-### `collection`
+If the store cannot be resolved, or the collection cannot be created, or `[vector_search]` is not
+installed, the tool degrades to keyword-only search rather than failing — one WARNING, and
+`search_planning` still answers from its keyword leg.
 
-A `VectorStoreParam` forwarded to `VectorStoreActor.create_collection("planning", …)` when
-`PlanActor` starts.
+**This field used to mean something else.** Before epic 49 it was a `bool | str` naming *which*
+`VectorStoreActor` to look up, and the configuration lived on a separate `collection` field. Both
+are gone: a persisted card carrying `vector_store: true` now fails validation rather than being
+ignored, and one carrying `collection:` silently takes the default.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
@@ -191,14 +192,15 @@ a known substring and you do not want to pay for an embedding.
 
 ```python
 from akgentic.tool.planning import PlanningTool
-from akgentic.tool.vector_store import VectorStoreTool
 
-ToolFactory([PlanningTool(), VectorStoreTool()], observer=agent)
-# -> topologically sorted to [VectorStoreTool, PlanningTool]; order in the list is irrelevant
+ToolFactory([PlanningTool()], observer=agent)
+# -> no ordering to arrange: the card creates its own store inside observer()
 ```
 
-Listing `PlanningTool` with `vector_store=True` and **no** `VectorStoreTool` raises `ValueError`
-at factory construction — fail fast at team creation, not at the first search.
+There is no second card to list and no order to get wrong. What still fails fast at team creation
+is a card naming a backend the environment has not provisioned — a cluster URL that is not
+exported, or a dimension contradicting the embedding model — which `observer()` refuses with a
+`ValueError` rather than degrading at the first search.
 
 ### Recipes
 
