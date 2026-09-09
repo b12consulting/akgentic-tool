@@ -49,7 +49,12 @@ from akgentic.tool.sandbox.actor import (
     SandboxMode,
     sandbox_actor_name,
 )
-from akgentic.tool.sandbox.backend import ExecReport, ExecResult, SandboxBackend
+from akgentic.tool.sandbox.backend import (
+    ExecReport,
+    ExecResult,
+    SandboxBackend,
+    validate_command,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -215,9 +220,12 @@ shutdown that follows it does not wait at all.
 **Three seconds, and the arithmetic that picks it.** Teardown kills first, and a
 healthy child dies in milliseconds, so this is generous for the case that is not
 wedged. The worst case for the whole of exec teardown is this plus the backend's
-own ``stop()``, and ``docker stop`` defaults to a 10 s SIGTERM grace before it
-SIGKILLs — so ~13 s, comfortably under the orchestrator's 30 s stop backstop. If
-this number changes, state that arithmetic again.
+own ``stop()``, and the slowest of those is docker's, which is now a single
+``docker rm -f`` — a forced removal, so it spends none of ``docker stop``'s
+ten-second SIGTERM grace. That leaves ~3 s plus one round trip to the daemon,
+comfortably under the orchestrator's 30 s stop backstop and with far more room
+than the ~13 s this was originally sized for. If this number changes, state that
+arithmetic again.
 
 What it converts is the failure mode, not the hazard: an unbounded teardown hang
 becomes three seconds of teardown latency. Signalling the process group would
@@ -780,7 +788,18 @@ class ExecRunner:
         down is retried by the next run. That costs a failing probe per run in a
         broken deployment, and is the honest trade against a latched failure
         that would need a restart to clear.
+
+        **The allowlist is checked before the start, and the cost it saves is
+        real.** Every backend also checks it inside its own ``exec``, which is
+        what actually enforces it and is not being moved. But the check that
+        happens *here* is what stops a command that will be refused from
+        provisioning first: on a cold docker backend, ``start()`` builds an image
+        and creates a container, and doing that for a command the very next line
+        rejects is minutes of work thrown away. Both raises land in
+        :meth:`perform`'s failure branch and reach the agent as the same report,
+        so validating twice changes no answer — only what was spent reaching it.
         """
+        validate_command(cmd)
         if not self._started:
             self.backend.start(self.workspace_path)
             self._started = True
@@ -800,11 +819,12 @@ class ExecRunner:
 
         **This may run while the worker is still inside ``exec``**, and at
         teardown that is the right answer rather than a violation of the
-        ordering the normal path protects. For docker, ``docker stop`` is the
-        only thing that ends the process *inside* the container — ``kill()``
-        reaches the local ``docker exec`` client and no further — so a bounded
-        drain that gave up must still be followed by this. For the three local
-        backends ``_release()`` is a no-op, so the case does not arise.
+        ordering the normal path protects. For docker, **removing the container
+        is the only thing that ends the process inside it** — ``kill()`` reaches
+        the local ``docker exec`` client and no further — so a bounded drain that
+        gave up must still be followed by this, and the container going away is
+        what bounds the abandoned process's life. For the three local backends
+        ``_release()`` is a no-op, so the case does not arise.
         """
         self.backend.stop()
 

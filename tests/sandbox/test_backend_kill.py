@@ -212,29 +212,40 @@ def test_kill_survives_a_child_that_exits_between_the_read_and_the_signal(
 # ---------------------------------------------------------------------------
 
 
-def test_docker_stop_kills_the_run_then_stops_the_container() -> None:
-    """AC10: ``kill`` precedes the release, and the release is ``docker stop`` alone.
+def test_docker_stop_kills_the_run_then_removes_the_container() -> None:
+    """AC10: ``kill`` precedes the release, and the release is one ``docker rm -f``.
 
-    Ordering matters where the release does something: stopping a container
+    Ordering matters where the release does something: removing a container
     around a command still writing to the tree is the failure this rules out.
+    The container is ephemeral compute, so the release removes rather than stops
+    — there is no filesystem here worth preserving between runs, and the only
+    writes that outlive it are on the bind mount.
     """
     docker = DockerBackend("t1")
-    docker.container_name = "sandbox-t1"
+    docker.container_name = "akgentic-sandbox-0123456789ab"
     proc = MagicMock()
     order: list[str] = []
     proc.kill.side_effect = lambda: order.append("kill")
     docker._running = proc
 
+    def record(argv: list[str], **_kwargs: object) -> MagicMock:
+        order.append(" ".join(argv[:3]))
+        return MagicMock(stdout="", stderr="", returncode=0)
+
     with patch("akgentic.tool.sandbox.docker.subprocess.run") as mock_run:
-        mock_run.side_effect = lambda argv, **kwargs: order.append(" ".join(argv[:2]))
+        mock_run.side_effect = record
         docker.stop()
 
-    assert order == ["kill", "docker stop"]
-    assert mock_run.call_args_list[0][0][0] == ["docker", "stop", "sandbox-t1"]
-    # As today: the container filesystem is preserved between restarts.
+    assert order == ["kill", "docker rm -f"]
+    assert mock_run.call_args_list[0][0][0] == [
+        "docker",
+        "rm",
+        "-f",
+        "akgentic-sandbox-0123456789ab",
+    ]
     assert mock_run.call_count == 1
     for call_item in mock_run.call_args_list:
-        assert "rm" not in call_item[0][0]
+        assert "stop" not in call_item[0][0]
 
 
 def test_stop_releases_after_killing_on_a_backend_with_nothing_to_release() -> None:
@@ -514,12 +525,14 @@ def test_every_backend_is_still_constructible_with_no_arguments(
     assert backend_class().team_id == ""
 
 
-def test_resolve_mode_carries_the_team_to_the_backend_that_needs_it() -> None:
-    """The team names the docker container, and this is the only path it travels.
+def test_resolve_mode_carries_the_team_to_the_backend() -> None:
+    """The team reaches the backend by this path, and by no other.
 
-    Asserted through the container name rather than only the attribute: the name
-    is the consequence, and a ``team_id`` stored but never used in it would be a
-    per-team resource shared across teams.
+    **It no longer names the container.** The name became opaque and per
+    lifetime, because ``stop()`` removes the container and a name derived from
+    the team collides with its own predecessor on the next ``start()``. What is
+    asserted here is the wiring — ``resolve_mode``'s keyword reaches the
+    constructor — not a consequence the name no longer has.
     """
     _mode, backend = resolve_mode("docker", team_id="team-42")
 
@@ -541,7 +554,8 @@ def test_an_unstarted_docker_release_returns_instead_of_raising() -> None:
     It used to ``assert self.container_name is not None``. That is an
     ``AssertionError`` raised inside ``on_stop`` — where an exception is worse
     than any error it could report — and under ``python -O`` it is worse still:
-    the assert is stripped and ``docker stop None`` is what actually runs.
+    the assert is stripped and the docker command runs carrying a literal
+    ``None`` as the container name.
     """
     backend = DockerBackend(team_id="team-42")
     assert backend.container_name is None

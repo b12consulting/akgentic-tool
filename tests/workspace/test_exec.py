@@ -660,11 +660,16 @@ class TestTheLease:
 class TestADisallowedCommand:
     """What an agent is actually told when the allowlist refuses its command.
 
-    The allowlist check lives in ``SandboxActor.exec``, which the tell handler
-    calls on the **sandbox's** thread — so ``CommandNotAllowedError`` never
-    propagates out of ``request_exec`` or ``exec_status`` to a caller. It is
-    caught by the handler and arrives as a reported failure instead, and this is
-    where that is asserted end to end.
+    The check runs on the **worker** thread, in ``ExecRunner._exec`` and again in
+    each backend's own ``exec`` — so ``CommandNotAllowedError`` never propagates
+    out of ``request_exec`` or ``exec_status`` to a caller. It is caught by
+    ``perform`` and arrives as a reported failure instead, and this is where that
+    is asserted end to end.
+
+    **The check in the runner is the one that precedes provisioning**, and it is
+    there for a cost rather than for the answer: the backends' own checks are
+    what enforce the list, but they run after the lazy ``start()``, so without it
+    a command that will be refused first builds an image and creates a container.
     """
 
     def test_it_is_reported_as_a_failure_naming_the_binary_and_the_allowed_list(
@@ -690,6 +695,55 @@ class TestADisallowedCommand:
 
         answer = mutate(card, "workspace_exec_result", start.run_id)
         assert "ssh" in answer
+
+    def test_it_is_refused_before_the_backend_is_ever_provisioned(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        """A command that will be refused must not pay for a cold start first.
+
+        ``start()`` is lazy and it is the expensive call — on the docker backend
+        it builds an image and creates a container. Refusing after it means an
+        agent's typo can cost minutes and leave a container behind, so the
+        allowlist runs ahead of it.
+
+        ``starts`` is empty rather than ``commands``: the sibling spec above
+        already asserts nothing reached ``exec``, and a check that only moved
+        earlier *within* the backend would pass that one unchanged.
+        """
+        card, actor, harness = exec_setup
+        assert not sandbox_script.starts  # nothing provisioned yet
+
+        start = actor.request_exec(card._agent_id, "ssh nowhere")
+        assert start.run_id, start.refusal
+        harness.join()
+
+        assert sandbox_script.starts == [], (
+            "a refused command provisioned the backend before it was refused"
+        )
+        assert actor.exec_status(card._agent_id, start.run_id).state is ExecState.FAILED
+
+    def test_an_allowed_command_still_provisions_on_its_first_run(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        """The other half, without which the spec above passes on a broken lazy start.
+
+        A ``start()`` that had simply stopped being called would satisfy "a
+        refused command provisions nothing" perfectly, and this is what makes
+        that reading unreachable.
+        """
+        card, actor, harness = exec_setup
+        sandbox_script.gate.set()  # this run completes rather than blocking
+
+        start = actor.request_exec(card._agent_id, "echo hello")
+        assert start.run_id, start.refusal
+        harness.join()
+
+        assert len(sandbox_script.starts) == 1
+        assert actor.exec_status(card._agent_id, start.run_id).state is ExecState.DONE
 
     def test_it_does_not_leave_the_tree_leased(
         self,

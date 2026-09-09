@@ -26,9 +26,11 @@ RUN pip install --no-cache-dir --upgrade pip && \
         pillow pdf2image pytesseract pypdfium2 \
         openpyxl 'markitdown[pptx]'
 
-# uv (fast Python package manager)
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:${PATH}"
+# uv (fast Python package manager). Installed into /usr/local/bin rather than
+# the installer's default /root/.local/bin: Debian's /root is mode 0700, so a
+# container run under --user <non-root> cannot reach anything below it however
+# the PATH is set.
+RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
 
 # Node.js 18 and globally available Node dependencies used by DOCX, PPTX,
 # and PDF skills. NODE_PATH lets require() resolve them from any workdir.
