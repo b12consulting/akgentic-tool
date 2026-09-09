@@ -25,6 +25,7 @@ from akgentic.core.agent_state import BaseState
 from pydantic import ValidationError
 
 from akgentic.tool.errors import RetriableError
+from akgentic.tool.sandbox import SANDBOX_ACTOR_CLASSES
 from akgentic.tool.sandbox.actor import (
     DEFAULT_BACKEND_TIMEOUT_S,
     SANDBOX_ACTOR_NAME,
@@ -40,7 +41,6 @@ from akgentic.tool.sandbox.bwrap import BwrapSandboxActor
 from akgentic.tool.sandbox.docker import DockerSandboxActor
 from akgentic.tool.sandbox.local import LocalSandboxActor
 from akgentic.tool.sandbox.seatbelt import SeatbeltSandboxActor
-from akgentic.tool.sandbox.tool import ExecTool
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
 from akgentic.tool.workspace.edit import EditItem
 from akgentic.tool.workspace.execution import (
@@ -77,6 +77,7 @@ from tests.workspace.conftest import (
     WORKSPACE_PATH,
     FakeActorToolObserver,
     FakeOrchestratorProxy,
+    FakeSandboxActor,
     SandboxHarness,
     SandboxScript,
     SilentAgent,
@@ -198,7 +199,7 @@ class TestTheCapability:
         def explode() -> str:
             raise AssertionError("a card with exec off probed the host for a backend")
 
-        monkeypatch.setattr("akgentic.tool.sandbox.tool._resolve_auto_mode", explode)
+        monkeypatch.setattr("akgentic.tool.sandbox._resolve_auto_mode", explode)
         card = WorkspaceTool(workspace_id=workspace_tree.name)
         card.observer(FakeActorToolObserver(orchestrator_proxy))
 
@@ -288,7 +289,7 @@ class TestTheCapability:
         def explode() -> str:
             raise AssertionError("a card with exec off the tool channel probed the host")
 
-        monkeypatch.setattr("akgentic.tool.sandbox.tool._resolve_auto_mode", explode)
+        monkeypatch.setattr("akgentic.tool.sandbox._resolve_auto_mode", explode)
         card = WorkspaceTool(
             workspace_id=workspace_tree.name,
             workspace_exec=WorkspaceExec(expose=set()),
@@ -586,9 +587,7 @@ class TestADisallowedCommand:
     calls on the **sandbox's** thread — so ``CommandNotAllowedError`` never
     propagates out of ``request_exec`` or ``exec_status`` to a caller. It is
     caught by the handler and arrives as a reported failure instead, and this is
-    where that is asserted end to end. The handler in ``ExecTool.exec_command``
-    is defence against a future path that raises synchronously, and the tests
-    over it in ``tests/sandbox/`` say so.
+    where that is asserted end to end.
     """
 
     def test_it_is_reported_as_a_failure_naming_the_binary_and_the_allowed_list(
@@ -1754,89 +1753,23 @@ class TestTheJournalOff:
 
 
 # ---------------------------------------------------------------------------
-# AC2 — the deprecated shim behaves identically
+# Two cards over one tree, and a backend registered from outside the package
 # ---------------------------------------------------------------------------
 
 
 @requires_git
-class TestTheShimAndTheCapabilityAgree:
-    def test_the_same_command_produces_the_same_observable_outcome(
+class TestTwoCardsOverOneTree:
+    def test_each_card_commits_as_its_own_agent(
         self,
         orchestrator_proxy: FakeOrchestratorProxy,
         workspace_tree: Path,
         sandbox_script: SandboxScript,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # The equivalence is asserted on what an agent and a repository can see:
-        # the outcome body, the files on disk, and the lease being taken and
-        # released — not on which code path was taken to get there.
-        #
-        # It is the BODY rather than the whole answer, and that is the change
-        # AC8 forces rather than a weakening: a DONE result now opens with a
-        # provenance line naming its own run and command, and the two surfaces
-        # are two different runs, so byte equality of the whole string is a
-        # property neither can have any more. Everything below the line — the
-        # rendering the model actually reads the result out of — is still one
-        # shared format_outcome, and that is what this class exists to guard.
-        card, _ = exec_card_for(
-            orchestrator_proxy, poll_attempts=50, poll_delay_seconds=0.01, git_journal=True
-        )
-        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
-        assert isinstance(actor, WorkspaceActor)
-        harness = SandboxHarness(actor, orchestrator_proxy)
-        harness.install(monkeypatch)
-
-        shim = ExecTool(mode="local", workspace_id=workspace_tree.name)
-        with pytest.warns(DeprecationWarning):
-            shim.observer(FakeActorToolObserver(orchestrator_proxy, name="bob"))
-
-        sandbox_script.files = [("built.txt", "x\n")]
-        sandbox_script.stdout = "done"
-
-        through_capability = self._run(tool_named(card, "workspace_exec"), sandbox_script, harness)
-        (workspace_tree / "built.txt").unlink()
-        actor._journal.commit_out_of_band()
-        sandbox_script.started.clear()
-        sandbox_script.gate.clear()
-        through_shim = self._run(
-            next(t for t in shim.get_tools() if t.__name__ == "exec_command"),
-            sandbox_script,
-            harness,
-        )
-
-        capability_run, shim_run = (request.run_id for request in harness.requests)
-        assert through_capability.startswith(f"Run {capability_run} - exit_code:")
-        assert through_shim.startswith(f"Run {shim_run} - exit_code:")
-        assert self._body(through_capability) == self._body(through_shim)
-        # The exit code now rides the header beside the run id, so each surface
-        # states its own; what must match byte for byte is everything below it.
-        assert through_capability.startswith(f"Run {capability_run} - exit_code: 0 (OK)")
-        assert through_shim.startswith(f"Run {shim_run} - exit_code: 0 (OK)")
-        assert "done" in self._body(through_shim)
-        assert (workspace_tree / "built.txt").read_text(encoding="utf-8") == "x\n"
-        assert actor._running is None
-
-    @staticmethod
-    def _body(answer: str) -> str:
-        """Everything below the provenance line — the shared rendering."""
-        return answer.split("\n", 1)[1]
-
-    @staticmethod
-    def _run(callable_: Any, script: SandboxScript, harness: SandboxHarness) -> str:
-        """Drive one surface to completion and return what the agent was told."""
-        script.gate.set()
-        answer = str(callable_(cmd="make build"))
-        harness.join()
-        return answer
-
-    def test_both_surfaces_commit_as_their_own_agent(
-        self,
-        orchestrator_proxy: FakeOrchestratorProxy,
-        workspace_tree: Path,
-        sandbox_script: SandboxScript,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        card, observer = exec_card_for(
+        # Two agents sharing one workspace share one #Workspace and one sandbox,
+        # yet every run is journalled under the agent that requested it — the
+        # author is carried by the run, not by the actor.
+        alice, _ = exec_card_for(
             orchestrator_proxy,
             name="alice",
             poll_attempts=50,
@@ -1847,21 +1780,73 @@ class TestTheShimAndTheCapabilityAgree:
         assert isinstance(actor, WorkspaceActor)
         harness = SandboxHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
-        shim = ExecTool(mode="local", workspace_id=workspace_tree.name)
-        with pytest.warns(DeprecationWarning):
-            shim.observer(FakeActorToolObserver(orchestrator_proxy, name="bob"))
+        bob, _ = exec_card_for(
+            orchestrator_proxy, name="bob", poll_attempts=50, poll_delay_seconds=0.01
+        )
 
         sandbox_script.gate.set()
         sandbox_script.files = [("one.txt", "1\n")]
-        tool_named(card, "workspace_exec")(cmd="make one")
+        tool_named(alice, "workspace_exec")(cmd="make one")
         harness.join()
         sandbox_script.files = [("two.txt", "2\n")]
-        next(t for t in shim.get_tools() if t.__name__ == "exec_command")(cmd="make two")
+        tool_named(bob, "workspace_exec")(cmd="make two")
         harness.join()
 
         log = journal_log(workspace_tree)
         assert log[-2].author_name == "alice"
         assert log[-1].author_name == "bob"
+
+
+class InjectedSandboxActor(FakeSandboxActor):
+    """A backend registered from outside the package, as a deployment would.
+
+    A subclass rather than the fixture's fake itself, so the assertion below is
+    on *this* class having been resolved — the fixture already sits at the
+    ``local`` key, and a test that resolved it would prove nothing about the
+    registration it made.
+    """
+
+
+class TestARegisteredBackendIsReached:
+    """``SANDBOX_ACTOR_CLASSES`` is the documented extension point, and this is its contract.
+
+    A deployment assigns its own ``SandboxActor`` subclass into the registry
+    before any card is constructed. What matters is not the spelling of the
+    import but that ``workspace_exec`` — the wiring *and* the run — resolves
+    through the registry at call time and therefore reaches the injected class.
+    """
+
+    def test_a_backend_assigned_into_the_registry_runs_the_command(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        sandbox_script: SandboxScript,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Registered under a key a card may name, before the card exists —
+        # exactly the sequence the sandbox README documents.
+        monkeypatch.setitem(SANDBOX_ACTOR_CLASSES, "docker", InjectedSandboxActor)
+        card = WorkspaceTool(
+            workspace_id=workspace_tree.name,
+            workspace_exec=WorkspaceExec(mode="docker", poll_attempts=50, poll_delay_seconds=0.01),
+        )
+        card.observer(FakeActorToolObserver(orchestrator_proxy))
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
+        assert isinstance(actor, WorkspaceActor)
+        harness = SandboxHarness(actor, orchestrator_proxy)
+        harness.install(monkeypatch)
+
+        # The wiring resolved the injected class, not the shipped docker backend.
+        _, sandbox = orchestrator_proxy.children[sandbox_actor_name(WORKSPACE_PATH)]
+        assert type(sandbox) is InjectedSandboxActor
+
+        sandbox_script.gate.set()
+        sandbox_script.stdout = "ran in the injected backend"
+        answer = tool_named(card, "workspace_exec")(cmd="make build")
+        harness.join()
+
+        assert "ran in the injected backend" in answer
+        assert sandbox_script.commands == [("make build", "")]
 
 
 # ---------------------------------------------------------------------------

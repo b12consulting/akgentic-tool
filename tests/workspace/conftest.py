@@ -35,7 +35,7 @@ from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.tool.core import ToolState
 from akgentic.tool.sandbox.actor import ExecRequest, ExecResult, SandboxActor
-from akgentic.tool.sandbox.tool import SANDBOX_ACTOR_CLASSES
+from akgentic.tool.sandbox import SANDBOX_ACTOR_CLASSES
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
 from akgentic.tool.workspace.execution import DEFAULT_EXEC_TIMEOUT_S
 from akgentic.tool.workspace.journal import git_dir_for

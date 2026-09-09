@@ -445,9 +445,10 @@ def test_unbalanced_quote_raises_command_parse_error_and_never_reaches_exec() ->
 def test_command_parse_error_is_not_a_command_not_allowed_error() -> None:
     """AC3: the two are siblings, so an allowlist handler cannot swallow a parse error.
 
-    ``sandbox/tool.py`` renders ``CommandNotAllowedError`` with the allowed
-    command list appended. That is the wrong answer to a quoting mistake — it
-    sends the model hunting for a binary it already has.
+    ``CommandNotAllowedError``'s own message carries the allowed command list,
+    and ``workspace_exec`` reports it verbatim as the run's failure. That is the
+    wrong answer to a quoting mistake — it sends the model hunting for a binary
+    it already has — so a parse error must never be caught as an allowlist one.
     """
     assert not issubclass(CommandParseError, CommandNotAllowedError)
     assert not issubclass(CommandNotAllowedError, CommandParseError)
