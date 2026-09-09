@@ -8,21 +8,25 @@ import pytest
 from akgentic.core.actor_address import ActorAddress
 
 from akgentic.tool.vector_store.protocol import WEAVIATE_API_KEY_ENV, WEAVIATE_URL_ENV
+from akgentic.tool.vector_store.qdrant import QDRANT_API_KEY_ENV, QDRANT_URL_ENV
 
 
 @pytest.fixture(autouse=True)
 def _no_ambient_weaviate_cluster(monkeypatch: pytest.MonkeyPatch) -> None:
     """Hide a developer's exported cluster from every test in the package.
 
-    ``CollectionConfig.backend`` resolves from ``AKGENTIC_WEAVIATE_URL`` at
-    instantiation, so without this the suite means different things depending on
-    whose shell it runs in: green on a CI runner that exports nothing, red for the
-    developer running the local Weaviate the feature exists to support.
+    ``CollectionConfig.backend`` resolves from the backends' environment
+    variables at instantiation, so without this the suite means different things
+    depending on whose shell it runs in: green on a CI runner that exports
+    nothing, red for the developer running the local cluster the feature exists
+    to support.
 
     Tests that want a cluster opt in with ``monkeypatch.setenv``.
     """
     monkeypatch.delenv(WEAVIATE_URL_ENV, raising=False)
     monkeypatch.delenv(WEAVIATE_API_KEY_ENV, raising=False)
+    monkeypatch.delenv(QDRANT_URL_ENV, raising=False)
+    monkeypatch.delenv(QDRANT_API_KEY_ENV, raising=False)
 
 
 class MockActorAddress(ActorAddress):

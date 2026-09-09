@@ -46,6 +46,7 @@ vector_search = [
     "numpy>=1.26.0",
 ]
 weaviate = ["weaviate-client>=4.9.0"]
+qdrant = ["qdrant-client>=1.10.0"]
 docs = ["markitdown[pdf,docx,xlsx,xls,pptx,outlook]>=0.1"]
 vision = ["Pillow>=10.0"]
 dev = [
@@ -57,6 +58,7 @@ dev = [
     "ruff>=0.1.0",
     "openai>=1.0.0",
     "numpy>=1.26.0",
+    "qdrant-client>=1.10.0",
 ]
 
 # Note: akgentic-* dependencies have NO [tool.uv.sources] entry here.

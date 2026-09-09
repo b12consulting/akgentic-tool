@@ -14,7 +14,7 @@ from akgentic.tool.vector_store import VectorStoreTool
 | Actor | `VectorStoreActor`, singleton named `#VectorStore` by default |
 | Channels used | **none** — `get_tools()`, `get_system_prompts()`, `get_commands()` and `get_toolsets()` all return empty |
 | Consumers | `PlanningTool`, `KnowledgeGraphTool` |
-| Optional extras | `[vector_search]` (numpy + openai), `[weaviate]` |
+| Optional extras | `[vector_search]` (numpy + openai), `[weaviate]`, `[qdrant]` |
 
 ---
 
@@ -111,6 +111,12 @@ A card that names no backend therefore lands wherever the deployment actually is
 deployed to be used, and a collection with no opinion should not quietly get a process-local index
 that disappears with the actor.
 
+Weaviate is one *registered* backend, not a hard-coded branch. `default_backend()` delegates to
+the [backend registry](#pluggable-backends): it returns the first registered, environment-provisioned
+backend that is `selectable_as_default`, falling back to `inmemory`. Weaviate is registered before
+Qdrant, so an installation that exports both cluster URLs keeps the historical Weaviate default;
+export only `AKGENTIC_QDRANT_URL` and the default becomes `qdrant`.
+
 An exported but *empty* variable counts as unset, so a deployment template that always exports the
 name does not read as a cluster at `""`. Resolution happens per instantiation, not at import, so a
 process that exports the variable late still sees it.
@@ -142,12 +148,114 @@ resolved to `inmemory`, so there is nothing to contradict.
 |---|---|
 | `weaviate_url()` | Cluster URL, or `None`. Empty counts as unset. |
 | `weaviate_api_key()` | API key, or `None`. |
-| `default_backend()` | `"weaviate"` when a URL is set, else `"inmemory"`. |
+| `default_backend()` | Highest-priority provisioned backend from the registry; `"inmemory"` when none. |
 | `require_weaviate_configured(config, card_name)` | Raises `ValueError` when *config* names Weaviate and no URL is set. |
+| `require_backend_configured(config, card_name)` | Backend-agnostic guard: dispatches to the named backend's own `require_configured`. Prefer this in new consumer cards. |
 
 ---
 
-## Hybrid search lives here, not in the backends
+## Pluggable backends
+
+A backend is any object satisfying the `VectorStoreService` protocol (`create_collection`, `add`,
+`remove`, `search`). Backends register themselves by name; the actor resolves and routes to them
+through the registry and **never switches on a backend string**, so adding one needs no edit to the
+actor or the protocol. `inmemory`, `weaviate`, and `qdrant` are just the three built-ins, each
+registered the same way a third party would register its own.
+
+### The capability table
+
+`resolve_default_backend()` and the actor read a backend's declared capabilities from its
+`BackendSpec` instead of special-casing it:
+
+| `BackendSpec` field | Type | Default | What it decides |
+|---|---|---|---|
+| `name` | `str` | — | Identifier matched against `CollectionConfig.backend`. |
+| `factory` | `Callable[[BackendContext], VectorStoreService]` | — | Builds the instance. Import the client library *inside* the factory so registering never forces the optional dependency. |
+| `persists_in_actor_state` | `bool` | `False` | `True` for stores whose data lives *in* the actor and must be snapshotted on every mutation. The backend must also implement `ActorStateBackend` (`get_state` / `restore_state`). `False` is for external stores that own their persistence. |
+| `selectable_as_default` | `bool` | `True` | Whether `resolve_default_backend()` may pick it for a collection that names none. `inmemory` sets this `False` so it is only ever the fallback. |
+| `is_configured` | `Callable[[], bool]` | always `True` | `True` when the environment has provisioned it (e.g. a URL is exported). Drives default resolution. |
+| `require_configured` | `Callable[[str], None]` | no-op | Raises `ValueError` with remediation when the backend is named but unprovisioned. Reached from `require_backend_configured`. |
+
+| Built-in | `persists_in_actor_state` | `selectable_as_default` | Provisioned by |
+|---|---|---|---|
+| `inmemory` | `True` | `False` | always available |
+| `weaviate` | `False` | `True` | `AKGENTIC_WEAVIATE_URL` |
+| `qdrant` | `False` | `True` | `AKGENTIC_QDRANT_URL` |
+
+### Adding a backend
+
+```python
+from akgentic.tool.vector_store.protocol import VectorStoreService
+from akgentic.tool.vector_store.registry import (
+    BackendContext, BackendSpec, register_backend,
+)
+
+class PineconeBackend:                       # satisfies VectorStoreService structurally
+    def __init__(self, ctx: BackendContext) -> None:
+        import pinecone                       # lazy: optional dependency stays optional
+        self._team_id = ctx.team_id           # stamp objects for team-scoped cleanup
+        ...
+    def create_collection(self, name, config): ...
+    def add(self, collection, entries): ...
+    def remove(self, collection, ref_ids): ...
+    def search(self, collection, query_vector, top_k, query=None): ...
+
+register_backend(BackendSpec(
+    name="pinecone",
+    factory=PineconeBackend,
+    is_configured=lambda: bool(os.environ.get("PINECONE_API_KEY")),
+))
+```
+
+A card then selects it with `CollectionConfig(backend="pinecone")`; nothing in the actor changes.
+`register_backend` / `unregister_backend` / `is_registered` / `available_backends` manage the
+registry (tests use `unregister_backend` to clean up). Prefer **subclassing** a built-in when you
+only need to bend one behaviour — `WeaviateBackend` and `QdrantBackend` expose overridable hooks
+(`_build_filter`, `_search_kwargs` / `_near_vector_kwargs`) so a subclass can inject native query
+options without reimplementing ingestion or team-scoping.
+
+### Per-query parameters (`VectorQuery`)
+
+`search` takes an optional `VectorQuery` so a caller can refine one query without touching the
+backend or the collection. Every field is optional and a backend applies what it understands and
+ignores the rest, so the same query stays portable across backends of differing capability.
+
+| `VectorQuery` field | Type | Meaning |
+|---|---|---|
+| `filters` | `dict[str, Any] \| None` | Exact-match metadata constraints, e.g. `{"ref_type": "entity"}`. A value may be a scalar or a list (match-any). Applied by `inmemory`, `weaviate`, and `qdrant`. |
+| `score_threshold` | `float \| None` | Drop hits whose raw cosine score is below this floor. |
+| `params` | `dict[str, Any] \| None` | Backend-native knobs passed through untouched — HNSW `ef`, an exact-search toggle, a certainty floor — recognised only by the backend that defines them. |
+
+```python
+from akgentic.tool.vector_store.protocol import VectorQuery
+
+actor.search("kg", vector, top_k=5, query=VectorQuery(
+    filters={"ref_type": "entity"},
+    score_threshold=0.75,
+    params={"search_params": {"hnsw_ef": 128}},  # honoured by qdrant, ignored by inmemory
+))
+```
+
+Omitting `query` calls the historical three-argument `search`, so pre-parameter backends keep
+working unchanged.
+
+### Qdrant setup
+
+```bash
+uv add "akgentic-tool[qdrant]"                # qdrant-client
+export AKGENTIC_QDRANT_URL="https://your-cluster.qdrant.io"
+export AKGENTIC_QDRANT_API_KEY="..."          # omit for an unauthenticated instance
+```
+
+`QdrantBackend` mirrors the Weaviate model: every point carries its owning `team_id` in the payload,
+searches and removes are team-scoped (a team-less backend raises rather than leaking across teams),
+and point ids are derived from the team, effective tenant, and `ref_id`, with `ref_id` kept in the
+payload for filtering. Naming `backend="qdrant"` without a URL or the `[qdrant]` dependency fails
+at card build time via `require_backend_configured`, exactly like Weaviate — a card asking for a
+durable store is never silently downgraded to the in-memory index.
+
+---
+
 
 `akgentic.tool.vector_store.hybrid` owns the one rule that combines keyword and vector hits. Both
 `KnowledgeGraphActor` and `PlanActor` search through it, so they rank identically.
@@ -221,7 +329,7 @@ PlanningTool(collection=CollectionConfig(backend="weaviate", tenant="team-42"))
 | `CollectionConfig` field | Type | Default | Meaning |
 |---|---|---|---|
 | `dimension` | `int` (≥1) | `1536` | Embedding vector dimensionality. Must match `embedding_model`. |
-| `backend` | `"inmemory" \| "weaviate"` | **follows the environment** | `weaviate` when `AKGENTIC_WEAVIATE_URL` is set, else `inmemory`. `inmemory` is a numpy cosine index inside the actor; `weaviate` delegates to a cluster and requires `akgentic-tool[weaviate]`. See below. |
+| `backend` | `str` | **follows the environment** | A registered backend name (`inmemory` / `weaviate` / `qdrant` / any third-party). Defaults via `default_backend()`: the highest-priority provisioned store, else `inmemory`. External backends require their extra (e.g. `akgentic-tool[qdrant]`). See [Pluggable backends](#pluggable-backends). |
 | `tenant` | `str \| None` | `None` | Weaviate tenant id for multi-tenancy — normally the workspace or team id. |
 
 ---
@@ -237,7 +345,7 @@ PlanningTool(collection=CollectionConfig(backend="weaviate", tenant="team-42"))
 | `create_collection(name, config)` | Create or reconfigure a named collection. Called by each consumer's actor on start. |
 | `add(collection, entries, requester=None, request_ref=None)` | Ingest `VectorEntry` records. Entries arriving without a vector are embedded asynchronously. |
 | `remove(collection, ref_ids, scope=None, path_prefix=None)` | Drop entries by reference id, narrowed by the predicates. |
-| `search(collection, query_vector, top_k, scope=None, path_prefix=None)` | Cosine search, returning a `SearchResult`. |
+| `search(collection, query_vector, top_k, scope=None, path_prefix=None, query=None)` | Cosine search, returning a `SearchResult`. `scope` / `path_prefix` narrow within a team; pass an optional `VectorQuery` to filter, threshold, or forward backend-native params. |
 | `embed(texts)` | Embed a batch directly. |
 
 `SearchResult` carries `hits: list[SearchHit]` (`ref_type`, `ref_id`, `text`, `score`, plus
@@ -380,12 +488,14 @@ deployment layer, not in this package.
 ```bash
 uv add "akgentic-tool[vector_search]"   # numpy + openai — required for any embedding at all
 uv add "akgentic-tool[weaviate]"        # weaviate-client — only for backend="weaviate"
+uv add "akgentic-tool[qdrant]"          # qdrant-client   — only for backend="qdrant"
 ```
 
 Without `[vector_search]` the consumer cards degrade to keyword-only search
 (`KnowledgeGraphTool` excepted: it checks the dependency in `observer()` and raises). Selecting
-`backend="weaviate"` without `[weaviate]`, or without a `weaviate_url`, logs a warning and leaves
-the backend unavailable rather than crashing the team.
+`backend="weaviate"` without `[weaviate]`, or without a `weaviate_url`, leaves the backend
+unavailable. `backend="qdrant"` without `[qdrant]` or `AKGENTIC_QDRANT_URL` fails during consumer
+card construction with an actionable installation or configuration message.
 
 ### Recipes
 
@@ -422,13 +532,19 @@ KnowledgeGraphTool(
 ```python
 from akgentic.tool.vector_store import (
     VectorStoreTool, VectorStoreActor, VectorStoreConfig, VS_ACTOR_NAME,
-    CollectionConfig, CollectionStatus, SearchHit, SearchResult,
-    VectorEntry, VectorIndex, EmbeddingService, InMemoryBackend, WeaviateBackend,
+    CollectionConfig, CollectionStatus, SearchHit, SearchResult, VectorQuery,
+    VectorEntry, VectorIndex, EmbeddingService,
+    VectorStoreService, InMemoryBackend, WeaviateBackend, QdrantBackend,
+    BackendContext, BackendSpec, register_backend, unregister_backend,
+    is_registered, available_backends, get_backend_spec,
+    default_backend, resolve_default_backend, require_backend_configured,
 )
 ```
 
-`WeaviateBackend` is `None` when `weaviate-client` is not installed — the import never fails, so
-guard on the value rather than on the import.
+Backend classes remain importable when their optional client is absent. Construction raises an
+`ImportError` with the corresponding extra to install. Qdrant consumer cards fail earlier through
+`require_backend_configured`; Weaviate's guard currently validates its URL and dependency failure
+is reported when the backend is constructed.
 
 ---
 

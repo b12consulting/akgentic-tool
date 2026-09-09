@@ -26,20 +26,37 @@ try:
     from akgentic.tool.vector_store.weaviate import WeaviateBackend
 except ImportError:
     WeaviateBackend = None  # type: ignore[assignment,misc]
+try:
+    from akgentic.tool.vector_store.qdrant import QdrantBackend
+except ImportError:
+    QdrantBackend = None  # type: ignore[assignment,misc]
 from akgentic.tool.vector_store.protocol import (
     WEAVIATE_API_KEY_ENV,
     WEAVIATE_URL_ENV,
+    ActorStateBackend,
     CollectionConfig,
     CollectionStatus,
     EmbeddingProvider,
     SearchHit,
     SearchResult,
+    VectorQuery,
     VectorStoreConfig,
     VectorStoreService,
     default_backend,
+    require_backend_configured,
     require_weaviate_configured,
     weaviate_api_key,
     weaviate_url,
+)
+from akgentic.tool.vector_store.registry import (
+    BackendContext,
+    BackendSpec,
+    available_backends,
+    get_backend_spec,
+    is_registered,
+    register_backend,
+    resolve_default_backend,
+    unregister_backend,
 )
 from akgentic.tool.vector_store.tool import VectorStoreTool
 from akgentic.tool.vector_store.vector import EmbeddingService, VectorEntry, VectorIndex
@@ -55,6 +72,9 @@ from akgentic.tool.vector_store.vector import (  # noqa: F401
 __all__ = [
     "WEAVIATE_API_KEY_ENV",
     "WEAVIATE_URL_ENV",
+    "ActorStateBackend",
+    "BackendContext",
+    "BackendSpec",
     "CollectionConfig",
     "CollectionStatus",
     "EmbeddingActor",
@@ -66,6 +86,7 @@ __all__ = [
     "EmbeddingService",
     "InMemoryBackend",
     "PendingRequest",
+    "QdrantBackend",
     "WeaviateBackend",
     "SearchHit",
     "SearchResult",
@@ -73,13 +94,21 @@ __all__ = [
     "VS_ACTOR_ROLE",
     "VectorEntry",
     "VectorIndex",
+    "VectorQuery",
     "VectorStoreActor",
     "VectorStoreConfig",
     "VectorStoreService",
     "VectorStoreState",
     "VectorStoreTool",
+    "available_backends",
     "default_backend",
+    "get_backend_spec",
+    "is_registered",
+    "register_backend",
+    "require_backend_configured",
     "require_weaviate_configured",
+    "resolve_default_backend",
+    "unregister_backend",
     "weaviate_api_key",
     "weaviate_url",
 ]

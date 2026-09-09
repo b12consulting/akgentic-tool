@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, TypeGuard, cast
 
 from pydantic import Field
 
@@ -20,11 +21,15 @@ from akgentic.core.agent_state import BaseState
 from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.vector_store.protocol import (
+    ActorStateBackend,
     CollectionConfig,
     CollectionStatus,
     SearchResult,
+    VectorQuery,
     VectorStoreConfig,
+    VectorStoreService,
 )
+from akgentic.tool.vector_store.registry import BackendContext, get_backend_spec
 
 if TYPE_CHECKING:
     from akgentic.core.actor_address import ActorAddress
@@ -43,6 +48,13 @@ VS_ACTOR_NAME: str = "#VectorStore"
 
 VS_ACTOR_ROLE: str = "ToolActor"
 """Actor role constant for ToolCard integration."""
+
+
+def _supports_actor_state(backend: object) -> TypeGuard[ActorStateBackend]:
+    """Return whether *backend* provides the actor-state persistence contract."""
+    return callable(getattr(backend, "get_state", None)) and callable(
+        getattr(backend, "restore_state", None)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +104,11 @@ class VectorStoreState(BaseState):
 
     backend_state: dict[str, Any] = Field(
         default_factory=dict,
-        description="Serialisable snapshot from InMemoryBackend.get_state()",
+        description="Legacy serialisable snapshot from InMemoryBackend.get_state()",
+    )
+    backend_states: dict[str, dict[str, Any]] = Field(
+        default_factory=dict,
+        description="Serialisable snapshots for registered actor-state-backed backends",
     )
     collection_statuses: dict[str, CollectionStatus] = Field(
         default_factory=dict,
@@ -151,6 +167,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         self.state.observer(self)
         self._backend: InMemoryBackend | None = None
         self._weaviate_backend: WeaviateBackend | None = None
+        self._backends: dict[str, VectorStoreService] = {}
         self._embedding_svc: EmbeddingService | None = None
         self._request_requesters: dict[str, ActorAddress] = {}
         self._request_entries: dict[str, list[VectorEntry]] = {}
@@ -243,13 +260,76 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
             return None
         return self._weaviate_backend
 
+    def _get_backend(
+        self, name: str
+    ) -> InMemoryBackend | WeaviateBackend | VectorStoreService | None:
+        """Return the backend registered under *name*, building it lazily.
+
+        Every backend resolves through its current :class:`BackendSpec`. Built-in
+        specs retain their pre-registry private accessors through a compatibility
+        hook; deliberately replacing either registration routes through the
+        replacement factory like any other third-party backend.
+
+        Args:
+            name: Backend identifier (a ``CollectionConfig.backend`` value).
+
+        Returns:
+            The backend instance, or ``None`` when it cannot be built (missing
+            dependency, misconfiguration, unknown name) — logged and swallowed so
+            a routed operation degrades rather than raising.
+        """
+        existing = self._backends.get(name)
+        if existing is not None:
+            return existing
+        try:
+            spec = get_backend_spec(name)
+            if spec.legacy_actor_accessor:
+                accessor = cast(
+                    Callable[[], VectorStoreService | None],
+                    getattr(self, spec.legacy_actor_accessor),
+                )
+                return accessor()
+            backend = spec.factory(
+                BackendContext(config=self.config, team_id=str(self.team_id))
+            )
+            if spec.persists_in_actor_state:
+                self._restore_backend_state(name, backend)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[%s] Failed to initialize '%s' backend: %s",
+                self.config.name,
+                name,
+                exc,
+            )
+            return None
+        self._backends[name] = backend
+        return backend
+
+    def _persists_in_actor_state(self, name: str) -> bool:
+        """Return whether backend *name* stores its data inside the actor state.
+
+        Drives the state-sync decision that used to be a ``!= "weaviate"`` name
+        check. Reads the backend's registered capability; an unregistered name
+        falls back to treating only ``inmemory`` as actor-state-backed.
+
+        Args:
+            name: Backend identifier.
+
+        Returns:
+            ``True`` for actor-state-backed backends (the in-memory index).
+        """
+        try:
+            return get_backend_spec(name).persists_in_actor_state
+        except ValueError:
+            return name == "inmemory"
+
     def _get_backend_for_collection(
         self, collection: str,
-    ) -> InMemoryBackend | WeaviateBackend | None:
+    ) -> InMemoryBackend | WeaviateBackend | VectorStoreService | None:
         """Return the correct backend for the given collection.
 
-        Checks ``self.state.collection_configs`` to determine whether the
-        collection uses the inmemory or weaviate backend.
+        Checks ``self.state.collection_configs`` for the collection's backend
+        name and resolves it through :meth:`_get_backend`.
 
         Args:
             collection: Collection name to look up.
@@ -259,35 +339,47 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         """
         cfg_data = self.state.collection_configs.get(collection, {})
         backend_type = cfg_data.get("backend", "inmemory")
-        if backend_type == "weaviate":
-            return self._get_or_create_weaviate_backend()
-        return self._get_or_create_backend()
+        return self._get_backend(backend_type)
 
     # ------------------------------------------------------------------
     # State synchronisation
     # ------------------------------------------------------------------
 
-    def _is_weaviate(self, collection: str) -> bool:
-        """Return whether *collection* is configured to live in Weaviate.
+    def _restore_backend_state(self, name: str, backend: VectorStoreService) -> None:
+        """Restore a factory-built actor-state-backed backend's saved snapshot.
 
-        The single reading of the stored config, so the ``_sync_backend_state()``
-        guards on the synchronous and asynchronous ingest paths cannot drift apart:
-        the in-memory snapshot is meaningless for a Weaviate-backed collection and is
-        taken for neither.
-
-        Args:
-            collection: Collection name to look up.
-
-        Returns:
-            ``True`` when the collection's configured backend is Weaviate.
+        Reads from the per-backend ``backend_states`` map. The built-in in-memory
+        backend restores from the legacy ``backend_state`` slot inside its own
+        accessor (:meth:`_get_or_create_backend`) and never reaches here.
         """
-        cfg_data = self.state.collection_configs.get(collection, {})
-        return bool(cfg_data.get("backend", "inmemory") == "weaviate")
+        if not _supports_actor_state(backend):
+            msg = (
+                f"Backend '{name}' declares persists_in_actor_state=True but does not "
+                "implement get_state() and restore_state()."
+            )
+            raise TypeError(msg)
+        if name in self.state.backend_states:
+            backend.restore_state(self.state.backend_states[name])
 
-    def _sync_backend_state(self) -> None:
-        """Copy the backend's serialisable snapshot into actor state."""
-        if self._backend is not None:
-            self.state.backend_state = self._backend.get_state()
+    def _sync_backend_state(self, name: str, backend: VectorStoreService) -> None:
+        """Copy an actor-state-backed backend's serialisable snapshot into state.
+
+        The built-in in-memory backend (``self._backend``) writes the legacy
+        ``backend_state`` slot for compatibility; every other actor-state-backed
+        backend — including a registered replacement for ``inmemory`` — writes the
+        per-backend ``backend_states`` map.
+        """
+        if not _supports_actor_state(backend):
+            msg = (
+                f"Backend '{name}' declares persists_in_actor_state=True but does not "
+                "implement get_state() and restore_state()."
+            )
+            raise TypeError(msg)
+        snapshot = backend.get_state()
+        if name == "inmemory" and backend is self._backend:
+            self.state.backend_state = snapshot
+        else:
+            self.state.backend_states[name] = snapshot
 
     # ------------------------------------------------------------------
     # Proxy methods
@@ -305,24 +397,15 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
             config: Collection configuration.
         """
         try:
-            if config.backend == "weaviate":
-                wb = self._get_or_create_weaviate_backend()
-                if wb is None:
-                    logger.warning(
-                        "[%s] Weaviate backend unavailable, skipping create_collection",
-                        self.config.name,
-                    )
-                    return
-                wb.create_collection(name, config)
-            else:
-                backend = self._get_or_create_backend()
-                if backend is None:
-                    logger.warning(
-                        "[%s] Backend unavailable, skipping create_collection",
-                        self.config.name,
-                    )
-                    return
-                backend.create_collection(name, config)
+            backend = self._get_backend(config.backend)
+            if backend is None:
+                logger.warning(
+                    "[%s] '%s' backend unavailable, skipping create_collection",
+                    self.config.name,
+                    config.backend,
+                )
+                return
+            backend.create_collection(name, config)
 
             self.state.collection_configs[name] = {
                 "dimension": config.dimension,
@@ -330,8 +413,8 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
                 "tenant": config.tenant,
             }
             self.state.collection_statuses[name] = CollectionStatus.READY
-            if config.backend != "weaviate":
-                self._sync_backend_state()
+            if self._persists_in_actor_state(config.backend):
+                self._sync_backend_state(config.backend, backend)
             self.state.notify_state_change()
         except Exception as exc:  # noqa: BLE001
             logger.warning("[%s] create_collection failed: %s", self.config.name, exc)
@@ -394,8 +477,11 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
             return
         try:
             backend.add(collection, entries)
-            if not self._is_weaviate(collection):
-                self._sync_backend_state()
+            backend_name = self.state.collection_configs.get(collection, {}).get(
+                "backend", "inmemory"
+            )
+            if self._persists_in_actor_state(backend_name):
+                self._sync_backend_state(backend_name, backend)
             self.state.notify_state_change()
         except ValueError as exc:
             raise RetriableError(str(exc)) from exc
@@ -501,8 +587,11 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
             return
         try:
             backend.remove(collection, ref_ids, scope=scope, path_prefix=path_prefix)
-            if not self._is_weaviate(collection):
-                self._sync_backend_state()
+            backend_name = self.state.collection_configs.get(collection, {}).get(
+                "backend", "inmemory"
+            )
+            if self._persists_in_actor_state(backend_name):
+                self._sync_backend_state(backend_name, backend)
             self.state.notify_state_change()
         except ValueError as exc:
             raise RetriableError(str(exc)) from exc
@@ -516,6 +605,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         top_k: int,
         scope: str | None = None,
         path_prefix: str | None = None,
+        query: VectorQuery | None = None,
     ) -> SearchResult:
         """Search a collection by cosine similarity.
 
@@ -528,6 +618,8 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
             top_k: Maximum number of results to return.
             scope: Restrict the search to entries carrying this ``scope``.
             path_prefix: Restrict the search to entries whose ``path`` starts with this.
+            query: Optional per-call refinement (filters, score threshold,
+                backend-native params). ``None`` preserves the historical call.
 
         Returns:
             Search results with hits and collection status.
@@ -537,9 +629,23 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
             logger.warning("[%s] Backend unavailable, returning empty search", self.config.name)
             return SearchResult(hits=[], status=CollectionStatus.READY, indexing_pending=0)
         try:
-            result: SearchResult = backend.search(
-                collection, query_vector, top_k, scope=scope, path_prefix=path_prefix
-            )
+            if query is None:
+                result: SearchResult = backend.search(
+                    collection,
+                    query_vector,
+                    top_k,
+                    scope=scope,
+                    path_prefix=path_prefix,
+                )
+            else:
+                result = backend.search(
+                    collection,
+                    query_vector,
+                    top_k,
+                    scope=scope,
+                    path_prefix=path_prefix,
+                    query=query,
+                )
             # Status and pending count come from the open-request map, never from the
             # backend: the backend has no idea a batch is still being embedded. Only
             # the two derived fields are overridden — a field added to SearchResult
@@ -591,8 +697,11 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         error: str | None = None
         try:
             backend.add(msg.collection, self._restore_metadata(msg))
-            if not self._is_weaviate(msg.collection):
-                self._sync_backend_state()
+            backend_name = self.state.collection_configs.get(msg.collection, {}).get(
+                "backend", "inmemory"
+            )
+            if self._persists_in_actor_state(backend_name):
+                self._sync_backend_state(backend_name, backend)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "[%s] receiveMsg_EmbeddingResult failed: %s",

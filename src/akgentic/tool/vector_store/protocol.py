@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import os
 from enum import StrEnum
-from typing import TYPE_CHECKING, Final, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, runtime_checkable
 
 from pydantic import Field
 
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.utils.serializer import SerializableBaseModel
+from akgentic.tool.vector_store import registry
 
 if TYPE_CHECKING:
     from akgentic.tool.vector_store.vector import VectorEntry
@@ -51,17 +52,21 @@ def weaviate_api_key() -> str | None:
     return os.environ.get(WEAVIATE_API_KEY_ENV) or None
 
 
-def default_backend() -> Literal["inmemory", "weaviate"]:
+def default_backend() -> str:
     """Return the backend a collection uses when its card names none.
 
-    The environment decides: a cluster URL means Weaviate is deployed, and a
-    collection that expresses no preference should land there rather than in a
-    process-local index that disappears with the actor.
+    Delegates to :func:`akgentic.tool.vector_store.registry.resolve_default_backend`,
+    which consults every registered backend's ``is_configured()`` probe. With
+    only the built-in backends this preserves the historical rule — ``weaviate``
+    when a cluster URL is set, ``inmemory`` otherwise — while letting a
+    registered external backend (e.g. Qdrant) also claim the default when it,
+    and no earlier-registered backend, is the one the environment provisioned.
 
-    Resolved per instantiation rather than at import, so a process that exports the
-    variable after the module loads — a test, a late-configured worker — still sees it.
+    Resolved per instantiation rather than at import, so a process that exports
+    a backend's variables after the module loads — a test, a late-configured
+    worker — still sees it.
     """
-    return "weaviate" if weaviate_url() else "inmemory"
+    return registry.resolve_default_backend()
 
 
 # ---------------------------------------------------------------------------
@@ -107,16 +112,27 @@ class CollectionConfig(SerializableBaseModel):
     """
 
     dimension: int = Field(default=1536, ge=1, description="Embedding vector dimensionality")
-    backend: Literal["inmemory", "weaviate"] = Field(
+    backend: str = Field(
         default_factory=default_backend,
         description=(
-            "Storage backend for this collection. Defaults to 'weaviate' when "
-            f"{WEAVIATE_URL_ENV} names a cluster, otherwise 'inmemory'."
+            "Storage backend for this collection, matched against a registered "
+            "BackendSpec.name. Built-ins: 'inmemory' and 'weaviate' (plus 'qdrant' "
+            "when akgentic-tool[qdrant] is installed). Defaults to whichever backend "
+            "the environment has provisioned, else 'inmemory'. Custom backends can be "
+            "added via akgentic.tool.vector_store.registry.register_backend."
         ),
     )
     tenant: str | None = Field(
         default=None,
         description="Weaviate tenant ID for multi-tenancy (maps to workspace/team ID)",
+    )
+    params: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Backend-native collection/connection settings passed through untouched "
+            "to the backend (e.g. HNSW tuning, distance metric overrides). Ignored by "
+            "backends that do not recognise a given key."
+        ),
     )
 
 
@@ -146,6 +162,31 @@ def require_weaviate_configured(config: CollectionConfig, card_name: str) -> Non
         f"Export {WEAVIATE_URL_ENV} (and {WEAVIATE_API_KEY_ENV} for an authenticated "
         f"cluster), or drop the backend setting to use the in-memory index."
     )
+
+
+def require_backend_configured(config: CollectionConfig, card_name: str) -> None:
+    """Raise when *config* names a backend the environment has not provisioned.
+
+    The backend-agnostic generalisation of :func:`require_weaviate_configured`:
+    it looks up the registered backend named by ``config.backend`` and delegates
+    to that backend's ``require_configured`` probe. A consumer card calls this at
+    ``observer()`` time so a team that names a durable store — Weaviate, Qdrant,
+    a custom backend — fails to build rather than starting up silently pointed at
+    a process-local index.
+
+    The in-memory backend's probe is a no-op, so a card that names no backend
+    (already resolved to ``inmemory``) never raises.
+
+    Args:
+        config: The collection configuration carried by the card.
+        card_name: Card class name, for the error message.
+
+    Raises:
+        ValueError: When the named backend is unknown, or is named but the
+            environment has not provisioned it.
+    """
+    spec = registry.get_backend_spec(config.backend)
+    spec.require_configured(card_name)
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +239,37 @@ def check_path_prefix(path_prefix: str | None) -> None:
 # ---------------------------------------------------------------------------
 # SearchHit
 # ---------------------------------------------------------------------------
+
+
+class VectorQuery(SerializableBaseModel):
+    """Optional per-call knobs that refine a similarity search.
+
+    Threaded through :meth:`VectorStoreService.search` so a caller can tune a
+    query without changing the backend or the collection. Every field is
+    optional; a backend applies what it understands and ignores the rest, so the
+    same query stays portable across backends of differing capability.
+
+    Attributes:
+        filters: Exact-match metadata constraints, e.g. ``{"ref_type": "entity"}``.
+            Keys name stored properties (``ref_type`` / ``ref_id`` / ``text`` on
+            the built-in schema); a value may be a scalar or a list (match-any).
+        score_threshold: Drop hits whose raw cosine score is below this value.
+        params: Backend-native query parameters passed through untouched — HNSW
+            ``ef``, an exact-search toggle, a certainty floor — recognised only
+            by the backend that defines them.
+    """
+
+    filters: dict[str, Any] | None = Field(
+        default=None,
+        description="Exact-match metadata filters, e.g. {'ref_type': 'entity'}.",
+    )
+    score_threshold: float | None = Field(
+        default=None, description="Drop hits scoring below this cosine value."
+    )
+    params: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Backend-native query parameters passed through untouched.",
+    )
 
 
 class SearchHit(SerializableBaseModel):
@@ -333,6 +405,7 @@ class VectorStoreService(Protocol):
         top_k: int,
         scope: str | None = None,
         path_prefix: str | None = None,
+        query: VectorQuery | None = None,
     ) -> SearchResult:
         """Search a collection by cosine similarity.
 
@@ -346,6 +419,8 @@ class VectorStoreService(Protocol):
             top_k: Maximum number of results to return.
             scope: Restrict the search to entries carrying this ``scope``.
             path_prefix: Restrict the search to entries whose ``path`` starts with this.
+            query: Optional refinement (filters, score threshold, backend-native
+                params). ``None`` runs a plain top-k similarity search.
 
         Returns:
             Search results with hits and collection status.
@@ -354,6 +429,29 @@ class VectorStoreService(Protocol):
             ValueError: When ``path_prefix`` contains ``*`` or ``?`` — see
                 :func:`check_path_prefix`.
         """
+        ...
+
+
+# ---------------------------------------------------------------------------
+# ActorStateBackend (Protocol)
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class ActorStateBackend(Protocol):
+    """Persistence contract for backends stored in ``VectorStoreState``.
+
+    A backend whose :class:`~akgentic.tool.vector_store.registry.BackendSpec`
+    sets ``persists_in_actor_state=True`` must implement this protocol in
+    addition to :class:`VectorStoreService`.
+    """
+
+    def get_state(self) -> dict[str, Any]:
+        """Return a serialisable snapshot of the backend."""
+        ...
+
+    def restore_state(self, state: dict[str, Any]) -> None:
+        """Restore a snapshot previously returned by :meth:`get_state`."""
         ...
 
 
