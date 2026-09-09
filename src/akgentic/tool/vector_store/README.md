@@ -121,6 +121,14 @@ An exported but *empty* variable counts as unset, so a deployment template that 
 name does not read as a cluster at `""`. Resolution happens per instantiation, not at import, so a
 process that exports the variable late still sees it.
 
+**One client per cluster per process.** Every consumer that resolves the same cluster is handed the
+same `weaviate.WeaviateClient`, from `get_client(url, api_key)` in `vector_store/client.py`. The
+cache is keyed on the parsed connection — host, port, scheme and API key, so `http://localhost:8080`
+and `http://LOCALHOST:8080/` are one cluster and two API keys are two — guarded by a lock so that two
+actor threads resolving one cluster at once open one connection, and emptied by `close_all()`, which
+is registered with `atexit` on the first successful connect. A `WeaviateBackend` takes that client;
+it never connects and never closes.
+
 ### Naming a cluster that is not there is an error
 
 ```python
@@ -397,7 +405,7 @@ object it writes. Unlike those three, `team_id` is always stamped. The value is 
 card:
 
 ```python
-WeaviateBackend(url=..., api_key=..., team_id=str(actor.team_id))
+WeaviateBackend(client=get_client(url, api_key), team_id=str(actor.team_id))
 ```
 
 **Why it is there.** An in-memory collection dies with its actor; a Weaviate collection does not.
@@ -459,20 +467,26 @@ Both work on a backend that created nothing — which is the point, since the sw
 the team and its actors are gone:
 
 ```python
+from akgentic.tool.vector_store import close_all, get_client
 from akgentic.tool.vector_store.weaviate import WeaviateBackend
 
-backend = WeaviateBackend(url=WEAVIATE_URL, api_key=WEAVIATE_API_KEY)
+backend = WeaviateBackend(client=get_client(WEAVIATE_URL, WEAVIATE_API_KEY))
 try:
     for team_id in deleted_team_ids:
         for collection in backend.list_collections():
             deleted = backend.delete_by_team(collection, team_id)
             log.info("reaped %d objects from %s for team %s", deleted, collection, team_id)
 finally:
-    backend.close()
+    close_all()
 ```
 
+A backend has no `close()` of its own: it does not own the connection. `close_all()` is
+process-level — it closes every client this process has cached, for every cluster — so it belongs
+at the end of a script or at process shutdown, where it also runs by itself through `atexit`, and it
+must not run while teams are live in the same process.
+
 On a **multi-tenant** collection the delete is scoped to the backend's tenant, so pass the tenant
-too when the deployment maps one tenant per team — `WeaviateBackend(url=..., tenant=team_id)`.
+too when the deployment maps one tenant per team — `WeaviateBackend(client=..., tenant=team_id)`.
 `tenant` and `team_id` are independent: the tenant partitions storage, `team_id` is a property on
 the object, and a backend given both stamps its own `team_id` rather than the tenant name.
 

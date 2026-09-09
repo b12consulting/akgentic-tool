@@ -1431,10 +1431,10 @@ class TestWeaviateRouting:
 
 
 class TestWeaviateTeamIdPropagation:
-    """The actor's own team_id reaches the WeaviateBackend it builds."""
+    """The actor's own team_id reaches the WeaviateBackend it builds from the shared client."""
 
     def test_backend_built_with_actor_team_id(self) -> None:
-        """_get_or_create_weaviate_backend passes str(self.team_id)."""
+        """The accessor resolves the process's client and stamps str(self.team_id)."""
         actor = _make_actor()
         actor.config = VectorStoreConfig(
             name=VS_ACTOR_NAME,
@@ -1443,21 +1443,24 @@ class TestWeaviateTeamIdPropagation:
             weaviate_api_key="secret",
         )
 
-        with patch(
-            "akgentic.tool.vector_store.weaviate.WeaviateBackend"
-        ) as mock_cls:
+        with (
+            patch("akgentic.tool.vector_store.client.get_client") as get_client,
+            patch("akgentic.tool.vector_store.weaviate.WeaviateBackend") as mock_cls,
+        ):
             actor._get_or_create_weaviate_backend()
 
-        assert mock_cls.call_args[1]["team_id"] == str(actor.team_id)
-        assert mock_cls.call_args[1]["url"] == "http://localhost:8080"
-        assert mock_cls.call_args[1]["api_key"] == "secret"
+        get_client.assert_called_once_with("http://localhost:8080", "secret")
+        assert mock_cls.call_args[1] == {
+            "client": get_client.return_value,
+            "team_id": str(actor.team_id),
+        }
 
     def test_team_id_is_not_configuration(self) -> None:
         """team_id is propagated by the actor system, never a VectorStoreConfig field."""
         assert "team_id" not in VectorStoreConfig.model_fields
 
     def test_two_actors_stamp_distinct_team_ids(self) -> None:
-        """Each team's actor builds a backend carrying its own id."""
+        """Each team's actor builds a backend carrying its own id, on the one client."""
         first, second = _make_actor(), _make_actor()
         for actor in (first, second):
             actor.config = VectorStoreConfig(
@@ -1466,13 +1469,39 @@ class TestWeaviateTeamIdPropagation:
                 weaviate_url="http://localhost:8080",
             )
 
-        with patch("akgentic.tool.vector_store.weaviate.WeaviateBackend") as mock_cls:
+        with (
+            patch("akgentic.tool.vector_store.client.get_client") as get_client,
+            patch("akgentic.tool.vector_store.weaviate.WeaviateBackend") as mock_cls,
+        ):
             first._get_or_create_weaviate_backend()
             second._get_or_create_weaviate_backend()
 
         stamped = [c[1]["team_id"] for c in mock_cls.call_args_list]
         assert stamped == [str(first.team_id), str(second.team_id)]
         assert stamped[0] != stamped[1]
+        assert all(c[1]["client"] is get_client.return_value for c in mock_cls.call_args_list)
+
+
+class TestStoppingAnActorLeavesTheSharedClientOpen:
+    """Invariant 3 of the thread-safety answer: a team stopping must not disconnect the others.
+
+    The client is shared across every team in the process, so ``VectorStoreActor``
+    gains no ``on_stop`` and the only closer is ``close_all()`` at process exit.
+    """
+
+    def test_on_stop_does_not_close_the_client(self) -> None:
+        """Stopping an actor that holds a Weaviate backend calls no close() on the client."""
+        actor = _make_actor()
+        client = MagicMock(name="shared-client")
+        backend = MagicMock(name="weaviate-backend")
+        backend._client = client
+        actor._weaviate_backend = backend
+        actor._backends["weaviate"] = backend
+
+        actor.on_stop()
+
+        client.close.assert_not_called()
+        backend.close.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

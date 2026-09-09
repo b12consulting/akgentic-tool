@@ -1185,6 +1185,12 @@ the actor, never from a card), so `delete_by_team()` and `list_collections()` gi
 two primitives it needs to reap the vectors of a deleted team — otherwise unreachable, since
 nothing else on a Weaviate object says who produced it.
 
+Every consumer in a process reaches a cluster through **one shared client**, keyed on the connection
+it names (host, port, scheme, API key) and obtained with `get_client(url, api_key)` from
+`akgentic.tool.vector_store`; a `WeaviateBackend` takes that client and never opens or closes one of
+its own. `close_all()` closes every cached client and runs by itself at process exit — an embedder
+or a script that wants its connections released earlier calls it once no consumer is live.
+
 **[Full reference → `src/akgentic/tool/vector_store/README.md`](src/akgentic/tool/vector_store/README.md)** —
 `CollectionConfig` in full, the service protocol, asynchronous embedding, team-scoped cleanup, and
 multi-store setups.

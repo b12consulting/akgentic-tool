@@ -226,17 +226,24 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
     def _get_or_create_weaviate_backend(self) -> WeaviateBackend | None:
         """Return the ``WeaviateBackend``, creating it lazily on first call.
 
-        Uses ``self.config.weaviate_url`` and ``self.config.weaviate_api_key``
-        for connection. Returns ``None`` when ``weaviate-client`` is missing
-        or connection fails.
+        Obtains the process's shared client for ``self.config.weaviate_url`` and
+        ``self.config.weaviate_api_key`` through ``get_client`` — one client per
+        cluster per process, never one per actor — and wraps it in a backend
+        scoped to this team. Returns ``None`` when ``weaviate-client`` is missing
+        or the first connect to the cluster fails.
 
         The owning team's id is taken from ``self.team_id`` — propagated by the
         actor system, never configured — and stamped onto every object the
         backend writes, so a deleted team's vectors stay findable.
+
+        This actor has no ``on_stop`` on purpose: the client is shared across
+        every team in the process, and one team stopping must not disconnect the
+        others. ``close_all()`` at process exit is the only closer.
         """
         if self._weaviate_backend is not None:
             return self._weaviate_backend
         try:
+            from akgentic.tool.vector_store.client import get_client
             from akgentic.tool.vector_store.weaviate import WeaviateBackend
 
             url = self.config.weaviate_url
@@ -247,8 +254,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
                 )
                 return None
             self._weaviate_backend = WeaviateBackend(
-                url=url,
-                api_key=self.config.weaviate_api_key,
+                client=get_client(url, self.config.weaviate_api_key),
                 team_id=str(self.team_id),
             )
         except Exception as exc:  # noqa: BLE001

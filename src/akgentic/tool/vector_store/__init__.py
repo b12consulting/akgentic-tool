@@ -13,6 +13,7 @@ from akgentic.tool.vector_store.actor import (
     VectorStoreActor,
     VectorStoreState,
 )
+from akgentic.tool.vector_store.client import ClusterKey, close_all, get_client
 from akgentic.tool.vector_store.embedding_actor import (
     EmbeddingActor,
     EmbeddingCompleted,
@@ -75,6 +76,7 @@ __all__ = [
     "ActorStateBackend",
     "BackendContext",
     "BackendSpec",
+    "ClusterKey",
     "CollectionConfig",
     "CollectionStatus",
     "EmbeddingActor",
@@ -101,8 +103,10 @@ __all__ = [
     "VectorStoreState",
     "VectorStoreTool",
     "available_backends",
+    "close_all",
     "default_backend",
     "get_backend_spec",
+    "get_client",
     "is_registered",
     "register_backend",
     "require_backend_configured",

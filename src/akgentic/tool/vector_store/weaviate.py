@@ -9,8 +9,14 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
 
+# ``_check_weaviate_dependencies`` moved to ``client.py`` with the connection it
+# guards; the redundant ``as`` alias keeps it importable from here as a deliberate
+# re-export (mypy strict turns off implicit re-export).
+from akgentic.tool.vector_store.client import (
+    _check_weaviate_dependencies as _check_weaviate_dependencies,
+)
+from akgentic.tool.vector_store.client import get_client
 from akgentic.tool.vector_store.protocol import (
     CollectionConfig,
     CollectionStatus,
@@ -68,18 +74,6 @@ ORDINAL_PROPERTY: str = "ordinal"
 Returned on a hit for ordering reassembly; never filtered on. Stamped only when set."""
 
 
-# ---------------------------------------------------------------------------
-# Dependency guard
-# ---------------------------------------------------------------------------
-
-try:
-    import weaviate as _weaviate  # noqa: F811, F401
-except ImportError:
-    _WEAVIATE_AVAILABLE = False
-else:
-    _WEAVIATE_AVAILABLE = True
-
-
 def _optional_str(value: object) -> str | None:
     """Return *value* as a string, or ``None`` when the property is absent.
 
@@ -95,20 +89,6 @@ def _optional_str(value: object) -> str | None:
     return None if value is None else str(value)
 
 
-def _check_weaviate_dependencies() -> None:
-    """Validate that ``weaviate-client`` is installed.
-
-    Raises:
-        ImportError: With install instructions when ``weaviate-client`` is missing.
-    """
-    if not _WEAVIATE_AVAILABLE:
-        msg = (
-            "Weaviate backend requires the 'weaviate-client' package. "
-            "Install with: pip install akgentic-tool[weaviate]"
-        )
-        raise ImportError(msg)
-
-
 # ---------------------------------------------------------------------------
 # WeaviateBackend
 # ---------------------------------------------------------------------------
@@ -118,8 +98,13 @@ class WeaviateBackend:
     """Weaviate-backed vector store implementing ``VectorStoreService``.
 
     This is a plain Python class (not a Pydantic model) because it holds
-    non-serialisable runtime state (the Weaviate client connection).
-    It satisfies the ``VectorStoreService`` protocol structurally.
+    non-serialisable runtime state: a handle to the process's **shared**
+    Weaviate client, not a connection of its own. The client is obtained from
+    :func:`akgentic.tool.vector_store.client.get_client` — one per cluster per
+    process — and closed by ``close_all()`` at process exit, never by a backend.
+    What a backend owns is its scope (``tenant``, ``team_id``) and its own
+    created-collections bookkeeping. It satisfies the ``VectorStoreService``
+    protocol structurally.
 
     **The backend is team-scoped by construction.** Every query it issues
     carries a predicate on ``team_id``: ``search`` sees only its own team's
@@ -130,8 +115,9 @@ class WeaviateBackend:
     boundary deliberately and say so in their signatures.
 
     Args:
-        url: Weaviate cluster URL (e.g. ``http://localhost:8080``).
-        api_key: Optional API key for authentication.
+        client: The connected ``weaviate.WeaviateClient`` for the cluster, from
+            ``get_client(url, api_key)``. The backend never connects and never
+            closes it.
         tenant: Optional default tenant ID for multi-tenancy.
         team_id: Owning team id. Stamped onto every object written through this
             backend and used as the filter on every object it reads or removes.
@@ -144,36 +130,15 @@ class WeaviateBackend:
 
     def __init__(
         self,
-        url: str,
-        api_key: str | None = None,
+        client: weaviate.WeaviateClient,
         tenant: str | None = None,
         team_id: str | None = None,
     ) -> None:
         _check_weaviate_dependencies()
 
-        import weaviate as _wv
-        from weaviate.auth import AuthApiKey
-
+        self._client: weaviate.WeaviateClient = client
         self._tenant = tenant
         self._team_id = team_id
-        parsed = urlparse(url)
-        host = parsed.hostname or "localhost"
-        port = parsed.port or (443 if parsed.scheme == "https" else 8080)
-        use_https = parsed.scheme == "https"
-
-        # gRPC defaults: same host, port 50051
-        grpc_port = 50051
-
-        auth = AuthApiKey(api_key) if api_key else None
-        self._client: weaviate.WeaviateClient = _wv.connect_to_custom(
-            http_host=host,
-            http_port=port,
-            http_secure=use_https,
-            grpc_host=host,
-            grpc_port=grpc_port,
-            grpc_secure=use_https,
-            auth_credentials=auth,
-        )
         self._collections_created: set[str] = set()
         self._collection_tenants: dict[str, str] = {}
 
@@ -258,6 +223,12 @@ class WeaviateBackend:
         auto-extend a schema those producers never asked for. Omitting them keeps an
         entry from planning or the knowledge graph byte-identical to what it was
         before this dimension existed.
+
+        The batch context is opened here, on a handle fetched in this call, and
+        left here — never stored on the instance, never shared between calls —
+        because a shared batch object is the one thing the vendor says is not
+        thread-safe, and the client underneath is shared by every consumer in the
+        process.
 
         Args:
             collection: Target collection name.
@@ -527,10 +498,6 @@ class WeaviateBackend:
         )
         return int(getattr(result, "successful", 0) or 0)
 
-    def close(self) -> None:
-        """Disconnect the Weaviate client."""
-        self._client.close()
-
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
@@ -665,7 +632,9 @@ def _make_weaviate_backend(context: BackendContext) -> WeaviateBackend:
 
     Prefers connection settings already present on the ``VectorStoreConfig``
     (injected by the tool card from the environment), falling back to reading the
-    environment directly so a hand-built context still resolves a cluster.
+    environment directly so a hand-built context still resolves a cluster. The
+    resolved pair goes to :func:`get_client`, so every backend built for one
+    cluster in this process shares its client.
     """
     from akgentic.tool.vector_store.protocol import weaviate_api_key, weaviate_url
 
@@ -675,7 +644,7 @@ def _make_weaviate_backend(context: BackendContext) -> WeaviateBackend:
         msg = "weaviate_url is not configured; cannot build WeaviateBackend."
         raise ValueError(msg)
     api_key = getattr(cfg, "weaviate_api_key", None) or weaviate_api_key()
-    return WeaviateBackend(url=url, api_key=api_key, team_id=context.team_id)
+    return WeaviateBackend(client=get_client(url, api_key), team_id=context.team_id)
 
 
 register_backend(
