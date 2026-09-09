@@ -40,11 +40,19 @@ A consumer card calls `ensure_store_actor` in its `observer()`, **before** it cr
 consumer actor, because that actor resolves the store during its `on_start`:
 
 ```python
-require_backend_configured(self.vector_store, "PlanningTool")
-require_dimension_matches(self.vector_store, "PlanningTool")
-ensure_store_actor(self.vector_store, orchestrator_proxy)      # nothing, on a cluster
-orchestrator_proxy.getChildrenOrCreate(PlanActor, config=PlanConfig(...))
+param = resolve_store_param(self.vector_store)            # None when the card declined a store
+if param is not None:
+    require_backend_configured(param, "PlanningTool")
+    require_dimension_matches(param, "PlanningTool")
+...
+if param is not None:
+    ensure_store_actor(param, orchestrator_proxy)         # nothing, on a cluster
+orchestrator_proxy.getChildrenOrCreate(PlanActor, config=PlanConfig(vector_store=param, ...))
 ```
+
+**A card that declined a store owes none of those three obligations.** The probe is skipped as well
+as the creation, so a stored card that names `weaviate` explicitly and is *then* switched off does
+not take its whole team down for a cluster nothing will ever open.
 
 The consumer actor then resolves an **engine**, not a proxy. The four methods it calls —
 `create_collection`, `add`, `remove`, `search` — are exactly `VectorStoreService`, which the store
@@ -74,6 +82,35 @@ Every setting a store needs is on `VectorStoreParam`, carried by the consumer as
 `vector_store` field: `backend`, `dimension`, `tenant`, `params`, `embedding_model` and
 `embedding_provider`. **The consumer's `embedding_model` is the one that embeds** — the store
 writes vectors and produces none.
+
+### Three shapes on the card, two below it
+
+`PlanningTool` and `KnowledgeGraphTool` declare `vector_store: VectorStoreParam | bool`, because the
+card is the author's surface and an author needs to be able to decline a store outright.
+`WorkspaceTool` keeps a narrow `VectorStoreParam`: it already carries that opt-out under the larger
+`_rag_enabled()`, and a second switch would be contradictable.
+
+`resolve_store_param` in `protocol.py` is the single place the three collapse into two, for the same
+reason `needs_store_actor` is a single place — two halves of the wiring must get the same answer:
+
+```python
+def resolve_store_param(value: VectorStoreParam | bool) -> VectorStoreParam | None:
+    if value is True:
+        return VectorStoreParam()
+    if value is False:
+        return None
+    return value
+```
+
+`False` becomes `None` because `None` is what every consumer's store slot already means: `_vs_proxy
+is None`, `_resolve_store(...) -> VectorStoreService | None`, and `store is None` in
+`semantic_scores`. A literal `False` carried downstream would give every consumer three shapes to
+test for, and a `VectorStoreParam` carrying a disabled flag would be a live object meaning "not
+live" — one that still names a backend, so every guard here would have to learn to ignore an object
+it was handed.
+
+An explicit param passes through **by identity**, so a param two cards share through a catalog
+`__ref__` is not silently duplicated.
 
 ### What is deliberately *not* here
 

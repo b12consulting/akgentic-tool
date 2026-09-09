@@ -157,32 +157,44 @@ class TestPlanningToolDependsOn:
 
         assert "depends_on" not in PlanningTool().model_dump()
 
-    def test_vector_store_field_is_a_param(self) -> None:
+    def test_vector_store_field_accepts_a_param_or_a_bool(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
         from akgentic.tool.vector_store.protocol import VectorStoreParam
 
         tool = PlanningTool()
-        assert isinstance(tool.vector_store, VectorStoreParam)
+        assert tool.vector_store is True
         assert "vector_store" in PlanningTool.model_fields
-        assert PlanningTool.model_fields["vector_store"].annotation is VectorStoreParam
+        assert PlanningTool.model_fields["vector_store"].annotation == VectorStoreParam | bool
         assert "collection" not in PlanningTool.model_fields
 
     def test_vector_store_appears_in_model_dump(self) -> None:
+        """The default dumps as the bool the author would have written."""
         from akgentic.tool.planning.planning import PlanningTool
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
         dump = PlanningTool().model_dump()
         assert "vector_store" in dump
-        assert isinstance(dump["vector_store"], dict)
+        assert dump["vector_store"] is True
+        assert isinstance(
+            PlanningTool(vector_store=VectorStoreParam()).model_dump()["vector_store"], dict
+        )
 
-    def test_the_old_lookup_shapes_fail_loudly(self) -> None:
-        """A boolean or a named-actor string is a validation error, not an ignored key."""
+    def test_the_old_lookup_shape_fails_loudly(self) -> None:
+        """A named-actor string is a validation error; a bool is the opt-out.
+
+        Only the *string* half of the old ``bool | str`` field stays dead: the
+        ``VectorStoreActor`` lookup it addressed no longer exists. The boolean
+        half is the opt-out, and it validates.
+        """
         from pydantic import ValidationError
 
         from akgentic.tool.planning.planning import PlanningTool
 
-        for value in (True, False, "#VectorStore-RAG"):
-            with pytest.raises(ValidationError):
-                PlanningTool(vector_store=value)  # type: ignore[arg-type]
+        with pytest.raises(ValidationError):
+            PlanningTool(vector_store="#VectorStore-RAG")  # type: ignore[arg-type]
+
+        assert PlanningTool(vector_store=True).vector_store is True
+        assert PlanningTool(vector_store=False).vector_store is False
 
     def test_vector_store_roundtrip(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
@@ -253,18 +265,26 @@ class TestPlanningToolObserverNoVsCreation:
 
 
 class TestPlanningToolCollectionField:
-    """AC-2: PlanningTool.vector_store is a VectorStoreParam field."""
+    """AC-2: PlanningTool.vector_store accepts a VectorStoreParam or a bool."""
 
-    def test_default_collection_is_default_collection_config(self) -> None:
+    def test_the_default_resolves_to_a_default_param(self) -> None:
+        """The default is ``True``, and ``True`` resolves to ``VectorStoreParam()``.
+
+        The card records the author's declaration; the settings live one step
+        later, in what the normaliser produces from it.
+        """
         from akgentic.tool.planning.planning import PlanningTool
-        from akgentic.tool.vector_store.protocol import VectorStoreParam
+        from akgentic.tool.vector_store.protocol import VectorStoreParam, resolve_store_param
 
         tool = PlanningTool()
-        assert isinstance(tool.vector_store, VectorStoreParam)
-        assert tool.vector_store == VectorStoreParam()
-        assert tool.vector_store.dimension == 1536
-        assert tool.vector_store.backend == "inmemory"
-        assert tool.vector_store.tenant is None
+        assert tool.vector_store is True
+
+        param = resolve_store_param(tool.vector_store)
+        assert param == VectorStoreParam()
+        assert param is not None
+        assert param.dimension == 1536
+        assert param.backend == "inmemory"
+        assert param.tenant is None
 
     def test_collection_field_present_in_model_fields(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
@@ -289,11 +309,12 @@ class TestPlanningToolCollectionField:
 
     def test_collection_roundtrip_default(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
-        from akgentic.tool.vector_store.protocol import VectorStoreParam
+        from akgentic.tool.vector_store.protocol import VectorStoreParam, resolve_store_param
 
         tool = PlanningTool()
         reloaded = PlanningTool.model_validate(tool.model_dump())
-        assert reloaded.vector_store == VectorStoreParam()
+        assert reloaded.vector_store is True
+        assert resolve_store_param(reloaded.vector_store) == VectorStoreParam()
 
     def test_collection_roundtrip_custom(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
@@ -307,13 +328,21 @@ class TestPlanningToolCollectionField:
         assert reloaded.vector_store.tenant == "plan-tenant"
         assert reloaded.vector_store.dimension == 1536  # default preserved
 
-    def test_independent_tools_do_not_alias_collection(self) -> None:
-        """`default_factory=VectorStoreParam` gives each instance a fresh object."""
+    def test_independent_tools_do_not_share_a_mutable_param(self) -> None:
+        """Two default cards can never mutate one another's store settings.
+
+        The default is now the immutable ``True`` rather than a shared object, so
+        the aliasing this spec guards against moved one step later: it is
+        ``resolve_store_param`` that must hand each caller its own param.
+        """
         from akgentic.tool.planning.planning import PlanningTool
+        from akgentic.tool.vector_store.protocol import resolve_store_param
 
         a = PlanningTool()
         b = PlanningTool()
-        assert a.vector_store is not b.vector_store
+        assert a.vector_store is True
+        assert b.vector_store is True
+        assert resolve_store_param(a.vector_store) is not resolve_store_param(b.vector_store)
 
 
 class TestPlanningToolObserverCollection:

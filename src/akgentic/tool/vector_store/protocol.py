@@ -296,6 +296,51 @@ def needs_store_actor(param: VectorStoreParam) -> bool:
     return registry.get_backend_spec(param.backend).persists_in_actor_state
 
 
+def resolve_store_param(value: VectorStoreParam | bool) -> VectorStoreParam | None:
+    """The declared store, or ``None`` when this consumer declines one.
+
+    A consumer card's ``vector_store`` is the author's surface and carries three
+    shapes — ``True`` for "enabled, defaults everywhere", ``False`` for "no store
+    at all", and an explicit param for "enabled, configured like this". Below the
+    card there are only two, and this is the one place the third collapses into
+    them, for the same reason :func:`needs_store_actor` is one place: two halves
+    of the wiring must get the same answer (ADR-049 Decision 1).
+
+    **``False`` becomes ``None``, and the two obvious alternatives were refused.**
+    Carrying a literal ``False`` downstream would give every consumer three shapes
+    to test for — a param, a ``False``, and the ``None`` its store slot already
+    means — which is the state this normaliser exists to prevent. Carrying a
+    ``VectorStoreParam`` with a disabled flag would be a live object meaning "not
+    live": it still names a ``backend``, so ``require_backend_configured``,
+    :func:`needs_store_actor`, ``ensure_store_actor``, ``create_collection`` and
+    ``BackendSpec.factory`` would each have to learn to ignore an object they were
+    handed, and the flag would be a further catalog-settable field an author could
+    flip on a param a second card shares by ``__ref__``. ``None`` is what
+    ``_vs_proxy`` and ``_resolve_store`` already mean by "no store".
+
+    **This is deliberately not a Pydantic validator on the card.** Coercing
+    ``True`` into ``VectorStoreParam()`` at validation time would resolve
+    :func:`default_backend` — which ``VectorStoreParam.backend`` resolves *per
+    instantiation*, from the environment — and write the build environment's
+    backend into a stored record whose author wrote ``true``. Catalogs are
+    routinely promoted between tiers, so that record would then name a backend the
+    next tier has not provisioned. The card keeps the author's declaration
+    verbatim and the collapse happens here, at the point of use.
+
+    Args:
+        value: What the card's ``vector_store`` field holds.
+
+    Returns:
+        The declared param, a fresh default one for ``True``, or ``None`` for
+        ``False``.
+    """
+    if value is True:
+        return VectorStoreParam()
+    if value is False:
+        return None
+    return value
+
+
 # ---------------------------------------------------------------------------
 # path_prefix validation — one constant, one sentence, both backends
 # ---------------------------------------------------------------------------
@@ -321,6 +366,27 @@ PATH_PREFIX_REJECTED: Final[str] = (
     "two different things. Use a shorter prefix without them."
 )
 """The one sentence a rejected prefix is refused with, wherever it is refused."""
+
+SEMANTIC_DISABLED: Final[str] = (
+    "Semantic search is switched off for this tool (vector_store=False). "
+    "Keyword and hybrid search still work."
+)
+"""What a semantic-only search answers on a tool that declined a store.
+
+The precedent is :data:`PATH_PREFIX_REJECTED` directly above: a capability that
+cannot serve a request answers the model in a sentence rather than raising or
+returning an empty result. ``mode="vector"`` on a store-less tool has nothing to
+score, and an empty result would be read as "the graph holds nothing about this"
+— an assertion about the data rather than about the configuration.
+
+One constant, two readers, so the two tools cannot drift: ``search_planning`` on
+``PlanActor`` returns it as its only line, and ``KnowledgeGraphTool``'s search
+closure returns it in place of asking the actor at all.
+
+It is only ever the answer for a store that was **declined**. A store that was
+configured and then failed to build keeps returning an empty result, so a real
+misconfiguration is not swallowed under a reassuring sentence (ADR-049 Decision 5).
+"""
 
 
 def check_path_prefix(path_prefix: str | None) -> None:

@@ -23,7 +23,7 @@ from akgentic.tool.planning import PlanningTool
 ```python
 class PlanningTool(ToolCard):
     # Vector-search wiring
-    vector_store: VectorStoreParam = VectorStoreParam()
+    vector_store: VectorStoreParam | bool = True
     search_top_k: int = 10
     search_score_threshold: float = 0.5
 
@@ -51,9 +51,25 @@ now two lines in one method. There is no second card to add to the team and noth
 
 ### `vector_store`
 
-A `VectorStoreParam`: the one object saying where the plan's vectors live and how they are
-embedded. It is forwarded to `PlanConfig` and is what `PlanActor` resolves its storage engine from
-at `on_start`, calling `create_collection("planning", …)` on whatever it resolves.
+A `VectorStoreParam` or a `bool`, saying where the plan's vectors live and how they are embedded,
+in one of three shapes:
+
+| Written | Means |
+|---|---|
+| `True` (the default) | an enabled store with default settings |
+| `False` | no store at all — no store actor, no embedding, semantic search absent |
+| `VectorStoreParam(…)` | an enabled store configured explicitly |
+
+The card keeps what the author wrote, verbatim, and normalises it at the point of use:
+`resolve_store_param` turns `True` into a fresh `VectorStoreParam()` and `False` into `None`, so
+everything below the card sees only two shapes. The resolved value is forwarded to `PlanConfig` and
+is what `PlanActor` resolves its storage engine from at `on_start`, calling
+`create_collection("planning", …)` on whatever it resolves.
+
+**Why the bool is not expanded on the card.** `VectorStoreParam.backend` resolves from the
+environment *per instantiation*, so coercing `True` into a param at validation time would write the
+build environment's backend into a stored catalog record whose author wrote `true` — and catalogs
+are routinely promoted between tiers.
 
 **The backend decides whether an actor is involved at all.** An actor-state backend — the in-memory
 index, whose data *is* the store actor's state — gets a store actor, created by this card's
@@ -65,10 +81,13 @@ If the store cannot be resolved, or the collection cannot be created, or `[vecto
 installed, the tool degrades to keyword-only search rather than failing — one WARNING, and
 `search_planning` still answers from its keyword leg.
 
-**This field used to mean something else.** Before epic 49 it was a `bool | str` naming *which*
-`VectorStoreActor` to look up, and the configuration lived on a separate `collection` field. Both
-are gone: a persisted card carrying `vector_store: true` now fails validation rather than being
-ignored, and one carrying `collection:` silently takes the default.
+**Only half of what this field used to mean is gone.** Before epic 49 it was a `bool | str` doing
+two jobs: the string named *which* `VectorStoreActor` to look up, and the bool said whether to have
+a store at all. The lookup is gone for good — a card writing `vector_store: "#VectorStore-RAG"`
+fails validation, because the actor it addressed no longer exists — and the configuration that used
+to live on a separate `collection` field now lives in the param, so a persisted card carrying
+`collection:` silently takes the default. The **bool** is not gone: it is the opt-out described
+above, and every stored card writing `vector_store: false` keeps loading.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
@@ -268,10 +287,28 @@ is never dropped by it.
 
 Without the extra, or whenever the store cannot be resolved or its collection cannot be created,
 `search_planning` still answers — keyword and field filters only. There is no error and no warning
-at call time; the degradation is by design. **There is no longer a way to switch the vector store
-off on this card:** `vector_store` is a `VectorStoreParam`, not a `bool`, so a card that passes
-`False` fails validation. A team that wants keyword-only search simply omits the
-`[vector_search]` extra.
+at call time; the degradation is by design.
+
+**To switch the vector store off deliberately, write `vector_store=False`.** Nothing is probed at
+bind — a card naming an unprovisioned cluster and then switched off does not fail its team's build —
+no store actor is created, and nothing is embedded. The capability is **not** unregistered, because
+most of it still works:
+
+```python
+PlanningTool(vector_store=False)   # keyword and hybrid search still answer from the task list
+```
+
+| Mode | With `vector_store=False` |
+|---|---|
+| `"keyword"` | unchanged — substring matching over the task list |
+| `"hybrid"` | unchanged — the keyword leg answers, the semantic leg is empty |
+| `"vector"` | returns `[SEMANTIC_DISABLED]`, one sentence saying semantic search is off |
+
+The sentence matters: an empty list would read as "no task matches" rather than "there is no index".
+A store that was *asked for* and could not be built keeps returning empty results, so a real
+misconfiguration is still visible rather than hidden behind a reassuring sentence. The two cases are
+also distinguishable in the logs — a declined store logs one line at bind saying it is off by
+configuration.
 
 ### Import paths
 

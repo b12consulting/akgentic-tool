@@ -74,15 +74,23 @@ class KnowledgeGraphConfig(BaseConfig):
     Carries the storage configuration itself rather than a binding to a
     singleton: the backend ``vector_store`` names is what decides whether an
     actor is involved at all.
+
+    **This is the resolved value, not the author's declaration.**
+    ``KnowledgeGraphTool`` carries three shapes and normalises them into the two
+    this field holds, so ``None`` here means the card declined a store and this
+    actor stays in its degraded mode for good.
     """
 
-    vector_store: VectorStoreParam = Field(
+    vector_store: VectorStoreParam | None = Field(
         default_factory=VectorStoreParam,
         description=(
             "Vector store configuration for the knowledge graph collection: backend, "
             "dimension, tenant, embedding model and provider. The backend decides how "
             "the actor resolves its storage engine — an actor-state backend through the "
-            "store actor, a cluster one through the backend's own client."
+            "store actor, a cluster one through the backend's own client. None means the "
+            "card declined a store: nothing is resolved, nothing is embedded, and "
+            "semantic search stays off. An absent key still defaults to a param, so a "
+            "config persisted before the opt-out returned is unchanged."
         ),
     )
     search_top_k: int = Field(
@@ -167,8 +175,20 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         ``config.vector_store``: the store embeds nothing, so the model this
         actor's ``VectorStoreParam`` names is the model that embeds its entities
         and relations.
+
+        **A ``None`` param means the card declined a store**, and this returns
+        immediately: no orchestrator lookup, no backend built, ``_vs_proxy`` and
+        ``_embedder`` left at ``None``. It logs one line saying so, distinct from
+        every other warning here, so a reader of the logs can tell a deliberate
+        opt-out from a store that was asked for and failed to build.
         """
         param = self.config.vector_store
+        if param is None:
+            logger.warning(
+                "[%s] vector_store is off by configuration — semantic search disabled",
+                self.config.name,
+            )
+            return
         store = self._resolve_store(param)
         if store is None:
             return

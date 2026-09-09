@@ -561,3 +561,122 @@ class TestSearchPlanningWiring:
 
         commands = tool.get_commands()
         assert SearchPlanning not in commands
+
+
+# ---------------------------------------------------------------------------
+# vector_store=False — a plan that declined a store, driven through a real config
+#
+# Every negative here is paired with a positive in the same fixture. "A disabled
+# actor does not embed" proves nothing on its own, because the enabled actor in
+# this module does not embed either — it has no orchestrator. So each spec shows
+# the two answering *differently*, which is what the story changed.
+# ---------------------------------------------------------------------------
+
+
+def _make_disabled_actor() -> PlanActor:
+    """A ``PlanActor`` whose card declined a store, built from a real config.
+
+    Not a hand-set ``_vs_proxy``: the point is to exercise the path the card
+    actually takes, so ``vector_store=None`` is what ``PlanningTool`` hands the
+    config for ``vector_store=False``.
+    """
+    actor = PlanActor()
+    actor.config = PlanConfig(name="test-plan", role="ToolActor", vector_store=None)
+    actor.on_start()
+    return actor
+
+
+class TestADisabledPlanStillDoesEverythingButSemanticSearch:
+    """Task CRUD, keyword and hybrid search all work with no store."""
+
+    def test_task_crud_is_unaffected(self) -> None:
+        from akgentic.tool.planning.planning_actor import TaskCreate, TaskUpdate, UpdatePlan
+
+        actor = _make_disabled_actor()
+        addr = MockActorAddress("@Alice", "Agent")
+
+        actor.update_planning(
+            UpdatePlan(
+                create_tasks=[
+                    TaskCreate(id=1, status="pending", description="auth flow", owner="@Alice"),
+                    TaskCreate(id=2, status="pending", description="payments", owner="@Bob"),
+                ]
+            ),
+            addr,
+        )
+        assert {t.id for t in actor.get_planning()} == {1, 2}
+
+        actor.update_planning(
+            UpdatePlan(update_tasks=[TaskUpdate(id=1, status="completed")]), addr
+        )
+        assert next(t for t in actor.get_planning() if t.id == 1).status == "completed"
+
+        actor.update_planning(UpdatePlan(delete_tasks=[2]), addr)
+        assert {t.id for t in actor.get_planning()} == {1}
+
+    def test_keyword_and_hybrid_still_return_their_hits(self) -> None:
+        from akgentic.tool.vector_store.protocol import SEMANTIC_DISABLED
+
+        actor = _make_disabled_actor()
+        _add_task(actor, 1, "auth flow")
+        _add_task(actor, 2, "payment gateway")
+
+        for mode in ("keyword", "hybrid"):
+            result = actor.search_planning(query="auth", mode=mode)  # type: ignore[arg-type]
+            assert _extract_ids(result) == {1}
+            assert SEMANTIC_DISABLED not in result
+
+    def test_vector_mode_answers_a_sentence(self) -> None:
+        """The negative half: the one mode that has nothing to score says so."""
+        from akgentic.tool.vector_store.protocol import SEMANTIC_DISABLED
+
+        actor = _make_disabled_actor()
+        _add_task(actor, 1, "auth flow")
+
+        assert actor.search_planning(query="auth", mode="vector") == [SEMANTIC_DISABLED]
+
+    def test_an_unfiltered_listing_is_untouched(self) -> None:
+        """With no query there is no semantic phase to disable."""
+        actor = _make_disabled_actor()
+        _add_task(actor, 1, "auth flow")
+        _add_task(actor, 2, "payment gateway")
+
+        assert _extract_ids(actor.search_planning()) == {1, 2}
+
+
+class TestAFailedStoreIsNotADeclinedOne:
+    """The positive that stops the sentence swallowing a real misconfiguration."""
+
+    def test_an_enabled_plan_with_no_store_still_returns_empty_for_vector_mode(
+        self,
+    ) -> None:
+        """This actor *asked* for a store and did not get one — today's behaviour.
+
+        ``_make_actor`` builds an enabled config with no orchestrator, so
+        ``_vs_proxy`` ends up ``None`` exactly as it does for a store that failed
+        to build. It must keep returning nothing, so an operator sees an empty
+        result and looks, rather than reading a sentence and stopping.
+        """
+        from akgentic.tool.vector_store.protocol import SEMANTIC_DISABLED
+
+        actor = _make_actor()
+        _add_task(actor, 1, "auth flow")
+
+        assert actor.config.vector_store is not None
+        assert actor._vs_proxy is None
+
+        result = actor.search_planning(query="auth", mode="vector")
+        assert result == []
+        assert SEMANTIC_DISABLED not in result
+
+    def test_the_two_actors_answer_the_same_query_differently(self) -> None:
+        """The pairing stated as one assertion: declined and failed diverge."""
+        from akgentic.tool.vector_store.protocol import SEMANTIC_DISABLED
+
+        failed = _make_actor()
+        declined = _make_disabled_actor()
+        for actor in (failed, declined):
+            _add_task(actor, 1, "auth flow")
+
+        assert failed.search_planning(query="auth", mode="vector") == []
+        assert declined.search_planning(query="auth", mode="vector") == [SEMANTIC_DISABLED]

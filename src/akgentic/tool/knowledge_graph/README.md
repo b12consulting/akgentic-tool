@@ -23,7 +23,7 @@ from akgentic.tool.knowledge_graph import KnowledgeGraphTool
 ```python
 class KnowledgeGraphTool(ToolCard):
     # Vector-search wiring
-    vector_store: VectorStoreParam = VectorStoreParam()
+    vector_store: VectorStoreParam | bool = True
     search_top_k: int = 10
     search_score_threshold: float = 0.3
     hybrid_alpha: float = 0.7
@@ -50,10 +50,25 @@ holds no graph state; its methods are formatting helpers over the actor's ask pr
 
 ### `vector_store`
 
-A `VectorStoreParam`: the one object saying where the graph's vectors live and how they are
-embedded. It is forwarded to `KnowledgeGraphConfig` and is what `KnowledgeGraphActor` resolves its
-storage engine from at `on_start`, calling `create_collection("knowledge_graph", …)` on whatever it
-resolves.
+A `VectorStoreParam` or a `bool`, saying where the graph's vectors live and how they are embedded,
+in one of three shapes:
+
+| Written | Means |
+|---|---|
+| `True` (the default) | an enabled store with default settings |
+| `False` | no store at all — no store actor, no embedding, semantic search absent |
+| `VectorStoreParam(…)` | an enabled store configured explicitly |
+
+The card keeps what the author wrote, verbatim, and normalises it at the point of use:
+`resolve_store_param` turns `True` into a fresh `VectorStoreParam()` and `False` into `None`, so
+everything below the card sees only two shapes. The resolved value is forwarded to
+`KnowledgeGraphConfig` and is what `KnowledgeGraphActor` resolves its storage engine from at
+`on_start`, calling `create_collection("knowledge_graph", …)` on whatever it resolves.
+
+**Why the bool is not expanded on the card.** `VectorStoreParam.backend` resolves from the
+environment *per instantiation*, so coercing `True` into a param at validation time would write the
+build environment's backend into a stored catalog record whose author wrote `true` — and catalogs
+are routinely promoted between tiers.
 
 **The backend decides whether an actor is involved at all.** An actor-state backend — the in-memory
 index, whose data *is* the store actor's state — gets a store actor, created by this card's
@@ -62,10 +77,13 @@ data lives on the cluster, so the actor builds the backend through the registere
 to the process's shared client directly. This card declares no `depends_on`; the ordering a
 dependency edge used to enforce between two cards is now two lines in one method.
 
-**This field used to mean something else.** Before epic 49 it was a `bool | str` naming *which*
-`VectorStoreActor` to look up, and the configuration lived on a separate `collection` field. Both
-are gone: a persisted card carrying `vector_store: true` now fails validation rather than being
-ignored, and one carrying `collection:` silently takes the default.
+**Only half of what this field used to mean is gone.** Before epic 49 it was a `bool | str` doing
+two jobs: the string named *which* `VectorStoreActor` to look up, and the bool said whether to have
+a store at all. The lookup is gone for good — a card writing `vector_store: "#VectorStore-RAG"`
+fails validation, because the actor it addressed no longer exists — and the configuration that used
+to live on a separate `collection` field now lives in the param, so a persisted card carrying
+`collection:` silently takes the default. The **bool** is not gone: it is the opt-out described
+above, and every stored card writing `vector_store: false` keeps loading.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
@@ -215,14 +233,19 @@ time. The rule, and the reasons behind it, are documented once in
 
 `observer()` calls `_check_kg_dependencies()` **before** anything else. That check requires
 `numpy` and `openai` — the `[vector_search]` extra — and raises `ImportError` with the install
-command when either is missing. It runs whatever the card's `vector_store` names, so unlike
-`PlanningTool` this card cannot be used at all without the extra:
+command when either is missing. It runs whatever the card's `vector_store` says — **including
+`vector_store=False`** — so unlike `PlanningTool` this card cannot be used at all without the extra:
 
 ```bash
 uv add "akgentic-tool[vector_search]"
 ```
 
-The check is on the card, not on the storage: a cluster backend does not exempt it.
+The check is on the card, not on the storage: neither a cluster backend nor a declined store
+exempts it. That is deliberate rather than an oversight — `_check_kg_dependencies` is
+`_check_vector_search_dependencies` under an alias, so it guards the extra for the whole
+knowledge-graph package rather than for the store. Whether a store-less graph should still need
+`numpy` and `openai` is an open question recorded on ADR-049; loosening it would change the extra's
+documented contract, which `tests/test_vector_extra_absent.py` pins.
 
 ### Wiring order
 
@@ -261,9 +284,27 @@ KnowledgeGraphTool(                                   # persistent, tenant-isola
 )
 ```
 
-**There is no way to switch the vector store off on this card.** `vector_store` is a
-`VectorStoreParam`, not a `bool`, so a card passing `False` fails validation. This card requires
-the `[vector_search]` extra unconditionally in any case.
+**To switch the vector store off deliberately, write `vector_store=False`.** Nothing is probed at
+bind — a card naming an unprovisioned cluster and then switched off does not fail its team's build —
+no store actor is created, and nothing is embedded. The capability is **not** unregistered, because
+most of it still works:
+
+```python
+KnowledgeGraphTool(vector_store=False)   # keyword and hybrid search still answer from the graph
+```
+
+| Mode | With `vector_store=False` |
+|---|---|
+| `"keyword"` | unchanged — matching over entity and relation text |
+| `"hybrid"` | unchanged — the keyword leg answers, the semantic leg is empty |
+| `"vector"` | returns `SEMANTIC_DISABLED`, one sentence saying semantic search is off |
+
+The sentence is answered by the card's search closure rather than by the actor, because
+`KnowledgeGraphActor.search` returns a `SearchResult` with no channel for one — and an empty result
+renders as "No results found.", which asserts something about the graph rather than about the
+configuration. A store that was *asked for* and could not be built keeps returning empty results, so
+a real misconfiguration is still visible. The card still requires the `[vector_search]` extra either
+way.
 
 > **The environment picks the backend; you only override it.** The connection is read from the
 > environment at `observer()` time, never from the card — a catalog entry must not carry a cluster

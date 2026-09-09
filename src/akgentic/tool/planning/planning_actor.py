@@ -22,6 +22,7 @@ from akgentic.tool.vector_store.actor import (
 from akgentic.tool.vector_store.embedding_actor import build_embedding_service
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA, hybrid_search
 from akgentic.tool.vector_store.protocol import (
+    SEMANTIC_DISABLED,
     EmbeddingProvider,
     VectorStoreConfig,
     VectorStoreParam,
@@ -139,15 +140,24 @@ class PlanConfig(BaseConfig):
     The binding-to-an-actor field is gone: ``vector_store`` now carries the
     storage configuration itself, and the backend it names is what decides
     whether an actor is involved at all.
+
+    **This is the resolved value, not the author's declaration.** ``PlanningTool``
+    carries three shapes and normalises them into the two this field holds, so
+    ``None`` here means the card declined a store and this actor stays in its
+    degraded mode for good. The config is the only channel to the actor, so it is
+    the only way the actor can learn that.
     """
 
-    vector_store: VectorStoreParam = Field(
+    vector_store: VectorStoreParam | None = Field(
         default_factory=VectorStoreParam,
         description=(
             "Vector store configuration for the planning collection: backend, "
             "dimension, tenant, embedding model and provider. The backend decides "
             "how the actor resolves its storage engine — an actor-state backend "
-            "through the store actor, a cluster one through the backend's own client."
+            "through the store actor, a cluster one through the backend's own client. "
+            "None means the card declined a store: nothing is resolved, nothing is "
+            "embedded, and semantic search stays off. An absent key still defaults to "
+            "a param, so a config persisted before the opt-out returned is unchanged."
         ),
     )
     search_top_k: int = Field(
@@ -227,8 +237,21 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
         The embedder is built here too, from **this actor's own**
         ``config.vector_store``: the store embeds nothing, so the model this
         actor's ``VectorStoreParam`` names is the model that embeds its tasks.
+
+        **A ``None`` param means the card declined a store**, and this returns
+        immediately: no orchestrator lookup, no backend built, ``_vs_proxy`` and
+        ``_embedder`` left at ``None`` — the state the degraded path already
+        expects. It logs one line saying so, distinct from every other warning
+        here, so a reader of the logs can tell a deliberate opt-out from a store
+        that was asked for and failed to build.
         """
         param = self.config.vector_store
+        if param is None:
+            logger.warning(
+                "[%s] vector_store is off by configuration — semantic search disabled",
+                self.config.name,
+            )
+            return
         store = self._resolve_store(param)
         if store is None:
             return
@@ -394,10 +417,19 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
                    None means no filter.
             mode: Search mode — ``"hybrid"`` (default) runs both keyword and
                    semantic phases; ``"keyword"`` skips embedding/vector search;
-                   ``"vector"`` skips keyword substring matching. When
-                   ``_vs_proxy is None`` and ``mode="vector"``, returns empty
-                   results; ``mode="hybrid"`` falls back to keyword-only with
-                   a warning.
+                   ``"vector"`` skips keyword substring matching.
+
+                   **Three things can leave the semantic phase with nothing, and
+                   they are answered differently.** When the card *declined* a
+                   store (``vector_store=False``), ``mode="vector"`` returns
+                   exactly ``[SEMANTIC_DISABLED]`` — a sentence, because an empty
+                   list would read as "no task matches" rather than "there is no
+                   index". When a store was *asked for* and could not be built or
+                   reached, ``mode="vector"`` still returns empty results, so a
+                   real misconfiguration is not hidden behind a reassuring
+                   sentence. ``mode="hybrid"`` falls back to keyword-only with a
+                   warning in both cases, and ``mode="keyword"`` never touches the
+                   store at all.
             top_k: Maximum number of semantic search hits. When None, uses
                    ``config.search_top_k`` (default 10).
             score_threshold: Minimum cosine similarity score for semantic results.
@@ -410,6 +442,8 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
             ``(keyword match)`` for keyword-only hits, or ``(hybrid: 0.90)``
             for hits found by both keyword and semantic.
             When all parameters are None, returns the full task list (unscored).
+            For a declined store queried with ``mode="vector"``, the single-element
+            list ``[SEMANTIC_DISABLED]``.
         """
         # Filter first, so the query phase only ever scores viable candidates and
         # the top_k cut is never spent on tasks the AND filters would discard.
@@ -417,6 +451,9 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
 
         if query is None:
             return [self._format_task_line(t, {}) for t in tasks]
+
+        if mode == "vector" and self.config.vector_store is None:
+            return [SEMANTIC_DISABLED]
 
         scores = self._score_query_matches(tasks, query, mode, top_k, score_threshold)
         matched = [t for t in tasks if t.id in scores]

@@ -1974,3 +1974,95 @@ class TestBackwardCompatibility:
         result = actor.search(SearchQuery(query="Alice", mode="keyword"))
         assert len(result.hits) == 1
         assert result.hits[0].score == 1.0
+
+
+# ---------------------------------------------------------------------------
+# vector_store=False — a graph that declined a store, driven through a real config
+#
+# ``_actor()`` above builds an *enabled* config and hand-clears ``_vs_proxy``,
+# which is the shape of a store that failed. The specs below build a genuinely
+# disabled one, so each negative is paired with an enabled actor answering the
+# same call differently.
+# ---------------------------------------------------------------------------
+
+
+def _disabled_actor() -> KnowledgeGraphActor:
+    """A ``KnowledgeGraphActor`` whose card declined a store.
+
+    Built through ``on_start`` on a real ``KnowledgeGraphConfig(vector_store=None)``
+    — the value ``KnowledgeGraphTool`` hands the config for ``vector_store=False``
+    — rather than by hand-clearing a private slot.
+    """
+    actor = KnowledgeGraphActor()
+    actor.config = KnowledgeGraphConfig(
+        name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store=None
+    )
+    actor.on_start()
+    return actor
+
+
+class TestADisabledGraphStillDoesEverythingButSemanticSearch:
+    """Graph CRUD and the two non-semantic modes work with no store."""
+
+    def test_the_config_and_the_slots_agree(self) -> None:
+        actor = _disabled_actor()
+        assert actor.config.vector_store is None
+        assert actor._vs_proxy is None
+        assert actor._embedder is None
+
+    def test_entity_and_relation_crud_is_unaffected(self) -> None:
+        actor = _disabled_actor()
+        _seed_with_relation(actor)
+
+        view = actor.get_graph()
+        assert {e.name for e in view.entities} == {"Alice", "Bob"}
+        assert len(view.relations) == 1
+
+        actor.update_graph(
+            ManageGraph(
+                update_entities=[EntityUpdate(name="Alice", description="Staff engineer")]
+            )
+        )
+        alice = next(e for e in actor.get_graph().entities if e.name == "Alice")
+        assert alice.description == "Staff engineer"
+
+        actor.update_graph(
+            ManageGraph(
+                delete_relations=[
+                    RelationDelete(from_entity="Alice", to_entity="Bob", relation_type="knows")
+                ]
+            )
+        )
+        assert actor.get_graph().relations == []
+
+    def test_keyword_and_hybrid_still_return_their_hits(self) -> None:
+        actor = _disabled_actor()
+        _seed_entities(actor)
+
+        for mode in ("keyword", "hybrid"):
+            result = actor.search(SearchQuery(query="Alice", top_k=5, mode=mode))
+            assert [h.entity.name for h in result.hits if h.entity] == ["Alice"]
+
+    def test_the_actor_still_returns_an_empty_result_for_vector_mode(self) -> None:
+        """The actor has no channel for a sentence — the card answers that.
+
+        ``search`` returns a ``SearchResult``, so the semantic-disabled sentence
+        cannot live here; it lives on ``KnowledgeGraphTool``'s search closure.
+        This pins where the boundary is.
+        """
+        actor = _disabled_actor()
+        _seed_entities(actor)
+
+        assert actor.search(SearchQuery(query="Alice", top_k=5, mode="vector")).hits == []
+
+
+class TestAFailedGraphStoreIsNotADeclinedOne:
+    """A store that was asked for and failed keeps today's empty answer."""
+
+    def test_an_enabled_graph_with_no_store_returns_empty_for_vector_mode(self) -> None:
+        enabled = _actor()
+        _seed_entities(enabled)
+
+        assert enabled.config.vector_store is not None
+        assert enabled._vs_proxy is None
+        assert enabled.search(SearchQuery(query="Alice", top_k=5, mode="vector")).hits == []

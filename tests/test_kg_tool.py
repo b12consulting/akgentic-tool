@@ -44,7 +44,11 @@ from akgentic.tool.knowledge_graph.models import (
 )
 from akgentic.tool.vector_store.actor import VectorStoreActor
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA
-from akgentic.tool.vector_store.protocol import WEAVIATE_URL_ENV, VectorStoreParam
+from akgentic.tool.vector_store.protocol import (
+    WEAVIATE_URL_ENV,
+    VectorStoreParam,
+    resolve_store_param,
+)
 
 # ---------------------------------------------------------------------------
 # Mock helpers
@@ -370,13 +374,20 @@ class TestKnowledgeGraphToolObserver:
         assert len(captured) == 1
         assert captured[0].vector_store.tenant == "kg-tenant"
 
-    def test_observer_refuses_the_old_lookup_shapes(self) -> None:
-        """A boolean or a named-actor string is a validation error at construction."""
+    def test_observer_refuses_the_old_lookup_shape(self) -> None:
+        """A named-actor string is a validation error; a bool is the opt-out.
+
+        Only the *string* half of the old ``bool | str`` field stays dead: it
+        addressed a ``VectorStoreActor`` by name, and that lookup no longer
+        exists. The boolean half is the opt-out, and it validates.
+        """
         from pydantic import ValidationError
 
-        for value in (True, False, "#VectorStore-RAG"):
-            with pytest.raises(ValidationError):
-                KnowledgeGraphTool(vector_store=value)  # type: ignore[arg-type]
+        with pytest.raises(ValidationError):
+            KnowledgeGraphTool(vector_store="#VectorStore-RAG")  # type: ignore[arg-type]
+
+        assert KnowledgeGraphTool(vector_store=True).vector_store is True
+        assert KnowledgeGraphTool(vector_store=False).vector_store is False
 
     def test_a_named_string_never_reaches_a_config(self) -> None:
         tool = KnowledgeGraphTool(vector_store=VectorStoreParam())
@@ -415,17 +426,25 @@ class TestKnowledgeGraphToolDependsOn:
         dump = KnowledgeGraphTool().model_dump()
         assert "depends_on" not in dump
 
-    def test_vector_store_field_is_a_param(self) -> None:
+    def test_vector_store_field_accepts_a_param_or_a_bool(self) -> None:
         tool = KnowledgeGraphTool()
-        assert isinstance(tool.vector_store, VectorStoreParam)
+        assert tool.vector_store is True
         assert "vector_store" in KnowledgeGraphTool.model_fields
-        assert KnowledgeGraphTool.model_fields["vector_store"].annotation is VectorStoreParam
+        assert (
+            KnowledgeGraphTool.model_fields["vector_store"].annotation
+            == VectorStoreParam | bool
+        )
         assert "collection" not in KnowledgeGraphTool.model_fields
 
     def test_vector_store_appears_in_model_dump(self) -> None:
+        """The default dumps as the bool the author would have written."""
         dump = KnowledgeGraphTool().model_dump()
         assert "vector_store" in dump
-        assert isinstance(dump["vector_store"], dict)
+        assert dump["vector_store"] is True
+        assert isinstance(
+            KnowledgeGraphTool(vector_store=VectorStoreParam()).model_dump()["vector_store"],
+            dict,
+        )
 
     def test_vector_store_roundtrip(self) -> None:
         tool = KnowledgeGraphTool(vector_store=VectorStoreParam(tenant="t1"))
@@ -784,15 +803,22 @@ class TestSummaryStateConfig:
 class TestKnowledgeGraphToolCollectionField:
     """AC-1: KnowledgeGraphTool.vector_store is a VectorStoreParam field."""
 
-    def test_default_collection_is_default_collection_config(self) -> None:
-        """Default ``collection`` matches a freshly-constructed ``VectorStoreParam()``."""
+    def test_the_default_resolves_to_a_default_param(self) -> None:
+        """The default is ``True``, and ``True`` resolves to ``VectorStoreParam()``.
+
+        The card records the author's declaration; the settings live one step
+        later, in what the normaliser produces from it.
+        """
         tool = KnowledgeGraphTool()
-        assert isinstance(tool.vector_store, VectorStoreParam)
-        assert tool.vector_store == VectorStoreParam()
+        assert tool.vector_store is True
+
+        param = resolve_store_param(tool.vector_store)
+        assert param == VectorStoreParam()
         # Default values explicitly (guards against AC-11 regressions).
-        assert tool.vector_store.dimension == 1536
-        assert tool.vector_store.backend == "inmemory"
-        assert tool.vector_store.tenant is None
+        assert param is not None
+        assert param.dimension == 1536
+        assert param.backend == "inmemory"
+        assert param.tenant is None
 
     def test_collection_field_present_in_model_fields(self) -> None:
         assert "vector_store" in KnowledgeGraphTool.model_fields
@@ -811,7 +837,8 @@ class TestKnowledgeGraphToolCollectionField:
     def test_collection_roundtrip_default(self) -> None:
         tool = KnowledgeGraphTool()
         reloaded = KnowledgeGraphTool.model_validate(tool.model_dump())
-        assert reloaded.vector_store == VectorStoreParam()
+        assert reloaded.vector_store is True
+        assert resolve_store_param(reloaded.vector_store) == VectorStoreParam()
 
     def test_collection_roundtrip_custom(self) -> None:
         tool = KnowledgeGraphTool(
@@ -823,11 +850,18 @@ class TestKnowledgeGraphToolCollectionField:
         # Non-touched fields preserved at VectorStoreParam defaults.
         assert reloaded.vector_store.dimension == 1536
 
-    def test_independent_tools_do_not_alias_collection(self) -> None:
-        """`default_factory=VectorStoreParam` gives each instance a fresh object."""
+    def test_independent_tools_do_not_share_a_mutable_param(self) -> None:
+        """Two default cards can never mutate one another's store settings.
+
+        The default is now the immutable ``True`` rather than a shared object, so
+        the aliasing this spec guards against moved one step later: it is
+        ``resolve_store_param`` that must hand each caller its own param.
+        """
         a = KnowledgeGraphTool()
         b = KnowledgeGraphTool()
-        assert a.vector_store is not b.vector_store
+        assert a.vector_store is True
+        assert b.vector_store is True
+        assert resolve_store_param(a.vector_store) is not resolve_store_param(b.vector_store)
 
 
 class TestKnowledgeGraphToolObserverCollection:
@@ -1032,3 +1066,73 @@ class TestKnowledgeGraphToolObserverSearchFields:
         """Without this the knob is unreachable from a catalog YAML."""
         captured = self._run_observer(KnowledgeGraphTool(hybrid_alpha=0.2))
         assert captured[0].hybrid_alpha == 0.2
+
+
+class TestTheSearchClosureAnswersADeclinedStore:
+    """``mode="vector"`` on a store-less card answers a sentence, not nothing.
+
+    The sentence lives on the card rather than in the actor because
+    ``KnowledgeGraphActor.search`` returns a ``SearchResult``, which has no
+    channel for one, and ``_format_search_result`` renders an empty result as
+    "No results found." — an assertion about the graph rather than about the
+    configuration.
+
+    Every negative below is paired: the disabled card's closure is checked
+    against an enabled card's closure over the same double, so "it did not ask
+    the actor" cannot pass by the closure never being reachable.
+    """
+
+    @staticmethod
+    def _search_callable(tool: KnowledgeGraphTool) -> tuple[Any, MagicMock]:
+        """Wire *tool* to a recording actor proxy and return its search closure."""
+        from akgentic.tool.knowledge_graph.models import SearchResult
+
+        proxy = MagicMock()
+        proxy.search.return_value = SearchResult(hits=[])
+
+        observer = MockActorToolObserver()
+        observer._kg_actor = proxy  # type: ignore[assignment]
+        tool.observer(observer)
+
+        search_fn = next(t for t in tool.get_tools() if t.__name__ == "search_graph")
+        return search_fn, proxy
+
+    def test_a_disabled_card_answers_the_sentence_without_asking_the_actor(self) -> None:
+        from akgentic.tool.vector_store.protocol import SEMANTIC_DISABLED
+
+        search_fn, proxy = self._search_callable(KnowledgeGraphTool(vector_store=False))
+
+        assert search_fn(SearchQuery(query="Alice", mode="vector")) == SEMANTIC_DISABLED
+        assert proxy.search.call_count == 0
+
+    def test_an_enabled_card_asks_the_actor_for_the_same_query(self) -> None:
+        """The positive half: the closure is reachable and does ask."""
+        from akgentic.tool.vector_store.protocol import SEMANTIC_DISABLED
+
+        search_fn, proxy = self._search_callable(KnowledgeGraphTool(vector_store=True))
+
+        result = search_fn(SearchQuery(query="Alice", mode="vector"))
+        assert proxy.search.call_count == 1
+        assert result != SEMANTIC_DISABLED
+
+    @pytest.mark.parametrize("mode", ["keyword", "hybrid"])
+    def test_a_disabled_card_still_asks_the_actor_for_the_other_two_modes(
+        self, mode: str
+    ) -> None:
+        """Only ``mode="vector"`` is short-circuited; the tool is not unregistered."""
+        from akgentic.tool.vector_store.protocol import SEMANTIC_DISABLED
+
+        search_fn, proxy = self._search_callable(KnowledgeGraphTool(vector_store=False))
+
+        result = search_fn(SearchQuery(query="Alice", mode=mode))
+        assert proxy.search.call_count == 1
+        assert result != SEMANTIC_DISABLED
+
+    def test_the_capability_stays_registered_when_disabled(self) -> None:
+        """Keyword and hybrid are fully functional, so nothing is unregistered."""
+        tool = KnowledgeGraphTool(vector_store=False)
+        observer = MockActorToolObserver()
+        observer.setup_kg_actor()
+        tool.observer(observer)
+
+        assert "search_graph" in [t.__name__ for t in tool.get_tools()]

@@ -34,6 +34,7 @@ from akgentic.tool.vector_store.protocol import (
     VectorStoreParam,
     require_backend_configured,
     require_dimension_matches,
+    resolve_store_param,
 )
 
 logger = logging.getLogger(__name__)
@@ -129,21 +130,30 @@ def _build_planning_state(
 class PlanningTool(ToolCard):
     """Team planning management via actor-based plan store.
 
-    **This card configures its own storage.** ``vector_store`` is the one object
-    that says where the plan's vectors live, and there is no second card to add
-    to the team and no dependency edge to order against: an in-memory backend
-    gets a store actor created here, before the ``PlanActor`` that will look it
-    up; a cluster backend gets none, because there is nothing for an actor to
-    hold and the ``PlanActor`` talks to the shared client directly.
+    **This card configures its own storage, or declines it.** ``vector_store``
+    says where the plan's vectors live, and there is no second card to add to the
+    team and no dependency edge to order against: an in-memory backend gets a
+    store actor created here, before the ``PlanActor`` that will look it up; a
+    cluster backend gets none, because there is nothing for an actor to hold and
+    the ``PlanActor`` talks to the shared client directly.
+
+    ``vector_store=False`` declines a store outright. Nothing is probed, nothing
+    is created and nothing is embedded, and the tool keeps working: task CRUD is
+    untouched, and ``search_planning`` still serves ``mode="keyword"`` and
+    ``mode="hybrid"`` from the task list. Only ``mode="vector"`` has nothing to
+    score, and it answers a sentence saying so.
     """
 
-    vector_store: VectorStoreParam = Field(
-        default_factory=VectorStoreParam,
+    vector_store: VectorStoreParam | bool = Field(
+        default=True,
         description=(
-            "Vector store configuration (backend, dimension, tenant, embedding model and "
-            "provider) for the planning collection. Propagated to PlanConfig, which is "
-            "what PlanActor resolves its storage engine from. The name that used to mean "
-            "'which VectorStoreActor to look up' now means 'which store, configured how'."
+            "Where the planning collection's vectors live, in one of three shapes. "
+            "True (the default) means an enabled store with default settings. False "
+            "means no store at all: no store actor, no embedding, and semantic search "
+            "absent — keyword and hybrid search still work. A VectorStoreParam means an "
+            "enabled store configured explicitly (backend, dimension, tenant, embedding "
+            "model and provider). The resolved value is propagated to PlanConfig, which "
+            "is what PlanActor resolves its storage engine from."
         ),
     )
 
@@ -184,17 +194,29 @@ class PlanningTool(ToolCard):
         the param names a cluster backend, which is the whole of what the second
         card and the dependency edge existed for.
 
+        **A card that declined a store owes none of the three store obligations.**
+        The param is resolved once, first, before the backend probe — which is
+        otherwise the first statement here and runs before ``super().observer()``.
+        A stored card that names ``weaviate`` or ``qdrant`` explicitly and is
+        *then* switched off would otherwise fail its whole team's build for a
+        cluster nothing will ever open. The dimension check is skipped for the
+        same reason: a dimension that contradicts an embedding model is a
+        contradiction about vectors nobody will produce.
+
         Requires an ActorToolObserver for actor system access; the parameter keeps
         the base ``ToolObserver`` type so the override stays substitutable, and
         :meth:`_actor_observer` applies the narrower type.
 
         Raises:
-            ValueError: If observer.orchestrator is None, if the named backend is
-                unknown or unprovisioned, or if the declared dimension
-                contradicts the embedding model.
+            ValueError: If observer.orchestrator is None, or — for a card that
+                declared a store — if the named backend is unknown or
+                unprovisioned, or the declared dimension contradicts the
+                embedding model.
         """
-        require_backend_configured(self.vector_store, "PlanningTool")
-        require_dimension_matches(self.vector_store, "PlanningTool")
+        param = resolve_store_param(self.vector_store)
+        if param is not None:
+            require_backend_configured(param, "PlanningTool")
+            require_dimension_matches(param, "PlanningTool")
         super().observer(observer)  # store the observer weakly via the base setter
         actor_observer = self._actor_observer()
         if actor_observer.orchestrator is None:
@@ -202,13 +224,14 @@ class PlanningTool(ToolCard):
 
         orchestrator_proxy = actor_observer.proxy_ask(actor_observer.orchestrator, Orchestrator)
 
-        ensure_store_actor(self.vector_store, orchestrator_proxy)
+        if param is not None:
+            ensure_store_actor(param, orchestrator_proxy)
         planning_tool_addr = orchestrator_proxy.getChildrenOrCreate(
             PlanActor,
             config=PlanConfig(
                 name=PLANNING_ACTOR_NAME,
                 role=PLANNING_ACTOR_ROLE,
-                vector_store=self.vector_store,
+                vector_store=param,
                 search_top_k=self.search_top_k,
                 search_score_threshold=self.search_score_threshold,
                 hybrid_alpha=self.hybrid_alpha,
