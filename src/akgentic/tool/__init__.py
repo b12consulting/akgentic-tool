@@ -45,7 +45,6 @@ from .model.tool import ModelTool  # noqa: F401
 from .notification.tool import NotificationTool  # noqa: F401
 from .sandbox.bwrap import BwrapSandboxActor  # noqa: F401
 from .sandbox.seatbelt import SeatbeltSandboxActor  # noqa: F401
-from .sandbox.tool import ExecTool  # noqa: F401
 from .skill.tool import SkillTool  # noqa: F401
 from .team.observer import TeamManagementToolObserver  # noqa: F401
 from .workspace.tool import WorkspaceTool  # noqa: F401
@@ -100,7 +99,6 @@ __all__ = [
     "team",
     "workspace",
     "BwrapSandboxActor",
-    "ExecTool",
     "MailboxTool",
     "MetadataTool",
     "ModelTool",
@@ -122,9 +120,17 @@ def __getattr__(name: str) -> Any:
     Exposing it via module ``__getattr__`` keeps the bare ``akgentic.tool``
     import cheap (see ``test_tool_import_does_not_trigger_kg_import``) while
     still honoring AC #5 of Story 17.1.
+
+    ``ExecTool`` takes the other exit. The card was removed — sandboxed
+    execution is ``WorkspaceTool(workspace_exec=...)`` — and the sandbox
+    package answers the name with an ``ImportError`` that says so. Delegating
+    keeps one message for both import paths; every other missing name keeps
+    the ordinary ``AttributeError``.
     """
     if name == "KnowledgeGraphStateEvent":
         from .knowledge_graph.models import KnowledgeGraphStateEvent
 
         return KnowledgeGraphStateEvent
+    if name == "ExecTool":
+        return getattr(sandbox, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -1,7 +1,8 @@
-# The sandbox backend — and `ExecTool`, deprecated
+# The sandbox backend
 
 Sandboxed execution of one binary plus arguments inside the team workspace: one `SandboxActor` per
 workspace tree, an allow-listed binary set, and four isolation backends selected by a single `mode`.
+This is the backend `WorkspaceTool(workspace_exec=…)` runs commands on — there is no card here.
 
 | | |
 |---|---|
@@ -13,12 +14,13 @@ workspace tree, an allow-listed binary set, and four isolation backends selected
 
 ---
 
-## `ExecTool` is deprecated — use `WorkspaceTool(workspace_exec=…)`
+## Migration: `ExecTool` was removed
 
-**The card moved. The backend did not.** Sandboxed execution is now a capability of
-`WorkspaceTool`, because exec and the write gate share one resource — the tree — and two cards over
-one tree means two mailboxes that interleave. Everything on *this* page below the next section is
-the exec **backend**, is not deprecated, and is what `workspace_exec` resolves through.
+**The card is gone; the backend is not.** `ExecTool` used to be the card over this backend. Sandboxed
+execution is now a capability of `WorkspaceTool`, because exec and the write gate share one
+resource — the tree — and two cards over one tree means two mailboxes that interleave. Everything
+below this section is the exec **backend**, is not deprecated, and is what `workspace_exec` resolves
+through.
 
 ```python
 # Before
@@ -28,75 +30,32 @@ ToolFactory([WorkspaceTool(workspace_id="proj-42"), ExecTool(workspace_id="proj-
 ToolFactory([WorkspaceTool(workspace_id="proj-42", workspace_exec=True)], observer=agent)
 ```
 
-| | `ExecTool` | `WorkspaceTool(workspace_exec=…)` |
-|---|---|---|
-| Callable | `exec_command(cmd, cwd="")` | `workspace_exec(cmd, cwd="")` + `workspace_exec_result(run_id)` |
-| Mode | `ExecTool(mode=…)` | `WorkspaceExec(mode=…)` |
-| Budget | not configurable | `WorkspaceExec(timeout_s=…, poll_attempts=…, poll_delay_seconds=…)` |
-| Directory | `ExecTool(workspace_id=…)` — the `<leaf>` only | `WorkspaceTool(workspace_id=…)`, **or** `workspace_metadata_keys=[…]` for the shared layout, which `ExecTool` does not have and will not get |
-| Journal | off by default, and **not reachable** by any `ExecTool` field | `WorkspaceTool(git_journal=…)` |
+| Was | Is |
+|---|---|
+| `exec_command(cmd, cwd="")` | `workspace_exec(cmd, cwd="")` + `workspace_exec_result(run_id)` |
+| `ExecTool(mode=…)` | `WorkspaceExec(mode=…)` |
+| `ExecTool(workspace_id=…)` | `WorkspaceTool(workspace_id=…)`, or `workspace_metadata_keys=[…]` for the shared layout |
+| no budget, no journal | `WorkspaceExec(timeout_s=…, poll_attempts=…, poll_delay_seconds=…)`, `WorkspaceTool(git_journal=…)` |
 
-**What still works.** The class resolves, the field names are unchanged, and `exec_command` behaves
-identically — same hold on the tree, same sandbox, same discovery, same commit. It is a shim over
-`workspace_exec`, not a second implementation, so the two cannot drift.
+**Mind the other capabilities.** `WorkspaceTool`'s file capabilities default to `True`. A card that
+used to carry `ExecTool` *alone* — a shell and nothing else — becomes
+`WorkspaceTool(workspace_exec=True, workspace_read=False, workspace_write=False, …)` with every
+other capability turned off explicitly. A bare `model_type` swap grants read, write, delete, edit,
+multi-edit, patch and mkdir to an agent that previously had only a shell.
 
-**What warns.** A `DeprecationWarning` when the card is **wired** — at `observer()` — naming its
-replacement. Deliberately not at import: an import-time warning fires for anybody who merely has
-the module in a dependency's `__init__`, which is nobody's decision to change.
-
-**What an `ExecTool`-only agent gives up.** It creates the `#Workspace-<scope>/<leaf>` actor for its workspace, and
-the first card to create that actor decides the configuration — so it gets the journal's default,
-which is **off**. `AC2` froze the shim's three fields, so there is no `git_journal` on it and no way
-to reach one. An `ExecTool` agent sharing a workspace whose actor a `WorkspaceTool(git_journal=True)`
-created first does get a journal, by that same first-card-wins rule. Move to `WorkspaceTool` if you
-need to decide it yourself.
-
-### What "a deprecated card" means here
-
-The package's [§Migration](../../../../README.md#migration-moved-import-paths) policy governs moved
-**import paths** and their Stable/Internal tiers. `ExecTool` moves no module, so that policy does
-not cover it. The policy for a deprecated *card* is:
-
-- it keeps working, identically, for as long as it ships;
-- it emits a `DeprecationWarning` naming its replacement;
-- it leaves the package README's Tool Catalog for a migration pointer, and stops counting towards
-  the number of tools the package advertises — a shim is not a distinct usable capability;
-- it is removed **no earlier than the minor release after** the one that deprecated it.
-
----
-
-## The `ExecTool` card, as it stands
-
-```python
-class ExecTool(ToolCard):
-    exec_command: ExecCommand | bool = True
-    mode: Literal["local", "bwrap", "seatbelt", "docker", "auto"] = "auto"
-    workspace_id: str | None = None
-
-    _sandbox_proxy: SandboxActor | None = PrivateAttr(default=None)
-    _workspace_proxy: WorkspaceActor | None = PrivateAttr(default=None)
-    _agent_id: str = PrivateAttr(default="")
-```
-
-**The backend class is resolved at `observer()` time, not at import time.** `observer()` looks
-`mode` up in the module-level `SANDBOX_ACTOR_CLASSES` registry, which infrastructure packages may
-extend before any card is constructed. A `mode` naming an unregistered backend raises `KeyError` —
-deliberately fail-fast, at team creation.
-
-**One actor per tree, many callers.** `getChildrenOrCreate(actor_class, config=SandboxConfig(...))`
-is idempotent and keys on the actor **name**, so every agent whose card resolves to one workspace
-shares one `#SandboxActor-<scope>/<leaf>`. The name carries the resolved path for the same reason
-`#Workspace-<scope>/<leaf>` does: a constant name would resolve two exec-capable cards on two
-workspaces onto the *first* actor, and the second agent's commands would then run in the first
-agent's tree while its own workspace actor gated an untouched one. With `mode="docker"`, note that
-the **container** is still named per team (`sandbox-{team_id}`), so two workspaces in one team on
-the docker backend still share one container and therefore one mount.
+`from akgentic.tool import ExecTool` and `from akgentic.tool.sandbox import ExecTool` raise an
+`ImportError` naming `WorkspaceTool(workspace_exec=…)`; every other name on those modules behaves as
+before. The row is in the package README's
+[§Migration](../../../../README.md#migration-moved-import-paths), and the policy this removal
+follows is [§Deprecating a card](../../../../README.md#deprecating-a-card--not-the-same-as-moving-an-import-path).
 
 ---
 
 ## Backend selection
 
 ### `mode`
+
+Set on `WorkspaceExec(mode=…)`; resolved once, when the card is wired.
 
 | Mode | Platform | Isolation | Requirement |
 |---|---|---|---|
@@ -115,10 +74,25 @@ backend was found, and the caller should know.
 `local` is a development convenience, not a security boundary. The sandboxed process can read
 anything the host user can read; the **command allowlist is the primary boundary** in that mode.
 
-### `workspace_id`
+**The backend class is resolved at wiring time, not at import time.** `resolve_mode` looks `mode` up
+in the module-level `SANDBOX_ACTOR_CLASSES` registry, which infrastructure packages may extend
+before any card is constructed, and `#Workspace` looks it up again on every run. A `mode` naming an
+unregistered backend raises `KeyError` — deliberately fail-fast, at team creation.
 
-A workspace is a relative path of **exactly two segments**, `<scope>/<leaf>`, and this field supplies
-the `<leaf>` only. The `<scope>` is the owning principal, and the card never chooses it.
+**One actor per tree, many callers.** `getChildrenOrCreate(actor_class, config=SandboxConfig(...))`
+is idempotent and keys on the actor **name**, so every agent whose card resolves to one workspace
+shares one `#SandboxActor-<scope>/<leaf>`. The name carries the resolved path for the same reason
+`#Workspace-<scope>/<leaf>` does: a constant name would resolve two exec-capable cards on two
+workspaces onto the *first* actor, and the second agent's commands would then run in the first
+agent's tree while its own workspace actor gated an untouched one. With `mode="docker"`, note that
+the **container** is still named per team (`sandbox-{team_id}`), so two workspaces in one team on
+the docker backend still share one container and therefore one mount.
+
+### The directory
+
+A workspace is a relative path of **exactly two segments**, `<scope>/<leaf>`, and the card's
+`workspace_id` supplies the `<leaf>` only. The `<scope>` is the owning principal, and the card never
+chooses it.
 
 | Value | Effect |
 |---|---|
@@ -126,40 +100,24 @@ the `<leaf>` only. The `<scope>` is the owning principal, and the card never cho
 | any `str` | `<user_id>/<that string>` — a second tree of the **same** principal, not a tree shared with other principals. |
 
 The card resolves that path **once**, at bind time, and hands the result to
-`SandboxConfig.workspace_path` — the already-resolved value, which replaced the raw `workspace_id`
-override this config used to carry. A backend that joins a path it was handed cannot open a different
-directory from the one the card, the write gate and the journal are working on. The same resolved
-path is also the sandbox actor's own **name**, so a card resolving to one workspace gets one backend
-over one directory. On `WorkspaceTool` it likewise names the tree the file tools use and the workspace
-actor that gates it — one derivation, one tree.
+`SandboxConfig.workspace_path` — the already-resolved value. A backend that joins a path it was
+handed cannot open a different directory from the one the card, the write gate and the journal are
+working on. The same resolved path is also the sandbox actor's own **name**, so a card resolving to
+one workspace gets one backend over one directory — the same tree the file tools use and the
+workspace actor gates. One derivation, one tree.
 
 The Docker **container** name still derives from the team id (`sandbox-{team_id}`): containers are
 per-team execution resources. Two workspaces in one team therefore get two sandbox *actors* but one
 container, whose mount is whichever tree started first — use one workspace per team on the docker
 backend, or a different `mode`.
 
-### `exec_command`
-
-| Field | Type | Default | Meaning |
-|---|---|---|---|
-| `expose` | `set[Channels]` | `{TOOL_CALL}` | The only field. |
-
-`ExecCommand` adds nothing beyond the inherited `expose` and `instructions`. Use `instructions` to
-attach policy the model reads with the tool description:
-
-```python
-ExecTool(exec_command=ExecCommand(
-    instructions="Run the test suite with `pytest -q`. Never install packages.",
-))
-```
-
 ---
 
 ## The callable
 
 ```python
-exec_command(cmd: str, cwd: str = "") -> str          # the shim
-workspace_exec(cmd: str, cwd: str = "") -> str        # the replacement — same arguments
+workspace_exec(cmd: str, cwd: str = "") -> str
+workspace_exec_result(run_id: str) -> str
 ```
 
 | Argument | Meaning |
@@ -167,7 +125,7 @@ workspace_exec(cmd: str, cwd: str = "") -> str        # the replacement — same
 | `cmd` | One binary plus arguments — tokenised POSIX-style so quoting groups, **first token** in `ALLOWED_COMMANDS`. `&&`, `\|\|`, `;`, `\|`, `>`, `$VAR` and `$(…)` are **not** interpreted; use `bash -c '…'` for shell syntax. |
 | `cwd` | Subdirectory relative to the workspace root. Empty ⇒ the root. |
 
-Both render a finished run through one formatter, so the two surfaces cannot drift:
+A finished run renders through one formatter:
 
 ```
 exit_code: 0 (OK)
@@ -178,8 +136,8 @@ stderr (note: many tools write progress to stderr even on success):
 ```
 
 A command still running when the caller's poll budget runs out returns
-`Run <id> is still in progress. …` instead, and its output is collected on the next turn — through
-`workspace_exec_result(run_id)` on the capability, or by a second `exec_command` poll on the shim.
+`Run <id> is still in progress. …` instead, and its output is collected on the next turn through
+`workspace_exec_result(run_id)`.
 
 The allowed binaries are appended to the docstring at build time, so the model sees the list in
 the tool description rather than discovering it by failing.
@@ -228,7 +186,7 @@ was never the problem.
 
 A command its budget killed is an **outcome**, not a failure — "too slow" is the ordinary case for
 a shell, so it comes back collectible, with exit code 124 and a stderr saying so. Nothing
-propagates as an exception from either surface: a tool call must always yield a tool response.
+propagates as an exception from the tool call: a tool call must always yield a tool response.
 
 ---
 
@@ -302,19 +260,29 @@ docker build \
 ### Registering another backend
 
 `SANDBOX_ACTOR_CLASSES` is a mutable `dict[str, type[SandboxActor]]`. Infrastructure packages
-inject into it at import time, before any `ExecTool` is constructed:
+inject into it at import time, before any card is constructed:
 
 ```python
-from akgentic.tool.sandbox.tool import SANDBOX_ACTOR_CLASSES
+from akgentic.tool.sandbox import SANDBOX_ACTOR_CLASSES
 from my_infra.e2b_actor import E2BSandboxActor
 
-SANDBOX_ACTOR_CLASSES["e2b"] = E2BSandboxActor   # now available as ExecTool(mode="e2b")
+SANDBOX_ACTOR_CLASSES["e2b"] = E2BSandboxActor
 ```
 
+Import it from `akgentic.tool.sandbox`, as above — that is the documented surface. The module the
+registry happens to live in is not, and may move again behind it.
+
+Resolution reads the registry **at call time**, both when a card is wired and on every run, so the
+assignment is seen wherever it happens before the card exists. An entry under one of the four
+shipped keys **replaces** that backend for every card naming it — the test suite does exactly this,
+swapping a fake in at `local`. A *new* key is reachable only by a `mode` that names it: `CardMode`
+is a `Literal` of the four keys plus `auto`, so a stored card asking for `"e2b"` fails validation
+until that literal is widened.
+
 A backend is a `SandboxActor` subclass implementing three methods: `_start_sandbox()`,
-`_stop_sandbox()` and `_exec(cmd, cwd) -> ExecResult`. The base class owns state initialisation,
-the allowlist check, and swallowing exceptions raised during teardown so a broken backend cannot
-leave a Pykka actor wedged.
+`_stop_sandbox()` and `_exec(cmd, cwd, timeout) -> ExecResult`. The base class owns state
+initialisation, the allowlist check, and swallowing exceptions raised during teardown so a broken
+backend cannot leave a Pykka actor wedged.
 
 **The base has two entry points, and a backend implements neither.**
 
@@ -333,9 +301,6 @@ the same call `exec()` made to derive the binary it validated.
 
 ### Recipes
 
-Written on `WorkspaceTool`, which is where the card now lives. Every line has an `ExecTool`
-equivalent that still works and still warns.
-
 ```python
 WorkspaceTool(workspace_exec=True)                              # auto: bwrap -> seatbelt -> docker -> local
 WorkspaceTool(workspace_exec=WorkspaceExec(mode="docker"))      # deterministic toolchain
@@ -349,14 +314,14 @@ WorkspaceTool()                                                 # exec withheld 
 ### Import paths
 
 ```python
-from akgentic.tool import ExecTool, WorkspaceTool          # ExecTool: deprecated, still resolves
+from akgentic.tool import WorkspaceTool
 from akgentic.tool.workspace import WorkspaceExec
 from akgentic.tool.sandbox import (
-    ALLOWED_COMMANDS, SANDBOX_ACTOR_NAME, CommandNotAllowedError, CommandParseError, ExecResult,
+    ALLOWED_COMMANDS, SANDBOX_ACTOR_CLASSES, SANDBOX_ACTOR_NAME,
+    CommandNotAllowedError, CommandParseError, ExecResult,
     SandboxActor, SandboxConfig, SandboxState, sandbox_actor_name,
     LocalSandboxActor, BwrapSandboxActor, SeatbeltSandboxActor, DockerSandboxActor,
 )
-from akgentic.tool.sandbox.tool import SANDBOX_ACTOR_CLASSES, ExecCommand
 ```
 
 `SANDBOX_ACTOR_NAME` is the `#`-prefix, **not** the actor's name; `sandbox_actor_name(workspace)`

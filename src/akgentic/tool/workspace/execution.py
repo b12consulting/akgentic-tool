@@ -7,8 +7,8 @@ set is unknowable before it runs and only partly guessable after. So exec is
 of the run — and git is what tells us afterwards what it did (ADR-036 §5).
 
 This module holds everything exec needs that is not the gate itself: the models
-crossing the actor boundary, the budgets, and the one formatter both the
-``workspace_exec`` capability and the deprecated ``ExecTool`` shim render through.
+crossing the actor boundary, the budgets, and the one formatter ``workspace_exec``
+renders through.
 
 **The blocking call happens on ``#SandboxActor``'s own thread**, which is the
 thread it was always going to happen on. ``#Workspace`` hands the sandbox one
@@ -63,7 +63,7 @@ DEFAULT_EXEC_TIMEOUT_S = 15.0
 """Wall-clock budget for the sandboxed command itself.
 
 Below :data:`MAX_EXEC_BUDGET_S` (20 s), which is below the orchestrator's 30 s
-stop backstop. The old ``ExecTool`` default of 30 s sat *at* the backstop and
+stop backstop. The exec card's old default of 30 s sat *at* the backstop and
 docker's sat above it, which is why exec could not simply keep it: a Python
 thread cannot be cancelled, so a command still running past its budget holds its
 parent's teardown open for the difference.
@@ -90,10 +90,10 @@ the same.
 def effective_budget(timeout_s: float) -> float:
     """Return the budget a run will actually get — the card's ask, capped.
 
-    Three sites need this number and each of them used to compute the ``min``
-    by hand: the actor building the request, the capability resolving its poll,
-    and the deprecated shim resolving its own. Three copies of a clamp is three
-    places for a ceiling change to be applied twice and missed once.
+    The actor building the request and the capability resolving its poll both
+    need this number, and each used to compute the ``min`` by hand. Two copies
+    of a clamp is two places for a ceiling change to be applied once and missed
+    once.
 
     Args:
         timeout_s: What the card asked for.
@@ -595,9 +595,8 @@ def wait_out_the_turn(
 def resolve_mode(mode: CardMode) -> tuple[SandboxMode, type[SandboxActor]]:
     """Turn a card's requested mode into a backend, warning where the host has none.
 
-    Both exec-capable cards go through this rather than each probing for
-    themselves — a second copy of the probe is a second place for the warning to
-    stop firing.
+    Every wiring goes through this rather than probing for itself — a second
+    copy of the probe is a second place for the warning to stop firing.
 
     Args:
         mode: What the card asked for, possibly ``"auto"``.
@@ -612,7 +611,9 @@ def resolve_mode(mode: CardMode) -> tuple[SandboxMode, type[SandboxActor]]:
     """
     import warnings  # noqa: PLC0415 — only on the wiring path
 
-    from akgentic.tool.sandbox.tool import (  # noqa: PLC0415 — import cycle
+    # Resolved at call time through the package, so a backend registered — or a
+    # probe replaced — after this module was imported is what gets consulted.
+    from akgentic.tool.sandbox import (  # noqa: PLC0415
         SANDBOX_ACTOR_CLASSES,
         _resolve_auto_mode,
     )
@@ -665,8 +666,8 @@ def sandbox_config(config: ExecConfig) -> SandboxConfig:
 def format_outcome(outcome: ExecOutcome, run_id: str = "") -> str:
     """Render a finished run: one header line, then only the streams that spoke.
 
-    One shape for both surfaces — the capability and the ``exec_command`` shim —
-    because two formats for one thing is how the pair drifts.
+    One shape for every caller that renders an outcome, because two formats for
+    one thing is how they drift.
 
     **An empty stream is omitted rather than labelled.** The previous shape
     printed ``stdout:`` and ``stderr:`` unconditionally, so a silent success
@@ -676,7 +677,7 @@ def format_outcome(outcome: ExecOutcome, run_id: str = "") -> str:
 
     ``run_id`` joins the header rather than taking a line of its own: an answer
     that names no run is what let a collected result be mistaken for a sibling
-    call's. The shim passes it too, now that it issues runs through the queue.
+    call's.
 
     Args:
         outcome: The finished run.

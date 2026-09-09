@@ -8,7 +8,7 @@ only they change the file **behind the actor's back**: not through a tool, not
 through the actor, just bytes appearing on disk.
 
 That case is not exotic. It is the ``akgentic-infra`` frontend upload, ADR-026
-resource seeding, an ``ExecTool`` sandbox run, and a second team sharing a
+resource seeding, a ``workspace_exec`` sandbox run, and a second team sharing a
 ``workspace_id`` — four writers that never call the actor, all caught for free,
 because the check consults the *file* rather than a record of who wrote it.
 

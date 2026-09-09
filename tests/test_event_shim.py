@@ -37,7 +37,8 @@ from akgentic.tool.event import _MOVED
 # guarding every remaining name.
 # A brand-new export breaks no consumer, so a new tool card joins the list with its
 # story (``NotificationTool``, epic 28). What the list still forbids is a name leaving
-# or changing.
+# or changing. ``ExecTool`` is the second name to leave, and on the same basis as the
+# first: a removal decision (epic 41), recorded in the README's migration table.
 _EXPECTED_ROOT_ALL: list[str] = [
     "BaseToolParam",
     "ContextState",  # epic 31: the context-state contract joins the stable surface
@@ -74,7 +75,6 @@ _EXPECTED_ROOT_ALL: list[str] = [
     "team",
     "workspace",
     "BwrapSandboxActor",
-    "ExecTool",
     "MailboxTool",  # epic 34: the mailbox card joins the stable surface
     "MetadataTool",
     "ModelTool",  # epic 36: the model-switch card joins the stable surface

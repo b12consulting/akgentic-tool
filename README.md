@@ -37,7 +37,6 @@ commands.
   - [MailboxTool](#mailboxtool)
   - [ModelTool](#modeltool)
   - [MCPTool](#mcptool)
-  - [ExecTool — deprecated](#exectool--deprecated-use-workspacetoolworkspace_exec)
   - [Deprecating a card](#deprecating-a-card--not-the-same-as-moving-an-import-path)
 - [Error Handling](#error-handling)
 - [Optional Extras](#optional-extras)
@@ -67,9 +66,7 @@ running inside it. It provides:
   sandboxed shell execution**, task planning, knowledge graph, web search, team management, the
   team's business context, on-demand skill guidance, the agent's own mailbox and run-cancellation
   surface, runtime model switching, vector-store configuration, MCP server integration, and
-  self-scheduled notifications. A thirteenth card, `ExecTool`, still ships as a deprecated shim over
-  `WorkspaceTool(workspace_exec=…)` and is not counted — it advertises no capability the workspace
-  card does not
+  self-scheduled notifications
 
 ```
 ToolCard(s)
@@ -473,6 +470,15 @@ a sibling package imports `CommandsAnnouncedEvent` from the old path.
 | `akgentic.tool.event.TeamManagementToolObserver` | `akgentic.tool` (root) or `akgentic.tool.team.observer` |
 | `akgentic.tool.vector.EmbeddingService` | `akgentic.tool` (root) or `akgentic.tool.vector_store.vector` |
 | `akgentic.tool.vector.VectorIndex` | `akgentic.tool` (root) or `akgentic.tool.vector_store.vector` |
+| `akgentic.tool.sandbox.ExecTool`, `akgentic.tool.ExecTool` | `WorkspaceTool(workspace_exec=…)` from `akgentic.tool` — **removed**, not moved: the card was deprecated in 1.7.0 and shipped its warning through 1.8.0; the next release drops it |
+
+`ExecTool` is the one row here that is a *card* rather than a path, so it is governed by
+[Deprecating a card](#deprecating-a-card--not-the-same-as-moving-an-import-path) rather than by the
+tiers below. Unlike the other withdrawn entries the failure is not a bare "cannot import name":
+both paths raise an `ImportError` naming `WorkspaceTool(workspace_exec=…)`, because a stored
+catalog row naming the class has nothing else to tell it where the capability went. When migrating
+such a row, turn every other `WorkspaceTool` capability off explicitly — they default to `True`,
+and a bare `model_type` swap grants file access to an agent that previously had only a shell.
 
 The observers are Stable-tier **symbols** — but the promise attaches to the package root,
 their supported surface, not to every path they historically resolved from. Their `event.py`
@@ -999,13 +1005,6 @@ the `ToolCard` definition, every field and every nested capability parameter, an
 configuration surface — environment, extras, actor wiring and failure modes. The entries below
 are the index; the detail lives beside the module it documents.
 
-`ExecTool` has a row below and is **not** one of the twelve: it is a deprecated shim over
-`WorkspaceTool(workspace_exec=…)`, kept working and kept listed so a reader who arrives looking for
-it is told where the capability went. A shim is not a distinct usable capability, so it does not
-count towards what the package advertises. See
-[Deprecating a card](#deprecating-a-card--not-the-same-as-moving-an-import-path) for what that
-status commits us to.
-
 | Tool | Module | What it does | Reference |
 |---|---|---|---|
 | `WorkspaceTool` | `akgentic.tool.workspace` | Team-scoped filesystem behind a write gate, with a git journal and sandboxed shell execution | [README](src/akgentic/tool/workspace/README.md) |
@@ -1020,7 +1019,11 @@ status commits us to.
 | `MailboxTool` | `akgentic.tool.mailbox` | A signal naming one message in the agent's own mailbox, and the `/stop` cancel surface | [README](src/akgentic/tool/mailbox/README.md) |
 | `ModelTool` | `akgentic.tool.model` | The model roster listed, the switch between its entries, and the resulting selection persisted | [README](src/akgentic/tool/model/README.md) |
 | `MCPTool` | `akgentic.tool.mcp` | External MCP servers as pydantic-ai toolsets | [README](src/akgentic/tool/mcp/README.md) |
-| ~~`ExecTool`~~ | `akgentic.tool.sandbox` | **Deprecated** — use `WorkspaceTool(workspace_exec=…)`. The sandbox *backend* it wired is not deprecated and is documented in the same place | [README](src/akgentic/tool/sandbox/README.md) |
+
+The sandbox *backend* `WorkspaceTool.workspace_exec` runs on — the four isolation backends, the
+allowlist, the Docker image and the registry a deployment injects its own backend into — has its
+own reference beside the code: [`src/akgentic/tool/sandbox/README.md`](src/akgentic/tool/sandbox/README.md).
+It is not a card.
 
 ### WorkspaceTool
 
@@ -1498,38 +1501,12 @@ be requested explicitly.
 both connection models field by field, the SSE timeout subtlety, tool prefixing, diagnostics and
 the OAuth helpers.
 
-### ExecTool — deprecated, use `WorkspaceTool(workspace_exec=…)`
-
-**The card moved; the backend did not.** Sandboxed execution is a capability of `WorkspaceTool`,
-because exec and the write gate share one resource — the tree — and two cards over one tree means
-two mailboxes that interleave. `SANDBOX_ACTOR_CLASSES`, the four backends and the bundled Docker
-image are unchanged, are not deprecated, and are what `workspace_exec` resolves through.
-
-```python
-# Before
-ToolFactory([WorkspaceTool(workspace_id="proj-42"), ExecTool(workspace_id="proj-42")], observer=agent)
-
-# After
-ToolFactory([WorkspaceTool(workspace_id="proj-42", workspace_exec=True)], observer=agent)
-```
-
-`ExecTool` still resolves and `exec_command` still behaves identically — same lease, same worker,
-same discovery, same commit — because it is a shim over `workspace_exec` rather than a second
-implementation. It emits a `DeprecationWarning` when the card is **wired**, not at import. What it
-cannot express is `git_journal`: its three fields are frozen, so an `ExecTool`-only agent always
-gets the journal's default, which is off.
-
-**[Full reference → `src/akgentic/tool/sandbox/README.md`](src/akgentic/tool/sandbox/README.md)** —
-the migration table, the four backends compared (isolation, timeouts, rlimits, network), the
-allowlist and why it is not the boundary, the Docker image lifecycle, and how to register a backend
-of your own.
-
 ### Deprecating a card — not the same as moving an import path
 
 [§Migration](#migration-moved-import-paths) governs **import paths** and their Stable/Internal
 tiers: a symbol that moves modules gets a shim, and the tier says whether the old path was ever a
 promise. A deprecated **card** is a different thing — no module moved, and the class keeps working.
-The policy, stated once because `ExecTool` is the first to need it:
+The policy, stated once because `ExecTool` was the first to need it:
 
 - **It keeps working, identically**, for as long as it ships. A shim that behaves differently from
   its replacement is worse than no shim.
@@ -1538,7 +1515,21 @@ The policy, stated once because `ExecTool` is the first to need it:
   change.
 - **It leaves the Tool Catalog for a migration pointer** and stops counting towards the number of
   tools the package advertises.
-- **It is removed no earlier than the minor release after** the one that deprecated it.
+- **It is removed no earlier than the minor release after the first *published* release that
+  warns.** The clock counts published releases, not commits: a warning that exists only on a branch
+  has warned nobody. A card whose deprecated form has **never been published** is therefore removed
+  outright rather than shimmed — a shim's only purpose is to give an already-released consumer one
+  warned upgrade, and an audience that never received the card being deprecated has nothing to be
+  warned about.
+- **When it is removed, the break stays legible**: the module answers the old name with an
+  `ImportError` naming the replacement, and the row moves to [§Migration](#migration-moved-import-paths).
+
+`ExecTool` is the case that produced the last two rules, and it is worth recording how. The
+removal was drafted on the finding that the shim had never been published — PyPI held 1.6.10, in
+which `ExecTool` was the only exec card and carried no warning — which would have made removing it
+outright the right call. By the time the removal landed, 1.7.0 and 1.8.0 had both shipped the
+warning, so it also satisfies the window as originally written. Either way the policy now says what
+its clock counts, so that the next card does not have to re-derive it.
 
 ## Error Handling
 
@@ -1761,24 +1752,24 @@ src/akgentic/tool/
         │                     #   content_sha, the refusal texts and every cap
         journal.py            # GitJournal, Identity — linear history, out-of-band commits,
         │                     #   the seeded .gitignore, graceful absence
-        execution.py          # workspace_exec's models, budgets, ExecWorker and the one
-        │                     #   formatter both exec surfaces render through
+        execution.py          # workspace_exec's models, budgets, and the one formatter
+        │                     #   a finished run renders through
         edit.py               # EditMatcher (7-strategy), FilePatch, parse_patch,
         │                     #   render_file_patch (hunk-context verified), HunkContextError
         readers.py            # DocumentReader (Pydantic BaseModel), TEXT_EXTENSIONS
         └── tool.py           # WorkspaceTool ToolCard
     sandbox/
-        README.md           # The exec backend — backends compared, allowlist, image;
-        │                     #   and ExecTool's migration pointer
-        __init__.py           # Public exports: ExecTool, SandboxActor subclasses, models
+        README.md           # The exec backend — backends compared, allowlist, image,
+        │                     #   registering a backend; and the ExecTool migration note
+        __init__.py           # Public exports: SandboxActor subclasses, models, the registry;
+        │                     #   refuses `ExecTool` by name with a pointer to workspace_exec
         actor.py              # SandboxActor (abstract), SandboxConfig, ALLOWED_COMMANDS,
         │                     #   sandbox_actor_name() — the name carries the workspace
         local.py              # LocalSandboxActor (subprocess, resource limits)
         docker.py             # DockerSandboxActor (persistent container per team)
         seatbelt.py           # SeatbeltSandboxActor (macOS Apple Seatbelt)
         bwrap.py              # BwrapSandboxActor (Linux bubblewrap)
-        tool.py               # ExecTool ToolCard (deprecated shim over workspace_exec),
-        │                     #   SANDBOX_ACTOR_CLASSES registry, auto-mode probing
+        registry.py           # SANDBOX_ACTOR_CLASSES registry, auto-mode probing
         └── sandbox.Dockerfile # Bundled image definition for akgentic-sandbox:latest
 tests/                        # Tests organised by domain
 ```

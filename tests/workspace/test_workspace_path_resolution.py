@@ -598,12 +598,6 @@ class TestTheTwoFieldsAreMutuallyExclusive:
         restored = WorkspaceTool.model_validate(card.model_dump())
         assert restored.workspace_metadata_keys == ["customer_id", "case_id"]
 
-    def test_the_deprecated_exec_card_gains_no_metadata_field(self) -> None:
-        """A card epic 41 deletes must not ship a capability that is then deleted again."""
-        from akgentic.tool.sandbox.tool import ExecTool
-
-        assert "workspace_metadata_keys" not in ExecTool.model_fields
-
 
 ##
 ## AC 2, 7 — the invariants, over generated input rather than hand-picked rows

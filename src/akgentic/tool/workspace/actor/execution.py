@@ -251,7 +251,7 @@ class ExecMixin(_ExecBase):
         Raises:
             RuntimeError: If this actor has no orchestrator to resolve through.
         """
-        from akgentic.tool.sandbox.tool import SANDBOX_ACTOR_CLASSES  # noqa: PLC0415 — cycle
+        from akgentic.tool.sandbox import SANDBOX_ACTOR_CLASSES  # noqa: PLC0415 — call time
 
         orchestrator = self.orchestrator
         if orchestrator is None:

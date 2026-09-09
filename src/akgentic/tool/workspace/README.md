@@ -367,9 +367,8 @@ exit_code: 0 (OK)
 stdout: acf1942f5389dd…
 ```
 
-The provenance line is added by `format_status`, not by `format_outcome`: the outcome body is
-shared with the deprecated `exec_command` shim, and the caller that knows the run is the one that
-names it.
+The provenance line is added by `format_status`, not by `format_outcome`: the outcome body is one
+shared rendering, and the caller that knows the run is the one that names it.
 
 **Mutations still refuse while a run holds the tree, and that asymmetry is deliberate.** `workspace_write`,
 `_edit`, `_patch`, `_delete` and `_mkdir` are *gated*, not fenced: they declare their write set, so
@@ -642,8 +641,8 @@ WorkspaceTool(
 | `poll_delay_seconds` | `float` | `0.5` | Seconds between those looks — the granularity of the wait, not its length. The length comes from `poll_attempts` resolved against the run budget, and can never outlast the run it waits for: past that point there is nothing left to wait for. |
 
 None of these reaches an LLM-facing signature: nothing lets a model name a mode, a timeout, or a
-git argument. See the [`ExecTool` reference](../sandbox/README.md) for what each backend actually
-isolates, the bundled Docker image, and how to register a backend of your own.
+git argument. See the [sandbox backend reference](../sandbox/README.md) for what each backend
+actually isolates, the bundled Docker image, and how to register a backend of your own.
 
 ---
 
