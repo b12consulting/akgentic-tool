@@ -470,7 +470,7 @@ a sibling package imports `CommandsAnnouncedEvent` from the old path.
 | `akgentic.tool.event.TeamManagementToolObserver` | `akgentic.tool` (root) or `akgentic.tool.team.observer` |
 | `akgentic.tool.vector.EmbeddingService` | `akgentic.tool` (root) or `akgentic.tool.vector_store.vector` |
 | `akgentic.tool.vector.VectorIndex` | `akgentic.tool` (root) or `akgentic.tool.vector_store.vector` |
-| `akgentic.tool.sandbox.ExecTool`, `akgentic.tool.ExecTool` | `WorkspaceTool(workspace_exec=…)` from `akgentic.tool` — **removed**, not moved: the card was deprecated in 1.7.0 and shipped its warning through 1.8.0; the next release drops it |
+| `akgentic.tool.sandbox.ExecTool`, `akgentic.tool.ExecTool` | `WorkspaceTool(workspace_exec=…)` from `akgentic.tool` — **removed**, not moved: the card was deprecated in 1.7.0, shipped its warning through 1.8.0, and is absent from every release after |
 
 `ExecTool` is the one row here that is a *card* rather than a path, so it is governed by
 [Deprecating a card](#deprecating-a-card--not-the-same-as-moving-an-import-path) rather than by the

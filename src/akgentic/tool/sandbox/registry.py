@@ -27,7 +27,6 @@ from akgentic.tool.sandbox.local import LocalSandboxActor
 from akgentic.tool.sandbox.seatbelt import SeatbeltSandboxActor
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
 # ---------------------------------------------------------------------------
 # SANDBOX_ACTOR_CLASSES — mutable injection window for runtime registration

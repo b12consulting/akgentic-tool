@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.tool.core.deferred import DeferredResultActor
+from akgentic.tool.sandbox import SANDBOX_ACTOR_CLASSES
 from akgentic.tool.sandbox.actor import ExecReport, ExecRequest
 from akgentic.tool.workspace.execution import (
     DEFAULT_EXEC_TIMEOUT_S,
@@ -251,8 +252,8 @@ class ExecMixin(_ExecBase):
         Raises:
             RuntimeError: If this actor has no orchestrator to resolve through.
         """
-        from akgentic.tool.sandbox import SANDBOX_ACTOR_CLASSES  # noqa: PLC0415 — call time
-
+        # The registry is one mutable dict, so a backend a deployment assigns
+        # into it after import is seen here regardless of when it was imported.
         orchestrator = self.orchestrator
         if orchestrator is None:
             raise RuntimeError("#Workspace cannot resolve its sandbox without an orchestrator.")
