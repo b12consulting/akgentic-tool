@@ -13,12 +13,17 @@ import inspect
 import sys
 import threading
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from akgentic.tool.vector_store.protocol import WEAVIATE_API_KEY_ENV, WEAVIATE_URL_ENV
+
+if TYPE_CHECKING:
+    # Only under TYPE_CHECKING: at runtime the mock ``weaviate`` module must be
+    # installed into ``sys.modules`` before this module is imported.
+    from akgentic.tool.vector_store.weaviate import WeaviateBackend
 
 # ---------------------------------------------------------------------------
 # Recording Filter double
@@ -1594,7 +1599,7 @@ class TestCollectionHandleCache:
 
 def _backend_with(
     mock_client: MagicMock, *collections: str, team_id: str | None = "team-42"
-) -> Any:
+) -> WeaviateBackend:
     """Build a backend that has created each named collection.
 
     ``team_id=None`` builds the team-less kind — a hand-written script, or the

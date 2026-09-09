@@ -708,8 +708,10 @@ later cannot omit the collection's only remaining boundary.
 One consequence to weigh deliberately rather than meet as a surprise: two teams indexing one tree
 produce identical chunk ids for identical content, so team A re-indexing a file removes the rows team
 B also reads. That is correct — it is the same file in the same tree — but it means a re-index is
-visible across teams. Each hit renders its path, its heading path, a score label — `(hybrid: 0.90)`,
-`(semantic: 0.85)` or `(keyword match)` — and the chunk's text.
+visible across teams.
+
+Each hit renders its path, its heading path, a score label — `(hybrid: 0.90)`, `(semantic: 0.85)` or
+`(keyword match)` — and the chunk's text.
 
 **A hit's text comes from the vector store, not from the cache**, which is what keeps a file whose
 extraction body was evicted both searchable and renderable. That file loses only its lexical leg:
