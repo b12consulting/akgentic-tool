@@ -13,8 +13,16 @@ git, and an argv assertion cannot reach any of them.
 and registers no markers; ``integration`` exists only in the workspace-root
 ``pyproject.toml``. The package's own CI runs ``pytest tests/`` with **no ``-m``
 filter**, so a marker alone keeps these out of the local gate command and does
-**not** keep them out of package CI — where a runner with no daemon would go red.
-The ``skipif`` is what covers that half.
+**not** keep them out of package CI. The ``skipif`` is what protects a runner
+with no daemon.
+
+**And package CI is not such a runner.** GitHub-hosted ``ubuntu-latest`` ships a
+running Docker daemon, so these specs *execute* there on every push — building
+the image in-run, at about two minutes of CI time, and then running as the
+runner's uid. That is the one place the host-side ownership check in the uid spec
+below is literal rather than remapped, so it is coverage rather than a hazard;
+but nobody should read the ``skipif`` as keeping a daemon-dependent spec out of
+CI.
 
 The daemon probe runs once at import under its own timeout, so a host with the
 CLI installed but no daemon running skips rather than hangs.

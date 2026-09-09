@@ -222,9 +222,10 @@ healthy child dies in milliseconds, so this is generous for the case that is not
 wedged. The worst case for the whole of exec teardown is this plus the backend's
 own ``stop()``, and the slowest of those is docker's, which is now a single
 ``docker rm -f`` — a forced removal, so it spends none of ``docker stop``'s
-ten-second SIGTERM grace. That leaves ~3 s plus one round trip to the daemon,
-comfortably under the orchestrator's 30 s stop backstop and with far more room
-than the ~13 s this was originally sized for. If this number changes, state that
+ten-second SIGTERM grace — bounded at ``DOCKER_RM_TIMEOUT_S`` (10 s) because a
+wedged daemon never answers and this runs on the actor's thread. So ~13 s worst
+case, the figure this was originally sized for, comfortably under the
+orchestrator's 30 s stop backstop. If either number changes, state that
 arithmetic again.
 
 What it converts is the failure mode, not the hazard: an unbounded teardown hang

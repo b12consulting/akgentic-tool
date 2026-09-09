@@ -35,12 +35,14 @@ from akgentic.tool.sandbox.actor import (
 from akgentic.tool.sandbox.docker import (
     CONTAINER_NAME_PREFIX,
     DOCKER_EXEC_TIMEOUT,
+    DOCKER_RM_TIMEOUT_S,
     SANDBOX_IMAGE,
     SANDBOX_IMAGE_BUILD_TIMEOUT_S,
     WORKSPACE_PATH_LABEL,
     DockerBackend,
     DockerSandboxActor,
 )
+from akgentic.tool.workspace.execution import EXEC_SHUTDOWN_GRACE_S
 
 # The exec path runs through ``ProcessBackend._run``, so exec-path mocks target
 # ``backend.subprocess.Popen``. The start, build and stop paths still run
@@ -222,6 +224,17 @@ def test_the_build_budget_sits_far_above_any_exec_budget() -> None:
     the relationship is the invariant rather than the figure.
     """
     assert SANDBOX_IMAGE_BUILD_TIMEOUT_S > DOCKER_EXEC_TIMEOUT * 10
+
+
+def test_the_whole_of_exec_teardown_fits_under_the_orchestrator_backstop() -> None:
+    """The teardown arithmetic, asserted rather than stated in a docstring.
+
+    Teardown is the bounded drain followed by the backend's ``stop()``, and the
+    slowest ``stop()`` is docker's bounded ``rm -f``. Their sum is what the
+    orchestrator's stop backstop has to cover; a docstring that says "~13 s" goes
+    stale the day either constant moves, and this does not.
+    """
+    assert EXEC_SHUTDOWN_GRACE_S + DOCKER_RM_TIMEOUT_S < STOP_TIMEOUT
 
 
 # ---------------------------------------------------------------------------
@@ -529,10 +542,12 @@ def test_both_tmpfs_mounts_carry_rw_exec_a_world_writable_mode_and_a_size(
 ) -> None:
     """AC8: a bare ``--tmpfs /tmp`` is a second wall, not a smaller fix.
 
-    Docker's defaults are ``rw,noexec,nosuid,nodev`` at **mode 755 owned by
-    root** with a small default size. Under a non-root ``--user`` that directory
-    is unwritable, ``pip``'s wheel builds fail on ``noexec``, and an install into
-    a small cache fails with a disk-full error that names nothing.
+    Observed on the daemon rather than assumed: a bare ``--tmpfs`` mounts
+    ``rw,nosuid,nodev,noexec`` with no ``size=`` at the kernel's default mode
+    ``1777`` — so it *is* writable by a non-root uid, and the wall is ``noexec``
+    (``pip``'s wheel builds and build backends run out of ``TMPDIR``) plus a
+    size that defaults to half the daemon's RAM. ``mode=1777`` is pinned here
+    because it restates the default explicitly, not because the default differs.
     """
     _backend, argv = start_and_capture(mock_run)
 
@@ -828,6 +843,9 @@ def test_stop_removes_the_container(mock_run: MagicMock) -> None:
         "-f",
         "akgentic-sandbox-0123456789ab",
     ]
+    # Bounded, because this runs on the actor's thread inside ``on_stop``: a
+    # daemon that never answers must not hold teardown open to the backstop.
+    assert mock_run.call_args_list[0][1]["timeout"] == DOCKER_RM_TIMEOUT_S
     for call_item in mock_run.call_args_list:
         assert "stop" not in call_item[0][0]
         assert "start" not in call_item[0][0]
@@ -913,6 +931,33 @@ def test_stop_does_not_raise_when_docker_has_left_the_path_since_start(
         backend.stop()  # must not raise
 
     assert [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert backend.container_name is None
+
+
+@patch("akgentic.tool.sandbox.docker.subprocess.run")
+def test_stop_warns_when_the_removal_outlives_its_budget_and_does_not_raise(
+    mock_run: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    """AC17's fifth case: a daemon that never answers is a warning, not a hang.
+
+    ``subprocess.run`` raises ``TimeoutExpired`` at the bound, which is not an
+    ``OSError`` — a handler that caught only the latter would let it propagate
+    into ``on_stop``. The name is cleared regardless, so nothing retries a
+    daemon that has already shown it will not answer.
+    """
+    backend = DockerBackend("team-1")
+    backend.container_name = "akgentic-sandbox-0123456789ab"
+    mock_run.side_effect = subprocess.TimeoutExpired(
+        cmd=["docker", "rm", "-f"], timeout=DOCKER_RM_TIMEOUT_S
+    )
+
+    with caplog.at_level(logging.DEBUG, logger=DOCKER_LOGGER):
+        caplog.clear()
+        backend.stop()  # must not raise
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    assert "akgentic-sandbox-0123456789ab" in warnings[0].getMessage()
     assert backend.container_name is None
 
 

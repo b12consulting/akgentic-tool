@@ -66,6 +66,21 @@ teardown gives up. A Python thread cannot be cancelled, so the difference is rea
 wall clock, not a formality. Docker is no longer the exception.
 """
 
+DOCKER_RM_TIMEOUT_S: float = 10.0
+"""Budget for the ``docker rm -f`` that :meth:`DockerBackend.stop` issues.
+
+**This runs on the actor's thread, inside ``on_stop``**, so an unbounded call
+here is a teardown hang — the exact class the executor's ordered shutdown was
+built to remove. A daemon that answers removes a container in well under a
+second; a daemon that has wedged never answers, and without a bound the actor
+would sit in ``on_stop`` until the orchestrator's 30 s backstop gave up on it.
+
+**Ten seconds, and the arithmetic.** Teardown's bounded drain is
+``EXEC_SHUTDOWN_GRACE_S`` (3 s) and this follows it, so the whole of exec
+teardown is ~13 s worst case — under the 30 s backstop, and the figure the grace
+was originally sized for. If either number changes, state the sum again.
+"""
+
 CONTAINER_NAME_PREFIX: str = "akgentic-sandbox-"
 """What every container this backend creates is named, before its random half."""
 
@@ -90,14 +105,17 @@ before it can mount a writable one, and :meth:`DockerBackend._run_argv` sets
 TMPFS_MOUNT_OPTIONS: str = "rw,exec,mode=1777,size=512m"
 """What makes a tmpfs usable under ``--user <non-root>`` on a read-only root.
 
-**The defaults are a wall, not a smaller version of this.** A bare
-``--tmpfs /path`` mounts ``rw,noexec,nosuid,nodev`` at **mode 755 owned by
-root** with a small default size, which a non-root process cannot write to — it
-fails exactly the way the plain ``--read-only`` failed. So the mode is what makes
-the mount a fix rather than a second wall. ``exec`` is required because ``pip``
-builds wheels and runs build backends out of ``TMPDIR`` and ``noexec`` breaks
-that. The size is stated rather than defaulted because an install into a 64 MB
-cache fails with a disk-full error that names nothing.
+**What a bare ``--tmpfs /path`` actually gives, observed on the daemon rather
+than assumed.** It mounts ``rw,nosuid,nodev,noexec`` with **no** ``size=`` — the
+kernel's default, which is half of the machine's RAM — at the kernel's default
+tmpfs mode, ``1777`` owned by root. So a bare tmpfs *is* writable by a non-root
+uid; the wall is elsewhere. ``noexec`` is it: ``pip`` builds wheels and runs
+build backends out of ``TMPDIR``, and a script on a ``noexec`` mount fails with
+*Permission denied* however it is chmod'ed — so ``exec`` is what turns the mount
+into a fix. The size is stated because the default is *unbounded* for practical
+purposes: a runaway install would eat the daemon's memory rather than fail. And
+``mode=1777`` restates the kernel default explicitly, so the spec can pin it and
+nobody has to know what the default was.
 """
 
 SANDBOX_TMPDIR: str = "/tmp"
@@ -383,13 +401,20 @@ class DockerBackend(ProcessBackend):
         a container whose only purpose was to hold a process the caller has
         already given up on.
 
-        The four cases, and **a container that is already gone is the outcome
+        The five cases, and **a container that is already gone is the outcome
         that was asked for** rather than a problem to report: an unstarted
         backend issues no docker command at all; a successful removal logs at
         debug; a *no such container* failure logs at debug; anything else — a
-        daemon that has gone away, ``docker`` no longer on ``PATH`` — logs at
-        warning. The name is cleared first, so a second ``stop()`` is a no-op and
-        a later ``exec`` cannot address a container that is no longer there.
+        daemon that has gone away, ``docker`` no longer on ``PATH``, a removal
+        that outlived :data:`DOCKER_RM_TIMEOUT_S` — logs at warning. The name is
+        cleared first, so a second ``stop()`` is a no-op and a later ``exec``
+        cannot address a container that is no longer there.
+
+        **The removal is bounded because this is the actor's thread.** A daemon
+        that never answers would otherwise hold ``on_stop`` open until the
+        orchestrator's backstop gave up on it. A container the bound abandoned
+        may still be running; it carries :data:`WORKSPACE_PATH_LABEL`, which is
+        what a host-side reaper keys on.
         """
         container_name = self.container_name
         if container_name is None:
@@ -397,8 +422,19 @@ class DockerBackend(ProcessBackend):
         self.container_name = None
         try:
             result = subprocess.run(
-                ["docker", "rm", "-f", container_name], capture_output=True, text=True
+                ["docker", "rm", "-f", container_name],
+                capture_output=True,
+                text=True,
+                timeout=DOCKER_RM_TIMEOUT_S,
             )
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "Removing sandbox container %s outlived its %.0fs budget — abandoning it "
+                "to the reaper.",
+                container_name,
+                DOCKER_RM_TIMEOUT_S,
+            )
+            return
         except OSError as exc:
             logger.warning("Could not remove sandbox container %s: %s", container_name, exc)
             return
