@@ -127,6 +127,15 @@ class ExecMixin(_ExecBase):
         not a race, and the honest failure is the run reporting an error rather
         than a lock nobody can see.
 
+        **The old runner is released before the new one exists**, which leaves
+        one window worth naming: a registered backend whose *constructor* raises
+        strands this actor holding the runner it has just stopped, under the
+        config it has just kept — and the equality check above then short-circuits
+        every later announcement, so it holds it for good. It is left this way
+        rather than reordered because the alternative leaks the very backend the
+        release exists to reclaim, and because the degradation is loud: every run
+        reports the stopped backend's error, which is an answer its caller reads.
+
         Args:
             config: The resolved backend and the ids to build payloads from.
         """
@@ -637,6 +646,17 @@ class ExecMixin(_ExecBase):
         queued futures cancelled, so a worker that ignored the kill costs
         :data:`EXEC_SHUTDOWN_GRACE_S` of teardown latency rather than holding
         teardown open for ever.
+
+        **What the bound does not reach is interpreter exit**, and the boundary
+        is worth knowing before somebody reads this as a fix. A pool's worker
+        threads are non-daemon and stay registered for the whole process;
+        ``shutdown(wait=False)`` abandons the wait here but deregisters nothing,
+        and the interpreter joins every one of them on its way out. So a worker
+        genuinely wedged in that second drain still stops **this actor** in
+        bounded time and still blocks the **process** from exiting. Teardown was
+        what had to be bounded and is; the wedge itself is untouched, and closing
+        it means signalling the process group — an ADR decision, deliberately not
+        taken here.
         """
         pending = self._pending
         if pending is not None:
