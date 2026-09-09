@@ -1,8 +1,10 @@
 """SandboxActor — abstract base class for sandbox execution backends.
 
-Defines models, the command allowlist, module constants, and the lifecycle/exec
-contract. Concrete subclasses (LocalSandboxActor, DockerSandboxActor) provide
-the execution backend by implementing _start_sandbox, _stop_sandbox, and _exec.
+Defines the actor's models, its module constants and the lifecycle/exec
+contract. Concrete subclasses (LocalSandboxActor, DockerSandboxActor) implement
+_start_sandbox, _stop_sandbox and _exec by delegating to the strategy in
+:mod:`akgentic.tool.sandbox.backend` and its four backend modules — the actor
+holds no execution path of its own.
 
 The base has **two** entry points and a backend implements neither. ``exec()``
 is the ask: a validated command in, an ``ExecResult`` out, raising on anything
@@ -15,21 +17,55 @@ both.
 from __future__ import annotations
 
 import logging
-import shlex
 import subprocess
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Literal
 
-from pydantic import BaseModel, model_validator
+from pydantic import model_validator
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.core.utils.serializer import SerializableBaseModel
+from akgentic.tool.sandbox.backend import (
+    ALLOWED_COMMANDS,
+    DEFAULT_BACKEND_TIMEOUT_S,
+    CardMode,
+    CommandNotAllowedError,
+    CommandParseError,
+    ExecResult,
+    SandboxMode,
+    validate_command,
+)
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "ALLOWED_COMMANDS",
+    "DEFAULT_BACKEND_TIMEOUT_S",
+    "SANDBOX_ACTOR_NAME",
+    "SANDBOX_ACTOR_ROLE",
+    "CardMode",
+    "CommandNotAllowedError",
+    "CommandParseError",
+    "ExecReport",
+    "ExecRequest",
+    "ExecResult",
+    "SandboxActor",
+    "SandboxConfig",
+    "SandboxMode",
+    "SandboxState",
+    "sandbox_actor_name",
+    "validate_command",
+]
+"""The allowlist, the two exceptions, ``ExecResult`` and the two mode aliases now
+live in :mod:`akgentic.tool.sandbox.backend` and are re-exported here.
+
+They moved with the backends they belong to; the re-export is what keeps
+``from akgentic.tool.sandbox.actor import ALLOWED_COMMANDS`` — and everything
+that reaches them through the package — resolving to the same objects.
+"""
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -72,84 +108,6 @@ def sandbox_actor_name(workspace_name: str) -> str:
     return f"{SANDBOX_ACTOR_NAME}-{workspace_name}"
 
 
-SandboxMode = Literal["local", "bwrap", "seatbelt", "docker"]
-"""A backend that has been resolved. ``"auto"`` is not one of these."""
-
-CardMode = Literal["local", "bwrap", "seatbelt", "docker", "auto"]
-"""What a card may ask for, which includes ``"auto"``: probe the host and pick.
-
-Both aliases live here, in the module with no dependencies of its own, because
-both sides of the exec merge need them and a second definition in either would
-be a second place to add a backend to.
-"""
-
-DEFAULT_BACKEND_TIMEOUT_S: float = 30.0
-"""What a backend gives a command when the caller names no budget.
-
-Strictly at the orchestrator's stop backstop rather than above it: a worker
-cannot cancel a Python thread, so a subprocess still running past the backstop
-holds its parent's ``stop_children(blocking=True)`` open for the difference.
-Callers that own a tighter budget pass it to :meth:`SandboxActor.exec`.
-"""
-
-##
-## Only the FIRST token of a command is checked against this set, and both
-## ``bash`` and ``sh`` are in it — so ``bash -c "<anything>"`` walks straight
-## past it.  Nothing may rely on this allowlist for safety: it is a usability
-## filter that keeps an obvious mistake from running, and a way to tell an agent
-## what the sandbox offers.
-##
-## ``git`` is on the list.  It was briefly removed, to stop a ``git reset
-## --hard`` from destroying the workspace journal — but the bypass above meant
-## that stopped nobody, while costing an agent the use of git in a directory
-## that *is* a git repository.  The real guarantee is a filesystem fact: the
-## journal lives at the sibling ``<root>.git``, outside the mount of every
-## backend that constructs one, so it is not there to be reached.  Note that
-## ``LocalSandboxActor`` constructs no mount, so that guarantee does not cover
-## it — use an isolating backend where it matters.
-##
-ALLOWED_COMMANDS: frozenset[str] = frozenset(
-    {
-        ## Python
-        "python",
-        "python3",
-        "pytest",
-        "ruff",
-        "mypy",
-        "uv",
-        "pip",
-        ## Web
-        "node",
-        "npm",
-        "npx",
-        ## bash
-        "sh",
-        "bash",
-        "cat",
-        "echo",
-        "ls",
-        "cp",
-        "mv",
-        "rm",
-        "mkdir",
-        "find",
-        "grep",
-        "sed",
-        "awk",
-        "jq",
-        "wc",
-        "xargs",
-        "touch",
-        "make",
-        "git",
-        "kill",
-        ## Network
-        "curl",
-        "wget",
-    }
-)
-
-
 # ---------------------------------------------------------------------------
 # Data models
 # ---------------------------------------------------------------------------
@@ -190,20 +148,6 @@ class SandboxState(BaseState):
 
     workspace_path: Path | None = None
     container_name: str | None = None
-
-
-class ExecResult(BaseModel):
-    """Result of a sandbox command execution.
-
-    Attributes:
-        stdout: Captured standard output from the command.
-        stderr: Captured standard error from the command.
-        exit_code: Process exit code (0 indicates success).
-    """
-
-    stdout: str
-    stderr: str
-    exit_code: int
 
 
 class ExecRequest(SerializableBaseModel):
@@ -276,32 +220,6 @@ class ExecReport(SerializableBaseModel):
                 f"ExecReport carries exactly one of result, timed_out or error — got {carried}."
             )
         return self
-
-
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
-
-
-class CommandNotAllowedError(Exception):
-    """Raised when exec() is called with a command binary not in ALLOWED_COMMANDS.
-
-    Only the first token (binary name) of the command string is checked.
-    Argument-level filtering is out of scope for the base class.
-    """
-
-
-class CommandParseError(Exception):
-    """Raised when the command string cannot be tokenised at all.
-
-    A quoting mistake — an unbalanced ``"`` or ``'`` — not a binary outside the
-    allowlist. The distinction is deliberate and visible in the output: the tool
-    surface appends ``Allowed commands: [...]`` to a
-    :class:`CommandNotAllowedError`, which is the wrong answer to a quoting
-    mistake and sends the caller hunting for a binary it already has. Kept a
-    sibling of that class rather than a subclass, so an existing
-    ``except CommandNotAllowedError`` cannot swallow one.
-    """
 
 
 # ---------------------------------------------------------------------------
@@ -427,9 +345,12 @@ class SandboxActor(Akgent[SandboxConfig, SandboxState], ABC):
         ``>``, ``$VAR`` and globs arrive as literal arguments. Wrap anything
         needing shell syntax in ``bash -c '…'``.
 
-        Tokenising here with the same function the backends use is what keeps
-        the validated binary and the executed one the same string: a check that
-        split on whitespace would validate ``"my`` and run something else.
+        **The filter exists in exactly one place**, :func:`validate_command` in
+        ``backend.py``, and both this method and the backend call it. Calling it
+        here is what keeps the raise ahead of the backend — a refused command
+        must never reach a process — and calling it there is what keeps the
+        validated binary and the executed one the same string, because the
+        backend runs the very tokens the check returned.
 
         Args:
             cmd: Full command string to execute (e.g. "python main.py").
@@ -451,23 +372,7 @@ class SandboxActor(Akgent[SandboxConfig, SandboxState], ABC):
                 an unbalanced quote. Raised before the backend is reached.
             CommandNotAllowedError: If the command binary is not in ALLOWED_COMMANDS.
         """
-        try:
-            tokens = shlex.split(cmd)
-        except ValueError as exc:
-            raise CommandParseError(
-                f"Command could not be parsed ({exc}): {cmd!r}. "
-                "Balance the quotes, or wrap shell syntax in bash -c '...'."
-            ) from exc
-        if not tokens:
-            raise CommandNotAllowedError(
-                "Command string is empty — no binary to validate against the allowlist."
-            )
-        binary = tokens[0]
-        if binary not in ALLOWED_COMMANDS:
-            raise CommandNotAllowedError(
-                f"Command '{binary}' is not in the allowed commands list. "
-                f"Allowed: {sorted(ALLOWED_COMMANDS)}"
-            )
+        validate_command(cmd)
         return self._exec(cmd, cwd, timeout)
 
     # ------------------------------------------------------------------

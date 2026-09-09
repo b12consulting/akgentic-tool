@@ -32,11 +32,43 @@ from akgentic.tool.sandbox.actor import (
     SandboxConfig,
     SandboxState,
 )
-from akgentic.tool.sandbox.local import _SAFE_ENV_KEYS, LocalSandboxActor
+from akgentic.tool.sandbox.local import _SAFE_ENV_KEYS, LocalBackend, LocalSandboxActor
 
 # ---------------------------------------------------------------------------
 # Helper factory
 # ---------------------------------------------------------------------------
+
+
+def popen_mock(
+    mock_popen: MagicMock, stdout: str = "", stderr: str = "", returncode: int = 0
+) -> MagicMock:
+    """Shape *mock_popen* like a ``Popen``: ``communicate()`` pair plus ``returncode``.
+
+    ``subprocess.run`` returned a ``CompletedProcess`` carrying ``stdout`` /
+    ``stderr`` / ``returncode`` as attributes. ``Popen`` yields the two streams
+    from ``communicate()`` and the exit status from an attribute set once the
+    child is reaped, so every migrated mock is built here rather than eleven
+    times by hand.
+    """
+    proc = mock_popen.return_value
+    proc.communicate.return_value = (stdout, stderr)
+    proc.returncode = returncode
+    return proc
+
+
+def attach_backend(actor: LocalSandboxActor, workspace_path: Path) -> None:
+    """Give *actor* a backend already pointed at *workspace_path*, without starting one.
+
+    The equivalent of ``_start_sandbox`` for a test that wants a specific
+    directory rather than one derived from ``AKGENTIC_WORKSPACES_ROOT``. The
+    actor holds no execution path of its own, so an actor with no backend cannot
+    run a command — which is the point of the delegation, and the reason this
+    helper exists rather than a second copy of the exec body on the actor.
+    """
+    backend = LocalBackend()
+    backend.workspace_path = workspace_path
+    actor._backend = backend
+    actor.state.workspace_path = workspace_path
 
 
 def make_actor(team_id: str = "team-test", workspace_path: str | None = None) -> LocalSandboxActor:
@@ -175,9 +207,9 @@ def test_stop_sandbox_does_not_remove_workspace(
 # ---------------------------------------------------------------------------
 
 
-@patch("akgentic.tool.sandbox.local.subprocess.run")
+@patch("akgentic.tool.sandbox.backend.subprocess.Popen")
 def test_exec_no_cwd_uses_workspace_path(
-    mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    mock_popen: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC4: _exec(cmd, cwd='') passes state.workspace_path as cwd to subprocess.run."""
     monkeypatch.chdir(tmp_path)
@@ -185,17 +217,20 @@ def test_exec_no_cwd_uses_workspace_path(
     actor = make_actor(team_id="team-1")
     actor._start_sandbox()
 
-    mock_run.return_value = MagicMock(stdout="output", stderr="", returncode=0)
+    popen_mock(mock_popen, stdout="output")
 
     actor._exec("pytest tests/", "")
 
-    call_kwargs = mock_run.call_args
+    call_kwargs = mock_popen.call_args
     assert call_kwargs is not None
     assert call_kwargs.args[0] == ["pytest", "tests/"]
     assert call_kwargs.kwargs["cwd"] == str(actor.state.workspace_path)
-    assert call_kwargs.kwargs["capture_output"] is True
+    assert call_kwargs.kwargs["stdout"] is subprocess.PIPE
+    assert call_kwargs.kwargs["stderr"] is subprocess.PIPE
     assert call_kwargs.kwargs["text"] is True
-    assert call_kwargs.kwargs["timeout"] == 30
+    # The budget is an argument to communicate(), not to the constructor: Popen
+    # returns as soon as the child is spawned, so the wait is where the wait is.
+    assert mock_popen.return_value.communicate.call_args.kwargs["timeout"] == 30
     assert call_kwargs.kwargs["preexec_fn"] is not None
     assert callable(call_kwargs.kwargs["preexec_fn"])
     env = call_kwargs.kwargs["env"]
@@ -209,9 +244,9 @@ def test_exec_no_cwd_uses_workspace_path(
 # ---------------------------------------------------------------------------
 
 
-@patch("akgentic.tool.sandbox.local.subprocess.run")
+@patch("akgentic.tool.sandbox.backend.subprocess.Popen")
 def test_exec_with_cwd_appends_to_workspace_path(
-    mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    mock_popen: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC5: _exec(cmd, cwd='src') passes state.workspace_path / 'src' as cwd."""
     monkeypatch.chdir(tmp_path)
@@ -219,18 +254,19 @@ def test_exec_with_cwd_appends_to_workspace_path(
     actor = make_actor(team_id="team-1")
     actor._start_sandbox()
 
-    mock_run.return_value = MagicMock(stdout="output", stderr="", returncode=0)
+    popen_mock(mock_popen, stdout="output")
 
     actor._exec("pytest tests/", "src")
 
     expected_cwd = str(actor.state.workspace_path / "src")
-    call_kwargs = mock_run.call_args
+    call_kwargs = mock_popen.call_args
     assert call_kwargs is not None
     assert call_kwargs.args[0] == ["pytest", "tests/"]
     assert call_kwargs.kwargs["cwd"] == expected_cwd
-    assert call_kwargs.kwargs["capture_output"] is True
+    assert call_kwargs.kwargs["stdout"] is subprocess.PIPE
+    assert call_kwargs.kwargs["stderr"] is subprocess.PIPE
     assert call_kwargs.kwargs["text"] is True
-    assert call_kwargs.kwargs["timeout"] == 30
+    assert mock_popen.return_value.communicate.call_args.kwargs["timeout"] == 30
     assert call_kwargs.kwargs["preexec_fn"] is not None
     assert callable(call_kwargs.kwargs["preexec_fn"])
     env = call_kwargs.kwargs["env"]
@@ -244,9 +280,9 @@ def test_exec_with_cwd_appends_to_workspace_path(
 # ---------------------------------------------------------------------------
 
 
-@patch("akgentic.tool.sandbox.local.subprocess.run")
+@patch("akgentic.tool.sandbox.backend.subprocess.Popen")
 def test_exec_returns_exec_result(
-    mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    mock_popen: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """_exec() returns ExecResult with stdout, stderr, exit_code from subprocess.run."""
     monkeypatch.chdir(tmp_path)
@@ -254,7 +290,7 @@ def test_exec_returns_exec_result(
     actor = make_actor(team_id="team-1")
     actor._start_sandbox()
 
-    mock_run.return_value = MagicMock(stdout="test passed", stderr="warning", returncode=0)
+    popen_mock(mock_popen, stdout="test passed", stderr="warning")
 
     result = actor._exec("pytest tests/", "")
 
@@ -264,9 +300,9 @@ def test_exec_returns_exec_result(
     assert result.exit_code == 0
 
 
-@patch("akgentic.tool.sandbox.local.subprocess.run")
+@patch("akgentic.tool.sandbox.backend.subprocess.Popen")
 def test_exec_captures_non_zero_exit_code(
-    mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    mock_popen: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """_exec() correctly captures non-zero exit codes from subprocess.run."""
     monkeypatch.chdir(tmp_path)
@@ -274,7 +310,7 @@ def test_exec_captures_non_zero_exit_code(
     actor = make_actor(team_id="team-1")
     actor._start_sandbox()
 
-    mock_run.return_value = MagicMock(stdout="", stderr="test failed", returncode=1)
+    popen_mock(mock_popen, stderr="test failed", returncode=1)
 
     result = actor._exec("pytest tests/", "")
 
@@ -287,20 +323,37 @@ def test_exec_captures_non_zero_exit_code(
 # ---------------------------------------------------------------------------
 
 
-@patch("akgentic.tool.sandbox.local.subprocess.run")
+@patch("akgentic.tool.sandbox.backend.subprocess.Popen")
 def test_exec_timeout_propagates(
-    mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    mock_popen: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """AC6: subprocess.TimeoutExpired from subprocess.run propagates out of _exec()."""
+    """AC6: subprocess.TimeoutExpired propagates out of _exec().
+
+    The command is ``sh -c 'sleep 999'`` rather than ``sleep 999`` because the
+    backend now applies the allowlist inside its own ``exec()``, so ``_exec`` is
+    no longer a way past it. ``sleep`` was never on the list; this only ever
+    passed because the private hook skipped the check.
+    """
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
     actor = make_actor(team_id="team-1")
     actor._start_sandbox()
 
-    mock_run.side_effect = subprocess.TimeoutExpired(cmd=["sleep", "999"], timeout=30)
+    proc = popen_mock(mock_popen)
+    # First communicate() expires; the second is the drain after the kill, which
+    # ProcessBackend._run performs to reproduce subprocess.run's semantics.
+    proc.communicate.side_effect = [
+        subprocess.TimeoutExpired(cmd=["sh", "-c", "sleep 999"], timeout=30),
+        ("", ""),
+    ]
 
     with pytest.raises(subprocess.TimeoutExpired):
-        actor._exec("sleep 999", "")
+        actor._exec("sh -c 'sleep 999'", "")
+
+    # The child is killed and drained, not left behind: skipping either is how a
+    # timed-out run becomes a zombie and stops answering ``timed_out``.
+    proc.kill.assert_called_once()
+    assert proc.communicate.call_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -308,9 +361,9 @@ def test_exec_timeout_propagates(
 # ---------------------------------------------------------------------------
 
 
-@patch("akgentic.tool.sandbox.local.subprocess.run")
+@patch("akgentic.tool.sandbox.backend.subprocess.Popen")
 def test_public_exec_method_end_to_end(
-    mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    mock_popen: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC7: actor.exec() through inherited SandboxActor.exec() delegates to _exec()."""
     monkeypatch.chdir(tmp_path)
@@ -318,14 +371,14 @@ def test_public_exec_method_end_to_end(
     actor = make_actor(team_id="team-1")
     actor.on_start()  # Use the full lifecycle (sets state via SandboxActor.on_start)
 
-    mock_run.return_value = MagicMock(stdout="passed", stderr="", returncode=0)
+    popen_mock(mock_popen, stdout="passed")
 
     result = actor.exec("pytest tests/")
 
     assert isinstance(result, ExecResult)
     assert result.stdout == "passed"
     assert result.exit_code == 0
-    mock_run.assert_called_once()
+    mock_popen.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -488,9 +541,9 @@ def test_the_sandbox_and_the_workspace_open_one_directory(
 # ---------------------------------------------------------------------------
 
 
-@patch("akgentic.tool.sandbox.local.subprocess.run")
+@patch("akgentic.tool.sandbox.backend.subprocess.Popen")
 def test_exec_passes_preexec_fn_to_subprocess(
-    mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    mock_popen: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC5 (Story 8.1): _exec() passes a non-None callable preexec_fn to subprocess.run."""
     monkeypatch.chdir(tmp_path)
@@ -498,20 +551,20 @@ def test_exec_passes_preexec_fn_to_subprocess(
     actor = make_actor(team_id="team-1")
     actor._start_sandbox()
 
-    mock_run.return_value = MagicMock(stdout="output", stderr="", returncode=0)
+    popen_mock(mock_popen, stdout="output")
 
     actor._exec("echo hello", "")
 
-    call_kwargs = mock_run.call_args
+    call_kwargs = mock_popen.call_args
     assert call_kwargs is not None
     preexec_fn = call_kwargs.kwargs.get("preexec_fn")
     assert preexec_fn is not None
     assert callable(preexec_fn)
 
 
-@patch("akgentic.tool.sandbox.local.subprocess.run")
+@patch("akgentic.tool.sandbox.backend.subprocess.Popen")
 def test_exec_strips_env_to_safe_keys(
-    mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    mock_popen: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC5 (Story 8.1): _exec() passes env with only safe keys to subprocess.run."""
     monkeypatch.chdir(tmp_path)
@@ -519,11 +572,11 @@ def test_exec_strips_env_to_safe_keys(
     actor = make_actor(team_id="team-1")
     actor._start_sandbox()
 
-    mock_run.return_value = MagicMock(stdout="output", stderr="", returncode=0)
+    popen_mock(mock_popen, stdout="output")
 
     actor._exec("echo hello", "")
 
-    call_kwargs = mock_run.call_args
+    call_kwargs = mock_popen.call_args
     assert call_kwargs is not None
     env = call_kwargs.kwargs.get("env")
     assert isinstance(env, dict)
@@ -531,9 +584,9 @@ def test_exec_strips_env_to_safe_keys(
     assert all(k in _SAFE_ENV_KEYS for k in env), f"Unexpected keys: {set(env) - _SAFE_ENV_KEYS}"
 
 
-@patch("akgentic.tool.sandbox.local.subprocess.run")
+@patch("akgentic.tool.sandbox.backend.subprocess.Popen")
 def test_exec_env_excludes_secrets(
-    mock_run: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    mock_popen: MagicMock, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """AC5 (Story 8.1): env dict does not contain API keys or secrets."""
     monkeypatch.chdir(tmp_path)
@@ -543,11 +596,11 @@ def test_exec_env_excludes_secrets(
     actor = make_actor(team_id="team-1")
     actor._start_sandbox()
 
-    mock_run.return_value = MagicMock(stdout="output", stderr="", returncode=0)
+    popen_mock(mock_popen, stdout="output")
 
     actor._exec("echo hello", "")
 
-    call_kwargs = mock_run.call_args
+    call_kwargs = mock_popen.call_args
     assert call_kwargs is not None
     env = call_kwargs.kwargs.get("env")
     assert isinstance(env, dict)
@@ -685,36 +738,36 @@ def test_make_preexec_sets_rlimit_as_on_linux() -> None:
 # ---------------------------------------------------------------------------
 
 
-@patch("akgentic.tool.sandbox.local.subprocess.run")
-def test_exec_keeps_a_quoted_argument_whole(mock_run: MagicMock, tmp_path: Path) -> None:
+@patch("akgentic.tool.sandbox.backend.subprocess.Popen")
+def test_exec_keeps_a_quoted_argument_whole(mock_popen: MagicMock, tmp_path: Path) -> None:
     """AC1: ``echo "hello world"`` reaches the binary as two tokens, quotes consumed.
 
     Under ``cmd.split()`` this arrived as ``['echo', '"hello', 'world"']`` — no
     command could ever receive an argument containing a space.
     """
     actor = make_actor(team_id="team-1")
-    actor.state.workspace_path = tmp_path
-    mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+    attach_backend(actor, tmp_path)
+    popen_mock(mock_popen)
 
     actor._exec('echo "hello world"', "")
 
-    assert mock_run.call_args.args[0] == ["echo", "hello world"]
+    assert mock_popen.call_args.args[0] == ["echo", "hello world"]
 
 
-@patch("akgentic.tool.sandbox.local.subprocess.run")
-def test_exec_strips_backslash_escapes_posix_style(mock_run: MagicMock, tmp_path: Path) -> None:
+@patch("akgentic.tool.sandbox.backend.subprocess.Popen")
+def test_exec_strips_backslash_escapes_posix_style(mock_popen: MagicMock, tmp_path: Path) -> None:
     """AC5: POSIX mode — ``echo a\\ b`` is two tokens, the escape consumed.
 
     Guards against a later ``posix=False``, which would keep the backslash
     literal and split ``a\\`` from ``b`` — the old behaviour wearing a new call.
     """
     actor = make_actor(team_id="team-1")
-    actor.state.workspace_path = tmp_path
-    mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+    attach_backend(actor, tmp_path)
+    popen_mock(mock_popen)
 
     actor._exec("echo a\\ b", "")
 
-    assert mock_run.call_args.args[0] == ["echo", "a b"]
+    assert mock_popen.call_args.args[0] == ["echo", "a b"]
 
 
 def test_bash_dash_c_runs_the_whole_script_for_real(tmp_path: Path) -> None:
@@ -727,7 +780,7 @@ def test_bash_dash_c_runs_the_whole_script_for_real(tmp_path: Path) -> None:
     only running it can.
     """
     actor = make_actor(team_id="team-1")
-    actor.state.workspace_path = tmp_path
+    attach_backend(actor, tmp_path)
 
     result = actor._exec("bash -c 'echo first && echo second'", "")
 

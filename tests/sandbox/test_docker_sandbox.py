@@ -33,8 +33,41 @@ from akgentic.tool.sandbox.actor import (
 from akgentic.tool.sandbox.docker import (
     DOCKER_EXEC_TIMEOUT,
     SANDBOX_IMAGE,
+    DockerBackend,
     DockerSandboxActor,
 )
+
+# The exec path runs through ``ProcessBackend._run``, so exec-path mocks target
+# ``backend.subprocess.Popen``. The start path (``docker ps -a`` / ``start`` /
+# ``run`` / ``build``) and the stop path (``docker stop``) still run
+# ``docker.subprocess.run`` and keep their target.
+POPEN = "akgentic.tool.sandbox.backend.subprocess.Popen"
+
+
+def popen_mock(
+    mock_popen: MagicMock, stdout: str = "", stderr: str = "", returncode: int = 0
+) -> MagicMock:
+    """Shape *mock_popen* like a ``Popen``: ``communicate()`` pair plus ``returncode``."""
+    proc = mock_popen.return_value
+    proc.communicate.return_value = (stdout, stderr)
+    proc.returncode = returncode
+    return proc
+
+
+def attach_backend(
+    actor: DockerSandboxActor, container_name: str = "sandbox-team-1"
+) -> DockerBackend:
+    """Give *actor* the running backend ``_start_sandbox`` would have built.
+
+    The actor holds no execution path of its own, so an actor with no backend
+    cannot run or stop anything — which is the delegation working, and the reason
+    a test that skips ``_start_sandbox`` has to supply one.
+    """
+    backend = DockerBackend(actor.config.team_id)
+    backend.container_name = container_name
+    actor._backend = backend
+    actor.state.container_name = container_name
+    return backend
 
 # ---------------------------------------------------------------------------
 # Helper factory
@@ -92,7 +125,7 @@ def test_docker_exec_timeout_constant() -> None:
 # ---------------------------------------------------------------------------
 
 
-@patch.object(DockerSandboxActor, "_ensure_image")
+@patch.object(DockerBackend, "_ensure_image")
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
 @patch("akgentic.tool.sandbox.docker.subprocess.run")
 def test_start_sandbox_creates_container_when_absent(
@@ -114,7 +147,7 @@ def test_start_sandbox_creates_container_when_absent(
     assert second_call_args[1] == "run"
 
 
-@patch.object(DockerSandboxActor, "_ensure_image")
+@patch.object(DockerBackend, "_ensure_image")
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
 @patch("akgentic.tool.sandbox.docker.subprocess.run")
 def test_start_sandbox_docker_run_uses_correct_flags(
@@ -150,7 +183,7 @@ def test_start_sandbox_docker_run_uses_correct_flags(
     ]
 
 
-@patch.object(DockerSandboxActor, "_ensure_image")
+@patch.object(DockerBackend, "_ensure_image")
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
 @patch("akgentic.tool.sandbox.docker.subprocess.run")
 def test_start_sandbox_docker_run_uses_custom_workspaces_root(
@@ -173,7 +206,7 @@ def test_start_sandbox_docker_run_uses_custom_workspaces_root(
     assert run_call_args[volume_arg_idx] == "/workspaces/team-1:/workspace"
 
 
-@patch.object(DockerSandboxActor, "_ensure_image")
+@patch.object(DockerBackend, "_ensure_image")
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
 @patch("akgentic.tool.sandbox.docker.subprocess.run")
 def test_start_sandbox_docker_run_normalizes_trailing_slash_in_root(
@@ -203,7 +236,7 @@ def test_start_sandbox_docker_run_normalizes_trailing_slash_in_root(
     )
 
 
-@patch.object(DockerSandboxActor, "_ensure_image")
+@patch.object(DockerBackend, "_ensure_image")
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
 @patch("akgentic.tool.sandbox.docker.subprocess.run")
 def test_start_sandbox_sets_container_name_in_state(
@@ -225,7 +258,7 @@ def test_start_sandbox_sets_container_name_in_state(
 # ---------------------------------------------------------------------------
 
 
-@patch.object(DockerSandboxActor, "_ensure_image")
+@patch.object(DockerBackend, "_ensure_image")
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
 @patch("akgentic.tool.sandbox.docker.subprocess.run")
 def test_start_sandbox_reuses_existing_container(
@@ -246,7 +279,7 @@ def test_start_sandbox_reuses_existing_container(
     assert actor.state.container_name == "sandbox-team-1"
 
 
-@patch.object(DockerSandboxActor, "_ensure_image")
+@patch.object(DockerBackend, "_ensure_image")
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
 @patch("akgentic.tool.sandbox.docker.subprocess.run")
 def test_start_sandbox_docker_start_uses_correct_args(
@@ -264,7 +297,7 @@ def test_start_sandbox_docker_start_uses_correct_args(
     assert start_call_args == ["docker", "start", "sandbox-team-1"]
 
 
-@patch.object(DockerSandboxActor, "_ensure_image")
+@patch.object(DockerBackend, "_ensure_image")
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
 @patch("akgentic.tool.sandbox.docker.subprocess.run")
 def test_start_sandbox_no_false_positive_on_prefix_container_name(
@@ -319,7 +352,7 @@ def test_start_sandbox_runtime_error_message(mock_which: MagicMock) -> None:
 def test_stop_sandbox_runs_docker_stop(mock_run: MagicMock) -> None:
     """AC4: _stop_sandbox() calls docker stop with the container name."""
     actor = make_actor(team_id="team-1")
-    actor.state.container_name = "sandbox-team-1"
+    attach_backend(actor)
     mock_run.return_value = MagicMock(returncode=0)
 
     actor._stop_sandbox()
@@ -331,7 +364,7 @@ def test_stop_sandbox_runs_docker_stop(mock_run: MagicMock) -> None:
 def test_stop_sandbox_does_not_rm_container(mock_run: MagicMock) -> None:
     """AC4: _stop_sandbox() does NOT run docker rm — container preserved between restarts."""
     actor = make_actor(team_id="team-1")
-    actor.state.container_name = "sandbox-team-1"
+    attach_backend(actor)
     mock_run.return_value = MagicMock(returncode=0)
 
     actor._stop_sandbox()
@@ -345,7 +378,7 @@ def test_stop_sandbox_does_not_rm_container(mock_run: MagicMock) -> None:
 def test_stop_sandbox_only_one_subprocess_call(mock_run: MagicMock) -> None:
     """AC4: _stop_sandbox() makes exactly one subprocess.run call (docker stop only)."""
     actor = make_actor(team_id="team-1")
-    actor.state.container_name = "sandbox-team-1"
+    attach_backend(actor)
     mock_run.return_value = MagicMock(returncode=0)
 
     actor._stop_sandbox()
@@ -358,7 +391,7 @@ def test_stop_sandbox_only_one_subprocess_call(mock_run: MagicMock) -> None:
 # ---------------------------------------------------------------------------
 
 
-@patch.object(DockerSandboxActor, "_ensure_image")
+@patch.object(DockerBackend, "_ensure_image")
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
 @patch("akgentic.tool.sandbox.docker.subprocess.run")
 def test_on_stop_swallows_stop_sandbox_exception(
@@ -383,12 +416,12 @@ def test_on_stop_swallows_stop_sandbox_exception(
 # ---------------------------------------------------------------------------
 
 
-@patch("akgentic.tool.sandbox.docker.subprocess.run")
-def test_exec_with_cwd_builds_correct_docker_command(mock_run: MagicMock) -> None:
+@patch(POPEN)
+def test_exec_with_cwd_builds_correct_docker_command(mock_popen: MagicMock) -> None:
     """AC6: _exec('pytest tests/', cwd='src') builds docker exec -w /workspace/src."""
     actor = make_actor(team_id="team-1")
-    actor.state.container_name = "sandbox-team-1"
-    mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+    attach_backend(actor)
+    popen_mock(mock_popen)
 
     actor._exec("pytest tests/", "src")
 
@@ -401,12 +434,18 @@ def test_exec_with_cwd_builds_correct_docker_command(mock_run: MagicMock) -> Non
         "pytest",
         "tests/",
     ]
-    mock_run.assert_called_once_with(
+    mock_popen.assert_called_once_with(
         expected_cmd,
-        capture_output=True,
+        cwd=None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=DOCKER_EXEC_TIMEOUT,
+        env=None,
+        preexec_fn=None,
     )
+    # The budget moved with the call shape: Popen returns once the child is
+    # spawned, so the wall clock is spent in communicate().
+    assert mock_popen.return_value.communicate.call_args.kwargs["timeout"] == DOCKER_EXEC_TIMEOUT
 
 
 # ---------------------------------------------------------------------------
@@ -414,12 +453,12 @@ def test_exec_with_cwd_builds_correct_docker_command(mock_run: MagicMock) -> Non
 # ---------------------------------------------------------------------------
 
 
-@patch("akgentic.tool.sandbox.docker.subprocess.run")
-def test_exec_without_cwd_uses_workspace_root(mock_run: MagicMock) -> None:
+@patch(POPEN)
+def test_exec_without_cwd_uses_workspace_root(mock_popen: MagicMock) -> None:
     """AC7: _exec('pytest tests/', cwd='') builds docker exec -w /workspace (no trailing slash)."""
     actor = make_actor(team_id="team-1")
-    actor.state.container_name = "sandbox-team-1"
-    mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+    attach_backend(actor)
+    popen_mock(mock_popen)
 
     actor._exec("pytest tests/", "")
 
@@ -432,12 +471,16 @@ def test_exec_without_cwd_uses_workspace_root(mock_run: MagicMock) -> None:
         "pytest",
         "tests/",
     ]
-    mock_run.assert_called_once_with(
+    mock_popen.assert_called_once_with(
         expected_cmd,
-        capture_output=True,
+        cwd=None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=DOCKER_EXEC_TIMEOUT,
+        env=None,
+        preexec_fn=None,
     )
+    assert mock_popen.return_value.communicate.call_args.kwargs["timeout"] == DOCKER_EXEC_TIMEOUT
 
 
 # ---------------------------------------------------------------------------
@@ -445,12 +488,12 @@ def test_exec_without_cwd_uses_workspace_root(mock_run: MagicMock) -> None:
 # ---------------------------------------------------------------------------
 
 
-@patch("akgentic.tool.sandbox.docker.subprocess.run")
-def test_exec_returns_exec_result_with_correct_fields(mock_run: MagicMock) -> None:
+@patch(POPEN)
+def test_exec_returns_exec_result_with_correct_fields(mock_popen: MagicMock) -> None:
     """_exec() returns ExecResult with stdout, stderr, exit_code from mocked subprocess."""
     actor = make_actor(team_id="team-1")
-    actor.state.container_name = "sandbox-team-1"
-    mock_run.return_value = MagicMock(stdout="test passed", stderr="warning", returncode=0)
+    attach_backend(actor)
+    popen_mock(mock_popen, stdout="test passed", stderr="warning")
 
     result = actor._exec("pytest tests/", "")
 
@@ -460,12 +503,12 @@ def test_exec_returns_exec_result_with_correct_fields(mock_run: MagicMock) -> No
     assert result.exit_code == 0
 
 
-@patch("akgentic.tool.sandbox.docker.subprocess.run")
-def test_exec_captures_non_zero_exit_code(mock_run: MagicMock) -> None:
+@patch(POPEN)
+def test_exec_captures_non_zero_exit_code(mock_popen: MagicMock) -> None:
     """_exec() correctly captures non-zero exit codes."""
     actor = make_actor(team_id="team-1")
-    actor.state.container_name = "sandbox-team-1"
-    mock_run.return_value = MagicMock(stdout="", stderr="test failed", returncode=1)
+    attach_backend(actor)
+    popen_mock(mock_popen, stderr="test failed", returncode=1)
 
     result = actor._exec("pytest tests/", "")
 
@@ -478,15 +521,21 @@ def test_exec_captures_non_zero_exit_code(mock_run: MagicMock) -> None:
 # ---------------------------------------------------------------------------
 
 
-@patch("akgentic.tool.sandbox.docker.subprocess.run")
-def test_exec_timeout_propagates(mock_run: MagicMock) -> None:
+@patch(POPEN)
+def test_exec_timeout_propagates(mock_popen: MagicMock) -> None:
     """_exec() propagates subprocess.TimeoutExpired — not swallowed."""
     actor = make_actor(team_id="team-1")
-    actor.state.container_name = "sandbox-team-1"
-    mock_run.side_effect = subprocess.TimeoutExpired(cmd=["docker", "exec"], timeout=60)
+    attach_backend(actor)
+    proc = popen_mock(mock_popen)
+    proc.communicate.side_effect = [
+        subprocess.TimeoutExpired(cmd=["docker", "exec"], timeout=60),
+        ("", ""),
+    ]
 
     with pytest.raises(subprocess.TimeoutExpired):
         actor._exec("pytest tests/", "")
+
+    proc.kill.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -494,7 +543,7 @@ def test_exec_timeout_propagates(mock_run: MagicMock) -> None:
 # ---------------------------------------------------------------------------
 
 
-@patch.object(DockerSandboxActor, "_ensure_image")
+@patch.object(DockerBackend, "_ensure_image")
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
 @patch("akgentic.tool.sandbox.docker.subprocess.run")
 def test_integration_container_name_set_after_start(
@@ -518,7 +567,7 @@ def test_integration_container_name_set_after_start(
 # ---------------------------------------------------------------------------
 
 
-@patch.object(DockerSandboxActor, "_ensure_image")
+@patch.object(DockerBackend, "_ensure_image")
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
 @patch("akgentic.tool.sandbox.docker.subprocess.run")
 def test_start_sandbox_calls_notify_state_change(
@@ -541,7 +590,7 @@ def test_start_sandbox_calls_notify_state_change(
 # ---------------------------------------------------------------------------
 
 
-@patch.object(DockerSandboxActor, "_ensure_image")
+@patch.object(DockerBackend, "_ensure_image")
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
 @patch("akgentic.tool.sandbox.docker.subprocess.run")
 def test_the_volume_mount_is_exactly_the_path_it_was_handed(
@@ -564,7 +613,7 @@ def test_the_volume_mount_is_exactly_the_path_it_was_handed(
     assert run_call_args[volume_arg_idx] == f"{Path('./workspaces/test').resolve()}:/workspace"
 
 
-@patch.object(DockerSandboxActor, "_ensure_image")
+@patch.object(DockerBackend, "_ensure_image")
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
 @patch("akgentic.tool.sandbox.docker.subprocess.run")
 def test_the_volume_mount_carries_a_two_segment_path_whole(
@@ -589,7 +638,7 @@ def test_the_volume_mount_carries_a_two_segment_path_whole(
     assert actor.state.container_name == "sandbox-t1"
 
 
-@patch.object(DockerSandboxActor, "_ensure_image")
+@patch.object(DockerBackend, "_ensure_image")
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
 @patch("akgentic.tool.sandbox.docker.subprocess.run")
 def test_the_container_is_named_per_team_while_its_tree_is_per_workspace(
@@ -613,7 +662,7 @@ def test_the_container_is_named_per_team_while_its_tree_is_per_workspace(
     assert run_call_args[name_idx] == "sandbox-t1"
 
 
-@patch.object(DockerSandboxActor, "_ensure_image")
+@patch.object(DockerBackend, "_ensure_image")
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
 @patch("akgentic.tool.sandbox.docker.subprocess.run")
 def test_the_volume_uses_the_harness_default_path(
@@ -648,18 +697,17 @@ def test_the_volume_uses_the_harness_default_path(
 def test_resolved_image_defaults_to_sandbox_image(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC3: _resolved_image() returns SANDBOX_IMAGE when AKGENTIC_SANDBOX_IMAGE is unset."""
     monkeypatch.delenv("AKGENTIC_SANDBOX_IMAGE", raising=False)
-    actor = make_actor()
-    assert actor._resolved_image() == SANDBOX_IMAGE
+    assert DockerBackend("team-test")._resolved_image() == SANDBOX_IMAGE
 
 
 def test_resolved_image_uses_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     """AC3: _resolved_image() returns AKGENTIC_SANDBOX_IMAGE when set."""
     monkeypatch.setenv("AKGENTIC_SANDBOX_IMAGE", "ghcr.io/myorg/akgentic-sandbox:v1.2")
-    actor = make_actor()
-    assert actor._resolved_image() == "ghcr.io/myorg/akgentic-sandbox:v1.2"
+    backend = DockerBackend("team-test")
+    assert backend._resolved_image() == "ghcr.io/myorg/akgentic-sandbox:v1.2"
 
 
-@patch.object(DockerSandboxActor, "_ensure_image")
+@patch.object(DockerBackend, "_ensure_image")
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
 @patch("akgentic.tool.sandbox.docker.subprocess.run")
 def test_start_sandbox_docker_run_uses_env_override_image(
@@ -694,9 +742,9 @@ def test_ensure_image_env_override_skips_all_docker(
 ) -> None:
     """AC3: AKGENTIC_SANDBOX_IMAGE set → _ensure_image() runs no docker command at all."""
     monkeypatch.setenv("AKGENTIC_SANDBOX_IMAGE", "ghcr.io/myorg/akgentic-sandbox:v1.2")
-    actor = make_actor()
+    backend = DockerBackend("team-test")
 
-    actor._ensure_image()
+    backend._ensure_image()
 
     assert mock_run.call_count == 0
 
@@ -708,9 +756,9 @@ def test_ensure_image_skips_build_when_image_present(
     """AC2: image present (docker images -q non-empty) → only the images check, no docker build."""
     monkeypatch.delenv("AKGENTIC_SANDBOX_IMAGE", raising=False)
     mock_run.return_value = MagicMock(stdout="cached-id\n", returncode=0)
-    actor = make_actor()
+    backend = DockerBackend("team-test")
 
-    actor._ensure_image()
+    backend._ensure_image()
 
     assert mock_run.call_count == 1
     images_call = mock_run.call_args_list[0][0][0]
@@ -734,9 +782,9 @@ def test_ensure_image_builds_when_absent(
         MagicMock(stdout="", returncode=0),  # docker images -q → absent
         MagicMock(returncode=0),  # docker build → success
     ]
-    actor = make_actor()
+    backend = DockerBackend("team-test")
 
-    actor._ensure_image()
+    backend._ensure_image()
 
     build_call = mock_run.call_args_list[1][0][0]
     assert build_call[:4] == ["docker", "build", "-t", SANDBOX_IMAGE]
@@ -759,10 +807,10 @@ def test_ensure_image_build_failure_raises_runtime_error(
         MagicMock(stdout="", returncode=0),  # docker images -q → absent
         MagicMock(returncode=1),  # docker build → failure
     ]
-    actor = make_actor()
+    backend = DockerBackend("team-test")
 
     with pytest.raises(RuntimeError) as exc_info:
-        actor._ensure_image()
+        backend._ensure_image()
 
     message = str(exc_info.value)
     assert SANDBOX_IMAGE in message
@@ -774,17 +822,17 @@ def test_ensure_image_build_failure_raises_runtime_error(
 # ---------------------------------------------------------------------------
 
 
-@patch("akgentic.tool.sandbox.docker.subprocess.run")
+@patch(POPEN)
 def test_exec_keeps_a_quoted_argument_whole_after_the_docker_prefix(
-    mock_run: MagicMock,
+    mock_popen: MagicMock,
 ) -> None:
     """AC1: shlex tokens follow ``docker exec -w <workdir> <container>``, unchanged."""
     actor = make_actor(team_id="team-1")
-    actor.state.container_name = "sandbox-team-1"
-    mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+    attach_backend(actor)
+    popen_mock(mock_popen)
 
     actor._exec('echo "hello world"', "src")
 
-    docker_cmd: list[str] = mock_run.call_args[0][0]
+    docker_cmd: list[str] = mock_popen.call_args[0][0]
     assert docker_cmd[:5] == ["docker", "exec", "-w", "/workspace/src", "sandbox-team-1"]
     assert docker_cmd[5:] == ["echo", "hello world"]

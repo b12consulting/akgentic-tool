@@ -1,8 +1,9 @@
-"""The sandbox backend registry, and the probe that picks one for ``mode="auto"``.
+"""The sandbox backend registries, and the probe that picks one for ``mode="auto"``.
 
-``SANDBOX_ACTOR_CLASSES`` is the package's extension point: a mutable ``dict`` a
-deployment assigns its own :class:`SandboxActor` subclass into, before any card
-is constructed. ``workspace_exec`` resolves through it **at call time** — when a
+``SANDBOX_ACTOR_CLASSES`` and ``SANDBOX_BACKEND_CLASSES`` are the package's
+extension point: mutable ``dict``s a deployment assigns its own
+:class:`SandboxActor` subclass and its own :class:`SandboxBackend` into, before
+any card is constructed. ``workspace_exec`` resolves through it **at call time** — when a
 card is wired (``resolve_mode`` in ``workspace/execution.py``) and again on every
 run (``#Workspace``'s sandbox resolution) — so a class registered after this
 module was imported is still found.
@@ -21,10 +22,11 @@ import subprocess
 from typing import Literal
 
 from akgentic.tool.sandbox.actor import SandboxActor
-from akgentic.tool.sandbox.bwrap import BwrapSandboxActor
-from akgentic.tool.sandbox.docker import DockerSandboxActor
-from akgentic.tool.sandbox.local import LocalSandboxActor
-from akgentic.tool.sandbox.seatbelt import SeatbeltSandboxActor
+from akgentic.tool.sandbox.backend import SandboxBackend
+from akgentic.tool.sandbox.bwrap import BwrapBackend, BwrapSandboxActor
+from akgentic.tool.sandbox.docker import DockerBackend, DockerSandboxActor
+from akgentic.tool.sandbox.local import LocalBackend, LocalSandboxActor
+from akgentic.tool.sandbox.seatbelt import SeatbeltBackend, SeatbeltSandboxActor
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,22 @@ SANDBOX_ACTOR_CLASSES: dict[str, type[SandboxActor]] = {
     "docker": DockerSandboxActor,
     # "e2b": E2BSandboxActor  ← injected by akgentic-infra at runtime
 }
+
+SANDBOX_BACKEND_CLASSES: dict[str, type[SandboxBackend]] = {
+    "local": LocalBackend,
+    "bwrap": BwrapBackend,
+    "seatbelt": SeatbeltBackend,
+    "docker": DockerBackend,
+    # "e2b": E2BBackend  ← injected by akgentic-infra at runtime
+}
+"""The strategies, under the same four keys as the actors above.
+
+Two registries that must agree is a drift hazard for exactly as long as both
+exist, which is until the actor is retired and ``SANDBOX_ACTOR_CLASSES`` goes
+with it. Until then a spec asserts the two key sets are equal — one line, and it
+dies with the dict it guards. A deployment registering a backend of its own
+writes into **both**.
+"""
 
 
 # ---------------------------------------------------------------------------

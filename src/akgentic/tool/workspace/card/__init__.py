@@ -47,6 +47,7 @@ from akgentic.tool.core import (
     _resolve,
 )
 from akgentic.tool.core.observer import ActorToolObserver
+from akgentic.tool.sandbox import SANDBOX_ACTOR_CLASSES
 from akgentic.tool.vector_store.actor import ensure_store_actor
 from akgentic.tool.vector_store.protocol import (
     VectorStoreParam,
@@ -462,7 +463,12 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
         params = self._enabled_exec()
         if params is None:
             return
-        mode, actor_class = resolve_mode(params.mode)
+        # The strategy ``resolve_mode`` builds is what ``#Workspace``'s executor
+        # will run on once it owns a worker thread. Until then the actor is what
+        # ``getChildrenOrCreate`` needs, so the instance is dropped here and the
+        # class comes from the registry — one mutable dict, so a backend a
+        # deployment assigns into it is seen whenever this module was imported.
+        mode, _backend = resolve_mode(params.mode)
         config = ExecConfig(
             mode=mode,
             team_id=str(observer.team_id),
@@ -470,7 +476,9 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
             timeout_s=params.timeout_s,
         )
         orchestrator_proxy = observer.proxy_ask(orchestrator, Orchestrator)
-        orchestrator_proxy.getChildrenOrCreate(actor_class, config=sandbox_config(config))
+        orchestrator_proxy.getChildrenOrCreate(
+            SANDBOX_ACTOR_CLASSES[mode], config=sandbox_config(config)
+        )
         self._announce_exec(config)
 
     def _announce_exec(self, config: ExecConfig) -> None:

@@ -44,11 +44,11 @@ from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.sandbox.actor import (
     SANDBOX_ACTOR_ROLE,
     CardMode,
-    SandboxActor,
     SandboxConfig,
     SandboxMode,
     sandbox_actor_name,
 )
+from akgentic.tool.sandbox.backend import SandboxBackend
 
 logger = logging.getLogger(__name__)
 
@@ -592,17 +592,27 @@ def wait_out_the_turn(
         time.sleep(delay)
 
 
-def resolve_mode(mode: CardMode) -> tuple[SandboxMode, type[SandboxActor]]:
+def resolve_mode(mode: CardMode) -> tuple[SandboxMode, SandboxBackend]:
     """Turn a card's requested mode into a backend, warning where the host has none.
 
     Every wiring goes through this rather than probing for itself — a second
     copy of the probe is a second place for the warning to stop firing.
 
+    **The returned instance has no consumer yet.** It is what ``#Workspace``'s
+    executor will run commands on once it owns a worker thread; until then the
+    one caller, ``_bind_sandbox``, drops it and takes the actor class from
+    ``SANDBOX_ACTOR_CLASSES`` directly — the same line ``#Workspace`` already
+    uses to resolve its sandbox. Constructing a backend is inert: nothing is
+    probed, created or started until ``start()``, so building one at wiring time
+    and discarding it costs nothing. The signature lands here rather than with
+    its consumer so the four strategies have exactly one resolution path from the
+    day they exist.
+
     Args:
         mode: What the card asked for, possibly ``"auto"``.
 
     Returns:
-        The resolved mode and its actor class.
+        The resolved mode and a fresh, unstarted backend for it.
 
     Raises:
         KeyError: If *mode* names no registered backend. Deliberately at wiring
@@ -614,7 +624,7 @@ def resolve_mode(mode: CardMode) -> tuple[SandboxMode, type[SandboxActor]]:
     # Resolved at call time through the package, so a backend registered — or a
     # probe replaced — after this module was imported is what gets consulted.
     from akgentic.tool.sandbox import (  # noqa: PLC0415
-        SANDBOX_ACTOR_CLASSES,
+        SANDBOX_BACKEND_CLASSES,
         _resolve_auto_mode,
     )
 
@@ -626,7 +636,7 @@ def resolve_mode(mode: CardMode) -> tuple[SandboxMode, type[SandboxActor]]:
             DeprecationWarning,
             stacklevel=3,
         )
-    return resolved, SANDBOX_ACTOR_CLASSES[resolved]
+    return resolved, SANDBOX_BACKEND_CLASSES[resolved]()
 
 
 def sandbox_config(config: ExecConfig) -> SandboxConfig:

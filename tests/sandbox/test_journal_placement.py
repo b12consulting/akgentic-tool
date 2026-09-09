@@ -22,10 +22,10 @@ from typing import Any
 import pytest
 
 from akgentic.tool.sandbox.actor import ALLOWED_COMMANDS, SandboxConfig, SandboxState
-from akgentic.tool.sandbox.bwrap import BwrapSandboxActor
-from akgentic.tool.sandbox.docker import DockerSandboxActor
-from akgentic.tool.sandbox.local import LocalSandboxActor
-from akgentic.tool.sandbox.seatbelt import SeatbeltSandboxActor
+from akgentic.tool.sandbox.bwrap import BwrapBackend, BwrapSandboxActor
+from akgentic.tool.sandbox.docker import DockerBackend, DockerSandboxActor
+from akgentic.tool.sandbox.local import LocalBackend, LocalSandboxActor
+from akgentic.tool.sandbox.seatbelt import SeatbeltBackend, SeatbeltSandboxActor
 from akgentic.tool.workspace.journal import git_dir_for
 
 
@@ -38,6 +38,30 @@ def tree_with_journal(tmp_path: Path) -> Path:
     journal.mkdir()
     (journal / "HEAD").write_text("ref: refs/heads/master\n", encoding="utf-8")
     return root
+
+
+#: The strategy each actor delegates to. The argv is built inside the backend
+#: now, so the harness has to give the actor the one ``_start_sandbox`` would.
+BACKEND_FOR: dict[type[Any], type[Any]] = {
+    BwrapSandboxActor: BwrapBackend,
+    LocalSandboxActor: LocalBackend,
+    SeatbeltSandboxActor: SeatbeltBackend,
+    DockerSandboxActor: DockerBackend,
+}
+
+
+def fake_popen(seen: list[list[str]]) -> Any:
+    """Return a ``Popen`` stand-in that records its argv into *seen*."""
+
+    def spawn(argv: list[str], *args: Any, **kwargs: Any) -> Any:
+        seen.append(list(argv))
+        return SimpleNamespace(
+            communicate=lambda timeout=None: ("", ""),
+            returncode=0,
+            kill=lambda: None,
+        )
+
+    return spawn
 
 
 def captured_argv(
@@ -55,15 +79,18 @@ def captured_argv(
     actor.state.observer(actor)
     actor.state.workspace_path = root
     actor.state.container_name = "sandbox-team-1"
+    backend = BACKEND_FOR[actor_class]()
+    backend.workspace_path = root
+    backend.container_name = "sandbox-team-1"
+    actor._backend = backend
 
     seen: list[list[str]] = []
 
-    def fake_run(argv: list[str], *args: Any, **kwargs: Any) -> Any:
-        seen.append(list(argv))
-        return SimpleNamespace(stdout="", stderr="", returncode=0)
-
-    module = actor_class.__module__.rsplit(".", 1)[-1]
-    monkeypatch.setattr(f"akgentic.tool.sandbox.{module}.subprocess.run", fake_run)
+    # One target for all four: the argv is built per backend but spawned in the
+    # one place ``ProcessBackend`` starts a process from.
+    monkeypatch.setattr(
+        "akgentic.tool.sandbox.backend.subprocess.Popen", fake_popen(seen)
+    )
     actor._exec("echo hi", "", 1.0)
     assert len(seen) == 1
     return seen[0]
@@ -97,7 +124,7 @@ class TestTheJournalIsOutsideEveryMount:
         monkeypatch.setattr(
             "akgentic.tool.sandbox.docker.shutil.which", lambda _cmd: "/usr/bin/docker"
         )
-        monkeypatch.setattr(DockerSandboxActor, "_ensure_image", lambda _self: None)
+        monkeypatch.setattr(DockerBackend, "_ensure_image", lambda _self: None)
 
         seen: list[list[str]] = []
 
@@ -127,6 +154,9 @@ class TestTheJournalIsOutsideEveryMount:
         actor.state = SandboxState()
         actor.state.observer(actor)
         actor.state.workspace_path = tree_with_journal
+        backend = SeatbeltBackend()
+        backend.workspace_path = tree_with_journal
+        actor._backend = backend
 
         import tempfile  # noqa: PLC0415
 
@@ -147,8 +177,10 @@ class TestTheJournalIsOutsideEveryMount:
             "akgentic.tool.sandbox.seatbelt.tempfile.NamedTemporaryFile", capturing_named
         )
         monkeypatch.setattr(
-            "akgentic.tool.sandbox.seatbelt.subprocess.run",
-            lambda *a, **k: SimpleNamespace(stdout="", stderr="", returncode=0),
+            "akgentic.tool.sandbox.backend.subprocess.Popen",
+            lambda *a, **k: SimpleNamespace(
+                communicate=lambda timeout=None: ("", ""), returncode=0, kill=lambda: None
+            ),
         )
         actor._exec("echo hi", "", 1.0)
 

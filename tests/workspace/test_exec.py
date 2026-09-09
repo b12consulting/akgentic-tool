@@ -37,10 +37,10 @@ from akgentic.tool.sandbox.actor import (
     SandboxState,
     sandbox_actor_name,
 )
-from akgentic.tool.sandbox.bwrap import BwrapSandboxActor
-from akgentic.tool.sandbox.docker import DockerSandboxActor
-from akgentic.tool.sandbox.local import LocalSandboxActor
-from akgentic.tool.sandbox.seatbelt import SeatbeltSandboxActor
+from akgentic.tool.sandbox.bwrap import BwrapBackend, BwrapSandboxActor
+from akgentic.tool.sandbox.docker import DockerBackend, DockerSandboxActor
+from akgentic.tool.sandbox.local import LocalBackend, LocalSandboxActor
+from akgentic.tool.sandbox.seatbelt import SeatbeltBackend, SeatbeltSandboxActor
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
 from akgentic.tool.workspace.edit import EditItem
 from akgentic.tool.workspace.execution import (
@@ -65,6 +65,7 @@ from akgentic.tool.workspace.execution import (
     new_run_id,
     poll_attempts_within,
     queued,
+    sandbox_config,
     timed_out,
 )
 from akgentic.tool.workspace.journal import MAX_COMMIT_BODY_CHARS
@@ -112,6 +113,18 @@ REAL_BACKENDS: dict[str, type[SandboxActor]] = {
 
 ``SANDBOX_ACTOR_CLASSES`` is the injection window this suite writes a fake into,
 so a budget test that read the registry would be asserting about the fake.
+"""
+
+REAL_STRATEGIES: dict[str, type[Any]] = {
+    "local": LocalBackend,
+    "bwrap": BwrapBackend,
+    "seatbelt": SeatbeltBackend,
+    "docker": DockerBackend,
+}
+"""The strategy each of those actors delegates to, in the same order.
+
+Named directly for the same reason: ``SANDBOX_BACKEND_CLASSES`` is the other
+injection window, so reading it here would assert about whatever a test put in.
 """
 
 # ---------------------------------------------------------------------------
@@ -274,6 +287,37 @@ class TestTheCapability:
             if config.name.startswith(SANDBOX_ACTOR_NAME)
         ]
         assert set(created) == {sandbox_actor_name(WORKSPACE_PATH)}
+
+    def test_the_card_binds_the_actor_from_the_registry_with_the_sandbox_config(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        sandbox_script: SandboxScript,
+    ) -> None:
+        # AC14. ``resolve_mode`` now hands back a strategy instance, which the
+        # card drops until ``#Workspace`` owns a worker thread — so the class it
+        # binds has to keep coming from ``SANDBOX_ACTOR_CLASSES`` and the config
+        # has to stay the one ``sandbox_config`` builds. A card that bound the
+        # strategy, or built its own config, would create a second actor per run
+        # or point the reused one at the wrong tree.
+        _card, observer = exec_card_for(orchestrator_proxy)
+
+        bound = [
+            (cls, config)
+            for cls, config in orchestrator_proxy.create_calls
+            if config.name.startswith(SANDBOX_ACTOR_NAME)
+        ]
+        assert len(bound) == 1
+        actor_class, config = bound[0]
+        assert actor_class is SANDBOX_ACTOR_CLASSES["local"]
+        assert config == sandbox_config(
+            ExecConfig(
+                mode="local",
+                team_id=str(observer.team_id),
+                workspace_path=WORKSPACE_PATH,
+                timeout_s=DEFAULT_EXEC_TIMEOUT_S,
+            )
+        )
 
     def test_off_the_tool_channel_creates_no_sandbox_actor_and_probes_nothing(
         self,
@@ -1008,6 +1052,38 @@ class TestCollectingARun:
 # ---------------------------------------------------------------------------
 
 
+def started_strategy(mode: str, workspace_path: Path) -> Any:
+    """The strategy an actor of *mode* would hold after ``_start_sandbox``.
+
+    Assembled rather than started: no bwrap, no sandbox-exec and no docker daemon
+    has to be present for a budget to be asserted.
+    """
+    backend = REAL_STRATEGIES[mode]()
+    backend.workspace_path = workspace_path
+    backend.container_name = "sandbox-t1"
+    return backend
+
+
+def capture_budget(monkeypatch: pytest.MonkeyPatch) -> list[float | None]:
+    """Record the budget each backend hands the process, and return the list.
+
+    One patch target for all four: the budget is now an argument to
+    ``communicate()`` inside ``ProcessBackend._run``, which is the single place a
+    process is started from. Captured rather than measured — nothing slow runs.
+    """
+    captured: list[float | None] = []
+
+    def fake_popen(*args: Any, **kwargs: Any) -> Any:
+        return SimpleNamespace(
+            communicate=lambda timeout=None: (captured.append(timeout), ("", ""))[1],
+            returncode=0,
+            kill=lambda: None,
+        )
+
+    monkeypatch.setattr("akgentic.tool.sandbox.backend.subprocess.Popen", fake_popen)
+    return captured
+
+
 class TestTheBudgets:
     def test_the_run_budget_reaches_the_backend(
         self,
@@ -1038,14 +1114,9 @@ class TestTheBudgets:
         actor.state.observer(actor)
         actor.state.workspace_path = tmp_path
         actor.state.container_name = "sandbox-t1"
+        actor._backend = started_strategy(mode, tmp_path)
 
-        captured: list[float | None] = []
-
-        def fake_run(*args: Any, **kwargs: Any) -> Any:
-            captured.append(kwargs.get("timeout"))
-            return SimpleNamespace(stdout="", stderr="", returncode=0)
-
-        monkeypatch.setattr(f"akgentic.tool.sandbox.{mode}.subprocess.run", fake_run)
+        captured = capture_budget(monkeypatch)
         actor._exec("echo hi", "", 3.25)
 
         assert captured == [3.25]
@@ -1067,14 +1138,9 @@ class TestTheBudgets:
         actor.state.observer(actor)
         actor.state.workspace_path = tmp_path
         actor.state.container_name = "sandbox-t1"
+        actor._backend = started_strategy(mode, tmp_path)
 
-        captured: list[float | None] = []
-
-        def fake_run(*args: Any, **kwargs: Any) -> Any:
-            captured.append(kwargs.get("timeout"))
-            return SimpleNamespace(stdout="", stderr="", returncode=0)
-
-        monkeypatch.setattr(f"akgentic.tool.sandbox.{mode}.subprocess.run", fake_run)
+        captured = capture_budget(monkeypatch)
         actor._exec("echo hi", "", None)
 
         assert captured == [DEFAULT_BACKEND_TIMEOUT_S]

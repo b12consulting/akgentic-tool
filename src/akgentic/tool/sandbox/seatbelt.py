@@ -1,18 +1,27 @@
-"""SeatbeltSandboxActor — macOS Apple Seatbelt sandbox for policy-based filesystem isolation."""
+"""SeatbeltBackend — macOS Apple Seatbelt sandbox for policy-based filesystem isolation.
+
+``SeatbeltSandboxActor`` is kept beside it as a thin delegator: it owns the
+actor lifecycle and the state it publishes, and nothing else.
+"""
 
 from __future__ import annotations
 
 import logging
 import os
 import platform
-import shlex
 import shutil
 import subprocess
 import tempfile
 import warnings
 from pathlib import Path
 
-from akgentic.tool.sandbox.actor import DEFAULT_BACKEND_TIMEOUT_S, ExecResult, SandboxActor
+from akgentic.tool.sandbox.actor import SandboxActor
+from akgentic.tool.sandbox.backend import (
+    DEFAULT_BACKEND_TIMEOUT_S,
+    ExecResult,
+    ProcessBackend,
+    validate_command,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,30 +49,36 @@ _SEATBELT_POLICY: str = """\
 """
 
 
-class SeatbeltSandboxActor(SandboxActor):
-    """macOS-only sandbox actor that uses Apple Seatbelt (``sandbox-exec``) for isolation.
+class SeatbeltBackend(ProcessBackend):
+    """macOS-only sandbox that uses Apple Seatbelt (``sandbox-exec``) for isolation.
 
     Requires ``sandbox-exec`` to be on PATH — it ships with macOS but is
     deprecated since macOS 10.15 Catalina and may be removed in a future
-    macOS release. This actor is intended for macOS developer workstations
+    macOS release. This backend is intended for macOS developer workstations
     only.
 
-    Each ``_exec()`` invocation writes a write-restricted SBPL policy to a
+    Each ``exec()`` invocation writes a write-restricted SBPL policy to a
     temporary ``.sb`` file that allows all reads but restricts writes to the
     workspace directory and tmpdir. Network access is allowed. The temp file
     is deleted in a ``finally`` block after the subprocess completes.
 
-    Unlike ``BwrapSandboxActor`` and ``LocalSandboxActor``, no ``preexec_fn``
+    Unlike :class:`~akgentic.tool.sandbox.bwrap.BwrapBackend` and
+    :class:`~akgentic.tool.sandbox.local.LocalBackend`, no ``preexec_fn``
     or env-stripping is applied: ``resource.setrlimit`` behaves differently on
     macOS and the Seatbelt policy handles the primary threat model.
     """
 
-    def _start_sandbox(self) -> None:
+    def __init__(self) -> None:
+        super().__init__()
+        self.workspace_path: Path | None = None
+        """The resolved host directory, set by :meth:`start`."""
+
+    def start(self, workspace_path: str) -> None:
         """Start the Seatbelt sandbox.
 
         Checks that ``sandbox-exec`` is available on PATH **and** that
         ``sandbox_apply`` actually works at runtime (macOS 15+ blocks it),
-        then joins the card's already-resolved ``config.workspace_path`` to
+        then joins the card's already-resolved *workspace_path* to
         ``AKGENTIC_WORKSPACES_ROOT`` (defaulting to ``./workspaces``) and creates
         the directory if it does not yet exist — deriving nothing itself. Emits a
         ``DeprecationWarning`` noting that ``sandbox-exec`` is deprecated
@@ -93,14 +108,10 @@ class SeatbeltSandboxActor(SandboxActor):
                     "Use mode='docker' or mode='local' instead."
                 )
         base = os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
-        workspace_path = Path(base) / self.config.workspace_path
-        workspace_path.mkdir(parents=True, exist_ok=True)
-        self.state.workspace_path = workspace_path.resolve()
-        self.state.notify_state_change()
-        logger.debug(
-            "SeatbeltSandboxActor started: workspace=%s",
-            self.state.workspace_path,
-        )
+        resolved = Path(base) / workspace_path
+        resolved.mkdir(parents=True, exist_ok=True)
+        self.workspace_path = resolved.resolve()
+        logger.debug("SeatbeltBackend started: workspace=%s", self.workspace_path)
         warnings.warn(
             "sandbox-exec is deprecated since macOS 10.15 Catalina and may be removed "
             "in a future macOS release. SeatbeltSandboxActor is for macOS developer "
@@ -109,15 +120,7 @@ class SeatbeltSandboxActor(SandboxActor):
             stacklevel=2,
         )
 
-    def _stop_sandbox(self) -> None:
-        """Stop the Seatbelt sandbox.
-
-        No-op: ``sandbox-exec`` processes do not persist between ``_exec()``
-        calls — each invocation spawns and terminates its own sandboxed process.
-        """
-        logger.debug("SeatbeltSandboxActor stopped.")
-
-    def _exec(self, cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
+    def exec(self, cmd: str, cwd: str = "", timeout: float | None = None) -> ExecResult:
         """Execute a command inside an Apple Seatbelt policy sandbox.
 
         Writes the deny-by-default SBPL policy to a temporary ``.sb`` file
@@ -134,7 +137,7 @@ class SeatbeltSandboxActor(SandboxActor):
         would undo that with no other visible effect.
 
         Args:
-            cmd: Full command string to execute (pre-validated by ``exec()``).
+            cmd: Full command string to execute.
             cwd: Working directory for the sandboxed process. Falls back to the
                  workspace path when empty or not provided.
             timeout: Wall-clock budget in seconds, or ``None`` for the default.
@@ -142,31 +145,22 @@ class SeatbeltSandboxActor(SandboxActor):
         Returns:
             ExecResult with stdout, stderr, and exit_code from the process.
         """
-        assert self.state.workspace_path is not None
-        ws = self.state.workspace_path
+        assert self.workspace_path is not None
+        ws = self.workspace_path
         effective_cwd = str(ws / cwd) if cwd else str(ws)
-        logger.debug("SeatbeltSandboxActor exec: cmd=%r cwd=%s", cmd, effective_cwd)
+        logger.debug("SeatbeltBackend exec: cmd=%r cwd=%s", cmd, effective_cwd)
         tmpdir = tempfile.gettempdir()
-        policy = _SEATBELT_POLICY.replace(
-            "{workspace}", str(self.state.workspace_path)
-        ).replace("{tmpdir}", tmpdir)
+        policy = _SEATBELT_POLICY.replace("{workspace}", str(ws)).replace("{tmpdir}", tmpdir)
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".sb", delete=False
         ) as policy_file:
             policy_file.write(policy)
             policy_path = policy_file.name
         try:
-            result = subprocess.run(
-                ["sandbox-exec", "-f", policy_path] + shlex.split(cmd),
-                capture_output=True,
-                text=True,
-                timeout=DEFAULT_BACKEND_TIMEOUT_S if timeout is None else timeout,
+            return self._run(
+                ["sandbox-exec", "-f", policy_path] + validate_command(cmd),
                 cwd=effective_cwd,
-            )
-            return ExecResult(
-                stdout=result.stdout,
-                stderr=result.stderr,
-                exit_code=result.returncode,
+                timeout=DEFAULT_BACKEND_TIMEOUT_S if timeout is None else timeout,
             )
         except FileNotFoundError:
             return ExecResult(
@@ -176,3 +170,30 @@ class SeatbeltSandboxActor(SandboxActor):
             )
         finally:
             os.unlink(policy_path)
+
+    def _release(self) -> None:
+        """Nothing to release: a ``sandbox-exec`` process lives only as long as its run."""
+        logger.debug("SeatbeltBackend stopped.")
+
+
+class SeatbeltSandboxActor(SandboxActor):
+    """macOS-only sandbox actor that uses Apple Seatbelt (``sandbox-exec``) for isolation.
+
+    A thin delegator over :class:`SeatbeltBackend`, which holds the implementation.
+    """
+
+    _backend: SeatbeltBackend | None = None
+
+    def _start_sandbox(self) -> None:
+        self._backend = SeatbeltBackend()
+        self._backend.start(self.config.workspace_path)
+        self.state.workspace_path = self._backend.workspace_path
+        self.state.notify_state_change()
+
+    def _stop_sandbox(self) -> None:
+        if self._backend is not None:
+            self._backend.stop()
+
+    def _exec(self, cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
+        assert self._backend is not None
+        return self._backend.exec(cmd, cwd, timeout)

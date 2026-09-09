@@ -21,7 +21,22 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from akgentic.tool.sandbox.actor import ExecResult, SandboxConfig, SandboxState
-from akgentic.tool.sandbox.bwrap import BwrapSandboxActor
+from akgentic.tool.sandbox.bwrap import BwrapBackend, BwrapSandboxActor
+
+# The exec path runs through ``ProcessBackend._run``, so every exec-path mock
+# targets ``backend.subprocess.Popen``. The start path is unchanged and still
+# lives in ``bwrap.py``.
+POPEN = "akgentic.tool.sandbox.backend.subprocess.Popen"
+
+
+def popen_mock(
+    mock_popen: MagicMock, stdout: str = "", stderr: str = "", returncode: int = 0
+) -> MagicMock:
+    """Shape *mock_popen* like a ``Popen``: ``communicate()`` pair plus ``returncode``."""
+    proc = mock_popen.return_value
+    proc.communicate.return_value = (stdout, stderr)
+    proc.returncode = returncode
+    return proc
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -44,6 +59,12 @@ def actor(tmp_path: Path) -> BwrapSandboxActor:
     )
     a.state = SandboxState()
     a.state.workspace_path = tmp_path
+    # The actor holds no execution path of its own, so it needs the backend
+    # ``_start_sandbox`` would have built — pointed at *tmp_path* rather than at
+    # a directory derived from ``AKGENTIC_WORKSPACES_ROOT``.
+    backend = BwrapBackend()
+    backend.workspace_path = tmp_path
+    a._backend = backend
     return a
 
 
@@ -197,8 +218,13 @@ def test_start_sandbox_idempotent_existing_workspace(
 
 
 def test_stop_sandbox_is_noop(actor: BwrapSandboxActor) -> None:
-    """AC3: _stop_sandbox() returns None and makes no subprocess calls."""
-    with patch("akgentic.tool.sandbox.bwrap.subprocess.run") as mock_run:
+    """AC3: _stop_sandbox() returns None and spawns no process.
+
+    ``bwrap.py`` no longer imports ``subprocess`` at all — the exec path moved to
+    ``ProcessBackend`` — so the same fact is asserted where a process could now
+    actually be spawned from.
+    """
+    with patch(POPEN) as mock_run:
         result = actor._stop_sandbox()
 
     assert result is None
@@ -212,8 +238,8 @@ def test_stop_sandbox_is_noop(actor: BwrapSandboxActor) -> None:
 
 def test_exec_builds_correct_bwrap_command(actor: BwrapSandboxActor) -> None:
     """AC4: _exec() passes a bwrap command list with all required flags to subprocess.run."""
-    with patch("akgentic.tool.sandbox.bwrap.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+    with patch(POPEN) as mock_run:
+        popen_mock(mock_run)
         actor._exec("ls .", "")
 
         cmd_list: list[str] = mock_run.call_args[0][0]  # first positional arg
@@ -241,8 +267,8 @@ def test_exec_builds_correct_bwrap_command(actor: BwrapSandboxActor) -> None:
 
 def test_exec_cwd_empty_uses_workspace_root(actor: BwrapSandboxActor) -> None:
     """AC4: When cwd='', --chdir is followed by '/workspace'."""
-    with patch("akgentic.tool.sandbox.bwrap.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+    with patch(POPEN) as mock_run:
+        popen_mock(mock_run)
         actor._exec("ls .", "")
 
         cmd_list: list[str] = mock_run.call_args[0][0]
@@ -253,8 +279,8 @@ def test_exec_cwd_empty_uses_workspace_root(actor: BwrapSandboxActor) -> None:
 
 def test_exec_cwd_nonempty_appends_to_workspace(actor: BwrapSandboxActor) -> None:
     """AC4: When cwd='subdir', --chdir is followed by '/workspace/subdir'."""
-    with patch("akgentic.tool.sandbox.bwrap.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+    with patch(POPEN) as mock_run:
+        popen_mock(mock_run)
         actor._exec("ls .", "subdir")
 
         cmd_list: list[str] = mock_run.call_args[0][0]
@@ -270,8 +296,8 @@ def test_exec_cwd_nonempty_appends_to_workspace(actor: BwrapSandboxActor) -> Non
 
 def test_exec_passes_preexec_fn_to_subprocess(actor: BwrapSandboxActor) -> None:
     """AC5: _exec() passes a non-None callable preexec_fn to subprocess.run."""
-    with patch("akgentic.tool.sandbox.bwrap.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+    with patch(POPEN) as mock_run:
+        popen_mock(mock_run)
         actor._exec("ls .", "")
 
         call_kwargs = mock_run.call_args
@@ -283,14 +309,16 @@ def test_exec_passes_preexec_fn_to_subprocess(actor: BwrapSandboxActor) -> None:
 
 def test_exec_strips_env_to_minimal_path(actor: BwrapSandboxActor) -> None:
     """AC5: _exec() passes minimal PATH-only env dict to subprocess.run."""
-    with patch("akgentic.tool.sandbox.bwrap.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+    with patch(POPEN) as mock_run:
+        popen_mock(mock_run)
         actor._exec("ls .", "")
 
         call_kwargs = mock_run.call_args
     assert call_kwargs is not None
     env = call_kwargs.kwargs.get("env")
     assert env == {"PATH": "/usr/bin:/bin:/usr/local/bin"}
+    # The budget is an argument to communicate(), not to the constructor.
+    assert mock_run.return_value.communicate.call_args.kwargs["timeout"] == 30
 
 
 # ---------------------------------------------------------------------------
@@ -300,8 +328,8 @@ def test_exec_strips_env_to_minimal_path(actor: BwrapSandboxActor) -> None:
 
 def test_exec_returns_exec_result(actor: BwrapSandboxActor) -> None:
     """AC4: _exec() returns ExecResult with stdout, stderr, exit_code from subprocess.run."""
-    with patch("akgentic.tool.sandbox.bwrap.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(stdout="out", stderr="err", returncode=0)
+    with patch(POPEN) as mock_run:
+        popen_mock(mock_run, stdout="out", stderr="err")
         result = actor._exec("ls .", "")
 
     assert isinstance(result, ExecResult)
@@ -312,8 +340,8 @@ def test_exec_returns_exec_result(actor: BwrapSandboxActor) -> None:
 
 def test_exec_returns_exec_result_nonzero_exit(actor: BwrapSandboxActor) -> None:
     """AC4: _exec() correctly captures non-zero exit codes."""
-    with patch("akgentic.tool.sandbox.bwrap.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(stdout="", stderr="error output", returncode=1)
+    with patch(POPEN) as mock_run:
+        popen_mock(mock_run, stderr="error output", returncode=1)
         result = actor._exec("ls .", "")
 
     assert result.exit_code == 1
@@ -333,8 +361,8 @@ def test_exec_keeps_a_quoted_argument_whole_after_the_bwrap_prefix(
     The trap this guards is a fix landing in ``local.py`` only: bwrap builds its
     own argv, so it has its own ``split`` call to forget.
     """
-    with patch("akgentic.tool.sandbox.bwrap.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+    with patch(POPEN) as mock_run:
+        popen_mock(mock_run)
         actor._exec('echo "hello world"', "")
 
         cmd_list: list[str] = mock_run.call_args[0][0]

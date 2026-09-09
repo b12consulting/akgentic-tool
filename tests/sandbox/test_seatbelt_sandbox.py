@@ -27,7 +27,21 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from akgentic.tool.sandbox.actor import ExecResult, SandboxConfig, SandboxState
-from akgentic.tool.sandbox.seatbelt import SeatbeltSandboxActor
+from akgentic.tool.sandbox.seatbelt import SeatbeltBackend, SeatbeltSandboxActor
+
+# The exec path runs through ``ProcessBackend._run``. The start-path probe
+# (``sandbox_apply``) still runs ``seatbelt.subprocess.run`` and is untouched.
+POPEN = "akgentic.tool.sandbox.backend.subprocess.Popen"
+
+
+def popen_mock(
+    mock_popen: MagicMock, stdout: str = "", stderr: str = "", returncode: int = 0
+) -> MagicMock:
+    """Shape *mock_popen* like a ``Popen``: ``communicate()`` pair plus ``returncode``."""
+    proc = mock_popen.return_value
+    proc.communicate.return_value = (stdout, stderr)
+    proc.returncode = returncode
+    return proc
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -51,6 +65,12 @@ def actor(tmp_path: Path) -> SeatbeltSandboxActor:
     )
     a.state = SandboxState()
     a.state.workspace_path = tmp_path
+    # The actor holds no execution path of its own, so it needs the backend
+    # ``_start_sandbox`` would have built — pointed at *tmp_path* rather than at
+    # a directory derived from ``AKGENTIC_WORKSPACES_ROOT``.
+    backend = SeatbeltBackend()
+    backend.workspace_path = tmp_path
+    a._backend = backend
     return a
 
 
@@ -204,11 +224,20 @@ def test_start_sandbox_idempotent_existing_workspace(
 
 
 def test_stop_sandbox_is_noop(actor: SeatbeltSandboxActor) -> None:
-    """AC3: _stop_sandbox() completes without error and makes no subprocess calls."""
-    with patch("akgentic.tool.sandbox.seatbelt.subprocess.run") as mock_run:
+    """AC3: _stop_sandbox() completes without error and makes no subprocess calls.
+
+    Both targets are asserted: ``seatbelt.subprocess.run`` still exists for the
+    start-path probe, and ``backend.subprocess.Popen`` is where the exec path
+    now spawns from.
+    """
+    with (
+        patch("akgentic.tool.sandbox.seatbelt.subprocess.run") as mock_run,
+        patch(POPEN) as mock_popen,
+    ):
         actor._stop_sandbox()
 
     mock_run.assert_not_called()
+    mock_popen.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -218,8 +247,8 @@ def test_stop_sandbox_is_noop(actor: SeatbeltSandboxActor) -> None:
 
 def test_exec_writes_policy_and_calls_sandbox_exec(actor: SeatbeltSandboxActor) -> None:
     """AC4: _exec() calls subprocess.run with sandbox-exec -f <policy.sb> + cmd."""
-    with patch("akgentic.tool.sandbox.seatbelt.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(stdout="out", stderr="", returncode=0)
+    with patch(POPEN) as mock_run:
+        popen_mock(mock_run, stdout="out")
         with patch("akgentic.tool.sandbox.seatbelt.os.unlink"):
             actor._exec("ls .", "")
         cmd_list: list[str] = mock_run.call_args[0][0]
@@ -239,8 +268,8 @@ def test_exec_empty_cwd_defaults_to_workspace(
     actor: SeatbeltSandboxActor, tmp_path: Path
 ) -> None:
     """_exec() passes workspace_path as cwd when cwd is empty string."""
-    with patch("akgentic.tool.sandbox.seatbelt.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+    with patch(POPEN) as mock_run:
+        popen_mock(mock_run)
         with patch("akgentic.tool.sandbox.seatbelt.os.unlink"):
             actor._exec("ls .", "")
     assert mock_run.call_args.kwargs["cwd"] == str(tmp_path)
@@ -250,8 +279,8 @@ def test_exec_explicit_cwd_is_resolved_relative_to_workspace(
     actor: SeatbeltSandboxActor, tmp_path: Path
 ) -> None:
     """_exec() resolves cwd as a subdirectory of the workspace path."""
-    with patch("akgentic.tool.sandbox.seatbelt.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+    with patch(POPEN) as mock_run:
+        popen_mock(mock_run)
         with patch("akgentic.tool.sandbox.seatbelt.os.unlink"):
             actor._exec("ls .", "subdir")
     assert mock_run.call_args.kwargs["cwd"] == str(tmp_path / "subdir")
@@ -261,7 +290,7 @@ def test_exec_missing_cwd_returns_error_result(
     actor: SeatbeltSandboxActor, tmp_path: Path
 ) -> None:
     """_exec() returns ExecResult with exit_code=1 when cwd does not exist."""
-    with patch("akgentic.tool.sandbox.seatbelt.subprocess.run") as mock_run:
+    with patch(POPEN) as mock_run:
         mock_run.side_effect = FileNotFoundError(
             2, "No such file or directory", str(tmp_path / "nope")
         )
@@ -300,10 +329,10 @@ def _capture_policy(actor: SeatbeltSandboxActor) -> str:
 
     with (
         patch("akgentic.tool.sandbox.seatbelt.tempfile.NamedTemporaryFile", side_effect=fake_ntf),
-        patch("akgentic.tool.sandbox.seatbelt.subprocess.run") as mock_run,
+        patch(POPEN) as mock_run,
         patch("akgentic.tool.sandbox.seatbelt.os.unlink"),
     ):
-        mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+        popen_mock(mock_run)
         actor._exec("ls .", "")
 
     policy_path = policy_path_holder[0]
@@ -375,8 +404,8 @@ def test_exec_policy_allows_workspace_write(
 
 def test_exec_deletes_tempfile_in_finally(actor: SeatbeltSandboxActor) -> None:
     """AC4: _exec() deletes the temp .sb policy file in a finally block."""
-    with patch("akgentic.tool.sandbox.seatbelt.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+    with patch(POPEN) as mock_run:
+        popen_mock(mock_run)
         with patch("akgentic.tool.sandbox.seatbelt.os.unlink") as mock_unlink:
             actor._exec("ls .", "")
             mock_unlink.assert_called_once()
@@ -389,8 +418,8 @@ def test_exec_deletes_tempfile_in_finally(actor: SeatbeltSandboxActor) -> None:
 
 def test_exec_returns_exec_result(actor: SeatbeltSandboxActor) -> None:
     """AC4: _exec() returns ExecResult with stdout, stderr, exit_code from subprocess.run."""
-    with patch("akgentic.tool.sandbox.seatbelt.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(stdout="out", stderr="err", returncode=0)
+    with patch(POPEN) as mock_run:
+        popen_mock(mock_run, stdout="out", stderr="err")
         with patch("akgentic.tool.sandbox.seatbelt.os.unlink"):
             result = actor._exec("ls .", "")
 
@@ -406,14 +435,22 @@ def test_exec_returns_exec_result(actor: SeatbeltSandboxActor) -> None:
 
 
 def test_exec_no_preexec_fn_passed(actor: SeatbeltSandboxActor) -> None:
-    """AC6: _exec() does NOT pass preexec_fn to subprocess.run (macOS: no resource.setrlimit)."""
-    with patch("akgentic.tool.sandbox.seatbelt.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+    """AC6: _exec() applies no preexec_fn (macOS: no resource.setrlimit).
+
+    ``ProcessBackend._run`` always passes the keyword through to ``Popen``, so
+    the assertion is on its **value** being ``None`` rather than on the key being
+    absent. ``preexec_fn=None`` is what "no preexec_fn" means to ``Popen`` — the
+    same fact, at the one place the process is now started from.
+    """
+    with patch(POPEN) as mock_run:
+        popen_mock(mock_run)
         with patch("akgentic.tool.sandbox.seatbelt.os.unlink"):
             actor._exec("ls .", "")
 
     assert mock_run.call_args is not None
-    assert "preexec_fn" not in mock_run.call_args.kwargs
+    assert mock_run.call_args.kwargs["preexec_fn"] is None
+    # And the budget, which moved to communicate() with the call shape.
+    assert mock_run.return_value.communicate.call_args.kwargs["timeout"] == 30
 
 
 # ---------------------------------------------------------------------------
@@ -425,8 +462,8 @@ def test_exec_keeps_a_quoted_argument_whole_after_the_policy_flags(
     actor: SeatbeltSandboxActor,
 ) -> None:
     """AC1: shlex tokens follow ``sandbox-exec -f <policy>``, which is unchanged."""
-    with patch("akgentic.tool.sandbox.seatbelt.subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
+    with patch(POPEN) as mock_run:
+        popen_mock(mock_run)
         actor._exec('echo "hello world"', "")
 
         argv: list[str] = mock_run.call_args[0][0]
