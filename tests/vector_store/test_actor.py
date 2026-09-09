@@ -292,6 +292,23 @@ class TestCreateCollection:
         assert actor.state.collection_configs["c"]["extra_field"] == "sentinel"
         assert actor.state.collection_configs["c"]["params"] == {}
 
+    def test_the_record_is_a_plain_dict_that_survives_the_state_round_trip(self) -> None:
+        """The serializer's class tag is stripped, so the state's own copy validates.
+
+        ``Agent.notify_state_change`` re-validates the dumped state; a tagged record
+        would be re-hydrated into a model and refused by the per-collection dict.
+        """
+        actor = _make_actor()
+        actor._backend = _mock_backend()
+
+        actor.create_collection("c", VectorStoreParam(embedding_model="test-embedding"))
+
+        record = actor.state.collection_configs["c"]
+        assert "__model__" not in record
+        assert type(actor.state).model_validate(actor.state.model_dump()).collection_configs == {
+            "c": record
+        }
+
     def test_notifies_state_change(self) -> None:
         """AC12: state.notify_state_change() called after creation."""
         actor = _make_actor()
