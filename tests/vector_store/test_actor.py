@@ -1287,3 +1287,97 @@ class TestRegistryRouting:
             second.restore_state.assert_called_once_with({"value": "replacement"})
         finally:
             register_backend(original, replace=True)
+
+
+# ---------------------------------------------------------------------------
+# The store refuses a collection it could not create (AC 25, 26, 28)
+# ---------------------------------------------------------------------------
+
+
+class TestCreateCollectionRefusesInsteadOfDegrading:
+    """Both ways this method used to swallow now raise.
+
+    The setup path told the truth only after 49-3's fixup made the *write* path
+    tell it; this closes the other half.
+    """
+
+    def test_an_unbuildable_backend_raises_and_writes_nothing(self) -> None:
+        from akgentic.tool.errors import RetriableError
+
+        actor = _make_actor()
+        with patch.object(actor, "_get_backend", return_value=None):
+            with pytest.raises(RetriableError) as excinfo:
+                actor.create_collection("c", VectorStoreParam(backend="inmemory"))
+
+        message = str(excinfo.value)
+        assert "c" in message
+        assert "inmemory" in message
+        # Nothing is written before the raise, so there is no partial state.
+        assert actor.state.collection_configs == {}
+        assert actor.state.collection_statuses == {}
+
+    def test_a_backend_that_raises_is_re_raised_as_retriable_with_one_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from akgentic.tool.errors import RetriableError
+
+        actor = _make_actor()
+        backend = _mock_backend()
+        backend.create_collection.side_effect = RuntimeError("schema")
+
+        with patch.object(actor, "_get_backend", return_value=backend):
+            with caplog.at_level(logging.WARNING, logger="akgentic.tool.vector_store.actor"):
+                with pytest.raises(RetriableError, match="schema"):
+                    actor.create_collection("c", VectorStoreParam(backend="inmemory"))
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert actor.state.collection_configs == {}
+        assert actor.state.collection_statuses == {}
+
+    def test_a_contradictory_dimension_is_still_a_value_error(self) -> None:
+        """``require_dimension_matches`` runs outside the try, so it is not retriable."""
+        from akgentic.tool.errors import RetriableError
+
+        actor = _make_actor()
+        param = VectorStoreParam(dimension=3072, embedding_model="text-embedding-3-small")
+
+        with pytest.raises(ValueError) as excinfo:
+            actor.create_collection("c", param)
+
+        assert not isinstance(excinfo.value, RetriableError)
+
+    def test_remove_and_search_still_degrade(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The asymmetry is the decision: a read that answers empty costs a miss."""
+        actor = _make_actor()
+
+        with patch.object(actor, "_get_backend", return_value=None):
+            with caplog.at_level(logging.WARNING, logger="akgentic.tool.vector_store.actor"):
+                actor.remove("c", ["1"])  # must not raise
+                result = actor.search("c", [0.1], 3)  # must not raise
+
+        assert result.hits == []
+        assert result.status == CollectionStatus.READY
+
+    def test_the_in_memory_extra_being_absent_degrades_at_the_consumer(self) -> None:
+        """The reason the loud option was refused.
+
+        A missing ``[vector_search]`` extra is a legitimate build failure for the
+        in-memory backend, and the package's documented contract is to degrade.
+        The store refuses; it does not fail the team's build.
+        """
+        from akgentic.tool.errors import RetriableError
+
+        actor = _make_actor()
+        with patch(
+            "akgentic.tool.vector_store.inmemory._check_vector_search_dependencies",
+            side_effect=ImportError("numpy"),
+        ):
+            # _get_or_create_backend catches the ImportError and answers None,
+            # which is the same shape as an unreachable cluster from here.
+            with pytest.raises(RetriableError):
+                actor.create_collection("c", VectorStoreParam(backend="inmemory"))
+
+        assert actor.state.collection_statuses == {}

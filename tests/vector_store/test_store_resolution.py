@@ -37,7 +37,6 @@ from akgentic.tool.vector_store.protocol import (
 from akgentic.tool.vector_store.registry import BackendSpec, register_backend, unregister_backend
 from tests.conftest import MockActorAddress
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -480,3 +479,92 @@ class TestTheThreeCardsCarryOneParam:
         )
         assert card.vector_store == VectorStoreParam()
         assert card.vector_store.tenant is None
+
+
+# ---------------------------------------------------------------------------
+# A consumer whose collection cannot be created does not bind (AC 27)
+# ---------------------------------------------------------------------------
+
+
+class _RefusingStore(_RecordingStore):
+    """A store whose ``create_collection`` refuses, as the actor now does."""
+
+    def create_collection(self, name: str, config: VectorStoreParam) -> None:
+        from akgentic.tool.errors import RetriableError
+
+        super().create_collection(name, config)
+        raise RetriableError(f"no backend could be built; collection '{name}' was not created.")
+
+
+class TestAConsumerDoesNotBindWhenTheCollectionCannotBeCreated:
+    """The store refuses; each consumer degrades with the answer it already had.
+
+    None of the three raises: the ``RuntimeError`` belongs to a *missing actor*,
+    not to a *failed collection*.
+    """
+
+    def test_plan_actor_leaves_the_slot_empty_and_logs_once(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        actor, _orch_proxy = _plan_actor(VectorStoreParam(backend="inmemory"))
+        actor._store_double = _RefusingStore()
+        refusing = actor._store_double
+
+        def _proxy_ask(
+            target: object, actor_type: type | None = None, timeout: int | None = None
+        ) -> object:
+            return _orch_proxy if target is actor.orchestrator else refusing
+
+        actor.proxy_ask = _proxy_ask  # type: ignore[method-assign,assignment]
+
+        logger_name = "akgentic.tool.planning.planning_actor"
+        with caplog.at_level(logging.WARNING, logger=logger_name):
+            actor._acquire_vs_proxy()  # must not raise
+
+        assert actor._vs_proxy is None
+        assert actor._embedder is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        # The collection *was* attempted — this is a refusal, not a skipped call.
+        assert refusing.of("create_collection")
+
+    def test_kg_actor_leaves_the_slot_empty_and_logs_once(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        actor, _orch_proxy = _kg_actor(VectorStoreParam(backend="inmemory"))
+        refusing = _RefusingStore()
+
+        def _proxy_ask(
+            target: object, actor_type: type | None = None, timeout: int | None = None
+        ) -> object:
+            return _orch_proxy if target is actor.orchestrator else refusing
+
+        actor.proxy_ask = _proxy_ask  # type: ignore[method-assign,assignment]
+
+        logger_name = "akgentic.tool.knowledge_graph.kg_actor"
+        with caplog.at_level(logging.WARNING, logger=logger_name):
+            actor._acquire_vs_proxy()  # must not raise
+
+        assert actor._vs_proxy is None
+        assert actor._embedder is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert refusing.of("create_collection")
+
+    def test_a_cluster_consumer_whose_collection_is_refused_also_degrades(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Same answer on the factory branch: refused is refused, whoever refused."""
+        actor, _orch_proxy = _plan_actor(VectorStoreParam(backend="weaviate"))
+        refusing = _RefusingStore()
+
+        logger_name = "akgentic.tool.planning.planning_actor"
+        with (
+            _factory_for("weaviate", lambda _context: refusing),
+            caplog.at_level(logging.WARNING, logger=logger_name),
+        ):
+            actor._acquire_vs_proxy()  # must not raise
+
+        assert actor._vs_proxy is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1

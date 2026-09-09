@@ -426,16 +426,36 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         - ``"inmemory"``: delegates to ``InMemoryBackend``
         - ``"weaviate"``: delegates to ``WeaviateBackend``
 
-        **A backend that could not be built raises, rather than being logged
-        and skipped.** Skipping it was the *cause* whose consequence ``add``
-        already refuses to hide: the caller's ``create_collection`` returned
-        normally, so a consumer kept its optimistic binding and every later
-        write went nowhere until ``add`` raised with no explanation of why. The
-        raise happens outside the error handling below, so it reaches the
-        caller, where each consumer's existing ``try`` around this call turns it
-        into the same one-WARNING degraded mode a cluster consumer enters when
-        its factory raises. Both paths now answer an unbuildable backend the
-        same way, and neither leaves a binding behind that cannot work.
+        **This method refuses; it does not degrade.** Both ways it used to
+        swallow now raise ``RetriableError`` — a backend that could not be built,
+        and anything the backend's own ``create_collection`` throws. Swallowing
+        was the *cause* whose consequence ``add`` already refuses to hide: the
+        caller returned normally with no collection created, kept its optimistic
+        binding, and found out at the first write. It is on the write side of the
+        read/write line this class draws, because everything downstream of a
+        collection is a write.
+
+        **Nothing is written before a raise** — no ``collection_configs`` record,
+        no ``READY`` status, no state sync — so there is no partial state to
+        unwind.
+
+        **No consumer's policy changes.** Each of the three already wraps this
+        call in a ``try`` and already has its own answer; refusing here makes
+        those answers reachable rather than replacing them. Planning and the
+        knowledge graph log one WARNING and stay keyword-only; the workspace
+        leaves retrieval off.
+
+        **Why this is not a build failure.** Failing the team's build would be
+        consistent with ``require_backend_configured``, and it is refused for one
+        concrete reason: the in-memory backend can fail to build *legitimately*.
+        ``InMemoryBackend.__init__`` raises ``ImportError`` when the
+        ``[vector_search]`` extra is absent, and degrading there is this
+        package's documented optional-extra contract. This method cannot tell
+        "the extra is not installed" from "the cluster is down", so refusing here
+        and degrading at the consumer is the only split that serves both.
+
+        ``remove`` and ``search`` keep degrading, and the asymmetry is the
+        decision: a read that answers empty costs a miss.
 
         Args:
             name: Unique collection identifier.
@@ -443,11 +463,14 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
 
         Raises:
             ValueError: When ``config.dimension`` is not the native width of a
-                known ``config.embedding_model``.
-            RetriableError: When no backend could be built for
-                ``config.backend`` — a missing dependency, a misconfiguration,
-                an unregistered name. Retriable for the same reason it is on
-                ``add``: the fault is usually the environment, not the call.
+                known ``config.embedding_model``. Raised from **outside** the
+                error handling below, so a contradictory param reaches the caller
+                as a ``ValueError`` rather than as a ``RetriableError``.
+            RetriableError: When no backend could be built for ``config.backend``
+                — a missing optional dependency, a misconfiguration, an
+                unregistered name — or when the backend's own
+                ``create_collection`` fails. Retriable for the same reason it is
+                on ``add``: the fault is usually the environment, not the call.
         """
         require_dimension_matches(config, f"{self.config.name} collection '{name}'")
         backend = self._get_backend(config.backend)
@@ -470,8 +493,9 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
             if self._persists_in_actor_state(config.backend):
                 self._sync_backend_state(config.backend, backend)
             self.state.notify_state_change()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("[%s] create_collection failed: %s", self.config.name, exc)
+            raise RetriableError(str(exc)) from exc
 
     def add(self, collection: str, entries: list[VectorEntry]) -> None:
         """Write pre-embedded entries into a collection.
