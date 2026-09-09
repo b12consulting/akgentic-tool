@@ -271,8 +271,17 @@ def _reap(pid: int) -> None:
 
 
 def _kill_once_the_grandchild_exists(target: ProcessBackend, pid_file: Path) -> None:
-    """Wait for the forked job's pid to be published, then kill *target*."""
+    """Wait for the job's pid to be published and the handle to be held, then kill *target*.
+
+    The shell writes the pid from inside the child; ``_run`` records the handle
+    on the calling thread after ``Popen`` returns. Nothing orders the two, so
+    both are waited for — a kill issued between them finds no handle, sends
+    nothing, and the spec would then run out its whole budget before going red.
+    """
     _pid_written_to(pid_file)
+    deadline = time.monotonic() + KILL_SPEC_BOUND_S
+    while target._running is None and time.monotonic() < deadline:
+        time.sleep(0.01)
     target.kill()
 
 
