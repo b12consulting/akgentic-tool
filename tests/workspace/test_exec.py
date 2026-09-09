@@ -9,23 +9,25 @@ bubblewrap or ``sandbox-exec``, and nothing sleeps for seconds.
 
 from __future__ import annotations
 
+import signal
 import subprocess
 import threading
 import time
+from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
 
 import pykka
 import pytest
-from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from pydantic import ValidationError
 
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.sandbox import SANDBOX_ACTOR_CLASSES
+from akgentic.tool.sandbox import SANDBOX_BACKEND_CLASSES
 from akgentic.tool.sandbox.actor import (
     DEFAULT_BACKEND_TIMEOUT_S,
     SANDBOX_ACTOR_NAME,
@@ -35,7 +37,6 @@ from akgentic.tool.sandbox.actor import (
     SandboxActor,
     SandboxConfig,
     SandboxState,
-    sandbox_actor_name,
 )
 from akgentic.tool.sandbox.bwrap import BwrapBackend, BwrapSandboxActor
 from akgentic.tool.sandbox.docker import DockerBackend, DockerSandboxActor
@@ -46,12 +47,12 @@ from akgentic.tool.workspace.edit import EditItem
 from akgentic.tool.workspace.execution import (
     DEFAULT_EXEC_TIMEOUT_S,
     EXEC_REPORT_MARGIN_S,
+    EXEC_SHUTDOWN_GRACE_S,
     LEASE_GRACE_S,
     MAX_EXEC_BUDGET_S,
     MAX_QUEUED_RUNS,
     MAX_TRACKED_RUNS,
     RUN_ID_CHARS,
-    SANDBOX_RESOLVE_TIMEOUT_S,
     TIMED_OUT_EXIT_CODE,
     ExecConfig,
     ExecOutcome,
@@ -65,7 +66,6 @@ from akgentic.tool.workspace.execution import (
     new_run_id,
     poll_attempts_within,
     queued,
-    sandbox_config,
     timed_out,
 )
 from akgentic.tool.workspace.journal import MAX_COMMIT_BODY_CHARS
@@ -76,10 +76,10 @@ from tests.workspace.conftest import (
     workspace_path_for,
     HANDSHAKE_TIMEOUT_S,
     WORKSPACE_PATH,
+    ExecHarness,
     FakeActorToolObserver,
+    FakeBackend,
     FakeOrchestratorProxy,
-    FakeSandboxActor,
-    SandboxHarness,
     SandboxScript,
     SilentAgent,
     exec_card_for,
@@ -138,14 +138,20 @@ def exec_setup(
     workspace_tree: Path,
     sandbox_script: SandboxScript,
     monkeypatch: pytest.MonkeyPatch,
-) -> tuple[WorkspaceTool, WorkspaceActor, SandboxHarness]:
-    """An exec-capable card, the singleton behind it, and the sandbox harness."""
+) -> Generator[tuple[WorkspaceTool, WorkspaceActor, ExecHarness], None, None]:
+    """An exec-capable card, the singleton behind it, and the exec harness.
+
+    A generator, unlike its predecessor, because the worker is now a real
+    ``ThreadPoolExecutor`` thread rather than a daemon: one left running per
+    spec would be a hundred idle threads by the end of the session.
+    """
     card, _observer = exec_card_for(orchestrator_proxy)
     _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
     assert isinstance(actor, WorkspaceActor)
-    harness = SandboxHarness(actor, orchestrator_proxy)
+    harness = ExecHarness(actor, orchestrator_proxy)
     harness.install(monkeypatch)
-    return card, actor, harness
+    yield card, actor, harness
+    harness.close()
 
 
 def start_run(
@@ -158,7 +164,7 @@ def start_run(
     return start.run_id
 
 
-def finish_run(script: SandboxScript, harness: SandboxHarness) -> None:
+def finish_run(script: SandboxScript, harness: ExecHarness) -> None:
     """Release the blocked run and wait for the sandbox to report."""
     script.gate.set()
     harness.join()
@@ -182,7 +188,7 @@ class TestTheCapability:
         assert "workspace_exec_result" not in names
 
     def test_on_registers_both_callables(
-        self, exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness]
+        self, exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness]
     ) -> None:
         card, _actor, _harness = exec_setup
         names = {tool.__name__ for tool in card.get_tools()}
@@ -229,95 +235,121 @@ class TestTheCapability:
         created = [config.name for _cls, config in orchestrator_proxy.create_calls]
         assert not any(name.startswith(SANDBOX_ACTOR_NAME) for name in created)
 
-    def test_on_creates_the_sandbox_actor(
+    def test_on_builds_a_runner_and_still_creates_no_sandbox_actor(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         orchestrator_proxy: FakeOrchestratorProxy,
     ) -> None:
-        created = [config.name for _cls, config in orchestrator_proxy.create_calls]
-        assert sandbox_actor_name(WORKSPACE_PATH) in created
+        # What "on" buys is a backend on #Workspace itself, anchored to this
+        # card's tree — and no second actor. An actor nothing uses would still
+        # provision at start: on the docker backend, a container nobody execs in.
+        _card, actor, _harness = exec_setup
 
-    def test_two_workspaces_in_one_team_get_two_sandbox_actors(
+        assert actor._runner is not None
+        assert actor._runner.workspace_path == WORKSPACE_PATH
+        assert isinstance(actor._runner.backend, FakeBackend)
+        created = [config.name for _cls, config in orchestrator_proxy.create_calls]
+        assert not any(name.startswith(SANDBOX_ACTOR_NAME) for name in created)
+
+    def test_two_workspaces_in_one_team_get_two_runners_on_their_own_trees(
         self,
         orchestrator_proxy: FakeOrchestratorProxy,
         workspaces_root: Path,
         sandbox_script: SandboxScript,
     ) -> None:
-        # getChildrenOrCreate resolves on config.name alone, so a constant name
-        # handed the second card the FIRST card's actor — whose directory is the
-        # first card's tree. The second agent's commands then ran in tree `a`
-        # while its own #Workspace-b gated, discovered and committed tree `b`:
-        # `a` mutated entirely outside the gate, nothing raised, nothing logged.
+        # The hazard the per-workspace naming removed is still the hazard: a
+        # second card that ended up sharing the first card's backend would run
+        # its commands in tree `a` while its own #Workspace-b gated, discovered
+        # and committed tree `b` — `a` mutated entirely outside the gate, with
+        # nothing raised and nothing logged.
         #
-        # Asserted on where each backend actually ended up, not only on the
-        # names: the name is the mechanism, the directory is the consequence.
+        # It is now structural rather than nominal: the backend hangs off the
+        # workspace actor, and there is one of those per tree. Asserted on the
+        # tree each runner is anchored to, which is the consequence, not on the
+        # actor names, which were only ever the mechanism.
         for leaf in ("alpha", "beta"):
             (workspaces_root / workspace_path_for(leaf)).mkdir(parents=True, exist_ok=True)
         exec_card_for(orchestrator_proxy, name="a", workspace_id="alpha")
         exec_card_for(orchestrator_proxy, name="b", workspace_id="beta")
 
-        alpha = orchestrator_proxy.children[sandbox_actor_name(workspace_path_for("alpha"))][1]
-        beta = orchestrator_proxy.children[sandbox_actor_name(workspace_path_for("beta"))][1]
+        alpha = orchestrator_proxy.children[
+            workspace_actor_name(workspace_path_for("alpha"))
+        ][1]
+        beta = orchestrator_proxy.children[workspace_actor_name(workspace_path_for("beta"))][1]
 
         assert alpha is not beta
-        assert (
-            alpha.state.workspace_path
-            == (workspaces_root / workspace_path_for("alpha")).resolve()
-        )
-        assert (
-            beta.state.workspace_path
-            == (workspaces_root / workspace_path_for("beta")).resolve()
-        )
+        assert alpha._runner is not None
+        assert beta._runner is not None
+        assert alpha._runner is not beta._runner
+        assert alpha._runner.backend is not beta._runner.backend
+        assert alpha._runner.workspace_path == workspace_path_for("alpha")
+        assert beta._runner.workspace_path == workspace_path_for("beta")
 
-    def test_two_cards_on_one_workspace_still_share_one_sandbox_actor(
+    def test_two_cards_on_one_workspace_still_share_one_backend(
         self,
         orchestrator_proxy: FakeOrchestratorProxy,
         workspace_tree: Path,
         sandbox_script: SandboxScript,
     ) -> None:
-        # The other half of "one actor per tree": naming by workspace must not
-        # turn into naming by card. Two agents over one tree share one backend,
-        # exactly as they share one #Workspace.
-        exec_card_for(orchestrator_proxy, name="a")
-        exec_card_for(orchestrator_proxy, name="b")
+        # The other half of "one backend per tree": two agents over one tree
+        # share one, exactly as they share one #Workspace. The second card
+        # announces a config equal to the first's, and an equal config must not
+        # replace the runner — a replacement would leak the first backend, and on
+        # the docker backend that is a container with nobody left to stop it.
+        # Both observers carry the SAME team, which is what "two cards over one
+        # tree" means: the fake hands every observer a fresh uuid, so two cards
+        # built the lazy way would announce two configs differing in team_id and
+        # this spec would pass for the wrong reason — by never reaching the
+        # equal-config branch at all.
+        first_card, first_observer = exec_card_for(orchestrator_proxy, name="a")
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
+        assert isinstance(actor, WorkspaceActor)
+        first = actor._runner
 
-        created = [
-            config.name
-            for _cls, config in orchestrator_proxy.create_calls
-            if config.name.startswith(SANDBOX_ACTOR_NAME)
-        ]
-        assert set(created) == {sandbox_actor_name(WORKSPACE_PATH)}
+        second_observer = FakeActorToolObserver(orchestrator_proxy, name="b")
+        second_observer._team_id = first_observer._team_id
+        second_card = WorkspaceTool(
+            workspace_id=first_card.workspace_id,
+            workspace_exec=WorkspaceExec(mode="local", poll_attempts=1),
+        )
+        second_card.observer(second_observer)
 
-    def test_the_card_binds_the_actor_from_the_registry_with_the_sandbox_config(
+        assert first is not None
+        assert actor._runner is first
+        assert actor._runner.backend is first.backend
+        assert sandbox_script.stops == 0
+
+    def test_the_actor_builds_the_backend_from_the_registry_with_the_cards_config(
         self,
         orchestrator_proxy: FakeOrchestratorProxy,
         workspace_tree: Path,
         sandbox_script: SandboxScript,
     ) -> None:
-        # AC14. ``resolve_mode`` now hands back a strategy instance, which the
-        # card drops until ``#Workspace`` owns a worker thread — so the class it
-        # binds has to keep coming from ``SANDBOX_ACTOR_CLASSES`` and the config
-        # has to stay the one ``sandbox_config`` builds. A card that bound the
-        # strategy, or built its own config, would create a second actor per run
-        # or point the reused one at the wrong tree.
+        # ``resolve_mode`` hands back a strategy instance, and this is the caller
+        # that keeps it. The class has to come from ``SANDBOX_BACKEND_CLASSES``
+        # at call time — that is the injection window a deployment writes into —
+        # and every value the backend needs has to arrive on the card's own
+        # ``ExecConfig``. A backend built from anything else could open a
+        # directory other than the one this #Workspace gates, or name another
+        # team's container.
         _card, observer = exec_card_for(orchestrator_proxy)
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
+        assert isinstance(actor, WorkspaceActor)
 
-        bound = [
-            (cls, config)
-            for cls, config in orchestrator_proxy.create_calls
-            if config.name.startswith(SANDBOX_ACTOR_NAME)
-        ]
-        assert len(bound) == 1
-        actor_class, config = bound[0]
-        assert actor_class is SANDBOX_ACTOR_CLASSES["local"]
-        assert config == sandbox_config(
-            ExecConfig(
-                mode="local",
-                team_id=str(observer.team_id),
-                workspace_path=WORKSPACE_PATH,
-                timeout_s=DEFAULT_EXEC_TIMEOUT_S,
-            )
+        assert actor._exec_config == ExecConfig(
+            mode="local",
+            team_id=str(observer.team_id),
+            workspace_path=WORKSPACE_PATH,
+            timeout_s=DEFAULT_EXEC_TIMEOUT_S,
         )
+        runner = actor._runner
+        assert runner is not None
+        assert type(runner.backend) is SANDBOX_BACKEND_CLASSES["local"]
+        assert runner.workspace_path == WORKSPACE_PATH
+        # AC11: the team reached the constructor, which is the whole of what
+        # ``team_id`` is for — it names the docker container.
+        assert isinstance(runner.backend, FakeBackend)
+        assert runner.backend.team_id == str(observer.team_id)
 
     def test_off_the_tool_channel_creates_no_sandbox_actor_and_probes_nothing(
         self,
@@ -424,7 +456,7 @@ class TestTheCapability:
 class TestTheLease:
     def test_a_run_holds_it_and_a_mutation_is_refused(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         workspace_tree: Path,
     ) -> None:
@@ -442,7 +474,7 @@ class TestTheLease:
 
     def test_the_refusal_names_the_holder(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         orchestrator_proxy: FakeOrchestratorProxy,
     ) -> None:
@@ -467,7 +499,7 @@ class TestTheLease:
     )
     def test_every_mutation_is_refused(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         tool_name: str,
         args: tuple[Any, ...],
@@ -481,7 +513,7 @@ class TestTheLease:
 
     def test_a_second_exec_is_queued_rather_than_refused(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # This spec used to assert the refusal. The refusal is the defect: the
@@ -500,12 +532,12 @@ class TestTheLease:
         assert status.state is ExecState.QUEUED
         assert status.run_id == second.run_id
         assert status.queue_position == 1
-        assert len(harness.requests) == 1  # only the head is on the sandbox
+        assert len(harness.runs) == 1  # only the head is on the sandbox
         finish_run(sandbox_script, harness)
 
     def test_a_refusal_costs_no_file_read(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -529,7 +561,7 @@ class TestTheLease:
 
     def test_a_refused_mutation_records_nothing(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         workspace_tree: Path,
     ) -> None:
@@ -548,7 +580,7 @@ class TestTheLease:
 
     def test_a_mutation_succeeds_immediately_after_a_run_completes(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         card, actor, harness = exec_setup
@@ -559,7 +591,7 @@ class TestTheLease:
 
     def test_a_failed_run_releases_it(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         card, actor, harness = exec_setup
@@ -571,7 +603,7 @@ class TestTheLease:
 
     def test_a_run_killed_by_its_budget_releases_it(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         card, actor, harness = exec_setup
@@ -584,32 +616,33 @@ class TestTheLease:
         assert status.outcome is not None and status.outcome.timed_out
         assert "Created" in mutate(card, "workspace_mkdir", "src")
 
-    def test_a_sandbox_that_cannot_be_told_fails_the_run_at_once_and_releases_it(
+    def test_a_run_that_cannot_be_submitted_fails_at_once_and_releases_it(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
-        # The address is dead BEFORE the request is made, and the assertions
-        # come straight after ``request_exec`` returns — no poll in between.
-        # That is what separates ActorAddress.tell from a tell proxy: the proxy
-        # would drop the ActorDeadError on a future nobody reads, the run would
-        # still be marked running, and only a later poll's liveness check would
-        # ever notice.
+        # The submit fails BEFORE the request is made, and the assertions come
+        # straight after ``request_exec`` returns — no poll in between. That is
+        # the whole of "the hold is taken before the submit": a failure that
+        # found no run to release would strand the tree, and one reported
+        # asynchronously would leave the run marked RUNNING until some later
+        # look. ``submit`` on an executor that has already been shut down raises
+        # ``RuntimeError``, so the case is reachable rather than invented.
         card, actor, harness = exec_setup
-        # Both are needed: the wired sandbox is alive, and the resolve replaces
-        # a dead child with a live one — which is the production behaviour.
-        harness.sandbox_addresses[0].alive = False
-        harness.orchestrator_proxy.sandbox_born_dead = True
+        harness.executor.submit_raises = RuntimeError("cannot schedule new futures")
 
         start = actor.request_exec(AGENT, "echo hi")
 
-        assert start.run_id  # the id was issued; the send is what failed
+        assert start.run_id  # the id was issued; the submit is what failed
         assert actor._running is None
-        assert actor.exec_status(AGENT, start.run_id).state is ExecState.FAILED
+        status = actor.exec_status(AGENT, start.run_id)
+        assert status.state is ExecState.FAILED
+        assert "cannot schedule new futures" in status.reason
+        assert not sandbox_script.commands  # nothing reached the backend
         assert "Created" in mutate(card, "workspace_mkdir", "src")
 
     def test_a_late_report_does_not_clear_a_newer_lease(
-        self, exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness]
+        self, exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness]
     ) -> None:
         # The wedge release is what makes this reachable: a run whose hold was
         # given up past its budget can still report afterwards.
@@ -636,7 +669,7 @@ class TestADisallowedCommand:
 
     def test_it_is_reported_as_a_failure_naming_the_binary_and_the_allowed_list(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         card, actor, harness = exec_setup
@@ -660,7 +693,7 @@ class TestADisallowedCommand:
 
     def test_it_does_not_leave_the_tree_leased(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # The tree is taken before the request is sent, so a command the
@@ -676,7 +709,7 @@ class TestADisallowedCommand:
 class TestReadsDuringARun:
     def test_every_read_still_works(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         workspace_tree: Path,
     ) -> None:
@@ -692,7 +725,7 @@ class TestReadsDuringARun:
 
     def test_a_full_read_still_records_its_observation(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         workspace_tree: Path,
     ) -> None:
@@ -849,7 +882,7 @@ class TestTheTwoSpikes:
 class TestCollectingARun:
     def test_a_slow_run_hands_back_its_id_before_it_finishes(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         card, _actor, harness = exec_setup
@@ -857,13 +890,13 @@ class TestCollectingARun:
 
         assert "in progress" in result
         assert sandbox_script.started.wait(timeout=HANDSHAKE_TIMEOUT_S)
-        run_id = harness.requests[0].run_id
+        run_id = harness.runs[0].run_id
         assert run_id in result
         finish_run(sandbox_script, harness)
 
     def test_the_run_id_is_short(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         _card, actor, harness = exec_setup
@@ -873,7 +906,7 @@ class TestCollectingARun:
 
     def test_a_running_run_reports_running_with_the_same_id(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         card, actor, harness = exec_setup
@@ -885,7 +918,7 @@ class TestCollectingARun:
 
     def test_polling_after_completion_returns_the_outcome(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         card, actor, harness = exec_setup
@@ -902,7 +935,7 @@ class TestCollectingARun:
 
     def test_a_failed_run_is_collected_as_a_failure_not_as_running(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         card, actor, harness = exec_setup
@@ -917,7 +950,7 @@ class TestCollectingARun:
 
     def test_an_unknown_run_id_lists_this_agents_runs_rather_than_raising(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         card, actor, harness = exec_setup
@@ -929,7 +962,7 @@ class TestCollectingARun:
         assert run_id in answer
 
     def test_recent_run_ids_are_capped(
-        self, exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness]
+        self, exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness]
     ) -> None:
         _card, actor, _harness = exec_setup
         for index in range(MAX_TRACKED_RUNS + 5):
@@ -939,7 +972,7 @@ class TestCollectingARun:
 
     def test_a_settled_run_is_never_reported_as_running_once_its_result_is_evicted(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # The two maps have different capacities: _recent_runs holds 32 ids PER
@@ -966,7 +999,7 @@ class TestCollectingARun:
 
     def test_running_is_answered_from_the_in_flight_set_not_from_the_tracking_map(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # A run is running iff it is in flight. Asserted in both directions
@@ -986,7 +1019,7 @@ class TestCollectingARun:
 
     def test_two_polls_during_one_run_do_not_queue_behind_it(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # The property the worker exists for: the actor's own methods never touch
@@ -1009,34 +1042,34 @@ class TestCollectingARun:
 
     def test_the_actors_own_methods_perform_no_sandbox_call(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # The property the whole design rests on: #Workspace's own methods stay
-        # O(1) and never reach the sandbox, which is what keeps its mailbox
-        # draining while a run is held. It needs asserting more since the worker
-        # went, not less — exec_status now runs two release checks, and either
-        # can reach _start_next() and a real send.
+        # O(1) and never reach the backend, which is what keeps its mailbox
+        # draining while a run is held. exec_status runs a release check that can
+        # reach _start_next() and a real submit, so the counts are what say it
+        # did not.
         _card, actor, harness = exec_setup
         run_id = start_run(actor, sandbox_script)
         commands_so_far = len(sandbox_script.commands)
-        requests_so_far = len(harness.requests)
-        asks_so_far = len(harness.ask_timeouts)
+        submits_so_far = len(harness.runs)
+        starts_so_far = len(sandbox_script.starts)
 
         actor.exec_status(AGENT, run_id)
         actor.apply_mkdir(AGENT, "src")
         actor.get(run_id)
 
         assert len(sandbox_script.commands) == commands_so_far
-        assert len(harness.requests) == requests_so_far
-        # The ask counts too: a resolve on the poll path is an orchestrator
-        # round trip on the team singleton's own thread, which is the cost this
-        # design pays once per run and must not pay once per look.
-        assert len(harness.ask_timeouts) == asks_so_far
+        assert len(harness.runs) == submits_so_far
+        # ``start()`` counts too: provisioning is the expensive half, and the
+        # whole reason it is lazy and on the worker is that it must never happen
+        # on this thread.
+        assert len(sandbox_script.starts) == starts_so_far
         finish_run(sandbox_script, harness)
 
     def test_the_result_cache_is_lru_capped(
-        self, exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness]
+        self, exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness]
     ) -> None:
         # The deferred base's cache half is the half this actor uses, and an
         # uncapped map on a team singleton leaks for the life of the team.
@@ -1087,7 +1120,7 @@ def capture_budget(monkeypatch: pytest.MonkeyPatch) -> list[float | None]:
 class TestTheBudgets:
     def test_the_run_budget_reaches_the_backend(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         _card, actor, harness = exec_setup
@@ -1155,7 +1188,7 @@ class TestTheBudgets:
         card, _ = exec_card_for(orchestrator_proxy)
         _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
-        harness = SandboxHarness(actor, orchestrator_proxy)
+        harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
         actor.configure_exec(
             ExecConfig(
@@ -1217,7 +1250,7 @@ class TestTheBudgets:
         monkeypatch.setattr("akgentic.tool.workspace.card.execution.poll_deferred", capture)
         _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
-        harness = SandboxHarness(actor, orchestrator_proxy)
+        harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
         sandbox_script.gate.set()
 
@@ -1300,7 +1333,7 @@ class TestWaitingOutTheRun:
         )
         _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
-        harness = SandboxHarness(actor, orchestrator_proxy)
+        harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
         sandbox_script.stdout = "hello from the run"
         sandbox_script.gate.set()
@@ -1308,7 +1341,7 @@ class TestWaitingOutTheRun:
         answer = tool_named(card, "workspace_exec")(cmd="echo hi")
         harness.join()
 
-        run_id = harness.requests[0].run_id
+        run_id = harness.runs[0].run_id
         assert "exit_code: 0 (OK)" in answer
         assert "hello from the run" in answer
         assert answer.startswith(f"Run {run_id} - exit_code:")
@@ -1350,7 +1383,7 @@ class TestWaitingOutTheRun:
         )
         _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
-        harness = SandboxHarness(actor, orchestrator_proxy)
+        harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
         sandbox_script.gate.set()
 
@@ -1370,7 +1403,7 @@ class TestWaitingOutTheRun:
         bounded = tool_named(bounded_card, "workspace_exec")(cmd="echo hi")
         harness.join()
 
-        waited_run, bounded_run = (request.run_id for request in harness.requests)
+        waited_run, bounded_run = (request.run_id for request in harness.runs)
         # The sentinel's answer: the budget was spent, and it says which budget.
         assert waited == timed_out(waited_run, 0.05)
         assert waited_run in waited
@@ -1403,7 +1436,7 @@ class TestWaitingOutTheRun:
         )
         _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
-        harness = SandboxHarness(actor, orchestrator_proxy)
+        harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
         sandbox_script.raise_with = subprocess.TimeoutExpired(cmd="echo hi", timeout=0.05)
 
@@ -1432,7 +1465,7 @@ class TestWaitingOutTheRun:
 
     def test_a_running_run_asked_about_directly_is_still_in_progress(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # AC6: workspace_exec_result is untouched. That path has no budget of its
@@ -1466,14 +1499,14 @@ class TestWaitingOutTheRun:
         )
         _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
-        harness = SandboxHarness(actor, orchestrator_proxy)
+        harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
         sandbox_script.gate.set()
 
         tool_named(card, "workspace_exec")(cmd="echo hi")
         harness.join()
 
-        assert harness.requests[0].timeout_s == MAX_EXEC_BUDGET_S
+        assert harness.runs[0].timeout_s == MAX_EXEC_BUDGET_S
         command_budget = sandbox_script.timeouts[0]
         assert command_budget is not None
         assert command_budget <= MAX_EXEC_BUDGET_S
@@ -1521,7 +1554,7 @@ class TestTheDiscoveredWriteSet:
         workspace_tree: Path,
         sandbox_script: SandboxScript,
         monkeypatch: pytest.MonkeyPatch,
-    ) -> tuple[WorkspaceTool, WorkspaceActor, SandboxHarness]:
+    ) -> tuple[WorkspaceTool, WorkspaceActor, ExecHarness]:
         """The module fixture with the journal on.
 
         The card's default is off, and this class is about what the journal
@@ -1531,13 +1564,13 @@ class TestTheDiscoveredWriteSet:
         card, _observer = exec_card_for(orchestrator_proxy, git_journal=True)
         _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
-        harness = SandboxHarness(actor, orchestrator_proxy)
+        harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
         return card, actor, harness
 
     def test_a_nested_untracked_directory_is_discovered_file_by_file(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         workspace_tree: Path,
     ) -> None:
@@ -1568,7 +1601,7 @@ class TestTheDiscoveredWriteSet:
         assert "dist/nested/deeper/c.txt" in head.files
 
     def test_the_discovery_names_files_never_a_directory(
-        self, workspace_tree: Path, exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness]
+        self, workspace_tree: Path, exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness]
     ) -> None:
         # The same property, asserted directly on the journal's own answer, so
         # that dropping ``-uall`` is caught even if the commit path changes.
@@ -1582,7 +1615,7 @@ class TestTheDiscoveredWriteSet:
 
     def test_one_run_is_one_commit_and_history_stays_linear(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         workspace_tree: Path,
     ) -> None:
@@ -1600,7 +1633,7 @@ class TestTheDiscoveredWriteSet:
 
     def test_the_commit_is_authored_by_the_requester(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         workspace_tree: Path,
     ) -> None:
@@ -1616,7 +1649,7 @@ class TestTheDiscoveredWriteSet:
 
     def test_a_dirty_tree_is_committed_out_of_band_first(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         workspace_tree: Path,
     ) -> None:
@@ -1633,7 +1666,7 @@ class TestTheDiscoveredWriteSet:
 
     def test_a_run_that_changes_nothing_adds_no_commit(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         workspace_tree: Path,
     ) -> None:
@@ -1646,7 +1679,7 @@ class TestTheDiscoveredWriteSet:
 
     def test_debris_is_excluded_by_the_seeded_ignore_list(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         workspace_tree: Path,
     ) -> None:
@@ -1662,7 +1695,7 @@ class TestTheDiscoveredWriteSet:
 
     def test_the_command_goes_in_the_body_never_the_subject(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         workspace_tree: Path,
     ) -> None:
@@ -1677,7 +1710,7 @@ class TestTheDiscoveredWriteSet:
 
     def test_the_command_reaches_the_body_sanitised(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         workspace_tree: Path,
     ) -> None:
@@ -1696,7 +1729,7 @@ class TestTheDiscoveredWriteSet:
 
     def test_an_over_long_command_is_capped(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         workspace_tree: Path,
     ) -> None:
@@ -1710,7 +1743,7 @@ class TestTheDiscoveredWriteSet:
 
     def test_a_refused_mutation_adds_no_commit(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         workspace_tree: Path,
     ) -> None:
@@ -1729,7 +1762,7 @@ class TestTheDiscoveredWriteSet:
 
     def test_the_tree_is_clean_after_a_run(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         workspace_tree: Path,
     ) -> None:
@@ -1752,7 +1785,7 @@ class TestTheJournalOff:
         card, _ = exec_card_for(orchestrator_proxy, git_journal=False)
         _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
-        harness = SandboxHarness(actor, orchestrator_proxy)
+        harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
         sandbox_script.files = [("out.txt", "x\n")]
 
@@ -1777,7 +1810,7 @@ class TestTheJournalOff:
     )
     def test_a_journal_failure_leaves_the_result_and_the_lease_alone(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         monkeypatch: pytest.MonkeyPatch,
         failure: BaseException,
@@ -1800,7 +1833,7 @@ class TestTheJournalOff:
 
     def test_a_non_zero_git_exit_leaves_the_result_and_the_lease_alone(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -1844,7 +1877,7 @@ class TestTwoCardsOverOneTree:
         )
         _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
-        harness = SandboxHarness(actor, orchestrator_proxy)
+        harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
         bob, _ = exec_card_for(
             orchestrator_proxy, name="bob", poll_attempts=50, poll_delay_seconds=0.01
@@ -1863,7 +1896,7 @@ class TestTwoCardsOverOneTree:
         assert log[-1].author_name == "bob"
 
 
-class InjectedSandboxActor(FakeSandboxActor):
+class InjectedBackend(FakeBackend):
     """A backend registered from outside the package, as a deployment would.
 
     A subclass rather than the fixture's fake itself, so the assertion below is
@@ -1874,12 +1907,21 @@ class InjectedSandboxActor(FakeSandboxActor):
 
 
 class TestARegisteredBackendIsReached:
-    """``SANDBOX_ACTOR_CLASSES`` is the documented extension point, and this is its contract.
+    """``SANDBOX_BACKEND_CLASSES`` is the live extension point, and this is its contract.
 
-    A deployment assigns its own ``SandboxActor`` subclass into the registry
-    before any card is constructed. What matters is not the spelling of the
-    import but that ``workspace_exec`` — the wiring *and* the run — resolves
-    through the registry at call time and therefore reaches the injected class.
+    A deployment assigns its own backend into the registry before any card is
+    constructed. What matters is not the spelling of the import but that
+    ``workspace_exec`` — the wiring *and* the run — resolves through the registry
+    at call time and therefore reaches the injected class.
+
+    **This spec moved from the actor registry to the backend registry**, because
+    that is where the extension point moved. ``SANDBOX_ACTOR_CLASSES`` is no
+    longer on any exec path, so the same spec written against it would install a
+    class nothing reaches and pass without executing a line of it — the exact
+    shape of vacuity this suite is written against. The actor registry's own
+    contract still holds for the actor and is asserted where it belongs, in
+    ``tests/sandbox/test_registry.py`` and beside the two-registries-agree check
+    in ``tests/sandbox/test_backend_kill.py``.
     """
 
     def test_a_backend_assigned_into_the_registry_runs_the_command(
@@ -1891,7 +1933,7 @@ class TestARegisteredBackendIsReached:
     ) -> None:
         # Registered under a key a card may name, before the card exists —
         # exactly the sequence the sandbox README documents.
-        monkeypatch.setitem(SANDBOX_ACTOR_CLASSES, "docker", InjectedSandboxActor)
+        monkeypatch.setitem(SANDBOX_BACKEND_CLASSES, "docker", InjectedBackend)
         card = WorkspaceTool(
             workspace_id=workspace_tree.name,
             workspace_exec=WorkspaceExec(mode="docker", poll_attempts=50, poll_delay_seconds=0.01),
@@ -1899,17 +1941,18 @@ class TestARegisteredBackendIsReached:
         card.observer(FakeActorToolObserver(orchestrator_proxy))
         _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
-        harness = SandboxHarness(actor, orchestrator_proxy)
+        harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
 
         # The wiring resolved the injected class, not the shipped docker backend.
-        _, sandbox = orchestrator_proxy.children[sandbox_actor_name(WORKSPACE_PATH)]
-        assert type(sandbox) is InjectedSandboxActor
+        assert actor._runner is not None
+        assert type(actor._runner.backend) is InjectedBackend
 
         sandbox_script.gate.set()
         sandbox_script.stdout = "ran in the injected backend"
         answer = tool_named(card, "workspace_exec")(cmd="make build")
         harness.join()
+        harness.close()
 
         assert "ran in the injected backend" in answer
         assert sandbox_script.commands == [("make build", "")]
@@ -1922,7 +1965,7 @@ class TestARegisteredBackendIsReached:
 
 class TestTheToolSurface:
     def test_the_two_signatures_are_what_they_claim(
-        self, exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness]
+        self, exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness]
     ) -> None:
         import inspect  # noqa: PLC0415
 
@@ -1950,7 +1993,7 @@ class TestTheToolSurface:
             assert list(signature.parameters) == parameters
 
     def test_nothing_lets_a_model_name_a_mode_a_timeout_or_a_git_argument(
-        self, exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness]
+        self, exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness]
     ) -> None:
         import inspect  # noqa: PLC0415
 
@@ -1969,7 +2012,7 @@ class TestTheToolSurface:
 class TestOwnershipIsNeverAssumed:
     def test_a_file_a_run_created_is_governed_by_its_content_hash(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         orchestrator_proxy: FakeOrchestratorProxy,
         workspace_tree: Path,
@@ -2021,7 +2064,7 @@ class TestPermissionErrorsAreDistinguished:
 # 47-1 — admission's third answer: the queue, and who a run belongs to
 #
 # Every spec here asserts on MODEL FIELDS first — status.state, .run_id,
-# .command, .queue_position, script.commands, harness.requests,
+# .command, .queue_position, script.commands, harness.runs,
 # actor._running, actor._in_flight, actor._queue — and only then
 # on a rendered string. A guard whose whole assertion is ``"X" in result`` is
 # satisfied by static text that was already there, which is how two inert guards
@@ -2034,7 +2077,7 @@ class TestAQueuedRunRuns:
 
     def test_a_queued_run_runs_when_the_lease_releases_with_its_own_output(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # The defect in one test. Two commands, two distinguishable outputs: the
@@ -2072,7 +2115,7 @@ class TestAQueuedRunRuns:
 
     def test_a_queued_run_still_runs_when_the_head_fails(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # Both exits reach _finish_run — deliver AND fail — so a head that blew
@@ -2096,7 +2139,7 @@ class TestAQueuedEntryIsInert:
 
     def test_nothing_is_sent_or_held_for_a_queued_entry(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # A request handed to the sandbox at enqueue would run out of order
@@ -2107,7 +2150,7 @@ class TestAQueuedEntryIsInert:
 
         tail = actor.request_exec(AGENT_B, "echo tail")
 
-        assert [request.run_id for request in harness.requests] == [head]
+        assert [request.run_id for request in harness.runs] == [head]
         assert tail.run_id not in actor._in_flight
         assert actor._running is not None
         assert actor._running.run_id == head  # still the head's, untouched
@@ -2117,28 +2160,20 @@ class TestAQueuedEntryIsInert:
 
     def test_the_budget_is_measured_from_the_dequeue_not_from_the_wait(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # started_at is taken when the entry is DEQUEUED, and budget + grace is
         # measured from it. Clocked at enqueue instead, a run that waited behind
         # a long head would be past its budget before its own command started.
         #
-        # Read inside _start_run, between the hold being taken and the request
-        # being sent, which is the only window in which the value is observable:
-        # a run released by an already-set gate can report and clear _running
-        # before the call that took it has even returned.
+        # Read inside _start_run, between the hold being taken and the work
+        # being submitted, which is the only window in which the value is
+        # observable: a run released by an already-set gate can report and clear
+        # _running before the call that took it has even returned. The harness's
+        # executor records it at every submit, which is exactly that window.
         _card, actor, harness = exec_setup
-        holds: list[RunningExec] = []
-        original = actor._resolve_sandbox
-
-        def spy(config: ExecConfig) -> ActorAddress:
-            assert actor._running is not None
-            holds.append(actor._running)
-            return original(config)
-
-        monkeypatch.setattr(actor, "_resolve_sandbox", spy)
+        holds = harness.holds
         start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
         tail = actor.request_exec(AGENT_B, "echo tail")
         assert len(holds) == 1, "the enqueue started a run of its own"
@@ -2148,6 +2183,7 @@ class TestAQueuedEntryIsInert:
 
         assert len(holds) == 2
         dequeued = holds[1]
+        assert dequeued is not None
         assert dequeued.run_id == tail.run_id
         assert dequeued.started_at >= released_at, "the run was clocked from the wait"
 
@@ -2157,7 +2193,7 @@ class TestARunBelongsToTheAgentThatStartedIt:
 
     def test_a_second_agent_cannot_collect_the_first_agents_finished_run(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         _card, actor, harness = exec_setup
@@ -2186,7 +2222,7 @@ class TestARunBelongsToTheAgentThatStartedIt:
     @pytest.mark.parametrize("state", ["running", "queued"])
     def test_a_foreign_run_is_unknown_whatever_state_it_is_really_in(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         state: str,
     ) -> None:
@@ -2211,7 +2247,7 @@ class TestARunBelongsToTheAgentThatStartedIt:
 
     def test_a_failed_run_is_not_collectable_by_another_agent_either(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         _card, actor, harness = exec_setup
@@ -2233,7 +2269,7 @@ class TestADoneResultNamesItsRunAndItsCommand:
 
     def test_the_status_carries_the_command_and_the_rendering_leads_with_both(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         card, actor, harness = exec_setup
@@ -2253,7 +2289,7 @@ class TestADoneResultNamesItsRunAndItsCommand:
 
     def test_two_runs_of_different_commands_are_told_apart_by_their_answers(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # The incident restated as a property: before this, the two answers were
@@ -2275,35 +2311,483 @@ class TestADoneResultNamesItsRunAndItsCommand:
         assert format_status(first_status) != format_status(second_status)
 
 
-class TestTeardownDropsTheQueue:
-    """G5 — only the head is on the sandbox, so only the head can hold stop open."""
+LONG_COMMAND = "sh -c 'sleep 30'"
+"""A real command that outlives the whole teardown budget, for the real backend.
 
-    def test_on_stop_clears_queued_entries_and_leaves_the_head_alone(
+``sh`` is on the allowlist and every ``sh`` this runs on execs ``sleep`` in place
+for a single trailing command, so the direct child *is* the sleeping process and
+``Popen.kill`` reaches it. A shell that forked instead would leave a grandchild
+holding the pipes — which is the hazard :data:`EXEC_SHUTDOWN_GRACE_S` bounds, and
+which the wedged-worker spec below reproduces deliberately rather than by luck.
+
+**Its budget is deliberately not shortened.** Under a short budget the *budget*
+would end the run and every assertion below would pass with the kill removed —
+the exact narrowing these specs are written against.
+"""
+
+
+@pytest.fixture
+def live_exec(
+    orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+) -> Generator[tuple[WorkspaceTool, WorkspaceActor], None, None]:
+    """An exec-capable card over a **real** ``LocalBackend`` and the real executor.
+
+    No ``sandbox_script``, so nothing is injected into the registry and the
+    command genuinely runs; no harness, so the actor keeps the
+    ``ThreadPoolExecutor`` its own ``on_start`` built. This is the only setup in
+    which "the child is dead, and it was killed" is a statement about a process.
+    """
+    card, _observer = exec_card_for(
+        orchestrator_proxy, poll_attempts=0, timeout_s=MAX_EXEC_BUDGET_S
+    )
+    _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
+    assert isinstance(actor, WorkspaceActor)
+    yield card, actor
+    actor._executor.shutdown(wait=False, cancel_futures=True)
+
+
+def await_child(actor: WorkspaceActor) -> subprocess.Popen[str]:
+    """Wait until the real backend is holding a process handle, and return it.
+
+    Polled rather than waited on an event because the handle belongs to
+    ``ProcessBackend`` and nothing about the production path announces it. The
+    bound is a failure budget: a run that never reaches ``Popen`` is a failure,
+    not something to wait longer for.
+    """
+    runner = actor._runner
+    assert runner is not None
+    backend = runner.backend
+    assert isinstance(backend, LocalBackend)
+    deadline = time.monotonic() + HANDSHAKE_TIMEOUT_S
+    while time.monotonic() < deadline:
+        proc = backend._running
+        if proc is not None:
+            return proc
+        time.sleep(0.01)
+    raise AssertionError("the run never reached a subprocess")
+
+
+class TestTheExecutorAndItsWorker:
+    """AC 1, 2, 9, 10 — one worker per workspace, and what runs on it."""
+
+    def test_every_workspace_owns_one_single_worker_executor(
+        self, wired_card: WorkspaceTool, orchestrator_proxy: FakeOrchestratorProxy
+    ) -> None:
+        # AC1. Created unconditionally, exec capability or not: a
+        # ThreadPoolExecutor spawns no thread until the first submit, so a
+        # workspace that never runs a command pays for the object and nothing
+        # else — which is what makes the branch-free version correct rather than
+        # merely tidy. More than one worker would break nothing and prove
+        # nothing: the tree admits one run at a time, so a second could only idle.
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
+        assert isinstance(actor, WorkspaceActor)
+
+        assert isinstance(actor._executor, ThreadPoolExecutor)
+        assert actor._executor._max_workers == 1
+        assert actor._executor._threads == set()  # nothing spawned, nothing submitted
+        assert actor._pending is None
+
+    def test_the_backend_is_never_touched_on_the_actors_thread(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
-        # Three queued 15 s runs are 45 s of work but never more than one run's
-        # worth of liveness, because a queued entry was never sent anywhere.
-        # Dropping them costs nothing: they never ran and produced nothing.
+        # AC2 and AC9's thread half, in one place because they are one property:
+        # neither ``start`` nor ``exec`` may happen where the mailbox drains.
+        # ``start`` is the expensive one — on the docker backend it is a
+        # ``docker build`` — and it is exactly what would serialise behind every
+        # read, mutation and poll in the team if it ran here.
+        _card, actor, harness = exec_setup
+        actor_thread = threading.get_ident()
+        run_id = start_run(actor, sandbox_script)
+
+        # Answered while the command is genuinely in flight, not afterwards.
+        assert actor.exec_status(AGENT, run_id).state is ExecState.RUNNING
+        finish_run(sandbox_script, harness)
+
+        assert sandbox_script.threads, "the backend was never reached"
+        assert all(ident != actor_thread for _what, ident in sandbox_script.threads)
+        # One worker, so one thread for both calls.
+        assert len({ident for _what, ident in sandbox_script.threads}) == 1
+
+    def test_start_runs_once_before_the_first_command_and_not_again(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        # AC9. Lazy — nothing is provisioned by binding a card — and once, so a
+        # second run does not rebuild a container it already has.
+        _card, actor, harness = exec_setup
+        assert sandbox_script.starts == []  # binding provisioned nothing
+
+        start_run(actor, sandbox_script, cmd="echo one")
+        finish_run(sandbox_script, harness)
+        sandbox_script.started.clear()
+        sandbox_script.gate.clear()
+        start_run(actor, sandbox_script, cmd="echo two")
+        finish_run(sandbox_script, harness)
+
+        assert sandbox_script.starts == [WORKSPACE_PATH]
+        assert sandbox_script.commands == [("echo one", ""), ("echo two", "")]
+        # Ordered, not merely counted: a start that followed the first exec
+        # would still be one start.
+        assert sandbox_script.events[0] == ("start", WORKSPACE_PATH)
+        assert sandbox_script.events[1] == ("exec-enter", "echo one")
+
+    def test_a_start_that_fails_is_the_runs_answer_and_the_next_run_retries(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        # AC10. The flag is set only AFTER start() returns, so a daemon that was
+        # down is retried rather than latched off until the team restarts. It
+        # costs a failing probe per run in a broken deployment, which is the
+        # honest half of the trade.
+        _card, actor, harness = exec_setup
+        sandbox_script.gate.set()
+        sandbox_script.start_raises = RuntimeError("docker daemon is not running")
+
+        first = actor.request_exec(AGENT, "echo one")
+        assert first.run_id, first.refusal
+        harness.join()
+
+        status = actor.exec_status(AGENT, first.run_id)
+        assert status.state is ExecState.FAILED
+        assert "docker daemon is not running" in status.reason
+        assert sandbox_script.commands == []  # nothing ran
+        assert actor._running is None  # and the tree was handed back
+
+        sandbox_script.start_raises = None
+        second = actor.request_exec(AGENT, "echo two")
+        assert second.run_id, second.refusal
+        harness.join()
+
+        assert len(sandbox_script.starts) == 2  # retried, not latched off
+        assert actor.exec_status(AGENT, second.run_id).state is ExecState.DONE
+
+
+class TestTheBackendFakeIsReallyReached:
+    """The migration's own guard: a fixture installed but unreached is silent.
+
+    ``#Workspace`` no longer resolves a sandbox actor, so a fake left at
+    ``SANDBOX_ACTOR_CLASSES["local"]`` would be installed, restored, and never
+    called — and every spec in this file would go green while exercising the real
+    ``LocalBackend`` or nothing at all. This is the sentinel that says otherwise.
+    """
+
+    def test_the_answer_could_only_have_come_from_the_fake(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        # The discriminator is the OUTPUT, not the absence of an error: the real
+        # LocalBackend answers "hi" to ``echo hi`` and cannot answer this, and
+        # exit code 7 is not something ``echo`` produces either.
+        card, actor, harness = exec_setup
+        sandbox_script.stdout = "<<<only-the-fake-backend-says-this>>>"
+        sandbox_script.exit_code = 7
+        run_id = start_run(actor, sandbox_script, cmd="echo hi", agent=card._agent_id)
+        finish_run(sandbox_script, harness)
+
+        answer = mutate(card, "workspace_exec_result", run_id)
+
+        assert "<<<only-the-fake-backend-says-this>>>" in answer
+        assert "exit_code: 7" in answer
+        assert sandbox_script.commands == [("echo hi", "")]
+
+    def test_the_runner_holds_the_injected_backend_and_not_the_shipped_one(
+        self, exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness]
+    ) -> None:
+        # The other half: the object itself, resolved through the registry the
+        # fixture writes into.
+        _card, actor, _harness = exec_setup
+
+        runner = actor._runner
+        assert runner is not None
+        assert isinstance(runner.backend, FakeBackend)
+        assert not isinstance(runner.backend, LocalBackend)
+
+
+class TestReplacingTheConfiguration:
+    """AC 8 — an equal config changes nothing; a different one stops the old backend."""
+
+    def test_an_equal_config_keeps_the_same_runner_and_stops_nothing(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        # The common case, and close to the only one. Rebuilding here would leak
+        # the old backend — on the docker backend, a container with nobody left
+        # to stop it.
+        _card, actor, _harness = exec_setup
+        config = actor._exec_config
+        assert config is not None
+        first = actor._runner
+
+        actor.configure_exec(config.model_copy())
+
+        assert actor._runner is first
+        assert sandbox_script.stops == 0
+        assert sandbox_script.events == []
+
+    def test_a_different_config_stops_the_old_runner_and_builds_a_new_one(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        _card, actor, _harness = exec_setup
+        config = actor._exec_config
+        assert config is not None
+        first = actor._runner
+        assert first is not None
+
+        actor.configure_exec(config.model_copy(update={"team_id": "another-team"}))
+
+        assert actor._runner is not first
+        assert actor._runner is not None
+        assert actor._runner.backend is not first.backend
+        assert sandbox_script.stops == 1  # the replaced backend was released
+        assert isinstance(actor._runner.backend, FakeBackend)
+        assert actor._runner.backend.team_id == "another-team"
+
+    def test_a_backend_that_raises_on_release_does_not_take_the_binding_down(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Same requirement as teardown's, and the same reason: the degradation
+        # from a swallowed failure is a refused run, which is visible and
+        # recoverable, while a raise on a binding path takes the card down.
+        _card, actor, _harness = exec_setup
+        config = actor._exec_config
+        assert config is not None
+        first = actor._runner
+        assert first is not None
+        monkeypatch.setattr(
+            first.backend, "stop", _raise_on_stop, raising=True
+        )
+
+        actor.configure_exec(config.model_copy(update={"team_id": "another-team"}))
+
+        assert actor._runner is not first  # the replacement still happened
+
+
+def _raise_on_stop() -> None:
+    """A backend release that fails, for the wrapped-stop path."""
+    raise RuntimeError("the backend fell over on release")
+
+
+class TestTeardownEndsTheRunInFlight:
+    """AC 12, 13 — a real child, really killed, and killed before the drain.
+
+    Every natural guard for an ordered teardown is vacuous — ``on_stop`` did not
+    raise, the executor reports itself shut down, the queue is empty — so these
+    observe the **effect** on a real process instead.
+
+    **What each assertion actually carries, measured rather than assumed.**
+    ``ProcessBackend.stop()`` calls ``kill()`` itself, so with a real backend the
+    child is killed by teardown's *fourth* step even when the second is deleted:
+    the exit-signal assertion therefore proves that no command outlives
+    teardown, and it does **not** distinguish step 2 from step 4. That
+    distinction is what the elapsed bound carries here, with two orders of
+    magnitude of margin — the kill lands in milliseconds, while an ``on_stop``
+    that reaches the drain with a live child burns the whole grace — and what
+    ``TestTeardownIsOrderedAndBounded`` carries structurally, by requiring
+    ``("kill",)`` in the record at all.
+
+    Deleting either step is red in both places. Saying which assertion does
+    which job is the point: a guard whose owner is guessed is a guard nobody
+    has checked.
+    """
+
+    def test_the_child_is_killed_and_the_kill_precedes_the_drain(
+        self, live_exec: tuple[WorkspaceTool, WorkspaceActor]
+    ) -> None:
+        _card, actor = live_exec
+        start = actor.request_exec(AGENT, LONG_COMMAND)
+        assert start.run_id, start.refusal
+        proc = await_child(actor)
+
+        began = time.monotonic()
+        actor.on_stop()
+        elapsed = time.monotonic() - began
+
+        # AC12 — the command did not outlive teardown, and it was KILLED rather
+        # than allowed to finish. ``poll() is not None`` alone would also pass
+        # for a command that simply ended, which is why the signal is named:
+        # nothing but SIGKILL produces -9 here.
+        assert proc.wait(timeout=HANDSHAKE_TIMEOUT_S) == -signal.SIGKILL
+        assert proc.returncode == -signal.SIGKILL
+        # AC13 — killing FIRST is what makes the drain cheap: the signal lands in
+        # milliseconds, so an ``on_stop`` in this order returns two orders of
+        # magnitude inside the grace. Reaching the drain with a live child burns
+        # the whole of it, whether that is because the kill was deleted or
+        # because it was moved after.
+        assert elapsed < EXEC_SHUTDOWN_GRACE_S / 2
+
+    def test_the_command_really_would_have_outlived_the_teardown(
+        self, live_exec: tuple[WorkspaceTool, WorkspaceActor]
+    ) -> None:
+        # The positive control for the spec above. Without it, "the child is
+        # dead" is compatible with a command that was never going to be alive:
+        # a budget too short, a binary that exits at once, a run that never
+        # started. This shows the same command, on the same setup, still running
+        # well past the grace when nothing tears it down.
+        _card, actor = live_exec
+        start = actor.request_exec(AGENT, LONG_COMMAND)
+        assert start.run_id, start.refusal
+        proc = await_child(actor)
+
+        assert proc.poll() is None
+        with pytest.raises(subprocess.TimeoutExpired):
+            proc.wait(timeout=EXEC_SHUTDOWN_GRACE_S + 0.5)
+        assert proc.poll() is None
+
+        proc.kill()
+
+
+class TestTeardownIsOrderedAndBounded:
+    """AC 14–17 — the four steps, their order, and what a failing one may not skip."""
+
+    def test_the_queued_run_never_starts(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        # AC15, the negative half. Worth nothing without the control below: "B is
+        # absent from the record" passes if B was never enqueued, if the fake was
+        # never reached, or if the record was never written at all.
         _card, actor, harness = exec_setup
         head = start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
-        actor.request_exec(AGENT_B, "echo one")
-        actor.request_exec(AGENT_C, "echo two")
-        assert len(actor._queue) == 2
+        tail = actor.request_exec(AGENT_B, "echo tail")
+        assert [entry.run_id for entry in actor._queue] == [tail.run_id]
 
         actor.on_stop()
+        harness.join()
 
         assert list(actor._queue) == []
-        assert actor._running is not None
-        assert actor._running.run_id == head  # the head is the only thing left holding
-        assert [request.run_id for request in harness.requests] == [head]
-        finish_run(sandbox_script, harness)
+        assert ("exec-enter", "echo tail") not in sandbox_script.events
+        assert [run.run_id for run in harness.runs] == [head]
         assert sandbox_script.commands == [("echo head", "")]
 
+    def test_the_same_queued_run_does_start_when_the_head_finishes_normally(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        # AC15, the positive control, and it is half the guard. Same setup, same
+        # record, same assertion — with teardown removed, B IS asked for. That
+        # is what makes the absence above a statement about ``on_stop`` rather
+        # than about a queue that never drains at all.
+        _card, actor, harness = exec_setup
+        start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
+        tail = actor.request_exec(AGENT_B, "echo tail")
+        assert [entry.run_id for entry in actor._queue] == [tail.run_id]
+
+        finish_run(sandbox_script, harness)
+
+        assert ("exec-enter", "echo tail") in sandbox_script.events
+        assert sandbox_script.commands == [("echo head", ""), ("echo tail", "")]
+
+    def test_the_kill_lands_on_a_live_run_and_the_release_follows_the_drain(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        # AC16, asserted on POSITIONS in one shared record rather than on
+        # presence. Presence alone cannot tell "released after the worker
+        # drained" from "released around the same time", which is the whole
+        # difference between tearing a container down around a command that is
+        # still writing and tearing it down after.
+        #
+        # The tail is the one deliberate wall clock in this suite, and it is
+        # here to make a cross-thread order observable rather than raced: with
+        # step 4 moved ahead of step 3, ``stop`` lands inside this window.
+        _card, actor, harness = exec_setup
+        sandbox_script.exec_tail_s = 0.2
+        start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
+
+        actor.on_stop()
+        harness.join()
+
+        events = sandbox_script.events
+        assert ("kill",) in events
+        assert ("stop",) in events
+        assert ("exec-return", "echo head") in events
+        assert events.index(("kill",)) < events.index(("exec-return", "echo head"))
+        assert events.index(("stop",)) > events.index(("exec-return", "echo head"))
+
+    def test_a_worker_that_ignores_the_kill_is_abandoned_rather_than_waited_out(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        # AC14, and the whole reason the drain is bounded at all.
+        # ``shutdown(wait=True)`` takes no timeout, and a worker wedged in
+        # ``_run``'s second drain never returns — so teardown would hang for
+        # ever, not merely slowly.
+        #
+        # The load-bearing assertion is the one about the record, not the one
+        # about the clock: with an unbounded drain, ``exec-return`` is in the
+        # record BEFORE on_stop can return, whatever the machine's timing.
+        _card, actor, harness = exec_setup
+        sandbox_script.kill_releases = False
+        start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
+
+        began = time.monotonic()
+        actor.on_stop()
+        elapsed = time.monotonic() - began
+        during_teardown = list(sandbox_script.events)
+
+        assert ("exec-return", "echo head") not in during_teardown
+        assert ("stop",) in during_teardown  # step 4 still ran
+        assert elapsed < HANDSHAKE_TIMEOUT_S
+        assert elapsed >= EXEC_SHUTDOWN_GRACE_S  # it did wait for the grace
+        sandbox_script.gate.set()
+        harness.join()
+
+    def test_a_kill_that_raises_still_leaves_the_drain_and_the_release_done(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        # AC17. Every step is wrapped SEPARATELY, which is stricter than the
+        # single wrapper the queue clear used to carry — and this is the reason:
+        # one wrapper around the group would let a raising kill leave the
+        # executor undrained and the container up.
+        _card, actor, harness = exec_setup
+        sandbox_script.kill_raises = RuntimeError("the backend fell over on kill")
+        start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
+        sandbox_script.gate.set()
+
+        actor.on_stop()  # must not raise
+        harness.join()
+
+        assert sandbox_script.kills == 1
+        assert ("stop",) in sandbox_script.events
+        assert actor._executor._inner._shutdown  # type: ignore[attr-defined]
+
+    def test_on_stop_on_a_workspace_that_never_ran_a_command_does_nothing(
+        self, wired_card: WorkspaceTool, orchestrator_proxy: FakeOrchestratorProxy
+    ) -> None:
+        # AC18. **Inert on its own** and worth nothing without AC 12–17 beside
+        # it: it would pass for an ``on_stop`` whose body was deleted. What it
+        # covers is the branch, not the behaviour — no runner, no backend, and an
+        # executor that never spawned a thread.
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
+        assert isinstance(actor, WorkspaceActor)
+        assert actor._runner is None
+
+        actor.on_stop()  # must not raise
+
+        assert actor._executor._shutdown
+
+
+class TestTeardownChainsToTheBase:
     def test_on_stop_chains_to_the_base(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # An on_stop that forgets super() leaves the actor's own teardown undone,
@@ -2331,7 +2815,7 @@ class TestTheQueueIsFifoAndCapped:
 
     def test_three_requests_dequeue_in_the_order_they_arrived(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         _card, actor, harness = exec_setup
@@ -2347,7 +2831,7 @@ class TestTheQueueIsFifoAndCapped:
         finish_run(sandbox_script, harness)
 
         assert sandbox_script.commands == [("echo a", ""), ("echo b", ""), ("echo c", "")]
-        assert [request.run_id for request in harness.requests] == [
+        assert [request.run_id for request in harness.runs] == [
             first,
             second.run_id,
             third.run_id,
@@ -2355,7 +2839,7 @@ class TestTheQueueIsFifoAndCapped:
 
     def test_over_the_cap_the_refusal_names_no_run_and_no_agent(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # The only exec refusal left, and the one place an agent has no id of its
@@ -2388,7 +2872,7 @@ class TestTheCardAnswersAQueuedCaller:
 
     def test_a_caller_still_queued_when_its_budget_expires_is_told_so(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # poll_deferred answers None without saying WHY, so without the extra ask
@@ -2424,7 +2908,7 @@ class TestTheCardAnswersAQueuedCaller:
 
     def test_a_queued_run_that_starts_and_finishes_is_collected_normally(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # The whole point of handing back an id rather than a refusal: the run is
@@ -2444,7 +2928,7 @@ class TestTheCardAnswersAQueuedCaller:
 
     def test_collecting_a_queued_run_renders_the_queued_message(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # The other way an agent meets a queued run: it holds an id from a
@@ -2466,7 +2950,7 @@ class TestTheCardAnswersAQueuedCaller:
 
     def test_the_card_raises_retriable_when_the_queue_is_full(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # The one refusal left, at the card boundary: it still becomes a
@@ -2502,7 +2986,7 @@ class TestAQueuedCallerWaitsOutItsTurn:
         monkeypatch: pytest.MonkeyPatch,
         name: str = "waiter",
         timeout_s: float = 2.0,
-    ) -> tuple[WorkspaceTool, WorkspaceActor, SandboxHarness]:
+    ) -> tuple[WorkspaceTool, WorkspaceActor, ExecHarness]:
         card, _ = exec_card_for(
             orchestrator_proxy,
             name=name,
@@ -2512,7 +2996,7 @@ class TestAQueuedCallerWaitsOutItsTurn:
         )
         _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
-        harness = SandboxHarness(actor, orchestrator_proxy)
+        harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
         return card, actor, harness
 
@@ -2633,7 +3117,7 @@ class TestAQueuedCallerWaitsOutItsTurn:
         answer = tool_named(card, "workspace_exec")(cmd="echo mine")
         harness.join()
 
-        run_id = harness.requests[0].run_id
+        run_id = harness.runs[0].run_id
         assert answer == queued(run_id, 1)
         assert run_id in answer
 
@@ -2682,7 +3166,7 @@ class TestAQueuedCallerWaitsOutItsTurn:
         # A first-look deadline is (2 + 1) x 0.05 = 0.15 s; the climb above takes
         # ~0.25 s of looks, so a pinned deadline gives up around look 16.
         assert len(looks) >= 25, "the poll abandoned a caller that was still advancing"
-        run_id = harness.requests[0].run_id
+        run_id = harness.runs[0].run_id
         assert answer.startswith(f"Run {run_id} - exit_code:")
         assert "CLIMBED" in answer
         assert "is queued at position" not in answer
@@ -2693,7 +3177,7 @@ class TestAQueuedCallerWaitsOutItsTurn:
 #
 # Same rule as the G-classes above: every assertion here reads a MODEL FIELD
 # first — status.state, status.reason, actor._running, actor._queue,
-# harness.requests, script.commands, journal_log(...) — and only then, if at
+# harness.runs, script.commands, journal_log(...) — and only then, if at
 # all, a rendered string.
 # ---------------------------------------------------------------------------
 
@@ -2703,7 +3187,7 @@ class TestTheHandlerAlwaysReports:
 
     def test_a_backend_that_raises_is_reported_and_the_queue_drains(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # N1. The handler's finally is the whole contract: an exception escaping
@@ -2728,7 +3212,7 @@ class TestTheHandlerAlwaysReports:
 
     def test_a_timeout_from_the_backend_is_an_outcome_not_a_failure(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # N2. "Too slow" is the ordinary case for a shell, so it is an answer
@@ -2748,7 +3232,7 @@ class TestTheHandlerAlwaysReports:
 
     def test_an_unbalanced_quote_reaches_the_caller_as_a_reported_failure(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # N3, the second half — the disallowed binary is TestADisallowedCommand.
@@ -2768,30 +3252,36 @@ class TestTheHandlerAlwaysReports:
 
     def test_an_exception_with_no_message_names_its_type_instead_of_escaping(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # ``str(RuntimeError())`` is the empty string, and an empty ``error``
         # fails ExecReport's exactly-one validator — so building the failure
-        # report raises INSIDE the except clause and propagates out of the tell
-        # handler, which stops the sandbox actor. That is the exact failure this
-        # handler exists to prevent, reached through the handler's own answer.
+        # report raises INSIDE the except clause and is lost onto a future
+        # nobody reads, leaving the run holding the tree until the grace
+        # releases it. That is the exact failure ``or repr(exc)`` exists to
+        # prevent, reached through the runner's own answer.
         #
-        # The handler is called directly here rather than through the harness's
-        # thread: an escape on a thread is a warning nobody fails on, while an
-        # escape on this one is the raise it would be inside Pykka's actor loop.
+        # ``perform`` is called directly here rather than through the executor:
+        # an escape on the worker's thread is swallowed onto the future, which
+        # is precisely why it must be asserted on a thread that fails.
         _card, actor, harness = exec_setup
         sandbox_script.raise_with = RuntimeError()
         sandbox_script.gate.set()
         start = actor.request_exec(AGENT, "echo hi")
         assert start.run_id, start.refusal
         harness.join()
-        request = harness.requests[0]
-        sandbox = harness.orchestrator_proxy.actor_for(harness.sandbox_addresses[0])
-        assert isinstance(sandbox, SandboxActor)
-        routed = request.model_copy(update={"reply_to": harness.workspace_address})
+        runner = actor._runner
+        assert runner is not None
+        submitted = harness.runs[0]
 
-        sandbox.receiveMsg_ExecRequest(routed)  # must not raise
+        runner.perform(  # must not raise
+            run_id=submitted.run_id,
+            cmd=submitted.cmd,
+            cwd=submitted.cwd,
+            timeout_s=submitted.timeout_s,
+            reply_to=harness.workspace_address,
+        )
 
         status = actor.exec_status(AGENT, start.run_id)
         assert status.state is ExecState.FAILED
@@ -2800,13 +3290,13 @@ class TestTheHandlerAlwaysReports:
 
     def test_one_request_per_run_carries_the_clamped_budget_and_a_reply_address(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # N4. One send, never two — a second would run the command twice against
-        # one tree — and request() is never reached at all: the deferred base's
-        # worker half is not used here, only its cache.
+        # N4. One submit, never two — a second would run the command twice
+        # against one tree — and request() is never reached at all: the deferred
+        # base's worker half is not used here, only its cache.
         _card, actor, harness = exec_setup
 
         def no_worker(*args: Any, **kwargs: Any) -> None:
@@ -2816,13 +3306,16 @@ class TestTheHandlerAlwaysReports:
         run_id = start_run(actor, sandbox_script, cmd="echo hi")
         finish_run(sandbox_script, harness)
 
-        assert len(harness.requests) == 1
-        request = harness.requests[0]
-        assert request.run_id == run_id
-        assert request.cmd == "echo hi"
-        assert request.timeout_s == effective_budget(DEFAULT_EXEC_TIMEOUT_S)
-        assert request.reply_to is not None
-        assert harness.ask_timeouts == [SANDBOX_RESOLVE_TIMEOUT_S]
+        assert len(harness.runs) == 1
+        submitted = harness.runs[0]
+        assert submitted.run_id == run_id
+        assert submitted.cmd == "echo hi"
+        assert submitted.timeout_s == effective_budget(DEFAULT_EXEC_TIMEOUT_S)
+        # The address is captured on the ACTOR's thread and handed over, which is
+        # what stops the worker reaching into ``self`` for it. ``myAddress``
+        # builds a fresh wrapper per read, so identity is the wrong test —
+        # naming the same actor is the property.
+        assert submitted.reply_to.name == actor.myAddress.name
 
 
 @requires_git
@@ -2836,17 +3329,17 @@ class TestACommitPrecedesTheNextStart:
         workspace_tree: Path,
         sandbox_script: SandboxScript,
         monkeypatch: pytest.MonkeyPatch,
-    ) -> tuple[WorkspaceActor, SandboxHarness]:
+    ) -> tuple[WorkspaceActor, ExecHarness]:
         exec_card_for(orchestrator_proxy, git_journal=True)
         _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
-        harness = SandboxHarness(actor, orchestrator_proxy)
+        harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
         return actor, harness
 
     def test_bs_files_are_absent_from_as_discovered_commit(
         self,
-        journalled: tuple[WorkspaceActor, SandboxHarness],
+        journalled: tuple[WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         workspace_tree: Path,
     ) -> None:
@@ -2876,74 +3369,55 @@ class TestACommitPrecedesTheNextStart:
         assert b_commit.files == ["b.txt"]
 
 
-class TestACrashedSandbox:
-    """N6, N9a, N10 — the sandbox is gone, and the run is answered anyway."""
+class TestAReportThatCannotLand:
+    """N10 — ``#Workspace`` is stopping, and the worker has nowhere to report."""
 
-    def test_a_crash_mid_run_fails_the_run_and_the_next_admission_recreates_it(
+    def test_a_dead_reply_address_does_not_escape_the_worker(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # N6 and N9's crash half. No send primitive can see this: the request
-        # was delivered to an actor that was alive at the time. The poll is the
-        # message guaranteed to arrive, so the liveness check lives there.
+        # The guard the body carried over from the sandbox actor, and its purpose
+        # is stronger here: the address is now #Workspace ITSELF, which may
+        # already be part-way through its own on_stop when the worker returns.
+        # ``ActorAddress.tell`` raises synchronously on a dead address, so
+        # without the guard the exception surfaces on a Future nobody reads and
+        # the report is lost with no log line at all.
+        #
+        # ``perform`` is driven directly, on a thread that fails: run through the
+        # executor, an escape would be swallowed onto the future and this spec
+        # would pass with the guard removed.
         _card, actor, harness = exec_setup
-        discovered: list[str] = []
-        monkeypatch.setattr(
-            actor._journal,
-            "commit_discovered",
-            lambda identity, capability, detail="": discovered.append(detail),
+        sandbox_script.gate.set()
+        runner = actor._runner
+        assert runner is not None
+        harness.workspace_address.dead = True
+
+        runner.perform(  # must not raise
+            run_id="run-0001",
+            cmd="echo hi",
+            cwd="",
+            timeout_s=1.0,
+            reply_to=harness.workspace_address,
         )
-        head = start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
-        tail = actor.request_exec(AGENT_B, "echo tail")
-        creates_before = len(harness.orchestrator_proxy.create_calls)
-        dead = harness.sandbox_addresses[0]
-        dead.alive = False
 
-        status = actor.exec_status(AGENT, head)
+        # It really did run — otherwise "nothing escaped" would be the answer to
+        # a command that was never attempted.
+        assert sandbox_script.commands == [("echo hi", "")]
 
-        assert status.state is ExecState.FAILED
-        assert dead.name in status.reason
-        assert actor._running is not None
-        assert actor._running.run_id == tail.run_id  # N9a: the release drained
-        assert list(actor._queue) == []
-        assert len(harness.orchestrator_proxy.create_calls) > creates_before
-        # The replacement is registered under the same name, so identity is what
-        # says the dead child was skipped rather than handed back.
-        assert harness.sandbox_addresses[0] is not dead
-        assert harness.sandbox_addresses[0].is_alive()
-        assert discovered == []  # nothing committed as the crashed run's agent
-        finish_run(sandbox_script, harness)
-
-    def test_a_send_that_cannot_land_fails_synchronously_and_the_queue_still_drains(
+    def test_the_dead_address_case_is_reachable(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
-        # N10. Both halves matter. The synchronous half is what separates
-        # ActorAddress.tell from a tell proxy — the proxy sets ActorDeadError on
-        # a future it drops, so the run would sit RUNNING until some later poll.
-        # The drain half is what _running-before-the-send buys: a failure that
-        # found no run to release would strand everything behind it.
-        _card, actor, harness = exec_setup
-        head = start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
-        first = actor.request_exec(AGENT_B, "echo one")
-        second = actor.request_exec(AGENT_C, "echo two")
-        assert len(actor._queue) == 2
-        harness.sandbox_addresses[0].alive = False
-        harness.orchestrator_proxy.sandbox_born_dead = True
+        # The positive control for the spec above: the same stand-in really does
+        # raise when it is dead, so "the worker swallowed it" is a statement
+        # about the guard rather than about an address that never raises.
+        _card, _actor, harness = exec_setup
+        harness.workspace_address.dead = True
 
-        finish_run(sandbox_script, harness)
-
-        # State FIRST, before any exec_status: the poll's liveness check would
-        # otherwise rescue a silent send, and the whole point of the address
-        # over a tell proxy is that nothing has to wait for a poll.
-        assert actor._running is None
-        assert list(actor._queue) == []
-        assert actor.exec_status(AGENT, head).state is ExecState.DONE
-        assert actor.exec_status(AGENT_B, first.run_id).state is ExecState.FAILED
-        assert actor.exec_status(AGENT_C, second.run_id).state is ExecState.FAILED
+        with pytest.raises(pykka.ActorDeadError):
+            harness.workspace_address.tell(ExecReport(run_id="run-0001", error="boom"))
 
 
 class TestAWedgedChild:
@@ -2951,7 +3425,7 @@ class TestAWedgedChild:
 
     def test_past_the_budget_and_the_grace_the_gate_is_released(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # N7. The clock is moved, never the wall clock: the run's own started_at
@@ -2973,7 +3447,7 @@ class TestAWedgedChild:
 
     def test_the_release_starts_the_queue_head(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # N9's wedge half. Releasing without starting the head would leave the
@@ -2994,12 +3468,12 @@ class TestAWedgedChild:
         assert actor._running.run_id == tail.run_id
         assert actor._running.run_id != head
         assert list(actor._queue) == []
-        assert [request.run_id for request in harness.requests] == [head, tail.run_id]
+        assert [request.run_id for request in harness.runs] == [head, tail.run_id]
         finish_run(sandbox_script, harness)
 
     def test_inside_the_grace_the_mutation_is_still_refused(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
         # The other side of the same boundary, and what makes the grace itself
@@ -3020,7 +3494,7 @@ class TestAWedgedChild:
 
     def test_the_late_report_commits_nothing_and_clears_nothing(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, SandboxHarness],
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:

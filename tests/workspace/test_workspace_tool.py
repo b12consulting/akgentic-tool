@@ -28,7 +28,7 @@ from akgentic.tool.workspace.tool import (
     ResourceType,
     WorkspaceTool,
 )
-from akgentic.tool.sandbox.actor import sandbox_actor_name
+from akgentic.tool.sandbox.actor import SANDBOX_ACTOR_NAME
 from akgentic.tool.workspace.card.params import WorkspaceExec
 from akgentic.tool.workspace.workspace import Filesystem, PathEscapeError, Workspace
 
@@ -1380,14 +1380,18 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
         assert workspace_actor_name("alice/notes") in orchestrator_proxy.children
         assert workspace_actor_name("bob/notes") in orchestrator_proxy.children
 
-    def test_two_cards_on_two_workspaces_get_two_workspace_and_two_sandbox_actors(
+    def test_two_exec_cards_on_two_workspaces_get_two_actors_and_no_sandbox_actor(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
     ) -> None:
-        """AC 14: both actor names carry the full two-segment path, slash included.
+        """AC 14: the actor name carries the full two-segment path, slash included.
 
         Nothing parses an actor name and the path is injective by construction,
         so it is carried whole rather than flattened through a second encoding
         whose injectivity would have to be proved separately.
+
+        An exec-capable card creates **no** ``#SandboxActor``: ``#Workspace``
+        owns its own backend, so a second actor here would be one nothing ever
+        reaches — and on the docker backend, a container nobody execs in.
         """
         for leaf in ("alpha", "beta"):
             (workspaces_root / "alice" / leaf).mkdir(parents=True, exist_ok=True)
@@ -1403,12 +1407,10 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
         assert {
             workspace_actor_name("alice/alpha"),
             workspace_actor_name("alice/beta"),
-            sandbox_actor_name("alice/alpha"),
-            sandbox_actor_name("alice/beta"),
         } <= names
         # The slash survives into the name verbatim — it is not escaped away.
         assert "#Workspace-alice/alpha" in names
-        assert "#SandboxActor-alice/beta" in names
+        assert not any(name.startswith(SANDBOX_ACTOR_NAME) for name in names)
 
     def test_a_bare_card_never_asks_the_orchestrator_for_metadata(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path

@@ -47,7 +47,6 @@ from akgentic.tool.core import (
     _resolve,
 )
 from akgentic.tool.core.observer import ActorToolObserver
-from akgentic.tool.sandbox import SANDBOX_ACTOR_CLASSES
 from akgentic.tool.vector_store.actor import ensure_store_actor
 from akgentic.tool.vector_store.protocol import (
     VectorStoreParam,
@@ -84,11 +83,7 @@ from akgentic.tool.workspace.card.rag import RagFactories
 from akgentic.tool.workspace.card.read import ReadFactories
 from akgentic.tool.workspace.card.write import WriteFactories
 from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION, derived_document_caps
-from akgentic.tool.workspace.execution import (
-    ExecConfig,
-    resolve_mode,
-    sandbox_config,
-)
+from akgentic.tool.workspace.execution import ExecConfig, resolve_mode
 from akgentic.tool.workspace.models import (
     Observation,
     WorkspaceConfig,
@@ -376,7 +371,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
         self._workspace = get_workspace(ws_path)
         self._seed_resources()
         self._bind_workspace_actor(observer, observer.orchestrator, ws_path)
-        self._bind_sandbox(observer, observer.orchestrator, ws_path)
+        self._bind_sandbox(observer, ws_path)
         self._announce_rag()
         return self
 
@@ -435,25 +430,35 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
             return None
         return params
 
-    def _bind_sandbox(
-        self, observer: ActorToolObserver, orchestrator: ActorAddress, workspace_path: str
-    ) -> None:
-        """Bring up the team's ``#SandboxActor`` and tell ``#Workspace`` about it.
+    def _bind_sandbox(self, observer: ActorToolObserver, workspace_path: str) -> None:
+        """Resolve the mode and tell ``#Workspace`` which backend to run on.
 
         **Nothing happens here when the capability is off** — no host probe, no
-        actor, no message. That is the whole of what ``workspace_exec=False``
-        buys, and it is why the check is at the top rather than inside.
+        message. That is the whole of what ``workspace_exec=False`` buys, and it
+        is why the check is at the top rather than inside.
+
+        **No actor is created any more.** ``#Workspace`` owns its own backend and
+        its own worker thread, so a ``#SandboxActor`` here would be an actor
+        nothing uses — and on the docker backend that is a container nobody execs
+        in, provisioned at wiring time for a team that may never run a command.
 
         The order matters: this runs *after* ``_bind_workspace_actor``, because
         ``configure_exec`` travels over the tell proxy that method binds, and
         after ``register_agent``, so the actor can already name this agent in a
         refusal the first run causes.
 
+        **``resolve_mode``'s instance is still dropped here, and that is
+        correct**: this card does not run commands. What it needs from that call
+        is the resolved mode and the ``"auto"`` probe's ``DeprecationWarning``,
+        which must fire at wiring time in front of the admin who configured the
+        card. ``#Workspace.configure_exec`` makes the same call with the concrete
+        mode — so the probe short-circuits, no second warning fires — and keeps
+        the instance.
+
         Args:
             observer: The owning agent, live at bind time.
-            orchestrator: Address of the orchestrator.
             workspace_path: The already-resolved two-segment path this card is
-                anchored to. Passed down rather than re-derived, so the sandbox
+                anchored to. Passed down rather than re-derived, so the backend
                 cannot open a directory other than the one being gated.
 
         Raises:
@@ -463,23 +468,15 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
         params = self._enabled_exec()
         if params is None:
             return
-        # The strategy ``resolve_mode`` builds is what ``#Workspace``'s executor
-        # will run on once it owns a worker thread. Until then the actor is what
-        # ``getChildrenOrCreate`` needs, so the instance is dropped here and the
-        # class comes from the registry — one mutable dict, so a backend a
-        # deployment assigns into it is seen whenever this module was imported.
         mode, _backend = resolve_mode(params.mode)
-        config = ExecConfig(
-            mode=mode,
-            team_id=str(observer.team_id),
-            workspace_path=workspace_path,
-            timeout_s=params.timeout_s,
+        self._announce_exec(
+            ExecConfig(
+                mode=mode,
+                team_id=str(observer.team_id),
+                workspace_path=workspace_path,
+                timeout_s=params.timeout_s,
+            )
         )
-        orchestrator_proxy = observer.proxy_ask(orchestrator, Orchestrator)
-        orchestrator_proxy.getChildrenOrCreate(
-            SANDBOX_ACTOR_CLASSES[mode], config=sandbox_config(config)
-        )
-        self._announce_exec(config)
 
     def _announce_exec(self, config: ExecConfig) -> None:
         """Tell the actor which backend to run commands on — fire and forget.

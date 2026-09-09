@@ -51,12 +51,13 @@ class DockerBackend(ProcessBackend):
     Args:
         team_id: Names the container, and nothing else. Defaulted so that the
             backend is constructible with no arguments, which is what
-            ``resolve_mode`` needs to build one from the registry.
+            ``resolve_mode`` needs to build one from the registry. It is
+            :class:`~akgentic.tool.sandbox.backend.ProcessBackend`'s parameter —
+            this is the one backend that reads it.
     """
 
     def __init__(self, team_id: str = "") -> None:
-        super().__init__()
-        self.team_id = team_id
+        super().__init__(team_id)
         self.container_name: str | None = None
         """The container this backend runs in, set by :meth:`start`."""
 
@@ -153,8 +154,17 @@ class DockerBackend(ProcessBackend):
 
         Only ``<root>:/workspace`` is mounted (see :meth:`start`), so the
         sibling journal at ``<root>.git`` is not visible inside the container.
+
+        Raises:
+            RuntimeError: If :meth:`start` has not run, so there is no container
+                to exec in. An explicit raise rather than an ``assert``: under
+                ``python -O`` the assert is stripped and the argv would carry a
+                literal ``None`` straight to the docker CLI.
         """
-        assert self.container_name is not None
+        if self.container_name is None:
+            raise RuntimeError(
+                "DockerBackend.exec was called before start() — there is no container to run in."
+            )
         effective_workdir = f"/workspace/{cwd}" if cwd else "/workspace"
         docker_cmd = [
             "docker",
@@ -183,8 +193,17 @@ class DockerBackend(ProcessBackend):
         super().kill()
 
     def _release(self) -> None:
-        """Stop the container, keeping its filesystem for the next run."""
-        assert self.container_name is not None
+        """Stop the container, keeping its filesystem for the next run.
+
+        **Returns when nothing was started**, rather than asserting. This runs
+        from ``stop()``, and ``stop()`` runs from ``#Workspace``'s teardown — on
+        a backend that may never have had a first command to start it. An
+        ``AssertionError`` there is an exception raised into a shutdown path,
+        and under ``python -O`` it is worse: the assert vanishes and
+        ``docker stop None`` is what actually runs.
+        """
+        if self.container_name is None:
+            return
         subprocess.run(
             ["docker", "stop", self.container_name],
             capture_output=True,

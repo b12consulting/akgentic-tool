@@ -21,8 +21,6 @@ import subprocess
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from pydantic import model_validator
-
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
@@ -34,6 +32,7 @@ from akgentic.tool.sandbox.backend import (
     CardMode,
     CommandNotAllowedError,
     CommandParseError,
+    ExecReport,
     ExecResult,
     SandboxMode,
     validate_command,
@@ -59,12 +58,19 @@ __all__ = [
     "sandbox_actor_name",
     "validate_command",
 ]
-"""The allowlist, the two exceptions, ``ExecResult`` and the two mode aliases now
-live in :mod:`akgentic.tool.sandbox.backend` and are re-exported here.
+"""The allowlist, the two exceptions, ``ExecResult``, ``ExecReport`` and the two
+mode aliases now live in :mod:`akgentic.tool.sandbox.backend` and are re-exported
+here.
 
 They moved with the backends they belong to; the re-export is what keeps
 ``from akgentic.tool.sandbox.actor import ALLOWED_COMMANDS`` — and everything
 that reaches them through the package — resolving to the same objects.
+
+``ExecReport`` was the last of them, and it moved for a different reason: this
+module is what the sandbox actor's retirement deletes, and the report is still
+told by whatever performed the run — which is now ``#Workspace``'s own worker
+thread. ``ExecRequest`` stays, because only :meth:`SandboxActor.receiveMsg_ExecRequest`
+uses it and it dies with that method.
 """
 
 # ---------------------------------------------------------------------------
@@ -182,44 +188,6 @@ class ExecRequest(SerializableBaseModel):
     cwd: str = ""
     timeout_s: float
     reply_to: ActorAddress
-
-
-class ExecReport(SerializableBaseModel):
-    """What the sandbox tells back when a run is over — however it ended.
-
-    Exactly one of the three outcomes is carried, and it is **enforced**: the
-    receiving actor branches on them in order, so a report carrying none would
-    close a run out with no answer at all and one carrying two would deliver an
-    outcome for a run it had also failed.
-
-    It lives here rather than beside ``ExecOutcome`` because ``sandbox/`` cannot
-    import ``workspace/`` — the edge runs the other way — and the report has to
-    be constructible on this side.
-
-    Attributes:
-        run_id: The run being reported, verbatim from the request.
-        result: What the command produced, when it ran to completion — well or
-            badly. A non-zero exit code is a **result**, not a failure.
-        timed_out: True when the budget killed the command. Also an answer an
-            agent can read, which is why it is not folded into *error*.
-        error: Why there is no result — the backend raised, the allowlist
-            refused the binary, the quoting would not parse.
-    """
-
-    run_id: str
-    result: ExecResult | None = None
-    timed_out: bool = False
-    error: str = ""
-
-    @model_validator(mode="after")
-    def _exactly_one(self) -> ExecReport:
-        """Reject a report that carries no outcome, or more than one."""
-        carried = sum((self.result is not None, self.timed_out, bool(self.error)))
-        if carried != 1:
-            raise ValueError(
-                f"ExecReport carries exactly one of result, timed_out or error — got {carried}."
-            )
-        return self
 
 
 # ---------------------------------------------------------------------------

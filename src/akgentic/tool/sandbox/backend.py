@@ -12,8 +12,17 @@ and returns only when it is over: there was no handle, so there was nothing a
 caller could end. A backend now keeps the handle of the run in flight, so a
 caller that no longer wants a run can stop it.
 
-This module imports nothing else from the package, which is what lets
-``actor.py`` import it and re-export the names it moved from there.
+This module imports nothing else from ``akgentic.tool``, which is what lets
+``actor.py`` import it and re-export the names it moved from there. (It does
+reach ``akgentic.core`` for the serializer base, which is a package below this
+one and cannot import back.)
+
+**``ExecReport`` lives here, beside the ``ExecResult`` it carries.** It used to
+live in ``actor.py``, whose only remaining reason to exist is the sandbox actor;
+the report is told by whatever performed the run, and since the run moved to
+``#Workspace``'s own worker thread that is no longer an actor at all. It is
+re-exported from ``actor.py`` so every existing import path still resolves to
+this one object.
 """
 
 from __future__ import annotations
@@ -25,7 +34,9 @@ import threading
 from collections.abc import Callable
 from typing import Literal, Protocol, runtime_checkable
 
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
+
+from akgentic.core.utils.serializer import SerializableBaseModel
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +144,44 @@ class ExecResult(BaseModel):
     exit_code: int
 
 
+class ExecReport(SerializableBaseModel):
+    """What the runner tells back when a run is over — however it ended.
+
+    Exactly one of the three outcomes is carried, and it is **enforced**: the
+    receiving actor branches on them in order, so a report carrying none would
+    close a run out with no answer at all and one carrying two would deliver an
+    outcome for a run it had also failed.
+
+    It lives here rather than beside ``ExecOutcome`` because ``sandbox/`` cannot
+    import ``workspace/`` — the edge runs the other way — and the report has to
+    be constructible on this side.
+
+    Attributes:
+        run_id: The run being reported, verbatim from the request.
+        result: What the command produced, when it ran to completion — well or
+            badly. A non-zero exit code is a **result**, not a failure.
+        timed_out: True when the budget killed the command. Also an answer an
+            agent can read, which is why it is not folded into *error*.
+        error: Why there is no result — the backend raised, the allowlist
+            refused the binary, the quoting would not parse.
+    """
+
+    run_id: str
+    result: ExecResult | None = None
+    timed_out: bool = False
+    error: str = ""
+
+    @model_validator(mode="after")
+    def _exactly_one(self) -> ExecReport:
+        """Reject a report that carries no outcome, or more than one."""
+        carried = sum((self.result is not None, self.timed_out, bool(self.error)))
+        if carried != 1:
+            raise ValueError(
+                f"ExecReport carries exactly one of result, timed_out or error — got {carried}."
+            )
+        return self
+
+
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
@@ -220,8 +269,20 @@ class SandboxBackend(Protocol):
     ``exec()`` took the wrong arguments would pass it. The real conformance check
     is mypy over ``src/``; the runtime check is a smoke test, and any sentence
     written about it should say the four names are present rather than that the
-    Protocol is satisfied.
+    Protocol is satisfied. Declaring ``__init__`` below does not strengthen it in
+    the slightest — every object has one — and mypy ignores ``__init__``
+    entirely when deciding whether a class *implements* a Protocol.
+
+    **What ``__init__`` is declared for is the other direction**: the registry
+    holds ``type[SandboxBackend]`` and ``resolve_mode`` constructs from it, so
+    "constructible from a team id alone" is part of what registering a backend
+    commits to, and a Protocol that did not say so would leave the one call site
+    that builds one unable to be type-checked at all.
     """
+
+    def __init__(self, team_id: str = "") -> None:
+        """Build an unstarted backend for *team_id*. Only docker reads it."""
+        ...
 
     def start(self, workspace_path: str) -> None:
         """Provision the backend for the already-resolved two-segment *workspace_path*."""
@@ -253,9 +314,20 @@ class ProcessBackend:
     ending a run early lives here. It is deliberately not a
     :class:`SandboxBackend` itself — it implements neither ``start`` nor ``exec``,
     which is the whole of what distinguishes one backend from another.
+
+    **Every backend takes a** ``team_id``, **and three of the four ignore it.**
+    Only docker uses it — it names the container, which is a per-team execution
+    resource. The parameter is here rather than only on that one subclass so
+    that the caller building a backend from the registry has one uniform
+    constructor to call and never a type switch on the mode it just resolved.
+
+    Args:
+        team_id: The team this backend runs for. Defaulted, so a backend is
+            still constructible with no arguments.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, team_id: str = "") -> None:
+        self.team_id = team_id
         self._lock = threading.Lock()
         self._running: subprocess.Popen[str] | None = None
 

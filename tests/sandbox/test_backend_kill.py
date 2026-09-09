@@ -482,3 +482,79 @@ def test_replacing_the_backend_changes_what_the_actor_returns(tmp_path: Path) ->
 
     assert result.stdout == "from the stub"
     assert result.exit_code == 7
+
+
+# ---------------------------------------------------------------------------
+# 50-2 — one uniform constructor, and docker's two asserts become guards
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "backend_class", [LocalBackend, BwrapBackend, SeatbeltBackend, DockerBackend]
+)
+def test_every_backend_accepts_a_team_id(backend_class: type[Any]) -> None:
+    """All four take it, and it is stored, so the caller needs no type switch.
+
+    The registry holds classes and ``resolve_mode`` constructs from it, so a
+    backend that refused the keyword would make that one call site branch on the
+    mode it had just resolved — which is the thing having a registry is for.
+    """
+    backend = backend_class(team_id="team-42")
+
+    assert backend.team_id == "team-42"
+
+
+@pytest.mark.parametrize(
+    "backend_class", [LocalBackend, BwrapBackend, SeatbeltBackend, DockerBackend]
+)
+def test_every_backend_is_still_constructible_with_no_arguments(
+    backend_class: type[Any],
+) -> None:
+    """The default is what keeps ``resolve_mode`` able to build one from the registry."""
+    assert backend_class().team_id == ""
+
+
+def test_resolve_mode_carries_the_team_to_the_backend_that_needs_it() -> None:
+    """The team names the docker container, and this is the only path it travels.
+
+    Asserted through the container name rather than only the attribute: the name
+    is the consequence, and a ``team_id`` stored but never used in it would be a
+    per-team resource shared across teams.
+    """
+    _mode, backend = resolve_mode("docker", team_id="team-42")
+
+    assert isinstance(backend, DockerBackend)
+    assert backend.team_id == "team-42"
+
+
+def test_resolve_mode_without_a_team_leaves_the_backend_teamless() -> None:
+    """The card's wiring call names no team and must not invent one."""
+    _mode, backend = resolve_mode("docker")
+
+    assert isinstance(backend, DockerBackend)
+    assert backend.team_id == ""
+
+
+def test_an_unstarted_docker_release_returns_instead_of_raising() -> None:
+    """``stop()`` on a backend that never ran must not raise into a teardown.
+
+    It used to ``assert self.container_name is not None``. That is an
+    ``AssertionError`` raised inside ``on_stop`` — where an exception is worse
+    than any error it could report — and under ``python -O`` it is worse still:
+    the assert is stripped and ``docker stop None`` is what actually runs.
+    """
+    backend = DockerBackend(team_id="team-42")
+    assert backend.container_name is None
+
+    with patch("akgentic.tool.sandbox.docker.subprocess.run") as run:
+        backend.stop()  # must not raise
+
+    assert run.call_count == 0  # and it reached no docker CLI
+
+
+def test_an_unstarted_docker_exec_raises_a_readable_error() -> None:
+    """The other assert. A refusal a reader can act on, and one ``-O`` cannot strip."""
+    backend = DockerBackend(team_id="team-42")
+
+    with pytest.raises(RuntimeError, match="before start"):
+        backend.exec("echo hi", "", None)

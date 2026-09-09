@@ -68,8 +68,8 @@ class SeatbeltBackend(ProcessBackend):
     macOS and the Seatbelt policy handles the primary threat model.
     """
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, team_id: str = "") -> None:
+        super().__init__(team_id)
         self.workspace_path: Path | None = None
         """The resolved host directory, set by :meth:`start`."""
 

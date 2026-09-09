@@ -6,12 +6,12 @@ the file it names. A shell command cannot, so ``workspace_exec`` takes an
 exclusive lease over the tree instead, and its write set is *discovered*
 afterwards from ``git status --porcelain -uall`` (ADR-036 §5).
 
-The deferred-result mechanism (ADR-033) is engaged in full: the blocking sandbox
-call happens in a ``#defer-`` worker, never on the actor's thread. Everything
-this module does on the ask path is O(1) plus the journal's bounded git calls.
+The blocking call happens on ``#Workspace``'s own single worker thread, never on
+the actor's thread and no longer on a second actor's. Everything this module does
+on the ask path is O(1) plus the journal's bounded git calls.
 
 **Two modules are called ``execution`` and they are not the same one.**
-:mod:`akgentic.tool.workspace.execution` holds the exec models, ``ExecWorker``
+:mod:`akgentic.tool.workspace.execution` holds the exec models, ``ExecRunner``
 and the sandbox edge; this module holds the mixin that drives them. The
 dependency runs one way — this module imports **from** that one — and every
 import here is absolute so the two never blur.
@@ -22,22 +22,22 @@ from __future__ import annotations
 import logging
 import time
 from collections import OrderedDict, deque
+from concurrent import futures
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
-from akgentic.core.actor_address import ActorAddress
-from akgentic.core.orchestrator import Orchestrator
 from akgentic.tool.core.deferred import DeferredResultActor
-from akgentic.tool.sandbox import SANDBOX_ACTOR_CLASSES
-from akgentic.tool.sandbox.actor import ExecReport, ExecRequest
+from akgentic.tool.sandbox.backend import ExecReport
 from akgentic.tool.workspace.execution import (
     DEFAULT_EXEC_TIMEOUT_S,
+    EXEC_SHUTDOWN_GRACE_S,
     LEASE_GRACE_S,
     MAX_QUEUED_RUNS,
     MAX_TRACKED_RUNS,
-    SANDBOX_RESOLVE_TIMEOUT_S,
     TIMED_OUT_EXIT_CODE,
     ExecConfig,
     ExecOutcome,
+    ExecRunner,
     ExecStart,
     ExecState,
     ExecStatus,
@@ -46,7 +46,7 @@ from akgentic.tool.workspace.execution import (
     effective_budget,
     new_run_id,
     queue_full,
-    sandbox_config,
+    resolve_mode,
     unconfigured,
 )
 from akgentic.tool.workspace.journal import GitJournal, Identity
@@ -65,6 +65,8 @@ operations — the six mutations and a second ``workspace_exec``.
 """
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     # ``deliver`` and ``fail`` call ``super()``, which resolves against this
     # mixin's own bases — ``(object,)`` at runtime. mypy needs the real base
     # there or it reports ``"deliver" undefined in superclass``. The MRO stays
@@ -76,9 +78,12 @@ else:
 
 
 class ExecMixin(_ExecBase):
-    """The lease, the run bookkeeping, and the deferred surface."""
+    """The lease, the run bookkeeping, the worker thread and its ordered teardown."""
 
     _exec_config: ExecConfig | None
+    _runner: ExecRunner | None
+    _executor: ThreadPoolExecutor
+    _pending: Future[None] | None
     _running: RunningExec | None
     _queue: deque[QueuedExec]
     _run_errors: OrderedDict[str, str]
@@ -95,7 +100,7 @@ class ExecMixin(_ExecBase):
     ## Exec — the queue, the running run, and the discovered commit
     ##
     def configure_exec(self, config: ExecConfig) -> None:
-        """Record which backend to run commands on — **tell** path, once per card.
+        """Build the backend commands will run on — **tell** path, once per card.
 
         The actor cannot take this from :class:`WorkspaceConfig`, because
         ``getChildrenOrCreate`` fixes that at creation and the card that creates
@@ -103,15 +108,55 @@ class ExecMixin(_ExecBase):
         all. So an exec-capable card announces itself here instead, at bind time,
         exactly as :meth:`register_agent` does.
 
+        **This is the one place a backend is built**, and it is here because
+        :class:`ExecConfig` is the one place ``mode``, ``team_id``,
+        ``workspace_path`` and ``timeout_s`` all arrive together. Nothing is
+        probed, created or started by the construction: the container is
+        provisioned by the worker thread on the first command.
+
         Last writer wins, and that is correct: two exec-capable cards over one
-        tree must agree on the backend anyway, since they share one
-        ``#SandboxActor-<workspace>`` — the sandbox actor is named per workspace,
-        for the same reason this one is.
+        tree must agree on the backend anyway. What is new is that overwriting
+        now **leaks** — a backend with no owner, and for docker a container with
+        nobody left to stop it. So an *equal* config changes nothing at all, which
+        is the common case and close to the only one; a *different* one stops the
+        old runner and builds a new one.
+
+        **A replacement mid-run is deliberately not guarded**, for the reason
+        :meth:`_run_budget` gives about the same situation: two exec-capable
+        cards over one tree that disagree on the backend are a misconfiguration,
+        not a race, and the honest failure is the run reporting an error rather
+        than a lock nobody can see.
 
         Args:
             config: The resolved backend and the ids to build payloads from.
         """
+        if self._exec_config == config and self._runner is not None:
+            return
+        self._stop_runner()
+        _mode, backend = resolve_mode(config.mode, team_id=config.team_id)
+        self._runner = ExecRunner(backend, config.workspace_path)
         self._exec_config = config
+
+    def _stop_runner(self) -> None:
+        """Release the current runner's backend, if there is one, swallowing failures.
+
+        Two callers with the same requirement: :meth:`configure_exec` replacing a
+        runner, and teardown's fourth step. Neither may raise — one is on a
+        binding path where the degradation is a refused run, and the other is
+        inside ``on_stop``, where leaving a Pykka actor part-way stopped is worse
+        than any error this could report.
+        """
+        runner = self._runner
+        if runner is None:
+            return
+        try:
+            runner.stop()
+        except Exception:
+            logger.warning(
+                "Workspace %s: releasing the exec backend raised — swallowing",
+                self.config.workspace_path,
+                exc_info=True,
+            )
 
     def request_exec(self, agent_id: str, cmd: str, cwd: str = "") -> ExecStart:
         """Start the run, or queue it — in one mailbox turn, under the caller's own id.
@@ -159,11 +204,11 @@ class ExecMixin(_ExecBase):
         return ExecStart(run_id=entry.run_id)
 
     def _start_run(self, entry: QueuedExec, config: ExecConfig) -> None:
-        """Take the tree for *entry* and send it to the sandbox — the one accept path.
+        """Take the tree for *entry* and submit it to the worker — the one accept path.
 
         Reached from :meth:`request_exec` over a free tree and from
         :meth:`_start_next` when the head releases it, and there is deliberately
-        only one of it: the out-of-band commit, the hold and the send have to
+        only one of it: the out-of-band commit, the hold and the submit have to
         happen together and in this order, and a second copy is where the two
         paths would drift.
 
@@ -172,51 +217,54 @@ class ExecMixin(_ExecBase):
         committed, so anything already lying in it would be swept into this run's
         discovered commit and attributed to an agent that never wrote it.
 
-        **The hold is taken before the send**, and that ordering is load-bearing:
-        a resolve or a send that raises reports through :meth:`fail`
+        **The hold is taken before the submit**, and that ordering is
+        load-bearing: a submit that raises reports through :meth:`fail`
         *synchronously*, on this thread, and that has to find a run to release or
-        the queue behind it never drains.
+        the queue behind it never drains. A ``submit`` onto an executor that has
+        already been shut down raises ``RuntimeError``, so the case is reachable
+        rather than theoretical.
 
-        **The send is** ``ActorAddress.tell``, **never a tell proxy.** A tell
-        proxy's calls carry ask semantics underneath, so a dead sandbox's
-        ``ActorDeadError`` is set on a future the proxy drops — the send vanishes
-        with the run still marked running, and only a much later poll would
-        notice. The address checks liveness and raises here, where the failure is
-        an answer.
+        **This method submits and returns**, and nothing about the command runs
+        here: no ``start``, no ``exec``, no ``subprocess``. That is what keeps the
+        mailbox draining, which is what makes reads work during a run and a
+        refused mutation cost one turn instead of the run's whole duration.
+
+        **``reply_to`` is captured here, on the actor's thread**, and handed to
+        the worker as an argument. The worker must never read ``self.myAddress``
+        — or anything else on this actor — for itself.
 
         Args:
             entry: The run to start.
-            config: The backend to start it on.
+            config: The budget to start it under.
         """
         # The tree's existing dirt belongs to nobody, and must not end up inside
         # this run's discovered commit — which is exactly what would happen,
         # since that commit takes whatever the tree shows afterwards.
         self._journal.commit_out_of_band()
-        running = RunningExec(
+        self._running = RunningExec(
             run_id=entry.run_id,
             agent_id=entry.agent_id,
             cmd=entry.cmd,
             started_at=time.monotonic(),
         )
-        self._running = running
         # What ``request()`` used to do, and ``exec_status`` still answers
         # RUNNING from it. The base's deliver/fail clear it, unchanged.
         self._in_flight.add(entry.run_id)
         try:
-            address = self._resolve_sandbox(config)
-            running.attach(address)
-            address.tell(
-                ExecRequest(
-                    run_id=entry.run_id,
-                    cmd=entry.cmd,
-                    cwd=entry.cwd,
-                    timeout_s=effective_budget(config.timeout_s),
-                    reply_to=self.myAddress,
-                )
+            runner = self._runner
+            if runner is None:
+                raise RuntimeError("#Workspace has no execution backend to run this command on.")
+            self._pending = self._executor.submit(
+                runner.perform,
+                run_id=entry.run_id,
+                cmd=entry.cmd,
+                cwd=entry.cwd,
+                timeout_s=effective_budget(config.timeout_s),
+                reply_to=self.myAddress,
             )
         except Exception as exc:  # noqa: BLE001 — every failure here is the run's answer
             logger.warning(
-                "Workspace %s: run %s never reached the sandbox: %r",
+                "Workspace %s: run %s never reached the worker: %r",
                 self.config.workspace_path,
                 entry.run_id,
                 exc,
@@ -224,56 +272,14 @@ class ExecMixin(_ExecBase):
             )
             self.fail(entry.run_id, f"The command was never handed to the sandbox: {exc}")
 
-    def _resolve_sandbox(self, config: ExecConfig) -> ActorAddress:
-        """Get-or-create ``#SandboxActor-<workspace>`` and return its address.
-
-        Idempotent by construction (ADR-025): the card already created it at
-        wiring time, so this ordinarily resolves the existing one. It is also
-        what recreates it after a crash — the orchestrator skips a child that is
-        no longer alive, so the next run gets a fresh sandbox without anything
-        here having to notice.
-
-        The class comes from ``SANDBOX_ACTOR_CLASSES`` at call time, never at
-        import time, so a backend injected by a deployment package is still
-        found.
-
-        **The ask carries a timeout**, because it is made on the team singleton's
-        own thread and everything else queued behind it waits for it. It returns
-        before a cold backend's ``on_start`` has finished provisioning — Pykka
-        starts the actor's thread and returns — so what is being waited on is one
-        orchestrator turn, not a container build.
-
-        Args:
-            config: The card's resolved backend and ids.
-
-        Returns:
-            The sandbox actor's address.
-
-        Raises:
-            RuntimeError: If this actor has no orchestrator to resolve through.
-        """
-        # The registry is one mutable dict, so a backend a deployment assigns
-        # into it after import is seen here regardless of when it was imported.
-        orchestrator = self.orchestrator
-        if orchestrator is None:
-            raise RuntimeError("#Workspace cannot resolve its sandbox without an orchestrator.")
-        orchestrator_proxy = self.proxy_ask(
-            orchestrator, Orchestrator, timeout=SANDBOX_RESOLVE_TIMEOUT_S
-        )
-        address: ActorAddress = orchestrator_proxy.getChildrenOrCreate(
-            SANDBOX_ACTOR_CLASSES[config.mode], config=sandbox_config(config)
-        )
-        return address
-
     def _start_next(self) -> None:
         """Hand the freed tree to the queue head, if anything is waiting.
 
         Called from every place the tree is released and from nowhere else:
         :meth:`_finish_run` on a report (both exits — ``deliver`` and ``fail``
         alike, so a run that failed drains the queue exactly as a run that
-        succeeded does), and the two release paths that need no report,
-        :meth:`_holding_run` for a wedged child and
-        :meth:`_release_a_dead_sandbox` for a sandbox that stopped.
+        succeeded does), and the one release path that needs no report,
+        :meth:`_holding_run` for a wedged child.
 
         A workspace whose exec configuration was never announced cannot start
         anything; the entries stay queued rather than being silently dropped,
@@ -286,10 +292,10 @@ class ExecMixin(_ExecBase):
         self._start_run(self._queue.popleft(), config)
 
     def receiveMsg_ExecReport(self, report: ExecReport) -> None:
-        """TELL, from the sandbox. Turn one report into the run's settled answer.
+        """TELL, from this actor's own worker thread. Turn one report into an answer.
 
         The only thing that closes a run out on the ordinary path, and it has
-        exactly three branches because the sandbox reports exactly three things.
+        exactly three branches because the worker reports exactly three things.
         Two of them are *answers* the agent can read and one is a failure:
 
         - a **result** — whatever it exited with. A non-zero exit code is an
@@ -300,13 +306,15 @@ class ExecMixin(_ExecBase):
           the quotes would not balance. Nothing ran, and the reason says why.
 
         Dispatched by name from ``Akgent.on_receive``, which is what a
-        non-``Message`` payload delivered by ``ActorAddress.tell`` gets.
-        ``deliver`` and ``fail`` do the rest, so a report for a run that no
-        longer holds the tree is handled in exactly one place
+        non-``Message`` payload delivered by ``ActorAddress.tell`` gets. It
+        arrives through the mailbox exactly as it did from the sandbox actor, so
+        this runs on the actor's own thread and the worker's does not touch a
+        thing here. ``deliver`` and ``fail`` do the rest, so a report for a run
+        that no longer holds the tree is handled in exactly one place
         (:meth:`_finish_run`) rather than here.
 
         Args:
-            report: What the sandbox produced for one run.
+            report: What the worker produced for one run.
         """
         if report.error:
             self.fail(report.run_id, report.error)
@@ -395,19 +403,11 @@ class ExecMixin(_ExecBase):
             agent's recent run ids.
         """
         # Housekeeping first, ahead of even the ownership gate, and it is what
-        # makes both release paths reachable at all: this actor is passive,
+        # makes the release path reachable at all: this actor is passive,
         # nothing releases on a timer, and a head that will never report with
         # entries behind it would otherwise wait for some unrelated later
         # message. The message that is *guaranteed* to arrive is this one —
         # every queued caller polls its own run by construction.
-        #
-        # The liveness check lives HERE and only here. The mutation path needs
-        # no address: a dead sandbox's run is released by the wedge timestamp
-        # within budget + LEASE_GRACE_S anyway, and the queued callers' polls
-        # catch it sooner than any mutation would. It costs a flag read, and
-        # the start it can trigger is the same one ``request_exec`` performs on
-        # the same thread.
-        self._release_a_dead_sandbox()
         self._holding_run()
         runs: OrderedDict[str, str] = self._recent_runs.get(agent_id, OrderedDict())
         if run_id not in runs:
@@ -520,12 +520,13 @@ class ExecMixin(_ExecBase):
         queue for the life of the team.
 
         **The release covers one case: a child that ignores the kill.** Every
-        other exit reports, because the sandbox's handler reports in a
-        ``finally`` — a command that ran, one the budget killed, a backend that
-        raised, an allowlist refusal. A subprocess still alive past its budget is
-        the one thing no report can cover, since the thread waiting on it is not
-        free to say so. By ``budget + LEASE_GRACE_S`` the backend has killed the
-        child, so this is not a race against a live writer.
+        other exit reports, because the worker reports in a ``finally`` — a
+        command that ran, one the budget killed, a backend that raised, an
+        allowlist refusal, and now also a callable that raised on its way in. A
+        subprocess still alive past its budget is the one thing no report can
+        cover, since the thread waiting on it is not free to say so. By
+        ``budget + LEASE_GRACE_S`` the backend has killed the child, so this is
+        not a race against a live writer.
 
         **A release drains the queue, and that is what stops a newcomer
         overtaking.** Handing back the tree without starting the head would leave
@@ -536,8 +537,11 @@ class ExecMixin(_ExecBase):
         created. So the head is started here and this method answers with the run
         **it** now holds; only a genuinely empty queue answers ``None``.
 
-        **No liveness check here.** A sandbox that died is handled once, in
-        :meth:`exec_status`, on the message that is guaranteed to arrive.
+        **No liveness check anywhere any more.** There is no second actor to
+        die: a callable that raises is caught in :meth:`ExecRunner.perform` and
+        reported, a submit that raises is caught in :meth:`_start_run` and
+        reported, and a callable that never returns is exactly the wedge this
+        timestamp releases.
 
         Returns:
             The run holding the tree — the original, or the queue head's after a
@@ -562,45 +566,82 @@ class ExecMixin(_ExecBase):
         self._start_next()
         return self._running
 
-    def _release_a_dead_sandbox(self) -> None:
-        """Fail the running run when the sandbox performing it has stopped.
+    ##
+    ## Teardown — four steps, in one order, each independently wrapped
+    ##
+    def _teardown_exec(self) -> None:
+        """Take the worker down in the one order that leaves nothing running.
 
-        A sandbox that dies mid-run takes the answer with it: no report is
-        coming, and no send primitive can see it happen — the request was
-        delivered to an actor that was alive at the time. So the run is recorded
-        as failed with a reason naming the sandbox, which is an answer its owner
-        can read, rather than being left to time out into silence.
+        Called by ``WorkspaceActor.on_stop`` before it chains to the base, and
+        split out of it so ``on_stop`` stays short and exec teardown stays beside
+        the exec code.
 
-        **Nothing is committed as the agent.** The run may have written half of
-        something before the sandbox went, and attributing a half-written tree to
-        the agent would put work in the journal under an author who never saw it
-        finish. Whatever is there is committed out of band by the next
-        :meth:`_start_run` or the next mutation, belonging to nobody.
+        The four steps, and why they are in this order:
 
-        The next admission resolves a **new** sandbox: the orchestrator skips a
-        child that is no longer alive, so ``getChildrenOrCreate`` creates one.
+        1. **cancel the queued runs.** They never started, were never submitted
+           anywhere and produced nothing, so dropping them is free.
+        2. **kill the running subprocess.** This is what makes the drain that
+           follows cheap: after the kill a healthy child dies in milliseconds. It
+           is also the only step that stops a command from outliving the team's
+           teardown, so it must be *attempted*, never assumed.
+        3. **drain the executor**, bounded (see :meth:`_drain_executor`).
+        4. **release the backend.** Last, because for docker it is the only thing
+           that ends the process *inside* the container, so it must still happen
+           when step 3 gave up — see :meth:`ExecRunner.stop`.
+
+        **Every step is wrapped separately**, which is stricter than the single
+        wrapper the queue clear used to have and is the reason for the change: a
+        ``kill()`` that raised would otherwise skip the drain and the release,
+        leaving the executor undrained and the container up.
+
+        **A workspace with no exec capability never built a runner**, and no
+        branch of this is a special case for it: steps 2 and 4 are skipped, step
+        1 clears an empty deque, and step 3 shuts down an executor that never
+        spawned a thread.
         """
-        running = self._running
-        if running is None:
-            return
-        sandbox = running.sandbox
-        if sandbox is None or sandbox.is_alive():
-            return
-        reason = (
-            f"The execution sandbox '{sandbox.name}' stopped while run {running.run_id} was "
-            "running, so the command's outcome is lost. Nothing further is waiting on it — "
-            "retry the command."
-        )
-        logger.warning(
-            "Workspace %s: %s (agent %s, command %r)",
-            self.config.workspace_path,
-            reason,
-            self._name_of(running.agent_id),
-            running.cmd,
-        )
-        self._running = None
-        self._record_failure(running.run_id, reason)
-        self._start_next()
+        runner = self._runner
+        self._teardown_step("clearing the exec queue", self._queue.clear)
+        if runner is not None:
+            self._teardown_step("killing the running command", runner.kill)
+        self._teardown_step("draining the exec worker", self._drain_executor)
+        self._teardown_step("releasing the exec backend", self._stop_runner)
+
+    def _teardown_step(self, what: str, step: Callable[[], None]) -> None:
+        """Run one teardown step, swallowing whatever it raises.
+
+        Nothing here may raise past ``super().on_stop()``: leaving a Pykka actor
+        part-way stopped is worse than any error a step could report. Wrapping
+        each step separately rather than the group is what keeps a failing one
+        from skipping the ones after it.
+        """
+        try:
+            step()
+        except Exception:
+            logger.warning(
+                "Workspace %s: %s raised during on_stop — swallowing",
+                self.config.workspace_path,
+                what,
+                exc_info=True,
+            )
+
+    def _drain_executor(self) -> None:
+        """Wait a bounded time for the killed run, then shut the executor down.
+
+        **``shutdown(wait=True)`` would be unbounded and the case is reachable**,
+        so the wait is on the ``Future`` :meth:`_start_run` kept instead —
+        ``ThreadPoolExecutor.shutdown`` takes no timeout, and a worker wedged in
+        ``ProcessBackend._run``'s second drain never returns. Only the head is
+        ever submitted, so there is at most one future to wait on.
+
+        Past the grace the executor is shut down **without** waiting and with the
+        queued futures cancelled, so a worker that ignored the kill costs
+        :data:`EXEC_SHUTDOWN_GRACE_S` of teardown latency rather than holding
+        teardown open for ever.
+        """
+        pending = self._pending
+        if pending is not None:
+            futures.wait([pending], timeout=EXEC_SHUTDOWN_GRACE_S)
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     def _busy_refusal(self) -> str | None:
         """Refuse a **mutation** while a run holds the tree, or allow it.
