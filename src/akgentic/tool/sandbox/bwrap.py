@@ -1,7 +1,7 @@
 """BwrapBackend — Linux bubblewrap sandbox for filesystem-isolated command execution.
 
-``BwrapSandboxActor`` is kept beside it as a thin delegator: it owns the
-actor lifecycle and the state it publishes, and nothing else.
+A plain strategy, built by ``resolve_mode`` and owned by ``#Workspace``'s
+``ExecRunner``; no actor stands between the workspace and the namespace.
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ import os
 import shutil
 from pathlib import Path
 
-from akgentic.tool.sandbox.actor import SandboxActor
 from akgentic.tool.sandbox.backend import (
     DEFAULT_BACKEND_TIMEOUT_S,
     ExecResult,
@@ -110,36 +109,18 @@ class BwrapBackend(ProcessBackend):
             "--new-session",
             "--chdir", effective_cwd,
         ] + validate_command(cmd)
+        # ``process_group`` goes with ``_make_preexec``: the group it creates is
+        # what a kill or a timeout signals. ``bwrap`` itself leads that group;
+        # ``--new-session`` moves the sandboxed command into a session of its
+        # own, and ``--die-with-parent`` is what ends it when bwrap dies.
         return self._run(
             bwrap_cmd,
             timeout=DEFAULT_BACKEND_TIMEOUT_S if timeout is None else timeout,
             preexec_fn=_make_preexec(),
+            process_group=True,
             env={"PATH": "/usr/bin:/bin:/usr/local/bin"},
         )
 
     def _release(self) -> None:
         """Nothing to release: a bubblewrap namespace lives only as long as its run."""
         logger.debug("BwrapBackend stopped.")
-
-
-class BwrapSandboxActor(SandboxActor):
-    """Linux-only sandbox actor that uses bubblewrap (bwrap) for filesystem isolation.
-
-    A thin delegator over :class:`BwrapBackend`, which holds the implementation.
-    """
-
-    _backend: BwrapBackend | None = None
-
-    def _start_sandbox(self) -> None:
-        self._backend = BwrapBackend()
-        self._backend.start(self.config.workspace_path)
-        self.state.workspace_path = self._backend.workspace_path
-        self.state.notify_state_change()
-
-    def _stop_sandbox(self) -> None:
-        if self._backend is not None:
-            self._backend.stop()
-
-    def _exec(self, cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
-        assert self._backend is not None
-        return self._backend.exec(cmd, cwd, timeout)

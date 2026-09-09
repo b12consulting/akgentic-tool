@@ -28,7 +28,6 @@ from akgentic.tool.workspace.tool import (
     ResourceType,
     WorkspaceTool,
 )
-from akgentic.tool.sandbox.actor import SANDBOX_ACTOR_NAME
 from akgentic.tool.workspace.card.params import WorkspaceExec
 from akgentic.tool.workspace.workspace import Filesystem, PathEscapeError, Workspace
 
@@ -1380,7 +1379,7 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
         assert workspace_actor_name("alice/notes") in orchestrator_proxy.children
         assert workspace_actor_name("bob/notes") in orchestrator_proxy.children
 
-    def test_two_exec_cards_on_two_workspaces_get_two_actors_and_no_sandbox_actor(
+    def test_two_exec_cards_on_two_workspaces_create_exactly_two_workspace_actors(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
     ) -> None:
         """AC 14: the actor name carries the full two-segment path, slash included.
@@ -1389,9 +1388,13 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
         so it is carried whole rather than flattened through a second encoding
         whose injectivity would have to be proved separately.
 
-        An exec-capable card creates **no** ``#SandboxActor``: ``#Workspace``
-        owns its own backend, so a second actor here would be one nothing ever
-        reaches — and on the docker backend, a container nobody execs in.
+        **And nothing else is created.** An exec-capable card used to bring up a
+        ``#SandboxActor-<path>`` beside each workspace actor; ``#Workspace`` now
+        owns its own backend and no second actor exists. That is asserted as an
+        **equality** over the created set, not as the absence of a name: the old
+        superset check (``<=``) and a ``not any(startswith(...))`` both pass over
+        whatever extra actor a regression creates — the equality does not, and
+        it cannot pass over an empty set either.
         """
         for leaf in ("alpha", "beta"):
             (workspaces_root / "alice" / leaf).mkdir(parents=True, exist_ok=True)
@@ -1404,13 +1407,14 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
             )
 
         names = set(orchestrator_proxy.children)
-        assert {
+        assert names == {
             workspace_actor_name("alice/alpha"),
             workspace_actor_name("alice/beta"),
-        } <= names
+        }
         # The slash survives into the name verbatim — it is not escaped away.
         assert "#Workspace-alice/alpha" in names
-        assert not any(name.startswith(SANDBOX_ACTOR_NAME) for name in names)
+        # Stated as well as implied: the retired actor's prefix appears nowhere.
+        assert not any(name.startswith("#SandboxActor") for name in names)
 
     def test_a_bare_card_never_asks_the_orchestrator_for_metadata(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path

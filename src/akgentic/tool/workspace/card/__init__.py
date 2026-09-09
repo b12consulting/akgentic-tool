@@ -213,7 +213,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
     a file operation the card already implies. Exec is not: defaulting it to
     ``True`` would give every ``WorkspaceTool()`` in existence sandboxed shell
     execution through a dependency bump, probe the host for docker at wiring
-    time, and bring a ``#SandboxActor`` into teams that never asked for one.
+    time, and hand ``#Workspace`` a backend in teams that never asked for one.
     Capability escalation must be opt-in.
 
     It is also the one field that registers **two** callables — ``workspace_exec``
@@ -418,9 +418,9 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
         what "on" means. They did not: the wiring looked at the field and
         ``read_only``, while ``_exec_tools`` also required the ``TOOL_CALL``
         channel — so a card that put exec off the tool channel still resolved the
-        backend, still emitted the ``auto`` fallback warning, and still brought up
-        a ``#SandboxActor`` (a running container, on the docker backend) to serve
-        two callables it then never registered.
+        backend, still emitted the ``auto`` fallback warning, and — while a
+        sandbox actor still existed — still brought one up (a running container,
+        on the docker backend) to serve two callables it then never registered.
 
         Returns:
             The parameters, or ``None`` when nothing exec-related should happen.
@@ -437,10 +437,11 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
         message. That is the whole of what ``workspace_exec=False`` buys, and it
         is why the check is at the top rather than inside.
 
-        **No actor is created any more.** ``#Workspace`` owns its own backend and
-        its own worker thread, so a ``#SandboxActor`` here would be an actor
-        nothing uses — and on the docker backend that is a container nobody execs
-        in, provisioned at wiring time for a team that may never run a command.
+        **No actor is created here.** ``#Workspace`` owns its own backend and its
+        own worker thread; the sandbox actor that used to be created at this
+        point is gone, and one would be an actor nothing uses — on the docker
+        backend, a container nobody execs in, provisioned at wiring time for a
+        team that may never run a command.
 
         The order matters: this runs *after* ``_bind_workspace_actor``, because
         ``configure_exec`` travels over the tell proxy that method binds, and

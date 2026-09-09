@@ -106,14 +106,19 @@ class TestTheBackendSurfaceDidNotMove:
     @pytest.mark.parametrize(
         ("name", "home"),
         [
-            ("SANDBOX_ACTOR_CLASSES", "akgentic.tool.sandbox.registry"),
-            ("ALLOWED_COMMANDS", "akgentic.tool.sandbox.actor"),
-            ("SandboxActor", "akgentic.tool.sandbox.actor"),
-            ("CommandNotAllowedError", "akgentic.tool.sandbox.actor"),
-            ("DockerSandboxActor", "akgentic.tool.sandbox.docker"),
-            ("BwrapSandboxActor", "akgentic.tool.sandbox.bwrap"),
-            ("SeatbeltSandboxActor", "akgentic.tool.sandbox.seatbelt"),
-            ("LocalSandboxActor", "akgentic.tool.sandbox.local"),
+            ("SANDBOX_BACKEND_CLASSES", "akgentic.tool.sandbox.registry"),
+            ("ALLOWED_COMMANDS", "akgentic.tool.sandbox.backend"),
+            ("SandboxBackend", "akgentic.tool.sandbox.backend"),
+            ("ProcessBackend", "akgentic.tool.sandbox.backend"),
+            ("CommandNotAllowedError", "akgentic.tool.sandbox.backend"),
+            ("CommandParseError", "akgentic.tool.sandbox.backend"),
+            ("ExecResult", "akgentic.tool.sandbox.backend"),
+            ("ExecReport", "akgentic.tool.sandbox.backend"),
+            ("validate_command", "akgentic.tool.sandbox.backend"),
+            ("DockerBackend", "akgentic.tool.sandbox.docker"),
+            ("BwrapBackend", "akgentic.tool.sandbox.bwrap"),
+            ("SeatbeltBackend", "akgentic.tool.sandbox.seatbelt"),
+            ("LocalBackend", "akgentic.tool.sandbox.local"),
         ],
     )
     def test_the_documented_name_resolves_to_its_defining_object(
@@ -123,6 +128,30 @@ class TestTheBackendSurfaceDidNotMove:
         assert resolved is getattr(importlib.import_module(home), name)
         assert name in akgentic.tool.sandbox.__all__
 
-    def test_the_root_still_re_exports_the_two_platform_backends(self) -> None:
-        assert akgentic.tool.BwrapSandboxActor is akgentic.tool.sandbox.BwrapSandboxActor
-        assert akgentic.tool.SeatbeltSandboxActor is akgentic.tool.sandbox.SeatbeltSandboxActor
+    def test_every_exported_name_resolves_and_the_actor_names_are_gone(self) -> None:
+        """``__all__`` lists nothing that does not resolve, and none of the retired names.
+
+        The first half is what makes the second mean something: a name could be
+        absent from ``__all__`` and still importable, so the retired names are
+        also asserted to raise on the ``from`` form.
+        """
+        for name in akgentic.tool.sandbox.__all__:
+            assert _from_import("akgentic.tool.sandbox", name) is not None
+        retired = {
+            "SandboxActor",
+            "SandboxConfig",
+            "SandboxState",
+            "SANDBOX_ACTOR_CLASSES",
+            "SANDBOX_ACTOR_NAME",
+            "sandbox_actor_name",
+            "LocalSandboxActor",
+            "BwrapSandboxActor",
+            "SeatbeltSandboxActor",
+            "DockerSandboxActor",
+            "ExecRequest",
+        }
+        assert not retired & set(akgentic.tool.sandbox.__all__)
+        assert not retired & set(akgentic.tool.__all__)
+        for name in retired:
+            with pytest.raises(ImportError):
+                _from_import("akgentic.tool.sandbox", name)

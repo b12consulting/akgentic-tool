@@ -26,12 +26,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from akgentic.core.orchestrator import STOP_TIMEOUT
 
-from akgentic.tool.sandbox.actor import (
-    DEFAULT_BACKEND_TIMEOUT_S,
-    ExecResult,
-    SandboxConfig,
-    SandboxState,
-)
+from akgentic.tool.sandbox.backend import DEFAULT_BACKEND_TIMEOUT_S, ExecResult
 from akgentic.tool.sandbox.docker import (
     CONTAINER_NAME_PREFIX,
     DOCKER_EXEC_TIMEOUT,
@@ -40,7 +35,6 @@ from akgentic.tool.sandbox.docker import (
     SANDBOX_IMAGE_BUILD_TIMEOUT_S,
     WORKSPACE_PATH_LABEL,
     DockerBackend,
-    DockerSandboxActor,
 )
 from akgentic.tool.workspace.execution import EXEC_SHUTDOWN_GRACE_S
 
@@ -48,6 +42,7 @@ from akgentic.tool.workspace.execution import EXEC_SHUTDOWN_GRACE_S
 # ``backend.subprocess.Popen``. The start, build and stop paths still run
 # ``docker.subprocess.run`` and keep that target.
 POPEN = "akgentic.tool.sandbox.backend.subprocess.Popen"
+KILLPG = "akgentic.tool.sandbox.backend.os.killpg"
 DOCKER_LOGGER = "akgentic.tool.sandbox.docker"
 
 TMPFS_OPTIONS = "rw,exec,mode=1777,size=512m"
@@ -62,42 +57,21 @@ def popen_mock(
     proc = mock_popen.return_value
     proc.communicate.return_value = (stdout, stderr)
     proc.returncode = returncode
+    proc.pid = 4242
     return proc
 
 
-def attach_backend(
-    actor: DockerSandboxActor, container_name: str = "akgentic-sandbox-0123456789ab"
+def started_backend(
+    team_id: str = "team-1", container_name: str = "akgentic-sandbox-0123456789ab"
 ) -> DockerBackend:
-    """Give *actor* the running backend ``_start_sandbox`` would have built.
+    """A backend that believes its container is running, without a daemon.
 
-    The actor holds no execution path of its own, so an actor with no backend
-    cannot run or stop anything — which is the delegation working, and the reason
-    a test that skips ``_start_sandbox`` has to supply one. **Nothing is written
-    to ``state``**, because ``_start_sandbox`` no longer writes anything there.
+    What ``start()`` would leave behind — the name — is set directly, so the
+    ``exec()`` argv can be asserted with no ``docker run`` having happened.
     """
-    backend = DockerBackend(actor.config.team_id)
+    backend = DockerBackend(team_id)
     backend.container_name = container_name
-    actor._backend = backend
     return backend
-
-
-def make_actor(
-    team_id: str = "team-test", workspace_path: str | None = None
-) -> DockerSandboxActor:
-    """Create a DockerSandboxActor with config and state pre-initialized (no Pykka runtime)."""
-    actor = DockerSandboxActor()
-    actor.config = SandboxConfig(
-        name="sandbox",
-        role="ToolActor",
-        team_id=team_id,
-        # The card resolves the path and the backend joins it. The harness
-        # stands in for the card, so it supplies the path rather than
-        # letting the actor derive one — which it no longer can.
-        workspace_path=team_id if workspace_path is None else workspace_path,
-    )
-    actor.state = SandboxState()
-    actor.state.observer(actor)
-    return actor
 
 
 def run_argv(mock_run: MagicMock) -> list[str]:
@@ -995,97 +969,45 @@ def test_an_exec_after_stop_refuses_rather_than_addressing_a_removed_container(
         backend.exec("echo hi", "", None)
 
 
-@patch("akgentic.tool.sandbox.docker.subprocess.run")
-def test_the_actor_delegates_stop_to_the_backend(mock_run: MagicMock) -> None:
-    """``_stop_sandbox`` holds no execution path of its own."""
-    actor = make_actor(team_id="team-1")
-    attach_backend(actor)
-    mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
-
-    actor._stop_sandbox()
-
-    assert mock_run.call_args_list[0][0][0][:3] == ["docker", "rm", "-f"]
-
-
-@patch.object(DockerBackend, "_ensure_image")
-@patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
-@patch("akgentic.tool.sandbox.docker.subprocess.run")
-def test_on_stop_swallows_a_stop_sandbox_exception(
-    mock_run: MagicMock, mock_which: MagicMock, mock_ensure: MagicMock
-) -> None:
-    """The base class swallows whatever the backend's teardown raises."""
-    mock_run.side_effect = [
-        MagicMock(stdout="abc123", stderr="", returncode=0),  # docker run
-        subprocess.CalledProcessError(1, "docker rm"),  # the removal raises
-    ]
-    actor = make_actor(team_id="team-1")
-    actor._start_sandbox()
-
-    actor.on_stop()  # must not raise
-
-
 # ---------------------------------------------------------------------------
-# AC 19 — no container name is persisted
+# The name lives on the backend and nowhere else
 # ---------------------------------------------------------------------------
 
 
 @patch.object(DockerBackend, "_ensure_image")
 @patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
 @patch("akgentic.tool.sandbox.docker.subprocess.run")
-def test_no_container_name_reaches_the_checkpointed_state(
+def test_the_backend_knows_its_own_name_after_start(
     mock_run: MagicMock, mock_which: MagicMock, mock_ensure: MagicMock
 ) -> None:
-    """AC19: the backend knows its name; ``SandboxState`` does not.
+    """The only record of the container's name is the instance that created it.
 
-    ``SandboxState`` is checkpointed, so a name written there lands in the team's
-    event stream. Nothing needs to find the container again once it is gone, and
-    a restored team carrying the name of a removed container is worse than one
-    carrying nothing: it reads as a handle.
+    There is no checkpointed state for the name to reach any more — the sandbox
+    actor and its ``SandboxState`` are gone — so the positive half is what is
+    left to assert: the backend can address what it started, and ``stop()``
+    forgets it.
     """
     mock_run.return_value = MagicMock(stdout="abc123", stderr="", returncode=0)
-    actor = make_actor(team_id="team-1")
+    backend = DockerBackend("team-1")
 
-    actor._start_sandbox()
+    backend.start("team-1")
 
-    assert actor.state.container_name is None
-    assert actor._backend is not None
-    assert actor._backend.container_name is not None
-
-
-@patch.object(DockerBackend, "_ensure_image")
-@patch("akgentic.tool.sandbox.docker.shutil.which", return_value="/usr/bin/docker")
-@patch("akgentic.tool.sandbox.docker.subprocess.run")
-def test_start_sandbox_notifies_nothing_because_it_changes_nothing(
-    mock_run: MagicMock, mock_which: MagicMock, mock_ensure: MagicMock
-) -> None:
-    """AC19: the notification went with the field it was announcing.
-
-    ``notify_state_change`` published the container name to the team's
-    subscribers. With no state left to change there is nothing to announce, and
-    a notification for an unchanged state is a checkpoint written for nothing.
-    """
-    mock_run.return_value = MagicMock(stdout="abc123", stderr="", returncode=0)
-    actor = make_actor(team_id="team-1")
-
-    with patch("akgentic.tool.sandbox.actor.SandboxState.notify_state_change") as mock_notify:
-        actor._start_sandbox()
-
-    mock_notify.assert_not_called()
+    assert backend.container_name is not None
+    assert backend.container_name.startswith(CONTAINER_NAME_PREFIX)
 
 
 # ---------------------------------------------------------------------------
-# exec() — unchanged by this story, and asserted so
+# exec() — through the backend, with the container's name already known
 # ---------------------------------------------------------------------------
 
 
 @patch(POPEN)
 def test_exec_with_cwd_builds_correct_docker_command(mock_popen: MagicMock) -> None:
-    """_exec('pytest tests/', cwd='src') builds docker exec -w /workspace/src."""
-    actor = make_actor(team_id="team-1")
-    attach_backend(actor)
+    """exec('pytest tests/', cwd='src') builds docker exec -w /workspace/src."""
+    backend = started_backend()
     popen_mock(mock_popen)
 
-    actor._exec("pytest tests/", "src")
+    backend.exec("pytest tests/", "src")
 
     expected_cmd = [
         "docker",
@@ -1112,12 +1034,11 @@ def test_exec_with_cwd_builds_correct_docker_command(mock_popen: MagicMock) -> N
 
 @patch(POPEN)
 def test_exec_without_cwd_uses_workspace_root(mock_popen: MagicMock) -> None:
-    """_exec('pytest tests/', cwd='') builds docker exec -w /workspace (no trailing slash)."""
-    actor = make_actor(team_id="team-1")
-    attach_backend(actor)
+    """exec('pytest tests/', cwd='') builds docker exec -w /workspace (no trailing slash)."""
+    backend = started_backend()
     popen_mock(mock_popen)
 
-    actor._exec("pytest tests/", "")
+    backend.exec("pytest tests/", "")
 
     expected_cmd = [
         "docker",
@@ -1142,12 +1063,11 @@ def test_exec_without_cwd_uses_workspace_root(mock_popen: MagicMock) -> None:
 
 @patch(POPEN)
 def test_exec_returns_exec_result_with_correct_fields(mock_popen: MagicMock) -> None:
-    """_exec() returns ExecResult with stdout, stderr, exit_code from mocked subprocess."""
-    actor = make_actor(team_id="team-1")
-    attach_backend(actor)
+    """exec() returns ExecResult with stdout, stderr, exit_code from mocked subprocess."""
+    backend = started_backend()
     popen_mock(mock_popen, stdout="test passed", stderr="warning")
 
-    result = actor._exec("pytest tests/", "")
+    result = backend.exec("pytest tests/", "")
 
     assert isinstance(result, ExecResult)
     assert result.stdout == "test passed"
@@ -1157,22 +1077,29 @@ def test_exec_returns_exec_result_with_correct_fields(mock_popen: MagicMock) -> 
 
 @patch(POPEN)
 def test_exec_captures_non_zero_exit_code(mock_popen: MagicMock) -> None:
-    """_exec() correctly captures non-zero exit codes."""
-    actor = make_actor(team_id="team-1")
-    attach_backend(actor)
+    """exec() correctly captures non-zero exit codes."""
+    backend = started_backend()
     popen_mock(mock_popen, stderr="test failed", returncode=1)
 
-    result = actor._exec("pytest tests/", "")
+    result = backend.exec("pytest tests/", "")
 
     assert result.exit_code == 1
     assert result.stderr == "test failed"
 
 
+@patch(KILLPG)
 @patch(POPEN)
-def test_exec_timeout_propagates(mock_popen: MagicMock) -> None:
-    """_exec() propagates subprocess.TimeoutExpired — not swallowed."""
-    actor = make_actor(team_id="team-1")
-    attach_backend(actor)
+def test_exec_timeout_propagates_and_signals_the_direct_child(
+    mock_popen: MagicMock, mock_killpg: MagicMock
+) -> None:
+    """exec() propagates subprocess.TimeoutExpired, and the kill is the direct child's.
+
+    This backend passes no ``preexec_fn`` and so makes no process group of its
+    own: the host-side tree is the ``docker exec`` client, one process deep. A
+    group kill here would be ``killpg`` on the caller's own group, which is why
+    the expiry path must reach ``Popen.kill`` and never ``os.killpg``.
+    """
+    backend = started_backend()
     proc = popen_mock(mock_popen)
     proc.communicate.side_effect = [
         subprocess.TimeoutExpired(cmd=["docker", "exec"], timeout=60),
@@ -1180,9 +1107,10 @@ def test_exec_timeout_propagates(mock_popen: MagicMock) -> None:
     ]
 
     with pytest.raises(subprocess.TimeoutExpired):
-        actor._exec("pytest tests/", "")
+        backend.exec("pytest tests/", "")
 
     proc.kill.assert_called_once()
+    mock_killpg.assert_not_called()
 
 
 @patch(POPEN)
@@ -1190,11 +1118,10 @@ def test_exec_keeps_a_quoted_argument_whole_after_the_docker_prefix(
     mock_popen: MagicMock,
 ) -> None:
     """shlex tokens follow ``docker exec -w <workdir> <container>``, unchanged."""
-    actor = make_actor(team_id="team-1")
-    attach_backend(actor)
+    backend = started_backend()
     popen_mock(mock_popen)
 
-    actor._exec('echo "hello world"', "src")
+    backend.exec('echo "hello world"', "src")
 
     docker_cmd: list[str] = mock_popen.call_args[0][0]
     assert docker_cmd[:5] == [

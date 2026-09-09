@@ -1,7 +1,8 @@
 """DockerBackend — an ephemeral Docker container as compute for one tree.
 
-``DockerSandboxActor`` is kept beside it as a thin delegator: it owns the
-actor lifecycle and the state it publishes, and nothing else.
+A plain strategy, built by ``resolve_mode`` and owned by ``#Workspace``'s
+``ExecRunner``; no actor stands between the workspace and the container, and
+no container name is persisted anywhere.
 """
 
 from __future__ import annotations
@@ -16,7 +17,6 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
-from akgentic.tool.sandbox.actor import SandboxActor
 from akgentic.tool.sandbox.backend import (
     DEFAULT_BACKEND_TIMEOUT_S,
     ExecResult,
@@ -329,7 +329,7 @@ class DockerBackend(ProcessBackend):
                 built, or ``docker run`` exited non-zero.
         """
         if shutil.which("docker") is None:
-            raise RuntimeError("docker CLI not found on PATH — cannot start DockerSandboxActor")
+            raise RuntimeError("docker CLI not found on PATH — cannot start DockerBackend")
         self._ensure_image()
         base = os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
         volume = f"{(Path(base) / workspace_path).resolve()}:/workspace"
@@ -377,10 +377,13 @@ class DockerBackend(ProcessBackend):
     def kill(self) -> None:
         """End the local ``docker exec`` client — **not**, necessarily, what runs inside.
 
-        The signal reaches the ``docker exec`` process on this host. The command
-        it started inside the container is a child of the container's own init,
-        not of this process, so it may keep running after this returns — and it
-        keeps writing to ``/workspace`` until the container is gone.
+        The signal reaches the ``docker exec`` process on this host — the direct
+        child, because this backend passes no ``preexec_fn`` and so makes no
+        process group of its own, and the host-side tree is one process deep
+        anyway. The command it started inside the container is a child of the
+        container's own init, not of this process, so it may keep running after
+        this returns — and it keeps writing to ``/workspace`` until the
+        container is gone.
 
         :meth:`stop` is the authoritative end: it **removes** the container,
         which does end everything inside it. Use ``kill`` to abandon a run,
@@ -449,33 +452,3 @@ class DockerBackend(ProcessBackend):
                 result.returncode,
                 result.stderr.strip(),
             )
-
-
-class DockerSandboxActor(SandboxActor):
-    """Docker sandbox actor for one tree.
-
-    A thin delegator over :class:`DockerBackend`, which holds the implementation.
-    """
-
-    _backend: DockerBackend | None = None
-
-    def _start_sandbox(self) -> None:
-        """Build the backend and start its container. **Nothing is published.**
-
-        The container name used to be written to ``SandboxState`` and notified,
-        which put it in the team's checkpointed event stream. Nothing needs to
-        find the container again after it is gone, and a restored team carrying
-        the name of a removed container is worse than one carrying nothing: it
-        reads as a handle. With no state left to change there is nothing to
-        notify about either.
-        """
-        self._backend = DockerBackend(self.config.team_id)
-        self._backend.start(self.config.workspace_path)
-
-    def _stop_sandbox(self) -> None:
-        if self._backend is not None:
-            self._backend.stop()
-
-    def _exec(self, cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
-        assert self._backend is not None
-        return self._backend.exec(cmd, cwd, timeout)

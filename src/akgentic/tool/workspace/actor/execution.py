@@ -653,10 +653,11 @@ class ExecMixin(_ExecBase):
         ``shutdown(wait=False)`` abandons the wait here but deregisters nothing,
         and the interpreter joins every one of them on its way out. So a worker
         genuinely wedged in that second drain still stops **this actor** in
-        bounded time and still blocks the **process** from exiting. Teardown was
-        what had to be bounded and is; the wedge itself is untouched, and closing
-        it means signalling the process group — an ADR decision, deliberately not
-        taken here.
+        bounded time and still blocks the **process** from exiting. The ordinary
+        wedge — a shell's forked command holding the pipes — is closed by the
+        backend's group kill on ``local`` and ``bwrap``; what can still wedge
+        the worker is a process that left the group on its own, or docker's
+        in-container process, which only ``stop()``'s removal ends.
         """
         pending = self._pending
         if pending is not None:

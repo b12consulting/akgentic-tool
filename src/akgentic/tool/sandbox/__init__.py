@@ -1,8 +1,9 @@
 """Sandbox submodule — the exec backend ``workspace_exec`` runs on.
 
-The four backends — each a strategy class and, until the actor is retired, the
-thin actor that delegates to it — the two registries they sit in and the probe
-that picks one for ``mode="auto"`` are what lives here. The card that once
+The four backends — plain strategy classes behind one Protocol — the registry
+they sit in and the probe that picks one for ``mode="auto"`` are what lives
+here. There is no actor: ``#Workspace`` builds its backend through
+``resolve_mode`` and runs it on its own worker thread. The card that once
 wrapped them, ``ExecTool``, is gone: sandboxed execution is a capability of
 ``WorkspaceTool`` — ``WorkspaceTool(workspace_exec=...)`` — and
 :func:`__getattr__` below says so to anybody still importing the old name.
@@ -12,55 +13,50 @@ from __future__ import annotations
 
 from typing import Any
 
-from .actor import (
+from .backend import (
     ALLOWED_COMMANDS,
-    SANDBOX_ACTOR_NAME,
     CommandNotAllowedError,
     CommandParseError,
     ExecReport,
-    ExecRequest,
     ExecResult,
-    SandboxActor,
-    SandboxConfig,
-    SandboxState,
-    sandbox_actor_name,
+    ProcessBackend,
+    SandboxBackend,
+    validate_command,
 )
-from .backend import ProcessBackend, SandboxBackend, validate_command
-from .bwrap import BwrapBackend, BwrapSandboxActor
-from .docker import DockerBackend, DockerSandboxActor
-from .local import LocalBackend, LocalSandboxActor
+from .bwrap import BwrapBackend
+from .docker import DockerBackend
+from .local import LocalBackend
 
 # ``_resolve_auto_mode`` is re-exported so that ``workspace/execution.py`` reaches
 # the probe through this package, exactly as it reaches the registry — a single
 # import surface, and one attribute a test can replace.
-from .registry import SANDBOX_ACTOR_CLASSES, SANDBOX_BACKEND_CLASSES
+from .registry import SANDBOX_BACKEND_CLASSES
 from .registry import _resolve_auto_mode as _resolve_auto_mode
-from .seatbelt import SeatbeltBackend, SeatbeltSandboxActor
+from .seatbelt import SeatbeltBackend
+
+# The sandbox actor and its two persisted models, ``SandboxConfig`` and
+# ``SandboxState``, used to be exported from here and are deleted, not
+# tombstoned. Any persisted sandbox start event or checkpoint carrying their
+# ``__model__`` tag is now unreadable — core's deserializer imports the tagged
+# class before its guarded construction, so a stale tag fails the whole record
+# rather than dropping a field. Accepted: the only affected records were the
+# decision maker's own test teams, and agents, files and the UI are untouched.
+# This exemption does not extend to the next removal — once anything is
+# released and adopted, a persisted model is a migration.
 
 __all__ = [
     "ALLOWED_COMMANDS",
     "BwrapBackend",
-    "BwrapSandboxActor",
     "CommandNotAllowedError",
     "CommandParseError",
     "DockerBackend",
-    "DockerSandboxActor",
     "ExecReport",
-    "ExecRequest",
     "ExecResult",
     "LocalBackend",
-    "LocalSandboxActor",
     "ProcessBackend",
-    "SANDBOX_ACTOR_CLASSES",
-    "SANDBOX_ACTOR_NAME",
     "SANDBOX_BACKEND_CLASSES",
-    "SandboxActor",
     "SandboxBackend",
-    "SandboxConfig",
-    "SandboxState",
     "SeatbeltBackend",
-    "SeatbeltSandboxActor",
-    "sandbox_actor_name",
     "validate_command",
 ]
 

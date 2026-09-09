@@ -28,20 +28,15 @@ from pydantic import ValidationError
 
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.sandbox import SANDBOX_BACKEND_CLASSES
-from akgentic.tool.sandbox.actor import (
+from akgentic.tool.sandbox.backend import (
     DEFAULT_BACKEND_TIMEOUT_S,
-    SANDBOX_ACTOR_NAME,
     ExecReport,
-    ExecRequest,
     ExecResult,
-    SandboxActor,
-    SandboxConfig,
-    SandboxState,
 )
-from akgentic.tool.sandbox.bwrap import BwrapBackend, BwrapSandboxActor
-from akgentic.tool.sandbox.docker import DockerBackend, DockerSandboxActor
-from akgentic.tool.sandbox.local import LocalBackend, LocalSandboxActor
-from akgentic.tool.sandbox.seatbelt import SeatbeltBackend, SeatbeltSandboxActor
+from akgentic.tool.sandbox.bwrap import BwrapBackend
+from akgentic.tool.sandbox.docker import DockerBackend
+from akgentic.tool.sandbox.local import LocalBackend
+from akgentic.tool.sandbox.seatbelt import SeatbeltBackend
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
 from akgentic.tool.workspace.edit import EditItem
 from akgentic.tool.workspace.execution import (
@@ -71,7 +66,6 @@ from akgentic.tool.workspace.execution import (
 from akgentic.tool.workspace.journal import MAX_COMMIT_BODY_CHARS
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
 
-from tests.conftest import MockActorAddress
 from tests.workspace.conftest import (
     workspace_path_for,
     HANDSHAKE_TIMEOUT_S,
@@ -103,28 +97,16 @@ somebody else being collectable by anybody was never caught: with one id there i
 no "somebody else". Every ownership and queue spec below uses at least two.
 """
 
-REAL_BACKENDS: dict[str, type[SandboxActor]] = {
-    "local": LocalSandboxActor,
-    "bwrap": BwrapSandboxActor,
-    "seatbelt": SeatbeltSandboxActor,
-    "docker": DockerSandboxActor,
-}
-"""The four real backends, named directly rather than read from the registry.
-
-``SANDBOX_ACTOR_CLASSES`` is the injection window this suite writes a fake into,
-so a budget test that read the registry would be asserting about the fake.
-"""
-
 REAL_STRATEGIES: dict[str, type[Any]] = {
     "local": LocalBackend,
     "bwrap": BwrapBackend,
     "seatbelt": SeatbeltBackend,
     "docker": DockerBackend,
 }
-"""The strategy each of those actors delegates to, in the same order.
+"""The four real backends, named directly rather than read from the registry.
 
-Named directly for the same reason: ``SANDBOX_BACKEND_CLASSES`` is the other
-injection window, so reading it here would assert about whatever a test put in.
+``SANDBOX_BACKEND_CLASSES`` is the injection window this suite writes a fake
+into, so a budget test that read the registry would be asserting about the fake.
 """
 
 # ---------------------------------------------------------------------------
@@ -214,7 +196,9 @@ class TestTheCapability:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # The whole of what the default buys: no host probe at wiring time and
-        # no #SandboxActor in a team that never asked for one.
+        # exactly one actor — the workspace's own — in a team that never asked
+        # for exec. Asserted as an equality over the created list rather than
+        # as the absence of a name, so it cannot pass over an empty list.
         def explode() -> str:
             raise AssertionError("a card with exec off probed the host for a backend")
 
@@ -223,9 +207,9 @@ class TestTheCapability:
         card.observer(FakeActorToolObserver(orchestrator_proxy))
 
         created = [config.name for _cls, config in orchestrator_proxy.create_calls]
-        assert not any(name.startswith(SANDBOX_ACTOR_NAME) for name in created)
+        assert created == [workspace_actor_name(WORKSPACE_PATH)]
 
-    def test_read_only_creates_no_sandbox_actor_either(
+    def test_read_only_creates_only_the_workspace_actor_too(
         self,
         orchestrator_proxy: FakeOrchestratorProxy,
         workspace_tree: Path,
@@ -233,23 +217,24 @@ class TestTheCapability:
     ) -> None:
         exec_card_for(orchestrator_proxy, read_only=True)
         created = [config.name for _cls, config in orchestrator_proxy.create_calls]
-        assert not any(name.startswith(SANDBOX_ACTOR_NAME) for name in created)
+        assert created == [workspace_actor_name(WORKSPACE_PATH)]
 
-    def test_on_builds_a_runner_and_still_creates_no_sandbox_actor(
+    def test_on_builds_a_runner_and_still_creates_only_the_workspace_actor(
         self,
         exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         orchestrator_proxy: FakeOrchestratorProxy,
     ) -> None:
         # What "on" buys is a backend on #Workspace itself, anchored to this
-        # card's tree — and no second actor. An actor nothing uses would still
-        # provision at start: on the docker backend, a container nobody execs in.
+        # card's tree — and no second actor. Three actors per exec-enabled team
+        # became two: the workspace and the agent. The created list is exactly
+        # the workspace, so a second getChildrenOrCreate of any name reddens it.
         _card, actor, _harness = exec_setup
 
         assert actor._runner is not None
         assert actor._runner.workspace_path == WORKSPACE_PATH
         assert isinstance(actor._runner.backend, FakeBackend)
         created = [config.name for _cls, config in orchestrator_proxy.create_calls]
-        assert not any(name.startswith(SANDBOX_ACTOR_NAME) for name in created)
+        assert created == [workspace_actor_name(WORKSPACE_PATH)]
 
     def test_two_workspaces_in_one_team_get_two_runners_on_their_own_trees(
         self,
@@ -359,9 +344,8 @@ class TestTheCapability:
     ) -> None:
         # The two halves of the capability have to agree on what "on" means. A
         # card that takes exec off the tool channel registers no callable, so it
-        # must not resolve a backend, warn about the fallback, or bring up a
-        # #SandboxActor either — on the docker backend that last one is a running
-        # container, brought up to serve tools that do not exist.
+        # must not resolve a backend, warn about the fallback, or create any
+        # actor beyond the workspace's own.
         def explode() -> str:
             raise AssertionError("a card with exec off the tool channel probed the host")
 
@@ -373,7 +357,7 @@ class TestTheCapability:
         card.observer(FakeActorToolObserver(orchestrator_proxy))
 
         created = [config.name for _cls, config in orchestrator_proxy.create_calls]
-        assert not any(name.startswith(SANDBOX_ACTOR_NAME) for name in created)
+        assert created == [workspace_actor_name(WORKSPACE_PATH)]
         names = {tool.__name__ for tool in card.get_tools()}
         assert "workspace_exec" not in names
 
@@ -430,22 +414,6 @@ class TestTheCapability:
             run_id="abc12345", agent_id=AGENT, cmd="pytest", started_at=1.0
         )
         assert RunningExec.model_validate(running.model_dump()) == running
-
-        # ExecRequest carries a live ActorAddress in ``reply_to``, which
-        # serialises but cannot be hydrated back without a resolver — and it is
-        # an in-process tell that is never persisted. So the dump is asserted
-        # without the round trip, which is what the rule is actually about: no
-        # field here is a type that refuses to serialise.
-        request = ExecRequest(
-            run_id="abc12345",
-            cmd="pytest",
-            cwd="src",
-            timeout_s=12.0,
-            reply_to=MockActorAddress("#Workspace", "ToolActor"),
-        )
-        dumped = request.model_dump()
-        assert dumped["cmd"] == "pytest"
-        assert dumped["timeout_s"] == 12.0
 
 
 # ---------------------------------------------------------------------------
@@ -678,11 +646,11 @@ class TestADisallowedCommand:
         sandbox_script: SandboxScript,
     ) -> None:
         card, actor, harness = exec_setup
-        # The fake backend is a real SandboxActor subclass, so exec() runs the
-        # real allowlist — the command never reaches _exec at all. `ssh` is the
-        # exemplar because it has to stay off the list for this to mean
-        # anything; a binary the sandbox might plausibly want would eventually be
-        # added and turn this into a test of nothing.
+        # ExecRunner validates before the backend is ever reached, so the
+        # command never lands on the fake at all. `ssh` is the exemplar because
+        # it has to stay off the list for this to mean anything; a binary the
+        # sandbox might plausibly want would eventually be added and turn this
+        # into a test of nothing.
         start = actor.request_exec(card._agent_id, "ssh nowhere")
         assert start.run_id, start.refusal
         harness.join()
@@ -799,30 +767,6 @@ class TestReadsDuringARun:
 # ---------------------------------------------------------------------------
 
 
-class _BlockedSandbox(SandboxActor):
-    """A backend whose ``on_start`` is held open until a test releases it.
-
-    Stands in for the incident's 78-second ``docker build``: everything the actor
-    could answer is behind a provisioning step that has not finished.
-    """
-
-    order: ClassVar[list[str]] = []
-    entered: ClassVar[threading.Event] = threading.Event()
-    release: ClassVar[threading.Event] = threading.Event()
-
-    def _start_sandbox(self) -> None:
-        type(self).order.append("on_start entered")
-        type(self).entered.set()
-        assert type(self).release.wait(timeout=HANDSHAKE_TIMEOUT_S), "on_start was never released"
-        type(self).order.append("on_start returned")
-
-    def _stop_sandbox(self) -> None:
-        pass
-
-    def _exec(self, cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
-        raise AssertionError("this backend exists to block in on_start, not to run commands")
-
-
 class _TellTarget(Akgent[BaseConfig, BaseState]):
     """An actor with one tell-shaped method, for observing what a send does.
 
@@ -840,48 +784,16 @@ class _TellTarget(Akgent[BaseConfig, BaseState]):
 
 
 class TestTheTwoSpikes:
-    """The two questions the design rests on, each pinned by a spec.
+    """The framework question the report path rests on, pinned by a spec.
 
-    Neither is a guard over this package's own behaviour — they are records of
-    what the *framework* does, and the design is only correct while they hold.
-    Written before the tell handler, because either answer changes the shape.
+    Not a guard over this package's own behaviour — a record of what the
+    *framework* does, and the design is only correct while it holds. There used
+    to be two spikes here. The first — that ``getChildrenOrCreate`` returns while
+    a sandbox actor's ``on_start`` is still provisioning — pinned a property the
+    exec path no longer rests on: nothing resolves a sandbox actor any more, and
+    provisioning is ``ExecRunner``'s lazy ``start()`` on the worker thread,
+    guarded by ``TestTheLazyStart``. It went with the actor.
     """
-
-    def test_get_children_or_create_returns_while_on_start_is_still_blocked(
-        self, threaded_orchestrator_proxy: FakeOrchestratorProxy
-    ) -> None:
-        # Spike (a). A cold container backend spends a minute inside on_start,
-        # and #Workspace resolves the sandbox on its own thread — so if the
-        # resolve waited for on_start the whole team would wait with it.
-        # Asserted as an ordering, never timed: on_start CANNOT return until
-        # this test sets ``release``, so anything observed before that set is
-        # provably concurrent with a blocked on_start.
-        #
-        # The live proxy is mandatory here. The inert one calls ``on_start()``
-        # synchronously inside getChildrenOrCreate, so this spec would pass
-        # against a blocking resolve and prove nothing at all.
-        _BlockedSandbox.order = []
-        _BlockedSandbox.entered = threading.Event()
-        _BlockedSandbox.release = threading.Event()
-
-        address = threaded_orchestrator_proxy.getChildrenOrCreate(
-            _BlockedSandbox,
-            config=SandboxConfig(
-                name="#SandboxActor-spike-a",
-                role="ToolActor",
-                team_id="t1",
-                workspace_path="t1",
-            ),
-        )
-
-        assert address is not None
-        assert not _BlockedSandbox.release.is_set()
-        assert "on_start returned" not in _BlockedSandbox.order
-        assert _BlockedSandbox.entered.wait(timeout=HANDSHAKE_TIMEOUT_S), "on_start never ran"
-        assert _BlockedSandbox.order == ["on_start entered"]
-
-        # Release it, so the fixture's stop_all does not hang behind it.
-        _BlockedSandbox.release.set()
 
     def test_address_tell_raises_on_a_dead_actor_where_a_held_proxy_tell_is_silent(
         self, threaded_orchestrator_proxy: FakeOrchestratorProxy
@@ -1140,7 +1052,7 @@ class TestCollectingARun:
 
 
 def started_strategy(mode: str, workspace_path: Path) -> Any:
-    """The strategy an actor of *mode* would hold after ``_start_sandbox``.
+    """The backend of *mode*, as ``start()`` would have left it.
 
     Assembled rather than started: no bwrap, no sandbox-exec and no docker daemon
     has to be present for a budget to be asserted.
@@ -1188,23 +1100,12 @@ class TestTheBudgets:
         self, mode: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         # Captured rather than measured: nothing slow is run and no backend
-        # binary has to be present. A budget that stops at the proxy is
-        # decoration, so this asserts it reaches subprocess.run in all four.
-        actor = REAL_BACKENDS[mode]()
-        actor.config = SandboxConfig(
-            name="#SandboxActor",
-            role="ToolActor",
-            team_id="t1",
-            workspace_path="t1",
-        )
-        actor.state = SandboxState()
-        actor.state.observer(actor)
-        actor.state.workspace_path = tmp_path
-        actor.state.container_name = "sandbox-t1"
-        actor._backend = started_strategy(mode, tmp_path)
+        # binary has to be present. A budget that stops at the caller is
+        # decoration, so this asserts it reaches the process in all four.
+        backend = started_strategy(mode, tmp_path)
 
         captured = capture_budget(monkeypatch)
-        actor._exec("echo hi", "", 3.25)
+        backend.exec("echo hi", "", 3.25)
 
         assert captured == [3.25]
 
@@ -1214,21 +1115,10 @@ class TestTheBudgets:
     ) -> None:
         # ``None`` keeps each backend's default, so no existing caller changed
         # behaviour when the parameter arrived.
-        actor = REAL_BACKENDS[mode]()
-        actor.config = SandboxConfig(
-            name="#SandboxActor",
-            role="ToolActor",
-            team_id="t1",
-            workspace_path="t1",
-        )
-        actor.state = SandboxState()
-        actor.state.observer(actor)
-        actor.state.workspace_path = tmp_path
-        actor.state.container_name = "sandbox-t1"
-        actor._backend = started_strategy(mode, tmp_path)
+        backend = started_strategy(mode, tmp_path)
 
         captured = capture_budget(monkeypatch)
-        actor._exec("echo hi", "", None)
+        backend.exec("echo hi", "", None)
 
         assert captured == [DEFAULT_BACKEND_TIMEOUT_S]
 
@@ -1969,13 +1859,12 @@ class TestARegisteredBackendIsReached:
     at call time and therefore reaches the injected class.
 
     **This spec moved from the actor registry to the backend registry**, because
-    that is where the extension point moved. ``SANDBOX_ACTOR_CLASSES`` is no
-    longer on any exec path, so the same spec written against it would install a
-    class nothing reaches and pass without executing a line of it — the exact
-    shape of vacuity this suite is written against. The actor registry's own
-    contract still holds for the actor and is asserted where it belongs, in
-    ``tests/sandbox/test_registry.py`` and beside the two-registries-agree check
-    in ``tests/sandbox/test_backend_kill.py``.
+    that is where the extension point moved — and the actor registry is now
+    gone with the actor. A spec written against a registry nothing reads would
+    install a class nothing reaches and pass without executing a line of it —
+    the exact shape of vacuity this suite is written against. The backend
+    registry's own shape is asserted in ``tests/sandbox/test_registry.py`` and
+    its mapping in ``tests/sandbox/test_backend_kill.py``.
     """
 
     def test_a_backend_assigned_into_the_registry_runs_the_command(
@@ -2523,9 +2412,9 @@ class TestTheExecutorAndItsWorker:
 class TestTheBackendFakeIsReallyReached:
     """The migration's own guard: a fixture installed but unreached is silent.
 
-    ``#Workspace`` no longer resolves a sandbox actor, so a fake left at
-    ``SANDBOX_ACTOR_CLASSES["local"]`` would be installed, restored, and never
-    called — and every spec in this file would go green while exercising the real
+    ``#Workspace`` resolves no sandbox actor, so a fake left at the retired
+    actor registry's ``local`` key was installed, restored, and never called —
+    and every spec in this file went green while exercising the real
     ``LocalBackend`` or nothing at all. This is the sentinel that says otherwise.
     """
 

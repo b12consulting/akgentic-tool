@@ -43,8 +43,6 @@ from .model.observer import ModelSwitchToolObserver  # noqa: F401
 from .model.state import ModelRow  # noqa: F401
 from .model.tool import ModelTool  # noqa: F401
 from .notification.tool import NotificationTool  # noqa: F401
-from .sandbox.bwrap import BwrapSandboxActor  # noqa: F401
-from .sandbox.seatbelt import SeatbeltSandboxActor  # noqa: F401
 from .skill.tool import SkillTool  # noqa: F401
 from .team.observer import TeamManagementToolObserver  # noqa: F401
 from .workspace.tool import WorkspaceTool  # noqa: F401
@@ -98,12 +96,10 @@ __all__ = [
     "search",
     "team",
     "workspace",
-    "BwrapSandboxActor",
     "MailboxTool",
     "MetadataTool",
     "ModelTool",
     "NotificationTool",
-    "SeatbeltSandboxActor",
     "SkillTool",
     "WorkspaceTool",
 ]

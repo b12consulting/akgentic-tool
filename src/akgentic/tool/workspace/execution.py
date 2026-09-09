@@ -42,24 +42,19 @@ from pydantic import model_validator
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.utils.serializer import SerializableBaseModel
-from akgentic.tool.sandbox.actor import (
-    SANDBOX_ACTOR_ROLE,
-    CardMode,
-    SandboxConfig,
-    SandboxMode,
-    sandbox_actor_name,
-)
 from akgentic.tool.sandbox.backend import (
+    CardMode,
     ExecReport,
     ExecResult,
     SandboxBackend,
+    SandboxMode,
     validate_command,
 )
 
 logger = logging.getLogger(__name__)
 
 ##
-## ``SandboxMode`` and ``CardMode`` are defined in ``sandbox.actor`` and used
+## ``SandboxMode`` and ``CardMode`` are defined in ``sandbox.backend`` and used
 ## here as they are: a resolved backend and a card's request are the same two
 ## vocabularies on both sides of the merge, and a second definition would be a
 ## second place to register a backend in.
@@ -79,15 +74,16 @@ MAX_EXEC_BUDGET_S = 20.0
 """The ceiling every run budget is clamped to, whatever a card asks for.
 
 **What it bounds is a teardown, not a command.** The subprocess runs on
-``#SandboxActor``'s own thread, and a Python thread cannot be cancelled — so the
-orchestrator's ``stop_children(blocking=True)`` is held open for as long as the
-command runs. The backstop on that stop is 30 s, so a run allowed past 20 s is a
-team that cannot be shut down inside its own backstop.
+``#Workspace``'s single worker thread, and a Python thread cannot be cancelled —
+so a command that ignores the kill teardown sends it holds the actor's bounded
+drain open for as long as it runs, and past that the orchestrator's
+``stop_children(blocking=True)``. The backstop on that stop is 30 s, so a run
+allowed past 20 s is a team that cannot be shut down inside its own backstop.
 
-The number is the one the retired ``#defer-`` worker used, and it is unchanged on
-purpose: the constraint never belonged to the worker. A thread that cannot be
-cancelled holds the blocking stop open whether it is a worker's thread or the
-sandbox's, so the ceiling below the backstop is still owed and only its owner has
+The number is the one the retired ``#defer-`` worker used, and then the retired
+sandbox actor, and it is unchanged on purpose: the constraint never belonged to
+either. A thread that cannot be cancelled holds the blocking stop open whoever
+owns it, so the ceiling below the backstop is still owed and only its owner has
 changed. Every budget arithmetic, README figure and existing spec therefore reads
 the same.
 """
@@ -212,10 +208,13 @@ EXEC_SHUTDOWN_GRACE_S = 3.0
 **A bound is owed because ``ThreadPoolExecutor.shutdown`` takes no timeout**, so
 ``shutdown(wait=True)`` can wait for ever and the case is reachable:
 ``ProcessBackend._run``'s timeout path drains with a second ``communicate()``,
-which reads both pipes to EOF, and a grandchild that inherited them and outlived
-the killed child holds that call open. ``kill()`` signals the direct child only,
-so it is no escape. The wait is therefore on the submitted ``Future``, and the
-shutdown that follows it does not wait at all.
+which reads both pipes to EOF, and a process that inherited them and outlived
+the kill holds that call open. ``kill()`` now signals the child's whole process
+group on ``local`` and ``bwrap``, which closes the ordinary case — a shell's
+forked command — but a process that left the group of its own accord is still
+out of reach, and docker's ``kill()`` never reaches inside the container at all.
+The wait is therefore on the submitted ``Future``, and the shutdown that follows
+it does not wait at all.
 
 **Three seconds, and the arithmetic that picks it.** Teardown kills first, and a
 healthy child dies in milliseconds, so this is generous for the case that is not
@@ -229,32 +228,8 @@ orchestrator's 30 s stop backstop. If either number changes, state that
 arithmetic again.
 
 What it converts is the failure mode, not the hazard: an unbounded teardown hang
-becomes three seconds of teardown latency. Signalling the process group would
-close the root cause, but it would also change what a **timeout** does to a
-subtree on every ordinary run, which is a decision that belongs to the ADR rather
-than to a wiring story.
-"""
-
-SANDBOX_RESOLVE_TIMEOUT_S = 5
-"""Seconds ``#Workspace`` will wait for the orchestrator to hand back the sandbox.
-
-**No production caller is left.** ``#Workspace`` owns its backend directly and
-resolves no second actor, so nothing reads this any more. It is a re-exported
-public name and is kept until the sweep that retires the sandbox actor removes
-the whole surface at once — an API removal is not something to fold into a
-wiring change.
-
-An ask made **on the team singleton's own thread**, which is the shape that must
-never be untimed: everything else queued behind it — every read, every mutation,
-every other agent's poll — waits for it. Five is generous rather than tight, since
-what is being waited on is one O(1) orchestrator turn plus a thread start;
-``getChildrenOrCreate`` returns before a cold backend's ``on_start`` has finished,
-so a slow provision is not what this bounds.
-
-On expiry the run **fails with a reason** rather than parking the singleton, which
-is what keeps a wedged orchestrator from taking the workspace with it.
-
-Whole seconds because ``proxy_ask`` takes an ``int``.
+becomes three seconds of teardown latency. The group kill closed the root cause
+for what a shell forks; the bound stays for what the group cannot reach.
 """
 
 RUN_ID_CHARS = 8
@@ -664,7 +639,7 @@ def resolve_mode(mode: CardMode, *, team_id: str = "") -> tuple[SandboxMode, San
     if mode == "auto" and resolved == "local":
         warnings.warn(
             "sandbox mode='auto': no isolation backend found (bwrap, sandbox-exec, "
-            "docker). Falling back to LocalSandboxActor — no filesystem isolation.",
+            "docker). Falling back to LocalBackend — no filesystem isolation.",
             DeprecationWarning,
             stacklevel=3,
         )
@@ -810,8 +785,10 @@ class ExecRunner:
         """ACTOR THREAD ONLY, at teardown step 2. End the run in flight.
 
         Best-effort and idempotent, because the backend's is: with no run in
-        flight there is nothing to signal, and a direct child that has already
-        exited is what the caller wanted anyway.
+        flight there is nothing to signal, and a child that has already exited
+        is what the caller wanted anyway. On ``local`` and ``bwrap`` the signal
+        reaches the child's whole process group, so a shell's forked command
+        dies with the shell.
         """
         self.backend.kill()
 
@@ -828,44 +805,6 @@ class ExecRunner:
         ``_release()`` is a no-op, so the case does not arise.
         """
         self.backend.stop()
-
-
-def sandbox_config(config: ExecConfig) -> SandboxConfig:
-    """Build the sandbox actor's configuration — in one place, for both callers.
-
-    **No production caller is left.** Neither the card nor ``#Workspace`` creates
-    a sandbox actor any more. It is a re-exported public name and is kept until
-    the sweep that retires the actor removes the whole surface at once.
-
-    ``getChildrenOrCreate`` keys on the actor **name**, so a config that differs
-    in name creates a *second* actor per run instead of resolving the existing
-    one; a config that differs in ``workspace_path`` would point the reused actor
-    at the wrong directory. The card builds one at wiring time and ``#Workspace``
-    builds one per run, and the two must be identical — so they are built here
-    rather than twice by hand.
-
-    **The name carries the workspace**, exactly as ``#Workspace-<workspace>``
-    does. A constant name resolved two exec-capable cards on two workspaces onto
-    the first actor, so one agent's commands ran in the other's tree while its
-    own ``#Workspace`` gated an untouched one — see :func:`sandbox_actor_name`.
-
-    **Nothing is derived here.** The path arrives already resolved from the card
-    that built the ``ExecConfig``, and both the name and the directory are taken
-    from that one value, so the two cannot disagree.
-
-    Args:
-        config: The card's resolved backend, team and workspace path.
-
-    Returns:
-        The configuration for ``#SandboxActor-<workspace>``.
-    """
-    return SandboxConfig(
-        name=sandbox_actor_name(config.workspace_path),
-        role=SANDBOX_ACTOR_ROLE,
-        team_id=config.team_id,
-        workspace_path=config.workspace_path,
-        mode=config.mode,
-    )
 
 
 def format_outcome(outcome: ExecOutcome, run_id: str = "") -> str:

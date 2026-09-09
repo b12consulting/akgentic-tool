@@ -12,23 +12,32 @@ and returns only when it is over: there was no handle, so there was nothing a
 caller could end. A backend now keeps the handle of the run in flight, so a
 caller that no longer wants a run can stop it.
 
-This module imports nothing else from ``akgentic.tool``, which is what lets
-``actor.py`` import it and re-export the names it moved from there. (It does
-reach ``akgentic.core`` for the serializer base, which is a package below this
-one and cannot import back.)
+**A kill reaches the child's whole process group where one was made for it.**
+``local`` and ``bwrap`` start the child under a ``preexec_fn`` that calls
+``os.setpgrp()``, and the group exists precisely so that a timeout or a kill can
+end the subtree rather than the shell at its root — ``sh -c '…'`` on Linux forks
+the command as a grandchild, which used to survive a direct-child kill and hold
+the pipes open for the rest of its life. A backend says so when it spawns —
+``_run(..., process_group=True)`` beside the ``preexec_fn`` that creates the
+group — and :meth:`ProcessBackend._signal` ends the group where it was told one
+exists and the direct child everywhere else. Docker (one host process, the
+``docker exec`` client) and seatbelt (no ``preexec_fn``) take the second path.
 
-**``ExecReport`` lives here, beside the ``ExecResult`` it carries.** It used to
-live in ``actor.py``, whose only remaining reason to exist is the sandbox actor;
-the report is told by whatever performed the run, and since the run moved to
-``#Workspace``'s own worker thread that is no longer an actor at all. It is
-re-exported from ``actor.py`` so every existing import path still resolves to
-this one object.
+This module imports nothing else from ``akgentic.tool``. (It does reach
+``akgentic.core`` for the serializer base, which is a package below this one and
+cannot import back.)
+
+**``ExecReport`` lives here, beside the ``ExecResult`` it carries.** The report
+is told by whatever performed the run, which is ``#Workspace``'s own worker
+thread; the sandbox actor that used to carry it is gone.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import shlex
+import signal
 import subprocess
 import threading
 from collections.abc import Callable
@@ -330,6 +339,13 @@ class ProcessBackend:
         self.team_id = team_id
         self._lock = threading.Lock()
         self._running: subprocess.Popen[str] | None = None
+        self._leads_a_group: bool = False
+        """Whether ``_running`` was spawned as the leader of its own process group.
+
+        Set beside the handle, under the same lock, from the ``process_group``
+        argument the backend gave :meth:`_run` — so :meth:`kill` signals the
+        group only where the backend said it made one.
+        """
 
     def _run(
         self,
@@ -339,25 +355,43 @@ class ProcessBackend:
         timeout: float,
         env: dict[str, str] | None = None,
         preexec_fn: Callable[[], None] | None = None,
+        process_group: bool = False,
     ) -> ExecResult:
         """Run *argv* to completion, holding its handle for the duration.
 
+        Args:
+            argv: The command line, already validated.
+            cwd: Working directory for the child, or ``None`` for this process's.
+            timeout: The run's budget in seconds.
+            env: The child's environment, or ``None`` to inherit.
+            preexec_fn: Run in the child before ``exec``; ``local`` and ``bwrap``
+                pass ``_make_preexec()``, which sets resource limits and calls
+                ``os.setpgrp()``.
+            process_group: ``True`` when *preexec_fn* makes the child the leader
+                of a new process group, so that a kill or a timeout can end the
+                whole subtree. **Pass it only beside a ``preexec_fn`` that calls
+                ``os.setpgrp()``**: it is what tells :meth:`_signal` there is a
+                group to signal, and nothing here checks the claim.
+
         Reproduces the part of ``subprocess.run(timeout=)`` the contract rests
         on: on expiry it kills the child and re-raises ``TimeoutExpired``, which
-        is what ``receiveMsg_ExecRequest`` turns into "too slow" rather than
+        is what ``ExecRunner.perform`` turns into "too slow" rather than
         "failed". ``Popen.communicate(timeout=)`` only raises — it does not kill
         — so the kill cannot be skipped without leaving a zombie.
 
-        **It is not identical to ``subprocess.run``, and the difference has a
-        cost.** CPython's POSIX path calls ``proc.wait()`` after the kill,
-        because ``_communicate`` already collected the output; this drains with
-        a second ``communicate()`` instead. A second drain reads both pipes to
-        EOF, so a grandchild that inherited them and outlived the killed child
-        holds this call open — past the budget, and past the stop backstop
-        :data:`DEFAULT_BACKEND_TIMEOUT_S` is sized against. Reachable through
-        any allowlisted command that leaves a process behind. Recorded in epic
-        50's deferred findings rather than changed here: narrowing it would
-        alter what every timing-out run does.
+        **It is not identical to ``subprocess.run``, and the difference is what
+        makes the group kill necessary.** CPython's POSIX path calls
+        ``proc.wait()`` after the kill, because ``_communicate`` already
+        collected the output; this drains with a second ``communicate()``
+        instead, which reads both pipes to EOF. A grandchild that inherited the
+        pipes and outlived the killed child would hold that drain open past the
+        budget and past the stop backstop :data:`DEFAULT_BACKEND_TIMEOUT_S` is
+        sized against — which is why the expiry signals the child's whole
+        process group through :meth:`_signal`, where the backend made one, rather
+        than the child alone. What remains out of reach is a process that left
+        the group of its own accord (``setsid``, ``nohup``-style daemonising);
+        that one holds the drain exactly as before and is the sandbox's
+        ordinary limit rather than a defect here.
 
         The handle is cleared in a ``finally`` on every exit. That is not
         tidiness: a retained handle to an exited process makes a later
@@ -377,10 +411,11 @@ class ProcessBackend:
         )
         with self._lock:
             self._running = proc
+            self._leads_a_group = process_group
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            self._signal(proc, process_group)
             stdout, stderr = proc.communicate()
             raise subprocess.TimeoutExpired(
                 argv, timeout, output=stdout, stderr=stderr
@@ -388,7 +423,38 @@ class ProcessBackend:
         finally:
             with self._lock:
                 self._running = None
+                self._leads_a_group = False
         return ExecResult(stdout=stdout, stderr=stderr, exit_code=proc.returncode)
+
+    @staticmethod
+    def _signal(proc: subprocess.Popen[str], process_group: bool) -> None:
+        """``SIGKILL`` *proc* — its whole process group where *process_group* says it leads one.
+
+        A child started under ``_make_preexec`` called ``os.setpgrp()`` and is
+        the **leader** of a group whose id is its own pid; the group is the
+        subtree, and ``os.killpg(proc.pid, …)`` is what ends it — the shell and
+        whatever the shell forked, together. A child that leads no group
+        (docker's ``docker exec`` client, seatbelt's ``sandbox-exec``) shares
+        this process's group and gets ``Popen.kill`` alone: ``killpg`` on *that*
+        group would take the caller down with it, which is why nothing here
+        guesses and the backend has to say so.
+
+        Best-effort on every path. A child or a group that was already gone by
+        the time the signal was sent is the outcome this asked for, so the
+        ``OSError`` is swallowed; a group that could not be signalled still gets
+        the direct-child kill, so the worst case is today's behaviour rather
+        than no kill at all.
+        """
+        if process_group:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+                return
+            except OSError:
+                pass
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
 
     def kill(self) -> None:
         """End the run in flight, if there is one.
@@ -399,18 +465,21 @@ class ProcessBackend:
         ``ProcessLookupError`` is swallowed rather than raised at a caller who
         asked for exactly that outcome.
 
-        **The direct child only.** ``Popen.kill`` sends ``SIGKILL`` to the process
-        it started, not to its process group, even where ``os.setpgrp()`` ran in
-        a ``preexec_fn``. Killing ``sh`` may therefore orphan what ``sh`` started.
+        **The whole subtree, where the backend made one.** ``local`` and
+        ``bwrap`` put the child in a new process group, and the group — the
+        shell *and* what the shell forked — is what :meth:`_signal` ends. That
+        is the promise ``_make_preexec``'s docstring has always made, and on
+        Linux, where ``sh -c '…'`` forks its command rather than exec'ing it in
+        place, it is the difference between a kill that lands and one that
+        leaves a grandchild holding the pipes. Docker and seatbelt create no
+        group and are signalled as the direct child they are.
         """
         with self._lock:
             proc = self._running
+            process_group = self._leads_a_group
         if proc is None:
             return
-        try:
-            proc.kill()
-        except (ProcessLookupError, OSError):
-            pass
+        self._signal(proc, process_group)
 
     def stop(self) -> None:
         """Kill the run in flight, then release the backend's own resources.

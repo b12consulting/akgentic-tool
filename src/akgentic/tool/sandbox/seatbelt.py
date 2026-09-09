@@ -1,7 +1,7 @@
 """SeatbeltBackend — macOS Apple Seatbelt sandbox for policy-based filesystem isolation.
 
-``SeatbeltSandboxActor`` is kept beside it as a thin delegator: it owns the
-actor lifecycle and the state it publishes, and nothing else.
+A plain strategy, built by ``resolve_mode`` and owned by ``#Workspace``'s
+``ExecRunner``; no actor stands between the workspace and ``sandbox-exec``.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ import tempfile
 import warnings
 from pathlib import Path
 
-from akgentic.tool.sandbox.actor import SandboxActor
 from akgentic.tool.sandbox.backend import (
     DEFAULT_BACKEND_TIMEOUT_S,
     ExecResult,
@@ -114,7 +113,7 @@ class SeatbeltBackend(ProcessBackend):
         logger.debug("SeatbeltBackend started: workspace=%s", self.workspace_path)
         warnings.warn(
             "sandbox-exec is deprecated since macOS 10.15 Catalina and may be removed "
-            "in a future macOS release. SeatbeltSandboxActor is for macOS developer "
+            "in a future macOS release. SeatbeltBackend is for macOS developer "
             "workstations only.",
             DeprecationWarning,
             stacklevel=2,
@@ -130,6 +129,10 @@ class SeatbeltBackend(ProcessBackend):
 
         No ``preexec_fn`` or env-stripping is applied — ``resource.setrlimit``
         behaviour differs on macOS and the SBPL policy covers the threat model.
+        With no ``preexec_fn`` there is no process group of its own either, so a
+        kill or a timeout signals the direct ``sandbox-exec`` child; on macOS
+        ``sh -c`` execs a single command in place, so that child *is* the
+        command.
 
         **The only writable subpath is the workspace root.** The journal at the
         sibling ``<root>.git`` is outside it, which is what keeps a sandboxed run
@@ -174,26 +177,3 @@ class SeatbeltBackend(ProcessBackend):
     def _release(self) -> None:
         """Nothing to release: a ``sandbox-exec`` process lives only as long as its run."""
         logger.debug("SeatbeltBackend stopped.")
-
-
-class SeatbeltSandboxActor(SandboxActor):
-    """macOS-only sandbox actor that uses Apple Seatbelt (``sandbox-exec``) for isolation.
-
-    A thin delegator over :class:`SeatbeltBackend`, which holds the implementation.
-    """
-
-    _backend: SeatbeltBackend | None = None
-
-    def _start_sandbox(self) -> None:
-        self._backend = SeatbeltBackend()
-        self._backend.start(self.config.workspace_path)
-        self.state.workspace_path = self._backend.workspace_path
-        self.state.notify_state_change()
-
-    def _stop_sandbox(self) -> None:
-        if self._backend is not None:
-            self._backend.stop()
-
-    def _exec(self, cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
-        assert self._backend is not None
-        return self._backend.exec(cmd, cwd, timeout)

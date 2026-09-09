@@ -1,7 +1,7 @@
 """LocalBackend — subprocess-based sandbox for local filesystem execution.
 
-``LocalSandboxActor`` is kept beside it as a thin delegator: it owns the
-actor lifecycle and the state it publishes, and nothing else.
+A plain strategy, built by ``resolve_mode`` and owned by ``#Workspace``'s
+``ExecRunner``; no actor stands between the workspace and the process.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
-from akgentic.tool.sandbox.actor import SandboxActor
 from akgentic.tool.sandbox.backend import (
     DEFAULT_BACKEND_TIMEOUT_S,
     ExecResult,
@@ -88,7 +87,10 @@ def _make_preexec(cpu_s: int = 30, mem_mb: int = 512, fsize_mb: int = 100) -> Ca
     - ``RLIMIT_FSIZE``: Maximum file size in bytes
 
     Also calls ``os.setpgrp()`` to put the child process into a new process group,
-    so that a timeout can kill the entire subtree.
+    so that a timeout or a ``kill()`` can end the entire subtree. **The group
+    is only signalled where the backend says it exists**: every ``_run`` call
+    that passes this callable must pass ``process_group=True`` beside it, or the
+    group is created and never used.
     """
 
     def preexec() -> None:
@@ -96,7 +98,7 @@ def _make_preexec(cpu_s: int = 30, mem_mb: int = 512, fsize_mb: int = 100) -> Ca
         if sys.platform != "darwin":
             resource.setrlimit(resource.RLIMIT_AS, (mem_mb * 1024**2, mem_mb * 1024**2))
         resource.setrlimit(resource.RLIMIT_FSIZE, (fsize_mb * 1024**2, fsize_mb * 1024**2))
-        os.setpgrp()  # new process group → timeout kills entire subtree
+        os.setpgrp()  # new process group → a timeout or kill() ends the entire subtree
 
     return preexec
 
@@ -142,6 +144,7 @@ class LocalBackend(ProcessBackend):
                 cwd=str(effective_cwd),
                 timeout=DEFAULT_BACKEND_TIMEOUT_S if timeout is None else timeout,
                 preexec_fn=_make_preexec(),
+                process_group=True,
                 env=_make_sandbox_env(),
             )
         except FileNotFoundError:
@@ -154,30 +157,3 @@ class LocalBackend(ProcessBackend):
     def _release(self) -> None:
         """Nothing to release: the workspace directory outlives the backend."""
         logger.debug("LocalBackend stopped.")
-
-
-class LocalSandboxActor(SandboxActor):
-    """Subprocess-based sandbox actor for local filesystem execution.
-
-    A thin delegator over :class:`LocalBackend`, which holds the implementation.
-
-    This actor does NOT provide filesystem isolation — an allowed command can still
-    read files outside the workspace. It is a development convenience only, not a
-    production security boundary.
-    """
-
-    _backend: LocalBackend | None = None
-
-    def _start_sandbox(self) -> None:
-        self._backend = LocalBackend()
-        self._backend.start(self.config.workspace_path)
-        self.state.workspace_path = self._backend.workspace_path
-        self.state.notify_state_change()
-
-    def _stop_sandbox(self) -> None:
-        if self._backend is not None:
-            self._backend.stop()
-
-    def _exec(self, cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
-        assert self._backend is not None
-        return self._backend.exec(cmd, cwd, timeout)

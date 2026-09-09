@@ -5,9 +5,11 @@ resolved through them. The card is gone (epic 41); the registry and the probe
 are not deprecated and keep their coverage here, where a reader looking for the
 backend's tests will look.
 
-- ``SANDBOX_ACTOR_CLASSES`` holds the four shipped backends under their keys
+- ``SANDBOX_BACKEND_CLASSES`` holds the four shipped strategies under their keys
   and is a plain mutable ``dict`` — the injection window a deployment writes
-  its own backend into.
+  its own backend into. The entry-by-entry mapping is pinned in
+  ``tests/sandbox/test_backend_kill.py``; what is asserted here is the shape of
+  the dict itself.
 - ``_resolve_auto_mode`` probes ``bwrap`` → ``seatbelt`` → ``docker`` →
   ``local``, in that order, and the seatbelt probe is a runtime check rather
   than a PATH lookup.
@@ -18,53 +20,22 @@ from __future__ import annotations
 import subprocess
 from unittest.mock import MagicMock, patch
 
-from akgentic.tool.sandbox import (
-    SANDBOX_ACTOR_CLASSES,
-    BwrapSandboxActor,
-    DockerSandboxActor,
-    LocalSandboxActor,
-    SeatbeltSandboxActor,
-    _resolve_auto_mode,
-)
+from akgentic.tool.sandbox import SANDBOX_BACKEND_CLASSES, _resolve_auto_mode
 from akgentic.tool.sandbox.registry import _seatbelt_available
 
 # ---------------------------------------------------------------------------
-# SANDBOX_ACTOR_CLASSES — the registry
+# SANDBOX_BACKEND_CLASSES — the registry
 # ---------------------------------------------------------------------------
 
 
-def test_sandbox_actor_classes_has_local_key() -> None:
-    """SANDBOX_ACTOR_CLASSES['local'] maps to LocalSandboxActor."""
-    assert "local" in SANDBOX_ACTOR_CLASSES
-    assert SANDBOX_ACTOR_CLASSES["local"] is LocalSandboxActor
-
-
-def test_sandbox_actor_classes_has_docker_key() -> None:
-    """SANDBOX_ACTOR_CLASSES['docker'] maps to DockerSandboxActor."""
-    assert "docker" in SANDBOX_ACTOR_CLASSES
-    assert SANDBOX_ACTOR_CLASSES["docker"] is DockerSandboxActor
-
-
-def test_sandbox_actor_classes_has_bwrap_key() -> None:
-    """Story 8.4: SANDBOX_ACTOR_CLASSES['bwrap'] maps to BwrapSandboxActor."""
-    assert "bwrap" in SANDBOX_ACTOR_CLASSES
-    assert SANDBOX_ACTOR_CLASSES["bwrap"] is BwrapSandboxActor
-
-
-def test_sandbox_actor_classes_has_seatbelt_key() -> None:
-    """Story 8.4: SANDBOX_ACTOR_CLASSES['seatbelt'] maps to SeatbeltSandboxActor."""
-    assert "seatbelt" in SANDBOX_ACTOR_CLASSES
-    assert SANDBOX_ACTOR_CLASSES["seatbelt"] is SeatbeltSandboxActor
-
-
-def test_sandbox_actor_classes_is_mutable_dict() -> None:
-    """SANDBOX_ACTOR_CLASSES is a regular dict (mutable — injection window)."""
-    assert isinstance(SANDBOX_ACTOR_CLASSES, dict)
+def test_the_backend_registry_is_a_mutable_dict() -> None:
+    """A regular dict — the injection window a deployment assigns into."""
+    assert isinstance(SANDBOX_BACKEND_CLASSES, dict)
 
 
 def test_the_registry_holds_exactly_the_four_shipped_backends() -> None:
     """Nothing is registered by import alone; a fifth key is a deployment's doing."""
-    assert set(SANDBOX_ACTOR_CLASSES) == {"local", "bwrap", "seatbelt", "docker"}
+    assert set(SANDBOX_BACKEND_CLASSES) == {"local", "bwrap", "seatbelt", "docker"}
 
 
 # ---------------------------------------------------------------------------

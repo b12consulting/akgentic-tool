@@ -577,12 +577,12 @@ def outcome_of(actor: WorkspaceActor, method: str, *args: Any) -> MutationOutcom
 ## is held open by an event and released by the test, so every concurrency
 ## assertion is a handshake with a failure budget rather than a wait.
 ##
-## **The injection window is** ``SANDBOX_BACKEND_CLASSES``, **not**
-## ``SANDBOX_ACTOR_CLASSES``.  ``#Workspace`` builds its own backend in
-## ``configure_exec`` and runs it on its own single-worker executor; it resolves
-## no sandbox actor at all, so a fake installed at the actor key would be
-## installed and never reached — every spec below would go green while testing
-## nothing.  Injecting the *backend* keeps the whole production path live:
+## **The injection window is** ``SANDBOX_BACKEND_CLASSES``, the one registry.
+## ``#Workspace`` builds its own backend in ``configure_exec`` and runs it on its
+## own single-worker executor; there is no sandbox actor to resolve, and when
+## there still was one a fake installed at its registry key was installed and
+## never reached — every spec below went green while testing nothing.
+## Injecting the *backend* keeps the whole production path live:
 ## ``configure_exec`` → ``resolve_mode`` → the registry → ``ExecRunner`` → the
 ## real executor → ``perform``.  Only the four lines that would touch a real
 ## process are the fake's.
@@ -796,8 +796,8 @@ class SubmittedRun:
 
     The five values plus the reply address are what ``_start_run`` hands the
     worker, so recording them here is recording the whole of what crosses the
-    thread boundary — the successor to the ``ExecRequest`` the sandbox actor
-    used to receive.
+    thread boundary — the successor to the request model the retired sandbox
+    actor used to receive.
     """
 
     run_id: str
@@ -816,7 +816,7 @@ class RecordingExecutor:
       id and the reply address are observable now that no request model crosses
       the boundary;
     - it **redirects** ``reply_to`` to the inert actor's stand-in, exactly as the
-      old harness rewrote it on the ``ExecRequest``;
+      old harness rewrote it on the request it intercepted;
     - it **runs the real callable on a real single worker thread**, so the
       command genuinely runs elsewhere. That is the only way the tree's hold can
       be observed *while it is held*, and it is what makes "call ``perform``

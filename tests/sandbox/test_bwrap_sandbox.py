@@ -1,16 +1,17 @@
-"""Tests for BwrapSandboxActor — Linux bubblewrap sandbox execution.
+"""Tests for ``BwrapBackend`` — Linux bubblewrap sandbox execution.
 
-Covers Story 8.2 (AC: 1–8):
-- _start_sandbox() raises RuntimeError when bwrap not on PATH (AC2)
-- _start_sandbox() creates workspace directory (AC1)
-- _start_sandbox() is idempotent (AC1 — mkdir exist_ok=True)
-- _stop_sandbox() is a no-op (AC3)
-- _exec() builds correct bwrap command with all required flags (AC4)
-- _exec() passes preexec_fn callable to subprocess.run (AC5)
-- _exec() passes minimal PATH-only env dict to subprocess.run (AC5)
-- _exec() uses /workspace as cwd when cwd="" (AC4)
-- _exec() appends cwd to /workspace when cwd is non-empty (AC4)
-- _exec() returns ExecResult with correct fields (AC4)
+The backend is constructed directly; the ``backend`` fixture points it at a
+temp directory the way ``start()`` would, without needing ``bwrap`` on PATH.
+
+Covers Story 8.2 (AC: 1–8), through the backend:
+- ``start()`` raises RuntimeError when bwrap not on PATH (AC2)
+- ``start()`` creates the workspace directory and is idempotent (AC1)
+- ``stop()`` spawns nothing (AC3)
+- ``exec()`` builds the bwrap command with all required flags (AC4)
+- ``exec()`` passes a preexec_fn and declares the process group it makes (AC5)
+- ``exec()`` passes a minimal PATH-only env dict (AC5)
+- ``exec()`` uses /workspace as cwd when cwd="" and appends cwd otherwise (AC4)
+- ``exec()`` returns ExecResult with correct fields (AC4)
 """
 
 from __future__ import annotations
@@ -20,8 +21,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from akgentic.tool.sandbox.actor import ExecResult, SandboxConfig, SandboxState
-from akgentic.tool.sandbox.bwrap import BwrapBackend, BwrapSandboxActor
+from akgentic.tool.sandbox.backend import ExecResult
+from akgentic.tool.sandbox.bwrap import BwrapBackend
 
 # The exec path runs through ``ProcessBackend._run``, so every exec-path mock
 # targets ``backend.subprocess.Popen``. The start path is unchanged and still
@@ -36,6 +37,7 @@ def popen_mock(
     proc = mock_popen.return_value
     proc.communicate.return_value = (stdout, stderr)
     proc.returncode = returncode
+    proc.pid = 4242
     return proc
 
 # ---------------------------------------------------------------------------
@@ -44,203 +46,129 @@ def popen_mock(
 
 
 @pytest.fixture
-def actor(tmp_path: Path) -> BwrapSandboxActor:
-    """Return a BwrapSandboxActor with workspace resolved to a temp directory.
+def backend(tmp_path: Path) -> BwrapBackend:
+    """Return a BwrapBackend with its workspace resolved to a temp directory.
 
-    Uses ``BwrapSandboxActor.__new__`` to bypass Pykka's actor instantiation.
-    Config and state are set directly, mirroring the pattern in test_local_sandbox.py.
+    Pointed at *tmp_path* directly rather than through ``start()``, so no
+    ``bwrap`` binary has to be present for the ``exec()`` argv to be asserted.
     """
-    a: BwrapSandboxActor = BwrapSandboxActor.__new__(BwrapSandboxActor)
-    a.config = SandboxConfig(
-        name="sandbox",
-        role="ToolActor",
-        team_id="test-team",
-        workspace_path="test-team",
-    )
-    a.state = SandboxState()
-    a.state.workspace_path = tmp_path
-    # The actor holds no execution path of its own, so it needs the backend
-    # ``_start_sandbox`` would have built — pointed at *tmp_path* rather than at
-    # a directory derived from ``AKGENTIC_WORKSPACES_ROOT``.
-    backend = BwrapBackend()
-    backend.workspace_path = tmp_path
-    a._backend = backend
-    return a
+    b = BwrapBackend()
+    b.workspace_path = tmp_path
+    return b
 
 
 # ---------------------------------------------------------------------------
-# AC2: _start_sandbox() raises RuntimeError when bwrap not on PATH
+# AC2: start() raises RuntimeError when bwrap not on PATH
 # ---------------------------------------------------------------------------
 
 
-def test_start_sandbox_bwrap_not_on_path_raises_runtime_error() -> None:
-    """AC2: _start_sandbox() raises RuntimeError with install hints when bwrap missing."""
-    a: BwrapSandboxActor = BwrapSandboxActor.__new__(BwrapSandboxActor)
-    a.config = SandboxConfig(
-        name="sandbox",
-        role="ToolActor",
-        team_id="test-team",
-        workspace_path="test-team",
-    )
-    a.state = SandboxState()
-
+def test_start_bwrap_not_on_path_raises_runtime_error() -> None:
+    """AC2: start() raises RuntimeError with install hints when bwrap missing."""
     with patch("akgentic.tool.sandbox.bwrap.shutil.which", return_value=None):
         with pytest.raises(RuntimeError, match="bwrap not found"):
-            a._start_sandbox()
+            BwrapBackend().start("test-team")
 
 
-def test_start_sandbox_bwrap_not_on_path_error_contains_apt_hint() -> None:
+def test_start_bwrap_not_on_path_error_contains_apt_hint() -> None:
     """AC2: RuntimeError message includes 'apt install bubblewrap'."""
-    a: BwrapSandboxActor = BwrapSandboxActor.__new__(BwrapSandboxActor)
-    a.config = SandboxConfig(
-        name="sandbox",
-        role="ToolActor",
-        team_id="test-team",
-        workspace_path="test-team",
-    )
-    a.state = SandboxState()
-
     with patch("akgentic.tool.sandbox.bwrap.shutil.which", return_value=None):
         with pytest.raises(RuntimeError, match="apt install bubblewrap"):
-            a._start_sandbox()
+            BwrapBackend().start("test-team")
 
 
-def test_start_sandbox_bwrap_not_on_path_error_contains_dnf_hint() -> None:
+def test_start_bwrap_not_on_path_error_contains_dnf_hint() -> None:
     """AC2: RuntimeError message includes 'dnf install bubblewrap'."""
-    a: BwrapSandboxActor = BwrapSandboxActor.__new__(BwrapSandboxActor)
-    a.config = SandboxConfig(
-        name="sandbox",
-        role="ToolActor",
-        team_id="test-team",
-        workspace_path="test-team",
-    )
-    a.state = SandboxState()
-
     with patch("akgentic.tool.sandbox.bwrap.shutil.which", return_value=None):
         with pytest.raises(RuntimeError, match="dnf install bubblewrap"):
-            a._start_sandbox()
+            BwrapBackend().start("test-team")
 
 
 # ---------------------------------------------------------------------------
-# AC1: _start_sandbox() creates workspace directory
+# AC1: start() creates workspace directory
 # ---------------------------------------------------------------------------
 
 
-def test_start_sandbox_creates_workspace_directory(
+def test_start_creates_workspace_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """AC1: _start_sandbox() creates workspace under AKGENTIC_WORKSPACES_ROOT."""
+    """AC1: start() creates workspace under AKGENTIC_WORKSPACES_ROOT."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
 
-    a: BwrapSandboxActor = BwrapSandboxActor.__new__(BwrapSandboxActor)
-    a.config = SandboxConfig(
-        name="sandbox",
-        role="ToolActor",
-        team_id="test-team",
-        workspace_path="test-team",
-    )
-    a.state = SandboxState()
-
-    with (
-        patch("akgentic.tool.sandbox.bwrap.shutil.which", return_value="/usr/bin/bwrap"),
-        patch("akgentic.tool.sandbox.actor.SandboxState.notify_state_change"),
-    ):
-        a._start_sandbox()
+    with patch("akgentic.tool.sandbox.bwrap.shutil.which", return_value="/usr/bin/bwrap"):
+        BwrapBackend().start("test-team")
 
     expected = tmp_path / "workspaces" / "test-team"
     assert expected.exists()
     assert expected.is_dir()
 
 
-def test_start_sandbox_stores_resolved_absolute_path(
+def test_start_stores_resolved_absolute_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """AC1: _start_sandbox() stores resolved absolute path in state.workspace_path."""
+    """AC1: start() stores the resolved absolute path in ``workspace_path``."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
+    b = BwrapBackend()
 
-    a: BwrapSandboxActor = BwrapSandboxActor.__new__(BwrapSandboxActor)
-    a.config = SandboxConfig(
-        name="sandbox",
-        role="ToolActor",
-        team_id="test-team",
-        workspace_path="test-team",
-    )
-    a.state = SandboxState()
+    with patch("akgentic.tool.sandbox.bwrap.shutil.which", return_value="/usr/bin/bwrap"):
+        b.start("test-team")
 
-    with (
-        patch("akgentic.tool.sandbox.bwrap.shutil.which", return_value="/usr/bin/bwrap"),
-        patch("akgentic.tool.sandbox.actor.SandboxState.notify_state_change"),
-    ):
-        a._start_sandbox()
-
-    assert a.state.workspace_path is not None
-    assert a.state.workspace_path.is_absolute()
-    assert a.state.workspace_path == (tmp_path / "workspaces" / "test-team").resolve()
+    assert b.workspace_path is not None
+    assert b.workspace_path.is_absolute()
+    assert b.workspace_path == (tmp_path / "workspaces" / "test-team").resolve()
 
 
 # ---------------------------------------------------------------------------
-# AC1: _start_sandbox() is idempotent (exist_ok=True)
+# AC1: start() is idempotent (exist_ok=True)
 # ---------------------------------------------------------------------------
 
 
-def test_start_sandbox_idempotent_existing_workspace(
+def test_start_idempotent_existing_workspace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """AC1: Calling _start_sandbox() twice does not raise (idempotent mkdir)."""
+    """AC1: Calling start() twice does not raise (idempotent mkdir)."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
+    b = BwrapBackend()
 
-    a: BwrapSandboxActor = BwrapSandboxActor.__new__(BwrapSandboxActor)
-    a.config = SandboxConfig(
-        name="sandbox",
-        role="ToolActor",
-        team_id="test-team",
-        workspace_path="test-team",
-    )
-    a.state = SandboxState()
-
-    with (
-        patch("akgentic.tool.sandbox.bwrap.shutil.which", return_value="/usr/bin/bwrap"),
-        patch("akgentic.tool.sandbox.actor.SandboxState.notify_state_change"),
-    ):
-        a._start_sandbox()
-        a._start_sandbox()  # Must not raise
+    with patch("akgentic.tool.sandbox.bwrap.shutil.which", return_value="/usr/bin/bwrap"):
+        b.start("test-team")
+        b.start("test-team")  # Must not raise
 
     expected = tmp_path / "workspaces" / "test-team"
     assert expected.exists()
 
 
 # ---------------------------------------------------------------------------
-# AC3: _stop_sandbox() is a no-op
+# AC3: stop() spawns nothing
 # ---------------------------------------------------------------------------
 
 
-def test_stop_sandbox_is_noop(actor: BwrapSandboxActor) -> None:
-    """AC3: _stop_sandbox() returns None and spawns no process.
+def test_stop_spawns_nothing(backend: BwrapBackend) -> None:
+    """AC3: stop() returns None and spawns no process.
 
-    ``bwrap.py`` no longer imports ``subprocess`` at all — the exec path moved to
+    ``bwrap.py`` does not import ``subprocess`` at all — the exec path lives in
     ``ProcessBackend`` — so the same fact is asserted where a process could now
     actually be spawned from.
     """
     with patch(POPEN) as mock_run:
-        result = actor._stop_sandbox()
+        result = backend.stop()
 
     assert result is None
     mock_run.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# AC4: _exec() builds correct bwrap command with all required flags
+# AC4: exec() builds correct bwrap command with all required flags
 # ---------------------------------------------------------------------------
 
 
-def test_exec_builds_correct_bwrap_command(actor: BwrapSandboxActor) -> None:
-    """AC4: _exec() passes a bwrap command list with all required flags to subprocess.run."""
+def test_exec_builds_correct_bwrap_command(backend: BwrapBackend) -> None:
+    """AC4: exec() passes a bwrap command list with all required flags to the process."""
     with patch(POPEN) as mock_run:
         popen_mock(mock_run)
-        actor._exec("ls .", "")
+        backend.exec("ls .", "")
 
         cmd_list: list[str] = mock_run.call_args[0][0]  # first positional arg
 
@@ -265,11 +193,11 @@ def test_exec_builds_correct_bwrap_command(actor: BwrapSandboxActor) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_exec_cwd_empty_uses_workspace_root(actor: BwrapSandboxActor) -> None:
+def test_exec_cwd_empty_uses_workspace_root(backend: BwrapBackend) -> None:
     """AC4: When cwd='', --chdir is followed by '/workspace'."""
     with patch(POPEN) as mock_run:
         popen_mock(mock_run)
-        actor._exec("ls .", "")
+        backend.exec("ls .", "")
 
         cmd_list: list[str] = mock_run.call_args[0][0]
 
@@ -277,11 +205,11 @@ def test_exec_cwd_empty_uses_workspace_root(actor: BwrapSandboxActor) -> None:
     assert cmd_list[chdir_idx + 1] == "/workspace"
 
 
-def test_exec_cwd_nonempty_appends_to_workspace(actor: BwrapSandboxActor) -> None:
+def test_exec_cwd_nonempty_appends_to_workspace(backend: BwrapBackend) -> None:
     """AC4: When cwd='subdir', --chdir is followed by '/workspace/subdir'."""
     with patch(POPEN) as mock_run:
         popen_mock(mock_run)
-        actor._exec("ls .", "subdir")
+        backend.exec("ls .", "subdir")
 
         cmd_list: list[str] = mock_run.call_args[0][0]
 
@@ -290,15 +218,15 @@ def test_exec_cwd_nonempty_appends_to_workspace(actor: BwrapSandboxActor) -> Non
 
 
 # ---------------------------------------------------------------------------
-# AC5: resource limits and env stripping
+# AC5: resource limits, the process group, and env stripping
 # ---------------------------------------------------------------------------
 
 
-def test_exec_passes_preexec_fn_to_subprocess(actor: BwrapSandboxActor) -> None:
-    """AC5: _exec() passes a non-None callable preexec_fn to subprocess.run."""
+def test_exec_passes_preexec_fn_to_subprocess(backend: BwrapBackend) -> None:
+    """AC5: exec() passes a non-None callable preexec_fn to the process."""
     with patch(POPEN) as mock_run:
         popen_mock(mock_run)
-        actor._exec("ls .", "")
+        backend.exec("ls .", "")
 
         call_kwargs = mock_run.call_args
     assert call_kwargs is not None
@@ -307,11 +235,35 @@ def test_exec_passes_preexec_fn_to_subprocess(actor: BwrapSandboxActor) -> None:
     assert callable(preexec_fn)
 
 
-def test_exec_strips_env_to_minimal_path(actor: BwrapSandboxActor) -> None:
-    """AC5: _exec() passes minimal PATH-only env dict to subprocess.run."""
+def test_exec_declares_the_process_group_while_the_run_is_in_flight(
+    backend: BwrapBackend,
+) -> None:
+    """The group ``_make_preexec`` creates is declared to ``_run``, for the whole run.
+
+    bwrap builds its own argv and makes its own ``_run`` call, so it has its own
+    flag to forget — and a forgotten flag is a group nothing ever signals.
+    """
+    seen: list[bool] = []
+
+    with patch(POPEN) as mock_run:
+        proc = popen_mock(mock_run)
+
+        def communicate(timeout: float | None = None) -> tuple[str, str]:
+            seen.append(backend._leads_a_group)
+            return ("", "")
+
+        proc.communicate.side_effect = communicate
+        backend.exec("ls .", "")
+
+    assert seen == [True]
+    assert backend._leads_a_group is False
+
+
+def test_exec_strips_env_to_minimal_path(backend: BwrapBackend) -> None:
+    """AC5: exec() passes minimal PATH-only env dict to the process."""
     with patch(POPEN) as mock_run:
         popen_mock(mock_run)
-        actor._exec("ls .", "")
+        backend.exec("ls .", "")
 
         call_kwargs = mock_run.call_args
     assert call_kwargs is not None
@@ -322,15 +274,15 @@ def test_exec_strips_env_to_minimal_path(actor: BwrapSandboxActor) -> None:
 
 
 # ---------------------------------------------------------------------------
-# AC4: _exec() returns ExecResult with correct fields
+# AC4: exec() returns ExecResult with correct fields
 # ---------------------------------------------------------------------------
 
 
-def test_exec_returns_exec_result(actor: BwrapSandboxActor) -> None:
-    """AC4: _exec() returns ExecResult with stdout, stderr, exit_code from subprocess.run."""
+def test_exec_returns_exec_result(backend: BwrapBackend) -> None:
+    """AC4: exec() returns ExecResult with stdout, stderr, exit_code from the process."""
     with patch(POPEN) as mock_run:
         popen_mock(mock_run, stdout="out", stderr="err")
-        result = actor._exec("ls .", "")
+        result = backend.exec("ls .", "")
 
     assert isinstance(result, ExecResult)
     assert result.stdout == "out"
@@ -338,11 +290,11 @@ def test_exec_returns_exec_result(actor: BwrapSandboxActor) -> None:
     assert result.exit_code == 0
 
 
-def test_exec_returns_exec_result_nonzero_exit(actor: BwrapSandboxActor) -> None:
-    """AC4: _exec() correctly captures non-zero exit codes."""
+def test_exec_returns_exec_result_nonzero_exit(backend: BwrapBackend) -> None:
+    """AC4: exec() correctly captures non-zero exit codes."""
     with patch(POPEN) as mock_run:
         popen_mock(mock_run, stderr="error output", returncode=1)
-        result = actor._exec("ls .", "")
+        result = backend.exec("ls .", "")
 
     assert result.exit_code == 1
     assert result.stderr == "error output"
@@ -354,7 +306,7 @@ def test_exec_returns_exec_result_nonzero_exit(actor: BwrapSandboxActor) -> None
 
 
 def test_exec_keeps_a_quoted_argument_whole_after_the_bwrap_prefix(
-    actor: BwrapSandboxActor,
+    backend: BwrapBackend,
 ) -> None:
     """AC1: the tokens are shlex tokens and the whole bwrap flag list still precedes them.
 
@@ -363,7 +315,7 @@ def test_exec_keeps_a_quoted_argument_whole_after_the_bwrap_prefix(
     """
     with patch(POPEN) as mock_run:
         popen_mock(mock_run)
-        actor._exec('echo "hello world"', "")
+        backend.exec('echo "hello world"', "")
 
         cmd_list: list[str] = mock_run.call_args[0][0]
 
