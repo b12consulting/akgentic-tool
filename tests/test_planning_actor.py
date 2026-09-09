@@ -437,10 +437,10 @@ class TestPlanConfigCollectionField:
 
     def test_collection_default_is_default_collection_config(self) -> None:
         from akgentic.tool.planning.planning_actor import PlanConfig
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
         cfg = PlanConfig(name="#PlanningTool", role="ToolActor")
-        assert cfg.collection == CollectionConfig()
+        assert cfg.collection == VectorStoreParam()
         # Structural defaults — AC-11 backward-compat guard.
         assert cfg.collection.dimension == 1536
         assert cfg.collection.backend == "inmemory"
@@ -448,32 +448,32 @@ class TestPlanConfigCollectionField:
 
     def test_collection_accepts_custom_value(self) -> None:
         from akgentic.tool.planning.planning_actor import PlanConfig
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
         cfg = PlanConfig(
             name="#PlanningTool",
             role="ToolActor",
-            collection=CollectionConfig(backend="inmemory", tenant="plan-tenant"),
+            collection=VectorStoreParam(backend="inmemory", tenant="plan-tenant"),
         )
         assert cfg.collection.backend == "inmemory"
         assert cfg.collection.tenant == "plan-tenant"
 
     def test_collection_roundtrip_default(self) -> None:
         from akgentic.tool.planning.planning_actor import PlanConfig
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
         cfg = PlanConfig(name="#PlanningTool", role="ToolActor")
         reloaded = PlanConfig.model_validate(cfg.model_dump())
-        assert reloaded.collection == CollectionConfig()
+        assert reloaded.collection == VectorStoreParam()
 
     def test_collection_roundtrip_custom(self) -> None:
         from akgentic.tool.planning.planning_actor import PlanConfig
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
         cfg = PlanConfig(
             name="#PlanningTool",
             role="ToolActor",
-            collection=CollectionConfig(backend="inmemory", tenant="plan-tenant"),
+            collection=VectorStoreParam(backend="inmemory", tenant="plan-tenant"),
         )
         reloaded = PlanConfig.model_validate(cfg.model_dump())
         assert reloaded.collection.backend == "inmemory"
@@ -489,7 +489,7 @@ class TestPlanConfigCollectionField:
             PlanConfig,
             PlanManagerState,
         )
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
         actor = PlanActor()
         actor.config = BaseConfig(  # type: ignore[assignment]
@@ -507,7 +507,7 @@ class TestPlanConfigCollectionField:
                 role=actor.config.role,
             )
         assert isinstance(actor.config, PlanConfig)
-        assert actor.config.collection == CollectionConfig()
+        assert actor.config.collection == VectorStoreParam()
         assert actor.config.vector_store is True  # 10-9 invariant
 
 
@@ -558,11 +558,11 @@ class TestPlanActorAcquireVsProxyCollectionPropagation:
     """AC-7 / AC-11: _acquire_vs_proxy forwards config.collection to create_collection."""
 
     def test_create_collection_receives_same_instance_as_config_collection(self) -> None:
-        """AC-7: the CollectionConfig passed to create_collection is the config's instance."""
+        """AC-7: the VectorStoreParam passed to create_collection is the config's instance."""
         from akgentic.tool.planning.planning_actor import PLAN_COLLECTION
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        custom = CollectionConfig(backend="inmemory", tenant="plan-tenant")
+        custom = VectorStoreParam(backend="inmemory", tenant="plan-tenant")
         actor, vs_proxy = _plan_actor_with_vs_proxy(collection=custom)
 
         actor._acquire_vs_proxy()
@@ -570,21 +570,21 @@ class TestPlanActorAcquireVsProxyCollectionPropagation:
         vs_proxy.create_collection.assert_called_once()
         args, _ = vs_proxy.create_collection.call_args
         assert args[0] == PLAN_COLLECTION
-        # Identity assertion — proves no fresh CollectionConfig is constructed.
+        # Identity assertion — proves no fresh VectorStoreParam is constructed.
         assert args[1] is actor.config.collection
         assert args[1] is custom
 
     def test_default_config_collection_is_structurally_default(self) -> None:
-        """AC-11 regression guard: default config gets a default ``CollectionConfig()``."""
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        """AC-11 regression guard: default config gets a default ``VectorStoreParam()``."""
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        default_collection = CollectionConfig()
+        default_collection = VectorStoreParam()
         actor, vs_proxy = _plan_actor_with_vs_proxy(collection=default_collection)
 
         actor._acquire_vs_proxy()
 
         args, _ = vs_proxy.create_collection.call_args
-        assert args[1] == CollectionConfig()
+        assert args[1] == VectorStoreParam()
         assert args[1].dimension == 1536
         assert args[1].backend == "inmemory"
         assert args[1].tenant is None
@@ -592,7 +592,7 @@ class TestPlanActorAcquireVsProxyCollectionPropagation:
     def test_vector_store_false_short_circuits_before_collection_examined(self) -> None:
         """vector_store=False → _acquire_vs_proxy never runs, even with custom coll."""
         from akgentic.tool.planning.planning_actor import PlanConfig
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
         # Non-default collection, orchestrator absent (would otherwise warn+return).
         # vector_store=False must short-circuit in on_start before we touch it.
@@ -601,7 +601,7 @@ class TestPlanActorAcquireVsProxyCollectionPropagation:
             name="#PlanningTool",
             role="ToolActor",
             vector_store=False,
-            collection=CollectionConfig(backend="weaviate", tenant="t1"),
+            collection=VectorStoreParam(backend="weaviate", tenant="t1"),
         )
         actor.on_start()
         assert actor._vs_proxy is None

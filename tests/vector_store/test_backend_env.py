@@ -15,7 +15,7 @@ import pytest
 from akgentic.tool.vector_store.protocol import (
     WEAVIATE_API_KEY_ENV,
     WEAVIATE_URL_ENV,
-    CollectionConfig,
+    VectorStoreParam,
     default_backend,
     require_weaviate_configured,
     weaviate_api_key,
@@ -66,42 +66,42 @@ class TestEnvironmentReading:
 
 
 class TestDefaultBackend:
-    """`CollectionConfig()` with no backend named."""
+    """`VectorStoreParam()` with no backend named."""
 
     def test_defaults_to_inmemory_without_a_cluster(self) -> None:
         assert default_backend() == "inmemory"
-        assert CollectionConfig().backend == "inmemory"
+        assert VectorStoreParam().backend == "inmemory"
 
     def test_defaults_to_weaviate_with_a_cluster(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(WEAVIATE_URL_ENV, CLUSTER)
         assert default_backend() == "weaviate"
-        assert CollectionConfig().backend == "weaviate"
+        assert VectorStoreParam().backend == "weaviate"
 
     def test_an_empty_url_does_not_switch_the_default(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv(WEAVIATE_URL_ENV, "")
-        assert CollectionConfig().backend == "inmemory"
+        assert VectorStoreParam().backend == "inmemory"
 
     def test_resolved_per_instantiation_not_at_import(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A process that exports the variable late must still see it."""
-        assert CollectionConfig().backend == "inmemory"
+        assert VectorStoreParam().backend == "inmemory"
         monkeypatch.setenv(WEAVIATE_URL_ENV, CLUSTER)
-        assert CollectionConfig().backend == "weaviate"
+        assert VectorStoreParam().backend == "weaviate"
 
     def test_an_explicit_backend_still_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(WEAVIATE_URL_ENV, CLUSTER)
-        assert CollectionConfig(backend="inmemory").backend == "inmemory"
+        assert VectorStoreParam(backend="inmemory").backend == "inmemory"
 
     def test_the_default_survives_a_serialisation_round_trip(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv(WEAVIATE_URL_ENV, CLUSTER)
-        dumped = CollectionConfig().model_dump()
+        dumped = VectorStoreParam().model_dump()
         assert dumped["backend"] == "weaviate"
-        assert CollectionConfig.model_validate(dumped).backend == "weaviate"
+        assert VectorStoreParam.model_validate(dumped).backend == "weaviate"
 
 
 # ---------------------------------------------------------------------------
@@ -114,37 +114,37 @@ class TestRequireWeaviateConfigured:
 
     def test_raises_when_weaviate_is_named_without_a_cluster(self) -> None:
         with pytest.raises(ValueError, match=WEAVIATE_URL_ENV):
-            require_weaviate_configured(CollectionConfig(backend="weaviate"), "PlanningTool")
+            require_weaviate_configured(VectorStoreParam(backend="weaviate"), "PlanningTool")
 
     def test_the_error_names_the_offending_card(self) -> None:
         with pytest.raises(ValueError, match="KnowledgeGraphTool"):
-            require_weaviate_configured(CollectionConfig(backend="weaviate"), "KnowledgeGraphTool")
+            require_weaviate_configured(VectorStoreParam(backend="weaviate"), "KnowledgeGraphTool")
 
     def test_the_error_names_the_way_out(self) -> None:
         """A configuration error should say what to change, not only what is wrong."""
         with pytest.raises(ValueError, match="in-memory"):
-            require_weaviate_configured(CollectionConfig(backend="weaviate"), "PlanningTool")
+            require_weaviate_configured(VectorStoreParam(backend="weaviate"), "PlanningTool")
 
     def test_an_empty_url_counts_as_no_cluster(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(WEAVIATE_URL_ENV, "")
         with pytest.raises(ValueError, match=WEAVIATE_URL_ENV):
-            require_weaviate_configured(CollectionConfig(backend="weaviate"), "PlanningTool")
+            require_weaviate_configured(VectorStoreParam(backend="weaviate"), "PlanningTool")
 
     def test_passes_when_the_cluster_is_configured(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(WEAVIATE_URL_ENV, CLUSTER)
-        require_weaviate_configured(CollectionConfig(backend="weaviate"), "PlanningTool")
+        require_weaviate_configured(VectorStoreParam(backend="weaviate"), "PlanningTool")
 
     def test_passes_for_inmemory_without_a_cluster(self) -> None:
-        require_weaviate_configured(CollectionConfig(backend="inmemory"), "PlanningTool")
+        require_weaviate_configured(VectorStoreParam(backend="inmemory"), "PlanningTool")
 
     def test_a_defaulted_collection_never_trips_the_guard(self) -> None:
         """Without a cluster the default is already inmemory, so there is nothing to catch."""
-        require_weaviate_configured(CollectionConfig(), "PlanningTool")
+        require_weaviate_configured(VectorStoreParam(), "PlanningTool")
 
     def test_an_api_key_alone_is_not_a_cluster(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(WEAVIATE_API_KEY_ENV, "secret")
         with pytest.raises(ValueError, match=WEAVIATE_URL_ENV):
-            require_weaviate_configured(CollectionConfig(backend="weaviate"), "PlanningTool")
+            require_weaviate_configured(VectorStoreParam(backend="weaviate"), "PlanningTool")
 
 
 # ---------------------------------------------------------------------------
@@ -167,14 +167,14 @@ class TestCardsFailAtWiring:
     def test_planning_tool_refuses_to_wire(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
 
-        tool = PlanningTool(collection=CollectionConfig(backend="weaviate"))
+        tool = PlanningTool(collection=VectorStoreParam(backend="weaviate"))
         with pytest.raises(ValueError, match="PlanningTool"):
             tool.observer(self._observer())  # type: ignore[arg-type]
 
     def test_knowledge_graph_tool_refuses_to_wire(self) -> None:
         from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
 
-        tool = KnowledgeGraphTool(collection=CollectionConfig(backend="weaviate"))
+        tool = KnowledgeGraphTool(collection=VectorStoreParam(backend="weaviate"))
         with pytest.raises(ValueError, match="KnowledgeGraphTool"):
             tool.observer(self._observer())  # type: ignore[arg-type]
 
@@ -183,7 +183,7 @@ class TestCardsFailAtWiring:
         from akgentic.tool.planning.planning import PlanningTool
 
         observer = self._observer()
-        tool = PlanningTool(collection=CollectionConfig(backend="weaviate"))
+        tool = PlanningTool(collection=VectorStoreParam(backend="weaviate"))
         with pytest.raises(ValueError):
             tool.observer(observer)  # type: ignore[arg-type]
         observer.proxy_ask.assert_not_called()  # type: ignore[attr-defined]
@@ -193,7 +193,7 @@ class TestCardsFailAtWiring:
         from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
 
         observer = self._observer()
-        tool = KnowledgeGraphTool(collection=CollectionConfig(backend="weaviate"))
+        tool = KnowledgeGraphTool(collection=VectorStoreParam(backend="weaviate"))
         with pytest.raises(ValueError):
             tool.observer(observer)  # type: ignore[arg-type]
         observer.proxy_ask.assert_not_called()  # type: ignore[attr-defined]
@@ -204,5 +204,57 @@ class TestCardsFailAtWiring:
         from akgentic.tool.planning.planning import PlanningTool
 
         monkeypatch.setenv(WEAVIATE_URL_ENV, CLUSTER)
-        tool = PlanningTool(collection=CollectionConfig(backend="weaviate"))
+        tool = PlanningTool(collection=VectorStoreParam(backend="weaviate"))
+        tool.observer(self._observer())  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# A dimension the model cannot produce fails the build too
+# ---------------------------------------------------------------------------
+
+
+class TestCardsRefuseAMismatchedDimension:
+    """Refused at bind, before any actor is created — not discovered at the first insert."""
+
+    @staticmethod
+    def _observer() -> object:
+        from unittest.mock import MagicMock
+
+        observer = MagicMock()
+        observer.orchestrator = MagicMock()
+        observer.proxy_ask.return_value = MagicMock()
+        return observer
+
+    def test_planning_tool_refuses_to_wire(self) -> None:
+        from akgentic.tool.planning.planning import PlanningTool
+
+        observer = self._observer()
+        tool = PlanningTool(collection=VectorStoreParam(dimension=3072))
+        with pytest.raises(ValueError, match="PlanningTool.*dimension=3072"):
+            tool.observer(observer)  # type: ignore[arg-type]
+        observer.proxy_ask.return_value.getChildrenOrCreate.assert_not_called()  # type: ignore[attr-defined]
+
+    def test_knowledge_graph_tool_refuses_to_wire(self) -> None:
+        from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
+
+        observer = self._observer()
+        tool = KnowledgeGraphTool(collection=VectorStoreParam(dimension=3072))
+        with pytest.raises(ValueError, match="KnowledgeGraphTool.*dimension=3072"):
+            tool.observer(observer)  # type: ignore[arg-type]
+        observer.proxy_ask.return_value.getChildrenOrCreate.assert_not_called()  # type: ignore[attr-defined]
+
+    def test_a_backend_error_still_wins_over_a_dimension_error(self) -> None:
+        """A card wrong both ways reports the backend first, as it did before."""
+        from akgentic.tool.planning.planning import PlanningTool
+
+        tool = PlanningTool(collection=VectorStoreParam(backend="weaviate", dimension=3072))
+        with pytest.raises(ValueError, match=WEAVIATE_URL_ENV):
+            tool.observer(self._observer())  # type: ignore[arg-type]
+
+    def test_an_unknown_model_binds_at_any_dimension(self) -> None:
+        from akgentic.tool.planning.planning import PlanningTool
+
+        tool = PlanningTool(
+            collection=VectorStoreParam(dimension=3072, embedding_model="my-deployment")
+        )
         tool.observer(self._observer())  # type: ignore[arg-type]

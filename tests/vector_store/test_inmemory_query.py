@@ -7,13 +7,13 @@ constraints client-side; these tests pin that behaviour.
 from __future__ import annotations
 
 from akgentic.tool.vector_store.inmemory import InMemoryBackend
-from akgentic.tool.vector_store.protocol import CollectionConfig, VectorQuery
+from akgentic.tool.vector_store.protocol import VectorQuery, VectorStoreParam
 from akgentic.tool.vector_store.vector import VectorEntry
 
 
 def _backend() -> InMemoryBackend:
     backend = InMemoryBackend()
-    backend.create_collection("c", CollectionConfig(dimension=3))
+    backend.create_collection("c", VectorStoreParam(dimension=3))
     backend.add(
         "c",
         [

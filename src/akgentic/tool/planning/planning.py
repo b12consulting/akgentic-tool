@@ -29,7 +29,11 @@ from akgentic.tool.planning.planning_actor import (
 )
 from akgentic.tool.planning.state import PlanningState, TaskRow
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA
-from akgentic.tool.vector_store.protocol import CollectionConfig, require_backend_configured
+from akgentic.tool.vector_store.protocol import (
+    VectorStoreParam,
+    require_backend_configured,
+    require_dimension_matches,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -137,12 +141,12 @@ class PlanningTool(ToolCard):
         ),
     )
 
-    collection: CollectionConfig = Field(
-        default_factory=CollectionConfig,
+    collection: VectorStoreParam = Field(
+        default_factory=VectorStoreParam,
         description=(
-            "Vector collection configuration (backend, dimension, tenant). "
-            "Propagated to PlanConfig and used by PlanActor._acquire_vs_proxy when calling "
-            "create_collection on the VectorStoreActor."
+            "Vector store configuration (backend, dimension, tenant, embedding model and "
+            "provider). Propagated to PlanConfig and used by PlanActor._acquire_vs_proxy "
+            "when calling create_collection on the VectorStoreActor."
         ),
     )
 
@@ -201,6 +205,7 @@ class PlanningTool(ToolCard):
             ValueError: If observer.orchestrator is None.
         """
         require_backend_configured(self.collection, "PlanningTool")
+        require_dimension_matches(self.collection, "PlanningTool")
         super().observer(observer)  # store the observer weakly via the base setter
         actor_observer = self._actor_observer()
         if actor_observer.orchestrator is None:

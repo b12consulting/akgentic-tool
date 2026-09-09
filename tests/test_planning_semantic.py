@@ -257,15 +257,15 @@ class TestPlanningToolObserverNoVsCreation:
 
 
 class TestPlanningToolCollectionField:
-    """AC-2: PlanningTool.collection is a CollectionConfig field."""
+    """AC-2: PlanningTool.collection is a VectorStoreParam field."""
 
     def test_default_collection_is_default_collection_config(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
         tool = PlanningTool()
-        assert isinstance(tool.collection, CollectionConfig)
-        assert tool.collection == CollectionConfig()
+        assert isinstance(tool.collection, VectorStoreParam)
+        assert tool.collection == VectorStoreParam()
         assert tool.collection.dimension == 1536
         assert tool.collection.backend == "inmemory"
         assert tool.collection.tenant is None
@@ -283,9 +283,9 @@ class TestPlanningToolCollectionField:
 
     def test_custom_collection_stored_on_instance(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        custom = CollectionConfig(backend="inmemory", tenant="plan-tenant")
+        custom = VectorStoreParam(backend="inmemory", tenant="plan-tenant")
         tool = PlanningTool(collection=custom)
         assert tool.collection is custom
         assert tool.collection.backend == "inmemory"
@@ -293,18 +293,18 @@ class TestPlanningToolCollectionField:
 
     def test_collection_roundtrip_default(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
         tool = PlanningTool()
         reloaded = PlanningTool.model_validate(tool.model_dump())
-        assert reloaded.collection == CollectionConfig()
+        assert reloaded.collection == VectorStoreParam()
 
     def test_collection_roundtrip_custom(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
         tool = PlanningTool(
-            collection=CollectionConfig(backend="inmemory", tenant="plan-tenant")
+            collection=VectorStoreParam(backend="inmemory", tenant="plan-tenant")
         )
         reloaded = PlanningTool.model_validate(tool.model_dump())
         assert reloaded.collection.backend == "inmemory"
@@ -312,7 +312,7 @@ class TestPlanningToolCollectionField:
         assert reloaded.collection.dimension == 1536  # default preserved
 
     def test_independent_tools_do_not_alias_collection(self) -> None:
-        """`default_factory=CollectionConfig` gives each instance a fresh object."""
+        """`default_factory=VectorStoreParam` gives each instance a fresh object."""
         from akgentic.tool.planning.planning import PlanningTool
 
         a = PlanningTool()
@@ -340,11 +340,11 @@ class TestPlanningToolObserverCollection:
         return captured
 
     def test_observer_propagates_custom_collection_identity(self) -> None:
-        """The exact CollectionConfig object on the ToolCard reaches the config."""
+        """The exact VectorStoreParam object on the ToolCard reaches the config."""
         from akgentic.tool.planning.planning import PlanningTool
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        custom = CollectionConfig(backend="inmemory", tenant="plan-tenant")
+        custom = VectorStoreParam(backend="inmemory", tenant="plan-tenant")
         tool = PlanningTool(collection=custom)
 
         captured = self._run_observer(tool)
@@ -355,22 +355,22 @@ class TestPlanningToolObserverCollection:
         assert captured[0].vector_store is True
 
     def test_observer_propagates_default_collection_structurally_equal(self) -> None:
-        """AC-11 backward-compat: default tool → config.collection == CollectionConfig()."""
+        """AC-11 backward-compat: default tool → config.collection == VectorStoreParam()."""
         from akgentic.tool.planning.planning import PlanningTool
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
         tool = PlanningTool()
 
         captured = self._run_observer(tool)
 
         assert len(captured) == 1
-        assert captured[0].collection == CollectionConfig()
+        assert captured[0].collection == VectorStoreParam()
 
     def test_observer_does_not_mutate_tool_collection(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        custom = CollectionConfig(backend="inmemory", tenant="plan-tenant-x")
+        custom = VectorStoreParam(backend="inmemory", tenant="plan-tenant-x")
         tool = PlanningTool(collection=custom)
         before_dump = tool.collection.model_dump()
 

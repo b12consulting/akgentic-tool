@@ -1,7 +1,7 @@
 """Vector store protocol definitions, data models, and configuration.
 
 Defines the structural contracts (``VectorStoreService``, ``EmbeddingProvider``)
-and Pydantic models (``CollectionConfig``, ``SearchHit``, ``SearchResult``,
+and Pydantic models (``VectorStoreParam``, ``SearchHit``, ``SearchResult``,
 ``VectorStoreConfig``) for the centralised vector storage service.
 """
 
@@ -96,14 +96,40 @@ class CollectionStatus(StrEnum):
 
 
 # ---------------------------------------------------------------------------
-# CollectionConfig
+# VectorStoreParam
 # ---------------------------------------------------------------------------
 
+EMBEDDING_DIMENSIONS: Final[dict[str, int]] = {
+    "text-embedding-3-small": 1536,
+    "text-embedding-3-large": 3072,
+    "text-embedding-ada-002": 1536,
+}
+"""Native vector width of every embedding model this package knows.
 
-class CollectionConfig(SerializableBaseModel):
-    """Configuration for a single vector collection.
+The table is **exact** because ``EmbeddingService.embed`` never passes a
+``dimensions=`` argument, so each model returns its full native width and nothing
+else. Whoever adds ``dimensions=`` to ``embed()`` (Matryoshka truncation on the
+``text-embedding-3-*`` models) owns widening :func:`require_dimension_matches`
+from an equality into a range check at the same time.
 
-    Controls the embedding dimensionality and storage backend for the collection.
+A model absent from the table is accepted at whatever dimension the author
+declares: an Azure ``embedding_model`` is a deployment name, which is routinely
+not a model name, and a test names a synthetic one.
+"""
+
+
+class VectorStoreParam(SerializableBaseModel):
+    """How a tool reaches its vector store. One object, embedded by every consumer.
+
+    ``PlanningTool``, ``KnowledgeGraphTool`` and ``WorkspaceTool`` each carry one
+    of these as a single field, so a store's five settings — backend, dimension,
+    tenant, embedding model and embedding provider — live in one place and a
+    reader learns one shape.
+
+    **Not a ``BaseToolParam``.** That base carries ``instructions`` and ``expose``
+    because it describes a capability the model can be shown; a vector store is
+    backing configuration that is exposed through no channel and has no docstring
+    to append to, so a catalog rendering ``expose`` on it would be a lie.
 
     A payload persisted before the workspace-persistence mode was deleted may still
     carry ``persistence`` and ``workspace_path``. Neither is a field any more; this
@@ -111,7 +137,6 @@ class CollectionConfig(SerializableBaseModel):
     drops them on validation. No migration is needed.
     """
 
-    dimension: int = Field(default=1536, ge=1, description="Embedding vector dimensionality")
     backend: str = Field(
         default_factory=default_backend,
         description=(
@@ -122,6 +147,7 @@ class CollectionConfig(SerializableBaseModel):
             "added via akgentic.tool.vector_store.registry.register_backend."
         ),
     )
+    dimension: int = Field(default=1536, ge=1, description="Embedding vector dimensionality")
     tenant: str | None = Field(
         default=None,
         description="Weaviate tenant ID for multi-tenancy (maps to workspace/team ID)",
@@ -131,12 +157,53 @@ class CollectionConfig(SerializableBaseModel):
         description=(
             "Backend-native collection/connection settings passed through untouched "
             "to the backend (e.g. HNSW tuning, distance metric overrides). Ignored by "
-            "backends that do not recognise a given key."
+            "backends that do not recognise a given key. Schemaless by nature: each "
+            "backend defines its own keys."
         ),
+    )
+    embedding_model: str = Field(
+        default="text-embedding-3-small", description="Embedding model identifier"
+    )
+    embedding_provider: Literal["openai", "azure"] = Field(
+        default="openai", description="Embedding API provider"
     )
 
 
-def require_weaviate_configured(config: CollectionConfig, card_name: str) -> None:
+def require_dimension_matches(param: VectorStoreParam, owner: str) -> None:
+    """Raise when *param* declares a dimension its embedding model cannot produce.
+
+    A consumer card calls this at ``observer()`` time, beside
+    :func:`require_backend_configured`, so a self-contradictory configuration
+    fails the team's build in front of its author rather than surfacing as a
+    width error on the first insert. ``VectorStoreActor.create_collection`` calls
+    it again, before its own error handling, for the caller that bypasses every
+    card.
+
+    Deliberately **not** a ``model_validator``: that would fire on every
+    ``model_validate`` — a restored backend snapshot, a persisted config replay —
+    and turn a mismatch into an unloadable state.
+
+    Args:
+        param: The vector store configuration carried by the owner.
+        owner: Who declares it, for the error message — a card class name, or an
+            actor and collection.
+
+    Raises:
+        ValueError: When ``param.embedding_model`` is in
+            :data:`EMBEDDING_DIMENSIONS` and ``param.dimension`` differs from its
+            native width. An unknown model is accepted at any dimension.
+    """
+    expected = EMBEDDING_DIMENSIONS.get(param.embedding_model)
+    if expected is None or expected == param.dimension:
+        return
+    raise ValueError(
+        f"{owner} declares dimension={param.dimension} for embedding_model="
+        f"'{param.embedding_model}', which produces {expected}-dimensional vectors. "
+        f"Set dimension={expected}, or name the model that produces {param.dimension}."
+    )
+
+
+def require_weaviate_configured(config: VectorStoreParam, card_name: str) -> None:
     """Raise when *config* asks for Weaviate and the environment has no cluster.
 
     Called by a consumer card at ``observer()`` time, so the team fails to build
@@ -164,7 +231,7 @@ def require_weaviate_configured(config: CollectionConfig, card_name: str) -> Non
     )
 
 
-def require_backend_configured(config: CollectionConfig, card_name: str) -> None:
+def require_backend_configured(config: VectorStoreParam, card_name: str) -> None:
     """Raise when *config* names a backend the environment has not provisioned.
 
     The backend-agnostic generalisation of :func:`require_weaviate_configured`:
@@ -355,12 +422,12 @@ class VectorStoreService(Protocol):
     and similarity search without exposing backend details.
     """
 
-    def create_collection(self, name: str, config: CollectionConfig) -> None:
+    def create_collection(self, name: str, config: VectorStoreParam) -> None:
         """Create or reconfigure a named collection.
 
         Args:
             name: Unique collection identifier.
-            config: Collection configuration.
+            config: Vector store configuration for the collection.
         """
         ...
 

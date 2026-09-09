@@ -12,11 +12,11 @@ from typing import TYPE_CHECKING, Any
 
 from akgentic.tool.vector_store.client import _check_weaviate_dependencies, get_client
 from akgentic.tool.vector_store.protocol import (
-    CollectionConfig,
     CollectionStatus,
     SearchHit,
     SearchResult,
     VectorQuery,
+    VectorStoreParam,
     check_path_prefix,
 )
 from akgentic.tool.vector_store.registry import BackendContext, BackendSpec, register_backend
@@ -140,7 +140,7 @@ class WeaviateBackend:
     # VectorStoreService protocol methods
     # ------------------------------------------------------------------
 
-    def create_collection(self, name: str, config: CollectionConfig) -> None:
+    def create_collection(self, name: str, config: VectorStoreParam) -> None:
         """Create a named Weaviate collection. No-op if it already exists.
 
         When multi-tenancy is enabled (``self._tenant`` or ``config.tenant``

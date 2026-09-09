@@ -9,8 +9,8 @@ import pytest
 from akgentic.tool.vector_store.inmemory import InMemoryBackend, _entry_matches
 from akgentic.tool.vector_store.protocol import (
     PATH_PREFIX_REJECTED,
-    CollectionConfig,
     CollectionStatus,
+    VectorStoreParam,
 )
 from akgentic.tool.vector_store.vector import VectorEntry
 
@@ -26,9 +26,9 @@ def backend() -> InMemoryBackend:
 
 
 @pytest.fixture()
-def config() -> CollectionConfig:
-    """Return a default CollectionConfig."""
-    return CollectionConfig()
+def config() -> VectorStoreParam:
+    """Return a default VectorStoreParam."""
+    return VectorStoreParam()
 
 
 def _make_entry(ref_id: str, vector: list[float], text: str = "test") -> VectorEntry:
@@ -45,7 +45,7 @@ class TestCreateCollection:
     """Tests for create_collection."""
 
     def test_creates_new_collection(
-        self, backend: InMemoryBackend, config: CollectionConfig
+        self, backend: InMemoryBackend, config: VectorStoreParam
     ) -> None:
         """AC3: create_collection creates a new collection."""
         backend.create_collection("col1", config)
@@ -54,7 +54,7 @@ class TestCreateCollection:
         assert result.hits == []
         assert result.status == CollectionStatus.READY
 
-    def test_idempotent(self, backend: InMemoryBackend, config: CollectionConfig) -> None:
+    def test_idempotent(self, backend: InMemoryBackend, config: VectorStoreParam) -> None:
         """AC3: second call with same name is no-op, does not reset data."""
         backend.create_collection("col1", config)
         backend.add("col1", [_make_entry("e1", [1.0, 0.0, 0.0])])
@@ -76,7 +76,7 @@ class TestAdd:
     """Tests for add."""
 
     def test_inserts_entries_searchable(
-        self, backend: InMemoryBackend, config: CollectionConfig
+        self, backend: InMemoryBackend, config: VectorStoreParam
     ) -> None:
         """AC4: add inserts entries and they are searchable."""
         backend.create_collection("col1", config)
@@ -104,7 +104,7 @@ class TestRemove:
     """Tests for remove."""
 
     def test_removes_entries(
-        self, backend: InMemoryBackend, config: CollectionConfig
+        self, backend: InMemoryBackend, config: VectorStoreParam
     ) -> None:
         """AC5: remove deletes entries by ref_ids."""
         backend.create_collection("col1", config)
@@ -132,7 +132,7 @@ class TestSearch:
     """Tests for search."""
 
     def test_returns_search_result_with_correct_fields(
-        self, backend: InMemoryBackend, config: CollectionConfig
+        self, backend: InMemoryBackend, config: VectorStoreParam
     ) -> None:
         """AC6: search returns SearchResult with correct SearchHit fields."""
         backend.create_collection("col1", config)
@@ -148,7 +148,7 @@ class TestSearch:
         assert result.indexing_pending == 0
 
     def test_ranked_by_cosine_similarity(
-        self, backend: InMemoryBackend, config: CollectionConfig
+        self, backend: InMemoryBackend, config: VectorStoreParam
     ) -> None:
         """AC6: results ranked by cosine similarity (highest first)."""
         backend.create_collection("col1", config)
@@ -163,7 +163,7 @@ class TestSearch:
         assert result.hits[0].ref_id == "close"
 
     def test_empty_collection_returns_empty_hits(
-        self, backend: InMemoryBackend, config: CollectionConfig
+        self, backend: InMemoryBackend, config: VectorStoreParam
     ) -> None:
         """search on empty collection returns empty hits with READY status."""
         backend.create_collection("col1", config)
@@ -177,7 +177,7 @@ class TestSearch:
             backend.search("missing", [1.0], top_k=5)
 
     def test_respects_top_k(
-        self, backend: InMemoryBackend, config: CollectionConfig
+        self, backend: InMemoryBackend, config: VectorStoreParam
     ) -> None:
         """search respects top_k limit."""
         backend.create_collection("col1", config)
@@ -199,7 +199,7 @@ class TestActorStatePersistence:
     """Tests for get_state / restore_state round-trip."""
 
     def test_round_trip(
-        self, backend: InMemoryBackend, config: CollectionConfig
+        self, backend: InMemoryBackend, config: VectorStoreParam
     ) -> None:
         """AC8: get_state / restore_state round-trip preserves data."""
         backend.create_collection("col1", config)
@@ -222,7 +222,7 @@ class TestActorStatePersistence:
         self, backend: InMemoryBackend
     ) -> None:
         """get_state includes collection config."""
-        cfg = CollectionConfig(dimension=768, tenant="team-42")
+        cfg = VectorStoreParam(dimension=768, tenant="team-42")
         backend.create_collection("col1", cfg)
 
         state = backend.get_state()
@@ -239,7 +239,7 @@ class TestMultipleCollections:
     """Tests for collection independence."""
 
     def test_collections_are_independent(
-        self, backend: InMemoryBackend, config: CollectionConfig
+        self, backend: InMemoryBackend, config: VectorStoreParam
     ) -> None:
         """Adding to one collection does not affect another."""
         backend.create_collection("col1", config)
@@ -280,7 +280,7 @@ class TestRestoreStateEdgeCases:
 
     def test_restore_empty_state(self, backend: InMemoryBackend) -> None:
         """restore_state with empty collections dict clears existing data."""
-        config = CollectionConfig()
+        config = VectorStoreParam()
         backend.create_collection("col1", config)
         backend.add("col1", [_make_entry("e1", [1.0, 0.0])])
 
@@ -302,7 +302,7 @@ class TestCosineCorrectness:
     """Verify cosine similarity scores are mathematically correct."""
 
     def test_identical_vectors_score_one(
-        self, backend: InMemoryBackend, config: CollectionConfig
+        self, backend: InMemoryBackend, config: VectorStoreParam
     ) -> None:
         """Identical vectors should have cosine similarity ~1.0."""
         backend.create_collection("col1", config)
@@ -311,7 +311,7 @@ class TestCosineCorrectness:
         assert math.isclose(result.hits[0].score, 1.0, abs_tol=1e-9)
 
     def test_orthogonal_vectors_score_zero(
-        self, backend: InMemoryBackend, config: CollectionConfig
+        self, backend: InMemoryBackend, config: VectorStoreParam
     ) -> None:
         """Orthogonal vectors should have cosine similarity ~0.0."""
         backend.create_collection("col1", config)
@@ -348,7 +348,7 @@ class TestScopeAndPathFilters:
     """Both predicates narrow search and remove, and both default to no filter."""
 
     @pytest.fixture()
-    def two_scopes(self, backend: InMemoryBackend, config: CollectionConfig) -> InMemoryBackend:
+    def two_scopes(self, backend: InMemoryBackend, config: VectorStoreParam) -> InMemoryBackend:
         """A collection holding three entries in scope A and three in scope B."""
         backend.create_collection("ws", config)
         backend.add(
@@ -399,7 +399,7 @@ class TestScopeAndPathFilters:
         assert len(result.hits) == 6
 
     def test_entry_without_a_path_never_matches_a_prefix(
-        self, backend: InMemoryBackend, config: CollectionConfig
+        self, backend: InMemoryBackend, config: VectorStoreParam
     ) -> None:
         """A planning entry sets no path and must not answer a path-scoped search."""
         backend.create_collection("mixed", config)
@@ -419,7 +419,7 @@ class TestScopeAndPathFilters:
         assert hit.ordinal == 2
 
     def test_hits_carry_none_when_the_entry_sets_nothing(
-        self, backend: InMemoryBackend, config: CollectionConfig
+        self, backend: InMemoryBackend, config: VectorStoreParam
     ) -> None:
         """An entry from planning or the knowledge graph reads back unchanged."""
         backend.create_collection("plain", config)
@@ -456,7 +456,7 @@ class TestScopeAndPathFilters:
         assert {h.ref_id for h in result.hits} == {"a2", "a3", "b2", "b3"}
 
     def test_remove_by_scope_spares_a_colliding_ref_id_in_another_scope(
-        self, backend: InMemoryBackend, config: CollectionConfig
+        self, backend: InMemoryBackend, config: VectorStoreParam
     ) -> None:
         """Two scopes, one shared ref_id: only the named scope's entry goes.
 
@@ -492,7 +492,7 @@ class TestPathPrefixWildcardsAreRefused:
     """
 
     @pytest.fixture()
-    def one_doc(self, backend: InMemoryBackend, config: CollectionConfig) -> InMemoryBackend:
+    def one_doc(self, backend: InMemoryBackend, config: VectorStoreParam) -> InMemoryBackend:
         """A collection holding a single entry under ``docs/``."""
         backend.create_collection("ws", config)
         backend.add(

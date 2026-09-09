@@ -44,7 +44,7 @@ from akgentic.tool.knowledge_graph.models import (
 )
 from akgentic.tool.vector_store.actor import VectorStoreActor
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA
-from akgentic.tool.vector_store.protocol import WEAVIATE_URL_ENV, CollectionConfig
+from akgentic.tool.vector_store.protocol import WEAVIATE_URL_ENV, VectorStoreParam
 
 # ---------------------------------------------------------------------------
 # Mock helpers
@@ -772,13 +772,13 @@ class TestSummaryStateConfig:
 
 
 class TestKnowledgeGraphToolCollectionField:
-    """AC-1: KnowledgeGraphTool.collection is a CollectionConfig field."""
+    """AC-1: KnowledgeGraphTool.collection is a VectorStoreParam field."""
 
     def test_default_collection_is_default_collection_config(self) -> None:
-        """Default ``collection`` matches a freshly-constructed ``CollectionConfig()``."""
+        """Default ``collection`` matches a freshly-constructed ``VectorStoreParam()``."""
         tool = KnowledgeGraphTool()
-        assert isinstance(tool.collection, CollectionConfig)
-        assert tool.collection == CollectionConfig()
+        assert isinstance(tool.collection, VectorStoreParam)
+        assert tool.collection == VectorStoreParam()
         # Default values explicitly (guards against AC-11 regressions).
         assert tool.collection.dimension == 1536
         assert tool.collection.backend == "inmemory"
@@ -792,7 +792,7 @@ class TestKnowledgeGraphToolCollectionField:
         assert "collection" in dump
 
     def test_custom_collection_stored_on_instance(self) -> None:
-        custom = CollectionConfig(backend="weaviate", tenant="team-42")
+        custom = VectorStoreParam(backend="weaviate", tenant="team-42")
         tool = KnowledgeGraphTool(collection=custom)
         assert tool.collection is custom
         assert tool.collection.backend == "weaviate"
@@ -801,20 +801,20 @@ class TestKnowledgeGraphToolCollectionField:
     def test_collection_roundtrip_default(self) -> None:
         tool = KnowledgeGraphTool()
         reloaded = KnowledgeGraphTool.model_validate(tool.model_dump())
-        assert reloaded.collection == CollectionConfig()
+        assert reloaded.collection == VectorStoreParam()
 
     def test_collection_roundtrip_custom(self) -> None:
         tool = KnowledgeGraphTool(
-            collection=CollectionConfig(backend="weaviate", tenant="team-123")
+            collection=VectorStoreParam(backend="weaviate", tenant="team-123")
         )
         reloaded = KnowledgeGraphTool.model_validate(tool.model_dump())
         assert reloaded.collection.backend == "weaviate"
         assert reloaded.collection.tenant == "team-123"
-        # Non-touched fields preserved at CollectionConfig defaults.
+        # Non-touched fields preserved at VectorStoreParam defaults.
         assert reloaded.collection.dimension == 1536
 
     def test_independent_tools_do_not_alias_collection(self) -> None:
-        """`default_factory=CollectionConfig` gives each instance a fresh object."""
+        """`default_factory=VectorStoreParam` gives each instance a fresh object."""
         a = KnowledgeGraphTool()
         b = KnowledgeGraphTool()
         assert a.collection is not b.collection
@@ -842,9 +842,9 @@ class TestKnowledgeGraphToolObserverCollection:
     def test_observer_propagates_custom_collection_identity(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The exact CollectionConfig object on the ToolCard reaches the config."""
+        """The exact VectorStoreParam object on the ToolCard reaches the config."""
         monkeypatch.setenv(WEAVIATE_URL_ENV, "http://localhost:8080")
-        custom = CollectionConfig(backend="weaviate", tenant="t1")
+        custom = VectorStoreParam(backend="weaviate", tenant="t1")
         tool = KnowledgeGraphTool(collection=custom)
 
         captured = self._run_observer(tool)
@@ -856,25 +856,25 @@ class TestKnowledgeGraphToolObserverCollection:
         assert captured[0].vector_store is True
 
     def test_observer_propagates_default_collection_structurally_equal(self) -> None:
-        """Default ``KnowledgeGraphTool()`` propagates a CollectionConfig() to the config.
+        """Default ``KnowledgeGraphTool()`` propagates a VectorStoreParam() to the config.
 
         Verifies the AC-11 backward-compatibility guarantee: the value reaching
         ``_acquire_vs_proxy`` via ``self.config.collection`` is structurally
-        identical to the historical hardcoded ``CollectionConfig()``.
+        identical to the historical hardcoded ``VectorStoreParam()``.
         """
         tool = KnowledgeGraphTool()  # default collection
 
         captured = self._run_observer(tool)
 
         assert len(captured) == 1
-        assert captured[0].collection == CollectionConfig()
+        assert captured[0].collection == VectorStoreParam()
 
     def test_observer_does_not_mutate_tool_collection(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """observer() passes collection through without mutating the ToolCard."""
         monkeypatch.setenv(WEAVIATE_URL_ENV, "http://localhost:8080")
-        custom = CollectionConfig(backend="weaviate", tenant="zz")
+        custom = VectorStoreParam(backend="weaviate", tenant="zz")
         tool = KnowledgeGraphTool(collection=custom)
         before_dump = tool.collection.model_dump()
 

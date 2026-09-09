@@ -1154,7 +1154,7 @@ VectorStoreTool()                                  # "#VectorStore", OpenAI embe
 VectorStoreTool(vector_store_name="#VectorStore-RAG", embedding_provider="azure")
 ```
 
-Collections are configured on the *consumer* card (`collection: CollectionConfig`), and Weaviate
+Collections are configured on the *consumer* card (`collection: VectorStoreParam`), and Weaviate
 connection settings are deliberately not fields on any card — they are infrastructure. The card
 reads them from the environment when the observer attaches:
 
@@ -1164,7 +1164,7 @@ export AKGENTIC_WEAVIATE_API_KEY="..."          # omit for an unauthenticated cl
 ```
 
 **Exporting the URL is what turns the Weaviate backend on**, and it also picks the *default*:
-`CollectionConfig.backend` resolves to `weaviate` when a cluster is configured and `inmemory`
+`VectorStoreParam.backend` resolves to `weaviate` when a cluster is configured and `inmemory`
 otherwise, so a card that names no backend lands wherever the deployment actually is. An exported
 but empty variable counts as unset. Requires `akgentic-tool[weaviate]`.
 
@@ -1192,7 +1192,7 @@ its own. `close_all()` closes every cached client and runs by itself at process 
 or a script that wants its connections released earlier calls it once no consumer is live.
 
 **[Full reference → `src/akgentic/tool/vector_store/README.md`](src/akgentic/tool/vector_store/README.md)** —
-`CollectionConfig` in full, the service protocol, asynchronous embedding, team-scoped cleanup, and
+`VectorStoreParam` in full, the service protocol, asynchronous embedding, team-scoped cleanup, and
 multi-store setups.
 
 ### SearchTool
@@ -1670,7 +1670,7 @@ src/akgentic/tool/
     vector.py                 # Compatibility façade only — moved to
     │                         #   vector_store/vector.py. See the migration table
     vector_store/
-    │   README.md           # VectorStoreTool reference — fields, CollectionConfig, backends
+    │   README.md           # VectorStoreTool reference — fields, VectorStoreParam, backends
     │   vector.py             # VectorEntry, EmbeddingService, VectorIndex
     │   │                     #   [optional: vector_search extra]
     │   protocol.py           # VectorStore Protocol, VectorStoreConfig, data models

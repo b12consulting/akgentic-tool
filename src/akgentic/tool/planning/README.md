@@ -24,7 +24,7 @@ from akgentic.tool.planning import PlanningTool
 class PlanningTool(ToolCard):
     # Vector-search wiring
     vector_store: bool | str = True
-    collection: CollectionConfig = CollectionConfig()
+    collection: VectorStoreParam = VectorStoreParam()
     search_top_k: int = 10
     search_score_threshold: float = 0.5
 
@@ -67,14 +67,16 @@ tool degrades to keyword-only search rather than failing.
 
 ### `collection`
 
-A `CollectionConfig` forwarded to `VectorStoreActor.create_collection("planning", …)` when
+A `VectorStoreParam` forwarded to `VectorStoreActor.create_collection("planning", …)` when
 `PlanActor` starts.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `dimension` | `int` | `1536` | Embedding dimensionality; must match the embedding model. |
+| `dimension` | `int` | `1536` | Embedding dimensionality; must be the native width of a known `embedding_model`, refused at bind otherwise. |
 | `backend` | `"inmemory" \| "weaviate"` | `"inmemory"` | `weaviate` requires `akgentic-tool[weaviate]`. |
 | `tenant` | `str \| None` | `None` | Weaviate tenant id for multi-tenancy — usually the team id. |
+| `embedding_model` | `str` | `"text-embedding-3-small"` | The model that produces the collection's vectors. |
+| `embedding_provider` | `Literal["openai", "azure"]` | `"openai"` | The embedding API provider. |
 
 ### `search_top_k` / `search_score_threshold`
 
@@ -213,7 +215,7 @@ PlanningTool(vector_store=False)                             # keyword-only, no 
 PlanningTool(update_planning=False)                          # read-only board for an observer agent
 
 PlanningTool(                                                # persistent, multi-tenant board
-    collection=CollectionConfig(backend="weaviate", tenant="team-42"),
+    collection=VectorStoreParam(backend="weaviate", tenant="team-42"),
     search_score_threshold=0.65,
 )
 
@@ -229,7 +231,7 @@ PlanningTool(hybrid_alpha=0.3)                               # trust exact wordi
 > export AKGENTIC_WEAVIATE_API_KEY="..."          # omit for an unauthenticated cluster
 > ```
 >
-> **Exporting the URL is what turns Weaviate on**, and a `CollectionConfig` that names no backend
+> **Exporting the URL is what turns Weaviate on**, and a `VectorStoreParam` that names no backend
 > then defaults to `weaviate` rather than to the in-memory index. An exported but empty variable
 > counts as unset. Requires `akgentic-tool[weaviate]`.
 >

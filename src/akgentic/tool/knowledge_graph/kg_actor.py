@@ -45,7 +45,7 @@ from akgentic.tool.vector_store.hybrid import (
     hybrid_search,
     semantic_scores,
 )
-from akgentic.tool.vector_store.protocol import CollectionConfig
+from akgentic.tool.vector_store.protocol import VectorStoreParam
 from akgentic.tool.vector_store.vector import VectorEntry
 
 logger = logging.getLogger(__name__)
@@ -76,8 +76,8 @@ class KnowledgeGraphConfig(BaseConfig):
             "str=named instance, False=degraded mode (no vector search)."
         ),
     )
-    collection: CollectionConfig = Field(
-        default_factory=CollectionConfig,
+    collection: VectorStoreParam = Field(
+        default_factory=VectorStoreParam,
         description=(
             "Vector collection configuration forwarded to "
             "VectorStoreActor.create_collection."

@@ -32,7 +32,7 @@ from akgentic.tool.workspace.readers import DocumentReader
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from akgentic.tool.vector_store.protocol import CollectionConfig
+    from akgentic.tool.vector_store.protocol import VectorStoreParam
     from akgentic.tool.workspace.actor import WorkspaceActor
 
 logger = logging.getLogger(__name__)
@@ -58,7 +58,7 @@ class RagFactories:
         workspace_rag_list: WorkspaceRagList | bool
         workspace_rag_search: WorkspaceRagSearch | bool
         workspace_read: WorkspaceRead | bool
-        rag_collection: CollectionConfig
+        rag_collection: VectorStoreParam
 
         _workspace_proxy: WorkspaceActor | None
         _workspace_tell: WorkspaceActor | None

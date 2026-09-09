@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 from akgentic.tool.core import COMMAND, LLM_CONTEXT, TOOL_CALL
-from akgentic.tool.vector_store.protocol import CollectionConfig
+from akgentic.tool.vector_store.protocol import VectorStoreParam
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
 from akgentic.tool.workspace.card.params import (
     WorkspaceRagIndex,
@@ -73,7 +73,7 @@ class RecordingTell:
         agent_id: str,
         params: WorkspaceRagIndex,
         reader: DocumentReader,
-        collection: CollectionConfig,
+        collection: VectorStoreParam,
     ) -> None:
         self.enable_calls.append((agent_id, params, reader, collection))
 
@@ -182,7 +182,7 @@ class TestTheSearchCapability:
         bind(
             orchestrator_proxy,
             workspace_rag_search=True,
-            rag_collection=CollectionConfig(backend="inmemory"),
+            rag_collection=VectorStoreParam(backend="inmemory"),
         )
 
         assert workspace_config_of(orchestrator_proxy).max_documents == IN_MEMORY_MAX_DOCUMENTS
@@ -195,8 +195,27 @@ class TestTheSearchCapability:
             bind(
                 orchestrator_proxy,
                 workspace_rag_search=True,
-                rag_collection=CollectionConfig(backend="weaviate"),
+                rag_collection=VectorStoreParam(backend="weaviate"),
             )
+
+    def test_a_retrieval_card_with_a_mismatched_dimension_fails_at_wiring(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """Same severity as the Weaviate check three lines above it."""
+        with pytest.raises(ValueError, match="WorkspaceTool.*dimension=3072"):
+            bind(
+                orchestrator_proxy,
+                workspace_rag_index=True,
+                rag_collection=VectorStoreParam(dimension=3072),
+            )
+
+    def test_a_card_with_retrieval_off_never_inherits_the_dimension_rule(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """Most cards never create the collection and must not be constrained by it."""
+        card, _ = bind(orchestrator_proxy, rag_collection=VectorStoreParam(dimension=3072))
+
+        assert card.rag_collection.dimension == 3072
 
     def test_a_payload_carrying_the_search_capability_round_trips(self) -> None:
         """Compare the models, never two dumps — ``expose`` is a ``set``."""
@@ -309,7 +328,7 @@ class TestTheDerivedCaps:
         bind(
             orchestrator_proxy,
             workspace_rag_index=True,
-            rag_collection=CollectionConfig(backend="inmemory"),
+            rag_collection=VectorStoreParam(backend="inmemory"),
         )
 
         config = workspace_config_of(orchestrator_proxy)
@@ -330,7 +349,7 @@ class TestTheDerivedCaps:
         bind(
             orchestrator_proxy,
             workspace_rag_index=True,
-            rag_collection=CollectionConfig(backend="weaviate"),
+            rag_collection=VectorStoreParam(backend="weaviate"),
         )
 
         config = workspace_config_of(orchestrator_proxy)
@@ -343,7 +362,7 @@ class TestTheDerivedCaps:
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         """No vectors exist, so nothing is derived from the document cap."""
-        bind(orchestrator_proxy, rag_collection=CollectionConfig(backend="inmemory"))
+        bind(orchestrator_proxy, rag_collection=VectorStoreParam(backend="inmemory"))
 
         config = workspace_config_of(orchestrator_proxy)
         assert (config.max_documents, config.max_document_chars) == (
@@ -358,7 +377,7 @@ class TestTheDerivedCaps:
         bind(
             orchestrator_proxy,
             workspace_rag_index=True,
-            rag_collection=CollectionConfig(backend="inmemory"),
+            rag_collection=VectorStoreParam(backend="inmemory"),
             max_documents=99,
             max_document_chars=12345,
         )
@@ -373,7 +392,7 @@ class TestTheDerivedCaps:
         bind(
             orchestrator_proxy,
             workspace_rag_list=True,
-            rag_collection=CollectionConfig(backend="inmemory"),
+            rag_collection=VectorStoreParam(backend="inmemory"),
         )
 
         config = workspace_config_of(orchestrator_proxy)
@@ -391,14 +410,14 @@ class TestTheWeaviateCheck:
             bind(
                 orchestrator_proxy,
                 workspace_rag_index=True,
-                rag_collection=CollectionConfig(backend="weaviate"),
+                rag_collection=VectorStoreParam(backend="weaviate"),
             )
 
     def test_a_card_with_retrieval_off_is_untouched_by_the_check(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         """The overwhelming majority of ``WorkspaceTool()`` instances never enable it."""
-        card, _ = bind(orchestrator_proxy, rag_collection=CollectionConfig(backend="weaviate"))
+        card, _ = bind(orchestrator_proxy, rag_collection=VectorStoreParam(backend="weaviate"))
 
         assert card.rag_collection.backend == "weaviate"
 
@@ -424,7 +443,7 @@ class TestTheBindTimeAnnouncement:
             orchestrator_proxy,
             tell_proxy=tell,
             workspace_rag_index=params,
-            rag_collection=CollectionConfig(backend="inmemory", tenant="acme"),
+            rag_collection=VectorStoreParam(backend="inmemory", tenant="acme"),
         )
 
         [(agent_id, announced, reader, collection)] = tell.enable_calls

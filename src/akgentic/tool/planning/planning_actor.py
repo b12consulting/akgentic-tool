@@ -16,7 +16,7 @@ from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA, hybrid_search
-from akgentic.tool.vector_store.protocol import CollectionConfig
+from akgentic.tool.vector_store.protocol import VectorStoreParam
 from akgentic.tool.vector_store.vector import VectorEntry
 
 logger = logging.getLogger(__name__)
@@ -131,8 +131,8 @@ class PlanConfig(BaseConfig):
             "str=named instance, False=degraded mode (no vector search)."
         ),
     )
-    collection: CollectionConfig = Field(
-        default_factory=CollectionConfig,
+    collection: VectorStoreParam = Field(
+        default_factory=VectorStoreParam,
         description=(
             "Vector collection configuration forwarded to "
             "VectorStoreActor.create_collection."

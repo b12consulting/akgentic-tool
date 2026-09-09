@@ -11,9 +11,9 @@ from typing import TYPE_CHECKING
 import pytest
 
 from akgentic.tool.vector_store.protocol import (
-    CollectionConfig,
     SearchResult,
     VectorQuery,
+    VectorStoreParam,
 )
 from akgentic.tool.vector_store.qdrant import QDRANT_URL_ENV
 from akgentic.tool.vector_store.registry import (
@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 class _StubBackend:
     """Minimal VectorStoreService-shaped stub for registry tests."""
 
-    def create_collection(self, name: str, config: CollectionConfig) -> None:
+    def create_collection(self, name: str, config: VectorStoreParam) -> None:
         pass
 
     def add(self, collection: str, entries: list[VectorEntry]) -> None:
@@ -96,7 +96,7 @@ class TestDefaultResolution:
     ) -> None:
         monkeypatch.setenv(QDRANT_URL_ENV, "http://localhost:6333")
         assert resolve_default_backend() == "qdrant"
-        assert CollectionConfig().backend == "qdrant"
+        assert VectorStoreParam().backend == "qdrant"
 
 
 # ---------------------------------------------------------------------------

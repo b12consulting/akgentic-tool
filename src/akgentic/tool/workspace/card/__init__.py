@@ -47,7 +47,11 @@ from akgentic.tool.core import (
     _resolve,
 )
 from akgentic.tool.core.observer import ActorToolObserver
-from akgentic.tool.vector_store.protocol import CollectionConfig, require_weaviate_configured
+from akgentic.tool.vector_store.protocol import (
+    VectorStoreParam,
+    require_dimension_matches,
+    require_weaviate_configured,
+)
 from akgentic.tool.workspace.actor import (
     WORKSPACE_ACTOR_ROLE,
     WorkspaceActor,
@@ -249,8 +253,9 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
     indexer and ``read_only=True, workspace_rag_search=True`` registers the search.
     """
 
-    rag_collection: CollectionConfig = Field(default_factory=CollectionConfig)
-    """Backend, dimension and tenant of the one ``workspace_chunks`` collection.
+    rag_collection: VectorStoreParam = Field(default_factory=VectorStoreParam)
+    """Backend, dimension, tenant, embedding model and provider of the one
+    ``workspace_chunks`` collection.
 
     **``rag_collection`` rather than the house's bare ``collection``.**
     ``PlanningTool`` and ``KnowledgeGraphTool`` both declare ``collection``, and
@@ -355,6 +360,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
             # the overwhelming majority of ``WorkspaceTool()`` instances that
             # never enable retrieval at all.
             require_weaviate_configured(self.rag_collection, "WorkspaceTool")
+            require_dimension_matches(self.rag_collection, "WorkspaceTool")
         super().observer(observer)  # store the observer weakly via the base setter
         ws_path = str(self._resolve_path(observer, observer.orchestrator))
         self._workspace = get_workspace(ws_path)

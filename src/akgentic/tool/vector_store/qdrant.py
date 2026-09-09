@@ -27,11 +27,11 @@ import uuid
 from typing import TYPE_CHECKING, Any
 
 from akgentic.tool.vector_store.protocol import (
-    CollectionConfig,
     CollectionStatus,
     SearchHit,
     SearchResult,
     VectorQuery,
+    VectorStoreParam,
     check_path_prefix,
 )
 from akgentic.tool.vector_store.registry import BackendContext, BackendSpec, register_backend
@@ -210,7 +210,7 @@ class QdrantBackend:
     # VectorStoreService protocol methods
     # ------------------------------------------------------------------
 
-    def create_collection(self, name: str, config: CollectionConfig) -> None:
+    def create_collection(self, name: str, config: VectorStoreParam) -> None:
         """Create a named Qdrant collection. No-op if it already exists.
 
         The distance metric is cosine, matching the ``VectorStoreService``
@@ -545,7 +545,7 @@ class QdrantBackend:
         return str(uuid.uuid5(_POINT_ID_NAMESPACE, identity))
 
     @staticmethod
-    def _resolve_distance(config: CollectionConfig) -> qmodels.Distance:
+    def _resolve_distance(config: VectorStoreParam) -> qmodels.Distance:
         """Return cosine distance or reject an incompatible metric."""
         from qdrant_client import models
 
@@ -653,7 +653,7 @@ def _make_qdrant_backend(context: BackendContext) -> QdrantBackend:
     if not url:
         msg = "qdrant_url is not configured; cannot build QdrantBackend."
         raise ValueError(msg)
-    # Tenancy is per-collection (CollectionConfig.tenant), not per-actor, so the
+    # Tenancy is per-collection (VectorStoreParam.tenant), not per-actor, so the
     # actor-level factory leaves it unset; a hand-built backend or subclass may
     # still pass tenant= directly.
     return QdrantBackend(

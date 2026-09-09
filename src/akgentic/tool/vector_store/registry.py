@@ -3,7 +3,7 @@
 A backend is anything satisfying the :class:`VectorStoreService` protocol. The
 registry decouples *which* backend a collection uses from the actor that routes
 to it: the actor never names a backend, it asks the registry for the spec whose
-``name`` a :class:`CollectionConfig` carries and drives everything — construction,
+``name`` a :class:`VectorStoreParam` carries and drives everything — construction,
 state-sync policy, environment readiness — off that spec.
 
 Adding a backend (Qdrant, pgvector, a bespoke store) is therefore a single
@@ -88,7 +88,7 @@ class BackendSpec:
     it names a store the environment has not provisioned.
 
     Attributes:
-        name: Unique backend identifier, matched against ``CollectionConfig.backend``.
+        name: Unique backend identifier, matched against ``VectorStoreParam.backend``.
         factory: Builds a backend instance from a :class:`BackendContext`.
         persists_in_actor_state: ``True`` for backends whose data lives *in* the
             actor (the in-memory index) and must be snapshotted on every
@@ -179,7 +179,7 @@ def get_backend_spec(name: str) -> BackendSpec:
     """Return the :class:`BackendSpec` registered under *name*.
 
     Args:
-        name: Backend identifier (a ``CollectionConfig.backend`` value).
+        name: Backend identifier (a ``VectorStoreParam.backend`` value).
 
     Returns:
         The registered spec.

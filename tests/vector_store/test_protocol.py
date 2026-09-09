@@ -5,14 +5,17 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from akgentic.tool.core.params import BaseToolParam
 from akgentic.tool.vector_store.protocol import (
-    CollectionConfig,
+    EMBEDDING_DIMENSIONS,
     CollectionStatus,
     EmbeddingProvider,
     SearchHit,
     SearchResult,
     VectorStoreConfig,
+    VectorStoreParam,
     VectorStoreService,
+    require_dimension_matches,
 )
 
 # ---------------------------------------------------------------------------
@@ -44,27 +47,27 @@ class TestCollectionStatus:
 
 
 # ---------------------------------------------------------------------------
-# CollectionConfig tests (AC2, AC8)
+# VectorStoreParam tests (AC2, AC8)
 # ---------------------------------------------------------------------------
 
 
-class TestCollectionConfig:
-    """Tests for CollectionConfig serialization and defaults."""
+class TestVectorStoreParam:
+    """Tests for VectorStoreParam serialization and defaults."""
 
     def test_default_values(self) -> None:
-        cfg = CollectionConfig()
+        cfg = VectorStoreParam()
         assert cfg.dimension == 1536
         assert cfg.backend == "inmemory"
         assert cfg.tenant is None
 
     def test_round_trip_serialization_defaults(self) -> None:
-        cfg = CollectionConfig()
+        cfg = VectorStoreParam()
         data = cfg.model_dump()
-        restored = CollectionConfig.model_validate(data)
+        restored = VectorStoreParam.model_validate(data)
         assert restored == cfg
 
     def test_non_default_values(self) -> None:
-        cfg = CollectionConfig(
+        cfg = VectorStoreParam(
             dimension=768,
             backend="weaviate",
             tenant="team-42",
@@ -74,22 +77,134 @@ class TestCollectionConfig:
         assert cfg.tenant == "team-42"
 
     def test_round_trip_serialization_non_defaults(self) -> None:
-        cfg = CollectionConfig(
+        cfg = VectorStoreParam(
             dimension=768,
             backend="weaviate",
             tenant="team-42",
         )
         data = cfg.model_dump()
-        restored = CollectionConfig.model_validate(data)
+        restored = VectorStoreParam.model_validate(data)
         assert restored == cfg
 
     def test_dimension_must_be_positive(self) -> None:
         with pytest.raises(ValidationError):
-            CollectionConfig(dimension=0)
+            VectorStoreParam(dimension=0)
 
     def test_dimension_rejects_negative(self) -> None:
         with pytest.raises(ValidationError):
-            CollectionConfig(dimension=-1)
+            VectorStoreParam(dimension=-1)
+
+    def test_six_fields_in_order_with_their_defaults(self) -> None:
+        """The whole shape: what every consumer carries when it names nothing."""
+        assert list(VectorStoreParam.model_fields) == [
+            "backend",
+            "dimension",
+            "tenant",
+            "params",
+            "embedding_model",
+            "embedding_provider",
+        ]
+        param = VectorStoreParam()
+        assert {name: getattr(param, name) for name in VectorStoreParam.model_fields} == {
+            "backend": "inmemory",
+            "dimension": 1536,
+            "tenant": None,
+            "params": {},
+            "embedding_model": "text-embedding-3-small",
+            "embedding_provider": "openai",
+        }
+
+    def test_embedding_model_round_trips(self) -> None:
+        cfg = VectorStoreParam(dimension=3072, embedding_model="text-embedding-3-large")
+        restored = VectorStoreParam.model_validate(cfg.model_dump())
+        assert restored == cfg
+        assert restored.embedding_model == "text-embedding-3-large"
+
+    def test_embedding_provider_round_trips(self) -> None:
+        cfg = VectorStoreParam(embedding_provider="azure", embedding_model="my-deployment")
+        restored = VectorStoreParam.model_validate(cfg.model_dump())
+        assert restored == cfg
+        assert restored.embedding_provider == "azure"
+
+    def test_every_field_non_default_round_trips(self) -> None:
+        cfg = VectorStoreParam(
+            backend="weaviate",
+            dimension=3072,
+            tenant="team-42",
+            params={"distance": "cosine"},
+            embedding_model="text-embedding-3-large",
+            embedding_provider="azure",
+        )
+        assert VectorStoreParam.model_validate(cfg.model_dump()) == cfg
+
+    def test_embedding_provider_is_closed(self) -> None:
+        with pytest.raises(ValidationError):
+            VectorStoreParam(embedding_provider="cohere")  # type: ignore[arg-type]
+
+    def test_a_pre_story_payload_still_validates(self) -> None:
+        """A persisted three-key record gets the two embedding defaults."""
+        cfg = VectorStoreParam.model_validate(
+            {"dimension": 768, "backend": "inmemory", "tenant": "t"}
+        )
+        assert cfg.dimension == 768
+        assert cfg.embedding_model == "text-embedding-3-small"
+        assert cfg.embedding_provider == "openai"
+
+    def test_a_payload_carrying_deleted_keys_still_validates(self) -> None:
+        """No ``extra="forbid"``: the deleted persistence keys are dropped, not refused."""
+        cfg = VectorStoreParam.model_validate(
+            {"persistence": "workspace", "workspace_path": "/tmp/x", "dimension": 8}
+        )
+        assert cfg.dimension == 8
+        assert "persistence" not in cfg.model_dump()
+        assert "workspace_path" not in cfg.model_dump()
+
+    def test_it_is_not_a_capability_param(self) -> None:
+        """Backing configuration is exposed through no channel: no expose, no instructions."""
+        assert not issubclass(VectorStoreParam, BaseToolParam)
+        assert "expose" not in VectorStoreParam.model_fields
+        assert "instructions" not in VectorStoreParam.model_fields
+
+
+# ---------------------------------------------------------------------------
+# require_dimension_matches
+# ---------------------------------------------------------------------------
+
+
+class TestRequireDimensionMatches:
+    """A known model's width is exact; an unknown model is trusted."""
+
+    def test_the_table_names_the_three_models(self) -> None:
+        assert EMBEDDING_DIMENSIONS == {
+            "text-embedding-3-small": 1536,
+            "text-embedding-3-large": 3072,
+            "text-embedding-ada-002": 1536,
+        }
+
+    def test_known_model_with_matching_dimension_passes(self) -> None:
+        require_dimension_matches(
+            VectorStoreParam(dimension=3072, embedding_model="text-embedding-3-large"),
+            "PlanningTool",
+        )
+        require_dimension_matches(VectorStoreParam(), "PlanningTool")
+
+    def test_known_model_with_wrong_dimension_raises_with_all_four_facts(self) -> None:
+        with pytest.raises(ValueError) as excinfo:
+            require_dimension_matches(VectorStoreParam(dimension=3072), "KnowledgeGraphTool")
+        message = str(excinfo.value)
+        assert "KnowledgeGraphTool" in message
+        assert "text-embedding-3-small" in message
+        assert "dimension=3072" in message
+        assert "1536" in message
+
+    def test_unknown_model_passes_at_any_dimension(self) -> None:
+        """An Azure deployment name is routinely not a model name."""
+        require_dimension_matches(
+            VectorStoreParam(dimension=3, embedding_model="my-azure-deployment"), "Card"
+        )
+        require_dimension_matches(
+            VectorStoreParam(dimension=99999, embedding_model="test-embedding"), "Card"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +374,7 @@ class TestVectorStoreService:
         from akgentic.tool.vector_store.vector import VectorEntry
 
         class _FakeStore:
-            def create_collection(self, name: str, config: CollectionConfig) -> None:
+            def create_collection(self, name: str, config: VectorStoreParam) -> None:
                 pass
 
             def add(self, collection: str, entries: list[VectorEntry]) -> None:
@@ -274,7 +389,7 @@ class TestVectorStoreService:
                 return SearchResult(hits=[], status=CollectionStatus.READY)
 
         store: VectorStoreService = _FakeStore()
-        store.create_collection("test", CollectionConfig())
+        store.create_collection("test", VectorStoreParam())
         result = store.search("test", [0.1, 0.2], top_k=5)
         assert result.hits == []
         assert result.status == CollectionStatus.READY

@@ -61,7 +61,7 @@ resolves to the same actor rather than racing to create duplicates.
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `vector_store_name` | `str` | `"#VectorStore"` | Singleton actor name. Several named stores can coexist in one team — give each a distinct name and point each consumer at the one it wants with `vector_store="#VectorStore-RAG"`. The `#` prefix is the package's tool-actor convention and is load-bearing for teardown; keep it. |
-| `embedding_model` | `str` | `"text-embedding-3-small"` | Embedding model identifier. Must agree with the `dimension` in every `CollectionConfig` pointed at this store (`text-embedding-3-small` ⇒ 1536). |
+| `embedding_model` | `str` | `"text-embedding-3-small"` | Embedding model identifier. The consumer's `VectorStoreParam` declares both `embedding_model` and `dimension`, and a known model whose native width disagrees with the declared dimension is refused at bind (`text-embedding-3-small` ⇒ 1536). This store still embeds every collection with its own model; a consumer declaring a different one is warned once at `create_collection`. |
 | `embedding_provider` | `Literal["openai", "azure"]` | `"openai"` | Selects `openai.OpenAI()` or `openai.AzureOpenAI()`. The client is constructed lazily on the first `embed()` call, so a team that never searches never needs credentials. Both read their configuration from the standard `OPENAI_*` / `AZURE_OPENAI_*` environment variables. |
 
 That is the whole card. Three primitives, no nested param models, no capability toggles — there is
@@ -76,7 +76,7 @@ an API key as plain configuration.
 
 The card reads them from the environment instead, at `observer()` time — `AKGENTIC_WEAVIATE_URL`
 and `AKGENTIC_WEAVIATE_API_KEY`. **Exporting a URL is what turns Weaviate on**; leave it unset and
-every collection stays on the in-memory backend, whatever a `CollectionConfig` asks for (selecting
+every collection stays on the in-memory backend, whatever a `VectorStoreParam` asks for (selecting
 `backend="weaviate"` without a URL logs a warning and leaves the backend unavailable). An exported
 but *empty* variable counts as unset — `or None` — so a deployment template that always exports
 the name does not read as a cluster at `""`.
@@ -90,7 +90,7 @@ a field — see *The environment picks the backend* below. A card only overrides
 
 **Collections.** The store is a container of named collections, and each consumer owns its own —
 `PlanningTool` creates `planning`, `KnowledgeGraphTool` creates `knowledge_graph`. The
-`CollectionConfig` therefore lives on the *consumer* card, not here.
+`VectorStoreParam` therefore lives on the *consumer* card, not here.
 
 **Keyword search.** The backends answer pure similarity queries — `search` takes a vector and
 nothing else, and neither backend is ever asked for text. The lexical half of a hybrid search runs
@@ -105,7 +105,7 @@ export AKGENTIC_WEAVIATE_URL="https://your-cluster.weaviate.network"
 export AKGENTIC_WEAVIATE_API_KEY="..."          # omit for an unauthenticated cluster
 ```
 
-**Exporting the URL is what turns Weaviate on.** `CollectionConfig.backend` resolves through
+**Exporting the URL is what turns Weaviate on.** `VectorStoreParam.backend` resolves through
 `default_backend()` at instantiation: `weaviate` when a cluster URL is set, `inmemory` otherwise.
 A card that names no backend therefore lands wherever the deployment actually is — a cluster is
 deployed to be used, and a collection with no opinion should not quietly get a process-local index
@@ -132,7 +132,7 @@ it never connects and never closes.
 ### Naming a cluster that is not there is an error
 
 ```python
-PlanningTool(collection=CollectionConfig(backend="weaviate"))   # with no URL exported
+PlanningTool(collection=VectorStoreParam(backend="weaviate"))   # with no URL exported
 # ValueError: PlanningTool configures backend='weaviate' but AKGENTIC_WEAVIATE_URL is not set.
 #   Export AKGENTIC_WEAVIATE_URL (and AKGENTIC_WEAVIATE_API_KEY for an authenticated cluster),
 #   or drop the backend setting to use the in-memory index.
@@ -147,7 +147,7 @@ substituting it loses data that everything downstream assumes is persisted.
 A card that names *no* backend never reaches the guard: without a cluster the default already
 resolved to `inmemory`, so there is nothing to contradict.
 
-> **A catalog entry records the resolved value.** `CollectionConfig()` dumped on a machine with a
+> **A catalog entry records the resolved value.** `VectorStoreParam()` dumped on a machine with a
 > cluster writes `backend: weaviate`, and loading that entry where no URL is exported raises. That
 > is the intended behaviour — the entry is asking for a cluster — but it is why an environment
 > promoting catalogs between tiers must export the variable in every tier that runs them.
@@ -177,7 +177,7 @@ registered the same way a third party would register its own.
 
 | `BackendSpec` field | Type | Default | What it decides |
 |---|---|---|---|
-| `name` | `str` | — | Identifier matched against `CollectionConfig.backend`. |
+| `name` | `str` | — | Identifier matched against `VectorStoreParam.backend`. |
 | `factory` | `Callable[[BackendContext], VectorStoreService]` | — | Builds the instance. Import the client library *inside* the factory so registering never forces the optional dependency. |
 | `persists_in_actor_state` | `bool` | `False` | `True` for stores whose data lives *in* the actor and must be snapshotted on every mutation. The backend must also implement `ActorStateBackend` (`get_state` / `restore_state`). `False` is for external stores that own their persistence. |
 | `selectable_as_default` | `bool` | `True` | Whether `resolve_default_backend()` may pick it for a collection that names none. `inmemory` sets this `False` so it is only ever the fallback. |
@@ -215,7 +215,7 @@ register_backend(BackendSpec(
 ))
 ```
 
-A card then selects it with `CollectionConfig(backend="pinecone")`; nothing in the actor changes.
+A card then selects it with `VectorStoreParam(backend="pinecone")`; nothing in the actor changes.
 `register_backend` / `unregister_backend` / `is_registered` / `available_backends` manage the
 registry (tests use `unregister_backend` to clean up). Prefer **subclassing** a built-in when you
 only need to bend one behaviour — `WeaviateBackend` and `QdrantBackend` expose overridable hooks
@@ -331,14 +331,16 @@ store is an authoritative index of the graph rather than a lossy projection of i
 ## Collection configuration (on the consumer card)
 
 ```python
-PlanningTool(collection=CollectionConfig(backend="weaviate", tenant="team-42"))
+PlanningTool(collection=VectorStoreParam(backend="weaviate", tenant="team-42"))
 ```
 
-| `CollectionConfig` field | Type | Default | Meaning |
+| `VectorStoreParam` field | Type | Default | Meaning |
 |---|---|---|---|
-| `dimension` | `int` (≥1) | `1536` | Embedding vector dimensionality. Must match `embedding_model`. |
+| `dimension` | `int` (≥1) | `1536` | Embedding vector dimensionality. Must be the native width of a known `embedding_model`; a mismatch is refused when the card binds. |
 | `backend` | `str` | **follows the environment** | A registered backend name (`inmemory` / `weaviate` / `qdrant` / any third-party). Defaults via `default_backend()`: the highest-priority provisioned store, else `inmemory`. External backends require their extra (e.g. `akgentic-tool[qdrant]`). See [Pluggable backends](#pluggable-backends). |
 | `tenant` | `str \| None` | `None` | Weaviate tenant id for multi-tenancy — normally the workspace or team id. |
+| `embedding_model` | `str` | `"text-embedding-3-small"` | The model that produces this collection's vectors. Known models (`text-embedding-3-small` 1536, `text-embedding-3-large` 3072, `text-embedding-ada-002` 1536) pin `dimension`; an unknown name — an Azure deployment — is accepted at any dimension. |
+| `embedding_provider` | `Literal["openai", "azure"]` | `"openai"` | The embedding API provider. |
 
 ---
 
@@ -532,12 +534,13 @@ ToolFactory([
 ], observer=agent)
 ```
 
-A larger embedding model needs a matching `dimension` on the consumer's collection:
+A larger embedding model needs a matching `dimension` on the consumer's collection, declared beside
+the model that produces it — `dimension=3072` with the default model is refused at bind:
 
 ```python
 KnowledgeGraphTool(
     vector_store="#VectorStore-RAG",
-    collection=CollectionConfig(dimension=3072),          # text-embedding-3-large
+    collection=VectorStoreParam(dimension=3072, embedding_model="text-embedding-3-large"),
 )
 ```
 
@@ -546,7 +549,7 @@ KnowledgeGraphTool(
 ```python
 from akgentic.tool.vector_store import (
     VectorStoreTool, VectorStoreActor, VectorStoreConfig, VS_ACTOR_NAME,
-    CollectionConfig, CollectionStatus, SearchHit, SearchResult, VectorQuery,
+    VectorStoreParam, CollectionStatus, SearchHit, SearchResult, VectorQuery,
     VectorEntry, VectorIndex, EmbeddingService,
     VectorStoreService, InMemoryBackend, WeaviateBackend, QdrantBackend,
     BackendContext, BackendSpec, register_backend, unregister_backend,

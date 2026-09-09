@@ -101,7 +101,7 @@ if TYPE_CHECKING:
     # an import cycle through this very module — neither is needed to annotate a
     # ``None`` at start.
     from akgentic.tool.vector_store.actor import VectorStoreActor
-    from akgentic.tool.vector_store.protocol import CollectionConfig
+    from akgentic.tool.vector_store.protocol import VectorStoreParam
     from akgentic.tool.workspace.card.params import WorkspaceRagIndex
     from akgentic.tool.workspace.readers import DocumentReader
 
@@ -229,7 +229,7 @@ class WorkspaceActor(
         self._recent_runs: dict[str, OrderedDict[str, str]] = {}
         self._rag_params: WorkspaceRagIndex | None = None
         self._rag_reader: DocumentReader | None = None
-        self._rag_collection: CollectionConfig | None = None
+        self._rag_collection: VectorStoreParam | None = None
         self._vs_proxy: VectorStoreActor | None = None
         self._vs_tell: VectorStoreActor | None = None
         self._index_active: set[str] = set()

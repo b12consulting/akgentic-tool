@@ -22,12 +22,13 @@ from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.vector_store.protocol import (
     ActorStateBackend,
-    CollectionConfig,
     CollectionStatus,
     SearchResult,
     VectorQuery,
     VectorStoreConfig,
+    VectorStoreParam,
     VectorStoreService,
+    require_dimension_matches,
 )
 from akgentic.tool.vector_store.registry import BackendContext, get_backend_spec
 
@@ -124,7 +125,7 @@ class VectorStoreState(BaseState):
     )
     collection_configs: dict[str, dict[str, Any]] = Field(
         default_factory=dict,
-        description="Serialised CollectionConfig per collection (for backend lookups)",
+        description="Serialised VectorStoreParam per collection (for backend lookups)",
     )
 
 
@@ -277,7 +278,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         replacement factory like any other third-party backend.
 
         Args:
-            name: Backend identifier (a ``CollectionConfig.backend`` value).
+            name: Backend identifier (a ``VectorStoreParam.backend`` value).
 
         Returns:
             The backend instance, or ``None`` when it cannot be built (missing
@@ -391,8 +392,16 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
     # Proxy methods
     # ------------------------------------------------------------------
 
-    def create_collection(self, name: str, config: CollectionConfig) -> None:
+    def create_collection(self, name: str, config: VectorStoreParam) -> None:
         """Create or reconfigure a named collection.
+
+        Refuses a ``config`` whose ``dimension`` contradicts its ``embedding_model``
+        **before** the backend is touched and outside the error handling below, so
+        the ``ValueError`` reaches the caller instead of degrading into a WARNING
+        and a collection that was never created. Warns once when the config's
+        embedding fields disagree with this actor's own — the actor is still the
+        only embedder, so its values apply until the pipeline moves. Records the
+        whole param, never an enumeration of its fields.
 
         Routes to the appropriate backend based on ``config.backend``:
         - ``"inmemory"``: delegates to ``InMemoryBackend``
@@ -400,8 +409,14 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
 
         Args:
             name: Unique collection identifier.
-            config: Collection configuration.
+            config: Vector store configuration for the collection.
+
+        Raises:
+            ValueError: When ``config.dimension`` is not the native width of a
+                known ``config.embedding_model``.
         """
+        require_dimension_matches(config, f"{self.config.name} collection '{name}'")
+        self._warn_if_embedding_disagrees(name, config)
         try:
             backend = self._get_backend(config.backend)
             if backend is None:
@@ -413,17 +428,42 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
                 return
             backend.create_collection(name, config)
 
-            self.state.collection_configs[name] = {
-                "dimension": config.dimension,
-                "backend": config.backend,
-                "tenant": config.tenant,
-            }
+            record = config.model_dump()
+            # The serializer's class tag would re-hydrate this record into a model on
+            # the state's own round trip, and the field is a plain dict per collection.
+            record.pop("__model__", None)
+            self.state.collection_configs[name] = record
             self.state.collection_statuses[name] = CollectionStatus.READY
             if self._persists_in_actor_state(config.backend):
                 self._sync_backend_state(config.backend, backend)
             self.state.notify_state_change()
         except Exception as exc:  # noqa: BLE001
             logger.warning("[%s] create_collection failed: %s", self.config.name, exc)
+
+    def _warn_if_embedding_disagrees(self, name: str, config: VectorStoreParam) -> None:
+        """Log one WARNING when *config*'s embedding fields differ from this actor's.
+
+        The param is recorded as declared, but this actor still embeds every
+        collection with its own ``embedding_model`` / ``embedding_provider``. A
+        disagreement is therefore a migration signal for the catalog, not an
+        error: refusing it would break the documented named-store shape.
+        """
+        if (
+            config.embedding_model == self.config.embedding_model
+            and config.embedding_provider == self.config.embedding_provider
+        ):
+            return
+        logger.warning(
+            "[%s] collection '%s' declares embedding_model='%s' (provider '%s') but this "
+            "store embeds with embedding_model='%s' (provider '%s'); the store's model "
+            "applies until the embedding pipeline moves to the consumer.",
+            self.config.name,
+            name,
+            config.embedding_model,
+            config.embedding_provider,
+            self.config.embedding_model,
+            self.config.embedding_provider,
+        )
 
     def add(
         self,

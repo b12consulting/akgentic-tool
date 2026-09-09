@@ -13,7 +13,7 @@ import pytest
 
 from akgentic.tool.vector_store.actor import VectorStoreState
 from akgentic.tool.vector_store.inmemory import InMemoryBackend
-from akgentic.tool.vector_store.protocol import CollectionConfig
+from akgentic.tool.vector_store.protocol import VectorStoreParam
 
 # Three of the four retired names belong to nothing else in the package, so they are
 # swept across the whole tree — which is what catches a reintroduction in a package the
@@ -31,7 +31,7 @@ SCOPED_RETIRED_NAMES = ("workspace_path",)
 def _executable_source(path: Path) -> str:
     """Return *path*'s source with every comment and string literal removed.
 
-    Docstrings are documentation, not references: ``CollectionConfig`` explains in
+    Docstrings are documentation, not references: ``VectorStoreParam`` explains in
     prose that a legacy payload carrying the two retired keys is ignored, and that
     sentence must not read as a surviving use. Stripping tokens rather than matching
     a regex is what lets the sweep be strict about code while staying silent about
@@ -83,7 +83,7 @@ class TestNoReferenceSurvivesInSource:
         joined = " ".join(_executable_source(f) for f in every)
         # Stripping strings must not have emptied the source of real code.
         assert "create_collection" in joined
-        assert "CollectionConfig" in joined
+        assert "VectorStoreParam" in joined
         # And the wide sweep really does reach outside the three packages.
         assert "SandboxState" in joined
 
@@ -108,22 +108,22 @@ class TestNoReferenceSurvivesInSource:
         assert hasattr(InMemoryBackend, "restore_state")
 
     def test_the_config_no_longer_declares_the_two_fields(self) -> None:
-        """Neither field exists on CollectionConfig any more."""
-        assert "persistence" not in CollectionConfig.model_fields
-        assert "workspace_path" not in CollectionConfig.model_fields
+        """Neither field exists on VectorStoreParam any more."""
+        assert "persistence" not in VectorStoreParam.model_fields
+        assert "workspace_path" not in VectorStoreParam.model_fields
 
 
 class TestLegacyPayloadsStillValidate:
     """A payload written before the deletion loads and quietly drops the dead keys.
 
-    ``CollectionConfig`` declares no ``extra="forbid"`` and its base contributes only
+    ``VectorStoreParam`` declares no ``extra="forbid"`` and its base contributes only
     ``arbitrary_types_allowed``, so Pydantic's default ``extra="ignore"`` applies.
     That is why no migration is needed — and this test is what says so out loud.
     """
 
     def test_collection_config_ignores_the_two_legacy_keys(self) -> None:
         """The payload validates, keeps its live fields, and exposes neither dead key."""
-        cfg = CollectionConfig.model_validate(
+        cfg = VectorStoreParam.model_validate(
             {
                 "dimension": 1536,
                 "backend": "inmemory",
@@ -140,7 +140,7 @@ class TestLegacyPayloadsStillValidate:
         assert "workspace_path" not in cfg.model_dump()
 
     def test_a_restored_backend_snapshot_carrying_them_still_loads(self) -> None:
-        """The keys reach CollectionConfig through restore_state and are dropped there."""
+        """The keys reach VectorStoreParam through restore_state and are dropped there."""
         backend = InMemoryBackend()
         backend.restore_state(
             {

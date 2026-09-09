@@ -43,7 +43,11 @@ from akgentic.tool.knowledge_graph.models import (
 )
 from akgentic.tool.knowledge_graph.state import KnowledgeGraphSummaryState, RootRow
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA
-from akgentic.tool.vector_store.protocol import CollectionConfig, require_backend_configured
+from akgentic.tool.vector_store.protocol import (
+    VectorStoreParam,
+    require_backend_configured,
+    require_dimension_matches,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -139,11 +143,11 @@ class KnowledgeGraphTool(ToolCard):
         ),
     )
 
-    collection: CollectionConfig = Field(
-        default_factory=CollectionConfig,
+    collection: VectorStoreParam = Field(
+        default_factory=VectorStoreParam,
         description=(
-            "Vector collection configuration (backend, dimension, tenant). "
-            "Propagated to KnowledgeGraphConfig and used by "
+            "Vector store configuration (backend, dimension, tenant, embedding model and "
+            "provider). Propagated to KnowledgeGraphConfig and used by "
             "KnowledgeGraphActor._acquire_vs_proxy when calling create_collection on the "
             "VectorStoreActor."
         ),
@@ -221,6 +225,7 @@ class KnowledgeGraphTool(ToolCard):
 
         _check_kg_dependencies()
         require_backend_configured(self.collection, "KnowledgeGraphTool")
+        require_dimension_matches(self.collection, "KnowledgeGraphTool")
         super().observer(observer)  # store the observer weakly via the base setter
 
         if observer.orchestrator is None:

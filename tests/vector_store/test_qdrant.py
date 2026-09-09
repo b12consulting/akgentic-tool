@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from akgentic.tool.vector_store.protocol import CollectionConfig, VectorQuery
+from akgentic.tool.vector_store.protocol import VectorQuery, VectorStoreParam
 from akgentic.tool.vector_store.qdrant import (
     QDRANT_URL_ENV,
     QdrantBackend,
@@ -73,7 +73,7 @@ class TestEnvironment:
 class TestCreateCollection:
     def test_creates_when_absent(self) -> None:
         backend, client = _make_backend()
-        backend.create_collection("kg", CollectionConfig(dimension=384))
+        backend.create_collection("kg", VectorStoreParam(dimension=384))
         client.create_collection.assert_called_once()
         kwargs = client.create_collection.call_args[1]
         assert kwargs["collection_name"] == "kg"
@@ -91,7 +91,7 @@ class TestCreateCollection:
                 )
             )
         )
-        backend.create_collection("kg", CollectionConfig())
+        backend.create_collection("kg", VectorStoreParam())
         client.create_collection.assert_not_called()
 
     def test_rejects_non_cosine_distance(self) -> None:
@@ -101,7 +101,7 @@ class TestCreateCollection:
         with pytest.raises(ValueError, match="only cosine distance"):
             backend.create_collection(
                 "kg",
-                CollectionConfig(params={"distance": models.Distance.EUCLID}),
+                VectorStoreParam(params={"distance": models.Distance.EUCLID}),
             )
 
     def test_rejects_existing_non_cosine_collection(self) -> None:
@@ -117,7 +117,7 @@ class TestCreateCollection:
             )
         )
         with pytest.raises(ValueError, match="does not use cosine distance"):
-            backend.create_collection("kg", CollectionConfig())
+            backend.create_collection("kg", VectorStoreParam())
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +128,7 @@ class TestCreateCollection:
 class TestAdd:
     def test_stamps_team_id_on_every_point(self) -> None:
         backend, client = _make_backend(team_id="team-42")
-        backend.create_collection("kg", CollectionConfig())
+        backend.create_collection("kg", VectorStoreParam())
         backend.add("kg", [_entry("e1"), _entry("e2")])
         points = client.upsert.call_args[1]["points"]
         assert len(points) == 2
@@ -139,7 +139,7 @@ class TestAdd:
         first, first_client = _make_backend(team_id="team-a")
         second, second_client = _make_backend(team_id="team-b")
         for backend in (first, second):
-            backend.create_collection("planning", CollectionConfig())
+            backend.create_collection("planning", VectorStoreParam())
 
         first.add("planning", [_entry("3")])
         second.add("planning", [_entry("3")])
@@ -151,8 +151,8 @@ class TestAdd:
     def test_point_ids_are_scoped_by_collection_tenant(self) -> None:
         first, first_client = _make_backend(team_id="team-a")
         second, second_client = _make_backend(team_id="team-a")
-        first.create_collection("planning", CollectionConfig(tenant="tenant-a"))
-        second.create_collection("planning", CollectionConfig(tenant="tenant-b"))
+        first.create_collection("planning", VectorStoreParam(tenant="tenant-a"))
+        second.create_collection("planning", VectorStoreParam(tenant="tenant-b"))
 
         first.add("planning", [_entry("3")])
         second.add("planning", [_entry("3")])
@@ -172,7 +172,7 @@ class TestAdd:
 class TestRemove:
     def test_remove_is_team_scoped(self) -> None:
         backend, client = _make_backend(team_id="team-42")
-        backend.create_collection("kg", CollectionConfig())
+        backend.create_collection("kg", VectorStoreParam())
         backend.remove("kg", ["e1", "e2"])
         selector = client.delete.call_args[1]["points_selector"]
         # FilterSelector.filter.must carries both the team predicate and ref_id match.
@@ -196,7 +196,7 @@ class TestSearch:
 
     def test_maps_hits_and_scopes_to_team(self) -> None:
         backend, client = _make_backend(team_id="team-42")
-        backend.create_collection("kg", CollectionConfig())
+        backend.create_collection("kg", VectorStoreParam())
         client.query_points.return_value = self._response()
 
         result = backend.search("kg", [0.1, 0.2, 0.3], top_k=5)
@@ -209,7 +209,7 @@ class TestSearch:
 
     def test_query_filters_are_anded_onto_team_scope(self) -> None:
         backend, client = _make_backend(team_id="team-42")
-        backend.create_collection("kg", CollectionConfig())
+        backend.create_collection("kg", VectorStoreParam())
         client.query_points.return_value = self._response()
 
         backend.search(
@@ -226,7 +226,7 @@ class TestSearch:
 
     def test_native_params_passed_through(self) -> None:
         backend, client = _make_backend(team_id="team-42")
-        backend.create_collection("kg", CollectionConfig())
+        backend.create_collection("kg", VectorStoreParam())
         client.query_points.return_value = self._response()
 
         backend.search(
@@ -240,13 +240,13 @@ class TestTeamlessBackendCannotQuery:
 
     def test_search_refuses(self) -> None:
         backend, client = _make_backend(team_id=None)
-        backend.create_collection("kg", CollectionConfig())
+        backend.create_collection("kg", VectorStoreParam())
         with pytest.raises(ValueError, match="without a team_id"):
             backend.search("kg", [0.1, 0.2, 0.3], top_k=5)
 
     def test_remove_refuses(self) -> None:
         backend, _client = _make_backend(team_id=None)
-        backend.create_collection("kg", CollectionConfig())
+        backend.create_collection("kg", VectorStoreParam())
         with pytest.raises(ValueError, match="without a team_id"):
             backend.remove("kg", ["e1"])
 

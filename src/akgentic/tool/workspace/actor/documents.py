@@ -76,7 +76,7 @@ if TYPE_CHECKING:
     from akgentic.core.agent import Akgent
     from akgentic.tool.vector_store.actor import VectorStoreActor
     from akgentic.tool.vector_store.embedding_actor import EmbeddingCompleted
-    from akgentic.tool.vector_store.protocol import CollectionConfig, SearchHit
+    from akgentic.tool.vector_store.protocol import SearchHit, VectorStoreParam
     from akgentic.tool.workspace.card.params import WorkspaceRagIndex
     from akgentic.tool.workspace.documents.worker import IndexFailure, IndexResult
 
@@ -165,7 +165,7 @@ class DocumentsMixin(_DocumentsBase):
     _workspace: Filesystem
     _rag_params: WorkspaceRagIndex | None
     _rag_reader: DocumentReader | None
-    _rag_collection: CollectionConfig | None
+    _rag_collection: VectorStoreParam | None
     _vs_proxy: VectorStoreActor | None
     _vs_tell: VectorStoreActor | None
     _index_active: set[str]
@@ -275,7 +275,7 @@ class DocumentsMixin(_DocumentsBase):
         agent_id: str,
         params: WorkspaceRagIndex,
         reader: DocumentReader,
-        collection: CollectionConfig,
+        collection: VectorStoreParam,
     ) -> None:
         """Turn retrieval on for this tree — **tell** path, once per card.
 

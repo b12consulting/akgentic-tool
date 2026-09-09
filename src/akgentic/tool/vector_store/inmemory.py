@@ -11,11 +11,11 @@ import logging
 from typing import Any
 
 from akgentic.tool.vector_store.protocol import (
-    CollectionConfig,
     CollectionStatus,
     SearchHit,
     SearchResult,
     VectorQuery,
+    VectorStoreParam,
     check_path_prefix,
 )
 from akgentic.tool.vector_store.registry import BackendContext, BackendSpec, register_backend
@@ -66,13 +66,13 @@ class InMemoryBackend:
     def __init__(self) -> None:
         _check_vector_search_dependencies()
         self._collections: dict[str, VectorIndex] = {}
-        self._configs: dict[str, CollectionConfig] = {}
+        self._configs: dict[str, VectorStoreParam] = {}
 
     # ------------------------------------------------------------------
     # VectorStoreService protocol methods
     # ------------------------------------------------------------------
 
-    def create_collection(self, name: str, config: CollectionConfig) -> None:
+    def create_collection(self, name: str, config: VectorStoreParam) -> None:
         """Create a named collection. No-op if the collection already exists.
 
         Args:
@@ -222,7 +222,7 @@ class InMemoryBackend:
         self._configs.clear()
         collections = state.get("collections", {})
         for name, col_data in collections.items():
-            config = CollectionConfig.model_validate(col_data["config"])
+            config = VectorStoreParam.model_validate(col_data["config"])
             self._configs[name] = config
             index = VectorIndex()
             for entry_data in col_data["entries"]:

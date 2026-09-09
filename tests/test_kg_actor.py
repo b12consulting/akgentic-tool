@@ -39,7 +39,7 @@ from akgentic.tool.knowledge_graph.models import (
     SearchQuery,
 )
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA
-from akgentic.tool.vector_store.protocol import CollectionConfig, CollectionStatus
+from akgentic.tool.vector_store.protocol import CollectionStatus, VectorStoreParam
 from akgentic.tool.vector_store.protocol import SearchHit as VsSearchHit
 from akgentic.tool.vector_store.protocol import SearchResult as VsSearchResult
 
@@ -1535,7 +1535,7 @@ class TestKnowledgeGraphConfigCollectionField:
 
     def test_collection_default_is_default_collection_config(self) -> None:
         cfg = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
-        assert cfg.collection == CollectionConfig()
+        assert cfg.collection == VectorStoreParam()
         # Structural defaults — AC-11 backward-compat guard.
         assert cfg.collection.dimension == 1536
         assert cfg.collection.backend == "inmemory"
@@ -1545,7 +1545,7 @@ class TestKnowledgeGraphConfigCollectionField:
         cfg = KnowledgeGraphConfig(
             name=KG_ACTOR_NAME,
             role=KG_ACTOR_ROLE,
-            collection=CollectionConfig(backend="weaviate", tenant="t1"),
+            collection=VectorStoreParam(backend="weaviate", tenant="t1"),
         )
         assert cfg.collection.backend == "weaviate"
         assert cfg.collection.tenant == "t1"
@@ -1553,13 +1553,13 @@ class TestKnowledgeGraphConfigCollectionField:
     def test_collection_roundtrip_default(self) -> None:
         cfg = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
         reloaded = KnowledgeGraphConfig.model_validate(cfg.model_dump())
-        assert reloaded.collection == CollectionConfig()
+        assert reloaded.collection == VectorStoreParam()
 
     def test_collection_roundtrip_custom(self) -> None:
         cfg = KnowledgeGraphConfig(
             name=KG_ACTOR_NAME,
             role=KG_ACTOR_ROLE,
-            collection=CollectionConfig(backend="weaviate", tenant="team-abc"),
+            collection=VectorStoreParam(backend="weaviate", tenant="team-abc"),
         )
         reloaded = KnowledgeGraphConfig.model_validate(cfg.model_dump())
         assert reloaded.collection.backend == "weaviate"
@@ -1588,7 +1588,7 @@ class TestKnowledgeGraphConfigCollectionField:
                 role=actor.config.role,
             )
         assert isinstance(actor.config, KnowledgeGraphConfig)
-        assert actor.config.collection == CollectionConfig()
+        assert actor.config.collection == VectorStoreParam()
         assert actor.config.vector_store is True  # 10-9 invariant
 
 
@@ -1597,7 +1597,7 @@ class TestKnowledgeGraphActorAcquireVsProxyCollectionPropagation:
 
     def _build_actor_with_vs_proxy(
         self,
-        collection: CollectionConfig,
+        collection: VectorStoreParam,
         vector_store_value: object = True,
     ) -> tuple[KnowledgeGraphActor, MagicMock]:
         """Return (actor, vs_proxy_mock) with everything wired so _acquire_vs_proxy
@@ -1639,8 +1639,8 @@ class TestKnowledgeGraphActorAcquireVsProxyCollectionPropagation:
         return actor, vs_proxy
 
     def test_create_collection_receives_same_instance_as_config_collection(self) -> None:
-        """AC-6: the CollectionConfig passed to create_collection is the config's instance."""
-        custom = CollectionConfig(backend="weaviate", tenant="t1")
+        """AC-6: the VectorStoreParam passed to create_collection is the config's instance."""
+        custom = VectorStoreParam(backend="weaviate", tenant="t1")
         actor, vs_proxy = self._build_actor_with_vs_proxy(collection=custom)
 
         actor._acquire_vs_proxy()
@@ -1649,23 +1649,23 @@ class TestKnowledgeGraphActorAcquireVsProxyCollectionPropagation:
         args, _ = vs_proxy.create_collection.call_args
         assert args[0] == KG_COLLECTION
         # Identity assertion — proves the same object is threaded through,
-        # rather than a freshly-constructed CollectionConfig().
+        # rather than a freshly-constructed VectorStoreParam().
         assert args[1] is actor.config.collection
         assert args[1] is custom
         assert args[1].backend == "weaviate"
         assert args[1].tenant == "t1"
 
     def test_default_config_collection_is_structurally_default(self) -> None:
-        """AC-11: default `KnowledgeGraphConfig()` → create_collection gets a CollectionConfig()
+        """AC-11: default `KnowledgeGraphConfig()` → create_collection gets a VectorStoreParam()
         structurally equal to the pre-10-10 hardcoded default.
         """
-        default_collection = CollectionConfig()
+        default_collection = VectorStoreParam()
         actor, vs_proxy = self._build_actor_with_vs_proxy(collection=default_collection)
 
         actor._acquire_vs_proxy()
 
         args, _ = vs_proxy.create_collection.call_args
-        assert args[1] == CollectionConfig()
+        assert args[1] == VectorStoreParam()
         assert args[1].dimension == 1536
         assert args[1].backend == "inmemory"
         assert args[1].tenant is None

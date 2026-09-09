@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 from akgentic.core.agent_state import BaseState
 from akgentic.tool.vector_store.embedding_actor import EmbeddingCompleted
-from akgentic.tool.vector_store.protocol import CollectionConfig
+from akgentic.tool.vector_store.protocol import VectorStoreParam
 from akgentic.tool.workspace.actor import (
     WORKSPACE_ACTOR_ROLE,
     WorkspaceActor,
@@ -64,7 +64,7 @@ class FakeVectorStore:
         self.create_error: Exception | None = None
         self.remove_error: Exception | None = None
 
-    def create_collection(self, name: str, config: CollectionConfig) -> None:
+    def create_collection(self, name: str, config: VectorStoreParam) -> None:
         self.calls.append(("create", (name, config)))
         if self.create_error is not None:
             raise self.create_error
@@ -143,7 +143,7 @@ class RagHarness:
         self,
         params: WorkspaceRagIndex | None = None,
         reader: DocumentReader | None = None,
-        collection: CollectionConfig | None = None,
+        collection: VectorStoreParam | None = None,
         agent_id: str = "alice",
     ) -> None:
         """Announce retrieval exactly as a bound card does."""
@@ -151,7 +151,7 @@ class RagHarness:
             agent_id,
             params or WorkspaceRagIndex(),
             reader or DocumentReader(llm_client=None),
-            collection or CollectionConfig(backend="inmemory"),
+            collection or VectorStoreParam(backend="inmemory"),
         )
 
     def watch(self) -> StateSpy:
@@ -296,7 +296,7 @@ class TestEnableRag:
 
     def test_enabling_creates_the_one_collection(self, harness: RagHarness) -> None:
         """Lazily, in ``enable_rag`` — never in ``on_start``."""
-        harness.enable(collection=CollectionConfig(backend="inmemory", tenant="acme"))
+        harness.enable(collection=VectorStoreParam(backend="inmemory", tenant="acme"))
 
         [(name, config)] = harness.vs.of("create")
         assert name == RAG_COLLECTION
@@ -304,7 +304,7 @@ class TestEnableRag:
 
     def test_the_card_collection_reaches_create_collection(self, harness: RagHarness) -> None:
         """``rag_collection`` is the card's only lever on the backend and the tenant."""
-        harness.enable(collection=CollectionConfig(backend="weaviate", dimension=3072))
+        harness.enable(collection=VectorStoreParam(backend="weaviate", dimension=3072))
 
         [(_, config)] = harness.vs.of("create")
         assert (config.backend, config.dimension) == ("weaviate", 3072)

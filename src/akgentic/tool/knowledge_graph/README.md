@@ -24,7 +24,7 @@ from akgentic.tool.knowledge_graph import KnowledgeGraphTool
 class KnowledgeGraphTool(ToolCard):
     # Vector-search wiring
     vector_store: bool | str = True
-    collection: CollectionConfig = CollectionConfig()
+    collection: VectorStoreParam = VectorStoreParam()
     search_top_k: int = 10
     search_score_threshold: float = 0.3
     hybrid_alpha: float = 0.7
@@ -66,13 +66,15 @@ it by name during `on_start`.
 
 ### `collection`
 
-`CollectionConfig` forwarded to `VectorStoreActor.create_collection("knowledge_graph", …)`.
+`VectorStoreParam` forwarded to `VectorStoreActor.create_collection("knowledge_graph", …)`.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `dimension` | `int` | `1536` | Embedding dimensionality. |
+| `dimension` | `int` | `1536` | Embedding dimensionality; must be the native width of a known `embedding_model`, refused at bind otherwise. |
 | `backend` | `"inmemory" \| "weaviate"` | `"inmemory"` | `weaviate` requires `akgentic-tool[weaviate]`. |
 | `tenant` | `str \| None` | `None` | Weaviate tenant id. |
+| `embedding_model` | `str` | `"text-embedding-3-small"` | The model that produces the collection's vectors. |
+| `embedding_provider` | `Literal["openai", "azure"]` | `"openai"` | The embedding API provider. |
 
 ### `search_top_k` / `search_score_threshold` / `hybrid_alpha`
 
@@ -242,7 +244,7 @@ KnowledgeGraphTool(get_graph=GetGraph(                # also fetchable on demand
 ))
 
 KnowledgeGraphTool(                                   # persistent, tenant-isolated
-    collection=CollectionConfig(backend="weaviate", tenant="team-42"),
+    collection=VectorStoreParam(backend="weaviate", tenant="team-42"),
     search_score_threshold=0.45,
     search_top_k=25,
     hybrid_alpha=0.3,                                 # trust exact names over similarity
@@ -260,7 +262,7 @@ KnowledgeGraphTool(vector_store=False)                # keyword-only search
 > export AKGENTIC_WEAVIATE_API_KEY="..."          # omit for an unauthenticated cluster
 > ```
 >
-> **Exporting the URL is what turns Weaviate on**, and a `CollectionConfig` that names no backend
+> **Exporting the URL is what turns Weaviate on**, and a `VectorStoreParam` that names no backend
 > then defaults to `weaviate` rather than to the in-memory index. An exported but empty variable
 > counts as unset. Requires `akgentic-tool[weaviate]`.
 >

@@ -21,9 +21,9 @@ from akgentic.tool.vector_store.actor import (
 )
 from akgentic.tool.vector_store.embedding_actor import EmbeddingResult
 from akgentic.tool.vector_store.protocol import (
-    CollectionConfig,
     CollectionStatus,
     VectorStoreConfig,
+    VectorStoreParam,
 )
 from akgentic.tool.vector_store.vector import VectorEntry
 
@@ -78,7 +78,7 @@ class TestFullLifecycle:
         self, actor: VectorStoreActor
     ) -> None:
         """End-to-end: create collection, add, search, remove, verify."""
-        config = CollectionConfig(dimension=3)
+        config = VectorStoreParam(dimension=3, embedding_model="test-embedding")
         actor.create_collection("test_col", config)
         assert actor.state.collection_statuses["test_col"] == CollectionStatus.READY
 
@@ -119,7 +119,7 @@ class TestIndexingToReady:
 
     def test_indexing_to_ready_lifecycle(self, actor: VectorStoreActor) -> None:
         """Async lifecycle: add needs-embedding -> INDEXING -> result -> READY."""
-        config = CollectionConfig(dimension=3)
+        config = VectorStoreParam(dimension=3, embedding_model="test-embedding")
         actor.create_collection("async_col", config)
 
         # Add entries without vectors (triggers embedding path)
@@ -171,8 +171,8 @@ class TestMultipleCollections:
         self, actor: VectorStoreActor
     ) -> None:
         """Two collections with different dimensions stay independent."""
-        config_kg = CollectionConfig(dimension=3)
-        config_plan = CollectionConfig(dimension=4)
+        config_kg = VectorStoreParam(dimension=3, embedding_model="test-embedding")
+        config_plan = VectorStoreParam(dimension=4, embedding_model="test-embedding")
 
         actor.create_collection("kg", config_kg)
         actor.create_collection("planning", config_plan)
@@ -227,7 +227,7 @@ class TestIdempotentCreateCollection:
 
     def test_idempotent_create_collection(self, actor: VectorStoreActor) -> None:
         """create_collection twice -> entries from first call preserved."""
-        config = CollectionConfig(dimension=3)
+        config = VectorStoreParam(dimension=3, embedding_model="test-embedding")
         actor.create_collection("idem_col", config)
 
         # Add entries
@@ -254,7 +254,7 @@ class TestRemoveEntries:
 
     def test_remove_entries(self, actor: VectorStoreActor) -> None:
         """Remove subset of entries and verify search results."""
-        config = CollectionConfig(dimension=3)
+        config = VectorStoreParam(dimension=3, embedding_model="test-embedding")
         actor.create_collection("rm_col", config)
 
         entries = [

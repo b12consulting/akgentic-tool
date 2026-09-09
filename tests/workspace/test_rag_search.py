@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA, OVERFETCH
 from akgentic.tool.vector_store.inmemory import InMemoryBackend
-from akgentic.tool.vector_store.protocol import CollectionConfig, SearchResult
+from akgentic.tool.vector_store.protocol import VectorStoreParam, SearchResult
 from akgentic.tool.vector_store.vector import VectorEntry
 from akgentic.tool.workspace.actor import (
     WORKSPACE_ACTOR_ROLE,
@@ -71,14 +71,14 @@ class SearchStore:
 
     def __init__(self) -> None:
         self.backend = InMemoryBackend()
-        self.backend.create_collection(RAG_COLLECTION, CollectionConfig(backend="inmemory"))
+        self.backend.create_collection(RAG_COLLECTION, VectorStoreParam(backend="inmemory"))
         self.searches: list[tuple[str, int, str | None, str | None]] = []
         self.embeds: list[list[str]] = []
         self.embed_error: Exception | None = None
         self.search_error: Exception | None = None
         self.embed_returns: list[list[float]] | None = None
 
-    def create_collection(self, name: str, config: CollectionConfig) -> None:
+    def create_collection(self, name: str, config: VectorStoreParam) -> None:
         self.backend.create_collection(name, config)
 
     def add(
@@ -159,7 +159,7 @@ class SearchHarness:
             "alice",
             WorkspaceRagIndex(),
             DocumentReader(llm_client=None),
-            CollectionConfig(backend="inmemory"),
+            VectorStoreParam(backend="inmemory"),
         )
 
     def index(
@@ -701,7 +701,7 @@ class TestThePathPrefixDecision:
             "alice",
             WorkspaceRagIndex(),
             DocumentReader(llm_client=None),
-            CollectionConfig(backend=backend),
+            VectorStoreParam(backend=backend),
         )
 
         answers = {harness.actor.rag_search("payment", path_prefix="report?.md")}

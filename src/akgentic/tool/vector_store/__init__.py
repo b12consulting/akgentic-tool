@@ -32,19 +32,21 @@ try:
 except ImportError:
     QdrantBackend = None  # type: ignore[assignment,misc]
 from akgentic.tool.vector_store.protocol import (
+    EMBEDDING_DIMENSIONS,
     WEAVIATE_API_KEY_ENV,
     WEAVIATE_URL_ENV,
     ActorStateBackend,
-    CollectionConfig,
     CollectionStatus,
     EmbeddingProvider,
     SearchHit,
     SearchResult,
     VectorQuery,
     VectorStoreConfig,
+    VectorStoreParam,
     VectorStoreService,
     default_backend,
     require_backend_configured,
+    require_dimension_matches,
     require_weaviate_configured,
     weaviate_api_key,
     weaviate_url,
@@ -71,13 +73,13 @@ from akgentic.tool.vector_store.vector import (  # noqa: F401
 )
 
 __all__ = [
+    "EMBEDDING_DIMENSIONS",
     "WEAVIATE_API_KEY_ENV",
     "WEAVIATE_URL_ENV",
     "ActorStateBackend",
     "BackendContext",
     "BackendSpec",
     "ClusterKey",
-    "CollectionConfig",
     "CollectionStatus",
     "EmbeddingActor",
     "EmbeddingCompleted",
@@ -99,6 +101,7 @@ __all__ = [
     "VectorQuery",
     "VectorStoreActor",
     "VectorStoreConfig",
+    "VectorStoreParam",
     "VectorStoreService",
     "VectorStoreState",
     "VectorStoreTool",
@@ -110,6 +113,7 @@ __all__ = [
     "is_registered",
     "register_backend",
     "require_backend_configured",
+    "require_dimension_matches",
     "require_weaviate_configured",
     "resolve_default_backend",
     "unregister_backend",

@@ -11,6 +11,7 @@ on_start(). Same approach as test_kg_actor.py and test_planning_actor.py.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -30,15 +31,27 @@ from akgentic.tool.vector_store.embedding_actor import (
     EmbeddingResult,
 )
 from akgentic.tool.vector_store.protocol import (
-    CollectionConfig,
     CollectionStatus,
     SearchResult,
     VectorStoreConfig,
+    VectorStoreParam,
 )
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+_ACTOR_LOGGER = "akgentic.tool.vector_store.actor"
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """The WARNING records the actor's logger emitted."""
+    return [
+        record
+        for record in caplog.records
+        if record.name == _ACTOR_LOGGER and record.levelno == logging.WARNING
+    ]
 
 
 def _make_actor() -> VectorStoreActor:
@@ -171,7 +184,7 @@ class TestCreateCollection:
         backend = _mock_backend()
         actor._backend = backend
 
-        config = CollectionConfig()
+        config = VectorStoreParam()
         actor.create_collection("test_col", config)
 
         backend.create_collection.assert_called_once_with("test_col", config)
@@ -182,7 +195,7 @@ class TestCreateCollection:
         backend = _mock_backend()
         actor._backend = backend
 
-        actor.create_collection("test_col", CollectionConfig())
+        actor.create_collection("test_col", VectorStoreParam())
         assert actor.state.collection_statuses["test_col"] == CollectionStatus.READY
 
     def test_populates_collection_configs(self) -> None:
@@ -191,16 +204,93 @@ class TestCreateCollection:
         backend = _mock_backend()
         actor._backend = backend
 
-        config = CollectionConfig(dimension=128, tenant="team-42")
+        config = VectorStoreParam(dimension=128, tenant="team-42", embedding_model="test-embedding")
         actor.create_collection("test_col", config)
         assert "test_col" in actor.state.collection_configs
         cfg = actor.state.collection_configs["test_col"]
         assert cfg["dimension"] == 128
         assert cfg["tenant"] == "team-42"
         assert cfg["backend"] == "inmemory"
+        assert cfg["embedding_model"] == "test-embedding"
         # The deleted workspace-persistence mode leaves no trace in the serialised config.
         assert "persistence" not in cfg
         assert "workspace_path" not in cfg
+
+    def test_refuses_a_dimension_its_model_cannot_produce(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A configuration rule is not a backend fault: it raises, it is not swallowed."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+        caplog.clear()
+
+        with (
+            caplog.at_level(logging.WARNING, logger=_ACTOR_LOGGER),
+            pytest.raises(ValueError, match="dimension=3072"),
+        ):
+            actor.create_collection("c", VectorStoreParam(dimension=3072))
+
+        backend.create_collection.assert_not_called()
+        assert "c" not in actor.state.collection_configs
+        assert "c" not in actor.state.collection_statuses
+        assert _warnings(caplog) == []
+
+    def test_agreeing_embedding_fields_log_nothing(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        actor = _make_actor()
+        actor.config = VectorStoreConfig(
+            name=VS_ACTOR_NAME, role=VS_ACTOR_ROLE, embedding_model="text-embedding-3-large"
+        )
+        actor._backend = _mock_backend()
+        caplog.clear()
+
+        with caplog.at_level(logging.WARNING, logger=_ACTOR_LOGGER):
+            actor.create_collection(
+                "c", VectorStoreParam(dimension=3072, embedding_model="text-embedding-3-large")
+            )
+
+        assert _warnings(caplog) == []
+        assert actor.state.collection_statuses["c"] == CollectionStatus.READY
+
+    def test_disagreeing_embedding_fields_warn_once_and_record_the_params_value(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Warned, served, and recorded as declared — the store's model still embeds."""
+        actor = _make_actor()
+        backend = _mock_backend()
+        actor._backend = backend
+        caplog.clear()
+
+        with caplog.at_level(logging.WARNING, logger=_ACTOR_LOGGER):
+            actor.create_collection(
+                "c", VectorStoreParam(dimension=3072, embedding_model="text-embedding-3-large")
+            )
+
+        [record] = _warnings(caplog)
+        message = record.getMessage()
+        assert "'c'" in message
+        assert "text-embedding-3-large" in message
+        assert "text-embedding-3-small" in message
+        assert "store's model applies" in message
+        backend.create_collection.assert_called_once()
+        assert actor.state.collection_configs["c"]["embedding_model"] == "text-embedding-3-large"
+        assert actor.state.collection_statuses["c"] == CollectionStatus.READY
+
+    def test_the_record_is_the_whole_model_never_an_enumeration(self) -> None:
+        """A field the write path has never heard of must survive into state."""
+
+        class _ParamWithExtra(VectorStoreParam):
+            extra_field: str = "sentinel"
+
+        actor = _make_actor()
+        actor._backend = _mock_backend()
+
+        actor.create_collection("c", _ParamWithExtra(embedding_model="test-embedding"))
+
+        assert actor.state.collection_configs["c"]["extra_field"] == "sentinel"
+        assert actor.state.collection_configs["c"]["params"] == {}
 
     def test_notifies_state_change(self) -> None:
         """AC12: state.notify_state_change() called after creation."""
@@ -209,7 +299,7 @@ class TestCreateCollection:
         actor._backend = backend
 
         with patch.object(VectorStoreState, "notify_state_change") as mock_notify:
-            actor.create_collection("test_col", CollectionConfig())
+            actor.create_collection("test_col", VectorStoreParam())
             mock_notify.assert_called_once()
 
     def test_syncs_backend_state(self) -> None:
@@ -219,7 +309,7 @@ class TestCreateCollection:
         backend.get_state.return_value = {"collections": {"test_col": {}}}
         actor._backend = backend
 
-        actor.create_collection("test_col", CollectionConfig())
+        actor.create_collection("test_col", VectorStoreParam())
         assert actor.state.backend_state == {"collections": {"test_col": {}}}
 
     def test_idempotent_second_call(self) -> None:
@@ -228,8 +318,8 @@ class TestCreateCollection:
         backend = _mock_backend()
         actor._backend = backend
 
-        actor.create_collection("test_col", CollectionConfig())
-        actor.create_collection("test_col", CollectionConfig())
+        actor.create_collection("test_col", VectorStoreParam())
+        actor.create_collection("test_col", VectorStoreParam())
         assert backend.create_collection.call_count == 2
         # Backend itself handles idempotency (no-op on existing collection)
 
@@ -238,7 +328,7 @@ class TestCreateCollection:
         actor = _make_actor()
         with patch.object(actor, "_get_or_create_backend", return_value=None):
             # Should not raise
-            actor.create_collection("test_col", CollectionConfig())
+            actor.create_collection("test_col", VectorStoreParam())
             assert "test_col" not in actor.state.collection_statuses
 
 
@@ -1115,7 +1205,7 @@ class TestStatePersistence:
         state_snapshot: dict[str, Any] = {
             "collections": {
                 "test_col": {
-                    "config": CollectionConfig().model_dump(),
+                    "config": VectorStoreParam().model_dump(),
                     "entries": [
                         {
                             "ref_type": "test",
@@ -1131,7 +1221,7 @@ class TestStatePersistence:
         actor._backend = backend
 
         # Trigger a mutation to sync state
-        actor.create_collection("test_col", CollectionConfig())
+        actor.create_collection("test_col", VectorStoreParam())
 
         # Verify actor state has the snapshot
         assert actor.state.backend_state == state_snapshot
@@ -1168,8 +1258,8 @@ class TestCollectionStatuses:
         backend = _mock_backend()
         actor._backend = backend
 
-        actor.create_collection("col_a", CollectionConfig())
-        actor.create_collection("col_b", CollectionConfig())
+        actor.create_collection("col_a", VectorStoreParam())
+        actor.create_collection("col_b", VectorStoreParam())
 
         assert actor.state.collection_statuses["col_a"] == CollectionStatus.READY
         assert actor.state.collection_statuses["col_b"] == CollectionStatus.READY
@@ -1311,7 +1401,9 @@ class TestWeaviateRouting:
         mock_wb = MagicMock()
         actor._weaviate_backend = mock_wb
 
-        config = CollectionConfig(backend="weaviate", dimension=384)
+        config = VectorStoreParam(
+            backend="weaviate", dimension=384, embedding_model="test-embedding"
+        )
         actor.create_collection("wv_col", config)
 
         mock_wb.create_collection.assert_called_once_with("wv_col", config)
@@ -1324,7 +1416,7 @@ class TestWeaviateRouting:
         backend = _mock_backend()
         actor._backend = backend
 
-        config = CollectionConfig(backend="inmemory")
+        config = VectorStoreParam(backend="inmemory")
         actor.create_collection("im_col", config)
 
         backend.create_collection.assert_called_once_with("im_col", config)
@@ -1392,7 +1484,7 @@ class TestWeaviateRouting:
         actor.config = VectorStoreConfig(name=VS_ACTOR_NAME, role=VS_ACTOR_ROLE)
         # No weaviate_url => _get_or_create_weaviate_backend returns None
 
-        config = CollectionConfig(backend="weaviate")
+        config = VectorStoreParam(backend="weaviate")
         actor.create_collection("wv_col", config)
 
         # Should not crash, just skip
@@ -1409,7 +1501,7 @@ class TestWeaviateRouting:
             weaviate_url="http://localhost:8080",
         )
 
-        config = CollectionConfig(backend="weaviate")
+        config = VectorStoreParam(backend="weaviate")
         actor.create_collection("wv_col", config)
 
         # backend_state should still be empty (not synced for weaviate)
@@ -1728,7 +1820,7 @@ class TestRegistryRouting:
             )
         )
         try:
-            config = CollectionConfig(backend="custom")
+            config = VectorStoreParam(backend="custom")
             actor.create_collection("cc", config)
 
             custom.create_collection.assert_called_once_with("cc", config)
@@ -1762,7 +1854,7 @@ class TestRegistryRouting:
         )
         try:
             actor = _make_actor()
-            config = CollectionConfig(backend="stateful")
+            config = VectorStoreParam(backend="stateful")
             actor.create_collection("cc", config)
             assert actor.state.backend_states["stateful"] == {"value": "saved"}
 
@@ -1838,7 +1930,7 @@ class TestRegistryRouting:
         )
         try:
             actor = _make_actor()
-            actor.create_collection("cc", CollectionConfig(backend="inmemory"))
+            actor.create_collection("cc", VectorStoreParam(backend="inmemory"))
             assert actor.state.backend_state == {}
             assert actor.state.backend_states["inmemory"] == {"value": "replacement"}
 
