@@ -10,13 +10,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-# ``_check_weaviate_dependencies`` moved to ``client.py`` with the connection it
-# guards; the redundant ``as`` alias keeps it importable from here as a deliberate
-# re-export (mypy strict turns off implicit re-export).
-from akgentic.tool.vector_store.client import (
-    _check_weaviate_dependencies as _check_weaviate_dependencies,
-)
-from akgentic.tool.vector_store.client import get_client
+from akgentic.tool.vector_store.client import _check_weaviate_dependencies, get_client
 from akgentic.tool.vector_store.protocol import (
     CollectionConfig,
     CollectionStatus,
