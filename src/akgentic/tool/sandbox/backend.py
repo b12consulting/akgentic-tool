@@ -270,12 +270,22 @@ class ProcessBackend:
     ) -> ExecResult:
         """Run *argv* to completion, holding its handle for the duration.
 
-        Reproduces ``subprocess.run(timeout=)`` exactly, and that exactness is
-        load-bearing: on expiry it kills the child, drains it, and re-raises
-        ``TimeoutExpired``. ``Popen.communicate(timeout=)`` only raises — it does
-        not kill — so skipping the kill-and-drain would leave a zombie and change
-        the answer ``receiveMsg_ExecRequest`` gives an agent from "too slow" to
-        "failed".
+        Reproduces the part of ``subprocess.run(timeout=)`` the contract rests
+        on: on expiry it kills the child and re-raises ``TimeoutExpired``, which
+        is what ``receiveMsg_ExecRequest`` turns into "too slow" rather than
+        "failed". ``Popen.communicate(timeout=)`` only raises — it does not kill
+        — so the kill cannot be skipped without leaving a zombie.
+
+        **It is not identical to ``subprocess.run``, and the difference has a
+        cost.** CPython's POSIX path calls ``proc.wait()`` after the kill,
+        because ``_communicate`` already collected the output; this drains with
+        a second ``communicate()`` instead. A second drain reads both pipes to
+        EOF, so a grandchild that inherited them and outlived the killed child
+        holds this call open — past the budget, and past the stop backstop
+        :data:`DEFAULT_BACKEND_TIMEOUT_S` is sized against. Reachable through
+        any allowlisted command that leaves a process behind. Recorded in epic
+        50's deferred findings rather than changed here: narrowing it would
+        alter what every timing-out run does.
 
         The handle is cleared in a ``finally`` on every exit. That is not
         tidiness: a retained handle to an exited process makes a later
