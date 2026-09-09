@@ -34,6 +34,8 @@ from akgentic.tool.vector_store.protocol import (
     VectorQuery,
     VectorStoreParam,
     check_path_prefix,
+    check_shared_scope,
+    collection_is_team_scoped,
 )
 from akgentic.tool.vector_store.registry import BackendContext, BackendSpec, register_backend
 
@@ -308,12 +310,15 @@ class QdrantBackend:
             path_prefix: Restrict removal to points whose ``path`` starts with this.
 
         Raises:
-            ValueError: If the collection has not been created, the backend was
-                built without a ``team_id``, or ``path_prefix`` contains ``*`` or ``?``.
+            ValueError: If the collection has not been created, ``path_prefix``
+                contains ``*`` or ``?``, the collection is shared across teams
+                and no ``scope`` was given, or — on a team-scoped collection
+                only — the backend was built without a ``team_id``.
         """
         from qdrant_client import models
 
         check_path_prefix(path_prefix)
+        check_shared_scope(collection, scope)
         self._check_collection(collection)
         selector = self._build_filter(collection, None, scope=scope)
         selector.must.append(  # type: ignore[union-attr]
@@ -392,10 +397,13 @@ class QdrantBackend:
             Search results with hits ranked by cosine similarity.
 
         Raises:
-            ValueError: If the collection has not been created, the backend was
-                built without a ``team_id``, or ``path_prefix`` contains ``*`` or ``?``.
+            ValueError: If the collection has not been created, ``path_prefix``
+                contains ``*`` or ``?``, the collection is shared across teams
+                and no ``scope`` was given, or — on a team-scoped collection
+                only — the backend was built without a ``team_id``.
         """
         check_path_prefix(path_prefix)
+        check_shared_scope(collection, scope)
         self._check_collection(collection)
         limit = top_k if path_prefix is None else max(top_k * 4, top_k)
         response = self._client.query_points(
@@ -430,7 +438,7 @@ class QdrantBackend:
             if len(hits) >= top_k:
                 break
 
-        return SearchResult(hits=hits, status=CollectionStatus.READY, indexing_pending=0)
+        return SearchResult(hits=hits, status=CollectionStatus.READY)
 
     # ------------------------------------------------------------------
     # Query construction hooks (override in a subclass for bespoke behaviour)
@@ -443,23 +451,40 @@ class QdrantBackend:
         *,
         scope: str | None = None,
     ) -> qmodels.Filter:
-        """Combine the mandatory team predicate with ``scope`` and ``query.filters``.
+        """Combine the collection's own predicate with ``scope`` and ``query.filters``.
 
         ``scope`` and each entry in ``query.filters`` become a ``MatchValue``
-        (scalar) or ``MatchAny`` (list) condition AND-ed onto the team scope.
+        (scalar) or ``MatchAny`` (list) condition AND-ed onto that predicate.
         Override to support ranges, geo, or nested payload operators.
 
+        On a team-scoped collection the predicate starts from
+        :meth:`_team_scope`, which refuses a backend that does not know its team.
+        On a collection listed in
+        :data:`~akgentic.tool.vector_store.protocol.SHARED_COLLECTIONS` the team leg
+        is not built at all — its rows belong to a filesystem tree rather than to a
+        team — and only the tenant leg survives from the base. The result is never
+        an empty conjunction, because
+        :func:`~akgentic.tool.vector_store.protocol.check_shared_scope` has already
+        made ``scope`` mandatory for such a collection.
+
         Args:
-            collection: Collection whose effective tenant must be included.
+            collection: The collection being queried, which decides whether the
+                team leg is part of the predicate. Its effective tenant is
+                included either way.
             query: The active query, or ``None``.
             scope: Optional ``scope`` equality predicate.
 
         Returns:
-            A Qdrant ``Filter`` always scoped to this team.
+            A Qdrant ``Filter``, scoped to this team unless *collection* is shared
+            across teams.
         """
         from qdrant_client import models
 
-        selector = self._team_scope(collection)
+        selector = (
+            self._team_scope(collection)
+            if collection_is_team_scoped(collection)
+            else models.Filter(must=self._tenant_conditions(collection))
+        )
         if scope is not None:
             selector.must.append(  # type: ignore[union-attr]
                 models.FieldCondition(
@@ -509,14 +534,31 @@ class QdrantBackend:
         Existence is checked against the cluster, not local bookkeeping: the
         caller is typically a sweeper reaping a team that no longer exists.
 
+        **A collection shared across teams is refused, before any cluster call.**
+        On such a collection ``team_id`` records *who wrote the point* and is read
+        by nothing once the query predicate stops using it, so a sweeper pointed at
+        it would delete points another live team is still reading, from a tree that
+        still exists. The check consults a module-level fact rather than this
+        backend's own bookkeeping, so it still bites on an administrative backend
+        that has created no collection — the only kind a sweeper has.
+
         Args:
             collection: Target collection name.
             team_id: The team whose points are to be removed.
 
         Raises:
-            ValueError: If the collection does not exist in the cluster.
+            ValueError: If the collection is shared across teams, or does not
+                exist in the cluster.
         """
         from qdrant_client import models
+
+        if not collection_is_team_scoped(collection):
+            msg = (
+                f"Collection '{collection}' is shared across teams, so deleting one "
+                "team's points would remove rows another live team is still reading. "
+                "Remove by ref_id with a scope instead."
+            )
+            raise ValueError(msg)
 
         if not self._client.collection_exists(collection):
             msg = f"Collection '{collection}' does not exist"
@@ -618,14 +660,33 @@ class QdrantBackend:
                 key=TEAM_ID_PAYLOAD, match=models.MatchValue(value=self._team_id)
             )
         ]
-        tenant = self._collection_tenants.get(collection) or self._tenant
-        if tenant:
-            must.append(
-                models.FieldCondition(
-                    key=TENANT_PAYLOAD, match=models.MatchValue(value=tenant)
-                )
-            )
+        must.extend(self._tenant_conditions(collection))
         return models.Filter(must=must)
+
+    def _tenant_conditions(self, collection: str) -> list[qmodels.Condition]:
+        """Return the tenant leg for *collection*, or no leg when none is configured.
+
+        Split out of :meth:`_team_scope` because a shared collection drops the team
+        leg and keeps this one: tenancy is a deployment partition, orthogonal to
+        which team wrote a row, so it applies whether or not the collection is
+        team-scoped. Duplicating it in two filter builders is how the two would
+        drift.
+
+        Args:
+            collection: The collection whose effective tenant is wanted.
+
+        Returns:
+            A one-element list holding the tenant equality condition, or an empty
+            list when neither the collection nor the backend names a tenant.
+        """
+        from qdrant_client import models
+
+        tenant = self._collection_tenants.get(collection) or self._tenant
+        if not tenant:
+            return []
+        return [
+            models.FieldCondition(key=TENANT_PAYLOAD, match=models.MatchValue(value=tenant))
+        ]
 
     def _check_collection(self, collection: str) -> None:
         """Raise ``ValueError`` if *collection* was never created via this backend.

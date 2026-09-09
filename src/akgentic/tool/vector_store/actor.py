@@ -619,7 +619,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         backend = self._get_backend_for_collection(collection)
         if backend is None:
             logger.warning("[%s] Backend unavailable, returning empty search", self.config.name)
-            return SearchResult(hits=[], status=CollectionStatus.READY, indexing_pending=0)
+            return SearchResult(hits=[], status=CollectionStatus.READY)
         try:
             if query is None:
                 result: SearchResult = backend.search(
@@ -646,4 +646,4 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
             raise RetriableError(str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
             logger.warning("[%s] search failed: %s", self.config.name, exc)
-            return SearchResult(hits=[], status=CollectionStatus.READY, indexing_pending=0)
+            return SearchResult(hits=[], status=CollectionStatus.READY)

@@ -18,6 +18,8 @@ from akgentic.tool.vector_store.protocol import (
     VectorQuery,
     VectorStoreParam,
     check_path_prefix,
+    check_shared_scope,
+    collection_is_team_scoped,
 )
 from akgentic.tool.vector_store.registry import BackendContext, BackendSpec, register_backend
 
@@ -374,18 +376,21 @@ class WeaviateBackend:
             path_prefix: Restrict removal to objects whose ``path`` starts with this.
 
         Raises:
-            ValueError: If the collection has not been created, if this backend
-                was built without a ``team_id``, or if ``path_prefix`` contains
-                ``*`` or ``?``.
+            ValueError: If the collection has not been created, if
+                ``path_prefix`` contains ``*`` or ``?``, if the collection is
+                shared across teams and no ``scope`` was given, or — on a
+                team-scoped collection only — if this backend was built without a
+                ``team_id``.
         """
         from weaviate.classes.query import Filter
 
         check_path_prefix(path_prefix)
+        check_shared_scope(collection, scope)
         self._check_collection(collection)
         col = self._get_collection(collection)
         col.data.delete_many(
             where=Filter.by_property("ref_id").contains_any(ref_ids)
-            & self._query_filter(scope, path_prefix),
+            & self._query_filter(collection, scope, path_prefix),
         )
 
     def search(
@@ -421,20 +426,23 @@ class WeaviateBackend:
             Search results with hits ranked by distance (converted to score).
 
         Raises:
-            ValueError: If the collection has not been created, if this backend
-                was built without a ``team_id``, or if ``path_prefix`` contains
-                ``*`` or ``?``.
+            ValueError: If the collection has not been created, if
+                ``path_prefix`` contains ``*`` or ``?``, if the collection is
+                shared across teams and no ``scope`` was given, or — on a
+                team-scoped collection only — if this backend was built without a
+                ``team_id``.
         """
         from weaviate.classes.query import MetadataQuery
 
         check_path_prefix(path_prefix)
+        check_shared_scope(collection, scope)
         self._check_collection(collection)
         col = self._get_collection(collection)
 
         result = col.query.near_vector(
             near_vector=query_vector,
             limit=top_k,
-            filters=self._build_filter(query, scope=scope, path_prefix=path_prefix),
+            filters=self._build_filter(collection, query, scope=scope, path_prefix=path_prefix),
             return_metadata=MetadataQuery(distance=True),
             **self._near_vector_kwargs(query),
         )
@@ -460,11 +468,7 @@ class WeaviateBackend:
                 )
             )
 
-        return SearchResult(
-            hits=hits,
-            status=CollectionStatus.READY,
-            indexing_pending=0,
-        )
+        return SearchResult(hits=hits, status=CollectionStatus.READY)
 
     # ------------------------------------------------------------------
     # Query construction hooks (override in a subclass for bespoke behaviour)
@@ -472,27 +476,32 @@ class WeaviateBackend:
 
     def _build_filter(
         self,
+        collection: str,
         query: VectorQuery | None,
         *,
         scope: str | None = None,
         path_prefix: str | None = None,
     ) -> FilterReturn:
-        """Combine the team/scope/path predicate with ``query.filters``.
+        """Combine the collection's own predicate with ``query.filters``.
 
-        The team predicate (optionally narrowed by ``scope`` / ``path_prefix``
-        via :meth:`_query_filter`) is always present; each entry in
-        ``query.filters`` is AND-ed onto it as an equality (scalar) or
-        ``contains_any`` (list) condition. Override to support richer operators.
+        The predicate :meth:`_query_filter` builds for *collection* — the team leg
+        where the collection is team-scoped, narrowed by ``scope`` / ``path_prefix``
+        — is always present; each entry in ``query.filters`` is AND-ed onto it as an
+        equality (scalar) or ``contains_any`` (list) condition. Override to support
+        richer operators.
 
         Args:
+            collection: The collection being queried, which decides whether the
+                team leg is part of the predicate at all.
             query: The active query, or ``None``.
             scope: Restrict to objects carrying this ``scope``.
             path_prefix: Restrict to objects whose ``path`` starts with this.
 
         Returns:
-            A combined Weaviate ``Filter`` always scoped to this team.
+            A combined Weaviate ``Filter``, scoped to this team unless *collection*
+            is shared across teams.
         """
-        base = self._query_filter(scope, path_prefix)
+        base = self._query_filter(collection, scope, path_prefix)
         if query is None or not query.filters:
             return base
         from weaviate.classes.query import Filter
@@ -553,6 +562,17 @@ class WeaviateBackend:
         anding it on would leave a sweeper able to reap only itself, which is
         the one team that is never being reaped.
 
+        **A collection shared across teams is refused, before any cluster call.**
+        On such a collection ``team_id`` records *who wrote the row* and is read by
+        nothing once the query predicate stops using it, so a sweeper pointed at it
+        would delete rows another live team is still reading, from a tree that still
+        exists. This method has no caller anywhere in ``src/``, which is exactly why
+        it needs a guard rather than a docstring: the first caller will be written
+        by someone reading the signature. The check consults a module-level fact
+        rather than this backend's own bookkeeping, so it still bites on an
+        administrative backend that has created no collection — the only kind a
+        sweeper has.
+
         Args:
             collection: Target collection name.
             team_id: The team whose objects are to be removed.
@@ -561,9 +581,18 @@ class WeaviateBackend:
             Number of objects deleted, or ``0`` when the cluster reports none.
 
         Raises:
-            ValueError: If the collection does not exist in the cluster.
+            ValueError: If the collection is shared across teams, or does not
+                exist in the cluster.
         """
         from weaviate.classes.query import Filter
+
+        if not collection_is_team_scoped(collection):
+            msg = (
+                f"Collection '{collection}' is shared across teams, so deleting one "
+                "team's objects would remove rows another live team is still reading. "
+                "Remove by ref_id with a scope instead."
+            )
+            raise ValueError(msg)
 
         if not self._client.collections.exists(collection):
             msg = f"Collection '{collection}' does not exist"
@@ -628,16 +657,29 @@ class WeaviateBackend:
         return Filter.by_property(TEAM_ID_PROPERTY).equal(self._team_id)
 
     def _query_filter(
-        self, scope: str | None, path_prefix: str | None
+        self, collection: str, scope: str | None, path_prefix: str | None
     ) -> FilterReturn:
-        """Return the full predicate for a query: the team leg plus what was asked.
+        """Return the full predicate for a query on *collection*.
 
-        Built **around** :meth:`_team_filter`, never instead of it — a scoped query is
-        still a team's query, and no argument can widen it past its own team. A
-        predicate left at ``None`` contributes no leg, so the default is exactly the
-        team filter this backend has always applied.
+        On a team-scoped collection this is built **around** :meth:`_team_filter`,
+        never instead of it — a scoped query is still a team's query, and no
+        argument can widen it past its own team. A predicate left at ``None``
+        contributes no leg, so the default there is exactly the team filter this
+        backend has always applied.
+
+        On a collection listed in
+        :data:`~akgentic.tool.vector_store.protocol.SHARED_COLLECTIONS` the team leg
+        is not built at all: its rows belong to a filesystem tree rather than to a
+        team, and two teams over one tree must read the same rows. The conjunction
+        is then made from the scope and path legs alone — and it is never empty,
+        because :func:`~akgentic.tool.vector_store.protocol.check_shared_scope` has
+        already made ``scope`` mandatory for such a collection at the top of
+        ``search`` and ``remove``. That guard is the guarantee, so there is no
+        defensive branch here for a predicate with no legs.
 
         Args:
+            collection: The collection being queried, which decides whether the
+                team leg is part of the predicate.
             scope: Restrict to objects carrying this ``scope``, or ``None``.
             path_prefix: Restrict to objects whose ``path`` starts with this, or ``None``.
 
@@ -645,15 +687,25 @@ class WeaviateBackend:
             The conjunction of every applicable predicate.
 
         Raises:
-            ValueError: When the backend was built without a ``team_id``.
+            ValueError: When the collection is team-scoped and the backend was
+                built without a ``team_id``. A team-less backend can therefore
+                query a shared collection and still cannot query ``planning`` —
+                which is the correct reading of ADR-046 §D2: on a shared
+                collection there is no identity to invent, because the boundary
+                is the scope.
         """
         from weaviate.classes.query import Filter
 
-        predicate = self._team_filter()
+        legs: list[FilterReturn] = []
+        if collection_is_team_scoped(collection):
+            legs.append(self._team_filter())
         if scope is not None:
-            predicate = predicate & Filter.by_property(SCOPE_PROPERTY).equal(scope)
+            legs.append(Filter.by_property(SCOPE_PROPERTY).equal(scope))
         if path_prefix is not None:
-            predicate = predicate & Filter.by_property(PATH_PROPERTY).like(f"{path_prefix}*")
+            legs.append(Filter.by_property(PATH_PROPERTY).like(f"{path_prefix}*"))
+        predicate = legs[0]
+        for leg in legs[1:]:
+            predicate = predicate & leg
         return predicate
 
     def _get_collection(self, name: str) -> weaviate.collections.Collection:

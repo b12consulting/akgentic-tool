@@ -70,10 +70,21 @@ ignored, and one carrying `collection:` silently takes the default.
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `dimension` | `int` | `1536` | Embedding dimensionality; must be the native width of a known `embedding_model`, refused at bind otherwise. |
-| `backend` | `"inmemory" \| "weaviate"` | `"inmemory"` | `weaviate` requires `akgentic-tool[weaviate]`. |
-| `tenant` | `str \| None` | `None` | Weaviate tenant id. |
+| `backend` | `str` | `default_backend()` | Any **registered** backend name — `inmemory`, `weaviate`, `qdrant`, or one a deployment registers itself. Not a closed union: the set is the registry's, so a name nobody registered fails the build rather than silently taking a branch. The two cluster backends need `akgentic-tool[weaviate]` / `[qdrant]`. |
+| `tenant` | `str \| None` | `None` | Tenant id for multi-tenancy. Native on Weaviate; a payload field on Qdrant. |
+| `params` | `dict[str, Any]` | `{}` | Backend-native settings passed through untouched. Schemaless by nature, so it is the one place `Any` is the honest type. |
 | `embedding_model` | `str` | `"text-embedding-3-small"` | The model that produces the collection's vectors. |
 | `embedding_provider` | `Literal["openai", "azure"]` | `"openai"` | The embedding API provider. |
+
+**`default_backend()` is resolved per instantiation, not at import.** It asks every registered
+backend whether the environment has provisioned it, so a card that names no backend lands wherever
+the deployment actually is.
+
+**`knowledge_graph` is a team-scoped collection**, so every search and every removal the store issues
+carries this team's id as a predicate. That is declared by collection *name* in
+`vector_store/protocol.py`, not by any field on this card — the workspace's `workspace_chunks` is the
+one collection in the package that is shared across teams, because its rows belong to a filesystem
+tree rather than to a team.
 
 ### `search_top_k` / `search_score_threshold` / `hybrid_alpha`
 

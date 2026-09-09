@@ -366,15 +366,16 @@ PlanningTool(vector_store=VectorStoreParam(backend="weaviate", tenant="team-42")
 |---|---|
 | `create_collection(name, config)` | Create or reconfigure a named collection. Called by each consumer's actor on start. |
 | `add(collection, entries)` | Write pre-embedded `VectorEntry` records. An entry with an empty vector raises `ValueError`; a backend fault raises `RetriableError` rather than being swallowed. |
-| `remove(collection, ref_ids, scope=None, path_prefix=None)` | Drop entries by reference id, narrowed by the predicates. |
-| `search(collection, query_vector, top_k, scope=None, path_prefix=None, query=None)` | Cosine search, returning a `SearchResult`. `scope` / `path_prefix` narrow within a team; pass an optional `VectorQuery` to filter, threshold, or forward backend-native params. |
+| `remove(collection, ref_ids, scope=None, path_prefix=None)` | Drop entries by reference id, narrowed by the predicates. `scope` is **required** on a collection shared across teams. |
+| `search(collection, query_vector, top_k, scope=None, path_prefix=None, query=None)` | Cosine search, returning a `SearchResult`. `scope` / `path_prefix` narrow within a team, and `scope` is **required** on a collection shared across teams; pass an optional `VectorQuery` to filter, threshold, or forward backend-native params. |
 
 `SearchResult` carries `hits: list[SearchHit]` (`ref_type`, `ref_id`, `text`, `score`, plus
-`scope` / `path` / `ordinal` when the entry set them), a `status` of `ready` / `indexing`, and
-`indexing_pending`, which is now always `0`: a write either lands on the turn it arrives or raises,
-so the store tracks no work in progress. `indexing` and `error` remain in the enum — nothing in this
-package assigns either — because a backend-level fault that invalidates a whole collection is what
-`error` is for.
+`scope` / `path` / `ordinal` when the entry set them) and a `status` of `ready` or `error`. That is
+the whole model — `indexing_pending` was removed once the store stopped tracking work in progress,
+and `CollectionStatus.indexing` with it: a write either lands on the turn it arrives or raises, so
+there is no interval left for a collection to be indexing in. `error` stays, unassigned by anything
+in this package today, because a backend-level fault that invalidates a whole collection is what it
+is for.
 
 `VectorEntry` links an embedding back to its source: `ref_type` (a free-form domain label —
 `"entity"`, `"relation"`, a planning label), `ref_id` (a UUID string), `text`, `vector`, and the
@@ -435,34 +436,66 @@ A backend built without a `team_id` still writes the property, as the empty stri
 is uniform and a sweep never has to reason about objects that predate the field or come from an
 unattributed writer.
 
-**And read back on every query.** Collection names are module constants — `knowledge_graph`,
-`planning` — so every team on a cluster shares the same two collections, and multi-tenancy is off
-unless a deployment turns it on. `team_id` is therefore also the predicate:
+**And read back on every query — but not on every collection.** Collection names are module
+constants, so every team on a cluster shares the same collections and multi-tenancy is off unless a
+deployment turns it on. Which of them the team predicate applies to is **a property the collection
+declares**, not a backend-wide invariant:
 
-| Method | Filter |
-|---|---|
-| `add` | stamps `team_id` |
-| `search` | `team_id == <backend's own>`, passed to the cluster as `filters=` so it applies **before** `limit` |
-| `remove` | `ref_id IN (...)` **AND** `team_id == <backend's own>` |
-| `delete_by_team(collection, team_id)` | `team_id == <argument>` — the backend's own is deliberately *not* anded on |
-| `list_collections()` | none; a collection name identifies no team |
+| Collection | Team-scoped? | Why |
+|---|---|---|
+| `planning`, `knowledge_graph` | **yes** | their rows belong to one team |
+| `workspace_chunks` | **no** | its rows belong to a *filesystem tree*, and two teams indexing one tree must read the same rows |
 
-`remove` needs both legs. `ref_id` alone deletes the matching object of every team on the cluster,
-and reference ids collide across teams by construction — planning ids are small integers, so
-completing task `3` would reach every team's task `3`. The team leg alone deletes the collection.
+The declaration lives in `protocol.py`, beside `check_path_prefix`, so the two cluster backends
+cannot drift apart: `SHARED_COLLECTIONS` is a frozen set of names and
+`collection_is_team_scoped(collection)` answers from it. An unregistered name is team-scoped — the
+safe answer for a collection nobody declared is the isolating one.
 
-**A backend with no `team_id` cannot query at all** — `search` and `remove` raise `ValueError`
-rather than filtering on something. Filtering on `""` would not be a safe default: `""` is a real
-value in the data, written by `add` for a team-less writer, so a query filtering on it would answer
-*as* the unattributed team — an identity the caller never claimed. There is no safe guess here, so
-the backend refuses instead of making one. `team_id=""` is refused on the same grounds.
+**It is declared by name and deliberately not by a field on `VectorStoreParam`.** Every field on that
+model is catalog-settable, so a `team_scoped: false` there would let a catalog author silently unscope
+`planning` — with no error and no log line. The set is frozen for the same reason: a registry anyone
+may add to at runtime is the same hazard in another shape.
+
+| Method | Filter on a team-scoped collection | Filter on a shared collection |
+|---|---|---|
+| `add` | stamps `team_id` | stamps `team_id` — it records *who wrote the row*, and nothing filters on it |
+| `search` | `team_id == <backend's own>`, plus `scope` / `path` legs, passed to the cluster as `filters=` so it applies **before** `limit` | the `scope` and `path` legs alone; **`scope` is mandatory** |
+| `remove` | `ref_id IN (...)` **AND** `team_id == <backend's own>` | `ref_id IN (...)` **AND** `scope == <argument>`; **`scope` is mandatory** |
+| `delete_by_team(collection, team_id)` | `team_id == <argument>` — the backend's own is deliberately *not* anded on | **refused**, before any cluster call |
+| `list_collections()` | none; a collection name identifies no team | none |
+
+`remove` needs both legs on a team-scoped collection. `ref_id` alone deletes the matching object of
+every team on the cluster, and reference ids collide across teams by construction — planning ids are
+small integers, so completing task `3` would reach every team's task `3`. The team leg alone deletes
+the collection.
+
+**Where the team predicate goes, the scope predicate becomes mandatory.** The team leg was doing two
+jobs on the workspace collection, and only one of them was wrong. It was wrong as an *ownership*
+boundary. It was incidentally right as a *blast-radius* limit: a caller who forgot `scope` read only
+its own team's chunks. Remove the predicate and that second job has no owner, so an omitted `scope`
+would read or delete every workspace on the cluster — strictly worse than the bug the team predicate
+was added to fix. `search` and `remove` therefore raise `ValueError` for a shared collection with no
+`scope`, on **all three** backends. The in-memory one has no team predicate to lose and carries the
+guard anyway: one team may hold two `WorkspaceTool` cards on two trees.
+
+**`delete_by_team` refuses a shared collection**, in both cluster backends, before any client call. On
+one, `team_id` records only who wrote the row, so a sweeper pointed at `workspace_chunks` would delete
+rows another live team is still reading, from a tree that still exists. The guard reads a module-level
+fact rather than the backend's own bookkeeping, which is why it still bites on the administrative
+backend a sweeper builds — one that has created no collection at all.
+
+**A backend with no `team_id` cannot query a team-scoped collection** — `search` and `remove` raise
+`ValueError` rather than filtering on something. Filtering on `""` would not be a safe default: `""`
+is a real value in the data, written by `add` for a team-less writer, so a query filtering on it would
+answer *as* the unattributed team — an identity the caller never claimed. There is no safe guess
+here, so the backend refuses instead of making one. `team_id=""` is refused on the same grounds.
+
+**It can, however, query a shared one**, and that follows from the same argument rather than
+weakening it: on a shared collection there is no identity to invent, because the boundary is the
+scope. So a team-less backend can search `workspace_chunks` and still cannot search `planning`.
 
 Writing without a team is still allowed, and the asymmetry is deliberate: `""` on a stored object is
 a value a sweeper can find and act on, whereas `""` in a *query* is an invented identity.
-
-A sweeper is the one script that legitimately has no `team_id`, and the example under *Reaping a
-deleted team* below builds one without: `list_collections` and `delete_by_team` are the two methods
-that carry no team predicate, so neither is affected by the rule above.
 
 In a running deployment the raise is unreachable — `VectorStoreActor` always passes
 `str(self.team_id)`, and an actor's `team_id` is a UUID defaulted at construction. It guards
@@ -479,24 +512,31 @@ administration, not vector storage — the in-memory backend has no equivalent a
 | Method | Purpose |
 |---|---|
 | `list_collections()` | Every collection name in the cluster, read from Weaviate rather than from this backend's own bookkeeping. |
-| `delete_by_team(collection, team_id)` | Delete every object in one collection stamped with `team_id`. Returns the number deleted. Raises `ValueError` if the cluster has no such collection. |
+| `delete_by_team(collection, team_id)` | Delete every object in one collection stamped with `team_id`. Returns the number deleted. Raises `ValueError` if the collection is **shared across teams**, or if the cluster has no such collection. |
 
 Both work on a backend that created nothing — which is the point, since the sweeper runs after
-the team and its actors are gone:
+the team and its actors are gone. **A sweep must skip the shared collections**, and the backend
+enforces that rather than trusting the loop to:
 
 ```python
 from akgentic.tool.vector_store import close_all
+from akgentic.tool.vector_store.protocol import collection_is_team_scoped
 from akgentic.tool.vector_store.weaviate import WeaviateBackend, _weaviate_client
 
 backend = WeaviateBackend(client=_weaviate_client(WEAVIATE_URL, WEAVIATE_API_KEY))
 try:
     for team_id in deleted_team_ids:
         for collection in backend.list_collections():
+            if not collection_is_team_scoped(collection):
+                continue  # workspace_chunks belongs to a tree, not to a team
             deleted = backend.delete_by_team(collection, team_id)
             log.info("reaped %d objects from %s for team %s", deleted, collection, team_id)
 finally:
     close_all()
 ```
+
+The `continue` is a courtesy that keeps the log honest. Dropping it does not cause damage: the call
+raises `ValueError` naming the collection before it reaches the cluster.
 
 A backend has no `close()` of its own: it does not own the connection. `close_all()` is
 process-level — it closes every client this process has cached, for every cluster — so it belongs

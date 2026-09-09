@@ -346,3 +346,176 @@ class TestRegistry:
         spec = get_backend_spec("qdrant")
         with pytest.raises(ValueError, match="qdrant_url is not configured"):
             spec.factory(BackendContext(config=MagicMock(), team_id="team-42"))
+
+
+# ---------------------------------------------------------------------------
+# The team predicate is a per-collection choice
+# ---------------------------------------------------------------------------
+
+
+def _keys(qfilter: object) -> list[str]:
+    """Return the payload keys of the conditions that were sent to the cluster."""
+    return [c.key for c in qfilter.must]  # type: ignore[attr-defined]
+
+
+class TestTheTeamLegFollowsTheCollection:
+    """Read what was *sent*: a double returns what it was told to, filter or no filter."""
+
+    def _searching_backend(
+        self, team_id: str | None = "team-42"
+    ) -> tuple[QdrantBackend, MagicMock]:
+        backend, client = _make_backend(team_id=team_id)
+        client.query_points.return_value = SimpleNamespace(points=[])
+        return backend, client
+
+    def test_a_team_scoped_search_names_the_team(self) -> None:
+        backend, client = self._searching_backend()
+        backend.create_collection("planning", VectorStoreParam())
+
+        backend.search("planning", [0.1, 0.2, 0.3], top_k=5)
+
+        assert _keys(client.query_points.call_args[1]["query_filter"]) == ["team_id"]
+
+    def test_a_shared_search_names_the_scope_and_not_the_team(self) -> None:
+        backend, client = self._searching_backend()
+        backend.create_collection("workspace_chunks", VectorStoreParam())
+
+        backend.search("workspace_chunks", [0.1, 0.2, 0.3], top_k=5, scope="u/t")
+
+        keys = _keys(client.query_points.call_args[1]["query_filter"])
+        assert keys == ["scope"]
+        assert "team_id" not in keys
+
+    def test_a_team_scoped_removal_names_the_team(self) -> None:
+        backend, client = _make_backend()
+        backend.create_collection("planning", VectorStoreParam())
+
+        backend.remove("planning", ["e1"])
+
+        keys = _keys(client.delete.call_args[1]["points_selector"].filter)
+        assert set(keys) == {"team_id", "ref_id"}
+
+    def test_a_shared_removal_names_ref_id_and_scope_and_not_the_team(self) -> None:
+        backend, client = _make_backend()
+        backend.create_collection("workspace_chunks", VectorStoreParam())
+
+        backend.remove("workspace_chunks", ["e1", "e2"], scope="u/t")
+
+        keys = _keys(client.delete.call_args[1]["points_selector"].filter)
+        assert set(keys) == {"scope", "ref_id"}
+        assert "team_id" not in keys
+
+    def test_a_shared_query_keeps_the_tenant_leg(self) -> None:
+        """Tenancy is a deployment partition, orthogonal to which team wrote a row."""
+        backend, client = self._searching_backend()
+        backend.create_collection("workspace_chunks", VectorStoreParam(tenant="acme"))
+
+        backend.search("workspace_chunks", [0.1, 0.2, 0.3], top_k=5, scope="u/t")
+
+        keys = _keys(client.query_points.call_args[1]["query_filter"])
+        assert set(keys) == {"tenant", "scope"}
+        assert "team_id" not in keys
+
+
+class TestATeamlessBackendAndTheSharedCollection:
+    """No team leg means no identity to invent, so a team-less backend may query it."""
+
+    def test_it_can_search_the_shared_collection(self) -> None:
+        backend, client = _make_backend(team_id=None)
+        client.query_points.return_value = SimpleNamespace(points=[])
+        backend.create_collection("workspace_chunks", VectorStoreParam())
+
+        backend.search("workspace_chunks", [0.1, 0.2, 0.3], top_k=5, scope="u/t")
+
+        assert _keys(client.query_points.call_args[1]["query_filter"]) == ["scope"]
+
+    def test_it_can_remove_from_the_shared_collection(self) -> None:
+        backend, client = _make_backend(team_id=None)
+        backend.create_collection("workspace_chunks", VectorStoreParam())
+
+        backend.remove("workspace_chunks", ["e1"], scope="u/t")
+
+        assert set(_keys(client.delete.call_args[1]["points_selector"].filter)) == {
+            "scope",
+            "ref_id",
+        }
+
+    def test_it_still_cannot_search_a_team_scoped_collection(self) -> None:
+        backend, client = _make_backend(team_id=None)
+        backend.create_collection("planning", VectorStoreParam())
+
+        with pytest.raises(ValueError, match="without a team_id"):
+            backend.search("planning", [0.1, 0.2, 0.3], top_k=5)
+        client.query_points.assert_not_called()
+
+    def test_it_still_cannot_remove_from_a_team_scoped_collection(self) -> None:
+        backend, client = _make_backend(team_id=None)
+        backend.create_collection("planning", VectorStoreParam())
+
+        with pytest.raises(ValueError, match="without a team_id"):
+            backend.remove("planning", ["e1"])
+        client.delete.assert_not_called()
+
+
+class TestASharedCollectionRefusesAnUnscopedQuery:
+    """Scope is the shared collection's only boundary once the team leg is gone."""
+
+    def test_search_refuses_before_reaching_the_cluster(self) -> None:
+        backend, client = _make_backend()
+        backend.create_collection("workspace_chunks", VectorStoreParam())
+
+        with pytest.raises(ValueError, match="workspace_chunks") as excinfo:
+            backend.search("workspace_chunks", [0.1, 0.2, 0.3], top_k=3)
+
+        assert "scope" in str(excinfo.value)
+        client.query_points.assert_not_called()
+
+    def test_remove_refuses_before_reaching_the_cluster(self) -> None:
+        backend, client = _make_backend()
+        backend.create_collection("workspace_chunks", VectorStoreParam())
+
+        with pytest.raises(ValueError, match="workspace_chunks"):
+            backend.remove("workspace_chunks", ["a"])
+
+        client.delete.assert_not_called()
+
+    def test_a_team_scoped_collection_is_unaffected(self) -> None:
+        backend, client = _make_backend()
+        client.query_points.return_value = SimpleNamespace(points=[])
+        backend.create_collection("planning", VectorStoreParam())
+
+        backend.search("planning", [0.1, 0.2, 0.3], top_k=3)
+
+        client.query_points.assert_called_once()
+
+
+class TestDeleteByTeamRefusesASharedCollection:
+    """A sweeper pointed at the workspace collection would reap a live team's points."""
+
+    def test_it_refuses_before_any_cluster_call(self) -> None:
+        backend, client = _make_backend()
+        client.collection_exists.return_value = True
+
+        with pytest.raises(ValueError, match="workspace_chunks"):
+            backend.delete_by_team("workspace_chunks", "team-42")
+
+        client.collection_exists.assert_not_called()
+        client.delete.assert_not_called()
+
+    def test_the_refusal_holds_on_an_administrative_backend(self) -> None:
+        """No team of its own and no collection created here — the only kind a sweeper has."""
+        backend, client = _make_backend(team_id=None)
+        client.collection_exists.return_value = True
+
+        with pytest.raises(ValueError, match="workspace_chunks"):
+            backend.delete_by_team("workspace_chunks", "team-42")
+
+        client.delete.assert_not_called()
+
+    def test_a_team_scoped_collection_is_still_reaped(self) -> None:
+        backend, client = _make_backend(team_id=None)
+        client.collection_exists.return_value = True
+
+        backend.delete_by_team("planning", "team-gone")
+
+        assert _keys(client.delete.call_args[1]["points_selector"].filter) == ["team_id"]

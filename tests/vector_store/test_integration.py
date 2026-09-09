@@ -1,8 +1,8 @@
 """Integration tests for VectorStoreActor — end-to-end lifecycle validation.
 
-Covers: full lifecycle (create/add/search/remove), INDEXING-to-READY transition,
-multiple collection independence, embed delegation, idempotent create_collection,
-remove verification, and workspace npz save/load round-trip.
+Covers: full lifecycle (create/add/search/remove), multiple collection
+independence, embed delegation, idempotent create_collection, remove
+verification, and workspace npz save/load round-trip.
 
 Pattern: Direct instantiation of VectorStoreActor (no Pykka actor system),
 same approach as test_actor.py.

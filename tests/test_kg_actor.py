@@ -684,7 +684,7 @@ def _make_mock_vs_proxy() -> MagicMock:
     proxy.remove.return_value = None
     proxy.create_collection.return_value = None
     proxy.search.return_value = VsSearchResult(
-        hits=[], status=CollectionStatus.READY, indexing_pending=0
+        hits=[], status=CollectionStatus.READY
     )
     return proxy
 
@@ -949,7 +949,6 @@ class TestVectorSearch:
                 VsSearchHit(ref_type="entity", ref_id=entity_ids[1], text="", score=0.5),
             ],
             status=CollectionStatus.READY,
-            indexing_pending=0,
         )
         result = actor.search(SearchQuery(query="engineer", top_k=2, mode="vector"))
         assert len(result.hits) == 2
@@ -1035,7 +1034,6 @@ class TestHybridSearch:
         mock_proxy.search.return_value = VsSearchResult(
             hits=[VsSearchHit(ref_type="entity", ref_id=alice_id, text="", score=0.8)],
             status=CollectionStatus.READY,
-            indexing_pending=0,
         )
         result = actor.search(SearchQuery(query="Alice", top_k=10, mode="hybrid"))
         alice_hits = [h for h in result.hits if h.ref_id == alice_id]
@@ -1054,7 +1052,6 @@ class TestHybridSearch:
                 VsSearchHit(ref_type="entity", ref_id=bob_id, text="", score=0.85),
             ],
             status=CollectionStatus.READY,
-            indexing_pending=0,
         )
         result = actor.search(SearchQuery(query="login", top_k=5, mode="hybrid"))
         ref_ids = [h.ref_id for h in result.hits]
@@ -1078,7 +1075,6 @@ class TestHybridSearch:
                 VsSearchHit(ref_type="entity", ref_id=bob_id, text="", score=0.9),
             ],
             status=CollectionStatus.READY,
-            indexing_pending=0,
         )
         result = actor.search(SearchQuery(query="login", top_k=5, mode="hybrid"))
         assert [h.ref_id for h in result.hits][0] == bob_id
@@ -1101,7 +1097,6 @@ class TestHybridSearch:
                 for eid in entity_ids
             ],
             status=CollectionStatus.READY,
-            indexing_pending=0,
         )
         result = actor.search(SearchQuery(query="desc", top_k=3, mode="hybrid"))
         assert len(result.hits) <= 3
@@ -1830,7 +1825,6 @@ class TestVectorSearchThresholdFiltering:
                 VsSearchHit(ref_type="entity", ref_id=low_id, text="", score=0.2),
             ],
             status=CollectionStatus.READY,
-            indexing_pending=0,
         )
         result = actor.search(SearchQuery(query="test", mode="vector"))
         # Default threshold is 0.3, so the 0.2-score hit should be filtered
@@ -1853,7 +1847,6 @@ class TestVectorSearchThresholdFiltering:
                 VsSearchHit(ref_type="entity", ref_id=entity_id, text="", score=0.4),
             ],
             status=CollectionStatus.READY,
-            indexing_pending=0,
         )
         # Config default is 0.3, query override is 0.5 -> should filter
         result = actor.search(
@@ -1877,7 +1870,6 @@ class TestVectorSearchThresholdFiltering:
                 VsSearchHit(ref_type="entity", ref_id=entity_id, text="", score=0.35),
             ],
             status=CollectionStatus.READY,
-            indexing_pending=0,
         )
         # Default threshold is 0.3, 0.35 >= 0.3 -> included
         result = actor.search(
@@ -1909,7 +1901,6 @@ class TestHybridSearchThresholdFiltering:
                 VsSearchHit(ref_type="entity", ref_id=bad_id, text="", score=0.1),
             ],
             status=CollectionStatus.READY,
-            indexing_pending=0,
         )
         # Threshold 0.3 (default): vector-only hits at 0.1 should be filtered
         result = actor.search(
@@ -1954,7 +1945,6 @@ class TestHybridSearchThresholdFiltering:
                 VsSearchHit(ref_type="entity", ref_id=entity_id, text="", score=0.4),
             ],
             status=CollectionStatus.READY,
-            indexing_pending=0,
         )
         # Override threshold to 0.5 -> vector-only hit at 0.4 should be filtered
         result = actor.search(

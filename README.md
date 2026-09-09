@@ -721,6 +721,12 @@ Seven ship in this package today: `#VectorStore`, `#PlanningTool`, `#KnowledgeGr
 `#SandboxActor-<scope>/<leaf>`, `#TeamActivity`, `#NotificationTool` and
 `#Workspace-<scope>/<leaf>`.
 
+**`#VectorStore` is the exception among them: it exists only for a backend that keeps its data in
+actor state.** Today that means the in-memory backend. On a cluster the rows live in the cluster,
+so there is nothing for an actor to own and none is created — each consumer holds its own backend
+object and calls it directly. Whether the actor exists at all is the backend's answer, read from the
+`persists_in_actor_state` flag on its registered spec, not a card's.
+
 **Note the two names that carry a suffix.** Five of the seven are one per *team*, and their name is
 a constant. The workspace actor and the sandbox actor are one per *workspace tree*, so their names
 are **built** from the workspace's resolved two-segment path — slash included — rather than being
@@ -1185,15 +1191,15 @@ the actor, never from a card), so `delete_by_team()` and `list_collections()` gi
 two primitives it needs to reap the vectors of a deleted team — otherwise unreachable, since
 nothing else on a Weaviate object says who produced it.
 
-Every consumer in a process reaches a cluster through **one shared client**, keyed on the connection
-it names (host, port, scheme, API key) and obtained with `get_client(url, api_key)` from
-`akgentic.tool.vector_store`; a `WeaviateBackend` takes that client and never opens or closes one of
-its own. `close_all()` closes every cached client and runs by itself at process exit — an embedder
+Every consumer in a process reaches a cluster through **one shared client**, keyed on the backend and
+the connection it names (host, port, scheme, API key) and obtained with `get_client(key, connect)`
+from `akgentic.tool.vector_store`; a cluster backend takes that client and never opens or closes one
+of its own. `close_all()` closes every cached client and runs by itself at process exit — an embedder
 or a script that wants its connections released earlier calls it once no consumer is live.
 
 **[Full reference → `src/akgentic/tool/vector_store/README.md`](src/akgentic/tool/vector_store/README.md)** —
-`VectorStoreParam` in full, the service protocol, asynchronous embedding, team-scoped cleanup, and
-multi-store setups.
+`VectorStoreParam` in full, the service protocol, per-collection team scoping, team-scoped cleanup,
+and multi-store setups.
 
 ### SearchTool
 

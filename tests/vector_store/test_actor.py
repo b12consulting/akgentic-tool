@@ -16,6 +16,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.vector_store.actor import (
@@ -552,11 +553,7 @@ class TestSearch:
         """AC7: Delegation to InMemoryBackend.search."""
         actor = _make_actor()
         backend = _mock_backend()
-        expected = SearchResult(
-            hits=[],
-            status=CollectionStatus.READY,
-            indexing_pending=0,
-        )
+        expected = SearchResult(hits=[], status=CollectionStatus.READY)
         backend.search.return_value = expected
         actor._backend = backend
 
@@ -602,7 +599,7 @@ class TestSearch:
         actor = _make_actor()
         backend = _mock_backend()
         backend.search.return_value = _SearchResultWithExtra(
-            hits=[], status=CollectionStatus.READY, indexing_pending=0
+            hits=[], status=CollectionStatus.READY
         )
         actor._backend = backend
         actor.state.collection_statuses["col1"] = CollectionStatus.READY
@@ -611,7 +608,6 @@ class TestSearch:
 
         assert result is backend.search.return_value
         assert result.status == CollectionStatus.READY
-        assert result.indexing_pending == 0
         assert isinstance(result, _SearchResultWithExtra)
         assert result.extra_field == "sentinel"
 
@@ -693,9 +689,7 @@ class TestScopePassThrough:
         """search(scope=..., path_prefix=...) reaches the backend as given."""
         actor = _make_actor()
         backend = _mock_backend()
-        backend.search.return_value = SearchResult(
-            hits=[], status=CollectionStatus.READY, indexing_pending=0
-        )
+        backend.search.return_value = SearchResult(hits=[], status=CollectionStatus.READY)
         actor._backend = backend
 
         actor.search("col1", [0.1], 5, scope="ws-1", path_prefix="docs/")
@@ -796,12 +790,47 @@ class TestCollectionStatuses:
     def test_status_in_serialised_state(self) -> None:
         """Collection statuses survive serialisation."""
         state = VectorStoreState(
-            collection_statuses={"c1": CollectionStatus.READY, "c2": CollectionStatus.INDEXING}
+            collection_statuses={"c1": CollectionStatus.READY, "c2": CollectionStatus.ERROR}
         )
         data = state.model_dump()
         restored = VectorStoreState.model_validate(data)
         assert restored.collection_statuses["c1"] == CollectionStatus.READY
-        assert restored.collection_statuses["c2"] == CollectionStatus.INDEXING
+        assert restored.collection_statuses["c2"] == CollectionStatus.ERROR
+
+    def test_a_checkpoint_carrying_indexing_no_longer_loads(self) -> None:
+        """The accepted break: deleting an enum member is a *third* persisted-record case.
+
+        Two cases were already catalogued in this package. A deleted **field** is
+        harmless — the payload's extra key is dropped by ``extra="ignore"``. A
+        deleted **class** breaks loading outright, because the serialiser resolves
+        every nested ``__model__`` tag by import.
+
+        An enum *member* is neither, and it behaves like the second.
+        ``collection_statuses`` is persisted actor state, and its key is still
+        declared — so ``extra="ignore"`` never comes into play. It is the **value**
+        that is no longer a member, and validation rejects it.
+
+        A checkpoint written before the embedding pipeline left the store, that
+        happened to catch a collection mid-index, is therefore unloadable. That
+        break is accepted in the same release only because the release already
+        breaks those records harder, and the exemption does not extend to the next
+        removal.
+        """
+        with pytest.raises(ValidationError) as excinfo:
+            VectorStoreState.model_validate(
+                {"collection_statuses": {"planning": "indexing", "kg": "ready"}}
+            )
+
+        assert "indexing" in str(excinfo.value)
+
+    def test_a_checkpoint_carrying_only_live_members_still_loads(self) -> None:
+        """The break is confined to the deleted member: everything else survives."""
+        restored = VectorStoreState.model_validate(
+            {"collection_statuses": {"planning": "ready", "kg": "error"}}
+        )
+
+        assert restored.collection_statuses["planning"] == CollectionStatus.READY
+        assert restored.collection_statuses["kg"] == CollectionStatus.ERROR
 
 
 # ---------------------------------------------------------------------------
@@ -960,7 +989,7 @@ class TestWeaviateRouting:
         """search() for a weaviate collection routes to WeaviateBackend."""
         actor = _make_actor()
         mock_wb = MagicMock()
-        expected = SearchResult(hits=[], status=CollectionStatus.READY, indexing_pending=0)
+        expected = SearchResult(hits=[], status=CollectionStatus.READY)
         mock_wb.search.return_value = expected
         actor._weaviate_backend = mock_wb
         actor.state.collection_configs["wv_col"] = {"backend": "weaviate"}
@@ -1119,7 +1148,7 @@ class TestQueryPassthrough:
         """No query still routes through the scoped call with ``query=None``."""
         actor = _make_actor()
         backend = _mock_backend()
-        expected = SearchResult(hits=[], status=CollectionStatus.READY, indexing_pending=0)
+        expected = SearchResult(hits=[], status=CollectionStatus.READY)
         backend.search.return_value = expected
         actor._backend = backend
 
@@ -1134,9 +1163,7 @@ class TestQueryPassthrough:
 
         actor = _make_actor()
         backend = _mock_backend()
-        backend.search.return_value = SearchResult(
-            hits=[], status=CollectionStatus.READY, indexing_pending=0
-        )
+        backend.search.return_value = SearchResult(hits=[], status=CollectionStatus.READY)
         actor._backend = backend
         query = VectorQuery(filters={"ref_type": "entity"})
 

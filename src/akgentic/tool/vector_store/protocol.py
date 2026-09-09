@@ -77,21 +77,27 @@ def default_backend() -> str:
 class CollectionStatus(StrEnum):
     """Lifecycle state of a vector collection.
 
-    **Nothing in this package assigns ``INDEXING`` or ``ERROR`` any more.** Both are
-    always-default members today: a collection is created ``READY`` and stays there,
-    the three backends return ``READY``, and the actor overrides nothing. ``INDEXING``
-    used to be derived from the store's open embedding requests, which no longer
-    exist — a write either lands on the turn it arrives or raises — and progress is
-    now tracked by the consumer that owns the file, not by the collection.
+    **``INDEXING`` is gone and ``ERROR`` stays, and the asymmetry has a reason.**
+    ``INDEXING`` used to be derived from the store's open embedding requests. Those
+    no longer exist — after the embedding pipeline left the store, a write either
+    lands on the turn it arrives or raises — so there is no interval left for a
+    collection to be "indexing" in, and the member could not regain a meaning.
+    ``ERROR`` is unassigned today but retains one: a backend-level fault that really
+    does invalidate a whole collection is what it is for.
 
-    They remain on the enum because three backends and the consumer-facing docs name
-    them, and because a backend-level fault that really does invalidate a whole
-    collection is what ``ERROR`` is for. Whether to delete them is a decision the
-    epic routes to ADR-049.
+    Deleting an enum *member* is a **third** persisted-record case, distinct from the
+    two this package has catalogued (a deleted field is dropped by ``extra="ignore"``;
+    a deleted class breaks the ``__model__`` tag resolution outright).
+    ``VectorStoreState.collection_statuses`` is persisted actor state, so a
+    checkpoint written before the pipeline moved that caught a collection mid-index
+    carries ``{"planning": "indexing"}`` and is now rejected on the **value** —
+    the key is still declared, so ``extra="ignore"`` cannot help. That break is
+    accepted in ADR-049 *Migration* on the ground that the same release already
+    breaks those records harder, and the exemption does not extend to the next
+    removal.
     """
 
     READY = "ready"
-    INDEXING = "indexing"
     ERROR = "error"
 
 
@@ -338,6 +344,97 @@ def check_path_prefix(path_prefix: str | None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-collection scoping — one declaration, both cluster backends
+# ---------------------------------------------------------------------------
+
+SHARED_COLLECTIONS: Final[frozenset[str]] = frozenset({"workspace_chunks"})
+"""Collections whose rows are read by every team that indexes the same tree.
+
+A workspace collection holds the chunks of a *filesystem path*, not of a team, so
+two teams pointed at one tree must see the same rows. Every other collection in
+this package — ``planning``, ``knowledge_graph`` — holds rows that belong to one
+team and keeps its team predicate.
+
+**The declaration is by name, and it lives here rather than on a model, on a
+constructor or in per-instance state.** Three alternatives were weighed:
+
+- **A field on ``VectorStoreParam``** is catalog-settable, so an author could write
+  ``team_scoped: false`` on ``id_planning`` and silently reproduce the
+  cross-tenant destruction that ADR-046 exists to prevent, with no error and no
+  log line.
+- **A keyword on ``create_collection``, kept per instance**, is vacuous exactly
+  where it is needed: a sweeper builds an administrative backend that has created
+  no collection, so its per-instance map is empty when
+  :meth:`delete_by_team`'s guard has to bite.
+- **A flag on the backend constructor or ``BackendContext``** puts the declaration
+  on the *wiring* rather than on the collection, and one backend instance serves
+  several collections on the actor's backstop path.
+
+The one cost is a duplicated string: ``RAG_COLLECTION`` is declared in the
+workspace package, which ``vector_store`` may not import. A spec in
+``tests/vector_store/test_protocol.py`` imports that constant and asserts
+membership, so renaming it reddens a test rather than silently un-sharing the
+collection.
+
+Deliberately a ``frozenset`` and deliberately not extensible at runtime: a
+mutable registry anyone may add to is the catalog hazard in another shape, plus
+an import-order trap for a bare sweeper script that imports no consumer. A
+third-party shared collection, if ever needed, wants a ``BackendSpec``-style
+registration with the same fail-loud discipline (ADR-049 open item).
+"""
+
+SHARED_SCOPE_REQUIRED: Final[str] = (
+    "Collection '{collection}' is shared across teams, so a scope is the only boundary it "
+    "has. Pass scope= to search or remove."
+)
+"""The one sentence an unscoped query against a shared collection is refused with."""
+
+
+def collection_is_team_scoped(collection: str) -> bool:
+    """Whether reads and removals on *collection* filter on the caller's own team.
+
+    Consulted by both cluster backends when they build a query predicate and when
+    they refuse a team-wide deletion. An unregistered name is team-scoped: the
+    safe answer for a collection nobody declared is the isolating one.
+
+    Args:
+        collection: The collection name a query or a removal names.
+
+    Returns:
+        ``True`` unless *collection* is listed in :data:`SHARED_COLLECTIONS`.
+    """
+    return collection not in SHARED_COLLECTIONS
+
+
+def check_shared_scope(collection: str, scope: str | None) -> None:
+    """Raise when a shared collection is queried or modified without a scope.
+
+    **The boundary moves; it does not disappear.** ADR-046 §D1 rejected a
+    ``team_id`` argument on the protocol on the ground that "a boundary a caller
+    can omit is a boundary that will be omitted". Dropping the team leg from a
+    shared collection leaves ``scope`` as its only boundary, and ``scope`` is an
+    optional argument — so an omitted one would read or delete every workspace's
+    chunks on the cluster, a strictly worse version of the bug ADR-046 fixed.
+    Making it mandatory here gives that job an owner.
+
+    Called at the top of ``search()`` and ``remove()`` on **all three** backends,
+    on the line after :func:`check_path_prefix`. In memory there is no team
+    predicate to lose, but one team may hold two ``WorkspaceTool`` cards on two
+    trees, so an unscoped query crosses a boundary there as well — and putting it
+    on all three is what lets the suite exercise the rule without a cluster.
+
+    Args:
+        collection: The collection being queried or modified.
+        scope: The partition the caller named, or ``None``.
+
+    Raises:
+        ValueError: When *collection* is shared and *scope* is ``None``.
+    """
+    if scope is None and not collection_is_team_scoped(collection):
+        raise ValueError(SHARED_SCOPE_REQUIRED.format(collection=collection))
+
+
+# ---------------------------------------------------------------------------
 # SearchHit
 # ---------------------------------------------------------------------------
 
@@ -415,9 +512,6 @@ class SearchResult(SerializableBaseModel):
 
     hits: list[SearchHit] = Field(description="Ranked search results")
     status: CollectionStatus = Field(description="Current collection lifecycle state")
-    indexing_pending: int = Field(
-        default=0, ge=0, description="Number of entries still being indexed"
-    )
 
 
 # ---------------------------------------------------------------------------

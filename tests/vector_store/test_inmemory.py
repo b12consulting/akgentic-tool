@@ -145,7 +145,6 @@ class TestSearch:
         assert hit.text == "hello"
         assert isinstance(hit.score, float)
         assert result.status == CollectionStatus.READY
-        assert result.indexing_pending == 0
 
     def test_ranked_by_cosine_similarity(
         self, backend: InMemoryBackend, config: VectorStoreParam
@@ -554,3 +553,70 @@ class TestPathPrefixWildcardsAreRefused:
     ) -> None:
         """The guard refuses two characters and nothing else, including the empty one."""
         assert one_doc.search("ws", [1.0, 0.0], top_k=10, path_prefix=prefix).hits
+
+
+# ---------------------------------------------------------------------------
+# The shared collection needs a scope here too
+# ---------------------------------------------------------------------------
+
+
+class TestASharedCollectionRefusesAnUnscopedQuery:
+    """This backend has no team predicate to lose, and still carries the guard.
+
+    One team may hold two ``WorkspaceTool`` cards on two trees, so an unscoped
+    query crosses a boundary here as well. Putting the rule on all three backends
+    is also what lets the suite exercise it without a cluster.
+    """
+
+    @pytest.fixture()
+    def shared(self, config: VectorStoreParam) -> InMemoryBackend:
+        """A backend holding the shared workspace collection with one entry in it."""
+        store = InMemoryBackend()
+        store.create_collection("workspace_chunks", config)
+        store.add(
+            "workspace_chunks",
+            [
+                VectorEntry(
+                    ref_type="chunk",
+                    ref_id="c1",
+                    text="hello",
+                    vector=[1.0, 0.0],
+                    scope="u/t",
+                    path="docs/one.md",
+                )
+            ],
+        )
+        return store
+
+    def test_search_without_a_scope_is_refused(self, shared: InMemoryBackend) -> None:
+        with pytest.raises(ValueError, match="workspace_chunks") as excinfo:
+            shared.search("workspace_chunks", [1.0, 0.0], top_k=3)
+
+        assert "scope" in str(excinfo.value)
+
+    def test_remove_without_a_scope_is_refused(self, shared: InMemoryBackend) -> None:
+        with pytest.raises(ValueError, match="workspace_chunks"):
+            shared.remove("workspace_chunks", ["c1"])
+
+    def test_the_entry_survives_the_refused_removal(self, shared: InMemoryBackend) -> None:
+        """The guard runs before anything is touched, so nothing was half-deleted."""
+        with pytest.raises(ValueError):
+            shared.remove("workspace_chunks", ["c1"])
+
+        assert shared.search("workspace_chunks", [1.0, 0.0], top_k=3, scope="u/t").hits
+
+    def test_a_scoped_search_works(self, shared: InMemoryBackend) -> None:
+        hits = shared.search("workspace_chunks", [1.0, 0.0], top_k=3, scope="u/t").hits
+        assert [hit.ref_id for hit in hits] == ["c1"]
+
+    def test_a_scoped_removal_works(self, shared: InMemoryBackend) -> None:
+        shared.remove("workspace_chunks", ["c1"], scope="u/t")
+        assert shared.search("workspace_chunks", [1.0, 0.0], top_k=3, scope="u/t").hits == []
+
+    def test_a_team_scoped_collection_needs_no_scope(
+        self, backend: InMemoryBackend, config: VectorStoreParam
+    ) -> None:
+        """``planning`` is unaffected: an unscoped query there is still bounded."""
+        backend.create_collection("planning", config)
+        assert backend.search("planning", [1.0, 0.0], top_k=3).hits == []
+        backend.remove("planning", ["nothing"])  # does not raise

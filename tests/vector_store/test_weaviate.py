@@ -1585,3 +1585,268 @@ class TestCollectionHandleCache:
 
         assert mock_client.collections.get.call_count == 2
         assert first._collection_handles is not second._collection_handles
+
+
+# ---------------------------------------------------------------------------
+# The team predicate is a per-collection choice
+# ---------------------------------------------------------------------------
+
+
+def _backend_with(
+    mock_client: MagicMock, *collections: str, team_id: str | None = "team-42"
+) -> Any:
+    """Build a backend that has created each named collection.
+
+    ``team_id=None`` builds the team-less kind — a hand-written script, or the
+    administrative backend a sweeper uses.
+    """
+    from akgentic.tool.vector_store.protocol import VectorStoreParam
+    from akgentic.tool.vector_store.weaviate import WeaviateBackend
+
+    backend = WeaviateBackend(client=mock_client, team_id=team_id)
+    for name in collections:
+        backend.create_collection(name, VectorStoreParam())
+    return backend
+
+
+def _empty_query_client() -> tuple[MagicMock, MagicMock]:
+    """Return (client, collection) whose ``near_vector`` yields no objects."""
+    _mock_weaviate, mock_client = _install_mock_weaviate()
+    mock_client.collections.exists.return_value = False
+    mock_collection = MagicMock()
+    mock_client.collections.get.return_value = mock_collection
+    mock_collection.query.near_vector.return_value = MagicMock(objects=[])
+    return mock_client, mock_collection
+
+
+class TestTheTeamLegFollowsTheCollection:
+    """What was *sent* to the cluster, never what a double chose to return.
+
+    A double returns whatever it was told to return, filter or no filter, so a
+    search that yields no foreign hits proves nothing. Every spec here reads the
+    recorded conjunction off the call.
+    """
+
+    def test_a_team_scoped_search_names_the_team(self) -> None:
+        client, collection = _empty_query_client()
+        backend = _backend_with(client, "planning")
+
+        backend.search("planning", [0.1, 0.2], top_k=5)
+
+        sent = collection.query.near_vector.call_args[1]["filters"]
+        assert _legs(sent) == [("team_id", "equal", "team-42")]
+
+    def test_a_shared_search_names_the_scope_and_not_the_team(self) -> None:
+        """Two teams over one tree must read the same rows, so no team leg is built."""
+        client, collection = _empty_query_client()
+        backend = _backend_with(client, "workspace_chunks")
+
+        backend.search("workspace_chunks", [0.1, 0.2], top_k=5, scope="u/t")
+
+        sent = collection.query.near_vector.call_args[1]["filters"]
+        assert _legs(sent) == [("scope", "equal", "u/t")]
+        assert not any(leg[0] == "team_id" for leg in _legs(sent))
+
+    def test_a_shared_search_still_conjoins_a_path_prefix(self) -> None:
+        client, collection = _empty_query_client()
+        backend = _backend_with(client, "workspace_chunks")
+
+        backend.search("workspace_chunks", [0.1], top_k=5, scope="u/t", path_prefix="docs/")
+
+        assert _legs(collection.query.near_vector.call_args[1]["filters"]) == [
+            ("scope", "equal", "u/t"),
+            ("path", "like", "docs/*"),
+        ]
+
+    def test_a_team_scoped_removal_names_the_team(self) -> None:
+        _mock_weaviate, client = _install_mock_weaviate()
+        client.collections.exists.return_value = False
+        collection = MagicMock()
+        client.collections.get.return_value = collection
+        backend = _backend_with(client, "planning")
+
+        backend.remove("planning", ["r1"])
+
+        assert _legs(collection.data.delete_many.call_args[1]["where"]) == [
+            ("ref_id", "contains_any", ["r1"]),
+            ("team_id", "equal", "team-42"),
+        ]
+
+    def test_a_shared_removal_names_ref_id_and_scope_and_not_the_team(self) -> None:
+        """The ref-id leg is still required: ids collide across scopes."""
+        _mock_weaviate, client = _install_mock_weaviate()
+        client.collections.exists.return_value = False
+        collection = MagicMock()
+        client.collections.get.return_value = collection
+        backend = _backend_with(client, "workspace_chunks")
+
+        backend.remove("workspace_chunks", ["r1", "r2"], scope="u/t")
+
+        legs = _legs(collection.data.delete_many.call_args[1]["where"])
+        assert legs == [
+            ("ref_id", "contains_any", ["r1", "r2"]),
+            ("scope", "equal", "u/t"),
+        ]
+        assert not any(leg[0] == "team_id" for leg in legs)
+
+
+class TestATeamlessBackendAndTheSharedCollection:
+    """A backend that does not know its team can query the shared collection only.
+
+    On a shared collection there is no identity to invent, because the boundary is
+    the scope — so ``_team_filter``'s refusal is simply never reached. On a
+    team-scoped one it still bites, unchanged.
+    """
+
+    def test_it_can_search_the_shared_collection(self) -> None:
+        client, collection = _empty_query_client()
+        backend = _backend_with(client, "workspace_chunks", team_id=None)
+
+        backend.search("workspace_chunks", [0.1], top_k=5, scope="u/t")
+
+        assert _legs(collection.query.near_vector.call_args[1]["filters"]) == [
+            ("scope", "equal", "u/t")
+        ]
+
+    def test_it_can_remove_from_the_shared_collection(self) -> None:
+        _mock_weaviate, client = _install_mock_weaviate()
+        client.collections.exists.return_value = False
+        collection = MagicMock()
+        client.collections.get.return_value = collection
+        backend = _backend_with(client, "workspace_chunks", team_id=None)
+
+        backend.remove("workspace_chunks", ["r1"], scope="u/t")
+
+        assert _legs(collection.data.delete_many.call_args[1]["where"]) == [
+            ("ref_id", "contains_any", ["r1"]),
+            ("scope", "equal", "u/t"),
+        ]
+
+    def test_it_still_cannot_search_a_team_scoped_collection(self) -> None:
+        client, collection = _empty_query_client()
+        backend = _backend_with(client, "planning", team_id=None)
+
+        with pytest.raises(ValueError, match="without a team_id"):
+            backend.search("planning", [0.1], top_k=5)
+        collection.query.near_vector.assert_not_called()
+
+    def test_it_still_cannot_remove_from_a_team_scoped_collection(self) -> None:
+        _mock_weaviate, client = _install_mock_weaviate()
+        client.collections.exists.return_value = False
+        collection = MagicMock()
+        client.collections.get.return_value = collection
+        backend = _backend_with(client, "planning", team_id=None)
+
+        with pytest.raises(ValueError, match="without a team_id"):
+            backend.remove("planning", ["r1"])
+        collection.data.delete_many.assert_not_called()
+
+
+class TestASharedCollectionRefusesAnUnscopedQuery:
+    """Scope is the shared collection's only boundary, so it is mandatory.
+
+    A caller that forgets it would otherwise read or delete every workspace's
+    chunks on the cluster — a strictly worse version of the bug the team predicate
+    was added to fix.
+    """
+
+    def test_search_refuses_before_reaching_the_cluster(self) -> None:
+        client, collection = _empty_query_client()
+        backend = _backend_with(client, "workspace_chunks")
+
+        with pytest.raises(ValueError, match="workspace_chunks") as excinfo:
+            backend.search("workspace_chunks", [0.1], top_k=3)
+
+        assert "scope" in str(excinfo.value)
+        collection.query.near_vector.assert_not_called()
+
+    def test_remove_refuses_before_reaching_the_cluster(self) -> None:
+        _mock_weaviate, client = _install_mock_weaviate()
+        client.collections.exists.return_value = False
+        collection = MagicMock()
+        client.collections.get.return_value = collection
+        backend = _backend_with(client, "workspace_chunks")
+
+        with pytest.raises(ValueError, match="workspace_chunks"):
+            backend.remove("workspace_chunks", ["a"])
+
+        collection.data.delete_many.assert_not_called()
+
+    def test_a_team_scoped_collection_is_unaffected(self) -> None:
+        """It keeps its team predicate, so an unscoped query is still a bounded one."""
+        client, collection = _empty_query_client()
+        backend = _backend_with(client, "planning")
+
+        backend.search("planning", [0.1], top_k=3)
+
+        collection.query.near_vector.assert_called_once()
+
+
+class TestDeleteByTeamRefusesASharedCollection:
+    """A sweeper pointed at the workspace collection would reap a live team's rows."""
+
+    def test_it_refuses_before_any_cluster_call(self) -> None:
+        _mock_weaviate, client = _install_mock_weaviate()
+        client.collections.exists.return_value = True
+        collection = MagicMock()
+        client.collections.get.return_value = collection
+
+        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+
+        backend = WeaviateBackend(client=client, team_id="team-42")
+
+        with pytest.raises(ValueError, match="workspace_chunks"):
+            backend.delete_by_team("workspace_chunks", "team-42")
+
+        client.collections.exists.assert_not_called()
+        collection.data.delete_many.assert_not_called()
+
+    def test_the_refusal_holds_on_an_administrative_backend(self) -> None:
+        """The only kind a sweeper has: no team of its own, no collection created here.
+
+        The guard consults a module-level fact rather than per-instance state, which
+        is precisely why it is not vacuous on this backend.
+        """
+        _mock_weaviate, client = _install_mock_weaviate()
+        client.collections.exists.return_value = True
+        collection = MagicMock()
+        client.collections.get.return_value = collection
+
+        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+
+        backend = WeaviateBackend(client=client)  # no team_id, nothing created
+
+        with pytest.raises(ValueError, match="workspace_chunks"):
+            backend.delete_by_team("workspace_chunks", "team-42")
+
+        collection.data.delete_many.assert_not_called()
+
+    def test_a_team_scoped_collection_is_still_reaped(self) -> None:
+        _mock_weaviate, client = _install_mock_weaviate()
+        client.collections.exists.return_value = True
+        collection = MagicMock()
+        collection.data.delete_many.return_value = MagicMock(successful=4)
+        client.collections.get.return_value = collection
+
+        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+
+        backend = WeaviateBackend(client=client)
+
+        assert backend.delete_by_team("planning", "team-42") == 4
+        assert _legs(collection.data.delete_many.call_args[1]["where"]) == [
+            ("team_id", "equal", "team-42")
+        ]
+
+    def test_list_collections_is_untouched_and_lists_the_shared_one(self) -> None:
+        """A collection name identifies no team, so enumeration needs no scoping."""
+        _mock_weaviate, client = _install_mock_weaviate()
+        client.collections.list_all.return_value = {
+            "planning": object(),
+            "workspace_chunks": object(),
+        }
+
+        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+
+        backend = WeaviateBackend(client=client)  # no team_id
+
+        assert sorted(backend.list_collections()) == ["planning", "workspace_chunks"]

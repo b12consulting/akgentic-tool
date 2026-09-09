@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from akgentic.tool.core.params import BaseToolParam
 from akgentic.tool.vector_store.protocol import (
     EMBEDDING_DIMENSIONS,
+    SHARED_COLLECTIONS,
     CollectionStatus,
     EmbeddingProvider,
     SearchHit,
@@ -15,6 +16,8 @@ from akgentic.tool.vector_store.protocol import (
     VectorStoreConfig,
     VectorStoreParam,
     VectorStoreService,
+    check_shared_scope,
+    collection_is_team_scoped,
     require_dimension_matches,
 )
 
@@ -26,16 +29,12 @@ from akgentic.tool.vector_store.protocol import (
 class TestCollectionStatus:
     """Tests for CollectionStatus StrEnum."""
 
-    def test_has_exactly_three_values(self) -> None:
-        assert len(CollectionStatus) == 3
+    def test_has_exactly_two_values(self) -> None:
+        assert len(CollectionStatus) == 2
 
     def test_ready_value(self) -> None:
         assert CollectionStatus.READY == "ready"
         assert str(CollectionStatus.READY) == "ready"
-
-    def test_indexing_value(self) -> None:
-        assert CollectionStatus.INDEXING == "indexing"
-        assert str(CollectionStatus.INDEXING) == "indexing"
 
     def test_error_value(self) -> None:
         assert CollectionStatus.ERROR == "error"
@@ -43,7 +42,19 @@ class TestCollectionStatus:
 
     def test_values_list(self) -> None:
         values = {s.value for s in CollectionStatus}
-        assert values == {"ready", "indexing", "error"}
+        assert values == {"ready", "error"}
+
+    def test_indexing_is_gone_and_error_survives(self) -> None:
+        """The member nothing could assign again is deleted; the one with a meaning stays.
+
+        ``INDEXING`` was derived from the store's open embedding requests. Those no
+        longer exist, so there is no interval left for a collection to be indexing
+        in. ``ERROR`` is unassigned today but still means a backend-level fault that
+        invalidates a whole collection.
+        """
+        assert "INDEXING" not in CollectionStatus.__members__
+        assert "ERROR" in CollectionStatus.__members__
+        assert list(CollectionStatus) == [CollectionStatus.READY, CollectionStatus.ERROR]
 
 
 # ---------------------------------------------------------------------------
@@ -263,29 +274,33 @@ class TestSearchResult:
 
     def test_construction_with_hits(self) -> None:
         hit = SearchHit(ref_type="entity", ref_id="id-1", text="some text", score=0.9)
-        result = SearchResult(
-            hits=[hit], status=CollectionStatus.READY, indexing_pending=5
-        )
+        result = SearchResult(hits=[hit], status=CollectionStatus.READY)
         assert len(result.hits) == 1
         assert result.status == CollectionStatus.READY
-        assert result.indexing_pending == 5
-
-    def test_default_indexing_pending(self) -> None:
-        result = SearchResult(hits=[], status=CollectionStatus.READY)
-        assert result.indexing_pending == 0
 
     def test_round_trip_serialization(self) -> None:
         hit = SearchHit(ref_type="relation", ref_id="r-1", text="related", score=0.85)
-        result = SearchResult(
-            hits=[hit], status=CollectionStatus.INDEXING, indexing_pending=3
-        )
+        result = SearchResult(hits=[hit], status=CollectionStatus.READY)
         data = result.model_dump()
         restored = SearchResult.model_validate(data)
         assert restored == result
 
-    def test_indexing_pending_rejects_negative(self) -> None:
-        with pytest.raises(ValidationError):
-            SearchResult(hits=[], status=CollectionStatus.READY, indexing_pending=-1)
+    def test_indexing_pending_is_gone_from_the_schema(self) -> None:
+        """The field nothing assigns any more is off the model."""
+        assert "indexing_pending" not in SearchResult.model_fields
+
+    def test_a_payload_still_carrying_the_key_validates(self) -> None:
+        """The benign field case: a stored payload drops the key rather than failing.
+
+        ``SearchResult`` is a return value, not a persisted model, so this matters
+        only for a caller that kept one on disk. Pydantic's default ``extra="ignore"``
+        drops the key and the attribute is simply absent.
+        """
+        restored = SearchResult.model_validate(
+            {"hits": [], "status": "ready", "indexing_pending": 7}
+        )
+        assert restored.status == CollectionStatus.READY
+        assert not hasattr(restored, "indexing_pending")
 
     def test_empty_hits_with_error_status(self) -> None:
         result = SearchResult(hits=[], status=CollectionStatus.ERROR)
@@ -410,3 +425,86 @@ class TestVectorStoreService:
         result = store.search("test", [0.1, 0.2], top_k=5)
         assert result.hits == []
         assert result.status == CollectionStatus.READY
+
+
+# ---------------------------------------------------------------------------
+# Per-collection scoping: the declaration, and the guard that replaces the boundary
+# ---------------------------------------------------------------------------
+
+
+class TestCollectionIsTeamScoped:
+    """A collection declares its scoping by name, and the default is isolation."""
+
+    def test_the_workspace_collection_is_shared(self) -> None:
+        """Two teams over one filesystem tree must read the same rows."""
+        assert collection_is_team_scoped("workspace_chunks") is False
+
+    @pytest.mark.parametrize("collection", ["planning", "knowledge_graph"])
+    def test_the_per_team_collections_stay_scoped(self, collection: str) -> None:
+        """Rows that belong to one team keep the predicate that isolates them."""
+        assert collection_is_team_scoped(collection) is True
+
+    def test_an_unregistered_name_is_team_scoped(self) -> None:
+        """The safe answer for a collection nobody declared is the isolating one."""
+        assert collection_is_team_scoped("a_collection_nobody_declared") is True
+
+    def test_the_declaration_is_a_frozenset(self) -> None:
+        """Nothing can add to it at runtime — a mutable global is the catalog hazard again."""
+        assert isinstance(SHARED_COLLECTIONS, frozenset)
+        with pytest.raises(AttributeError):
+            SHARED_COLLECTIONS.add("planning")  # type: ignore[attr-defined]
+
+    def test_it_holds_exactly_the_workspace_collection(self) -> None:
+        assert SHARED_COLLECTIONS == frozenset({"workspace_chunks"})
+
+
+class TestTheDeclarationCannotDriftFromTheConstantsItNames:
+    """The one cost of naming collections by string, closed by a spec rather than a comment.
+
+    ``vector_store`` may not import from ``workspace``, ``planning`` or
+    ``knowledge_graph``, so the shared-collection name is duplicated here. These
+    specs make a rename of any of those constants redden a test instead of
+    silently un-sharing — or silently un-isolating — a collection.
+    """
+
+    def test_the_workspace_rag_collection_is_the_shared_one(self) -> None:
+        from akgentic.tool.workspace import RAG_COLLECTION
+
+        assert collection_is_team_scoped(RAG_COLLECTION) is False
+        assert RAG_COLLECTION in SHARED_COLLECTIONS
+
+    def test_the_planning_collection_is_team_scoped(self) -> None:
+        from akgentic.tool.planning.planning_actor import PLAN_COLLECTION
+
+        assert collection_is_team_scoped(PLAN_COLLECTION) is True
+
+    def test_the_knowledge_graph_collection_is_team_scoped(self) -> None:
+        from akgentic.tool.knowledge_graph.kg_actor import KG_COLLECTION
+
+        assert collection_is_team_scoped(KG_COLLECTION) is True
+
+
+class TestCheckSharedScope:
+    """The boundary moves rather than disappearing: a shared collection needs a scope."""
+
+    def test_a_shared_collection_without_a_scope_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="workspace_chunks") as excinfo:
+            check_shared_scope("workspace_chunks", None)
+
+        assert "scope" in str(excinfo.value)
+
+    def test_a_shared_collection_with_a_scope_passes(self) -> None:
+        check_shared_scope("workspace_chunks", "user/tree")  # does not raise
+
+    def test_an_empty_scope_is_a_scope(self) -> None:
+        """Only ``None`` is the omission this guard exists for.
+
+        ``""`` is a value the caller chose, not a value it forgot; treating it as
+        missing would invent a rule the workspace's own path semantics do not have.
+        """
+        check_shared_scope("workspace_chunks", "")  # does not raise
+
+    @pytest.mark.parametrize("collection", ["planning", "knowledge_graph"])
+    def test_a_team_scoped_collection_needs_no_scope(self, collection: str) -> None:
+        """Those collections still have their team predicate, so nothing changes for them."""
+        check_shared_scope(collection, None)  # does not raise

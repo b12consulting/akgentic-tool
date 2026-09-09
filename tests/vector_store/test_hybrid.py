@@ -109,7 +109,7 @@ def _proxy(hits: list[SearchHit]) -> MagicMock:
     """
     proxy = MagicMock()
     proxy.search.return_value = SearchResult(
-        hits=hits, status=CollectionStatus.READY, indexing_pending=0
+        hits=hits, status=CollectionStatus.READY
     )
     return proxy
 

@@ -35,9 +35,11 @@ The workspace does **not** need `git`. It does not need a sandbox backend. It do
 vector store. With none of them, the gate still refuses every stale write, because the gate hashes
 the file rather than consulting a record of who wrote it.
 
-Retrieval degrades further **within** itself: with the capability on and no `#VectorStore` reachable,
-every retrieval callable answers one sentence rather than raising, and a search whose embedding call
-fails falls back to its keyword leg. That is deliberate rather than defensive — this actor owns the
+Retrieval degrades further **within** itself: with the capability on and no store reachable, every
+retrieval callable answers one sentence rather than raising, and a search whose embedding call fails
+falls back to its keyword leg. ("No store reachable" means the backend this card's `vector_store`
+names could not be built — on the in-memory backend that is the `#VectorStore` actor, and on a
+cluster backend there is no actor at all, only a client that failed to connect.) That is deliberate rather than defensive — this actor owns the
 write gate, and a misconfigured vector store must not be a way to take the gate down with it.
 
 ---
@@ -693,7 +695,20 @@ loss. `stale` means the tree changed underneath an indexed file.
 
 Two legs, combined by the fusion rule the whole package shares: a scoped similarity search against
 `workspace_chunks`, and a case-insensitive term match over the extraction bodies the actor already
-holds. Each hit renders its path, its heading path, a score label — `(hybrid: 0.90)`,
+holds.
+
+**`workspace_chunks` is shared across teams, and the `scope` is what bounds it.** The collection's
+rows belong to a *filesystem tree*, not to a team, so on a cluster two teams pointed at one tree read
+the same rows — which is the point, since it is the same file in the same tree. `planning` and
+`knowledge_graph` keep their per-team predicate; this one does not have it, and instead the store
+**requires** a `scope` on every search and every removal against it. This actor always passes its
+resolved `workspace_path`, so the requirement is invisible here; it exists so that a caller written
+later cannot omit the collection's only remaining boundary.
+
+One consequence to weigh deliberately rather than meet as a surprise: two teams indexing one tree
+produce identical chunk ids for identical content, so team A re-indexing a file removes the rows team
+B also reads. That is correct — it is the same file in the same tree — but it means a re-index is
+visible across teams. Each hit renders its path, its heading path, a score label — `(hybrid: 0.90)`,
 `(semantic: 0.85)` or `(keyword match)` — and the chunk's text.
 
 **A hit's text comes from the vector store, not from the cache**, which is what keeps a file whose
@@ -993,8 +1008,10 @@ WorkspaceTool(workspace_read=WorkspaceRead(document_reader=DocumentReader(llm_cl
 WorkspaceTool(workspace_view=WorkspaceView(max_dimension=0))
 
 # Retrieval over a document corpus at <user_id>/corpus — reachable by this
-# principal's other teams, and by nobody else's. Needs a #VectorStore on the team;
-# without one every retrieval callable answers a sentence and nothing raises.
+# principal's other teams, and by nobody else's. The card's own vector_store
+# decides where the chunks live and whether a store actor is created at all;
+# if that store cannot be built, every retrieval callable answers a sentence
+# and nothing raises.
 WorkspaceTool(
     workspace_id="corpus",
     read_only=True,
