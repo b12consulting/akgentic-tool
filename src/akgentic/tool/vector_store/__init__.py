@@ -9,17 +9,17 @@ from __future__ import annotations
 from akgentic.tool.vector_store.actor import (
     VS_ACTOR_NAME,
     VS_ACTOR_ROLE,
-    PendingRequest,
     VectorStoreActor,
     VectorStoreState,
 )
 from akgentic.tool.vector_store.client import ClusterKey, close_all, get_client
 from akgentic.tool.vector_store.embedding_actor import (
-    EmbeddingActor,
-    EmbeddingCompleted,
     EmbeddingError,
     EmbeddingRequest,
     EmbeddingResult,
+    EmbeddingWorker,
+    build_embedding_service,
+    embedding_worker_name,
 )
 from akgentic.tool.vector_store.inmemory import InMemoryBackend
 
@@ -81,15 +81,13 @@ __all__ = [
     "BackendSpec",
     "ClusterKey",
     "CollectionStatus",
-    "EmbeddingActor",
-    "EmbeddingCompleted",
     "EmbeddingError",
     "EmbeddingProvider",
     "EmbeddingRequest",
     "EmbeddingResult",
     "EmbeddingService",
+    "EmbeddingWorker",
     "InMemoryBackend",
-    "PendingRequest",
     "QdrantBackend",
     "WeaviateBackend",
     "SearchHit",
@@ -106,8 +104,10 @@ __all__ = [
     "VectorStoreState",
     "VectorStoreTool",
     "available_backends",
+    "build_embedding_service",
     "close_all",
     "default_backend",
+    "embedding_worker_name",
     "get_backend_spec",
     "get_client",
     "is_registered",

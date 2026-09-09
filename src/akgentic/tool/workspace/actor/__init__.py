@@ -101,7 +101,7 @@ if TYPE_CHECKING:
     # an import cycle through this very module — neither is needed to annotate a
     # ``None`` at start.
     from akgentic.tool.vector_store.actor import VectorStoreActor
-    from akgentic.tool.vector_store.protocol import VectorStoreParam
+    from akgentic.tool.vector_store.protocol import EmbeddingProvider, VectorStoreParam
     from akgentic.tool.workspace.card.params import WorkspaceRagIndex
     from akgentic.tool.workspace.readers import DocumentReader
 
@@ -231,7 +231,7 @@ class WorkspaceActor(
         self._rag_reader: DocumentReader | None = None
         self._rag_collection: VectorStoreParam | None = None
         self._vs_proxy: VectorStoreActor | None = None
-        self._vs_tell: VectorStoreActor | None = None
+        self._embedder: EmbeddingProvider | None = None
         self._index_active: set[str] = set()
         self._workspace: Filesystem = get_workspace(self.config.workspace_path)
         self._sweep_staging_files()
@@ -255,13 +255,11 @@ class WorkspaceActor(
         ``akgentic-team``'s restorer calls. Reaping in ``on_start`` is therefore
         provably a no-op, and the criterion's intent lands here instead.
 
-        What it frees is a file whose ``EMBEDDING`` signal is never coming.
-        ``VectorStoreActor`` keeps the map from an open request to its requester in
-        a private attribute — correctly, because an ``ActorAddress`` inside a
-        ``BaseState`` breaks ``notify_state_change()`` — so a restart drops the
-        pending requests with it and the store's own status truthfully reads
-        ``READY``. Nothing there knows a workspace file is still waiting. Reverting
-        it to ``PENDING`` costs one re-index and never a wrong answer.
+        What it frees is a file whose ``EMBEDDING`` signal is never coming. The
+        ``#embed-`` workers that would have reported it are children of this actor
+        and died with the process; nothing survives a restart that could tell the
+        file its batches are gone. Reverting it to ``PENDING`` costs one re-index
+        and never a wrong answer.
 
         Args:
             state: The snapshot to adopt.
@@ -270,13 +268,23 @@ class WorkspaceActor(
         self.reap_stale_embedding()
 
     def worker_class(self) -> type[DeferredWorker]:
-        """Never called: ``#Workspace`` spawns nothing.
+        """Never called: nothing here is spawned through ``request()``.
 
         The base declares this abstract because its worker half spawns one actor
-        per key, and ``core/deferred.py`` is shared with ``TeamTool``, which uses
-        that half in full. This actor uses only the cache half — the sandbox
-        performs the run and tells the report back — so ``request()`` is never
-        called and there is nothing for this to return.
+        per key through :meth:`~akgentic.tool.core.deferred.DeferredResultActor.request`,
+        and ``core/deferred.py`` is shared with ``TeamTool``, which uses that half
+        in full. This actor uses only the cache half — the sandbox performs the run
+        and tells the report back — so ``request()`` is never called and there is
+        nothing for this to return.
+
+        **It does spawn a ``DeferredWorker``, and that is not a contradiction.**
+        ``DocumentsMixin`` creates an ``EmbeddingWorker`` per batch with
+        ``createActor`` and hands it its payload directly, because that worker
+        reports through this actor's ``receiveMsg_EmbeddingResult`` /
+        ``receiveMsg_EmbeddingError`` rather than through ``deliver`` / ``fail`` —
+        which here are the **exec** result cache. Routing it through ``request()``
+        would put a batch of vectors into that cache and evict a running agent's
+        exec outcome.
 
         Raising rather than returning a never-spawned stub: a stub would be dead
         code carrying a ``produce`` nobody runs, and the next reader would have to
@@ -286,8 +294,9 @@ class WorkspaceActor(
             NotImplementedError: Always.
         """
         raise NotImplementedError(
-            "#Workspace spawns no deferred worker — the sandbox runs the command "
-            "and reports back, so request() is never called."
+            "#Workspace routes nothing through request() — the sandbox runs the "
+            "command and reports back, and an embedding worker is spawned directly "
+            "because it reports outside the deferred cache."
         )
 
     def on_stop(self) -> None:

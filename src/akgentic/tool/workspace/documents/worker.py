@@ -7,23 +7,25 @@ it. This module is where they happen instead: one short-lived actor per file,
 which reads, extracts, splits, composes the chunk texts, reports once and stops
 itself.
 
-**It is a plain :class:`~akgentic.core.agent.Akgent`, not a ``DeferredWorker``,
-and that is a correctness requirement rather than a preference.**
+**It is a plain :class:`~akgentic.core.agent.Akgent`, not a ``DeferredWorker``.**
+The trap either way is the **report channel**, not the base class:
 ``DeferredWorker`` reports through ``parent.deliver(key, value)`` /
 ``parent.fail(key, error)``, and on ``WorkspaceActor`` those belong to a
 ``DeferredResultActor[…, str, ExecOutcome]`` — the **exec** result cache. An
 index result delivered that way would evict a running agent's exec outcome and
-mis-type the cache's value. ``EmbeddingActor`` is the package's existing idiom
-for this shape and is what this follows.
+mis-type the cache's value.
+:class:`~akgentic.tool.vector_store.embedding_actor.EmbeddingWorker` takes the
+other exit: it inherits ``DeferredWorker`` for the budget contract, the role and
+the single-shot lifecycle, and overrides ``receiveMsg_DeferredPayload`` so the
+report goes to the consumer's own handlers instead. This worker is deliberately
+left as it is — converting it is hygiene with no behaviour change and belongs in
+its own story.
 
-**The worker extracts and splits; the actor batches and adds.** ADR §5's literal
-wording puts the ``add()`` calls here, and it cannot be here: the vector store
-delivers ``EmbeddingCompleted`` to the *requester* address, and this worker stops
-itself the instant it reports — so a worker-issued ``add()`` would name a
-requester that is dead before the first batch embeds, and the ``EMBEDDED``
-transition the whole design turns on would be delivered to nothing. The actor is
-also the only place that can hold ``batches_expected`` consistently with the row
-it counts for.
+**The worker extracts and splits; the actor batches, embeds and adds.** ADR §5's
+literal wording puts the ``add()`` calls here, and it cannot be here: this worker
+stops itself the instant it reports, so it could neither hold the embedding
+workers it would have to spawn nor take their reports. The actor is also the only
+place that can hold ``batches_expected`` consistently with the row it counts for.
 
 **The three payloads are ``SerializableBaseModel`` and never ``Message``.**
 ``Akgent.on_receive`` emits the ``ReceivedMessage`` / ``ProcessedMessage``
@@ -37,8 +39,8 @@ because that class is a Pydantic *field type* here and a string annotation canno
 serve; importing ``card.params`` executes ``card/__init__.py``, which imports
 ``workspace.actor``, which imports ``actor/documents.py``, which imports this
 package. Re-exporting it from the package façade would close that cycle. The one
-production caller imports it inside the method that spawns — the shape
-``vector_store/actor.py`` already uses for ``EmbeddingActor``.
+production caller imports it inside the method that spawns — the same shape
+``DocumentsMixin`` uses for the embedding worker.
 """
 
 from __future__ import annotations
@@ -72,14 +74,14 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 EMBED_BATCH_SIZE = 64
-"""How many chunks one ``add()`` call carries.
+"""How many chunks one ``#embed-`` worker carries, and therefore one ``add()``.
 
 **Not a card parameter**: it is a provider limit, not a corpus property.
 ``EmbeddingService.embed`` sends every text it is given in **one**
-``client.embeddings.create(input=texts)`` call, and the vector store spawns one
-``EmbeddingActor`` per ``add()`` carrying every entry it was handed. An 800-page
-document is ~1,900 chunks; one request of that size fails whole. Batching is what
-turns that into thirty requests of which one can fail.
+``client.embeddings.create(input=texts)`` call, and the workspace spawns one
+``EmbeddingWorker`` per batch. An 800-page document is ~1,900 chunks; one request
+of that size fails whole. Batching is what turns that into thirty requests of
+which one can fail.
 """
 
 MAX_CONCURRENT_INDEX_WORKERS = 4
@@ -99,9 +101,10 @@ INDEX_WORKER_NAME_PREFIX = "#index-"
 
 **Only the leading ``#`` is load-bearing** — it is what classifies the actor as a
 tool actor during the orchestrator's two-phase stop. The rest is a readability
-aid, mirroring ``#embed-{collection}-{request_id}``. Deliberately not
-``WORKER_NAME_PREFIX``, which belongs to the deferred mechanism this worker is
-not part of.
+aid, mirroring
+:data:`~akgentic.tool.vector_store.embedding_actor.EMBED_WORKER_NAME_PREFIX`.
+Deliberately not ``WORKER_NAME_PREFIX``, which belongs to the cache actor's own
+spawns.
 """
 
 _NAME_DIGEST_CHARS = 12

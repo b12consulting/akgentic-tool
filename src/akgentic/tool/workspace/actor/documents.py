@@ -17,10 +17,12 @@ move it notify. The call sites are now, and only:
   costs nothing.
 - :meth:`DocumentsMixin.receiveMsg_IndexResult` / :meth:`DocumentsMixin.receiveMsg_IndexFailure`
   — one per file, at its transition.
-- :meth:`DocumentsMixin.receiveMsg_EmbeddingCompleted` — **only** at the file's
-  final transition. A batch that lands without settling the file mutates
-  ``batches_landed`` in memory and notifies nothing, so a 1,900-chunk document
-  costs one event rather than thirty.
+- :meth:`DocumentsMixin.receiveMsg_EmbeddingResult` — **only** at the file's
+  final transition, or at the turn a write could not land. A batch that lands
+  without settling the file mutates ``batches_landed`` in memory and notifies
+  nothing, so a 1,900-chunk document costs one event rather than thirty.
+- :meth:`DocumentsMixin.receiveMsg_EmbeddingError` — one per file, at its
+  transition to ``FAILED``.
 - :meth:`DocumentsMixin.mark_paths_stale` — only when it actually changed a
   status, so a tree that has never been indexed pays nothing on the mutation path.
 - :meth:`DocumentsMixin.reap_stale_embedding` — only when it actually reverted a
@@ -35,12 +37,12 @@ Everything on the ask path here is O(1)/O(n) dict work on the actor thread, plus
 bounded file reads while queueing and bounded proxy calls to ``#VectorStore`` —
 including, on :meth:`DocumentsMixin.rag_search`, **one query embed per call**.
 That is the one external round trip this package puts on the gate's own thread.
-It is bounded (one call, not thirty — which is why the indexing path issues its
-``add()`` batches as a *tell*) and every one of its failure modes degrades to the
-keyword leg, which is what makes it acceptable rather than a defect. Do not add a
-second network call to that turn. The
-slow half — extraction and splitting — happens in a ``#index-`` worker and never
-here. Nothing here raises: an exception in a document handler would kill the actor
+It is bounded (one call, not thirty) and every one of its failure modes degrades
+to the keyword leg, which is what makes it acceptable rather than a defect. Do not
+add a second network call to that turn. The two slow halves happen elsewhere:
+extraction and splitting in a ``#index-`` worker, embedding in an ``#embed-``
+worker, and each batch's ``add()`` lands on its own turn when its worker reports.
+Nothing here raises: an exception in a document handler would kill the actor
 that owns the write gate, so a document path degrades — a miss, a file left
 ``FAILED``, a cache that did not grow — and never propagates.
 """
@@ -53,6 +55,7 @@ from datetime import UTC, datetime, timedelta
 from math import ceil
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
+from uuid import uuid4
 
 from akgentic.core.agent_config import BaseConfig
 from akgentic.tool.vector_store.protocol import PATH_PREFIX_REJECTED, PATH_PREFIX_WILDCARDS
@@ -75,8 +78,13 @@ from akgentic.tool.workspace.workspace import Filesystem
 if TYPE_CHECKING:
     from akgentic.core.agent import Akgent
     from akgentic.tool.vector_store.actor import VectorStoreActor
-    from akgentic.tool.vector_store.embedding_actor import EmbeddingCompleted
-    from akgentic.tool.vector_store.protocol import SearchHit, VectorStoreParam
+    from akgentic.tool.vector_store.embedding_actor import EmbeddingError, EmbeddingResult
+    from akgentic.tool.vector_store.protocol import (
+        EmbeddingProvider,
+        SearchHit,
+        VectorStoreParam,
+    )
+    from akgentic.tool.vector_store.vector import VectorEntry
     from akgentic.tool.workspace.card.params import WorkspaceRagIndex
     from akgentic.tool.workspace.documents.worker import IndexFailure, IndexResult
 
@@ -167,7 +175,7 @@ class DocumentsMixin(_DocumentsBase):
     _rag_reader: DocumentReader | None
     _rag_collection: VectorStoreParam | None
     _vs_proxy: VectorStoreActor | None
-    _vs_tell: VectorStoreActor | None
+    _embedder: EmbeddingProvider | None
     _index_active: set[str]
 
     ##
@@ -329,27 +337,35 @@ class DocumentsMixin(_DocumentsBase):
             )
 
     def _acquire_vs_proxy(self) -> None:
-        """Resolve ``#VectorStore``, bind both proxies, and create the collection.
+        """Resolve ``#VectorStore``, bind one ask proxy and the embedder, create the collection.
 
-        **Two proxies over one address, and the split is a correctness choice.**
-        ``create_collection`` and ``remove`` are **asks**: the first has to be
-        known to have worked before anything is added, and the second re-raises a
-        missing collection as a ``RetriableError`` that this actor must see to
-        keep the superseded ids for a later retry. ``add`` is a **tell**: a
-        1,900-chunk document is thirty of them, and thirty asks would park the
-        actor that owns the write gate on another actor's mailbox.
+        **One proxy, and every call through it is an ask.** ``create_collection``
+        has to be known to have worked before anything is added; ``remove``
+        re-raises a missing collection as a ``RetriableError`` this actor must see
+        to keep the superseded ids for a later retry; and ``add`` is now one ask
+        per batch **on its own mailbox turn**, when that batch's worker reports —
+        not thirty in a row on one turn, which is what made it a tell before the
+        embedding pipeline moved to this actor.
+
+        The embedder is built here too, from the card's own ``VectorStoreParam``:
+        it is what the query leg embeds through, and every worker this actor spawns
+        is handed the same param's model and provider.
 
         Any failure drops to degraded mode — ``_vs_proxy`` stays ``None`` and
-        ``workspace_rag_index`` answers a sentence. **Both proxies are bound
-        together or neither is**: ``index_paths`` gates on ``_vs_proxy`` alone, so
-        a half-bound actor would accept work whose ``add()`` calls go nowhere,
-        leaving every file at ``EMBEDDING`` until the reaper queues it again — and
-        again, every ten minutes, for ever.
+        ``workspace_rag_index`` answers a sentence. **The up-front gate is no
+        longer what protects a file from parking at ``EMBEDDING``**: the write
+        happens on this actor's own turn inside a ``try``, so an ask that raises
+        settles the file ``FAILED`` with the reason there and then. A stale handle
+        can no longer accept work whose writes go nowhere; it accepts work whose
+        write fails visibly.
         """
         from akgentic.core.orchestrator import Orchestrator  # noqa: PLC0415 — cycle
         from akgentic.tool.vector_store.actor import (  # noqa: PLC0415 — optional extra
             VS_ACTOR_NAME,
             VectorStoreActor,
+        )
+        from akgentic.tool.vector_store.embedding_actor import (  # noqa: PLC0415 — optional extra
+            build_embedding_service,
         )
 
         if self.orchestrator is None or self._rag_collection is None:
@@ -379,9 +395,10 @@ class DocumentsMixin(_DocumentsBase):
                 exc,
             )
             return
-        tell = self.proxy_tell(vs_addr, VectorStoreActor)
+        self._embedder = build_embedding_service(
+            self._rag_collection.embedding_model, self._rag_collection.embedding_provider
+        )
         self._vs_proxy = proxy
-        self._vs_tell = tell
 
     ##
     ## workspace_rag_index — the spawn side
@@ -393,6 +410,11 @@ class DocumentsMixin(_DocumentsBase):
         on the actor thread — validate, read-and-hash, set ``PENDING``, spawn up
         to the concurrency cap — and no extraction, split or embedding happens on
         this turn.
+
+        The ``_vs_proxy`` gate here refuses the whole capability when no vector
+        store is wired. It is **not** what protects a file from parking at
+        ``EMBEDDING``: each batch is written on the turn its worker reports, and a
+        write that raises settles that file ``FAILED`` there and then.
 
         Args:
             path: A file, a directory, or ``""`` for the whole tree.
@@ -675,18 +697,20 @@ class DocumentsMixin(_DocumentsBase):
         self.state.notify_state_change()
 
     def _issue_batches(self, msg: IndexResult) -> None:
-        """Send one ``add()`` per ``EMBED_BATCH_SIZE`` chunks, correlated by path.
+        """Spawn one ``#embed-`` worker per ``EMBED_BATCH_SIZE`` chunks of *msg*.
 
-        ``requester`` is this actor and ``request_ref`` is the file's path, which
-        is what lets :meth:`receiveMsg_EmbeddingCompleted` attribute a completion
-        to the row that is counting it. ``batches_expected`` is already written by
-        the caller, before the first call goes out.
+        The entries are built whole here and handed to the worker whole, so the
+        ``scope``, ``path`` and ``ordinal`` every scoped removal and every scoped
+        search filters on never leave this actor's own objects.
+        ``batches_expected`` is already written by the caller, before the first
+        worker is spawned.
+
+        A spawn that raises fails the file and stops issuing. Every later report
+        for that path is then dropped by the status guard, exactly as the first
+        error for a file wins today.
         """
         from akgentic.tool.vector_store.vector import VectorEntry  # noqa: PLC0415 — optional extra
 
-        tell = self._vs_tell
-        if tell is None:
-            return
         entries = [
             VectorEntry(
                 ref_type=_CHUNK_REF_TYPE,
@@ -701,12 +725,57 @@ class DocumentsMixin(_DocumentsBase):
         ]
         size = _batch_size()
         for start in range(0, len(entries), size):
-            tell.add(
-                RAG_COLLECTION,
-                entries[start : start + size],
-                requester=self.myAddress,
-                request_ref=msg.path,
+            if not self._spawn_embedding(msg.path, msg.source_sha, entries[start : start + size]):
+                return
+
+    def _spawn_embedding(self, path: str, source_sha: str, batch: list[VectorEntry]) -> bool:
+        """Start one ``#embed-`` worker for *batch*, or fail *path* and say so.
+
+        The model and the provider come from ``self._rag_collection`` — the card's
+        own param, which is authoritative from this story on. The worker is
+        spawned with ``createActor`` and handed the batch in one payload, the shape
+        :meth:`_spawn` uses for an index worker.
+
+        Returns:
+            Whether a worker is now embedding *batch*.
+        """
+        from akgentic.tool.core.deferred import WORKER_ROLE  # noqa: PLC0415 — cycle
+        from akgentic.tool.vector_store.embedding_actor import (  # noqa: PLC0415 — optional extra
+            EmbeddingRequest,
+            EmbeddingWorker,
+            embedding_worker_name,
+        )
+
+        collection = self._rag_collection
+        if collection is None:
+            return False
+        request_id = str(uuid4())
+        try:
+            address = self.createActor(
+                EmbeddingWorker,
+                config=BaseConfig(
+                    name=embedding_worker_name(RAG_COLLECTION, request_id), role=WORKER_ROLE
+                ),
             )
+            self.proxy_tell(address, EmbeddingWorker).receiveMsg_DeferredPayload(
+                EmbeddingRequest(
+                    deferred_key=request_id,
+                    collection=RAG_COLLECTION,
+                    entries=batch,
+                    request_ref=path,
+                    embedding_model=collection.embedding_model,
+                    embedding_provider=collection.embedding_provider,
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "Workspace %s: could not spawn an embedding worker for %s",
+                self.config.workspace_path,
+                path,
+            )
+            self._fail(path, source_sha, f"{type(exc).__name__}: {exc}")
+            return False
+        return True
 
     def receiveMsg_IndexFailure(self, msg: IndexFailure) -> None:  # noqa: N802
         """TELL, from a worker. Mark the file ``FAILED`` and free its slot."""
@@ -724,36 +793,78 @@ class DocumentsMixin(_DocumentsBase):
                 exc_info=True,
             )
 
-    def receiveMsg_EmbeddingCompleted(self, msg: EmbeddingCompleted) -> None:  # noqa: N802
-        """TELL, from ``#VectorStore``. Count one batch, and settle the file at the last.
+    def receiveMsg_EmbeddingResult(self, msg: EmbeddingResult) -> None:  # noqa: N802
+        """TELL, from an ``#embed-`` worker. Write the batch, count it, settle at the last.
 
-        Only the **final** transition notifies. A batch that lands without
-        settling its file mutates ``batches_landed`` in memory and says nothing,
-        so a 1,900-chunk document costs one event rather than thirty.
+        **The write happens here, and this is where the epic's gate now lives.**
+        One ask per worker report, on its own mailbox turn — never thirty on one
+        turn. An ask that raises settles the file ``FAILED`` with the reason on
+        this turn, so a batch that could not land can no longer leave a file
+        sitting at ``EMBEDDING`` for the reaper to find ten minutes later.
 
-        The **first** completion carrying an error marks the file ``FAILED``, and
-        every later completion for the same path is dropped without a second
-        transition — the status guard below is what does it.
+        Only the **final** transition notifies on the success path. A batch that
+        lands without settling its file mutates ``batches_landed`` in memory and
+        says nothing, so a 1,900-chunk document costs one event rather than thirty.
+
+        The **first** report that fails the file marks it ``FAILED``, and every
+        later report for the same path is dropped without a second transition —
+        the status guard below is what does it.
         """
         try:
-            self._on_embedding_completed(msg)
+            self._on_embedding_result(msg)
         except Exception:
             logger.warning(
-                "Workspace %s: could not record an embedding completion",
+                "Workspace %s: could not record an embedded batch",
                 self.config.workspace_path,
                 exc_info=True,
             )
 
-    def _on_embedding_completed(self, msg: EmbeddingCompleted) -> None:
-        """Apply one settled batch to the row that is counting it."""
-        path = msg.request_ref
-        if msg.collection != RAG_COLLECTION or path is None:
-            return
+    def receiveMsg_EmbeddingError(self, msg: EmbeddingError) -> None:  # noqa: N802
+        """TELL, from an ``#embed-`` worker. Fail the file with the worker's reason."""
+        try:
+            self._on_embedding_error(msg)
+        except Exception:
+            logger.warning(
+                "Workspace %s: could not record an embedding failure",
+                self.config.workspace_path,
+                exc_info=True,
+            )
+
+    def _counting_row(self, collection: str, path: str | None) -> RagFile | None:
+        """Return the row *path* is counting batches into, or ``None`` to drop the report.
+
+        A report for another collection, for a path this actor never queued, or
+        for a file that has already left ``EMBEDDING`` — settled, failed, or
+        re-queued at other bytes — belongs to nothing and is dropped.
+        """
+        if collection != RAG_COLLECTION or path is None:
+            return None
         entry = self.state.rag_index.get(path)
         if entry is None or entry.status is not RagStatus.EMBEDDING:
+            return None
+        return entry
+
+    def _on_embedding_error(self, msg: EmbeddingError) -> None:
+        """Fail the file one worker could not embed for."""
+        entry = self._counting_row(msg.collection, msg.request_ref)
+        if entry is None or msg.request_ref is None:
             return
-        if msg.error is not None:
-            self._fail(path, entry.indexed_sha, msg.error)
+        self._fail(msg.request_ref, entry.indexed_sha, msg.error)
+        self.state.notify_state_change()
+
+    def _on_embedding_result(self, msg: EmbeddingResult) -> None:
+        """Write one embedded batch, then apply it to the row that is counting it."""
+        entry = self._counting_row(msg.collection, msg.request_ref)
+        if entry is None or msg.request_ref is None:
+            return
+        path = msg.request_ref
+        proxy = self._vs_proxy
+        try:
+            if proxy is None:
+                raise RuntimeError("no vector store is bound")
+            proxy.add(RAG_COLLECTION, msg.entries)
+        except Exception as exc:
+            self._fail(path, entry.indexed_sha, f"{type(exc).__name__}: {exc}")
             self.state.notify_state_change()
             return
         landed = entry.batches_landed + 1
@@ -855,11 +966,13 @@ class DocumentsMixin(_DocumentsBase):
         restored snapshot arrives afterwards, so reaping there would run against an
         empty index. See that method for the whole of it.
 
-        It is also the only thing that will ever free such a file. ``#VectorStore``
-        keeps the map from an open request to its requester in a private attribute,
-        so a resume drops it along with the pending requests themselves, and the
-        store's own status then truthfully reads ``READY``. Nothing there knows a
-        workspace file is still waiting.
+        **It is the backstop for the one case no gate can see: an ``#embed-``
+        worker that dies without reporting.** Every other way a batch can fail now
+        arrives as a message — a worker that could not embed tells
+        ``EmbeddingError``, and a write that could not land raises on the turn it
+        is attempted. A worker killed with the process reports neither, and its
+        file would otherwise stay ``EMBEDDING`` for ever; a resume also loses every
+        live worker the same way.
 
         Returns:
             Whether any row was reverted, so the caller can make one notify.
@@ -1048,14 +1161,15 @@ class DocumentsMixin(_DocumentsBase):
         from akgentic.tool.vector_store.hybrid import OVERFETCH
 
         proxy = self._vs_proxy
-        if proxy is None:
+        embedder = self._embedder
+        if proxy is None or embedder is None:
             logger.warning(
                 "Workspace %s: no vector store — searching on the keyword leg alone",
                 self.config.workspace_path,
             )
             return {}
         try:
-            vectors = proxy.embed([query])
+            vectors = embedder.embed([query])
             if not vectors:
                 logger.warning(
                     "Workspace %s: embedding a search query returned nothing — keyword only",

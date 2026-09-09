@@ -15,8 +15,9 @@ from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
+from akgentic.tool.vector_store.embedding_actor import build_embedding_service
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA, hybrid_search
-from akgentic.tool.vector_store.protocol import VectorStoreParam
+from akgentic.tool.vector_store.protocol import EmbeddingProvider, VectorStoreParam
 from akgentic.tool.vector_store.vector import VectorEntry
 
 logger = logging.getLogger(__name__)
@@ -183,6 +184,7 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
                 role=self.config.role,
             )
         self._vs_proxy: VectorStoreActor | None = None
+        self._embedder: EmbeddingProvider | None = None
         if self.config.vector_store is not False:
             self._acquire_vs_proxy()
 
@@ -204,6 +206,10 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
         - A transient backend error during ``create_collection`` drops
           back to degraded mode with a WARNING (matches existing
           behaviour for embedding failures).
+
+        The embedder is built here too, from **this actor's own**
+        ``config.collection``: the vector store embeds nothing, so the model this
+        actor's ``VectorStoreParam`` names is the model that embeds its tasks.
         """
         if self.config.vector_store is False:
             return  # degraded mode by design
@@ -237,19 +243,31 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
                 exc,
             )
             self._vs_proxy = None
+            return
+        self._embedder = build_embedding_service(
+            self.config.collection.embedding_model,
+            self.config.collection.embedding_provider,
+        )
 
     def _embed_task(self, task: Task) -> None:
         """Embed a task's description and store the resulting VectorEntry.
 
-        Called after task create or update. Does nothing when VectorStoreActor
-        proxy is unavailable (vector_store=False or proxy not acquired).
-        Any embedding error is logged and swallowed so that task CRUD
+        Called after task create or update. Does nothing when the proxy or the
+        embedder is unavailable (vector_store=False, or the proxy was not
+        acquired). Any embedding error is logged and swallowed so that task CRUD
         is never interrupted by a transient embedding failure.
+
+        **Synchronous on purpose.** One entry per call, on a call site that already
+        blocks — a worker would add a spawn, a report and an in-flight map to
+        preserve behaviour that exists today without any of them. What the move to
+        an owned embedder buys instead is a **budget**: the blocking call now
+        carries the embedding worker's ``timeout_s``, so this actor's mailbox turn
+        is bounded.
         """
-        if self._vs_proxy is None:
+        if self._vs_proxy is None or self._embedder is None:
             return
         try:
-            vectors = self._vs_proxy.embed([task.description])
+            vectors = self._embedder.embed([task.description])
             if not vectors:
                 return
             entry = VectorEntry(
@@ -386,6 +404,7 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
         result = hybrid_search(
             [str(task_id) for task_id in sorted(keyword_ids)],
             self._vs_proxy,
+            self._embedder,
             PLAN_COLLECTION,
             query,
             top_k=top_k if top_k is not None else self.config.search_top_k,

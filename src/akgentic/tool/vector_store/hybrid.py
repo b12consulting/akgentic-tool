@@ -8,8 +8,9 @@ combined here.
 The pieces live here because both the knowledge-graph and the planning actor
 need them and had drifted apart:
 
-- :func:`semantic_scores` — embed a query, search a collection, and degrade to
-  no hits instead of raising when the vector store is absent or failing.
+- :func:`semantic_scores` — embed a query through the caller's own embedder,
+  search a collection, and degrade to no hits instead of raising when either the
+  embedder or the vector store is absent or failing.
 - :func:`fuse` — the single rule that combines keyword and vector hits.
 - :func:`hybrid_search` — the whole algorithm: semantic leg, fusion, ranking.
 
@@ -31,6 +32,7 @@ from typing import TYPE_CHECKING, Final, NamedTuple
 
 if TYPE_CHECKING:
     from akgentic.tool.vector_store.actor import VectorStoreActor
+    from akgentic.tool.vector_store.protocol import EmbeddingProvider
 
 logger = logging.getLogger(__name__)
 
@@ -53,19 +55,23 @@ leave the final result short.
 
 def semantic_scores(
     proxy: VectorStoreActor | None,
+    embedder: EmbeddingProvider | None,
     collection: str,
     query_text: str,
     top_k: int,
 ) -> dict[str, float]:
     """Return ``{ref_id: cosine_score}`` for *query_text* against *collection*.
 
-    Embeds the query through *proxy* and searches the collection. Every failure
-    mode — no proxy wired, an embedding call that raises or returns nothing, a
-    search that raises — yields an empty mapping and a warning rather than an
-    exception, so a caller running a hybrid search degrades to keyword-only.
+    Embeds the query through *embedder* — the caller's own, built from the same
+    ``VectorStoreParam`` that embedded what it is searching — and searches
+    *collection* through *proxy*. Every failure mode — no proxy wired, no embedder
+    wired, an embedding call that raises or returns nothing, a search that raises —
+    yields an empty mapping and a warning rather than an exception, so a caller
+    running a hybrid search degrades to keyword-only.
 
     Args:
         proxy: Vector store actor proxy, or ``None`` when none is wired.
+        embedder: The caller's embedding service, or ``None`` when none is wired.
         collection: Collection to search.
         query_text: Natural-language query to embed.
         top_k: Maximum number of hits to request.
@@ -77,8 +83,11 @@ def semantic_scores(
     if proxy is None:
         logger.warning("No vector store proxy — semantic search skipped")
         return {}
+    if embedder is None:
+        logger.warning("No embedder — semantic search skipped")
+        return {}
     try:
-        vectors = proxy.embed([query_text])
+        vectors = embedder.embed([query_text])
         if not vectors:
             logger.warning("Embedding returned nothing for collection '%s'", collection)
             return {}
@@ -172,6 +181,7 @@ class HybridResult(NamedTuple):
 def hybrid_search(
     keyword_keys: Iterable[str],
     proxy: VectorStoreActor | None,
+    embedder: EmbeddingProvider | None,
     collection: str,
     query_text: str,
     *,
@@ -193,6 +203,7 @@ def hybrid_search(
     Args:
         keyword_keys: Keys hit by the caller's keyword phase, best-first.
         proxy: Vector store actor proxy, or ``None`` for keyword-only.
+        embedder: The caller's embedding service, or ``None`` for keyword-only.
         collection: Collection to search.
         query_text: Natural-language query.
         top_k: How many hits the caller intends to keep. The semantic leg is
@@ -214,7 +225,7 @@ def hybrid_search(
         {
             key: score
             for key, score in semantic_scores(
-                proxy, collection, query_text, top_k * OVERFETCH
+                proxy, embedder, collection, query_text, top_k * OVERFETCH
             ).items()
             if score >= score_threshold
         }

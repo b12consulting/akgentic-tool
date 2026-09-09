@@ -1677,9 +1677,9 @@ src/akgentic/tool/
     │   inmemory.py           # InMemory backend
     │   weaviate.py           # Weaviate backend [optional: weaviate extra]
     │   actor.py              # VectorStoreActor singleton
-    │   embedding_actor.py    # EmbeddingActor (non-blocking embedding); spawned as
-    │                         #   "#embed-<collection>-<request_id>" (teardown
-    │                         #   invariant — see Deferred Results)
+    │   embedding_actor.py    # EmbeddingWorker (a DeferredWorker), spawned by the
+    │                         #   CONSUMER as "#embed-<collection>-<request_id>"
+    │                         #   (teardown invariant — see Deferred Results)
     │   └── tool.py           # VectorStoreTool ToolCard
     planning/
     │   README.md           # PlanningTool reference — capabilities, task models, wiring

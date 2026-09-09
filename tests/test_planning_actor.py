@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -327,6 +327,7 @@ def _plan_actor_with_orchestrator(
     actor.state = PlanManagerState()
     actor.state.observer(actor)
     actor._vs_proxy = None
+    actor._embedder = None
 
     orch_addr = MockActorAddress("orchestrator", "Orchestrator")
     actor._orchestrator = orch_addr  # type: ignore[assignment]
@@ -357,6 +358,56 @@ class TestPlanActorAcquireVsProxy:
         orch_proxy.get_team_member.assert_called_once_with(VS_ACTOR_NAME)
         orch_proxy.getChildrenOrCreate.assert_not_called()
         assert actor._vs_proxy is not None
+
+    def test_the_embedder_is_built_from_this_actors_own_param(self) -> None:
+        """AC 18: the store embeds nothing, so this actor's param is what embeds."""
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
+        from akgentic.tool.vector_store.embedding_actor import EmbeddingWorker
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
+
+        actor, orch_proxy, _ = _plan_actor_with_orchestrator(vector_store_value=True)
+        actor.config = actor.config.model_copy(
+            update={
+                "collection": VectorStoreParam(
+                    embedding_model="custom-model", embedding_provider="azure"
+                )
+            }
+        )
+        orch_proxy.get_team_member.return_value = MockActorAddress(VS_ACTOR_NAME, "ToolActor")
+
+        with patch("akgentic.tool.vector_store.vector.EmbeddingService") as service_cls:
+            actor._acquire_vs_proxy()
+
+        service_cls.assert_called_once_with(
+            model="custom-model",
+            provider="azure",
+            timeout_s=EmbeddingWorker.timeout_s,
+        )
+        assert actor._embedder is service_cls.return_value
+
+    def test_a_task_is_embedded_by_the_embedder_and_written_by_the_proxy(self) -> None:
+        """AC 18: ``proxy.embed`` is never called, and ``add`` takes two arguments."""
+        from akgentic.tool.planning.planning_actor import PLAN_COLLECTION
+
+        actor = PlanActor()
+        actor.on_start()
+        proxy = MagicMock()
+        embedder = MagicMock()
+        embedder.embed.return_value = [[0.1, 0.2, 0.3]]
+        actor._vs_proxy = proxy
+        actor._embedder = embedder
+
+        actor._create_task(
+            TaskCreate(id=1, status="pending", description="write the report", owner="alice"),
+            MockActorAddress("alice", "Agent"),
+        )
+
+        embedder.embed.assert_called_once_with(["write the report"])
+        assert proxy.embed.call_count == 0
+        collection, entries = proxy.add.call_args.args
+        assert collection == PLAN_COLLECTION
+        assert proxy.add.call_args.kwargs == {}
+        assert entries[0].vector == [0.1, 0.2, 0.3]
 
     def test_named_instance(self) -> None:
         named = "#VectorStore-RAG"
@@ -402,6 +453,7 @@ class TestPlanActorAcquireVsProxy:
         actor.state = PlanManagerState()
         actor.state.observer(actor)
         actor._vs_proxy = None
+        actor._embedder = None
         actor._orchestrator = None  # type: ignore[assignment]
 
         actor._acquire_vs_proxy()
@@ -498,6 +550,7 @@ class TestPlanConfigCollectionField:
         actor.state = PlanManagerState()
         actor.state.observer(actor)
         actor._vs_proxy = None
+        actor._embedder = None
         actor._orchestrator = None  # type: ignore[assignment]
 
         # Exercise the coercion block from on_start.
@@ -532,6 +585,7 @@ def _plan_actor_with_vs_proxy(
     actor.state = PlanManagerState()
     actor.state.observer(actor)
     actor._vs_proxy = None
+    actor._embedder = None
 
     orch_addr = MockActorAddress("orchestrator", "Orchestrator")
     actor._orchestrator = orch_addr  # type: ignore[assignment]

@@ -224,7 +224,7 @@ class TestLLMTunableParameters:
         actor = _make_actor(vector_store=True, search_top_k=5)
         _add_task(actor, 1, "auth service")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.8)]
         )
 
@@ -239,7 +239,7 @@ class TestLLMTunableParameters:
         actor = _make_actor(vector_store=True, search_top_k=5)
         _add_task(actor, 1, "auth service")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.8)]
         )
 
@@ -253,7 +253,7 @@ class TestLLMTunableParameters:
         actor = _make_actor(vector_store=True, search_score_threshold=0.7)
         _add_task(actor, 1, "database task")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.6)]
         )
 
@@ -267,7 +267,7 @@ class TestLLMTunableParameters:
         actor = _make_actor(vector_store=True, search_score_threshold=0.7)
         _add_task(actor, 1, "database task")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.6)]
         )
 
@@ -298,7 +298,7 @@ class TestScoreExposure:
         actor = _make_actor(vector_store=True)
         _add_task(actor, 1, "database task")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.85)]
         )
 
@@ -312,7 +312,7 @@ class TestScoreExposure:
         actor = _make_actor(vector_store=True)
         _add_task(actor, 1, "auth module")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.9)]
         )
 
@@ -352,7 +352,7 @@ class TestResultOrdering:
         _add_task(actor, 1, "auth flow setup")  # keyword only
         _add_task(actor, 2, "database schema")  # semantic only
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]],
             search_hits=[("2", 0.75)],
         )
@@ -370,7 +370,7 @@ class TestResultOrdering:
         _add_task(actor, 1, "auth flow setup")  # keyword only
         _add_task(actor, 2, "database schema")  # semantic only
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]],
             search_hits=[("2", 0.75)],
         )
@@ -387,7 +387,7 @@ class TestResultOrdering:
         _add_task(actor, 2, "task beta")
         _add_task(actor, 3, "task gamma")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]],
             search_hits=[("1", 0.6), ("2", 0.9), ("3", 0.75)],
         )
@@ -412,7 +412,7 @@ class TestActorParameterizedValues:
         actor = _make_actor(vector_store=True, search_top_k=15)
         _add_task(actor, 1, "auth service")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[]
         )
 
@@ -425,7 +425,7 @@ class TestActorParameterizedValues:
         actor = _make_actor(vector_store=True, search_score_threshold=0.8)
         _add_task(actor, 1, "database task")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.75)]
         )
 
@@ -438,7 +438,7 @@ class TestActorParameterizedValues:
         actor = _make_actor(vector_store=True, search_top_k=5)
         _add_task(actor, 1, "auth service")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[]
         )
 
@@ -451,7 +451,7 @@ class TestActorParameterizedValues:
         actor = _make_actor(vector_store=True, search_score_threshold=0.8)
         _add_task(actor, 1, "database task")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.75)]
         )
 
@@ -518,7 +518,7 @@ class TestBackwardCompatibility:
         actor = _make_actor(vector_store=True)
         _add_task(actor, 1, "auth service")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.49)]
         )
 
@@ -532,7 +532,7 @@ class TestBackwardCompatibility:
         actor = _make_actor(vector_store=True)
         _add_task(actor, 1, "auth service")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[]
         )
 
@@ -546,7 +546,7 @@ class TestBackwardCompatibility:
         actor = _make_actor(vector_store=True)
         _add_task(actor, 1, "auth service")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.8)]
         )
 
@@ -570,7 +570,7 @@ class TestSearchModeKeyword:
         _add_task(actor, 1, "auth flow setup")
         _add_task(actor, 2, "database schema")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("2", 0.9)]
         )
 
@@ -584,7 +584,7 @@ class TestSearchModeKeyword:
         actor = _make_actor(vector_store=True)
         _add_task(actor, 1, "auth flow setup")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[]
         )
 
@@ -612,7 +612,7 @@ class TestSearchModeVector:
         _add_task(actor, 1, "auth flow setup")  # keyword match for "auth"
         _add_task(actor, 2, "database schema")  # semantic match only
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.85), ("2", 0.75)]
         )
 
@@ -629,7 +629,7 @@ class TestSearchModeVector:
         _add_task(actor, 1, "auth flow setup")  # would be keyword match
         _add_task(actor, 2, "database schema")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("2", 0.9)]
         )
 
@@ -668,7 +668,7 @@ class TestSearchModeHybrid:
         _add_task(actor, 1, "auth flow setup")  # keyword match
         _add_task(actor, 2, "database schema")  # semantic only
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("2", 0.75)]
         )
 
@@ -682,7 +682,7 @@ class TestSearchModeHybrid:
         actor = _make_actor(vector_store=True)
         _add_task(actor, 1, "auth module")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.90)]
         )
 
@@ -725,7 +725,7 @@ class TestForeignRefIds:
         """Before the shared rule this conversion sat inside a try/except; it must stay safe."""
         actor = _make_actor(vector_store=True)
         _add_task(actor, 1, "auth flow setup")
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]],
             search_hits=[("not-an-int", 0.9)],
         )
@@ -738,7 +738,7 @@ class TestForeignRefIds:
         actor = _make_actor(vector_store=True)
         _add_task(actor, 1, "auth flow setup")
         _add_task(actor, 2, "database schema")
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]],
             search_hits=[("not-an-int", 0.95), ("2", 0.9)],
         )
@@ -750,7 +750,7 @@ class TestForeignRefIds:
     def test_the_skipped_entry_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
         actor = _make_actor(vector_store=True)
         _add_task(actor, 1, "auth flow setup")
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]],
             search_hits=[("not-an-int", 0.9)],
         )
@@ -766,7 +766,9 @@ class TestForeignRefIds:
         """mode='keyword' skips the leg deliberately; a healthy proxy is wired."""
         actor = _make_actor(vector_store=True)
         _add_task(actor, 1, "auth flow setup")
-        actor._vs_proxy = _make_vs_proxy_mock(embed_return=[[0.1]], search_hits=[])
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
+            embed_return=[[0.1]], search_hits=[]
+        )
 
         with caplog.at_level(logging.WARNING):
             result = actor.search_planning(query="auth", mode="keyword")

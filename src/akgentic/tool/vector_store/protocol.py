@@ -77,17 +77,17 @@ def default_backend() -> str:
 class CollectionStatus(StrEnum):
     """Lifecycle state of a vector collection.
 
-    ``INDEXING`` is derived, not assigned: a collection is ``INDEXING`` exactly while
-    at least one embedding request is open against it, and returns to ``READY`` when
-    the last one settles — whether that request succeeded or failed.
+    **Nothing in this package assigns ``INDEXING`` or ``ERROR`` any more.** Both are
+    always-default members today: a collection is created ``READY`` and stays there,
+    the three backends return ``READY``, and the actor overrides nothing. ``INDEXING``
+    used to be derived from the store's open embedding requests, which no longer
+    exist — a write either lands on the turn it arrives or raises — and progress is
+    now tracked by the consumer that owns the file, not by the collection.
 
-    **``ERROR`` is no longer reachable from a single failed batch.** It used to be:
-    one failing ``EmbeddingActor`` marked the whole collection ``ERROR`` and discarded
-    every other request's pending entries with it. A failure is now reported to the
-    caller that asked for the batch, through ``EmbeddingCompleted.error``, and leaves
-    every concurrent request untouched. Nothing in this package assigns ``ERROR``
-    today; the member remains for a backend-level fault that really does invalidate a
-    whole collection.
+    They remain on the enum because three backends and the consumer-facing docs name
+    them, and because a backend-level fault that really does invalidate a whole
+    collection is what ``ERROR`` is for. Whether to delete them is a decision the
+    epic routes to ADR-049.
     """
 
     READY = "ready"
@@ -535,10 +535,19 @@ class VectorStoreConfig(BaseConfig):
     """
 
     embedding_model: str = Field(
-        default="text-embedding-3-small", description="Embedding model identifier"
+        default="text-embedding-3-small",
+        description=(
+            "Inert. The actor embeds nothing; the consumer's VectorStoreParam names "
+            "the model that embeds. Still forwarded by VectorStoreTool and stored by "
+            "the catalog, and removed with the card."
+        ),
     )
     embedding_provider: Literal["openai", "azure"] = Field(
-        default="openai", description="Embedding API provider"
+        default="openai",
+        description=(
+            "Inert. The consumer's VectorStoreParam names the provider that embeds. "
+            "Removed with the card."
+        ),
     )
     weaviate_url: str | None = Field(
         default=None, description="Weaviate cluster URL"

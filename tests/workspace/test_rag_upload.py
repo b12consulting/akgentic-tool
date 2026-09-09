@@ -272,7 +272,7 @@ class TestTheAsymmetryWithTheGate:
         write(workspace_tree, "written.md")
         upload.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["written.md"]))
         upload.report("written.md")
-        upload.complete("written.md")
+        upload.result("written.md")
         assert upload.actor.state.rag_index["written.md"].status is RagStatus.EMBEDDED
 
         upload.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["uploaded.md"]))
@@ -288,7 +288,7 @@ class TestTheAsymmetryWithTheGate:
         write(workspace_tree, "written.md")
         upload.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["written.md"]))
         upload.report("written.md")
-        upload.complete("written.md")
+        upload.result("written.md")
         before = len(upload.requests)
 
         upload.actor.mark_paths_stale(["written.md"])

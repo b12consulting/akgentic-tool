@@ -20,8 +20,14 @@ from typing import Any
 
 import pytest
 from akgentic.core.agent_state import BaseState
-from akgentic.tool.vector_store.embedding_actor import EmbeddingCompleted
+from akgentic.tool.vector_store.embedding_actor import (
+    EmbeddingError,
+    EmbeddingRequest,
+    EmbeddingResult,
+    EmbeddingWorker,
+)
 from akgentic.tool.vector_store.protocol import VectorStoreParam
+from akgentic.tool.vector_store.vector import VectorEntry
 from akgentic.tool.workspace.actor import (
     WORKSPACE_ACTOR_ROLE,
     WorkspaceActor,
@@ -63,20 +69,17 @@ class FakeVectorStore:
         self.calls: list[tuple[str, Any]] = []
         self.create_error: Exception | None = None
         self.remove_error: Exception | None = None
+        self.add_error: Exception | None = None
 
     def create_collection(self, name: str, config: VectorStoreParam) -> None:
         self.calls.append(("create", (name, config)))
         if self.create_error is not None:
             raise self.create_error
 
-    def add(
-        self,
-        collection: str,
-        entries: list[Any],
-        requester: Any = None,
-        request_ref: str | None = None,
-    ) -> None:
-        self.calls.append(("add", (collection, list(entries), request_ref, requester)))
+    def add(self, collection: str, entries: list[Any]) -> None:
+        self.calls.append(("add", (collection, list(entries))))
+        if self.add_error is not None:
+            raise self.add_error
 
     def remove(
         self,
@@ -96,6 +99,19 @@ class FakeVectorStore:
     def of(self, kind: str) -> list[Any]:
         """Every payload recorded under *kind*, in order."""
         return [payload for recorded, payload in self.calls if recorded == kind]
+
+
+def _embedded(ref_id: str, path: str = "a.md", ordinal: int = 0) -> VectorEntry:
+    """One entry as an ``#embed-`` worker hands it back — vector filled in."""
+    return VectorEntry(
+        ref_type="workspace_chunk",
+        ref_id=ref_id,
+        text=f"text {ordinal}",
+        vector=[0.1, 0.2],
+        scope=WORKSPACE_PATH,
+        path=path,
+        ordinal=ordinal,
+    )
 
 
 class StateSpy:
@@ -129,8 +145,11 @@ class RagHarness:
         self.orchestrator = DeadAddress("orchestrator")
         self.vs_address: MockActorAddress | None = MockActorAddress("#VectorStore")
         self.requests: list[IndexRequest] = []
+        self.embed_requests: list[EmbeddingRequest] = []
         self.worker_names: list[str] = []
+        self.embed_worker_names: list[str] = []
         self.spawn_error: BaseException | None = None
+        self.embed_spawn_error: BaseException | None = None
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Point the actor's orchestrator, proxies and spawn path at this harness."""
@@ -207,13 +226,29 @@ class RagHarness:
             )
         )
 
-    def complete(
-        self, path: str, error: str | None = None, collection: str = RAG_COLLECTION
+    def result(
+        self,
+        path: str,
+        entries: list[VectorEntry] | None = None,
+        collection: str = RAG_COLLECTION,
     ) -> None:
-        """Deliver one ``EmbeddingCompleted``, as ``#VectorStore`` would."""
-        self.actor.receiveMsg_EmbeddingCompleted(
-            EmbeddingCompleted(
-                request_id="r", request_ref=path, collection=collection, count=1, error=error
+        """Deliver one ``EmbeddingResult``, as an ``#embed-`` worker would."""
+        self.actor.receiveMsg_EmbeddingResult(
+            EmbeddingResult(
+                collection=collection,
+                entries=entries if entries is not None else [_embedded("e1")],
+                request_id="r",
+                request_ref=path,
+            )
+        )
+
+    def error(
+        self, path: str, reason: str = "boom", collection: str = RAG_COLLECTION
+    ) -> None:
+        """Deliver one ``EmbeddingError``, as an ``#embed-`` worker would."""
+        self.actor.receiveMsg_EmbeddingError(
+            EmbeddingError(
+                collection=collection, error=reason, request_id="r", request_ref=path
             )
         )
 
@@ -235,13 +270,21 @@ class RagHarness:
     def _tell(self, address: Any, actor_type: Any = None) -> Any:
         if address is self.vs_address:
             return self.vs
-        return SimpleNamespace(receiveMsg_IndexRequest=self.requests.append)
+        return SimpleNamespace(
+            receiveMsg_IndexRequest=self.requests.append,
+            receiveMsg_DeferredPayload=self.embed_requests.append,
+        )
 
     def _create(self, actor_class: Any, agent_id: Any = None, config: Any = None) -> Any:
+        assert config is not None
+        if actor_class is EmbeddingWorker:
+            if self.embed_spawn_error is not None:
+                raise self.embed_spawn_error
+            self.embed_worker_names.append(config.name)
+            return MockActorAddress(config.name, config.role)
         if self.spawn_error is not None:
             raise self.spawn_error
         assert actor_class is IndexWorker
-        assert config is not None
         self.worker_names.append(config.name)
         return MockActorAddress(config.name, config.role)
 
@@ -353,34 +396,6 @@ class TestEnableRag:
         harness.enable()  # must not raise
 
         assert harness.actor._vs_proxy is None
-
-    def test_a_failing_tell_proxy_leaves_neither_proxy_bound(
-        self, harness: RagHarness, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Both proxies bind together or neither does, and a half-bind livelocks.
-
-        ``index_paths`` gates on ``_vs_proxy`` alone. With the ask proxy bound and
-        the tell proxy missing it would accept work, spawn a worker, write the row
-        to ``EMBEDDING`` — and issue no ``add()`` at all, because ``_issue_batches``
-        returns silently on a missing tell. Ten minutes later the reaper reverts
-        the row to ``PENDING`` and the whole cycle repeats, re-extracting every
-        document for ever. Degrading is the only safe answer.
-        """
-        original = harness._tell
-
-        def tell(address: Any, actor_type: Any = None) -> Any:
-            if address is harness.vs_address:
-                raise RuntimeError("tell proxy is gone")
-            return original(address, actor_type)
-
-        monkeypatch.setattr(harness.actor, "proxy_tell", tell)
-
-        harness.enable()  # must not raise
-
-        assert (harness.actor._vs_proxy, harness.actor._vs_tell) == (None, None)
-        assert harness.actor.index_paths("") == (
-            "Retrieval indexing is not available for this workspace."
-        )
 
     def test_the_first_enable_fixes_the_parameters_for_the_tree(self, harness: RagHarness) -> None:
         """Two agents on one team must not make one file chunk two ways."""
@@ -510,7 +525,7 @@ class TestIdempotence:
         write(workspace_tree, "notes.md")
         harness.actor.index_paths("")
         harness.report("notes.md")
-        harness.complete("notes.md")
+        harness.result("notes.md")
         assert harness.actor.state.rag_index["notes.md"].status is RagStatus.EMBEDDED
 
         assert harness.actor.index_paths("") == (
@@ -525,7 +540,7 @@ class TestIdempotence:
         write(workspace_tree, "notes.md")
         harness.actor.index_paths("")
         harness.report("notes.md")
-        harness.complete("notes.md")
+        harness.result("notes.md")
 
         answer = harness.actor.index_paths("", force=True)
 
@@ -539,7 +554,7 @@ class TestIdempotence:
         write(workspace_tree, "notes.md")
         harness.actor.index_paths("")
         harness.report("notes.md")
-        harness.complete("notes.md")
+        harness.result("notes.md")
         write(workspace_tree, "notes.md", "# Replaced\n\nOther text.\n")
 
         assert harness.actor.index_paths("") == (
@@ -682,7 +697,7 @@ class TestTheSpawnSide:
 class TestBatching:
     """``EmbeddingService.embed`` sends every text in one request, so batches matter."""
 
-    def test_a_large_file_is_split_into_ceil_n_over_the_batch_size_calls(
+    def test_a_large_file_spawns_ceil_n_over_the_batch_size_workers(
         self, harness: RagHarness, workspace_tree: Path
     ) -> None:
         """An 800-page document is one request that fails whole, unless batched."""
@@ -692,31 +707,62 @@ class TestBatching:
 
         harness.report("big.md", chunks=EMBED_BATCH_SIZE * 2 + 1)
 
-        adds = harness.vs.of("add")
-        assert len(adds) == 3
-        assert [len(entries) for _, entries, _, _ in adds] == [
+        assert len(harness.embed_requests) == 3
+        assert [len(request.entries) for request in harness.embed_requests] == [
             EMBED_BATCH_SIZE,
             EMBED_BATCH_SIZE,
             1,
         ]
+        assert len(harness.embed_worker_names) == 3
+        assert all(name.startswith("#embed-") for name in harness.embed_worker_names)
         assert harness.actor.state.rag_index["big.md"].batches_expected == 3
 
-    def test_every_batch_is_correlated_by_path_and_addressed_to_this_actor(
+    def test_no_write_reaches_the_store_on_the_spawn_turn(
         self, harness: RagHarness, workspace_tree: Path
     ) -> None:
-        """``request_ref`` is how a completion finds the row that is counting it."""
+        """The write now happens when a worker reports, never when one is spawned."""
         harness.enable()
         write(workspace_tree, "big.md")
         harness.actor.index_paths("")
 
         harness.report("big.md", chunks=EMBED_BATCH_SIZE + 1)
 
-        for collection, _, request_ref, requester in harness.vs.of("add"):
-            assert collection == RAG_COLLECTION
-            assert request_ref == "big.md"
-            # ``myAddress`` builds a fresh wrapper per call, so identity is the
-            # agent id rather than the object.
-            assert requester.agent_id == harness.actor.myAddress.agent_id
+        assert harness.vs.of("add") == []
+
+    def test_every_request_carries_the_path_as_request_ref(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        """``request_ref`` is how a report finds the row that is counting it."""
+        harness.enable()
+        write(workspace_tree, "big.md")
+        harness.actor.index_paths("")
+
+        harness.report("big.md", chunks=EMBED_BATCH_SIZE + 1)
+
+        for request in harness.embed_requests:
+            assert request.collection == RAG_COLLECTION
+            assert request.request_ref == "big.md"
+            assert request.deferred_key
+
+    def test_the_cards_own_embedding_model_reaches_the_payload(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        """AC 14: the consumer's ``VectorStoreParam`` is what embeds, from this story on."""
+        harness.enable(
+            collection=VectorStoreParam(
+                backend="inmemory",
+                embedding_model="text-embedding-3-large",
+                dimension=3072,
+            )
+        )
+        write(workspace_tree, "notes.md")
+        harness.actor.index_paths("")
+
+        harness.report("notes.md", chunks=2)
+
+        [request] = harness.embed_requests
+        assert request.embedding_model == "text-embedding-3-large"
+        assert request.embedding_provider == "openai"
 
     def test_each_entry_carries_the_scope_the_path_and_the_ordinal(
         self, harness: RagHarness, workspace_tree: Path
@@ -728,12 +774,29 @@ class TestBatching:
 
         harness.report("notes.md", chunks=2, texts=["first", "second"])
 
-        [(_, entries, _, _)] = harness.vs.of("add")
+        [request] = harness.embed_requests
+        entries = request.entries
         assert [entry.scope for entry in entries] == [WORKSPACE_PATH, WORKSPACE_PATH]
         assert [entry.path for entry in entries] == ["notes.md", "notes.md"]
         assert [entry.ordinal for entry in entries] == [0, 1]
         assert [entry.text for entry in entries] == ["first", "second"]
         assert all(entry.vector == [] for entry in entries)
+
+    def test_a_spawn_failure_fails_the_file_and_stops_issuing(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        """A worker that never started can never report, so the row must not wait."""
+        harness.enable()
+        write(workspace_tree, "big.md")
+        harness.actor.index_paths("")
+        harness.embed_spawn_error = RuntimeError("no thread")
+
+        harness.report("big.md", chunks=EMBED_BATCH_SIZE * 2 + 1)
+
+        entry = harness.actor.state.rag_index["big.md"]
+        assert entry.status is RagStatus.FAILED
+        assert "no thread" in (entry.reason or "")
+        assert harness.embed_requests == []
 
     def test_embedded_is_reached_only_after_the_last_batch(
         self, harness: RagHarness, workspace_tree: Path
@@ -744,12 +807,30 @@ class TestBatching:
         harness.actor.index_paths("")
         harness.report("big.md", chunks=EMBED_BATCH_SIZE * 2 + 1)
 
-        harness.complete("big.md")
+        harness.result("big.md")
         assert harness.actor.state.rag_index["big.md"].status is RagStatus.EMBEDDING
-        harness.complete("big.md")
+        assert harness.actor.state.rag_index["big.md"].batches_landed == 1
+        harness.result("big.md")
         assert harness.actor.state.rag_index["big.md"].status is RagStatus.EMBEDDING
-        harness.complete("big.md")
+        harness.result("big.md")
         assert harness.actor.state.rag_index["big.md"].status is RagStatus.EMBEDDED
+
+    def test_each_result_is_written_by_ask_with_its_own_entries(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        """AC 15: one ``add`` per report, carrying that report's batch."""
+        harness.enable()
+        write(workspace_tree, "big.md")
+        harness.actor.index_paths("")
+        harness.report("big.md", chunks=EMBED_BATCH_SIZE + 1)
+
+        harness.result("big.md", entries=[_embedded("first")])
+
+        [(collection, entries)] = harness.vs.of("add")
+        assert collection == RAG_COLLECTION
+        assert [entry.ref_id for entry in entries] == ["first"]
+        assert harness.actor.state.rag_index["big.md"].status is RagStatus.EMBEDDING
+        assert harness.actor.state.rag_index["big.md"].batches_landed == 1
 
     def test_a_failing_batch_fails_the_file_and_later_batches_are_ignored(
         self, harness: RagHarness, workspace_tree: Path
@@ -760,37 +841,40 @@ class TestBatching:
         harness.actor.index_paths("")
         harness.report("big.md", chunks=EMBED_BATCH_SIZE * 2 + 1)
 
-        harness.complete("big.md")  # batch 1 lands
-        harness.complete("big.md", error="rate limited")  # batch 2 fails
+        harness.result("big.md")  # batch 1 lands
+        harness.error("big.md", reason="rate limited")  # batch 2 fails
         failed_at = harness.actor.state.rag_index["big.md"].updated_at
-        harness.complete("big.md")  # batch 3 succeeds, and is dropped
+        harness.result("big.md")  # batch 3 succeeds, and is dropped
 
         entry = harness.actor.state.rag_index["big.md"]
         assert entry.status is RagStatus.FAILED
         assert entry.reason == "rate limited"
         assert entry.updated_at == failed_at
 
-    def test_a_completion_for_another_collection_is_ignored(
+    def test_a_report_for_another_collection_is_ignored(
         self, harness: RagHarness, workspace_tree: Path
     ) -> None:
-        """The actor is a requester for one collection and must not read another's."""
+        """The actor counts for one collection and must not read another's."""
         harness.enable()
         write(workspace_tree, "notes.md")
         harness.actor.index_paths("")
         harness.report("notes.md")
 
-        harness.complete("notes.md", collection="Planning")
+        harness.result("notes.md", collection="Planning")
 
         assert harness.actor.state.rag_index["notes.md"].status is RagStatus.EMBEDDING
+        assert harness.vs.of("add") == []
 
-    def test_a_completion_for_an_unknown_path_is_ignored(
+    def test_a_report_for_an_unknown_path_is_ignored(
         self, harness: RagHarness, workspace_tree: Path
     ) -> None:
         harness.enable()
 
-        harness.complete("never-seen.md")  # must not raise
+        harness.result("never-seen.md")  # must not raise
+        harness.error("never-seen.md")  # must not raise
 
         assert harness.actor.state.rag_index == {}
+        assert harness.vs.of("add") == []
 
     def test_only_the_final_transition_notifies(
         self, harness: RagHarness, workspace_tree: Path
@@ -802,12 +886,79 @@ class TestBatching:
         harness.report("big.md", chunks=EMBED_BATCH_SIZE * 2 + 1)
         spy = harness.watch()
 
-        harness.complete("big.md")
-        harness.complete("big.md")
+        harness.result("big.md")
+        harness.result("big.md")
         assert spy.notifications == []
 
-        harness.complete("big.md")
+        harness.result("big.md")
         assert len(spy.notifications) == 1
+
+
+class TestTheWriteSide:
+    """AC 16: the gate moved to the write, and a write that cannot land is visible."""
+
+    def _two_batches(self, harness: RagHarness, workspace_tree: Path) -> None:
+        harness.enable()
+        write(workspace_tree, "big.md")
+        harness.actor.index_paths("")
+        harness.report("big.md", chunks=EMBED_BATCH_SIZE + 1)
+
+    def test_a_write_that_cannot_land_fails_the_file_on_that_turn(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        from akgentic.tool.errors import RetriableError
+
+        self._two_batches(harness, workspace_tree)
+        harness.vs.add_error = RetriableError(
+            "Collection 'workspace_chunks' does not exist"
+        )
+        spy = harness.watch()
+
+        harness.result("big.md")
+
+        entry = harness.actor.state.rag_index["big.md"]
+        assert entry.status is RagStatus.FAILED
+        assert "does not exist" in (entry.reason or "")
+        assert entry.batches_landed == 0
+        assert len(spy.notifications) == 1
+        assert harness.vs.of("remove") == []
+
+    def test_a_second_result_after_a_failed_write_is_dropped(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        from akgentic.tool.errors import RetriableError
+
+        self._two_batches(harness, workspace_tree)
+        harness.vs.add_error = RetriableError("dead cluster")
+        harness.result("big.md")
+        failed_at = harness.actor.state.rag_index["big.md"].updated_at
+        harness.vs.add_error = None
+        spy = harness.watch()
+
+        harness.result("big.md")
+
+        entry = harness.actor.state.rag_index["big.md"]
+        assert entry.status is RagStatus.FAILED
+        assert entry.updated_at == failed_at
+        assert spy.notifications == []
+
+    def test_an_embedding_error_fails_the_file_the_same_way(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        self._two_batches(harness, workspace_tree)
+        spy = harness.watch()
+
+        harness.error("big.md", reason="rate limited")
+
+        entry = harness.actor.state.rag_index["big.md"]
+        assert entry.status is RagStatus.FAILED
+        assert entry.reason == "rate limited"
+        assert len(spy.notifications) == 1
+
+    def test_the_tell_proxy_is_gone(self, harness: RagHarness) -> None:
+        """AC 16: one proxy, and every call through it is an ask."""
+        harness.enable()
+        assert not hasattr(harness.actor, "_vs_tell")
 
 
 class TestReIndexOrdering:
@@ -819,7 +970,7 @@ class TestReIndexOrdering:
         write(tree, "notes.md")
         harness.actor.index_paths("")
         harness.report("notes.md", chunks=2)
-        harness.complete("notes.md")
+        harness.result("notes.md")
         old_ids = [c.chunk_id for c in harness.actor.state.rag_index["notes.md"].chunks]
 
         write(tree, "notes.md", "# Replaced\n\nOther text.\n")
@@ -844,7 +995,7 @@ class TestReIndexOrdering:
         harness.vs.calls.clear()
 
         harness.report("notes.md", chunks=2)
-        harness.complete("notes.md")
+        harness.result("notes.md")
 
         kinds = harness.vs.kinds()
         assert "add" in kinds and "remove" in kinds
@@ -856,7 +1007,7 @@ class TestReIndexOrdering:
         """One collection holds every workspace; an unscoped removal is a cross-tree one."""
         old_ids = self._reindex(harness, workspace_tree)
         harness.report("notes.md", chunks=2)
-        harness.complete("notes.md")
+        harness.result("notes.md")
 
         [(collection, ref_ids, scope)] = harness.vs.of("remove")
         assert collection == RAG_COLLECTION
@@ -868,7 +1019,7 @@ class TestReIndexOrdering:
     ) -> None:
         self._reindex(harness, workspace_tree)
         harness.report("notes.md", chunks=2)
-        harness.complete("notes.md")
+        harness.result("notes.md")
 
         assert harness.actor.state.rag_index["notes.md"].superseded_chunk_ids == []
 
@@ -880,7 +1031,7 @@ class TestReIndexOrdering:
         harness.vs.remove_error = RuntimeError("collection is gone")
 
         harness.report("notes.md", chunks=2)
-        harness.complete("notes.md")
+        harness.result("notes.md")
 
         entry = harness.actor.state.rag_index["notes.md"]
         assert entry.status is RagStatus.EMBEDDED
@@ -893,7 +1044,7 @@ class TestReIndexOrdering:
         self._reindex(harness, workspace_tree)
         harness.report("notes.md", chunks=2)
 
-        harness.complete("notes.md", error="rate limited")
+        harness.error("notes.md", reason="rate limited")
 
         assert harness.actor.state.rag_index["notes.md"].status is RagStatus.FAILED
         assert harness.vs.of("remove") == []
@@ -997,7 +1148,7 @@ class TestReportAttribution:
         write(workspace_tree, "notes.md")
         harness.actor.index_paths("")
         harness.report("notes.md", chunks=2)
-        harness.complete("notes.md")
+        harness.result("notes.md")
         write(workspace_tree, "notes.md", "# Replaced\n")
         harness.actor.index_paths("")
 
@@ -1019,10 +1170,12 @@ class TestReportAttribution:
             raise RuntimeError("state is broken")
 
         monkeypatch.setattr(harness.actor, "_on_index_result", boom)
-        monkeypatch.setattr(harness.actor, "_on_embedding_completed", boom)
+        monkeypatch.setattr(harness.actor, "_on_embedding_result", boom)
+        monkeypatch.setattr(harness.actor, "_on_embedding_error", boom)
 
         harness.report("notes.md")  # must not raise
-        harness.complete("notes.md")  # must not raise
+        harness.result("notes.md")  # must not raise
+        harness.error("notes.md")  # must not raise
 
 
 ##
@@ -1038,7 +1191,7 @@ class TestTheGateMarksStale:
         write(tree, name)
         harness.actor.index_paths("")
         harness.report(name)
-        harness.complete(name)
+        harness.result(name)
         assert harness.actor.state.rag_index[name].status is RagStatus.EMBEDDED
 
     def test_an_accepted_write_marks_the_file_stale(
@@ -1129,7 +1282,7 @@ class TestTheGateMarksStale:
         write(workspace_tree, "two.md")
         harness.actor.index_paths("")
         harness.report("two.md")
-        harness.complete("two.md")
+        harness.result("two.md")
         spy = harness.watch()
 
         harness.actor.mark_paths_stale(["one.md", "two.md"])

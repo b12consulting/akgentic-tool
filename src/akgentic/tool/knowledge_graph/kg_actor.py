@@ -39,13 +39,14 @@ from akgentic.tool.knowledge_graph.models import (
     SearchResult,
 )
 from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
+from akgentic.tool.vector_store.embedding_actor import build_embedding_service
 from akgentic.tool.vector_store.hybrid import (
     DEFAULT_ALPHA,
     OVERFETCH,
     hybrid_search,
     semantic_scores,
 )
-from akgentic.tool.vector_store.protocol import VectorStoreParam
+from akgentic.tool.vector_store.protocol import EmbeddingProvider, VectorStoreParam
 from akgentic.tool.vector_store.vector import VectorEntry
 
 logger = logging.getLogger(__name__)
@@ -137,6 +138,7 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
                 role=self.config.role,
             )
         self._vs_proxy: VectorStoreActor | None = None
+        self._embedder: EmbeddingProvider | None = None
         self._acquire_vs_proxy()
         self._state_event_seq: int = 0
 
@@ -158,6 +160,11 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         - A transient backend error during ``create_collection`` drops
           back to degraded mode with a WARNING (matches existing
           behaviour for embedding failures).
+
+        The embedder is built here too, from **this actor's own**
+        ``config.collection``: the vector store embeds nothing, so the model this
+        actor's ``VectorStoreParam`` names is the model that embeds its entities
+        and relations.
         """
         if self.config.vector_store is False:
             return  # degraded mode by design
@@ -191,22 +198,31 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
                 exc,
             )
             self._vs_proxy = None
+            return
+        self._embedder = build_embedding_service(
+            self.config.collection.embedding_model,
+            self.config.collection.embedding_provider,
+        )
 
     # ------------------------------------------------------------------
-    # Embedding helpers (via VectorStoreActor proxy)
+    # Embedding helpers — this actor's own service, the store's proxy for writes
     # ------------------------------------------------------------------
 
     def _embed_entity(self, entity: Entity) -> None:
-        """Embed an entity and store the result via VectorStoreActor proxy.
+        """Embed an entity and store the result through the VectorStoreActor proxy.
 
-        Silently logs a WARNING and returns if the proxy is unavailable
-        or if the embedding call fails.
+        Silently logs a WARNING and returns if the proxy or the embedder is
+        unavailable, or if the embedding call fails.
+
+        **Synchronous on purpose.** One entry per call, on a call site that already
+        blocks; what the owned embedder buys is a bounded mailbox turn, since the
+        call now carries the embedding worker's ``timeout_s``.
         """
-        if self._vs_proxy is None:
+        if self._vs_proxy is None or self._embedder is None:
             return
         try:
             text = f"{entity.name}: {entity.description}"
-            vectors = self._vs_proxy.embed([text])
+            vectors = self._embedder.embed([text])
             if not vectors:
                 return
             self._vs_proxy.add(
@@ -233,14 +249,14 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         """
         if not relation.description:
             return
-        if self._vs_proxy is None:
+        if self._vs_proxy is None or self._embedder is None:
             return
         try:
             text = (
                 f"{relation.from_entity} {relation.relation_type} "
                 f"{relation.to_entity}: {relation.description}"
             )
-            vectors = self._vs_proxy.embed([text])
+            vectors = self._embedder.embed([text])
             if not vectors:
                 return
             self._vs_proxy.add(
@@ -905,7 +921,9 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         Returns:
             ``SearchResult`` with hits ranked by cosine similarity score.
         """
-        scores = semantic_scores(self._vs_proxy, KG_COLLECTION, query_text, top_k)
+        scores = semantic_scores(
+            self._vs_proxy, self._embedder, KG_COLLECTION, query_text, top_k
+        )
         hits: list[SearchHit] = []
         for ref_id, score in scores.items():
             if score < score_threshold:
@@ -955,6 +973,7 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         result = hybrid_search(
             by_ref_id.keys(),
             self._vs_proxy,
+            self._embedder,
             KG_COLLECTION,
             query_text,
             top_k=top_k,

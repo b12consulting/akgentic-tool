@@ -123,14 +123,17 @@ literal.
 EMBEDDING_STALE_AFTER_S = 600.0
 """How long a file may sit at :attr:`RagStatus.EMBEDDING` before it is reaped.
 
-Not a card parameter. ``VectorStoreActor`` keeps the map from an open request to
-its requester in a **private** attribute — correctly, because an ``ActorAddress``
-inside a ``BaseState`` breaks ``notify_state_change()``
-(``b12consulting/akgentic-core#131``) — so after a resume the store's own pending
-requests are gone too and its derived status truthfully reads ``READY``. Nothing
-in the store will ever tell a file left at ``EMBEDDING`` that its signal is not
-coming. The reaper is the only thing that will, and reverting to
-:attr:`RagStatus.PENDING` costs one re-index and never a wrong answer.
+Not a card parameter. The workspace spawns one ``#embed-`` worker per batch and
+counts the reports; a worker that **dies without reporting** — killed with the
+process, or lost across a resume — leaves its file waiting for a signal that is
+never coming, and no message will ever arrive to say so. The reaper is the only
+thing that frees it, and reverting to :attr:`RagStatus.PENDING` costs one
+re-index and never a wrong answer.
+
+Every other failure is a message and needs no bound: a worker that could not embed
+tells ``EmbeddingError``, and a write that could not land raises on the turn the
+workspace attempts it. The value is therefore generous relative to the worker's own
+20 s budget; shortening it is defensible once the new shape has run.
 """
 
 

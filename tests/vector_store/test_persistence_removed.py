@@ -170,5 +170,5 @@ class TestLegacyPayloadsStillValidate:
             }
         )
 
-        assert restored.pending_requests == {}
         assert not hasattr(restored, "pending_entries")
+        assert not hasattr(restored, "indexing_pending")

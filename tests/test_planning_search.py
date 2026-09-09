@@ -323,7 +323,7 @@ class TestSearchPlanningQuerySemantic:
         _add_task(actor, 2, "database schema")  # semantic match only
         _add_task(actor, 3, "deployment pipeline")  # no match
 
-        actor._vs_proxy = self._make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = self._make_vs_proxy_mock(
             embed_return=[[0.1, 0.2, 0.3]],
             search_hits=[("2", 0.75), ("3", 0.3)],
         )
@@ -337,7 +337,7 @@ class TestSearchPlanningQuerySemantic:
         actor = _make_actor(vector_store=True)
         _add_task(actor, 1, "auth module")
 
-        actor._vs_proxy = self._make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = self._make_vs_proxy_mock(
             embed_return=[[0.1, 0.2, 0.3]],
             search_hits=[("1", 0.9)],
         )
@@ -352,7 +352,7 @@ class TestSearchPlanningQuerySemantic:
         actor = _make_actor(vector_store=True)
         _add_task(actor, 1, "database task")
 
-        actor._vs_proxy = self._make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = self._make_vs_proxy_mock(
             embed_return=[[0.1, 0.2]],
             search_hits=[("1", 0.5)],
         )
@@ -367,7 +367,7 @@ class TestSearchPlanningQuerySemantic:
         actor = _make_actor(vector_store=True)
         _add_task(actor, 1, "database task")
 
-        actor._vs_proxy = self._make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = self._make_vs_proxy_mock(
             embed_return=[[0.1, 0.2]],
             search_hits=[("1", 0.49)],
         )
@@ -381,7 +381,7 @@ class TestSearchPlanningQuerySemantic:
         actor = _make_actor(vector_store=True)
         _add_task(actor, 1, "auth flow setup")
 
-        actor._vs_proxy = self._make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = self._make_vs_proxy_mock(
             embed_return=[],
             search_hits=[],
         )
@@ -476,7 +476,7 @@ class TestSearchPlanningVectorFallback:
 
         mock_proxy = MagicMock()
         mock_proxy.embed.side_effect = RuntimeError("embedding API error")
-        actor._vs_proxy = mock_proxy
+        actor._vs_proxy = actor._embedder = mock_proxy
 
         result = actor.search_planning(query="auth")
 

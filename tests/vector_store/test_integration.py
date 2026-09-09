@@ -109,55 +109,6 @@ class TestFullLifecycle:
         assert len(result2.hits) == 2
 
 
-# ---------------------------------------------------------------------------
-# AC4: Integration Test — INDEXING to READY
-# ---------------------------------------------------------------------------
-
-
-class TestIndexingToReady:
-    """AC4: add without vectors -> INDEXING -> deliver EmbeddingResult -> READY."""
-
-    def test_indexing_to_ready_lifecycle(self, actor: VectorStoreActor) -> None:
-        """Async lifecycle: add needs-embedding -> INDEXING -> result -> READY."""
-        config = VectorStoreParam(dimension=3, embedding_model="test-embedding")
-        actor.create_collection("async_col", config)
-
-        # Add entries without vectors (triggers embedding path)
-        entries = [
-            _entry("e1", text="hello"),
-            _entry("e2", text="world"),
-        ]
-        actor.add("async_col", entries)
-
-        # Verify INDEXING status
-        assert (
-            actor.state.collection_statuses["async_col"] == CollectionStatus.INDEXING
-        )
-        assert actor.state.indexing_pending["async_col"] == 2
-        request_id = next(iter(actor.state.pending_requests))
-
-        # Deliver EmbeddingResult manually
-        embedded_entries = [
-            VectorEntry(
-                ref_type="entity", ref_id="e1", text="hello", vector=[1.0, 0.0, 0.0]
-            ),
-            VectorEntry(
-                ref_type="entity", ref_id="e2", text="world", vector=[0.0, 1.0, 0.0]
-            ),
-        ]
-        result_msg = EmbeddingResult(
-            collection="async_col", entries=embedded_entries, request_id=request_id
-        )
-        actor.receiveMsg_EmbeddingResult(result_msg)
-
-        # Verify READY status
-        assert actor.state.collection_statuses["async_col"] == CollectionStatus.READY
-
-        # Search returns the newly-embedded entries
-        search_result = actor.search("async_col", [0.9, 0.1, 0.0], top_k=2)
-        assert len(search_result.hits) == 2
-        assert search_result.hits[0].ref_id == "e1"
-
 
 # ---------------------------------------------------------------------------
 # AC5: Integration Test — Multiple Collections
@@ -193,28 +144,6 @@ class TestMultipleCollections:
         plan_result = actor.search("planning", [1.0, 0.0, 0.0, 0.0], top_k=5)
         assert len(plan_result.hits) == 1
         assert plan_result.hits[0].ref_id == "p1"
-
-
-# ---------------------------------------------------------------------------
-# AC6: Integration Test — embed()
-# ---------------------------------------------------------------------------
-
-
-class TestEmbedReturnsVectors:
-    """AC6: embed() delegates to EmbeddingService and returns vectors."""
-
-    def test_embed_returns_vectors(self, actor: VectorStoreActor) -> None:
-        """Mock EmbeddingService.embed -> verify correct dimension vectors."""
-        mock_svc = MagicMock()
-        mock_svc.embed.return_value = [[0.1, 0.2, 0.3]]
-        actor._embedding_svc = mock_svc
-
-        result = actor.embed(["hello"])
-
-        mock_svc.embed.assert_called_once_with(["hello"])
-        assert len(result) == 1
-        assert len(result[0]) == 3
-        assert result[0] == [0.1, 0.2, 0.3]
 
 
 # ---------------------------------------------------------------------------

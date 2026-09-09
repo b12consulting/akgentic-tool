@@ -353,17 +353,16 @@ PlanningTool(collection=VectorStoreParam(backend="weaviate", tenant="team-42"))
 | Method | Purpose |
 |---|---|
 | `create_collection(name, config)` | Create or reconfigure a named collection. Called by each consumer's actor on start. |
-| `add(collection, entries, requester=None, request_ref=None)` | Ingest `VectorEntry` records. Entries arriving without a vector are embedded asynchronously. |
+| `add(collection, entries)` | Write pre-embedded `VectorEntry` records. An entry with an empty vector raises `ValueError`; a backend fault raises `RetriableError` rather than being swallowed. |
 | `remove(collection, ref_ids, scope=None, path_prefix=None)` | Drop entries by reference id, narrowed by the predicates. |
 | `search(collection, query_vector, top_k, scope=None, path_prefix=None, query=None)` | Cosine search, returning a `SearchResult`. `scope` / `path_prefix` narrow within a team; pass an optional `VectorQuery` to filter, threshold, or forward backend-native params. |
-| `embed(texts)` | Embed a batch directly. |
 
 `SearchResult` carries `hits: list[SearchHit]` (`ref_type`, `ref_id`, `text`, `score`, plus
 `scope` / `path` / `ordinal` when the entry set them), a `status` of `ready` / `indexing`, and
-`indexing_pending` — the number of entries still being embedded. A non-zero `indexing_pending` is
-why a just-written task can be missing from a semantic search a moment later and present a moment
-after. `error` remains in the enum for a backend-level fault, but no single failed batch reaches
-it: a failure is reported to the caller that asked for the batch and leaves the collection alone.
+`indexing_pending`, which is now always `0`: a write either lands on the turn it arrives or raises,
+so the store tracks no work in progress. `indexing` and `error` remain in the enum — nothing in this
+package assigns either — because a backend-level fault that invalidates a whole collection is what
+`error` is for.
 
 `VectorEntry` links an embedding back to its source: `ref_type` (a free-form domain label —
 `"entity"`, `"relation"`, a planning label), `ref_id` (a UUID string), `text`, `vector`, and the
@@ -379,18 +378,23 @@ default to `None`, and an entry that sets none of them is written exactly as it 
 existed. Both predicates are applied **before** `top_k`, in the cluster on Weaviate and before the
 cut in memory, so a scoped search returns a full `top_k` of its own entries.
 
-### Embedding happens off the actor thread
+### Embedding belongs to the consumer, not to the store
 
-Entries needing an embedding are handed to an `EmbeddingActor`, which answers with an
-`EmbeddingResult` or an `EmbeddingError`. The store actor never blocks on the OpenAI call, so a
-slow or failing embedding endpoint degrades search freshness rather than freezing every tool call
-routed through the store.
+The store embeds nothing. The code that owns a `VectorStoreParam` — the workspace indexer, the
+planning actor, the knowledge graph — embeds with the model *its own* param names and hands the
+store finished vectors.
 
-Each asynchronous `add` opens its own request, and a result or an error settles only that
-request: two concurrent adds into one collection never settle each other, and a failure fails one
-batch. A caller that passes a `requester` is told `EmbeddingCompleted` when its request settles —
-either way, with `error` set on failure — carrying back the `request_ref` it gave, since `add` is
-reached by `tell` and cannot return the id the store mints internally.
+The workspace indexer spawns one `EmbeddingWorker` per batch under a `#embed-` name, using
+`build_embedding_service`, which is the single place the worker's timeout budget is chosen. The
+worker embeds off the actor thread and reports back through the consumer's own
+`receiveMsg_EmbeddingResult` / `receiveMsg_EmbeddingError`, carrying the whole entries with their
+vectors filled in — so `scope`, `path` and `ordinal` never leave the consumer's objects. The
+consumer then writes that batch with a single `add` ask on its own mailbox turn, and a write that
+cannot land marks the file `FAILED` with the reason there and then.
+
+Planning and the knowledge graph embed one entry at a time on a call site that already blocks, so
+they keep their synchronous shape and simply hold their own `EmbeddingService`. What they gain is a
+bounded turn: the blocking call now carries the worker's timeout budget.
 
 ### The in-memory index
 
@@ -534,8 +538,10 @@ ToolFactory([
 ], observer=agent)
 ```
 
-A larger embedding model needs a matching `dimension` on the consumer's collection, declared beside
-the model that produces it — `dimension=3072` with the default model is refused at bind:
+**The consumer's `embedding_model` is the one that embeds.** `VectorStoreTool`'s own
+`embedding_model` / `embedding_provider` are inert — the store writes vectors and produces none —
+and are kept only until the card drops them. Declare the model on the consumer's collection, beside
+the `dimension` it pins; `dimension=3072` with the default model is refused at bind:
 
 ```python
 KnowledgeGraphTool(
@@ -551,6 +557,7 @@ from akgentic.tool.vector_store import (
     VectorStoreTool, VectorStoreActor, VectorStoreConfig, VS_ACTOR_NAME,
     VectorStoreParam, CollectionStatus, SearchHit, SearchResult, VectorQuery,
     VectorEntry, VectorIndex, EmbeddingService,
+    EmbeddingWorker, build_embedding_service, embedding_worker_name,
     VectorStoreService, InMemoryBackend, WeaviateBackend, QdrantBackend,
     BackendContext, BackendSpec, register_backend, unregister_backend,
     is_registered, available_backends, get_backend_spec,
