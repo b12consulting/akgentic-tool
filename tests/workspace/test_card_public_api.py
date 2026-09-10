@@ -102,6 +102,7 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "RunningExec",
         "STAGING_SWEEP_GRACE_S",
         "Span",
+        "SweepTick",
         "TEXT_EXTENSIONS",
         "TIMED_OUT_EXIT_CODE",
         "TextSplitter",

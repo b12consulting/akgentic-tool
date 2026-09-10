@@ -491,8 +491,8 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
 
         ``attach`` is deliberately **not** guarded like this, and the difference
         is the point: a lost ``attach`` does not degrade, it leaves the actor
-        unaware that this agent holds it, which from the liveness sweep on lets it
-        reap a tree an agent is still using — silently.
+        unaware that this agent holds it, which lets the liveness sweep reap a
+        tree an agent is still using — silently.
         """
         tell = self._workspace_tell
         if tell is None:

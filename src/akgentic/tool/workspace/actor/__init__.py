@@ -29,7 +29,8 @@ timeout.
 process's ``WorkspaceHost``, forwarded by its own team's orchestrator: the host
 starts it with no orchestrator and no parent, so it is nobody's child, emits no
 ``StartMessage``, and is shared by every team whose cards resolve its path. Agents
-``attach`` to it; teams do not own it.
+``attach`` to it; teams do not own it, and it reaps itself when its last holder
+has stopped.
 
 **The name carries the workspace, and that is load-bearing.** The host keys its
 registry on the actor *name*, so a fixed ``#Workspace`` would collapse two cards
@@ -64,20 +65,26 @@ observation and last-writer maps in :mod:`~akgentic.tool.workspace.actor.observa
 the gate and the six mutations in :mod:`~akgentic.tool.workspace.actor.gate`, and
 the lease and the deferred surface in :mod:`~akgentic.tool.workspace.actor.execution`.
 Each body is the same code with the same ``self``; what stays here is the class
-itself, ``on_start``, ``init_state``, ``worker_class`` and the startup sweep
-``on_start`` calls.
+itself, ``on_start``, ``init_state``, ``worker_class``, the startup sweep
+``on_start`` calls, and the actor's lifetime — the liveness sweep's tick, the
+grace and the self-stop — which spans three mixins' maps.
 """
 
 from __future__ import annotations
 
 import contextlib
 import logging
+import threading
 import time
 from collections import OrderedDict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from pykka import ActorDeadError
+
+from akgentic.core.actor_system_impl import ActorSystem
+from akgentic.core.messages.message import ResourceStopped
 from akgentic.tool.core.deferred import DeferredResultActor, DeferredWorker
 from akgentic.tool.workspace.actor.documents import DocumentsMixin
 from akgentic.tool.workspace.actor.execution import EXEC_CAPABILITY, ExecMixin
@@ -91,11 +98,13 @@ from akgentic.tool.workspace.execution import (
     QueuedExec,
     RunningExec,
 )
+from akgentic.tool.workspace.host import WorkspaceHost
 from akgentic.tool.workspace.journal import GitJournal
 from akgentic.tool.workspace.models import (
     STAGING_SWEEP_GRACE_S,
     LastWrite,
     Observation,
+    SweepTick,
     WorkspaceConfig,
     WorkspaceState,
 )
@@ -172,6 +181,46 @@ def _is_sweepable_orphan(entry: Path, cutoff: float) -> bool:
         return False
 
 
+def _tell_tick(address: ActorAddress) -> None:
+    """TIMER THREAD ONLY. Tell the workspace at *address* one ``SweepTick``, and nothing else.
+
+    **The whole of what the timer thread does.** Every piece of state the sweep
+    reads or changes is the actor's, so it is touched on the actor's mailbox and
+    never here — the rule core ADR-014 set when it took a wall-clock timer out
+    of the orchestrator, and the reason ADR-050 withdrew an inactivity timer
+    from inside a strategy.
+
+    It closes over the **address**, never over the actor: an ``ActorAddressImpl``
+    holds its actor weakly, so an armed timer cannot pin a stopped workspace —
+    the rule ``ExecRunner.perform`` states for its ``reply_to``.
+
+    ``ActorDeadError`` is the ordinary end of every timer, not an error: the
+    actor stopped between arming and firing, and a cancel that lost the race to
+    the firing still runs this.
+
+    Args:
+        address: The workspace's own address, captured on its thread at arming.
+    """
+    with contextlib.suppress(ActorDeadError):
+        address.tell(SweepTick())
+
+
+def _host_address() -> ActorAddress | None:
+    """The process's ``WorkspaceHost``, looked up at each use and never cached.
+
+    Core's reference shape for a hosted actor's way home. It names
+    ``WorkspaceHost`` and never the base: the lookup is by exact class, so
+    asking for ``ResourceHost`` in a process that runs a ``WorkspaceHost``
+    answers nothing. An empty answer is not an error — at process exit the host
+    may already be gone.
+
+    Returns:
+        The host's address, or ``None`` when no ``WorkspaceHost`` is running.
+    """
+    hosts = ActorSystem.find_by_class(WorkspaceHost)
+    return hosts[0] if hosts else None
+
+
 class WorkspaceActor(
     DocumentsMixin,
     ExecMixin,
@@ -187,6 +236,18 @@ class WorkspaceActor(
     ``config`` on a hit, so a later card that disagrees gets the tree as it was
     created, with nothing raised — two cards disagreeing about one tree is a
     catalog inconsistency, not something the host arbitrates.
+
+    **It owns its own lifetime, because nobody else can.** No team's teardown
+    reaches it and the host never stops it. A daemon timer tells it a
+    :class:`~akgentic.tool.workspace.models.SweepTick` every ``sweep_interval_s``;
+    the tick, on this mailbox, drops every holder whose actor has stopped and
+    prunes what the actor kept about it, and discards the queued runs nobody is
+    left to wait for. At zero holders a ``reap_grace_s`` grace starts, which an
+    ``attach`` cancels; the first tick at or past its end stops the actor through
+    its own ``Akgent.stop`` — so ``stop_children`` takes the store child and any
+    live worker down with it — and ``on_stop`` tells the host a
+    ``ResourceStopped``. A team stopping and an equivalent one starting inside
+    the grace find this same actor, journal and container.
 
     ``DocumentsMixin`` sits ahead of ``ExecMixin`` in the MRO, so anything it
     named ``deliver`` or ``fail`` would silently take over the deferred delivery
@@ -233,9 +294,16 @@ class WorkspaceActor(
         commit would commit orphaned staging files and then delete them, and
         seeding ``.gitignore`` after that commit would leave the sidecars inside
         it.
+
+        **The liveness timer is armed last, here, and not at the first
+        ``attach``.** A get-or-create whose ``attach`` then failed leaves an actor
+        nobody holds; armed here, the sweep reaps that orphan like any other.
         """
         self.state = WorkspaceState()
         super().on_start()
+        self._sweep_timer: threading.Timer | None = None
+        self._reap_deadline: float | None = None
+        self._discarded_run: str | None = None
         self._holders: dict[str, ActorAddress] = {}
         self._observations: dict[str, OrderedDict[str, Observation]] = {}
         self._last_writers: OrderedDict[str, LastWrite] = OrderedDict()
@@ -275,6 +343,7 @@ class WorkspaceActor(
         if self._journal.initialise():
             self._journal.seed_gitignore(self._workspace.write)
             self._journal.commit_out_of_band()
+        self._arm_sweep()
 
     def init_state(self, state: WorkspaceState) -> None:
         """Take a restored snapshot, then free anything left mid-embed (ADR-045 §7).
@@ -345,9 +414,9 @@ class WorkspaceActor(
         )
 
     def on_stop(self) -> None:
-        """Take exec down in its stated order, then chain to the base.
+        """Close the sweep, take exec down in its stated order, announce, chain to the base.
 
-        The four steps and the reasoning behind their order live in
+        The four exec steps and the reasoning behind their order live in
         :meth:`~akgentic.tool.workspace.actor.execution.ExecMixin._teardown_exec`,
         beside the exec code they tear down: cancel the queued runs, kill the
         running subprocess, drain the worker under a bound, release the backend.
@@ -360,12 +429,157 @@ class WorkspaceActor(
         :data:`~akgentic.tool.workspace.execution.EXEC_SHUTDOWN_GRACE_S`, rather
         than one run's full budget.
 
-        Nothing there may raise past ``super()``: leaving a Pykka actor part-way
+        **It runs on three paths, and the announcement is a tidy-up on all of
+        them:** the self-stop after the grace, a fixture's stop in tests, and
+        ``ActorSystem.shutdown`` through ``ActorRegistry.stop_all()``. Core treats
+        a dead registry entry as a miss, so nothing depends on the
+        ``ResourceStopped`` arriving, and an empty host lookup at process exit is
+        not an error. The sweep timer is closed first so no tick is armed past
+        this point; one already in flight lands on a dead address and is
+        swallowed by :func:`_tell_tick`.
+
+        Nothing here may raise past ``super()``: leaving a Pykka actor part-way
         stopped is worse than any error a step could report, which is why every
         step is wrapped individually.
         """
+        self._close_sweep()
         self._teardown_exec()
+        self._announce_stop()
         super().on_stop()
+
+    ##
+    ## Lifetime — the liveness sweep, the grace, and the self-stop
+    ##
+    def receiveMsg_SweepTick(self, msg: SweepTick) -> None:
+        """TELL, from this actor's own timer thread. Sweep the holders; reap at the grace's end.
+
+        On this mailbox, so no sweep interleaves with an ``attach``. A holder is
+        dropped only when its actor's ``is_alive()`` is false — pykka's stopped
+        flag, never a health probe: an agent whose handler raised is still
+        running, and still holds the tree. What the actor kept about a dropped
+        holder goes with it, and so do its queued runs; its running run is
+        marked and completes on its budget.
+
+        Then the grace (:meth:`_grace_expired`), and the timer is re-armed —
+        unless the grace ran out, in which case the actor stops itself and
+        nothing is re-armed.
+
+        Args:
+            msg: The tick. It carries nothing.
+        """
+        dropped = self._drop_dead_holders()
+        self._drop_runs_of(dropped)
+        if dropped:
+            logger.info(
+                "Workspace %s: swept %d stopped holder(s)",
+                self.config.workspace_path,
+                len(dropped),
+            )
+        if self._grace_expired():
+            self._reap()
+            return
+        self._arm_sweep()
+
+    def _grace_expired(self) -> bool:
+        """Advance the grace by one tick, and say whether it has run out.
+
+        **One clock, not two.** The grace is a monotonic deadline checked here,
+        rather than a second timer, so the reap lands at the first tick at or
+        past it — between ``reap_grace_s`` and ``reap_grace_s + sweep_interval_s``
+        after the last holder stopped, never before — and ``attach`` cancels it
+        with one assignment and nothing to cancel.
+
+        With holders the deadline is cleared, defensively: ``attach`` is what
+        clears it, on this same mailbox.
+
+        Returns:
+            True only at zero holders, at or past a deadline an earlier tick set.
+        """
+        if self._holders:
+            self._reap_deadline = None
+            return False
+        now = time.monotonic()
+        if self._reap_deadline is None:
+            self._reap_deadline = now + self.config.reap_grace_s
+            logger.info(
+                "Workspace %s: no holder; reaping in %gs unless one attaches",
+                self.config.workspace_path,
+                self.config.reap_grace_s,
+            )
+            return False
+        if now < self._reap_deadline:
+            return False
+        logger.info(
+            "Workspace %s: the grace expired with no holder; stopping",
+            self.config.workspace_path,
+        )
+        return True
+
+    def _arm_sweep(self) -> None:
+        """Arm the one-shot timer that tells the next ``SweepTick``, replacing any armed one.
+
+        Only this actor's thread ever touches the ``Timer`` object; the timer
+        thread runs :func:`_tell_tick` and nothing else. Daemon, so an armed
+        timer never holds the interpreter open.
+
+        An inert actor — built and ``on_start``-ed by a test harness rather than
+        started — arms one too. Unless its ``on_stop`` closes it, it fires once
+        into an inbox nobody drains and ends. That is harmless, so there is no
+        flag to opt out of it.
+        """
+        self._close_sweep()
+        timer = threading.Timer(self.config.sweep_interval_s, _tell_tick, args=(self.myAddress,))
+        timer.daemon = True
+        timer.name = f"sweep-{self.config.workspace_path}"
+        timer.start()
+        self._sweep_timer = timer
+
+    def _close_sweep(self) -> None:
+        """Cancel and drop the armed sweep timer, if there is one."""
+        timer = self._sweep_timer
+        self._sweep_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def _reap(self) -> None:
+        """Stop this actor from its own tick, through ``Akgent.stop`` — never the ref's stop.
+
+        ``Akgent.stop`` checkpoints (a no-op with no orchestrator), then
+        ``stop_children(blocking=True)`` — the ``#VectorStore-<path>`` child and
+        any live ``#index-`` / ``#embed-`` worker, each asked to stop — then
+        pykka's stop, which tells ``_ActorStop`` to this actor's own inbox. It is
+        processed after this handler returns, so ``on_stop`` runs on this thread.
+        ``self.actor_ref.stop()`` would run ``on_stop`` too but no
+        ``stop_children``, and leave the store child running with nobody left to
+        stop it.
+
+        **The blocking ``stop_children`` cannot deadlock here**, which is not true
+        of every actor (the orchestrator's children ask it back, which is why it
+        never calls ``super().stop()``). No child of this one ever asks its
+        parent: the index and embedding workers report by ``proxy_tell``, and
+        the store child asks nobody. A worker mid-extraction holds the stop open
+        for its own duration, as a team's teardown already does.
+        """
+        self._close_sweep()
+        self.stop()
+
+    def _announce_stop(self) -> None:
+        """Tell the process's ``WorkspaceHost`` that this tree's actor is gone.
+
+        Looked up now, never cached. A host already gone — the lookup answers
+        nothing, or it stops between the lookup and the tell — is nobody to tell,
+        not a failure: the host treats a dead entry as a miss anyway.
+        """
+        host = _host_address()
+        if host is None:
+            return
+        try:
+            self.send(host, ResourceStopped(scope=self.config.name))
+        except ActorDeadError:
+            logger.debug(
+                "Workspace %s: its host stopped before the announcement reached it",
+                self.config.workspace_path,
+            )
 
     ##
     ## Startup housekeeping

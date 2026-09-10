@@ -38,6 +38,7 @@ class ObservationMixin:
     _observations: dict[str, OrderedDict[str, Observation]]
     _last_writers: OrderedDict[str, LastWrite]
     _touched: list[str]
+    _reap_deadline: float | None
     config: WorkspaceConfig
 
     ##
@@ -53,11 +54,16 @@ class ObservationMixin:
 
         **The holder is what the actor's lifetime is made of.** A hosted
         ``#Workspace`` is nobody's child, so no team's teardown stops it; it lives
-        while agents hold it, and the liveness sweep (story 51-3) drops a holder
-        whose actor has stopped. The holder map is therefore **not capped**: it is
-        bounded by live agents and pruned by that sweep. Nothing in this story
-        removes a holder, and a second ``attach`` from the same agent overwrites
-        its entry rather than adding one.
+        while agents hold it. The holder map is therefore **not capped**: it is
+        bounded by live agents and pruned by the liveness sweep
+        (:meth:`_drop_dead_holders`), which drops a holder **only** when its
+        actor's ``is_alive()`` is false. A second ``attach`` from the same agent
+        overwrites its entry rather than adding one.
+
+        **An attach cancels the reap grace**, and it is the one thing that does:
+        the first line clears the deadline. It runs on the actor's mailbox, so it
+        cannot interleave with a tick — a tick either ran before it, and the
+        deadline it set is cleared here, or runs after it and finds a holder.
 
         **The name is what the journal and the refusals print.** The card can
         capture ``agent_id`` without an edge back to the agent (ADR-030), but an
@@ -75,12 +81,36 @@ class ObservationMixin:
             agent: The binding agent's address.
             agent_name: Its configured, human-readable name.
         """
+        self._reap_deadline = None
         agent_id = str(agent.agent_id)
         self._holders[agent_id] = agent
         self._agent_names[agent_id] = agent_name
         self._agent_names.move_to_end(agent_id)
         while len(self._agent_names) > self.config.max_tracked_writers:
             self._agent_names.popitem(last=False)
+
+    def _drop_dead_holders(self) -> list[str]:
+        """Drop every holder whose actor has stopped, and what this actor kept about it.
+
+        The one question asked is ``is_alive()`` — pykka's stopped flag, which
+        ``ActorAddressImpl`` also answers false for a collected actor, and which
+        never raises. It is not a health probe and must never become one: an
+        agent whose handler raised is still running, and still holds the tree.
+
+        The holder's observations and its name go with it. **The last-writer map
+        is not touched**: it is keyed by path, and a later refusal on that path
+        prints the writer's id through :meth:`_name_of`'s fallback rather than
+        losing the attribution.
+
+        Returns:
+            The dropped agent ids, for the exec side to prune its own maps by.
+        """
+        dropped = [agent_id for agent_id, agent in self._holders.items() if not agent.is_alive()]
+        for agent_id in dropped:
+            del self._holders[agent_id]
+            self._observations.pop(agent_id, None)
+            self._agent_names.pop(agent_id, None)
+        return dropped
 
     def _name_of(self, agent_id: str) -> str:
         """Return *agent_id*'s registered name, falling back to the id itself."""

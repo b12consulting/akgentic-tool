@@ -15,6 +15,7 @@ import threading
 import time
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -63,13 +64,22 @@ from akgentic.tool.workspace.execution import (
     queued,
     timed_out,
 )
+from akgentic.tool.workspace.documents.models import (
+    EXTRACTOR_VERSION,
+    DocumentExtract,
+    RagFile,
+    RagStatus,
+)
 from akgentic.tool.workspace.journal import MAX_COMMIT_BODY_CHARS
+from akgentic.tool.workspace.models import MutationStatus, Observation, SweepTick, content_sha
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
 
+from tests.conftest import MockActorAddress
 from tests.workspace.conftest import (
     workspace_path_for,
     HANDSHAKE_TIMEOUT_S,
     WORKSPACE_PATH,
+    DeadAddress,
     ExecHarness,
     FakeActorToolObserver,
     FakeBackend,
@@ -3539,3 +3549,209 @@ class TestAWedgedChild:
         # "echo head" is absent: the late report committed nothing as its agent.
         assert discovered == ["echo tail"]
         assert actor.exec_status(AGENT, head).state is ExecState.DONE
+
+
+# ---------------------------------------------------------------------------
+# Story 51-3 — the liveness sweep's exec half: the dropped run and the prune
+# ---------------------------------------------------------------------------
+
+
+class MortalAddress(MockActorAddress):
+    """A holder's address whose actor a spec can stop, by setting :attr:`dead`.
+
+    ``DeadAddress`` is dead from the start; a holder that must run first and
+    stop afterwards needs the flag.
+    """
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.dead = False
+
+    def is_alive(self) -> bool:
+        return not self.dead
+
+
+def attached_mortal(actor: WorkspaceActor, name: str) -> tuple[str, MortalAddress]:
+    """Attach a holder a spec can later stop, and return the id its maps key on."""
+    address = MortalAddress(name)
+    actor.attach(address, name)
+    return str(address.agent_id), address
+
+
+class TestASweptHoldersQueuedRunNeverStarts:
+    """A shell nobody is waiting for must not start — dropped at the sweep, before the backend."""
+
+    def test_the_dropped_agents_queued_run_never_reaches_exec_and_a_live_ones_does(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        _card, actor, harness = exec_setup
+        alpha = attached(actor, "alpha")
+        dead = DeadAddress("beta")
+        actor.attach(dead, "beta")
+        beta = str(dead.agent_id)
+        gamma = attached(actor, "gamma")
+        # Beta also has an earlier failed run, so the ``_run_errors`` prune is observable.
+        earlier = new_run_id()
+        actor._track_run(beta, earlier, "false")
+        actor._record_failure(earlier, "exit 1")
+        actor.record_observation(beta, "notes.md", Observation(sha="0" * 64, full=True))
+        head = start_run(actor, sandbox_script, cmd="echo alpha", agent=alpha)
+        queued_beta = actor.request_exec(beta, "echo beta").run_id
+        queued_gamma = actor.request_exec(gamma, "echo gamma").run_id
+        assert queued_beta is not None and queued_gamma is not None
+        assert actor.exec_status(beta, queued_beta).state is ExecState.QUEUED
+        in_flight = set(actor._in_flight)
+
+        actor.receiveMsg_SweepTick(SweepTick())
+
+        assert beta not in actor._holders
+        assert beta not in actor._observations
+        assert beta not in actor._agent_names
+        assert beta not in actor._recent_runs
+        assert earlier not in actor._run_errors
+        assert [entry.run_id for entry in actor._queue] == [queued_gamma]
+        assert actor._running is not None
+        assert actor._running.run_id == head
+        assert actor._in_flight == in_flight
+        assert actor.exec_status(beta, queued_beta).state is ExecState.UNKNOWN
+        assert {alpha, gamma} <= set(actor._holders)
+
+        finish_run(sandbox_script, harness)
+
+        # Released and joined, so the backend has seen everything it ever will.
+        assert [cmd for cmd, _cwd in sandbox_script.commands] == ["echo alpha", "echo gamma"]
+        assert actor.exec_status(gamma, queued_gamma).state is ExecState.DONE
+
+
+class TestASweptHoldersRunningRunCompletesAndIsDiscarded:
+    """Decision 9: a running run completes on its budget, and its report is not cached."""
+
+    @pytest.fixture
+    def journal_setup(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        sandbox_script: SandboxScript,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> Generator[tuple[WorkspaceActor, ExecHarness], None, None]:
+        """The module fixture with the journal on — the discovered commit is asserted."""
+        _card, _observer = exec_card_for(orchestrator_proxy, git_journal=True)
+        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+        assert isinstance(actor, WorkspaceActor)
+        harness = ExecHarness(actor, orchestrator_proxy)
+        harness.install(monkeypatch)
+        yield actor, harness
+        harness.close()
+
+    @requires_git
+    def test_the_run_is_not_killed_its_outcome_is_not_cached_and_the_tree_moves_on(
+        self,
+        journal_setup: tuple[WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+        workspace_tree: Path,
+    ) -> None:
+        actor, harness = journal_setup
+        alpha, alpha_address = attached_mortal(actor, "alpha")
+        beta = attached(actor, "beta")
+        sandbox_script.files_by_cmd = {"make alpha": [("alpha.txt", "a\n")]}
+        run_id = start_run(actor, sandbox_script, cmd="make alpha", agent=alpha)
+        queued_beta = actor.request_exec(beta, "echo beta").run_id
+        assert queued_beta is not None
+        alpha_address.dead = True
+
+        actor.receiveMsg_SweepTick(SweepTick())
+
+        assert sandbox_script.kills == 0
+        assert actor._running is not None
+        assert actor._running.run_id == run_id
+        assert run_id in actor._in_flight
+        assert actor._discarded_run == run_id
+
+        finish_run(sandbox_script, harness)
+
+        # Joined first: the report has arrived, so ``None`` is an absence and not a wait.
+        assert actor._running is None
+        assert actor.get(run_id) is None
+        assert run_id not in actor._run_errors
+        assert run_id not in actor._in_flight
+        assert actor._discarded_run is None
+        assert actor.exec_status(alpha, run_id).state is ExecState.UNKNOWN
+        # The tree was handed on, and beta's run answers as usual.
+        assert [cmd for cmd, _cwd in sandbox_script.commands] == ["make alpha", "echo beta"]
+        assert actor.exec_status(beta, queued_beta).state is ExecState.DONE
+        # The tree's own record is kept, authored by the id — the name went with the holder.
+        [commit] = [c for c in journal_log(workspace_tree) if "alpha.txt" in c.files]
+        assert commit.author_name == alpha
+        assert alpha in commit.author_email
+
+
+class TestTheSweepsPruneIsExact:
+    """Every per-agent map loses the swept agent; nothing keyed otherwise is touched."""
+
+    def test_the_agent_maps_lose_it_and_the_path_and_state_maps_keep_everything(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+        workspace_tree: Path,
+    ) -> None:
+        _card, actor, harness = exec_setup
+        alpha, alpha_address = attached_mortal(actor, "alpha")
+        beta = attached(actor, "beta")
+        (workspace_tree / "notes.md").write_text("v1\n", encoding="utf-8")
+        for agent in (alpha, beta):
+            actor.record_observation(
+                agent, "notes.md", Observation(sha=content_sha(b"v1\n"), full=True)
+            )
+        assert actor.apply_write(alpha, "notes.md", "v2\n").status is MutationStatus.ACCEPTED
+        sandbox_script.raise_with = RuntimeError("the command failed")
+        failed = start_run(actor, sandbox_script, cmd="echo fail", agent=alpha)
+        finish_run(sandbox_script, harness)
+        sandbox_script.raise_with = None
+        succeeded = start_run(actor, sandbox_script, cmd="echo beta", agent=beta)
+        finish_run(sandbox_script, harness)
+        assert failed in actor._run_errors
+        actor.state.documents["report.pdf"] = DocumentExtract(
+            path="report.pdf",
+            source_sha="0" * 64,
+            extractor_version=EXTRACTOR_VERSION,
+            markdown="# report",
+            char_count=8,
+            extracted_at=datetime.now(UTC),
+        )
+        actor.state.rag_index["report.pdf"] = RagFile(
+            path="report.pdf", status=RagStatus.PENDING, updated_at=datetime.now(UTC)
+        )
+        documents = actor.state.documents.copy()
+        rag_index = actor.state.rag_index.copy()
+        alpha_address.dead = True
+
+        actor.receiveMsg_SweepTick(SweepTick())
+
+        for per_agent in (actor._holders, actor._observations, actor._agent_names):
+            assert alpha not in per_agent
+            assert beta in per_agent
+        assert alpha not in actor._recent_runs
+        assert succeeded in actor._recent_runs[beta]
+        assert failed not in actor._run_errors
+        # Keyed by path: kept, and a refusal now prints the id through the fallback.
+        assert actor._last_writers["notes.md"].agent_id == alpha
+        assert actor._name_of(alpha) == alpha
+        assert actor.state.documents == documents
+        assert actor.state.rag_index == rag_index
+
+    def test_a_tick_that_finds_every_holder_alive_changes_nothing(
+        self, exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness]
+    ) -> None:
+        """The positive control: a sweep that drops on anything but ``is_alive()`` fails it."""
+        _card, actor, _harness = exec_setup
+        alpha = attached(actor, "alpha")
+        actor.record_observation(alpha, "notes.md", Observation(sha="0" * 64, full=True))
+        holders = dict(actor._holders)
+
+        actor.receiveMsg_SweepTick(SweepTick())
+
+        assert actor._holders == holders
+        assert alpha in actor._observations
+        assert actor._agent_names[alpha] == "alpha"

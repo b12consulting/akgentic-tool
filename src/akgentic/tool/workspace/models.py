@@ -16,6 +16,8 @@ import hashlib
 from enum import StrEnum
 from typing import Literal
 
+from pydantic import Field
+
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.core.utils.serializer import SerializableBaseModel
@@ -111,6 +113,31 @@ A staging file this young is being written **now** by somebody, and with a
 would make the other team's ``os.replace`` raise, turning a healthy write into a
 refusal. Orphans, by contrast, are minutes or restarts old — no real value of
 this constant separates the two badly.
+"""
+
+DEFAULT_SWEEP_INTERVAL_S = 30.0
+"""How often a hosted ``#Workspace`` sweeps its holders for stopped agents.
+
+It is how stale a stopped holder may be before the tree notices, and nothing
+more: the sweep asks each holder's ``is_alive()`` and costs one pass over a map
+bounded by live agents. It is no longer than the orchestrator's 30 s stop
+backstop and a quarter of :data:`DEFAULT_REAP_GRACE_S`, so the grace is measured
+in whole ticks.
+"""
+
+DEFAULT_REAP_GRACE_S = 120.0
+"""How long a hosted ``#Workspace`` outlives its last holder before it stops itself.
+
+A hosted tree is outside a team's two-phase teardown, so the grace is what keeps
+it alive through a stopping team's last handlers — which is why it sits above
+the orchestrator's 30 s stop backstop (see :data:`DEFAULT_GIT_TIMEOUT_S`), and
+above a run's longest life, ``MAX_EXEC_BUDGET_S`` plus ``LEASE_GRACE_S``. It is
+also what lets a team stopping and an equivalent one starting a minute later
+find the same actor, journal and container rather than rebuild them.
+
+The grace is checked on each sweep tick rather than by a second timer, so the
+reap lands between ``reap_grace_s`` and ``reap_grace_s + sweep_interval_s``
+after the last holder stopped — never before.
 """
 
 GIT_DIR_SUFFIX = ".git"
@@ -289,6 +316,11 @@ class WorkspaceConfig(BaseConfig):
         git_journal: Whether to keep a git journal of accepted mutations. The
             gate is unaffected either way — it is pure Python and independent.
         git_timeout_s: Wall-clock budget for one ``git`` invocation.
+        sweep_interval_s: Seconds between two liveness sweeps of the holders —
+            see :data:`DEFAULT_SWEEP_INTERVAL_S`. Positive.
+        reap_grace_s: Seconds the actor outlives its last holder before it stops
+            itself — see :data:`DEFAULT_REAP_GRACE_S`. Positive. Neither field is
+            a card setting: the first bind fixes both, like every field here.
     """
 
     workspace_path: str
@@ -298,6 +330,19 @@ class WorkspaceConfig(BaseConfig):
     max_document_chars: int = DEFAULT_MAX_DOCUMENT_CHARS
     git_journal: bool = False
     git_timeout_s: float = DEFAULT_GIT_TIMEOUT_S
+    sweep_interval_s: float = Field(default=DEFAULT_SWEEP_INTERVAL_S, gt=0)
+    reap_grace_s: float = Field(default=DEFAULT_REAP_GRACE_S, gt=0)
+
+
+class SweepTick(SerializableBaseModel):
+    """Time for a hosted ``#Workspace`` to sweep its holders — no fields, no meaning beyond that.
+
+    Told by the actor's own timer thread, which does nothing else, and handled
+    on the actor's mailbox, so a sweep can never interleave with an ``attach``.
+    **Never a** ``Message``: ``Akgent.on_receive`` dispatches a plain model by
+    name with no telemetry sandwich, so a tick puts nothing on any stream and
+    costs no orchestrator anything — a hosted actor has none to tell.
+    """
 
 
 class WorkspaceState(BaseState):

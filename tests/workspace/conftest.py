@@ -40,11 +40,15 @@ from akgentic.core.agent_state import BaseState
 from akgentic.tool.core import ToolState
 from akgentic.tool.sandbox import SANDBOX_BACKEND_CLASSES
 from akgentic.tool.sandbox.backend import ExecResult, validate_command
-from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
+from akgentic.tool.workspace.actor import (
+    WORKSPACE_ACTOR_ROLE,
+    WorkspaceActor,
+    workspace_actor_name,
+)
 from akgentic.tool.workspace.execution import DEFAULT_EXEC_TIMEOUT_S, RunningExec
 from akgentic.tool.workspace.host import WorkspaceHost
 from akgentic.tool.workspace.journal import git_dir_for
-from akgentic.tool.workspace.models import MutationOutcome, Observation
+from akgentic.tool.workspace.models import MutationOutcome, Observation, WorkspaceConfig
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
 
 from tests.conftest import MockActorAddress
@@ -670,6 +674,42 @@ def card_for(
     card = WorkspaceTool(workspace_id=workspace_id, git_journal=git_journal)
     card.observer(observer)
     return card, observer
+
+
+FAST_SWEEP_INTERVAL_S = 0.05
+"""The liveness sweep's interval in every spec that watches it tick — never a real default."""
+
+FAST_REAP_GRACE_S = 0.3
+"""The reap grace in those specs: six ticks, so "inside the grace" and "past it" are far apart."""
+
+
+def fast_config(workspace_path: str, **overrides: Any) -> WorkspaceConfig:
+    """A ``WorkspaceConfig`` for *workspace_path* whose sweep and grace run at test speed.
+
+    The card never learns the two fields — the first bind fixes them at their
+    defaults — so a spec that wants a tree to tick fast creates its actor through
+    the host with this config **before** any card binds.
+    """
+    fields: dict[str, Any] = {
+        "name": workspace_actor_name(workspace_path),
+        "role": WORKSPACE_ACTOR_ROLE,
+        "workspace_path": workspace_path,
+        "sweep_interval_s": FAST_SWEEP_INTERVAL_S,
+        "reap_grace_s": FAST_REAP_GRACE_S,
+    }
+    fields.update(overrides)
+    return WorkspaceConfig(**fields)
+
+
+def hosted_ahead(orchestrator_proxy: FakeOrchestratorProxy, config: WorkspaceConfig) -> Any:
+    """Create *config*'s actor through the fake host before any card binds, and return it.
+
+    The host ignores ``config`` on a hit, exactly as core's does, so a card that
+    binds afterwards gets this actor — with this config — rather than one built
+    from the card's own.
+    """
+    address = orchestrator_proxy.host.get_or_create(WorkspaceActor, config)
+    return orchestrator_proxy.host.actor_for(address)
 
 
 def attached(actor: WorkspaceActor, name: str) -> str:
