@@ -97,6 +97,10 @@ from tests.workspace.conftest import (
     SilentAgent,
     attached,
     exec_card_for,
+    seed_extract,
+    seed_row,
+    stored_docs,
+    stored_rows,
     journal_body,
     journal_log,
     mutate,
@@ -3600,19 +3604,19 @@ class TestTheSweepsPruneIsExact:
         succeeded = start_run(actor, sandbox_script, cmd="echo beta", agent=beta)
         finish_run(sandbox_script, harness)
         assert failed in actor._run_errors
-        actor.state.documents["report.pdf"] = DocumentExtract(
+        seed_extract(actor, "report.pdf", DocumentExtract(
             path="report.pdf",
             source_sha="0" * 64,
             extractor_version=EXTRACTOR_VERSION,
             markdown="# report",
             char_count=8,
             extracted_at=datetime.now(UTC),
-        )
-        actor.state.rag_index["report.pdf"] = RagFile(
+        ))
+        seed_row(actor, "report.pdf", RagFile(
             path="report.pdf", status=RagStatus.PENDING, updated_at=datetime.now(UTC)
-        )
-        documents = actor.state.documents.copy()
-        rag_index = actor.state.rag_index.copy()
+        ))
+        documents = stored_docs(actor)
+        rag_index = stored_rows(actor)
         alpha_address.dead = True
 
         actor.receiveMsg_SweepTick(SweepTick())
@@ -3626,8 +3630,10 @@ class TestTheSweepsPruneIsExact:
         # Keyed by path: kept, and a refusal now prints the id through the fallback.
         assert actor._last_writers["notes.md"].agent_id == alpha
         assert actor._name_of(alpha) == alpha
-        assert actor.state.documents == documents
-        assert actor.state.rag_index == rag_index
+        # The per-agent maps are swept; the document records are not the sweep's
+        # to touch, and they are on disk where a sweep cannot reach them at all.
+        assert stored_docs(actor) == documents
+        assert stored_rows(actor) == rag_index
 
     def test_a_tick_that_finds_every_holder_alive_changes_nothing(
         self, exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness]

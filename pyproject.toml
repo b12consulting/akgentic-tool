@@ -38,6 +38,11 @@ dependencies = [
     # reserved for the heavyweight ones (markitdown, Pillow, openai/numpy,
     # weaviate-client). No ceiling, for the reason Golden Rule #13 gives.
     "markdown-it-py>=3",
+    # The workspace document store writes one YAML file per source document under
+    # the tree's sibling metadata directory (`documents/store.py`). Base, not an
+    # extra: pure Python, no transitive dependencies, and already in the workspace
+    # through akgentic-team's event store. No ceiling, per Golden Rule #13.
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -55,6 +60,7 @@ dev = [
     "pytest-cov>=4.1.0",
     "pytest-timeout>=2.3.0",
     "mypy>=1.8.0",
+    "types-PyYAML>=6.0",
     "ruff>=0.1.0",
     "openai>=1.0.0",
     "numpy>=1.26.0",

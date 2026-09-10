@@ -48,6 +48,8 @@ from akgentic.tool.workspace.actor import (
     WorkspaceActor,
     workspace_actor_name,
 )
+from akgentic.tool.workspace.documents.models import DocumentExtract, RagFile
+from akgentic.tool.workspace.documents.store import DocumentEntry, YamlDocumentStore
 from akgentic.tool.workspace.execution import DEFAULT_EXEC_TIMEOUT_S, RunningExec
 from akgentic.tool.workspace.host import WorkspaceHost
 from akgentic.tool.workspace.journal import git_dir_for
@@ -1321,3 +1323,147 @@ def factory_for(backend: str, factory: BackendFactory) -> Iterator[list[BackendC
         yield contexts
     finally:
         registry.register_backend(original, replace=True)
+
+
+##
+## The document store — reading an actor's records back off the disk
+##
+# Every helper below reads or writes through a **fresh** ``YamlDocumentStore``,
+# never the object the actor under test holds. That is deliberate and it is what
+# makes these assertions worth more than the two in-memory maps they replace: a
+# spec that reads back through a second object proves the record reached the
+# disk, where one that inspected ``actor.state`` could only prove it reached
+# memory. It is also exactly the shape story 52-3's AC 13 asks for.
+
+
+def attach_store(actor: WorkspaceActor) -> WorkspaceActor:
+    """Announce a document store to *actor*, exactly as a bound card does.
+
+    A directly constructed actor gets none — ``on_start`` leaves the slot
+    ``None``, because resolving one is the card's job and an actor that resolved
+    its own would be reading configuration nobody handed it. Every fixture that
+    builds an actor by hand therefore stands in for the card here.
+    """
+    actor.configure_document_store(YamlDocumentStore())
+    return actor
+
+
+def store_of(actor: WorkspaceActor) -> YamlDocumentStore:
+    """A second store object over *actor*'s tree — never the one it was given."""
+    return YamlDocumentStore()
+
+
+def stored_entries(actor: WorkspaceActor) -> dict[str, DocumentEntry]:
+    """Every record on disk for *actor*'s tree, keyed by path."""
+    return {
+        entry.path: entry
+        for entry in store_of(actor).list_documents(actor.config.workspace_path)
+    }
+
+
+def stored_rows(actor: WorkspaceActor) -> dict[str, RagFile]:
+    """The retrieval index as the disk holds it — the former ``state.rag_index``."""
+    return {
+        path: entry.row for path, entry in stored_entries(actor).items() if entry.row is not None
+    }
+
+
+def stored_docs(actor: WorkspaceActor) -> dict[str, DocumentExtract]:
+    """The extraction cache as the disk holds it — the former ``state.documents``."""
+    return {
+        path: entry.extract
+        for path, entry in stored_entries(actor).items()
+        if entry.extract is not None
+    }
+
+
+def seed_row(actor: WorkspaceActor, path: str, row: RagFile) -> None:
+    """Put *row* on disk for *path*, keeping whatever extraction is already stored."""
+    store = store_of(actor)
+    key = actor.config.workspace_path
+    existing = store.get_document(key, path) or DocumentEntry(path=path)
+    store.put_document(key, existing.model_copy(update={"row": row}))
+
+
+def seed_extract(actor: WorkspaceActor, path: str, extract: DocumentExtract) -> None:
+    """Put *extract* on disk for *path*, keeping whatever row is already stored."""
+    store = store_of(actor)
+    key = actor.config.workspace_path
+    existing = store.get_document(key, path) or DocumentEntry(path=path)
+    store.put_document(key, existing.model_copy(update={"extract": extract}))
+
+
+def drop_row(actor: WorkspaceActor, path: str) -> None:
+    """Remove *path*'s index row, keeping its extraction — the former ``rag_index.pop``."""
+    store = store_of(actor)
+    key = actor.config.workspace_path
+    existing = store.get_document(key, path)
+    if existing is not None:
+        store.put_document(key, existing.model_copy(update={"row": None}))
+
+
+def drop_extract(actor: WorkspaceActor, path: str) -> None:
+    """Remove *path*'s extraction, keeping its row — the former ``documents.pop``."""
+    store = store_of(actor)
+    key = actor.config.workspace_path
+    existing = store.get_document(key, path)
+    if existing is not None:
+        store.put_document(key, existing.model_copy(update={"extract": None}))
+
+
+class RecordingDocumentStore:
+    """A real :class:`YamlDocumentStore` that also records what was asked of it.
+
+    The successor to ``delta_recorder``: where that counted the deltas a persist
+    point sent, this counts the **writes** a turn performed. It is the same
+    question one layer down, and a stronger one — a delta could be counted
+    without anything reaching a disk, and a put here cannot.
+
+    It delegates rather than faking, so a spec that reads back through
+    :func:`stored_rows` sees exactly what the actor wrote.
+
+    Attributes:
+        puts: ``(tree_key, path)`` for every ``put_document``, in order.
+        evicted: ``(tree_key, path)`` for every ``evict``, in order.
+        gets: ``(tree_key, path)`` for every ``get_document``, in order.
+        listings: ``tree_key`` for every ``list_documents``, in order.
+    """
+
+    def __init__(self) -> None:
+        self._inner = YamlDocumentStore()
+        self.puts: list[tuple[str, str]] = []
+        self.evicted: list[tuple[str, str]] = []
+        self.gets: list[tuple[str, str]] = []
+        self.listings: list[str] = []
+
+    @property
+    def written(self) -> list[str]:
+        """The paths written, in order — what most specs actually assert on."""
+        return [path for _, path in self.puts]
+
+    def get_document(self, tree_key: str, path: str) -> DocumentEntry | None:
+        self.gets.append((tree_key, path))
+        return self._inner.get_document(tree_key, path)
+
+    def put_document(self, tree_key: str, entry: DocumentEntry) -> None:
+        self.puts.append((tree_key, entry.path))
+        self._inner.put_document(tree_key, entry)
+
+    def evict(self, tree_key: str, path: str) -> None:
+        self.evicted.append((tree_key, path))
+        self._inner.evict(tree_key, path)
+
+    def list_documents(self, tree_key: str) -> list[DocumentEntry]:
+        self.listings.append(tree_key)
+        return self._inner.list_documents(tree_key)
+
+
+def watch_store(actor: WorkspaceActor) -> RecordingDocumentStore:
+    """Give *actor* a recording store and hand the recorder back.
+
+    Announced through ``configure_document_store`` rather than assigned, so the
+    spec exercises the same tell path a card uses.
+    """
+    recorder = RecordingDocumentStore()
+    actor.configure_document_store(recorder)
+    return recorder

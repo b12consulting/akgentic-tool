@@ -65,7 +65,7 @@ observation and last-writer maps in :mod:`~akgentic.tool.workspace.actor.observa
 the gate and the six mutations in :mod:`~akgentic.tool.workspace.actor.gate`, and
 the lease and the deferred surface in :mod:`~akgentic.tool.workspace.actor.execution`.
 Each body is the same code with the same ``self``; what stays here is the class
-itself, ``on_start``, ``init_state``, ``worker_class``, the startup sweep
+itself, ``on_start``, ``worker_class``, the startup sweep
 ``on_start`` calls, and the actor's lifetime — the liveness sweep's tick, the
 grace and the self-stop — which spans three mixins' maps.
 """
@@ -89,6 +89,7 @@ from akgentic.tool.workspace.actor.documents import DocumentsMixin
 from akgentic.tool.workspace.actor.execution import EXEC_CAPABILITY, ExecMixin
 from akgentic.tool.workspace.actor.gate import GateMixin
 from akgentic.tool.workspace.actor.observation import ObservationMixin
+from akgentic.tool.workspace.documents.store import DocumentStore
 from akgentic.tool.workspace.edit import EditMatcher
 from akgentic.tool.workspace.execution import (
     ExecConfig,
@@ -327,8 +328,10 @@ class WorkspaceActor(
         self._vs_proxy: VectorStoreService | None = None
         self._embedder: EmbeddingProvider | None = None
         self._index_active: set[str] = set()
-        self._dirty_rows: set[str] = set()
-        self._dirty_documents: set[str] = set()
+        # Announced by the card at bind time, exactly as ``_lock`` is. Until
+        # then the document cache misses and the index looks empty: an ordinary,
+        # visible degradation, never a raise (ADR-051 Decision 6).
+        self._document_store: DocumentStore | None = None
         self._workspace: Filesystem = get_workspace(self.config.workspace_path)
         self._sweep_staging_files()
         self._journal = GitJournal(
@@ -340,50 +343,6 @@ class WorkspaceActor(
             self._journal.seed_gitignore(self._workspace.write)
             self._journal.commit_out_of_band()
         self._arm_sweep()
-
-    def init_state(self, state: WorkspaceState) -> None:
-        """Take a restored state, re-sort its cache, and re-queue what no worker carries now.
-
-        **This is the restore hook, and ``on_start`` is not.** The caller is the
-        ``WorkspaceHost``: on a get-or-create miss it starts this actor, asks its
-        store for the scope, and tells the stored state here — a ``proxy_tell``,
-        so it lands after ``on_start`` and before any caller's first message. The
-        first line of ``on_start`` assigns a fresh :class:`WorkspaceState`, so
-        anything done to the index in ``on_start`` would act on an empty one.
-
-        **The cache is re-sorted by ``extracted_at``.** A store keeps a re-filled
-        key where it first landed, so the order it hands back is first-insertion
-        order, not recency; the LRU would then evict the wrong entry. Every fill
-        stamps ``extracted_at``, so sorting on it restores recency as of the last
-        fill — the cache-hit reorder was never persisted, and still is not.
-
-        **Every row a worker was carrying goes back to ``PENDING``, whatever its
-        age** — ``DocumentsMixin._requeue_orphaned_rows`` in
-        :mod:`~akgentic.tool.workspace.actor.documents`. The workers were
-        children of the previous actor and died with it. The
-        re-queue is persisted by a delta sent from here, which is safe: core's
-        host records its registry entry before it can dequeue anything this actor
-        tells it.
-
-        **``EMBEDDED`` rows are deliberately not re-marked here**, although on an
-        in-memory engine they must be: the store child of a restored actor has no
-        checkpoint and starts empty. At this moment the backend is unknown —
-        ``_rag_collection`` is ``None`` from ``on_start`` until a card's
-        ``enable_rag`` tell arrives, which the mailbox orders after this call —
-        and a cluster engine loses nothing and must not be re-marked. The moment
-        the in-memory child is created is the moment its emptiness is a fact, and
-        it is the one that knows the backend, so the re-mark lives there:
-        :meth:`~akgentic.tool.workspace.actor.documents.DocumentsMixin._requeue_embedded_rows`.
-
-        Args:
-            state: The restored state to adopt.
-        """
-        documents = dict(sorted(state.documents.items(), key=lambda item: item[1].extracted_at))
-        super().init_state(state.model_copy(update={"documents": documents}))
-        self._dirty_rows.clear()
-        self._dirty_documents.clear()
-        self._requeue_orphaned_rows()
-        self._persist()
 
     def worker_class(self) -> type[DeferredWorker]:
         """Never called: nothing here is spawned through ``request()``.

@@ -24,8 +24,6 @@ from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.workspace.documents.models import (
     DEFAULT_MAX_DOCUMENT_CHARS,
     DEFAULT_MAX_DOCUMENTS,
-    DocumentExtract,
-    RagFile,
 )
 
 DEFAULT_MAX_OBSERVATIONS_PER_AGENT = 256
@@ -308,13 +306,15 @@ class WorkspaceConfig(BaseConfig):
         max_observations_per_agent: Cap on the per-agent observation map.
         max_tracked_writers: Cap on the path-keyed last-writer map, which the
             gate consults only to name the other writer in a refusal.
-        max_documents: Cap on the number of rows in
-            :attr:`WorkspaceState.documents`. Over it, the least recently used
-            entry is removed outright.
+        max_documents: Cap on the number of cached extractions the document
+            store holds for this tree. Over it, the least recently extracted
+            body is dropped and its record removed when nothing else is left in
+            it — an eviction never de-indexes a file, so a record still carrying
+            an index row survives with its extraction half cleared.
         max_document_chars: Cap on the characters held across the cached
-            extracts that still have a body. Over it, the least recently used
-            body is dropped and its metadata kept — a different remedy from the
-            row cap because it answers a different pressure
+            extracts that still have a body. Over it, the least recently
+            extracted body is dropped and its metadata kept — a different remedy
+            from the row cap because it answers a different pressure
             (:func:`~akgentic.tool.workspace.documents.models.evict_document_bodies`).
         git_journal: Whether to keep a git journal of accepted mutations. The
             gate is unaffected either way — it is pure Python and independent.
@@ -349,50 +349,28 @@ class SweepTick(SerializableBaseModel):
 
 
 class WorkspaceState(BaseState):
-    """Persisted actor state — the derived cache, and no observation data.
+    """Persisted actor state — and there is nothing left in it to persist.
 
-    What this state must **not** carry is the observation map: reads are the
-    majority of workspace traffic, and a store write per recorded read would put
-    persistence on the read path that ADR-036's NFR1 exists to keep free.
-    Observations live as a plain actor instance attribute and do not survive a
-    restore — a reap or a process restart — which degrades towards *refusing* a
-    later write rather than accepting a stale one.
+    It carried two mappings: the extracted-document cache and the retrieval
+    index. Both are now one file per source document under the tree's sibling
+    metadata directory, written through a
+    :class:`~akgentic.tool.workspace.documents.store.DocumentStore` (ADR-051
+    Decision 6), so a second process over the same mount reads the same records
+    with no shared memory and nothing here is sent to any host.
 
-    What it does carry is *derived* data: the extracted-document cache and the
-    retrieval index, every byte of which is regenerable from the tree. The hosted
-    actor persists it by member-keyed ``StateDelta`` told to its
-    ``WorkspaceHost`` (see :mod:`akgentic.tool.workspace.actor.documents`), and
-    the host's store restores it on the next get-or-create miss. NFR1 is a
-    property of the **read path**, not of an empty state, and the rule the whole
-    design rests on is therefore about who sends a delta rather than about what
-    is stored:
+    What this state must **not** carry, and never did, is the observation map:
+    reads are the majority of workspace traffic, and a write per recorded read
+    would put persistence on the read path that ADR-036's NFR1 exists to keep
+    free. Observations live as a plain actor instance attribute and do not
+    survive a process restart, which degrades towards *refusing* a later write
+    rather than accepting a stale one.
 
-    - a text read never sends one,
-    - a document-cache **hit** never sends one — it reorders the LRU in memory,
-      so persisted recency lags live recency until the next fill, which is
-      deliberate and harmless,
-    - a cache **fill** sends exactly one, after the insert *and* the eviction,
-      amortised against the seconds of extraction that preceded it.
+    **NFR1 is a property of the read path, not of an empty state, and it still
+    holds** — now structurally rather than by a delta rule. A text read touches
+    no store, and a document-cache *hit* performs one ``get_document`` and no
+    write at all: there is no recency bookkeeping left for a read to do, because
+    recency is ``extract.extracted_at``, stamped at the fill.
 
-    Attributes:
-        documents: Workspace-relative path to its extracted Markdown, in
-            least-recently-used order — a plain ``dict`` preserves insertion
-            order, so the fill site's re-insert and the lookup's move-to-end are
-            the whole of the LRU. Bounded by ``max_documents`` and
-            ``max_document_chars`` on :class:`WorkspaceConfig`.
-        rag_index: Workspace-relative path to where that file stands in the
-            retrieval pipeline.
-
-            **This map is deliberately not governed by ``max_documents`` /
-            ``max_document_chars``.** Those two bound the *extraction cache*, and
-            an evicted body must not de-index its file: a search hit renders from
-            what the vector store holds, so an indexed file stays searchable with
-            no body in ``documents`` at all. Governing the index by the cache
-            caps would make ``max_documents`` a ceiling on the searchable corpus,
-            which is the opposite of what it is for. The index is bounded by the
-            tree — one row per candidate file, each a few hundred bytes plus its
-            offsets.
+    The class itself survives this story with no fields of its own; deleting it
+    belongs with the actor it is the state of.
     """
-
-    documents: dict[str, DocumentExtract] = {}
-    rag_index: dict[str, RagFile] = {}

@@ -82,6 +82,7 @@ from akgentic.tool.workspace.card.rag import RagFactories
 from akgentic.tool.workspace.card.read import ReadFactories
 from akgentic.tool.workspace.card.write import WriteFactories
 from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION, derived_document_caps
+from akgentic.tool.workspace.documents.store import DocumentStore, resolve_document_store
 from akgentic.tool.workspace.event import WorkspaceAttached
 from akgentic.tool.workspace.execution import ExecConfig, resolve_mode
 from akgentic.tool.workspace.host import WorkspaceHost
@@ -308,6 +309,10 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
     # Runtime state, never a serializable field: a backend is an object with a
     # method, and a ``ToolCard`` field holding one would not round-trip.
     _lock_backend: LockBackend | None = PrivateAttr(default=None)
+    # Same reasoning: where this tree's document records live is an object with
+    # methods, and a serializable field holding one would not round-trip
+    # (Golden Rule 1b).
+    _document_store: DocumentStore | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def _one_layout(self) -> WorkspaceTool:
@@ -385,8 +390,19 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
         # set it, not at the first command. Constructing one creates nothing —
         # the backend is stateless and touches the disk only on ``acquire``.
         self._lock_backend = resolve_lock_backend()
+        # Unconditional for the same reason as the lock backend, and one line
+        # later so the two failures are indistinguishable to an admin: a bad
+        # ``AKGENTIC_DOCUMENT_STORE`` must fail the bind in front of whoever set
+        # it, not at the first document read. Constructing one creates nothing —
+        # the store is stateless and touches the disk only on a put.
+        self._document_store = resolve_document_store()
         self._seed_resources()
         self._bind_workspace_actor(observer, observer.orchestrator, ws_path)
+        # Between the bind and the retrieval announcement, deliberately: the
+        # actor must never be able to enable retrieval under a store it has not
+        # been given, exactly as it must never admit a run under a hold it has
+        # not been given.
+        self._announce_document_store()
         self._bind_sandbox(observer, ws_path)
         self._announce_rag()
         return self
@@ -514,6 +530,31 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
             tell.configure_lock(backend)
         except Exception:
             logger.debug("Could not announce the exec lock backend to #Workspace", exc_info=True)
+
+    def _announce_document_store(self) -> None:
+        """Tell the actor where this tree's document records live — fire and forget.
+
+        Guarded exactly as :meth:`_announce_lock` is, and it degrades the same
+        way: without a store the actor's document cache misses and
+        ``workspace_rag_index`` answers its existing unavailable sentence —
+        visible, and recoverable by rebinding. A raise at wiring time is neither,
+        and this card's other twenty capabilities are file operations that have
+        nothing to do with retrieval.
+
+        **Unconditional, unlike the lock's announcement.** The store is not a
+        retrieval capability: ``document_extract`` serves every read that goes
+        through the extractor, whether or not any card on this tree ever enables
+        an index. A card that gated this on ``_rag_enabled()`` would leave the
+        common read path with no cache at all.
+        """
+        tell = self._workspace_tell
+        store = self._document_store
+        if tell is None or store is None:
+            return
+        try:
+            tell.configure_document_store(store)
+        except Exception:
+            logger.debug("Could not announce the document store to #Workspace", exc_info=True)
 
     def _announce_exec(self, config: ExecConfig) -> None:
         """Tell the actor which backend to run commands on — fire and forget.

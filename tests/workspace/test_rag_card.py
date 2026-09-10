@@ -38,6 +38,7 @@ from tests.workspace.conftest import (
     WORKSPACE_PATH,
     FakeActorToolObserver,
     FakeOrchestratorProxy,
+    seed_row,
 )
 
 
@@ -714,12 +715,12 @@ class TestTheProvider:
 
         card, _ = bind(orchestrator_proxy, workspace_rag_list=True)
         actor = self._actor(orchestrator_proxy)
-        actor.state.rag_index["notes.md"] = RagFile(
+        seed_row(actor, "notes.md", RagFile(
             path="notes.md",
             status=RagStatus.EMBEDDED,
             chunk_count=4,
             updated_at=datetime.now(UTC),
-        )
+        ))
 
         [provider] = card.get_context_states()
         state = provider()
@@ -871,12 +872,12 @@ class TestTheCallablesThemselves:
         card, _ = bind(orchestrator_proxy, workspace_rag_list=True)
         _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
-        actor.state.rag_index["notes.md"] = RagFile(
+        seed_row(actor, "notes.md", RagFile(
             path="notes.md",
             status=RagStatus.EMBEDDED,
             chunk_count=4,
             updated_at=datetime.now(UTC),
-        )
+        ))
 
         rendered = card.get_commands()[WorkspaceRagList]()
 

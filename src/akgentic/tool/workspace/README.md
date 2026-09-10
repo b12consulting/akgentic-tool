@@ -129,12 +129,15 @@ each owner's own scope. Sharing across principals is `workspace_metadata_keys`, 
   no holder the actor stops itself, taking its in-memory store child and any live worker with it.
   An `attach` during the grace cancels it, so a team stopping and an equivalent one starting keep
   the same actor, journal and container.
-- **Restored on the next bind.** The extraction cache and the retrieval index are persisted, by
-  member-keyed delta, into the deployment's store through the host. The next bind after a reap or a
-  process restart starts a new actor restored from it. Rows that were mid-extraction or
-  mid-embedding when the old actor stopped are queued again.
-- **Cold without a store.** A deployment that registers no store with the host restores nothing:
-  the next actor starts with an empty cache and index, and re-indexes on demand.
+- **Read back from the tree, not restored.** The extraction cache and the retrieval index are
+  **files under the tree's sibling metadata directory** — one YAML record per source document under
+  `<meta>/rag/`, written on the turn that changes it (ADR-051 Decision 6). The next actor after a
+  reap or a process restart simply reads the same files; nothing is registered anywhere, nothing is
+  handed to it, and a second process over the same mount sees the same cache with no shared memory.
+- **Nothing is restored, so nothing can be lost by a cold deployment.** A row that a worker was
+  carrying when its process died is queued again by the reaper, which covers a crash in this process
+  and one in another with a single rule: an in-flight row older than the staleness bound that no
+  live worker in *this* process is carrying.
 
 ---
 
@@ -546,21 +549,28 @@ truncated. A missing path or a path escaping the root surfaces as `RetriableErro
 can correct itself.
 
 **Binary reads** (`.pdf`, `.docx`, `.xlsx`, `.xls`, `.pptx`, `.msg`, `.epub`, and image
-extensions) go through the `DocumentReader`, and the extracted Markdown is cached **in
-`#Workspace`'s state** — not in a file beside the source (ADR-045 §3). The sidecar it replaced is
-gone, and so is the read-path rule that used to return a dotfile ending in `.md` as plain text.
+extensions) go through the `DocumentReader`, and the extracted Markdown is cached in the tree's
+**sibling metadata directory** — never in a file beside the source (ADR-045 §3, ADR-051 Decision 6).
+The sidecar it replaced is gone, and so is the read-path rule that used to return a dotfile ending
+in `.md` as plain text. No read capability can name a cache file, because `<meta>` is beside the
+tree rather than inside it.
 
 The cache is keyed by path and hits only when the entry was produced from *these* source bytes by
 *this* extractor version, so it can never serve a stale body: a changed file misses and re-extracts.
-It is persisted — each fill sends one member-keyed delta, carrying the entry it inserted and every
-entry the caps touched, through the `WorkspaceHost` to the deployment's store — and it is bounded on
-two dimensions, a row count and a character total, so the actor's state and the stored document stay
-bounded however many documents are read. Over the character cap the least-recently-used entry
-keeps its metadata and **drops its body**; over the row cap the entry goes entirely. Every byte is
-regenerable from the tree, so an eviction costs one re-extraction and never a wrong answer.
+Each fill writes one YAML record, temp-then-`replace()`, so a torn write leaves the previous record
+intact. It is bounded on two dimensions, a row count and a character total, so the metadata
+directory stays bounded however many documents are read. Over the character cap the entry whose body
+was **least recently extracted** keeps its metadata and drops its body; over the row cap that entry
+loses its extraction outright. Every byte is regenerable from the tree, so an eviction costs one
+re-extraction and never a wrong answer.
 
-An evicted body does **not** de-index its file: index membership lives in its own map and is never
-inferred from this one.
+**Recency is `extracted_at`, stamped at the fill.** A cache *hit* refreshes nothing and writes
+nothing: a read must never write, which is the rule the whole design rests on, and the price is at
+most one extra re-extraction of a file that was read but not re-extracted.
+
+An eviction does **not** de-index its file. Both halves of a document live in one record, so the row
+cap clears the extraction half and leaves the index row exactly where it was; the record is removed
+outright only when there is no row left in it.
 
 #### `DocumentReader`
 
@@ -1077,9 +1087,10 @@ WorkspaceTool(
 
 Retrieval adds three things worth knowing before you turn it on. **Indexing spends embedding credits
 per file**, which is why all three capabilities are opt-in. **The in-memory vector backend keeps
-every vector in the workspace actor's own store child**, which is never persisted: its vectors are
-lost with the actor, and a restored tree re-embeds its indexed files on the next
-`workspace_rag_index`. Enabling retrieval on that backend shrinks the extraction cache from 32
+every vector in the workspace actor's own store child**, which is not persisted: its vectors are
+lost with the actor, while the index rows describing them are on disk and are not. Re-index the tree
+after a process restart on that backend — `workspace_rag_index(force=True)` — until the local vector
+backend lands. Enabling retrieval on that backend shrinks the extraction cache from 32
 documents / 2 MB to 8 / 200 KB. A cluster backend keeps the vectors in the cluster and keeps the
 large caps. And **`workspace_rag_search`
 makes one embedding round trip on the mailbox turn of the actor that owns the write gate**: bounded

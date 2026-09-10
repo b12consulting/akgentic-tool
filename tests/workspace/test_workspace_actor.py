@@ -29,7 +29,7 @@ from akgentic.tool.workspace.models import (
 )
 from akgentic.tool.workspace.workspace import Filesystem, is_staging_name
 
-from tests.workspace.conftest import WORKSPACE_PATH, delta_recorder
+from tests.workspace.conftest import WORKSPACE_PATH, watch_store
 
 ALICE = "alice-id"
 BOB = "bob-id"
@@ -153,14 +153,13 @@ class TestObservationMap:
 
 
 class TestRecordingIsNotPersistedState:
-    def test_recording_sends_no_delta(
-        self, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_recording_writes_no_record(self, workspaces_root: Path) -> None:
         actor = start_actor()
-        store = delta_recorder(actor, monkeypatch)
+        writes = watch_store(actor)
         actor.record_observation(ALICE, "a.md", observation("hello"))
         assert actor.observation_for(ALICE, "a.md") is not None
-        assert store.applied == []
+        assert writes.puts == []
+        assert writes.evicted == []
 
     def test_recording_leaves_the_serialisable_state_untouched(self, workspaces_root: Path) -> None:
         actor = start_actor()

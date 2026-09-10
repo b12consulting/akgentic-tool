@@ -28,7 +28,7 @@ from akgentic.tool.workspace.documents.models import (
 from akgentic.tool.workspace.models import MutationStatus
 from akgentic.tool.workspace.workspace import PathEscapeError
 
-from tests.workspace.conftest import WORKSPACE_PATH
+from tests.workspace.conftest import WORKSPACE_PATH, seed_row, stored_rows
 from tests.workspace.test_rag_pipeline import RagHarness, write
 from tests.workspace.test_rag_search import build_actor
 
@@ -101,7 +101,7 @@ class TestItIsATellThatNeverRaises:
         """``PathEscapeError`` is a ``PermissionError``, which ``_digest`` absorbs."""
         upload.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["../../etc/passwd.md"]))
 
-        assert upload.actor.state.rag_index == {}
+        assert stored_rows(upload.actor) == {}
         assert upload.requests == []
         assert gate_still_works(upload.actor, "after-escape.md")
 
@@ -111,7 +111,7 @@ class TestItIsATellThatNeverRaises:
         """The message races the upload's own write: missing means "not yet"."""
         upload.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["never-written.md"]))
 
-        assert upload.actor.state.rag_index == {}
+        assert stored_rows(upload.actor) == {}
         assert gate_still_works(upload.actor, "after-missing.md")
 
     def test_an_unsupported_type_is_skipped_and_the_gate_survives(
@@ -123,7 +123,7 @@ class TestItIsATellThatNeverRaises:
 
         upload.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["archive.zip", "photo.png"]))
 
-        assert upload.actor.state.rag_index == {}
+        assert stored_rows(upload.actor) == {}
         assert gate_still_works(upload.actor, "after-unsupported.md")
 
     @pytest.mark.parametrize(
@@ -153,7 +153,7 @@ class TestItIsATellThatNeverRaises:
             NewFileMessage.model_construct(paths=[3, "good.md"], source="upload", force=False)
         )
 
-        assert "good.md" in upload.actor.state.rag_index
+        assert "good.md" in stored_rows(upload.actor)
 
     def test_a_broken_spawn_path_never_reaches_the_caller(
         self, upload: RagHarness, workspace_tree: Path
@@ -204,7 +204,7 @@ class TestEveryPathIsValidated:
 
         upload.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["../outside.md"]))
 
-        assert upload.actor.state.rag_index == {}
+        assert stored_rows(upload.actor) == {}
         assert upload.requests == []
 
     def test_the_validation_raises_a_permission_error_the_digest_absorbs(
@@ -273,13 +273,13 @@ class TestTheAsymmetryWithTheGate:
         upload.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["written.md"]))
         upload.report("written.md")
         upload.result("written.md")
-        assert upload.actor.state.rag_index["written.md"].status is RagStatus.EMBEDDED
+        assert stored_rows(upload.actor)["written.md"].status is RagStatus.EMBEDDED
 
         upload.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["uploaded.md"]))
         upload.actor.mark_paths_stale(["written.md"])
 
-        assert upload.actor.state.rag_index["uploaded.md"].status is not RagStatus.STALE
-        assert upload.actor.state.rag_index["written.md"].status is RagStatus.STALE
+        assert stored_rows(upload.actor)["uploaded.md"].status is not RagStatus.STALE
+        assert stored_rows(upload.actor)["written.md"].status is RagStatus.STALE
 
     def test_a_gate_write_spawns_no_worker_of_its_own(
         self, upload: RagHarness, workspace_tree: Path
@@ -314,7 +314,7 @@ class TestTheSpawnPathIsReused:
         assert len(upload.requests) == MAX_CONCURRENT_INDEX_WORKERS
         pending = [
             path
-            for path, entry in upload.actor.state.rag_index.items()
+            for path, entry in stored_rows(upload.actor).items()
             if entry.status is RagStatus.PENDING
         ]
         assert len(pending) == 2
@@ -328,19 +328,27 @@ class TestTheSpawnPathIsReused:
 
         assert upload.requests[0].scope == WORKSPACE_PATH
 
-    def test_queueing_persists_once_and_a_message_that_queued_nothing_sends_nothing(
+    def test_queueing_writes_the_row_and_an_unusable_notification_writes_nothing(
         self, upload: RagHarness, workspace_tree: Path
     ) -> None:
-        """The delta follows the queueing, so an unusable notification is free."""
+        """The write follows the queueing, so an unusable notification is free.
+
+        A notification is reachable from outside the framework, so "queued
+        nothing" has to cost nothing: an upload of a hundred unindexable files
+        must not write a hundred records.
+        """
         write(workspace_tree, "a.md")
-        store = upload.record_deltas()
+        writes = upload.record_writes()
 
         upload.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["nope.zip"]))
-        assert store.applied == []
+        assert writes.written == []
 
         upload.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["a.md"]))
-        assert len(store.applied) == 1
-        assert store.keys_applied() == {"rag_index.a.md"}
+        # Twice, and both are this one path: ``_enqueue`` writes the ``PENDING``
+        # row and the spawn ``_drain`` performs writes its transition. Each
+        # reaches the disk on its own turn, where the dirty set used to fold
+        # them into one delta.
+        assert set(writes.written) == {"a.md"}
 
 
 class TestTheCapabilityRefusal:
@@ -354,7 +362,7 @@ class TestTheCapabilityRefusal:
 
         upload_without_retrieval.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["a.md"]))
 
-        assert upload_without_retrieval.actor.state.rag_index["a.md"].status is RagStatus.PENDING
+        assert stored_rows(upload_without_retrieval.actor)["a.md"].status is RagStatus.PENDING
         assert upload_without_retrieval.requests == []
         assert upload_without_retrieval.vs.calls == []
 
@@ -393,7 +401,7 @@ class TestTheCapabilityRefusal:
 
         half.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["a.md"]))
 
-        assert half.actor.state.rag_index["a.md"].status is RagStatus.PENDING
+        assert stored_rows(half.actor)["a.md"].status is RagStatus.PENDING
         assert half.requests == []
         assert half.worker_names == []
 
@@ -405,7 +413,7 @@ class TestTheCapabilityRefusal:
 
         upload_without_retrieval.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["a.md"]))
 
-        assert upload_without_retrieval.actor.state.rag_index["a.md"].indexed_sha == sha
+        assert stored_rows(upload_without_retrieval.actor)["a.md"].indexed_sha == sha
 
     def test_a_row_already_current_survives_a_second_notification(
         self, upload_without_retrieval: RagHarness, workspace_tree: Path
@@ -420,11 +428,11 @@ class TestTheCapabilityRefusal:
         """
         harness = upload_without_retrieval
         sha = write(workspace_tree, "a.md")
-        harness.actor.state.rag_index["a.md"] = _embedded_row("a.md", sha)
+        seed_row(harness.actor, "a.md", _embedded_row("a.md", sha))
 
         harness.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["a.md"]))
 
-        row = harness.actor.state.rag_index["a.md"]
+        row = stored_rows(harness.actor)["a.md"]
         assert row.status is RagStatus.EMBEDDED
         assert [chunk.chunk_id for chunk in row.chunks] == ["chunk-0"]
         assert row.superseded_chunk_ids == []
@@ -435,11 +443,11 @@ class TestTheCapabilityRefusal:
         """``force`` means the same thing on both sides of the capability check."""
         harness = upload_without_retrieval
         sha = write(workspace_tree, "a.md")
-        harness.actor.state.rag_index["a.md"] = _embedded_row("a.md", sha)
+        seed_row(harness.actor, "a.md", _embedded_row("a.md", sha))
 
         harness.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["a.md"], force=True))
 
-        row = harness.actor.state.rag_index["a.md"]
+        row = stored_rows(harness.actor)["a.md"]
         assert row.status is RagStatus.PENDING
         assert row.superseded_chunk_ids == ["chunk-0"]
 
@@ -473,12 +481,12 @@ class TestUploadTransitionsAreCopies:
     """AC31 / Golden Rule #12, on the two write paths this story adds."""
 
     def _seed(self, harness: RagHarness, path: str) -> None:
-        harness.actor.state.rag_index[path] = _RagFileWithExtraField(
+        seed_row(harness.actor, path, _RagFileWithExtraField(
             path=path,
             status=RagStatus.EMBEDDED,
             indexed_sha="an-older-digest",
             updated_at=datetime.now(UTC),
-        )
+        ))
 
     def test_the_upload_queue_preserves_an_unknown_field(
         self, upload: RagHarness, workspace_tree: Path
@@ -488,7 +496,7 @@ class TestUploadTransitionsAreCopies:
 
         upload.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["a.md"]))
 
-        result = upload.actor.state.rag_index["a.md"]
+        result = stored_rows(upload.actor)["a.md"]
         assert result.indexed_sha == sha
         assert isinstance(result, _RagFileWithExtraField)
         assert result.extra_field == "sentinel"
@@ -502,7 +510,7 @@ class TestUploadTransitionsAreCopies:
 
         upload_without_retrieval.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["a.md"]))
 
-        result = upload_without_retrieval.actor.state.rag_index["a.md"]
+        result = stored_rows(upload_without_retrieval.actor)["a.md"]
         assert result.status is RagStatus.PENDING
         assert isinstance(result, _RagFileWithExtraField)
         assert result.extra_field == "sentinel"

@@ -38,11 +38,21 @@ from akgentic.tool.workspace.documents.models import (
     RagStatus,
     chunk_id,
 )
+from akgentic.tool.workspace.documents.store import DocumentEntry, YamlDocumentStore
 from akgentic.tool.workspace.models import WorkspaceConfig, WorkspaceState, content_sha
 from akgentic.tool.workspace.readers import DocumentReader
 
 from tests.conftest import MockActorAddress
-from tests.workspace.conftest import WORKSPACE_PATH, delta_recorder
+from tests.workspace.conftest import (
+    WORKSPACE_PATH,
+    attach_store,
+    drop_row,
+    seed_extract,
+    seed_row,
+    stored_docs,
+    stored_rows,
+    watch_store,
+)
 
 _UNAVAILABLE = "Retrieval indexing is not available for this workspace."
 _NO_HITS = (
@@ -218,22 +228,22 @@ class SearchHarness:
             if embedded:
                 self.store.store_chunk(identity, owner, path, ordinal, body[start:end])
         if owner == self.actor.config.workspace_path:
-            self.actor.state.rag_index[path] = RagFile(
+            seed_row(self.actor, path, RagFile(
                 path=path,
                 status=RagStatus.EMBEDDED,
                 indexed_sha=sha,
                 chunks=chunks,
                 chunk_count=len(chunks),
                 updated_at=datetime.now(UTC),
-            )
-            self.actor.state.documents[path] = DocumentExtract(
+            ))
+            seed_extract(self.actor, path, DocumentExtract(
                 path=path,
                 source_sha=sha,
                 extractor_version=EXTRACTOR_VERSION,
                 markdown=body if cache else None,
                 char_count=len(body),
                 extracted_at=datetime.now(UTC),
-            )
+            ))
         return sha
 
     def _ask(self, address: Any, actor_type: Any = None, timeout: int | None = None) -> Any:
@@ -265,7 +275,8 @@ def build_actor(workspace_path: str = WORKSPACE_PATH) -> WorkspaceActor:
         )
     )
     started.on_start()
-    return started
+    # The card announces this at bind time; a directly built actor gets none.
+    return attach_store(started)
 
 
 @pytest.fixture
@@ -478,9 +489,9 @@ class TestTheKeywordLeg:
     ) -> None:
         """The two maps have different lifetimes; mismatched offsets belong to neither."""
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
-        stale = search.actor.state.documents["invoice.md"]
-        search.actor.state.documents["invoice.md"] = stale.model_copy(
-            update={"source_sha": "a-different-digest"}
+        stale = stored_docs(search.actor)["invoice.md"]
+        seed_extract(
+            search.actor, "invoice.md", stale.model_copy(update={"source_sha": "a-different-digest"})
         )
         search.embedder.embed_error = RuntimeError("vector leg off")
 
@@ -490,14 +501,14 @@ class TestTheKeywordLeg:
         self, search: SearchHarness
     ) -> None:
         """The cache and the index have different caps as well as different lifetimes."""
-        search.actor.state.documents["orphan.md"] = DocumentExtract(
+        seed_extract(search.actor, "orphan.md", DocumentExtract(
             path="orphan.md",
             source_sha="sha",
             extractor_version=EXTRACTOR_VERSION,
             markdown="A payment note.\n",
             char_count=16,
             extracted_at=datetime.now(UTC),
-        )
+        ))
         search.embedder.embed_error = RuntimeError("vector leg off")
 
         assert search.actor.rag_search("payment") == _NO_HITS
@@ -572,9 +583,11 @@ class TestTheRender:
     ) -> None:
         """``SearchHit.text`` is what survives an eviction; a slice is not."""
         search.index("invoice.md", _INVOICE, [_FIRST])
-        held = search.actor.state.documents["invoice.md"]
-        search.actor.state.documents["invoice.md"] = held.model_copy(
-            update={"markdown": _INVOICE.replace("net thirty", "REPLACED")}
+        held = stored_docs(search.actor)["invoice.md"]
+        seed_extract(
+            search.actor,
+            "invoice.md",
+            held.model_copy(update={"markdown": _INVOICE.replace("net thirty", "REPLACED")}),
         )
 
         answer = search.actor.rag_search("payment", top_k=1)
@@ -587,7 +600,7 @@ class TestTheRender:
     ) -> None:
         """The chunk text is still the answer, so a hit is never dropped for this."""
         search.index("invoice.md", _INVOICE, [_FIRST], cache=False)
-        search.actor.state.rag_index.pop("invoice.md")
+        drop_row(search.actor, "invoice.md")
 
         answer = search.actor.rag_search("payment")
 
@@ -798,29 +811,48 @@ class TestTheFusionKnobs:
 class TestTheStateItNeverTouches:
     """A search is a read: it must persist nothing and mutate nothing."""
 
-    def test_a_search_sends_no_delta(
-        self, search: SearchHarness, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A delta on a read path is a defect until a decision says otherwise."""
+    def test_a_search_writes_nothing(self, search: SearchHarness) -> None:
+        """A write on a read path is a defect until a decision says otherwise."""
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
-        store = delta_recorder(search.actor, monkeypatch)
+        writes = watch_store(search.actor)
 
         assert "invoice.md" in search.actor.rag_search("payment")
 
-        assert store.applied == []
+        assert writes.puts == []
+        assert writes.evicted == []
 
     def test_a_search_leaves_the_index_untouched(self, search: SearchHarness) -> None:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
-        before = search.actor.state.rag_index["invoice.md"].model_copy(deep=True)
+        before = stored_rows(search.actor)["invoice.md"].model_copy(deep=True)
 
         search.actor.rag_search("payment")
 
-        assert search.actor.state.rag_index["invoice.md"] == before
+        assert stored_rows(search.actor)["invoice.md"] == before
 
 
-class TestTheWorkspaceStateContract:
-    """``rag_search`` reads two maps that the state actually declares."""
+class TestTheDocumentStoreContract:
+    """``rag_search`` reads records the store actually persists.
 
-    def test_both_maps_are_state_fields(self) -> None:
-        """A map that were not persisted would empty on every resume."""
-        assert {"documents", "rag_index"} <= set(WorkspaceState.model_fields)
+    The successor to the state-field contract: what used to be two declared
+    fields on ``WorkspaceState`` is one record on disk, and the claim worth
+    pinning is the same one — a half that were not persisted would empty on
+    every process start.
+    """
+
+    def test_neither_half_lives_on_the_actor_state_any_more(self) -> None:
+        """A field here would be a second, divergent copy of what is on disk."""
+        assert "documents" not in WorkspaceState.model_fields
+        assert "rag_index" not in WorkspaceState.model_fields
+
+    def test_both_halves_are_fields_of_the_stored_record(self) -> None:
+        assert {"extract", "row"} <= set(DocumentEntry.model_fields)
+
+    def test_a_search_reads_both_halves_through_a_second_store_object(
+        self, search: SearchHarness
+    ) -> None:
+        """The keyword leg joins the two halves, so both must have reached disk."""
+        search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
+        entry = YamlDocumentStore().get_document(WORKSPACE_PATH, "invoice.md")
+        assert entry is not None
+        assert entry.extract is not None and entry.extract.markdown is not None
+        assert entry.row is not None and entry.row.chunks

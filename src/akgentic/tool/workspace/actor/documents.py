@@ -1,48 +1,42 @@
-"""The extraction cache, the retrieval index, and every delta this package sends.
+"""The extraction cache and the retrieval index — files on disk, not maps in memory.
 
-**The actor's persisted state is ``documents`` and ``rag_index``, and it is
-persisted by delta.** A hosted workspace has no orchestrator, so the whole-state
-``notify_state_change()`` it used to call reaches nobody. What replaces it is a
-member-keyed :class:`~akgentic.core.resource_host.StateDelta` told to the
-process's ``WorkspaceHost`` — ``notify_delta(config.name, delta)`` — whose store
-writes it: ``set`` for a member that is present, ``unset`` for one that was
-removed, keyed ``documents.<path>`` / ``rag_index.<path>`` and never the bare
-mapping (ADR-022 Decision 6).
+**What this actor knows about a document lives in a file, not in its state.**
+Both halves of one document — the cached extraction and the retrieval row — are
+one :class:`~akgentic.tool.workspace.documents.store.DocumentEntry` under
+``<meta>/rag/``, written through a
+:class:`~akgentic.tool.workspace.documents.store.DocumentStore` the card
+announces at bind time (ADR-051 Decision 6). A second process over the same
+mount therefore reads the same cache with no shared memory, and nothing here
+sends a delta to anybody: the two state fields, both dirty sets, ``_persist``,
+``_send_delta`` and the restore hook they existed for are gone.
 
-**Every write goes through one of three places, and the ``ast`` canary in the
-suite pins them.** :meth:`DocumentsMixin._put_row` is the only writer of
-``rag_index``; :meth:`DocumentsMixin.cache_document` is the only writer of
-``documents``; :meth:`DocumentsMixin.document_extract` moves a hit to the end of
-the LRU, which is deliberately not a change. The first two mark the path dirty,
-and :meth:`DocumentsMixin._persist` turns the dirty paths into **one** delta —
-set-or-unset read off the map itself — and sends nothing when nothing is dirty.
+**There are exactly two writers, and each one writes to disk on the turn it is
+called.** :meth:`DocumentsMixin._put_row` is the only writer of a row;
+:meth:`DocumentsMixin.cache_document` is the only writer of an extraction. Both
+read the entry, copy it with the one half that changes, and put it back — never
+a field-by-field rebuild (Golden Rule 12). There is **no dirty set and no
+batching**: the ``batches_landed`` counter that deliberately persisted nothing on
+its own turn now writes, which costs ``ceil(chunks / EMBED_BATCH_SIZE)`` rewrites
+of one file and is accepted deliberately. The alternative is in-memory
+write-behind state, which is exactly what moving to files removes, and the
+counter has to survive a crash or its file parks at ``EMBEDDING`` until the
+reaper.
 
-The persist points — the handlers that end a unit of work — are, and only:
+**The rule that survives, unchanged and load-bearing: a read writes nothing.**
+Reads are the majority of workspace traffic, and a document-cache **hit** is a
+read: it performs one ``get_document`` and no write at all. The LRU reorder a hit
+used to perform in memory is deleted with the map it reordered — recency is
+``extract.extracted_at``, stamped at the fill and read off the disk by the
+eviction pass. A write on a *read* path — of any kind, in any of these methods —
+is a defect until a decision says otherwise.
 
-- :meth:`DocumentsMixin.cache_document` — a cache **fill**, one delta carrying the
-  entry it inserted and every entry the caps touched, amortised against the
-  seconds of extraction that preceded it.
-- :meth:`DocumentsMixin.index_paths` and :meth:`DocumentsMixin.receiveMsg_NewFileMessage`
-  — a queueing pass, including a row a failed spawn inside ``_drain`` just failed.
-- :meth:`DocumentsMixin.receiveMsg_IndexResult` / :meth:`DocumentsMixin.receiveMsg_IndexFailure`
-  — one per file, at its transition, and one for a report whose row had moved
-  on while ``_drain`` spawned the next file.
-- :meth:`DocumentsMixin.receiveMsg_EmbeddingResult` — **only** at the file's
-  final transition, or at the turn a write could not land. A batch that lands
-  without settling the file writes ``batches_landed`` through ``_put_row`` and
-  persists nothing on its own turn; the dirty row rides on the next delta, so a
-  1,900-chunk document costs one delta rather than thirty.
-- :meth:`DocumentsMixin.receiveMsg_EmbeddingError` — one per file, at its
-  transition to ``FAILED``.
-- :meth:`DocumentsMixin.mark_paths_stale` — so a tree that has never been indexed
-  marks nothing and sends nothing on the mutation path.
-- ``_acquire_vs_proxy`` — the in-memory re-mark of ``EMBEDDED`` rows — and
-  ``WorkspaceActor.init_state`` — the restore re-queue of every in-flight row.
-
-**The rule that survives, unchanged and load-bearing: no delta on a text read,
-and none on a document-cache hit.** Reads are the majority of workspace traffic.
-A new delta on a *read* path — of any kind, in any of these methods — is a
-defect until a decision says otherwise.
+**``self._document_store is None`` is an ordinary state and every path degrades through
+it**, never an ``assert`` and never a raise: a lost announcement means the cache
+misses and the index looks empty, which is visible and recoverable by rebinding.
+The card builds a store unconditionally in ``observer()``, so ``None`` is
+reachable only in harness shapes that wire a bare observer and in the window
+before the announcement lands — the two cases ``_workspace_proxy is None``
+already covers.
 
 Everything on the ask path here is O(1)/O(n) dict work on the actor thread, plus
 bounded file reads while queueing and bounded proxy calls to the store child —
@@ -68,11 +62,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 from uuid import uuid4
 
-from pydantic import JsonValue, TypeAdapter
-
 from akgentic.core import ActorDeadError
 from akgentic.core.agent_config import BaseConfig
-from akgentic.core.resource_host import StateDelta
 from akgentic.tool.vector_store.protocol import (
     PATH_PREFIX_REJECTED,
     PATH_PREFIX_WILDCARDS,
@@ -91,7 +82,7 @@ from akgentic.tool.workspace.documents.models import (
     RagStatus,
     evict_document_bodies,
 )
-from akgentic.tool.workspace.host import WorkspaceHost, workspace_host_address
+from akgentic.tool.workspace.documents.store import DocumentEntry, DocumentStore
 from akgentic.tool.workspace.models import WorkspaceConfig, WorkspaceState, content_sha
 from akgentic.tool.workspace.readers import _MIME_MAP, TEXT_EXTENSIONS, DocumentReader
 from akgentic.tool.workspace.workspace import Filesystem
@@ -143,18 +134,6 @@ take the gate down with it.
 
 _CHUNK_REF_TYPE = "workspace_chunk"
 """``VectorEntry.ref_type`` for every chunk this package stores."""
-
-_JSON_MEMBERS: TypeAdapter[dict[str, JsonValue]] = TypeAdapter(dict[str, JsonValue])
-"""Validates a delta's ``set`` half as JSON, without rehydrating it.
-
-``StateDelta`` is a ``SerializableBaseModel``, and that base's before-validator
-turns every ``__model__``-tagged dict back into the model it names — so a delta
-built the ordinary way cannot carry a member's dump: its ``DocumentExtract`` /
-``RagFile`` comes back as an instance and ``JsonValue`` rejects it. The tag is
-the point of the value (it is what lets a restore rebuild the member's own
-class), so :meth:`DocumentsMixin._persist` validates the values here and builds
-the delta with ``model_construct``, which skips only that rehydration.
-"""
 
 _STORE_UNREACHABLE: tuple[type[Exception], ...] = (RuntimeError, ActorDeadError)
 """What the in-memory store child's spawn raises when the environment refuses it.
@@ -209,14 +188,14 @@ class _KeywordMatch(NamedTuple):
 
 
 class DocumentsMixin(_DocumentsBase):
-    """The extraction cache and the retrieval index over ``WorkspaceState``.
+    """The extraction cache and the retrieval index, over a ``DocumentStore``.
 
-    Declares no Pydantic field and no state field: every map it uses is owned by
-    the actor and initialised in its ``on_start``. It defines no sibling's method
-    either — in particular not ``deliver``, ``fail`` or ``cache_capacity``, any of
-    which would silently take over the deferred delivery path or resize the exec
-    LRU, because this mixin precedes ``ExecMixin`` and ``DeferredResultActor`` in
-    the MRO.
+    Declares no Pydantic field and no state field: everything it uses is owned by
+    the actor and initialised in its ``on_start``, and what it *persists* lives on
+    disk. It defines no sibling's method either — in particular not ``deliver``,
+    ``fail`` or ``cache_capacity``, any of which would silently take over the
+    deferred delivery path or resize the exec LRU, because this mixin precedes
+    ``ExecMixin`` and ``DeferredResultActor`` in the MRO.
     """
 
     _workspace: Filesystem
@@ -226,8 +205,87 @@ class DocumentsMixin(_DocumentsBase):
     _vs_proxy: VectorStoreService | None
     _embedder: EmbeddingProvider | None
     _index_active: set[str]
-    _dirty_rows: set[str]
-    _dirty_documents: set[str]
+    _document_store: DocumentStore | None
+
+    ##
+    ## The store — four helpers, and the only place a ``tree_key`` is spelled
+    ##
+    def configure_document_store(self, backend: DocumentStore) -> None:
+        """Take the store the card resolved — **tell** path, last writer wins.
+
+        The shape ``configure_exec`` and ``configure_lock`` already have: the card
+        builds the backend in ``observer()`` and announces it here, so this actor
+        never inspects a card and never resolves configuration of its own. A
+        second announcement from a second card simply replaces the first; two
+        cards on one tree resolve the same backend from the same environment, so
+        there is nothing for a first-call-wins rule to protect.
+
+        Args:
+            backend: Where this tree's document records live.
+        """
+        self._document_store = backend
+
+    def _entry(self, path: str) -> DocumentEntry:
+        """Return *path*'s stored record, or a fresh empty one.
+
+        **A miss and an unannounced store are the same answer**, deliberately: a
+        fresh record with both halves absent is what every caller here already
+        handles, so neither case needs a branch of its own and neither can raise.
+
+        The *tree_key* is resolved here — ``config.workspace_path``, the same
+        two-segment string ``_lock.acquire`` is given, never ``config.name``,
+        which carries the ``#Workspace-`` prefix. Spelling it at every call site
+        would be fifteen places for one to drift.
+        """
+        store = self._document_store
+        if store is None:
+            return DocumentEntry(path=path)
+        return store.get_document(self.config.workspace_path, path) or DocumentEntry(path=path)
+
+    def _save(self, entry: DocumentEntry) -> None:
+        """Write *entry* whole, or do nothing when no store has been announced."""
+        store = self._document_store
+        if store is None:
+            return
+        store.put_document(self.config.workspace_path, entry)
+
+    def _entries(self) -> list[DocumentEntry]:
+        """Every stored record for this tree, in no guaranteed order.
+
+        **One listing serves all three of its callers** — the drain, the render
+        and the keyword leg — because one file carries both halves of a document.
+        The two-map shape needed two scans and a join; this needs neither, and
+        the join ``_keyword_leg`` performs is now between two fields of one
+        record rather than between two mappings with different lifetimes.
+
+        Callers that need an order sort for themselves: a directory glob's order
+        is the file system's, and leaning on it is how a render stops being
+        stable across runs.
+        """
+        store = self._document_store
+        if store is None:
+            return []
+        return store.list_documents(self.config.workspace_path)
+
+    def _forget_extract(self, path: str) -> None:
+        """Drop *path*'s cached extraction, **keeping its index row**.
+
+        The record is removed outright only when there is no row to keep. That is
+        the on-disk form of the rule the two maps used to hold structurally: the
+        caps bound the *extraction cache*, and
+        :func:`~akgentic.tool.workspace.documents.models.evict_document_bodies`
+        states it directly — a dropped body must not de-index its file. With both
+        halves in one file, unlinking on the row cap would de-index every file it
+        evicted, so the row cap drops the half it is a cap on and the file
+        survives for the half it is not.
+        """
+        entry = self._entry(path)
+        if entry.row is None:
+            store = self._document_store
+            if store is not None:
+                store.evict(self.config.workspace_path, path)
+            return
+        self._save(entry.model_copy(update={"extract": None}))
 
     ##
     ## The extraction cache — lookup (ask) and fill (tell)
@@ -240,13 +298,12 @@ class DocumentsMixin(_DocumentsBase):
         present. Four distinct reasons to miss, one answer — the caller
         re-extracts, which is correct in every one of them.
 
-        On a hit the entry moves to the end of the LRU. **That reorder is an
-        in-memory mutation with no delta**, deliberately: this is the read path,
-        and the one write of ``documents`` that does not mark its path dirty.
-        Persisted recency therefore lags live recency — the store keeps a
-        re-filled key where it first landed, and ``init_state`` re-sorts a
-        restore by ``extracted_at`` — which costs at most one extra
-        re-extraction after a restore and is not to be "fixed" into a delta.
+        **One ``get_document`` and no listing, and a hit writes nothing at all.**
+        The LRU reorder this used to perform is deleted with the map it
+        reordered: recency is ``extract.extracted_at``, stamped at the fill and
+        read off the disk by the eviction pass, so there is nothing for a hit to
+        record. That keeps the read path free, which is the rule this method has
+        always been the load-bearing case of.
 
         Args:
             path: Workspace-relative path of the source file.
@@ -256,39 +313,35 @@ class DocumentsMixin(_DocumentsBase):
         Returns:
             The cached Markdown, or ``None``.
         """
-        entry = self.state.documents.get(path)
+        extract = self._entry(path).extract
         if (
-            entry is None
-            or entry.source_sha != source_sha
-            or entry.extractor_version != extractor_version
-            or entry.markdown is None
+            extract is None
+            or extract.source_sha != source_sha
+            or extract.extractor_version != extractor_version
+            or extract.markdown is None
         ):
             return None
-        # LRU: most recently used moves to the end. In-memory only — no delta
-        # on a hit, because a hit is what a read does.
-        self.state.documents[path] = self.state.documents.pop(path)
-        return entry.markdown
+        return extract.markdown
 
     def cache_document(
         self, path: str, source_sha: str, extractor_version: int, markdown: str
     ) -> None:
-        """Cache *markdown* as the extraction of *path*, evict, and persist once.
+        """Cache *markdown* as the extraction of *path*, then apply both caps.
 
-        The delta follows the insert **and** the eviction, so one fill is one
-        delta however many entries it displaced — never twice, never once per
-        evicted entry. It carries ``set`` for the new entry and for every entry
-        whose body the char cap dropped, and ``unset`` for every entry the row
-        cap removed: :meth:`_persist` reads which is which off the map, because
-        ``evict_document_bodies``' flat return cannot say. It is amortised
-        against the seconds of extraction that preceded it.
+        **The write reaches the disk on this turn**, and so does every eviction
+        it causes. There is no dirty set to ride on and no delta to amortise
+        against: the fill costs one read-modify-write of one file, which is
+        nothing beside the seconds of extraction that preceded it.
+
+        The **row half is preserved by construction** —
+        ``model_copy(update={"extract": ...})`` over the stored record — so a
+        re-fill can never de-index a file it was only re-reading, and a field
+        added to :class:`~akgentic.tool.workspace.documents.store.DocumentEntry`
+        tomorrow survives (Golden Rule 12).
 
         ``char_count`` is computed here rather than taken as a parameter, so it
-        cannot disagree with the body it describes. Re-filling a known path
-        refreshes its recency instead of leaving it where it was.
-
-        **An eviction here must never de-index a file.** Nothing anywhere may
-        infer index membership from ``state.documents``; the two maps are
-        independent and only one of them is capped.
+        cannot disagree with the body it describes. Recency needs no bookkeeping:
+        ``extracted_at`` is stamped here, and the eviction pass sorts on it.
 
         Args:
             path: Workspace-relative path of the source file.
@@ -296,8 +349,7 @@ class DocumentsMixin(_DocumentsBase):
             extractor_version: The extractor that produced this body.
             markdown: The extracted body.
         """
-        self.state.documents.pop(path, None)  # a re-fill refreshes recency
-        self.state.documents[path] = DocumentExtract(
+        extract = DocumentExtract(
             path=path,
             source_sha=source_sha,
             extractor_version=extractor_version,
@@ -305,19 +357,49 @@ class DocumentsMixin(_DocumentsBase):
             char_count=len(markdown),
             extracted_at=datetime.now(UTC),
         )
+        self._save(self._entry(path).model_copy(update={"extract": extract}))
+        self._apply_document_caps(path)
+
+    def _apply_document_caps(self, filled: str) -> None:
+        """Bring the cache back under both caps, least recently extracted first.
+
+        The recency order is ``extract.extracted_at`` read off the disk, **not**
+        whatever order the directory glob returned — a glob's order is the file
+        system's, and evicting on it would evict an arbitrary document while
+        looking exactly like an LRU.
+
+        :func:`~akgentic.tool.workspace.documents.models.evict_document_bodies`
+        is consumed **unchanged**: the same signature, the same two caps and the
+        same flat return. What changed is only how its verdict is applied — a
+        path it removed from the mapping lost its whole entry to the row cap and
+        goes through :meth:`_forget_extract`; a path still present whose
+        ``markdown`` it nulled is written back with the body dropped and its row
+        untouched.
+
+        Args:
+            filled: The path whose fill triggered this, for the log line.
+        """
+        entries = {entry.path: entry for entry in sorted(self._entries(), key=_extracted_at)}
+        documents = {
+            path: entry.extract for path, entry in entries.items() if entry.extract is not None
+        }
         evicted = evict_document_bodies(
-            self.state.documents,
+            documents,
             max_documents=self.config.max_documents,
             max_document_chars=self.config.max_document_chars,
         )
-        self._dirty_documents.add(path)
-        self._dirty_documents.update(evicted)
+        for path in evicted:
+            remaining = documents.get(path)
+            if remaining is None:
+                self._forget_extract(path)
+            else:
+                self._save(entries[path].model_copy(update={"extract": remaining}))
         if evicted:
             # One line per fill, never one per path, and DEBUG rather than INFO:
             # on a workspace sitting at either cap this fires on every fill, and
             # the question it answers — "why does this document keep
             # re-extracting?" — is a debugging question. It is also the only
-            # evidence an entry-cap eviction ever happened, since the row is
+            # evidence an entry-cap eviction ever happened, since the body is
             # gone by the time anything else could look.
             #
             # "evicted" covers both remedies deliberately: the return is a flat
@@ -328,99 +410,33 @@ class DocumentsMixin(_DocumentsBase):
             # string even with DEBUG off. ``%s`` over the list defers all of it.
             logger.debug(
                 "Filling the document cache for %s evicted (entry removed or body dropped): %s",
-                path,
+                filled,
                 evicted,
             )
-        self._persist()
 
     ##
-    ## Persistence — the one row writer, and the one delta per persist point
+    ## The one row writer
     ##
     def _put_row(self, path: str, row: RagFile) -> None:
-        """Write *row* as ``rag_index[path]`` and mark the path dirty.
+        """Write *row* as *path*'s index half, on this turn.
 
-        **The only writer of ``state.rag_index``**, which is what makes the
-        persistence inventory structural rather than remembered: a write that
-        bypasses this is a write no delta carries, and the suite's ``ast``
-        canary refuses one.
+        **The only writer of a row**, which is what makes the write inventory
+        structural rather than remembered: a write that bypasses this is a write
+        no reader of the store can attribute, and the suite's ``ast`` canary
+        refuses one.
+
+        The extraction half is preserved by construction —
+        ``model_copy(update={"row": ...})`` over the stored record — so a status
+        transition can never blank a cached body, and a field added to
+        :class:`~akgentic.tool.workspace.documents.store.DocumentEntry` tomorrow
+        survives (Golden Rule 12).
 
         Args:
             path: Workspace-relative path the row describes.
             row: The row, already derived by ``model_copy(update=...)`` or built
                 fresh — never rebuilt by naming fields.
         """
-        self.state.rag_index[path] = row
-        self._dirty_rows.add(path)
-
-    def _persist(self) -> None:
-        """Send one delta for every dirty path, or nothing when nothing is dirty.
-
-        Each dirty path is ``set`` to its member's ``model_dump()`` when the map
-        still holds it and ``unset`` when it does not, under the key
-        ``documents.<path>`` or ``rag_index.<path>`` — one member at a time,
-        never the bare mapping, and the first dot separates the field from the
-        key. The value is core's serialiser output: a fresh, JSON-safe dict
-        carrying every field of the member and its ``__model__`` tag, so a field
-        added tomorrow and a subclass both survive the store (Golden Rule 12).
-        A dict built by naming fields is that rule's defect.
-
-        Both dirty sets are cleared before the send, so a delta is never sent
-        twice. Called unconditionally at every persist point: a persist with
-        nothing dirty sends nothing, which is what lets a handler never guess
-        whether a helper it called wrote something.
-        """
-        # Two loops rather than one over the two maps: binding a map to a local
-        # would put it out of reach of the suite's write-site canary.
-        present: dict[str, JsonValue] = {}
-        removed: list[str] = []
-        for path in sorted(self._dirty_documents):
-            document = self.state.documents.get(path)
-            if document is None:
-                removed.append(f"documents.{path}")
-            else:
-                present[f"documents.{path}"] = document.model_dump()
-        for path in sorted(self._dirty_rows):
-            row = self.state.rag_index.get(path)
-            if row is None:
-                removed.append(f"rag_index.{path}")
-            else:
-                present[f"rag_index.{path}"] = row.model_dump()
-        self._dirty_documents.clear()
-        self._dirty_rows.clear()
-        if present or removed:
-            # Not ``StateDelta(set=...)``: its before-validator would rehydrate
-            # the tagged dumps into models. See ``_JSON_MEMBERS``.
-            delta = StateDelta.model_construct(
-                set=_JSON_MEMBERS.validate_python(present), unset=removed
-            )
-            self._send_delta(self.config.name, delta)
-
-    def _send_delta(self, scope: str, delta: StateDelta) -> None:
-        """Tell *delta* to the process's ``WorkspaceHost`` under *scope*, or do nothing.
-
-        A **tell**, never an ask: an actor must not block its own thread on
-        another actor's reply, and ``notify_delta`` answers nothing. The host is
-        looked up at each send and never held. No host — a test harness, or
-        process exit — is this actor's no-op; a host with no store is core's.
-
-        A host that stopped between the lookup and the tell is one DEBUG line:
-        the delta has nowhere to go, and this actor owns the write gate. Anything
-        else propagates — a delta that does not validate is a defect.
-
-        Args:
-            scope: The host's registry key for this actor — ``config.name``.
-            delta: The members to set and the member keys to remove.
-        """
-        host = workspace_host_address()
-        if host is None:
-            return
-        try:
-            self.proxy_tell(host, WorkspaceHost).notify_delta(scope, delta)
-        except ActorDeadError:
-            logger.debug(
-                "Workspace %s: the host stopped before a delta could reach it",
-                self.config.workspace_path,
-            )
+        self._save(self._entry(path).model_copy(update={"row": row}))
 
     ##
     ## Retrieval — enabling it, and the collection that is created lazily
@@ -496,12 +512,15 @@ class DocumentsMixin(_DocumentsBase):
         two apart. (The attribute keeps the name ``_vs_proxy``: renaming it to
         ``_store`` is ~200 mechanical private sites, routed to its own follow-up.)
 
-        **A freshly created child holds nothing, so the index is told so.** On
-        the actor-state branch every ``EMBEDDED`` row goes back to ``PENDING``
-        the moment the child exists and before the collection is created — see
-        :meth:`_requeue_embedded_rows` for why that moment, and not
-        ``init_state``, is the one that can know. A cluster engine kept its
-        rows and is never re-marked.
+        **Nothing is re-marked here, and nothing is to be re-added.** An earlier
+        shape put every ``EMBEDDED`` row back to ``PENDING`` the moment an
+        in-memory store child was created, because a child of a hosted actor has
+        no checkpoint and therefore held nothing the rows claimed. The index is
+        on disk now and outlives every engine, so that premise is gone and
+        porting the rule would blank a good cache on every process start — one
+        full re-extraction and re-embedding of every indexed file, charged to
+        whoever pays for embeddings. A guard in the suite goes red for anyone who
+        re-adds it.
 
         **Every call through it is an ask.** ``create_collection`` has to be known
         to have worked before anything is added; ``remove`` re-raises a missing
@@ -522,7 +541,7 @@ class DocumentsMixin(_DocumentsBase):
         defect in the child's spawn is not an outage and propagates to
         :meth:`enable_rag`, which keeps retrieval off and logs it with its
         traceback — see :meth:`_resolve_store`. The
-        order on the actor-state branch is spawn, re-mark, ``create_collection``,
+        order on the actor-state branch is spawn, ``create_collection``,
         embedder, bind — so a child whose ``create_collection`` then fails has
         already been spawned and is **left alive and orphaned** until this actor
         stops and ``stop_children`` takes it; an idle actor, and the same shape a
@@ -546,9 +565,6 @@ class DocumentsMixin(_DocumentsBase):
         store = self._resolve_store(self._rag_collection)
         if store is None:
             return
-        if needs_store_actor(self._rag_collection):
-            self._requeue_embedded_rows()
-            self._persist()
         try:
             store.create_collection(RAG_COLLECTION, self._rag_collection)
         except Exception as exc:
@@ -681,7 +697,7 @@ class DocumentsMixin(_DocumentsBase):
         """
         if self._vs_proxy is None or self._rag_params is None:
             return _UNAVAILABLE
-        self.reap_stale_embedding()
+        self.reap_abandoned_rows()
         candidates, unsupported = self._candidates(path)
         queued = current = 0
         for candidate in candidates:
@@ -695,7 +711,6 @@ class DocumentsMixin(_DocumentsBase):
             self._enqueue(candidate, sha)
             queued += 1
         self._drain()
-        self._persist()
         return f"{queued} file(s) queued, {current} already current, {unsupported} unsupported"
 
     def _is_accounted_for(self, path: str, sha: str, force: bool) -> bool:
@@ -708,10 +723,10 @@ class DocumentsMixin(_DocumentsBase):
         """
         if force:
             return False
-        entry = self.state.rag_index.get(path)
-        if entry is None or entry.indexed_sha != sha:
+        row = self._entry(path).row
+        if row is None or row.indexed_sha != sha:
             return False
-        return entry.status in _IN_FLIGHT or entry.status is RagStatus.EMBEDDED
+        return row.status in _IN_FLIGHT or row.status is RagStatus.EMBEDDED
 
     def _enqueue(self, path: str, sha: str) -> None:
         """Put *path* at ``PENDING`` for *sha*, keeping the old ids to supersede.
@@ -722,23 +737,23 @@ class DocumentsMixin(_DocumentsBase):
         that previously failed are kept, so a later re-index retries them.
         """
         now = datetime.now(UTC)
-        entry = self.state.rag_index.get(path)
-        if entry is None:
+        row = self._entry(path).row
+        if row is None:
             self._put_row(
                 path, RagFile(path=path, status=RagStatus.PENDING, indexed_sha=sha, updated_at=now)
             )
             return
-        superseded = list(entry.superseded_chunk_ids)
+        superseded = list(row.superseded_chunk_ids)
         # The membership set is built once. Rebuilding it per chunk is O(n²) on
         # the actor's mailbox turn, and an 800-page document is ~1,900 chunks.
         seen = set(superseded)
-        for chunk in entry.chunks:
+        for chunk in row.chunks:
             if chunk.chunk_id not in seen:
                 superseded.append(chunk.chunk_id)
                 seen.add(chunk.chunk_id)
         self._put_row(
             path,
-            entry.model_copy(
+            row.model_copy(
                 update={
                     "status": RagStatus.PENDING,
                     "indexed_sha": sha,
@@ -757,9 +772,14 @@ class DocumentsMixin(_DocumentsBase):
         """Spawn workers for ``PENDING`` files up to the concurrency cap.
 
         It writes rows for paths its caller never named — ``EXTRACTION`` or
-        ``SPLITTING`` on a spawn, ``FAILED`` on a spawn that raised — which is
-        why it answers nothing and every caller persists unconditionally: an
-        answer of "nothing moved" is exactly what once hid the failed spawn.
+        ``SPLITTING`` on a spawn, ``FAILED`` on a spawn that raised — and each of
+        those reaches the disk on this turn, so it answers nothing and no caller
+        has to guess whether it moved anything.
+
+        The listing is re-read on every pass rather than taken once, because
+        every spawn writes a row: iterating a snapshot would re-offer a path a
+        previous pass already moved out of ``PENDING``. It costs one directory
+        scan per spawn, bounded by the concurrency cap.
         """
         from akgentic.tool.workspace.documents.worker import (  # noqa: PLC0415 — cycle
             MAX_CONCURRENT_INDEX_WORKERS,
@@ -768,9 +788,11 @@ class DocumentsMixin(_DocumentsBase):
         while len(self._index_active) < MAX_CONCURRENT_INDEX_WORKERS:
             waiting = next(
                 (
-                    candidate
-                    for candidate, entry in self.state.rag_index.items()
-                    if entry.status is RagStatus.PENDING and candidate not in self._index_active
+                    entry.path
+                    for entry in self._entries()
+                    if entry.row is not None
+                    and entry.row.status is RagStatus.PENDING
+                    and entry.path not in self._index_active
                 ),
                 None,
             )
@@ -799,12 +821,12 @@ class DocumentsMixin(_DocumentsBase):
             index_worker_name,
         )
 
-        entry = self.state.rag_index[path]
+        row = self._entry(path).row
         params, reader = self._rag_params, self._rag_reader
-        if params is None or reader is None or entry.indexed_sha is None:
+        if row is None or params is None or reader is None or row.indexed_sha is None:
             return False
         scope = self.config.workspace_path
-        markdown = self.document_extract(path, entry.indexed_sha, EXTRACTOR_VERSION)
+        markdown = self.document_extract(path, row.indexed_sha, EXTRACTOR_VERSION)
         try:
             address = self.createActor(
                 IndexWorker, config=BaseConfig(name=index_worker_name(scope, path))
@@ -813,7 +835,7 @@ class DocumentsMixin(_DocumentsBase):
                 IndexRequest(
                     path=path,
                     scope=scope,
-                    source_sha=entry.indexed_sha,
+                    source_sha=row.indexed_sha,
                     markdown=markdown,
                     params=params,
                     reader=reader,
@@ -821,12 +843,12 @@ class DocumentsMixin(_DocumentsBase):
             )
         except Exception as exc:
             logger.warning("Workspace %s: could not spawn an index worker for %s", scope, path)
-            self._fail(path, entry.indexed_sha, f"{type(exc).__name__}: {exc}")
+            self._fail(path, row.indexed_sha, f"{type(exc).__name__}: {exc}")
             return False
         self._index_active.add(path)
         self._put_row(
             path,
-            entry.model_copy(
+            row.model_copy(
                 update={
                     "status": RagStatus.SPLITTING if markdown is not None else RagStatus.EXTRACTION,
                     "updated_at": datetime.now(UTC),
@@ -919,27 +941,25 @@ class DocumentsMixin(_DocumentsBase):
             )
 
     def _on_index_result(self, msg: IndexResult) -> None:
-        """Record *msg*, issue its ``add()`` batches, and persist once.
+        """Record *msg* and issue its ``add()`` batches.
 
         A report whose row has moved on writes nothing itself, but the
-        ``_drain`` it frees a slot for spawns the next file — a row written and,
-        before this persisted, never carried by any delta.
+        ``_drain`` it frees a slot for spawns the next file, and that spawn's
+        row reaches the disk on this turn like any other.
         """
         self._index_active.discard(msg.path)
         entry = self._live_entry(msg.path, msg.source_sha)
         if entry is None:
             self._drain()
-            self._persist()
             return
         if msg.extracted:
-            # The worker did the extraction, so the cache learns from it. This is
-            # the one delta in this method that is not the file's own transition,
-            # and it is a fill like any other.
+            # The worker did the extraction, so the cache learns from it — a fill
+            # like any other, and the one write in this method that is not the
+            # file's own transition.
             self.cache_document(msg.path, msg.source_sha, EXTRACTOR_VERSION, msg.markdown)
         if len(msg.texts) != len(msg.chunks):
             self._fail(msg.path, msg.source_sha, "the worker returned mismatched chunks and texts")
             self._drain()
-            self._persist()
             return
         batches = ceil(len(msg.chunks) / _batch_size())
         self._put_row(
@@ -963,7 +983,6 @@ class DocumentsMixin(_DocumentsBase):
             # nothing to embed and nothing to wait for.
             self._drop_superseded(msg.path)
         self._drain()
-        self._persist()
 
     def _issue_batches(self, msg: IndexResult) -> None:
         """Spawn one ``#embed-`` worker per ``EMBED_BATCH_SIZE`` chunks of *msg*.
@@ -1061,7 +1080,6 @@ class DocumentsMixin(_DocumentsBase):
             if self._live_entry(msg.path, msg.source_sha) is not None:
                 self._fail(msg.path, msg.source_sha, msg.reason)
             self._drain()
-            self._persist()
         except Exception:
             logger.warning(
                 "Workspace %s: could not record the index failure for %s",
@@ -1119,10 +1137,10 @@ class DocumentsMixin(_DocumentsBase):
         """
         if collection != RAG_COLLECTION or path is None:
             return None
-        entry = self.state.rag_index.get(path)
-        if entry is None or entry.status is not RagStatus.EMBEDDING:
+        row = self._entry(path).row
+        if row is None or row.status is not RagStatus.EMBEDDING:
             return None
-        return entry
+        return row
 
     def _on_embedding_error(self, msg: EmbeddingError) -> None:
         """Fail the file one worker could not embed for."""
@@ -1130,7 +1148,6 @@ class DocumentsMixin(_DocumentsBase):
         if entry is None or msg.request_ref is None:
             return
         self._fail(msg.request_ref, entry.indexed_sha, msg.error)
-        self._persist()
 
     def _on_embedding_result(self, msg: EmbeddingResult) -> None:
         """Write one embedded batch, then apply it to the row that is counting it."""
@@ -1145,12 +1162,13 @@ class DocumentsMixin(_DocumentsBase):
             proxy.add(RAG_COLLECTION, msg.entries)
         except Exception as exc:
             self._fail(path, entry.indexed_sha, f"{type(exc).__name__}: {exc}")
-            self._persist()
             return
         landed = entry.batches_landed + 1
         if landed < entry.batches_expected:
-            # Dirty and not persisted on this turn: the file has not moved, so
-            # nothing is worth a delta. The next persist of any path carries it.
+            # Written on this turn, where it used to ride on the next delta. The
+            # cost is one rewrite of this file per landing batch; the counter has
+            # to survive a crash or the file parks at ``EMBEDDING`` until the
+            # reaper, and the only state-free alternative is not persisting it.
             self._put_row(path, entry.model_copy(update={"batches_landed": landed}))
             return
         self._put_row(
@@ -1164,7 +1182,6 @@ class DocumentsMixin(_DocumentsBase):
             ),
         )
         self._drop_superseded(path)
-        self._persist()
 
     def _drop_superseded(self, path: str) -> None:
         """Remove the previous chunk set, now that the new one has landed.
@@ -1180,14 +1197,14 @@ class DocumentsMixin(_DocumentsBase):
         never fails the file: the worst case is a few orphaned vectors, and the
         alternative is a file that is ``FAILED`` because of a cleanup.
         """
-        entry = self.state.rag_index.get(path)
+        row = self._entry(path).row
         proxy = self._vs_proxy
-        if entry is None or proxy is None or not entry.superseded_chunk_ids:
+        if row is None or proxy is None or not row.superseded_chunk_ids:
             return
         try:
             proxy.remove(
                 RAG_COLLECTION,
-                entry.superseded_chunk_ids,
+                row.superseded_chunk_ids,
                 scope=self.config.workspace_path,
             )
         except Exception as exc:
@@ -1195,12 +1212,14 @@ class DocumentsMixin(_DocumentsBase):
                 "Workspace %s: could not remove %d superseded chunk(s) of %s: %s — "
                 "they are kept for the next re-index to retry",
                 self.config.workspace_path,
-                len(entry.superseded_chunk_ids),
+                len(row.superseded_chunk_ids),
                 path,
                 exc,
             )
             return
-        current = self.state.rag_index[path]
+        current = self._entry(path).row
+        if current is None:
+            return
         self._put_row(path, current.model_copy(update={"superseded_chunk_ids": []}))
 
     def _live_entry(self, path: str, source_sha: str) -> RagFile | None:
@@ -1210,15 +1229,15 @@ class DocumentsMixin(_DocumentsBase):
         run nobody is waiting for, and applying it would overwrite the live run's
         chunk set with a stale one.
         """
-        entry = self.state.rag_index.get(path)
-        if entry is None or entry.indexed_sha != source_sha:
+        row = self._entry(path).row
+        if row is None or row.indexed_sha != source_sha:
             logger.debug(
                 "Workspace %s: dropping an index report for %s — the row has moved on",
                 self.config.workspace_path,
                 path,
             )
             return None
-        return entry
+        return row
 
     def _fail(self, path: str, source_sha: str | None, reason: str) -> None:
         """Mark *path* ``FAILED``, keeping whatever chunks it already had.
@@ -1227,12 +1246,12 @@ class DocumentsMixin(_DocumentsBase):
         searchable at its previous content, which is what makes a failure a
         degradation rather than a loss.
         """
-        entry = self.state.rag_index.get(path)
-        if entry is None or (source_sha is not None and entry.indexed_sha != source_sha):
+        row = self._entry(path).row
+        if row is None or (source_sha is not None and row.indexed_sha != source_sha):
             return
         self._put_row(
             path,
-            entry.model_copy(
+            row.model_copy(
                 update={
                     "status": RagStatus.FAILED,
                     "reason": reason,
@@ -1244,127 +1263,61 @@ class DocumentsMixin(_DocumentsBase):
     ##
     ## The ``EMBEDDING`` bound, and the gate's staleness signal
     ##
-    def reap_stale_embedding(self) -> bool:
-        """Revert files stuck at ``EMBEDDING`` past the bound, and say if any moved.
+    def reap_abandoned_rows(self) -> bool:
+        """Re-queue every in-flight row no live worker is carrying, and say if any moved.
 
         **Runs at the top of ``index_paths``, and never on a turn path** — not in
         the context-state provider, not in ``rag_snapshot``, not in the gate. It
-        is a state mutation, and one that fired on every turn of every agent
-        carrying the card would be both wasteful and a write from a render. The
-        caller persists what it moved.
+        is a mutation, and one that fired on every turn of every agent carrying
+        the card would be both wasteful and a write from a render.
 
-        **It is the backstop for the one case no gate can see on a running
-        actor: an ``#embed-`` worker that dies without reporting.** Every other
-        way a batch can fail arrives as a message — a worker that could not embed
-        tells ``EmbeddingError``, and a write that could not land raises on the
-        turn it is attempted. A worker that died silently reports neither, and
-        its file would otherwise stay ``EMBEDDING`` for ever. The bound is what
-        tells that worker from a slow one, which a running actor cannot
-        otherwise do. A restore needs no bound and does not come here: see
-        :meth:`_requeue_orphaned_rows`.
+        **It is the backstop for every row a worker was carrying and no longer
+        is, whichever process that worker belonged to.** Every other way a batch
+        can fail arrives as a message — a worker that could not embed tells
+        ``EmbeddingError``, and a write that could not land raises on the turn it
+        is attempted. A worker that died silently reports neither, and its file
+        would otherwise stay ``EXTRACTION``, ``SPLITTING`` or ``EMBEDDING`` for
+        ever: :meth:`_drain` spawns ``PENDING`` only and :meth:`_is_accounted_for`
+        counts in-flight as current, so nothing else would ever move it.
+
+        **Two cases, one predicate**, which is what folded the restore re-queue
+        into this method. With the index in one actor's memory there was a moment
+        called "restore" at which every in-flight row was abandoned *by
+        construction*, and a separate hook re-queued them with no age bound. With
+        the index on disk there is no such moment — another process may be
+        working on one of these rows right now — so the discriminator is
+        ``_index_active``, which is per-process by construction: a path in it is
+        live **here** and is never reaped however old it is; a path not in it and
+        older than :data:`~akgentic.tool.workspace.documents.models.EMBEDDING_STALE_AFTER_S`
+        was abandoned by whoever had it, in this process or another.
+
+        ``chunks`` and ``superseded_chunk_ids`` are kept — the superseded ids are
+        still owed a removal, and the chunk set keeps the row's heading paths
+        renderable until a worker replaces it.
 
         Returns:
-            Whether any row was reverted.
+            Whether any row was re-queued.
         """
         cutoff = datetime.now(UTC) - timedelta(seconds=EMBEDDING_STALE_AFTER_S)
-        reverted = 0
-        for path, entry in list(self.state.rag_index.items()):
-            if entry.status is not RagStatus.EMBEDDING or entry.updated_at >= cutoff:
-                continue
-            self._put_row(path, _requeued(entry, datetime.now(UTC)))
-            reverted += 1
-        if reverted:
-            logger.info(
-                "Workspace %s: %d file(s) left embedding past %.0fs are queued again",
-                self.config.workspace_path,
-                reverted,
-                EMBEDDING_STALE_AFTER_S,
-            )
-        return reverted > 0
-
-    def _requeue_orphaned_rows(self) -> None:
-        """Put every row a worker was carrying back to ``PENDING``, whatever its age.
-
-        **Runs on a restore, in ``WorkspaceActor.init_state``, and only then.**
-        Every worker that could still report for a restored row — an ``#index-``
-        extracting or splitting it, an ``#embed-`` embedding it — was a child of
-        the previous actor and died with it. At restore every ``EXTRACTION``,
-        ``SPLITTING`` and ``EMBEDDING`` row is therefore abandoned by
-        construction, and no age bound applies: the bound in
-        :meth:`reap_stale_embedding` tells a dead worker from a slow one on a
-        *running* actor, and a restored actor has no slow workers. Left as they
-        were, the first two would never move — :meth:`_drain` spawns ``PENDING``
-        only and :meth:`_is_accounted_for` counts in-flight as current — and the
-        third would wait out the reaper's bound for nothing.
-
-        The update is the reaper's: status, both batch counters and the time.
-        ``chunks`` and ``superseded_chunk_ids`` are kept, exactly as the reaper
-        keeps them — the superseded ids are still owed a removal. The caller
-        persists.
-        """
         now = datetime.now(UTC)
         requeued = 0
-        for path, entry in list(self.state.rag_index.items()):
-            if entry.status not in _ORPHANED_ON_RESTORE:
+        for entry in self._entries():
+            row = entry.row
+            if row is None or row.status not in _ORPHANED_ON_RESTORE:
                 continue
-            self._put_row(path, _requeued(entry, now))
+            if row.updated_at >= cutoff or entry.path in self._index_active:
+                continue
+            self._put_row(entry.path, _requeued(row, now))
             requeued += 1
         if requeued:
             logger.info(
-                "Workspace %s: %d file(s) in flight when the previous actor stopped "
+                "Workspace %s: %d file(s) left in flight past %.0fs with no live worker "
                 "are queued again",
                 self.config.workspace_path,
                 requeued,
+                EMBEDDING_STALE_AFTER_S,
             )
-
-    def _requeue_embedded_rows(self) -> None:
-        """Put every ``EMBEDDED`` row back to ``PENDING``: the in-memory engine starts empty.
-
-        **Runs at the moment the in-memory store child is created, and only
-        then.** A child of this actor has no checkpoint of its own — ``createActor``
-        gives it a fresh ``VectorStoreState`` and nobody calls ``init_state`` on
-        it — so at the moment it exists it holds nothing, and every row that
-        claims to be in it is a claim about an engine that has never seen the
-        file. The only way an ``EMBEDDED`` row exists at that moment is a
-        restore, because a fresh actor's index is empty or ``PENDING`` from
-        uploads. "On restore" and "at child creation" therefore name the same
-        event, and the second one knows the backend, which ``init_state`` cannot
-        (see ``WorkspaceActor.init_state``). ``EMBEDDED`` is the terminal
-        success status here; the decision this implements calls it "indexed".
-
-        A cluster engine kept its rows and is never re-marked: the caller gates
-        on ``needs_store_actor``. ``STALE`` and ``FAILED`` rows keep their status
-        — whether they should also move is an open question, not a silent
-        widening here.
-
-        **``superseded_chunk_ids`` is not touched, and ``chunks`` is kept.** The
-        engine never held the old ids, so pushing them into the superseded list
-        would make :meth:`_drop_superseded` issue a ``remove`` for nothing once
-        the re-index lands. The chunk set stays as provenance:
-        :meth:`_on_index_result` overwrites it with the worker's set, and until
-        then it keeps the row's heading paths renderable.
-
-        The row counts as "already current" to :meth:`index_paths` at the same
-        digest and is drained anyway — :meth:`_is_accounted_for` treats
-        ``PENDING`` as in flight and :meth:`_drain` spawns for every ``PENDING``
-        row — so the index rebuilds from the cache at the next
-        ``workspace_rag_index``. One re-embed per reaped tree, on the
-        development engine. The caller persists what moved.
-        """
-        now = datetime.now(UTC)
-        requeued = 0
-        for path, entry in list(self.state.rag_index.items()):
-            if entry.status is not RagStatus.EMBEDDED:
-                continue
-            self._put_row(path, _requeued(entry, now))
-            requeued += 1
-        if requeued:
-            logger.info(
-                "Workspace %s: %d indexed file(s) are queued again — "
-                "the in-memory engine starts empty",
-                self.config.workspace_path,
-                requeued,
-            )
+        return requeued > 0
 
     def mark_paths_stale(self, paths: list[str]) -> None:
         """Mark every indexed path in *paths* ``STALE`` — and re-index none of them.
@@ -1378,23 +1331,21 @@ class DocumentsMixin(_DocumentsBase):
         credits on every save and queue workers behind a file that is about to
         change again. Gate writes mark stale; uploads index.
 
-        It sends a delta **only when it actually changed a status**, so a tree
-        that has never been indexed pays nothing on the mutation path — which is
-        the common case, and must stay free. That is ``_persist``'s own rule: a
-        path it did not write is not dirty.
+        It writes **only when it actually changes a status**, so a tree that has
+        never been indexed pays one lookup per mutated path and no write at all —
+        which is the common case, and must stay cheap.
 
         Args:
             paths: The mutation's own write set.
         """
         now = datetime.now(UTC)
         for path in paths:
-            entry = self.state.rag_index.get(path)
-            if entry is None or entry.status is RagStatus.STALE:
+            row = self._entry(path).row
+            if row is None or row.status is RagStatus.STALE:
                 continue
             self._put_row(
-                path, entry.model_copy(update={"status": RagStatus.STALE, "updated_at": now})
+                path, row.model_copy(update={"status": RagStatus.STALE, "updated_at": now})
             )
-        self._persist()
 
     ##
     ## workspace_rag_list — a render, and therefore free
@@ -1402,10 +1353,19 @@ class DocumentsMixin(_DocumentsBase):
     def rag_snapshot(self, max_pending_shown: int) -> RagIndexState:
         """Return the index as rows, capped on ``PENDING`` only.
 
-        **No file access of any kind**, and no tree sweep: this is asked once per
-        turn by every agent carrying the card, and a ``stat`` per candidate would
-        put a tree walk on the hot path for a display. It is O(n) dict work over
-        rows that already exist.
+        **No file access inside the tree, and no tree sweep**: this is asked once
+        per turn by every agent carrying the card, and a ``stat`` per candidate
+        file would put a tree walk on the hot path for a display. Reading
+        ``<meta>/rag/`` is not that — it is one directory scan plus one parse per
+        record, bounded by ``max_documents`` (32, or 8 when the vector backend is
+        in-memory). That is real where the metadata root is a network share, and
+        the mitigation the decision already ships is
+        ``AKGENTIC_WORKSPACE_META_ROOT`` onto a tmpfs. **No read-through cache is
+        added here**: it would be exactly the in-memory state this move removes.
+
+        The rows are sorted by **path**, so the render is stable across runs. A
+        directory glob's order is the file system's, and a display that reordered
+        itself between two turns would look like the index had changed.
 
         Everything that is not ``PENDING`` is always shown — those rows each say
         something different. ``PENDING`` rows all say the same thing, so a
@@ -1420,18 +1380,21 @@ class DocumentsMixin(_DocumentsBase):
         rows: list[RagFileRow] = []
         hidden = 0
         pending_shown = 0
-        for path, entry in self.state.rag_index.items():
-            if entry.status is RagStatus.PENDING:
+        for entry in sorted(self._entries(), key=lambda stored: stored.path):
+            row = entry.row
+            if row is None:
+                continue
+            if row.status is RagStatus.PENDING:
                 if pending_shown >= max_pending_shown:
                     hidden += 1
                     continue
                 pending_shown += 1
             rows.append(
                 RagFileRow(
-                    path=path,
-                    status=entry.status.value,
-                    chunk_count=entry.chunk_count,
-                    reason=entry.reason or "",
+                    path=entry.path,
+                    status=row.status.value,
+                    chunk_count=row.chunk_count,
+                    reason=row.reason or "",
                 )
             )
         return RagIndexState(rows=rows, pending_hidden=hidden)
@@ -1571,10 +1534,11 @@ class DocumentsMixin(_DocumentsBase):
         corpus.
 
         **A body that is not the one the offsets were cut from is skipped too.**
-        The two maps have different lifetimes: a file re-read after a change holds
-        a new body while its row still describes the old chunk boundaries, and
-        slicing one with the other yields text that belongs to neither. The
-        offsets of such a row are provenance, exactly as an evicted file's are.
+        The two halves have different lifetimes even inside one record: a file
+        re-read after a change holds a new body while its row still describes the
+        old chunk boundaries, and slicing one with the other yields text that
+        belongs to neither. The offsets of such a row are provenance, exactly as
+        an evicted file's are.
 
         The keys are ``chunk_id``s — the key space ``fuse`` combines on, and what
         ``SearchHit.ref_id`` carries. It is an **indicator** and not a score: a
@@ -1585,18 +1549,20 @@ class DocumentsMixin(_DocumentsBase):
         matches: dict[str, _KeywordMatch] = {}
         if not terms:
             return matches
-        for path, extract in self.state.documents.items():
+        for entry in self._entries():
+            extract, row = entry.extract, entry.row
+            if extract is None or extract.markdown is None:
+                continue
+            if path_prefix and not entry.path.startswith(path_prefix):
+                continue
+            if row is None or row.indexed_sha != extract.source_sha:
+                continue
             body = extract.markdown
-            if body is None or (path_prefix and not path.startswith(path_prefix)):
-                continue
-            entry = self.state.rag_index.get(path)
-            if entry is None or entry.indexed_sha != extract.source_sha:
-                continue
             lowered = body.lower()
-            for chunk in entry.chunks:
+            for chunk in row.chunks:
                 if any(term in lowered[chunk.start : chunk.end] for term in terms):
                     matches[chunk.chunk_id] = _KeywordMatch(
-                        path=path, chunk=chunk, text=body[chunk.start : chunk.end]
+                        path=entry.path, chunk=chunk, text=body[chunk.start : chunk.end]
                     )
         return matches
 
@@ -1646,10 +1612,10 @@ class DocumentsMixin(_DocumentsBase):
         """
         if not path or ordinal is None:
             return None
-        entry = self.state.rag_index.get(path)
-        if entry is None or not 0 <= ordinal < len(entry.chunks):
+        row = self._entry(path).row
+        if row is None or not 0 <= ordinal < len(row.chunks):
             return None
-        chunk = entry.chunks[ordinal]
+        chunk = row.chunks[ordinal]
         return chunk if chunk.ordinal == ordinal else None
 
     ##
@@ -1693,13 +1659,12 @@ class DocumentsMixin(_DocumentsBase):
         Writing the rows ``PENDING`` means enabling retrieval later picks the
         files up; spawning would spend embedding credits in a team that never
         opted in. **That path is idempotent at the live digest too**, and for a
-        stronger reason than tidiness: ``WorkspaceState`` is persisted, so a
-        resume before any retrieval card enables restores ``EMBEDDED`` rows onto
-        a tree with no proxy. Re-queueing such a row here would clear its chunk
-        set into ``superseded_chunk_ids`` that no proxy will ever remove — losing
-        the heading paths a search renders. The rows stay as restored, and when
-        an in-memory engine arrives it is :meth:`_requeue_embedded_rows` — which
-        touches neither list — that queues them again.
+        stronger reason than tidiness: the index is on disk, so a fresh process
+        over the same tree sees ``EMBEDDED`` rows before any retrieval card has
+        enabled anything. Re-queueing such a row here would clear its chunk set
+        into ``superseded_chunk_ids`` that no proxy will ever remove — losing the
+        heading paths a search renders. The rows stay as they are, and a later
+        ``workspace_rag_index`` is what moves them.
         """
         candidates = self._uploaded_candidates(msg.paths)
         if not candidates:
@@ -1719,7 +1684,6 @@ class DocumentsMixin(_DocumentsBase):
                 len(candidates),
                 msg.source,
             )
-            self._persist()
             return
         queued = 0
         for path, sha in candidates:
@@ -1735,7 +1699,6 @@ class DocumentsMixin(_DocumentsBase):
             msg.source,
         )
         self._drain()
-        self._persist()
 
     def _uploaded_candidates(self, paths: list[str]) -> list[tuple[str, str]]:
         """Return ``(path, digest)`` for every named path that can be indexed.
@@ -1799,12 +1762,27 @@ _ORPHANED_ON_RESTORE = _IN_FLIGHT - {RagStatus.PENDING}
 """Statuses a worker was carrying — every one of them abandoned when its actor stopped."""
 
 
+def _extracted_at(entry: DocumentEntry) -> datetime:
+    """Sort key for the eviction pass — when *entry*'s body was last extracted.
+
+    **This is where recency lives now.** The map's insertion order used to be the
+    LRU, refreshed by a fill and by a hit; on disk there is no order at all, so
+    the stamp the fill already wrote is the only honest one. An entry with no
+    body sorts oldest, which is correct: it has nothing left for either cap to
+    reclaim, so it must never displace one that has.
+    """
+    if entry.extract is None:
+        return datetime.min.replace(tzinfo=UTC)
+    return entry.extract.extracted_at
+
+
 def _requeued(entry: RagFile, now: datetime) -> RagFile:
     """*entry* back at ``PENDING`` with both batch counters reset — its chunks kept.
 
-    The one update the three re-queues share — the running actor's reaper, the
-    in-memory re-mark and the restore — so they cannot drift. A copy with the
-    four fields that change, never a rebuild (Golden Rule 12).
+    A copy with the four fields that change, never a rebuild (Golden Rule 12).
+    One re-queue survives — :meth:`DocumentsMixin.reap_abandoned_rows` — where
+    there were three, so this is now the shape that one uses rather than the
+    agreement three had to keep.
     """
     return entry.model_copy(
         update={

@@ -47,6 +47,17 @@ from akgentic.tool.workspace.documents import (
     TextSplitter,
     derived_document_caps,
 )
+
+# Not from ``documents``: that package is imported by ``workspace.models``, which
+# ``store`` imports in turn, so a re-export there would close the cycle at import
+# time. The module path is the import edge; this is the public surface.
+from akgentic.tool.workspace.documents.store import (
+    DOCUMENT_STORE_CLASSES,
+    DocumentEntry,
+    DocumentStore,
+    YamlDocumentStore,
+    resolve_document_store,
+)
 from akgentic.tool.workspace.edit import (
     EditItem,
     EditMatcher,
@@ -175,6 +186,7 @@ __all__ = [
     "DEFAULT_MAX_DOCUMENT_CHARS",
     "DEFAULT_MAX_OBSERVATIONS_PER_AGENT",
     "DEFAULT_MAX_TRACKED_WRITERS",
+    "DOCUMENT_STORE_CLASSES",
     "EMBEDDING_STALE_AFTER_S",
     "EXEC_LOCK_FILENAME",
     "EXEC_REPORT_MARGIN_S",
@@ -202,7 +214,9 @@ __all__ = [
     "WORKSPACE_ACTOR_ROLE",
     "WRITE_DENIED_MSG",
     "BlockSplitter",
+    "DocumentEntry",
     "DocumentExtract",
+    "DocumentStore",
     "NewFileMessage",
     "RagChunk",
     "RagFile",
@@ -211,7 +225,9 @@ __all__ = [
     "RagStatus",
     "Span",
     "TextSplitter",
+    "YamlDocumentStore",
     "derived_document_caps",
+    "resolve_document_store",
     "ExecConfig",
     "ExecOutcome",
     "ExecStart",
