@@ -47,11 +47,21 @@ from akgentic.tool.core import (
     _resolve,
 )
 from akgentic.tool.core.observer import ActorToolObserver
+from akgentic.tool.vector_store.actor import (
+    VS_ACTOR_NAME,
+    VS_ACTOR_ROLE,
+    VectorStoreActor,
+    ensure_store_actor,
+)
 from akgentic.tool.vector_store.protocol import (
+    VectorStoreConfig,
     VectorStoreParam,
+    VectorStoreService,
+    needs_store_actor,
     require_backend_configured,
     require_dimension_matches,
 )
+from akgentic.tool.vector_store.registry import BackendContext, get_backend_spec
 from akgentic.tool.workspace.actor import (
     WORKSPACE_ACTOR_ROLE,
     WorkspaceActor,
@@ -78,7 +88,11 @@ from akgentic.tool.workspace.card.params import (
     WorkspaceView,
     WorkspaceWrite,
 )
-from akgentic.tool.workspace.card.rag import RagFactories
+from akgentic.tool.workspace.card.rag import (
+    RagFactories,
+    require_workspace_backend,
+    workspace_backend,
+)
 from akgentic.tool.workspace.card.read import ReadFactories
 from akgentic.tool.workspace.card.write import WriteFactories
 from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION, derived_document_caps
@@ -95,6 +109,7 @@ from akgentic.tool.workspace.models import (
 from akgentic.tool.workspace.workspace import (
     Filesystem,
     get_workspace,
+    meta_dir_for,
     resolve_workspace_path,
 )
 
@@ -266,11 +281,20 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
     ``PlanningTool`` and ``KnowledgeGraphTool`` carry the same field under the
     same name.
 
+    **What an author writes here survives the bind unchanged, and is not what the
+    store is built from.** ``observer()`` derives a copy carrying the resolved
+    backend and this tree's ``<meta>`` as its ``root``; that copy is what the
+    engine is built over and what reaches ``create_collection``. Two consequences
+    follow. A ``root`` declared in a catalog is **inert** — the card overrides it
+    unconditionally, so nothing an author writes can point one tree's index at
+    another tree's directory. And a card that names no backend indexes into
+    ``local``, files under its own tree's metadata directory, rather than into an
+    index that dies with the process.
+
     Three things read it besides the collection itself: it decides the
     backend-derived document caps below, it is what ``require_backend_configured``
-    checks, and — once announced to the workspace actor — it is what that actor
-    reads to decide whether to create its own in-memory store child at all. All
-    three only when a retrieval capability is actually enabled.
+    and ``require_workspace_backend`` check, and it is what the resolved copy is
+    derived from. All three only when a retrieval capability is actually enabled.
     """
 
     max_documents: int | None = None
@@ -313,6 +337,14 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
     # methods, and a serializable field holding one would not round-trip
     # (Golden Rule 1b).
     _document_store: DocumentStore | None = PrivateAttr(default=None)
+    # The author's ``vector_store`` with the backend resolved and this tree's
+    # ``<meta>`` stamped into ``root`` — derived at bind, never written back onto
+    # the field, so a stored card still says what its author wrote.
+    _resolved_store: VectorStoreParam | None = PrivateAttr(default=None)
+    # The engine itself: a proxy over the team's ``#VectorStore`` for a backend
+    # that needs an actor, a freshly built client for one that does not. Runtime
+    # state, so a ``PrivateAttr`` for the reason above.
+    _vector_store: VectorStoreService | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def _one_layout(self) -> WorkspaceTool:
@@ -382,6 +414,10 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
             # ``PlanningTool`` and ``KnowledgeGraphTool`` already did.
             require_backend_configured(self.vector_store, "WorkspaceTool")
             require_dimension_matches(self.vector_store, "WorkspaceTool")
+            # One line later, and refusing rather than substituting: an author who
+            # wrote the in-actor backend asked for an index that dies with the
+            # process, under rows that do not. See ``WORKSPACE_IN_MEMORY_REFUSED``.
+            require_workspace_backend(self.vector_store, "WorkspaceTool")
         super().observer(observer)  # store the observer weakly via the base setter
         ws_path = str(self._resolve_path(observer, observer.orchestrator))
         self._workspace = get_workspace(ws_path)
@@ -396,6 +432,11 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
         # it, not at the first document read. Constructing one creates nothing —
         # the store is stateless and touches the disk only on a put.
         self._document_store = resolve_document_store()
+        # Only when retrieval is on, for ``_bind_vector_store``'s own reason: a
+        # bare ``WorkspaceTool()`` must create no ``#VectorStore`` and open no
+        # client. Derived before the bind so the actor's config can be built from
+        # the backend the collection will really use.
+        self._resolved_store = self._resolve_store_param(ws_path)
         self._seed_resources()
         self._bind_workspace_actor(observer, observer.orchestrator, ws_path)
         # Between the bind and the retrieval announcement, deliberately: the
@@ -404,8 +445,136 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
         # not been given.
         self._announce_document_store()
         self._bind_sandbox(observer, ws_path)
+        self._bind_vector_store(observer, observer.orchestrator)
+        # Before ``_announce_rag``, and that ordering is the invariant: the actor
+        # enables retrieval on the turn it receives ``enable_rag``, so a store
+        # announced afterwards would arrive to an actor that has already decided
+        # it has none.
+        self._announce_vector_store()
         self._announce_rag()
         return self
+
+    def _resolve_store_param(self, workspace_path: str) -> VectorStoreParam | None:
+        """The author's ``vector_store`` with the backend resolved and the root stamped.
+
+        ``model_copy(update=...)`` rather than a rebuild: naming the six fields
+        that exist today would silently drop the seventh added tomorrow, on a
+        param that is persisted in a catalog and re-read (Golden Rule 12).
+
+        **``self.vector_store`` is not mutated.** A card is a stored record of
+        what its author declared; the substitution and the root belong to this
+        bind, on this host, over this tree — and a root written back onto the
+        field would be re-persisted into a catalog and then followed by a
+        deployment whose workspaces root is somewhere else.
+
+        The root is derived from the already-resolved *workspace_path* through
+        the one resolver, so the index cannot land beside a different tree from
+        the one the gate and the journal are guarding.
+
+        Args:
+            workspace_path: The resolved two-segment path this card is anchored to.
+
+        Returns:
+            The resolved param, or ``None`` when this card enables no retrieval
+            and therefore owns no collection.
+        """
+        if not self._rag_enabled():
+            return None
+        return self.vector_store.model_copy(
+            update={
+                "backend": workspace_backend(self.vector_store),
+                "root": str(meta_dir_for(workspace_path)),
+            }
+        )
+
+    def _bind_vector_store(self, observer: ActorToolObserver, orchestrator: ActorAddress) -> None:
+        """Resolve the engine this tree's chunks are written into — the card's job.
+
+        The third instance of one pattern, not a new one: the card builds or
+        resolves the runtime object in ``observer()`` and announces it, exactly as
+        it does for the exec hold and the document store (ADR-051 Decision 8). The
+        actor receives; it resolves nothing and asks nobody.
+
+        **Which of the two branches runs is the registry's answer, never a name
+        test.** A backend that needs an actor gets the team's one — created
+        through ``ensure_store_actor`` and looked up by name, so three cards in a
+        team share it — and one that does not is built straight from its factory,
+        because there would be nothing for an actor to hold but a socket.
+
+        **The team's real id is passed, and that is not the defect story 51-4
+        neutralised.** That fix passed ``None`` because a hosted workspace minted
+        a fresh id per lifetime, so the row identity moved and a re-add doubled;
+        the identity no longer carries the team on a shared collection at all
+        (:func:`~akgentic.tool.vector_store.protocol.row_object_id`), so the team
+        is free to be what it is — and it has to be, since it is what a sweep and
+        a team-scoped filter read.
+
+        Every failure here **degrades**: one WARNING, no store announced, and the
+        actor answers its existing unavailable sentence. A retrieval capability is
+        one of twenty on a card whose others are file operations, and this method
+        runs after the tree is already bound.
+
+        Args:
+            observer: The owning agent, live at bind time.
+            orchestrator: Address of the orchestrator.
+        """
+        resolved = self._resolved_store
+        if resolved is None:
+            return
+        try:
+            self._vector_store = self._build_store(observer, orchestrator, resolved)
+        except Exception as exc:  # noqa: BLE001 — a store is not worth failing a bind for
+            logger.warning(
+                "Workspace card: could not resolve the '%s' vector store: %s — retrieval "
+                "stays off for this card",
+                resolved.backend,
+                exc,
+            )
+
+    def _build_store(
+        self, observer: ActorToolObserver, orchestrator: ActorAddress, resolved: VectorStoreParam
+    ) -> VectorStoreService | None:
+        """Return the engine *resolved* names, over an actor or over a client."""
+        orchestrator_proxy = observer.proxy_ask(orchestrator, Orchestrator)
+        if not needs_store_actor(resolved):
+            return get_backend_spec(resolved.backend).factory(
+                BackendContext(
+                    config=VectorStoreConfig(name=VS_ACTOR_NAME, role=VS_ACTOR_ROLE),
+                    team_id=str(observer.team_id),
+                    root=resolved.root,
+                )
+            )
+        ensure_store_actor(resolved, orchestrator_proxy)
+        address = orchestrator_proxy.get_team_member(VS_ACTOR_NAME)
+        if address is None:
+            logger.warning(
+                "Workspace card: '%s' was not found in the team after ensure_store_actor "
+                "— retrieval stays off for this card",
+                VS_ACTOR_NAME,
+            )
+            return None
+        return observer.proxy_ask(address, VectorStoreActor)
+
+    def _announce_vector_store(self) -> None:
+        """Tell the actor which engine this tree's chunks go into — fire and forget.
+
+        Guarded exactly as :meth:`_announce_document_store` is, and it degrades
+        the same way: without a store the actor leaves ``_vs_proxy`` at ``None``,
+        logs one WARNING naming the workspace and answers the unavailable sentence
+        from ``workspace_rag_index`` — visible, and recoverable by rebinding.
+
+        **Conditional, unlike the document store's announcement**: nothing is
+        resolved at all for a card with retrieval off, so there is nothing here to
+        announce and no ``#VectorStore`` to have created.
+        """
+        tell = self._workspace_tell
+        store = self._vector_store
+        if tell is None or store is None:
+            return
+        try:
+            tell.configure_vector_store(store)
+        except Exception:
+            logger.debug("Could not announce the vector store to #Workspace", exc_info=True)
 
     def _resolve_path(
         self, observer: ActorToolObserver, orchestrator: ActorAddress
@@ -622,9 +791,10 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
         agent holds the tree.
 
         **This method creates at most one actor, and only through the host.** The
-        in-memory vector store a retrieval card needs is the workspace actor's
-        own child, created by that actor when ``enable_rag`` reaches it and
-        stopped with it; the card creates no store actor for any backend.
+        team's ``#VectorStore`` a retrieval card may need is created by
+        :meth:`_bind_vector_store`, further down and through the orchestrator, so
+        that it is shared with whatever planning or knowledge-graph card the team
+        also carries. Nothing about retrieval happens here.
 
         Args:
             observer: The owning agent, live at bind time.

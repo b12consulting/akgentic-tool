@@ -16,25 +16,24 @@ from typing import Any
 
 import pytest
 from akgentic.core.utils import SerializableBaseModel
+
 from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.vector_store.protocol import VectorStoreParam
 from akgentic.tool.workspace.actor import (
     WORKSPACE_ACTOR_ROLE,
     WorkspaceActor,
     workspace_actor_name,
 )
 from akgentic.tool.workspace.card.params import WorkspaceExec
+from akgentic.tool.workspace.card.read import _paginate
+from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION
 from akgentic.tool.workspace.event import WorkspaceAttached
 from akgentic.tool.workspace.host import WorkspaceHost
-from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION
 from akgentic.tool.workspace.models import Observation, WorkspaceConfig, content_sha
-from akgentic.tool.workspace.card.read import _paginate
 from akgentic.tool.workspace.tool import WorkspaceTool
 from akgentic.tool.workspace.workspace import Filesystem
-
+from tests.conftest import MockActorAddress
 from tests.workspace.conftest import (
-    workspace_path_for,
     DEFAULT_TEST_PRINCIPAL,
     HANDSHAKE_TIMEOUT_S,
     WORKSPACE_NAME,
@@ -49,8 +48,8 @@ from tests.workspace.conftest import (
     RecordingTellProxy,
     card_for,
     tool_named,
+    workspace_path_for,
 )
-from tests.conftest import MockActorAddress
 
 BODY = "alpha\nbravo\ncharlie\ndelta\necho\n"
 
@@ -654,11 +653,9 @@ def _card_shape(
         return card, WORKSPACE_PATH
     assert shape == "rag"
     pytest.importorskip("numpy", reason="the [vector_search] extra is not installed")
-    card = WorkspaceTool(
-        workspace_id=WORKSPACE_NAME,
-        workspace_rag_index=True,
-        vector_store=VectorStoreParam(backend="inmemory"),
-    )
+    # No ``vector_store``: a card that names the in-actor backend is refused at
+    # bind, and one that names none resolves to the file-backed one.
+    card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_rag_index=True)
     return card, WORKSPACE_PATH
 
 

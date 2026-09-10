@@ -20,7 +20,7 @@ from akgentic.tool.vector_store.protocol import (
     check_path_prefix,
     check_shared_scope,
     collection_is_team_scoped,
-    stable_object_id,
+    row_object_id,
 )
 from akgentic.tool.vector_store.registry import BackendContext, BackendSpec, register_backend
 
@@ -308,7 +308,7 @@ class WeaviateBackend:
         before this dimension existed.
 
         **Every object is written under a deterministic ``uuid``**, from
-        :func:`~akgentic.tool.vector_store.protocol.stable_object_id` over this
+        :func:`~akgentic.tool.vector_store.protocol.row_object_id` over this
         backend's team, the tenant the object is written to, and ``ref_id`` — the
         derivation the Qdrant backend's point ids use. The client replaces an
         object whose uuid already exists and mints a fresh UUIDv4 when none is
@@ -316,8 +316,9 @@ class WeaviateBackend:
         so without it every re-add of a chunk left one more copy, within one
         writer's lifetime as well as across two. On a team-scoped collection the
         team is inside the id, so two teams writing one ``ref_id`` stay two
-        objects; on the shared collection a team-less writer's id carries ``""``
-        and every lifetime of the tree writes the one object.
+        objects; on a **shared** collection the team is dropped from the
+        derivation whoever writes, so two teams indexing one tree write the one
+        object per chunk.
 
         The batch context is opened here, on a handle fetched in this call, and
         left here — never stored on the instance, never shared between calls —
@@ -341,7 +342,7 @@ class WeaviateBackend:
                 batch.add_object(
                     properties=self._object_properties(entry),
                     vector=entry.vector,
-                    uuid=stable_object_id(self._team_id, tenant, entry.ref_id),
+                    uuid=row_object_id(collection, self._team_id, tenant, entry.ref_id),
                 )
 
     def _object_properties(self, entry: VectorEntry) -> dict[str, str | int]:

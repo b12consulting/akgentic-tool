@@ -51,7 +51,6 @@ from akgentic.core.utils.deserializer import deserialize_object
 from akgentic.core.utils.serializer import SerializableBaseModel
 
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.vector_store.protocol import VectorStoreParam
 from akgentic.tool.workspace.actor import (
     WORKSPACE_ACTOR_ROLE,
     WorkspaceActor,
@@ -117,15 +116,15 @@ Pydantic model — a ``threading.Event`` cannot travel in one.
 class MemberConfig(BaseConfig):
     """A member's card declaration, plus the slot it records into.
 
-    ``rag_in_memory`` and ``exec_local`` switch on the two capabilities whose
-    teardown story 51-3 guards: the in-memory store child and the exec runner.
-    Both default off, so every earlier spec binds exactly the card it did.
+    ``rag_enabled`` and ``exec_local`` switch on the two capabilities whose
+    teardown story 51-3 guards: the vector store the card resolves and the exec
+    runner. Both default off, so every earlier spec binds exactly the card it did.
     """
 
     bind_key: str = ""
     workspace_id: str | None = None
     workspace_metadata_keys: list[str] = []
-    rag_in_memory: bool = False
+    rag_enabled: bool = False
     exec_local: bool = False
 
 
@@ -144,9 +143,10 @@ def _resolved_path(card: WorkspaceTool) -> PurePosixPath:
 def _capabilities(config: MemberConfig) -> dict[str, Any]:
     """The card fields *config* switches on — nothing at all for a plain member."""
     fields: dict[str, Any] = {}
-    if config.rag_in_memory:
+    if config.rag_enabled:
+        # No ``vector_store``: a card naming the in-actor backend is refused at
+        # bind, and one that names none resolves to the file-backed one.
         fields["workspace_rag_index"] = True
-        fields["vector_store"] = VectorStoreParam(backend="inmemory")
     if config.exec_local:
         # A tight poll so a completed run is answered in the call that started it.
         fields["workspace_exec"] = WorkspaceExec(
@@ -201,7 +201,7 @@ def spawn_member(
     restoring: bool = False,
     workspace_id: str | None = None,
     keys: list[str] | None = None,
-    rag_in_memory: bool = False,
+    rag_enabled: bool = False,
     exec_local: bool = False,
 ) -> Bind:
     """Build a team the way the lifecycle does, and return what the member recorded.
@@ -247,7 +247,7 @@ def spawn_member(
             bind_key=bind_key,
             workspace_id=workspace_id,
             workspace_metadata_keys=list(keys or []),
-            rag_in_memory=rag_in_memory,
+            rag_enabled=rag_enabled,
             exec_local=exec_local,
         ),
     )
@@ -846,16 +846,22 @@ def _host_ahead(system: ActorSystem, config: WorkspaceConfig) -> ActorAddress:
     return system.proxy_ask(host, WorkspaceHost).getResourceOrCreate(WorkspaceActor, config)
 
 
-class TestTheSelfStopTakesTheStoreChildAndTheExecutorDown:
+class TestTheSelfStopTakesTheExecutorDownAndTheTeamTakesItsStore:
     """Driven by the grace, not by a fixture: the team stops and the tree reaps itself.
 
     The only thing that stops the workspace here is its own sweep. The team's
     teardown never reaches a hosted actor, and no fixture stops it before the
     assertions run — a fixture already goes through ``Akgent.stop``, so a spec
     that let one stop the actor could not tell the self-stop's path from it.
+
+    **The store is on the other side of that line now** (story 52-4): the card
+    creates it through the orchestrator, so it is the *team's* member and the
+    team's teardown is what ends it — while the exec runner and the executor
+    belong to the workspace and go with its self-reap. Both must happen, and the
+    spec keeps asserting both because the two owners are what the pair proves.
     """
 
-    def test_the_team_stops_and_the_workspace_reaps_with_its_store_child_and_backend(
+    def test_the_team_stops_the_store_and_the_workspace_reaps_with_its_backend(
         self, system: ActorSystem, workspaces_root: Path, sandbox_script: SandboxScript
     ) -> None:
         pytest.importorskip("numpy", reason="the [vector_search] extra is not installed")
@@ -870,7 +876,7 @@ class TestTheSelfStopTakesTheStoreChildAndTheExecutorDown:
             user_id="u-alice",
             team_id=uuid.uuid4(),
             workspace_id="notes",
-            rag_in_memory=True,
+            rag_enabled=True,
             exec_local=True,
         )
         card, path = bound(record)
@@ -892,7 +898,7 @@ class TestTheSelfStopTakesTheStoreChildAndTheExecutorDown:
 
         assert wait_until(lambda: not workspace.is_alive()), "the workspace never reaped"
         assert store_ref.actor_stopped.wait(timeout=HANDSHAKE_TIMEOUT_S), (
-            "the store child outlived its workspace"
+            "the team's vector store outlived the team that created it"
         )
         assert pykka.ActorRegistry.get_by_class(VectorStoreActor) == []
         # ``is_alive`` turns false before ``on_stop`` runs, so its last step is waited for.

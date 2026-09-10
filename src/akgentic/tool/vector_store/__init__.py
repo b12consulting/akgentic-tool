@@ -15,6 +15,7 @@ from akgentic.tool.vector_store.actor import (
     ensure_store_actor,
 )
 from akgentic.tool.vector_store.backends.inmemory import InMemoryBackend
+from akgentic.tool.vector_store.backends.local import LocalBackend
 from akgentic.tool.vector_store.backends.qdrant import QdrantBackend
 from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
 from akgentic.tool.vector_store.client import ClusterKey, close_all, get_client
@@ -76,6 +77,7 @@ __all__ = [
     "EmbeddingService",
     "EmbeddingWorker",
     "InMemoryBackend",
+    "LocalBackend",
     "QdrantBackend",
     "WeaviateBackend",
     "SearchHit",

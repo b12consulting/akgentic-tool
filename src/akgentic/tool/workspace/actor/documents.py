@@ -67,8 +67,6 @@ from akgentic.core.agent_config import BaseConfig
 from akgentic.tool.vector_store.protocol import (
     PATH_PREFIX_REJECTED,
     PATH_PREFIX_WILDCARDS,
-    VectorStoreConfig,
-    needs_store_actor,
 )
 from akgentic.tool.workspace.documents.context import RagFileRow, RagIndexState
 from akgentic.tool.workspace.documents.models import (
@@ -203,6 +201,7 @@ class DocumentsMixin(_DocumentsBase):
     _rag_reader: DocumentReader | None
     _rag_collection: VectorStoreParam | None
     _vs_proxy: VectorStoreService | None
+    _vector_store: VectorStoreService | None
     _embedder: EmbeddingProvider | None
     _index_active: set[str]
     _document_store: DocumentStore | None
@@ -210,6 +209,25 @@ class DocumentsMixin(_DocumentsBase):
     ##
     ## The store — four helpers, and the only place a ``tree_key`` is spelled
     ##
+    def configure_vector_store(self, store: VectorStoreService) -> None:
+        """Take the engine the card resolved — **tell** path, last writer wins.
+
+        The shape ``configure_lock`` and ``configure_document_store`` already
+        have. It lands **before** ``enable_rag``, which is what makes it
+        impossible for this actor to turn retrieval on under a store it has not
+        been given; the card orders the two announcements and this method holds
+        nothing but the slot.
+
+        Last writer wins, and a replacement is not disruptive: two retrieval
+        cards on one tree resolve the same collection from the same team, and
+        the first ``enable_rag`` has already fixed the parameters for the tree,
+        so a second card's store is bound only if the first never was.
+
+        Args:
+            store: The engine this tree's chunks are written into and searched.
+        """
+        self._vector_store = store
+
     def configure_document_store(self, backend: DocumentStore) -> None:
         """Take the store the card resolved — **tell** path, last writer wins.
 
@@ -503,24 +521,24 @@ class DocumentsMixin(_DocumentsBase):
     def _acquire_vs_proxy(self) -> None:
         """Resolve the storage engine, bind it and the embedder, create the collection.
 
-        **The slot holds a ``VectorStoreService``, not necessarily a proxy.** An
-        actor-state backend — the in-memory index, whose data *is* the store
-        actor's state — is reached through a child this actor creates for
-        itself; a cluster backend is built here through the registered factory,
-        because there is no actor to hold anything. The four methods this actor
-        calls are exactly that protocol, so nothing below this line can tell the
-        two apart. (The attribute keeps the name ``_vs_proxy``: renaming it to
-        ``_store`` is ~200 mechanical private sites, routed to its own follow-up.)
+        **The slot holds a ``VectorStoreService``, not necessarily a proxy.** A
+        backend that needs an actor is reached through a proxy over the team's
+        ``#VectorStore``; a cluster backend is a client with no actor behind it.
+        Which one arrived is the card's decision and is invisible here: the four
+        methods this actor calls are exactly that protocol, so nothing below this
+        line can tell the two apart. (The attribute keeps the name ``_vs_proxy``:
+        renaming it to ``_store`` is ~200 mechanical private sites, routed to its
+        own follow-up.)
 
         **Nothing is re-marked here, and nothing is to be re-added.** An earlier
         shape put every ``EMBEDDED`` row back to ``PENDING`` the moment an
         in-memory store child was created, because a child of a hosted actor has
-        no checkpoint and therefore held nothing the rows claimed. The index is
-        on disk now and outlives every engine, so that premise is gone and
-        porting the rule would blank a good cache on every process start — one
-        full re-extraction and re-embedding of every indexed file, charged to
-        whoever pays for embeddings. A guard in the suite goes red for anyone who
-        re-adds it.
+        no checkpoint and therefore held nothing the rows claimed. Both the rows
+        and the index are on disk now and outlive every engine, so that premise is
+        gone and porting the rule would blank a good cache on every process start
+        — one full re-extraction and re-embedding of every indexed file, charged
+        to whoever pays for embeddings. A guard in the suite goes red for anyone
+        who re-adds it.
 
         **Every call through it is an ask.** ``create_collection`` has to be known
         to have worked before anything is added; ``remove`` re-raises a missing
@@ -534,19 +552,15 @@ class DocumentsMixin(_DocumentsBase):
         it is what the query leg embeds through, and every worker this actor spawns
         is handed the same param's model and provider.
 
-        **Every outage drops to degraded mode.** A child the environment refused
-        to spawn, a factory that cannot reach its cluster, a
-        ``create_collection`` that fails: each logs one WARNING and leaves
-        ``_vs_proxy`` ``None``, so ``workspace_rag_index`` answers a sentence. A
-        defect in the child's spawn is not an outage and propagates to
-        :meth:`enable_rag`, which keeps retrieval off and logs it with its
-        traceback — see :meth:`_resolve_store`. The
-        order on the actor-state branch is spawn, ``create_collection``,
-        embedder, bind — so a child whose ``create_collection`` then fails has
-        already been spawned and is **left alive and orphaned** until this actor
-        stops and ``stop_children`` takes it; an idle actor, and the same shape a
-        failed ``create_collection`` left the team store in. This actor also owns
-        the write gate, so a missing store must never be fatal here the way it is
+        **Every outage drops to degraded mode.** A store that was never announced
+        and a ``create_collection`` that fails each log one WARNING and leave
+        ``_vs_proxy`` ``None``, so ``workspace_rag_index`` answers a sentence;
+        anything unexpected propagates to :meth:`enable_rag`, which keeps
+        retrieval off and logs it with its traceback. The order is
+        ``create_collection``, embedder, bind — so a store whose
+        ``create_collection`` fails is simply not bound, and the card that
+        announced it is unaffected. This actor also owns the write gate, so a
+        missing store must never be fatal here the way it is
         for planning. **The up-front gate is no longer what protects a file from
         parking at ``EMBEDDING``**: the write happens on this actor's own turn
         inside a ``try``, so an ask that raises settles the file ``FAILED`` with
@@ -562,7 +576,7 @@ class DocumentsMixin(_DocumentsBase):
                 self.config.workspace_path,
             )
             return
-        store = self._resolve_store(self._rag_collection)
+        store = self._resolve_store()
         if store is None:
             return
         try:
@@ -580,97 +594,35 @@ class DocumentsMixin(_DocumentsBase):
         )
         self._vs_proxy = store
 
-    def _resolve_store(self, param: VectorStoreParam) -> VectorStoreService | None:
-        """Return the storage engine *param* names, or ``None`` to stay degraded.
+    def _resolve_store(self) -> VectorStoreService | None:
+        """Return the engine the card announced, or ``None`` to stay degraded.
 
-        **An in-memory store is this actor's own child.** It is created with
-        ``createActor`` exactly as :meth:`_spawn_embedding` creates an
-        ``EmbeddingWorker`` — named ``#VectorStore-<workspace_path>`` with the
-        slash verbatim, handed nothing to look up — and reached through an ask
-        proxy this actor holds. ``Akgent.createActor`` propagates ``parent``,
-        ``team_id``, ``user_id`` and **this actor's own orchestrator**: ``None``
-        once the workspace is hosted, in which case the child emits no
-        ``StartMessage`` and appears on no stream. Its lifetime is this actor's
-        by construction — ``stop_children`` stops it before this actor's
-        ``on_stop`` runs — so the ``#`` prefix on its name no longer matters to
-        any orchestrator's two-phase teardown, which never sees it. Nothing here
-        asks an orchestrator for anything, which is what a hosted actor requires.
+        **This actor receives a store; it does not make one.** It creates no
+        child, names no backend, calls no factory and asks no orchestrator — the
+        card resolved all of that in ``observer()`` and handed the object over
+        through :meth:`configure_vector_store`, which is the shape
+        ``configure_lock`` and ``configure_document_store`` already have
+        (ADR-051 Decision 8). Whether the object is a proxy over the team's
+        ``#VectorStore`` or a cluster client is invisible here and must stay so:
+        the four methods this actor calls are the ``VectorStoreService`` protocol
+        and nothing below this line can tell the two apart.
 
-        A cluster backend still gets an object and no actor: the data lives on
-        the cluster and there is nothing for an actor to hold.
-
-        **A cluster backend is handed no team.** ``workspace_chunks`` is shared by
-        every team on the tree and bounded by the mandatory ``scope``, and a
-        hosted workspace's ``self.team_id`` is auto-generated per lifetime and
-        names no team. With ``team_id=None`` both cluster backends stamp ``""``,
-        their documented no-team value, and derive a row's id from ``["",
-        tenant, ref_id]`` — the same id in every lifetime, so a re-add after a
-        reap overwrites instead of doubling. A team-less backend can still
-        query a shared collection and still cannot query a team-scoped one.
-        This supersedes story 51-2's ruling to document the meaningless id.
-
-        **A spawn the environment refused is the WARNING-and-degrade case** —
-        :data:`_STORE_UNREACHABLE`, and nothing wider — where the planning and
-        knowledge-graph actors raise a ``RuntimeError`` for a store they cannot
-        reach. This actor owns the write gate for a whole workspace, and
-        retrieval is one capability on a card whose other twenty are file
-        operations. **Anything else propagates**: a config that does not
-        validate, a signature that changed, a bug in the store's constructor.
-        :meth:`enable_rag` still keeps retrieval off rather than failing the
-        actor, but it logs the defect with its traceback instead of this
-        method's one line naming a cause that is not the real one.
-
-        Args:
-            param: The collection configuration the card announced.
+        A **lost announcement** is the degraded case, and it is the only one left:
+        one WARNING naming the workspace, ``_vs_proxy`` at ``None``, and
+        ``workspace_rag_index`` answering its unavailable sentence — visible, and
+        recoverable by rebinding. Nothing here can raise, because nothing here
+        does anything.
 
         Returns:
-            The child's proxy, a freshly built backend, or ``None``.
-
-        Raises:
-            Exception: Anything ``createActor`` or ``proxy_ask`` raises that is not
-                in :data:`_STORE_UNREACHABLE` — a defect, not an outage.
+            The announced store, or ``None`` when none was announced.
         """
-        from akgentic.tool.vector_store.actor import (  # noqa: PLC0415 — optional extra
-            VS_ACTOR_NAME,
-            VS_ACTOR_ROLE,
-            VectorStoreActor,
-        )
-        from akgentic.tool.vector_store.registry import (  # noqa: PLC0415 — optional extra
-            BackendContext,
-            get_backend_spec,
-        )
-
-        if needs_store_actor(param):
-            config = VectorStoreConfig(
-                name=f"{VS_ACTOR_NAME}-{self.config.workspace_path}",
-                role=VS_ACTOR_ROLE,
-            )
-            try:
-                address = self.createActor(VectorStoreActor, config=config)
-                return self.proxy_ask(address, VectorStoreActor)
-            except _STORE_UNREACHABLE as exc:
-                logger.warning(
-                    "Workspace %s: could not create the in-memory vector store child: %s "
-                    "— degraded mode",
-                    self.config.workspace_path,
-                    exc,
-                )
-                return None
-        try:
-            return get_backend_spec(param.backend).factory(
-                BackendContext(
-                    config=VectorStoreConfig(name=self.config.name, role=VS_ACTOR_ROLE),
-                    team_id=None,
-                )
-            )
-        except Exception as exc:  # noqa: BLE001
+        store = self._vector_store
+        if store is None:
             logger.warning(
-                "Workspace %s: could not build the '%s' vector store backend: %s — degraded mode",
+                "Workspace %s: no vector store was announced — degraded mode",
                 self.config.workspace_path,
-                param.backend,
-                exc,
             )
-            return None
+        return store
 
     ##
     ## workspace_rag_index — the spawn side

@@ -14,7 +14,9 @@ from akgentic.tool.vector_store.backends.qdrant import QDRANT_URL_ENV
 from akgentic.tool.vector_store.protocol import (
     SearchResult,
     VectorQuery,
+    VectorStoreConfig,
     VectorStoreParam,
+    needs_store_actor,
 )
 from akgentic.tool.vector_store.registry import (
     BackendContext,
@@ -169,3 +171,91 @@ class TestVectorQuery:
             filters={"ref_type": "entity"}, score_threshold=0.5, params={"hnsw_ef": 128}
         )
         assert VectorQuery.model_validate(q.model_dump()) == q
+
+
+# ---------------------------------------------------------------------------
+# BackendContext.root and BackendSpec.needs_actor
+# ---------------------------------------------------------------------------
+
+
+class TestTheContextCarriesARoot:
+    """The channel a filesystem-backed backend's directory travels on."""
+
+    def test_the_root_defaults_to_none_for_a_backend_with_no_filesystem(self) -> None:
+        context = BackendContext(config=VectorStoreConfig(name="#VectorStore", role="ToolActor"))
+
+        assert context.root is None
+
+    def test_the_root_reaches_the_factory_that_was_given_one(self) -> None:
+        """The factory is what reads it, so the factory is where it is asserted."""
+        seen: list[BackendContext] = []
+
+        def _recording(context: BackendContext) -> _StubBackend:
+            seen.append(context)
+            return _StubBackend()
+
+        register_backend(BackendSpec(name="root_watcher", factory=_recording))
+        try:
+            get_backend_spec("root_watcher").factory(
+                BackendContext(
+                    config=VectorStoreConfig(name="#VectorStore", role="ToolActor"),
+                    team_id="team-a",
+                    root="/tmp/notes.akgentic",
+                )
+            )
+        finally:
+            unregister_backend("root_watcher")
+
+        assert [context.root for context in seen] == ["/tmp/notes.akgentic"]
+        assert [context.team_id for context in seen] == ["team-a"]
+
+
+class TestNeedsActorSplitsFromPersistsInActorState:
+    """Two questions that used to be one, and the disjunction every caller asks."""
+
+    def test_the_flag_defaults_to_false_so_no_existing_backend_changes(self) -> None:
+        assert BackendSpec(name="x", factory=lambda _ctx: _StubBackend()).needs_actor is False
+
+    def test_the_shipped_backends_keep_the_answers_they_had(self) -> None:
+        """``inmemory`` through the old flag, both cluster backends still ``False``."""
+        assert needs_store_actor(VectorStoreParam(backend="inmemory")) is True
+        assert needs_store_actor(VectorStoreParam(backend="weaviate")) is False
+        assert needs_store_actor(VectorStoreParam(backend="qdrant")) is False
+
+    def test_a_backend_that_needs_an_actor_without_persisting_in_one_answers_true(
+        self,
+    ) -> None:
+        """The case the split exists for: an index on disk, behind one actor.
+
+        Asserted through a backend registered here rather than only through the
+        shipped one, so the rule is the registry's and not a property of a name.
+        """
+        register_backend(
+            BackendSpec(
+                name="needs_actor_only",
+                factory=lambda _ctx: _StubBackend(),
+                persists_in_actor_state=False,
+                needs_actor=True,
+            )
+        )
+        try:
+            spec = get_backend_spec("needs_actor_only")
+
+            assert spec.persists_in_actor_state is False
+            assert needs_store_actor(VectorStoreParam(backend="needs_actor_only")) is True
+        finally:
+            unregister_backend("needs_actor_only")
+
+    def test_neither_flag_means_no_actor(self) -> None:
+        register_backend(BackendSpec(name="plain_client", factory=lambda _ctx: _StubBackend()))
+        try:
+            assert needs_store_actor(VectorStoreParam(backend="plain_client")) is False
+        finally:
+            unregister_backend("plain_client")
+
+    def test_the_file_backed_backend_declares_the_split(self) -> None:
+        """It must never snapshot: the actor would serialise a numpy index per mutation."""
+        spec = get_backend_spec("local")
+
+        assert (spec.persists_in_actor_state, spec.needs_actor) == (False, True)
+        assert needs_store_actor(VectorStoreParam(backend="local")) is True

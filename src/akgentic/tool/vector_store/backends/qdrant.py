@@ -35,7 +35,7 @@ from akgentic.tool.vector_store.protocol import (
     check_path_prefix,
     check_shared_scope,
     collection_is_team_scoped,
-    stable_object_id,
+    row_object_id,
 )
 from akgentic.tool.vector_store.registry import BackendContext, BackendSpec, register_backend
 
@@ -261,7 +261,7 @@ class QdrantBackend:
         tenant = self._collection_tenants.get(collection) or self._tenant
         points = [
             models.PointStruct(
-                id=self._point_id(entry.ref_id, tenant),
+                id=self._point_id(collection, entry.ref_id, tenant),
                 vector=entry.vector,
                 payload={
                     "ref_type": entry.ref_type,
@@ -567,17 +567,19 @@ class QdrantBackend:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _point_id(self, ref_id: str, tenant: str | None = None) -> str:
+    def _point_id(self, collection: str, ref_id: str, tenant: str | None = None) -> str:
         """Derive the point id for ``ref_id`` under this backend's team and *tenant*.
 
         Qdrant point ids must be an unsigned int or a UUID, so the id is
-        :func:`~akgentic.tool.vector_store.protocol.stable_object_id` — the
+        :func:`~akgentic.tool.vector_store.protocol.row_object_id` — the
         derivation both cluster backends share, and the one every existing point
         was written under. Stable across re-ingest, and a team-scoped
         collection keeps the team inside it, so one team never overwrites
-        another's point. ``ref_id`` itself stays in the payload for filtering.
+        another's point. A **shared** collection drops the team, so two teams
+        indexing one tree write one point per chunk rather than two.
+        ``ref_id`` itself stays in the payload for filtering.
         """
-        return stable_object_id(self._team_id, tenant, ref_id)
+        return row_object_id(collection, self._team_id, tenant, ref_id)
 
     @staticmethod
     def _resolve_distance(config: VectorStoreParam) -> qmodels.Distance:

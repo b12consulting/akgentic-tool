@@ -36,12 +36,10 @@ import pykka
 import pytest
 
 from akgentic.tool import workspace as workspace_package
-from akgentic.tool.vector_store.protocol import VectorStoreParam
 from akgentic.tool.workspace import actor as actor_package
 from akgentic.tool.workspace.actor import workspace_actor_name
 from akgentic.tool.workspace.tool import WorkspaceTool
 from tests.workspace.conftest import (
-    HANDSHAKE_TIMEOUT_S,
     WORKSPACE_NAME,
     WORKSPACE_PATH,
     FakeActorToolObserver,
@@ -220,24 +218,31 @@ class TestTheWorkspaceIsNeverBoundAsAChild:
         assert _child_binds(module, tmp_path) == ["binding.py:4"]
 
 
-class TestAWorkspaceWithNoOrchestratorOwnsItsStore:
-    """The hosted-style falsifier on real threads, through public API only."""
+class TestAWorkspaceOwnsNoStoreOfItsOwn:
+    """**Premise reversed.** The workspace held a store child; it holds none.
 
-    def test_the_store_child_is_created_named_and_stopped_with_its_workspace(
+    Story 51-1 made the in-memory store this actor's own child so that a *hosted*
+    actor never had to ask an orchestrator for anything (core ADR-022 Decision 3).
+    Epic 52 retires hosting, and ADR-022 Decision 2 records that the prohibition
+    was always on the actor rather than on the card — "a card keeps talking to its
+    orchestrator" — so the card binds the team's ``#VectorStore`` again and the
+    actor creates nothing.
+
+    The invariant the two classes above hold is untouched by that and is what
+    makes this safe: the actor still reads no orchestrator, and still is not
+    bound as anybody's child. These two specs are the *other* side of it, and
+    they are inverted rather than deleted.
+    """
+
+    def test_a_bound_retrieval_card_leaves_the_workspace_with_no_store_child(
         self, threaded_orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
-        """A workspace started with no orchestrator indexes, and its child dies with it.
+        """The store exists — once, in the team — and the workspace did not make it.
 
-        ``FakeOrchestratorProxy`` in live mode starts the actor with no
-        orchestrator at all, which is exactly what ``ResourceHost`` will do. The
-        child is found through ``pykka.ActorRegistry`` and read through its own
-        proxy — never through ``_children``, ``_actor_ref`` or ``_actor``.
-
-        The workspace is stopped by ``stop_all``, which goes through
-        ``Akgent.stop`` exactly as the orchestrator's teardown does. Nothing
-        stops the child but its parent's ``stop_children``: a bare
-        ``ActorRef.stop()`` on the workspace runs ``on_stop`` only, and would
-        leave this spec red on the child outliving it.
+        ``FakeOrchestratorProxy`` in live mode starts the workspace with no
+        orchestrator at all, which is what ``ResourceHost`` does. So the one store
+        that exists cannot have come from it: a workspace that still spawned a
+        child would show two.
         """
         pytest.importorskip("numpy", reason="the [vector_search] extra is not installed")
         from akgentic.tool.vector_store.actor import (
@@ -248,68 +253,47 @@ class TestAWorkspaceWithNoOrchestratorOwnsItsStore:
 
         assert pykka.ActorRegistry.get_by_class(VectorStoreActor) == []
         observer = FakeActorToolObserver(threaded_orchestrator_proxy, name="alice")
-        card = WorkspaceTool(
-            workspace_id=WORKSPACE_NAME,
-            workspace_rag_index=True,
-            vector_store=VectorStoreParam(backend="inmemory"),
-        )
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_rag_index=True)
         card.observer(observer)
 
         answer = tool_named(card, "workspace_rag_index")("")
 
         assert answer == "0 file(s) queued, 0 already current, 0 unsupported"
         [store_ref] = pykka.ActorRegistry.get_by_class(VectorStoreActor)
-        store = store_ref.proxy()
-        config = store.config.get()
-        assert config.name == f"{VS_ACTOR_NAME}-{WORKSPACE_PATH}"
+        config = store_ref.proxy().config.get()
+        # The team's singleton name, not the per-tree one a child carried.
+        assert config.name == VS_ACTOR_NAME
         assert config.role == VS_ACTOR_ROLE
-        assert store.orchestrator.get() is None
-        workspace_address, _workspace = threaded_orchestrator_proxy.hosted[
+        assert f"{VS_ACTOR_NAME}-{WORKSPACE_PATH}" != config.name
+        _workspace_address, _workspace = threaded_orchestrator_proxy.hosted[
             workspace_actor_name(WORKSPACE_PATH)
         ]
-        assert store.team_id.get() == workspace_address.team_id
-        assert store_ref.is_alive()
 
         threaded_orchestrator_proxy.stop_all()
 
-        assert not workspace_address.is_alive()
-        assert store_ref.actor_stopped.wait(timeout=HANDSHAKE_TIMEOUT_S), (
-            "the store child outlived its workspace"
-        )
-        assert not store_ref.is_alive()
         assert pykka.ActorRegistry.get_by_class(VectorStoreActor) == []
 
-    def test_the_inert_teardown_stops_the_store_child_too(
+    def test_the_store_outlives_the_workspace_it_serves(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
-        """The inert half of ``stop_all``: an actor with no thread still stops its child.
+        """**Inverted.** A child died with its parent; a team member does not.
 
-        An inert ``WorkspaceActor`` runs ``enable_rag`` on the test's own thread,
-        and its real ``createActor`` starts a real store thread. ``stop_all`` has
-        to reach that child through the parent's ``stop_children``, as
-        ``Akgent.stop`` does; ``on_stop`` alone leaves it running. Nothing else in
-        the suite goes red when that half is missing: a later file's registry-wide
-        ``ActorRegistry.stop_all()`` reaps the orphan, and the only symptom left is
-        an interpreter that will not exit when a retrieval file runs alone.
+        That is the point of going back to the team's store: two trees in a team
+        share it, so one workspace stopping must not take the other's index down.
+        Here the workspace actor is stopped through the host while the team's
+        store — a child of the orchestrator, not of the workspace — stays alive.
         """
         pytest.importorskip("numpy", reason="the [vector_search] extra is not installed")
         from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
 
-        assert pykka.ActorRegistry.get_by_class(VectorStoreActor) == []
         observer = FakeActorToolObserver(orchestrator_proxy, name="alice")
-        card = WorkspaceTool(
-            workspace_id=WORKSPACE_NAME,
-            workspace_rag_index=True,
-            vector_store=VectorStoreParam(backend="inmemory"),
-        )
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_rag_index=True)
         card.observer(observer)
+        address, store = orchestrator_proxy.children[VS_ACTOR_NAME]
+        assert isinstance(store, VectorStoreActor)
 
-        [store_ref] = pykka.ActorRegistry.get_by_class(VectorStoreActor)
-        assert store_ref.proxy().config.get().name == f"{VS_ACTOR_NAME}-{WORKSPACE_PATH}"
+        orchestrator_proxy.host.stop_all()
 
-        orchestrator_proxy.stop_all()
-
-        assert store_ref.actor_stopped.wait(timeout=HANDSHAKE_TIMEOUT_S), (
-            "the store child outlived its inert workspace"
-        )
-        assert pykka.ActorRegistry.get_by_class(VectorStoreActor) == []
+        assert workspace_actor_name(WORKSPACE_PATH) not in orchestrator_proxy.hosted
+        assert orchestrator_proxy.children[VS_ACTOR_NAME][1] is store
+        assert address.is_alive()

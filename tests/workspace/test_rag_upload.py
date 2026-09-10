@@ -383,18 +383,17 @@ class TestTheCapabilityRefusal:
     ) -> None:
         """The reachable half-enabled state, and the one this branch really buys.
 
-        ``enable_rag`` sets the chunking parameters and *then* tries to acquire the
-        proxy, so a workspace whose store child could not be spawned or whose
-        ``create_collection`` failed ends up with parameters and no proxy — the
-        state ``test_a_store_child_that_cannot_be_spawned_degrades_rather_than_raising``
-        pins. Treating that as "retrieval is on" would spawn workers whose
-        ``add()`` calls go nowhere, leaving every file at ``EMBEDDING`` until the
-        reaper queues it again — and again, every ten minutes, for ever. Both
-        halves are required, which is why the branch tests both.
+        ``enable_rag`` sets the chunking parameters and *then* binds the store, so
+        a workspace whose store was never announced or whose ``create_collection``
+        failed ends up with parameters and no proxy — the state
+        ``test_a_store_that_was_never_announced_degrades_without_raising`` pins.
+        Treating that as "retrieval is on" would spawn workers whose ``add()``
+        calls go nowhere, leaving every file at ``EMBEDDING`` until the reaper
+        queues it again — and again, every ten minutes, for ever. Both halves are
+        required, which is why the branch tests both.
         """
         half = upload_without_retrieval
-        half.store_spawn_error = RuntimeError("no actor system")
-        half.enable()
+        half.enable(announce=False)
         assert half.actor._rag_params is not None
         assert half.actor._vs_proxy is None
         write(workspace_tree, "a.md")

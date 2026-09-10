@@ -213,7 +213,7 @@ class TestCreateCollection:
         """AC4: Delegation to InMemoryBackend.create_collection."""
         actor = _make_actor()
         backend = _mock_backend()
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
 
         config = VectorStoreParam()
         actor.create_collection("test_col", config)
@@ -224,7 +224,7 @@ class TestCreateCollection:
         """AC4: Collection status is READY after creation."""
         actor = _make_actor()
         backend = _mock_backend()
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
 
         actor.create_collection("test_col", VectorStoreParam())
         assert actor.state.collection_statuses["test_col"] == CollectionStatus.READY
@@ -233,7 +233,7 @@ class TestCreateCollection:
         """create_collection stores config dict in state.collection_configs."""
         actor = _make_actor()
         backend = _mock_backend()
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
 
         config = VectorStoreParam(dimension=128, tenant="team-42", embedding_model="test-embedding")
         actor.create_collection("test_col", config)
@@ -253,7 +253,7 @@ class TestCreateCollection:
         """A configuration rule is not a backend fault: it raises, it is not swallowed."""
         actor = _make_actor()
         backend = _mock_backend()
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
         caplog.clear()
 
         with (
@@ -273,7 +273,7 @@ class TestCreateCollection:
         """AC 11: the store embeds nothing, so there is nothing to disagree with."""
         actor = _make_actor()
         backend = _mock_backend()
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
         caplog.clear()
 
         with caplog.at_level(logging.WARNING, logger=_ACTOR_LOGGER):
@@ -294,7 +294,7 @@ class TestCreateCollection:
             extra_field: str = "sentinel"
 
         actor = _make_actor()
-        actor._backends["inmemory"] = _mock_backend()
+        actor._backends[("inmemory", None)] = _mock_backend()
 
         actor.create_collection("c", _ParamWithExtra(embedding_model="test-embedding"))
 
@@ -308,7 +308,7 @@ class TestCreateCollection:
         would be re-hydrated into a model and refused by the per-collection dict.
         """
         actor = _make_actor()
-        actor._backends["inmemory"] = _mock_backend()
+        actor._backends[("inmemory", None)] = _mock_backend()
 
         actor.create_collection("c", VectorStoreParam(embedding_model="test-embedding"))
 
@@ -322,7 +322,7 @@ class TestCreateCollection:
         """AC12: state.notify_state_change() called after creation."""
         actor = _make_actor()
         backend = _mock_backend()
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
 
         with patch.object(VectorStoreState, "notify_state_change") as mock_notify:
             actor.create_collection("test_col", VectorStoreParam())
@@ -333,7 +333,7 @@ class TestCreateCollection:
         actor = _make_actor()
         backend = _mock_backend()
         backend.get_state.return_value = {"collections": {"test_col": {}}}
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
 
         actor.create_collection("test_col", VectorStoreParam())
         assert actor.state.backend_states["inmemory"] == {"collections": {"test_col": {}}}
@@ -342,7 +342,7 @@ class TestCreateCollection:
         """AC4: Second create_collection for same name is no-op (via backend)."""
         actor = _make_actor()
         backend = _mock_backend()
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
 
         actor.create_collection("test_col", VectorStoreParam())
         actor.create_collection("test_col", VectorStoreParam())
@@ -378,7 +378,7 @@ class TestAdd:
         """AC9: Pre-embedded entries go directly to backend.add()."""
         actor = _make_actor()
         backend = _mock_backend()
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
         entry = _mock_entry(vector=[0.1, 0.2])
 
         actor.add("col1", [entry])
@@ -388,7 +388,7 @@ class TestAdd:
         """AC12: state.notify_state_change() called after pre-embedded add."""
         actor = _make_actor()
         backend = _mock_backend()
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
         entry = _mock_entry(vector=[0.1])
 
         with patch.object(VectorStoreState, "notify_state_change") as mock_notify:
@@ -400,7 +400,7 @@ class TestAdd:
         actor = _make_actor()
         backend = _mock_backend()
         backend.add.side_effect = ValueError("Collection 'col1' does not exist")
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
         entry = _mock_entry(vector=[0.1])
 
         with pytest.raises(RetriableError, match="does not exist"):
@@ -413,7 +413,7 @@ class TestAdd:
         actor = _make_actor()
         backend = _mock_backend()
         backend.add.side_effect = RuntimeError("disk")
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
         caplog.clear()
 
         with (
@@ -428,7 +428,7 @@ class TestAdd:
         """AC 9: a retry cannot invent a vector the caller never supplied."""
         actor = _make_actor()
         backend = _mock_backend()
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
 
         with (
             patch.object(VectorStoreState, "notify_state_change") as mock_notify,
@@ -443,7 +443,7 @@ class TestAdd:
     def test_an_empty_vector_is_not_retriable(self) -> None:
         """AC 9: ``ValueError``, deliberately not ``RetriableError``."""
         actor = _make_actor()
-        actor._backends["inmemory"] = _mock_backend()
+        actor._backends[("inmemory", None)] = _mock_backend()
 
         with pytest.raises(ValueError) as excinfo:
             actor.add("c", [_mock_entry(ref_id="e-empty", vector=[])])
@@ -454,7 +454,7 @@ class TestAdd:
         """AC 9: the populated half is not written behind the caller's back."""
         actor = _make_actor()
         backend = _mock_backend()
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
 
         with pytest.raises(ValueError, match="e-empty"):
             actor.add(
@@ -468,7 +468,7 @@ class TestAdd:
         """An empty list carries no empty vector, so nothing refuses it."""
         actor = _make_actor()
         backend = _mock_backend()
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
 
         actor.add("col1", [])
         backend.add.assert_called_once_with("col1", [])
@@ -523,18 +523,16 @@ class TestRemove:
         """AC6: Delegation to InMemoryBackend.remove."""
         actor = _make_actor()
         backend = _mock_backend()
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
 
         actor.remove("col1", ["id1", "id2"])
-        backend.remove.assert_called_once_with(
-            "col1", ["id1", "id2"], scope=None, path_prefix=None
-        )
+        backend.remove.assert_called_once_with("col1", ["id1", "id2"], scope=None, path_prefix=None)
 
     def test_notifies_state_change(self) -> None:
         """AC12: state.notify_state_change() called after remove."""
         actor = _make_actor()
         backend = _mock_backend()
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
 
         with patch.object(VectorStoreState, "notify_state_change") as mock_notify:
             actor.remove("col1", ["id1"])
@@ -545,7 +543,7 @@ class TestRemove:
         actor = _make_actor()
         backend = _mock_backend()
         backend.remove.side_effect = ValueError("Collection 'col1' does not exist")
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
 
         with pytest.raises(RetriableError, match="does not exist"):
             actor.remove("col1", ["id1"])
@@ -555,7 +553,7 @@ class TestRemove:
         actor = _make_actor()
         backend = _mock_backend()
         backend.remove.side_effect = RuntimeError("unexpected")
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
 
         actor.remove("col1", ["id1"])
 
@@ -574,12 +572,10 @@ class TestSearch:
         backend = _mock_backend()
         expected = SearchResult(hits=[], status=CollectionStatus.READY)
         backend.search.return_value = expected
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
 
         result = actor.search("col1", [0.1, 0.2], 5)
-        backend.search.assert_called_once_with(
-            "col1", [0.1, 0.2], 5, scope=None, path_prefix=None
-        )
+        backend.search.assert_called_once_with("col1", [0.1, 0.2], 5, scope=None, path_prefix=None)
         assert result == expected
 
     def test_nonexistent_collection_raises_retriable(self) -> None:
@@ -587,7 +583,7 @@ class TestSearch:
         actor = _make_actor()
         backend = _mock_backend()
         backend.search.side_effect = ValueError("Collection 'col1' does not exist")
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
 
         with pytest.raises(RetriableError, match="does not exist"):
             actor.search("col1", [0.1], 5)
@@ -597,7 +593,7 @@ class TestSearch:
         actor = _make_actor()
         backend = _mock_backend()
         backend.search.side_effect = RuntimeError("unexpected")
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
 
         result = actor.search("col1", [0.1], 5)
         assert result.hits == []
@@ -617,10 +613,8 @@ class TestSearch:
 
         actor = _make_actor()
         backend = _mock_backend()
-        backend.search.return_value = _SearchResultWithExtra(
-            hits=[], status=CollectionStatus.READY
-        )
-        actor._backends["inmemory"] = backend
+        backend.search.return_value = _SearchResultWithExtra(hits=[], status=CollectionStatus.READY)
+        actor._backends[("inmemory", None)] = backend
         actor.state.collection_statuses["col1"] = CollectionStatus.READY
 
         result = actor.search("col1", [0.1], 5)
@@ -709,25 +703,21 @@ class TestScopePassThrough:
         actor = _make_actor()
         backend = _mock_backend()
         backend.search.return_value = SearchResult(hits=[], status=CollectionStatus.READY)
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
 
         actor.search("col1", [0.1], 5, scope="ws-1", path_prefix="docs/")
 
-        backend.search.assert_called_once_with(
-            "col1", [0.1], 5, scope="ws-1", path_prefix="docs/"
-        )
+        backend.search.assert_called_once_with("col1", [0.1], 5, scope="ws-1", path_prefix="docs/")
 
     def test_remove_forwards_both_predicates(self) -> None:
         """remove(scope=..., path_prefix=...) reaches the backend as given."""
         actor = _make_actor()
         backend = _mock_backend()
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
 
         actor.remove("col1", ["id1"], scope="ws-1", path_prefix="docs/")
 
-        backend.remove.assert_called_once_with(
-            "col1", ["id1"], scope="ws-1", path_prefix="docs/"
-        )
+        backend.remove.assert_called_once_with("col1", ["id1"], scope="ws-1", path_prefix="docs/")
 
 
 # ---------------------------------------------------------------------------
@@ -814,7 +804,7 @@ class TestCollectionStatuses:
         """Multiple collections tracked independently."""
         actor = _make_actor()
         backend = _mock_backend()
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
 
         actor.create_collection("col_a", VectorStoreParam())
         actor.create_collection("col_b", VectorStoreParam())
@@ -980,7 +970,7 @@ class TestWeaviateRouting:
         """create_collection with backend='weaviate' uses WeaviateBackend."""
         actor = _make_actor()
         mock_wb = MagicMock()
-        actor._backends["weaviate"] = mock_wb
+        actor._backends[("weaviate", None)] = mock_wb
 
         config = VectorStoreParam(
             backend="weaviate", dimension=384, embedding_model="test-embedding"
@@ -995,7 +985,7 @@ class TestWeaviateRouting:
         """create_collection with backend='inmemory' still routes to InMemoryBackend."""
         actor = _make_actor()
         backend = _mock_backend()
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
 
         config = VectorStoreParam(backend="inmemory")
         actor.create_collection("im_col", config)
@@ -1007,7 +997,7 @@ class TestWeaviateRouting:
         """add() for a weaviate collection routes to WeaviateBackend."""
         actor = _make_actor()
         mock_wb = MagicMock()
-        actor._backends["weaviate"] = mock_wb
+        actor._backends[("weaviate", None)] = mock_wb
         actor.state.collection_configs["wv_col"] = {"backend": "weaviate"}
 
         entry = _mock_entry(vector=[0.1, 0.2])
@@ -1019,14 +1009,12 @@ class TestWeaviateRouting:
         """remove() for a weaviate collection routes to WeaviateBackend."""
         actor = _make_actor()
         mock_wb = MagicMock()
-        actor._backends["weaviate"] = mock_wb
+        actor._backends[("weaviate", None)] = mock_wb
         actor.state.collection_configs["wv_col"] = {"backend": "weaviate"}
 
         actor.remove("wv_col", ["id1"])
 
-        mock_wb.remove.assert_called_once_with(
-            "wv_col", ["id1"], scope=None, path_prefix=None
-        )
+        mock_wb.remove.assert_called_once_with("wv_col", ["id1"], scope=None, path_prefix=None)
 
     def test_search_routes_to_weaviate_backend(self) -> None:
         """search() for a weaviate collection routes to WeaviateBackend."""
@@ -1034,23 +1022,21 @@ class TestWeaviateRouting:
         mock_wb = MagicMock()
         expected = SearchResult(hits=[], status=CollectionStatus.READY)
         mock_wb.search.return_value = expected
-        actor._backends["weaviate"] = mock_wb
+        actor._backends[("weaviate", None)] = mock_wb
         actor.state.collection_configs["wv_col"] = {"backend": "weaviate"}
 
         result = actor.search("wv_col", [0.1], 5)
 
-        mock_wb.search.assert_called_once_with(
-            "wv_col", [0.1], 5, scope=None, path_prefix=None
-        )
+        mock_wb.search.assert_called_once_with("wv_col", [0.1], 5, scope=None, path_prefix=None)
         assert result == expected
 
     def test_inmemory_collection_not_routed_to_weaviate(self) -> None:
         """inmemory collections still go to InMemoryBackend even when weaviate is available."""
         actor = _make_actor()
         backend = _mock_backend()
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
         mock_wb = MagicMock()
-        actor._backends["weaviate"] = mock_wb
+        actor._backends[("weaviate", None)] = mock_wb
         actor.state.collection_configs["im_col"] = {"backend": "inmemory"}
 
         entry = _mock_entry(vector=[0.1])
@@ -1077,7 +1063,7 @@ class TestWeaviateRouting:
         """Weaviate collections should NOT call _sync_backend_state."""
         actor = _make_actor()
         mock_wb = MagicMock()
-        actor._backends["weaviate"] = mock_wb
+        actor._backends[("weaviate", None)] = mock_wb
 
         config = VectorStoreParam(backend="weaviate")
         actor.create_collection("wv_col", config)
@@ -1090,7 +1076,7 @@ class TestWeaviateRouting:
         """Unknown collections default to inmemory backend."""
         actor = _make_actor()
         backend = _mock_backend()
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
 
         result = actor._get_backend_for_collection("unknown")
         assert result is backend
@@ -1158,7 +1144,7 @@ class TestStoppingAnActorLeavesTheSharedClientOpen:
         client = MagicMock(name="shared-client")
         backend = MagicMock(name="weaviate-backend")
         backend._client = client
-        actor._backends["weaviate"] = backend
+        actor._backends[("weaviate", None)] = backend
 
         actor.on_stop()
 
@@ -1180,13 +1166,11 @@ class TestQueryPassthrough:
         backend = _mock_backend()
         expected = SearchResult(hits=[], status=CollectionStatus.READY)
         backend.search.return_value = expected
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
 
         actor.search("col1", [0.1], 5)
 
-        backend.search.assert_called_once_with(
-            "col1", [0.1], 5, scope=None, path_prefix=None
-        )
+        backend.search.assert_called_once_with("col1", [0.1], 5, scope=None, path_prefix=None)
 
     def test_query_is_forwarded_when_supplied(self) -> None:
         from akgentic.tool.vector_store.protocol import VectorQuery
@@ -1194,7 +1178,7 @@ class TestQueryPassthrough:
         actor = _make_actor()
         backend = _mock_backend()
         backend.search.return_value = SearchResult(hits=[], status=CollectionStatus.READY)
-        actor._backends["inmemory"] = backend
+        actor._backends[("inmemory", None)] = backend
         query = VectorQuery(filters={"ref_type": "entity"})
 
         actor.search("col1", [0.1], 5, query=query)
@@ -1403,9 +1387,7 @@ class TestCreateCollectionRefusesInsteadOfDegrading:
 
         assert not isinstance(excinfo.value, RetriableError)
 
-    def test_remove_and_search_still_degrade(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    def test_remove_and_search_still_degrade(self, caplog: pytest.LogCaptureFixture) -> None:
         """The asymmetry is the decision: a read that answers empty costs a miss."""
         actor = _make_actor()
 
@@ -1437,3 +1419,132 @@ class TestCreateCollectionRefusesInsteadOfDegrading:
                 actor.create_collection("c", VectorStoreParam(backend="inmemory"))
 
         assert actor.state.collection_statuses == {}
+
+
+# ---------------------------------------------------------------------------
+# The backend cache is keyed on (name, root)
+# ---------------------------------------------------------------------------
+
+
+class TestTheBackendCacheIsKeyedOnNameAndRoot:
+    """One team, two trees: two roots must be two instances, not one shared over one root.
+
+    ``protocol.py`` already states that one team may hold two ``WorkspaceTool``
+    cards on two trees. A cache keyed on the backend name alone hands the second
+    tree the first tree's instance, so one tree's chunks are written into the
+    other tree's directory — silently, with every search still answering.
+    """
+
+    @staticmethod
+    def _watching_factory() -> tuple[list[object], object]:
+        """A registered stub that records every context it is built from."""
+        from dataclasses import replace
+
+        from akgentic.tool.vector_store import registry
+
+        contexts: list[object] = []
+        original = registry.get_backend_spec("inmemory")
+
+        def _recording(context: object) -> MagicMock:
+            contexts.append(context)
+            return _mock_backend()
+
+        registry.register_backend(replace(original, factory=_recording), replace=True)
+        return contexts, original
+
+    @staticmethod
+    def _restore(original: object) -> None:
+        from akgentic.tool.vector_store import registry
+
+        registry.register_backend(original, replace=True)  # type: ignore[arg-type]
+
+    def test_two_roots_build_two_instances(self) -> None:
+        actor = _make_actor()
+        contexts, original = self._watching_factory()
+        try:
+            first = actor._get_backend("inmemory", "/trees/notes.akgentic")
+            second = actor._get_backend("inmemory", "/trees/cases.akgentic")
+        finally:
+            self._restore(original)
+
+        assert first is not second
+        assert [context.root for context in contexts] == [  # type: ignore[attr-defined]
+            "/trees/notes.akgentic",
+            "/trees/cases.akgentic",
+        ]
+
+    def test_one_root_is_built_once_and_then_cached(self) -> None:
+        """The cache still caches — keying on the pair must not disable it."""
+        actor = _make_actor()
+        contexts, original = self._watching_factory()
+        try:
+            first = actor._get_backend("inmemory", "/trees/notes.akgentic")
+            second = actor._get_backend("inmemory", "/trees/notes.akgentic")
+        finally:
+            self._restore(original)
+
+        assert first is second
+        assert len(contexts) == 1
+
+    def test_a_backend_with_no_root_keeps_the_entry_it_always_had(self) -> None:
+        actor = _make_actor()
+        contexts, original = self._watching_factory()
+        try:
+            first = actor._get_backend("inmemory")
+            second = actor._get_backend("inmemory")
+        finally:
+            self._restore(original)
+
+        assert first is second
+        assert list(actor._backends) == [("inmemory", None)]
+        assert [context.root for context in contexts] == [None]  # type: ignore[attr-defined]
+
+    def test_the_collections_root_is_read_back_out_of_its_recorded_param(self) -> None:
+        """The root travels on the param, so it has to come back off the record.
+
+        Miss this hop and the backend is built with ``root=None`` with nothing
+        raising — which is exactly what the whole chain has to be pinned against.
+        """
+        actor = _make_actor()
+        contexts, original = self._watching_factory()
+        try:
+            actor.create_collection(
+                "workspace_chunks",
+                VectorStoreParam(backend="inmemory", root="/trees/notes.akgentic"),
+            )
+            actor._backends.clear()
+            actor._get_backend_for_collection("workspace_chunks")
+        finally:
+            self._restore(original)
+
+        assert actor.state.collection_configs["workspace_chunks"]["root"] == (
+            "/trees/notes.akgentic"
+        )
+        assert [context.root for context in contexts] == [  # type: ignore[attr-defined]
+            "/trees/notes.akgentic",
+            "/trees/notes.akgentic",
+        ]
+
+    def test_two_collections_on_two_roots_route_to_their_own_instance(self) -> None:
+        """The falsifying case, end to end through the actor's own routing."""
+        actor = _make_actor()
+        contexts, original = self._watching_factory()
+        try:
+            actor.create_collection(
+                "workspace_chunks",
+                VectorStoreParam(backend="inmemory", root="/trees/notes.akgentic"),
+            )
+            notes = actor._get_backend_for_collection("workspace_chunks")
+            actor.state.collection_configs["other_chunks"] = {
+                "backend": "inmemory",
+                "root": "/trees/cases.akgentic",
+            }
+            cases = actor._get_backend_for_collection("other_chunks")
+        finally:
+            self._restore(original)
+
+        assert notes is not cases
+        assert sorted(actor._backends) == [
+            ("inmemory", "/trees/cases.akgentic"),
+            ("inmemory", "/trees/notes.akgentic"),
+        ]

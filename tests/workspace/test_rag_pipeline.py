@@ -14,14 +14,15 @@ so.
 from __future__ import annotations
 
 import logging
+import tempfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from akgentic.core import ActorDeadError
-from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE, VectorStoreActor
+
+from akgentic.tool.vector_store.actor import VectorStoreActor
 from akgentic.tool.vector_store.embedding_actor import (
     EmbeddingError,
     EmbeddingRequest,
@@ -58,11 +59,9 @@ from akgentic.tool.workspace.documents.worker import (
     IndexRequest,
     IndexResult,
     IndexWorker,
-    index_worker_name,
 )
-from akgentic.tool.workspace.models import WorkspaceConfig, WorkspaceState, content_sha
+from akgentic.tool.workspace.models import WorkspaceConfig, content_sha
 from akgentic.tool.workspace.readers import DocumentReader
-
 from tests.conftest import MockActorAddress
 from tests.workspace.conftest import (
     WORKSPACE_PATH,
@@ -75,7 +74,6 @@ from tests.workspace.conftest import (
     stored_rows,
     watch_store,
 )
-from tests.workspace.test_rag_models import _RagFileWithExtraField
 
 _DOCUMENTS_LOGGER = "akgentic.tool.workspace.actor.documents"
 _UNAVAILABLE = "Retrieval indexing is not available for this workspace."
@@ -187,6 +185,11 @@ class StaticEmbedder:
         return [[1.0, 0.0] for _ in texts]
 
 
+def _explodes(*args: Any, **kwargs: Any) -> Any:
+    """Raise whatever it is called with — a seam a spec asserts is never reached."""
+    raise RuntimeError("this seam must not be reached")
+
+
 class RagHarness:
     """Wires an inert actor to a fake vector store and a fake spawn path.
 
@@ -201,20 +204,27 @@ class RagHarness:
         self.actor = actor
         self.vs = FakeVectorStore()
         self.embedder = StaticEmbedder()
-        # The address ``createActor`` hands back for the store child, which
-        # ``_ask`` maps to the fake store. The actor is handed **no**
-        # orchestrator at all — ``install`` sets the slot to ``None`` — because
-        # that is what a hosted actor gets, and an ask to one is the trap
-        # ``_ask`` springs rather than a lookup it answers.
+        # The actor is handed **no** orchestrator at all — ``install`` sets the
+        # slot to ``None`` — because that is what a hosted actor gets, and an ask
+        # to one is the trap ``_ask`` springs rather than a lookup it answers.
+        # Nothing resolves a store here any more: the card announces one.
         self.vs_address = MockActorAddress("#VectorStore-child")
         self.store_configs: list[Any] = []
+        """Every store actor ``createActor`` was asked for — permanently empty now.
+
+        Kept rather than deleted: it is the negative that "the actor creates no
+        store of its own" is asserted on, and a list nothing appends to is only
+        worth having while something still *would* append to it if the branch
+        came back.
+        """
         self.requests: list[IndexRequest] = []
         self.embed_requests: list[EmbeddingRequest] = []
         self.worker_names: list[str] = []
         self.embed_worker_names: list[str] = []
         self.spawn_error: BaseException | None = None
         self.embed_spawn_error: BaseException | None = None
-        self.store_spawn_error: BaseException | None = None
+        self.index_root = Path(tempfile.mkdtemp(prefix="rag-index-"))
+        """The ``<meta>`` a card would stamp onto the param it announces."""
         self._monkeypatch: pytest.MonkeyPatch | None = None
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -234,13 +244,26 @@ class RagHarness:
         reader: DocumentReader | None = None,
         collection: VectorStoreParam | None = None,
         agent_id: str = "alice",
+        announce: bool = True,
+        store: Any = None,
     ) -> None:
-        """Announce retrieval exactly as a bound card does."""
+        """Announce the store and then retrieval, exactly as a bound card does.
+
+        **The two announcements are in the card's order**, and the harness keeps
+        them that way rather than assigning the slot: the actor enables retrieval
+        on the turn ``enable_rag`` arrives, so a store handed over afterwards
+        would arrive to an actor that has already decided it has none.
+
+        ``announce=False`` is the lost-announcement case — the only degraded path
+        this actor has left, since it resolves nothing of its own.
+        """
+        if announce:
+            self.actor.configure_vector_store(store if store is not None else self.vs)
         self.actor.enable_rag(
             agent_id,
             params or WorkspaceRagIndex(),
             reader or DocumentReader(llm_client=None),
-            collection or VectorStoreParam(backend="inmemory"),
+            collection or VectorStoreParam(backend="local", root=str(self.index_root)),
         )
         # ``enable_rag`` builds a real ``EmbeddingService`` from the card's param;
         # a search in these specs must embed through the double, never a network.
@@ -367,8 +390,8 @@ class RagHarness:
     def _create(self, actor_class: Any, agent_id: Any = None, config: Any = None) -> Any:
         assert config is not None
         if actor_class is VectorStoreActor:
-            if self.store_spawn_error is not None:
-                raise self.store_spawn_error
+            # Recorded rather than refused, so ``store_configs == []`` is a
+            # negative about behaviour and not about this branch being missing.
             self.store_configs.append(config)
             return self.vs_address
         if actor_class is EmbeddingWorker:
@@ -452,53 +475,58 @@ class TestEnableRag:
         [(_, config)] = harness.vs.of("create")
         assert (config.backend, config.dimension) == ("inmemory", 3072)
 
-    def test_a_cluster_param_builds_a_backend_instead_of_creating_a_child(
+    def test_a_cluster_param_binds_the_announced_store_and_builds_nothing(
         self, harness: RagHarness, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """No child is created at all: the engine comes from the registered factory."""
+        """**Premise reversed (was: the actor calls the factory).**
+
+        Story 51-1 put backend construction on this actor; the card does it now
+        (ADR-051 Decision 8), so the registered factory must not be reached from
+        here at all — whatever the param names. A factory that raises is the
+        falsifier: if this actor still called one, the spec would degrade instead
+        of binding.
+        """
         built: list[object] = []
         double = FakeVectorStore()
 
         def _factory(context: object) -> object:
             built.append(context)
-            return double
+            raise AssertionError("the actor built a backend of its own")
 
         with factory_for("weaviate", _factory):
-            harness.enable(collection=VectorStoreParam(backend="weaviate", dimension=3072))
+            harness.enable(
+                collection=VectorStoreParam(backend="weaviate", dimension=3072), store=double
+            )
 
-        assert len(built) == 1
-        # The workspace's collection is shared and bounded by ``scope``; its
-        # auto-generated team id names no team, so the backend is handed none.
-        assert built[0].team_id is None
-        assert built[0].config.name == harness.actor.config.name
+        assert built == []
         assert harness.actor._vs_proxy is double
         assert harness.store_names == []
         [(name, config)] = double.of("create")
         assert name == RAG_COLLECTION
         assert (config.backend, config.dimension) == ("weaviate", 3072)
 
-    def test_a_cluster_factory_that_raises_degrades_without_raising(
+    def test_a_store_that_was_never_announced_degrades_without_raising(
         self,
         harness: RagHarness,
-        monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """A failed connect is the cluster path's version of a failed create_collection."""
+        """**Premise reversed (was: a factory that raises).**
 
-        def _factory(_context: object) -> object:
-            raise ValueError("unreachable")
-
-        with (
-            factory_for("weaviate", _factory),
-            caplog.at_level(logging.WARNING, logger=_DOCUMENTS_LOGGER),
-        ):
-            harness.enable(collection=VectorStoreParam(backend="weaviate"))
+        The actor resolves nothing, so a failed connect is now the card's to
+        report and the only degraded path left here is a lost announcement. It
+        degrades exactly as every earlier cause did: one WARNING naming the
+        workspace, no proxy, no traceback, and the sentence from the indexer.
+        """
+        with caplog.at_level(logging.WARNING, logger=_DOCUMENTS_LOGGER):
+            harness.enable(announce=False)  # must not raise
 
         assert harness.actor._vs_proxy is None
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1
-        assert "unreachable" in warnings[0].getMessage()
-        assert harness.actor.index_paths("").startswith("Retrieval indexing is not available")
+        assert WORKSPACE_PATH in warnings[0].getMessage()
+        assert "no vector store was announced" in warnings[0].getMessage()
+        assert warnings[0].exc_info is None
+        assert harness.actor.index_paths("") == _UNAVAILABLE
 
     def test_indexing_is_unavailable_until_retrieval_is_enabled(
         self, harness: RagHarness, workspace_tree: Path
@@ -510,113 +538,56 @@ class TestEnableRag:
             "Retrieval indexing is not available for this workspace."
         )
 
-    @pytest.mark.parametrize(
-        "outage",
-        [
-            RuntimeError("can't start new thread"),
-            ActorDeadError("the store child is not alive"),
-        ],
-        ids=["no-thread", "dead-child"],
-    )
-    def test_a_store_child_that_cannot_be_spawned_degrades_rather_than_raising(
-        self,
-        harness: RagHarness,
-        workspace_tree: Path,
-        caplog: pytest.LogCaptureFixture,
-        outage: Exception,
-    ) -> None:
-        """``PlanActor`` raises for a store it cannot reach; this actor owns the write gate.
+    def test_the_actor_creates_no_store_of_its_own_for_any_param(self, harness: RagHarness) -> None:
+        """**Premise reversed (was: the spawn that the environment refused).**
 
-        The premise used to be "the team's ``#VectorStore`` was not found"; now
-        that the store is this actor's own child, the reachable failures are the
-        two a spawn raises when the environment refuses it — no thread to start,
-        a child dead before its proxy is built — and each must degrade the same
-        way: one WARNING naming the workspace and the cause, no traceback, no
-        proxy, and the sentence from ``workspace_rag_index``.
+        Both halves of the pair this replaces — an outage degrading and a defect
+        propagating — described a ``createActor`` that no longer exists. What
+        survives them is the rule they were both about: this actor resolves
+        nothing. ``createActor`` is watched rather than removed, so the branch
+        coming back turns this red instead of going unnoticed.
         """
-        harness.store_spawn_error = outage
+        harness.enable(collection=VectorStoreParam(backend="inmemory"))
 
-        with caplog.at_level(logging.WARNING, logger=_DOCUMENTS_LOGGER):
-            harness.enable()  # must not raise
+        assert harness.store_configs == []
+        assert harness.actor._vs_proxy is harness.vs
+
+    def test_resolving_the_store_asks_nobody_and_cannot_raise(self, harness: RagHarness) -> None:
+        """It returns the announced object, or ``None``, and does nothing else.
+
+        The ask proxy is made to explode: a resolve that still looked anything up
+        would raise through it rather than answering.
+        """
+        harness.actor.proxy_ask = _explodes  # type: ignore[method-assign]
+        harness.actor.createActor = _explodes  # type: ignore[method-assign]
+
+        assert harness.actor._resolve_store() is None
+
+        harness.actor.configure_vector_store(harness.vs)
+        assert harness.actor._resolve_store() is harness.vs
+
+    def test_a_failing_embedder_never_raises_out_of_enable_rag(
+        self, harness: RagHarness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """**Premise re-pointed (was: a broken proxy).**
+
+        ``_acquire_vs_proxy`` no longer builds a proxy, but it still builds an
+        embedder, and everything it does is inside one ``try``. A raise there
+        must leave retrieval off rather than taking the actor down.
+        """
+        from akgentic.tool.vector_store import embedding_actor
+
+        monkeypatch.setattr(embedding_actor, "build_embedding_service", _explodes)
+
+        harness.enable()  # must not raise
 
         assert harness.actor._vs_proxy is None
-        warnings = [
-            record
-            for record in caplog.records
-            if record.levelno == logging.WARNING and record.name == _DOCUMENTS_LOGGER
-        ]
-        assert len(warnings) == 1
-        message = warnings[0].getMessage()
-        assert WORKSPACE_PATH in message
-        assert "could not create the in-memory vector store child" in message
-        assert str(outage) in message
-        assert warnings[0].exc_info is None
-        assert harness.actor.index_paths("") == _UNAVAILABLE
-
-    @pytest.mark.parametrize(
-        "defect",
-        [
-            TypeError("createActor() got an unexpected keyword argument 'config'"),
-            AttributeError("'VectorStoreConfig' object has no attribute 'name'"),
-        ],
-        ids=["type-error", "attribute-error"],
-    )
-    def test_a_defect_in_the_store_childs_spawn_is_not_reported_as_an_outage(
-        self,
-        harness: RagHarness,
-        workspace_tree: Path,
-        caplog: pytest.LogCaptureFixture,
-        defect: Exception,
-    ) -> None:
-        """A bug is not the environment: it propagates, and reaches the log with its traceback.
-
-        The other half of the spec above. An ``except Exception`` around the spawn
-        would turn this into the outage line — one sentence, the cause's message
-        and nothing else — and a configuration error would read, in production,
-        exactly like a host that ran out of threads. ``enable_rag`` still keeps
-        retrieval off, because this actor owns the write gate; what changes is
-        that the defect arrives with its type and its stack.
-        """
-        harness.store_spawn_error = defect
-
-        with pytest.raises(type(defect)):
-            harness.actor._resolve_store(VectorStoreParam(backend="inmemory"))
-
-        with caplog.at_level(logging.WARNING, logger=_DOCUMENTS_LOGGER):
-            harness.enable()  # enable_rag keeps its own contract: it never raises
-
-        assert harness.actor._vs_proxy is None
-        warnings = [
-            record
-            for record in caplog.records
-            if record.levelno == logging.WARNING and record.name == _DOCUMENTS_LOGGER
-        ]
-        assert len(warnings) == 1
-        assert "could not enable retrieval" in warnings[0].getMessage()
-        assert "could not create the in-memory vector store child" not in caplog.text
-        assert warnings[0].exc_info is not None
-        assert warnings[0].exc_info[1] is defect
-        assert harness.actor.index_paths("") == _UNAVAILABLE
 
     def test_a_failing_create_collection_degrades_rather_than_raising(
         self, harness: RagHarness
     ) -> None:
         """A transient backend fault must not take the workspace down."""
         harness.vs.create_error = RuntimeError("cluster unreachable")
-
-        harness.enable()  # must not raise
-
-        assert harness.actor._vs_proxy is None
-
-    def test_a_broken_proxy_never_raises_out_of_enable_rag(
-        self, harness: RagHarness, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Everything in this method is wrapped, including the proxy over the child."""
-
-        def boom(*args: Any, **kwargs: Any) -> Any:
-            raise RuntimeError("proxy is gone")
-
-        monkeypatch.setattr(harness.actor, "proxy_ask", boom)
 
         harness.enable()  # must not raise
 
@@ -642,8 +613,19 @@ class TestEnableRag:
         assert len(harness.vs.of("create")) == 1
 
 
-class TestTheStoreChild:
-    """The in-memory store is this actor's own child, created with no orchestrator."""
+class TestTheStoreArrivesByAnnouncement:
+    """**Premise reversed.** There is no store child: the card hands one over.
+
+    Story 51-1 made the in-memory store this actor's own child, which core
+    ADR-022 Decision 3 required of a *hosted* actor. Nothing is hosted after this
+    epic, and ADR-022 Decision 2 records that the prohibition was always on the
+    actor rather than on the card — so the binding goes back to the card, which
+    is what lets a workspace share the team's one ``#VectorStore`` with whatever
+    planning or knowledge-graph card the team also carries.
+
+    What survives 51-1 unchanged is the invariant the class below it still holds:
+    the actor asks its orchestrator for nothing.
+    """
 
     def test_a_workspace_with_no_orchestrator_indexes_a_document(
         self, harness: RagHarness, workspace_tree: Path
@@ -671,30 +653,33 @@ class TestTheStoreChild:
         assert [entry.ref_id for entry in entries] == ["e1"]
         assert harness.rows["a.md"].status is RagStatus.EMBEDDED
 
-    def test_enabling_on_an_in_memory_param_creates_exactly_one_child(
-        self, harness: RagHarness
-    ) -> None:
-        """The actor creates it — the card's ``create_calls`` no longer name it."""
+    def test_enabling_on_a_file_backed_param_creates_no_child(self, harness: RagHarness) -> None:
+        """**Inverted.** The card created the store; this actor binds what it was given."""
         harness.enable()
 
-        [config] = harness.store_configs
-        assert config.name == f"{VS_ACTOR_NAME}-{WORKSPACE_PATH}"
-        assert config.role == VS_ACTOR_ROLE
+        assert harness.store_configs == []
+        assert harness.actor._vs_proxy is harness.vs
 
-    def test_enabling_on_a_cluster_param_creates_no_child(self, harness: RagHarness) -> None:
-        """The negative beside the positive above; the double being bound is the proof it ran."""
+    def test_enabling_on_a_cluster_param_creates_no_child_either(self, harness: RagHarness) -> None:
+        """Neither branch creates one now — the difference between them left this actor."""
         double = FakeVectorStore()
 
-        with factory_for("weaviate", lambda _context: double):
-            harness.enable(collection=VectorStoreParam(backend="weaviate", dimension=3072))
+        harness.enable(
+            collection=VectorStoreParam(backend="weaviate", dimension=3072), store=double
+        )
 
         assert harness.actor._vs_proxy is double
         assert harness.store_configs == []
 
-    def test_two_workspaces_create_two_differently_named_children(
+    def test_two_workspaces_bind_their_own_announced_store_and_create_nothing(
         self, workspace_tree: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The name carries the path, slash verbatim, so two trees cannot share one child."""
+        """**Inverted.** Two trees held two children; they hold two announcements.
+
+        The two stores must still not be the same object — that is what the two
+        differently-named children used to guarantee — so the identity of each
+        actor's bound store is the assertion the name check becomes.
+        """
         first = RagHarness(_started_actor(WORKSPACE_PATH))
         first.install(monkeypatch)
         second = RagHarness(_started_actor("u-bob/other-workspace"))
@@ -703,9 +688,28 @@ class TestTheStoreChild:
         first.enable()
         second.enable()
 
-        assert first.store_names == [f"{VS_ACTOR_NAME}-{WORKSPACE_PATH}"]
-        assert second.store_names == [f"{VS_ACTOR_NAME}-u-bob/other-workspace"]
-        assert first.store_names != second.store_names
+        assert first.store_configs == []
+        assert second.store_configs == []
+        assert first.actor._vs_proxy is first.vs
+        assert second.actor._vs_proxy is second.vs
+        assert first.actor._vs_proxy is not second.actor._vs_proxy
+
+    def test_the_announcement_must_land_before_retrieval_is_enabled(
+        self, harness: RagHarness
+    ) -> None:
+        """The ordering the card establishes, seen from the actor's side.
+
+        A store configured *after* ``enable_rag`` arrives too late: the first call
+        wins for the tree, so the actor has already settled into degraded mode and
+        a later announcement binds nothing.
+        """
+        harness.enable(announce=False)
+        assert harness.actor._vs_proxy is None
+
+        harness.actor.configure_vector_store(harness.vs)
+
+        assert harness.actor._vs_proxy is None
+        assert harness.actor.index_paths("") == _UNAVAILABLE
 
 
 class TestTheEmbeddedReMarkIsDeleted:
@@ -724,10 +728,13 @@ class TestTheEmbeddedReMarkIsDeleted:
     ``EMBEDDED`` row over a fresh engine and thinks "surely this should be
     re-queued" gets a red test instead of a plausible-looking commit.
 
-    (Between this story and 52-4 an in-memory engine on a fresh process is
-    genuinely empty while its rows say ``EMBEDDED``; 52-4 is what puts the
-    embeddings under ``<meta>/index/`` and makes the rows true for that engine
-    too. The window is one story wide on one stacked branch.)
+    **The one-story window is closed.** Between 52-3 and this story an in-memory
+    engine on a fresh process was genuinely empty while its rows said
+    ``EMBEDDED``. The embeddings are under ``<meta>/index/`` now, so an
+    ``EMBEDDED`` row over a fresh process is **honest** — and the case that would
+    still have been dishonest, a workspace running on the in-actor index, is
+    refused at bind rather than left to be re-marked
+    (``TestAWorkspaceMayNotRunOnTheInActorBackend``, ADR-051 Decision 11).
     """
 
     _BODY = "# A\n\nbody\n"
@@ -743,22 +750,30 @@ class TestTheEmbeddedReMarkIsDeleted:
             end=len(self._BODY),
             heading_path=["A"],
         )
-        seed_row(harness.actor, "a.md", RagFile(
-            path="a.md",
-            status=RagStatus.EMBEDDED,
-            indexed_sha=sha,
-            chunks=[old],
-            chunk_count=1,
-            updated_at=now,
-        ))
-        seed_extract(harness.actor, "a.md", DocumentExtract(
-            path="a.md",
-            source_sha=sha,
-            extractor_version=EXTRACTOR_VERSION,
-            markdown=None,
-            char_count=len(self._BODY),
-            extracted_at=now,
-        ))
+        seed_row(
+            harness.actor,
+            "a.md",
+            RagFile(
+                path="a.md",
+                status=RagStatus.EMBEDDED,
+                indexed_sha=sha,
+                chunks=[old],
+                chunk_count=1,
+                updated_at=now,
+            ),
+        )
+        seed_extract(
+            harness.actor,
+            "a.md",
+            DocumentExtract(
+                path="a.md",
+                source_sha=sha,
+                extractor_version=EXTRACTOR_VERSION,
+                markdown=None,
+                char_count=len(self._BODY),
+                extracted_at=now,
+            ),
+        )
         return old
 
     def test_enabling_an_in_memory_engine_leaves_the_row_embedded(
@@ -812,8 +827,9 @@ class TestTheEmbeddedReMarkIsDeleted:
         self._stored(harness, workspace_tree)
         double = FakeVectorStore()
 
-        with factory_for("weaviate", lambda _context: double):
-            harness.enable(collection=VectorStoreParam(backend="weaviate", dimension=3072))
+        harness.enable(
+            collection=VectorStoreParam(backend="weaviate", dimension=3072), store=double
+        )
 
         assert harness.actor._vs_proxy is double
         assert harness.store_configs == []
@@ -1057,9 +1073,7 @@ class TestTheSpawnSide:
 
         assert len(harness.requests) == MAX_CONCURRENT_INDEX_WORKERS
         pending = [
-            path
-            for path, entry in harness.rows.items()
-            if entry.status is RagStatus.PENDING
+            path for path, entry in harness.rows.items() if entry.status is RagStatus.PENDING
         ]
         assert len(pending) == 2
 
@@ -1756,16 +1770,22 @@ class TestRagSnapshot:
     def _seed(self, actor: WorkspaceActor, pending: int, embedded: int) -> None:
         now = datetime.now(UTC)
         for index in range(embedded):
-            seed_row(actor, f"done{index}.md", RagFile(
-                path=f"done{index}.md",
-                status=RagStatus.EMBEDDED,
-                chunk_count=3,
-                updated_at=now,
-            ))
+            seed_row(
+                actor,
+                f"done{index}.md",
+                RagFile(
+                    path=f"done{index}.md",
+                    status=RagStatus.EMBEDDED,
+                    chunk_count=3,
+                    updated_at=now,
+                ),
+            )
         for index in range(pending):
-            seed_row(actor, f"wait{index}.md", RagFile(
-                path=f"wait{index}.md", status=RagStatus.PENDING, updated_at=now
-            ))
+            seed_row(
+                actor,
+                f"wait{index}.md",
+                RagFile(path=f"wait{index}.md", status=RagStatus.PENDING, updated_at=now),
+            )
 
     def test_pending_rows_are_capped_and_the_rest_counted(self, actor: WorkspaceActor) -> None:
         """A 10,000-file tree must not flood the context window with identical rows."""
@@ -1785,12 +1805,16 @@ class TestRagSnapshot:
         assert sum(1 for row in state.rows if row.status == "embedded") == 6
 
     def test_a_failure_reason_reaches_the_row(self, actor: WorkspaceActor) -> None:
-        seed_row(actor, "a.md", RagFile(
-            path="a.md",
-            status=RagStatus.FAILED,
-            reason="rate limited",
-            updated_at=datetime.now(UTC),
-        ))
+        seed_row(
+            actor,
+            "a.md",
+            RagFile(
+                path="a.md",
+                status=RagStatus.FAILED,
+                reason="rate limited",
+                updated_at=datetime.now(UTC),
+            ),
+        )
 
         [row] = actor.rag_snapshot(max_pending_shown=5).rows
         assert (row.status, row.reason) == ("failed", "rate limited")
@@ -1832,11 +1856,15 @@ class TestRagSnapshot:
 
     def test_the_snapshot_does_not_run_the_reaper(self, actor: WorkspaceActor) -> None:
         """A mutation from a render would fire on every turn of every agent."""
-        seed_row(actor, "a.md", RagFile(
-            path="a.md",
-            status=RagStatus.EMBEDDING,
-            updated_at=datetime.now(UTC) - timedelta(seconds=EMBEDDING_STALE_AFTER_S + 1),
-        ))
+        seed_row(
+            actor,
+            "a.md",
+            RagFile(
+                path="a.md",
+                status=RagStatus.EMBEDDING,
+                updated_at=datetime.now(UTC) - timedelta(seconds=EMBEDDING_STALE_AFTER_S + 1),
+            ),
+        )
 
         actor.rag_snapshot(max_pending_shown=20)
 
@@ -1861,12 +1889,16 @@ class TestRagSnapshot:
     ) -> None:
         """``on_start`` and here — the two places that are not a turn path."""
         harness.enable()
-        seed_row(harness.actor, "a.md", RagFile(
-            path="a.md",
-            status=RagStatus.EMBEDDING,
-            indexed_sha="old",
-            updated_at=datetime.now(UTC) - timedelta(seconds=EMBEDDING_STALE_AFTER_S + 1),
-        ))
+        seed_row(
+            harness.actor,
+            "a.md",
+            RagFile(
+                path="a.md",
+                status=RagStatus.EMBEDDING,
+                indexed_sha="old",
+                updated_at=datetime.now(UTC) - timedelta(seconds=EMBEDDING_STALE_AFTER_S + 1),
+            ),
+        )
 
         harness.actor.index_paths("nowhere")
 

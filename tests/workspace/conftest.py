@@ -343,6 +343,13 @@ class FakeOrchestratorProxy:
         gained no bind-time round trip: :attr:`metadata_calls` stays at zero.
         """
         self.metadata_calls = 0
+        self.member_lookups: list[str] = []
+        """Every name :meth:`get_team_member` was asked for, in order.
+
+        A retrieval card looks the team's ``#VectorStore`` up here after creating
+        it; a card with retrieval off must leave this list empty, which is the
+        negative that "retrieval off costs nothing" is asserted on.
+        """
 
     @property
     def hosted(self) -> dict[str, tuple[ActorAddress, Any]]:
@@ -377,6 +384,18 @@ class FakeOrchestratorProxy:
         address, actor = _start_actor(actor_class, config, self.live, self._refs)
         self.children[config.name] = (address, actor)
         return address
+
+    def get_team_member(self, name: str) -> ActorAddress | None:  # noqa: N802 — mirrors core
+        """Return the address registered under *name*, or ``None`` — core's own answer.
+
+        Only children are looked up: a hosted actor sits in no team's roster by
+        construction, so a workspace found here would be a wiring defect rather
+        than a lookup. ``None`` for a miss is what the real orchestrator answers
+        and what every caller branches on.
+        """
+        self.member_lookups.append(name)
+        existing = self.children.get(name)
+        return existing[0] if existing is not None else None
 
     def get_metadata(self) -> Any:
         """Return the team's metadata, exactly as the orchestrator does."""

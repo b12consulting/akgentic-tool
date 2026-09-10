@@ -21,6 +21,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from akgentic.tool.core import ContextState, _resolve
+from akgentic.tool.vector_store.protocol import VectorStoreParam
 from akgentic.tool.workspace.card.params import (
     WorkspaceRagIndex,
     WorkspaceRagList,
@@ -32,7 +33,6 @@ from akgentic.tool.workspace.readers import DocumentReader
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from akgentic.tool.vector_store.protocol import VectorStoreParam
     from akgentic.tool.workspace.actor import WorkspaceActor
 
 logger = logging.getLogger(__name__)
@@ -44,6 +44,78 @@ Deliberately the same sentence the actor itself returns in degraded mode: an
 agent should not have to tell "no vector store is wired" apart from "the proxy is
 gone", because its next step is the same in both.
 """
+
+IN_ACTOR_BACKEND = "inmemory"
+"""The backend that keeps its index inside the store actor's serialisable state."""
+
+WORKSPACE_LOCAL_BACKEND = "local"
+"""The backend a workspace's index lives in — files under the tree's ``<meta>``."""
+
+WORKSPACE_IN_MEMORY_REFUSED = (
+    "{card} declares vector_store.backend='{in_actor}', which is not a workspace "
+    "backend: an in-memory index is lost with the process, so every row this "
+    "workspace persists would claim embeddings that are no longer there. Use "
+    "backend='{local}', which indexes into files under the tree's metadata "
+    "directory, or name a cluster backend. Declaring no backend at all already "
+    "resolves to '{local}' for a workspace."
+)
+"""Why a workspace may not run on the in-actor index, said at wiring time.
+
+The knowledge graph and the plan keep their **rows** in actor state alongside
+their index, so the two are lost and restored together and never disagree. A
+workspace's rows are files under ``<meta>`` and outlive every process, so an
+in-memory index leaves a persisted ``EMBEDDED`` row over an empty engine after
+every restart — the mismatch the deleted re-mark rule existed to repair
+(ADR-051 Decision 11).
+"""
+
+
+def workspace_backend(param: VectorStoreParam) -> str:
+    """The backend this workspace's collection actually uses.
+
+    A card that **named** a backend gets exactly that one; a card that named none
+    and resolved to the in-actor fallback gets the local one instead, because the
+    workspace is the one consumer with a filesystem to hang an index off. The
+    distinction is ``model_fields_set``, which is the only thing that records
+    whether an author wrote the value or Pydantic derived it — and it matters
+    because the two cases must not be answered the same way: substituting under a
+    declaration would silently ignore what an author wrote, and refusing a value
+    nobody wrote would fail every default ``WorkspaceTool``.
+
+    An explicit :data:`IN_ACTOR_BACKEND` is neither substituted nor accepted; it
+    is refused by :func:`require_workspace_backend` before this is ever reached.
+
+    Args:
+        param: The card's ``vector_store`` field, exactly as its author left it.
+
+    Returns:
+        The backend name the resolved param carries.
+    """
+    if "backend" in param.model_fields_set:
+        return param.backend
+    return WORKSPACE_LOCAL_BACKEND if param.backend == IN_ACTOR_BACKEND else param.backend
+
+
+def require_workspace_backend(param: VectorStoreParam, card_name: str) -> None:
+    """Raise when *param* explicitly names a backend a workspace cannot use.
+
+    Called at ``observer()`` time beside ``require_backend_configured``, and for
+    its reason: a configuration that cannot work must fail the team's build in
+    front of the admin who wrote it rather than degrade at the first index.
+
+    Args:
+        param: The card's ``vector_store`` field.
+        card_name: Card class name, for the error message.
+
+    Raises:
+        ValueError: When the author declared the in-actor backend.
+    """
+    if "backend" in param.model_fields_set and param.backend == IN_ACTOR_BACKEND:
+        raise ValueError(
+            WORKSPACE_IN_MEMORY_REFUSED.format(
+                card=card_name, in_actor=IN_ACTOR_BACKEND, local=WORKSPACE_LOCAL_BACKEND
+            )
+        )
 
 
 class RagFactories:
@@ -63,6 +135,7 @@ class RagFactories:
         _workspace_proxy: WorkspaceActor | None
         _workspace_tell: WorkspaceActor | None
         _agent_id: str
+        _resolved_store: VectorStoreParam | None
 
     ##
     ## Enablement — one predicate, because three sites have to agree on it
@@ -127,16 +200,23 @@ class RagFactories:
         whole card binding down. The degradation is a workspace whose
         ``workspace_rag_index`` answers that retrieval is unavailable: visible, and
         recoverable by rebinding.
+
+        **It sends the resolved param, not the author's field.** The backend and
+        the root the store was actually built over are what the actor hands to
+        ``create_collection``, and a collection created under the author's
+        declaration would name a backend nothing was built for.
         """
-        if not self._rag_enabled():
+        # ``_resolved_store`` is derived exactly when :meth:`_rag_enabled` holds, so
+        # this **is** the enablement gate rather than a second one beside it — and
+        # a param that is not ``None`` is the only thing there is to announce.
+        collection = self._resolved_store
+        if collection is None:
             return
         tell = self._workspace_tell
         if tell is None:
             return
         try:
-            tell.enable_rag(
-                self._agent_id, self._rag_params(), self._rag_reader(), self.vector_store
-            )
+            tell.enable_rag(self._agent_id, self._rag_params(), self._rag_reader(), collection)
         except Exception:
             logger.debug("Could not enable retrieval on #Workspace", exc_info=True)
 

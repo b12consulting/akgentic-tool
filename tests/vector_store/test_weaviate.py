@@ -1956,6 +1956,37 @@ class TestEveryObjectHasAStableUuid:
         ]
         assert uuids[0] != uuids[1]
 
+    def test_two_teams_writing_one_ref_id_to_the_shared_collection_pass_one_uuid(self) -> None:
+        """The falsifier for the workspace's shared collection, beside its opposite above.
+
+        Two teams pointed at one tree index the same chunk, and the chunk id is
+        already derived from the *tree* — so a team inside the object id would
+        mint a second point for it and every search would return the chunk twice.
+        The rule is per collection, which is why the two specs differ only in the
+        collection name.
+        """
+        from akgentic.tool.vector_store.protocol import stable_object_id
+        from akgentic.tool.workspace.documents.models import RAG_COLLECTION
+
+        _mock_weaviate, client = _install_mock_weaviate()
+        client.collections.exists.return_value = False
+        batch = self._batch(client)
+        first = _backend_with(client, RAG_COLLECTION, team_id="team-a")
+        second = _backend_with(client, RAG_COLLECTION, team_id="team-b")
+
+        first.add(RAG_COLLECTION, [_make_entry(ref_id="3")])
+        second.add(RAG_COLLECTION, [_make_entry(ref_id="3")])
+
+        uuids = [call.kwargs["uuid"] for call in batch.add_object.call_args_list]
+        assert uuids == [stable_object_id(None, None, "3"), stable_object_id(None, None, "3")]
+        assert uuids[0] == uuids[1]
+        # The team is still *stamped* — only the identity drops it, so a sweep and
+        # a team-scoped filter still find the row.
+        teams = [
+            call.kwargs["properties"]["team_id"] for call in batch.add_object.call_args_list
+        ]
+        assert teams == ["team-a", "team-b"]
+
     def test_the_uuid_names_the_tenant_the_object_is_written_to(self) -> None:
         from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
         from akgentic.tool.vector_store.protocol import VectorStoreParam, stable_object_id

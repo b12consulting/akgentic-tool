@@ -518,18 +518,41 @@ class TestDeleteByTeamRefusesASharedCollection:
 
 
 class TestThePointIdDerivationIsUnchanged:
-    """Every point already on a cluster keeps its id: the derivation moved, it did not change."""
+    """Every point already on a cluster keeps its id: the derivation moved, it did not change.
+
+    The team-scoped case below is the one every existing point was written under
+    and is asserted against the raw ``uuid5`` rather than against the helper, so
+    a change in the derivation cannot agree with the spec that guards it.
+    """
 
     def test_a_fixed_triple_derives_the_id_it_always_did(self) -> None:
         backend, _client = _make_backend(team_id="team-42")
         identity = json.dumps(["team-42", "t1", "e1"], ensure_ascii=True, separators=(",", ":"))
         expected = str(uuid.uuid5(uuid.UUID("6f9619ff-8b86-d011-b42d-00c04fc964ff"), identity))
 
-        assert backend._point_id("e1", "t1") == expected
+        assert backend._point_id("planning", "e1", "t1") == expected
 
     def test_a_teamless_writer_derives_from_an_empty_team(self) -> None:
         backend, _client = _make_backend(team_id=None)
         identity = json.dumps(["", "", "e1"], ensure_ascii=True, separators=(",", ":"))
         expected = str(uuid.uuid5(uuid.UUID("6f9619ff-8b86-d011-b42d-00c04fc964ff"), identity))
 
-        assert backend._point_id("e1") == expected
+        assert backend._point_id("planning", "e1") == expected
+
+    def test_a_shared_collection_derives_with_no_team_whichever_team_writes(self) -> None:
+        """Two teams indexing one tree must write **one** point per chunk, not two.
+
+        The workspace reached this the long way round while its backend was built
+        with ``team_id=None``; the rule belongs to the collection, so it is
+        asserted against a backend that genuinely carries a team.
+        """
+        from akgentic.tool.workspace.documents.models import RAG_COLLECTION
+
+        first, _client = _make_backend(team_id="team-a")
+        second, _other = _make_backend(team_id="team-b")
+        identity = json.dumps(["", "", "e1"], ensure_ascii=True, separators=(",", ":"))
+        teamless = str(uuid.uuid5(uuid.UUID("6f9619ff-8b86-d011-b42d-00c04fc964ff"), identity))
+
+        assert first._point_id(RAG_COLLECTION, "e1") == teamless
+        assert second._point_id(RAG_COLLECTION, "e1") == teamless
+        assert first._point_id("planning", "e1") != teamless

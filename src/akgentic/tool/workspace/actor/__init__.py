@@ -325,6 +325,10 @@ class WorkspaceActor(
         self._rag_params: WorkspaceRagIndex | None = None
         self._rag_reader: DocumentReader | None = None
         self._rag_collection: VectorStoreParam | None = None
+        # Announced by the card at bind time, exactly as ``_lock`` is, and always
+        # before ``enable_rag``: this actor resolves no store of its own, so
+        # until the announcement lands there is nothing to enable retrieval over.
+        self._vector_store: VectorStoreService | None = None
         self._vs_proxy: VectorStoreService | None = None
         self._embedder: EmbeddingProvider | None = None
         self._index_active: set[str] = set()

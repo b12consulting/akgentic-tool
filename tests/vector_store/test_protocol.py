@@ -106,10 +106,11 @@ class TestVectorStoreParam:
         with pytest.raises(ValidationError):
             VectorStoreParam(dimension=-1)
 
-    def test_six_fields_in_order_with_their_defaults(self) -> None:
+    def test_seven_fields_in_order_with_their_defaults(self) -> None:
         """The whole shape: what every consumer carries when it names nothing."""
         assert list(VectorStoreParam.model_fields) == [
             "backend",
+            "root",
             "dimension",
             "tenant",
             "params",
@@ -119,6 +120,7 @@ class TestVectorStoreParam:
         param = VectorStoreParam()
         assert {name: getattr(param, name) for name in VectorStoreParam.model_fields} == {
             "backend": "inmemory",
+            "root": None,
             "dimension": 1536,
             "tenant": None,
             "params": {},
