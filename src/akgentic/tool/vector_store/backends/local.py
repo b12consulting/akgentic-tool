@@ -52,6 +52,7 @@ import logging
 import os
 import tempfile
 import threading
+import zipfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -368,6 +369,14 @@ class LocalBackend:
         source document it was cut from — the rule
         ``YamlDocumentStore._read`` already follows one directory over.
 
+        **``zipfile.BadZipFile`` is in the tuple because it is the likely form
+        here, not an exotic one.** It derives from ``Exception`` alone, so it is
+        caught by none of the others, and it is what ``np.load`` raises for an
+        archive whose central directory is unreadable — a *damaged* ``.npz``,
+        which is a different failure from a file of unrelated bytes and the one a
+        network mount produces. Leaving it out made a backend written for exactly
+        that mount raise out of ``search`` instead of degrading.
+
         Returns:
             ``True`` when a stored index was adopted, ``False`` when there is
             nothing published to adopt.
@@ -389,7 +398,7 @@ class LocalBackend:
             for row, data in zip(matrix, payload["entries"], strict=True):
                 index.add(VectorEntry.model_validate({**data, "vector": [float(v) for v in row]}))
             stored_config = payload["config"]
-        except (OSError, ValueError, KeyError, TypeError) as exc:
+        except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile) as exc:
             logger.warning(
                 "Vector index %s does not load (%s) — treating it as empty and leaving "
                 "it in place; the chunks are regenerable from their source documents",

@@ -635,6 +635,35 @@ class TestAReloadFollowsTheStamp:
         assert "does not load" in caplog.text
         assert stored.is_file()
 
+    def test_a_damaged_archive_is_a_miss_too_rather_than_raising(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A truncated ``.npz``, not a file of unrelated bytes — a different exception.
+
+        The spec above overwrites the archive with bytes that were never a zip, so
+        ``np.load`` refuses on the magic and raises ``ValueError``. An archive that
+        *was* written by this backend and then damaged — the shape a network mount
+        produces, which is the mount this backend exists for — reaches
+        ``zipfile.ZipFile`` and raises ``BadZipFile``, which derives from
+        ``Exception`` alone and so is caught by no broader clause. Left out of the
+        tuple it propagated out of ``search``, which is the one thing this method
+        promises never to do.
+        """
+        import logging
+
+        written = backend_over(tmp_path, SHARED)
+        written.add(SHARED, [entry("c1")])
+        stored = index_dir(tmp_path) / INDEX_FILE
+        stored.write_bytes(stored.read_bytes()[:40])
+
+        reader = LocalBackend(root=str(tmp_path))
+        with caplog.at_level(logging.WARNING, logger="akgentic.tool.vector_store.backends.local"):
+            reader.create_collection(SHARED, VectorStoreParam(dimension=2))
+            hits = reader.search(SHARED, [1.0, 0.0], 5, scope=SCOPE).hits
+
+        assert hits == []
+        assert "does not load" in caplog.text
+
 
 ##
 ## AC 5 — the shared-collection rule, enforced here exactly as on a cluster

@@ -75,12 +75,17 @@ def workspace_backend(param: VectorStoreParam) -> str:
 
     A card that **named** a backend gets exactly that one; a card that named none
     and resolved to the in-actor fallback gets the local one instead, because the
-    workspace is the one consumer with a filesystem to hang an index off. The
-    distinction is ``model_fields_set``, which is the only thing that records
-    whether an author wrote the value or Pydantic derived it — and it matters
-    because the two cases must not be answered the same way: substituting under a
-    declaration would silently ignore what an author wrote, and refusing a value
-    nobody wrote would fail every default ``WorkspaceTool``.
+    workspace is the one consumer with a filesystem to hang an index off. The two
+    cases must not be answered the same way: substituting under a declaration
+    would silently ignore what an author wrote, and refusing a value nobody wrote
+    would fail every default ``WorkspaceTool``.
+
+    **The distinction is ``backend_declared``, and deliberately not
+    ``model_fields_set``.** A whole-model serializer emits every field, so one
+    ``model_dump()`` / ``model_validate()`` round trip — which the agent-card
+    store performs on every team resume — inflates ``model_fields_set`` until
+    every field looks authored. Reading it here would refuse a card that named
+    nothing the moment its team was resumed.
 
     An explicit :data:`IN_ACTOR_BACKEND` is neither substituted nor accepted; it
     is refused by :func:`require_workspace_backend` before this is ever reached.
@@ -91,7 +96,7 @@ def workspace_backend(param: VectorStoreParam) -> str:
     Returns:
         The backend name the resolved param carries.
     """
-    if "backend" in param.model_fields_set:
+    if param.backend_declared:
         return param.backend
     return WORKSPACE_LOCAL_BACKEND if param.backend == IN_ACTOR_BACKEND else param.backend
 
@@ -103,6 +108,11 @@ def require_workspace_backend(param: VectorStoreParam, card_name: str) -> None:
     its reason: a configuration that cannot work must fail the team's build in
     front of the admin who wrote it rather than degrade at the first index.
 
+    **Reads ``backend_declared``, never ``model_fields_set``** — see
+    :func:`workspace_backend`. A card that named no backend must keep binding
+    after it has been stored and read back, and ``model_fields_set`` cannot tell
+    the two apart once it has.
+
     Args:
         param: The card's ``vector_store`` field.
         card_name: Card class name, for the error message.
@@ -110,7 +120,7 @@ def require_workspace_backend(param: VectorStoreParam, card_name: str) -> None:
     Raises:
         ValueError: When the author declared the in-actor backend.
     """
-    if "backend" in param.model_fields_set and param.backend == IN_ACTOR_BACKEND:
+    if param.backend_declared and param.backend == IN_ACTOR_BACKEND:
         raise ValueError(
             WORKSPACE_IN_MEMORY_REFUSED.format(
                 card=card_name, in_actor=IN_ACTOR_BACKEND, local=WORKSPACE_LOCAL_BACKEND

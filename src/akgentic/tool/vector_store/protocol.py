@@ -12,7 +12,7 @@ import uuid
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, runtime_checkable
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.utils.serializer import SerializableBaseModel
@@ -128,6 +128,16 @@ class VectorStoreParam(SerializableBaseModel):
             "be added via akgentic.tool.vector_store.registry.register_backend."
         ),
     )
+    backend_declared: bool = Field(
+        default=False,
+        description=(
+            "Whether an author wrote 'backend' themselves rather than it being resolved "
+            "by default. Recorded once, at the first construction of the param, and "
+            "carried through every serialisation afterwards. A consumer that treats an "
+            "authored backend differently from a defaulted one must read this field and "
+            "never model_fields_set."
+        ),
+    )
     root: str | None = Field(
         default=None,
         description=(
@@ -162,6 +172,39 @@ class VectorStoreParam(SerializableBaseModel):
     embedding_provider: Literal["openai", "azure"] = Field(
         default="openai", description="Embedding API provider"
     )
+
+    @model_validator(mode="after")
+    def _record_whether_the_backend_was_declared(self) -> VectorStoreParam:
+        """Freeze "did the author name a backend" into a field, once.
+
+        **``model_fields_set`` cannot answer this, and the reason is structural.**
+        ``SerializableBaseModel`` declares a whole-model ``@model_serializer``
+        which emits **every** declared field — ``exclude_unset`` has no effect on
+        it — so one ``model_dump()`` / ``model_validate()`` round trip makes every
+        field look explicitly written. The agent-card store does exactly that round
+        trip on every team resume, so a card that named nothing would come back
+        looking as though its author had named the in-actor backend, and
+        :func:`~akgentic.tool.workspace.card.rag.require_workspace_backend` would
+        refuse a configuration that worked yesterday, blaming the author for a
+        value they never wrote.
+
+        The flag is therefore recorded at the **first** construction, where
+        ``model_fields_set`` is still honest, and preserved on every later one:
+        a param that already carries ``backend_declared`` — which every
+        round-tripped one does — is taken at its word rather than re-derived.
+
+        A payload persisted before this field existed carries no value and reads
+        ``False``, so an author's explicit in-actor backend written back then is
+        substituted rather than refused. That is the lenient direction on purpose:
+        an old record keeps working, and the refusal still meets every card
+        written since.
+
+        Returns:
+            This param, with :attr:`backend_declared` settled.
+        """
+        if "backend_declared" not in self.model_fields_set:
+            self.backend_declared = "backend" in self.model_fields_set
+        return self
 
 
 def require_dimension_matches(param: VectorStoreParam, owner: str) -> None:

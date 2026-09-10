@@ -1234,6 +1234,67 @@ class TestAWorkspaceMayNotRunOnTheInActorBackend:
         with pytest.raises(ValueError, match="not a workspace backend"):
             card.observer(observer)
 
+    def test_a_card_that_named_nothing_still_binds_after_a_serialisation_round_trip(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """The refusal must not fire on a value the author never wrote.
+
+        ``SerializableBaseModel`` declares a whole-model serializer that emits
+        **every** field, so one ``model_dump()`` / ``model_validate()`` round trip
+        makes every field look explicitly set — and the agent-card store performs
+        exactly that round trip on every team resume. Discriminating on
+        ``model_fields_set`` therefore turned a card that named no backend into one
+        that had "declared" the in-actor backend, and refused it at the next bind
+        with a message blaming its author. The record is a field now, so the trip
+        is invisible.
+        """
+        tell = RecordingTell()
+        stored = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_rag_index=True).model_dump()
+        card = WorkspaceTool.model_validate(stored)
+
+        # The trip really did inflate the naive discriminator — without this the
+        # spec could pass while proving nothing.
+        assert "backend" in card.vector_store.model_fields_set
+        assert card.vector_store.backend_declared is False
+
+        card.observer(FakeActorToolObserver(orchestrator_proxy, workspace_tell_proxy=tell))
+
+        [(_, _, _, collection)] = tell.enable_calls
+        assert collection.backend == "local"
+
+    def test_a_declaration_survives_the_round_trip_and_is_still_refused(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """The other half: the trip must not launder a declaration away either."""
+        stored = WorkspaceTool(
+            workspace_id=WORKSPACE_NAME,
+            workspace_rag_index=True,
+            vector_store=VectorStoreParam(backend="inmemory"),
+        ).model_dump()
+        card = WorkspaceTool.model_validate(stored)
+
+        assert card.vector_store.backend_declared is True
+        with pytest.raises(ValueError, match="not a workspace backend"):
+            card.observer(FakeActorToolObserver(orchestrator_proxy))
+
+    def test_a_retrieval_card_naming_a_backend_nobody_registered_fails_the_bind(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """At the bind, not merely in the resolver — the gap story 52-3 shipped.
+
+        ``require_backend_configured`` looks the name up in the registry, so an
+        unregistered one raises before anything is created. Asserting it on the
+        resolver alone would leave the card free to stop calling it.
+        """
+        with pytest.raises((ValueError, KeyError)):
+            bind(
+                orchestrator_proxy,
+                workspace_rag_index=True,
+                vector_store=VectorStoreParam(backend="no-such-backend"),
+            )
+
+        assert orchestrator_proxy.create_calls == []
+
     def test_a_retrieval_off_card_declaring_it_binds_normally(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
@@ -1307,8 +1368,7 @@ class TestTheStoreResolutionDegradesRatherThanFailingTheBind:
         warnings = [
             record
             for record in caplog.records
-            if record.levelno == logging.WARNING
-            and record.name == "akgentic.tool.workspace.card"
+            if record.levelno == logging.WARNING and record.name == "akgentic.tool.workspace.card"
         ]
         assert len(warnings) == 1
         assert "weaviate" in warnings[0].getMessage()
