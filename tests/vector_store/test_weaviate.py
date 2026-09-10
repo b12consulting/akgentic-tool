@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     # Only under TYPE_CHECKING: at runtime the mock ``weaviate`` module must be
     # installed into ``sys.modules`` before this module is imported.
     from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+    from akgentic.tool.vector_store.protocol import VectorStoreConfig
 
 # ---------------------------------------------------------------------------
 # Recording Filter double
@@ -905,12 +906,12 @@ class TestBackendTakesAClient:
 # ---------------------------------------------------------------------------
 
 
-def _config(**overrides: Any) -> Any:
-    """Return a ``VectorStoreConfig`` for the factory, with *overrides* applied."""
+def _config() -> VectorStoreConfig:
+    """Return a ``VectorStoreConfig`` for the factory."""
     from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE
     from akgentic.tool.vector_store.protocol import VectorStoreConfig
 
-    return VectorStoreConfig(name=VS_ACTOR_NAME, role=VS_ACTOR_ROLE, **overrides)
+    return VectorStoreConfig(name=VS_ACTOR_NAME, role=VS_ACTOR_ROLE)
 
 
 def _two_backends_for_one_cluster() -> tuple[Any, Any]:
@@ -984,7 +985,7 @@ class TestTwoBackendsShareOneClient:
 # ---------------------------------------------------------------------------
 
 
-def _config_carrying_the_removed_connection_keys() -> Any:
+def _config_carrying_the_removed_connection_keys() -> VectorStoreConfig:
     """A ``VectorStoreConfig`` validated from a record that still names a cluster.
 
     ``weaviate_url`` and ``weaviate_api_key`` are not fields any more, so validation drops
