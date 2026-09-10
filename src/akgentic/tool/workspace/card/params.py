@@ -18,7 +18,7 @@ from pydantic import Field, model_validator
 
 from akgentic.core.utils import SerializableBaseModel
 from akgentic.tool.core import COMMAND, LLM_CONTEXT, TOOL_CALL, BaseToolParam, Channels
-from akgentic.tool.sandbox.actor import CardMode
+from akgentic.tool.sandbox.backend import CardMode
 from akgentic.tool.workspace.execution import (
     DEFAULT_EXEC_POLL_ATTEMPTS,
     DEFAULT_EXEC_POLL_DELAY_S,

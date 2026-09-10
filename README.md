@@ -717,9 +717,10 @@ few are not. A plan, a knowledge graph and a vector index are **shared, mutable 
 any single tool call**, and the framework gives that state a home — a **tool actor**, one per team,
 that every agent carrying the card talks to.
 
-Seven ship in this package today: `#VectorStore`, `#PlanningTool`, `#KnowledgeGraphTool`,
-`#SandboxActor-<scope>/<leaf>`, `#TeamActivity`, `#NotificationTool` and
-`#Workspace-<scope>/<leaf>`.
+Six ship in this package today: `#VectorStore`, `#PlanningTool`, `#KnowledgeGraphTool`,
+`#TeamActivity`, `#NotificationTool` and `#Workspace-<scope>/<leaf>`. The sandbox actor that
+used to sit beside the workspace actor is retired: `#Workspace` owns the tree's exec backend and
+runs commands on its own worker thread, so an exec-enabled team runs two actors, not three.
 
 **`#VectorStore` is the exception among them: it exists only for a backend that keeps its data in
 actor state.** Today that means the in-memory backend. On a cluster the rows live in the cluster,
@@ -727,14 +728,15 @@ so there is nothing for an actor to own and none is created — each consumer ho
 object and calls it directly. Whether the actor exists at all is the backend's answer, read from the
 `persists_in_actor_state` flag on its registered spec, not a card's.
 
-**Note the two names that carry a suffix.** Five of the seven are one per *team*, and their name is
-a constant. The workspace actor and the sandbox actor are one per *workspace tree*, so their names
-are **built** from the workspace's resolved two-segment path — slash included — rather than being
-literals. Two of them can coexist in one team, each owning its own directory, and two *principals*
-whose cards both say `workspace_id="notes"` get two actors over two trees because the name carries
-the scope as well as the leaf. `getChildrenOrCreate` keys on the name, so this is not
-cosmetic: a fixed name would collapse two trees onto one actor, silently. The unicity domain of an
-actor must equal the resource it owns.
+**Note the one name that carries a suffix.** Five of the six are one per *team*, and their name is
+a constant. The workspace actor is one per *workspace tree*, so its name is **built** from the
+workspace's resolved two-segment path — slash included — rather than being a literal. Two of them
+can coexist in one team, each owning its own directory, and two *principals* whose cards both say
+`workspace_id="notes"` get two actors over two trees because the name carries the scope as well as
+the leaf. `getChildrenOrCreate` keys on the name, so this is not cosmetic: a fixed name would
+collapse two trees onto one actor, silently. The unicity domain of an actor must equal the resource
+it owns — and the exec backend, which serves exactly that tree, is held by the workspace actor
+rather than named and created as an actor of its own.
 
 ### One per team, and what that buys
 
@@ -1777,17 +1779,17 @@ src/akgentic/tool/
         └── tool.py           # WorkspaceTool ToolCard
     sandbox/
         README.md           # The exec backend — backends compared, allowlist, image,
-        │                     #   registering a backend; and the ExecTool migration note
-        __init__.py           # Public exports: SandboxActor subclasses, models, the registry;
+        │                     #   registering a backend; the ExecTool and sandbox-actor migrations
+        __init__.py           # Public exports: the four backends, the Protocol, the registry;
         │                     #   refuses `ExecTool` by name with a pointer to workspace_exec
-        actor.py              # SandboxActor (abstract), SandboxConfig, ALLOWED_COMMANDS,
-        │                     #   sandbox_actor_name() — the name carries the workspace
-        local.py              # LocalSandboxActor (subprocess, resource limits)
-        docker.py             # DockerSandboxActor (persistent container per team)
-        seatbelt.py           # SeatbeltSandboxActor (macOS Apple Seatbelt)
-        bwrap.py              # BwrapSandboxActor (Linux bubblewrap)
-        registry.py           # SANDBOX_ACTOR_CLASSES registry, auto-mode probing
-        └── sandbox.Dockerfile # Bundled image definition for akgentic-sandbox:latest
+        backend.py            # SandboxBackend (Protocol), ProcessBackend (the Popen dance, once),
+        │                     #   ExecResult, ExecReport, ALLOWED_COMMANDS, validate_command()
+        local.py              # LocalBackend (subprocess, resource limits, process group)
+        docker.py             # DockerBackend (ephemeral read-only container per workspace tree)
+        seatbelt.py           # SeatbeltBackend (macOS Apple Seatbelt)
+        bwrap.py              # BwrapBackend (Linux bubblewrap)
+        registry.py           # SANDBOX_BACKEND_CLASSES registry, auto-mode probing
+        └── sandbox.Dockerfile # Bundled image definition for akgentic-sandbox:v2
 tests/                        # Tests organised by domain
 ```
 

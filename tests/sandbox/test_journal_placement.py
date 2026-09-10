@@ -11,6 +11,10 @@ root and nothing above or beside it. These tests put a journal directory next to
 the tree and confirm it appears in no constructed argument and no rendered
 policy — a regression guard, so that a later "just mount the parent"
 convenience cannot destroy a team's history silently.
+
+The placement rule is a property of the **mount**, so every spec here drives a
+backend directly: the argv is built inside the strategy and there is no actor
+in front of it.
 """
 
 from __future__ import annotations
@@ -21,11 +25,11 @@ from typing import Any
 
 import pytest
 
-from akgentic.tool.sandbox.actor import ALLOWED_COMMANDS, SandboxConfig, SandboxState
-from akgentic.tool.sandbox.bwrap import BwrapSandboxActor
-from akgentic.tool.sandbox.docker import DockerSandboxActor
-from akgentic.tool.sandbox.local import LocalSandboxActor
-from akgentic.tool.sandbox.seatbelt import SeatbeltSandboxActor
+from akgentic.tool.sandbox.backend import ALLOWED_COMMANDS
+from akgentic.tool.sandbox.bwrap import BwrapBackend
+from akgentic.tool.sandbox.docker import DockerBackend
+from akgentic.tool.sandbox.local import LocalBackend
+from akgentic.tool.sandbox.seatbelt import SeatbeltBackend
 from akgentic.tool.workspace.journal import git_dir_for
 
 
@@ -40,31 +44,36 @@ def tree_with_journal(tmp_path: Path) -> Path:
     return root
 
 
+def fake_popen(seen: list[list[str]]) -> Any:
+    """Return a ``Popen`` stand-in that records its argv into *seen*."""
+
+    def spawn(argv: list[str], *args: Any, **kwargs: Any) -> Any:
+        seen.append(list(argv))
+        return SimpleNamespace(
+            communicate=lambda timeout=None: ("", ""),
+            returncode=0,
+            kill=lambda: None,
+            pid=4242,
+        )
+
+    return spawn
+
+
 def captured_argv(
-    actor_class: type[Any], root: Path, monkeypatch: pytest.MonkeyPatch
+    backend_class: type[Any], root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> list[str]:
-    """Run one command through *actor_class* and return the argv it built."""
-    actor = actor_class()
-    actor.config = SandboxConfig(
-        name="#SandboxActor",
-        role="ToolActor",
-        team_id="team-1",
-        workspace_path="team-1",
-    )
-    actor.state = SandboxState()
-    actor.state.observer(actor)
-    actor.state.workspace_path = root
-    actor.state.container_name = "sandbox-team-1"
+    """Run one command through a *backend_class* rooted at *root* and return its argv."""
+    backend = backend_class()
+    backend.workspace_path = root
 
     seen: list[list[str]] = []
 
-    def fake_run(argv: list[str], *args: Any, **kwargs: Any) -> Any:
-        seen.append(list(argv))
-        return SimpleNamespace(stdout="", stderr="", returncode=0)
-
-    module = actor_class.__module__.rsplit(".", 1)[-1]
-    monkeypatch.setattr(f"akgentic.tool.sandbox.{module}.subprocess.run", fake_run)
-    actor._exec("echo hi", "", 1.0)
+    # One target for all: the argv is built per backend but spawned in the one
+    # place ``ProcessBackend`` starts a process from.
+    monkeypatch.setattr(
+        "akgentic.tool.sandbox.backend.subprocess.Popen", fake_popen(seen)
+    )
+    backend.exec("echo hi", "", 1.0)
     assert len(seen) == 1
     return seen[0]
 
@@ -73,7 +82,7 @@ class TestTheJournalIsOutsideEveryMount:
     def test_bwrap_binds_the_root_and_nothing_beside_it(
         self, tree_with_journal: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        argv = captured_argv(BwrapSandboxActor, tree_with_journal, monkeypatch)
+        argv = captured_argv(BwrapBackend, tree_with_journal, monkeypatch)
 
         assert argv[argv.index("--bind") + 1] == str(tree_with_journal)
         assert str(git_dir_for(tree_with_journal)) not in argv
@@ -82,22 +91,14 @@ class TestTheJournalIsOutsideEveryMount:
     def test_docker_mounts_the_root_and_nothing_beside_it(
         self, tree_with_journal: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # The volume is built in _start_sandbox, so it is asserted there rather
-        # than on the exec argv.
-        actor = DockerSandboxActor()
-        actor.config = SandboxConfig(
-            name="#SandboxActor",
-            role="ToolActor",
-            team_id=tree_with_journal.name,
-            workspace_path=tree_with_journal.name,
-        )
-        actor.state = SandboxState()
-        actor.state.observer(actor)
+        # The volume is built in start(), so it is asserted there rather than
+        # on the exec argv.
+        backend = DockerBackend(tree_with_journal.name)
         monkeypatch.setenv("AKGENTIC_WORKSPACES_ROOT", str(tree_with_journal.parent))
         monkeypatch.setattr(
             "akgentic.tool.sandbox.docker.shutil.which", lambda _cmd: "/usr/bin/docker"
         )
-        monkeypatch.setattr(DockerSandboxActor, "_ensure_image", lambda _self: None)
+        monkeypatch.setattr(DockerBackend, "_ensure_image", lambda _self: None)
 
         seen: list[list[str]] = []
 
@@ -106,7 +107,7 @@ class TestTheJournalIsOutsideEveryMount:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
 
         monkeypatch.setattr("akgentic.tool.sandbox.docker.subprocess.run", fake_run)
-        actor._start_sandbox()
+        backend.start(tree_with_journal.name)
 
         run_argv = seen[-1]
         volume = run_argv[run_argv.index("-v") + 1]
@@ -117,16 +118,8 @@ class TestTheJournalIsOutsideEveryMount:
         self, tree_with_journal: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         rendered: list[str] = []
-        actor = SeatbeltSandboxActor()
-        actor.config = SandboxConfig(
-            name="#SandboxActor",
-            role="ToolActor",
-            team_id="team-1",
-            workspace_path="team-1",
-        )
-        actor.state = SandboxState()
-        actor.state.observer(actor)
-        actor.state.workspace_path = tree_with_journal
+        backend = SeatbeltBackend()
+        backend.workspace_path = tree_with_journal
 
         import tempfile  # noqa: PLC0415
 
@@ -147,10 +140,15 @@ class TestTheJournalIsOutsideEveryMount:
             "akgentic.tool.sandbox.seatbelt.tempfile.NamedTemporaryFile", capturing_named
         )
         monkeypatch.setattr(
-            "akgentic.tool.sandbox.seatbelt.subprocess.run",
-            lambda *a, **k: SimpleNamespace(stdout="", stderr="", returncode=0),
+            "akgentic.tool.sandbox.backend.subprocess.Popen",
+            lambda *a, **k: SimpleNamespace(
+                communicate=lambda timeout=None: ("", ""),
+                returncode=0,
+                kill=lambda: None,
+                pid=4242,
+            ),
         )
-        actor._exec("echo hi", "", 1.0)
+        backend.exec("echo hi", "", 1.0)
 
         policy = rendered[0]
         assert f'(allow file-write* (subpath "{tree_with_journal}"))' in policy
@@ -161,11 +159,11 @@ class TestTheJournalIsOutsideEveryMount:
     def test_local_provides_no_isolation_and_this_test_says_so(
         self, tree_with_journal: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Stated rather than pretended: LocalSandboxActor runs a plain
-        # subprocess with a cwd, so the journal beside the tree is reachable
-        # from it exactly as any other path on the host is. It is a development
+        # Stated rather than pretended: LocalBackend runs a plain subprocess
+        # with a cwd, so the journal beside the tree is reachable from it
+        # exactly as any other path on the host is. It is a development
         # convenience, not a boundary, and the class docstring says so.
-        argv = captured_argv(LocalSandboxActor, tree_with_journal, monkeypatch)
+        argv = captured_argv(LocalBackend, tree_with_journal, monkeypatch)
 
         assert argv == ["echo", "hi"]
 

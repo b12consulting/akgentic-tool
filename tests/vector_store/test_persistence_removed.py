@@ -20,10 +20,12 @@ from akgentic.tool.vector_store.protocol import VectorStoreParam
 # deleted mode never reached.
 GLOBALLY_RETIRED_NAMES = ("persistence", "save_collection", "load_collection")
 
-# ``workspace_path`` cannot be swept that widely: ``sandbox/`` declares
-# ``SandboxState.workspace_path`` (``sandbox/actor.py``), an unrelated field meaning a
-# sandbox directory on the host, and uses it in ``seatbelt.py`` / ``bwrap.py`` /
-# ``local.py``. It is swept only in the three packages the deleted mode reached.
+# ``workspace_path`` cannot be swept that widely: ``sandbox/`` declares a
+# ``workspace_path`` attribute on ``LocalBackend``, ``BwrapBackend`` and
+# ``SeatbeltBackend`` (``sandbox/local.py`` / ``bwrap.py`` / ``seatbelt.py``), an
+# unrelated name meaning the sandbox directory on the host, and ``workspace/``
+# carries the resolved two-segment path under the same name. It is swept only in
+# the three packages the deleted mode reached.
 SCOPED_PACKAGES = ("vector_store", "knowledge_graph", "planning")
 SCOPED_RETIRED_NAMES = ("workspace_path",)
 
@@ -84,8 +86,11 @@ class TestNoReferenceSurvivesInSource:
         # Stripping strings must not have emptied the source of real code.
         assert "create_collection" in joined
         assert "VectorStoreParam" in joined
-        # And the wide sweep really does reach outside the three packages.
-        assert "SandboxState" in joined
+        # And the wide sweep really does reach outside the three packages. The
+        # canary is a class that lives in ``sandbox/backend.py`` and nowhere the
+        # scoped sweep reads; deleting this line, or letting the canary go with
+        # its module, would let every assertion below pass over an empty sweep.
+        assert "ProcessBackend" in joined
 
     @pytest.mark.parametrize("name", GLOBALLY_RETIRED_NAMES)
     def test_globally_retired_name_is_absent_from_the_whole_package(self, name: str) -> None:

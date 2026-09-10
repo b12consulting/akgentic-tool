@@ -70,6 +70,7 @@ import contextlib
 import logging
 import time
 from collections import OrderedDict, deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -82,6 +83,7 @@ from akgentic.tool.workspace.edit import EditMatcher
 from akgentic.tool.workspace.execution import (
     ExecConfig,
     ExecOutcome,
+    ExecRunner,
     QueuedExec,
     RunningExec,
 )
@@ -226,6 +228,18 @@ class WorkspaceActor(
         self._touched: list[str] = []
         self._matcher = EditMatcher()
         self._exec_config: ExecConfig | None = None
+        self._runner: ExecRunner | None = None
+        # One worker, unconditionally, for every workspace whether or not exec is
+        # enabled. ``ThreadPoolExecutor`` spawns no thread until the first
+        # ``submit``, so a workspace that never runs a command pays for the object
+        # and nothing else — which is what makes the branch-free version correct
+        # rather than merely tidy. One worker per tree is also what preserves the
+        # serialisation the lease already guarantees: the tree admits one run at a
+        # time, so a second worker could only ever idle.
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"exec-{self.config.workspace_path}"
+        )
+        self._pending: Future[None] | None = None
         self._running: RunningExec | None = None
         self._queue: deque[QueuedExec] = deque()
         self._run_errors: OrderedDict[str, str] = OrderedDict()
@@ -303,29 +317,26 @@ class WorkspaceActor(
         )
 
     def on_stop(self) -> None:
-        """Drop everything still waiting for the tree, then chain to the base.
+        """Take exec down in its stated order, then chain to the base.
 
-        A queued entry never ran, was never sent anywhere and produced nothing,
-        so there is nothing to report and nothing to wait for — dropping it is
-        free. The running head is a different matter and is deliberately left
-        alone: it is on the sandbox, and the sandbox is the only thing that can
-        hold teardown open — for one run's budget, because the budget reaches the
-        subprocess. That is what bounds stop no matter how deep the queue got —
-        three queued fifteen-second runs are forty-five seconds of work but never
-        more than one run's worth of it.
+        The four steps and the reasoning behind their order live in
+        :meth:`~akgentic.tool.workspace.actor.execution.ExecMixin._teardown_exec`,
+        beside the exec code they tear down: cancel the queued runs, kill the
+        running subprocess, drain the worker under a bound, release the backend.
 
-        Nothing here may raise past ``super()``: leaving a Pykka actor part-way
-        stopped is worse than any error this could report, which is why the clear
-        is wrapped exactly as ``SandboxActor.on_stop`` wraps its own teardown.
+        **A run in flight is no longer left alone.** It used to be, because it
+        was on a second actor and its own budget was the only thing that could
+        end it. It is now on this actor's own worker, and the tree it is writing
+        to is this actor's, so a team that stops must not leave a command running
+        in it. What bounds teardown is therefore the kill plus
+        :data:`~akgentic.tool.workspace.execution.EXEC_SHUTDOWN_GRACE_S`, rather
+        than one run's full budget.
+
+        Nothing there may raise past ``super()``: leaving a Pykka actor part-way
+        stopped is worse than any error a step could report, which is why every
+        step is wrapped individually.
         """
-        try:
-            self._queue.clear()
-        except Exception:
-            logger.warning(
-                "Workspace %s: clearing the exec queue raised during on_stop — swallowing",
-                self.config.workspace_path,
-                exc_info=True,
-            )
+        self._teardown_exec()
         super().on_stop()
 
     ##

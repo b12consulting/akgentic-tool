@@ -10,50 +10,51 @@ This module holds everything exec needs that is not the gate itself: the models
 crossing the actor boundary, the budgets, and the one formatter ``workspace_exec``
 renders through.
 
-**The blocking call happens on ``#SandboxActor``'s own thread**, which is the
-thread it was always going to happen on. ``#Workspace`` hands the sandbox one
-command at a time and goes back to draining its mailbox; the sandbox tells the
-answer back. There is no worker in between — a worker only ever sat in an ``ask``
-waiting for that same subprocess, and the cost of it was two lifetimes and three
-clocks to keep in agreement.
+**The blocking call happens on ``#Workspace``'s own single worker thread**, and
+:class:`ExecRunner` is what owns it. ``#Workspace`` submits one command at a time
+and goes back to draining its mailbox; the worker tells the answer back to
+``#Workspace`` itself. There is no second actor and no ``#defer-`` worker in
+between — the worker only ever sat in an ``ask`` waiting for that same
+subprocess, and the second actor cost a lifetime, a registry entry and a liveness
+check to keep in agreement with this one.
 
 **The module is named ``execution``, not ``exec``.** ``exec`` is a builtin, and a
 module of that name shadows it at every import site in the package.
 
 **This is where ``workspace/`` starts importing ``sandbox/``.** The two were
 independent until the card surfaces merged, and the edge is now structural:
-``#Workspace`` builds the sandbox's config here and sends it an ``ExecRequest``
+``#Workspace`` builds its backend here and reports through an ``ExecReport``
 defined there. It is one-directional — ``workspace`` → ``sandbox``, never back —
 and inside one package. Keep it that way: an import in the other direction makes
-the pair a cycle, which is also why the request and the report models live on
-the sandbox side.
+the pair a cycle, which is also why the report model lives on the sandbox side.
 """
 
 from __future__ import annotations
 
 import logging
+import subprocess
 import time
 from collections.abc import Callable
 from enum import StrEnum
 from uuid import uuid4
 
-from pydantic import PrivateAttr, model_validator
+from pydantic import model_validator
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.utils.serializer import SerializableBaseModel
-from akgentic.tool.sandbox.actor import (
-    SANDBOX_ACTOR_ROLE,
+from akgentic.tool.sandbox.backend import (
     CardMode,
-    SandboxActor,
-    SandboxConfig,
+    ExecReport,
+    ExecResult,
+    SandboxBackend,
     SandboxMode,
-    sandbox_actor_name,
+    validate_command,
 )
 
 logger = logging.getLogger(__name__)
 
 ##
-## ``SandboxMode`` and ``CardMode`` are defined in ``sandbox.actor`` and used
+## ``SandboxMode`` and ``CardMode`` are defined in ``sandbox.backend`` and used
 ## here as they are: a resolved backend and a card's request are the same two
 ## vocabularies on both sides of the merge, and a second definition would be a
 ## second place to register a backend in.
@@ -73,15 +74,16 @@ MAX_EXEC_BUDGET_S = 20.0
 """The ceiling every run budget is clamped to, whatever a card asks for.
 
 **What it bounds is a teardown, not a command.** The subprocess runs on
-``#SandboxActor``'s own thread, and a Python thread cannot be cancelled — so the
-orchestrator's ``stop_children(blocking=True)`` is held open for as long as the
-command runs. The backstop on that stop is 30 s, so a run allowed past 20 s is a
-team that cannot be shut down inside its own backstop.
+``#Workspace``'s single worker thread, and a Python thread cannot be cancelled —
+so a command that ignores the kill teardown sends it holds the actor's bounded
+drain open for as long as it runs, and past that the orchestrator's
+``stop_children(blocking=True)``. The backstop on that stop is 30 s, so a run
+allowed past 20 s is a team that cannot be shut down inside its own backstop.
 
-The number is the one the retired ``#defer-`` worker used, and it is unchanged on
-purpose: the constraint never belonged to the worker. A thread that cannot be
-cancelled holds the blocking stop open whether it is a worker's thread or the
-sandbox's, so the ceiling below the backstop is still owed and only its owner has
+The number is the one the retired ``#defer-`` worker used, and then the retired
+sandbox actor, and it is unchanged on purpose: the constraint never belonged to
+either. A thread that cannot be cancelled holds the blocking stop open whoever
+owns it, so the ceiling below the backstop is still owed and only its owner has
 changed. Every budget arithmetic, README figure and existing spec therefore reads
 the same.
 """
@@ -192,27 +194,42 @@ the backend has killed the child, so the release is not a race against a live
 writer — and the late report that may still arrive commits nothing and clears
 nothing, because by then the tree may hold somebody else's work.
 
-Measured from the moment the run actually started, which is the moment the
-request was sent: resolving the sandbox is one orchestrator turn and a thread
-start, so nothing slow sits between admission and the command any more. A cold
-container backend spends its provisioning inside the sandbox's own ``on_start``,
-where the request waits in the mailbox rather than against this clock.
+Measured from the moment the run actually started, which is the moment the work
+was submitted: a submit onto an idle single-worker executor is O(1), so nothing
+slow sits between admission and the command. A cold container backend spends its
+provisioning inside the worker's own lazy ``start()``, which is inside the run
+this clock is measuring — deliberately, because that provisioning is time the
+command really does take.
 """
 
-SANDBOX_RESOLVE_TIMEOUT_S = 5
-"""Seconds ``#Workspace`` will wait for the orchestrator to hand back the sandbox.
+EXEC_SHUTDOWN_GRACE_S = 3.0
+"""How long teardown waits for the killed run's worker to return.
 
-An ask made **on the team singleton's own thread**, which is the shape that must
-never be untimed: everything else queued behind it — every read, every mutation,
-every other agent's poll — waits for it. Five is generous rather than tight, since
-what is being waited on is one O(1) orchestrator turn plus a thread start;
-``getChildrenOrCreate`` returns before a cold backend's ``on_start`` has finished,
-so a slow provision is not what this bounds.
+**A bound is owed because ``ThreadPoolExecutor.shutdown`` takes no timeout**, so
+``shutdown(wait=True)`` can wait for ever and the case is reachable:
+``ProcessBackend._run``'s timeout path drains with a second ``communicate()``,
+which reads both pipes to EOF, and a process that inherited them and outlived
+the kill holds that call open. ``kill()`` now signals the child's whole process
+group on ``local`` and ``bwrap``, which closes the ordinary case — a shell's
+forked command — but a process that left the group of its own accord is still
+out of reach, and docker's ``kill()`` never reaches inside the container at all.
+The wait is therefore on the submitted ``Future``, and the shutdown that follows
+it does not wait at all.
 
-On expiry the run **fails with a reason** rather than parking the singleton, which
-is what keeps a wedged orchestrator from taking the workspace with it.
+**Three seconds, and the arithmetic that picks it.** Teardown kills first, and a
+healthy child dies in milliseconds, so this is generous for the case that is not
+wedged. The worst case for the whole of exec teardown is this plus the backend's
+own ``stop()``, and the slowest of those is docker's, which is now a single
+``docker rm -f`` — a forced removal, so it spends none of ``docker stop``'s
+ten-second SIGTERM grace — bounded at ``DOCKER_RM_TIMEOUT_S`` (10 s) because a
+wedged daemon never answers and this runs on the actor's thread. So ~13 s worst
+case, the figure this was originally sized for, comfortably under the
+orchestrator's 30 s stop backstop. If either number changes, state that
+arithmetic again.
 
-Whole seconds because ``proxy_ask`` takes an ``int``.
+What it converts is the failure mode, not the hazard: an unbounded teardown hang
+becomes three seconds of teardown latency. The group kill closed the root cause
+for what a shell forks; the bound stays for what the group cannot reach.
 """
 
 RUN_ID_CHARS = 8
@@ -267,36 +284,17 @@ class RunningExec(SerializableBaseModel):
         agent_id: Who requested the run. Named in every refusal it causes, and
             who the discovered commit is attributed to.
         cmd: The command, kept for the discovered commit's body.
-        started_at: Monotonic clock at the moment the request was sent. The
+        started_at: Monotonic clock at the moment the work was submitted. The
             budget and the grace are both measured from here, and nothing
-            re-bases it: resolving the sandbox costs one orchestrator turn and a
-            thread start, so there is nothing slow left between admission and the
-            command for a fixed clock to mis-measure.
+            re-bases it: a submit onto an idle single-worker executor is O(1), so
+            there is nothing slow left between admission and the command for a
+            fixed clock to mis-measure.
     """
 
     run_id: str
     agent_id: str
     cmd: str
     started_at: float
-
-    _sandbox: ActorAddress | None = PrivateAttr(default=None)
-    """The sandbox performing the run — runtime state, never serialized.
-
-    A ``PrivateAttr`` rather than a field: an address is live actor state, and
-    Golden Rule #1b keeps that out of a model's field set. Travelling *on the
-    run* is what matters, because a second attribute beside ``_running`` would
-    have to be cleared in every place the run is, and the one that got missed
-    would pin a dead sandbox's address onto a live run.
-    """
-
-    def attach(self, sandbox: ActorAddress) -> None:
-        """Record which sandbox is performing this run."""
-        self._sandbox = sandbox
-
-    @property
-    def sandbox(self) -> ActorAddress | None:
-        """The sandbox performing this run, or ``None`` if none was attached."""
-        return self._sandbox
 
 
 class ExecStart(SerializableBaseModel):
@@ -592,17 +590,36 @@ def wait_out_the_turn(
         time.sleep(delay)
 
 
-def resolve_mode(mode: CardMode) -> tuple[SandboxMode, type[SandboxActor]]:
+def resolve_mode(mode: CardMode, *, team_id: str = "") -> tuple[SandboxMode, SandboxBackend]:
     """Turn a card's requested mode into a backend, warning where the host has none.
 
     Every wiring goes through this rather than probing for itself — a second
     copy of the probe is a second place for the warning to stop firing.
 
+    **Both halves of the answer have a consumer, and they are different callers.**
+
+    - ``_bind_sandbox`` calls it with the card's mode and uses only the
+      **resolved mode**. It runs no commands, so it drops the instance. What it
+      needs from here is the ``"auto"`` probe and its ``DeprecationWarning``,
+      which must fire at wiring time, in front of the admin who configured the
+      card.
+    - ``#Workspace.configure_exec`` calls it with the already-resolved
+      ``ExecConfig.mode`` and uses the **instance**, which becomes the backend
+      its worker thread runs on. Because that mode is concrete, the probe
+      short-circuits and no second warning fires for one card.
+
+    Constructing a backend is inert — nothing is probed, created or started until
+    ``start()`` — so building one at wiring time and discarding it costs nothing.
+
     Args:
         mode: What the card asked for, possibly ``"auto"``.
+        team_id: The team the backend will run for. Only ``DockerBackend`` reads
+            it, to name its container; the other three accept and ignore it, so
+            that this function has one uniform constructor to call and never a
+            type switch on the mode it has just resolved.
 
     Returns:
-        The resolved mode and its actor class.
+        The resolved mode and a fresh, unstarted backend for it.
 
     Raises:
         KeyError: If *mode* names no registered backend. Deliberately at wiring
@@ -614,7 +631,7 @@ def resolve_mode(mode: CardMode) -> tuple[SandboxMode, type[SandboxActor]]:
     # Resolved at call time through the package, so a backend registered — or a
     # probe replaced — after this module was imported is what gets consulted.
     from akgentic.tool.sandbox import (  # noqa: PLC0415
-        SANDBOX_ACTOR_CLASSES,
+        SANDBOX_BACKEND_CLASSES,
         _resolve_auto_mode,
     )
 
@@ -622,45 +639,172 @@ def resolve_mode(mode: CardMode) -> tuple[SandboxMode, type[SandboxActor]]:
     if mode == "auto" and resolved == "local":
         warnings.warn(
             "sandbox mode='auto': no isolation backend found (bwrap, sandbox-exec, "
-            "docker). Falling back to LocalSandboxActor — no filesystem isolation.",
+            "docker). Falling back to LocalBackend — no filesystem isolation.",
             DeprecationWarning,
             stacklevel=3,
         )
-    return resolved, SANDBOX_ACTOR_CLASSES[resolved]
+    return resolved, SANDBOX_BACKEND_CLASSES[resolved](team_id=team_id)
 
 
-def sandbox_config(config: ExecConfig) -> SandboxConfig:
-    """Build the sandbox actor's configuration — in one place, for both callers.
+class ExecRunner:
+    """One backend, one tree, and the body the worker thread runs.
 
-    ``getChildrenOrCreate`` keys on the actor **name**, so a config that differs
-    in name creates a *second* actor per run instead of resolving the existing
-    one; a config that differs in ``workspace_path`` would point the reused actor
-    at the wrong directory. The card builds one at wiring time and ``#Workspace``
-    builds one per run, and the two must be identical — so they are built here
-    rather than twice by hand.
+    **Thread ownership is the whole reason this class exists**, and it is stated
+    rather than enforced because there is nothing to enforce it with:
 
-    **The name carries the workspace**, exactly as ``#Workspace-<workspace>``
-    does. A constant name resolved two exec-capable cards on two workspaces onto
-    the first actor, so one agent's commands ran in the other's tree while its
-    own ``#Workspace`` gated an untouched one — see :func:`sandbox_actor_name`.
+    - :meth:`perform` runs on ``#Workspace``'s single executor worker and touches
+      nothing but this object. It is a plain method on a plain object rather than
+      a closure over the actor, so the worker has no path to actor state at all —
+      which is the exact race the mailbox exists to prevent, and one no test would
+      catch until it had corrupted a run.
+    - :meth:`kill` and :meth:`stop` are called from the **actor's** thread during
+      teardown, and are the only two methods that may be.
 
-    **Nothing is derived here.** The path arrives already resolved from the card
-    that built the ``ExecConfig``, and both the name and the directory are taken
-    from that one value, so the two cannot disagree.
+    **No lock guards the backend, and none is owed.** Only the single worker ever
+    calls ``start()`` or ``exec()``, so the one-worker executor is the lock, one
+    level below where the mailbox is. ``kill()`` and ``stop()`` do cross threads,
+    and :class:`~akgentic.tool.sandbox.backend.ProcessBackend` guards its own
+    handle for exactly that reason.
 
-    Args:
-        config: The card's resolved backend, team and workspace path.
-
-    Returns:
-        The configuration for ``#SandboxActor-<workspace>``.
+    Attributes:
+        backend: The strategy commands run on. Read by teardown and by specs;
+            never swapped after construction.
+        workspace_path: The already-resolved two-segment tree this runner's
+            backend is started on. One runner is anchored to one tree for its
+            whole life — a runner whose tree could change is a backend that
+            could open a directory other than the one its ``#Workspace`` gates.
     """
-    return SandboxConfig(
-        name=sandbox_actor_name(config.workspace_path),
-        role=SANDBOX_ACTOR_ROLE,
-        team_id=config.team_id,
-        workspace_path=config.workspace_path,
-        mode=config.mode,
-    )
+
+    def __init__(self, backend: SandboxBackend, workspace_path: str) -> None:
+        self.backend = backend
+        self.workspace_path = workspace_path
+        self._started = False
+
+    def perform(
+        self,
+        *,
+        run_id: str,
+        cmd: str,
+        cwd: str,
+        timeout_s: float,
+        reply_to: ActorAddress,
+    ) -> None:
+        """WORKER THREAD ONLY. Run one command and **always** report it.
+
+        Every exit builds a report, because a run whose report is dropped holds
+        the tree until the gate's grace releases it — and because the ``Future``
+        this returns onto is never read, so an exception escaping here would
+        surface nowhere at all.
+
+        The three outcomes are three different things to the agent waiting: a
+        command that ran is a result whatever it exited with; a command the
+        budget killed is an answer that says so; anything else — the backend
+        raised, the allowlist refused the binary, the quotes would not balance —
+        is a failure with the reason in it.
+
+        Args:
+            run_id: The run being performed, echoed into the report.
+            cmd: The command string, exactly as the agent gave it.
+            cwd: Working directory below the workspace root.
+            timeout_s: Wall-clock budget, already clamped by the caller.
+            reply_to: ``#Workspace``'s own address, captured on the actor's
+                thread at submit time. Never read from the actor here.
+        """
+        report: ExecReport | None = None
+        try:
+            result = self._exec(cmd, cwd, timeout_s)
+            report = ExecReport(run_id=run_id, result=result)
+        except subprocess.TimeoutExpired:
+            report = ExecReport(run_id=run_id, timed_out=True)
+        except Exception as exc:  # noqa: BLE001 — every failure is an answer, never a crash
+            # ``or repr(exc)`` is load-bearing, not defensive. ``str(exc)`` is
+            # the empty string for any exception raised with no message —
+            # ``raise RuntimeError()`` — and an empty ``error`` fails
+            # ``ExecReport``'s exactly-one validator, so the report that was
+            # meant to carry the failure raises *inside this except clause* and
+            # is lost onto a future nobody reads. ``repr`` always names the type.
+            report = ExecReport(run_id=run_id, error=str(exc) or repr(exc))
+        finally:
+            if report is None:
+                # Reachable only if building one of the reports above raises,
+                # which the ``or repr(exc)`` overhead is there to stop — so this
+                # is the branch for the exit nothing thought of. Kept rather
+                # than argued: a run whose report is dropped holds the tree
+                # until the gate's grace releases it.
+                report = ExecReport(
+                    run_id=run_id, error="The sandbox produced no report for this run."
+                )
+            try:
+                reply_to.tell(report)
+            except Exception:
+                # The address this reports to is ``#Workspace`` itself, which may
+                # already be part-way through its own ``on_stop``.
+                # ``ActorAddress.tell`` raises synchronously on a dead address, and
+                # a stopping workspace is nobody to report to — not a reason to
+                # lose the report with no log line.
+                logger.warning(
+                    "Workspace %s could not report run %s to %s — swallowing",
+                    self.workspace_path,
+                    run_id,
+                    reply_to.name,
+                    exc_info=True,
+                )
+
+    def _exec(self, cmd: str, cwd: str, timeout_s: float) -> ExecResult:
+        """WORKER THREAD ONLY. Start the backend if it is cold, then run *cmd*.
+
+        **``start()`` is lazy, and that is a decision rather than an
+        optimisation.** ``DockerBackend.start`` runs ``docker build``, which can
+        take minutes; ``configure_exec`` runs on the team singleton's own thread,
+        where every read, every mutation and every journal call in the team is
+        serialised behind it. The container is created on the first command, not
+        at bind time, and a workspace that never runs one provisions nothing.
+
+        **The flag is set only after ``start()`` returns**, so a daemon that was
+        down is retried by the next run. That costs a failing probe per run in a
+        broken deployment, and is the honest trade against a latched failure
+        that would need a restart to clear.
+
+        **The allowlist is checked before the start, and the cost it saves is
+        real.** Every backend also checks it inside its own ``exec``, which is
+        what actually enforces it and is not being moved. But the check that
+        happens *here* is what stops a command that will be refused from
+        provisioning first: on a cold docker backend, ``start()`` builds an image
+        and creates a container, and doing that for a command the very next line
+        rejects is minutes of work thrown away. Both raises land in
+        :meth:`perform`'s failure branch and reach the agent as the same report,
+        so validating twice changes no answer — only what was spent reaching it.
+        """
+        validate_command(cmd)
+        if not self._started:
+            self.backend.start(self.workspace_path)
+            self._started = True
+        return self.backend.exec(cmd, cwd, timeout_s)
+
+    def kill(self) -> None:
+        """ACTOR THREAD ONLY, at teardown step 2. End the run in flight.
+
+        Best-effort and idempotent, because the backend's is: with no run in
+        flight there is nothing to signal, and a child that has already exited
+        is what the caller wanted anyway. On ``local`` and ``bwrap`` the signal
+        reaches the child's whole process group, so a shell's forked command
+        dies with the shell.
+        """
+        self.backend.kill()
+
+    def stop(self) -> None:
+        """ACTOR THREAD ONLY, at teardown step 4. Release the backend.
+
+        **This may run while the worker is still inside ``exec``**, and at
+        teardown that is the right answer rather than a violation of the
+        ordering the normal path protects. For docker, **removing the container
+        is the only thing that ends the process inside it** — ``kill()`` reaches
+        the local ``docker exec`` client and no further — so a bounded drain that
+        gave up must still be followed by this, and the container going away is
+        what bounds the abandoned process's life. For the three local backends
+        ``_release()`` is a no-op, so the case does not arise.
+        """
+        self.backend.stop()
 
 
 def format_outcome(outcome: ExecOutcome, run_id: str = "") -> str:

@@ -1,17 +1,24 @@
-"""LocalSandboxActor — subprocess-based sandbox for local filesystem execution."""
+"""LocalBackend — subprocess-based sandbox for local filesystem execution.
+
+A plain strategy, built by ``resolve_mode`` and owned by ``#Workspace``'s
+``ExecRunner``; no actor stands between the workspace and the process.
+"""
 
 from __future__ import annotations
 
 import logging
 import os
 import resource
-import shlex
-import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
 
-from akgentic.tool.sandbox.actor import DEFAULT_BACKEND_TIMEOUT_S, ExecResult, SandboxActor
+from akgentic.tool.sandbox.backend import (
+    DEFAULT_BACKEND_TIMEOUT_S,
+    ExecResult,
+    ProcessBackend,
+    validate_command,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +87,10 @@ def _make_preexec(cpu_s: int = 30, mem_mb: int = 512, fsize_mb: int = 100) -> Ca
     - ``RLIMIT_FSIZE``: Maximum file size in bytes
 
     Also calls ``os.setpgrp()`` to put the child process into a new process group,
-    so that a timeout can kill the entire subtree.
+    so that a timeout or a ``kill()`` can end the entire subtree. **The group
+    is only signalled where the backend says it exists**: every ``_run`` call
+    that passes this callable must pass ``process_group=True`` beside it, or the
+    group is created and never used.
     """
 
     def preexec() -> None:
@@ -88,57 +98,54 @@ def _make_preexec(cpu_s: int = 30, mem_mb: int = 512, fsize_mb: int = 100) -> Ca
         if sys.platform != "darwin":
             resource.setrlimit(resource.RLIMIT_AS, (mem_mb * 1024**2, mem_mb * 1024**2))
         resource.setrlimit(resource.RLIMIT_FSIZE, (fsize_mb * 1024**2, fsize_mb * 1024**2))
-        os.setpgrp()  # new process group → timeout kills entire subtree
+        os.setpgrp()  # new process group → a timeout or kill() ends the entire subtree
 
     return preexec
 
 
-class LocalSandboxActor(SandboxActor):
-    """Subprocess-based sandbox actor for local filesystem execution.
+class LocalBackend(ProcessBackend):
+    """Subprocess-based sandbox for local filesystem execution.
 
     Creates and manages the workspace directory at
-    ``<AKGENTIC_WORKSPACES_ROOT>/{config.workspace_path}/`` (default root:
+    ``<AKGENTIC_WORKSPACES_ROOT>/{workspace_path}/`` (default root:
     ``./workspaces``) — the path the card already resolved, joined and never
     re-derived, so the directory is by construction the one the card, the write
     gate and the journal are working on. No Docker daemon required.
 
-    This actor does NOT provide filesystem isolation — an allowed command can still
-    read files outside the workspace. It is a development convenience only, not a
-    production security boundary.
+    This backend does NOT provide filesystem isolation — an allowed command can
+    still read files outside the workspace. It is a development convenience only,
+    not a production security boundary.
     """
 
-    def _start_sandbox(self) -> None:
+    def __init__(self, team_id: str = "") -> None:
+        super().__init__(team_id)
+        self.workspace_path: Path | None = None
+        """The resolved host directory, set by :meth:`start`."""
+
+    def start(self, workspace_path: str) -> None:
+        """Join *workspace_path* to the workspaces root and create the directory."""
         base = os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
-        workspace_path = Path(base) / self.config.workspace_path
-        workspace_path.mkdir(parents=True, exist_ok=True)
-        self.state.workspace_path = workspace_path.resolve()
-        self.state.notify_state_change()
+        resolved = Path(base) / workspace_path
+        resolved.mkdir(parents=True, exist_ok=True)
+        self.workspace_path = resolved.resolve()
         logger.debug(
-            "LocalSandboxActor started: workspace=%s (no filesystem isolation)",
-            self.state.workspace_path,
+            "LocalBackend started: workspace=%s (no filesystem isolation)",
+            self.workspace_path,
         )
 
-    def _stop_sandbox(self) -> None:
-        logger.debug("LocalSandboxActor stopped.")
-
-    def _exec(self, cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
-        assert self.state.workspace_path is not None
-        effective_cwd = self.state.workspace_path / cwd if cwd else self.state.workspace_path
-        logger.debug("LocalSandboxActor exec: cmd=%r cwd=%s", cmd, effective_cwd)
+    def exec(self, cmd: str, cwd: str = "", timeout: float | None = None) -> ExecResult:
+        """Run *cmd* as a plain subprocess rooted at the workspace."""
+        assert self.workspace_path is not None
+        effective_cwd = self.workspace_path / cwd if cwd else self.workspace_path
+        logger.debug("LocalBackend exec: cmd=%r cwd=%s", cmd, effective_cwd)
         try:
-            result = subprocess.run(
-                shlex.split(cmd),
+            return self._run(
+                validate_command(cmd),
                 cwd=str(effective_cwd),
-                capture_output=True,
-                text=True,
                 timeout=DEFAULT_BACKEND_TIMEOUT_S if timeout is None else timeout,
                 preexec_fn=_make_preexec(),
+                process_group=True,
                 env=_make_sandbox_env(),
-            )
-            return ExecResult(
-                stdout=result.stdout,
-                stderr=result.stderr,
-                exit_code=result.returncode,
             )
         except FileNotFoundError:
             return ExecResult(
@@ -146,3 +153,7 @@ class LocalSandboxActor(SandboxActor):
                 stderr=f"Working directory not found: {cwd or '.'}",
                 exit_code=1,
             )
+
+    def _release(self) -> None:
+        """Nothing to release: the workspace directory outlives the backend."""
+        logger.debug("LocalBackend stopped.")

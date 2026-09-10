@@ -11,7 +11,7 @@ from akgentic.tool import WorkspaceTool
 | | |
 |---|---|
 | Module | `akgentic.tool.workspace.tool` |
-| Actor | `#Workspace-<scope>/<leaf>` — the **resolved two-segment path**, slash included, so two principals' `notes` are two actors over two trees. One singleton per **tree**, not per team. Plus `#SandboxActor-<scope>/<leaf>` when `workspace_exec` is on |
+| Actor | `#Workspace-<scope>/<leaf>` — the **resolved two-segment path**, slash included, so two principals' `notes` are two actors over two trees. One singleton per **tree**, not per team. With `workspace_exec` on it also owns the tree's sandbox backend and the single worker thread that runs commands on it — no second actor |
 | Channels used | `TOOL_CALL` (11 callables, 13 with `workspace_exec`), `COMMAND` (`expand_media_refs`) |
 | Optional extras | `[docs]` for binary reads, `[vision]` for image resizing |
 | Environment | `AKGENTIC_WORKSPACES_ROOT` (default `./workspaces`) |
@@ -111,7 +111,7 @@ majority of `WorkspaceTool()` instances gain no round trip at wiring time.
 `workspace_id` values in one team get **two** actors, each owning its own tree — and so do two
 *principals* whose cards both say `workspace_id="notes"`, because the name carries the scope as well
 as the leaf. A fixed name would collapse them onto one actor owning one of the trees, silently. The
-same rule names the sandbox actor `#SandboxActor-<scope>/<leaf>`.
+sandbox backend needs no name of its own: it is held by the workspace actor whose tree it serves.
 
 **Two teams of the same principal sharing one `workspace_id` get two actors over one tree**, and
 their writes are therefore *not* ordered. They are still *checked*: the gate hashes the live file, so

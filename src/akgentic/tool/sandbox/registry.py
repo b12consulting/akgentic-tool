@@ -1,11 +1,11 @@
 """The sandbox backend registry, and the probe that picks one for ``mode="auto"``.
 
-``SANDBOX_ACTOR_CLASSES`` is the package's extension point: a mutable ``dict`` a
-deployment assigns its own :class:`SandboxActor` subclass into, before any card
-is constructed. ``workspace_exec`` resolves through it **at call time** — when a
-card is wired (``resolve_mode`` in ``workspace/execution.py``) and again on every
-run (``#Workspace``'s sandbox resolution) — so a class registered after this
-module was imported is still found.
+``SANDBOX_BACKEND_CLASSES`` is the package's extension point: a mutable ``dict``
+a deployment assigns its own :class:`SandboxBackend` into, before any card is
+constructed. ``workspace_exec`` resolves through it **at call time** — when a
+card is wired and when ``#Workspace`` builds its runner (both through
+``resolve_mode`` in ``workspace/execution.py``) — so a class registered after
+this module was imported is still found.
 
 Both names are reached through ``akgentic.tool.sandbox``, never through this
 module directly. The package is the documented import surface; this file is
@@ -20,25 +20,31 @@ import shutil
 import subprocess
 from typing import Literal
 
-from akgentic.tool.sandbox.actor import SandboxActor
-from akgentic.tool.sandbox.bwrap import BwrapSandboxActor
-from akgentic.tool.sandbox.docker import DockerSandboxActor
-from akgentic.tool.sandbox.local import LocalSandboxActor
-from akgentic.tool.sandbox.seatbelt import SeatbeltSandboxActor
+from akgentic.tool.sandbox.backend import SandboxBackend
+from akgentic.tool.sandbox.bwrap import BwrapBackend
+from akgentic.tool.sandbox.docker import DockerBackend
+from akgentic.tool.sandbox.local import LocalBackend
+from akgentic.tool.sandbox.seatbelt import SeatbeltBackend
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# SANDBOX_ACTOR_CLASSES — mutable injection window for runtime registration
+# SANDBOX_BACKEND_CLASSES — mutable injection window for runtime registration
 # ---------------------------------------------------------------------------
 
-SANDBOX_ACTOR_CLASSES: dict[str, type[SandboxActor]] = {
-    "local": LocalSandboxActor,
-    "bwrap": BwrapSandboxActor,
-    "seatbelt": SeatbeltSandboxActor,
-    "docker": DockerSandboxActor,
-    # "e2b": E2BSandboxActor  ← injected by akgentic-infra at runtime
+SANDBOX_BACKEND_CLASSES: dict[str, type[SandboxBackend]] = {
+    "local": LocalBackend,
+    "bwrap": BwrapBackend,
+    "seatbelt": SeatbeltBackend,
+    "docker": DockerBackend,
+    # "e2b": E2BBackend  ← injected by akgentic-infra at runtime
 }
+"""The four strategies, under the four mode keys.
+
+The one registry there is. A deployment registering a backend of its own writes
+into it, and an entry under one of the four shipped keys replaces that backend
+for every card naming it — which is what the test suite does at ``local``.
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +81,7 @@ def _resolve_auto_mode() -> Literal["local", "bwrap", "seatbelt", "docker"]:
     4. fallback → ``"local"`` (no filesystem isolation)
 
     Returns:
-        String key matching an entry in SANDBOX_ACTOR_CLASSES.
+        String key matching an entry in SANDBOX_BACKEND_CLASSES.
     """
     if shutil.which("bwrap") is not None:
         logger.debug("_resolve_auto_mode: selected bwrap")

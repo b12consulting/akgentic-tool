@@ -18,8 +18,11 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 import uuid
 from collections.abc import Generator
+from concurrent import futures
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -34,10 +37,10 @@ from akgentic.core.agent import Akgent, AkgentType
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.tool.core import ToolState
-from akgentic.tool.sandbox.actor import ExecRequest, ExecResult, SandboxActor
-from akgentic.tool.sandbox import SANDBOX_ACTOR_CLASSES
+from akgentic.tool.sandbox import SANDBOX_BACKEND_CLASSES
+from akgentic.tool.sandbox.backend import ExecResult, validate_command
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
-from akgentic.tool.workspace.execution import DEFAULT_EXEC_TIMEOUT_S
+from akgentic.tool.workspace.execution import DEFAULT_EXEC_TIMEOUT_S, RunningExec
 from akgentic.tool.workspace.journal import git_dir_for
 from akgentic.tool.workspace.models import MutationOutcome, Observation
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
@@ -211,13 +214,6 @@ class FakeOrchestratorProxy:
         self.create_calls: list[tuple[type[Akgent[Any, Any]], BaseConfig]] = []
         self.live = live
         self._refs: list[Any] = []
-        self.sandbox_sink: Any = None
-        """Where a :class:`SandboxAddress` hands the requests it is told.
-
-        Set by :class:`SandboxHarness` when it installs itself, and ``None``
-        otherwise — the wiring suites resolve sandbox actors without ever
-        sending them anything.
-        """
         self.metadata: Any = None
         """What :meth:`get_metadata` answers — the team's metadata, or ``None``.
 
@@ -226,15 +222,6 @@ class FakeOrchestratorProxy:
         gained no bind-time round trip: :attr:`metadata_calls` stays at zero.
         """
         self.metadata_calls = 0
-
-        self.sandbox_born_dead = False
-        """Hand out sandbox addresses that are already dead.
-
-        The one way to reach "the sandbox is gone at the moment the request is
-        sent": flipping an *existing* address dead does not do it, because the
-        next resolve skips a dead child and creates a live replacement — which
-        is the production behaviour and the point of the skip.
-        """
 
     def getChildrenOrCreate(  # noqa: N802 — mirrors the orchestrator's method name
         self, actor_class: type[Akgent[Any, Any]], config: BaseConfig
@@ -254,12 +241,7 @@ class FakeOrchestratorProxy:
             return address
         actor = actor_class(config=config)
         actor.on_start()
-        if issubclass(actor_class, SandboxActor):
-            sandbox_address = SandboxAddress(config.name, config.role, self)
-            sandbox_address.alive = not self.sandbox_born_dead
-            address = sandbox_address
-        else:
-            address = MockActorAddress(config.name, config.role)
+        address = MockActorAddress(config.name, config.role)
         self.children[config.name] = (address, actor)
         return address
 
@@ -590,10 +572,20 @@ def outcome_of(actor: WorkspaceActor, method: str, *args: Any) -> MutationOutcom
 
 
 ##
-## Exec (29-5) — a fake backend at the ``local`` key, and a worker on a real
+## Exec — a fake **backend** at the ``local`` key, and the actor's own worker
 ## thread.  No docker, no bwrap, no sandbox-exec, and no wall-clock sleeps: a run
 ## is held open by an event and released by the test, so every concurrency
 ## assertion is a handshake with a failure budget rather than a wait.
+##
+## **The injection window is** ``SANDBOX_BACKEND_CLASSES``, the one registry.
+## ``#Workspace`` builds its own backend in ``configure_exec`` and runs it on its
+## own single-worker executor; there is no sandbox actor to resolve, and when
+## there still was one a fake installed at its registry key was installed and
+## never reached — every spec below went green while testing nothing.
+## Injecting the *backend* keeps the whole production path live:
+## ``configure_exec`` → ``resolve_mode`` → the registry → ``ExecRunner`` → the
+## real executor → ``perform``.  Only the four lines that would touch a real
+## process are the fake's.
 ##
 
 
@@ -622,8 +614,34 @@ class SandboxScript:
             output" cannot be asserted at all. A command absent from the map
             falls back to :attr:`stdout`, so every existing test is unaffected.
         raise_with: Raised instead of returning, for the failure path.
+        start_raises: Raised by :meth:`FakeBackend.start` instead of
+            provisioning, for the cold-start failure path. Cleared by a test
+            that wants the retry to succeed.
         timeouts: Every budget the backend was handed, in order.
         commands: Every ``(cmd, cwd)`` it was handed, in order.
+        starts: Every ``workspace_path`` ``start()`` was called with, in order.
+            Its **length** is the whole of the "started once, lazily" assertion.
+        kills: How many times ``kill()`` was called.
+        stops: How many times ``stop()`` was called.
+        kill_raises: Raised by ``kill()`` instead of ending the run, for the
+            "a failing step must not skip the ones after it" path.
+        kill_releases: Whether ``kill()`` ends the blocked run, as a real
+            backend's does. Turned **off** to reproduce the child that ignores
+            the kill, which is what the bounded drain exists for.
+        exec_tail_s: Wall clock ``exec`` spends *after* it is released, before
+            it returns. Zero everywhere except the one spec that asserts a
+            teardown ordering across two threads, where it is what makes the
+            order observable rather than a race.
+        threads: ``("start" | "exec", thread ident)`` for every call, in order.
+            The whole of "no backend call happens on the actor's thread": the
+            identity of the thread is the property, and a name would only be a
+            proxy for it.
+        events: One shared ordered record of everything the backend was asked to
+            do — ``("start", path)``, ``("exec-enter", cmd)``,
+            ``("exec-return", cmd)``, ``("kill",)``, ``("stop",)``. Teardown
+            order is a property of *positions* in this list; the separate
+            counters above answer "how many", which is a different question and
+            cannot express an order at all.
     """
 
     started: threading.Event = field(default_factory=threading.Event)
@@ -635,49 +653,100 @@ class SandboxScript:
     exit_code: int = 0
     stdout_by_cmd: dict[str, str] = field(default_factory=dict)
     raise_with: BaseException | None = None
+    start_raises: BaseException | None = None
     timeouts: list[float | None] = field(default_factory=list)
     commands: list[tuple[str, str]] = field(default_factory=list)
+    starts: list[str] = field(default_factory=list)
+    kills: int = 0
+    stops: int = 0
+    kill_raises: BaseException | None = None
+    kill_releases: bool = True
+    exec_tail_s: float = 0.0
+    threads: list[tuple[str, int]] = field(default_factory=list)
+    events: list[tuple[str, ...]] = field(default_factory=list)
 
 
-class FakeSandboxActor(SandboxActor):
+class FakeBackend:
     """A backend that writes what a test asks for and blocks when a test asks it to.
 
-    Injected into ``SANDBOX_ACTOR_CLASSES`` at the ``local`` key, which the
-    module documents as a mutable injection window. It is a real
-    :class:`SandboxActor` subclass, so it goes through the same
-    ``getChildrenOrCreate`` the production path uses and honours the same
-    allowlist — what it does not do is start a process.
+    Installed at ``SANDBOX_BACKEND_CLASSES["local"]``, which the registry
+    documents as a mutable injection window. It **exposes the four Protocol
+    names** — which is all ``@runtime_checkable`` would check anyway — and
+    honours the same allowlist the four shipped backends do, by calling
+    ``validate_command`` in ``exec`` exactly as they each do. What it does not do
+    is start a process.
+
+    The script is a class attribute rather than a constructor argument because
+    ``resolve_mode`` constructs the backend itself, from the registry, with only
+    a ``team_id`` — which is the production path and the reason this fake is
+    reached at all.
     """
 
     script: ClassVar[SandboxScript] = SandboxScript()
 
-    def _start_sandbox(self) -> None:
+    def __init__(self, team_id: str = "") -> None:
+        self.team_id = team_id
+        self.workspace_path: Path | None = None
+
+    def start(self, workspace_path: str) -> None:
         # Joins the path it was handed and derives nothing, exactly as the four
         # shipped backends do — a fake that still resolved would hide the very
         # thing the shipped ones stopped doing.
-        base = os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
-        root = Path(base) / self.config.workspace_path
-        root.mkdir(parents=True, exist_ok=True)
-        self.state.workspace_path = root.resolve()
-
-    def _stop_sandbox(self) -> None:
-        pass
-
-    def _exec(self, cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
         script = type(self).script
+        script.starts.append(workspace_path)
+        script.threads.append(("start", threading.get_ident()))
+        script.events.append(("start", workspace_path))
+        if script.start_raises is not None:
+            raise script.start_raises
+        base = os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
+        root = Path(base) / workspace_path
+        root.mkdir(parents=True, exist_ok=True)
+        self.workspace_path = root.resolve()
+
+    def exec(self, cmd: str, cwd: str = "", timeout: float | None = None) -> ExecResult:
+        script = type(self).script
+        # Ahead of every recording, so a refused command leaves no trace of
+        # having reached the backend — the same order the four shipped backends
+        # produce by validating while they build their argv.
+        validate_command(cmd)
         script.commands.append((cmd, cwd))
         script.timeouts.append(timeout)
+        script.threads.append(("exec", threading.get_ident()))
+        script.events.append(("exec-enter", cmd))
         script.started.set()
-        assert script.gate.wait(timeout=HANDSHAKE_TIMEOUT_S), "the run was never released"
-        assert self.state.workspace_path is not None
-        for relative, body in script.files_by_cmd.get(cmd, script.files):
-            target = self.state.workspace_path / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(body, encoding="utf-8")
-        if script.raise_with is not None:
-            raise script.raise_with
-        stdout = script.stdout_by_cmd.get(cmd, script.stdout)
-        return ExecResult(stdout=stdout, stderr=script.stderr, exit_code=script.exit_code)
+        try:
+            assert script.gate.wait(timeout=HANDSHAKE_TIMEOUT_S), "the run was never released"
+            if script.exec_tail_s:
+                time.sleep(script.exec_tail_s)
+            assert self.workspace_path is not None
+            for relative, body in script.files_by_cmd.get(cmd, script.files):
+                target = self.workspace_path / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(body, encoding="utf-8")
+            if script.raise_with is not None:
+                raise script.raise_with
+            stdout = script.stdout_by_cmd.get(cmd, script.stdout)
+            return ExecResult(stdout=stdout, stderr=script.stderr, exit_code=script.exit_code)
+        finally:
+            # In a ``finally`` because "the worker left ``exec``" is the event
+            # teardown ordering is asserted against, and a raise leaves it too.
+            script.events.append(("exec-return", cmd))
+
+    def kill(self) -> None:
+        script = type(self).script
+        script.kills += 1
+        script.events.append(("kill",))
+        if script.kill_raises is not None:
+            raise script.kill_raises
+        if script.kill_releases:
+            # A real backend's kill ends the blocked command. Turning this off
+            # is how the child that ignores the kill is reproduced.
+            script.gate.set()
+
+    def stop(self) -> None:
+        script = type(self).script
+        script.stops += 1
+        script.events.append(("stop",))
 
 
 class DeadAddress(MockActorAddress):
@@ -694,51 +763,15 @@ class DeadAddress(MockActorAddress):
         return False
 
 
-class SandboxAddress(MockActorAddress):
-    """The address ``#Workspace`` resolves for a sandbox, and tells its requests to.
-
-    Two things a stand-in has to get right, because the actor now decides on
-    both:
-
-    - ``is_alive()`` follows a flag a test flips. ``exec_status`` consults it to
-      notice a sandbox that died mid-run, so an address that always claimed to be
-      alive would make that path untestable and one that always claimed to be
-      dead would make every other path untestable.
-    - ``tell()`` **raises** ``ActorDeadError`` when the flag is down, exactly as
-      ``ActorAddressImpl.tell`` does. That is the whole reason ``_start_run``
-      sends through the address rather than a tell proxy, so a stand-in that
-      swallowed it would guard nothing.
-
-    A live tell hands the request to the harness, which runs the **real**
-    base-class handler against the fake backend on its own thread.
-    """
-
-    def __init__(self, name: str, role: str, proxy: FakeOrchestratorProxy) -> None:
-        super().__init__(name, role)
-        self.alive = True
-        self._proxy = proxy
-
-    def is_alive(self) -> bool:
-        return self.alive
-
-    def tell(self, message: Any) -> None:
-        if not self.alive:
-            raise ActorDeadError(f"{self.name} not found")
-        sink = self._proxy.sandbox_sink
-        if sink is None:
-            raise RuntimeError(f"{self.name} was told {message!r} with no harness installed")
-        sink(self, message)
-
-
 class WorkspaceAddress(MockActorAddress):
-    """``#Workspace``'s own address, as the sandbox sees it — the reply stand-in.
+    """``#Workspace``'s own address, as its worker sees it — the reply stand-in.
 
     The actor under test is inert: the suite calls its methods directly, so its
     real ``myAddress`` names an inbox nobody drains and a report told to it would
     simply vanish (a never-started Pykka actor even reports ``is_alive()`` as
     ``True``). So the harness rewrites ``reply_to`` to this, which calls the
-    handler directly — on the sandbox's thread, exactly where the worker's
-    ``deliver`` and ``fail`` used to land.
+    handler directly — on the worker's thread, exactly where production's mailbox
+    hand-off lands the work.
 
     Do not "fix" this by starting the workspace actor for real: the point of the
     inert actor is that a test can read ``_running`` and ``_queue`` while a run
@@ -748,98 +781,147 @@ class WorkspaceAddress(MockActorAddress):
     def __init__(self, name: str, role: str, actor: WorkspaceActor) -> None:
         super().__init__(name, role)
         self._actor = actor
+        self.dead = False
+        """When set, :meth:`tell` raises, exactly as a stopping actor's does."""
 
     def tell(self, message: Any) -> None:
+        if self.dead:
+            raise ActorDeadError(f"{self.name} not found")
         self._actor.receiveMsg_ExecReport(message)
 
 
-class SandboxHarness:
-    """Runs the sandbox's real tell handler on a real thread, with no actor system.
+@dataclass
+class SubmittedRun:
+    """One call the actor made to ``executor.submit``, as it made it.
+
+    The five values plus the reply address are what ``_start_run`` hands the
+    worker, so recording them here is recording the whole of what crosses the
+    thread boundary — the successor to the request model the retired sandbox
+    actor used to receive.
+    """
+
+    run_id: str
+    cmd: str
+    cwd: str
+    timeout_s: float
+    reply_to: ActorAddress
+
+
+class RecordingExecutor:
+    """Stands in for ``#Workspace``'s own executor, and delegates to a real one.
+
+    Three jobs, and it is deliberately not a mock for any of them:
+
+    - it **records** what the actor submitted, which is the only place the run
+      id and the reply address are observable now that no request model crosses
+      the boundary;
+    - it **redirects** ``reply_to`` to the inert actor's stand-in, exactly as the
+      old harness rewrote it on the request it intercepted;
+    - it **runs the real callable on a real single worker thread**, so the
+      command genuinely runs elsewhere. That is the only way the tree's hold can
+      be observed *while it is held*, and it is what makes "call ``perform``
+      inline instead of submitting" an observable mutation rather than an
+      invisible one.
+
+    ``submit_raises`` is the reachable failure of the submit itself: production
+    raises ``RuntimeError`` here when the executor has already been shut down.
+    """
+
+    def __init__(self, workspace_address: WorkspaceAddress, actor: WorkspaceActor) -> None:
+        self._inner = ThreadPoolExecutor(max_workers=1)
+        self._workspace_address = workspace_address
+        self._actor = actor
+        self.runs: list[SubmittedRun] = []
+        self.futures: list[Future[None]] = []
+        self.holds: list[RunningExec | None] = []
+        """``actor._running`` as it stood at each submit, in order.
+
+        Read between the hold being taken and the work being handed over, which
+        is the only window in which the value is observable: a run released by an
+        already-set gate can report and clear ``_running`` before the call that
+        took it has even returned.
+        """
+        self.submit_raises: BaseException | None = None
+
+    def submit(self, fn: Any, **kwargs: Any) -> Future[None]:
+        self.holds.append(self._actor._running)
+        self.runs.append(SubmittedRun(**kwargs))
+        if self.submit_raises is not None:
+            raise self.submit_raises
+        future = self._inner.submit(fn, **{**kwargs, "reply_to": self._workspace_address})
+        self.futures.append(future)
+        return future
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        self._inner.shutdown(wait=wait, cancel_futures=cancel_futures)
+
+
+class ExecHarness:
+    """Gives the inert actor a recording executor and an address to report to.
 
     The workspace actor stays inert — the tests call its methods directly,
-    exactly as the other workspace suites do — but the command genuinely runs
-    elsewhere, which is the only way the tree's hold can be observed *while it is
-    held*.
+    exactly as the other workspace suites do — but the command genuinely runs on
+    a worker thread, which is the only way the tree's hold can be observed *while
+    it is held*.
 
-    Nothing about the actor's exec path is stubbed: it resolves the sandbox
-    through the fake orchestrator exactly as production resolves it through the
-    real one, and it sends the request with ``ActorAddress.tell``. What the
-    harness supplies is the two ends — an orchestrator to ask and an address to
-    reply to.
+    Nothing about the actor's exec path is stubbed: it builds its backend through
+    ``configure_exec`` and ``resolve_mode`` exactly as production does, and it
+    submits the real ``ExecRunner.perform``. What the harness supplies is the two
+    ends — an executor whose worker it can wait on, and an address to reply to.
     """
 
     def __init__(self, actor: WorkspaceActor, orchestrator_proxy: FakeOrchestratorProxy) -> None:
         self.actor = actor
         self.orchestrator_proxy = orchestrator_proxy
-        self.threads: list[threading.Thread] = []
-        self.requests: list[ExecRequest] = []
-        """Every request the actor told a sandbox, in order — one per started run."""
-        self.ask_timeouts: list[int | None] = []
-        """Every timeout the actor's asks carried, in order.
-
-        The sandbox resolve is an ask on the team singleton's own thread, so an
-        untimed one parks every read, mutation and poll behind it. Recorded here
-        so that property is asserted rather than assumed.
-        """
         self.workspace_address = WorkspaceAddress("#Workspace", "ToolActor", actor)
+        self.executor = RecordingExecutor(self.workspace_address, actor)
         self._orchestrator = DeadAddress("orchestrator")
 
     @property
-    def sandbox_addresses(self) -> list[SandboxAddress]:
-        """Every sandbox address handed out so far, in creation order."""
-        return [
-            address
-            for address, _actor in self.orchestrator_proxy.children.values()
-            if isinstance(address, SandboxAddress)
-        ]
+    def runs(self) -> list[SubmittedRun]:
+        """Every run the actor submitted, in order — one per started run."""
+        return self.executor.runs
+
+    @property
+    def holds(self) -> list[RunningExec | None]:
+        """``actor._running`` as it stood at each submit, in order."""
+        return self.executor.holds
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Give the actor an orchestrator to resolve through, and a reply address."""
+        """Put the recording executor on the actor, and give it an orchestrator."""
         monkeypatch.setattr(self.actor, "_orchestrator", self._orchestrator)
         monkeypatch.setattr(self.actor, "proxy_ask", self._proxy_ask)
-        monkeypatch.setattr(self.orchestrator_proxy, "sandbox_sink", self._deliver)
+        monkeypatch.setattr(self.actor, "_executor", self.executor)
 
     def _proxy_ask(
         self, target: ActorAddress, actor_type: Any = None, timeout: int | None = None
     ) -> Any:
-        self.ask_timeouts.append(timeout)
         if target is self._orchestrator:
             return self.orchestrator_proxy
         return self.orchestrator_proxy.actor_for(target)
 
-    def _deliver(self, address: SandboxAddress, request: ExecRequest) -> None:
-        """Run the real ``receiveMsg_ExecRequest`` for *request*, off this thread."""
-        self.requests.append(request)
-        sandbox = self.orchestrator_proxy.actor_for(address)
-        assert isinstance(sandbox, SandboxActor)
-        # The actor's own ``myAddress`` names an inbox nobody drains, so the
-        # reply is redirected here. model_copy(update=...) rather than a
-        # rebuild: a field added to ExecRequest later must survive the rewrite
-        # (Golden Rule #12).
-        routed = request.model_copy(update={"reply_to": self.workspace_address})
-        thread = threading.Thread(
-            target=sandbox.receiveMsg_ExecRequest, args=(routed,), daemon=True
-        )
-        self.threads.append(thread)
-        thread.start()
-
     def join(self) -> None:
-        """Wait for every started run, bounded — a hang is a failure, not a wait."""
-        for thread in self.threads:
-            thread.join(timeout=HANDSHAKE_TIMEOUT_S)
-            assert not thread.is_alive(), "a sandbox run never finished"
-        self.threads.clear()
+        """Wait for every submitted run, bounded — a hang is a failure, not a wait."""
+        for future in self.executor.futures:
+            futures.wait([future], timeout=HANDSHAKE_TIMEOUT_S)
+            assert future.done(), "a sandbox run never finished"
+            future.result()  # a callable that raised would otherwise be silent
+        self.executor.futures.clear()
+
+    def close(self) -> None:
+        """Release the worker thread. Never leaves one behind a failed assertion."""
+        self.executor.shutdown(wait=False, cancel_futures=True)
 
 
 @pytest.fixture
 def sandbox_script() -> Generator[SandboxScript, None, None]:
-    """Install :class:`FakeSandboxActor` at the ``local`` key for one test."""
+    """Install :class:`FakeBackend` at the ``local`` key for one test."""
     script = SandboxScript()
-    FakeSandboxActor.script = script
-    previous = SANDBOX_ACTOR_CLASSES["local"]
-    SANDBOX_ACTOR_CLASSES["local"] = FakeSandboxActor
+    FakeBackend.script = script
+    previous = SANDBOX_BACKEND_CLASSES["local"]
+    SANDBOX_BACKEND_CLASSES["local"] = FakeBackend
     yield script
-    SANDBOX_ACTOR_CLASSES["local"] = previous
+    SANDBOX_BACKEND_CLASSES["local"] = previous
     script.gate.set()  # never leave a worker blocked behind a failed assertion
 
 
