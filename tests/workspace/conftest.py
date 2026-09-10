@@ -21,7 +21,7 @@ import subprocess
 import threading
 import time
 import uuid
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from concurrent import futures
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -701,15 +701,29 @@ def fast_config(workspace_path: str, **overrides: Any) -> WorkspaceConfig:
     return WorkspaceConfig(**fields)
 
 
-def hosted_ahead(orchestrator_proxy: FakeOrchestratorProxy, config: WorkspaceConfig) -> Any:
+def hosted_ahead(
+    orchestrator_proxy: FakeOrchestratorProxy, config: WorkspaceConfig
+) -> WorkspaceActor:
     """Create *config*'s actor through the fake host before any card binds, and return it.
 
     The host ignores ``config`` on a hit, exactly as core's does, so a card that
     binds afterwards gets this actor — with this config — rather than one built
-    from the card's own.
+    from the card's own. Inert fixtures only: the actor is the instance itself.
     """
     address = orchestrator_proxy.host.get_or_create(WorkspaceActor, config)
-    return orchestrator_proxy.host.actor_for(address)
+    actor = orchestrator_proxy.host.actor_for(address)
+    assert isinstance(actor, WorkspaceActor)
+    return actor
+
+
+def wait_until(predicate: Callable[[], bool], timeout: float = HANDSHAKE_TIMEOUT_S) -> bool:
+    """Poll *predicate* every 10 ms until it holds or *timeout* elapses — a budget, not a delay."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
 
 
 def attached(actor: WorkspaceActor, name: str) -> str:
@@ -939,6 +953,21 @@ class DeadAddress(MockActorAddress):
 
     def is_alive(self) -> bool:
         return False
+
+
+class MortalAddress(MockActorAddress):
+    """A holder's address whose actor a spec can stop, by setting :attr:`dead`.
+
+    ``DeadAddress`` is dead from the start; a holder that must be live when it
+    attaches and stopped by the next sweep needs the flag.
+    """
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.dead = False
+
+    def is_alive(self) -> bool:
+        return not self.dead
 
 
 class WorkspaceAddress(MockActorAddress):

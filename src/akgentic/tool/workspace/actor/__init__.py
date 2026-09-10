@@ -83,8 +83,6 @@ from typing import TYPE_CHECKING
 
 from pykka import ActorDeadError
 
-from akgentic.core.actor_system_impl import ActorSystem
-from akgentic.core.messages.message import ResourceStopped
 from akgentic.tool.core.deferred import DeferredResultActor, DeferredWorker
 from akgentic.tool.workspace.actor.documents import DocumentsMixin
 from akgentic.tool.workspace.actor.execution import EXEC_CAPABILITY, ExecMixin
@@ -98,7 +96,6 @@ from akgentic.tool.workspace.execution import (
     QueuedExec,
     RunningExec,
 )
-from akgentic.tool.workspace.host import WorkspaceHost
 from akgentic.tool.workspace.journal import GitJournal
 from akgentic.tool.workspace.models import (
     STAGING_SWEEP_GRACE_S,
@@ -205,22 +202,6 @@ def _tell_tick(address: ActorAddress) -> None:
         address.tell(SweepTick())
 
 
-def _host_address() -> ActorAddress | None:
-    """The process's ``WorkspaceHost``, looked up at each use and never cached.
-
-    Core's reference shape for a hosted actor's way home. It names
-    ``WorkspaceHost`` and never the base: the lookup is by exact class, so
-    asking for ``ResourceHost`` in a process that runs a ``WorkspaceHost``
-    answers nothing. An empty answer is not an error — at process exit the host
-    may already be gone.
-
-    Returns:
-        The host's address, or ``None`` when no ``WorkspaceHost`` is running.
-    """
-    hosts = ActorSystem.find_by_class(WorkspaceHost)
-    return hosts[0] if hosts else None
-
-
 class WorkspaceActor(
     DocumentsMixin,
     ExecMixin,
@@ -245,9 +226,10 @@ class WorkspaceActor(
     left to wait for. At zero holders a ``reap_grace_s`` grace starts, which an
     ``attach`` cancels; the first tick at or past its end stops the actor through
     its own ``Akgent.stop`` — so ``stop_children`` takes the store child and any
-    live worker down with it — and ``on_stop`` tells the host a
-    ``ResourceStopped``. A team stopping and an equivalent one starting inside
-    the grace find this same actor, journal and container.
+    live worker down with it. **It tells the host nothing** (see :meth:`on_stop`):
+    the host answers a miss for a dead entry, so the next get-or-create on this
+    path constructs a successor. A team stopping and an equivalent one starting
+    inside the grace find this same actor, journal and container.
 
     ``DocumentsMixin`` sits ahead of ``ExecMixin`` in the MRO, so anything it
     named ``deliver`` or ``fail`` would silently take over the deferred delivery
@@ -414,7 +396,7 @@ class WorkspaceActor(
         )
 
     def on_stop(self) -> None:
-        """Close the sweep, take exec down in its stated order, announce, chain to the base.
+        """Close the sweep, take exec down in its stated order, chain to the base.
 
         The four exec steps and the reasoning behind their order live in
         :meth:`~akgentic.tool.workspace.actor.execution.ExecMixin._teardown_exec`,
@@ -429,14 +411,22 @@ class WorkspaceActor(
         :data:`~akgentic.tool.workspace.execution.EXEC_SHUTDOWN_GRACE_S`, rather
         than one run's full budget.
 
-        **It runs on three paths, and the announcement is a tidy-up on all of
-        them:** the self-stop after the grace, a fixture's stop in tests, and
-        ``ActorSystem.shutdown`` through ``ActorRegistry.stop_all()``. Core treats
-        a dead registry entry as a miss, so nothing depends on the
-        ``ResourceStopped`` arriving, and an empty host lookup at process exit is
-        not an error. The sweep timer is closed first so no tick is armed past
-        this point; one already in flight lands on a dead address and is
+        It runs on three paths — the self-stop after the grace, a fixture's stop
+        in tests, and ``ActorSystem.shutdown`` through ``ActorRegistry.stop_all()``
+        — and the sweep timer is closed first on all of them, so no tick is armed
+        past this point; one already in flight lands on a dead address and is
         swallowed by :func:`_tell_tick`.
+
+        **It tells the host nothing, on any path, and an announcement here would
+        be a defect rather than a tidy-up.** pykka sets the stopped flag before it
+        calls this, so from the first line of this method the host already
+        answers a miss for this path, and a get-or-create arriving now starts the
+        successor. A ``ResourceStopped`` sent after that — it would have to wait
+        out the exec drain above — drops the registry entry by *name*, which is by
+        then the successor's; the next get-or-create would start a third actor
+        while the successor is live, two actors on one tree. The dead entry this
+        leaves behind is replaced by the next get-or-create, which is all the
+        reclamation needs.
 
         Nothing here may raise past ``super()``: leaving a Pykka actor part-way
         stopped is worse than any error a step could report, which is why every
@@ -444,7 +434,6 @@ class WorkspaceActor(
         """
         self._close_sweep()
         self._teardown_exec()
-        self._announce_stop()
         super().on_stop()
 
     ##
@@ -489,14 +478,17 @@ class WorkspaceActor(
         after the last holder stopped, never before — and ``attach`` cancels it
         with one assignment and nothing to cancel.
 
-        With holders the deadline is cleared, defensively: ``attach`` is what
-        clears it, on this same mailbox.
+        **Nothing here clears the deadline, and nothing needs to.** A deadline is
+        set only at zero holders, and ``attach`` — the one way a holder is added
+        — clears it, so with holders it is already ``None``. A second clear here
+        would also hide a missing one there: a holder that attaches during grace
+        and stops before the next tick is never seen by a tick at all, and only
+        the ``attach`` clear restarts the grace from its stop.
 
         Returns:
             True only at zero holders, at or past a deadline an earlier tick set.
         """
         if self._holders:
-            self._reap_deadline = None
             return False
         now = time.monotonic()
         if self._reap_deadline is None:
@@ -562,24 +554,6 @@ class WorkspaceActor(
         """
         self._close_sweep()
         self.stop()
-
-    def _announce_stop(self) -> None:
-        """Tell the process's ``WorkspaceHost`` that this tree's actor is gone.
-
-        Looked up now, never cached. A host already gone — the lookup answers
-        nothing, or it stops between the lookup and the tell — is nobody to tell,
-        not a failure: the host treats a dead entry as a miss anyway.
-        """
-        host = _host_address()
-        if host is None:
-            return
-        try:
-            self.send(host, ResourceStopped(scope=self.config.name))
-        except ActorDeadError:
-            logger.debug(
-                "Workspace %s: its host stopped before the announcement reached it",
-                self.config.workspace_path,
-            )
 
     ##
     ## Startup housekeeping

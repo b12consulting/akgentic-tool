@@ -30,9 +30,8 @@ import json
 import logging
 import os
 import threading
-import time
 import uuid
-from collections.abc import Callable, Generator
+from collections.abc import Generator
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -67,6 +66,7 @@ from tests.workspace.conftest import (
     SandboxScript,
     fast_config,
     tool_named,
+    wait_until,
 )
 
 SPAWN_TIMEOUT_S = 15.0
@@ -830,14 +830,9 @@ REAPED_PATH = "u-alice/notes"
 """What ``workspace_id="notes"`` resolves to for ``u-alice``; the specs below pre-create it."""
 
 
-def _wait_until(predicate: Callable[[], bool], timeout: float = HANDSHAKE_TIMEOUT_S) -> bool:
-    """Poll *predicate* every 10 ms until it holds or *timeout* elapses — a budget, not a delay."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(0.01)
-    return predicate()
+def _exec_workers(path: str) -> list[threading.Thread]:
+    """The live worker threads of *path*'s exec executor, named by its ``thread_name_prefix``."""
+    return [t for t in threading.enumerate() if t.name.startswith(f"exec-{path}_")]
 
 
 def _host_ahead(system: ActorSystem, config: WorkspaceConfig) -> ActorAddress:
@@ -880,26 +875,32 @@ class TestTheSelfStopTakesTheStoreChildAndTheExecutorDown:
         )
         card, path = bound(record)
         assert path == PurePosixPath(REAPED_PATH)
-        assert _wait_until(lambda: len(pykka.ActorRegistry.get_by_class(VectorStoreActor)) == 1)
+        assert wait_until(lambda: len(pykka.ActorRegistry.get_by_class(VectorStoreActor)) == 1)
         [store_ref] = pykka.ActorRegistry.get_by_class(VectorStoreActor)
         # The runner is built and live: a run answers, and nothing has stopped it.
         answer = str(tool_named(card, "workspace_exec")(cmd="echo hi"))
         assert "ok" in answer, answer
         assert sandbox_script.commands == [("echo hi", "")]
         assert sandbox_script.stops == 0
+        # The run spawned the executor's one worker, and an idle worker never exits
+        # on its own: only the teardown's ``shutdown`` ends it.
+        assert _exec_workers(REAPED_PATH), "the run left no exec worker to shut down"
         assert record.orchestrator is not None
 
         stopped = system.proxy_ask(record.orchestrator, Orchestrator).stop(5.0)
         assert stopped.wait(timeout=SPAWN_TIMEOUT_S), "the team never finished stopping"
 
-        assert _wait_until(lambda: not workspace.is_alive()), "the workspace never reaped"
+        assert wait_until(lambda: not workspace.is_alive()), "the workspace never reaped"
         assert store_ref.actor_stopped.wait(timeout=HANDSHAKE_TIMEOUT_S), (
             "the store child outlived its workspace"
         )
         assert pykka.ActorRegistry.get_by_class(VectorStoreActor) == []
         # ``is_alive`` turns false before ``on_stop`` runs, so its last step is waited for.
-        assert _wait_until(lambda: sandbox_script.stops == 1), "the backend was never released"
+        assert wait_until(lambda: sandbox_script.stops == 1), "the backend was never released"
         assert sandbox_script.events[-1] == ("stop",)
+        assert wait_until(lambda: not _exec_workers(REAPED_PATH)), (
+            "the executor was never shut down"
+        )
         assert ActorSystem.find_by_class(WorkspaceActor) == []
 
 
@@ -913,9 +914,9 @@ class TestActorSystemShutdownStillReachesAHostedWorkspace:
     ) -> None:
         """Default config, so no tick fires: only ``ActorRegistry.stop_all`` can stop it.
 
-        ``stop_all`` stops in reverse start order, so the workspace — started
-        after both hosts — stops while its host is still alive, and the
-        announcement in ``on_stop`` is sent to a live host.
+        ``stop_all`` is a graceful stop, so ``on_stop`` runs in full — the backend
+        is released — and nothing it does is logged as an error. It tells the
+        host nothing on this path either.
         """
         caplog.set_level(logging.ERROR)
         sandbox_script.gate.set()

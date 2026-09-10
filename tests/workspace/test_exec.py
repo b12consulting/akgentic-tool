@@ -74,7 +74,6 @@ from akgentic.tool.workspace.journal import MAX_COMMIT_BODY_CHARS
 from akgentic.tool.workspace.models import MutationStatus, Observation, SweepTick, content_sha
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
 
-from tests.conftest import MockActorAddress
 from tests.workspace.conftest import (
     workspace_path_for,
     HANDSHAKE_TIMEOUT_S,
@@ -85,6 +84,7 @@ from tests.workspace.conftest import (
     FakeBackend,
     FakeOrchestratorProxy,
     FakeWorkspaceHost,
+    MortalAddress,
     SandboxScript,
     SilentAgent,
     attached,
@@ -3554,21 +3554,6 @@ class TestAWedgedChild:
 # ---------------------------------------------------------------------------
 # Story 51-3 — the liveness sweep's exec half: the dropped run and the prune
 # ---------------------------------------------------------------------------
-
-
-class MortalAddress(MockActorAddress):
-    """A holder's address whose actor a spec can stop, by setting :attr:`dead`.
-
-    ``DeadAddress`` is dead from the start; a holder that must run first and
-    stop afterwards needs the flag.
-    """
-
-    def __init__(self, name: str) -> None:
-        super().__init__(name)
-        self.dead = False
-
-    def is_alive(self) -> bool:
-        return not self.dead
 
 
 def attached_mortal(actor: WorkspaceActor, name: str) -> tuple[str, MortalAddress]:

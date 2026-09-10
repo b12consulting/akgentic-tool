@@ -11,10 +11,10 @@ holders started and stopped through the system.
 until it is false — so those two sleep for a stated number of whole ticks past
 the point that matters, with the arithmetic written beside the number.
 
-**``find_by_class`` is an exact-class lookup.** The probe below subclasses
+**``find_by_class`` is an exact-class lookup.** The probes below subclass
 ``WorkspaceActor``, so ``find_by_class(WorkspaceActor)`` answers ``[]`` for a
-live probe; every lookup of a probe asks for ``_ProbeWorkspace``, and the
-fixture's teardown asks for both.
+live probe; every lookup of a probe asks for its own class, and the fixture's
+teardown asks for all three.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Generator
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -34,11 +34,10 @@ from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.core.orchestrator import STOP_TIMEOUT
-from akgentic.core.resource_host import ResourceHost
+from akgentic.core.resource_host import ResourceHost, StateDelta
 from akgentic.core.utils.serializer import SerializableBaseModel
 from pydantic import ValidationError
 
-from akgentic.tool.workspace import actor as actor_module
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
 from akgentic.tool.workspace.execution import LEASE_GRACE_S, MAX_EXEC_BUDGET_S
 from akgentic.tool.workspace.host import WorkspaceHost
@@ -54,9 +53,11 @@ from tests.workspace.conftest import (
     HANDSHAKE_TIMEOUT_S,
     WORKSPACE_PATH,
     FakeOrchestratorProxy,
+    MortalAddress,
     card_for,
     fast_config,
     hosted_ahead,
+    wait_until,
 )
 
 PATH = "u-alice/swept"
@@ -124,6 +125,25 @@ class _ProbeWorkspace(WorkspaceActor):
         return threading.get_ident()
 
 
+class _GatedWorkspace(_ProbeWorkspace):
+    """A probe whose ``on_stop`` waits for the spec before it runs, and says when it has run.
+
+    Holding ``on_stop`` open is holding open the window the real one has: pykka
+    has already set the stopped flag, so the host answers a miss for the path,
+    while the exec drain has not finished. ``released`` is set by the fixture,
+    so a gated actor no spec is holding stops like any other; the wait is
+    bounded, so a spec that fails before releasing cannot hang the teardown.
+    """
+
+    released: ClassVar[threading.Event] = threading.Event()
+    stopped: ClassVar[threading.Event] = threading.Event()
+
+    def on_stop(self) -> None:
+        _GatedWorkspace.released.wait(timeout=HANDSHAKE_TIMEOUT_S)
+        super().on_stop()
+        _GatedWorkspace.stopped.set()
+
+
 ##
 ## Harness
 ##
@@ -131,7 +151,7 @@ class _ProbeWorkspace(WorkspaceActor):
 def system(workspaces_root: Path) -> Generator[ActorSystem, None, None]:
     """A real actor system with both hosts, torn down whatever the spec did.
 
-    The teardown proves nothing hosted outlived it, asking by both classes
+    The teardown proves nothing hosted outlived it, asking by every class
     because the lookup is exact.
     """
     actor_system = ActorSystem()
@@ -148,16 +168,22 @@ def system(workspaces_root: Path) -> Generator[ActorSystem, None, None]:
         ActorRegistry.stop_all()
         assert ActorSystem.find_by_class(WorkspaceActor) == [], "a workspace outlived its test"
         assert ActorSystem.find_by_class(_ProbeWorkspace) == [], "a probe outlived its test"
+        assert ActorSystem.find_by_class(_GatedWorkspace) == [], "a gated probe outlived its test"
 
 
-def _wait_until(predicate: Callable[[], bool], timeout: float = HANDSHAKE_TIMEOUT_S) -> bool:
-    """Poll *predicate* every 10 ms until it holds or *timeout* elapses — a budget, not a delay."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(0.01)
-    return predicate()
+@pytest.fixture
+def gate() -> Generator[type[_GatedWorkspace], None, None]:
+    """The gated probe, released and unstopped, and released again whatever the spec did.
+
+    Requested after ``system``, so it is torn down first: every gated actor is
+    released before the system's shutdown asks it to stop.
+    """
+    _GatedWorkspace.released.set()
+    _GatedWorkspace.stopped.clear()
+    try:
+        yield _GatedWorkspace
+    finally:
+        _GatedWorkspace.released.set()
 
 
 def _hosted(
@@ -170,7 +196,7 @@ def _hosted(
     return system.proxy_ask(host, WorkspaceHost).getResourceOrCreate(actor_class, config)
 
 
-def _probe(system: ActorSystem, address: ActorAddress) -> Any:
+def _probe(system: ActorSystem, address: ActorAddress) -> _ProbeWorkspace:
     """An ask proxy onto a hosted probe."""
     return system.proxy_ask(address, _ProbeWorkspace)
 
@@ -185,15 +211,6 @@ def _holder(
 def _stop(system: ActorSystem, address: ActorAddress) -> None:
     """Stop a holder through ``Akgent.stop``, as its team's teardown would."""
     system.proxy_ask(address, Akgent).stop()
-
-
-def _host_recorded(caplog: pytest.LogCaptureFixture, scope: str) -> bool:
-    """Whether the host's own logger recorded dropping *scope*'s registry entry."""
-    return any(
-        record.name == HOST_LOGGER
-        and record.getMessage().endswith(f"registry entry dropped for scope {scope}")
-        for record in caplog.records
-    )
 
 
 ##
@@ -215,7 +232,7 @@ class TestTheSweepDropsAStoppedHolderAndKeepsARaisingOne:
 
         _stop(system, stopped)
 
-        assert _wait_until(lambda: str(stopped.agent_id) not in probe.holder_ids()), (
+        assert wait_until(lambda: str(stopped.agent_id) not in probe.holder_ids()), (
             "the sweep never dropped a holder whose actor had stopped"
         )
         assert probe.holder_ids() == [str(kept.agent_id)]
@@ -241,7 +258,7 @@ class TestTheSweepDropsAStoppedHolderAndKeepsARaisingOne:
         raising.tell(Poke())
 
         assert _RaisingHolder.raised.wait(timeout=HANDSHAKE_TIMEOUT_S), "the handler never ran"
-        assert _wait_until(
+        assert wait_until(
             lambda: any(
                 "@raising" in record.getMessage()
                 and "ERROR processing message" in record.getMessage()
@@ -249,9 +266,9 @@ class TestTheSweepDropsAStoppedHolderAndKeepsARaisingOne:
             )
         ), "pykka never reported the handler's failure"
         _stop(system, stopped)
-        assert _wait_until(lambda: str(stopped.agent_id) not in probe.holder_ids())
+        assert wait_until(lambda: str(stopped.agent_id) not in probe.holder_ids())
         after_drop = probe.tick_count()
-        assert _wait_until(lambda: probe.tick_count() >= after_drop + 2), "the sweep stopped"
+        assert wait_until(lambda: probe.tick_count() >= after_drop + 2), "the sweep stopped"
 
         assert raising.is_alive()
         assert probe.holder_ids() == [str(raising.agent_id)]
@@ -273,7 +290,7 @@ class TestTheSweepRunsOnTheActorsThread:
         address = _hosted(system, fast_config(PATH))
         probe = _probe(system, address)
         probe.attach(_holder(system, "@holder"), "holder")  # keeps the grace from starting
-        assert _wait_until(lambda: probe.tick_count() >= 2)
+        assert wait_until(lambda: probe.tick_count() >= 2)
         timer_name = f"sweep-{PATH}"
         timer_idents: set[int | None] = set()
 
@@ -281,7 +298,7 @@ class TestTheSweepRunsOnTheActorsThread:
             timer_idents.update(t.ident for t in threading.enumerate() if t.name == timer_name)
             return bool(timer_idents)
 
-        assert _wait_until(a_timer_is_armed), "no sweep timer thread was ever seen"
+        assert wait_until(a_timer_is_armed), "no sweep timer thread was ever seen"
         actor_ident = probe.thread_ident()
 
         assert set(probe.tick_idents()) == {actor_ident}
@@ -302,7 +319,7 @@ class TestANeverAttachedWorkspaceIsReaped:
         address = _hosted(system, fast_config(PATH), WorkspaceActor)
         assert [a.agent_id for a in ActorSystem.find_by_class(WorkspaceActor)] == [address.agent_id]
 
-        assert _wait_until(lambda: not address.is_alive()), "the orphan was never reaped"
+        assert wait_until(lambda: not address.is_alive()), "the orphan was never reaped"
         assert ActorSystem.find_by_class(WorkspaceActor) == []
 
 
@@ -323,7 +340,7 @@ class TestTheGrace:
         _stop(system, first)
         # The drop and the deadline happen in the same tick. Attaching before the
         # drop would cancel a grace that never started.
-        assert _wait_until(lambda: probe.holder_ids() == []), "the first holder was never dropped"
+        assert wait_until(lambda: probe.holder_ids() == []), "the first holder was never dropped"
         second = _holder(system, "@second")
         probe.attach(second, "second")
 
@@ -339,7 +356,7 @@ class TestTheGrace:
 
         _stop(system, second)
 
-        assert _wait_until(lambda: not address.is_alive()), "the last holder left; nothing reaped"
+        assert wait_until(lambda: not address.is_alive()), "the last holder left; nothing reaped"
 
     def test_the_grace_is_real_the_first_empty_tick_does_not_reap(
         self, system: ActorSystem
@@ -350,7 +367,7 @@ class TestTheGrace:
         first = _holder(system, "@first")
         probe.attach(first, "first")
         _stop(system, first)
-        assert _wait_until(lambda: probe.holder_ids() == [])
+        assert wait_until(lambda: probe.holder_ids() == [])
         empty_at = probe.tick_count()
 
         # Negative again: three 0.05 s ticks, well inside the 1.0 s grace.
@@ -368,10 +385,10 @@ class TestTheGrace:
         first = _holder(system, "@first")
         probe.attach(first, "first")
         _stop(system, first)
-        assert _wait_until(lambda: probe.holder_ids() == [])
+        assert wait_until(lambda: probe.holder_ids() == [])
 
         # From the drop the reap lands between grace and grace + one interval.
-        assert _wait_until(
+        assert wait_until(
             lambda: not address.is_alive(),
             timeout=config.reap_grace_s + 3 * config.sweep_interval_s,
         ), "the grace expired at zero holders and nothing reaped"
@@ -380,62 +397,117 @@ class TestTheGrace:
         assert renewed.agent_id != address.agent_id, "the host answered the dead actor"
         assert renewed.is_alive()
 
-    def test_the_host_records_the_dropped_entry(
-        self, system: ActorSystem, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """The announcement's tidy-up, and **not load-bearing**.
 
-        Core treats a dead registry entry as a miss, so the construction in the
-        spec above does not depend on the announcement arriving. What does is
-        this record, which is the whole of what ``ResourceStopped`` buys.
+class TestAnAttachRestartsTheGrace:
+    """The ``attach`` clear is load-bearing: a holder no tick ever saw still restarts the grace.
+
+    Inert, with every tick called by hand, because the interleaving is a holder
+    that attaches during grace and stops before the next tick — which a live
+    spec could only hope to land between two ticks. Without the clear the tree
+    reaps on the *first* holder's deadline, a full grace too early for the second.
+    """
+
+    def test_a_holder_that_attaches_during_grace_and_stops_before_any_tick_restarts_it(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        grace = 0.05
+        # A 30 s interval, so the real timer never fires inside the spec.
+        actor = hosted_ahead(
+            orchestrator_proxy,
+            fast_config(WORKSPACE_PATH, sweep_interval_s=30.0, reap_grace_s=grace),
+        )
+        first = MortalAddress("first")
+        actor.attach(first, "first")
+        first.dead = True
+        actor.receiveMsg_SweepTick(SweepTick())
+        first_deadline = actor._reap_deadline
+        assert first_deadline is not None, "the first holder's stop started no grace"
+
+        second = MortalAddress("second")
+        actor.attach(second, "second")
+        second.dead = True  # stopped before any tick saw it alive
+        time.sleep(2 * grace)  # past the first deadline; a sleep never returns early
+        assert time.monotonic() >= first_deadline
+        before = time.monotonic()
+
+        actor.receiveMsg_SweepTick(SweepTick())
+
+        assert str(second.agent_id) not in actor._holders
+        assert actor._sweep_timer is not None, "the tree reaped on the first holder's deadline"
+        assert actor._reap_deadline is not None
+        assert actor._reap_deadline >= before + grace, "the grace did not restart at the stop"
+
+
+##
+## The self-stop tells the host nothing — the 51-3 review's ruling
+##
+class TestTheSelfStopTellsTheHostNothing:
+    """The host keeps a dead entry until the next get-or-create replaces it, and that is enough.
+
+    A late ``ResourceStopped`` would drop the registry entry by *name*, which by
+    then may be a successor's. Both specs read the host through its public
+    surface and its own logger; neither reaches into its registry.
+    """
+
+    def test_the_host_keeps_the_dead_entry_and_the_next_get_or_create_starts_exactly_one(
+        self,
+        system: ActorSystem,
+        gate: type[_GatedWorkspace],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """After a self-stop the dead entry is still there, and one new actor replaces it.
+
+        The entry is read through ``notify_delta``: a delta for a scope with no
+        entry is dropped with a warning on the host's logger, and one for a scope
+        whose entry is still there — dead or not — is not. No store is
+        registered, so nothing is written either way.
         """
         caplog.set_level(logging.INFO, logger=HOST_LOGGER)
         config = fast_config(PATH)
-        address = _hosted(system, config)
-        assert not _host_recorded(caplog, config.name)
+        address = _hosted(system, config, gate)
+        assert gate.stopped.wait(timeout=HANDSHAKE_TIMEOUT_S), "the orphan never reaped"
+        assert not address.is_alive()
 
-        assert _wait_until(lambda: not address.is_alive())
+        [host] = ActorSystem.find_by_class(WorkspaceHost)
+        system.proxy_ask(host, WorkspaceHost).notify_delta(config.name, StateDelta())
 
-        assert _wait_until(lambda: _host_recorded(caplog, config.name)), (
-            "the host never heard that its workspace stopped"
-        )
-
-
-##
-## AC 6's host-lookup halves — the announcement is a tidy-up on every path
-##
-class TestTheAnnouncementNeverRaises:
-    def test_an_empty_lookup_is_nothing_to_tell(
-        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
-    ) -> None:
-        """No ``WorkspaceHost`` in the process — the ordinary state at exit."""
-        assert ActorSystem.find_by_class(WorkspaceHost) == []
-        actor = hosted_ahead(orchestrator_proxy, fast_config(WORKSPACE_PATH))
-
-        actor.on_stop()  # raises nothing
-
-    def test_a_host_that_died_between_the_lookup_and_the_tell_is_swallowed(
-        self,
-        system: ActorSystem,
-        orchestrator_proxy: FakeOrchestratorProxy,
-        workspace_tree: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """A real address whose actor has stopped: its ``tell`` raises ``ActorDeadError``."""
-        caplog.set_level(logging.DEBUG, logger=actor_module.__name__)
-        gone = _holder(system, "#GoneHost")
-        _stop(system, gone)
-        assert _wait_until(lambda: not gone.is_alive())
-        monkeypatch.setattr(actor_module, "_host_address", lambda: gone)
-        actor = hosted_ahead(orchestrator_proxy, fast_config(WORKSPACE_PATH))
-
-        actor.on_stop()  # raises nothing
-
-        assert any(
-            record.name == actor_module.__name__ and "host" in record.getMessage()
+        heard = [
+            record.getMessage()
             for record in caplog.records
-        ), "the swallowed announcement left no trace"
+            if record.name == HOST_LOGGER and config.name in record.getMessage()
+        ]
+        assert heard == [], f"the host heard about the stop, or lost the entry: {heard}"
+        renewed = _hosted(system, fast_config(PATH, reap_grace_s=60.0), gate)
+        assert renewed.agent_id != address.agent_id, "the host answered the dead actor"
+        assert [a.agent_id for a in ActorSystem.find_by_class(gate)] == [renewed.agent_id]
+
+    def test_a_successor_started_during_teardown_is_the_one_the_next_bind_gets(
+        self, system: ActorSystem, gate: type[_GatedWorkspace]
+    ) -> None:
+        """The race, driven in-process and in order, with nothing left to timing.
+
+        The doomed actor reaps itself and its ``on_stop`` is held open: the
+        stopped flag is set, so the host answers a miss and a get-or-create
+        starts the successor. Then the teardown is let finish. Anything it tells
+        the host is queued ahead of the next get-or-create, so a
+        ``ResourceStopped`` would drop the successor's entry by name and that
+        ask would start a third actor beside a live successor.
+        """
+        gate.released.clear()
+        doomed = _hosted(system, fast_config(PATH), gate)
+        assert wait_until(lambda: not doomed.is_alive()), "the orphan never reaped"
+        # A long grace, so neither live actor reaps inside the spec.
+        lasting = fast_config(PATH, reap_grace_s=60.0)
+        successor = _hosted(system, lasting, gate)
+        assert successor.agent_id != doomed.agent_id
+        assert not gate.stopped.is_set(), "the doomed actor's teardown was not held open"
+
+        gate.released.set()
+        assert gate.stopped.wait(timeout=HANDSHAKE_TIMEOUT_S), "the teardown never finished"
+        again = _hosted(system, lasting, gate)
+
+        assert again.agent_id == successor.agent_id, "the host lost the live successor's entry"
+        assert [a.agent_id for a in ActorSystem.find_by_class(gate)] == [successor.agent_id]
 
 
 ##
