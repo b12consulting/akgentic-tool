@@ -60,10 +60,11 @@ def ensure_store_actor(param: VectorStoreParam, orchestrator_proxy: Orchestrator
     Called by a consumer card at ``observer()`` time, **before** it creates its
     own consumer actor: that actor looks the store up during its ``on_start``,
     so the store has to exist first. This is where ``VectorStoreTool.observer``'s
-    ``getChildrenOrCreate`` call went when the card was deleted — the three
-    consumers each call it now, so a store's existence is decided by the
-    consumer that needs it rather than by a singleton card someone had to
-    remember to add.
+    ``getChildrenOrCreate`` call went when the card was deleted — the planning
+    and knowledge-graph cards call it now, so a store's existence is decided by
+    the consumer that needs it rather than by a singleton card someone had to
+    remember to add. The workspace card does not: its actor creates an in-memory
+    store as its own child instead of sharing the team's.
 
     **A cluster backend returns without creating anything.** There is nothing
     for an actor to hold: the data is on the cluster and the consumer talks to

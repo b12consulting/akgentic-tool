@@ -34,7 +34,7 @@ A new notify on a *read* path — of any kind, in any of these methods — is a
 defect until a decision says otherwise.
 
 Everything on the ask path here is O(1)/O(n) dict work on the actor thread, plus
-bounded file reads while queueing and bounded proxy calls to ``#VectorStore`` —
+bounded file reads while queueing and bounded proxy calls to the store child —
 including, on :meth:`DocumentsMixin.rag_search`, **one query embed per call**.
 That is the one external round trip this package puts on the gate's own thread.
 It is bounded (one call, not thirty) and every one of its failure modes degrades
@@ -58,7 +58,12 @@ from typing import TYPE_CHECKING, NamedTuple
 from uuid import uuid4
 
 from akgentic.core.agent_config import BaseConfig
-from akgentic.tool.vector_store.protocol import PATH_PREFIX_REJECTED, PATH_PREFIX_WILDCARDS
+from akgentic.tool.vector_store.protocol import (
+    PATH_PREFIX_REJECTED,
+    PATH_PREFIX_WILDCARDS,
+    VectorStoreConfig,
+    needs_store_actor,
+)
 from akgentic.tool.workspace.documents.context import RagFileRow, RagIndexState
 from akgentic.tool.workspace.documents.models import (
     EMBEDDING_STALE_AFTER_S,
@@ -89,10 +94,11 @@ if TYPE_CHECKING:
     from akgentic.tool.workspace.documents.worker import IndexFailure, IndexResult
 
     # The mixin consumes the actor's own surface — ``createActor``, the two proxy
-    # builders, ``myAddress``, ``orchestrator``, ``config`` and ``state``. Naming
-    # the base under ``if TYPE_CHECKING:`` is how ``ExecMixin`` already reaches
-    # its own; at runtime the mixin contributes only ``object``, so the MRO the
-    # actor declares is unchanged and nothing here shadows a sibling.
+    # builders, ``myAddress``, ``config``, ``state`` and ``team_id``, and never
+    # its orchestrator: a hosted actor has none. Naming the base under
+    # ``if TYPE_CHECKING:`` is how ``ExecMixin`` already reaches its own; at
+    # runtime the mixin contributes only ``object``, so the MRO the actor
+    # declares is unchanged and nothing here shadows a sibling.
     _DocumentsBase = Akgent[WorkspaceConfig, WorkspaceState]
 else:
     _DocumentsBase = object
@@ -302,10 +308,11 @@ class DocumentsMixin(_DocumentsBase):
         This is also where the collection is created — **lazily, and never in
         ``on_start``**: a workspace with retrieval off must never create one. It
         follows ``PlanActor._acquire_vs_proxy`` with one deliberate divergence:
-        where that actor *raises* when ``#VectorStore`` is absent, this one logs
-        and degrades. A missing vector store is a configuration error for a
-        planning tool, whose whole purpose it is; here it must never be fatal,
-        because this actor also owns the write gate.
+        where that actor *raises* when the team's store is absent, this one logs
+        and degrades when its own store child cannot be spawned. A missing vector
+        store is a configuration error for a planning tool, whose whole purpose
+        it is; here it must never be fatal, because this actor also owns the
+        write gate.
 
         Args:
             agent_id: The announcing agent, for the log line only.
@@ -341,12 +348,19 @@ class DocumentsMixin(_DocumentsBase):
 
         **The slot holds a ``VectorStoreService``, not necessarily a proxy.** An
         actor-state backend — the in-memory index, whose data *is* the store
-        actor's state — is reached through that actor, looked up by name; a
-        cluster backend is built here through the registered factory, because
-        there is no actor to hold anything. The four methods this actor calls are
-        exactly that protocol, so nothing below this line can tell the two apart.
-        (The attribute keeps the name ``_vs_proxy``: renaming it to ``_store`` is
-        ~200 mechanical private sites, routed to its own follow-up.)
+        actor's state — is reached through a child this actor creates for
+        itself; a cluster backend is built here through the registered factory,
+        because there is no actor to hold anything. The four methods this actor
+        calls are exactly that protocol, so nothing below this line can tell the
+        two apart. (The attribute keeps the name ``_vs_proxy``: renaming it to
+        ``_store`` is ~200 mechanical private sites, routed to its own follow-up.)
+
+        **A freshly created child holds nothing, so the index is told so.** On
+        the actor-state branch every ``EMBEDDED`` row goes back to ``PENDING``
+        the moment the child exists and before the collection is created — see
+        :meth:`_requeue_embedded_rows` for why that moment, and not
+        ``init_state``, is the one that can know. A cluster engine kept its
+        rows and is never re-marked.
 
         **Every call through it is an ask.** ``create_collection`` has to be known
         to have worked before anything is added; ``remove`` re-raises a missing
@@ -360,12 +374,17 @@ class DocumentsMixin(_DocumentsBase):
         it is what the query leg embeds through, and every worker this actor spawns
         is handed the same param's model and provider.
 
-        **Any failure drops to degraded mode — never raises.** A missing store
-        actor, a factory that cannot reach its cluster, a ``create_collection``
-        that fails: each logs one WARNING and leaves ``_vs_proxy`` ``None``, so
-        ``workspace_rag_index`` answers a sentence. This actor also owns the write
-        gate, so a missing store must never be fatal here the way it is for
-        planning. **The up-front gate is no longer what protects a file from
+        **Any failure drops to degraded mode — never raises.** A child that could
+        not be spawned, a factory that cannot reach its cluster, a
+        ``create_collection`` that fails: each logs one WARNING and leaves
+        ``_vs_proxy`` ``None``, so ``workspace_rag_index`` answers a sentence. The
+        order on the actor-state branch is spawn, re-mark, ``create_collection``,
+        embedder, bind — so a child whose ``create_collection`` then fails has
+        already been spawned and is **left alive and orphaned** until this actor
+        stops and ``stop_children`` takes it; an idle actor, and the same shape a
+        failed ``create_collection`` left the team store in. This actor also owns
+        the write gate, so a missing store must never be fatal here the way it is
+        for planning. **The up-front gate is no longer what protects a file from
         parking at ``EMBEDDING``**: the write happens on this actor's own turn
         inside a ``try``, so an ask that raises settles the file ``FAILED`` with
         the reason there and then.
@@ -383,6 +402,8 @@ class DocumentsMixin(_DocumentsBase):
         store = self._resolve_store(self._rag_collection)
         if store is None:
             return
+        if needs_store_actor(self._rag_collection) and self._requeue_embedded_rows():
+            self.state.notify_state_change()
         try:
             store.create_collection(RAG_COLLECTION, self._rag_collection)
         except Exception as exc:
@@ -401,26 +422,38 @@ class DocumentsMixin(_DocumentsBase):
     def _resolve_store(self, param: VectorStoreParam) -> VectorStoreService | None:
         """Return the storage engine *param* names, or ``None`` to stay degraded.
 
-        Unlike the planning and knowledge-graph actors, a missing store actor is
-        a WARNING here rather than a ``RuntimeError`` — this actor owns the write
-        gate for a whole workspace, and retrieval is one capability on a card
-        whose other twenty are file operations.
+        **An in-memory store is this actor's own child.** It is created with
+        ``createActor`` exactly as :meth:`_spawn_embedding` creates an
+        ``EmbeddingWorker`` — named ``#VectorStore-<workspace_path>`` with the
+        slash verbatim, handed nothing to look up — and reached through an ask
+        proxy this actor holds. ``Akgent.createActor`` propagates ``parent``,
+        ``team_id``, ``user_id`` and **this actor's own orchestrator**: ``None``
+        once the workspace is hosted, in which case the child emits no
+        ``StartMessage`` and appears on no stream. Its lifetime is this actor's
+        by construction — ``stop_children`` stops it before this actor's
+        ``on_stop`` runs — so the ``#`` prefix on its name no longer matters to
+        any orchestrator's two-phase teardown, which never sees it. Nothing here
+        asks an orchestrator for anything, which is what a hosted actor requires.
+
+        A cluster backend still gets an object and no actor: the data lives on
+        the cluster and there is nothing for an actor to hold.
+
+        A spawn that raises is the WARNING-and-degrade case, where the planning
+        and knowledge-graph actors raise a ``RuntimeError`` for a store they
+        cannot reach. This actor owns the write gate for a whole workspace, and
+        retrieval is one capability on a card whose other twenty are file
+        operations.
 
         Args:
             param: The collection configuration the card announced.
 
         Returns:
-            The store actor's proxy, a freshly built backend, or ``None``.
+            The child's proxy, a freshly built backend, or ``None``.
         """
-        from akgentic.core.orchestrator import Orchestrator  # noqa: PLC0415 — cycle
         from akgentic.tool.vector_store.actor import (  # noqa: PLC0415 — optional extra
             VS_ACTOR_NAME,
             VS_ACTOR_ROLE,
             VectorStoreActor,
-        )
-        from akgentic.tool.vector_store.protocol import (  # noqa: PLC0415 — optional extra
-            VectorStoreConfig,
-            needs_store_actor,
         )
         from akgentic.tool.vector_store.registry import (  # noqa: PLC0415 — optional extra
             BackendContext,
@@ -428,22 +461,23 @@ class DocumentsMixin(_DocumentsBase):
         )
 
         if needs_store_actor(param):
-            if self.orchestrator is None:
+            try:
+                address = self.createActor(
+                    VectorStoreActor,
+                    config=VectorStoreConfig(
+                        name=f"{VS_ACTOR_NAME}-{self.config.workspace_path}",
+                        role=VS_ACTOR_ROLE,
+                    ),
+                )
+                return self.proxy_ask(address, VectorStoreActor)
+            except Exception as exc:
                 logger.warning(
-                    "Workspace %s: no orchestrator — retrieval stays in degraded mode",
+                    "Workspace %s: could not create the in-memory vector store child: %s "
+                    "— degraded mode",
                     self.config.workspace_path,
+                    exc,
                 )
                 return None
-            orch_proxy = self.proxy_ask(self.orchestrator, Orchestrator)
-            vs_addr = orch_proxy.get_team_member(VS_ACTOR_NAME)
-            if vs_addr is None:
-                logger.warning(
-                    "Workspace %s: %s was not found — retrieval stays in degraded mode.",
-                    self.config.workspace_path,
-                    VS_ACTOR_NAME,
-                )
-                return None
-            return self.proxy_ask(vs_addr, VectorStoreActor)
         try:
             return get_backend_spec(param.backend).factory(
                 BackendContext(
@@ -453,8 +487,7 @@ class DocumentsMixin(_DocumentsBase):
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Workspace %s: could not build the '%s' vector store backend: %s "
-                "— degraded mode",
+                "Workspace %s: could not build the '%s' vector store backend: %s — degraded mode",
                 self.config.workspace_path,
                 param.backend,
                 exc,
@@ -1069,6 +1102,66 @@ class DocumentsMixin(_DocumentsBase):
             )
         return reverted > 0
 
+    def _requeue_embedded_rows(self) -> bool:
+        """Put every ``EMBEDDED`` row back to ``PENDING``: the in-memory engine starts empty.
+
+        **Runs at the moment the in-memory store child is created, and only
+        then.** A child of this actor has no checkpoint of its own — ``createActor``
+        gives it a fresh ``VectorStoreState`` and nobody calls ``init_state`` on
+        it — so at the moment it exists it holds nothing, and every row that
+        claims to be in it is a claim about an engine that has never seen the
+        file. The only way an ``EMBEDDED`` row exists at that moment is a
+        restore, because a fresh actor's index is empty or ``PENDING`` from
+        uploads. "On restore" and "at child creation" therefore name the same
+        event, and the second one knows the backend, which ``init_state`` cannot
+        (see ``WorkspaceActor.init_state``). ``EMBEDDED`` is the terminal
+        success status here; the decision this implements calls it "indexed".
+
+        A cluster engine kept its rows and is never re-marked: the caller gates
+        on ``needs_store_actor``. ``STALE`` and ``FAILED`` rows keep their status
+        — whether they should also move is an open question, not a silent
+        widening here.
+
+        **``superseded_chunk_ids`` is not touched, and ``chunks`` is kept.** The
+        engine never held the old ids, so pushing them into the superseded list
+        would make :meth:`_drop_superseded` issue a ``remove`` for nothing once
+        the re-index lands. The chunk set stays as provenance:
+        :meth:`_on_index_result` overwrites it with the worker's set, and until
+        then it keeps the row's heading paths renderable.
+
+        The row counts as "already current" to :meth:`index_paths` at the same
+        digest and is drained anyway — :meth:`_is_accounted_for` treats
+        ``PENDING`` as in flight and :meth:`_drain` spawns for every ``PENDING``
+        row — so the index rebuilds from the cache at the next
+        ``workspace_rag_index``. One re-embed per reaped tree, on the
+        development engine.
+
+        Returns:
+            Whether any row moved, so the caller can make one notify.
+        """
+        now = datetime.now(UTC)
+        requeued = 0
+        for path, entry in list(self.state.rag_index.items()):
+            if entry.status is not RagStatus.EMBEDDED:
+                continue
+            self.state.rag_index[path] = entry.model_copy(
+                update={
+                    "status": RagStatus.PENDING,
+                    "batches_expected": 0,
+                    "batches_landed": 0,
+                    "updated_at": now,
+                }
+            )
+            requeued += 1
+        if requeued:
+            logger.info(
+                "Workspace %s: %d indexed file(s) are queued again — "
+                "the in-memory engine starts empty",
+                self.config.workspace_path,
+                requeued,
+            )
+        return requeued > 0
+
     def mark_paths_stale(self, paths: list[str]) -> None:
         """Mark every indexed path in *paths* ``STALE`` — and re-index none of them.
 
@@ -1399,11 +1492,12 @@ class DocumentsMixin(_DocumentsBase):
         files up; spawning would spend embedding credits in a team that never
         opted in. **That path is idempotent at the live digest too**, and for a
         stronger reason than tidiness: ``WorkspaceState`` is persisted, so a
-        resume whose ``#VectorStore`` is missing restores ``EMBEDDED`` rows onto
-        a tree with no proxy. Re-queueing such a row would clear its chunk set
-        into ``superseded_chunk_ids`` that no proxy will ever remove — losing the
-        heading paths a search renders, and buying a re-embedding of content that
-        was already embedded.
+        resume before any retrieval card enables restores ``EMBEDDED`` rows onto
+        a tree with no proxy. Re-queueing such a row here would clear its chunk
+        set into ``superseded_chunk_ids`` that no proxy will ever remove — losing
+        the heading paths a search renders. The rows stay as restored, and when
+        an in-memory engine arrives it is :meth:`_requeue_embedded_rows` — which
+        touches neither list — that queues them again.
         """
         candidates = self._uploaded_candidates(msg.paths)
         if not candidates:

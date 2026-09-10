@@ -278,6 +278,16 @@ class WorkspaceActor(
         file its batches are gone. Reverting it to ``PENDING`` costs one re-index
         and never a wrong answer.
 
+        **``EMBEDDED`` rows are deliberately not re-marked here**, although on an
+        in-memory engine they must be: the store child of a restored actor has no
+        checkpoint and starts empty. At this moment the backend is unknown —
+        ``_rag_collection`` is ``None`` from ``on_start`` until a card's
+        ``enable_rag`` tell arrives, which the mailbox orders after this call —
+        and a cluster engine loses nothing and must not be re-marked. The moment
+        the in-memory child is created is the moment its emptiness is a fact, and
+        it is the one that knows the backend, so the re-mark lives there:
+        :meth:`~akgentic.tool.workspace.actor.documents.DocumentsMixin._requeue_embedded_rows`.
+
         Args:
             state: The snapshot to adopt.
         """
@@ -294,14 +304,17 @@ class WorkspaceActor(
         and tells the report back — so ``request()`` is never called and there is
         nothing for this to return.
 
-        **It does spawn a ``DeferredWorker``, and that is not a contradiction.**
+        **It does spawn actors directly, and that is not a contradiction.**
         ``DocumentsMixin`` creates an ``EmbeddingWorker`` per batch with
         ``createActor`` and hands it its payload directly, because that worker
         reports through this actor's ``receiveMsg_EmbeddingResult`` /
         ``receiveMsg_EmbeddingError`` rather than through ``deliver`` / ``fail`` —
         which here are the **exec** result cache. Routing it through ``request()``
         would put a batch of vectors into that cache and evict a running agent's
-        exec outcome.
+        exec outcome. The second actor spawned outside ``request()`` is the
+        in-memory ``VectorStoreActor`` child — a storage engine this actor asks,
+        not a worker that reports — created in the same way and stopped with
+        this actor through ``stop_children``.
 
         Raising rather than returning a never-spawned stub: a stub would be dead
         code carrying a ``produce`` nobody runs, and the next reader would have to

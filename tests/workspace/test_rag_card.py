@@ -464,10 +464,15 @@ class TestTheWeaviateCheck:
         assert card.vector_store.backend == "inmemory"
 
 
-class TestTheStoreActorIsCreatedBeforeRetrievalIsAnnounced:
-    """An in-memory retrieval card creates the store; a cluster card creates none."""
+class TestTheCardCreatesNoStoreActor:
+    """The in-memory store is the workspace actor's own child; the card creates none.
 
-    def test_an_in_memory_retrieval_card_creates_the_store_actor(
+    The card creates exactly one actor for any backend. The announcement it
+    makes over the tell proxy is what triggers the store's creation, on the
+    actor's side — ``test_rag_pipeline.py`` holds that positive.
+    """
+
+    def test_an_in_memory_retrieval_card_creates_only_the_workspace_actor(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         from akgentic.tool.vector_store.actor import VectorStoreActor
@@ -481,8 +486,9 @@ class TestTheStoreActorIsCreatedBeforeRetrievalIsAnnounced:
         )
 
         created = [cls for cls, _config in orchestrator_proxy.create_calls]
-        assert VectorStoreActor in created
-        # And it exists by the time retrieval is announced to the workspace actor.
+        assert created == [WorkspaceActor]
+        assert VectorStoreActor not in created
+        # The announcement still fires: it is what now triggers creation, on the actor.
         assert tell.enable_calls
 
     def test_a_cluster_retrieval_card_creates_no_store_actor(

@@ -47,7 +47,6 @@ from akgentic.tool.core import (
     _resolve,
 )
 from akgentic.tool.core.observer import ActorToolObserver
-from akgentic.tool.vector_store.actor import ensure_store_actor
 from akgentic.tool.vector_store.protocol import (
     VectorStoreParam,
     require_backend_configured,
@@ -264,7 +263,8 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
 
     Three things read it besides the collection itself: it decides the
     backend-derived document caps below, it is what ``require_backend_configured``
-    checks, and it is what decides whether a store actor is created at all — all
+    checks, and — once announced to the workspace actor — it is what that actor
+    reads to decide whether to create its own in-memory store child at all. All
     three only when a retrieval capability is actually enabled.
     """
 
@@ -518,6 +518,11 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
         which need the verdict, and a tell proxy for observations, which need
         nothing back.
 
+        **This method creates one actor.** The in-memory vector store a retrieval
+        card needs is the workspace actor's own child, created by that actor when
+        ``enable_rag`` reaches it and stopped with it; the card no longer creates
+        a store actor for any backend, and holds no handle on one.
+
         The agent's **name** is registered here, once, over the tell proxy. What
         the card can capture without an edge back to the agent is
         ``agent_id`` — a UUID — and a journal authored by UUID, or a refusal
@@ -534,15 +539,6 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
                 whose injectivity would have to be proved separately.
         """
         orchestrator_proxy = observer.proxy_ask(orchestrator, Orchestrator)
-        if self._rag_enabled():
-            # The store is created **here**, not in ``_announce_rag``, for one
-            # concrete reason: this method is the only one that holds an
-            # orchestrator proxy, and ``_announce_rag`` holds a tell proxy over
-            # the *workspace* actor instead. Threading an orchestrator proxy down
-            # to the announcement would buy nothing — this runs first, and the
-            # store only has to exist by the time ``enable_rag`` makes the
-            # workspace actor resolve it. A cluster backend creates nothing.
-            ensure_store_actor(self.vector_store, orchestrator_proxy)
         derived_documents, derived_chars = derived_document_caps(
             self.vector_store.backend, self._rag_enabled()
         )

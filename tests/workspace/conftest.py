@@ -78,6 +78,7 @@ def workspace_root_for(base: Path, leaf: str, user_id: str = DEFAULT_TEST_PRINCI
     """The on-disk root of the workspace *leaf* belonging to *user_id*."""
     return base / user_id / leaf
 
+
 HANDSHAKE_TIMEOUT_S = 5.0
 """Upper bound on a thread handshake — never a delay, only a failure budget."""
 
@@ -258,12 +259,26 @@ class FakeOrchestratorProxy:
         return None
 
     def stop_all(self) -> None:
-        """Stop every created actor — a live one on its thread, an inert one in place."""
+        """Stop every created actor **and its children** — live on its thread, inert in place.
+
+        The real orchestrator stops a member through ``Akgent.stop``, which runs
+        ``stop_children`` first; a bare ``ActorRef.stop()`` runs ``on_stop`` only.
+        Since the in-memory vector store became the workspace actor's own child,
+        the difference is a real thread: an inert actor whose ``enable_rag`` ran
+        has started one through ``createActor``, and stopping the parent any other
+        way leaves it alive until the interpreter refuses to exit.
+        """
         for ref in self._refs:
+            if ref.is_alive():
+                try:
+                    ref.proxy().stop().get(timeout=HANDSHAKE_TIMEOUT_S)
+                except ActorDeadError:
+                    pass
             ref.stop()
         self._refs.clear()
         if not self.live:
             for _, actor in self.children.values():
+                actor.stop_children()
                 actor.on_stop()
         self.children.clear()
 
