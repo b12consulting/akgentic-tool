@@ -13,7 +13,7 @@ from akgentic.tool.planning import PlanningTool
 | Module | `akgentic.tool.planning.planning` |
 | Actor | `PlanActor`, singleton named `#PlanningTool` |
 | Channels used | `LLM_CONTEXT`, `TOOL_CALL`, `COMMAND` |
-| Depends on | `VectorStoreTool` — conditionally, see [`vector_store`](#vector_store) |
+| Depends on | nothing — the card creates its own store, see [`vector_store`](#vector_store) |
 | Optional extras | `[vector_search]` for semantic search |
 
 ---
@@ -23,8 +23,7 @@ from akgentic.tool.planning import PlanningTool
 ```python
 class PlanningTool(ToolCard):
     # Vector-search wiring
-    vector_store: bool | str = True
-    collection: CollectionConfig = CollectionConfig()
+    vector_store: VectorStoreParam | bool = True
     search_top_k: int = 10
     search_score_threshold: float = 0.5
 
@@ -33,10 +32,6 @@ class PlanningTool(ToolCard):
     get_planning_task: GetPlanningTask | bool = True
     update_planning: UpdatePlanning | bool = True
     search_planning: SearchPlanning | bool = True
-
-    @property
-    def depends_on(self) -> list[str]:
-        return ["VectorStoreTool"] if self.vector_store is not False else []
 ```
 
 **The card is a thin proxy; the plan lives in an actor.** `observer()` asks the orchestrator for
@@ -44,10 +39,11 @@ class PlanningTool(ToolCard):
 a `PlanningTool` binds to the *same* `#PlanningTool` singleton and sees the same task list. All
 four capabilities are closures over that actor's ask proxy.
 
-**`depends_on` is a property, not a field.** It returns `["VectorStoreTool"]` only when
-`vector_store` is not `False`, so `ToolFactory`'s topological sort wires `VectorStoreTool` first
-when it is needed and does not demand one when the tool runs keyword-only. Because it is a
-property it never appears in `model_dump()` and cannot be set through `model_validate`.
+**This card declares no `depends_on`, because it owns its own storage.** `observer()` creates the
+store actor itself — when the backend needs one — immediately before it creates the `PlanActor`
+that will look it up, so the ordering that a dependency edge between two cards used to enforce is
+now two lines in one method. There is no second card to add to the team and nothing for
+`ToolFactory`'s topological sort to order.
 
 ---
 
@@ -55,26 +51,63 @@ property it never appears in `model_dump()` and cannot be set through `model_val
 
 ### `vector_store`
 
-| Value | Effect |
+A `VectorStoreParam` or a `bool`, saying where the plan's vectors live and how they are embedded,
+in one of three shapes:
+
+| Written | Means |
 |---|---|
-| `True` *(default)* | Bind to the default `#VectorStore` actor. `depends_on` requires a `VectorStoreTool` in the team. |
-| `"#VectorStore-RAG"` (any `str`) | Bind to that named singleton, created by `VectorStoreTool(vector_store_name=...)`. |
-| `False` | Degraded mode: no vector wiring, no `depends_on`, `search_planning` runs keyword-only. |
+| `True` (the default) | an enabled store with default settings |
+| `False` | no store at all — no store actor, no embedding, semantic search absent |
+| `VectorStoreParam(…)` | an enabled store configured explicitly |
 
-The card never creates the vector store actor — `VectorStoreTool` owns it. `PlanActor` looks it up
-by name during its own `on_start`. If the lookup fails, or `[vector_search]` is not installed, the
-tool degrades to keyword-only search rather than failing.
+The card keeps what the author wrote, verbatim, and normalises it at the point of use:
+`resolve_store_param` turns `True` into a fresh `VectorStoreParam()` and `False` into `None`, so
+everything below the card sees only two shapes. The resolved value is forwarded to `PlanConfig` and
+is what `PlanActor` resolves its storage engine from at `on_start`, calling
+`create_collection("planning", …)` on whatever it resolves.
 
-### `collection`
+**Why the bool is not expanded on the card.** `VectorStoreParam.backend` resolves from the
+environment *per instantiation*, so coercing `True` into a param at validation time would write the
+build environment's backend into a stored catalog record whose author wrote `true` — and catalogs
+are routinely promoted between tiers.
 
-A `CollectionConfig` forwarded to `VectorStoreActor.create_collection("planning", …)` when
-`PlanActor` starts.
+**The backend decides whether an actor is involved at all.** An actor-state backend — the in-memory
+index, whose data *is* the store actor's state — gets a store actor, created by this card's
+`observer()` before the `PlanActor` that looks it up. A cluster backend gets none: the data lives on
+the cluster, so `PlanActor` builds the backend through the registered factory and talks to the
+process's shared client directly.
+
+If the store cannot be resolved, or the collection cannot be created, or `[vector_search]` is not
+installed, the tool degrades to keyword-only search rather than failing — one WARNING, and
+`search_planning` still answers from its keyword leg.
+
+**Only half of what this field used to mean is gone.** Before epic 49 it was a `bool | str` doing
+two jobs: the string named *which* `VectorStoreActor` to look up, and the bool said whether to have
+a store at all. The lookup is gone for good — a card writing `vector_store: "#VectorStore-RAG"`
+fails validation, because the actor it addressed no longer exists — and the configuration that used
+to live on a separate `collection` field now lives in the param, so a persisted card carrying
+`collection:` silently takes the default. The **bool** is not gone: it is the opt-out described
+above, and every stored card writing `vector_store: false` keeps loading.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `dimension` | `int` | `1536` | Embedding dimensionality; must match the embedding model. |
-| `backend` | `"inmemory" \| "weaviate"` | `"inmemory"` | `weaviate` requires `akgentic-tool[weaviate]`. |
-| `tenant` | `str \| None` | `None` | Weaviate tenant id for multi-tenancy — usually the team id. |
+| `dimension` | `int` | `1536` | Embedding dimensionality; must be the native width of a known `embedding_model`, refused at bind otherwise. |
+| `backend` | `str` | `default_backend()` | Any **registered** backend name — `inmemory`, `weaviate`, `qdrant`, or one a deployment registers itself. Not a closed union: the set is the registry's, so a name nobody registered fails the build rather than silently taking a branch. The two cluster backends need `akgentic-tool[weaviate]` / `[qdrant]`. |
+| `tenant` | `str \| None` | `None` | Tenant id for multi-tenancy — usually the team id. Native on Weaviate; a payload field on Qdrant. |
+| `params` | `dict[str, Any]` | `{}` | Backend-native settings passed through untouched. Schemaless by nature, so it is the one place `Any` is the honest type. |
+| `embedding_model` | `str` | `"text-embedding-3-small"` | The model that produces the collection's vectors. |
+| `embedding_provider` | `Literal["openai", "azure"]` | `"openai"` | The embedding API provider. |
+
+**`default_backend()` is resolved per instantiation, not at import.** It asks every registered
+backend whether the environment has provisioned it, so a card that names no backend lands wherever
+the deployment actually is: a configured cluster is deployed to be used, and a collection with no
+opinion should not quietly receive a process-local index that disappears with the actor.
+
+**`planning` is a team-scoped collection**, so every search and every removal the store issues
+carries this team's id as a predicate. That is not true of every collection in the package — the
+workspace's `workspace_chunks` is shared across teams, because its rows belong to a filesystem tree
+rather than to a team — but it is true of this one, and it is declared by name in
+`vector_store/protocol.py` rather than by anything a catalog author can set.
 
 ### `search_top_k` / `search_score_threshold`
 
@@ -189,14 +222,15 @@ a known substring and you do not want to pay for an embedding.
 
 ```python
 from akgentic.tool.planning import PlanningTool
-from akgentic.tool.vector_store import VectorStoreTool
 
-ToolFactory([PlanningTool(), VectorStoreTool()], observer=agent)
-# -> topologically sorted to [VectorStoreTool, PlanningTool]; order in the list is irrelevant
+ToolFactory([PlanningTool()], observer=agent)
+# -> no ordering to arrange: the card creates its own store inside observer()
 ```
 
-Listing `PlanningTool` with `vector_store=True` and **no** `VectorStoreTool` raises `ValueError`
-at factory construction — fail fast at team creation, not at the first search.
+There is no second card to list and no order to get wrong. What still fails fast at team creation
+is a card naming a backend the environment has not provisioned — a cluster URL that is not
+exported, or a dimension contradicting the embedding model — which `observer()` refuses with a
+`ValueError` rather than degrading at the first search.
 
 ### Recipes
 
@@ -208,13 +242,11 @@ PlanningTool(get_planning=GetPlanning(filter_by_agent=False))  # everyone sees e
 PlanningTool(get_planning=GetPlanning(expose={LLM_CONTEXT, TOOL_CALL, COMMAND}))
                                                              # also fetchable on demand
 
-PlanningTool(vector_store=False)                             # keyword-only, no vector store needed
-
 PlanningTool(update_planning=False)                          # read-only board for an observer agent
 
-PlanningTool(                                                # persistent, multi-tenant board
-    collection=CollectionConfig(backend="weaviate", tenant="team-42"),
-    search_score_threshold=0.65,
+PlanningTool(                                                # persistent, multi-tenant board;
+    vector_store=VectorStoreParam(backend="weaviate", tenant="team-42"),
+    search_score_threshold=0.65,                             # no store actor is created for it
 )
 
 PlanningTool(hybrid_alpha=0.3)                               # trust exact wording over similarity
@@ -229,7 +261,7 @@ PlanningTool(hybrid_alpha=0.3)                               # trust exact wordi
 > export AKGENTIC_WEAVIATE_API_KEY="..."          # omit for an unauthenticated cluster
 > ```
 >
-> **Exporting the URL is what turns Weaviate on**, and a `CollectionConfig` that names no backend
+> **Exporting the URL is what turns Weaviate on**, and a `VectorStoreParam` that names no backend
 > then defaults to `weaviate` rather than to the in-memory index. An exported but empty variable
 > counts as unset. Requires `akgentic-tool[weaviate]`.
 >
@@ -240,7 +272,8 @@ PlanningTool(hybrid_alpha=0.3)                               # trust exact wordi
 ### Semantic search
 
 With `[vector_search]` installed, task descriptions are embedded on create and update and stored
-in the `planning` collection of the bound `VectorStoreActor`.
+in the `planning` collection of whatever storage engine the card's `vector_store` resolves — the
+store actor on an actor-state backend, the backend itself on a cluster one.
 
 `mode="hybrid"` fuses the keyword and semantic legs with the shared rule, Weaviate's
 `relativeScoreFusion` at `alpha = 0.7`: `alpha * norm(cosine) + (1 - alpha) * keyword`. A strong
@@ -252,8 +285,30 @@ documented once in
 `score_threshold` gates the semantic leg only, on the raw cosine before fusion, so a keyword match
 is never dropped by it.
 
-Without the extra, or with `vector_store=False`, `search_planning` still answers — keyword and
-field filters only. There is no error and no warning at call time; the degradation is by design.
+Without the extra, or whenever the store cannot be resolved or its collection cannot be created,
+`search_planning` still answers — keyword and field filters only. There is no error and no warning
+at call time; the degradation is by design.
+
+**To switch the vector store off deliberately, write `vector_store=False`.** Nothing is probed at
+bind — a card naming an unprovisioned cluster and then switched off does not fail its team's build —
+no store actor is created, and nothing is embedded. The capability is **not** unregistered, because
+most of it still works:
+
+```python
+PlanningTool(vector_store=False)   # keyword and hybrid search still answer from the task list
+```
+
+| Mode | With `vector_store=False` |
+|---|---|
+| `"keyword"` | unchanged — substring matching over the task list |
+| `"hybrid"` | unchanged — the keyword leg answers, the semantic leg is empty |
+| `"vector"` | returns `[SEMANTIC_DISABLED]`, one sentence saying semantic search is off |
+
+The sentence matters: an empty list would read as "no task matches" rather than "there is no index".
+A store that was *asked for* and could not be built keeps returning empty results, so a real
+misconfiguration is still visible rather than hidden behind a reassuring sentence. The two cases are
+also distinguishable in the logs — a declined store logs one line at bind saying it is off by
+configuration.
 
 ### Import paths
 

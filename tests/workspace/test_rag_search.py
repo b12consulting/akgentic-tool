@@ -20,8 +20,8 @@ from typing import Any
 
 import pytest
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA, OVERFETCH
-from akgentic.tool.vector_store.inmemory import InMemoryBackend
-from akgentic.tool.vector_store.protocol import CollectionConfig, SearchResult
+from akgentic.tool.vector_store.backends.inmemory import InMemoryBackend
+from akgentic.tool.vector_store.protocol import VectorStoreParam, SearchResult
 from akgentic.tool.vector_store.vector import VectorEntry
 from akgentic.tool.workspace.actor import (
     WORKSPACE_ACTOR_ROLE,
@@ -71,23 +71,14 @@ class SearchStore:
 
     def __init__(self) -> None:
         self.backend = InMemoryBackend()
-        self.backend.create_collection(RAG_COLLECTION, CollectionConfig(backend="inmemory"))
+        self.backend.create_collection(RAG_COLLECTION, VectorStoreParam(backend="inmemory"))
         self.searches: list[tuple[str, int, str | None, str | None]] = []
-        self.embeds: list[list[str]] = []
-        self.embed_error: Exception | None = None
         self.search_error: Exception | None = None
-        self.embed_returns: list[list[float]] | None = None
 
-    def create_collection(self, name: str, config: CollectionConfig) -> None:
+    def create_collection(self, name: str, config: VectorStoreParam) -> None:
         self.backend.create_collection(name, config)
 
-    def add(
-        self,
-        collection: str,
-        entries: list[VectorEntry],
-        requester: Any = None,
-        request_ref: str | None = None,
-    ) -> None:
+    def add(self, collection: str, entries: list[VectorEntry]) -> None:
         self.backend.add(collection, entries)
 
     def remove(
@@ -98,14 +89,6 @@ class SearchStore:
         path_prefix: str | None = None,
     ) -> None:
         self.backend.remove(collection, ref_ids, scope=scope, path_prefix=path_prefix)
-
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        self.embeds.append(list(texts))
-        if self.embed_error is not None:
-            raise self.embed_error
-        if self.embed_returns is not None:
-            return self.embed_returns
-        return [vector_for(text) for text in texts]
 
     def search(
         self,
@@ -140,12 +123,35 @@ class SearchStore:
         )
 
 
+class SearchEmbedder:
+    """The consumer's own embedding service — the query leg no longer goes to the store.
+
+    The vector store embeds nothing after story 49-3, so the double that used to
+    carry ``embed`` beside ``search`` is split in two and this half is installed on
+    the actor as ``_embedder``.
+    """
+
+    def __init__(self) -> None:
+        self.embeds: list[list[str]] = []
+        self.embed_error: Exception | None = None
+        self.embed_returns: list[list[float]] | None = None
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        self.embeds.append(list(texts))
+        if self.embed_error is not None:
+            raise self.embed_error
+        if self.embed_returns is not None:
+            return self.embed_returns
+        return [vector_for(text) for text in texts]
+
+
 class SearchHarness:
     """An inert actor whose vector-store proxy is a :class:`SearchStore`."""
 
     def __init__(self, actor: WorkspaceActor, store: SearchStore) -> None:
         self.actor = actor
         self.store = store
+        self.embedder = SearchEmbedder()
         self.orchestrator = DeadAddress("orchestrator")
         self.vs_address: MockActorAddress | None = MockActorAddress("#VectorStore")
 
@@ -159,8 +165,11 @@ class SearchHarness:
             "alice",
             WorkspaceRagIndex(),
             DocumentReader(llm_client=None),
-            CollectionConfig(backend="inmemory"),
+            VectorStoreParam(backend="inmemory"),
         )
+        # ``enable_rag`` builds a real ``EmbeddingService`` from the card's param;
+        # the query leg under test must go to the double instead.
+        self.actor._embedder = self.embedder
 
     def index(
         self,
@@ -310,7 +319,7 @@ class TestDegradation:
     ) -> None:
         """One warning, no exception, and the lexical half still answers."""
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
-        search.store.embed_error = RuntimeError("the embedding provider is down")
+        search.embedder.embed_error = RuntimeError("the embedding provider is down")
 
         answer = search.actor.rag_search("payment")
 
@@ -321,7 +330,7 @@ class TestDegradation:
         self, search: SearchHarness
     ) -> None:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
-        search.store.embed_returns = []
+        search.embedder.embed_returns = []
 
         answer = search.actor.rag_search("payment")
 
@@ -418,7 +427,7 @@ class TestTheKeywordLeg:
 
     def test_it_matches_case_insensitively(self, search: SearchHarness) -> None:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
-        search.store.embed_error = RuntimeError("vector leg off")
+        search.embedder.embed_error = RuntimeError("vector leg off")
 
         assert "invoice.md" in search.actor.rag_search("PAYMENT")
 
@@ -432,7 +441,7 @@ class TestTheKeywordLeg:
         ``None`` body would be a ``TypeError`` on the gate's own thread.
         """
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND], cache=False)
-        search.store.embed_error = RuntimeError("vector leg off")
+        search.embedder.embed_error = RuntimeError("vector leg off")
 
         answer = search.actor.rag_search("payment")  # must not raise
 
@@ -459,7 +468,7 @@ class TestTheKeywordLeg:
         search.actor.state.documents["invoice.md"] = stale.model_copy(
             update={"source_sha": "a-different-digest"}
         )
-        search.store.embed_error = RuntimeError("vector leg off")
+        search.embedder.embed_error = RuntimeError("vector leg off")
 
         assert search.actor.rag_search("payment") == _NO_HITS
 
@@ -475,7 +484,7 @@ class TestTheKeywordLeg:
             char_count=16,
             extracted_at=datetime.now(UTC),
         )
-        search.store.embed_error = RuntimeError("vector leg off")
+        search.embedder.embed_error = RuntimeError("vector leg off")
 
         assert search.actor.rag_search("payment") == _NO_HITS
 
@@ -484,7 +493,7 @@ class TestTheKeywordLeg:
     ) -> None:
         """The offsets are what map a body match onto a chunk id."""
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
-        search.store.embed_error = RuntimeError("vector leg off")
+        search.embedder.embed_error = RuntimeError("vector leg off")
 
         answer = search.actor.rag_search("refund")
 
@@ -495,7 +504,7 @@ class TestTheKeywordLeg:
         """The backend filters its own leg; nothing else would filter this one."""
         search.index("reports/invoice.md", _INVOICE, [_FIRST])
         search.index("notes/invoice.md", _INVOICE, [_FIRST])
-        search.store.embed_error = RuntimeError("vector leg off")
+        search.embedder.embed_error = RuntimeError("vector leg off")
 
         answer = search.actor.rag_search("payment", path_prefix="reports/")
 
@@ -505,7 +514,7 @@ class TestTheKeywordLeg:
     def test_an_empty_query_hits_nothing_on_the_keyword_leg(self, search: SearchHarness) -> None:
         """A blank query must not match every chunk in the workspace."""
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
-        search.store.embed_error = RuntimeError("vector leg off")
+        search.embedder.embed_error = RuntimeError("vector leg off")
 
         assert search.actor.rag_search("   ") == _NO_HITS
 
@@ -695,16 +704,28 @@ class TestThePathPrefixDecision:
         backend: str,
     ) -> None:
         """The refusal is at the caller, so the two backends cannot disagree."""
+        from dataclasses import replace
+
+        from akgentic.tool.vector_store import registry
+
         harness = SearchHarness(build_actor(), store)
         harness.install(monkeypatch)
-        harness.actor.enable_rag(
-            "alice",
-            WorkspaceRagIndex(),
-            DocumentReader(llm_client=None),
-            CollectionConfig(backend=backend),
-        )
+        original = registry.get_backend_spec(backend)
+        # A cluster param resolves through the factory rather than the store
+        # actor, so the same double is installed there. ``BackendSpec`` is frozen,
+        # so the seam is a re-registration.
+        registry.register_backend(replace(original, factory=lambda _ctx: store), replace=True)
+        try:
+            harness.actor.enable_rag(
+                "alice",
+                WorkspaceRagIndex(),
+                DocumentReader(llm_client=None),
+                VectorStoreParam(backend=backend),
+            )
 
-        answers = {harness.actor.rag_search("payment", path_prefix="report?.md")}
+            answers = {harness.actor.rag_search("payment", path_prefix="report?.md")}
+        finally:
+            registry.register_backend(original, replace=True)
 
         assert len(answers) == 1
         assert "cannot contain" in answers.pop()
@@ -716,11 +737,11 @@ class TestThePathPrefixDecision:
         search.actor.rag_search("payment", path_prefix="report*")
 
         assert search.store.searches == []
-        assert search.store.embeds == []
+        assert search.embedder.embeds == []
 
     def test_the_in_memory_backend_treats_a_metacharacter_literally(self) -> None:
         """Half of the divergence the refusal exists for, pinned against real code."""
-        from akgentic.tool.vector_store.inmemory import _entry_matches
+        from akgentic.tool.vector_store.backends.inmemory import _entry_matches
 
         entry = VectorEntry(
             ref_type="workspace_chunk", ref_id="c", text="t", vector=[1.0], path="report?.md"

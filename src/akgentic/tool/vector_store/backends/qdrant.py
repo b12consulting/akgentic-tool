@@ -26,13 +26,16 @@ import logging
 import uuid
 from typing import TYPE_CHECKING, Any
 
+from akgentic.tool.vector_store.client import ClusterKey, get_client
 from akgentic.tool.vector_store.protocol import (
-    CollectionConfig,
     CollectionStatus,
     SearchHit,
     SearchResult,
     VectorQuery,
+    VectorStoreParam,
     check_path_prefix,
+    check_shared_scope,
+    collection_is_team_scoped,
 )
 from akgentic.tool.vector_store.registry import BackendContext, BackendSpec, register_backend
 
@@ -178,12 +181,21 @@ def _check_qdrant_dependencies() -> None:
 class QdrantBackend:
     """Qdrant-backed vector store implementing ``VectorStoreService``.
 
-    A plain class (not a Pydantic model) because it holds a live client
-    connection. It satisfies the ``VectorStoreService`` protocol structurally.
+    A plain class (not a Pydantic model) because it holds non-serialisable
+    runtime state: a handle to the process's **shared** Qdrant client, not a
+    connection of its own. It satisfies the ``VectorStoreService`` protocol
+    structurally.
+
+    **It takes a client and never closes one**, exactly as ``WeaviateBackend``
+    does. The client comes from
+    :func:`akgentic.tool.vector_store.client.get_client` — one per cluster per
+    process, keyed on the backend name as well as the connection — and is closed
+    only by ``close_all()`` at process exit. What a backend owns is its scope
+    (``tenant``, ``team_id``) and its created-collections bookkeeping.
 
     Args:
-        url: Qdrant cluster URL (e.g. ``http://localhost:6333``).
-        api_key: Optional API key for authentication.
+        client: The connected ``qdrant_client.QdrantClient`` for the cluster.
+            The backend never connects and never closes it.
         tenant: Optional tenant id, stored on every point and folded into the
             team scope for search/remove.
         team_id: Owning team id, stamped onto every point so a later sweep can
@@ -192,17 +204,15 @@ class QdrantBackend:
 
     def __init__(
         self,
-        url: str,
-        api_key: str | None = None,
+        client: QdrantClient,
         tenant: str | None = None,
         team_id: str | None = None,
     ) -> None:
         _check_qdrant_dependencies()
-        from qdrant_client import QdrantClient
 
         self._tenant = tenant
         self._team_id = team_id
-        self._client: QdrantClient = QdrantClient(url=url, api_key=api_key)
+        self._client: QdrantClient = client
         self._collections_created: set[str] = set()
         self._collection_tenants: dict[str, str] = {}
 
@@ -210,7 +220,7 @@ class QdrantBackend:
     # VectorStoreService protocol methods
     # ------------------------------------------------------------------
 
-    def create_collection(self, name: str, config: CollectionConfig) -> None:
+    def create_collection(self, name: str, config: VectorStoreParam) -> None:
         """Create a named Qdrant collection. No-op if it already exists.
 
         The distance metric is cosine, matching the ``VectorStoreService``
@@ -300,12 +310,15 @@ class QdrantBackend:
             path_prefix: Restrict removal to points whose ``path`` starts with this.
 
         Raises:
-            ValueError: If the collection has not been created, the backend was
-                built without a ``team_id``, or ``path_prefix`` contains ``*`` or ``?``.
+            ValueError: If the collection has not been created, ``path_prefix``
+                contains ``*`` or ``?``, the collection is shared across teams
+                and no ``scope`` was given, or — on a team-scoped collection
+                only — the backend was built without a ``team_id``.
         """
         from qdrant_client import models
 
         check_path_prefix(path_prefix)
+        check_shared_scope(collection, scope)
         self._check_collection(collection)
         selector = self._build_filter(collection, None, scope=scope)
         selector.must.append(  # type: ignore[union-attr]
@@ -384,10 +397,13 @@ class QdrantBackend:
             Search results with hits ranked by cosine similarity.
 
         Raises:
-            ValueError: If the collection has not been created, the backend was
-                built without a ``team_id``, or ``path_prefix`` contains ``*`` or ``?``.
+            ValueError: If the collection has not been created, ``path_prefix``
+                contains ``*`` or ``?``, the collection is shared across teams
+                and no ``scope`` was given, or — on a team-scoped collection
+                only — the backend was built without a ``team_id``.
         """
         check_path_prefix(path_prefix)
+        check_shared_scope(collection, scope)
         self._check_collection(collection)
         limit = top_k if path_prefix is None else max(top_k * 4, top_k)
         response = self._client.query_points(
@@ -422,7 +438,7 @@ class QdrantBackend:
             if len(hits) >= top_k:
                 break
 
-        return SearchResult(hits=hits, status=CollectionStatus.READY, indexing_pending=0)
+        return SearchResult(hits=hits, status=CollectionStatus.READY)
 
     # ------------------------------------------------------------------
     # Query construction hooks (override in a subclass for bespoke behaviour)
@@ -435,23 +451,40 @@ class QdrantBackend:
         *,
         scope: str | None = None,
     ) -> qmodels.Filter:
-        """Combine the mandatory team predicate with ``scope`` and ``query.filters``.
+        """Combine the collection's own predicate with ``scope`` and ``query.filters``.
 
         ``scope`` and each entry in ``query.filters`` become a ``MatchValue``
-        (scalar) or ``MatchAny`` (list) condition AND-ed onto the team scope.
+        (scalar) or ``MatchAny`` (list) condition AND-ed onto that predicate.
         Override to support ranges, geo, or nested payload operators.
 
+        On a team-scoped collection the predicate starts from
+        :meth:`_team_scope`, which refuses a backend that does not know its team.
+        On a collection listed in
+        :data:`~akgentic.tool.vector_store.protocol.SHARED_COLLECTIONS` the team leg
+        is not built at all — its rows belong to a filesystem tree rather than to a
+        team — and only the tenant leg survives from the base. The result is never
+        an empty conjunction, because
+        :func:`~akgentic.tool.vector_store.protocol.check_shared_scope` has already
+        made ``scope`` mandatory for such a collection.
+
         Args:
-            collection: Collection whose effective tenant must be included.
+            collection: The collection being queried, which decides whether the
+                team leg is part of the predicate. Its effective tenant is
+                included either way.
             query: The active query, or ``None``.
             scope: Optional ``scope`` equality predicate.
 
         Returns:
-            A Qdrant ``Filter`` always scoped to this team.
+            A Qdrant ``Filter``, scoped to this team unless *collection* is shared
+            across teams.
         """
         from qdrant_client import models
 
-        selector = self._team_scope(collection)
+        selector = (
+            self._team_scope(collection)
+            if collection_is_team_scoped(collection)
+            else models.Filter(must=self._tenant_conditions(collection))
+        )
         if scope is not None:
             selector.must.append(  # type: ignore[union-attr]
                 models.FieldCondition(
@@ -501,14 +534,31 @@ class QdrantBackend:
         Existence is checked against the cluster, not local bookkeeping: the
         caller is typically a sweeper reaping a team that no longer exists.
 
+        **A collection shared across teams is refused, before any cluster call.**
+        On such a collection ``team_id`` records *who wrote the point* and is read
+        by nothing once the query predicate stops using it, so a sweeper pointed at
+        it would delete points another live team is still reading, from a tree that
+        still exists. The check consults a module-level fact rather than this
+        backend's own bookkeeping, so it still bites on an administrative backend
+        that has created no collection — the only kind a sweeper has.
+
         Args:
             collection: Target collection name.
             team_id: The team whose points are to be removed.
 
         Raises:
-            ValueError: If the collection does not exist in the cluster.
+            ValueError: If the collection is shared across teams, or does not
+                exist in the cluster.
         """
         from qdrant_client import models
+
+        if not collection_is_team_scoped(collection):
+            msg = (
+                f"Collection '{collection}' is shared across teams, so deleting one "
+                "team's points would remove rows another live team is still reading. "
+                "Remove by ref_id with a scope instead."
+            )
+            raise ValueError(msg)
 
         if not self._client.collection_exists(collection):
             msg = f"Collection '{collection}' does not exist"
@@ -527,10 +577,6 @@ class QdrantBackend:
             ),
         )
 
-    def close(self) -> None:
-        """Close the Qdrant client connection."""
-        self._client.close()
-
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
@@ -545,7 +591,7 @@ class QdrantBackend:
         return str(uuid.uuid5(_POINT_ID_NAMESPACE, identity))
 
     @staticmethod
-    def _resolve_distance(config: CollectionConfig) -> qmodels.Distance:
+    def _resolve_distance(config: VectorStoreParam) -> qmodels.Distance:
         """Return cosine distance or reject an incompatible metric."""
         from qdrant_client import models
 
@@ -614,14 +660,33 @@ class QdrantBackend:
                 key=TEAM_ID_PAYLOAD, match=models.MatchValue(value=self._team_id)
             )
         ]
-        tenant = self._collection_tenants.get(collection) or self._tenant
-        if tenant:
-            must.append(
-                models.FieldCondition(
-                    key=TENANT_PAYLOAD, match=models.MatchValue(value=tenant)
-                )
-            )
+        must.extend(self._tenant_conditions(collection))
         return models.Filter(must=must)
+
+    def _tenant_conditions(self, collection: str) -> list[qmodels.Condition]:
+        """Return the tenant leg for *collection*, or no leg when none is configured.
+
+        Split out of :meth:`_team_scope` because a shared collection drops the team
+        leg and keeps this one: tenancy is a deployment partition, orthogonal to
+        which team wrote a row, so it applies whether or not the collection is
+        team-scoped. Duplicating it in two filter builders is how the two would
+        drift.
+
+        Args:
+            collection: The collection whose effective tenant is wanted.
+
+        Returns:
+            A one-element list holding the tenant equality condition, or an empty
+            list when neither the collection nor the backend names a tenant.
+        """
+        from qdrant_client import models
+
+        tenant = self._collection_tenants.get(collection) or self._tenant
+        if not tenant:
+            return []
+        return [
+            models.FieldCondition(key=TENANT_PAYLOAD, match=models.MatchValue(value=tenant))
+        ]
 
     def _check_collection(self, collection: str) -> None:
         """Raise ``ValueError`` if *collection* was never created via this backend.
@@ -642,23 +707,54 @@ class QdrantBackend:
 # ---------------------------------------------------------------------------
 
 
+def _connect_qdrant(key: ClusterKey) -> QdrantClient:
+    """Open the cluster connection *key* names — the callable ``get_client`` calls.
+
+    The one place in this package that constructs a ``QdrantClient``, which is
+    what keeps ``client.py`` free of any vendor name. It builds the **remote**
+    client only: the embedded implementation is reached exclusively through
+    ``location=":memory:"`` or ``path=``, neither of which anything here passes,
+    so a shared client is always the thread-safe remote one.
+
+    Args:
+        key: The cluster to connect to.
+
+    Returns:
+        A connected client.
+
+    Raises:
+        ImportError: When ``qdrant-client`` is not installed.
+    """
+    _check_qdrant_dependencies()
+    from qdrant_client import QdrantClient as _QdrantClient
+
+    scheme = "https" if key.secure else "http"
+    return _QdrantClient(url=f"{scheme}://{key.host}:{key.port}", api_key=key.api_key)
+
+
 def _make_qdrant_backend(context: BackendContext) -> QdrantBackend:
     """Build a :class:`QdrantBackend` from the environment.
 
-    Unlike Weaviate, connection settings are read straight from the environment
-    (``VectorStoreConfig`` carries no Qdrant fields), so a Qdrant deployment
-    needs only the ``AKGENTIC_QDRANT_*`` variables and no card changes.
+    Like Weaviate, connection settings are read straight from the environment
+    (``VectorStoreConfig`` carries no connection field), so a Qdrant deployment
+    needs only the ``AKGENTIC_QDRANT_*`` variables and no card changes. The
+    resolved pair goes through the shared cache, so every backend built for one
+    Qdrant cluster in this process holds one client — and none of them closes it.
+
+    ``default_port=6333`` is a keying concern: it collapses ``http://host`` and
+    ``http://host:6333`` onto one key rather than opening two clients against
+    one server.
     """
     url = qdrant_url()
     if not url:
         msg = "qdrant_url is not configured; cannot build QdrantBackend."
         raise ValueError(msg)
-    # Tenancy is per-collection (CollectionConfig.tenant), not per-actor, so the
+    key = ClusterKey.from_url("qdrant", url, qdrant_api_key(), default_port=6333)
+    # Tenancy is per-collection (VectorStoreParam.tenant), not per-actor, so the
     # actor-level factory leaves it unset; a hand-built backend or subclass may
     # still pass tenant= directly.
     return QdrantBackend(
-        url=url,
-        api_key=qdrant_api_key(),
+        client=get_client(key, _connect_qdrant),
         tenant=None,
         team_id=context.team_id,
     )

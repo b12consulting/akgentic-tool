@@ -1,18 +1,30 @@
 """Unit tests for WeaviateBackend with mocked Weaviate client.
 
 Covers: protocol compliance, create_collection (idempotent), add, remove,
-search, multi-tenancy, team_id metadata and team-scoped cleanup, import guard,
-and close().
+search, multi-tenancy, team_id metadata and team-scoped cleanup, and the
+client-taking constructor (the shared client, separate bookkeeping, and the
+per-call batch context). The client cache itself is specified in
+``test_client.py``.
 """
 
 from __future__ import annotations
 
 import inspect
 import sys
-from typing import Any
+import threading
+import time
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+from akgentic.tool.vector_store.backends.weaviate import WEAVIATE_API_KEY_ENV, WEAVIATE_URL_ENV
+
+if TYPE_CHECKING:
+    # Only under TYPE_CHECKING: at runtime the mock ``weaviate`` module must be
+    # installed into ``sys.modules`` before this module is imported.
+    from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+    from akgentic.tool.vector_store.protocol import VectorStoreConfig
 
 # ---------------------------------------------------------------------------
 # Recording Filter double
@@ -130,14 +142,23 @@ def _install_mock_weaviate() -> tuple[MagicMock, MagicMock]:
 
 
 def _cleanup_weaviate_modules() -> None:
-    """Remove all weaviate-related modules from sys.modules."""
+    """Close the client cache, then evict it, the backend and every ``weaviate*`` module.
+
+    The cache is process-global: without ``close_all()`` first, a client cached
+    under ``localhost:8080`` by one test is handed to the next, whose mock then
+    records no connect. Evicting ``client`` too makes the next import build a
+    fresh dict against the fresh mock.
+    """
+    client_key = "akgentic.tool.vector_store.client"
+    loaded = sys.modules.get(client_key)
+    if loaded is not None:
+        loaded.close_all()
     to_remove = [k for k in sys.modules if k.startswith("weaviate")]
     for k in to_remove:
         del sys.modules[k]
-    # Also force-reload our module so it picks up the mock state
-    backend_key = "akgentic.tool.vector_store.weaviate"
-    if backend_key in sys.modules:
-        del sys.modules[backend_key]
+    # Also force-reload our modules so they pick up the mock state
+    for key in (client_key, "akgentic.tool.vector_store.backends.weaviate"):
+        sys.modules.pop(key, None)
 
 
 def _make_entry(
@@ -160,37 +181,40 @@ def _make_entry(
 # ---------------------------------------------------------------------------
 
 
+_EVICTED_PACKAGE_MODULES = (
+    "akgentic.tool.vector_store.client",
+    "akgentic.tool.vector_store.backends.weaviate",
+)
+
+
 @pytest.fixture(autouse=True)
 def _clean_modules() -> Any:
-    """Ensure weaviate mock modules are cleaned up before and after each test."""
+    """Evict the weaviate modules around each test, then put the originals back.
+
+    Each test needs a fresh import of the backend against its own mock client, so the
+    modules are evicted before and after it. Putting the evicted originals back — the
+    ``sys.modules`` entries, their parent-package attributes, and the registry's
+    ``weaviate`` spec, which the fresh import replaced — keeps the eviction from leaking:
+    without it, every later test would see the package root's ``WeaviateBackend`` differ
+    from the class the registry builds, and an identity check would depend on file order.
+    """
+    from akgentic.tool.vector_store.registry import get_backend_spec, register_backend
+
+    saved = {
+        key: module
+        for key, module in sys.modules.items()
+        if key.startswith("weaviate") or key in _EVICTED_PACKAGE_MODULES
+    }
+    saved_spec = get_backend_spec("weaviate")
     _cleanup_weaviate_modules()
     yield
     _cleanup_weaviate_modules()
-
-
-# ---------------------------------------------------------------------------
-# Test: Import Guard (AC10)
-# ---------------------------------------------------------------------------
-
-
-class TestImportGuard:
-    """AC10: ImportError with install instructions when weaviate-client missing."""
-
-    def test_import_error_when_weaviate_missing(self) -> None:
-        """Instantiating WeaviateBackend without weaviate-client raises ImportError."""
-        # Ensure weaviate is NOT in sys.modules
-        _cleanup_weaviate_modules()
-
-        # Patch so that import weaviate fails
-        with patch.dict(sys.modules, {"weaviate": None}):
-            # Force reload to pick up the missing module
-            if "akgentic.tool.vector_store.weaviate" in sys.modules:
-                del sys.modules["akgentic.tool.vector_store.weaviate"]
-
-            from akgentic.tool.vector_store.weaviate import WeaviateBackend
-
-            with pytest.raises(ImportError, match="weaviate-client"):
-                WeaviateBackend(url="http://localhost:8080")
+    sys.modules.update(saved)
+    for key in _EVICTED_PACKAGE_MODULES:
+        parent, _, child = key.rpartition(".")
+        if key in saved and parent in sys.modules:
+            setattr(sys.modules[parent], child, saved[key])
+    register_backend(saved_spec, replace=True)
 
 
 # ---------------------------------------------------------------------------
@@ -206,11 +230,11 @@ class TestCreateCollection:
         _mock_weaviate, mock_client = _install_mock_weaviate()
         mock_client.collections.exists.return_value = False
 
-        from akgentic.tool.vector_store.protocol import CollectionConfig
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        backend = WeaviateBackend(url="http://localhost:8080")
-        config = CollectionConfig(dimension=384)
+        backend = WeaviateBackend(client=mock_client)
+        config = VectorStoreParam(dimension=384)
         backend.create_collection("test_col", config)
 
         mock_client.collections.create.assert_called_once()
@@ -222,11 +246,11 @@ class TestCreateCollection:
         _mock_weaviate, mock_client = _install_mock_weaviate()
         mock_client.collections.exists.return_value = False
 
-        from akgentic.tool.vector_store.protocol import CollectionConfig
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        backend = WeaviateBackend(url="http://localhost:8080")
-        config = CollectionConfig(dimension=384)
+        backend = WeaviateBackend(client=mock_client)
+        config = VectorStoreParam(dimension=384)
         backend.create_collection("test_col", config)
 
         # Now simulate exists=True
@@ -256,11 +280,11 @@ class TestAdd:
         mock_collection.batch.dynamic.return_value.__enter__ = MagicMock(return_value=mock_batch)
         mock_collection.batch.dynamic.return_value.__exit__ = MagicMock(return_value=False)
 
-        from akgentic.tool.vector_store.protocol import CollectionConfig
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        backend = WeaviateBackend(url="http://localhost:8080")
-        backend.create_collection("col1", CollectionConfig())
+        backend = WeaviateBackend(client=mock_client)
+        backend.create_collection("col1", VectorStoreParam())
 
         entry = _make_entry(ref_id="r1", text="test text", vector=[0.1, 0.2])
         backend.add("col1", [entry])
@@ -274,11 +298,11 @@ class TestAdd:
 
     def test_add_raises_on_unknown_collection(self) -> None:
         """add raises ValueError for non-existent collection."""
-        _install_mock_weaviate()
+        _mock_weaviate, mock_client = _install_mock_weaviate()
 
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
 
-        backend = WeaviateBackend(url="http://localhost:8080")
+        backend = WeaviateBackend(client=mock_client)
         entry = _make_entry()
 
         with pytest.raises(ValueError, match="does not exist"):
@@ -301,11 +325,11 @@ class TestRemove:
         mock_collection = MagicMock()
         mock_client.collections.get.return_value = mock_collection
 
-        from akgentic.tool.vector_store.protocol import CollectionConfig
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        backend = WeaviateBackend(url="http://localhost:8080", team_id="team-42")
-        backend.create_collection("col1", CollectionConfig())
+        backend = WeaviateBackend(client=mock_client, team_id="team-42")
+        backend.create_collection("col1", VectorStoreParam())
         backend.remove("col1", ["id1", "id2"])
 
         mock_collection.data.delete_many.assert_called_once()
@@ -320,11 +344,11 @@ class TestRemove:
         mock_collection = MagicMock()
         mock_client.collections.get.return_value = mock_collection
 
-        from akgentic.tool.vector_store.protocol import CollectionConfig
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        backend = WeaviateBackend(url="http://localhost:8080", team_id="team-42")
-        backend.create_collection("col1", CollectionConfig())
+        backend = WeaviateBackend(client=mock_client, team_id="team-42")
+        backend.create_collection("col1", VectorStoreParam())
         backend.remove("col1", ["id1", "id2"])
 
         where = mock_collection.data.delete_many.call_args[1]["where"]
@@ -335,11 +359,11 @@ class TestRemove:
 
     def test_remove_raises_on_unknown_collection(self) -> None:
         """remove raises ValueError for non-existent collection."""
-        _install_mock_weaviate()
+        _mock_weaviate, mock_client = _install_mock_weaviate()
 
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
 
-        backend = WeaviateBackend(url="http://localhost:8080")
+        backend = WeaviateBackend(client=mock_client)
         with pytest.raises(ValueError, match="does not exist"):
             backend.remove("nonexistent", ["id1"])
 
@@ -368,11 +392,11 @@ class TestSearch:
         mock_result.objects = [mock_obj]
         mock_collection.query.near_vector.return_value = mock_result
 
-        from akgentic.tool.vector_store.protocol import CollectionConfig
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        backend = WeaviateBackend(url="http://localhost:8080", team_id="team-42")
-        backend.create_collection("col1", CollectionConfig())
+        backend = WeaviateBackend(client=mock_client, team_id="team-42")
+        backend.create_collection("col1", VectorStoreParam())
         result = backend.search("col1", [0.1, 0.2, 0.3], top_k=5)
 
         assert len(result.hits) == 1
@@ -395,11 +419,11 @@ class TestSearch:
         mock_result.objects = [mock_obj]
         mock_collection.query.near_vector.return_value = mock_result
 
-        from akgentic.tool.vector_store.protocol import CollectionConfig
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        backend = WeaviateBackend(url="http://localhost:8080", team_id="team-42")
-        backend.create_collection("col1", CollectionConfig())
+        backend = WeaviateBackend(client=mock_client, team_id="team-42")
+        backend.create_collection("col1", VectorStoreParam())
         result = backend.search("col1", [0.1, 0.2], top_k=5)
 
         assert result.hits[0].score == 0.0
@@ -413,11 +437,11 @@ class TestSearch:
         mock_client.collections.get.return_value = mock_collection
         mock_collection.query.near_vector.return_value = MagicMock(objects=[])
 
-        from akgentic.tool.vector_store.protocol import CollectionConfig
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        backend = WeaviateBackend(url="http://localhost:8080", team_id="team-42")
-        backend.create_collection("col1", CollectionConfig())
+        backend = WeaviateBackend(client=mock_client, team_id="team-42")
+        backend.create_collection("col1", VectorStoreParam())
         backend.search("col1", [0.1, 0.2], top_k=5)
 
         filters = mock_collection.query.near_vector.call_args[1]["filters"]
@@ -425,11 +449,11 @@ class TestSearch:
 
     def test_search_raises_on_unknown_collection(self) -> None:
         """search raises ValueError for non-existent collection."""
-        _install_mock_weaviate()
+        _mock_weaviate, mock_client = _install_mock_weaviate()
 
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
 
-        backend = WeaviateBackend(url="http://localhost:8080")
+        backend = WeaviateBackend(client=mock_client)
         with pytest.raises(ValueError, match="does not exist"):
             backend.search("nonexistent", [0.1], top_k=5)
 
@@ -449,11 +473,11 @@ class TestMultiTenancy:
         mock_col = MagicMock()
         mock_client.collections.get.return_value = mock_col
 
-        from akgentic.tool.vector_store.protocol import CollectionConfig
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        backend = WeaviateBackend(url="http://localhost:8080", tenant="team-42")
-        config = CollectionConfig(dimension=384)
+        backend = WeaviateBackend(client=mock_client, tenant="team-42")
+        config = VectorStoreParam(dimension=384)
         backend.create_collection("col1", config)
 
         create_kwargs = mock_client.collections.create.call_args[1]
@@ -475,11 +499,11 @@ class TestMultiTenancy:
         mock_tenant_col.batch.dynamic.return_value.__enter__ = MagicMock(return_value=mock_batch)
         mock_tenant_col.batch.dynamic.return_value.__exit__ = MagicMock(return_value=False)
 
-        from akgentic.tool.vector_store.protocol import CollectionConfig
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        backend = WeaviateBackend(url="http://localhost:8080", tenant="team-42")
-        backend.create_collection("col1", CollectionConfig())
+        backend = WeaviateBackend(client=mock_client, tenant="team-42")
+        backend.create_collection("col1", VectorStoreParam())
 
         entry = _make_entry()
         backend.add("col1", [entry])
@@ -488,17 +512,17 @@ class TestMultiTenancy:
         mock_batch.add_object.assert_called_once()
 
     def test_tenant_from_collection_config(self) -> None:
-        """Tenant from CollectionConfig.tenant is used when backend tenant is None."""
+        """Tenant from VectorStoreParam.tenant is used when backend tenant is None."""
         _mock_weaviate, mock_client = _install_mock_weaviate()
         mock_client.collections.exists.return_value = False
         mock_col = MagicMock()
         mock_client.collections.get.return_value = mock_col
 
-        from akgentic.tool.vector_store.protocol import CollectionConfig
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        backend = WeaviateBackend(url="http://localhost:8080")  # no tenant
-        config = CollectionConfig(dimension=384, tenant="workspace-99")
+        backend = WeaviateBackend(client=mock_client)  # no tenant
+        config = VectorStoreParam(dimension=384, tenant="workspace-99")
         backend.create_collection("col1", config)
 
         create_kwargs = mock_client.collections.create.call_args[1]
@@ -506,7 +530,7 @@ class TestMultiTenancy:
         mock_col.tenants.create.assert_called_once()
 
     def test_config_tenant_scoped_on_operations(self) -> None:
-        """Operations use per-collection tenant from CollectionConfig, not backend."""
+        """Operations use per-collection tenant from VectorStoreParam, not backend."""
         _mock_weaviate, mock_client = _install_mock_weaviate()
         mock_client.collections.exists.return_value = False
 
@@ -520,11 +544,11 @@ class TestMultiTenancy:
         mock_tenant_col.batch.dynamic.return_value.__enter__ = MagicMock(return_value=mock_batch)
         mock_tenant_col.batch.dynamic.return_value.__exit__ = MagicMock(return_value=False)
 
-        from akgentic.tool.vector_store.protocol import CollectionConfig
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        backend = WeaviateBackend(url="http://localhost:8080")  # no backend tenant
-        config = CollectionConfig(tenant="workspace-99")
+        backend = WeaviateBackend(client=mock_client)  # no backend tenant
+        config = VectorStoreParam(tenant="workspace-99")
         backend.create_collection("col1", config)
 
         entry = _make_entry()
@@ -557,11 +581,11 @@ class TestTeamIdMetadata:
         _mock_weaviate, mock_client = _install_mock_weaviate()
         mock_client.collections.exists.return_value = False
 
-        from akgentic.tool.vector_store.protocol import CollectionConfig
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        backend = WeaviateBackend(url="http://localhost:8080", team_id="team-42")
-        backend.create_collection("col1", CollectionConfig())
+        backend = WeaviateBackend(client=mock_client, team_id="team-42")
+        backend.create_collection("col1", VectorStoreParam())
 
         properties = mock_client.collections.create.call_args[1]["properties"]
         assert {p["name"] for p in properties} == {
@@ -580,11 +604,11 @@ class TestTeamIdMetadata:
         mock_client.collections.exists.return_value = False
         mock_batch = _batch_for(mock_client)
 
-        from akgentic.tool.vector_store.protocol import CollectionConfig
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        backend = WeaviateBackend(url="http://localhost:8080", team_id="team-42")
-        backend.create_collection("col1", CollectionConfig())
+        backend = WeaviateBackend(client=mock_client, team_id="team-42")
+        backend.create_collection("col1", VectorStoreParam())
         backend.add("col1", [_make_entry(ref_id="r1"), _make_entry(ref_id="r2")])
 
         assert mock_batch.add_object.call_count == 2
@@ -604,13 +628,11 @@ class TestTeamIdMetadata:
         mock_tenant_col.batch.dynamic.return_value.__enter__ = MagicMock(return_value=mock_batch)
         mock_tenant_col.batch.dynamic.return_value.__exit__ = MagicMock(return_value=False)
 
-        from akgentic.tool.vector_store.protocol import CollectionConfig
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        backend = WeaviateBackend(
-            url="http://localhost:8080", tenant="workspace-99", team_id="team-42"
-        )
-        backend.create_collection("col1", CollectionConfig())
+        backend = WeaviateBackend(client=mock_client, tenant="workspace-99", team_id="team-42")
+        backend.create_collection("col1", VectorStoreParam())
         backend.add("col1", [_make_entry()])
 
         assert mock_batch.add_object.call_args[1]["properties"]["team_id"] == "team-42"
@@ -669,11 +691,11 @@ class TestTeamlessBackendCannotQuery:
         mock_client.collections.get.return_value = mock_collection
         mock_collection.query.near_vector.return_value = MagicMock(objects=[])
 
-        from akgentic.tool.vector_store.protocol import CollectionConfig
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        backend = WeaviateBackend(url="http://localhost:8080")  # no team_id
-        backend.create_collection("col1", CollectionConfig())
+        backend = WeaviateBackend(client=mock_client)  # no team_id
+        backend.create_collection("col1", VectorStoreParam())
 
         with pytest.raises(ValueError, match="without a team_id"):
             backend.search("col1", [0.1, 0.2], top_k=5)
@@ -689,11 +711,11 @@ class TestTeamlessBackendCannotQuery:
         mock_client.collections.exists.return_value = False
         mock_client.collections.get.return_value = MagicMock()
 
-        from akgentic.tool.vector_store.protocol import CollectionConfig
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        backend = WeaviateBackend(url="http://localhost:8080", team_id="")
-        backend.create_collection("col1", CollectionConfig())
+        backend = WeaviateBackend(client=mock_client, team_id="")
+        backend.create_collection("col1", VectorStoreParam())
 
         with pytest.raises(ValueError, match="without a team_id"):
             backend.search("col1", [0.1], top_k=5)
@@ -712,9 +734,9 @@ class TestTeamlessBackendCannotQuery:
         mock_collection.data.delete_many.return_value = MagicMock(successful=4)
         mock_client.collections.get.return_value = mock_collection
 
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
 
-        backend = WeaviateBackend(url="http://localhost:8080")  # no team_id
+        backend = WeaviateBackend(client=mock_client)  # no team_id
 
         assert backend.list_collections() == ["planning"]
         assert backend.delete_by_team("planning", "team-gone") == 4
@@ -732,9 +754,9 @@ class TestDeleteByTeam:
         mock_collection.data.delete_many.return_value = MagicMock(successful=7)
         mock_client.collections.get.return_value = mock_collection
 
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
 
-        backend = WeaviateBackend(url="http://localhost:8080")
+        backend = WeaviateBackend(client=mock_client)
         deleted = backend.delete_by_team("col1", "team-42")
 
         mock_weaviate.classes.query.Filter.by_property.assert_called_with("team_id")
@@ -751,9 +773,9 @@ class TestDeleteByTeam:
         mock_collection.data.delete_many.return_value = MagicMock(successful=4)
         mock_client.collections.get.return_value = mock_collection
 
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
 
-        backend = WeaviateBackend(url="http://localhost:8080", team_id="team-sweeper")
+        backend = WeaviateBackend(client=mock_client, team_id="team-sweeper")
         assert backend.delete_by_team("col1", "team-gone") == 4
 
         where = mock_collection.data.delete_many.call_args[1]["where"]
@@ -767,9 +789,9 @@ class TestDeleteByTeam:
             successful=0
         )
 
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
 
-        backend = WeaviateBackend(url="http://localhost:8080")
+        backend = WeaviateBackend(client=mock_client)
         assert backend.delete_by_team("never_created", "team-42") == 0
 
     def test_raises_when_collection_absent_from_cluster(self) -> None:
@@ -777,9 +799,9 @@ class TestDeleteByTeam:
         _mock_weaviate, mock_client = _install_mock_weaviate()
         mock_client.collections.exists.return_value = False
 
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
 
-        backend = WeaviateBackend(url="http://localhost:8080")
+        backend = WeaviateBackend(client=mock_client)
         with pytest.raises(ValueError, match="does not exist"):
             backend.delete_by_team("nonexistent", "team-42")
 
@@ -789,9 +811,9 @@ class TestDeleteByTeam:
         mock_client.collections.exists.return_value = True
         mock_client.collections.get.return_value.data.delete_many.return_value = None
 
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
 
-        backend = WeaviateBackend(url="http://localhost:8080")
+        backend = WeaviateBackend(client=mock_client)
         assert backend.delete_by_team("col1", "team-42") == 0
 
     def test_scoped_to_tenant_when_configured(self) -> None:
@@ -805,9 +827,9 @@ class TestDeleteByTeam:
         mock_col.with_tenant.return_value = mock_tenant_col
         mock_client.collections.get.return_value = mock_col
 
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
 
-        backend = WeaviateBackend(url="http://localhost:8080", tenant="team-42")
+        backend = WeaviateBackend(client=mock_client, tenant="team-42")
         assert backend.delete_by_team("col1", "team-42") == 3
         mock_col.with_tenant.assert_called_with("team-42")
 
@@ -823,9 +845,9 @@ class TestListCollections:
             "knowledge_graph": object(),
         }
 
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
 
-        backend = WeaviateBackend(url="http://localhost:8080")
+        backend = WeaviateBackend(client=mock_client)
         assert sorted(backend.list_collections()) == ["knowledge_graph", "planning"]
 
     def test_lists_collections_never_created_here(self) -> None:
@@ -833,75 +855,308 @@ class TestListCollections:
         _mock_weaviate, mock_client = _install_mock_weaviate()
         mock_client.collections.list_all.return_value = {"planning": object()}
 
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
 
-        backend = WeaviateBackend(url="http://localhost:8080")
+        backend = WeaviateBackend(client=mock_client)
         assert backend.list_collections() == ["planning"]
 
 
 # ---------------------------------------------------------------------------
-# Test: close (AC2)
+# The backend takes a client and never connects (AC 9, AC 13)
 # ---------------------------------------------------------------------------
 
 
-class TestClose:
-    """close() disconnects the Weaviate client."""
+class TestBackendTakesAClient:
+    """The constructor takes a ``WeaviateClient``; the connection is not its business."""
 
-    def test_close_calls_client_close(self) -> None:
-        """close() delegates to client.close()."""
+    def test_construction_does_not_connect(self) -> None:
+        """A backend built with a client opens nothing of its own."""
+        mock_weaviate, mock_client = _install_mock_weaviate()
+
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+
+        backend = WeaviateBackend(client=mock_client, team_id="team-42")
+
+        mock_weaviate.connect_to_custom.assert_not_called()
+        assert backend._client is mock_client
+
+    def test_url_and_api_key_left_the_signature(self) -> None:
+        """The constructor is (client, tenant, team_id) and nothing else."""
+        _install_mock_weaviate()
+
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+
+        params = inspect.signature(WeaviateBackend.__init__).parameters
+        assert list(params) == ["self", "client", "tenant", "team_id"]
+
+    def test_the_backend_has_no_close(self) -> None:
+        """It does not own the connection, so it cannot close it under the other consumers."""
         _mock_weaviate, mock_client = _install_mock_weaviate()
 
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
 
-        backend = WeaviateBackend(url="http://localhost:8080")
-        backend.close()
+        backend = WeaviateBackend(client=mock_client)
 
-        mock_client.close.assert_called_once()
+        assert not hasattr(backend, "close")
+        mock_client.close.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# Test: Connection config (AC8)
+# Two backends, one client, separate bookkeeping (AC 10)
 # ---------------------------------------------------------------------------
 
 
-class TestConnectionConfig:
-    """AC8: Connection parameters from url and api_key."""
+def _config() -> VectorStoreConfig:
+    """Return a ``VectorStoreConfig`` for the factory."""
+    from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE
+    from akgentic.tool.vector_store.protocol import VectorStoreConfig
 
-    def test_connects_with_api_key(self) -> None:
-        """AuthApiKey is used when api_key is provided."""
+    return VectorStoreConfig(name=VS_ACTOR_NAME, role=VS_ACTOR_ROLE)
+
+
+def _two_backends_for_one_cluster() -> tuple[Any, Any]:
+    """Build backends for teams ``a`` and ``b`` through the registry factory."""
+    from akgentic.tool.vector_store.backends.weaviate import _make_weaviate_backend
+    from akgentic.tool.vector_store.registry import BackendContext
+
+    config = _config()
+    first = _make_weaviate_backend(BackendContext(config=config, team_id="team-a"))
+    second = _make_weaviate_backend(BackendContext(config=config, team_id="team-b"))
+    return first, second
+
+
+class TestTwoBackendsShareOneClient:
+    """One cluster, one client, and each backend keeps its own created-collections cache."""
+
+    def test_the_client_is_the_same_object(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Both factory calls resolve the exported cluster to one connect."""
+        monkeypatch.setenv(WEAVIATE_URL_ENV, "http://localhost:8080")
         mock_weaviate, mock_client = _install_mock_weaviate()
 
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        first, second = _two_backends_for_one_cluster()
 
-        WeaviateBackend(url="http://localhost:8080", api_key="test-key")
-
+        assert first._client is mock_client
+        assert second._client is mock_client
         mock_weaviate.connect_to_custom.assert_called_once()
-        call_kwargs = mock_weaviate.connect_to_custom.call_args[1]
-        assert call_kwargs["auth_credentials"] is not None
+        assert (first._team_id, second._team_id) == ("team-a", "team-b")
 
-    def test_connects_without_api_key(self) -> None:
-        """No auth when api_key is None."""
-        mock_weaviate, mock_client = _install_mock_weaviate()
+    def test_bookkeeping_is_per_backend(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Creating through one backend does not mark the collection created on the other."""
+        monkeypatch.setenv(WEAVIATE_URL_ENV, "http://localhost:8080")
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
 
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        WeaviateBackend(url="http://localhost:8080")
+        first, second = _two_backends_for_one_cluster()
+        first.create_collection("col1", VectorStoreParam())
 
-        call_kwargs = mock_weaviate.connect_to_custom.call_args[1]
-        assert call_kwargs["auth_credentials"] is None
+        assert first._collections_created is not second._collections_created
+        assert first._collection_tenants is not second._collection_tenants
+        assert "col1" in first._collections_created
+        assert "col1" not in second._collections_created
+        with pytest.raises(ValueError, match="does not exist"):
+            second.add("col1", [_make_entry()])
 
-    def test_https_url_parsed_correctly(self) -> None:
-        """HTTPS URL sets http_secure and grpc_secure to True."""
-        mock_weaviate, _mock_client = _install_mock_weaviate()
+    def test_the_second_backend_records_an_existing_collection_locally(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The cost of separate bookkeeping is one existence check, not a second create."""
+        monkeypatch.setenv(WEAVIATE_URL_ENV, "http://localhost:8080")
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
 
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        WeaviateBackend(url="https://my-cluster.weaviate.cloud:443")
+        first, second = _two_backends_for_one_cluster()
+        first.create_collection("col1", VectorStoreParam())
+        mock_client.collections.create.assert_called_once()
 
-        call_kwargs = mock_weaviate.connect_to_custom.call_args[1]
-        assert call_kwargs["http_secure"] is True
-        assert call_kwargs["grpc_secure"] is True
-        assert call_kwargs["http_port"] == 443
+        mock_client.collections.exists.return_value = True
+        mock_client.collections.create.reset_mock()
+        second.create_collection("col1", VectorStoreParam())
+
+        mock_client.collections.create.assert_not_called()
+        assert "col1" in second._collections_created
+
+
+# ---------------------------------------------------------------------------
+# The factory reads the environment only, then hands the pair to get_client (AC 11)
+# ---------------------------------------------------------------------------
+
+
+def _config_carrying_the_removed_connection_keys() -> VectorStoreConfig:
+    """A ``VectorStoreConfig`` validated from a record that still names a cluster.
+
+    ``weaviate_url`` and ``weaviate_api_key`` are not fields any more, so validation drops
+    them. The record is what a hand-built or stored config might still carry.
+    """
+    from akgentic.tool.vector_store.protocol import VectorStoreConfig
+
+    return VectorStoreConfig.model_validate(
+        {
+            "name": "#VectorStore",
+            "role": "ToolActor",
+            "weaviate_url": "http://from-config:8080",
+            "weaviate_api_key": "config-key",
+        }
+    )
+
+
+class TestFactoryResolution:
+    """The environment is the only source; ValueError when it names no cluster."""
+
+    def test_a_config_carrying_connection_keys_does_not_outrank_the_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The exported pair goes to get_client, whatever the config record carried."""
+        monkeypatch.setenv(WEAVIATE_URL_ENV, "http://from-env:8080")
+        monkeypatch.setenv(WEAVIATE_API_KEY_ENV, "env-key")
+        _install_mock_weaviate()
+
+        import akgentic.tool.vector_store.backends.weaviate as weaviate_module
+        from akgentic.tool.vector_store.registry import BackendContext
+
+        config = _config_carrying_the_removed_connection_keys()
+        with patch.object(weaviate_module, "_weaviate_client") as get_client:
+            backend = weaviate_module._make_weaviate_backend(
+                BackendContext(config=config, team_id="team-42")
+            )
+
+        get_client.assert_called_once_with("http://from-env:8080", "env-key")
+        assert backend._client is get_client.return_value
+        assert backend._team_id == "team-42"
+
+    def test_a_config_carrying_connection_keys_is_no_cluster_without_the_environment(
+        self,
+    ) -> None:
+        """With nothing exported, a URL on the config record does not build a backend."""
+        _install_mock_weaviate()
+
+        import akgentic.tool.vector_store.backends.weaviate as weaviate_module
+        from akgentic.tool.vector_store.registry import BackendContext
+
+        config = _config_carrying_the_removed_connection_keys()
+        with (
+            patch.object(weaviate_module, "_weaviate_client") as get_client,
+            pytest.raises(ValueError, match=WEAVIATE_URL_ENV),
+        ):
+            weaviate_module._make_weaviate_backend(BackendContext(config=config))
+
+        get_client.assert_not_called()
+
+    def test_the_environment_is_the_only_source(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A config carrying no connection settings resolves the exported cluster."""
+        monkeypatch.setenv(WEAVIATE_URL_ENV, "http://from-env:8080")
+        monkeypatch.setenv(WEAVIATE_API_KEY_ENV, "env-key")
+        _install_mock_weaviate()
+
+        import akgentic.tool.vector_store.backends.weaviate as weaviate_module
+        from akgentic.tool.vector_store.registry import BackendContext
+
+        with patch.object(weaviate_module, "_weaviate_client") as get_client:
+            weaviate_module._make_weaviate_backend(BackendContext(config=_config()))
+
+        get_client.assert_called_once_with("http://from-env:8080", "env-key")
+
+    def test_no_url_anywhere_is_a_value_error(self) -> None:
+        """The environment names no cluster: raise before touching the cache."""
+        _install_mock_weaviate()
+
+        import akgentic.tool.vector_store.backends.weaviate as weaviate_module
+        from akgentic.tool.vector_store.registry import BackendContext
+
+        with (
+            patch.object(weaviate_module, "_weaviate_client") as get_client,
+            pytest.raises(ValueError, match=WEAVIATE_URL_ENV),
+        ):
+            weaviate_module._make_weaviate_backend(BackendContext(config=_config()))
+
+        get_client.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# add() opens a fresh batch context per call and stores none (AC 12)
+# ---------------------------------------------------------------------------
+
+
+def _recording_batch_contexts(
+    mock_client: MagicMock, enter_delay: float = 0.0
+) -> tuple[MagicMock, list[MagicMock]]:
+    """Make ``batch.dynamic()`` mint a new context per call and record each one."""
+    contexts: list[MagicMock] = []
+
+    def dynamic() -> MagicMock:
+        context = MagicMock(name="batch-context")
+        batch = MagicMock(name="batch")
+
+        def enter() -> MagicMock:
+            time.sleep(enter_delay)
+            return batch
+
+        context.__enter__ = MagicMock(side_effect=enter)
+        context.__exit__ = MagicMock(return_value=False)
+        contexts.append(context)
+        return context
+
+    mock_collection = MagicMock()
+    mock_collection.batch.dynamic.side_effect = dynamic
+    mock_client.collections.get.return_value = mock_collection
+    return mock_collection, contexts
+
+
+class TestBatchContextPerCall:
+    """Invariant 1 of the thread-safety answer: a batch context never escapes ``add()``."""
+
+    def test_two_adds_open_two_contexts_and_store_none(self) -> None:
+        """Each add opens its own context and leaves it before returning.
+
+        The **handle** is reused across the two adds (see the handle-cache specs);
+        the **batch context** is not, and that is the invariant this pins.
+        """
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        mock_collection, contexts = _recording_batch_contexts(mock_client)
+
+        backend = _scoped_backend(mock_client)
+        backend.add("col1", [_make_entry(ref_id="r1")])
+        backend.add("col1", [_make_entry(ref_id="r2")])
+
+        assert mock_collection.batch.dynamic.call_count == 2
+        assert len(contexts) == 2
+        assert contexts[0] is not contexts[1]
+        for context in contexts:
+            context.__enter__.assert_called_once()
+            context.__exit__.assert_called_once()
+
+        # No batch object survives the call: what the backend holds is the
+        # client and its cached handles, never a batch.
+        assert not any(context is value for value in vars(backend).values() for context in contexts)
+
+    def test_concurrent_adds_each_enter_their_own_context(self) -> None:
+        """Two threads inside add() at once hold two distinct contexts, never one."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        _mock_collection, contexts = _recording_batch_contexts(mock_client, enter_delay=0.05)
+
+        backend = _scoped_backend(mock_client)
+        barrier = threading.Barrier(2)
+
+        def worker(ref_id: str) -> None:
+            barrier.wait()
+            backend.add("col1", [_make_entry(ref_id=ref_id)])
+
+        threads = [threading.Thread(target=worker, args=(ref_id,)) for ref_id in ("r1", "r2")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert len(contexts) == 2
+        assert contexts[0] is not contexts[1]
+        for context in contexts:
+            context.__enter__.assert_called_once()
+            context.__exit__.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -925,11 +1180,11 @@ def _entry_with(
 
 def _scoped_backend(mock_client: MagicMock) -> Any:
     """Build a team-scoped backend with ``col1`` already created."""
-    from akgentic.tool.vector_store.protocol import CollectionConfig
-    from akgentic.tool.vector_store.weaviate import WeaviateBackend
+    from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+    from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-    backend = WeaviateBackend(url="http://localhost:8080", team_id="team-42")
-    backend.create_collection("col1", CollectionConfig())
+    backend = WeaviateBackend(client=mock_client, team_id="team-42")
+    backend.create_collection("col1", VectorStoreParam())
     return backend
 
 
@@ -1104,11 +1359,11 @@ class TestScopeAndPathPredicatesReachTheCluster:
         _mock_weaviate, mock_client = _install_mock_weaviate()
         mock_client.collections.exists.return_value = False
 
-        from akgentic.tool.vector_store.protocol import CollectionConfig
-        from akgentic.tool.vector_store.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        backend = WeaviateBackend(url="http://localhost:8080")
-        backend.create_collection("col1", CollectionConfig())
+        backend = WeaviateBackend(client=mock_client)
+        backend.create_collection("col1", VectorStoreParam())
 
         with pytest.raises(ValueError, match="without a team_id"):
             backend.search("col1", [0.1], top_k=5, scope="ws-1")
@@ -1222,3 +1477,446 @@ class TestPathPrefixWildcardsAreRefused:
             ("team_id", "equal", "team-42"),
             ("path", "like", "docs/*"),
         ]
+
+
+# ---------------------------------------------------------------------------
+# The connect callable and the dependency guard came back from client.py
+# ---------------------------------------------------------------------------
+
+
+class TestTheConnectCallable:
+    """``client.py`` names no vendor; this module owns the keyword set."""
+
+    def test_connects_with_the_pinned_keyword_set(self) -> None:
+        """The whole keyword set, including the fixed gRPC port."""
+        mock_weaviate, _client = _install_mock_weaviate()
+
+        from akgentic.tool.vector_store.backends.weaviate import _connect_weaviate
+        from akgentic.tool.vector_store.client import ClusterKey
+
+        _connect_weaviate(ClusterKey.from_url("weaviate", "http://localhost:8080"))
+
+        assert mock_weaviate.connect_to_custom.call_args[1] == {
+            "http_host": "localhost",
+            "http_port": 8080,
+            "http_secure": False,
+            "grpc_host": "localhost",
+            "grpc_port": 50051,
+            "grpc_secure": False,
+            "auth_credentials": None,
+        }
+
+    def test_https_is_secure_on_both_transports(self) -> None:
+        mock_weaviate, _client = _install_mock_weaviate()
+
+        from akgentic.tool.vector_store.backends.weaviate import _connect_weaviate
+        from akgentic.tool.vector_store.client import ClusterKey
+
+        _connect_weaviate(ClusterKey.from_url("weaviate", "https://my-cluster.weaviate.cloud"))
+
+        kwargs = mock_weaviate.connect_to_custom.call_args[1]
+        assert kwargs["http_secure"] is True
+        assert kwargs["grpc_secure"] is True
+        assert kwargs["http_port"] == 443
+
+    def test_an_api_key_becomes_auth_api_key(self) -> None:
+        mock_weaviate, _client = _install_mock_weaviate()
+
+        from akgentic.tool.vector_store.backends.weaviate import _connect_weaviate
+        from akgentic.tool.vector_store.client import ClusterKey
+
+        _connect_weaviate(ClusterKey.from_url("weaviate", "http://localhost:8080", "test-key"))
+
+        mock_weaviate.auth.AuthApiKey.assert_called_once_with("test-key")
+        kwargs = mock_weaviate.connect_to_custom.call_args[1]
+        assert kwargs["auth_credentials"] is mock_weaviate.auth.AuthApiKey.return_value
+
+    def test_no_api_key_means_no_auth(self) -> None:
+        """An empty key is unauthenticated, not authenticated with ``''``."""
+        mock_weaviate, _client = _install_mock_weaviate()
+
+        from akgentic.tool.vector_store.backends.weaviate import _connect_weaviate
+        from akgentic.tool.vector_store.client import ClusterKey
+
+        _connect_weaviate(ClusterKey.from_url("weaviate", "http://localhost:8080", ""))
+
+        assert mock_weaviate.connect_to_custom.call_args[1]["auth_credentials"] is None
+        mock_weaviate.auth.AuthApiKey.assert_not_called()
+
+    def test_the_shared_client_is_keyed_on_the_weaviate_backend_name(self) -> None:
+        """``_weaviate_client`` builds a ``weaviate``-keyed ClusterKey and caches on it."""
+        mock_weaviate, _client = _install_mock_weaviate()
+
+        import akgentic.tool.vector_store.client as client_module
+        from akgentic.tool.vector_store.backends.weaviate import _weaviate_client
+
+        first = _weaviate_client("http://localhost:8080", "k")
+        second = _weaviate_client("http://LOCALHOST:8080/", "k")
+
+        assert second is first
+        assert mock_weaviate.connect_to_custom.call_count == 1
+        assert [key.backend for key in client_module._clients] == ["weaviate"]
+
+
+class TestTheDependencyGuard:
+    """``_check_weaviate_dependencies`` and its message live here, beside qdrant's."""
+
+    def test_both_names_resolve_from_this_module(self) -> None:
+        from akgentic.tool.vector_store.backends import weaviate as weaviate_module
+
+        assert callable(weaviate_module._check_weaviate_dependencies)
+        assert "akgentic-tool[weaviate]" in weaviate_module.WEAVIATE_MISSING_MESSAGE
+
+    def test_import_error_when_weaviate_missing(self) -> None:
+        """The connect raises ImportError naming the extra to install."""
+        from akgentic.tool.vector_store.backends.weaviate import _connect_weaviate
+        from akgentic.tool.vector_store.client import ClusterKey
+
+        with (
+            patch.dict(sys.modules, {"weaviate": None}),
+            pytest.raises(ImportError, match=r"akgentic-tool\[weaviate\]"),
+        ):
+            _connect_weaviate(ClusterKey.from_url("weaviate", "http://localhost:8080"))
+
+    def test_client_py_imports_no_vendor_module(self) -> None:
+        """The cache is backend-agnostic: it names neither vendor at module scope."""
+        import akgentic.tool.vector_store.client as client_module
+
+        assert not hasattr(client_module, "_check_weaviate_dependencies")
+        assert not hasattr(client_module, "WEAVIATE_MISSING_MESSAGE")
+        assert not hasattr(client_module, "GRPC_PORT")
+
+
+# ---------------------------------------------------------------------------
+# The collection-handle cache
+# ---------------------------------------------------------------------------
+
+
+class TestCollectionHandleCache:
+    """One ``Collection`` per (name, tenant): the vendor mints a new one per call."""
+
+    def test_two_operations_on_one_collection_fetch_one_handle(self) -> None:
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        _recording_batch_contexts(mock_client)
+
+        backend = _scoped_backend(mock_client)
+        mock_client.collections.get.reset_mock()
+
+        backend.add("col1", [_make_entry(ref_id="r1")])
+        backend.add("col1", [_make_entry(ref_id="r2")])
+
+        assert mock_client.collections.get.call_count == 1
+
+    def test_a_second_collection_fetches_its_own_handle(self) -> None:
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        _recording_batch_contexts(mock_client)
+
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
+
+        backend = _scoped_backend(mock_client)
+        backend.create_collection("col2", VectorStoreParam())
+        mock_client.collections.get.reset_mock()
+
+        backend.add("col1", [_make_entry(ref_id="r1")])
+        backend.add("col2", [_make_entry(ref_id="r2")])
+
+        assert mock_client.collections.get.call_count == 2
+
+    def test_the_same_collection_under_a_different_tenant_fetches_again(self) -> None:
+        """``with_tenant()`` returns a different Collection, so the tenant is in the key."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        _recording_batch_contexts(mock_client)
+
+        backend = _scoped_backend(mock_client)
+        mock_client.collections.get.reset_mock()
+
+        backend.add("col1", [_make_entry(ref_id="r1")])
+        backend._collection_tenants["col1"] = "tenant-b"
+        backend.add("col1", [_make_entry(ref_id="r2")])
+
+        assert mock_client.collections.get.call_count == 2
+        assert set(backend._collection_handles) == {("col1", None), ("col1", "tenant-b")}
+
+    def test_the_cache_belongs_to_the_instance_not_the_class(self) -> None:
+        """One backend instance per actor is the invariant the cache rests on."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        _recording_batch_contexts(mock_client)
+
+        first = _scoped_backend(mock_client)
+        second = _scoped_backend(mock_client)
+        mock_client.collections.get.reset_mock()
+
+        first.add("col1", [_make_entry(ref_id="r1")])
+        second.add("col1", [_make_entry(ref_id="r2")])
+
+        assert mock_client.collections.get.call_count == 2
+        assert first._collection_handles is not second._collection_handles
+
+
+# ---------------------------------------------------------------------------
+# The team predicate is a per-collection choice
+# ---------------------------------------------------------------------------
+
+
+def _backend_with(
+    mock_client: MagicMock, *collections: str, team_id: str | None = "team-42"
+) -> WeaviateBackend:
+    """Build a backend that has created each named collection.
+
+    ``team_id=None`` builds the team-less kind — a hand-written script, or the
+    administrative backend a sweeper uses.
+    """
+    from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+    from akgentic.tool.vector_store.protocol import VectorStoreParam
+
+    backend = WeaviateBackend(client=mock_client, team_id=team_id)
+    for name in collections:
+        backend.create_collection(name, VectorStoreParam())
+    return backend
+
+
+def _empty_query_client() -> tuple[MagicMock, MagicMock]:
+    """Return (client, collection) whose ``near_vector`` yields no objects."""
+    _mock_weaviate, mock_client = _install_mock_weaviate()
+    mock_client.collections.exists.return_value = False
+    mock_collection = MagicMock()
+    mock_client.collections.get.return_value = mock_collection
+    mock_collection.query.near_vector.return_value = MagicMock(objects=[])
+    return mock_client, mock_collection
+
+
+class TestTheTeamLegFollowsTheCollection:
+    """What was *sent* to the cluster, never what a double chose to return.
+
+    A double returns whatever it was told to return, filter or no filter, so a
+    search that yields no foreign hits proves nothing. Every spec here reads the
+    recorded conjunction off the call.
+    """
+
+    def test_a_team_scoped_search_names_the_team(self) -> None:
+        client, collection = _empty_query_client()
+        backend = _backend_with(client, "planning")
+
+        backend.search("planning", [0.1, 0.2], top_k=5)
+
+        sent = collection.query.near_vector.call_args[1]["filters"]
+        assert _legs(sent) == [("team_id", "equal", "team-42")]
+
+    def test_a_shared_search_names_the_scope_and_not_the_team(self) -> None:
+        """Two teams over one tree must read the same rows, so no team leg is built."""
+        client, collection = _empty_query_client()
+        backend = _backend_with(client, "workspace_chunks")
+
+        backend.search("workspace_chunks", [0.1, 0.2], top_k=5, scope="u/t")
+
+        sent = collection.query.near_vector.call_args[1]["filters"]
+        assert _legs(sent) == [("scope", "equal", "u/t")]
+        assert not any(leg[0] == "team_id" for leg in _legs(sent))
+
+    def test_a_shared_search_still_conjoins_a_path_prefix(self) -> None:
+        client, collection = _empty_query_client()
+        backend = _backend_with(client, "workspace_chunks")
+
+        backend.search("workspace_chunks", [0.1], top_k=5, scope="u/t", path_prefix="docs/")
+
+        assert _legs(collection.query.near_vector.call_args[1]["filters"]) == [
+            ("scope", "equal", "u/t"),
+            ("path", "like", "docs/*"),
+        ]
+
+    def test_a_team_scoped_removal_names_the_team(self) -> None:
+        _mock_weaviate, client = _install_mock_weaviate()
+        client.collections.exists.return_value = False
+        collection = MagicMock()
+        client.collections.get.return_value = collection
+        backend = _backend_with(client, "planning")
+
+        backend.remove("planning", ["r1"])
+
+        assert _legs(collection.data.delete_many.call_args[1]["where"]) == [
+            ("ref_id", "contains_any", ["r1"]),
+            ("team_id", "equal", "team-42"),
+        ]
+
+    def test_a_shared_removal_names_ref_id_and_scope_and_not_the_team(self) -> None:
+        """The ref-id leg is still required: ids collide across scopes."""
+        _mock_weaviate, client = _install_mock_weaviate()
+        client.collections.exists.return_value = False
+        collection = MagicMock()
+        client.collections.get.return_value = collection
+        backend = _backend_with(client, "workspace_chunks")
+
+        backend.remove("workspace_chunks", ["r1", "r2"], scope="u/t")
+
+        legs = _legs(collection.data.delete_many.call_args[1]["where"])
+        assert legs == [
+            ("ref_id", "contains_any", ["r1", "r2"]),
+            ("scope", "equal", "u/t"),
+        ]
+        assert not any(leg[0] == "team_id" for leg in legs)
+
+
+class TestATeamlessBackendAndTheSharedCollection:
+    """A backend that does not know its team can query the shared collection only.
+
+    On a shared collection there is no identity to invent, because the boundary is
+    the scope — so ``_team_filter``'s refusal is simply never reached. On a
+    team-scoped one it still bites, unchanged.
+    """
+
+    def test_it_can_search_the_shared_collection(self) -> None:
+        client, collection = _empty_query_client()
+        backend = _backend_with(client, "workspace_chunks", team_id=None)
+
+        backend.search("workspace_chunks", [0.1], top_k=5, scope="u/t")
+
+        assert _legs(collection.query.near_vector.call_args[1]["filters"]) == [
+            ("scope", "equal", "u/t")
+        ]
+
+    def test_it_can_remove_from_the_shared_collection(self) -> None:
+        _mock_weaviate, client = _install_mock_weaviate()
+        client.collections.exists.return_value = False
+        collection = MagicMock()
+        client.collections.get.return_value = collection
+        backend = _backend_with(client, "workspace_chunks", team_id=None)
+
+        backend.remove("workspace_chunks", ["r1"], scope="u/t")
+
+        assert _legs(collection.data.delete_many.call_args[1]["where"]) == [
+            ("ref_id", "contains_any", ["r1"]),
+            ("scope", "equal", "u/t"),
+        ]
+
+    def test_it_still_cannot_search_a_team_scoped_collection(self) -> None:
+        client, collection = _empty_query_client()
+        backend = _backend_with(client, "planning", team_id=None)
+
+        with pytest.raises(ValueError, match="without a team_id"):
+            backend.search("planning", [0.1], top_k=5)
+        collection.query.near_vector.assert_not_called()
+
+    def test_it_still_cannot_remove_from_a_team_scoped_collection(self) -> None:
+        _mock_weaviate, client = _install_mock_weaviate()
+        client.collections.exists.return_value = False
+        collection = MagicMock()
+        client.collections.get.return_value = collection
+        backend = _backend_with(client, "planning", team_id=None)
+
+        with pytest.raises(ValueError, match="without a team_id"):
+            backend.remove("planning", ["r1"])
+        collection.data.delete_many.assert_not_called()
+
+
+class TestASharedCollectionRefusesAnUnscopedQuery:
+    """Scope is the shared collection's only boundary, so it is mandatory.
+
+    A caller that forgets it would otherwise read or delete every workspace's
+    chunks on the cluster — a strictly worse version of the bug the team predicate
+    was added to fix.
+    """
+
+    def test_search_refuses_before_reaching_the_cluster(self) -> None:
+        client, collection = _empty_query_client()
+        backend = _backend_with(client, "workspace_chunks")
+
+        with pytest.raises(ValueError, match="workspace_chunks") as excinfo:
+            backend.search("workspace_chunks", [0.1], top_k=3)
+
+        assert "scope" in str(excinfo.value)
+        collection.query.near_vector.assert_not_called()
+
+    def test_remove_refuses_before_reaching_the_cluster(self) -> None:
+        _mock_weaviate, client = _install_mock_weaviate()
+        client.collections.exists.return_value = False
+        collection = MagicMock()
+        client.collections.get.return_value = collection
+        backend = _backend_with(client, "workspace_chunks")
+
+        with pytest.raises(ValueError, match="workspace_chunks"):
+            backend.remove("workspace_chunks", ["a"])
+
+        collection.data.delete_many.assert_not_called()
+
+    def test_a_team_scoped_collection_is_unaffected(self) -> None:
+        """It keeps its team predicate, so an unscoped query is still a bounded one."""
+        client, collection = _empty_query_client()
+        backend = _backend_with(client, "planning")
+
+        backend.search("planning", [0.1], top_k=3)
+
+        collection.query.near_vector.assert_called_once()
+
+
+class TestDeleteByTeamRefusesASharedCollection:
+    """A sweeper pointed at the workspace collection would reap a live team's rows."""
+
+    def test_it_refuses_before_any_cluster_call(self) -> None:
+        _mock_weaviate, client = _install_mock_weaviate()
+        client.collections.exists.return_value = True
+        collection = MagicMock()
+        client.collections.get.return_value = collection
+
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+
+        backend = WeaviateBackend(client=client, team_id="team-42")
+
+        with pytest.raises(ValueError, match="workspace_chunks"):
+            backend.delete_by_team("workspace_chunks", "team-42")
+
+        client.collections.exists.assert_not_called()
+        collection.data.delete_many.assert_not_called()
+
+    def test_the_refusal_holds_on_an_administrative_backend(self) -> None:
+        """The only kind a sweeper has: no team of its own, no collection created here.
+
+        The guard consults a module-level fact rather than per-instance state, which
+        is precisely why it is not vacuous on this backend.
+        """
+        _mock_weaviate, client = _install_mock_weaviate()
+        client.collections.exists.return_value = True
+        collection = MagicMock()
+        client.collections.get.return_value = collection
+
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+
+        backend = WeaviateBackend(client=client)  # no team_id, nothing created
+
+        with pytest.raises(ValueError, match="workspace_chunks"):
+            backend.delete_by_team("workspace_chunks", "team-42")
+
+        collection.data.delete_many.assert_not_called()
+
+    def test_a_team_scoped_collection_is_still_reaped(self) -> None:
+        _mock_weaviate, client = _install_mock_weaviate()
+        client.collections.exists.return_value = True
+        collection = MagicMock()
+        collection.data.delete_many.return_value = MagicMock(successful=4)
+        client.collections.get.return_value = collection
+
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+
+        backend = WeaviateBackend(client=client)
+
+        assert backend.delete_by_team("planning", "team-42") == 4
+        assert _legs(collection.data.delete_many.call_args[1]["where"]) == [
+            ("team_id", "equal", "team-42")
+        ]
+
+    def test_list_collections_is_untouched_and_lists_the_shared_one(self) -> None:
+        """A collection name identifies no team, so enumeration needs no scoping."""
+        _mock_weaviate, client = _install_mock_weaviate()
+        client.collections.list_all.return_value = {
+            "planning": object(),
+            "workspace_chunks": object(),
+        }
+
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+
+        backend = WeaviateBackend(client=client)  # no team_id
+
+        assert sorted(backend.list_collections()) == ["planning", "workspace_chunks"]

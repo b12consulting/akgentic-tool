@@ -47,7 +47,12 @@ from akgentic.tool.core import (
     _resolve,
 )
 from akgentic.tool.core.observer import ActorToolObserver
-from akgentic.tool.vector_store.protocol import CollectionConfig, require_weaviate_configured
+from akgentic.tool.vector_store.actor import ensure_store_actor
+from akgentic.tool.vector_store.protocol import (
+    VectorStoreParam,
+    require_backend_configured,
+    require_dimension_matches,
+)
 from akgentic.tool.workspace.actor import (
     WORKSPACE_ACTOR_ROLE,
     WorkspaceActor,
@@ -249,19 +254,22 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
     indexer and ``read_only=True, workspace_rag_search=True`` registers the search.
     """
 
-    rag_collection: CollectionConfig = Field(default_factory=CollectionConfig)
-    """Backend, dimension and tenant of the one ``workspace_chunks`` collection.
+    vector_store: VectorStoreParam = Field(default_factory=VectorStoreParam)
+    """Backend, dimension, tenant, embedding model and provider of the one
+    ``workspace_chunks`` collection.
 
-    **``rag_collection`` rather than the house's bare ``collection``.**
-    ``PlanningTool`` and ``KnowledgeGraphTool`` both declare ``collection``, and
-    that is the house name — but on a card whose other twenty fields are all
-    workspace operations, a bare ``collection`` reads as "the workspace's
-    collection of files". This is the one departure and it is deliberate.
+    **The house name is now ``vector_store``, and this card no longer departs
+    from it.** The old name ``rag_collection`` existed because a bare
+    ``collection`` reads as "the workspace's collection of files" on a card whose
+    other twenty fields are file operations — a real objection, which the new
+    name answers rather than ignores: ``vector_store`` is unambiguous here, and
+    ``PlanningTool`` and ``KnowledgeGraphTool`` carry the same field under the
+    same name.
 
-    Two things read it besides the collection itself: it decides the
-    backend-derived document caps below, and it is what
-    ``require_weaviate_configured`` checks — but only when a retrieval capability
-    is actually enabled.
+    Three things read it besides the collection itself: it decides the
+    backend-derived document caps below, it is what ``require_backend_configured``
+    checks, and it is what decides whether a store actor is created at all — all
+    three only when a retrieval capability is actually enabled.
     """
 
     max_documents: int | None = None
@@ -350,11 +358,18 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
             raise ValueError("WorkspaceTool requires access to the orchestrator.")
         if self._rag_enabled():
             # Only when retrieval is on. ``protocol.py`` raises when a card names
-            # Weaviate and the environment has no cluster, which is correct for a
+            # a store the environment has not provisioned, which is correct for a
             # card that asked for durable shared storage and wrong to impose on
             # the overwhelming majority of ``WorkspaceTool()`` instances that
             # never enable retrieval at all.
-            require_weaviate_configured(self.rag_collection, "WorkspaceTool")
+            #
+            # The guard is backend-agnostic now, not Weaviate-shaped. The old
+            # check only tested ``backend == "weaviate"``, so a card naming
+            # ``qdrant`` with no URL passed it and degraded silently at
+            # ``enable_rag``; it now fails the team's build here, which is what
+            # ``PlanningTool`` and ``KnowledgeGraphTool`` already did.
+            require_backend_configured(self.vector_store, "WorkspaceTool")
+            require_dimension_matches(self.vector_store, "WorkspaceTool")
         super().observer(observer)  # store the observer weakly via the base setter
         ws_path = str(self._resolve_path(observer, observer.orchestrator))
         self._workspace = get_workspace(ws_path)
@@ -513,8 +528,17 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
                 whose injectivity would have to be proved separately.
         """
         orchestrator_proxy = observer.proxy_ask(orchestrator, Orchestrator)
+        if self._rag_enabled():
+            # The store is created **here**, not in ``_announce_rag``, for one
+            # concrete reason: this method is the only one that holds an
+            # orchestrator proxy, and ``_announce_rag`` holds a tell proxy over
+            # the *workspace* actor instead. Threading an orchestrator proxy down
+            # to the announcement would buy nothing — this runs first, and the
+            # store only has to exist by the time ``enable_rag`` makes the
+            # workspace actor resolve it. A cluster backend creates nothing.
+            ensure_store_actor(self.vector_store, orchestrator_proxy)
         derived_documents, derived_chars = derived_document_caps(
-            self.rag_collection.backend, self._rag_enabled()
+            self.vector_store.backend, self._rag_enabled()
         )
         workspace_addr = orchestrator_proxy.getChildrenOrCreate(
             WorkspaceActor,

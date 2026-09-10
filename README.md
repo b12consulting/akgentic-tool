@@ -28,7 +28,7 @@ commands.
   - [WorkspaceTool](#workspacetool)
   - [PlanningTool](#planningtool)
   - [KnowledgeGraphTool](#knowledgegraphtool)
-  - [VectorStoreTool](#vectorstoretool)
+  - [The vector store](#the-vector-store)
   - [SearchTool](#searchtool)
   - [TeamTool](#teamtool)
   - [MetadataTool](#metadatatool)
@@ -721,6 +721,12 @@ Seven ship in this package today: `#VectorStore`, `#PlanningTool`, `#KnowledgeGr
 `#SandboxActor-<scope>/<leaf>`, `#TeamActivity`, `#NotificationTool` and
 `#Workspace-<scope>/<leaf>`.
 
+**`#VectorStore` is the exception among them: it exists only for a backend that keeps its data in
+actor state.** Today that means the in-memory backend. On a cluster the rows live in the cluster,
+so there is nothing for an actor to own and none is created — each consumer holds its own backend
+object and calls it directly. Whether the actor exists at all is the backend's answer, read from the
+`persists_in_actor_state` flag on its registered spec, not a card's.
+
 **Note the two names that carry a suffix.** Five of the seven are one per *team*, and their name is
 a constant. The workspace actor and the sandbox actor are one per *workspace tree*, so their names
 are **built** from the workspace's resolved two-segment path — slash included — rather than being
@@ -1010,7 +1016,6 @@ are the index; the detail lives beside the module it documents.
 | `WorkspaceTool` | `akgentic.tool.workspace` | Team-scoped filesystem behind a write gate, with a git journal and sandboxed shell execution | [README](src/akgentic/tool/workspace/README.md) |
 | `PlanningTool` | `akgentic.tool.planning` | Shared task board backed by the `#PlanningTool` actor | [README](src/akgentic/tool/planning/README.md) |
 | `KnowledgeGraphTool` | `akgentic.tool.knowledge_graph` | Entities and relations with hybrid keyword + semantic search | [README](src/akgentic/tool/knowledge_graph/README.md) |
-| `VectorStoreTool` | `akgentic.tool.vector_store` | Configuration-only card owning the shared embedding store | [README](src/akgentic/tool/vector_store/README.md) |
 | `SearchTool` | `akgentic.tool.search` | Web search, fetch and crawl via Tavily | [README](src/akgentic/tool/search/README.md) |
 | `TeamTool` | `akgentic.tool.team` | Hire, fire, roster, role profiles, and who is busy right now | [README](src/akgentic/tool/team/README.md) |
 | `MetadataTool` | `akgentic.tool.metadata` | The team's business context, rendered once into every agent's prefix | [README](src/akgentic/tool/metadata/README.md) |
@@ -1106,15 +1111,14 @@ from akgentic.tool.planning import GetPlanning, PlanningTool
 
 PlanningTool()                                                  # default config
 PlanningTool(get_planning=GetPlanning(filter_by_agent=False))   # show all tasks
-PlanningTool(vector_store=False)                                # keyword-only search
 ```
 
-Semantic search needs `akgentic-tool[vector_search]` and a `VectorStoreTool` in the team; without
-either it degrades to keyword-only.
+Semantic search needs `akgentic-tool[vector_search]`; without it the card degrades to keyword-only.
+The store itself needs no second card — `PlanningTool` carries its own `vector_store:
+VectorStoreParam` and creates whatever that backend needs.
 
 **[Full reference → `src/akgentic/tool/planning/README.md`](src/akgentic/tool/planning/README.md)** —
-task model constraints, the four capabilities and their channels, collection configuration and
-the `depends_on` contract.
+task model constraints, the four capabilities and their channels, and collection configuration.
 
 ### KnowledgeGraphTool
 
@@ -1131,32 +1135,34 @@ KnowledgeGraphTool()
 KnowledgeGraphTool(read_only=True)
 ```
 
-Requires `akgentic-tool[vector_search]` — the dependency is checked at wiring time even when
-`vector_store=False`.
+Requires `akgentic-tool[vector_search]` — the dependency is checked at wiring time.
 
 **[Full reference → `src/akgentic/tool/knowledge_graph/README.md`](src/akgentic/tool/knowledge_graph/README.md)** —
 the mutation and query models, search modes and expansion flags, scoring, and the state-delta
 events.
 
-### VectorStoreTool
+### The vector store
 
-Configuration-only companion card for the `VectorStoreActor` singleton — it exposes **no LLM
-tools, system prompts, or commands** (`get_tools()` returns `[]`). Its sole runtime job is to
-ensure the singleton exists when the observer attaches. Consumer cards (`PlanningTool`,
-`KnowledgeGraphTool`) never create the actor themselves: they look it up by name and declare a
-conditional `depends_on: ["VectorStoreTool"]`, so `ToolFactory`'s topological sort wires this card
-first.
+**There is no configuration card.** Each consumer — `PlanningTool`, `KnowledgeGraphTool`,
+`WorkspaceTool` — carries its own `vector_store: VectorStoreParam` and resolves its own storage
+engine, so a store's settings live on the card that uses it and no card declares a `depends_on`
+edge.
+
+Whether an actor exists at all is the backend's answer, not a card's. In memory the
+`VectorStoreActor`'s state *is* the database, so the consumer's `observer()` creates it (through
+`ensure_store_actor`) before the actor that will look it up. On a cluster the data is elsewhere and
+an actor would hold nothing but a socket, so none is created and the consumer calls the shared
+client directly.
 
 ```python
-from akgentic.tool.vector_store import VectorStoreTool
+from akgentic.tool.vector_store import VectorStoreParam
 
-VectorStoreTool()                                  # "#VectorStore", OpenAI embeddings
-VectorStoreTool(vector_store_name="#VectorStore-RAG", embedding_provider="azure")
+PlanningTool()                                                          # in memory: an actor
+KnowledgeGraphTool(vector_store=VectorStoreParam(backend="weaviate"))   # a cluster: none
 ```
 
-Collections are configured on the *consumer* card (`collection: CollectionConfig`), and Weaviate
-connection settings are deliberately not fields on any card — they are infrastructure. The card
-reads them from the environment when the observer attaches:
+Weaviate connection settings are deliberately not fields on any card — they are infrastructure,
+read from the environment:
 
 ```bash
 export AKGENTIC_WEAVIATE_URL="https://your-cluster.weaviate.network"
@@ -1164,7 +1170,7 @@ export AKGENTIC_WEAVIATE_API_KEY="..."          # omit for an unauthenticated cl
 ```
 
 **Exporting the URL is what turns the Weaviate backend on**, and it also picks the *default*:
-`CollectionConfig.backend` resolves to `weaviate` when a cluster is configured and `inmemory`
+`VectorStoreParam.backend` resolves to `weaviate` when a cluster is configured and `inmemory`
 otherwise, so a card that names no backend lands wherever the deployment actually is. An exported
 but empty variable counts as unset. Requires `akgentic-tool[weaviate]`.
 
@@ -1172,7 +1178,7 @@ Naming `backend="weaviate"` with no URL exported **raises at team creation** rat
 to memory — a card asking for durable, shared storage should not be silently handed a process-local
 index that everything downstream assumes is persisted.
 
-This card is also where **hybrid search** lives. `akgentic.tool.vector_store.hybrid` owns the one
+This package is also where **hybrid search** lives. `akgentic.tool.vector_store.hybrid` owns the one
 rule that fuses keyword and vector hits, shared by `PlanningTool` and `KnowledgeGraphTool` so both
 rank identically: Weaviate's `relativeScoreFusion`, `alpha * norm(cosine) + (1 - alpha) * keyword`,
 at the client's default `alpha = 0.7`. The backends themselves answer pure similarity queries and
@@ -1185,9 +1191,15 @@ the actor, never from a card), so `delete_by_team()` and `list_collections()` gi
 two primitives it needs to reap the vectors of a deleted team — otherwise unreachable, since
 nothing else on a Weaviate object says who produced it.
 
+Every consumer in a process reaches a cluster through **one shared client**, keyed on the backend and
+the connection it names (host, port, scheme, API key) and obtained with `get_client(key, connect)`
+from `akgentic.tool.vector_store`; a cluster backend takes that client and never opens or closes one
+of its own. `close_all()` closes every cached client and runs by itself at process exit — an embedder
+or a script that wants its connections released earlier calls it once no consumer is live.
+
 **[Full reference → `src/akgentic/tool/vector_store/README.md`](src/akgentic/tool/vector_store/README.md)** —
-`CollectionConfig` in full, the service protocol, asynchronous embedding, team-scoped cleanup, and
-multi-store setups.
+`VectorStoreParam` in full, the service protocol, per-collection team scoping, team-scoped cleanup,
+and multi-store setups.
 
 ### SearchTool
 
@@ -1664,17 +1676,22 @@ src/akgentic/tool/
     vector.py                 # Compatibility façade only — moved to
     │                         #   vector_store/vector.py. See the migration table
     vector_store/
-    │   README.md           # VectorStoreTool reference — fields, CollectionConfig, backends
+    │   README.md           # Vector store reference — VectorStoreParam, backends, the client cache
     │   vector.py             # VectorEntry, EmbeddingService, VectorIndex
     │   │                     #   [optional: vector_search extra]
     │   protocol.py           # VectorStore Protocol, VectorStoreConfig, data models
-    │   inmemory.py           # InMemory backend
-    │   weaviate.py           # Weaviate backend [optional: weaviate extra]
-    │   actor.py              # VectorStoreActor singleton
-    │   embedding_actor.py    # EmbeddingActor (non-blocking embedding); spawned as
-    │                         #   "#embed-<collection>-<request_id>" (teardown
-    │                         #   invariant — see Deferred Results)
-    │   └── tool.py           # VectorStoreTool ToolCard
+    │   backends/             # The built-in backends; each self-registers on import.
+    │   │                     #   Import the classes from vector_store, not here
+    │   │   inmemory.py       # InMemory backend
+    │   │   weaviate.py       # Weaviate backend + its environment helpers
+    │   │                     #   [optional: weaviate extra]
+    │   │   └── qdrant.py     # Qdrant backend [optional: qdrant extra]
+    │   client.py             # One client per cluster per process, keyed and closed
+    │   registry.py           # Pluggable backend registry — BackendSpec, register_backend
+    │   actor.py              # VectorStoreActor singleton + ensure_store_actor
+    │   embedding_actor.py    # EmbeddingWorker (a DeferredWorker), spawned by the
+    │                         #   CONSUMER as "#embed-<collection>-<request_id>"
+    │   └──                   #   (teardown invariant — see Deferred Results)
     planning/
     │   README.md           # PlanningTool reference — capabilities, task models, wiring
     │   planning_actor.py     # Task models, PlanConfig, PlanActor

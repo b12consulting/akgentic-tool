@@ -1,7 +1,8 @@
 """Centralised vector storage service — protocols, models, and configuration.
 
 Re-exports all public types from ``protocol.py`` so consumers can import
-directly from ``akgentic.tool.vector_store``.
+directly from ``akgentic.tool.vector_store``. The backend classes are re-exported
+from the ``backends`` package; this module is their one public surface.
 """
 
 from __future__ import annotations
@@ -9,44 +10,37 @@ from __future__ import annotations
 from akgentic.tool.vector_store.actor import (
     VS_ACTOR_NAME,
     VS_ACTOR_ROLE,
-    PendingRequest,
     VectorStoreActor,
     VectorStoreState,
+    ensure_store_actor,
 )
+from akgentic.tool.vector_store.backends.inmemory import InMemoryBackend
+from akgentic.tool.vector_store.backends.qdrant import QdrantBackend
+from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+from akgentic.tool.vector_store.client import ClusterKey, close_all, get_client
 from akgentic.tool.vector_store.embedding_actor import (
-    EmbeddingActor,
-    EmbeddingCompleted,
     EmbeddingError,
     EmbeddingRequest,
     EmbeddingResult,
+    EmbeddingWorker,
+    build_embedding_service,
+    embedding_worker_name,
 )
-from akgentic.tool.vector_store.inmemory import InMemoryBackend
-
-try:
-    from akgentic.tool.vector_store.weaviate import WeaviateBackend
-except ImportError:
-    WeaviateBackend = None  # type: ignore[assignment,misc]
-try:
-    from akgentic.tool.vector_store.qdrant import QdrantBackend
-except ImportError:
-    QdrantBackend = None  # type: ignore[assignment,misc]
 from akgentic.tool.vector_store.protocol import (
-    WEAVIATE_API_KEY_ENV,
-    WEAVIATE_URL_ENV,
+    EMBEDDING_DIMENSIONS,
     ActorStateBackend,
-    CollectionConfig,
     CollectionStatus,
     EmbeddingProvider,
     SearchHit,
     SearchResult,
     VectorQuery,
     VectorStoreConfig,
+    VectorStoreParam,
     VectorStoreService,
     default_backend,
+    needs_store_actor,
     require_backend_configured,
-    require_weaviate_configured,
-    weaviate_api_key,
-    weaviate_url,
+    require_dimension_matches,
 )
 from akgentic.tool.vector_store.registry import (
     BackendContext,
@@ -58,7 +52,6 @@ from akgentic.tool.vector_store.registry import (
     resolve_default_backend,
     unregister_backend,
 )
-from akgentic.tool.vector_store.tool import VectorStoreTool
 from akgentic.tool.vector_store.vector import EmbeddingService, VectorEntry, VectorIndex
 
 # ``_check_vector_search_dependencies`` is private but imported by name from six modules
@@ -70,22 +63,19 @@ from akgentic.tool.vector_store.vector import (  # noqa: F401
 )
 
 __all__ = [
-    "WEAVIATE_API_KEY_ENV",
-    "WEAVIATE_URL_ENV",
+    "EMBEDDING_DIMENSIONS",
     "ActorStateBackend",
     "BackendContext",
     "BackendSpec",
-    "CollectionConfig",
+    "ClusterKey",
     "CollectionStatus",
-    "EmbeddingActor",
-    "EmbeddingCompleted",
     "EmbeddingError",
     "EmbeddingProvider",
     "EmbeddingRequest",
     "EmbeddingResult",
     "EmbeddingService",
+    "EmbeddingWorker",
     "InMemoryBackend",
-    "PendingRequest",
     "QdrantBackend",
     "WeaviateBackend",
     "SearchHit",
@@ -97,18 +87,22 @@ __all__ = [
     "VectorQuery",
     "VectorStoreActor",
     "VectorStoreConfig",
+    "VectorStoreParam",
     "VectorStoreService",
     "VectorStoreState",
-    "VectorStoreTool",
     "available_backends",
+    "build_embedding_service",
+    "close_all",
     "default_backend",
+    "embedding_worker_name",
+    "ensure_store_actor",
     "get_backend_spec",
+    "get_client",
     "is_registered",
+    "needs_store_actor",
     "register_backend",
     "require_backend_configured",
-    "require_weaviate_configured",
+    "require_dimension_matches",
     "resolve_default_backend",
     "unregister_backend",
-    "weaviate_api_key",
-    "weaviate_url",
 ]

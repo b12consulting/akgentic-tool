@@ -8,16 +8,18 @@ Vectors are provided externally (no Weaviate-side vectoriser).
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
+from typing import TYPE_CHECKING, Any, Final
 
+from akgentic.tool.vector_store.client import ClusterKey, get_client
 from akgentic.tool.vector_store.protocol import (
-    CollectionConfig,
     CollectionStatus,
     SearchHit,
     SearchResult,
     VectorQuery,
+    VectorStoreParam,
     check_path_prefix,
+    check_shared_scope,
+    collection_is_team_scoped,
 )
 from akgentic.tool.vector_store.registry import BackendContext, BackendSpec, register_backend
 
@@ -29,6 +31,88 @@ if TYPE_CHECKING:
     from akgentic.tool.vector_store.vector import VectorEntry
 
 logger = logging.getLogger(__name__)
+
+GRPC_PORT: Final[int] = 50051
+"""gRPC port used for every cluster. Fixed, and therefore not part of ``ClusterKey``.
+
+It lives here rather than in ``client.py`` for the same reason the dependency
+check does: a gRPC port is a Weaviate connection detail, and the cache is shared
+with backends that have none.
+"""
+
+WEAVIATE_MISSING_MESSAGE: Final[str] = (
+    "Weaviate backend requires the 'weaviate-client' package. "
+    "Install with: pip install akgentic-tool[weaviate]"
+)
+"""The ``ImportError`` text raised when ``weaviate-client`` is not installed."""
+
+
+def _check_weaviate_dependencies() -> None:
+    """Validate that ``weaviate-client`` is importable, at call time.
+
+    Lives beside ``qdrant.py``'s ``_check_qdrant_dependencies``, which is what
+    "generalised, not twinned" means for the client cache: each backend owns its
+    own dependency guard, and ``client.py`` owns neither.
+
+    Raises:
+        ImportError: With install instructions when ``weaviate-client`` is missing.
+    """
+    try:
+        import weaviate  # noqa: F401
+    except ImportError as exc:
+        raise ImportError(WEAVIATE_MISSING_MESSAGE) from exc
+
+
+def _connect_weaviate(key: ClusterKey) -> weaviate.WeaviateClient:
+    """Open the cluster connection *key* names — the callable ``get_client`` calls.
+
+    The one place in this package that names ``weaviate.connect_to_custom``, and
+    the reason ``client.py`` names no vendor at all. The keyword set is fixed:
+    HTTP and gRPC share the host and the ``secure`` flag, the gRPC port is
+    :data:`GRPC_PORT` for every cluster, and the credential is an ``AuthApiKey``
+    or nothing — never an ``AuthCredentials`` object, which is the module
+    docstring's invariant 2 in ``client.py``.
+
+    Args:
+        key: The cluster to connect to.
+
+    Returns:
+        A connected client.
+
+    Raises:
+        ImportError: When ``weaviate-client`` is not installed.
+    """
+    _check_weaviate_dependencies()
+    import weaviate as _weaviate
+    from weaviate.auth import AuthApiKey
+
+    return _weaviate.connect_to_custom(
+        http_host=key.host,
+        http_port=key.port,
+        http_secure=key.secure,
+        grpc_host=key.host,
+        grpc_port=GRPC_PORT,
+        grpc_secure=key.secure,
+        auth_credentials=AuthApiKey(key.api_key) if key.api_key else None,
+    )
+
+
+def _weaviate_client(url: str, api_key: str | None = None) -> weaviate.WeaviateClient:
+    """Return the process's shared client for the cluster *url* names.
+
+    The one entry point its callers use — the registered factory and a sweeper
+    built by hand — so the key's shape and the connect keyword set are written
+    once.
+
+    Args:
+        url: Cluster URL, e.g. ``http://localhost:8080``.
+        api_key: API key, or ``None`` for an unauthenticated cluster.
+
+    Returns:
+        The shared, connected client.
+    """
+    return get_client(ClusterKey.from_url("weaviate", url, api_key), _connect_weaviate)
+
 
 TEAM_ID_PROPERTY: str = "team_id"
 """Schema property carrying the owning team's id on every stored object.
@@ -68,18 +152,6 @@ ORDINAL_PROPERTY: str = "ordinal"
 Returned on a hit for ordering reassembly; never filtered on. Stamped only when set."""
 
 
-# ---------------------------------------------------------------------------
-# Dependency guard
-# ---------------------------------------------------------------------------
-
-try:
-    import weaviate as _weaviate  # noqa: F811, F401
-except ImportError:
-    _WEAVIATE_AVAILABLE = False
-else:
-    _WEAVIATE_AVAILABLE = True
-
-
 def _optional_str(value: object) -> str | None:
     """Return *value* as a string, or ``None`` when the property is absent.
 
@@ -95,20 +167,6 @@ def _optional_str(value: object) -> str | None:
     return None if value is None else str(value)
 
 
-def _check_weaviate_dependencies() -> None:
-    """Validate that ``weaviate-client`` is installed.
-
-    Raises:
-        ImportError: With install instructions when ``weaviate-client`` is missing.
-    """
-    if not _WEAVIATE_AVAILABLE:
-        msg = (
-            "Weaviate backend requires the 'weaviate-client' package. "
-            "Install with: pip install akgentic-tool[weaviate]"
-        )
-        raise ImportError(msg)
-
-
 # ---------------------------------------------------------------------------
 # WeaviateBackend
 # ---------------------------------------------------------------------------
@@ -118,8 +176,13 @@ class WeaviateBackend:
     """Weaviate-backed vector store implementing ``VectorStoreService``.
 
     This is a plain Python class (not a Pydantic model) because it holds
-    non-serialisable runtime state (the Weaviate client connection).
-    It satisfies the ``VectorStoreService`` protocol structurally.
+    non-serialisable runtime state: a handle to the process's **shared**
+    Weaviate client, not a connection of its own. The client is obtained from
+    :func:`akgentic.tool.vector_store.client.get_client` — one per cluster per
+    process — and closed by ``close_all()`` at process exit, never by a backend.
+    What a backend owns is its scope (``tenant``, ``team_id``) and its own
+    created-collections bookkeeping. It satisfies the ``VectorStoreService``
+    protocol structurally.
 
     **The backend is team-scoped by construction.** Every query it issues
     carries a predicate on ``team_id``: ``search`` sees only its own team's
@@ -130,8 +193,9 @@ class WeaviateBackend:
     boundary deliberately and say so in their signatures.
 
     Args:
-        url: Weaviate cluster URL (e.g. ``http://localhost:8080``).
-        api_key: Optional API key for authentication.
+        client: The connected ``weaviate.WeaviateClient`` for the cluster, from
+            ``get_client(url, api_key)``. The backend never connects and never
+            closes it.
         tenant: Optional default tenant ID for multi-tenancy.
         team_id: Owning team id. Stamped onto every object written through this
             backend and used as the filter on every object it reads or removes.
@@ -144,44 +208,24 @@ class WeaviateBackend:
 
     def __init__(
         self,
-        url: str,
-        api_key: str | None = None,
+        client: weaviate.WeaviateClient,
         tenant: str | None = None,
         team_id: str | None = None,
     ) -> None:
         _check_weaviate_dependencies()
 
-        import weaviate as _wv
-        from weaviate.auth import AuthApiKey
-
+        self._client: weaviate.WeaviateClient = client
         self._tenant = tenant
         self._team_id = team_id
-        parsed = urlparse(url)
-        host = parsed.hostname or "localhost"
-        port = parsed.port or (443 if parsed.scheme == "https" else 8080)
-        use_https = parsed.scheme == "https"
-
-        # gRPC defaults: same host, port 50051
-        grpc_port = 50051
-
-        auth = AuthApiKey(api_key) if api_key else None
-        self._client: weaviate.WeaviateClient = _wv.connect_to_custom(
-            http_host=host,
-            http_port=port,
-            http_secure=use_https,
-            grpc_host=host,
-            grpc_port=grpc_port,
-            grpc_secure=use_https,
-            auth_credentials=auth,
-        )
         self._collections_created: set[str] = set()
         self._collection_tenants: dict[str, str] = {}
+        self._collection_handles: dict[tuple[str, str | None], weaviate.collections.Collection] = {}
 
     # ------------------------------------------------------------------
     # VectorStoreService protocol methods
     # ------------------------------------------------------------------
 
-    def create_collection(self, name: str, config: CollectionConfig) -> None:
+    def create_collection(self, name: str, config: VectorStoreParam) -> None:
         """Create a named Weaviate collection. No-op if it already exists.
 
         When multi-tenancy is enabled (``self._tenant`` or ``config.tenant``
@@ -259,6 +303,12 @@ class WeaviateBackend:
         entry from planning or the knowledge graph byte-identical to what it was
         before this dimension existed.
 
+        The batch context is opened here, on a handle fetched in this call, and
+        left here — never stored on the instance, never shared between calls —
+        because a shared batch object is the one thing the vendor says is not
+        thread-safe, and the client underneath is shared by every consumer in the
+        process.
+
         Args:
             collection: Target collection name.
             entries: List of vector entries to store.
@@ -326,18 +376,21 @@ class WeaviateBackend:
             path_prefix: Restrict removal to objects whose ``path`` starts with this.
 
         Raises:
-            ValueError: If the collection has not been created, if this backend
-                was built without a ``team_id``, or if ``path_prefix`` contains
-                ``*`` or ``?``.
+            ValueError: If the collection has not been created, if
+                ``path_prefix`` contains ``*`` or ``?``, if the collection is
+                shared across teams and no ``scope`` was given, or — on a
+                team-scoped collection only — if this backend was built without a
+                ``team_id``.
         """
         from weaviate.classes.query import Filter
 
         check_path_prefix(path_prefix)
+        check_shared_scope(collection, scope)
         self._check_collection(collection)
         col = self._get_collection(collection)
         col.data.delete_many(
             where=Filter.by_property("ref_id").contains_any(ref_ids)
-            & self._query_filter(scope, path_prefix),
+            & self._query_filter(collection, scope, path_prefix),
         )
 
     def search(
@@ -373,20 +426,23 @@ class WeaviateBackend:
             Search results with hits ranked by distance (converted to score).
 
         Raises:
-            ValueError: If the collection has not been created, if this backend
-                was built without a ``team_id``, or if ``path_prefix`` contains
-                ``*`` or ``?``.
+            ValueError: If the collection has not been created, if
+                ``path_prefix`` contains ``*`` or ``?``, if the collection is
+                shared across teams and no ``scope`` was given, or — on a
+                team-scoped collection only — if this backend was built without a
+                ``team_id``.
         """
         from weaviate.classes.query import MetadataQuery
 
         check_path_prefix(path_prefix)
+        check_shared_scope(collection, scope)
         self._check_collection(collection)
         col = self._get_collection(collection)
 
         result = col.query.near_vector(
             near_vector=query_vector,
             limit=top_k,
-            filters=self._build_filter(query, scope=scope, path_prefix=path_prefix),
+            filters=self._build_filter(collection, query, scope=scope, path_prefix=path_prefix),
             return_metadata=MetadataQuery(distance=True),
             **self._near_vector_kwargs(query),
         )
@@ -412,11 +468,7 @@ class WeaviateBackend:
                 )
             )
 
-        return SearchResult(
-            hits=hits,
-            status=CollectionStatus.READY,
-            indexing_pending=0,
-        )
+        return SearchResult(hits=hits, status=CollectionStatus.READY)
 
     # ------------------------------------------------------------------
     # Query construction hooks (override in a subclass for bespoke behaviour)
@@ -424,27 +476,32 @@ class WeaviateBackend:
 
     def _build_filter(
         self,
+        collection: str,
         query: VectorQuery | None,
         *,
         scope: str | None = None,
         path_prefix: str | None = None,
     ) -> FilterReturn:
-        """Combine the team/scope/path predicate with ``query.filters``.
+        """Combine the collection's own predicate with ``query.filters``.
 
-        The team predicate (optionally narrowed by ``scope`` / ``path_prefix``
-        via :meth:`_query_filter`) is always present; each entry in
-        ``query.filters`` is AND-ed onto it as an equality (scalar) or
-        ``contains_any`` (list) condition. Override to support richer operators.
+        The predicate :meth:`_query_filter` builds for *collection* — the team leg
+        where the collection is team-scoped, narrowed by ``scope`` / ``path_prefix``
+        — is always present; each entry in ``query.filters`` is AND-ed onto it as an
+        equality (scalar) or ``contains_any`` (list) condition. Override to support
+        richer operators.
 
         Args:
+            collection: The collection being queried, which decides whether the
+                team leg is part of the predicate at all.
             query: The active query, or ``None``.
             scope: Restrict to objects carrying this ``scope``.
             path_prefix: Restrict to objects whose ``path`` starts with this.
 
         Returns:
-            A combined Weaviate ``Filter`` always scoped to this team.
+            A combined Weaviate ``Filter``, scoped to this team unless *collection*
+            is shared across teams.
         """
-        base = self._query_filter(scope, path_prefix)
+        base = self._query_filter(collection, scope, path_prefix)
         if query is None or not query.filters:
             return base
         from weaviate.classes.query import Filter
@@ -505,6 +562,17 @@ class WeaviateBackend:
         anding it on would leave a sweeper able to reap only itself, which is
         the one team that is never being reaped.
 
+        **A collection shared across teams is refused, before any cluster call.**
+        On such a collection ``team_id`` records *who wrote the row* and is read by
+        nothing once the query predicate stops using it, so a sweeper pointed at it
+        would delete rows another live team is still reading, from a tree that still
+        exists. This method has no caller anywhere in ``src/``, which is exactly why
+        it needs a guard rather than a docstring: the first caller will be written
+        by someone reading the signature. The check consults a module-level fact
+        rather than this backend's own bookkeeping, so it still bites on an
+        administrative backend that has created no collection — the only kind a
+        sweeper has.
+
         Args:
             collection: Target collection name.
             team_id: The team whose objects are to be removed.
@@ -513,9 +581,18 @@ class WeaviateBackend:
             Number of objects deleted, or ``0`` when the cluster reports none.
 
         Raises:
-            ValueError: If the collection does not exist in the cluster.
+            ValueError: If the collection is shared across teams, or does not
+                exist in the cluster.
         """
         from weaviate.classes.query import Filter
+
+        if not collection_is_team_scoped(collection):
+            msg = (
+                f"Collection '{collection}' is shared across teams, so deleting one "
+                "team's objects would remove rows another live team is still reading. "
+                "Remove by ref_id with a scope instead."
+            )
+            raise ValueError(msg)
 
         if not self._client.collections.exists(collection):
             msg = f"Collection '{collection}' does not exist"
@@ -526,10 +603,6 @@ class WeaviateBackend:
             where=Filter.by_property(TEAM_ID_PROPERTY).equal(team_id),
         )
         return int(getattr(result, "successful", 0) or 0)
-
-    def close(self) -> None:
-        """Disconnect the Weaviate client."""
-        self._client.close()
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -584,16 +657,29 @@ class WeaviateBackend:
         return Filter.by_property(TEAM_ID_PROPERTY).equal(self._team_id)
 
     def _query_filter(
-        self, scope: str | None, path_prefix: str | None
+        self, collection: str, scope: str | None, path_prefix: str | None
     ) -> FilterReturn:
-        """Return the full predicate for a query: the team leg plus what was asked.
+        """Return the full predicate for a query on *collection*.
 
-        Built **around** :meth:`_team_filter`, never instead of it — a scoped query is
-        still a team's query, and no argument can widen it past its own team. A
-        predicate left at ``None`` contributes no leg, so the default is exactly the
-        team filter this backend has always applied.
+        On a team-scoped collection this is built **around** :meth:`_team_filter`,
+        never instead of it — a scoped query is still a team's query, and no
+        argument can widen it past its own team. A predicate left at ``None``
+        contributes no leg, so the default there is exactly the team filter this
+        backend has always applied.
+
+        On a collection listed in
+        :data:`~akgentic.tool.vector_store.protocol.SHARED_COLLECTIONS` the team leg
+        is not built at all: its rows belong to a filesystem tree rather than to a
+        team, and two teams over one tree must read the same rows. The conjunction
+        is then made from the scope and path legs alone — and it is never empty,
+        because :func:`~akgentic.tool.vector_store.protocol.check_shared_scope` has
+        already made ``scope`` mandatory for such a collection at the top of
+        ``search`` and ``remove``. That guard is the guarantee, so there is no
+        defensive branch here for a predicate with no legs.
 
         Args:
+            collection: The collection being queried, which decides whether the
+                team leg is part of the predicate.
             scope: Restrict to objects carrying this ``scope``, or ``None``.
             path_prefix: Restrict to objects whose ``path`` starts with this, or ``None``.
 
@@ -601,15 +687,29 @@ class WeaviateBackend:
             The conjunction of every applicable predicate.
 
         Raises:
-            ValueError: When the backend was built without a ``team_id``.
+            ValueError: When the collection is team-scoped and the backend was
+                built without a ``team_id``. A team-less backend can therefore
+                query a shared collection and still cannot query ``planning`` —
+                which is the correct reading of ADR-046 §D2: on a shared
+                collection there is no identity to invent, because the boundary
+                is the scope.
         """
         from weaviate.classes.query import Filter
 
-        predicate = self._team_filter()
+        legs: list[FilterReturn] = []
+        if collection_is_team_scoped(collection):
+            legs.append(self._team_filter())
         if scope is not None:
-            predicate = predicate & Filter.by_property(SCOPE_PROPERTY).equal(scope)
+            legs.append(Filter.by_property(SCOPE_PROPERTY).equal(scope))
         if path_prefix is not None:
-            predicate = predicate & Filter.by_property(PATH_PROPERTY).like(f"{path_prefix}*")
+            # ``check_path_prefix`` has already refused ``*`` and ``?`` for this reason:
+            # both are wildcards in Weaviate's ``Like`` operator, and the v4 filter API
+            # offers no escape, so a literal one in a prefix would widen the match here
+            # while the in-memory backend's ``str.startswith`` reads it literally.
+            legs.append(Filter.by_property(PATH_PROPERTY).like(f"{path_prefix}*"))
+        predicate = legs[0]
+        for leg in legs[1:]:
+            predicate = predicate & leg
         return predicate
 
     def _get_collection(self, name: str) -> weaviate.collections.Collection:
@@ -618,16 +718,45 @@ class WeaviateBackend:
         Resolves the effective tenant from the per-collection mapping first,
         falling back to the backend-level default tenant.
 
+        **The handle is cached per ``(name, tenant)``, and it has to be.**
+        ``client.collections.get`` builds a *new* ``Collection`` on every call
+        (``weaviate/collections/collections/executor.py:85-91``), and each one
+        constructs a ``_BatchCollectionWrapper`` whose ``__init__`` creates a
+        ``ThreadPoolExecutor`` (``weaviate/collections/batch/collection.py:127-128``)
+        that nothing ever shuts down. Uncached, every ``add()`` leaked one idle
+        pool for the lifetime of the process. ``with_tenant()`` returns a
+        different ``Collection``, so the tenant is part of the key.
+
+        **The invariant that makes a cached handle safe: a backend instance
+        belongs to exactly one actor.** The vendor's "not thread-safe" caveat is
+        about the batching algorithm, and the batch wrapper is per-``Collection``
+        object: ``dynamic()`` assigns ``self._batch_mode`` and replaces
+        ``self._batch_data`` on that shared wrapper before handing back the
+        context (``weaviate/collections/batch/collection.py:151-170``), so one
+        ``Collection`` reached from two threads is precisely the unsafe case.
+        It is not reached from two threads here, because each consumer builds its
+        own backend through ``BackendSpec.factory`` at bind time and every
+        ``add`` / ``remove`` / ``search`` runs on that consumer's own mailbox
+        turn. What is shared across threads is the **client**, which is verified
+        safe; what is cached here is a **handle**, which is not.
+
+        **If that invariant ever stops holding — one backend instance handed to
+        a second actor — this cache is the first thing to undo.**
+
         Args:
             name: Collection name.
 
         Returns:
             Weaviate collection object (optionally scoped to tenant).
         """
-        col = self._client.collections.get(name)
         tenant = self._collection_tenants.get(name) or self._tenant
+        cached = self._collection_handles.get((name, tenant))
+        if cached is not None:
+            return cached
+        col = self._client.collections.get(name)
         if tenant:
             col = col.with_tenant(tenant)
+        self._collection_handles[(name, tenant)] = col
         return col
 
 
@@ -636,21 +765,44 @@ class WeaviateBackend:
 # ---------------------------------------------------------------------------
 
 
+WEAVIATE_URL_ENV: Final[str] = "AKGENTIC_WEAVIATE_URL"
+"""Environment variable naming the Weaviate cluster.
+
+Connection settings are infrastructure, never card fields: a card persisted in a
+catalog would otherwise carry a cluster URL and an API key as plain configuration.
+**Exporting this is what turns Weaviate on.**
+"""
+
+WEAVIATE_API_KEY_ENV: Final[str] = "AKGENTIC_WEAVIATE_API_KEY"
+"""Environment variable holding the Weaviate API key. Optional — an unauthenticated
+cluster needs only the URL."""
+
+
+def weaviate_url() -> str | None:
+    """Return the configured Weaviate cluster URL, or ``None`` when unset.
+
+    An exported but *empty* variable counts as unset, so a deployment template that
+    always exports the name does not read as a cluster at ``""``.
+    """
+    import os
+
+    return os.environ.get(WEAVIATE_URL_ENV) or None
+
+
+def weaviate_api_key() -> str | None:
+    """Return the configured Weaviate API key, or ``None`` when unset."""
+    import os
+
+    return os.environ.get(WEAVIATE_API_KEY_ENV) or None
+
+
 def _weaviate_is_configured() -> bool:
     """Return whether a Weaviate cluster URL is exported."""
-    from akgentic.tool.vector_store.protocol import weaviate_url
-
     return weaviate_url() is not None
 
 
 def _require_weaviate(card_name: str) -> None:
     """Raise when Weaviate is named but no cluster URL is exported."""
-    from akgentic.tool.vector_store.protocol import (
-        WEAVIATE_API_KEY_ENV,
-        WEAVIATE_URL_ENV,
-        weaviate_url,
-    )
-
     if weaviate_url():
         return
     raise ValueError(
@@ -661,21 +813,22 @@ def _require_weaviate(card_name: str) -> None:
 
 
 def _make_weaviate_backend(context: BackendContext) -> WeaviateBackend:
-    """Build a :class:`WeaviateBackend` from the actor config / environment.
+    """Build a :class:`WeaviateBackend` from the environment.
 
-    Prefers connection settings already present on the ``VectorStoreConfig``
-    (injected by the tool card from the environment), falling back to reading the
-    environment directly so a hand-built context still resolves a cluster.
+    Connection settings are read from the environment only, exactly as the Qdrant
+    factory reads its own: ``VectorStoreConfig`` carries no connection field. The
+    resolved pair goes to :func:`get_client`, so every backend built for one
+    cluster in this process shares its client.
+
+    Raises:
+        ValueError: When :data:`WEAVIATE_URL_ENV` is not set, before the client
+            cache is touched.
     """
-    from akgentic.tool.vector_store.protocol import weaviate_api_key, weaviate_url
-
-    cfg = context.config
-    url = getattr(cfg, "weaviate_url", None) or weaviate_url()
+    url = weaviate_url()
     if not url:
-        msg = "weaviate_url is not configured; cannot build WeaviateBackend."
-        raise ValueError(msg)
-    api_key = getattr(cfg, "weaviate_api_key", None) or weaviate_api_key()
-    return WeaviateBackend(url=url, api_key=api_key, team_id=context.team_id)
+        raise ValueError(f"{WEAVIATE_URL_ENV} is not set; cannot build WeaviateBackend.")
+    client = _weaviate_client(url, weaviate_api_key())
+    return WeaviateBackend(client=client, team_id=context.team_id)
 
 
 register_backend(
@@ -686,7 +839,6 @@ register_backend(
         selectable_as_default=True,
         is_configured=_weaviate_is_configured,
         require_configured=_require_weaviate,
-        legacy_actor_accessor="_get_or_create_weaviate_backend",
     ),
     replace=True,
 )

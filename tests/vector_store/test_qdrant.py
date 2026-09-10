@@ -12,22 +12,26 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from akgentic.tool.vector_store.protocol import CollectionConfig, VectorQuery
-from akgentic.tool.vector_store.qdrant import (
+import akgentic.tool.vector_store.backends.qdrant as qdrant_module
+from akgentic.tool.vector_store.backends.qdrant import (
     QDRANT_URL_ENV,
     QdrantBackend,
     require_qdrant_configured,
 )
+from akgentic.tool.vector_store.protocol import VectorQuery, VectorStoreParam
 from akgentic.tool.vector_store.registry import BackendContext, get_backend_spec
 from akgentic.tool.vector_store.vector import VectorEntry
 
 
 def _make_backend(team_id: str | None = "team-42") -> tuple[QdrantBackend, MagicMock]:
-    """Build a QdrantBackend whose client is a MagicMock."""
+    """Build a QdrantBackend over an injected client double.
+
+    The backend takes a connected client and never builds one, so every spec
+    here drives it through a double rather than patching the vendor module.
+    """
     client = MagicMock()
     client.collection_exists.return_value = False
-    with patch("qdrant_client.QdrantClient", return_value=client):
-        backend = QdrantBackend(url="http://localhost:6333", team_id=team_id)
+    backend = QdrantBackend(client=client, team_id=team_id)
     return backend, client
 
 
@@ -57,7 +61,7 @@ class TestEnvironment:
         monkeypatch.setenv(QDRANT_URL_ENV, "http://localhost:6333")
         with (
             patch(
-                "akgentic.tool.vector_store.qdrant.qdrant_dependencies_available",
+                "akgentic.tool.vector_store.backends.qdrant.qdrant_dependencies_available",
                 return_value=False,
             ),
             pytest.raises(ValueError, match=r"pip install akgentic-tool\[qdrant\]"),
@@ -73,7 +77,7 @@ class TestEnvironment:
 class TestCreateCollection:
     def test_creates_when_absent(self) -> None:
         backend, client = _make_backend()
-        backend.create_collection("kg", CollectionConfig(dimension=384))
+        backend.create_collection("kg", VectorStoreParam(dimension=384))
         client.create_collection.assert_called_once()
         kwargs = client.create_collection.call_args[1]
         assert kwargs["collection_name"] == "kg"
@@ -91,7 +95,7 @@ class TestCreateCollection:
                 )
             )
         )
-        backend.create_collection("kg", CollectionConfig())
+        backend.create_collection("kg", VectorStoreParam())
         client.create_collection.assert_not_called()
 
     def test_rejects_non_cosine_distance(self) -> None:
@@ -101,7 +105,7 @@ class TestCreateCollection:
         with pytest.raises(ValueError, match="only cosine distance"):
             backend.create_collection(
                 "kg",
-                CollectionConfig(params={"distance": models.Distance.EUCLID}),
+                VectorStoreParam(params={"distance": models.Distance.EUCLID}),
             )
 
     def test_rejects_existing_non_cosine_collection(self) -> None:
@@ -117,7 +121,7 @@ class TestCreateCollection:
             )
         )
         with pytest.raises(ValueError, match="does not use cosine distance"):
-            backend.create_collection("kg", CollectionConfig())
+            backend.create_collection("kg", VectorStoreParam())
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +132,7 @@ class TestCreateCollection:
 class TestAdd:
     def test_stamps_team_id_on_every_point(self) -> None:
         backend, client = _make_backend(team_id="team-42")
-        backend.create_collection("kg", CollectionConfig())
+        backend.create_collection("kg", VectorStoreParam())
         backend.add("kg", [_entry("e1"), _entry("e2")])
         points = client.upsert.call_args[1]["points"]
         assert len(points) == 2
@@ -139,7 +143,7 @@ class TestAdd:
         first, first_client = _make_backend(team_id="team-a")
         second, second_client = _make_backend(team_id="team-b")
         for backend in (first, second):
-            backend.create_collection("planning", CollectionConfig())
+            backend.create_collection("planning", VectorStoreParam())
 
         first.add("planning", [_entry("3")])
         second.add("planning", [_entry("3")])
@@ -151,8 +155,8 @@ class TestAdd:
     def test_point_ids_are_scoped_by_collection_tenant(self) -> None:
         first, first_client = _make_backend(team_id="team-a")
         second, second_client = _make_backend(team_id="team-a")
-        first.create_collection("planning", CollectionConfig(tenant="tenant-a"))
-        second.create_collection("planning", CollectionConfig(tenant="tenant-b"))
+        first.create_collection("planning", VectorStoreParam(tenant="tenant-a"))
+        second.create_collection("planning", VectorStoreParam(tenant="tenant-b"))
 
         first.add("planning", [_entry("3")])
         second.add("planning", [_entry("3")])
@@ -172,7 +176,7 @@ class TestAdd:
 class TestRemove:
     def test_remove_is_team_scoped(self) -> None:
         backend, client = _make_backend(team_id="team-42")
-        backend.create_collection("kg", CollectionConfig())
+        backend.create_collection("kg", VectorStoreParam())
         backend.remove("kg", ["e1", "e2"])
         selector = client.delete.call_args[1]["points_selector"]
         # FilterSelector.filter.must carries both the team predicate and ref_id match.
@@ -196,7 +200,7 @@ class TestSearch:
 
     def test_maps_hits_and_scopes_to_team(self) -> None:
         backend, client = _make_backend(team_id="team-42")
-        backend.create_collection("kg", CollectionConfig())
+        backend.create_collection("kg", VectorStoreParam())
         client.query_points.return_value = self._response()
 
         result = backend.search("kg", [0.1, 0.2, 0.3], top_k=5)
@@ -209,7 +213,7 @@ class TestSearch:
 
     def test_query_filters_are_anded_onto_team_scope(self) -> None:
         backend, client = _make_backend(team_id="team-42")
-        backend.create_collection("kg", CollectionConfig())
+        backend.create_collection("kg", VectorStoreParam())
         client.query_points.return_value = self._response()
 
         backend.search(
@@ -226,7 +230,7 @@ class TestSearch:
 
     def test_native_params_passed_through(self) -> None:
         backend, client = _make_backend(team_id="team-42")
-        backend.create_collection("kg", CollectionConfig())
+        backend.create_collection("kg", VectorStoreParam())
         client.query_points.return_value = self._response()
 
         backend.search(
@@ -240,13 +244,13 @@ class TestTeamlessBackendCannotQuery:
 
     def test_search_refuses(self) -> None:
         backend, client = _make_backend(team_id=None)
-        backend.create_collection("kg", CollectionConfig())
+        backend.create_collection("kg", VectorStoreParam())
         with pytest.raises(ValueError, match="without a team_id"):
             backend.search("kg", [0.1, 0.2, 0.3], top_k=5)
 
     def test_remove_refuses(self) -> None:
         backend, _client = _make_backend(team_id=None)
-        backend.create_collection("kg", CollectionConfig())
+        backend.create_collection("kg", VectorStoreParam())
         with pytest.raises(ValueError, match="without a team_id"):
             backend.remove("kg", ["e1"])
 
@@ -265,7 +269,253 @@ class TestRegistry:
             backend = spec.factory(BackendContext(config=config, team_id="team-42"))
         assert isinstance(backend, QdrantBackend)
 
+    def test_the_backend_takes_a_client_and_closes_none(self) -> None:
+        """It holds a shared client, so it has no ``close`` at all."""
+        assert not hasattr(QdrantBackend, "close")
+
+    def test_the_factory_shares_one_client_per_cluster(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two backends for one cluster hold one client, obtained through the cache."""
+        # The cache ``qdrant.py`` actually writes into. Reached through the bound
+        # function's globals rather than a fresh import, so this spec does not depend
+        # on ``test_weaviate.py``'s fixture, which evicts ``client`` from ``sys.modules``
+        # around each of its own tests and puts the original back afterwards.
+        cache = qdrant_module.get_client.__globals__
+
+        monkeypatch.setenv(QDRANT_URL_ENV, "http://localhost:6333")
+        spec = get_backend_spec("qdrant")
+        cache["close_all"]()
+        made: list[MagicMock] = []
+
+        def _new_client(**_kwargs: object) -> MagicMock:
+            client = MagicMock()
+            made.append(client)
+            return client
+
+        try:
+            with patch("qdrant_client.QdrantClient", side_effect=_new_client):
+                first = spec.factory(BackendContext(config=MagicMock(), team_id="t1"))
+                second = spec.factory(BackendContext(config=MagicMock(), team_id="t2"))
+            assert len(made) == 1
+            assert first._client is second._client is made[0]
+            assert [key.backend for key in cache["_clients"]] == ["qdrant"]
+        finally:
+            cache["close_all"]()
+
+    def test_the_factory_keys_a_portless_url_on_6333(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``http://h`` and ``http://h:6333`` are one cluster, not two clients."""
+        cache = qdrant_module.get_client.__globals__
+
+        spec = get_backend_spec("qdrant")
+        cache["close_all"]()
+        made: list[MagicMock] = []
+
+        def _new_client(**_kwargs: object) -> MagicMock:
+            client = MagicMock()
+            made.append(client)
+            return client
+
+        try:
+            with patch("qdrant_client.QdrantClient", side_effect=_new_client):
+                monkeypatch.setenv(QDRANT_URL_ENV, "http://qhost")
+                first = spec.factory(BackendContext(config=MagicMock(), team_id="t1"))
+                monkeypatch.setenv(QDRANT_URL_ENV, "http://qhost:6333")
+                second = spec.factory(BackendContext(config=MagicMock(), team_id="t2"))
+            assert len(made) == 1
+            assert first._client is second._client
+        finally:
+            cache["close_all"]()
+
+    def test_the_connect_builds_a_remote_client_only(self) -> None:
+        """``url=`` is the remote path; the embedded modes are never reachable."""
+        from akgentic.tool.vector_store.backends.qdrant import _connect_qdrant
+        from akgentic.tool.vector_store.client import ClusterKey
+
+        with patch("qdrant_client.QdrantClient") as client_cls:
+            _connect_qdrant(ClusterKey.from_url("qdrant", "https://q:6333", "k"))
+
+        client_cls.assert_called_once_with(url="https://q:6333", api_key="k")
+        kwargs = client_cls.call_args.kwargs
+        assert "path" not in kwargs
+        assert kwargs["url"] != ":memory:"
+
     def test_factory_raises_without_url(self) -> None:
         spec = get_backend_spec("qdrant")
         with pytest.raises(ValueError, match="qdrant_url is not configured"):
             spec.factory(BackendContext(config=MagicMock(), team_id="team-42"))
+
+
+# ---------------------------------------------------------------------------
+# The team predicate is a per-collection choice
+# ---------------------------------------------------------------------------
+
+
+def _keys(qfilter: object) -> list[str]:
+    """Return the payload keys of the conditions that were sent to the cluster."""
+    return [c.key for c in qfilter.must]  # type: ignore[attr-defined]
+
+
+class TestTheTeamLegFollowsTheCollection:
+    """Read what was *sent*: a double returns what it was told to, filter or no filter."""
+
+    def _searching_backend(
+        self, team_id: str | None = "team-42"
+    ) -> tuple[QdrantBackend, MagicMock]:
+        backend, client = _make_backend(team_id=team_id)
+        client.query_points.return_value = SimpleNamespace(points=[])
+        return backend, client
+
+    def test_a_team_scoped_search_names_the_team(self) -> None:
+        backend, client = self._searching_backend()
+        backend.create_collection("planning", VectorStoreParam())
+
+        backend.search("planning", [0.1, 0.2, 0.3], top_k=5)
+
+        assert _keys(client.query_points.call_args[1]["query_filter"]) == ["team_id"]
+
+    def test_a_shared_search_names_the_scope_and_not_the_team(self) -> None:
+        backend, client = self._searching_backend()
+        backend.create_collection("workspace_chunks", VectorStoreParam())
+
+        backend.search("workspace_chunks", [0.1, 0.2, 0.3], top_k=5, scope="u/t")
+
+        keys = _keys(client.query_points.call_args[1]["query_filter"])
+        assert keys == ["scope"]
+        assert "team_id" not in keys
+
+    def test_a_team_scoped_removal_names_the_team(self) -> None:
+        backend, client = _make_backend()
+        backend.create_collection("planning", VectorStoreParam())
+
+        backend.remove("planning", ["e1"])
+
+        keys = _keys(client.delete.call_args[1]["points_selector"].filter)
+        assert set(keys) == {"team_id", "ref_id"}
+
+    def test_a_shared_removal_names_ref_id_and_scope_and_not_the_team(self) -> None:
+        backend, client = _make_backend()
+        backend.create_collection("workspace_chunks", VectorStoreParam())
+
+        backend.remove("workspace_chunks", ["e1", "e2"], scope="u/t")
+
+        keys = _keys(client.delete.call_args[1]["points_selector"].filter)
+        assert set(keys) == {"scope", "ref_id"}
+        assert "team_id" not in keys
+
+    def test_a_shared_query_keeps_the_tenant_leg(self) -> None:
+        """Tenancy is a deployment partition, orthogonal to which team wrote a row."""
+        backend, client = self._searching_backend()
+        backend.create_collection("workspace_chunks", VectorStoreParam(tenant="acme"))
+
+        backend.search("workspace_chunks", [0.1, 0.2, 0.3], top_k=5, scope="u/t")
+
+        keys = _keys(client.query_points.call_args[1]["query_filter"])
+        assert set(keys) == {"tenant", "scope"}
+        assert "team_id" not in keys
+
+
+class TestATeamlessBackendAndTheSharedCollection:
+    """No team leg means no identity to invent, so a team-less backend may query it."""
+
+    def test_it_can_search_the_shared_collection(self) -> None:
+        backend, client = _make_backend(team_id=None)
+        client.query_points.return_value = SimpleNamespace(points=[])
+        backend.create_collection("workspace_chunks", VectorStoreParam())
+
+        backend.search("workspace_chunks", [0.1, 0.2, 0.3], top_k=5, scope="u/t")
+
+        assert _keys(client.query_points.call_args[1]["query_filter"]) == ["scope"]
+
+    def test_it_can_remove_from_the_shared_collection(self) -> None:
+        backend, client = _make_backend(team_id=None)
+        backend.create_collection("workspace_chunks", VectorStoreParam())
+
+        backend.remove("workspace_chunks", ["e1"], scope="u/t")
+
+        assert set(_keys(client.delete.call_args[1]["points_selector"].filter)) == {
+            "scope",
+            "ref_id",
+        }
+
+    def test_it_still_cannot_search_a_team_scoped_collection(self) -> None:
+        backend, client = _make_backend(team_id=None)
+        backend.create_collection("planning", VectorStoreParam())
+
+        with pytest.raises(ValueError, match="without a team_id"):
+            backend.search("planning", [0.1, 0.2, 0.3], top_k=5)
+        client.query_points.assert_not_called()
+
+    def test_it_still_cannot_remove_from_a_team_scoped_collection(self) -> None:
+        backend, client = _make_backend(team_id=None)
+        backend.create_collection("planning", VectorStoreParam())
+
+        with pytest.raises(ValueError, match="without a team_id"):
+            backend.remove("planning", ["e1"])
+        client.delete.assert_not_called()
+
+
+class TestASharedCollectionRefusesAnUnscopedQuery:
+    """Scope is the shared collection's only boundary once the team leg is gone."""
+
+    def test_search_refuses_before_reaching_the_cluster(self) -> None:
+        backend, client = _make_backend()
+        backend.create_collection("workspace_chunks", VectorStoreParam())
+
+        with pytest.raises(ValueError, match="workspace_chunks") as excinfo:
+            backend.search("workspace_chunks", [0.1, 0.2, 0.3], top_k=3)
+
+        assert "scope" in str(excinfo.value)
+        client.query_points.assert_not_called()
+
+    def test_remove_refuses_before_reaching_the_cluster(self) -> None:
+        backend, client = _make_backend()
+        backend.create_collection("workspace_chunks", VectorStoreParam())
+
+        with pytest.raises(ValueError, match="workspace_chunks"):
+            backend.remove("workspace_chunks", ["a"])
+
+        client.delete.assert_not_called()
+
+    def test_a_team_scoped_collection_is_unaffected(self) -> None:
+        backend, client = _make_backend()
+        client.query_points.return_value = SimpleNamespace(points=[])
+        backend.create_collection("planning", VectorStoreParam())
+
+        backend.search("planning", [0.1, 0.2, 0.3], top_k=3)
+
+        client.query_points.assert_called_once()
+
+
+class TestDeleteByTeamRefusesASharedCollection:
+    """A sweeper pointed at the workspace collection would reap a live team's points."""
+
+    def test_it_refuses_before_any_cluster_call(self) -> None:
+        backend, client = _make_backend()
+        client.collection_exists.return_value = True
+
+        with pytest.raises(ValueError, match="workspace_chunks"):
+            backend.delete_by_team("workspace_chunks", "team-42")
+
+        client.collection_exists.assert_not_called()
+        client.delete.assert_not_called()
+
+    def test_the_refusal_holds_on_an_administrative_backend(self) -> None:
+        """No team of its own and no collection created here — the only kind a sweeper has."""
+        backend, client = _make_backend(team_id=None)
+        client.collection_exists.return_value = True
+
+        with pytest.raises(ValueError, match="workspace_chunks"):
+            backend.delete_by_team("workspace_chunks", "team-42")
+
+        client.delete.assert_not_called()
+
+    def test_a_team_scoped_collection_is_still_reaped(self) -> None:
+        backend, client = _make_backend(team_id=None)
+        client.collection_exists.return_value = True
+
+        backend.delete_by_team("planning", "team-gone")
+
+        assert _keys(client.delete.call_args[1]["points_selector"].filter) == ["team_id"]

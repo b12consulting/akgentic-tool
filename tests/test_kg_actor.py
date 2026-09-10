@@ -39,7 +39,7 @@ from akgentic.tool.knowledge_graph.models import (
     SearchQuery,
 )
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA
-from akgentic.tool.vector_store.protocol import CollectionConfig, CollectionStatus
+from akgentic.tool.vector_store.protocol import CollectionStatus, VectorStoreParam
 from akgentic.tool.vector_store.protocol import SearchHit as VsSearchHit
 from akgentic.tool.vector_store.protocol import SearchResult as VsSearchResult
 
@@ -111,6 +111,7 @@ def _actor() -> KnowledgeGraphActor:
     actor.state = KnowledgeGraphState()
     actor.state.observer(actor)
     actor._vs_proxy = None
+    actor._embedder = None
     actor._state_event_seq = 0
     return actor
 
@@ -665,24 +666,40 @@ class TestIsRootWiring:
 _FAKE_VECTOR = [0.1, 0.2, 0.3]
 
 
+def _make_mock_embedder() -> MagicMock:
+    """Create the actor's own embedding service, as ``_acquire_vs_proxy`` builds it.
+
+    Separate from the store proxy: after story 49-3 the vector store embeds
+    nothing, and ``proxy.embed`` is never called by this actor again.
+    """
+    embedder = MagicMock()
+    embedder.embed.return_value = [_FAKE_VECTOR]
+    return embedder
+
+
 def _make_mock_vs_proxy() -> MagicMock:
     """Create a mock VectorStoreActor proxy with default return values."""
     proxy = MagicMock()
-    proxy.embed.return_value = [_FAKE_VECTOR]
     proxy.add.return_value = None
     proxy.remove.return_value = None
     proxy.create_collection.return_value = None
     proxy.search.return_value = VsSearchResult(
-        hits=[], status=CollectionStatus.READY, indexing_pending=0
+        hits=[], status=CollectionStatus.READY
     )
     return proxy
 
 
 def _actor_with_mock_embed() -> tuple[KnowledgeGraphActor, MagicMock]:
-    """Return (actor, mock_vs_proxy) with a pre-wired mock VectorStoreActor proxy."""
+    """Return (actor, mock_vs_proxy) with the proxy and the embedder both wired.
+
+    The embedder reaches the specs as ``actor._embedder`` rather than through the
+    tuple, because the two collaborators must stay distinct: a shared double would
+    let the actor go back to ``proxy.embed`` with every spec still green.
+    """
     actor = _actor()
     mock_proxy = _make_mock_vs_proxy()
     actor._vs_proxy = mock_proxy
+    actor._embedder = _make_mock_embedder()
     return actor, mock_proxy
 
 
@@ -698,8 +715,8 @@ class TestEmbeddingOnCreate:
                 ]
             )
         )
-        mock_proxy.embed.assert_called_once()
-        call_args = mock_proxy.embed.call_args[0][0]
+        actor._embedder.embed.assert_called_once()
+        call_args = actor._embedder.embed.call_args[0][0]
         assert "Alice" in call_args[0]
         assert "Eng" in call_args[0]
 
@@ -720,7 +737,8 @@ class TestEmbeddingOnCreate:
         actor, mock_proxy = _actor_with_mock_embed()
         _seed_entities(actor)
         mock_proxy.reset_mock()
-        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        actor._embedder.reset_mock()
+        actor._embedder.embed.return_value = [_FAKE_VECTOR]
         actor.update_graph(
             ManageGraph(
                 create_relations=[
@@ -733,14 +751,15 @@ class TestEmbeddingOnCreate:
                 ]
             )
         )
-        mock_proxy.embed.assert_called_once()
-        call_args = mock_proxy.embed.call_args[0][0]
+        actor._embedder.embed.assert_called_once()
+        call_args = actor._embedder.embed.call_args[0][0]
         assert "long colleagues" in call_args[0]
 
     def test_embedding_skipped_on_relation_create_empty_description(self) -> None:
         actor, mock_proxy = _actor_with_mock_embed()
         _seed_entities(actor)
         mock_proxy.reset_mock()
+        actor._embedder.reset_mock()
         actor.update_graph(
             ManageGraph(
                 create_relations=[
@@ -748,7 +767,7 @@ class TestEmbeddingOnCreate:
                 ]
             )
         )
-        mock_proxy.embed.assert_not_called()
+        actor._embedder.embed.assert_not_called()
 
 
 class TestEmbeddingOnUpdate:
@@ -763,13 +782,13 @@ class TestEmbeddingOnUpdate:
                 ]
             )
         )
-        embed_count_before = mock_proxy.embed.call_count
+        embed_count_before = actor._embedder.embed.call_count
         actor.update_graph(
             ManageGraph(update_entities=[EntityUpdate(name="Alice", description="Senior Eng")])
         )
-        assert mock_proxy.embed.call_count == embed_count_before + 1
+        assert actor._embedder.embed.call_count == embed_count_before + 1
         # Verify the new description is embedded, not the old one
-        last_call = mock_proxy.embed.call_args[0][0]
+        last_call = actor._embedder.embed.call_args[0][0]
         assert "Senior Eng" in last_call[0]
 
     def test_remove_called_before_re_embedding(self) -> None:
@@ -798,12 +817,12 @@ class TestEmbeddingOnUpdate:
                 ]
             )
         )
-        embed_count_before = mock_proxy.embed.call_count
+        embed_count_before = actor._embedder.embed.call_count
         # Update entity_type only — no description change
         actor.update_graph(
             ManageGraph(update_entities=[EntityUpdate(name="Alice", entity_type="Engineer")])
         )
-        assert mock_proxy.embed.call_count == embed_count_before
+        assert actor._embedder.embed.call_count == embed_count_before
 
 
 class TestEmbeddingOnDelete:
@@ -860,7 +879,7 @@ class TestEmbeddingGracefulDegradation:
 
     def test_embedding_failure_does_not_block_entity_create(self) -> None:
         actor, mock_proxy = _actor_with_mock_embed()
-        mock_proxy.embed.side_effect = RuntimeError("API key invalid")
+        actor._embedder.embed.side_effect = RuntimeError("API key invalid")
         result = actor.update_graph(
             ManageGraph(
                 create_entities=[
@@ -874,7 +893,7 @@ class TestEmbeddingGracefulDegradation:
     def test_embedding_failure_does_not_block_relation_create(self) -> None:
         actor, mock_proxy = _actor_with_mock_embed()
         _seed_entities(actor)
-        mock_proxy.embed.side_effect = RuntimeError("API timeout")
+        actor._embedder.embed.side_effect = RuntimeError("API timeout")
         result = actor.update_graph(
             ManageGraph(
                 create_relations=[
@@ -923,14 +942,13 @@ class TestVectorSearch:
             )
         )
         entity_ids = [str(e.id) for e in actor.get_graph().entities]
-        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        actor._embedder.embed.return_value = [_FAKE_VECTOR]
         mock_proxy.search.return_value = VsSearchResult(
             hits=[
                 VsSearchHit(ref_type="entity", ref_id=entity_ids[0], text="", score=0.9),
                 VsSearchHit(ref_type="entity", ref_id=entity_ids[1], text="", score=0.5),
             ],
             status=CollectionStatus.READY,
-            indexing_pending=0,
         )
         result = actor.search(SearchQuery(query="engineer", top_k=2, mode="vector"))
         assert len(result.hits) == 2
@@ -946,21 +964,21 @@ class TestVectorSearch:
     def test_vector_search_returns_empty_when_embed_call_fails(self) -> None:
         """Verify graceful empty result when embed() raises during vector search."""
         actor, mock_proxy = _actor_with_mock_embed()
-        mock_proxy.embed.side_effect = RuntimeError("API quota exceeded")
+        actor._embedder.embed.side_effect = RuntimeError("API quota exceeded")
         result = actor.search(SearchQuery(query="Alice", top_k=5, mode="vector"))
         assert result.hits == []
 
     def test_vector_search_returns_empty_when_embed_returns_empty(self) -> None:
         """VectorStoreActor returns [] on embed failure -- should result in empty search."""
         actor, mock_proxy = _actor_with_mock_embed()
-        mock_proxy.embed.return_value = []
+        actor._embedder.embed.return_value = []
         result = actor.search(SearchQuery(query="Alice", top_k=5, mode="vector"))
         assert result.hits == []
 
     def test_vector_search_returns_empty_when_search_call_fails(self) -> None:
         """Graceful empty result when vs_proxy.search() raises during vector search."""
         actor, mock_proxy = _actor_with_mock_embed()
-        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        actor._embedder.embed.return_value = [_FAKE_VECTOR]
         mock_proxy.search.side_effect = RuntimeError("Connection refused")
         result = actor.search(SearchQuery(query="Alice", top_k=5, mode="vector"))
         assert result.hits == []
@@ -1012,11 +1030,10 @@ class TestHybridSearch:
         alice_id = str(
             next(e for e in actor.get_graph().entities if e.name == "Alice").id
         )
-        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        actor._embedder.embed.return_value = [_FAKE_VECTOR]
         mock_proxy.search.return_value = VsSearchResult(
             hits=[VsSearchHit(ref_type="entity", ref_id=alice_id, text="", score=0.8)],
             status=CollectionStatus.READY,
-            indexing_pending=0,
         )
         result = actor.search(SearchQuery(query="Alice", top_k=10, mode="hybrid"))
         alice_hits = [h for h in result.hits if h.ref_id == alice_id]
@@ -1028,14 +1045,13 @@ class TestHybridSearch:
         entities = actor.get_graph().entities
         alice_id = str(next(e for e in entities if e.name == "Alice").id)
         bob_id = str(next(e for e in entities if e.name == "Bob").id)
-        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        actor._embedder.embed.return_value = [_FAKE_VECTOR]
         mock_proxy.search.return_value = VsSearchResult(
             hits=[
                 VsSearchHit(ref_type="entity", ref_id=alice_id, text="", score=0.85),
                 VsSearchHit(ref_type="entity", ref_id=bob_id, text="", score=0.85),
             ],
             status=CollectionStatus.READY,
-            indexing_pending=0,
         )
         result = actor.search(SearchQuery(query="login", top_k=5, mode="hybrid"))
         ref_ids = [h.ref_id for h in result.hits]
@@ -1052,14 +1068,13 @@ class TestHybridSearch:
         entities = actor.get_graph().entities
         alice_id = str(next(e for e in entities if e.name == "Alice").id)
         bob_id = str(next(e for e in entities if e.name == "Bob").id)
-        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        actor._embedder.embed.return_value = [_FAKE_VECTOR]
         mock_proxy.search.return_value = VsSearchResult(
             hits=[
                 VsSearchHit(ref_type="entity", ref_id=alice_id, text="", score=0.8),
                 VsSearchHit(ref_type="entity", ref_id=bob_id, text="", score=0.9),
             ],
             status=CollectionStatus.READY,
-            indexing_pending=0,
         )
         result = actor.search(SearchQuery(query="login", top_k=5, mode="hybrid"))
         assert [h.ref_id for h in result.hits][0] == bob_id
@@ -1075,14 +1090,13 @@ class TestHybridSearch:
             )
         )
         entity_ids = [str(e.id) for e in actor.get_graph().entities]
-        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        actor._embedder.embed.return_value = [_FAKE_VECTOR]
         mock_proxy.search.return_value = VsSearchResult(
             hits=[
                 VsSearchHit(ref_type="entity", ref_id=eid, text="", score=0.5)
                 for eid in entity_ids
             ],
             status=CollectionStatus.READY,
-            indexing_pending=0,
         )
         result = actor.search(SearchQuery(query="desc", top_k=3, mode="hybrid"))
         assert len(result.hits) <= 3
@@ -1360,37 +1374,30 @@ class TestToolStateEventEmission:
 # ---------------------------------------------------------------------------
 
 
-class TestKnowledgeGraphConfigVectorStoreField:
-    """AC-3: KnowledgeGraphConfig carries a fully-serialisable vector_store field."""
+class TestKnowledgeGraphConfigRefusesTheOldBinding:
+    """The lookup field is gone: the old catalog shapes fail loudly, not silently."""
 
-    def test_vector_store_default_true(self) -> None:
-        cfg = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
-        assert cfg.vector_store is True
+    def test_a_boolean_binding_is_a_validation_error(self) -> None:
+        from pydantic import ValidationError
 
-    def test_vector_store_accepts_false(self) -> None:
-        cfg = KnowledgeGraphConfig(
-            name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store=False
-        )
-        assert cfg.vector_store is False
+        for value in (True, False):
+            with pytest.raises(ValidationError):
+                KnowledgeGraphConfig(
+                    name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store=value
+                )
 
-    def test_vector_store_accepts_string(self) -> None:
-        cfg = KnowledgeGraphConfig(
-            name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store="#VectorStore-RAG"
-        )
-        assert cfg.vector_store == "#VectorStore-RAG"
+    def test_a_named_actor_string_is_a_validation_error(self) -> None:
+        from pydantic import ValidationError
 
-    def test_vector_store_roundtrip(self) -> None:
-        for value in (True, False, "#VectorStore-RAG"):
-            cfg = KnowledgeGraphConfig(
-                name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store=value
+        with pytest.raises(ValidationError):
+            KnowledgeGraphConfig(
+                name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store="#VectorStore-RAG"
             )
-            reloaded = KnowledgeGraphConfig.model_validate(cfg.model_dump())
-            assert reloaded.vector_store == value
 
 
-def _actor_with_orchestrator(
-    vector_store_value: object = True,
-) -> tuple[KnowledgeGraphActor, MagicMock, MockActorAddress | None]:
+def _actor_with_orchestrator() -> tuple[
+    KnowledgeGraphActor, MagicMock, MockActorAddress | None
+]:
     """Build a KG actor with a stubbed orchestrator + proxy_ask recorder.
 
     Returns (actor, orch_proxy_mock, orch_addr). Does NOT call on_start.
@@ -1400,12 +1407,11 @@ def _actor_with_orchestrator(
     from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
 
     actor = KnowledgeGraphActor()
-    actor.config = KnowledgeGraphConfig(
-        name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store=vector_store_value  # type: ignore[arg-type]
-    )
+    actor.config = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
     actor.state = KnowledgeGraphState()
     actor.state.observer(actor)
     actor._vs_proxy = None
+    actor._embedder = None
     actor._state_event_seq = 0
 
     orch_addr = MockActorAddress("orchestrator", "Orchestrator")
@@ -1431,7 +1437,7 @@ class TestKnowledgeGraphActorAcquireVsProxy:
     def test_acquire_vs_proxy_uses_get_team_member_not_get_children_or_create(self) -> None:
         from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
 
-        actor, orch_proxy, _ = _actor_with_orchestrator(vector_store_value=True)
+        actor, orch_proxy, _ = _actor_with_orchestrator()
         orch_proxy.get_team_member.return_value = MockActorAddress(VS_ACTOR_NAME, "ToolActor")
 
         actor._acquire_vs_proxy()
@@ -1440,32 +1446,69 @@ class TestKnowledgeGraphActorAcquireVsProxy:
         orch_proxy.getChildrenOrCreate.assert_not_called()
         assert actor._vs_proxy is not None
 
-    def test_acquire_vs_proxy_named_instance(self) -> None:
-        """AC-10: when vector_store is a string, the named actor is looked up."""
-        named = "#VectorStore-RAG"
-        actor, orch_proxy, _ = _actor_with_orchestrator(vector_store_value=named)
-        orch_proxy.get_team_member.return_value = MockActorAddress(named, "ToolActor")
+    def test_the_embedder_is_built_from_this_actors_own_param(self) -> None:
+        """AC 18: the store embeds nothing, so this actor's param is what embeds."""
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
+        from akgentic.tool.vector_store.embedding_actor import EmbeddingWorker
 
-        actor._acquire_vs_proxy()
+        actor, orch_proxy, _ = _actor_with_orchestrator()
+        actor.config = actor.config.model_copy(
+            update={
+                "vector_store": VectorStoreParam(
+                    embedding_model="custom-model", embedding_provider="azure"
+                )
+            }
+        )
+        orch_proxy.get_team_member.return_value = MockActorAddress(VS_ACTOR_NAME, "ToolActor")
 
-        orch_proxy.get_team_member.assert_called_once_with(named)
-        assert actor._vs_proxy is not None
+        with patch(
+            "akgentic.tool.vector_store.vector.EmbeddingService"
+        ) as service_cls:
+            actor._acquire_vs_proxy()
 
-    def test_acquire_vs_proxy_false_skips_all_wiring(self) -> None:
-        """AC-7: vector_store=False → no orchestrator lookup, degraded mode."""
-        actor, orch_proxy, _ = _actor_with_orchestrator(vector_store_value=False)
+        service_cls.assert_called_once_with(
+            model="custom-model",
+            provider="azure",
+            timeout_s=EmbeddingWorker.timeout_s,
+        )
+        assert actor._embedder is service_cls.return_value
 
-        actor._acquire_vs_proxy()
+    def test_an_entity_is_embedded_by_the_embedder_and_written_by_the_proxy(self) -> None:
+        """AC 18: ``proxy.embed`` is never called, and ``add`` takes two arguments."""
+        actor, mock_proxy = _actor_with_mock_embed()
 
-        assert actor._vs_proxy is None
-        orch_proxy.get_team_member.assert_not_called()
-        orch_proxy.getChildrenOrCreate.assert_not_called()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="Alice", entity_type="Person", description="Eng")
+                ]
+            )
+        )
 
-    def test_acquire_vs_proxy_missing_raises_runtime_error(self) -> None:
-        """AC-7: missing VectorStoreActor → RuntimeError naming actor + VS + VectorStoreTool."""
+        actor._embedder.embed.assert_called_once()
+        assert mock_proxy.embed.call_count == 0
+        collection, entries = mock_proxy.add.call_args.args
+        assert collection == KG_COLLECTION
+        assert mock_proxy.add.call_args.kwargs == {}
+        assert entries[0].vector == _FAKE_VECTOR
+
+    def test_acquire_vs_proxy_looks_the_store_up_under_its_one_name(self) -> None:
+        """A named-instance binding is gone: there is one store actor name."""
         from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
 
-        actor, orch_proxy, _ = _actor_with_orchestrator(vector_store_value=True)
+        actor, orch_proxy, _ = _actor_with_orchestrator()
+        orch_proxy.get_team_member.return_value = MockActorAddress(VS_ACTOR_NAME, "ToolActor")
+
+        actor._acquire_vs_proxy()
+
+        orch_proxy.get_team_member.assert_called_once_with(VS_ACTOR_NAME)
+        assert actor._vs_proxy is not None
+
+    def test_acquire_vs_proxy_missing_raises_runtime_error(self) -> None:
+        """A missing store actor is still a RuntimeError, naming the actor and the store."""
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
+
+        actor, orch_proxy, _ = _actor_with_orchestrator()
         orch_proxy.get_team_member.return_value = None
 
         with pytest.raises(RuntimeError) as exc_info:
@@ -1474,7 +1517,7 @@ class TestKnowledgeGraphActorAcquireVsProxy:
         msg = str(exc_info.value)
         assert KG_ACTOR_NAME in msg
         assert VS_ACTOR_NAME in msg
-        assert "VectorStoreTool" in msg
+        assert "VectorStoreTool" not in msg
         # No silent fallback — proxy remains None
         assert actor._vs_proxy is None
 
@@ -1483,9 +1526,7 @@ class TestKnowledgeGraphActorAcquireVsProxy:
         from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
 
         actor = KnowledgeGraphActor()
-        actor.config = KnowledgeGraphConfig(
-            name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store=True
-        )
+        actor.config = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
         actor.state = KnowledgeGraphState()
         actor.state.observer(actor)
         actor._vs_proxy = None
@@ -1501,7 +1542,7 @@ class TestKnowledgeGraphActorAcquireVsProxy:
         """Transient create_collection failure → degraded mode (not raised)."""
         from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
 
-        actor, orch_proxy, orch_addr = _actor_with_orchestrator(vector_store_value=True)
+        actor, orch_proxy, orch_addr = _actor_with_orchestrator()
         orch_proxy.get_team_member.return_value = MockActorAddress(
             VS_ACTOR_NAME, "ToolActor"
         )
@@ -1526,7 +1567,7 @@ class TestKnowledgeGraphActorAcquireVsProxy:
 
 
 # ---------------------------------------------------------------------------
-# Story 10-10 — KnowledgeGraphConfig.collection + _acquire_vs_proxy identity
+# Story 10-10 — KnowledgeGraphConfig.vector_store + _acquire_vs_proxy identity
 # ---------------------------------------------------------------------------
 
 
@@ -1535,36 +1576,36 @@ class TestKnowledgeGraphConfigCollectionField:
 
     def test_collection_default_is_default_collection_config(self) -> None:
         cfg = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
-        assert cfg.collection == CollectionConfig()
+        assert cfg.vector_store == VectorStoreParam()
         # Structural defaults — AC-11 backward-compat guard.
-        assert cfg.collection.dimension == 1536
-        assert cfg.collection.backend == "inmemory"
-        assert cfg.collection.tenant is None
+        assert cfg.vector_store.dimension == 1536
+        assert cfg.vector_store.backend == "inmemory"
+        assert cfg.vector_store.tenant is None
 
     def test_collection_accepts_custom_value(self) -> None:
         cfg = KnowledgeGraphConfig(
             name=KG_ACTOR_NAME,
             role=KG_ACTOR_ROLE,
-            collection=CollectionConfig(backend="weaviate", tenant="t1"),
+            vector_store=VectorStoreParam(backend="weaviate", tenant="t1"),
         )
-        assert cfg.collection.backend == "weaviate"
-        assert cfg.collection.tenant == "t1"
+        assert cfg.vector_store.backend == "weaviate"
+        assert cfg.vector_store.tenant == "t1"
 
     def test_collection_roundtrip_default(self) -> None:
         cfg = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE)
         reloaded = KnowledgeGraphConfig.model_validate(cfg.model_dump())
-        assert reloaded.collection == CollectionConfig()
+        assert reloaded.vector_store == VectorStoreParam()
 
     def test_collection_roundtrip_custom(self) -> None:
         cfg = KnowledgeGraphConfig(
             name=KG_ACTOR_NAME,
             role=KG_ACTOR_ROLE,
-            collection=CollectionConfig(backend="weaviate", tenant="team-abc"),
+            vector_store=VectorStoreParam(backend="weaviate", tenant="team-abc"),
         )
         reloaded = KnowledgeGraphConfig.model_validate(cfg.model_dump())
-        assert reloaded.collection.backend == "weaviate"
-        assert reloaded.collection.tenant == "team-abc"
-        assert reloaded.collection.dimension == 1536  # default preserved
+        assert reloaded.vector_store.backend == "weaviate"
+        assert reloaded.vector_store.tenant == "team-abc"
+        assert reloaded.vector_store.dimension == 1536  # default preserved
 
     def test_base_config_coercion_yields_default_collection(self) -> None:
         """AC-8: BaseConfig → KnowledgeGraphConfig coercion keeps default collection."""
@@ -1588,17 +1629,15 @@ class TestKnowledgeGraphConfigCollectionField:
                 role=actor.config.role,
             )
         assert isinstance(actor.config, KnowledgeGraphConfig)
-        assert actor.config.collection == CollectionConfig()
-        assert actor.config.vector_store is True  # 10-9 invariant
+        assert actor.config.vector_store == VectorStoreParam()
 
 
 class TestKnowledgeGraphActorAcquireVsProxyCollectionPropagation:
-    """AC-6 / AC-11: _acquire_vs_proxy forwards config.collection to create_collection."""
+    """AC-6 / AC-11: _acquire_vs_proxy forwards config.vector_store to create_collection."""
 
     def _build_actor_with_vs_proxy(
         self,
-        collection: CollectionConfig,
-        vector_store_value: object = True,
+        vector_store: VectorStoreParam,
     ) -> tuple[KnowledgeGraphActor, MagicMock]:
         """Return (actor, vs_proxy_mock) with everything wired so _acquire_vs_proxy
         reaches the create_collection branch without raising.
@@ -1610,8 +1649,7 @@ class TestKnowledgeGraphActorAcquireVsProxyCollectionPropagation:
         actor.config = KnowledgeGraphConfig(
             name=KG_ACTOR_NAME,
             role=KG_ACTOR_ROLE,
-            vector_store=vector_store_value,  # type: ignore[arg-type]
-            collection=collection,
+            vector_store=vector_store,
         )
         actor.state = KnowledgeGraphState()
         actor.state.observer(actor)
@@ -1639,9 +1677,13 @@ class TestKnowledgeGraphActorAcquireVsProxyCollectionPropagation:
         return actor, vs_proxy
 
     def test_create_collection_receives_same_instance_as_config_collection(self) -> None:
-        """AC-6: the CollectionConfig passed to create_collection is the config's instance."""
-        custom = CollectionConfig(backend="weaviate", tenant="t1")
-        actor, vs_proxy = self._build_actor_with_vs_proxy(collection=custom)
+        """AC-6: the VectorStoreParam passed to create_collection is the config's instance.
+
+        An actor-state backend, because that is the path the store-actor proxy
+        this helper wires is on; the cluster path is specified separately.
+        """
+        custom = VectorStoreParam(backend="inmemory", tenant="t1")
+        actor, vs_proxy = self._build_actor_with_vs_proxy(vector_store=custom)
 
         actor._acquire_vs_proxy()
 
@@ -1649,23 +1691,23 @@ class TestKnowledgeGraphActorAcquireVsProxyCollectionPropagation:
         args, _ = vs_proxy.create_collection.call_args
         assert args[0] == KG_COLLECTION
         # Identity assertion — proves the same object is threaded through,
-        # rather than a freshly-constructed CollectionConfig().
-        assert args[1] is actor.config.collection
+        # rather than a freshly-constructed VectorStoreParam().
+        assert args[1] is actor.config.vector_store
         assert args[1] is custom
-        assert args[1].backend == "weaviate"
+        assert args[1].backend == "inmemory"
         assert args[1].tenant == "t1"
 
     def test_default_config_collection_is_structurally_default(self) -> None:
-        """AC-11: default `KnowledgeGraphConfig()` → create_collection gets a CollectionConfig()
+        """AC-11: default `KnowledgeGraphConfig()` → create_collection gets a VectorStoreParam()
         structurally equal to the pre-10-10 hardcoded default.
         """
-        default_collection = CollectionConfig()
-        actor, vs_proxy = self._build_actor_with_vs_proxy(collection=default_collection)
+        default_collection = VectorStoreParam()
+        actor, vs_proxy = self._build_actor_with_vs_proxy(vector_store=default_collection)
 
         actor._acquire_vs_proxy()
 
         args, _ = vs_proxy.create_collection.call_args
-        assert args[1] == CollectionConfig()
+        assert args[1] == VectorStoreParam()
         assert args[1].dimension == 1536
         assert args[1].backend == "inmemory"
         assert args[1].tenant is None
@@ -1776,14 +1818,13 @@ class TestVectorSearchThresholdFiltering:
         entities = actor.get_graph().entities
         high_id = str(next(e for e in entities if e.name == "High").id)
         low_id = str(next(e for e in entities if e.name == "Low").id)
-        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        actor._embedder.embed.return_value = [_FAKE_VECTOR]
         mock_proxy.search.return_value = VsSearchResult(
             hits=[
                 VsSearchHit(ref_type="entity", ref_id=high_id, text="", score=0.8),
                 VsSearchHit(ref_type="entity", ref_id=low_id, text="", score=0.2),
             ],
             status=CollectionStatus.READY,
-            indexing_pending=0,
         )
         result = actor.search(SearchQuery(query="test", mode="vector"))
         # Default threshold is 0.3, so the 0.2-score hit should be filtered
@@ -1800,13 +1841,12 @@ class TestVectorSearchThresholdFiltering:
             )
         )
         entity_id = str(actor.get_graph().entities[0].id)
-        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        actor._embedder.embed.return_value = [_FAKE_VECTOR]
         mock_proxy.search.return_value = VsSearchResult(
             hits=[
                 VsSearchHit(ref_type="entity", ref_id=entity_id, text="", score=0.4),
             ],
             status=CollectionStatus.READY,
-            indexing_pending=0,
         )
         # Config default is 0.3, query override is 0.5 -> should filter
         result = actor.search(
@@ -1824,13 +1864,12 @@ class TestVectorSearchThresholdFiltering:
             )
         )
         entity_id = str(actor.get_graph().entities[0].id)
-        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        actor._embedder.embed.return_value = [_FAKE_VECTOR]
         mock_proxy.search.return_value = VsSearchResult(
             hits=[
                 VsSearchHit(ref_type="entity", ref_id=entity_id, text="", score=0.35),
             ],
             status=CollectionStatus.READY,
-            indexing_pending=0,
         )
         # Default threshold is 0.3, 0.35 >= 0.3 -> included
         result = actor.search(
@@ -1855,14 +1894,13 @@ class TestHybridSearchThresholdFiltering:
         entities = actor.get_graph().entities
         good_id = str(next(e for e in entities if e.name == "GoodVec").id)
         bad_id = str(next(e for e in entities if e.name == "BadVec").id)
-        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        actor._embedder.embed.return_value = [_FAKE_VECTOR]
         mock_proxy.search.return_value = VsSearchResult(
             hits=[
                 VsSearchHit(ref_type="entity", ref_id=good_id, text="", score=0.6),
                 VsSearchHit(ref_type="entity", ref_id=bad_id, text="", score=0.1),
             ],
             status=CollectionStatus.READY,
-            indexing_pending=0,
         )
         # Threshold 0.3 (default): vector-only hits at 0.1 should be filtered
         result = actor.search(
@@ -1901,13 +1939,12 @@ class TestHybridSearchThresholdFiltering:
             )
         )
         entity_id = str(actor.get_graph().entities[0].id)
-        mock_proxy.embed.return_value = [_FAKE_VECTOR]
+        actor._embedder.embed.return_value = [_FAKE_VECTOR]
         mock_proxy.search.return_value = VsSearchResult(
             hits=[
                 VsSearchHit(ref_type="entity", ref_id=entity_id, text="", score=0.4),
             ],
             status=CollectionStatus.READY,
-            indexing_pending=0,
         )
         # Override threshold to 0.5 -> vector-only hit at 0.4 should be filtered
         result = actor.search(
@@ -1937,3 +1974,95 @@ class TestBackwardCompatibility:
         result = actor.search(SearchQuery(query="Alice", mode="keyword"))
         assert len(result.hits) == 1
         assert result.hits[0].score == 1.0
+
+
+# ---------------------------------------------------------------------------
+# vector_store=False — a graph that declined a store, driven through a real config
+#
+# ``_actor()`` above builds an *enabled* config and hand-clears ``_vs_proxy``,
+# which is the shape of a store that failed. The specs below build a genuinely
+# disabled one, so each negative is paired with an enabled actor answering the
+# same call differently.
+# ---------------------------------------------------------------------------
+
+
+def _disabled_actor() -> KnowledgeGraphActor:
+    """A ``KnowledgeGraphActor`` whose card declined a store.
+
+    Built through ``on_start`` on a real ``KnowledgeGraphConfig(vector_store=None)``
+    — the value ``KnowledgeGraphTool`` hands the config for ``vector_store=False``
+    — rather than by hand-clearing a private slot.
+    """
+    actor = KnowledgeGraphActor()
+    actor.config = KnowledgeGraphConfig(
+        name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store=None
+    )
+    actor.on_start()
+    return actor
+
+
+class TestADisabledGraphStillDoesEverythingButSemanticSearch:
+    """Graph CRUD and the two non-semantic modes work with no store."""
+
+    def test_the_config_and_the_slots_agree(self) -> None:
+        actor = _disabled_actor()
+        assert actor.config.vector_store is None
+        assert actor._vs_proxy is None
+        assert actor._embedder is None
+
+    def test_entity_and_relation_crud_is_unaffected(self) -> None:
+        actor = _disabled_actor()
+        _seed_with_relation(actor)
+
+        view = actor.get_graph()
+        assert {e.name for e in view.entities} == {"Alice", "Bob"}
+        assert len(view.relations) == 1
+
+        actor.update_graph(
+            ManageGraph(
+                update_entities=[EntityUpdate(name="Alice", description="Staff engineer")]
+            )
+        )
+        alice = next(e for e in actor.get_graph().entities if e.name == "Alice")
+        assert alice.description == "Staff engineer"
+
+        actor.update_graph(
+            ManageGraph(
+                delete_relations=[
+                    RelationDelete(from_entity="Alice", to_entity="Bob", relation_type="knows")
+                ]
+            )
+        )
+        assert actor.get_graph().relations == []
+
+    def test_keyword_and_hybrid_still_return_their_hits(self) -> None:
+        actor = _disabled_actor()
+        _seed_entities(actor)
+
+        for mode in ("keyword", "hybrid"):
+            result = actor.search(SearchQuery(query="Alice", top_k=5, mode=mode))
+            assert [h.entity.name for h in result.hits if h.entity] == ["Alice"]
+
+    def test_the_actor_still_returns_an_empty_result_for_vector_mode(self) -> None:
+        """The actor has no channel for a sentence — the card answers that.
+
+        ``search`` returns a ``SearchResult``, so the semantic-disabled sentence
+        cannot live here; it lives on ``KnowledgeGraphTool``'s search closure.
+        This pins where the boundary is.
+        """
+        actor = _disabled_actor()
+        _seed_entities(actor)
+
+        assert actor.search(SearchQuery(query="Alice", top_k=5, mode="vector")).hits == []
+
+
+class TestAFailedGraphStoreIsNotADeclinedOne:
+    """A store that was asked for and failed keeps today's empty answer."""
+
+    def test_an_enabled_graph_with_no_store_returns_empty_for_vector_mode(self) -> None:
+        enabled = _actor()
+        _seed_entities(enabled)
+
+        assert enabled.config.vector_store is not None
+        assert enabled._vs_proxy is None
+        assert enabled.search(SearchQuery(query="Alice", top_k=5, mode="vector")).hits == []

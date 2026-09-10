@@ -1,45 +1,42 @@
 """VectorStoreActor singleton — centralised vector storage via Pykka proxy.
 
-Exposes the ``VectorStoreService`` protocol methods as actor proxy calls,
-routing all operations to ``InMemoryBackend``.  Follows the established
-KnowledgeGraphActor / PlanActor singleton pattern with lazy backend
-initialisation and catch/log/swallow error handling.
+Exposes the ``VectorStoreService`` protocol methods as actor proxy calls, routing
+each one to the backend its collection was created with, built lazily on first
+use. Follows the established KnowledgeGraphActor / PlanActor singleton pattern.
+
+Reads and cleanups keep the catch/log/degrade convention — a failed ``search``
+answers empty, a failed ``remove`` is logged — but :meth:`VectorStoreActor.add`
+does **not**: it is the only signal a consumer gets that its batch landed, so a
+write that could not land raises (ADR-049 Decision 1).
 """
 
 from __future__ import annotations
 
 import logging
-import uuid
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, TypeGuard, cast
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 from pydantic import Field
 
 from akgentic.core.agent import Akgent
-from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
+from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.vector_store.protocol import (
     ActorStateBackend,
-    CollectionConfig,
     CollectionStatus,
     SearchResult,
     VectorQuery,
     VectorStoreConfig,
+    VectorStoreParam,
     VectorStoreService,
+    needs_store_actor,
+    require_dimension_matches,
 )
 from akgentic.tool.vector_store.registry import BackendContext, get_backend_spec
 
 if TYPE_CHECKING:
-    from akgentic.core.actor_address import ActorAddress
-    from akgentic.tool.vector_store.embedding_actor import (
-        EmbeddingError,
-        EmbeddingResult,
-    )
-    from akgentic.tool.vector_store.inmemory import InMemoryBackend
-    from akgentic.tool.vector_store.vector import EmbeddingService, VectorEntry
-    from akgentic.tool.vector_store.weaviate import WeaviateBackend
+    from akgentic.tool.vector_store.vector import VectorEntry
 
 logger = logging.getLogger(__name__)
 
@@ -57,24 +54,69 @@ def _supports_actor_state(backend: object) -> TypeGuard[ActorStateBackend]:
     )
 
 
+def ensure_store_actor(param: VectorStoreParam, orchestrator_proxy: Orchestrator) -> None:
+    """Create the store actor for *param*, if that backend needs one.
+
+    Called by a consumer card at ``observer()`` time, **before** it creates its
+    own consumer actor: that actor looks the store up during its ``on_start``,
+    so the store has to exist first. This is where ``VectorStoreTool.observer``'s
+    ``getChildrenOrCreate`` call went when the card was deleted — the three
+    consumers each call it now, so a store's existence is decided by the
+    consumer that needs it rather than by a singleton card someone had to
+    remember to add.
+
+    **A cluster backend returns without creating anything.** There is nothing
+    for an actor to hold: the data is on the cluster and the consumer talks to
+    the shared client directly (:func:`~akgentic.tool.vector_store.protocol.needs_store_actor`).
+
+    **Idempotent, but not by anything here.** ``getChildrenOrCreate`` is
+    idempotent per ADR-025, so three cards in one team each calling this resolve
+    to the same actor and this helper keeps no bookkeeping of its own.
+
+    The config it builds sets **no connection field**, because
+    ``VectorStoreConfig`` has none: the actor this helper creates is the
+    in-memory one by construction, and needs no URL and no key. A caller who
+    reaches the actor with a cluster collection by hand is served by that
+    backend's registered factory, which reads the environment.
+
+    Args:
+        param: The consumer's vector store configuration.
+        orchestrator_proxy: An ask proxy over the team's orchestrator.
+
+    Raises:
+        ValueError: When ``param.backend`` names no registered backend, out of
+            :func:`~akgentic.tool.vector_store.protocol.needs_store_actor`.
+    """
+    if not needs_store_actor(param):
+        return
+    orchestrator_proxy.getChildrenOrCreate(
+        VectorStoreActor,
+        config=VectorStoreConfig(name=VS_ACTOR_NAME, role=VS_ACTOR_ROLE),
+    )
+
+
 # ---------------------------------------------------------------------------
 # PendingRequest
 # ---------------------------------------------------------------------------
 
 
 class PendingRequest(SerializableBaseModel):
-    """One asynchronous embedding request the actor is still waiting on.
+    """Tombstone. Nothing writes this model and nothing in ``src/`` reads it.
 
-    The unit of accounting for the asynchronous path. Everything a settle needs is
-    here, so a result can be attributed to the request that issued it rather than to
-    whatever happens to sit at the front of a shared per-collection list — which is
-    what made two concurrent ``add()`` calls into one collection settle each other's
-    entries.
+    It survives for exactly one reason: a checkpoint taken while a batch was in
+    flight — before the embedding pipeline moved to the consumers — holds
+    ``{"__model__": "akgentic.tool.vector_store.actor.PendingRequest", ...}`` under
+    a ``pending_requests`` key that :class:`VectorStoreState` no longer declares.
+    The ``SerializableBaseModel`` before-validator runs ``deserialize_object`` over
+    every top-level value **before** Pydantic sees the keys, and that resolves every
+    nested ``__model__`` tag with ``import_module`` + ``getattr``. With this class
+    gone the lookup raises ``AttributeError`` and the whole state fails to load;
+    with it here the record is rebuilt, then dropped with its unknown key.
 
-    The requester's ``ActorAddress`` is deliberately **not** a field: a ``BaseState``
-    carrying one raises ``AttributeError`` on every ``notify_state_change()``
-    (``b12consulting/akgentic-core#131``). It lives in a private attribute on the
-    actor instead.
+    Its fields are frozen as the last version that was ever written. Removing the
+    class is a checkpoint-format break: the day it goes, the spec that loads a
+    tagged snapshot goes with it and ADR-049 records the break, exactly as the
+    *Migration* section does for ``VectorStoreConfig``.
     """
 
     request_id: str = Field(description="Identifier minted when the request was issued")
@@ -98,33 +140,30 @@ class PendingRequest(SerializableBaseModel):
 class VectorStoreState(BaseState):
     """Serialisable state for the vector store actor.
 
-    Holds a snapshot of the ``InMemoryBackend`` state (via ``get_state()`` /
-    ``restore_state()``) and per-collection lifecycle statuses.
+    Holds one snapshot per actor-state-backed backend, keyed by its registered
+    name (via ``get_state()`` / ``restore_state()``), and per-collection lifecycle
+    statuses.
+
+    **The legacy single-backend snapshot slot that preceded ``backend_states`` is
+    gone, and is not migrated.** A stored state that still carries it loads —
+    Pydantic's default ``extra="ignore"`` drops the key — but its contents are
+    not restored: the in-memory index it held starts empty and is regenerated
+    from its source documents. Every released snapshot's slot holds collection
+    configs tagged with a class already deleted, so no released snapshot loses
+    an index it could have loaded (ADR-049 *Migration*).
     """
 
-    backend_state: dict[str, Any] = Field(
-        default_factory=dict,
-        description="Legacy serialisable snapshot from InMemoryBackend.get_state()",
-    )
     backend_states: dict[str, dict[str, Any]] = Field(
         default_factory=dict,
         description="Serialisable snapshots for registered actor-state-backed backends",
     )
     collection_statuses: dict[str, CollectionStatus] = Field(
         default_factory=dict,
-        description="Per-collection lifecycle status, derived from pending_requests",
-    )
-    pending_requests: dict[str, PendingRequest] = Field(
-        default_factory=dict,
-        description="Open embedding requests, keyed by request_id",
-    )
-    indexing_pending: dict[str, int] = Field(
-        default_factory=dict,
-        description="Entries pending embedding per collection, derived from pending_requests",
+        description="Per-collection lifecycle status, set to READY when a collection is created",
     )
     collection_configs: dict[str, dict[str, Any]] = Field(
         default_factory=dict,
-        description="Serialised CollectionConfig per collection (for backend lookups)",
+        description="Serialised VectorStoreParam per collection (for backend lookups)",
     )
 
 
@@ -136,9 +175,16 @@ class VectorStoreState(BaseState):
 class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
     """Singleton actor exposing ``VectorStoreService`` via Pykka proxy.
 
-    All vector operations are delegated to ``InMemoryBackend`` which is
-    created lazily on first use. Mutations synchronise serialisable state
-    and notify the orchestrator via ``state.notify_state_change()``.
+    **A storage engine and nothing else** (ADR-049 Decision 1). It creates
+    collections, writes vectors it is handed, removes them and searches them. It
+    does not embed: the code that owns a ``VectorStoreParam`` spawns its own
+    ``EmbeddingWorker`` and hands this actor finished vectors, so a consumer's
+    ``embedding_model`` means what it says and there is no second embedder to
+    disagree with it.
+
+    Operations are delegated to the backend the collection was created with, built
+    lazily on first use. Mutations synchronise serialisable state and notify the
+    orchestrator via ``state.notify_state_change()``.
     """
 
     # ------------------------------------------------------------------
@@ -146,132 +192,38 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
     # ------------------------------------------------------------------
 
     def on_start(self) -> None:  # noqa: ANN201
-        """Initialise state, attach observer, and prepare lazy runtime slots.
+        """Initialise state, attach observer, and prepare the lazy backend map.
 
-        ``_request_requesters`` maps an open ``request_id`` to the address that asked
-        for it. It is a private attribute rather than state for two reasons: an
-        ``ActorAddress`` in a ``BaseState`` breaks ``notify_state_change()``, and a
-        restored request could not be settled anyway — the ``EmbeddingActor`` children
-        that would deliver its result are gone. Losing the map on resume therefore
-        loses nothing that was still live.
-
-        ``_request_entries`` holds the **whole** ``VectorEntry`` of every open
-        request, and it exists because the round trip through ``EmbeddingActor``
-        is lossy: ``EmbeddingRequest`` carries ``{ref_type, ref_id, text}`` and
-        the result is rebuilt from exactly those three, so ``scope``, ``path`` and
-        ``ordinal`` — the three fields every scoped removal and every scoped search
-        filters on — would arrive back as ``None``. It is private for the same two
-        reasons the map above is, and it is dropped by the same settle.
+        There is no embedding service and no per-request bookkeeping here: a write
+        arrives already embedded, is written on this turn, and is either done or
+        raised. Nothing is left open for a later message to settle, which is what
+        removed the requester and entry maps this method used to carry.
         """
         self.state = VectorStoreState()
         self.state.observer(self)
-        self._backend: InMemoryBackend | None = None
-        self._weaviate_backend: WeaviateBackend | None = None
         self._backends: dict[str, VectorStoreService] = {}
-        self._embedding_svc: EmbeddingService | None = None
-        self._request_requesters: dict[str, ActorAddress] = {}
-        self._request_entries: dict[str, list[VectorEntry]] = {}
 
     # ------------------------------------------------------------------
     # Lazy initialisation
     # ------------------------------------------------------------------
 
-    def _get_or_create_backend(self) -> InMemoryBackend | None:
-        """Return the ``InMemoryBackend``, creating it lazily on first call.
-
-        If ``self.state.backend_state`` contains data the backend is restored
-        from the persisted snapshot.  Returns ``None`` when ``[vector_search]``
-        dependencies are missing.
-        """
-        if self._backend is not None:
-            return self._backend
-        try:
-            from akgentic.tool.vector_store.inmemory import InMemoryBackend
-
-            self._backend = InMemoryBackend()
-            if self.state.backend_state:
-                self._backend.restore_state(self.state.backend_state)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "[%s] Failed to initialize InMemoryBackend: %s",
-                self.config.name,
-                exc,
-            )
-            return None
-        return self._backend
-
-    def _get_or_create_embedding_svc(self) -> EmbeddingService | None:
-        """Return the ``EmbeddingService``, creating it lazily on first call.
-
-        Returns ``None`` when creation fails (e.g. missing deps or bad config).
-        """
-        if self._embedding_svc is not None:
-            return self._embedding_svc
-        try:
-            from akgentic.tool.vector_store.vector import EmbeddingService
-
-            self._embedding_svc = EmbeddingService(
-                model=self.config.embedding_model,
-                provider=self.config.embedding_provider,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "[%s] Failed to initialize EmbeddingService: %s",
-                self.config.name,
-                exc,
-            )
-            return None
-        return self._embedding_svc
-
-    def _get_or_create_weaviate_backend(self) -> WeaviateBackend | None:
-        """Return the ``WeaviateBackend``, creating it lazily on first call.
-
-        Uses ``self.config.weaviate_url`` and ``self.config.weaviate_api_key``
-        for connection. Returns ``None`` when ``weaviate-client`` is missing
-        or connection fails.
-
-        The owning team's id is taken from ``self.team_id`` — propagated by the
-        actor system, never configured — and stamped onto every object the
-        backend writes, so a deleted team's vectors stay findable.
-        """
-        if self._weaviate_backend is not None:
-            return self._weaviate_backend
-        try:
-            from akgentic.tool.vector_store.weaviate import WeaviateBackend
-
-            url = self.config.weaviate_url
-            if not url:
-                logger.warning(
-                    "[%s] weaviate_url not configured, cannot create WeaviateBackend",
-                    self.config.name,
-                )
-                return None
-            self._weaviate_backend = WeaviateBackend(
-                url=url,
-                api_key=self.config.weaviate_api_key,
-                team_id=str(self.team_id),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "[%s] Failed to initialize WeaviateBackend: %s",
-                self.config.name,
-                exc,
-            )
-            return None
-        return self._weaviate_backend
-
-    def _get_backend(
-        self, name: str
-    ) -> InMemoryBackend | WeaviateBackend | VectorStoreService | None:
+    def _get_backend(self, name: str) -> VectorStoreService | None:
         """Return the backend registered under *name*, building it lazily.
 
-        Every backend resolves through its current :class:`BackendSpec`. Built-in
-        specs retain their pre-registry private accessors through a compatibility
-        hook; deliberately replacing either registration routes through the
-        replacement factory like any other third-party backend.
+        **Every backend is built here, one way: through its registered
+        :class:`BackendSpec` factory**, with this actor's config and team id. A
+        backend whose spec sets ``persists_in_actor_state`` is then restored from
+        its own ``backend_states`` snapshot. Nothing names a backend: a built-in
+        and a third-party registration take the same path.
+
+        The owning team's id is taken from ``self.team_id`` — propagated by the
+        actor system, never configured — so a cluster backend stamps it onto every
+        object it writes and a deleted team's vectors stay findable. This actor
+        has no ``on_stop`` on purpose: a cluster client is shared across every
+        team in the process, and one team stopping must not disconnect the others.
 
         Args:
-            name: Backend identifier (a ``CollectionConfig.backend`` value).
+            name: Backend identifier (a ``VectorStoreParam.backend`` value).
 
         Returns:
             The backend instance, or ``None`` when it cannot be built (missing
@@ -283,15 +235,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
             return existing
         try:
             spec = get_backend_spec(name)
-            if spec.legacy_actor_accessor:
-                accessor = cast(
-                    Callable[[], VectorStoreService | None],
-                    getattr(self, spec.legacy_actor_accessor),
-                )
-                return accessor()
-            backend = spec.factory(
-                BackendContext(config=self.config, team_id=str(self.team_id))
-            )
+            backend = spec.factory(BackendContext(config=self.config, team_id=str(self.team_id)))
             if spec.persists_in_actor_state:
                 self._restore_backend_state(name, backend)
         except Exception as exc:  # noqa: BLE001
@@ -324,8 +268,9 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
             return name == "inmemory"
 
     def _get_backend_for_collection(
-        self, collection: str,
-    ) -> InMemoryBackend | WeaviateBackend | VectorStoreService | None:
+        self,
+        collection: str,
+    ) -> VectorStoreService | None:
         """Return the correct backend for the given collection.
 
         Checks ``self.state.collection_configs`` for the collection's backend
@@ -348,9 +293,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
     def _restore_backend_state(self, name: str, backend: VectorStoreService) -> None:
         """Restore a factory-built actor-state-backed backend's saved snapshot.
 
-        Reads from the per-backend ``backend_states`` map. The built-in in-memory
-        backend restores from the legacy ``backend_state`` slot inside its own
-        accessor (:meth:`_get_or_create_backend`) and never reaches here.
+        Reads from the per-backend ``backend_states`` map.
         """
         if not _supports_actor_state(backend):
             msg = (
@@ -364,10 +307,8 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
     def _sync_backend_state(self, name: str, backend: VectorStoreService) -> None:
         """Copy an actor-state-backed backend's serialisable snapshot into state.
 
-        The built-in in-memory backend (``self._backend``) writes the legacy
-        ``backend_state`` slot for compatibility; every other actor-state-backed
-        backend — including a registered replacement for ``inmemory`` — writes the
-        per-backend ``backend_states`` map.
+        Every actor-state-backed backend, built-in or registered, writes the
+        per-backend ``backend_states`` map under its registered name.
         """
         if not _supports_actor_state(backend):
             msg = (
@@ -375,106 +316,143 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
                 "implement get_state() and restore_state()."
             )
             raise TypeError(msg)
-        snapshot = backend.get_state()
-        if name == "inmemory" and backend is self._backend:
-            self.state.backend_state = snapshot
-        else:
-            self.state.backend_states[name] = snapshot
+        self.state.backend_states[name] = backend.get_state()
 
     # ------------------------------------------------------------------
     # Proxy methods
     # ------------------------------------------------------------------
 
-    def create_collection(self, name: str, config: CollectionConfig) -> None:
+    def create_collection(self, name: str, config: VectorStoreParam) -> None:
         """Create or reconfigure a named collection.
 
-        Routes to the appropriate backend based on ``config.backend``:
-        - ``"inmemory"``: delegates to ``InMemoryBackend``
-        - ``"weaviate"``: delegates to ``WeaviateBackend``
+        Refuses a ``config`` whose ``dimension`` contradicts its ``embedding_model``
+        **before** the backend is touched and outside the error handling below, so
+        the ``ValueError`` reaches the caller instead of degrading into a WARNING
+        and a collection that was never created. Records the whole param, never an
+        enumeration of its fields.
+
+        The param's embedding fields are recorded and not compared against
+        anything: this actor embeds nothing, so there is no second model for them
+        to disagree with.
+
+        Routes through the registry by ``config.backend``: the collection is
+        created on whichever backend that name is registered to.
+
+        **This method refuses; it does not degrade.** Both ways it used to
+        swallow now raise ``RetriableError`` — a backend that could not be built,
+        and anything the backend's own ``create_collection`` throws. Swallowing
+        was the *cause* whose consequence ``add`` already refuses to hide: the
+        caller returned normally with no collection created, kept its optimistic
+        binding, and found out at the first write. It is on the write side of the
+        read/write line this class draws, because everything downstream of a
+        collection is a write.
+
+        **Nothing is written before a raise** — no ``collection_configs`` record,
+        no ``READY`` status, no state sync — so there is no partial state to
+        unwind.
+
+        **No consumer's policy changes.** Each of the three already wraps this
+        call in a ``try`` and already has its own answer; refusing here makes
+        those answers reachable rather than replacing them. Planning and the
+        knowledge graph log one WARNING and stay keyword-only; the workspace
+        leaves retrieval off.
+
+        **Why this is not a build failure.** Failing the team's build would be
+        consistent with ``require_backend_configured``, and it is refused for one
+        concrete reason: the in-memory backend can fail to build *legitimately*.
+        ``InMemoryBackend.__init__`` raises ``ImportError`` when the
+        ``[vector_search]`` extra is absent, and degrading there is this
+        package's documented optional-extra contract. This method cannot tell
+        "the extra is not installed" from "the cluster is down", so refusing here
+        and degrading at the consumer is the only split that serves both.
+
+        ``remove`` and ``search`` keep degrading, and the asymmetry is the
+        decision: a read that answers empty costs a miss.
 
         Args:
             name: Unique collection identifier.
-            config: Collection configuration.
+            config: Vector store configuration for the collection.
+
+        Raises:
+            ValueError: When ``config.dimension`` is not the native width of a
+                known ``config.embedding_model``. Raised from **outside** the
+                error handling below, so a contradictory param reaches the caller
+                as a ``ValueError`` rather than as a ``RetriableError``.
+            RetriableError: When no backend could be built for ``config.backend``
+                — a missing optional dependency, a misconfiguration, an
+                unregistered name — or when the backend's own
+                ``create_collection`` fails. Retriable for the same reason it is
+                on ``add``: the fault is usually the environment, not the call.
         """
+        require_dimension_matches(config, f"{self.config.name} collection '{name}'")
+        backend = self._get_backend(config.backend)
+        if backend is None:
+            msg = (
+                f"[{self.config.name}] no '{config.backend}' backend could be built; "
+                f"collection '{name}' was not created."
+            )
+            logger.warning(msg)
+            raise RetriableError(msg)
         try:
-            backend = self._get_backend(config.backend)
-            if backend is None:
-                logger.warning(
-                    "[%s] '%s' backend unavailable, skipping create_collection",
-                    self.config.name,
-                    config.backend,
-                )
-                return
             backend.create_collection(name, config)
 
-            self.state.collection_configs[name] = {
-                "dimension": config.dimension,
-                "backend": config.backend,
-                "tenant": config.tenant,
-            }
+            record = config.model_dump()
+            # The serializer's class tag would re-hydrate this record into a model on
+            # the state's own round trip, and the field is a plain dict per collection.
+            record.pop("__model__", None)
+            self.state.collection_configs[name] = record
             self.state.collection_statuses[name] = CollectionStatus.READY
             if self._persists_in_actor_state(config.backend):
                 self._sync_backend_state(config.backend, backend)
             self.state.notify_state_change()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("[%s] create_collection failed: %s", self.config.name, exc)
+            raise RetriableError(str(exc)) from exc
 
-    def add(
-        self,
-        collection: str,
-        entries: list[VectorEntry],
-        requester: ActorAddress | None = None,
-        request_ref: str | None = None,
-    ) -> None:
-        """Ingest embedding entries into a collection.
+    def add(self, collection: str, entries: list[VectorEntry]) -> None:
+        """Write pre-embedded entries into a collection.
 
-        Entries with pre-populated vectors go through the synchronous path
-        directly to the backend.  Entries without vectors are sent to a
-        spawned ``EmbeddingActor`` for asynchronous embedding.
-
-        **Concurrent adds into one collection now settle independently.** Each
-        asynchronous call opens its own request, and a result or an error settles
-        only that request's entries and count: a failure fails one batch rather than
-        blanking the collection, and a result arriving out of order no longer discards
-        another request's pending entries. The collection returns to ``READY`` only
-        when the last open request against it settles.
-
-        Both new arguments are optional and additive — the three existing call sites
-        pass neither and are unaffected.
+        **A plain write, and a plain write does not hide its failure.** Every
+        entry arrives with its vector already produced by the consumer's own
+        ``EmbeddingWorker``, so there is nothing here to defer and nothing to
+        settle later. That makes the outcome of this call the only signal the
+        consumer will ever get about whether its batch landed, and an engine that
+        swallows a write fault and returns as if it had succeeded is the one thing
+        a storage engine may not do: the workspace indexer would mark a file
+        ``EMBEDDED`` with no vectors behind it.
 
         Args:
             collection: Target collection name.
-            entries: List of ``VectorEntry`` to store.
-            requester: Address told ``EmbeddingCompleted`` when the asynchronous
-                request settles, either way. ``None`` means no notification.
-            request_ref: The caller's own correlation key, returned unchanged on
-                ``EmbeddingCompleted``. ``add`` is reached by ``tell`` and returns
-                nothing, so this is the only way a caller can recognise its request.
+            entries: Entries to store, each carrying a non-empty ``vector``.
+
+        Raises:
+            ValueError: When any entry carries an empty vector. Not a
+                ``RetriableError``: a retry cannot produce a vector the caller
+                never supplied, so this is a programming error at the call site.
+            RetriableError: When the write cannot land — a backend that could not
+                be built, a missing collection, a dead cluster, a full disk. An
+                unavailable backend raises here rather than degrading, unlike
+                ``remove`` and ``search`` above it: a read that answers empty
+                costs a miss, but a write that answers nothing while storing
+                nothing is the swallow this method exists not to do.
         """
+        empty = [entry.ref_id for entry in entries if len(entry.vector) == 0]
+        if empty:
+            msg = (
+                f"[{self.config.name}] collection '{collection}': "
+                f"ref_id(s) {empty} carry no vector. Entries must be embedded by "
+                "their own consumer before they are added."
+            )
+            raise ValueError(msg)
+
         backend = self._get_backend_for_collection(collection)
         if backend is None:
-            logger.warning("[%s] Backend unavailable, skipping add", self.config.name)
-            return
-
-        pre_embedded = [e for e in entries if len(e.vector) > 0]
-        needs_embedding = [e for e in entries if len(e.vector) == 0]
-
-        if pre_embedded:
-            self._add_pre_embedded(collection, pre_embedded)
-
-        if needs_embedding:
-            self._add_needs_embedding(collection, needs_embedding, requester, request_ref)
-
-    def _add_pre_embedded(self, collection: str, entries: list[VectorEntry]) -> None:
-        """Add entries with pre-populated vectors directly to backend.
-
-        Args:
-            collection: Target collection name.
-            entries: Entries with non-empty vector fields.
-        """
-        backend = self._get_backend_for_collection(collection)
-        if backend is None:
-            return
+            msg = (
+                f"[{self.config.name}] no backend could be built for collection "
+                f"'{collection}'; {len(entries)} entries were not written."
+            )
+            logger.warning(msg)
+            raise RetriableError(msg)
         try:
             backend.add(collection, entries)
             backend_name = self.state.collection_configs.get(collection, {}).get(
@@ -485,83 +463,9 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
             self.state.notify_state_change()
         except ValueError as exc:
             raise RetriableError(str(exc)) from exc
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[%s] _add_pre_embedded failed: %s", self.config.name, exc)
-
-    def _add_needs_embedding(
-        self,
-        collection: str,
-        entries: list[VectorEntry],
-        requester: ActorAddress | None = None,
-        request_ref: str | None = None,
-    ) -> None:
-        """Open one embedding request and spawn an EmbeddingActor to fulfil it.
-
-        Records the request under its own ``request_id``, re-derives the collection's
-        status and pending count from the open requests, and fires the batch
-        asynchronously.
-
-        **The spawn and the tell are wrapped, and a failure settles the request it
-        just opened.** The record is written before the child exists, so an
-        unwrapped spawn failure would pin the collection at ``INDEXING`` for ever
-        with no result and no error to close it. Pre-existing shape, unreachable
-        while no caller waited on the signal; the workspace indexer is the first
-        that does.
-
-        Args:
-            collection: Target collection name.
-            entries: Entries with empty vector fields.
-            requester: Address to tell when this request settles, or ``None``.
-            request_ref: The caller's correlation key, echoed back on completion.
-        """
-        from akgentic.tool.vector_store.embedding_actor import (
-            EmbeddingActor,
-            EmbeddingRequest,
-        )
-
-        request_id = str(uuid.uuid4())
-        raw_entries = [
-            {"ref_type": e.ref_type, "ref_id": e.ref_id, "text": e.text} for e in entries
-        ]
-
-        self.state.pending_requests[request_id] = PendingRequest(
-            request_id=request_id,
-            collection=collection,
-            request_ref=request_ref,
-            count=len(entries),
-            entries=raw_entries,
-        )
-        if requester is not None:
-            self._request_requesters[request_id] = requester
-        # The full entries, kept because the round trip through EmbeddingActor
-        # carries only three of their seven fields.
-        self._request_entries[request_id] = list(entries)
-        self._refresh_derived(collection)
-
-        try:
-            # Spawn EmbeddingActor child
-            embed_config = BaseConfig(name=f"#embed-{collection}-{request_id}")
-            embed_addr = self.createActor(EmbeddingActor, config=embed_config)
-
-            request = EmbeddingRequest(
-                collection=collection,
-                entries=raw_entries,
-                request_id=request_id,
-                embedding_model=self.config.embedding_model,
-                embedding_provider=self.config.embedding_provider,
-            )
-            embed_proxy = self.proxy_tell(embed_addr, EmbeddingActor)
-            embed_proxy.receiveMsg_EmbeddingRequest(request)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "[%s] Could not start embedding for '%s': %s",
-                self.config.name,
-                request_id,
-                exc,
-            )
-            self._settle_request(request_id, str(exc))
-
-        self.state.notify_state_change()
+        except Exception as exc:
+            logger.warning("[%s] add failed: %s", self.config.name, exc)
+            raise RetriableError(str(exc)) from exc
 
     def remove(
         self,
@@ -627,7 +531,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         backend = self._get_backend_for_collection(collection)
         if backend is None:
             logger.warning("[%s] Backend unavailable, returning empty search", self.config.name)
-            return SearchResult(hits=[], status=CollectionStatus.READY, indexing_pending=0)
+            return SearchResult(hits=[], status=CollectionStatus.READY)
         try:
             if query is None:
                 result: SearchResult = backend.search(
@@ -646,224 +550,12 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
                     path_prefix=path_prefix,
                     query=query,
                 )
-            # Status and pending count come from the open-request map, never from the
-            # backend: the backend has no idea a batch is still being embedded. Only
-            # the two derived fields are overridden — a field added to SearchResult
-            # later must survive the override rather than be silently dropped.
-            actor_status = self.state.collection_statuses.get(collection)
-            if actor_status is not None:
-                result = result.model_copy(
-                    update={
-                        "status": actor_status,
-                        "indexing_pending": self.state.indexing_pending.get(collection, 0),
-                    }
-                )
+            # Returned exactly as the backend built it. There is no longer anything
+            # this actor knows about a collection's progress that the backend does
+            # not: a write either landed on this turn or raised.
             return result
         except ValueError as exc:
             raise RetriableError(str(exc)) from exc
         except Exception as exc:  # noqa: BLE001
             logger.warning("[%s] search failed: %s", self.config.name, exc)
-            return SearchResult(hits=[], status=CollectionStatus.READY, indexing_pending=0)
-
-    # ------------------------------------------------------------------
-    # Embedding result/error handlers
-    # ------------------------------------------------------------------
-
-    def receiveMsg_EmbeddingResult(self, msg: EmbeddingResult) -> None:  # noqa: N802
-        """Handle successful embedding delivery from EmbeddingActor.
-
-        Resolves the backend **for the collection**, not the in-memory one: an
-        asynchronously-embedded batch destined for Weaviate belongs in the cluster,
-        and writing it into a process-local index instead loses it silently while the
-        collection goes on reporting ``READY``.
-
-        Settles only ``msg.request_id``. Any other request open against the same
-        collection keeps its own count and entries, and the collection returns to
-        ``READY`` only once the last of them settles.
-
-        Args:
-            msg: Result containing entries with populated vectors.
-        """
-        backend = self._get_backend_for_collection(msg.collection)
-        if backend is None:
-            logger.warning(
-                "[%s] Backend unavailable, cannot insert embedding results",
-                self.config.name,
-            )
-            self._settle_request(msg.request_id, "Backend unavailable")
-            self.state.notify_state_change()
-            return
-
-        error: str | None = None
-        try:
-            backend.add(msg.collection, self._restore_metadata(msg))
-            backend_name = self.state.collection_configs.get(msg.collection, {}).get(
-                "backend", "inmemory"
-            )
-            if self._persists_in_actor_state(backend_name):
-                self._sync_backend_state(backend_name, backend)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "[%s] receiveMsg_EmbeddingResult failed: %s",
-                self.config.name,
-                exc,
-            )
-            error = str(exc)
-
-        self._settle_request(msg.request_id, error)
-        self.state.notify_state_change()
-
-    def _restore_metadata(self, msg: EmbeddingResult) -> list[VectorEntry]:
-        """Put ``scope``, ``path`` and ``ordinal`` back onto an embedded batch.
-
-        ``EmbeddingRequest`` carries ``{ref_type, ref_id, text}`` and the result is
-        rebuilt from exactly those three, so four of ``VectorEntry``'s seven fields
-        do not survive the round trip. Three of them are the ones every scoped
-        removal and every scoped search filters on — an entry stored without them
-        is findable by nobody and removable by nobody.
-
-        The originals are re-paired **by position**, which is the contract the two
-        sides already keep: ``EmbeddingService.embed`` returns one vector per input
-        in the same order, and ``EmbeddingActor`` zips them back in that order. A
-        batch that does not line up is passed through untouched rather than
-        mis-attributed — **with a WARNING**, because the pass-through stores
-        entries that no scoped removal and no scoped search can ever match, and
-        that is the one failure here nothing downstream can see.
-
-        Args:
-            msg: The result whose entries carry vectors and nothing else.
-
-        Returns:
-            The entries to store — the originals with their vectors filled in.
-        """
-        originals = self._request_entries.get(msg.request_id)
-        if originals is None or len(originals) != len(msg.entries):
-            logger.warning(
-                "[%s] Request '%s' came back with %d entr(ies) against %s held: "
-                "scope, path and ordinal are stored empty and nothing scoped will match them",
-                self.config.name,
-                msg.request_id,
-                len(msg.entries),
-                "none" if originals is None else str(len(originals)),
-            )
-            return msg.entries
-        return [
-            # Golden Rule #12: copy and override the one field that was produced.
-            original.model_copy(update={"vector": embedded.vector})
-            for original, embedded in zip(originals, msg.entries)
-        ]
-
-    def receiveMsg_EmbeddingError(self, msg: EmbeddingError) -> None:  # noqa: N802
-        """Handle embedding failure from EmbeddingActor.
-
-        Fails **one request**, not the collection. The failed request's record is
-        dropped and its requester told; every other request open against the same
-        collection keeps its entries, its count and the collection's status. A
-        collection reaches ``READY`` when its last open request settles, whichever way
-        each of them settled.
-
-        Args:
-            msg: Error details from the failed embedding batch.
-        """
-        logger.warning(
-            "[%s] Embedding failed for collection '%s': %s",
-            self.config.name,
-            msg.collection,
-            msg.error,
-        )
-        self._settle_request(msg.request_id, msg.error)
-        self.state.notify_state_change()
-
-    def _settle_request(self, request_id: str, error: str | None = None) -> None:
-        """Close one open request and tell its requester how it ended.
-
-        A ``request_id`` with no record settles nothing — a duplicate or unknown
-        delivery must not touch another request's bookkeeping.
-
-        Args:
-            request_id: The request being closed.
-            error: ``None`` on success, the failure description otherwise.
-        """
-        record = self.state.pending_requests.pop(request_id, None)
-        requester = self._request_requesters.pop(request_id, None)
-        self._request_entries.pop(request_id, None)
-        if record is None:
-            return
-        self._refresh_derived(record.collection)
-        if requester is not None:
-            self._tell_completed(requester, record, error)
-
-    def _tell_completed(
-        self, requester: ActorAddress, record: PendingRequest, error: str | None
-    ) -> None:
-        """Deliver ``EmbeddingCompleted`` for a settled request.
-
-        Fire-and-forget: a requester that has since stopped must not take the settle
-        down with it, so delivery failure is logged and swallowed.
-
-        Args:
-            requester: Address that asked for this request.
-            record: The request that just settled.
-            error: ``None`` on success, the failure description otherwise.
-        """
-        from akgentic.tool.vector_store.embedding_actor import EmbeddingCompleted
-
-        completed = EmbeddingCompleted(
-            request_id=record.request_id,
-            request_ref=record.request_ref,
-            collection=record.collection,
-            count=record.count,
-            error=error,
-        )
-        try:
-            self.send(requester, completed)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "[%s] Failed to deliver EmbeddingCompleted for '%s': %s",
-                self.config.name,
-                record.request_id,
-                exc,
-            )
-
-    def _refresh_derived(self, collection: str) -> None:
-        """Recompute *collection*'s status and pending count from its open requests.
-
-        The open-request map is the only authority: a collection is ``INDEXING`` iff at
-        least one request is open against it, and ``indexing_pending`` is the sum of
-        those requests' counts. Deriving both here is what keeps
-        ``SearchResult.indexing_pending`` from ever disagreeing with the map.
-
-        Args:
-            collection: Collection whose derived values are stale.
-        """
-        open_counts = [
-            r.count for r in self.state.pending_requests.values() if r.collection == collection
-        ]
-        if open_counts:
-            self.state.indexing_pending[collection] = sum(open_counts)
-            self.state.collection_statuses[collection] = CollectionStatus.INDEXING
-        else:
-            self.state.indexing_pending.pop(collection, None)
-            self.state.collection_statuses[collection] = CollectionStatus.READY
-
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        """Embed texts via ``EmbeddingService``.
-
-        Returns an empty list when the embedding service is unavailable or on
-        any failure (catch/log/swallow pattern).
-
-        Args:
-            texts: List of strings to embed.
-
-        Returns:
-            List of float vectors, one per input text. Empty on failure.
-        """
-        svc = self._get_or_create_embedding_svc()
-        if svc is None:
-            return []
-        try:
-            result: list[list[float]] = svc.embed(texts)
-            return result
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[%s] embed failed: %s", self.config.name, exc)
-            return []
+            return SearchResult(hits=[], status=CollectionStatus.READY)

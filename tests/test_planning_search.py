@@ -34,13 +34,12 @@ def _extract_id(result: str) -> int:
     return int(m.group(1))
 
 
-def _make_actor(vector_store: bool = False) -> PlanActor:
+def _make_actor() -> PlanActor:
     """Construct a bare PlanActor with no Pykka runtime -- calls on_start directly."""
     actor = PlanActor()
     actor.config = PlanConfig(
         name="test-plan",
         role="ToolActor",
-        vector_store=vector_store,
     )
     actor.on_start()
     return actor
@@ -78,7 +77,7 @@ class TestSearchPlanningAllNone:
     """AC8: When all parameters are None, the full task list is returned."""
 
     def test_returns_full_list_when_all_none(self) -> None:
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "Setup database", status="pending")
         _add_task(actor, 2, "Auth module", status="started")
         _add_task(actor, 3, "Deployment pipeline", status="completed")
@@ -89,7 +88,7 @@ class TestSearchPlanningAllNone:
         assert _extract_ids(result) == {1, 2, 3}
 
     def test_returns_empty_list_when_no_tasks_and_all_none(self) -> None:
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
 
         result = actor.search_planning()
 
@@ -105,21 +104,21 @@ class TestSearchPlanningEmptyList:
     """Empty task list -> empty result for any filter."""
 
     def test_empty_list_with_status_filter(self) -> None:
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
 
         result = actor.search_planning(status="pending")
 
         assert result == []
 
     def test_empty_list_with_owner_filter(self) -> None:
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
 
         result = actor.search_planning(owner="@Alice")
 
         assert result == []
 
     def test_empty_list_with_query_filter(self) -> None:
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
 
         result = actor.search_planning(query="auth")
 
@@ -135,7 +134,7 @@ class TestSearchPlanningStatusFilter:
     """AC2: status filter returns only tasks with exact matching status."""
 
     def test_status_pending_returns_only_pending(self) -> None:
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "Task A", status="pending")
         _add_task(actor, 2, "Task B", status="started")
         _add_task(actor, 3, "Task C", status="pending")
@@ -148,7 +147,7 @@ class TestSearchPlanningStatusFilter:
         assert _extract_ids(result) == {1, 3}
 
     def test_status_started_returns_only_started(self) -> None:
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "Task A", status="pending")
         _add_task(actor, 2, "Task B", status="started")
         _add_task(actor, 3, "Task C", status="started")
@@ -160,7 +159,7 @@ class TestSearchPlanningStatusFilter:
         assert _extract_ids(result) == {2, 3}
 
     def test_status_filter_returns_empty_when_no_match(self) -> None:
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "Task A", status="pending")
 
         result = actor.search_planning(status="completed")
@@ -177,7 +176,7 @@ class TestSearchPlanningOwnerFilter:
     """AC3: owner filter returns only tasks with exact owner match."""
 
     def test_owner_exact_match(self) -> None:
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "Task A", owner="@Alice")
         _add_task(actor, 2, "Task B", owner="@Bob")
         _add_task(actor, 3, "Task C", owner="@Alice")
@@ -189,7 +188,7 @@ class TestSearchPlanningOwnerFilter:
         assert _extract_ids(result) == {1, 3}
 
     def test_owner_empty_string_matches_unassigned(self) -> None:
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "Task A", owner="")
         _add_task(actor, 2, "Task B", owner="@Alice")
         _add_task(actor, 3, "Task C", owner="")
@@ -200,7 +199,7 @@ class TestSearchPlanningOwnerFilter:
         assert _extract_ids(result) == {1, 3}
 
     def test_owner_filter_returns_empty_when_no_match(self) -> None:
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "Task A", owner="@Alice")
 
         result = actor.search_planning(owner="@Charlie")
@@ -217,7 +216,7 @@ class TestSearchPlanningCreatorFilter:
     """AC4: creator filter returns only tasks with exact creator match."""
 
     def test_creator_exact_match(self) -> None:
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "Task A", creator="@Bob")
         _add_task(actor, 2, "Task B", creator="@Charlie")
         _add_task(actor, 3, "Task C", creator="@Bob")
@@ -229,7 +228,7 @@ class TestSearchPlanningCreatorFilter:
         assert _extract_ids(result) == {1, 3}
 
     def test_creator_filter_returns_empty_when_no_match(self) -> None:
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "Task A", creator="@Bob")
 
         result = actor.search_planning(creator="@Alice")
@@ -246,7 +245,7 @@ class TestSearchPlanningQueryKeyword:
     """AC5: query keyword filter -- case-insensitive substring on task.description."""
 
     def test_keyword_case_insensitive_match(self) -> None:
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "Authentication module setup")
         _add_task(actor, 2, "Database schema migration")
         _add_task(actor, 3, "OAuth authentication integration")
@@ -257,7 +256,7 @@ class TestSearchPlanningQueryKeyword:
         assert _extract_ids(result) == {1, 3}
 
     def test_keyword_uppercase_query_matches_lowercase_description(self) -> None:
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "auth flow setup")
         _add_task(actor, 2, "payment service")
 
@@ -267,7 +266,7 @@ class TestSearchPlanningQueryKeyword:
         assert _extract_id(result[0]) == 1
 
     def test_keyword_no_match_returns_empty(self) -> None:
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "Database setup")
 
         result = actor.search_planning(query="authentication")
@@ -276,7 +275,7 @@ class TestSearchPlanningQueryKeyword:
 
     def test_keyword_with_vector_store_disabled(self) -> None:
         """Keyword-only mode when vector_store=False -- _vs_proxy is None."""
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "auth flow")
         _add_task(actor, 2, "payment gateway")
 
@@ -318,12 +317,12 @@ class TestSearchPlanningQuerySemantic:
 
     def test_semantic_union_with_keyword(self) -> None:
         """Semantic hits union with keyword hits; tasks with score >= 0.5 included."""
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "auth flow setup")  # keyword match
         _add_task(actor, 2, "database schema")  # semantic match only
         _add_task(actor, 3, "deployment pipeline")  # no match
 
-        actor._vs_proxy = self._make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = self._make_vs_proxy_mock(
             embed_return=[[0.1, 0.2, 0.3]],
             search_hits=[("2", 0.75), ("3", 0.3)],
         )
@@ -334,10 +333,10 @@ class TestSearchPlanningQuerySemantic:
 
     def test_deduplication_keyword_and_semantic_overlap(self) -> None:
         """Tasks matched by both keyword and semantic are deduplicated."""
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "auth module")
 
-        actor._vs_proxy = self._make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = self._make_vs_proxy_mock(
             embed_return=[[0.1, 0.2, 0.3]],
             search_hits=[("1", 0.9)],
         )
@@ -349,10 +348,10 @@ class TestSearchPlanningQuerySemantic:
 
     def test_cosine_threshold_exactly_05_included(self) -> None:
         """Tasks with cosine score exactly 0.5 are included."""
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "database task")
 
-        actor._vs_proxy = self._make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = self._make_vs_proxy_mock(
             embed_return=[[0.1, 0.2]],
             search_hits=[("1", 0.5)],
         )
@@ -364,10 +363,10 @@ class TestSearchPlanningQuerySemantic:
 
     def test_cosine_threshold_below_05_excluded(self) -> None:
         """Tasks with cosine score < 0.5 are excluded (if not keyword match)."""
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "database task")
 
-        actor._vs_proxy = self._make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = self._make_vs_proxy_mock(
             embed_return=[[0.1, 0.2]],
             search_hits=[("1", 0.49)],
         )
@@ -378,10 +377,10 @@ class TestSearchPlanningQuerySemantic:
 
     def test_empty_embed_result_falls_back_to_keyword(self) -> None:
         """When embed returns empty list, semantic phase is skipped."""
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "auth flow setup")
 
-        actor._vs_proxy = self._make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = self._make_vs_proxy_mock(
             embed_return=[],
             search_hits=[],
         )
@@ -402,7 +401,7 @@ class TestSearchPlanningCombinedFilters:
     """AC7: multiple filters combined as AND conditions."""
 
     def test_status_and_owner_filter(self) -> None:
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "Task A", status="started", owner="@Alice")
         _add_task(actor, 2, "Task B", status="pending", owner="@Alice")
         _add_task(actor, 3, "Task C", status="started", owner="@Bob")
@@ -415,7 +414,7 @@ class TestSearchPlanningCombinedFilters:
 
     def test_status_owner_query_triple_filter(self) -> None:
         """AC7: status + owner + query together (AND logic)."""
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "database migration", status="started", owner="@Alice")
         _add_task(actor, 2, "database backup", status="pending", owner="@Alice")
         _add_task(actor, 3, "auth setup", status="started", owner="@Alice")
@@ -427,7 +426,7 @@ class TestSearchPlanningCombinedFilters:
         assert _extract_id(result[0]) == 1
 
     def test_creator_and_status_filter(self) -> None:
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "Task A", status="pending", creator="@Bob")
         _add_task(actor, 2, "Task B", status="completed", creator="@Bob")
         _add_task(actor, 3, "Task C", status="pending", creator="@Charlie")
@@ -448,7 +447,7 @@ class TestSearchPlanningVectorFallback:
 
     def test_no_exception_when_vs_proxy_is_none(self) -> None:
         """When VectorStoreActor proxy unavailable, search_planning works via keyword only."""
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "auth service")
         _add_task(actor, 2, "payment service")
 
@@ -460,7 +459,7 @@ class TestSearchPlanningVectorFallback:
 
     def test_no_exception_when_vector_store_disabled(self) -> None:
         """When vector_store=False, _vs_proxy is None and keyword fallback works."""
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "auth service")
 
         assert actor._vs_proxy is None
@@ -471,12 +470,12 @@ class TestSearchPlanningVectorFallback:
 
     def test_semantic_exception_falls_back_to_keyword(self) -> None:
         """When VectorStoreActor proxy raises an exception, keyword results still returned."""
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "auth service")
 
         mock_proxy = MagicMock()
         mock_proxy.embed.side_effect = RuntimeError("embedding API error")
-        actor._vs_proxy = mock_proxy
+        actor._vs_proxy = actor._embedder = mock_proxy
 
         result = actor.search_planning(query="auth")
 
@@ -562,3 +561,122 @@ class TestSearchPlanningWiring:
 
         commands = tool.get_commands()
         assert SearchPlanning not in commands
+
+
+# ---------------------------------------------------------------------------
+# vector_store=False — a plan that declined a store, driven through a real config
+#
+# Every negative here is paired with a positive in the same fixture. "A disabled
+# actor does not embed" proves nothing on its own, because the enabled actor in
+# this module does not embed either — it has no orchestrator. So each spec shows
+# the two answering *differently*, which is what the story changed.
+# ---------------------------------------------------------------------------
+
+
+def _make_disabled_actor() -> PlanActor:
+    """A ``PlanActor`` whose card declined a store, built from a real config.
+
+    Not a hand-set ``_vs_proxy``: the point is to exercise the path the card
+    actually takes, so ``vector_store=None`` is what ``PlanningTool`` hands the
+    config for ``vector_store=False``.
+    """
+    actor = PlanActor()
+    actor.config = PlanConfig(name="test-plan", role="ToolActor", vector_store=None)
+    actor.on_start()
+    return actor
+
+
+class TestADisabledPlanStillDoesEverythingButSemanticSearch:
+    """Task CRUD, keyword and hybrid search all work with no store."""
+
+    def test_task_crud_is_unaffected(self) -> None:
+        from akgentic.tool.planning.planning_actor import TaskCreate, TaskUpdate, UpdatePlan
+
+        actor = _make_disabled_actor()
+        addr = MockActorAddress("@Alice", "Agent")
+
+        actor.update_planning(
+            UpdatePlan(
+                create_tasks=[
+                    TaskCreate(id=1, status="pending", description="auth flow", owner="@Alice"),
+                    TaskCreate(id=2, status="pending", description="payments", owner="@Bob"),
+                ]
+            ),
+            addr,
+        )
+        assert {t.id for t in actor.get_planning()} == {1, 2}
+
+        actor.update_planning(
+            UpdatePlan(update_tasks=[TaskUpdate(id=1, status="completed")]), addr
+        )
+        assert next(t for t in actor.get_planning() if t.id == 1).status == "completed"
+
+        actor.update_planning(UpdatePlan(delete_tasks=[2]), addr)
+        assert {t.id for t in actor.get_planning()} == {1}
+
+    def test_keyword_and_hybrid_still_return_their_hits(self) -> None:
+        from akgentic.tool.vector_store.protocol import SEMANTIC_DISABLED
+
+        actor = _make_disabled_actor()
+        _add_task(actor, 1, "auth flow")
+        _add_task(actor, 2, "payment gateway")
+
+        for mode in ("keyword", "hybrid"):
+            result = actor.search_planning(query="auth", mode=mode)  # type: ignore[arg-type]
+            assert _extract_ids(result) == {1}
+            assert SEMANTIC_DISABLED not in result
+
+    def test_vector_mode_answers_a_sentence(self) -> None:
+        """The negative half: the one mode that has nothing to score says so."""
+        from akgentic.tool.vector_store.protocol import SEMANTIC_DISABLED
+
+        actor = _make_disabled_actor()
+        _add_task(actor, 1, "auth flow")
+
+        assert actor.search_planning(query="auth", mode="vector") == [SEMANTIC_DISABLED]
+
+    def test_an_unfiltered_listing_is_untouched(self) -> None:
+        """With no query there is no semantic phase to disable."""
+        actor = _make_disabled_actor()
+        _add_task(actor, 1, "auth flow")
+        _add_task(actor, 2, "payment gateway")
+
+        assert _extract_ids(actor.search_planning()) == {1, 2}
+
+
+class TestAFailedStoreIsNotADeclinedOne:
+    """The positive that stops the sentence swallowing a real misconfiguration."""
+
+    def test_an_enabled_plan_with_no_store_still_returns_empty_for_vector_mode(
+        self,
+    ) -> None:
+        """This actor *asked* for a store and did not get one — today's behaviour.
+
+        ``_make_actor`` builds an enabled config with no orchestrator, so
+        ``_vs_proxy`` ends up ``None`` exactly as it does for a store that failed
+        to build. It must keep returning nothing, so an operator sees an empty
+        result and looks, rather than reading a sentence and stopping.
+        """
+        from akgentic.tool.vector_store.protocol import SEMANTIC_DISABLED
+
+        actor = _make_actor()
+        _add_task(actor, 1, "auth flow")
+
+        assert actor.config.vector_store is not None
+        assert actor._vs_proxy is None
+
+        result = actor.search_planning(query="auth", mode="vector")
+        assert result == []
+        assert SEMANTIC_DISABLED not in result
+
+    def test_the_two_actors_answer_the_same_query_differently(self) -> None:
+        """The pairing stated as one assertion: declined and failed diverge."""
+        from akgentic.tool.vector_store.protocol import SEMANTIC_DISABLED
+
+        failed = _make_actor()
+        declined = _make_disabled_actor()
+        for actor in (failed, declined):
+            _add_task(actor, 1, "auth flow")
+
+        assert failed.search_planning(query="auth", mode="vector") == []
+        assert declined.search_planning(query="auth", mode="vector") == [SEMANTIC_DISABLED]

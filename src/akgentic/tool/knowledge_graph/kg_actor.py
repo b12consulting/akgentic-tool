@@ -38,14 +38,22 @@ from akgentic.tool.knowledge_graph.models import (
     SearchQuery,
     SearchResult,
 )
-from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
+from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE, VectorStoreActor
+from akgentic.tool.vector_store.embedding_actor import build_embedding_service
 from akgentic.tool.vector_store.hybrid import (
     DEFAULT_ALPHA,
     OVERFETCH,
     hybrid_search,
     semantic_scores,
 )
-from akgentic.tool.vector_store.protocol import CollectionConfig
+from akgentic.tool.vector_store.protocol import (
+    EmbeddingProvider,
+    VectorStoreConfig,
+    VectorStoreParam,
+    VectorStoreService,
+    needs_store_actor,
+)
+from akgentic.tool.vector_store.registry import BackendContext, get_backend_spec
 from akgentic.tool.vector_store.vector import VectorEntry
 
 logger = logging.getLogger(__name__)
@@ -57,30 +65,32 @@ KG_ACTOR_ROLE: str = "ToolActor"
 """Actor role constant for ToolCard integration."""
 
 KG_COLLECTION: str = "knowledge_graph"
-"""Collection name used in VectorStoreActor."""
+"""Collection name used by the knowledge graph's store."""
 
 
 class KnowledgeGraphConfig(BaseConfig):
     """Configuration for ``KnowledgeGraphActor``.
 
-    Carries the actor-level binding to a ``VectorStoreActor`` so the
-    knowledge graph can resolve its vector store by name (or operate in
-    degraded mode without one). The actor itself is created by
-    ``VectorStoreTool``; this config only points at it.
+    Carries the storage configuration itself rather than a binding to a
+    singleton: the backend ``vector_store`` names is what decides whether an
+    actor is involved at all.
+
+    **This is the resolved value, not the author's declaration.**
+    ``KnowledgeGraphTool`` carries three shapes and normalises them into the two
+    this field holds, so ``None`` here means the card declined a store and this
+    actor stays in its degraded mode for good.
     """
 
-    vector_store: bool | str = Field(
-        default=True,
+    vector_store: VectorStoreParam | None = Field(
+        default_factory=VectorStoreParam,
         description=(
-            "Binding to a VectorStoreActor: True=default #VectorStore, "
-            "str=named instance, False=degraded mode (no vector search)."
-        ),
-    )
-    collection: CollectionConfig = Field(
-        default_factory=CollectionConfig,
-        description=(
-            "Vector collection configuration forwarded to "
-            "VectorStoreActor.create_collection."
+            "Vector store configuration for the knowledge graph collection: backend, "
+            "dimension, tenant, embedding model and provider. The backend decides how "
+            "the actor resolves its storage engine — an actor-state backend through the "
+            "store actor, a cluster one through the backend's own client. None means the "
+            "card declined a store: nothing is resolved, nothing is embedded, and "
+            "semantic search stays off. An absent key still defaults to a param, so a "
+            "config persisted before the opt-out returned is unchanged."
         ),
     )
     search_top_k: int = Field(
@@ -124,7 +134,7 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
     # ------------------------------------------------------------------
 
     def on_start(self) -> None:  # noqa: ANN201
-        """Initialize state, attach observer, and acquire VectorStoreActor proxy."""
+        """Initialize state, attach observer, and resolve the vector store."""
         self.state = KnowledgeGraphState()
         self.state.observer(self)
         # Coerce BaseConfig → KnowledgeGraphConfig when the actor was started with
@@ -136,77 +146,131 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
                 name=self.config.name,
                 role=self.config.role,
             )
-        self._vs_proxy: VectorStoreActor | None = None
+        self._vs_proxy: VectorStoreService | None = None
+        self._embedder: EmbeddingProvider | None = None
         self._acquire_vs_proxy()
         self._state_event_seq: int = 0
 
     def _acquire_vs_proxy(self) -> None:
-        """Look up the VectorStoreActor proxy and create the KG collection.
+        """Resolve this actor's storage engine and create the KG collection.
 
-        The VectorStoreActor is owned by ``VectorStoreTool``; this actor
-        only resolves it by name. Behaviour:
+        **The slot holds a ``VectorStoreService``, not necessarily a proxy.** The
+        four methods this actor calls are exactly that protocol, and the store
+        actor and every backend satisfy it with identical signatures. (The
+        attribute keeps the name ``_vs_proxy``: renaming it to ``_store`` is
+        ~200 mechanical private sites and is routed to its own follow-up.)
 
-        - ``config.vector_store is False`` → stay in degraded mode (no
-          lookup, ``_vs_proxy`` remains ``None``).
-        - ``self.orchestrator is None`` (test harness) → log WARNING and
-          return — existing behaviour preserved.
-        - Otherwise look up the target actor name (``config.vector_store``
-          when a ``str``, else ``VS_ACTOR_NAME``) via
-          ``orch_proxy.get_team_member``. Raise ``RuntimeError`` when it
-          is missing — a missing VectorStoreTool is a **configuration**
-          error, not a runtime degradation.
-        - A transient backend error during ``create_collection`` drops
-          back to degraded mode with a WARNING (matches existing
-          behaviour for embedding failures).
+        Which one it is comes from the param's backend:
+
+        - **An actor-state backend** — the in-memory index, whose data *is* the
+          actor's state — is reached through the store actor, looked up by name.
+          A missing one is still a ``RuntimeError``: a configuration error, not
+          a runtime degradation.
+        - **A cluster backend** builds its own engine through the registered
+          factory. There is no lookup to fail, so nothing here raises
+          ``RuntimeError``; a failed connect degrades exactly as a failed
+          ``create_collection`` does.
+
+        The embedder is built here too, from **this actor's own**
+        ``config.vector_store``: the store embeds nothing, so the model this
+        actor's ``VectorStoreParam`` names is the model that embeds its entities
+        and relations.
+
+        **A ``None`` param means the card declined a store**, and this returns
+        immediately: no orchestrator lookup, no backend built, ``_vs_proxy`` and
+        ``_embedder`` left at ``None``. It logs one line saying so, distinct from
+        every other warning here, so a reader of the logs can tell a deliberate
+        opt-out from a store that was asked for and failed to build.
         """
-        if self.config.vector_store is False:
-            return  # degraded mode by design
-
-        if self.orchestrator is None:
+        param = self.config.vector_store
+        if param is None:
             logger.warning(
-                "[%s] No orchestrator; operating in degraded mode",
+                "[%s] vector_store is off by configuration — semantic search disabled",
                 self.config.name,
             )
             return
-
-        vs_name = (
-            self.config.vector_store
-            if isinstance(self.config.vector_store, str)
-            else VS_ACTOR_NAME
-        )
-        orch_proxy = self.proxy_ask(self.orchestrator, Orchestrator)
-        vs_addr = orch_proxy.get_team_member(vs_name)
-        if vs_addr is None:
-            raise RuntimeError(
-                f"{self.config.name} requires VectorStoreActor '{vs_name}' "
-                f"but it was not found. Ensure VectorStoreTool is in the team config."
-            )
-        self._vs_proxy = self.proxy_ask(vs_addr, VectorStoreActor)
+        store = self._resolve_store(param)
+        if store is None:
+            return
         try:
-            self._vs_proxy.create_collection(KG_COLLECTION, self.config.collection)
+            store.create_collection(KG_COLLECTION, param)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "[%s] create_collection on VectorStoreActor failed: %s — degraded mode",
+                "[%s] create_collection on the vector store failed: %s — degraded mode",
                 self.config.name,
                 exc,
             )
-            self._vs_proxy = None
+            return
+        self._vs_proxy = store
+        self._embedder = build_embedding_service(
+            param.embedding_model,
+            param.embedding_provider,
+        )
+
+    def _resolve_store(self, param: VectorStoreParam) -> VectorStoreService | None:
+        """Return the storage engine *param* names, or ``None`` to stay degraded.
+
+        Args:
+            param: This actor's vector store configuration.
+
+        Returns:
+            The store actor's proxy, a freshly built backend, or ``None`` when
+            retrieval must stay off.
+
+        Raises:
+            RuntimeError: When the backend needs a store actor and none is
+                registered with the team.
+        """
+        if needs_store_actor(param):
+            if self.orchestrator is None:
+                logger.warning(
+                    "[%s] No orchestrator; operating in degraded mode",
+                    self.config.name,
+                )
+                return None
+            orch_proxy = self.proxy_ask(self.orchestrator, Orchestrator)
+            vs_addr = orch_proxy.get_team_member(VS_ACTOR_NAME)
+            if vs_addr is None:
+                raise RuntimeError(
+                    f"{self.config.name} requires the vector store actor "
+                    f"'{VS_ACTOR_NAME}' but it was not found."
+                )
+            return self.proxy_ask(vs_addr, VectorStoreActor)
+        try:
+            return get_backend_spec(param.backend).factory(
+                BackendContext(
+                    config=VectorStoreConfig(name=self.config.name, role=VS_ACTOR_ROLE),
+                    team_id=str(self.team_id),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[%s] could not build the '%s' vector store backend: %s — degraded mode",
+                self.config.name,
+                param.backend,
+                exc,
+            )
+            return None
 
     # ------------------------------------------------------------------
-    # Embedding helpers (via VectorStoreActor proxy)
+    # Embedding helpers — this actor's own service, the store's proxy for writes
     # ------------------------------------------------------------------
 
     def _embed_entity(self, entity: Entity) -> None:
-        """Embed an entity and store the result via VectorStoreActor proxy.
+        """Embed an entity and store the result through the vector store.
 
-        Silently logs a WARNING and returns if the proxy is unavailable
-        or if the embedding call fails.
+        Silently logs a WARNING and returns if the proxy or the embedder is
+        unavailable, or if the embedding call fails.
+
+        **Synchronous on purpose.** One entry per call, on a call site that already
+        blocks; what the owned embedder buys is a bounded mailbox turn, since the
+        call now carries the embedding worker's ``timeout_s``.
         """
-        if self._vs_proxy is None:
+        if self._vs_proxy is None or self._embedder is None:
             return
         try:
             text = f"{entity.name}: {entity.description}"
-            vectors = self._vs_proxy.embed([text])
+            vectors = self._embedder.embed([text])
             if not vectors:
                 return
             self._vs_proxy.add(
@@ -233,14 +297,14 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         """
         if not relation.description:
             return
-        if self._vs_proxy is None:
+        if self._vs_proxy is None or self._embedder is None:
             return
         try:
             text = (
                 f"{relation.from_entity} {relation.relation_type} "
                 f"{relation.to_entity}: {relation.description}"
             )
-            vectors = self._vs_proxy.embed([text])
+            vectors = self._embedder.embed([text])
             if not vectors:
                 return
             self._vs_proxy.add(
@@ -437,7 +501,7 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
     ) -> tuple[list[uuid.UUID], list[uuid.UUID], list[str]]:
         """Remove entities by name with cascade deletion of relations.
 
-        Also removes any associated VectorEntry embeddings from VectorStoreActor.
+        Also removes any associated VectorEntry embeddings from the vector store.
 
         Returns:
             Tuple of (deleted entity ids, cascaded relation ids, errors).
@@ -491,7 +555,7 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
     ) -> tuple[list[uuid.UUID], list[str]]:
         """Remove relations by ``(from_entity, to_entity, relation_type)`` triple.
 
-        Also removes any associated VectorEntry embeddings from VectorStoreActor.
+        Also removes any associated VectorEntry embeddings from the vector store.
 
         Returns:
             Tuple of (ids of relations actually removed, errors).
@@ -893,7 +957,7 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
     ) -> SearchResult:
         """Embed ``query_text`` and return top-k results by cosine similarity.
 
-        Returns an empty ``SearchResult`` when the VectorStoreActor proxy is
+        Returns an empty ``SearchResult`` when the vector store is
         unavailable or the embedding call fails.  Hits with score below
         ``score_threshold`` are filtered out before returning.
 
@@ -905,7 +969,9 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         Returns:
             ``SearchResult`` with hits ranked by cosine similarity score.
         """
-        scores = semantic_scores(self._vs_proxy, KG_COLLECTION, query_text, top_k)
+        scores = semantic_scores(
+            self._vs_proxy, self._embedder, KG_COLLECTION, query_text, top_k
+        )
         hits: list[SearchHit] = []
         for ref_id, score in scores.items():
             if score < score_threshold:
@@ -955,6 +1021,7 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         result = hybrid_search(
             by_ref_id.keys(),
             self._vs_proxy,
+            self._embedder,
             KG_COLLECTION,
             query_text,
             top_k=top_k,

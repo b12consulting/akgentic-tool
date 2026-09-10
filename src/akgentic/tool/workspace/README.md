@@ -35,9 +35,11 @@ The workspace does **not** need `git`. It does not need a sandbox backend. It do
 vector store. With none of them, the gate still refuses every stale write, because the gate hashes
 the file rather than consulting a record of who wrote it.
 
-Retrieval degrades further **within** itself: with the capability on and no `#VectorStore` reachable,
-every retrieval callable answers one sentence rather than raising, and a search whose embedding call
-fails falls back to its keyword leg. That is deliberate rather than defensive — this actor owns the
+Retrieval degrades further **within** itself: with the capability on and no store reachable, every
+retrieval callable answers one sentence rather than raising, and a search whose embedding call fails
+falls back to its keyword leg. ("No store reachable" means the backend this card's `vector_store`
+names could not be built — on the in-memory backend that is the `#VectorStore` actor, and on a
+cluster backend there is no actor at all, only a client that failed to connect.) That is deliberate rather than defensive — this actor owns the
 write gate, and a misconfigured vector store must not be a way to take the gate down with it.
 
 ---
@@ -482,7 +484,7 @@ cannot argue with.
 | `workspace_rag_index` | `WorkspaceRagIndex \| bool` | **`False`** | Queue workspace files for retrieval indexing. On the **read** side of `read_only`: indexing derives from the tree and writes nothing into it. |
 | `workspace_rag_list` | `WorkspaceRagList \| bool` | **`False`** | Where every file stands in the index. `COMMAND` + `LLM_CONTEXT`, never `TOOL_CALL` — it is pushed into the context tail as a per-turn delta, so a tool call for it would be a round trip for what the model already has. |
 | `workspace_rag_search` | `WorkspaceRagSearch \| bool` | **`False`** | Hybrid search over the indexed chunks. `TOOL_CALL` only — a search is something the model *does*, not something it is *shown*. Read side, like its two siblings. |
-| `rag_collection` | `CollectionConfig` | `CollectionConfig()` | Backend, dimension and tenant of the one `workspace_chunks` collection. Named `rag_collection` rather than the house's bare `collection`: on a card whose other twenty fields are workspace operations, a bare `collection` reads as "the workspace's collection of files". |
+| `vector_store` | `VectorStoreParam` | `VectorStoreParam()` | Backend, dimension, tenant, embedding model and provider of the one `workspace_chunks` collection. The house name, shared with `PlanningTool` and `KnowledgeGraphTool`. It was once `rag_collection`, because a bare `collection` reads as "the workspace's collection of files" on a card whose other twenty fields are file operations — `vector_store` answers that objection rather than working around it. The backend it names also decides whether a store actor is created at all, and it is what the backend-configuration check reads. All of that only when a retrieval capability is on. |
 | `max_documents` | `int \| None` | `None` | Row cap on the extraction cache. `None` is **not** zero and not "use the default" — it means *derive it* from the vector backend and whether retrieval is on. An explicit value always wins. |
 | `max_document_chars` | `int \| None` | `None` | Character cap on the bodies the cache holds. Same three-way meaning. |
 
@@ -693,8 +695,23 @@ loss. `stale` means the tree changed underneath an indexed file.
 
 Two legs, combined by the fusion rule the whole package shares: a scoped similarity search against
 `workspace_chunks`, and a case-insensitive term match over the extraction bodies the actor already
-holds. Each hit renders its path, its heading path, a score label — `(hybrid: 0.90)`,
-`(semantic: 0.85)` or `(keyword match)` — and the chunk's text.
+holds.
+
+**`workspace_chunks` is shared across teams, and the `scope` is what bounds it.** The collection's
+rows belong to a *filesystem tree*, not to a team, so on a cluster two teams pointed at one tree read
+the same rows — which is the point, since it is the same file in the same tree. `planning` and
+`knowledge_graph` keep their per-team predicate; this one does not have it, and instead the store
+**requires** a `scope` on every search and every removal against it. This actor always passes its
+resolved `workspace_path`, so the requirement is invisible here; it exists so that a caller written
+later cannot omit the collection's only remaining boundary.
+
+One consequence to weigh deliberately rather than meet as a surprise: two teams indexing one tree
+produce identical chunk ids for identical content, so team A re-indexing a file removes the rows team
+B also reads. That is correct — it is the same file in the same tree — but it means a re-index is
+visible across teams.
+
+Each hit renders its path, its heading path, a score label — `(hybrid: 0.90)`, `(semantic: 0.85)` or
+`(keyword match)` — and the chunk's text.
 
 **A hit's text comes from the vector store, not from the cache**, which is what keeps a file whose
 extraction body was evicted both searchable and renderable. That file loses only its lexical leg:
@@ -993,8 +1010,10 @@ WorkspaceTool(workspace_read=WorkspaceRead(document_reader=DocumentReader(llm_cl
 WorkspaceTool(workspace_view=WorkspaceView(max_dimension=0))
 
 # Retrieval over a document corpus at <user_id>/corpus — reachable by this
-# principal's other teams, and by nobody else's. Needs a #VectorStore on the team;
-# without one every retrieval callable answers a sentence and nothing raises.
+# principal's other teams, and by nobody else's. The card's own vector_store
+# decides where the chunks live and whether a store actor is created at all;
+# if that store cannot be built, every retrieval callable answers a sentence
+# and nothing raises.
 WorkspaceTool(
     workspace_id="corpus",
     read_only=True,
@@ -1014,7 +1033,7 @@ WorkspaceTool(workspace_id="corpus", workspace_rag_search=True)
 # rather than silently giving a card that asked for a cluster a local index.
 WorkspaceTool(
     workspace_rag_index=True,
-    rag_collection=CollectionConfig(backend="weaviate", tenant="acme"),
+    vector_store=VectorStoreParam(backend="weaviate", tenant="acme"),
 )
 ```
 
@@ -1026,7 +1045,7 @@ WorkspaceTool(
 | `[vision]` (Pillow) | `workspace_view` logs one warning and returns unresized bytes. Nothing fails. |
 | `git` off `PATH` | The journal degrades off with one warning. The gate is unaffected. |
 | No isolation backend | `mode="auto"` falls through to `local` with a `DeprecationWarning`: commands run as a plain subprocess with no filesystem isolation. |
-| No `#VectorStore` on the team | Every retrieval callable answers *"Retrieval indexing is not available for this workspace."* — one warning at bind time, nothing raised. Add `VectorStoreTool` to the team configuration. |
+| The store cannot be resolved | Every retrieval callable answers *"Retrieval indexing is not available for this workspace."* — one warning at bind time, nothing raised. The card creates its own store when the backend needs one, so this is an unreachable cluster or a collection that could not be created, not a missing card. |
 | `[vector_search]` (numpy) | The in-memory vector backend cannot be built. Retrieval degrades as above; nothing else on the card changes. |
 
 ### What it costs

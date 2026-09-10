@@ -32,7 +32,7 @@ from akgentic.tool.workspace.readers import DocumentReader
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from akgentic.tool.vector_store.protocol import CollectionConfig
+    from akgentic.tool.vector_store.protocol import VectorStoreParam
     from akgentic.tool.workspace.actor import WorkspaceActor
 
 logger = logging.getLogger(__name__)
@@ -58,7 +58,7 @@ class RagFactories:
         workspace_rag_list: WorkspaceRagList | bool
         workspace_rag_search: WorkspaceRagSearch | bool
         workspace_read: WorkspaceRead | bool
-        rag_collection: CollectionConfig
+        vector_store: VectorStoreParam
 
         _workspace_proxy: WorkspaceActor | None
         _workspace_tell: WorkspaceActor | None
@@ -70,10 +70,11 @@ class RagFactories:
     def _rag_enabled(self) -> bool:
         """Whether this card carries any retrieval capability at all.
 
-        Read by three sites that must never disagree: the backend-derived document
-        caps, the Weaviate configuration check, and the bind-time announcement. A
-        card with retrieval off must create no collection, impose no Weaviate
-        requirement, and shrink no cache.
+        Read by four sites that must never disagree: the backend-derived document
+        caps, the backend configuration check, the store actor's creation, and the
+        bind-time announcement. A card with retrieval off must create no
+        collection, create no store actor, impose no backend requirement, and
+        shrink no cache.
 
         **All three capabilities are terms, and the third is the one that is easy
         to forget.** A card enabling only ``workspace_rag_search`` would otherwise
@@ -134,7 +135,7 @@ class RagFactories:
             return
         try:
             tell.enable_rag(
-                self._agent_id, self._rag_params(), self._rag_reader(), self.rag_collection
+                self._agent_id, self._rag_params(), self._rag_reader(), self.vector_store
             )
         except Exception:
             logger.debug("Could not enable retrieval on #Workspace", exc_info=True)

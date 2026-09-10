@@ -14,9 +14,22 @@ from akgentic.core.agent_state import BaseState
 from akgentic.core.orchestrator import Orchestrator
 from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
+from akgentic.tool.vector_store.actor import (
+    VS_ACTOR_NAME,
+    VS_ACTOR_ROLE,
+    VectorStoreActor,
+)
+from akgentic.tool.vector_store.embedding_actor import build_embedding_service
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA, hybrid_search
-from akgentic.tool.vector_store.protocol import CollectionConfig
+from akgentic.tool.vector_store.protocol import (
+    SEMANTIC_DISABLED,
+    EmbeddingProvider,
+    VectorStoreConfig,
+    VectorStoreParam,
+    VectorStoreService,
+    needs_store_actor,
+)
+from akgentic.tool.vector_store.registry import BackendContext, get_backend_spec
 from akgentic.tool.vector_store.vector import VectorEntry
 
 logger = logging.getLogger(__name__)
@@ -122,20 +135,29 @@ PLAN_COLLECTION: str = "planning"
 
 
 class PlanConfig(BaseConfig):
-    """Configuration for PlanActor with optional vector-backed semantic search."""
+    """Configuration for PlanActor with vector-backed semantic search.
 
-    vector_store: bool | str = Field(
-        default=True,
+    The binding-to-an-actor field is gone: ``vector_store`` now carries the
+    storage configuration itself, and the backend it names is what decides
+    whether an actor is involved at all.
+
+    **This is the resolved value, not the author's declaration.** ``PlanningTool``
+    carries three shapes and normalises them into the two this field holds, so
+    ``None`` here means the card declined a store and this actor stays in its
+    degraded mode for good. The config is the only channel to the actor, so it is
+    the only way the actor can learn that.
+    """
+
+    vector_store: VectorStoreParam | None = Field(
+        default_factory=VectorStoreParam,
         description=(
-            "Binding to a VectorStoreActor: True=default #VectorStore, "
-            "str=named instance, False=degraded mode (no vector search)."
-        ),
-    )
-    collection: CollectionConfig = Field(
-        default_factory=CollectionConfig,
-        description=(
-            "Vector collection configuration forwarded to "
-            "VectorStoreActor.create_collection."
+            "Vector store configuration for the planning collection: backend, "
+            "dimension, tenant, embedding model and provider. The backend decides "
+            "how the actor resolves its storage engine — an actor-state backend "
+            "through the store actor, a cluster one through the backend's own client. "
+            "None means the card declined a store: nothing is resolved, nothing is "
+            "embedded, and semantic search stays off. An absent key still defaults to "
+            "a param, so a config persisted before the opt-out returned is unchanged."
         ),
     )
     search_top_k: int = Field(
@@ -182,74 +204,136 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
                 name=self.config.name,
                 role=self.config.role,
             )
-        self._vs_proxy: VectorStoreActor | None = None
-        if self.config.vector_store is not False:
-            self._acquire_vs_proxy()
+        self._vs_proxy: VectorStoreService | None = None
+        self._embedder: EmbeddingProvider | None = None
+        self._acquire_vs_proxy()
 
     def _acquire_vs_proxy(self) -> None:
-        """Look up the VectorStoreActor proxy and create the planning collection.
+        """Resolve this actor's storage engine and create the planning collection.
 
-        The VectorStoreActor is owned by ``VectorStoreTool``; this actor
-        only resolves it by name. Behaviour:
+        **The slot holds a ``VectorStoreService``, not necessarily a proxy.** The
+        four methods this actor calls — ``create_collection``, ``add``,
+        ``remove``, ``search`` — are exactly that protocol, and the store actor
+        and every backend satisfy it with identical signatures, so which one is
+        behind the slot changes nothing below this method. (The attribute keeps
+        the name ``_vs_proxy``: renaming it to ``_store`` is ~200 mechanical
+        private sites and is routed to its own follow-up.)
 
-        - ``config.vector_store is False`` → stay in degraded mode (no
-          lookup, ``_vs_proxy`` remains ``None``).
-        - ``self.orchestrator is None`` (test harness) → log WARNING and
-          return — existing behaviour preserved.
-        - Otherwise look up the target actor name (``config.vector_store``
-          when a ``str``, else ``VS_ACTOR_NAME``) via
-          ``orch_proxy.get_team_member``. Raise ``RuntimeError`` when it
-          is missing — a missing VectorStoreTool is a **configuration**
-          error, not a runtime degradation.
-        - A transient backend error during ``create_collection`` drops
-          back to degraded mode with a WARNING (matches existing
-          behaviour for embedding failures).
+        Which one it is comes from the param's backend:
+
+        - **An actor-state backend** — the in-memory index, whose data *is* the
+          actor's state — is reached through the store actor, looked up by name.
+          A missing one is still a ``RuntimeError``: for a planning tool whose
+          whole purpose is the vector store, that is a configuration error.
+        - **A cluster backend** builds its own engine through the registered
+          factory. There is no lookup to fail, so nothing here can raise
+          ``RuntimeError``; what can fail is the connect, and that degrades
+          exactly as a failed ``create_collection`` does — one WARNING and
+          ``_vs_proxy`` left ``None``.
+
+        ``self.orchestrator is None`` (a test harness) still logs a WARNING and
+        returns, and only the actor path needs one at all.
+
+        The embedder is built here too, from **this actor's own**
+        ``config.vector_store``: the store embeds nothing, so the model this
+        actor's ``VectorStoreParam`` names is the model that embeds its tasks.
+
+        **A ``None`` param means the card declined a store**, and this returns
+        immediately: no orchestrator lookup, no backend built, ``_vs_proxy`` and
+        ``_embedder`` left at ``None`` — the state the degraded path already
+        expects. It logs one line saying so, distinct from every other warning
+        here, so a reader of the logs can tell a deliberate opt-out from a store
+        that was asked for and failed to build.
         """
-        if self.config.vector_store is False:
-            return  # degraded mode by design
-
-        if self.orchestrator is None:
+        param = self.config.vector_store
+        if param is None:
             logger.warning(
-                "[%s] No orchestrator; operating in degraded mode",
+                "[%s] vector_store is off by configuration — semantic search disabled",
                 self.config.name,
             )
             return
-
-        vs_name = (
-            self.config.vector_store
-            if isinstance(self.config.vector_store, str)
-            else VS_ACTOR_NAME
-        )
-        orch_proxy = self.proxy_ask(self.orchestrator, Orchestrator)
-        vs_addr = orch_proxy.get_team_member(vs_name)
-        if vs_addr is None:
-            raise RuntimeError(
-                f"{self.config.name} requires VectorStoreActor '{vs_name}' "
-                f"but it was not found. Ensure VectorStoreTool is in the team config."
-            )
-        self._vs_proxy = self.proxy_ask(vs_addr, VectorStoreActor)
+        store = self._resolve_store(param)
+        if store is None:
+            return
         try:
-            self._vs_proxy.create_collection(PLAN_COLLECTION, self.config.collection)
+            store.create_collection(PLAN_COLLECTION, param)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "[%s] create_collection on VectorStoreActor failed: %s — degraded mode",
+                "[%s] create_collection on the vector store failed: %s — degraded mode",
                 self.config.name,
                 exc,
             )
-            self._vs_proxy = None
+            return
+        self._vs_proxy = store
+        self._embedder = build_embedding_service(
+            param.embedding_model,
+            param.embedding_provider,
+        )
+
+    def _resolve_store(self, param: VectorStoreParam) -> VectorStoreService | None:
+        """Return the storage engine *param* names, or ``None`` to stay degraded.
+
+        Args:
+            param: This actor's vector store configuration.
+
+        Returns:
+            The store actor's proxy, a freshly built backend, or ``None`` when
+            retrieval must stay off.
+
+        Raises:
+            RuntimeError: When the backend needs a store actor and none is
+                registered with the team.
+        """
+        if needs_store_actor(param):
+            if self.orchestrator is None:
+                logger.warning(
+                    "[%s] No orchestrator; operating in degraded mode",
+                    self.config.name,
+                )
+                return None
+            orch_proxy = self.proxy_ask(self.orchestrator, Orchestrator)
+            vs_addr = orch_proxy.get_team_member(VS_ACTOR_NAME)
+            if vs_addr is None:
+                raise RuntimeError(
+                    f"{self.config.name} requires the vector store actor "
+                    f"'{VS_ACTOR_NAME}' but it was not found."
+                )
+            return self.proxy_ask(vs_addr, VectorStoreActor)
+        try:
+            return get_backend_spec(param.backend).factory(
+                BackendContext(
+                    config=VectorStoreConfig(name=self.config.name, role=VS_ACTOR_ROLE),
+                    team_id=str(self.team_id),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[%s] could not build the '%s' vector store backend: %s — degraded mode",
+                self.config.name,
+                param.backend,
+                exc,
+            )
+            return None
 
     def _embed_task(self, task: Task) -> None:
         """Embed a task's description and store the resulting VectorEntry.
 
-        Called after task create or update. Does nothing when VectorStoreActor
-        proxy is unavailable (vector_store=False or proxy not acquired).
-        Any embedding error is logged and swallowed so that task CRUD
+        Called after task create or update. Does nothing when the proxy or the
+        embedder is unavailable (vector_store=False, or the proxy was not
+        acquired). Any embedding error is logged and swallowed so that task CRUD
         is never interrupted by a transient embedding failure.
+
+        **Synchronous on purpose.** One entry per call, on a call site that already
+        blocks — a worker would add a spawn, a report and an in-flight map to
+        preserve behaviour that exists today without any of them. What the move to
+        an owned embedder buys instead is a **budget**: the blocking call now
+        carries the embedding worker's ``timeout_s``, so this actor's mailbox turn
+        is bounded.
         """
-        if self._vs_proxy is None:
+        if self._vs_proxy is None or self._embedder is None:
             return
         try:
-            vectors = self._vs_proxy.embed([task.description])
+            vectors = self._embedder.embed([task.description])
             if not vectors:
                 return
             entry = VectorEntry(
@@ -333,10 +417,19 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
                    None means no filter.
             mode: Search mode — ``"hybrid"`` (default) runs both keyword and
                    semantic phases; ``"keyword"`` skips embedding/vector search;
-                   ``"vector"`` skips keyword substring matching. When
-                   ``_vs_proxy is None`` and ``mode="vector"``, returns empty
-                   results; ``mode="hybrid"`` falls back to keyword-only with
-                   a warning.
+                   ``"vector"`` skips keyword substring matching.
+
+                   **Three things can leave the semantic phase with nothing, and
+                   they are answered differently.** When the card *declined* a
+                   store (``vector_store=False``), ``mode="vector"`` returns
+                   exactly ``[SEMANTIC_DISABLED]`` — a sentence, because an empty
+                   list would read as "no task matches" rather than "there is no
+                   index". When a store was *asked for* and could not be built or
+                   reached, ``mode="vector"`` still returns empty results, so a
+                   real misconfiguration is not hidden behind a reassuring
+                   sentence. ``mode="hybrid"`` falls back to keyword-only with a
+                   warning in both cases, and ``mode="keyword"`` never touches the
+                   store at all.
             top_k: Maximum number of semantic search hits. When None, uses
                    ``config.search_top_k`` (default 10).
             score_threshold: Minimum cosine similarity score for semantic results.
@@ -349,6 +442,8 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
             ``(keyword match)`` for keyword-only hits, or ``(hybrid: 0.90)``
             for hits found by both keyword and semantic.
             When all parameters are None, returns the full task list (unscored).
+            For a declined store queried with ``mode="vector"``, the single-element
+            list ``[SEMANTIC_DISABLED]``.
         """
         # Filter first, so the query phase only ever scores viable candidates and
         # the top_k cut is never spent on tasks the AND filters would discard.
@@ -356,6 +451,9 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
 
         if query is None:
             return [self._format_task_line(t, {}) for t in tasks]
+
+        if mode == "vector" and self.config.vector_store is None:
+            return [SEMANTIC_DISABLED]
 
         scores = self._score_query_matches(tasks, query, mode, top_k, score_threshold)
         matched = [t for t in tasks if t.id in scores]
@@ -386,6 +484,7 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
         result = hybrid_search(
             [str(task_id) for task_id in sorted(keyword_ids)],
             self._vs_proxy,
+            self._embedder,
             PLAN_COLLECTION,
             query,
             top_k=top_k if top_k is not None else self.config.search_top_k,

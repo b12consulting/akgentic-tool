@@ -34,7 +34,6 @@ def _extract_ids(results: list[str]) -> set[int]:
 
 
 def _make_actor(
-    vector_store: bool = False,
     search_top_k: int = 10,
     search_score_threshold: float = 0.5,
 ) -> PlanActor:
@@ -43,7 +42,6 @@ def _make_actor(
     actor.config = PlanConfig(
         name="test-plan",
         role="ToolActor",
-        vector_store=vector_store,
         search_top_k=search_top_k,
         search_score_threshold=search_score_threshold,
     )
@@ -163,8 +161,10 @@ class TestConfigPropagation:
         mock_proxy = MagicMock()
 
         def capture(actor_cls: type, config: object = None) -> MagicMock:
-            assert isinstance(config, PlanConfig)
-            captured.append(config)
+            # The card creates the store actor first when its backend needs one,
+            # so only the consumer's own config is captured here.
+            if isinstance(config, PlanConfig):
+                captured.append(config)
             return MagicMock()
 
         mock_proxy.getChildrenOrCreate.side_effect = capture
@@ -221,10 +221,10 @@ class TestLLMTunableParameters:
     """AC-3: search_planning accepts top_k and score_threshold overrides."""
 
     def test_none_top_k_uses_config_default(self) -> None:
-        actor = _make_actor(vector_store=True, search_top_k=5)
+        actor = _make_actor(search_top_k=5)
         _add_task(actor, 1, "auth service")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.8)]
         )
 
@@ -236,10 +236,10 @@ class TestLLMTunableParameters:
         assert call_args[0][2] == 5 * OVERFETCH  # third positional arg is top_k
 
     def test_explicit_top_k_overrides_config(self) -> None:
-        actor = _make_actor(vector_store=True, search_top_k=5)
+        actor = _make_actor(search_top_k=5)
         _add_task(actor, 1, "auth service")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.8)]
         )
 
@@ -250,10 +250,10 @@ class TestLLMTunableParameters:
 
     def test_none_score_threshold_uses_config_default(self) -> None:
         """Score threshold=0.7 in config: hit at 0.6 excluded."""
-        actor = _make_actor(vector_store=True, search_score_threshold=0.7)
+        actor = _make_actor(search_score_threshold=0.7)
         _add_task(actor, 1, "database task")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.6)]
         )
 
@@ -264,10 +264,10 @@ class TestLLMTunableParameters:
 
     def test_explicit_score_threshold_overrides_config(self) -> None:
         """Config threshold=0.7 but explicit override=0.5: hit at 0.6 included."""
-        actor = _make_actor(vector_store=True, search_score_threshold=0.7)
+        actor = _make_actor(search_score_threshold=0.7)
         _add_task(actor, 1, "database task")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.6)]
         )
 
@@ -286,7 +286,7 @@ class TestScoreExposure:
     """AC-4: search_planning results include score labels."""
 
     def test_keyword_match_label(self) -> None:
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "auth flow setup")
 
         result = actor.search_planning(query="auth")
@@ -295,10 +295,10 @@ class TestScoreExposure:
         assert "(keyword match)" in result[0]
 
     def test_semantic_match_label(self) -> None:
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "database task")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.85)]
         )
 
@@ -309,10 +309,10 @@ class TestScoreExposure:
 
     def test_hybrid_label_when_both_keyword_and_semantic(self) -> None:
         """When a task matches both keyword and semantic, hybrid label is used."""
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "auth module")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.9)]
         )
 
@@ -324,7 +324,7 @@ class TestScoreExposure:
 
     def test_no_score_label_when_no_query(self) -> None:
         """When no query is provided, results have no score label."""
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "auth service")
 
         result = actor.search_planning()
@@ -348,11 +348,11 @@ class TestResultOrdering:
         This is Weaviate's relativeScoreFusion weighting, so a strong semantic hit
         outranks a keyword-only one. Set ``hybrid_alpha`` below 0.5 to invert it.
         """
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "auth flow setup")  # keyword only
         _add_task(actor, 2, "database schema")  # semantic only
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]],
             search_hits=[("2", 0.75)],
         )
@@ -365,12 +365,12 @@ class TestResultOrdering:
 
     def test_low_alpha_restores_keyword_priority(self) -> None:
         """hybrid_alpha is the knob for teams whose lexical matches are the precise ones."""
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         actor.config.hybrid_alpha = 0.2
         _add_task(actor, 1, "auth flow setup")  # keyword only
         _add_task(actor, 2, "database schema")  # semantic only
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]],
             search_hits=[("2", 0.75)],
         )
@@ -382,12 +382,12 @@ class TestResultOrdering:
 
     def test_semantic_results_ordered_by_score(self) -> None:
         """Multiple semantic matches sorted by score descending."""
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "task alpha")
         _add_task(actor, 2, "task beta")
         _add_task(actor, 3, "task gamma")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]],
             search_hits=[("1", 0.6), ("2", 0.9), ("3", 0.75)],
         )
@@ -409,10 +409,10 @@ class TestActorParameterizedValues:
     """AC-6: PlanActor.search_planning uses top_k/score_threshold params."""
 
     def test_uses_config_top_k_when_param_none(self) -> None:
-        actor = _make_actor(vector_store=True, search_top_k=15)
+        actor = _make_actor(search_top_k=15)
         _add_task(actor, 1, "auth service")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[]
         )
 
@@ -422,10 +422,10 @@ class TestActorParameterizedValues:
         assert call_args[0][2] == 15 * OVERFETCH
 
     def test_uses_config_threshold_when_param_none(self) -> None:
-        actor = _make_actor(vector_store=True, search_score_threshold=0.8)
+        actor = _make_actor(search_score_threshold=0.8)
         _add_task(actor, 1, "database task")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.75)]
         )
 
@@ -435,10 +435,10 @@ class TestActorParameterizedValues:
         assert result == []
 
     def test_param_top_k_overrides_config(self) -> None:
-        actor = _make_actor(vector_store=True, search_top_k=5)
+        actor = _make_actor(search_top_k=5)
         _add_task(actor, 1, "auth service")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[]
         )
 
@@ -448,10 +448,10 @@ class TestActorParameterizedValues:
         assert call_args[0][2] == 30 * OVERFETCH
 
     def test_param_threshold_overrides_config(self) -> None:
-        actor = _make_actor(vector_store=True, search_score_threshold=0.8)
+        actor = _make_actor(search_score_threshold=0.8)
         _add_task(actor, 1, "database task")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.75)]
         )
 
@@ -479,9 +479,7 @@ class TestCatalogYAMLConfiguration:
 
     def test_yaml_config_propagates_to_actor(self) -> None:
         """Custom defaults reach PlanConfig via observer()."""
-        actor = _make_actor(
-            vector_store=True, search_top_k=10, search_score_threshold=0.6
-        )
+        actor = _make_actor(search_top_k=10, search_score_threshold=0.6)
         assert actor.config.search_top_k == 10
         assert actor.config.search_score_threshold == 0.6
 
@@ -495,11 +493,11 @@ class TestBackwardCompatibility:
     """AC-8: Without new fields, defaults match hardcoded behavior."""
 
     def test_default_top_k_is_10(self) -> None:
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         assert actor.config.search_top_k == 10
 
     def test_default_score_threshold_is_05(self) -> None:
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         assert actor.config.search_score_threshold == 0.5
 
     def test_planconfig_backward_compat_coercion(self) -> None:
@@ -515,10 +513,10 @@ class TestBackwardCompatibility:
 
     def test_search_with_default_config_uses_10_and_05(self) -> None:
         """Default config: search uses top_k=10, threshold=0.5."""
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "auth service")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.49)]
         )
 
@@ -529,10 +527,10 @@ class TestBackwardCompatibility:
 
     def test_search_with_default_config_top_k_passed(self) -> None:
         """Default config: search passes top_k=10 to vector store."""
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "auth service")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[]
         )
 
@@ -543,10 +541,10 @@ class TestBackwardCompatibility:
 
     def test_default_mode_is_hybrid(self) -> None:
         """Default mode is hybrid — same as current implicit behavior."""
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "auth service")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.8)]
         )
 
@@ -566,11 +564,11 @@ class TestSearchModeKeyword:
     """AC-4: mode='keyword' — only keyword matches, no embedding call."""
 
     def test_keyword_mode_returns_keyword_matches(self) -> None:
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "auth flow setup")
         _add_task(actor, 2, "database schema")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("2", 0.9)]
         )
 
@@ -581,10 +579,10 @@ class TestSearchModeKeyword:
         assert "(keyword match)" in result[0]
 
     def test_keyword_mode_no_embedding_call(self) -> None:
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "auth flow setup")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[]
         )
 
@@ -595,7 +593,7 @@ class TestSearchModeKeyword:
 
     def test_keyword_mode_with_no_vs_proxy(self) -> None:
         """mode='keyword' works fine even without vector store."""
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "auth flow setup")
 
         result = actor.search_planning(query="auth", mode="keyword")
@@ -608,11 +606,11 @@ class TestSearchModeVector:
     """AC-4: mode='vector' — only semantic matches, no keyword matching."""
 
     def test_vector_mode_returns_only_semantic_matches(self) -> None:
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "auth flow setup")  # keyword match for "auth"
         _add_task(actor, 2, "database schema")  # semantic match only
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.85), ("2", 0.75)]
         )
 
@@ -625,11 +623,11 @@ class TestSearchModeVector:
 
     def test_vector_mode_no_keyword_matching(self) -> None:
         """mode='vector' skips keyword matching — only semantic hits."""
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "auth flow setup")  # would be keyword match
         _add_task(actor, 2, "database schema")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("2", 0.9)]
         )
 
@@ -641,7 +639,7 @@ class TestSearchModeVector:
 
     def test_vector_mode_vs_proxy_none_returns_empty(self) -> None:
         """mode='vector' with _vs_proxy=None returns empty results."""
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "auth flow setup")
 
         result = actor.search_planning(query="auth", mode="vector")
@@ -650,7 +648,7 @@ class TestSearchModeVector:
 
     def test_vector_mode_vs_proxy_none_logs_warning(self) -> None:
         """mode='vector' with _vs_proxy=None returns empty (warning logged)."""
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "auth flow setup")
 
         # The main assertion is that empty results are returned;
@@ -664,11 +662,11 @@ class TestSearchModeHybrid:
     """AC-4: mode='hybrid' — both keyword and semantic, hybrid labels."""
 
     def test_hybrid_mode_unions_keyword_and_semantic(self) -> None:
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "auth flow setup")  # keyword match
         _add_task(actor, 2, "database schema")  # semantic only
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("2", 0.75)]
         )
 
@@ -679,10 +677,10 @@ class TestSearchModeHybrid:
 
     def test_hybrid_mode_labels_dual_match_as_hybrid(self) -> None:
         """Hit found by both keyword and semantic is labeled (hybrid: ...)."""
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "auth module")
 
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]], search_hits=[("1", 0.90)]
         )
 
@@ -693,7 +691,7 @@ class TestSearchModeHybrid:
 
     def test_hybrid_mode_vs_proxy_none_falls_back_to_keyword(self) -> None:
         """mode='hybrid' with _vs_proxy=None falls back to keyword-only."""
-        actor = _make_actor(vector_store=False)
+        actor = _make_actor()
         _add_task(actor, 1, "auth flow setup")
         _add_task(actor, 2, "database schema")
 
@@ -723,9 +721,9 @@ class TestForeignRefIds:
 
     def test_a_non_numeric_ref_id_is_skipped_not_raised(self) -> None:
         """Before the shared rule this conversion sat inside a try/except; it must stay safe."""
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "auth flow setup")
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]],
             search_hits=[("not-an-int", 0.9)],
         )
@@ -735,10 +733,10 @@ class TestForeignRefIds:
         assert _extract_ids(result) == {1}
 
     def test_a_good_ref_id_survives_alongside_a_foreign_one(self) -> None:
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "auth flow setup")
         _add_task(actor, 2, "database schema")
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]],
             search_hits=[("not-an-int", 0.95), ("2", 0.9)],
         )
@@ -748,9 +746,9 @@ class TestForeignRefIds:
         assert _extract_ids(result) == {1, 2}
 
     def test_the_skipped_entry_is_logged(self, caplog: pytest.LogCaptureFixture) -> None:
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "auth flow setup")
-        actor._vs_proxy = _make_vs_proxy_mock(
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
             embed_return=[[0.1]],
             search_hits=[("not-an-int", 0.9)],
         )
@@ -764,9 +762,11 @@ class TestForeignRefIds:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         """mode='keyword' skips the leg deliberately; a healthy proxy is wired."""
-        actor = _make_actor(vector_store=True)
+        actor = _make_actor()
         _add_task(actor, 1, "auth flow setup")
-        actor._vs_proxy = _make_vs_proxy_mock(embed_return=[[0.1]], search_hits=[])
+        actor._vs_proxy = actor._embedder = _make_vs_proxy_mock(
+            embed_return=[[0.1]], search_hits=[]
+        )
 
         with caplog.at_level(logging.WARNING):
             result = actor.search_planning(query="auth", mode="keyword")

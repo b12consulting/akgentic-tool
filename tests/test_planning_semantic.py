@@ -19,13 +19,12 @@ from akgentic.tool.planning.planning_actor import (
 from tests.conftest import MockActorAddress
 
 
-def _make_actor(vector_store: bool = False) -> PlanActor:
+def _make_actor() -> PlanActor:
     """Construct a bare PlanActor with no Pykka runtime — calls on_start directly."""
     actor = PlanActor()
     actor.config = PlanConfig(
         name="test-plan",
         role="ToolActor",
-        vector_store=vector_store,
     )
     actor.on_start()
     return actor
@@ -97,7 +96,9 @@ class TestPlanningToolObserverWiring:
     def test_observer_creates_only_plan_actor(self) -> None:
         """observer() no longer creates VectorStoreActor — VectorStoreTool owns that."""
         from akgentic.tool.planning.planning import PlanningTool
+        from akgentic.tool.planning.planning_actor import PlanActor
         from akgentic.tool.vector_store.actor import VectorStoreActor
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
         tool = PlanningTool()
 
@@ -122,15 +123,14 @@ class TestPlanningToolObserverWiring:
 
         tool.observer(mock_observer)
 
-        # Only ONE actor created: PlanActor. VectorStoreTool owns VectorStoreActor.
-        assert len(captured_configs) == 1
-        assert VectorStoreActor not in captured_classes
+        # The default param is in-memory, so the card creates the store itself,
+        # before the PlanActor that will look it up.
+        assert captured_classes == [VectorStoreActor, PlanActor]
 
-        # PlanConfig carries the default vector_store=True
-        plan_config = captured_configs[0]
+        plan_config = captured_configs[1]
         assert isinstance(plan_config, PlanConfig)
-        assert plan_config.vector_store is True
-        # No embedding fields leaked onto PlanConfig (centralised on VectorStoreConfig).
+        assert plan_config.vector_store == VectorStoreParam()
+        # No embedding fields leaked onto PlanConfig (centralised on VectorStoreParam).
         assert "embedding_model" not in PlanConfig.model_fields
 
 
@@ -142,10 +142,10 @@ class TestPlanningToolObserverWiring:
 class TestPlanningToolDependsOn:
     """AC-2: PlanningTool declares depends_on and a vector_store field."""
 
-    def test_depends_on_is_vector_store_tool(self) -> None:
+    def test_depends_on_is_empty(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
 
-        assert PlanningTool().depends_on == ["VectorStoreTool"]
+        assert PlanningTool().depends_on == []
 
     def test_depends_on_not_a_pydantic_field(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
@@ -157,59 +157,68 @@ class TestPlanningToolDependsOn:
 
         assert "depends_on" not in PlanningTool().model_dump()
 
-    def test_vector_store_field_default_true(self) -> None:
+    def test_vector_store_field_accepts_a_param_or_a_bool(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
         tool = PlanningTool()
         assert tool.vector_store is True
         assert "vector_store" in PlanningTool.model_fields
+        assert PlanningTool.model_fields["vector_store"].annotation == VectorStoreParam | bool
+        assert "collection" not in PlanningTool.model_fields
 
     def test_vector_store_appears_in_model_dump(self) -> None:
+        """The default dumps as the bool the author would have written."""
         from akgentic.tool.planning.planning import PlanningTool
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
         dump = PlanningTool().model_dump()
         assert "vector_store" in dump
         assert dump["vector_store"] is True
+        assert isinstance(
+            PlanningTool(vector_store=VectorStoreParam()).model_dump()["vector_store"], dict
+        )
 
-    def test_vector_store_roundtrip_true(self) -> None:
+    def test_the_old_lookup_shape_fails_loudly(self) -> None:
+        """A named-actor string is a validation error; a bool is the opt-out.
+
+        Only the *string* half of the old ``bool | str`` field stays dead: the
+        ``VectorStoreActor`` lookup it addressed no longer exists. The boolean
+        half is the opt-out, and it validates.
+        """
+        from pydantic import ValidationError
+
         from akgentic.tool.planning.planning import PlanningTool
 
-        tool = PlanningTool(vector_store=True)
-        reloaded = PlanningTool.model_validate(tool.model_dump())
-        assert reloaded.vector_store is True
+        with pytest.raises(ValidationError):
+            PlanningTool(vector_store="#VectorStore-RAG")  # type: ignore[arg-type]
 
-    def test_vector_store_roundtrip_false(self) -> None:
+        assert PlanningTool(vector_store=True).vector_store is True
+        assert PlanningTool(vector_store=False).vector_store is False
+
+    def test_vector_store_roundtrip(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        tool = PlanningTool(vector_store=False)
+        tool = PlanningTool(vector_store=VectorStoreParam(tenant="t1"))
         reloaded = PlanningTool.model_validate(tool.model_dump())
-        assert reloaded.vector_store is False
-
-    def test_vector_store_roundtrip_string(self) -> None:
-        from akgentic.tool.planning.planning import PlanningTool
-
-        tool = PlanningTool(vector_store="#VectorStore-RAG")
-        reloaded = PlanningTool.model_validate(tool.model_dump())
-        assert reloaded.vector_store == "#VectorStore-RAG"
+        assert reloaded.vector_store.tenant == "t1"
 
 
 class TestPlanningToolObserverNoVsCreation:
     """AC-5: observer() does not create VectorStoreActor and propagates vector_store."""
 
-    def _run_observer(self, vector_store_value: object) -> list[object]:
-        """Run observer with the given vector_store value and return captured configs."""
+    def _run_observer(self, param: object) -> list[type]:
+        """Run observer with the given param and return the actor classes created."""
         from akgentic.tool.planning.planning import PlanningTool
-        from akgentic.tool.vector_store.actor import VectorStoreActor
 
-        tool = PlanningTool(vector_store=vector_store_value)  # type: ignore[arg-type]
-        captured_configs: list[object] = []
+        tool = PlanningTool(vector_store=param)  # type: ignore[arg-type]
         captured_classes: list[type] = []
 
         mock_proxy = MagicMock()
 
         def capture(actor_cls: type, config: object = None) -> MagicMock:
             captured_classes.append(actor_cls)
-            captured_configs.append(config)
             return MagicMock()
 
         mock_proxy.getChildrenOrCreate.side_effect = capture
@@ -218,28 +227,27 @@ class TestPlanningToolObserverNoVsCreation:
         mock_observer.proxy_ask.return_value = mock_proxy
 
         tool.observer(mock_observer)
+        return captured_classes
 
-        # Never creates VectorStoreActor
-        assert VectorStoreActor not in captured_classes
-        return captured_configs
+    def test_an_in_memory_card_creates_the_store_before_the_plan_actor(self) -> None:
+        from akgentic.tool.planning.planning_actor import PlanActor
+        from akgentic.tool.vector_store.actor import VectorStoreActor
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-    def test_observer_propagates_vector_store_true(self) -> None:
-        configs = self._run_observer(True)
-        assert len(configs) == 1
-        assert isinstance(configs[0], PlanConfig)
-        assert configs[0].vector_store is True
+        created = self._run_observer(VectorStoreParam(backend="inmemory"))
+        assert created == [VectorStoreActor, PlanActor]
 
-    def test_observer_propagates_vector_store_false(self) -> None:
-        configs = self._run_observer(False)
-        assert len(configs) == 1
-        assert isinstance(configs[0], PlanConfig)
-        assert configs[0].vector_store is False
+    def test_a_cluster_card_creates_no_store_actor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from akgentic.tool.planning.planning_actor import PlanActor
+        from akgentic.tool.vector_store.actor import VectorStoreActor
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-    def test_observer_propagates_vector_store_named_string(self) -> None:
-        configs = self._run_observer("#VectorStore-RAG")
-        assert len(configs) == 1
-        assert isinstance(configs[0], PlanConfig)
-        assert configs[0].vector_store == "#VectorStore-RAG"
+        monkeypatch.setenv("AKGENTIC_WEAVIATE_URL", "http://localhost:8080")
+        created = self._run_observer(VectorStoreParam(backend="weaviate"))
+        assert created == [PlanActor]
+        assert VectorStoreActor not in created
 
     def test_observer_raises_when_no_orchestrator(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
@@ -252,72 +260,89 @@ class TestPlanningToolObserverNoVsCreation:
 
 
 # ---------------------------------------------------------------------------
-# Story 10-10 — PlanningTool.collection field + observer propagation
+# Story 10-10 — PlanningTool.vector_store field + observer propagation
 # ---------------------------------------------------------------------------
 
 
 class TestPlanningToolCollectionField:
-    """AC-2: PlanningTool.collection is a CollectionConfig field."""
+    """AC-2: PlanningTool.vector_store accepts a VectorStoreParam or a bool."""
 
-    def test_default_collection_is_default_collection_config(self) -> None:
+    def test_the_default_resolves_to_a_default_param(self) -> None:
+        """The default is ``True``, and ``True`` resolves to ``VectorStoreParam()``.
+
+        The card records the author's declaration; the settings live one step
+        later, in what the normaliser produces from it.
+        """
         from akgentic.tool.planning.planning import PlanningTool
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam, resolve_store_param
 
         tool = PlanningTool()
-        assert isinstance(tool.collection, CollectionConfig)
-        assert tool.collection == CollectionConfig()
-        assert tool.collection.dimension == 1536
-        assert tool.collection.backend == "inmemory"
-        assert tool.collection.tenant is None
+        assert tool.vector_store is True
+
+        param = resolve_store_param(tool.vector_store)
+        assert param == VectorStoreParam()
+        assert param is not None
+        assert param.dimension == 1536
+        assert param.backend == "inmemory"
+        assert param.tenant is None
 
     def test_collection_field_present_in_model_fields(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
 
-        assert "collection" in PlanningTool.model_fields
+        assert "vector_store" in PlanningTool.model_fields
 
     def test_collection_appears_in_model_dump(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
 
         dump = PlanningTool().model_dump()
-        assert "collection" in dump
+        assert "vector_store" in dump
 
     def test_custom_collection_stored_on_instance(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        custom = CollectionConfig(backend="inmemory", tenant="plan-tenant")
-        tool = PlanningTool(collection=custom)
-        assert tool.collection is custom
-        assert tool.collection.backend == "inmemory"
-        assert tool.collection.tenant == "plan-tenant"
+        custom = VectorStoreParam(backend="inmemory", tenant="plan-tenant")
+        tool = PlanningTool(vector_store=custom)
+        assert tool.vector_store is custom
+        assert tool.vector_store.backend == "inmemory"
+        assert tool.vector_store.tenant == "plan-tenant"
 
     def test_collection_roundtrip_default(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam, resolve_store_param
 
         tool = PlanningTool()
         reloaded = PlanningTool.model_validate(tool.model_dump())
-        assert reloaded.collection == CollectionConfig()
+        assert reloaded.vector_store is True
+        assert resolve_store_param(reloaded.vector_store) == VectorStoreParam()
 
     def test_collection_roundtrip_custom(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
         tool = PlanningTool(
-            collection=CollectionConfig(backend="inmemory", tenant="plan-tenant")
+            vector_store=VectorStoreParam(backend="inmemory", tenant="plan-tenant")
         )
         reloaded = PlanningTool.model_validate(tool.model_dump())
-        assert reloaded.collection.backend == "inmemory"
-        assert reloaded.collection.tenant == "plan-tenant"
-        assert reloaded.collection.dimension == 1536  # default preserved
+        assert reloaded.vector_store.backend == "inmemory"
+        assert reloaded.vector_store.tenant == "plan-tenant"
+        assert reloaded.vector_store.dimension == 1536  # default preserved
 
-    def test_independent_tools_do_not_alias_collection(self) -> None:
-        """`default_factory=CollectionConfig` gives each instance a fresh object."""
+    def test_independent_tools_do_not_share_a_mutable_param(self) -> None:
+        """Two default cards can never mutate one another's store settings.
+
+        The default is now the immutable ``True`` rather than a shared object, so
+        the aliasing this spec guards against moved one step later: it is
+        ``resolve_store_param`` that must hand each caller its own param.
+        """
         from akgentic.tool.planning.planning import PlanningTool
+        from akgentic.tool.vector_store.protocol import resolve_store_param
 
         a = PlanningTool()
         b = PlanningTool()
-        assert a.collection is not b.collection
+        assert a.vector_store is True
+        assert b.vector_store is True
+        assert resolve_store_param(a.vector_store) is not resolve_store_param(b.vector_store)
 
 
 class TestPlanningToolObserverCollection:
@@ -328,8 +353,10 @@ class TestPlanningToolObserverCollection:
         mock_proxy = MagicMock()
 
         def capture(actor_cls: type, config: object = None) -> MagicMock:
-            assert isinstance(config, PlanConfig)
-            captured.append(config)
+            # The card creates the store actor first when its backend needs one,
+            # so only the consumer's own config is captured here.
+            if isinstance(config, PlanConfig):
+                captured.append(config)
             return MagicMock()
 
         mock_proxy.getChildrenOrCreate.side_effect = capture
@@ -340,43 +367,41 @@ class TestPlanningToolObserverCollection:
         return captured
 
     def test_observer_propagates_custom_collection_identity(self) -> None:
-        """The exact CollectionConfig object on the ToolCard reaches the config."""
+        """The exact VectorStoreParam object on the ToolCard reaches the config."""
         from akgentic.tool.planning.planning import PlanningTool
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        custom = CollectionConfig(backend="inmemory", tenant="plan-tenant")
-        tool = PlanningTool(collection=custom)
+        custom = VectorStoreParam(backend="inmemory", tenant="plan-tenant")
+        tool = PlanningTool(vector_store=custom)
 
         captured = self._run_observer(tool)
 
         assert len(captured) == 1
-        assert captured[0].collection is custom
-        # 10-9 invariant preserved.
-        assert captured[0].vector_store is True
+        assert captured[0].vector_store is custom
 
     def test_observer_propagates_default_collection_structurally_equal(self) -> None:
-        """AC-11 backward-compat: default tool → config.collection == CollectionConfig()."""
+        """AC-11 backward-compat: default tool → config.vector_store == VectorStoreParam()."""
         from akgentic.tool.planning.planning import PlanningTool
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
         tool = PlanningTool()
 
         captured = self._run_observer(tool)
 
         assert len(captured) == 1
-        assert captured[0].collection == CollectionConfig()
+        assert captured[0].vector_store == VectorStoreParam()
 
     def test_observer_does_not_mutate_tool_collection(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        custom = CollectionConfig(backend="inmemory", tenant="plan-tenant-x")
-        tool = PlanningTool(collection=custom)
-        before_dump = tool.collection.model_dump()
+        custom = VectorStoreParam(backend="inmemory", tenant="plan-tenant-x")
+        tool = PlanningTool(vector_store=custom)
+        before_dump = tool.vector_store.model_dump()
 
         self._run_observer(tool)
 
-        assert tool.collection.model_dump() == before_dump
+        assert tool.vector_store.model_dump() == before_dump
 
 
 # ---------------------------------------------------------------------------
@@ -384,29 +409,26 @@ class TestPlanningToolObserverCollection:
 # ---------------------------------------------------------------------------
 
 
-class TestPlanningToolDependsOnProperty:
-    """AC-4, AC-8: depends_on is a conditional @property, not serialised."""
+class TestPlanningToolDeclaresNoDependency:
+    """The card owns its store, so it names no prerequisite card."""
 
-    def test_default_depends_on_vector_store_tool(self) -> None:
-        """Default (vector_store=True) depends on VectorStoreTool."""
+    def test_depends_on_is_the_base_property(self) -> None:
+        from akgentic.tool.core import ToolCard
         from akgentic.tool.planning.planning import PlanningTool
 
-        assert PlanningTool().depends_on == ["VectorStoreTool"]
+        assert type(PlanningTool).__mro__  # a plain class, not a metaclass trick
+        assert PlanningTool.depends_on is ToolCard.depends_on
+        assert PlanningTool().depends_on == []
 
-    def test_vector_store_true_depends_on_vector_store_tool(self) -> None:
+    def test_depends_on_is_empty_whatever_the_backend(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         from akgentic.tool.planning.planning import PlanningTool
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        assert PlanningTool(vector_store=True).depends_on == ["VectorStoreTool"]
-
-    def test_vector_store_str_depends_on_vector_store_tool(self) -> None:
-        from akgentic.tool.planning.planning import PlanningTool
-
-        assert PlanningTool(vector_store="#VectorStore-RAG").depends_on == ["VectorStoreTool"]
-
-    def test_vector_store_false_no_dependency(self) -> None:
-        from akgentic.tool.planning.planning import PlanningTool
-
-        assert PlanningTool(vector_store=False).depends_on == []
+        monkeypatch.setenv("AKGENTIC_WEAVIATE_URL", "http://localhost:8080")
+        for backend in ("inmemory", "weaviate"):
+            assert PlanningTool(vector_store=VectorStoreParam(backend=backend)).depends_on == []
 
     def test_depends_on_not_in_model_fields(self) -> None:
         """depends_on is a @property, not a Pydantic field."""
@@ -418,26 +440,17 @@ class TestPlanningToolDependsOnProperty:
         """depends_on never appears in serialised output."""
         from akgentic.tool.planning.planning import PlanningTool
 
-        tool_false = PlanningTool(vector_store=False)
-        tool_true = PlanningTool(vector_store=True)
-        assert "depends_on" not in tool_false.model_dump()
-        assert "depends_on" not in tool_true.model_dump()
-        assert "depends_on" not in tool_false.model_dump(mode="json")
-        assert "depends_on" not in tool_true.model_dump(mode="json")
+        tool = PlanningTool()
+        assert "depends_on" not in tool.model_dump()
+        assert "depends_on" not in tool.model_dump(mode="json")
 
-    def test_round_trip_preserves_depends_on_semantics(self) -> None:
-        """Round-trip via model_validate reconstructs conditional depends_on."""
+    def test_round_trip_preserves_the_param_and_the_empty_edge(self) -> None:
         from akgentic.tool.planning.planning import PlanningTool
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        tool = PlanningTool(vector_store=False)
-        dump = tool.model_dump()
-        reconstructed = PlanningTool.model_validate(dump)
+        tool = PlanningTool(vector_store=VectorStoreParam(tenant="plan-tenant"))
+        reconstructed = PlanningTool.model_validate(tool.model_dump())
         assert reconstructed.depends_on == []
-        assert reconstructed.vector_store is False
-
-        tool_true = PlanningTool(vector_store=True)
-        dump_true = tool_true.model_dump()
-        reconstructed_true = PlanningTool.model_validate(dump_true)
-        assert reconstructed_true.depends_on == ["VectorStoreTool"]
+        assert reconstructed.vector_store.tenant == "plan-tenant"
 
 

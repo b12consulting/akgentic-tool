@@ -3,7 +3,7 @@
 A backend is anything satisfying the :class:`VectorStoreService` protocol. The
 registry decouples *which* backend a collection uses from the actor that routes
 to it: the actor never names a backend, it asks the registry for the spec whose
-``name`` a :class:`CollectionConfig` carries and drives everything — construction,
+``name`` a :class:`VectorStoreParam` carries and drives everything — construction,
 state-sync policy, environment readiness — off that spec.
 
 Adding a backend (Qdrant, pgvector, a bespoke store) is therefore a single
@@ -25,6 +25,9 @@ register_backend(
 Subclassing is the second extension route: a backend can subclass an existing
 one (``QdrantBackend``, ``WeaviateBackend``) to override query construction and
 register the subclass under its own name.
+
+The built-in backends live in :mod:`akgentic.tool.vector_store.backends`, one
+module each, and each registers itself on import like any third-party backend.
 """
 
 from __future__ import annotations
@@ -50,9 +53,11 @@ class BackendContext:
     """Everything a backend factory may need to build an instance.
 
     Passed to :attr:`BackendSpec.factory`. Carries the actor's own
-    ``VectorStoreConfig`` (embedding + connection settings) and the owning
-    team's id — propagated by the actor system, never a card field — so a
-    backend can stamp its objects for later team-scoped cleanup.
+    ``VectorStoreConfig`` — its name and role, and no connection setting: a
+    backend reads its deployment from the environment — and the owning team's
+    id, propagated by the actor system and never a card field, so a backend can
+    stamp its objects for later team-scoped cleanup. No built-in factory reads
+    ``config``; it stays as the seam a third-party factory may use.
 
     Attributes:
         config: The ``VectorStoreConfig`` of the owning ``VectorStoreActor``.
@@ -88,7 +93,7 @@ class BackendSpec:
     it names a store the environment has not provisioned.
 
     Attributes:
-        name: Unique backend identifier, matched against ``CollectionConfig.backend``.
+        name: Unique backend identifier, matched against ``VectorStoreParam.backend``.
         factory: Builds a backend instance from a :class:`BackendContext`.
         persists_in_actor_state: ``True`` for backends whose data lives *in* the
             actor (the in-memory index) and must be snapshotted on every
@@ -105,10 +110,6 @@ class BackendSpec:
             the backend is named but not provisioned. Called by consumer cards
             via :func:`akgentic.tool.vector_store.protocol.require_backend_configured`.
             Defaults to a no-op.
-        legacy_actor_accessor: Private compatibility hook used only by built-in
-            backends whose actor accessors predate the registry. Replacing a
-            built-in registration without this hook routes through ``factory``
-            like any other third-party backend.
     """
 
     name: str
@@ -117,7 +118,6 @@ class BackendSpec:
     selectable_as_default: bool = True
     is_configured: Callable[[], bool] = field(default=lambda: True)
     require_configured: Callable[[str], None] = field(default=lambda _card_name: None)
-    legacy_actor_accessor: str | None = field(default=None, repr=False, compare=False)
 
 
 # ---------------------------------------------------------------------------
@@ -155,22 +155,23 @@ def unregister_backend(name: str) -> None:
 
 
 def _ensure_builtins() -> None:
-    """Import the built-in backend modules so they self-register.
+    """Import the built-in backend modules of ``akgentic.tool.vector_store.backends``.
 
-    Idempotent and lazy: importing the backend modules here — rather than at
-    registry import time — keeps the registry free of any dependency on the
-    backends and avoids an import cycle (backends import ``protocol``, which
-    imports this module).
+    Each module registers itself on import. Idempotent and lazy: importing them here, not at
+    registry import time, keeps the registry free of any dependency on the backends and avoids
+    an import cycle (backends import ``protocol``, which imports this module). The Qdrant
+    import is tolerated, but that isolates nothing today: the package root imports all three
+    unguarded, so a Qdrant module that fails to import fails the package import.
     """
     global _BUILTINS_LOADED
     if _BUILTINS_LOADED:
         return
     _BUILTINS_LOADED = True  # set first so a factory-triggered re-entry is a no-op
-    from akgentic.tool.vector_store import inmemory as _inmemory  # noqa: F401
-    from akgentic.tool.vector_store import weaviate as _weaviate  # noqa: F401
+    from akgentic.tool.vector_store.backends import inmemory as _inmemory  # noqa: F401
+    from akgentic.tool.vector_store.backends import weaviate as _weaviate  # noqa: F401
 
     try:
-        from akgentic.tool.vector_store import qdrant as _qdrant  # noqa: F401
+        from akgentic.tool.vector_store.backends import qdrant as _qdrant  # noqa: F401
     except Exception as exc:  # noqa: BLE001 — a broken optional backend must not break the rest
         logger.debug("Qdrant backend module unavailable: %s", exc)
 
@@ -179,7 +180,7 @@ def get_backend_spec(name: str) -> BackendSpec:
     """Return the :class:`BackendSpec` registered under *name*.
 
     Args:
-        name: Backend identifier (a ``CollectionConfig.backend`` value).
+        name: Backend identifier (a ``VectorStoreParam.backend`` value).
 
     Returns:
         The registered spec.

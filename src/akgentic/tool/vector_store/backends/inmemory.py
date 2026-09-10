@@ -11,12 +11,13 @@ import logging
 from typing import Any
 
 from akgentic.tool.vector_store.protocol import (
-    CollectionConfig,
     CollectionStatus,
     SearchHit,
     SearchResult,
     VectorQuery,
+    VectorStoreParam,
     check_path_prefix,
+    check_shared_scope,
 )
 from akgentic.tool.vector_store.registry import BackendContext, BackendSpec, register_backend
 from akgentic.tool.vector_store.vector import (
@@ -66,13 +67,13 @@ class InMemoryBackend:
     def __init__(self) -> None:
         _check_vector_search_dependencies()
         self._collections: dict[str, VectorIndex] = {}
-        self._configs: dict[str, CollectionConfig] = {}
+        self._configs: dict[str, VectorStoreParam] = {}
 
     # ------------------------------------------------------------------
     # VectorStoreService protocol methods
     # ------------------------------------------------------------------
 
-    def create_collection(self, name: str, config: CollectionConfig) -> None:
+    def create_collection(self, name: str, config: VectorStoreParam) -> None:
         """Create a named collection. No-op if the collection already exists.
 
         Args:
@@ -121,10 +122,12 @@ class InMemoryBackend:
             path_prefix: Restrict removal to entries whose ``path`` starts with this.
 
         Raises:
-            ValueError: If the collection does not exist, or if ``path_prefix``
-                contains ``*`` or ``?``.
+            ValueError: If the collection does not exist, if ``path_prefix``
+                contains ``*`` or ``?``, or if the collection is shared across
+                teams and no ``scope`` was given.
         """
         check_path_prefix(path_prefix)
+        check_shared_scope(collection, scope)
         index = self._get_index(collection)
         if scope is None and path_prefix is None:
             index.remove(set(ref_ids))
@@ -164,14 +167,19 @@ class InMemoryBackend:
             query: Optional filters / score threshold.
 
         Returns:
-            Search results with hits ranked by cosine similarity, collection
-            status ``READY``, and ``indexing_pending=0``.
+            Search results with hits ranked by cosine similarity and collection
+            status ``READY``.
 
         Raises:
-            ValueError: If the collection does not exist, or if ``path_prefix``
-                contains ``*`` or ``?``.
+            ValueError: If the collection does not exist, if ``path_prefix``
+                contains ``*`` or ``?``, or if the collection is shared across
+                teams and no ``scope`` was given. This backend has no team
+                predicate to lose, but one team may hold two ``WorkspaceTool``
+                cards on two trees, so an unscoped query crosses a boundary here
+                too.
         """
         check_path_prefix(path_prefix)
+        check_shared_scope(collection, scope)
         index = self._get_index(collection)
         scoped = scope is not None or path_prefix is not None
         refined = query is not None and (bool(query.filters) or query.score_threshold is not None)
@@ -182,11 +190,7 @@ class InMemoryBackend:
             hits = self._filtered_search(
                 index, query_vector, top_k, query, scope=scope, path_prefix=path_prefix
             )
-        return SearchResult(
-            hits=hits,
-            status=CollectionStatus.READY,
-            indexing_pending=0,
-        )
+        return SearchResult(hits=hits, status=CollectionStatus.READY)
 
     # ------------------------------------------------------------------
     # actor_state snapshot
@@ -222,7 +226,7 @@ class InMemoryBackend:
         self._configs.clear()
         collections = state.get("collections", {})
         for name, col_data in collections.items():
-            config = CollectionConfig.model_validate(col_data["config"])
+            config = VectorStoreParam.model_validate(col_data["config"])
             self._configs[name] = config
             index = VectorIndex()
             for entry_data in col_data["entries"]:
@@ -375,7 +379,6 @@ register_backend(
         factory=_make_inmemory_backend,
         persists_in_actor_state=True,
         selectable_as_default=False,
-        legacy_actor_accessor="_get_or_create_backend",
     ),
     replace=True,
 )
