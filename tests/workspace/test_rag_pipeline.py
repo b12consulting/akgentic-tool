@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from akgentic.core import ActorDeadError
 from akgentic.core.agent_state import BaseState
 from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE, VectorStoreActor
 from akgentic.tool.vector_store.embedding_actor import (
@@ -507,18 +508,31 @@ class TestEnableRag:
             "Retrieval indexing is not available for this workspace."
         )
 
+    @pytest.mark.parametrize(
+        "outage",
+        [
+            RuntimeError("can't start new thread"),
+            ActorDeadError("the store child is not alive"),
+        ],
+        ids=["no-thread", "dead-child"],
+    )
     def test_a_store_child_that_cannot_be_spawned_degrades_rather_than_raising(
-        self, harness: RagHarness, workspace_tree: Path, caplog: pytest.LogCaptureFixture
+        self,
+        harness: RagHarness,
+        workspace_tree: Path,
+        caplog: pytest.LogCaptureFixture,
+        outage: Exception,
     ) -> None:
         """``PlanActor`` raises for a store it cannot reach; this actor owns the write gate.
 
         The premise used to be "the team's ``#VectorStore`` was not found"; now
-        that the store is this actor's own child, the reachable failure is a
-        ``createActor`` that raises — no actor system, no thread — and it must
-        degrade the same way: one WARNING naming the workspace, no proxy, and the
-        sentence from ``workspace_rag_index``.
+        that the store is this actor's own child, the reachable failures are the
+        two a spawn raises when the environment refuses it — no thread to start,
+        a child dead before its proxy is built — and each must degrade the same
+        way: one WARNING naming the workspace and the cause, no traceback, no
+        proxy, and the sentence from ``workspace_rag_index``.
         """
-        harness.store_spawn_error = RuntimeError("no actor system")
+        harness.store_spawn_error = outage
 
         with caplog.at_level(logging.WARNING, logger=_DOCUMENTS_LOGGER):
             harness.enable()  # must not raise
@@ -530,8 +544,56 @@ class TestEnableRag:
             if record.levelno == logging.WARNING and record.name == _DOCUMENTS_LOGGER
         ]
         assert len(warnings) == 1
-        assert WORKSPACE_PATH in warnings[0].getMessage()
-        assert "no actor system" in warnings[0].getMessage()
+        message = warnings[0].getMessage()
+        assert WORKSPACE_PATH in message
+        assert "could not create the in-memory vector store child" in message
+        assert str(outage) in message
+        assert warnings[0].exc_info is None
+        assert harness.actor.index_paths("") == _UNAVAILABLE
+
+    @pytest.mark.parametrize(
+        "defect",
+        [
+            TypeError("createActor() got an unexpected keyword argument 'config'"),
+            AttributeError("'VectorStoreConfig' object has no attribute 'name'"),
+        ],
+        ids=["type-error", "attribute-error"],
+    )
+    def test_a_defect_in_the_store_childs_spawn_is_not_reported_as_an_outage(
+        self,
+        harness: RagHarness,
+        workspace_tree: Path,
+        caplog: pytest.LogCaptureFixture,
+        defect: Exception,
+    ) -> None:
+        """A bug is not the environment: it propagates, and reaches the log with its traceback.
+
+        The other half of the spec above. An ``except Exception`` around the spawn
+        would turn this into the outage line — one sentence, the cause's message
+        and nothing else — and a configuration error would read, in production,
+        exactly like a host that ran out of threads. ``enable_rag`` still keeps
+        retrieval off, because this actor owns the write gate; what changes is
+        that the defect arrives with its type and its stack.
+        """
+        harness.store_spawn_error = defect
+
+        with pytest.raises(type(defect)):
+            harness.actor._resolve_store(VectorStoreParam(backend="inmemory"))
+
+        with caplog.at_level(logging.WARNING, logger=_DOCUMENTS_LOGGER):
+            harness.enable()  # enable_rag keeps its own contract: it never raises
+
+        assert harness.actor._vs_proxy is None
+        warnings = [
+            record
+            for record in caplog.records
+            if record.levelno == logging.WARNING and record.name == _DOCUMENTS_LOGGER
+        ]
+        assert len(warnings) == 1
+        assert "could not enable retrieval" in warnings[0].getMessage()
+        assert "could not create the in-memory vector store child" not in caplog.text
+        assert warnings[0].exc_info is not None
+        assert warnings[0].exc_info[1] is defect
         assert harness.actor.index_paths("") == _UNAVAILABLE
 
     def test_a_failing_create_collection_degrades_rather_than_raising(

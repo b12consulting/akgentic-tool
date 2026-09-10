@@ -5,7 +5,9 @@ A hosted actor has no orchestrator: ``ResourceHost`` starts it with
 raises the moment hosting lands. So the invariant for the whole ``workspace/actor/``
 package is **no read of the orchestrator on ``self``** — not ``self.orchestrator``,
 not ``self._orchestrator``, not the ``orchestrator_proxy_ask`` the base builds
-when one exists. The canary here walks every module of the package with ``ast``.
+when one exists — **and no call to a base-class helper that asks it on this
+actor's behalf**, such as ``self.get_team_member``. The canary here walks every
+module of the package with ``ast``.
 
 **An AST walk, and deliberately not a text search.** ``documents.py`` names
 ``orchestrator`` in a comment and in docstrings, and a hosted actor may keep
@@ -49,7 +51,7 @@ from tests.workspace.conftest import (
 _ACTOR_PACKAGE_DIR = Path(actor_package.__file__).parent
 """Where the package's modules live on disk, taken from the import and not typed."""
 
-_FORBIDDEN_READS: frozenset[str] = frozenset(
+_ORCHESTRATOR_SLOTS: frozenset[str] = frozenset(
     {"orchestrator", "_orchestrator", "orchestrator_proxy_ask"}
 )
 """The three attributes a read of which reaches the orchestrator.
@@ -58,6 +60,29 @@ _FORBIDDEN_READS: frozenset[str] = frozenset(
 ``orchestrator_proxy_ask`` the ask proxy ``Akgent.__init__`` builds over it when
 one was handed in. A hosted actor has none of the three to offer.
 """
+
+_ORCHESTRATOR_ASK_HELPERS: frozenset[str] = frozenset(
+    {
+        "get_team",
+        "get_team_member",
+        "discover_catalog",
+        "get_agent_card",
+        "find_agents_with_skill",
+        "get_available_roles",
+    }
+)
+"""The ``Akgent`` methods that ask the orchestrator **on the caller's behalf**.
+
+Each one reads ``orchestrator_proxy_ask`` inside core, so a module here calling
+``self.get_team_member(VS_ACTOR_NAME)`` makes exactly the ask this story removed
+while reading none of the three slots above. A canary that only knew the slots
+would pass that line. ``createActor`` and ``send`` read the slot too, but only to
+hand it to a child or to emit telemetry, and neither asks the orchestrator
+anything — which is why they are not here.
+"""
+
+_FORBIDDEN_ON_SELF: frozenset[str] = _ORCHESTRATOR_SLOTS | _ORCHESTRATOR_ASK_HELPERS
+"""Every attribute on ``self`` the actor package may not touch."""
 
 _MINIMUM_MODULES = 5
 """``__init__``, ``documents``, ``execution``, ``gate``, ``observation`` — the package
@@ -88,7 +113,7 @@ def _orchestrator_reads(path: Path) -> list[str]:
         f"{path.name}:{node.lineno}"
         for node in ast.walk(tree)
         if isinstance(node, ast.Attribute)
-        and node.attr in _FORBIDDEN_READS
+        and node.attr in _FORBIDDEN_ON_SELF
         and isinstance(node.value, ast.Name)
         and node.value.id == "self"
     ]
@@ -117,10 +142,23 @@ class TestTheActorNeverReadsItsOrchestrator:
             "    def f(self):\n"
             "        # self.orchestrator in a comment is not a read\n"
             "        '''self.orchestrator in a docstring is not one either'''\n"
-            "        return self.orchestrator\n",
+            "        return self.orchestrator\n"
+            "    def g(self):\n"
+            "        return self.get_team_member('#VectorStore')\n",
             encoding="utf-8",
         )
-        assert _orchestrator_reads(reading) == ["reading.py:5"]
+        assert _orchestrator_reads(reading) == ["reading.py:5", "reading.py:7"]
+
+    def test_every_ask_helper_it_refuses_still_exists_on_akgent(self) -> None:
+        """A helper renamed in core would leave its old name here refusing nothing.
+
+        So the list is checked against the class it describes, and a rename turns
+        this red rather than turning the canary quietly blind to the new name.
+        """
+        from akgentic.core.agent import Akgent
+
+        missing = sorted(name for name in _ORCHESTRATOR_ASK_HELPERS if not hasattr(Akgent, name))
+        assert missing == [], f"no longer on Akgent: {missing}"
 
 
 class TestAWorkspaceWithNoOrchestratorOwnsItsStore:
@@ -180,4 +218,39 @@ class TestAWorkspaceWithNoOrchestratorOwnsItsStore:
             "the store child outlived its workspace"
         )
         assert not store_ref.is_alive()
+        assert pykka.ActorRegistry.get_by_class(VectorStoreActor) == []
+
+    def test_the_inert_teardown_stops_the_store_child_too(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """The inert half of ``stop_all``: an actor with no thread still stops its child.
+
+        An inert ``WorkspaceActor`` runs ``enable_rag`` on the test's own thread,
+        and its real ``createActor`` starts a real store thread. ``stop_all`` has
+        to reach that child through the parent's ``stop_children``, as
+        ``Akgent.stop`` does; ``on_stop`` alone leaves it running. Nothing else in
+        the suite goes red when that half is missing: a later file's registry-wide
+        ``ActorRegistry.stop_all()`` reaps the orphan, and the only symptom left is
+        an interpreter that will not exit when a retrieval file runs alone.
+        """
+        pytest.importorskip("numpy", reason="the [vector_search] extra is not installed")
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
+
+        assert pykka.ActorRegistry.get_by_class(VectorStoreActor) == []
+        observer = FakeActorToolObserver(orchestrator_proxy, name="alice")
+        card = WorkspaceTool(
+            workspace_id=WORKSPACE_NAME,
+            workspace_rag_index=True,
+            vector_store=VectorStoreParam(backend="inmemory"),
+        )
+        card.observer(observer)
+
+        [store_ref] = pykka.ActorRegistry.get_by_class(VectorStoreActor)
+        assert store_ref.proxy().config.get().name == f"{VS_ACTOR_NAME}-{WORKSPACE_PATH}"
+
+        orchestrator_proxy.stop_all()
+
+        assert store_ref.actor_stopped.wait(timeout=HANDSHAKE_TIMEOUT_S), (
+            "the store child outlived its inert workspace"
+        )
         assert pykka.ActorRegistry.get_by_class(VectorStoreActor) == []

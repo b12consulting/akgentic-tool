@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 from uuid import uuid4
 
+from akgentic.core import ActorDeadError
 from akgentic.core.agent_config import BaseConfig
 from akgentic.tool.vector_store.protocol import (
     PATH_PREFIX_REJECTED,
@@ -127,6 +128,21 @@ take the gate down with it.
 
 _CHUNK_REF_TYPE = "workspace_chunk"
 """``VectorEntry.ref_type`` for every chunk this package stores."""
+
+_STORE_UNREACHABLE: tuple[type[Exception], ...] = (RuntimeError, ActorDeadError)
+"""What the in-memory store child's spawn raises when the environment refuses it.
+
+Exactly two, read off what ``Akgent.createActor`` and ``proxy_ask`` can raise on
+this path. ``RuntimeError`` is ``threading.Thread.start`` finding no thread to
+start — ``createActor`` runs the child's constructor on this thread and then
+starts its loop. ``ActorDeadError`` is a child gone before its proxy could be
+built, which pykka checks eagerly, or this actor's orchestrator dying under the
+child's constructor, which builds a proxy over it and tells it a
+``StartMessage`` (never, once the workspace is hosted). Both are outages retrieval
+degrades through. A ``ValidationError`` from the config, a ``TypeError`` from a
+changed signature, an ``AttributeError`` in the store's constructor are defects,
+and :meth:`DocumentsMixin._resolve_store` lets them propagate.
+"""
 
 _NO_HITS = (
     "Nothing in the retrieval index matched that query. "
@@ -374,10 +390,13 @@ class DocumentsMixin(_DocumentsBase):
         it is what the query leg embeds through, and every worker this actor spawns
         is handed the same param's model and provider.
 
-        **Any failure drops to degraded mode — never raises.** A child that could
-        not be spawned, a factory that cannot reach its cluster, a
+        **Every outage drops to degraded mode.** A child the environment refused
+        to spawn, a factory that cannot reach its cluster, a
         ``create_collection`` that fails: each logs one WARNING and leaves
-        ``_vs_proxy`` ``None``, so ``workspace_rag_index`` answers a sentence. The
+        ``_vs_proxy`` ``None``, so ``workspace_rag_index`` answers a sentence. A
+        defect in the child's spawn is not an outage and propagates to
+        :meth:`enable_rag`, which keeps retrieval off and logs it with its
+        traceback — see :meth:`_resolve_store`. The
         order on the actor-state branch is spawn, re-mark, ``create_collection``,
         embedder, bind — so a child whose ``create_collection`` then fails has
         already been spawned and is **left alive and orphaned** until this actor
@@ -438,17 +457,26 @@ class DocumentsMixin(_DocumentsBase):
         A cluster backend still gets an object and no actor: the data lives on
         the cluster and there is nothing for an actor to hold.
 
-        A spawn that raises is the WARNING-and-degrade case, where the planning
-        and knowledge-graph actors raise a ``RuntimeError`` for a store they
-        cannot reach. This actor owns the write gate for a whole workspace, and
+        **A spawn the environment refused is the WARNING-and-degrade case** —
+        :data:`_STORE_UNREACHABLE`, and nothing wider — where the planning and
+        knowledge-graph actors raise a ``RuntimeError`` for a store they cannot
+        reach. This actor owns the write gate for a whole workspace, and
         retrieval is one capability on a card whose other twenty are file
-        operations.
+        operations. **Anything else propagates**: a config that does not
+        validate, a signature that changed, a bug in the store's constructor.
+        :meth:`enable_rag` still keeps retrieval off rather than failing the
+        actor, but it logs the defect with its traceback instead of this
+        method's one line naming a cause that is not the real one.
 
         Args:
             param: The collection configuration the card announced.
 
         Returns:
             The child's proxy, a freshly built backend, or ``None``.
+
+        Raises:
+            Exception: Anything ``createActor`` or ``proxy_ask`` raises that is not
+                in :data:`_STORE_UNREACHABLE` — a defect, not an outage.
         """
         from akgentic.tool.vector_store.actor import (  # noqa: PLC0415 — optional extra
             VS_ACTOR_NAME,
@@ -461,16 +489,14 @@ class DocumentsMixin(_DocumentsBase):
         )
 
         if needs_store_actor(param):
+            config = VectorStoreConfig(
+                name=f"{VS_ACTOR_NAME}-{self.config.workspace_path}",
+                role=VS_ACTOR_ROLE,
+            )
             try:
-                address = self.createActor(
-                    VectorStoreActor,
-                    config=VectorStoreConfig(
-                        name=f"{VS_ACTOR_NAME}-{self.config.workspace_path}",
-                        role=VS_ACTOR_ROLE,
-                    ),
-                )
+                address = self.createActor(VectorStoreActor, config=config)
                 return self.proxy_ask(address, VectorStoreActor)
-            except Exception as exc:
+            except _STORE_UNREACHABLE as exc:
                 logger.warning(
                     "Workspace %s: could not create the in-memory vector store child: %s "
                     "— degraded mode",
