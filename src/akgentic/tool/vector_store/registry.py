@@ -59,6 +59,12 @@ class BackendContext:
     stamp its objects for later team-scoped cleanup. No built-in factory reads
     ``config``; it stays as the seam a third-party factory may use.
 
+    ``team_id`` is ``None`` for a consumer with no team of its own — the hosted
+    workspace, one actor per tree shared by every team on it, whose rows live on
+    a shared collection bounded by ``scope`` — as well as for an administrative
+    backend. A cluster backend built with none stamps ``""`` and can still query
+    a shared collection, never a team-scoped one.
+
     Attributes:
         config: The ``VectorStoreConfig`` of the owning ``VectorStoreActor``.
         team_id: Owning team id as a string, or ``None`` when unattributed.

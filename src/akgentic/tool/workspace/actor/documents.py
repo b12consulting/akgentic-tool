@@ -1,36 +1,47 @@
-"""The extraction cache, the retrieval index, and every notify this package makes.
+"""The extraction cache, the retrieval index, and every delta this package sends.
 
-**Before story 45-7 ``notify_state_change()`` was called in exactly one place in
-the whole ``workspace/`` package, and it was :meth:`DocumentsMixin.cache_document`.**
-Every other tool actor calls it freely; this one did not call it at all before
-this module existed, which is how epic 29 kept the event-store write off the read
-path (ADR-036 §NFR1). ADR-045 §4 is the decision that adds more: the retrieval
-index is persisted state that has to survive a resume, so the transitions that
-move it notify. The call sites are now, and only:
+**The actor's persisted state is ``documents`` and ``rag_index``, and it is
+persisted by delta.** A hosted workspace has no orchestrator, so the whole-state
+``notify_state_change()`` it used to call reaches nobody. What replaces it is a
+member-keyed :class:`~akgentic.core.resource_host.StateDelta` told to the
+process's ``WorkspaceHost`` — ``notify_delta(config.name, delta)`` — whose store
+writes it: ``set`` for a member that is present, ``unset`` for one that was
+removed, keyed ``documents.<path>`` / ``rag_index.<path>`` and never the bare
+mapping (ADR-022 Decision 6).
 
-- :meth:`DocumentsMixin.cache_document` — a cache **fill**, amortised against the
+**Every write goes through one of three places, and the ``ast`` canary in the
+suite pins them.** :meth:`DocumentsMixin._put_row` is the only writer of
+``rag_index``; :meth:`DocumentsMixin.cache_document` is the only writer of
+``documents``; :meth:`DocumentsMixin.document_extract` moves a hit to the end of
+the LRU, which is deliberately not a change. The first two mark the path dirty,
+and :meth:`DocumentsMixin._persist` turns the dirty paths into **one** delta —
+set-or-unset read off the map itself — and sends nothing when nothing is dirty.
+
+The persist points — the handlers that end a unit of work — are, and only:
+
+- :meth:`DocumentsMixin.cache_document` — a cache **fill**, one delta carrying the
+  entry it inserted and every entry the caps touched, amortised against the
   seconds of extraction that preceded it.
-- :meth:`DocumentsMixin.index_paths` — a queueing pass that actually queued
-  something, or a drain that actually spawned.
-- :meth:`DocumentsMixin.receiveMsg_NewFileMessage` — the same, for an upload. It
-  is the *queueing* that notifies, so a notification that named no usable path
-  costs nothing.
+- :meth:`DocumentsMixin.index_paths` and :meth:`DocumentsMixin.receiveMsg_NewFileMessage`
+  — a queueing pass, including a row a failed spawn inside ``_drain`` just failed.
 - :meth:`DocumentsMixin.receiveMsg_IndexResult` / :meth:`DocumentsMixin.receiveMsg_IndexFailure`
-  — one per file, at its transition.
+  — one per file, at its transition, and one for a report whose row had moved
+  on while ``_drain`` spawned the next file.
 - :meth:`DocumentsMixin.receiveMsg_EmbeddingResult` — **only** at the file's
   final transition, or at the turn a write could not land. A batch that lands
-  without settling the file mutates ``batches_landed`` in memory and notifies
-  nothing, so a 1,900-chunk document costs one event rather than thirty.
+  without settling the file writes ``batches_landed`` through ``_put_row`` and
+  persists nothing on its own turn; the dirty row rides on the next delta, so a
+  1,900-chunk document costs one delta rather than thirty.
 - :meth:`DocumentsMixin.receiveMsg_EmbeddingError` — one per file, at its
   transition to ``FAILED``.
-- :meth:`DocumentsMixin.mark_paths_stale` — only when it actually changed a
-  status, so a tree that has never been indexed pays nothing on the mutation path.
-- :meth:`DocumentsMixin.reap_stale_embedding` — only when it actually reverted a
-  row.
+- :meth:`DocumentsMixin.mark_paths_stale` — so a tree that has never been indexed
+  marks nothing and sends nothing on the mutation path.
+- ``_acquire_vs_proxy`` — the in-memory re-mark of ``EMBEDDED`` rows — and
+  ``WorkspaceActor.init_state`` — the restore re-queue of every in-flight row.
 
-**The rule that survives, unchanged and load-bearing: no notify on a text read,
+**The rule that survives, unchanged and load-bearing: no delta on a text read,
 and none on a document-cache hit.** Reads are the majority of workspace traffic.
-A new notify on a *read* path — of any kind, in any of these methods — is a
+A new delta on a *read* path — of any kind, in any of these methods — is a
 defect until a decision says otherwise.
 
 Everything on the ask path here is O(1)/O(n) dict work on the actor thread, plus
@@ -57,8 +68,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 from uuid import uuid4
 
+from pydantic import JsonValue, TypeAdapter
+
 from akgentic.core import ActorDeadError
 from akgentic.core.agent_config import BaseConfig
+from akgentic.core.resource_host import StateDelta
 from akgentic.tool.vector_store.protocol import (
     PATH_PREFIX_REJECTED,
     PATH_PREFIX_WILDCARDS,
@@ -77,6 +91,7 @@ from akgentic.tool.workspace.documents.models import (
     RagStatus,
     evict_document_bodies,
 )
+from akgentic.tool.workspace.host import WorkspaceHost, workspace_host_address
 from akgentic.tool.workspace.models import WorkspaceConfig, WorkspaceState, content_sha
 from akgentic.tool.workspace.readers import _MIME_MAP, TEXT_EXTENSIONS, DocumentReader
 from akgentic.tool.workspace.workspace import Filesystem
@@ -128,6 +143,18 @@ take the gate down with it.
 
 _CHUNK_REF_TYPE = "workspace_chunk"
 """``VectorEntry.ref_type`` for every chunk this package stores."""
+
+_JSON_MEMBERS: TypeAdapter[dict[str, JsonValue]] = TypeAdapter(dict[str, JsonValue])
+"""Validates a delta's ``set`` half as JSON, without rehydrating it.
+
+``StateDelta`` is a ``SerializableBaseModel``, and that base's before-validator
+turns every ``__model__``-tagged dict back into the model it names — so a delta
+built the ordinary way cannot carry a member's dump: its ``DocumentExtract`` /
+``RagFile`` comes back as an instance and ``JsonValue`` rejects it. The tag is
+the point of the value (it is what lets a restore rebuild the member's own
+class), so :meth:`DocumentsMixin._persist` validates the values here and builds
+the delta with ``model_construct``, which skips only that rehydration.
+"""
 
 _STORE_UNREACHABLE: tuple[type[Exception], ...] = (RuntimeError, ActorDeadError)
 """What the in-memory store child's spawn raises when the environment refuses it.
@@ -199,6 +226,8 @@ class DocumentsMixin(_DocumentsBase):
     _vs_proxy: VectorStoreService | None
     _embedder: EmbeddingProvider | None
     _index_active: set[str]
+    _dirty_rows: set[str]
+    _dirty_documents: set[str]
 
     ##
     ## The extraction cache — lookup (ask) and fill (tell)
@@ -212,10 +241,12 @@ class DocumentsMixin(_DocumentsBase):
         re-extracts, which is correct in every one of them.
 
         On a hit the entry moves to the end of the LRU. **That reorder is an
-        in-memory mutation with no notify**, deliberately: this is the read
-        path. Persisted recency therefore lags live recency until the next fill,
-        which costs at most one extra re-extraction after a resume and is not to
-        be "fixed" into a notify.
+        in-memory mutation with no delta**, deliberately: this is the read path,
+        and the one write of ``documents`` that does not mark its path dirty.
+        Persisted recency therefore lags live recency — the store keeps a
+        re-filled key where it first landed, and ``init_state`` re-sorts a
+        restore by ``extracted_at`` — which costs at most one extra
+        re-extraction after a restore and is not to be "fixed" into a delta.
 
         Args:
             path: Workspace-relative path of the source file.
@@ -233,7 +264,7 @@ class DocumentsMixin(_DocumentsBase):
             or entry.markdown is None
         ):
             return None
-        # LRU: most recently used moves to the end. In-memory only — no notify
+        # LRU: most recently used moves to the end. In-memory only — no delta
         # on a hit, because a hit is what a read does.
         self.state.documents[path] = self.state.documents.pop(path)
         return entry.markdown
@@ -241,12 +272,15 @@ class DocumentsMixin(_DocumentsBase):
     def cache_document(
         self, path: str, source_sha: str, extractor_version: int, markdown: str
     ) -> None:
-        """Cache *markdown* as the extraction of *path*, evict, and notify once.
+        """Cache *markdown* as the extraction of *path*, evict, and persist once.
 
-        The notify follows the insert **and** the eviction, so one fill is one
-        event however many entries it displaced — never twice, never once per
-        evicted entry. It is amortised against the seconds of extraction that
-        preceded it.
+        The delta follows the insert **and** the eviction, so one fill is one
+        delta however many entries it displaced — never twice, never once per
+        evicted entry. It carries ``set`` for the new entry and for every entry
+        whose body the char cap dropped, and ``unset`` for every entry the row
+        cap removed: :meth:`_persist` reads which is which off the map, because
+        ``evict_document_bodies``' flat return cannot say. It is amortised
+        against the seconds of extraction that preceded it.
 
         ``char_count`` is computed here rather than taken as a parameter, so it
         cannot disagree with the body it describes. Re-filling a known path
@@ -276,6 +310,8 @@ class DocumentsMixin(_DocumentsBase):
             max_documents=self.config.max_documents,
             max_document_chars=self.config.max_document_chars,
         )
+        self._dirty_documents.add(path)
+        self._dirty_documents.update(evicted)
         if evicted:
             # One line per fill, never one per path, and DEBUG rather than INFO:
             # on a workspace sitting at either cap this fires on every fill, and
@@ -295,7 +331,96 @@ class DocumentsMixin(_DocumentsBase):
                 path,
                 evicted,
             )
-        self.state.notify_state_change()
+        self._persist()
+
+    ##
+    ## Persistence — the one row writer, and the one delta per persist point
+    ##
+    def _put_row(self, path: str, row: RagFile) -> None:
+        """Write *row* as ``rag_index[path]`` and mark the path dirty.
+
+        **The only writer of ``state.rag_index``**, which is what makes the
+        persistence inventory structural rather than remembered: a write that
+        bypasses this is a write no delta carries, and the suite's ``ast``
+        canary refuses one.
+
+        Args:
+            path: Workspace-relative path the row describes.
+            row: The row, already derived by ``model_copy(update=...)`` or built
+                fresh — never rebuilt by naming fields.
+        """
+        self.state.rag_index[path] = row
+        self._dirty_rows.add(path)
+
+    def _persist(self) -> None:
+        """Send one delta for every dirty path, or nothing when nothing is dirty.
+
+        Each dirty path is ``set`` to its member's ``model_dump()`` when the map
+        still holds it and ``unset`` when it does not, under the key
+        ``documents.<path>`` or ``rag_index.<path>`` — one member at a time,
+        never the bare mapping, and the first dot separates the field from the
+        key. The value is core's serialiser output: a fresh, JSON-safe dict
+        carrying every field of the member and its ``__model__`` tag, so a field
+        added tomorrow and a subclass both survive the store (Golden Rule 12).
+        A dict built by naming fields is that rule's defect.
+
+        Both dirty sets are cleared before the send, so a delta is never sent
+        twice. Called unconditionally at every persist point: a persist with
+        nothing dirty sends nothing, which is what lets a handler never guess
+        whether a helper it called wrote something.
+        """
+        # Two loops rather than one over the two maps: binding a map to a local
+        # would put it out of reach of the suite's write-site canary.
+        present: dict[str, JsonValue] = {}
+        removed: list[str] = []
+        for path in sorted(self._dirty_documents):
+            document = self.state.documents.get(path)
+            if document is None:
+                removed.append(f"documents.{path}")
+            else:
+                present[f"documents.{path}"] = document.model_dump()
+        for path in sorted(self._dirty_rows):
+            row = self.state.rag_index.get(path)
+            if row is None:
+                removed.append(f"rag_index.{path}")
+            else:
+                present[f"rag_index.{path}"] = row.model_dump()
+        self._dirty_documents.clear()
+        self._dirty_rows.clear()
+        if present or removed:
+            # Not ``StateDelta(set=...)``: its before-validator would rehydrate
+            # the tagged dumps into models. See ``_JSON_MEMBERS``.
+            delta = StateDelta.model_construct(
+                set=_JSON_MEMBERS.validate_python(present), unset=removed
+            )
+            self._send_delta(self.config.name, delta)
+
+    def _send_delta(self, scope: str, delta: StateDelta) -> None:
+        """Tell *delta* to the process's ``WorkspaceHost`` under *scope*, or do nothing.
+
+        A **tell**, never an ask: an actor must not block its own thread on
+        another actor's reply, and ``notify_delta`` answers nothing. The host is
+        looked up at each send and never held. No host — a test harness, or
+        process exit — is this actor's no-op; a host with no store is core's.
+
+        A host that stopped between the lookup and the tell is one DEBUG line:
+        the delta has nowhere to go, and this actor owns the write gate. Anything
+        else propagates — a delta that does not validate is a defect.
+
+        Args:
+            scope: The host's registry key for this actor — ``config.name``.
+            delta: The members to set and the member keys to remove.
+        """
+        host = workspace_host_address()
+        if host is None:
+            return
+        try:
+            self.proxy_tell(host, WorkspaceHost).notify_delta(scope, delta)
+        except ActorDeadError:
+            logger.debug(
+                "Workspace %s: the host stopped before a delta could reach it",
+                self.config.workspace_path,
+            )
 
     ##
     ## Retrieval — enabling it, and the collection that is created lazily
@@ -421,8 +546,9 @@ class DocumentsMixin(_DocumentsBase):
         store = self._resolve_store(self._rag_collection)
         if store is None:
             return
-        if needs_store_actor(self._rag_collection) and self._requeue_embedded_rows():
-            self.state.notify_state_change()
+        if needs_store_actor(self._rag_collection):
+            self._requeue_embedded_rows()
+            self._persist()
         try:
             store.create_collection(RAG_COLLECTION, self._rag_collection)
         except Exception as exc:
@@ -456,6 +582,16 @@ class DocumentsMixin(_DocumentsBase):
 
         A cluster backend still gets an object and no actor: the data lives on
         the cluster and there is nothing for an actor to hold.
+
+        **A cluster backend is handed no team.** ``workspace_chunks`` is shared by
+        every team on the tree and bounded by the mandatory ``scope``, and a
+        hosted workspace's ``self.team_id`` is auto-generated per lifetime and
+        names no team. With ``team_id=None`` both cluster backends stamp ``""``,
+        their documented no-team value, and derive a row's id from ``["",
+        tenant, ref_id]`` — the same id in every lifetime, so a re-add after a
+        reap overwrites instead of doubling. A team-less backend can still
+        query a shared collection and still cannot query a team-scoped one.
+        This supersedes story 51-2's ruling to document the meaningless id.
 
         **A spawn the environment refused is the WARNING-and-degrade case** —
         :data:`_STORE_UNREACHABLE`, and nothing wider — where the planning and
@@ -508,7 +644,7 @@ class DocumentsMixin(_DocumentsBase):
             return get_backend_spec(param.backend).factory(
                 BackendContext(
                     config=VectorStoreConfig(name=self.config.name, role=VS_ACTOR_ROLE),
-                    team_id=str(self.team_id),
+                    team_id=None,
                 )
             )
         except Exception as exc:  # noqa: BLE001
@@ -545,7 +681,7 @@ class DocumentsMixin(_DocumentsBase):
         """
         if self._vs_proxy is None or self._rag_params is None:
             return _UNAVAILABLE
-        changed = self.reap_stale_embedding()
+        self.reap_stale_embedding()
         candidates, unsupported = self._candidates(path)
         queued = current = 0
         for candidate in candidates:
@@ -558,9 +694,8 @@ class DocumentsMixin(_DocumentsBase):
                 continue
             self._enqueue(candidate, sha)
             queued += 1
-        changed = self._drain() or queued > 0 or changed
-        if changed:
-            self.state.notify_state_change()
+        self._drain()
+        self._persist()
         return f"{queued} file(s) queued, {current} already current, {unsupported} unsupported"
 
     def _is_accounted_for(self, path: str, sha: str, force: bool) -> bool:
@@ -589,8 +724,8 @@ class DocumentsMixin(_DocumentsBase):
         now = datetime.now(UTC)
         entry = self.state.rag_index.get(path)
         if entry is None:
-            self.state.rag_index[path] = RagFile(
-                path=path, status=RagStatus.PENDING, indexed_sha=sha, updated_at=now
+            self._put_row(
+                path, RagFile(path=path, status=RagStatus.PENDING, indexed_sha=sha, updated_at=now)
             )
             return
         superseded = list(entry.superseded_chunk_ids)
@@ -601,31 +736,35 @@ class DocumentsMixin(_DocumentsBase):
             if chunk.chunk_id not in seen:
                 superseded.append(chunk.chunk_id)
                 seen.add(chunk.chunk_id)
-        self.state.rag_index[path] = entry.model_copy(
-            update={
-                "status": RagStatus.PENDING,
-                "indexed_sha": sha,
-                "chunks": [],
-                "chunk_count": 0,
-                "batches_expected": 0,
-                "batches_landed": 0,
-                "superseded_chunk_ids": superseded,
-                "reason": None,
-                "updated_at": now,
-            }
+        self._put_row(
+            path,
+            entry.model_copy(
+                update={
+                    "status": RagStatus.PENDING,
+                    "indexed_sha": sha,
+                    "chunks": [],
+                    "chunk_count": 0,
+                    "batches_expected": 0,
+                    "batches_landed": 0,
+                    "superseded_chunk_ids": superseded,
+                    "reason": None,
+                    "updated_at": now,
+                }
+            ),
         )
 
-    def _drain(self) -> bool:
+    def _drain(self) -> None:
         """Spawn workers for ``PENDING`` files up to the concurrency cap.
 
-        Returns:
-            Whether anything moved, so the caller can make one notify.
+        It writes rows for paths its caller never named — ``EXTRACTION`` or
+        ``SPLITTING`` on a spawn, ``FAILED`` on a spawn that raised — which is
+        why it answers nothing and every caller persists unconditionally: an
+        answer of "nothing moved" is exactly what once hid the failed spawn.
         """
         from akgentic.tool.workspace.documents.worker import (  # noqa: PLC0415 — cycle
             MAX_CONCURRENT_INDEX_WORKERS,
         )
 
-        changed = False
         while len(self._index_active) < MAX_CONCURRENT_INDEX_WORKERS:
             waiting = next(
                 (
@@ -636,9 +775,7 @@ class DocumentsMixin(_DocumentsBase):
                 None,
             )
             if waiting is None or not self._spawn(waiting):
-                return changed
-            changed = True
-        return changed
+                return
 
     def _spawn(self, path: str) -> bool:
         """Start one ``#index-`` worker for *path*, or record why it could not start.
@@ -687,11 +824,14 @@ class DocumentsMixin(_DocumentsBase):
             self._fail(path, entry.indexed_sha, f"{type(exc).__name__}: {exc}")
             return False
         self._index_active.add(path)
-        self.state.rag_index[path] = entry.model_copy(
-            update={
-                "status": RagStatus.SPLITTING if markdown is not None else RagStatus.EXTRACTION,
-                "updated_at": datetime.now(UTC),
-            }
+        self._put_row(
+            path,
+            entry.model_copy(
+                update={
+                    "status": RagStatus.SPLITTING if markdown is not None else RagStatus.EXTRACTION,
+                    "updated_at": datetime.now(UTC),
+                }
+            ),
         )
         return True
 
@@ -779,33 +919,42 @@ class DocumentsMixin(_DocumentsBase):
             )
 
     def _on_index_result(self, msg: IndexResult) -> None:
-        """Record *msg*, issue its ``add()`` batches, and notify once."""
+        """Record *msg*, issue its ``add()`` batches, and persist once.
+
+        A report whose row has moved on writes nothing itself, but the
+        ``_drain`` it frees a slot for spawns the next file — a row written and,
+        before this persisted, never carried by any delta.
+        """
         self._index_active.discard(msg.path)
         entry = self._live_entry(msg.path, msg.source_sha)
         if entry is None:
             self._drain()
+            self._persist()
             return
         if msg.extracted:
             # The worker did the extraction, so the cache learns from it. This is
-            # the one notify in this method that is not the file's own transition,
+            # the one delta in this method that is not the file's own transition,
             # and it is a fill like any other.
             self.cache_document(msg.path, msg.source_sha, EXTRACTOR_VERSION, msg.markdown)
         if len(msg.texts) != len(msg.chunks):
             self._fail(msg.path, msg.source_sha, "the worker returned mismatched chunks and texts")
             self._drain()
-            self.state.notify_state_change()
+            self._persist()
             return
         batches = ceil(len(msg.chunks) / _batch_size())
-        self.state.rag_index[msg.path] = entry.model_copy(
-            update={
-                "status": RagStatus.EMBEDDING if msg.chunks else RagStatus.EMBEDDED,
-                "chunks": msg.chunks,
-                "chunk_count": len(msg.chunks),
-                "batches_expected": batches,
-                "batches_landed": 0,
-                "reason": None,
-                "updated_at": datetime.now(UTC),
-            }
+        self._put_row(
+            msg.path,
+            entry.model_copy(
+                update={
+                    "status": RagStatus.EMBEDDING if msg.chunks else RagStatus.EMBEDDED,
+                    "chunks": msg.chunks,
+                    "chunk_count": len(msg.chunks),
+                    "batches_expected": batches,
+                    "batches_landed": 0,
+                    "reason": None,
+                    "updated_at": datetime.now(UTC),
+                }
+            ),
         )
         if msg.chunks:
             self._issue_batches(msg)
@@ -814,7 +963,7 @@ class DocumentsMixin(_DocumentsBase):
             # nothing to embed and nothing to wait for.
             self._drop_superseded(msg.path)
         self._drain()
-        self.state.notify_state_change()
+        self._persist()
 
     def _issue_batches(self, msg: IndexResult) -> None:
         """Spawn one ``#embed-`` worker per ``EMBED_BATCH_SIZE`` chunks of *msg*.
@@ -912,7 +1061,7 @@ class DocumentsMixin(_DocumentsBase):
             if self._live_entry(msg.path, msg.source_sha) is not None:
                 self._fail(msg.path, msg.source_sha, msg.reason)
             self._drain()
-            self.state.notify_state_change()
+            self._persist()
         except Exception:
             logger.warning(
                 "Workspace %s: could not record the index failure for %s",
@@ -930,9 +1079,12 @@ class DocumentsMixin(_DocumentsBase):
         this turn, so a batch that could not land can no longer leave a file
         sitting at ``EMBEDDING`` for the reaper to find ten minutes later.
 
-        Only the **final** transition notifies on the success path. A batch that
-        lands without settling its file mutates ``batches_landed`` in memory and
-        says nothing, so a 1,900-chunk document costs one event rather than thirty.
+        Only the **final** transition persists on the success path. A batch that
+        lands without settling its file writes ``batches_landed`` through
+        ``_put_row`` and sends nothing on its own turn: the row is dirty and rides
+        on the next delta — this file's final transition, or any other path's —
+        so a 1,900-chunk document costs one delta rather than thirty, and the
+        store is never wrong about a status, only one counter behind.
 
         The **first** report that fails the file marks it ``FAILED``, and every
         later report for the same path is dropped without a second transition —
@@ -978,7 +1130,7 @@ class DocumentsMixin(_DocumentsBase):
         if entry is None or msg.request_ref is None:
             return
         self._fail(msg.request_ref, entry.indexed_sha, msg.error)
-        self.state.notify_state_change()
+        self._persist()
 
     def _on_embedding_result(self, msg: EmbeddingResult) -> None:
         """Write one embedded batch, then apply it to the row that is counting it."""
@@ -993,22 +1145,26 @@ class DocumentsMixin(_DocumentsBase):
             proxy.add(RAG_COLLECTION, msg.entries)
         except Exception as exc:
             self._fail(path, entry.indexed_sha, f"{type(exc).__name__}: {exc}")
-            self.state.notify_state_change()
+            self._persist()
             return
         landed = entry.batches_landed + 1
         if landed < entry.batches_expected:
-            # In memory only: the file has not moved, so nothing is worth an event.
-            self.state.rag_index[path] = entry.model_copy(update={"batches_landed": landed})
+            # Dirty and not persisted on this turn: the file has not moved, so
+            # nothing is worth a delta. The next persist of any path carries it.
+            self._put_row(path, entry.model_copy(update={"batches_landed": landed}))
             return
-        self.state.rag_index[path] = entry.model_copy(
-            update={
-                "status": RagStatus.EMBEDDED,
-                "batches_landed": landed,
-                "updated_at": datetime.now(UTC),
-            }
+        self._put_row(
+            path,
+            entry.model_copy(
+                update={
+                    "status": RagStatus.EMBEDDED,
+                    "batches_landed": landed,
+                    "updated_at": datetime.now(UTC),
+                }
+            ),
         )
         self._drop_superseded(path)
-        self.state.notify_state_change()
+        self._persist()
 
     def _drop_superseded(self, path: str) -> None:
         """Remove the previous chunk set, now that the new one has landed.
@@ -1045,7 +1201,7 @@ class DocumentsMixin(_DocumentsBase):
             )
             return
         current = self.state.rag_index[path]
-        self.state.rag_index[path] = current.model_copy(update={"superseded_chunk_ids": []})
+        self._put_row(path, current.model_copy(update={"superseded_chunk_ids": []}))
 
     def _live_entry(self, path: str, source_sha: str) -> RagFile | None:
         """Return *path*'s row when it is still the one *source_sha* was indexing.
@@ -1074,8 +1230,15 @@ class DocumentsMixin(_DocumentsBase):
         entry = self.state.rag_index.get(path)
         if entry is None or (source_sha is not None and entry.indexed_sha != source_sha):
             return
-        self.state.rag_index[path] = entry.model_copy(
-            update={"status": RagStatus.FAILED, "reason": reason, "updated_at": datetime.now(UTC)}
+        self._put_row(
+            path,
+            entry.model_copy(
+                update={
+                    "status": RagStatus.FAILED,
+                    "reason": reason,
+                    "updated_at": datetime.now(UTC),
+                }
+            ),
         )
 
     ##
@@ -1084,40 +1247,31 @@ class DocumentsMixin(_DocumentsBase):
     def reap_stale_embedding(self) -> bool:
         """Revert files stuck at ``EMBEDDING`` past the bound, and say if any moved.
 
-        **Runs on resume and at the top of ``index_paths``, and never on a turn
-        path** — not in the context-state provider, not in ``rag_snapshot``, not in
-        the gate. It is a state mutation, and one that fired on every turn of every
-        agent carrying the card would be both wasteful and a write from a render.
+        **Runs at the top of ``index_paths``, and never on a turn path** — not in
+        the context-state provider, not in ``rag_snapshot``, not in the gate. It
+        is a state mutation, and one that fired on every turn of every agent
+        carrying the card would be both wasteful and a write from a render. The
+        caller persists what it moved.
 
-        The resume call site is ``WorkspaceActor.init_state``, not ``on_start``:
-        ``on_start`` assigns a fresh :class:`WorkspaceState` on its first line and a
-        restored snapshot arrives afterwards, so reaping there would run against an
-        empty index. See that method for the whole of it.
-
-        **It is the backstop for the one case no gate can see: an ``#embed-``
-        worker that dies without reporting.** Every other way a batch can fail now
-        arrives as a message — a worker that could not embed tells
-        ``EmbeddingError``, and a write that could not land raises on the turn it
-        is attempted. A worker killed with the process reports neither, and its
-        file would otherwise stay ``EMBEDDING`` for ever; a resume also loses every
-        live worker the same way.
+        **It is the backstop for the one case no gate can see on a running
+        actor: an ``#embed-`` worker that dies without reporting.** Every other
+        way a batch can fail arrives as a message — a worker that could not embed
+        tells ``EmbeddingError``, and a write that could not land raises on the
+        turn it is attempted. A worker that died silently reports neither, and
+        its file would otherwise stay ``EMBEDDING`` for ever. The bound is what
+        tells that worker from a slow one, which a running actor cannot
+        otherwise do. A restore needs no bound and does not come here: see
+        :meth:`_requeue_orphaned_rows`.
 
         Returns:
-            Whether any row was reverted, so the caller can make one notify.
+            Whether any row was reverted.
         """
         cutoff = datetime.now(UTC) - timedelta(seconds=EMBEDDING_STALE_AFTER_S)
         reverted = 0
         for path, entry in list(self.state.rag_index.items()):
             if entry.status is not RagStatus.EMBEDDING or entry.updated_at >= cutoff:
                 continue
-            self.state.rag_index[path] = entry.model_copy(
-                update={
-                    "status": RagStatus.PENDING,
-                    "batches_expected": 0,
-                    "batches_landed": 0,
-                    "updated_at": datetime.now(UTC),
-                }
-            )
+            self._put_row(path, _requeued(entry, datetime.now(UTC)))
             reverted += 1
         if reverted:
             logger.info(
@@ -1128,7 +1282,42 @@ class DocumentsMixin(_DocumentsBase):
             )
         return reverted > 0
 
-    def _requeue_embedded_rows(self) -> bool:
+    def _requeue_orphaned_rows(self) -> None:
+        """Put every row a worker was carrying back to ``PENDING``, whatever its age.
+
+        **Runs on a restore, in ``WorkspaceActor.init_state``, and only then.**
+        Every worker that could still report for a restored row — an ``#index-``
+        extracting or splitting it, an ``#embed-`` embedding it — was a child of
+        the previous actor and died with it. At restore every ``EXTRACTION``,
+        ``SPLITTING`` and ``EMBEDDING`` row is therefore abandoned by
+        construction, and no age bound applies: the bound in
+        :meth:`reap_stale_embedding` tells a dead worker from a slow one on a
+        *running* actor, and a restored actor has no slow workers. Left as they
+        were, the first two would never move — :meth:`_drain` spawns ``PENDING``
+        only and :meth:`_is_accounted_for` counts in-flight as current — and the
+        third would wait out the reaper's bound for nothing.
+
+        The update is the reaper's: status, both batch counters and the time.
+        ``chunks`` and ``superseded_chunk_ids`` are kept, exactly as the reaper
+        keeps them — the superseded ids are still owed a removal. The caller
+        persists.
+        """
+        now = datetime.now(UTC)
+        requeued = 0
+        for path, entry in list(self.state.rag_index.items()):
+            if entry.status not in _ORPHANED_ON_RESTORE:
+                continue
+            self._put_row(path, _requeued(entry, now))
+            requeued += 1
+        if requeued:
+            logger.info(
+                "Workspace %s: %d file(s) in flight when the previous actor stopped "
+                "are queued again",
+                self.config.workspace_path,
+                requeued,
+            )
+
+    def _requeue_embedded_rows(self) -> None:
         """Put every ``EMBEDDED`` row back to ``PENDING``: the in-memory engine starts empty.
 
         **Runs at the moment the in-memory store child is created, and only
@@ -1160,24 +1349,14 @@ class DocumentsMixin(_DocumentsBase):
         ``PENDING`` as in flight and :meth:`_drain` spawns for every ``PENDING``
         row — so the index rebuilds from the cache at the next
         ``workspace_rag_index``. One re-embed per reaped tree, on the
-        development engine.
-
-        Returns:
-            Whether any row moved, so the caller can make one notify.
+        development engine. The caller persists what moved.
         """
         now = datetime.now(UTC)
         requeued = 0
         for path, entry in list(self.state.rag_index.items()):
             if entry.status is not RagStatus.EMBEDDED:
                 continue
-            self.state.rag_index[path] = entry.model_copy(
-                update={
-                    "status": RagStatus.PENDING,
-                    "batches_expected": 0,
-                    "batches_landed": 0,
-                    "updated_at": now,
-                }
-            )
+            self._put_row(path, _requeued(entry, now))
             requeued += 1
         if requeued:
             logger.info(
@@ -1186,7 +1365,6 @@ class DocumentsMixin(_DocumentsBase):
                 self.config.workspace_path,
                 requeued,
             )
-        return requeued > 0
 
     def mark_paths_stale(self, paths: list[str]) -> None:
         """Mark every indexed path in *paths* ``STALE`` — and re-index none of them.
@@ -1200,25 +1378,23 @@ class DocumentsMixin(_DocumentsBase):
         credits on every save and queue workers behind a file that is about to
         change again. Gate writes mark stale; uploads index.
 
-        It notifies **only when it actually changed a status**, so a tree that has
-        never been indexed pays nothing on the mutation path — which is the common
-        case, and must stay free.
+        It sends a delta **only when it actually changed a status**, so a tree
+        that has never been indexed pays nothing on the mutation path — which is
+        the common case, and must stay free. That is ``_persist``'s own rule: a
+        path it did not write is not dirty.
 
         Args:
             paths: The mutation's own write set.
         """
         now = datetime.now(UTC)
-        changed = False
         for path in paths:
             entry = self.state.rag_index.get(path)
             if entry is None or entry.status is RagStatus.STALE:
                 continue
-            self.state.rag_index[path] = entry.model_copy(
-                update={"status": RagStatus.STALE, "updated_at": now}
+            self._put_row(
+                path, entry.model_copy(update={"status": RagStatus.STALE, "updated_at": now})
             )
-            changed = True
-        if changed:
-            self.state.notify_state_change()
+        self._persist()
 
     ##
     ## workspace_rag_list — a render, and therefore free
@@ -1543,8 +1719,7 @@ class DocumentsMixin(_DocumentsBase):
                 len(candidates),
                 msg.source,
             )
-            if recorded > 0:
-                self.state.notify_state_change()
+            self._persist()
             return
         queued = 0
         for path, sha in candidates:
@@ -1559,8 +1734,8 @@ class DocumentsMixin(_DocumentsBase):
             len(candidates),
             msg.source,
         )
-        if self._drain() or queued > 0:
-            self.state.notify_state_change()
+        self._drain()
+        self._persist()
 
     def _uploaded_candidates(self, paths: list[str]) -> list[tuple[str, str]]:
         """Return ``(path, digest)`` for every named path that can be indexed.
@@ -1619,6 +1794,26 @@ _IN_FLIGHT = frozenset(
     {RagStatus.PENDING, RagStatus.EXTRACTION, RagStatus.SPLITTING, RagStatus.EMBEDDING}
 )
 """Statuses meaning "a run over these bytes has not finished yet"."""
+
+_ORPHANED_ON_RESTORE = _IN_FLIGHT - {RagStatus.PENDING}
+"""Statuses a worker was carrying — every one of them abandoned when its actor stopped."""
+
+
+def _requeued(entry: RagFile, now: datetime) -> RagFile:
+    """*entry* back at ``PENDING`` with both batch counters reset — its chunks kept.
+
+    The one update the three re-queues share — the running actor's reaper, the
+    in-memory re-mark and the restore — so they cannot drift. A copy with the
+    four fields that change, never a rebuild (Golden Rule 12).
+    """
+    return entry.model_copy(
+        update={
+            "status": RagStatus.PENDING,
+            "batches_expected": 0,
+            "batches_landed": 0,
+            "updated_at": now,
+        }
+    )
 
 
 def _batch_size() -> int:

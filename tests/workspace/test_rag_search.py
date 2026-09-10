@@ -15,7 +15,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -43,7 +42,7 @@ from akgentic.tool.workspace.models import WorkspaceConfig, WorkspaceState, cont
 from akgentic.tool.workspace.readers import DocumentReader
 
 from tests.conftest import MockActorAddress
-from tests.workspace.conftest import WORKSPACE_PATH
+from tests.workspace.conftest import WORKSPACE_PATH, delta_recorder
 
 _UNAVAILABLE = "Retrieval indexing is not available for this workspace."
 _NO_HITS = (
@@ -797,18 +796,18 @@ class TestTheFusionKnobs:
 
 
 class TestTheStateItNeverTouches:
-    """A search is a read: it must notify nothing and mutate nothing."""
+    """A search is a read: it must persist nothing and mutate nothing."""
 
-    def test_a_search_makes_no_state_notification(self, search: SearchHarness) -> None:
-        """A notify on a read path is a defect until a decision says otherwise."""
+    def test_a_search_sends_no_delta(
+        self, search: SearchHarness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A delta on a read path is a defect until a decision says otherwise."""
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
-        seen: list[Any] = []
-        search.actor.state.observer(SimpleNamespace(notify_state_change=seen.append))
-        seen.clear()
+        store = delta_recorder(search.actor, monkeypatch)
 
-        search.actor.rag_search("payment")
+        assert "invoice.md" in search.actor.rag_search("payment")
 
-        assert seen == []
+        assert store.applied == []
 
     def test_a_search_leaves_the_index_untouched(self, search: SearchHarness) -> None:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])

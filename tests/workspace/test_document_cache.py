@@ -5,14 +5,14 @@ the cache itself rather than on whoever calls it. ``workspace_read`` became that
 caller in 45-4; the read path's own guards live in
 ``test_document_read_path.py``. What is asserted here is the shape the read path
 calls into and the one rule the whole design rests on: **the read path never
-snapshots state**.
+persists state**.
 
-``notify_state_change()`` serialises the *whole* state through
-``model_dump_json()`` and the actor forwards it to the orchestrator, which is an
-event-store write. Reads are the majority of workspace traffic, so a notify on a
-read — or on a cache hit, which a read is — would put that write back on the
-path ADR-036's NFR1 exists to keep free. A *fill* is different: it is amortised
-against the seconds of extraction that preceded it, and it notifies exactly once.
+A hosted workspace persists by sending a member-keyed delta to its host, whose
+store writes it. Reads are the majority of workspace traffic, so a delta on a
+read — or on a cache hit, which a read is — would put a store write on the path
+ADR-036's NFR1 exists to keep free. A *fill* is different: it is amortised
+against the seconds of extraction that preceded it, and it persists exactly once.
+The specs count deltas through the recorder that replaces the actor's one send.
 
 The caps are exercised **at** the cap and one past it, so an off-by-one in
 either direction is visible. Small caps throughout: the production defaults
@@ -24,7 +24,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
-from akgentic.core.agent_state import BaseState
+import pytest
+
 from akgentic.tool.workspace.actor import (
     WORKSPACE_ACTOR_ROLE,
     WorkspaceActor,
@@ -40,7 +41,7 @@ from akgentic.tool.workspace.documents.models import (
 from akgentic.tool.workspace.models import WorkspaceConfig, WorkspaceState, content_sha
 from akgentic.tool.workspace.tool import WorkspaceTool
 
-from tests.workspace.conftest import WORKSPACE_PATH, read
+from tests.workspace.conftest import WORKSPACE_PATH, DeltaStore, delta_recorder, read
 
 
 def start_actor(
@@ -99,26 +100,9 @@ def an_extract(path: str, body: str | None, source: str | None = None) -> Docume
     )
 
 
-class _StateSpy:
-    """Records every state-change notification the actor's state emits.
-
-    The same shape ``test_workspace_actor.py`` uses, deliberately — a second
-    observer double would be a second thing to keep true.
-    """
-
-    def __init__(self) -> None:
-        self.notifications: list[BaseState] = []
-
-    def notify_state_change(self, state: BaseState) -> None:
-        self.notifications.append(state)
-
-
-def watch(actor: WorkspaceActor) -> _StateSpy:
-    """Attach a spy to *actor*'s state and discard the attach-time notification."""
-    spy = _StateSpy()
-    actor.state.observer(spy)
-    spy.notifications.clear()  # attaching an observer notifies once, by design
-    return spy
+def watch(actor: WorkspaceActor, monkeypatch: pytest.MonkeyPatch) -> DeltaStore:
+    """Record every delta *actor* sends from now on — the one channel that persists."""
+    return delta_recorder(actor, monkeypatch)
 
 
 class _ExtractWithExtraField(DocumentExtract):
@@ -283,51 +267,65 @@ class TestLruOrder:
 
 
 class TestNotifyMatrix:
-    def test_a_text_read_notifies_nothing(
+    def test_a_text_read_sends_nothing(
         self,
         wired_card: WorkspaceTool,
         workspace_actor: WorkspaceActor,
         workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # The property epic 29 shipped and this story must not spend: reads are
-        # the majority of workspace traffic and none of them writes an event.
+        # the majority of workspace traffic and none of them writes a delta.
         (workspace_tree / "plain.txt").write_text("hello\n", encoding="utf-8")
-        spy = watch(workspace_actor)
-        read(wired_card, "plain.txt")
-        assert spy.notifications == []
+        store = watch(workspace_actor, monkeypatch)
+        assert "hello" in read(wired_card, "plain.txt")
+        assert store.applied == []
 
-    def test_a_cache_hit_notifies_nothing(self, workspaces_root: Path) -> None:
+    def test_a_cache_hit_sends_nothing(
+        self, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         # The hit reorders the LRU in memory. Persisted recency therefore lags
         # live recency until the next fill — deliberate, and not to be "fixed".
+        # Two entries and a hit on the older one, so the hit really reorders.
         actor = start_actor()
         fill(actor, "notes.docx", body="# Notes")
-        spy = watch(actor)
+        fill(actor, "other.docx", body="# Other")
+        store = watch(actor, monkeypatch)
         assert look_up(actor, "notes.docx") == "# Notes"
-        assert spy.notifications == []
+        assert list(actor.state.documents) == ["other.docx", "notes.docx"]
+        assert store.applied == []
 
-    def test_a_lookup_miss_notifies_nothing(self, workspaces_root: Path) -> None:
-        actor = start_actor()
-        spy = watch(actor)
-        look_up(actor, "never-seen.docx")
-        assert spy.notifications == []
-
-    def test_a_fill_notifies_exactly_once(self, workspaces_root: Path) -> None:
-        actor = start_actor()
-        spy = watch(actor)
-        fill(actor, "notes.docx", body="# Notes")
-        assert len(spy.notifications) == 1
-
-    def test_a_fill_that_also_evicts_still_notifies_exactly_once(
-        self, workspaces_root: Path
+    def test_a_lookup_miss_sends_nothing(
+        self, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Never once per evicted entry: the notify follows the insert *and* the
-        # eviction, so one fill is one event however much it displaced.
+        actor = start_actor()
+        store = watch(actor, monkeypatch)
+        assert look_up(actor, "never-seen.docx") is None
+        assert store.applied == []
+
+    def test_a_fill_persists_exactly_once(
+        self, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        actor = start_actor()
+        store = watch(actor, monkeypatch)
+        fill(actor, "notes.docx", body="# Notes")
+        assert len(store.applied) == 1
+        assert store.keys_applied() == {"documents.notes.docx"}
+
+    def test_a_fill_that_also_evicts_still_persists_exactly_once(
+        self, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Never once per evicted entry: the delta follows the insert *and* the
+        # eviction, so one fill is one delta however much it displaced.
         actor = start_actor(max_documents=1)
         fill(actor, "a.docx")
-        spy = watch(actor)
+        store = watch(actor, monkeypatch)
         fill(actor, "b.docx")
-        assert len(spy.notifications) == 1
+        assert len(store.applied) == 1
         assert list(actor.state.documents) == ["b.docx"]
+        [(_, _, delta)] = store.applied
+        assert set(delta.set) == {"documents.b.docx"}
+        assert delta.unset == ["documents.a.docx"]
 
 
 # ---------------------------------------------------------------------------
@@ -353,9 +351,7 @@ class TestMaxDocumentsCap:
         assert "a.docx" not in actor.state.documents
         assert list(actor.state.documents) == ["b.docx", "c.docx", "d.docx"]
 
-    def test_a_hit_protects_an_entry_from_the_next_eviction(
-        self, workspaces_root: Path
-    ) -> None:
+    def test_a_hit_protects_an_entry_from_the_next_eviction(self, workspaces_root: Path) -> None:
         actor = start_actor(max_documents=3)
         for name in ("a.docx", "b.docx", "c.docx"):
             fill(actor, name)
@@ -393,9 +389,7 @@ class TestMaxDocumentCharsCap:
         assert actor.state.documents["b.docx"].markdown == "b" * 40
         assert actor.state.documents["c.docx"].markdown == "c"
 
-    def test_a_single_over_cap_document_drops_its_own_body(
-        self, workspaces_root: Path
-    ) -> None:
+    def test_a_single_over_cap_document_drops_its_own_body(self, workspaces_root: Path) -> None:
         # A permanent miss costing one re-extraction per read — correct, and not
         # a case to special-case. The loop must terminate rather than spin.
         actor = start_actor(max_documents=100, max_document_chars=100)
@@ -474,9 +468,7 @@ class TestDegradation:
         assert look_up(actor, "") is None
         assert look_up(actor, "nested/deeply/absent.docx") is None
 
-    def test_a_fill_of_an_empty_body_records_a_zero_char_count(
-        self, workspaces_root: Path
-    ) -> None:
+    def test_a_fill_of_an_empty_body_records_a_zero_char_count(self, workspaces_root: Path) -> None:
         actor = start_actor()
         fill(actor, "empty.docx", body="")
         assert actor.state.documents["empty.docx"].char_count == 0
@@ -489,9 +481,7 @@ class TestDegradation:
         assert look_up(actor, "a.docx") is None
         assert look_up(actor, "a.docx") is None
 
-    def test_char_count_is_computed_from_the_body_not_supplied(
-        self, workspaces_root: Path
-    ) -> None:
+    def test_char_count_is_computed_from_the_body_not_supplied(self, workspaces_root: Path) -> None:
         # It cannot disagree with the body it describes, because it is never a
         # parameter.
         actor = start_actor()

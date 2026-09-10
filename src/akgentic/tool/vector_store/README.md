@@ -309,9 +309,12 @@ export AKGENTIC_QDRANT_API_KEY="..."          # omit for an unauthenticated inst
 ```
 
 `QdrantBackend` mirrors the Weaviate model: every point carries its owning `team_id` in the payload,
-searches and removes are team-scoped (a team-less backend raises rather than leaking across teams),
-and point ids are derived from the team, effective tenant, and `ref_id`, with `ref_id` kept in the
-payload for filtering. Naming `backend="qdrant"` without a URL or the `[qdrant]` dependency fails
+searches and removes on a team-scoped collection are team-scoped (a team-less backend raises rather
+than leaking across teams), and point ids are derived from the team, effective tenant, and `ref_id`
+by `stable_object_id` in `protocol.py` — the derivation Weaviate's object ids share — with `ref_id`
+kept in the payload for filtering. A team-less writer on the shared `workspace_chunks` collection —
+the hosted workspace — stamps `""` and derives from an empty team, so the same chunk keeps one point
+id in every lifetime. Naming `backend="qdrant"` without a URL or the `[qdrant]` dependency fails
 at card build time via `require_backend_configured`, exactly like Weaviate — a card asking for a
 durable store is never silently downgraded to the in-memory index.
 
@@ -476,7 +479,17 @@ garbage accumulating in a shared cluster. `team_id` is the handle a cleanup proc
 
 A backend built without a `team_id` still writes the property, as the empty string, so the schema
 is uniform and a sweep never has to reason about objects that predate the field or come from an
-unattributed writer.
+unattributed writer. **The hosted workspace is such a writer** (epic 51): one actor per tree per
+process, shared by every team on the tree, whose own `team_id` is auto-generated per lifetime and
+names no team — so its backend is built with none and every `workspace_chunks` row carries `""`.
+
+**Every object's id is derived, like Qdrant's point ids.** `add` passes each object a `uuid` from
+`stable_object_id(team_id, tenant, ref_id)` in `protocol.py` — the backend's team, the tenant the
+object is written to, and its `ref_id`. The client replaces an object whose uuid already exists and
+mints a UUIDv4 when none is given, so before this every re-add of a chunk left one more copy. On a
+team-scoped collection the team is inside the id, so two teams writing one `ref_id` stay two
+objects; on the shared collection a team-less writer's id carries `""`, and every lifetime of a tree
+writes the same object.
 
 **And read back on every query — but not on every collection.** Collection names are module
 constants, so every team on a cluster shares the same collections and multi-tenancy is off unless a
@@ -500,7 +513,7 @@ may add to at runtime is the same hazard in another shape.
 
 | Method | Filter on a team-scoped collection | Filter on a shared collection |
 |---|---|---|
-| `add` | stamps `team_id` | stamps `team_id` — it records *who wrote the row*, and nothing filters on it |
+| `add` | stamps `team_id`; the object's `uuid` includes the team | stamps the backend's `team_id`, and nothing filters on it — for the hosted workspace, whose backend has no team, that is `""` |
 | `search` | `team_id == <backend's own>`, plus `scope` / `path` legs, passed to the cluster as `filters=` so it applies **before** `limit` | the `scope` and `path` legs alone; **`scope` is mandatory** |
 | `remove` | `ref_id IN (...)` **AND** `team_id == <backend's own>` | `ref_id IN (...)` **AND** `scope == <argument>`; **`scope` is mandatory** |
 | `delete_by_team(collection, team_id)` | `team_id == <argument>` — the backend's own is deliberately *not* anded on | **refused**, before any cluster call |

@@ -238,9 +238,7 @@ def _kg_actor(param: VectorStoreParam | None, *, store_found: bool = True) -> tu
     from akgentic.tool.knowledge_graph.models import KnowledgeGraphState
 
     actor = KnowledgeGraphActor()
-    actor.config = KnowledgeGraphConfig(
-        name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store=param
-    )
+    actor.config = KnowledgeGraphConfig(name=KG_ACTOR_NAME, role=KG_ACTOR_ROLE, vector_store=param)
     actor.state = KnowledgeGraphState()
     actor.state.observer(actor)
     actor._vs_proxy = None
@@ -294,6 +292,10 @@ class TestPlanActorResolution:
         assert actor._vs_proxy is double
         assert double.of("create_collection") == [(PLAN_COLLECTION, param)]
         assert len(contexts) == 1
+        # A team-scoped collection keeps its team — unlike the hosted workspace,
+        # whose backend is handed none. A ``None`` here would stamp ``""`` on
+        # every row and refuse every query.
+        assert contexts[0].team_id is not None
         assert contexts[0].team_id == str(actor.team_id)
         assert contexts[0].config.name == "#PlanningTool"
         assert contexts[0].config.role == VS_ACTOR_ROLE
@@ -360,6 +362,10 @@ class TestKnowledgeGraphActorResolution:
         assert actor._vs_proxy is double
         assert double.of("create_collection") == [(KG_COLLECTION, param)]
         assert len(contexts) == 1
+        # A team-scoped collection keeps its team — unlike the hosted workspace,
+        # whose backend is handed none. A ``None`` here would stamp ``""`` on
+        # every row and refuse every query.
+        assert contexts[0].team_id is not None
         assert contexts[0].team_id == str(actor.team_id)
         assert contexts[0].config.name == KG_ACTOR_NAME
 
@@ -804,9 +810,7 @@ class TestADisabledCardSkipsTheThreeStoreObligations:
         self, card_cls: type, consumer_cls: type
     ) -> None:
         """A dimension contradicting an embedding model nobody will run."""
-        contradictory = VectorStoreParam(
-            embedding_model="text-embedding-3-small", dimension=3072
-        )
+        contradictory = VectorStoreParam(embedding_model="text-embedding-3-small", dimension=3072)
 
         with pytest.raises(ValueError, match="dimension"):
             _run_card_observer(card_cls(vector_store=contradictory))
@@ -831,9 +835,7 @@ class TestTheKnowledgeGraphExtraIsStillRequired:
         from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
 
         calls: list[None] = []
-        monkeypatch.setattr(
-            kg_package, "_check_kg_dependencies", lambda: calls.append(None)
-        )
+        monkeypatch.setattr(kg_package, "_check_kg_dependencies", lambda: calls.append(None))
 
         _run_card_observer(KnowledgeGraphTool(vector_store=True))
         assert len(calls) == 1

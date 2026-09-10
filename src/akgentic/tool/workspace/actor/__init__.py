@@ -83,6 +83,7 @@ from typing import TYPE_CHECKING
 
 from pykka import ActorDeadError
 
+from akgentic.core.agent import Akgent
 from akgentic.tool.core.deferred import DeferredResultActor, DeferredWorker
 from akgentic.tool.workspace.actor.documents import DocumentsMixin
 from akgentic.tool.workspace.actor.execution import EXEC_CAPABILITY, ExecMixin
@@ -208,6 +209,13 @@ class WorkspaceActor(
     GateMixin,
     ObservationMixin,
     DeferredResultActor[WorkspaceConfig, WorkspaceState, str, ExecOutcome],
+    # Redundant for the MRO — ``DeferredResultActor`` already is an ``Akgent`` —
+    # and load-bearing for the restore. A store rebuilds this actor's state
+    # through core's ``resolve_state_type``, which reads a direct
+    # ``Akgent[Config, State]`` binding only; the one inherited through
+    # ``DeferredResultActor`` carries type variables, so without this line the
+    # answer is ``None`` and every restore is empty.
+    Akgent[WorkspaceConfig, WorkspaceState],
 ):
     """Hosted singleton owning one tree, the extraction cache, the observations, the gate.
 
@@ -315,6 +323,8 @@ class WorkspaceActor(
         self._vs_proxy: VectorStoreService | None = None
         self._embedder: EmbeddingProvider | None = None
         self._index_active: set[str] = set()
+        self._dirty_rows: set[str] = set()
+        self._dirty_documents: set[str] = set()
         self._workspace: Filesystem = get_workspace(self.config.workspace_path)
         self._sweep_staging_files()
         self._journal = GitJournal(
@@ -328,21 +338,28 @@ class WorkspaceActor(
         self._arm_sweep()
 
     def init_state(self, state: WorkspaceState) -> None:
-        """Take a restored snapshot, then free anything left mid-embed (ADR-045 §7).
+        """Take a restored state, re-sort its cache, and re-queue what no worker carries now.
 
-        **This is the resume hook, and ``on_start`` is not.** Story 45-7's
-        acceptance criterion says the ``EMBEDDING`` reaper runs "on ``on_start``
-        (resume)", and against this core it would run on an empty index: the first
-        line of ``on_start`` assigns a fresh :class:`WorkspaceState`, and a
-        restored snapshot arrives *afterwards* through this method — the one
-        ``akgentic-team``'s restorer calls. Reaping in ``on_start`` is therefore
-        provably a no-op, and the criterion's intent lands here instead.
+        **This is the restore hook, and ``on_start`` is not.** The caller is the
+        ``WorkspaceHost``: on a get-or-create miss it starts this actor, asks its
+        store for the scope, and tells the stored state here — a ``proxy_tell``,
+        so it lands after ``on_start`` and before any caller's first message. The
+        first line of ``on_start`` assigns a fresh :class:`WorkspaceState`, so
+        anything done to the index in ``on_start`` would act on an empty one.
 
-        What it frees is a file whose ``EMBEDDING`` signal is never coming. The
-        ``#embed-`` workers that would have reported it are children of this actor
-        and died with the process; nothing survives a restart that could tell the
-        file its batches are gone. Reverting it to ``PENDING`` costs one re-index
-        and never a wrong answer.
+        **The cache is re-sorted by ``extracted_at``.** A store keeps a re-filled
+        key where it first landed, so the order it hands back is first-insertion
+        order, not recency; the LRU would then evict the wrong entry. Every fill
+        stamps ``extracted_at``, so sorting on it restores recency as of the last
+        fill — the cache-hit reorder was never persisted, and still is not.
+
+        **Every row a worker was carrying goes back to ``PENDING``, whatever its
+        age** — ``DocumentsMixin._requeue_orphaned_rows`` in
+        :mod:`~akgentic.tool.workspace.actor.documents`. The workers were
+        children of the previous actor and died with it. The
+        re-queue is persisted by a delta sent from here, which is safe: core's
+        host records its registry entry before it can dequeue anything this actor
+        tells it.
 
         **``EMBEDDED`` rows are deliberately not re-marked here**, although on an
         in-memory engine they must be: the store child of a restored actor has no
@@ -355,10 +372,14 @@ class WorkspaceActor(
         :meth:`~akgentic.tool.workspace.actor.documents.DocumentsMixin._requeue_embedded_rows`.
 
         Args:
-            state: The snapshot to adopt.
+            state: The restored state to adopt.
         """
-        super().init_state(state)
-        self.reap_stale_embedding()
+        documents = dict(sorted(state.documents.items(), key=lambda item: item[1].extracted_at))
+        super().init_state(state.model_copy(update={"documents": documents}))
+        self._dirty_rows.clear()
+        self._dirty_documents.clear()
+        self._requeue_orphaned_rows()
+        self._persist()
 
     def worker_class(self) -> type[DeferredWorker]:
         """Never called: nothing here is spawned through ``request()``.

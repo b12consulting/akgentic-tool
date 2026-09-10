@@ -328,18 +328,19 @@ class TestTheSpawnPathIsReused:
 
         assert upload.requests[0].scope == WORKSPACE_PATH
 
-    def test_queueing_notifies_once_and_a_message_that_queued_nothing_notifies_not_at_all(
+    def test_queueing_persists_once_and_a_message_that_queued_nothing_sends_nothing(
         self, upload: RagHarness, workspace_tree: Path
     ) -> None:
-        """The notify follows the queueing, so an unusable notification is free."""
+        """The delta follows the queueing, so an unusable notification is free."""
         write(workspace_tree, "a.md")
-        spy = upload.watch()
+        store = upload.record_deltas()
 
         upload.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["nope.zip"]))
-        assert spy.notifications == []
+        assert store.applied == []
 
         upload.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["a.md"]))
-        assert len(spy.notifications) == 1
+        assert len(store.applied) == 1
+        assert store.keys_applied() == {"rag_index.a.md"}
 
 
 class TestTheCapabilityRefusal:
