@@ -26,14 +26,12 @@ from akgentic.tool.workspace.actor import WorkspaceActor
 from akgentic.tool.workspace.card.params import WorkspaceExec
 from akgentic.tool.workspace.card.write import _bound
 from akgentic.tool.workspace.execution import (
-    ExecState,
     ExecStatus,
     effective_budget,
     format_status,
     in_progress,
     poll_attempts_within,
-    queued,
-    wait_out_the_turn,
+    timed_out,
 )
 
 
@@ -94,9 +92,10 @@ class ExecFactories:
             Unwrapped, `&&` `||` `;` `|` `>` `$VAR` `$(...)` are literal arguments and fail.
 
             The workspace is held for the run: teammates still read, their changes wait. A
-            second command never refuses yours — it waits its turn and returns its own
-            output. Everything touched is recorded as one change attributed to you; if the
-            wait runs long you get a run id instead, which workspace_exec_result collects.
+            second command arriving while it is held is REFUSED, not queued — retry it once
+            the run has finished. Everything touched is recorded as one change attributed to
+            you; if the wait runs long you get a run id instead, which
+            workspace_exec_result collects.
 
             Args:
                 cmd: One binary plus its arguments, tokenised POSIX-style so quoting
@@ -108,7 +107,7 @@ class ExecFactories:
                 Combined stdout, stderr and exit code — or a run id, if the wait ran long.
 
             Raises:
-                RetriableError: If too many runs are already queued on this workspace.
+                RetriableError: If another command already holds this workspace.
             """
             start = _bound(proxy).request_exec(agent_id, cmd, cwd)
             if not start.run_id:
@@ -118,24 +117,19 @@ class ExecFactories:
             def fetch() -> ExecStatus:
                 return _bound(proxy).exec_status(agent_id, run_id)
 
-            if waits_out_the_run:
-                # "Wait out the run" now reaches the queue in front of it too, so
-                # a command that had to wait its turn still answers with its own
-                # output rather than a run id somebody has to collect.
-                return wait_out_the_turn(fetch, run_id, run_budget, delay)
             settled = poll_deferred(
                 lambda: _settled_status(fetch()), attempts=attempts, delay=delay
             )
             if settled is not None:
                 return format_status(settled)
-            # An explicitly bounded look is unchanged: it asked for a run id after
-            # N attempts and gets one. ``poll_deferred`` answers None without
-            # saying WHY it stopped, so one more ask tells the two honest messages
-            # apart — "queued" says the work has not begun and nothing is lost,
-            # where "in progress" says it is running and will land.
-            status = fetch()
-            if status.state is ExecState.QUEUED:
-                return queued(run_id, status.queue_position)
+            # Every admitted run starts at once now, so there is one thing an
+            # exhausted poll can mean and no second ask is needed to tell which:
+            # the run is in flight. Which message is honest still depends on the
+            # budget that was in force — the sentinel waited out the whole run
+            # and then some, so a run still going has overrun; a bounded look
+            # asked for a run id after N attempts and gets one.
+            if waits_out_the_run:
+                return timed_out(run_id, run_budget)
             return in_progress(run_id)
 
         workspace_exec.__doc__ = params.format_docstring(workspace_exec.__doc__)

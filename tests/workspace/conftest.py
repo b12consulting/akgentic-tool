@@ -998,8 +998,8 @@ class WorkspaceAddress(MockActorAddress):
     hand-off lands the work.
 
     Do not "fix" this by starting the workspace actor for real: the point of the
-    inert actor is that a test can read ``_running`` and ``_queue`` while a run
-    is held open.
+    inert actor is that a test can read ``_running`` — and the marker the run
+    holds on disk — while a run is held open.
     """
 
     def __init__(self, name: str, role: str, actor: WorkspaceActor) -> None:

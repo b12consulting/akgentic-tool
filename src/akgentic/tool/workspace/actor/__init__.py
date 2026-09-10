@@ -76,7 +76,7 @@ import contextlib
 import logging
 import threading
 import time
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -94,10 +94,10 @@ from akgentic.tool.workspace.execution import (
     ExecConfig,
     ExecOutcome,
     ExecRunner,
-    QueuedExec,
     RunningExec,
 )
 from akgentic.tool.workspace.journal import GitJournal
+from akgentic.tool.workspace.lock import LockBackend
 from akgentic.tool.workspace.models import (
     STAGING_SWEEP_GRACE_S,
     LastWrite,
@@ -314,7 +314,10 @@ class WorkspaceActor(
         )
         self._pending: Future[None] | None = None
         self._running: RunningExec | None = None
-        self._queue: deque[QueuedExec] = deque()
+        # Announced by the card at bind time, exactly as ``_exec_config`` is.
+        # Until then ``request_exec`` refuses as unconfigured: a run admitted
+        # under no hold is a run two workers could both admit.
+        self._lock: LockBackend | None = None
         self._run_errors: OrderedDict[str, str] = OrderedDict()
         self._recent_runs: dict[str, OrderedDict[str, str]] = {}
         self._rag_params: WorkspaceRagIndex | None = None

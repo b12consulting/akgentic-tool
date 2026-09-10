@@ -46,7 +46,6 @@ from akgentic.tool.workspace.execution import (
     EXEC_SHUTDOWN_GRACE_S,
     LEASE_GRACE_S,
     MAX_EXEC_BUDGET_S,
-    MAX_QUEUED_RUNS,
     MAX_TRACKED_RUNS,
     RUN_ID_CHARS,
     TIMED_OUT_EXIT_CODE,
@@ -61,7 +60,6 @@ from akgentic.tool.workspace.execution import (
     in_progress,
     new_run_id,
     poll_attempts_within,
-    queued,
     timed_out,
 )
 from akgentic.tool.workspace.documents.models import (
@@ -71,8 +69,16 @@ from akgentic.tool.workspace.documents.models import (
     RagStatus,
 )
 from akgentic.tool.workspace.journal import MAX_COMMIT_BODY_CHARS
+from akgentic.tool.workspace.lock import (
+    EXEC_LOCK_FILENAME,
+    FileLockBackend,
+    LockBackend,
+    LockGrant,
+    LockTicket,
+)
 from akgentic.tool.workspace.models import MutationStatus, Observation, SweepTick, content_sha
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
+from akgentic.tool.workspace.workspace import meta_dir_for
 
 from tests.workspace.conftest import (
     workspace_path_for,
@@ -162,6 +168,59 @@ def finish_run(script: SandboxScript, harness: ExecHarness) -> None:
     """Release the blocked run and wait for the sandbox to report."""
     script.gate.set()
     harness.join()
+
+
+def exec_marker() -> Path:
+    """The exec lock's marker for the suite's tree — a sibling, never inside it.
+
+    Derived through ``meta_dir_for`` rather than spelled out, so a spec asserting
+    on it cannot drift from where the backend actually writes. It reads the
+    environment at call time, so callers take the ``workspace_tree`` fixture.
+    """
+    return meta_dir_for(WORKSPACE_PATH) / EXEC_LOCK_FILENAME
+
+
+def _ticket(agent_id: str = AGENT_B, cmd: str = "echo hi") -> LockTicket:
+    """A ticket another process's backend would present for the suite's tree."""
+    return LockTicket(
+        agent_id=agent_id, cmd=cmd, budget_s=effective_budget(DEFAULT_EXEC_TIMEOUT_S)
+    )
+
+
+class _RaisingLock:
+    """A lock backend whose filesystem is broken — both calls raise.
+
+    Stands in for an unwritable metadata parent or a full disk, which is the
+    only way either call can fail: neither is a code path the shipped backend
+    can be talked into on its own.
+    """
+
+    def acquire(self, tree_key: str, ticket: LockTicket) -> LockGrant:
+        raise OSError("the metadata directory is not writable")
+
+    def release(self, tree_key: str, run_id: str) -> None:
+        raise OSError("the metadata directory is not writable")
+
+
+class _ReleaseObserver:
+    """Wraps a real backend and records the tree's state at each ``release``.
+
+    The only way to assert the ORDER of the commit and the release rather than
+    the end state: by the time ``_finish_run`` returns both have happened,
+    whichever came first.
+    """
+
+    def __init__(self, inner: LockBackend, tree: Path) -> None:
+        self._inner = inner
+        self._tree = tree
+        self.clean_at_release: list[bool] = []
+
+    def acquire(self, tree_key: str, ticket: LockTicket) -> LockGrant:
+        return self._inner.acquire(tree_key, ticket)
+
+    def release(self, tree_key: str, run_id: str) -> None:
+        self.clean_at_release.append(working_tree_is_clean(self._tree))
+        self._inner.release(tree_key, run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +406,74 @@ class TestTheCapability:
         assert isinstance(runner.backend, FakeBackend)
         assert runner.workspace_path == WORKSPACE_PATH
 
+    def test_the_actor_is_given_the_cards_own_lock_backend(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        sandbox_script: SandboxScript,
+    ) -> None:
+        # Built card-side in ``observer()`` and announced over the tell proxy,
+        # so the object the actor decides admission on is the one the card
+        # resolved — not a second instance built somewhere else under a
+        # different environment.
+        card, _observer = exec_card_for(orchestrator_proxy)
+        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+        assert isinstance(actor, WorkspaceActor)
+
+        assert isinstance(card._lock_backend, FileLockBackend)
+        assert actor._lock is card._lock_backend
+
+    def test_an_unknown_lock_backend_fails_at_wiring_time(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # A configuration error belongs at start-up, in front of the admin who
+        # set the variable — exactly as an unknown sandbox mode already fails.
+        # Deferred to the first command it would surface as an unexplained
+        # refusal, to an agent, hours later.
+        monkeypatch.setenv("AKGENTIC_LOCK_BACKEND", "nope")
+
+        with pytest.raises(KeyError):
+            WorkspaceTool(workspace_id=workspace_tree.name).observer(
+                FakeActorToolObserver(orchestrator_proxy)
+            )
+
+    def test_a_workspace_with_no_lock_refuses_every_run(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        # A lost announcement degrades to "unconfigured" rather than to a run
+        # admitted under no hold — which is a run two workers could both admit.
+        _card, actor, _harness = exec_setup
+        actor._lock = None
+
+        start = actor.request_exec(AGENT, "echo hi")
+
+        assert not start.run_id
+        assert "no execution backend configured" in start.refusal
+        assert sandbox_script.commands == []
+
+    def test_a_lock_that_raises_is_refused_rather_than_crashing_the_caller(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        # ``request_exec`` is an ASK: a raise here crosses the actor boundary
+        # and reaches the agent as a crash rather than as an answer it can act
+        # on. An unwritable metadata parent must be a refusal.
+        _card, actor, _harness = exec_setup
+        actor._lock = _RaisingLock()
+
+        start = actor.request_exec(AGENT, "echo hi")
+
+        assert not start.run_id
+        assert start.refusal.startswith("workspace busy")
+        assert sandbox_script.commands == []
+        assert actor._running is None
+
     def test_off_the_tool_channel_creates_no_sandbox_actor_and_probes_nothing(
         self,
         orchestrator_proxy: FakeOrchestratorProxy,
@@ -491,28 +618,48 @@ class TestTheLease:
             mutate(card, tool_name, *args)
         finish_run(sandbox_script, harness)
 
-    def test_a_second_exec_is_queued_rather_than_refused(
+    def test_a_second_exec_is_refused_and_nothing_is_parked(
         self,
         exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
-        # This spec used to assert the refusal. The refusal is the defect: the
-        # command was thrown away and the message published the *holder's* run
-        # id, which a model then collected as its own answer. A second exec now
-        # gets an id of its own and a place in the queue — and nothing is sent
-        # to the sandbox yet, so its budget is not being spent on the wait.
+        # The queue is gone (ADR-051 Decision 5): a second command is refused
+        # and its caller retries. What the queue was protecting is kept in the
+        # *wording* rather than in a deque — the refusal names no run and no
+        # agent, so a model's parallel batch still cannot read a sibling call's
+        # id out of it and collect that as its own answer.
         _card, actor, harness = exec_setup
+        first = start_run(actor, sandbox_script)
+
+        second = actor.request_exec(AGENT_B, "echo again")
+
+        assert not second.run_id
+        assert second.refusal
+        assert first not in second.refusal
+        assert AGENT not in second.refusal
+        # Nothing was parked: no id was issued, so the caller has nothing to
+        # collect and the worker was never handed a second command.
+        assert actor._recent_runs.get(AGENT_B) is None
+        assert len(harness.runs) == 1
+        finish_run(sandbox_script, harness)
+
+    def test_the_card_raises_retriable_rather_than_waiting_its_turn(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+        orchestrator_proxy: FakeOrchestratorProxy,
+    ) -> None:
+        # What the model actually sees, and the whole of the behaviour change:
+        # ``RetriableError`` reaches pydantic-ai as a ``ModelRetry``, so the
+        # collision costs one round trip instead of a place in a queue.
+        _card, actor, harness = exec_setup
+        second_card, _observer = exec_card_for(orchestrator_proxy, name="bob")
         start_run(actor, sandbox_script)
 
-        second = actor.request_exec("agent-2", "echo again")
+        with pytest.raises(RetriableError, match="workspace busy"):
+            tool_named(second_card, "workspace_exec")("echo again")
 
-        assert second.run_id
-        assert not second.refusal
-        status = actor.exec_status("agent-2", second.run_id)
-        assert status.state is ExecState.QUEUED
-        assert status.run_id == second.run_id
-        assert status.queue_position == 1
-        assert len(harness.runs) == 1  # only the head is on the sandbox
+        assert len(harness.runs) == 1
         finish_run(sandbox_script, harness)
 
     def test_a_refusal_costs_no_file_read(
@@ -2014,42 +2161,47 @@ class TestPermissionErrorsAreDistinguished:
 # 47-1 — admission's third answer: the queue, and who a run belongs to
 #
 # Every spec here asserts on MODEL FIELDS first — status.state, .run_id,
-# .command, .queue_position, script.commands, harness.runs,
-# actor._running, actor._in_flight, actor._queue — and only then
+# .command, script.commands, harness.runs, actor._running,
+# actor._in_flight, and the marker on disk — and only then
 # on a rendered string. A guard whose whole assertion is ``"X" in result`` is
 # satisfied by static text that was already there, which is how two inert guards
 # shipped in the story before this one.
 # ---------------------------------------------------------------------------
 
 
-class TestAQueuedRunRuns:
-    """G1 — the work is deferred, never discarded, and it stays its own."""
+class TestTheTreeIsGivenBackAndTheRetryRuns:
+    """G1 — a refused caller's retry runs, and answers with its OWN output.
 
-    def test_a_queued_run_runs_when_the_lease_releases_with_its_own_output(
+    The queue's guards, re-pointed rather than deleted. What the queue was
+    protecting is not the ordering — that is deliberately gone — but the two
+    invariants underneath it: the work is never silently lost, and one run's
+    answer is never another's. Both survive the queue, and both are asserted
+    here on the retry rather than on a dequeue.
+    """
+
+    def test_a_refused_caller_that_retries_runs_with_its_own_output(
         self,
         exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
-        # The defect in one test. Two commands, two distinguishable outputs: the
-        # queued one must come back with ITS OWN, because the incident was an
-        # agent collecting a sibling call's result and recording it as the answer
-        # to a question it never asked.
+        # The original defect in one test. Two commands, two distinguishable
+        # outputs: the second must come back with ITS OWN, because the incident
+        # was an agent collecting a sibling call's result and recording it as
+        # the answer to a question it never asked.
         _card, actor, harness = exec_setup
         sandbox_script.stdout_by_cmd = {"echo head": "HEAD OUTPUT", "echo tail": "TAIL OUTPUT"}
         head = start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
 
-        tail = actor.request_exec(AGENT_B, "echo tail")
+        refused = actor.request_exec(AGENT_B, "echo tail")
 
-        assert tail.run_id and not tail.refusal
-        assert tail.run_id != head
-        waiting = actor.exec_status(AGENT_B, tail.run_id)
-        assert waiting.state is ExecState.QUEUED
-        assert waiting.run_id == tail.run_id
-        assert waiting.queue_position == 1
-        assert sandbox_script.commands == [("echo head", "")]  # not started yet
+        assert refused.refusal and not refused.run_id
+        assert sandbox_script.commands == [("echo head", "")]  # nothing else started
 
         finish_run(sandbox_script, harness)
+        tail = actor.request_exec(AGENT_B, "echo tail")  # the retry
+        harness.join()
 
+        assert tail.run_id and tail.run_id != head
         assert sandbox_script.commands == [("echo head", ""), ("echo tail", "")]
         collected = actor.exec_status(AGENT_B, tail.run_id)
         assert collected.state is ExecState.DONE
@@ -2063,79 +2215,48 @@ class TestAQueuedRunRuns:
         assert head_status.outcome.stdout == "HEAD OUTPUT"
         assert format_status(collected).startswith(f"Run {tail.run_id} - exit_code:")
 
-    def test_a_queued_run_still_runs_when_the_head_fails(
+    def test_a_head_that_fails_still_gives_the_tree_back(
         self,
         exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
+        workspace_tree: Path,
     ) -> None:
-        # Both exits reach _finish_run — deliver AND fail — so a head that blew
-        # up must drain the queue exactly as one that succeeded does. A dequeue
-        # wired to the success path alone strands every waiting run.
+        # Both exits reach _finish_run — deliver AND fail — so a run that blew
+        # up must release the marker exactly as one that succeeded does. A
+        # release wired to the success path alone locks the tree for the whole
+        # staleness window after every failure.
         _card, actor, harness = exec_setup
         sandbox_script.raise_with = RuntimeError("the backend fell over")
         head = start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
-        tail = actor.request_exec(AGENT_B, "echo tail")
 
         finish_run(sandbox_script, harness)
 
         assert actor.exec_status(AGENT, head).state is ExecState.FAILED
-        assert sandbox_script.commands == [("echo head", ""), ("echo tail", "")]
-        assert actor.exec_status(AGENT_B, tail.run_id).state is ExecState.FAILED
-        assert not actor._queue
+        assert not exec_marker().exists()
+        assert actor.request_exec(AGENT_B, "echo tail").run_id
+        harness.join()
 
-
-class TestAQueuedEntryIsInert:
-    """G2 — nothing sent, no in-flight mark and no clock started until dequeue."""
-
-    def test_nothing_is_sent_or_held_for_a_queued_entry(
+    def test_nothing_is_recorded_for_a_refused_caller(
         self,
         exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
-        # A request handed to the sandbox at enqueue would run out of order
-        # behind the head's in the sandbox's own mailbox, and an _in_flight mark
-        # would make exec_status call a queued run RUNNING.
+        # A refusal issues no id, so there is nothing in flight, nothing
+        # tracked, and nothing for the holder's record to have been overwritten
+        # by. An admission path that recorded the refused caller anyway would
+        # leave it an id it could never collect.
         _card, actor, harness = exec_setup
         head = start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
 
-        tail = actor.request_exec(AGENT_B, "echo tail")
+        refused = actor.request_exec(AGENT_B, "echo tail")
 
         assert [request.run_id for request in harness.runs] == [head]
-        assert tail.run_id not in actor._in_flight
+        assert not refused.run_id
+        assert actor._recent_runs.get(AGENT_B) is None
         assert actor._running is not None
         assert actor._running.run_id == head  # still the head's, untouched
-        assert [entry.run_id for entry in actor._queue] == [tail.run_id]
         assert sandbox_script.commands == [("echo head", "")]
         finish_run(sandbox_script, harness)
-
-    def test_the_budget_is_measured_from_the_dequeue_not_from_the_wait(
-        self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
-        sandbox_script: SandboxScript,
-    ) -> None:
-        # started_at is taken when the entry is DEQUEUED, and budget + grace is
-        # measured from it. Clocked at enqueue instead, a run that waited behind
-        # a long head would be past its budget before its own command started.
-        #
-        # Read inside _start_run, between the hold being taken and the work
-        # being submitted, which is the only window in which the value is
-        # observable: a run released by an already-set gate can report and clear
-        # _running before the call that took it has even returned. The harness's
-        # executor records it at every submit, which is exactly that window.
-        _card, actor, harness = exec_setup
-        holds = harness.holds
-        start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
-        tail = actor.request_exec(AGENT_B, "echo tail")
-        assert len(holds) == 1, "the enqueue started a run of its own"
-
-        released_at = time.monotonic()
-        finish_run(sandbox_script, harness)
-
-        assert len(holds) == 2
-        dequeued = holds[1]
-        assert dequeued is not None
-        assert dequeued.run_id == tail.run_id
-        assert dequeued.started_at >= released_at, "the run was clocked from the wait"
 
 
 class TestARunBelongsToTheAgentThatStartedIt:
@@ -2169,29 +2290,22 @@ class TestARunBelongsToTheAgentThatStartedIt:
         assert rendered.startswith(f"Unknown run id '{mine}'")
         assert "MINE" not in rendered
 
-    @pytest.mark.parametrize("state", ["running", "queued"])
     def test_a_foreign_run_is_unknown_whatever_state_it_is_really_in(
         self,
         exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
-        state: str,
     ) -> None:
         # The ownership gate is ahead of every other branch, so no branch below
         # it can answer a foreign run — not the result cache, not the error map,
-        # not the queue, not _in_flight.
+        # not _in_flight. (The queued case went with the queue: a refused
+        # caller never receives an id for anyone to ask about.)
         _card, actor, harness = exec_setup
         head = start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
-        target = head
-        if state == "queued":
-            target = actor.request_exec(AGENT, "echo tail").run_id
-            assert actor.exec_status(AGENT, target).state is ExecState.QUEUED
-        else:
-            assert actor.exec_status(AGENT, target).state is ExecState.RUNNING
+        assert actor.exec_status(AGENT, head).state is ExecState.RUNNING
 
-        foreign = actor.exec_status(AGENT_C, target)
+        foreign = actor.exec_status(AGENT_C, head)
 
         assert foreign.state is ExecState.UNKNOWN
-        assert foreign.queue_position == 0
         assert foreign.recent_run_ids == []
         finish_run(sandbox_script, harness)
 
@@ -2678,45 +2792,48 @@ class TestTeardownEndsTheRunInFlight:
 class TestTeardownIsOrderedAndBounded:
     """AC 14–17 — the four steps, their order, and what a failing one may not skip."""
 
-    def test_the_queued_run_never_starts(
+    def test_a_clean_teardown_does_not_leave_the_tree_locked(
         self,
         exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
+        workspace_tree: Path,
     ) -> None:
-        # AC15, the negative half. Worth nothing without the control below: "B is
-        # absent from the record" passes if B was never enqueued, if the fake was
-        # never reached, or if the record was never written at all.
-        _card, actor, harness = exec_setup
-        head = start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
-        tail = actor.request_exec(AGENT_B, "echo tail")
-        assert [entry.run_id for entry in actor._queue] == [tail.run_id]
-
-        actor.on_stop()
-        harness.join()
-
-        assert list(actor._queue) == []
-        assert ("exec-enter", "echo tail") not in sandbox_script.events
-        assert [run.run_id for run in harness.runs] == [head]
-        assert sandbox_script.commands == [("echo head", "")]
-
-    def test_the_same_queued_run_does_start_when_the_head_finishes_normally(
-        self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
-        sandbox_script: SandboxScript,
-    ) -> None:
-        # AC15, the positive control, and it is half the guard. Same setup, same
-        # record, same assertion — with teardown removed, B IS asked for. That
-        # is what makes the absence above a statement about ``on_stop`` rather
-        # than about a queue that never drains at all.
+        # The marker outlives this process, which is what makes this step owed
+        # at all: a team that stops mid-run and leaves it behind locks the tree
+        # for the next worker until the staleness window expires — and nothing
+        # in that worker can tell the difference between "held" and "abandoned".
         _card, actor, harness = exec_setup
         start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
-        tail = actor.request_exec(AGENT_B, "echo tail")
-        assert [entry.run_id for entry in actor._queue] == [tail.run_id]
+        assert exec_marker().is_file()  # the control: it really was taken
 
-        finish_run(sandbox_script, harness)
+        actor.on_stop()
+        sandbox_script.gate.set()
+        harness.join()
 
-        assert ("exec-enter", "echo tail") in sandbox_script.events
-        assert sandbox_script.commands == [("echo head", ""), ("echo tail", "")]
+        assert not exec_marker().exists()
+        # And the tree is genuinely free, not merely tidy: another process's
+        # backend can take it at once.
+        assert FileLockBackend().acquire(WORKSPACE_PATH, _ticket()).run_id
+
+    def test_a_release_that_raises_does_not_skip_the_kill_or_the_backend_release(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+        workspace_tree: Path,
+    ) -> None:
+        # Every step is wrapped SEPARATELY, and the release is now the first of
+        # them — so a backend that raises here would, under one shared wrapper,
+        # leave a live child, an undrained executor and a container up.
+        _card, actor, harness = exec_setup
+        start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
+        actor._lock = _RaisingLock()
+        sandbox_script.gate.set()
+
+        actor.on_stop()  # must not raise
+        harness.join()
+
+        assert sandbox_script.kills == 1
+        assert ("stop",) in sandbox_script.events
 
     def test_the_kill_lands_on_a_live_run_and_the_release_follows_the_drain(
         self,
@@ -2838,374 +2955,27 @@ class TestTeardownChainsToTheBase:
         assert chained == [True]
 
 
-class TestTheQueueIsFifoAndCapped:
-    """G7 — order, and the one refusal left."""
+class TestTheStatusVocabulary:
+    """What ``settled`` means, now that admission has only two answers."""
 
-    def test_three_requests_dequeue_in_the_order_they_arrived(
-        self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
-        sandbox_script: SandboxScript,
-    ) -> None:
-        _card, actor, harness = exec_setup
-        first = start_run(actor, sandbox_script, cmd="echo a", agent=AGENT)
-        second = actor.request_exec(AGENT_B, "echo b")
-        third = actor.request_exec(AGENT_C, "echo c")
-
-        assert [entry.run_id for entry in actor._queue] == [second.run_id, third.run_id]
-        assert [entry.cmd for entry in actor._queue] == ["echo b", "echo c"]
-        assert actor.exec_status(AGENT_B, second.run_id).queue_position == 1
-        assert actor.exec_status(AGENT_C, third.run_id).queue_position == 2
-
-        finish_run(sandbox_script, harness)
-
-        assert sandbox_script.commands == [("echo a", ""), ("echo b", ""), ("echo c", "")]
-        assert [request.run_id for request in harness.runs] == [
-            first,
-            second.run_id,
-            third.run_id,
-        ]
-
-    def test_over_the_cap_the_refusal_names_no_run_and_no_agent(
-        self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
-        sandbox_script: SandboxScript,
-    ) -> None:
-        # The only exec refusal left, and the one place an agent has no id of its
-        # own to be handed instead. Quoting the holder's id here would reproduce
-        # the exact defect the queue removes.
-        _card, actor, harness = exec_setup
-        builder = attached(actor, "builder")
-        head = start_run(actor, sandbox_script, cmd="echo head", agent=builder)
-        queued_ids = [
-            actor.request_exec(AGENT_B, f"echo {index}").run_id
-            for index in range(MAX_QUEUED_RUNS)
-        ]
-        assert all(queued_ids)
-        assert len(actor._queue) == MAX_QUEUED_RUNS
-
-        over = actor.request_exec(AGENT_C, "echo over")
-
-        assert not over.run_id
-        assert over.refusal
-        assert len(actor._queue) == MAX_QUEUED_RUNS  # nothing was appended
-        for named in (head, *queued_ids):
-            assert named not in over.refusal
-        for agent in (builder, AGENT_B, AGENT_C, "builder"):
-            assert agent not in over.refusal
-        finish_run(sandbox_script, harness)
-
-
-class TestTheCardAnswersAQueuedCaller:
-    """AC9 — the exhaustion branch tells a queued caller that it is queued."""
-
-    def test_a_caller_still_queued_when_its_budget_expires_is_told_so(
-        self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
-        sandbox_script: SandboxScript,
-    ) -> None:
-        # poll_deferred answers None without saying WHY, so without the extra ask
-        # on this branch a queued caller would be told its run "timed out" or was
-        # "in progress" — both false, and the second of them tells the model the
-        # workspace is held by work that has not started.
-        card, actor, harness = exec_setup  # poll_attempts=1, delay=0.0
-        start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
-
-        answer = tool_named(card, "workspace_exec")(cmd="echo mine")
-
-        assert len(actor._queue) == 1
-        mine = actor._queue[0].run_id
-        status = actor.exec_status(card._agent_id, mine)
-        assert status.state is ExecState.QUEUED
-        assert status.run_id == mine
-        assert status.queue_position == 1
-        assert answer == queued(mine, 1)
-        assert mine in answer
-        assert "queued at position 1" in answer
-        assert "without reporting" not in answer  # not the timeout message
-        assert "still in progress" not in answer  # nor the in-flight one
-        finish_run(sandbox_script, harness)
-
-    def test_a_queued_status_is_not_settled_so_the_poll_looks_through_it(self) -> None:
-        # If QUEUED were settled, poll_deferred would stop on its first look and
-        # hand back a run id on the ordinary path where the head finishes in
-        # milliseconds — the degraded answer, for the common case.
-        assert not ExecStatus(state=ExecState.QUEUED, run_id="abc12345").settled
+    def test_only_done_and_failed_are_settled(self) -> None:
+        # ``poll_deferred`` stops at the first settled look, so a state wrongly
+        # marked settled hands the agent a run id on the ordinary path where the
+        # command finishes in milliseconds — the degraded answer, for the common
+        # case. (The queued state went with the queue: a refused caller never
+        # receives an id for a poll to ask about.)
         assert not ExecStatus(state=ExecState.RUNNING, run_id="abc12345").settled
+        assert not ExecStatus(state=ExecState.UNKNOWN, run_id="abc12345").settled
         assert ExecStatus(state=ExecState.DONE, run_id="abc12345").settled
         assert ExecStatus(state=ExecState.FAILED, run_id="abc12345").settled
-
-    def test_a_queued_run_that_starts_and_finishes_is_collected_normally(
-        self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
-        sandbox_script: SandboxScript,
-    ) -> None:
-        # The whole point of handing back an id rather than a refusal: the run is
-        # still there to be collected, and it carries its own command.
-        card, actor, harness = exec_setup
-        sandbox_script.stdout_by_cmd = {"echo mine": "MINE"}
-        start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
-        answer = tool_named(card, "workspace_exec")(cmd="echo mine")
-        mine = actor._queue[0].run_id
-        assert mine in answer
-
-        finish_run(sandbox_script, harness)
-
-        collected = mutate(card, "workspace_exec_result", mine)
-        assert collected.startswith(f"Run {mine} - exit_code:")
-        assert "MINE" in collected
-
-    def test_collecting_a_queued_run_renders_the_queued_message(
-        self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
-        sandbox_script: SandboxScript,
-    ) -> None:
-        # The other way an agent meets a queued run: it holds an id from a
-        # previous turn and asks about it directly. format_status has to render
-        # QUEUED, not fall through to the unknown-id message.
-        card, actor, harness = exec_setup
-        start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
-        mine = actor.request_exec(card._agent_id, "echo mine")
-        assert mine.run_id
-
-        answer = mutate(card, "workspace_exec_result", mine.run_id)
-
-        status = actor.exec_status(card._agent_id, mine.run_id)
-        assert status.state is ExecState.QUEUED
-        assert status.queue_position == 1
-        assert answer == queued(mine.run_id, 1)
-        assert "Unknown run id" not in answer
-        finish_run(sandbox_script, harness)
-
-    def test_the_card_raises_retriable_when_the_queue_is_full(
-        self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
-        sandbox_script: SandboxScript,
-    ) -> None:
-        # The one refusal left, at the card boundary: it still becomes a
-        # RetriableError so the model is told to try again rather than handed a
-        # string it can ignore — and it still names nobody.
-        card, actor, harness = exec_setup
-        head = start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
-        for index in range(MAX_QUEUED_RUNS):
-            assert actor.request_exec(AGENT_B, f"echo {index}").run_id
-
-        with pytest.raises(RetriableError) as refusal:
-            tool_named(card, "workspace_exec")(cmd="echo over")
-
-        assert len(actor._queue) == MAX_QUEUED_RUNS
-        assert head not in str(refusal.value)
-        assert str(MAX_QUEUED_RUNS) in str(refusal.value)
-        finish_run(sandbox_script, harness)
-
-
-class TestAQueuedCallerWaitsOutItsTurn:
-    """The point of the epic: a batch behaves as if it had been issued serially.
-
-    Under the sentinel a caller that had to queue still returns **its own
-    output** on the call that asked for it. Handing it a run id instead would be
-    barely better than the refusal the queue replaced — the model would be left
-    managing three results it never asked to manage.
-    """
-
-    @staticmethod
-    def _sentinel_card(
-        orchestrator_proxy: FakeOrchestratorProxy,
-        workspace_tree: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        name: str = "waiter",
-        timeout_s: float = 2.0,
-    ) -> tuple[WorkspaceTool, WorkspaceActor, ExecHarness]:
-        card, _ = exec_card_for(
-            orchestrator_proxy,
-            name=name,
-            poll_attempts=-1,
-            poll_delay_seconds=0.01,
-            timeout_s=timeout_s,
-        )
-        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
-        assert isinstance(actor, WorkspaceActor)
-        harness = ExecHarness(actor, orchestrator_proxy)
-        harness.install(monkeypatch)
-        return card, actor, harness
-
-    @staticmethod
-    def _await_queued(actor: WorkspaceActor) -> str:
-        """Block until something is queued, bounded — a hang is a failure, not a wait."""
-        limit = time.monotonic() + HANDSHAKE_TIMEOUT_S
-        while not actor._queue and time.monotonic() < limit:
-            time.sleep(0.005)
-        assert actor._queue, "the call never enqueued"
-        return actor._queue[0].run_id
-
-    def test_a_queued_caller_gets_its_own_output_not_a_run_id(
-        self,
-        orchestrator_proxy: FakeOrchestratorProxy,
-        workspace_tree: Path,
-        sandbox_script: SandboxScript,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        # The head is held open, the caller queues behind it, the head is then
-        # released — and the caller's own call returns the caller's own output.
-        #
-        # **The head is held past the un-extended deadline on purpose.** Releasing
-        # it promptly makes this spec inert: the initial deadline is a whole run
-        # budget, so a poll that never extended for the queue would still be
-        # looking when the output landed, and the assertions below would pass on
-        # a broken loop. (Measured, not assumed — the first draft of this spec
-        # survived exactly that mutation.) So the release is driven by the
-        # caller's OWN looks and fires only once it has been queued for longer
-        # than a run budget: past the deadline it would have had without the
-        # extension, and well inside the one it has with it.
-        monkeypatch.setattr("akgentic.tool.workspace.execution.EXEC_REPORT_MARGIN_S", 0.0)
-        run_budget = 0.2
-        card, actor, harness = self._sentinel_card(
-            orchestrator_proxy, workspace_tree, monkeypatch, timeout_s=run_budget
-        )
-        sandbox_script.stdout_by_cmd = {"echo head": "HEAD OUTPUT", "echo mine": "MINE OUTPUT"}
-        start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
-
-        original = actor.exec_status
-        queued_since: list[float] = []
-
-        def release_once_queued_past_one_budget(agent_id: str, run_id: str) -> ExecStatus:
-            status = original(agent_id, run_id)
-            if status.state is ExecState.QUEUED:
-                if not queued_since:
-                    queued_since.append(time.monotonic())
-                elif time.monotonic() - queued_since[0] > run_budget * 1.5:
-                    sandbox_script.gate.set()  # the head reports; the queue drains
-            return status
-
-        monkeypatch.setattr(actor, "exec_status", release_once_queued_past_one_budget)
-
-        answers: list[str] = []
-
-        def call() -> None:
-            answers.append(str(tool_named(card, "workspace_exec")(cmd="echo mine")))
-
-        caller = threading.Thread(target=call, daemon=True)
-        caller.start()
-        mine = self._await_queued(actor)
-        caller.join(timeout=HANDSHAKE_TIMEOUT_S)
-        sandbox_script.gate.set()  # never leave the head blocked, whatever the caller did
-        assert not caller.is_alive(), "the queued caller never returned"
-        harness.join()
-        assert queued_since, "the caller never saw its run queued"
-
-        status = original(card._agent_id, mine)
-        assert status.state is ExecState.DONE
-        assert status.run_id == mine
-        assert status.command == "echo mine"
-        assert status.outcome is not None
-        assert status.outcome.stdout == "MINE OUTPUT"
-        assert sandbox_script.commands == [("echo head", ""), ("echo mine", "")]
-        assert len(answers) == 1
-        answer = answers[0]
-        assert answer.startswith(f"Run {mine} - exit_code:")
-        assert "MINE OUTPUT" in answer
-        assert "HEAD OUTPUT" not in answer  # never the head's, which is the incident
-        assert "is queued at position" not in answer  # not a handoff
-        assert "workspace_exec_result" not in answer
-
-    # This guard's regression mode is an unbounded loop, not a wrong value: drop
-    # the ceiling and the deadline re-arms for ever, so the call never returns.
-    # Without an explicit bound that wedges the run instead of failing it, and a
-    # wedged pipeline reads as "still going" rather than as a defect. The budget
-    # here is a failure budget — the spec's own ceiling is 0.34 s — never a delay.
-    @pytest.mark.timeout(30)
-    def test_a_position_that_never_decreases_still_hits_the_absolute_ceiling(
-        self,
-        orchestrator_proxy: FakeOrchestratorProxy,
-        workspace_tree: Path,
-        sandbox_script: SandboxScript,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        # The deadline is re-armed on every QUEUED look, so on its own it is not
-        # a bound: a position that never decreases re-arms the clock for ever.
-        # That is reachable — a head whose worker died without reporting keeps
-        # its lease until some OTHER request arrives to reclaim it, and this loop
-        # is not that request. The absolute ceiling fixed on entry is what makes
-        # the stated worst case true of the code: the call returns, with the
-        # degraded queued handoff.
-        monkeypatch.setattr("akgentic.tool.workspace.execution.EXEC_REPORT_MARGIN_S", 0.0)
-        # With a 0.02 s budget the ceiling is (16 + 1) x 0.02 = 0.34 s of failure
-        # budget — never a delay anything spends when the loop is correct.
-        card, actor, harness = self._sentinel_card(
-            orchestrator_proxy, workspace_tree, monkeypatch, name="stuck", timeout_s=0.02
-        )
-        monkeypatch.setattr(
-            actor,
-            "exec_status",
-            lambda agent_id, run_id: ExecStatus(
-                state=ExecState.QUEUED, run_id=run_id, queue_position=1
-            ),
-        )
-        sandbox_script.gate.set()
-
-        answer = tool_named(card, "workspace_exec")(cmd="echo mine")
-        harness.join()
-
-        run_id = harness.runs[0].run_id
-        assert answer == queued(run_id, 1)
-        assert run_id in answer
-
-    def test_a_caller_that_keeps_advancing_is_never_abandoned_mid_queue(
-        self,
-        orchestrator_proxy: FakeOrchestratorProxy,
-        workspace_tree: Path,
-        sandbox_script: SandboxScript,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        # Why the deadline re-arms rather than being fixed at the first look. A
-        # run ahead costs its budget PLUS the lease grace and the spawn, so a
-        # deadline pinned to the position first seen gives a caller at position p
-        # exactly (p + 1) budgets for work that honestly takes more — and drops
-        # it WHILE IT IS STILL MOVING UP the queue, which is the load the queue
-        # exists for. Here the caller advances 2 -> 1 -> done over a wait longer
-        # than a first-look deadline would have allowed, and still gets its
-        # output. Positions are driven by look COUNT, so the spec is about the
-        # algorithm rather than about the machine it runs on.
-        monkeypatch.setattr("akgentic.tool.workspace.execution.EXEC_REPORT_MARGIN_S", 0.0)
-        run_budget = 0.05
-        card, _actor, harness = self._sentinel_card(
-            orchestrator_proxy, workspace_tree, monkeypatch, name="climber", timeout_s=run_budget
-        )
-        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
-        assert isinstance(actor, WorkspaceActor)
-        sandbox_script.gate.set()
-        looks: list[int] = []
-        outcome = ExecOutcome(stdout="CLIMBED", stderr="", exit_code=0)
-
-        def advance(agent_id: str, run_id: str) -> ExecStatus:
-            looks.append(len(looks) + 1)
-            if len(looks) <= 12:
-                return ExecStatus(state=ExecState.QUEUED, run_id=run_id, queue_position=2)
-            if len(looks) <= 24:
-                return ExecStatus(state=ExecState.QUEUED, run_id=run_id, queue_position=1)
-            return ExecStatus(
-                state=ExecState.DONE, run_id=run_id, outcome=outcome, command="echo mine"
-            )
-
-        monkeypatch.setattr(actor, "exec_status", advance)
-
-        answer = tool_named(card, "workspace_exec")(cmd="echo mine")
-        harness.join()
-
-        # A first-look deadline is (2 + 1) x 0.05 = 0.15 s; the climb above takes
-        # ~0.25 s of looks, so a pinned deadline gives up around look 16.
-        assert len(looks) >= 25, "the poll abandoned a caller that was still advancing"
-        run_id = harness.runs[0].run_id
-        assert answer.startswith(f"Run {run_id} - exit_code:")
-        assert "CLIMBED" in answer
-        assert "is queued at position" not in answer
 
 
 # ---------------------------------------------------------------------------
 # 47-2 — the sandbox reports back, and the two releases that need no report
 #
 # Same rule as the G-classes above: every assertion here reads a MODEL FIELD
-# first — status.state, status.reason, actor._running, actor._queue,
-# harness.runs, script.commands, journal_log(...) — and only then, if at
+# first — status.state, status.reason, actor._running, harness.runs,
+# script.commands, journal_log(...) — and only then, if at
 # all, a rendered string.
 # ---------------------------------------------------------------------------
 
@@ -3213,21 +2983,20 @@ class TestAQueuedCallerWaitsOutItsTurn:
 class TestTheHandlerAlwaysReports:
     """N1-N4 — whatever the command does, one report comes back."""
 
-    def test_a_backend_that_raises_is_reported_and_the_queue_drains(
+    def test_a_backend_that_raises_is_reported_and_the_tree_is_given_back(
         self,
         exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
+        workspace_tree: Path,
     ) -> None:
-        # N1. The handler's finally is the whole contract: an exception escaping
-        # a tell handler stops the sandbox actor, and a stopped sandbox reports
-        # nothing — with no worker left holding a budget to time it out. So a
-        # backend that falls over has to arrive as an answer, and the tree has
-        # to be handed on.
+        # N1. The handler's finally is the whole contract: a run whose report is
+        # dropped holds the tree until staleness releases it — and now that the
+        # hold is a file, "until staleness" means for the next process too. So a
+        # backend that falls over has to arrive as an answer, and the marker has
+        # to go with it.
         _card, actor, harness = exec_setup
         sandbox_script.raise_with = RuntimeError("the backend fell over")
         head = start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
-        tail = actor.request_exec(AGENT_B, "echo tail")
-        assert tail.run_id
 
         finish_run(sandbox_script, harness)
 
@@ -3235,7 +3004,10 @@ class TestTheHandlerAlwaysReports:
         assert status.state is ExecState.FAILED
         assert "the backend fell over" in status.reason
         assert actor._running is None
-        assert list(actor._queue) == []
+        assert not exec_marker().exists()
+        tail = actor.request_exec(AGENT_B, "echo tail")
+        assert tail.run_id
+        harness.join()
         assert sandbox_script.commands == [("echo head", ""), ("echo tail", "")]
 
     def test_a_timeout_from_the_backend_is_an_outcome_not_a_failure(
@@ -3347,8 +3119,8 @@ class TestTheHandlerAlwaysReports:
 
 
 @requires_git
-class TestACommitPrecedesTheNextStart:
-    """N5 — run A's write set is committed before run B is allowed to start."""
+class TestACommitPrecedesTheRelease:
+    """N5 — run A's write set is committed before the tree is given back."""
 
     @pytest.fixture
     def journalled(
@@ -3365,16 +3137,43 @@ class TestACommitPrecedesTheNextStart:
         harness.install(monkeypatch)
         return actor, harness
 
+    def test_the_write_set_is_committed_before_the_lock_is_given_back(
+        self,
+        journalled: tuple[WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+        workspace_tree: Path,
+    ) -> None:
+        # The release is the LAST thing _finish_run does, after the commit, and
+        # this asserts the ORDER rather than the end state — which is the only
+        # way to see it, since after the call both have happened either way.
+        #
+        # It matters more with a file lock than it did with a queue: the next
+        # acquirer may be in ANOTHER PROCESS, so a release before the commit
+        # hands over a tree still showing a.txt as untracked, and that run's own
+        # discovery sweeps it into a commit attributed to whoever asked next.
+        actor, harness = journalled
+        ann = attached(actor, "ann")
+        sandbox_script.files_by_cmd = {"make a": [("a.txt", "A\n")]}
+        observer = _ReleaseObserver(actor._lock, workspace_tree)
+        actor._lock = observer
+        start_run(actor, sandbox_script, cmd="make a", agent=ann)
+
+        finish_run(sandbox_script, harness)
+
+        assert observer.clean_at_release == [True], (
+            "the tree was given back before the run's write set was committed"
+        )
+        assert journal_log(workspace_tree)[-1].files == ["a.txt"]
+
     def test_bs_files_are_absent_from_as_discovered_commit(
         self,
         journalled: tuple[WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         workspace_tree: Path,
     ) -> None:
-        # The dequeue is the LAST thing _finish_run does, after the commit. Run
-        # before it, run B's own commit_out_of_band would sweep up a.txt as
-        # belonging to nobody — and with the order reversed the other way, A's
-        # discovery would sweep up b.txt and attribute B's work to A.
+        # The attribution half, on the retry path the queue's dequeue used to
+        # cover: B's command runs against a tree A already committed, so neither
+        # run's discovery can sweep up the other's files.
         actor, harness = journalled
         ann = attached(actor, "ann")
         bert = attached(actor, "bert")
@@ -3384,8 +3183,11 @@ class TestACommitPrecedesTheNextStart:
         }
         before = journal_log(workspace_tree)
         start_run(actor, sandbox_script, cmd="make a", agent=ann)
-        actor.request_exec(bert, "make b")
+        assert actor.request_exec(bert, "make b").refusal  # refused while A holds it
         finish_run(sandbox_script, harness)
+
+        assert actor.request_exec(bert, "make b").run_id  # the retry is granted
+        harness.join()
 
         log = journal_log(workspace_tree)
         assert len(log) == len(before) + 2
@@ -3473,30 +3275,35 @@ class TestAWedgedChild:
         assert actor.exec_status(AGENT, head).state is ExecState.RUNNING
         finish_run(sandbox_script, harness)
 
-    def test_the_release_starts_the_queue_head(
+    def test_the_release_gives_the_marker_back_as_well_as_the_record(
         self,
         exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
+        workspace_tree: Path,
     ) -> None:
-        # N9's wedge half. Releasing without starting the head would leave the
-        # queue with nothing scheduled to run it, and the next arriving request
-        # would find the tree free and jump the whole queue.
+        # N9's wedge half, re-pointed at the file. Clearing ``_running`` alone
+        # would let mutations resume while the tree stayed locked ON DISK until
+        # the marker's own staleness — so the next command would be refused by a
+        # run this actor has already declared dead. The marker's mtime and the
+        # record's started_at agree by construction, and this is the one path
+        # that could make them disagree.
         card, actor, harness = exec_setup
         head = start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
-        tail = actor.request_exec(AGENT_B, "echo tail")
+        assert exec_marker().is_file()
         assert actor._running is not None
         budget = effective_budget(DEFAULT_EXEC_TIMEOUT_S)
         actor._running.started_at = time.monotonic() - (budget + LEASE_GRACE_S + 1.0)
 
-        # Any message reaches the predicate; a refused mutation is the cheapest.
-        with pytest.raises(RetriableError, match=tail.run_id):
-            mutate(card, "workspace_mkdir", "src")
+        # Any message reaches the predicate; a mutation is the cheapest.
+        assert "Created" in mutate(card, "workspace_mkdir", "src")
 
-        assert actor._running is not None
-        assert actor._running.run_id == tail.run_id
-        assert actor._running.run_id != head
-        assert list(actor._queue) == []
-        assert [request.run_id for request in harness.runs] == [head, tail.run_id]
+        assert actor._running is None
+        assert not exec_marker().exists()
+        # And the next request is admitted at once, without waiting out the
+        # marker's own staleness window.
+        retry = actor.request_exec(AGENT_B, "echo tail")
+        assert retry.run_id and retry.run_id != head
+        assert [request.run_id for request in harness.runs] == [head, retry.run_id]
         finish_run(sandbox_script, harness)
 
     def test_inside_the_grace_the_mutation_is_still_refused(
@@ -3530,11 +3337,13 @@ class TestAWedgedChild:
         # late report must not do is touch the tree or the newer run's hold.
         _card, actor, harness = exec_setup
         head = start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
-        tail = actor.request_exec(AGENT_B, "echo tail")
         assert actor._running is not None
         budget = effective_budget(DEFAULT_EXEC_TIMEOUT_S)
         actor._running.started_at = time.monotonic() - (budget + LEASE_GRACE_S + 1.0)
         actor._holding_run()  # the release the next mutation or poll would do
+        assert actor._running is None
+        tail = actor.request_exec(AGENT_B, "echo tail")  # takes the freed tree
+        assert tail.run_id
         assert actor._running is not None
         assert actor._running.run_id == tail.run_id
         discovered: list[str] = []
@@ -3563,30 +3372,30 @@ def attached_mortal(actor: WorkspaceActor, name: str) -> tuple[str, MortalAddres
     return str(address.agent_id), address
 
 
-class TestASweptHoldersQueuedRunNeverStarts:
-    """A shell nobody is waiting for must not start — dropped at the sweep, before the backend."""
+class TestASweptHoldersRunsArePrunedAndTheHeadIsUntouched:
+    """The sweep drops an agent's runs without touching the run holding the tree."""
 
-    def test_the_dropped_agents_queued_run_never_reaches_exec_and_a_live_ones_does(
+    def test_the_dropped_agents_runs_go_and_a_live_ones_still_runs(
         self,
         exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
+        # The queued half of this spec went with the queue — a swept agent has
+        # nothing parked to be dropped any more. What survives is what mattered
+        # underneath it: the prune is exact, the run genuinely holding the tree
+        # is left alone, and a live agent's command still runs afterwards.
         _card, actor, harness = exec_setup
         alpha = attached(actor, "alpha")
         dead = DeadAddress("beta")
         actor.attach(dead, "beta")
         beta = str(dead.agent_id)
         gamma = attached(actor, "gamma")
-        # Beta also has an earlier failed run, so the ``_run_errors`` prune is observable.
+        # Beta has an earlier failed run, so the ``_run_errors`` prune is observable.
         earlier = new_run_id()
         actor._track_run(beta, earlier, "false")
         actor._record_failure(earlier, "exit 1")
         actor.record_observation(beta, "notes.md", Observation(sha="0" * 64, full=True))
         head = start_run(actor, sandbox_script, cmd="echo alpha", agent=alpha)
-        queued_beta = actor.request_exec(beta, "echo beta").run_id
-        queued_gamma = actor.request_exec(gamma, "echo gamma").run_id
-        assert queued_beta is not None and queued_gamma is not None
-        assert actor.exec_status(beta, queued_beta).state is ExecState.QUEUED
         in_flight = set(actor._in_flight)
 
         actor.receiveMsg_SweepTick(SweepTick())
@@ -3596,18 +3405,20 @@ class TestASweptHoldersQueuedRunNeverStarts:
         assert beta not in actor._agent_names
         assert beta not in actor._recent_runs
         assert earlier not in actor._run_errors
-        assert [entry.run_id for entry in actor._queue] == [queued_gamma]
         assert actor._running is not None
         assert actor._running.run_id == head
         assert actor._in_flight == in_flight
-        assert actor.exec_status(beta, queued_beta).state is ExecState.UNKNOWN
+        assert actor.exec_status(beta, earlier).state is ExecState.UNKNOWN
         assert {alpha, gamma} <= set(actor._holders)
 
         finish_run(sandbox_script, harness)
+        run_gamma = actor.request_exec(gamma, "echo gamma").run_id
+        assert run_gamma
+        harness.join()
 
         # Released and joined, so the backend has seen everything it ever will.
         assert [cmd for cmd, _cwd in sandbox_script.commands] == ["echo alpha", "echo gamma"]
-        assert actor.exec_status(gamma, queued_gamma).state is ExecState.DONE
+        assert actor.exec_status(gamma, run_gamma).state is ExecState.DONE
 
 
 class TestASweptHoldersRunningRunCompletesAndIsDiscarded:
@@ -3642,8 +3453,7 @@ class TestASweptHoldersRunningRunCompletesAndIsDiscarded:
         beta = attached(actor, "beta")
         sandbox_script.files_by_cmd = {"make alpha": [("alpha.txt", "a\n")]}
         run_id = start_run(actor, sandbox_script, cmd="make alpha", agent=alpha)
-        queued_beta = actor.request_exec(beta, "echo beta").run_id
-        assert queued_beta is not None
+        assert actor.request_exec(beta, "echo beta").refusal  # alpha holds it
         alpha_address.dead = True
 
         actor.receiveMsg_SweepTick(SweepTick())
@@ -3663,9 +3473,13 @@ class TestASweptHoldersRunningRunCompletesAndIsDiscarded:
         assert run_id not in actor._in_flight
         assert actor._discarded_run is None
         assert actor.exec_status(alpha, run_id).state is ExecState.UNKNOWN
-        # The tree was handed on, and beta's run answers as usual.
+        # The tree was given back — a discarded outcome still releases it — so
+        # beta's retry runs and answers as usual.
+        run_beta = actor.request_exec(beta, "echo beta").run_id
+        assert run_beta
+        harness.join()
         assert [cmd for cmd, _cwd in sandbox_script.commands] == ["make alpha", "echo beta"]
-        assert actor.exec_status(beta, queued_beta).state is ExecState.DONE
+        assert actor.exec_status(beta, run_beta).state is ExecState.DONE
         # The tree's own record is kept, authored by the id — the name went with the holder.
         [commit] = [c for c in journal_log(workspace_tree) if "alpha.txt" in c.files]
         assert commit.author_name == alpha

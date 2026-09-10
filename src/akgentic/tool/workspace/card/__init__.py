@@ -85,6 +85,7 @@ from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION, derived_
 from akgentic.tool.workspace.event import WorkspaceAttached
 from akgentic.tool.workspace.execution import ExecConfig, resolve_mode
 from akgentic.tool.workspace.host import WorkspaceHost
+from akgentic.tool.workspace.lock import LockBackend, resolve_lock_backend
 from akgentic.tool.workspace.models import (
     Observation,
     WorkspaceConfig,
@@ -304,6 +305,9 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
     _workspace_proxy: WorkspaceActor | None = PrivateAttr(default=None)
     _workspace_tell: WorkspaceActor | None = PrivateAttr(default=None)
     _agent_id: str = PrivateAttr(default="")
+    # Runtime state, never a serializable field: a backend is an object with a
+    # method, and a ``ToolCard`` field holding one would not round-trip.
+    _lock_backend: LockBackend | None = PrivateAttr(default=None)
 
     @model_validator(mode="after")
     def _one_layout(self) -> WorkspaceTool:
@@ -376,6 +380,11 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
         super().observer(observer)  # store the observer weakly via the base setter
         ws_path = str(self._resolve_path(observer, observer.orchestrator))
         self._workspace = get_workspace(ws_path)
+        # Unconditional, beside the filesystem and for the same reason: a bad
+        # ``AKGENTIC_LOCK_BACKEND`` must fail the bind in front of the admin who
+        # set it, not at the first command. Constructing one creates nothing —
+        # the backend is stateless and touches the disk only on ``acquire``.
+        self._lock_backend = resolve_lock_backend()
         self._seed_resources()
         self._bind_workspace_actor(observer, observer.orchestrator, ws_path)
         self._bind_sandbox(observer, ws_path)
@@ -477,9 +486,34 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
         if params is None:
             return
         mode, _backend = resolve_mode(params.mode)
+        # Before the exec config, deliberately: the actor refuses every run
+        # until it has both, so announcing the hold first means it can never
+        # admit a run under a backend it has not been given.
+        self._announce_lock()
         self._announce_exec(
             ExecConfig(mode=mode, workspace_path=workspace_path, timeout_s=params.timeout_s)
         )
+
+    def _announce_lock(self) -> None:
+        """Tell the actor what the tree's exclusive hold is taken on — fire and forget.
+
+        Guarded exactly as :meth:`_announce_exec` is, and it degrades the same
+        way: without a backend the actor refuses every run as unconfigured —
+        visible, and recoverable by rebinding. A raise at wiring time is neither.
+
+        The backend is built in :meth:`observer`, so a card whose exec capability
+        is off still resolves one; it simply never announces it. What that costs
+        is nothing — the object is stateless and touches no disk until an
+        ``acquire`` that will never come.
+        """
+        tell = self._workspace_tell
+        backend = self._lock_backend
+        if tell is None or backend is None:
+            return
+        try:
+            tell.configure_lock(backend)
+        except Exception:
+            logger.debug("Could not announce the exec lock backend to #Workspace", exc_info=True)
 
     def _announce_exec(self, config: ExecConfig) -> None:
         """Tell the actor which backend to run commands on — fire and forget.
