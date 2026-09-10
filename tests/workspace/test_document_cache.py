@@ -52,6 +52,7 @@ from akgentic.tool.workspace.tool import WorkspaceTool
 
 from tests.workspace.conftest import (
     WORKSPACE_PATH,
+    FakeActorToolObserver,
     RecordingDocumentStore,
     attach_store,
     read,
@@ -219,6 +220,52 @@ class TestTheCacheIsOnDisk:
         fill(actor, "notes.docx", body="# Notes")
         assert "documents" not in type(actor.state).model_fields
         assert "rag_index" not in type(actor.state).model_fields
+
+
+# ---------------------------------------------------------------------------
+# AC9/AC10 (52-3): the card resolves the store from the environment and the
+# actor uses the object it resolved — the pair 52-2 shipped for the lock backend
+# ---------------------------------------------------------------------------
+
+
+class TestTheCardResolvesTheStoreAndTheActorUsesIt:
+    """``AKGENTIC_DOCUMENT_STORE`` has to reach the actor, and be checked at the bind.
+
+    **Both of these were unguarded and both were caught by mutation**: replacing
+    ``resolve_document_store()`` in ``observer()`` with a direct
+    ``YamlDocumentStore()`` left the whole package suite green, so nothing
+    connected the variable to anything. The store's own specs assert that the
+    *resolver* fails on an unregistered name, which is a narrower question than
+    the one AC 9 asks — a resolver nobody calls at bind time still passes it.
+
+    These mirror ``test_the_actor_is_given_the_cards_own_lock_backend`` and
+    ``test_an_unknown_lock_backend_fails_at_wiring_time`` (``test_exec.py``), so
+    the two backends this card resolves are guarded the same way.
+    """
+
+    def test_the_actor_is_given_the_cards_own_document_store(
+        self, wired_card: WorkspaceTool, workspace_actor: WorkspaceActor
+    ) -> None:
+        # The object the actor caches through must be the one the card resolved
+        # from the environment — not a second instance built somewhere else, and
+        # not a default standing in for a backend a deployment registered.
+        assert isinstance(wired_card._document_store, YamlDocumentStore)
+        assert workspace_actor._document_store is wired_card._document_store
+
+    def test_an_unknown_document_store_fails_at_wiring_time(
+        self,
+        observer: FakeActorToolObserver,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # A configuration error belongs at start-up, in front of the admin who
+        # set the variable — exactly as an unknown lock backend already fails.
+        # Deferred to the first document read it would surface as a cache that
+        # never hits, to nobody, hours later.
+        with monkeypatch.context() as patch:
+            patch.setenv("AKGENTIC_DOCUMENT_STORE", "nope")
+            with pytest.raises(KeyError):
+                WorkspaceTool(workspace_id=workspace_tree.name).observer(observer)
 
 
 # ---------------------------------------------------------------------------

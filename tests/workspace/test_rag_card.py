@@ -68,6 +68,8 @@ class RecordingTell:
 
     def __init__(self) -> None:
         self.enable_calls: list[tuple[Any, ...]] = []
+        self.calls: list[str] = []
+        """Every announcement's name, in the order the bind made it."""
 
     def enable_rag(
         self,
@@ -76,10 +78,14 @@ class RecordingTell:
         reader: DocumentReader,
         collection: VectorStoreParam,
     ) -> None:
+        self.calls.append("enable_rag")
         self.enable_calls.append((agent_id, params, reader, collection))
 
     def __getattr__(self, name: str) -> Any:
-        return lambda *args, **kwargs: None
+        def announced(*args: Any, **kwargs: Any) -> None:
+            self.calls.append(name)
+
+        return announced
 
 
 class TestTheCardsRetrievalFields:
@@ -561,6 +567,30 @@ class TestTheBindTimeAnnouncement:
         assert announced == params
         assert isinstance(reader, DocumentReader)
         assert collection.tenant == "acme"
+
+    def test_the_document_store_is_announced_before_retrieval_is_enabled(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """The actor may never enable retrieval under a store it has not been given.
+
+        Story 52-3's ordering clause, and the reason ``_announce_document_store``
+        sits between the bind and ``_announce_rag`` rather than after it: the
+        moment retrieval is on, the actor reads and writes index rows, and a
+        window where it does that with no store is a window where the index looks
+        empty and every row it writes is dropped.
+        """
+        tell = RecordingTell()
+
+        bind(
+            orchestrator_proxy,
+            tell_proxy=tell,
+            workspace_rag_index=True,
+            vector_store=VectorStoreParam(backend="inmemory"),
+        )
+
+        assert "configure_document_store" in tell.calls
+        assert "enable_rag" in tell.calls
+        assert tell.calls.index("configure_document_store") < tell.calls.index("enable_rag")
 
     def test_a_card_with_retrieval_off_announces_nothing(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path

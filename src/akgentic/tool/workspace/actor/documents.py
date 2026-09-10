@@ -1303,7 +1303,7 @@ class DocumentsMixin(_DocumentsBase):
         requeued = 0
         for entry in self._entries():
             row = entry.row
-            if row is None or row.status not in _ORPHANED_ON_RESTORE:
+            if row is None or row.status not in _CARRIED_BY_A_WORKER:
                 continue
             if row.updated_at >= cutoff or entry.path in self._index_active:
                 continue
@@ -1758,8 +1758,16 @@ _IN_FLIGHT = frozenset(
 )
 """Statuses meaning "a run over these bytes has not finished yet"."""
 
-_ORPHANED_ON_RESTORE = _IN_FLIGHT - {RagStatus.PENDING}
-"""Statuses a worker was carrying — every one of them abandoned when its actor stopped."""
+_CARRIED_BY_A_WORKER = _IN_FLIGHT - {RagStatus.PENDING}
+"""Statuses a worker is carrying — the three a row can only leave by being reported.
+
+**Not "orphaned on restore", which is what this was called and is no longer
+true.** There is no restore any more, and therefore no moment at which every row
+in one of these statuses is abandoned by construction: the records are on disk
+and another process may be working on one of them right now.
+:meth:`DocumentsMixin.reap_abandoned_rows` is what decides, and it needs two more
+facts than this set — the age bound and ``_index_active``.
+"""
 
 
 def _extracted_at(entry: DocumentEntry) -> datetime:
