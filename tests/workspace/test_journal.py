@@ -57,6 +57,7 @@ from tests.workspace.conftest import (
     workspace_path_for,
     FakeActorToolObserver,
     FakeOrchestratorProxy,
+    attached,
     card_for,
     git_show,
     journal_branches,
@@ -795,16 +796,16 @@ class TestIdentity:
     ) -> None:
         # Angle brackets would open the email field and a newline would end the
         # identity line — either lets an agent id say something other than a name.
-        workspace_actor.register_agent("hostile-id", "Ali<ce>\nGIT_AUTHOR_NAME=root\x07")
+        hostile = attached(workspace_actor, "Ali<ce>\nGIT_AUTHOR_NAME=root\x07")
 
-        outcome_of(workspace_actor, "apply_write", "hostile-id", "fresh.md", "body\n")
+        outcome_of(workspace_actor, "apply_write", hostile, "fresh.md", "body\n")
 
         commit = journal_log(workspace_tree)[-1]
         assert "<" not in commit.author_name
         assert ">" not in commit.author_name
         assert "\n" not in commit.author_name
         assert "\x07" not in commit.author_name
-        assert commit.author_email == f"hostile-id@{IDENTITY_DOMAIN}"
+        assert commit.author_email == f"{hostile}@{IDENTITY_DOMAIN}"
 
     def test_an_identity_that_sanitises_to_nothing_is_never_empty(self) -> None:
         identity = Identity("\x00\x01", "<<<")
@@ -1100,7 +1101,7 @@ class TestTheCardField:
         observer = FakeActorToolObserver(orchestrator_proxy, name="alice")
         card = WorkspaceTool(workspace_id=WORKSPACE_NAME, git_journal=False)
         card.observer(observer)
-        _actor_class, config = orchestrator_proxy.create_calls[-1]
+        config = orchestrator_proxy.resource_calls[-1].config
         assert isinstance(config, WorkspaceConfig)
         assert config.git_journal is False
 

@@ -75,7 +75,7 @@ def tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 @pytest.fixture
 def started(tree: Path) -> Iterator[DockerBackend]:
     """A real container, removed in a ``finally`` so a failing spec leaks nothing."""
-    backend = DockerBackend("team-integration")
+    backend = DockerBackend()
     backend.start("u-alice/notes")
     try:
         yield backend
@@ -254,7 +254,7 @@ def test_stop_actually_removes_the_container_and_a_second_stop_still_does_not_ra
     The external ``docker rm`` stands in for a reaper, an operator, or a daemon
     restart — the case where the container is gone before teardown reaches it.
     """
-    backend = DockerBackend("team-integration")
+    backend = DockerBackend()
     backend.start("u-alice/notes")
     name = backend.container_name
     assert name is not None
@@ -282,7 +282,7 @@ def test_stop_actually_removes_the_container_and_a_second_stop_still_does_not_ra
 
 def test_a_container_removed_from_outside_does_not_make_stop_raise(tree: Path) -> None:
     """AC24: *already gone* is the outcome teardown asked for, not an error."""
-    backend = DockerBackend("team-integration")
+    backend = DockerBackend()
     backend.start("u-alice/notes")
     name = backend.container_name
     assert name is not None

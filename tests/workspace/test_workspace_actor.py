@@ -14,7 +14,6 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from akgentic.core.agent_state import BaseState
 from akgentic.tool.workspace.actor import (
     WORKSPACE_ACTOR_NAME,
     WORKSPACE_ACTOR_ROLE,
@@ -30,7 +29,7 @@ from akgentic.tool.workspace.models import (
 )
 from akgentic.tool.workspace.workspace import Filesystem, is_staging_name
 
-from tests.workspace.conftest import WORKSPACE_PATH
+from tests.workspace.conftest import WORKSPACE_PATH, delta_recorder
 
 ALICE = "alice-id"
 BOB = "bob-id"
@@ -57,16 +56,6 @@ def start_actor(workspace_path: str = WORKSPACE_PATH, cap: int = 256) -> Workspa
 def observation(text: str, full: bool = True) -> Observation:
     """An observation of *text*, hashed exactly as the read path hashes it."""
     return Observation(sha=content_sha(text.encode()), full=full)
-
-
-class _StateSpy:
-    """Records every state-change notification the actor's state emits."""
-
-    def __init__(self) -> None:
-        self.notifications: list[BaseState] = []
-
-    def notify_state_change(self, state: BaseState) -> None:
-        self.notifications.append(state)
 
 
 # ---------------------------------------------------------------------------
@@ -164,14 +153,14 @@ class TestObservationMap:
 
 
 class TestRecordingIsNotPersistedState:
-    def test_recording_emits_no_state_change_notification(self, workspaces_root: Path) -> None:
+    def test_recording_sends_no_delta(
+        self, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         actor = start_actor()
-        spy = _StateSpy()
-        actor.state.observer(spy)
-        spy.notifications.clear()  # attaching an observer notifies once, by design
+        store = delta_recorder(actor, monkeypatch)
         actor.record_observation(ALICE, "a.md", observation("hello"))
-        actor.observation_for(ALICE, "a.md")
-        assert spy.notifications == []
+        assert actor.observation_for(ALICE, "a.md") is not None
+        assert store.applied == []
 
     def test_recording_leaves_the_serialisable_state_untouched(self, workspaces_root: Path) -> None:
         actor = start_actor()

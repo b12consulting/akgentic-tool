@@ -21,7 +21,6 @@ Install with ``akgentic-tool[qdrant]``.
 from __future__ import annotations
 
 import importlib.util
-import json
 import logging
 import uuid
 from typing import TYPE_CHECKING, Any
@@ -36,6 +35,7 @@ from akgentic.tool.vector_store.protocol import (
     check_path_prefix,
     check_shared_scope,
     collection_is_team_scoped,
+    stable_object_id,
 )
 from akgentic.tool.vector_store.registry import BackendContext, BackendSpec, register_backend
 
@@ -83,15 +83,6 @@ def _optional_str(value: object) -> str | None:
         The value as a string, or ``None``.
     """
     return None if value is None else str(value)
-
-_POINT_ID_NAMESPACE: uuid.UUID = uuid.UUID("6f9619ff-8b86-d011-b42d-00c04fc964ff")
-"""Fixed namespace for deriving a valid Qdrant point id from an arbitrary ref_id.
-
-Qdrant point ids must be an unsigned int or a UUID; the point id is therefore a
-deterministic ``uuid5`` of the owning team, effective tenant, and ``ref_id``.
-It stays stable across re-ingest without allowing one team to overwrite
-another team's point. ``ref_id`` itself remains in the payload for filtering.
-"""
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +144,7 @@ def require_qdrant_configured(card_name: str) -> None:
 # ---------------------------------------------------------------------------
 # Dependency guard
 # ---------------------------------------------------------------------------
+
 
 def qdrant_dependencies_available() -> bool:
     """Return whether the optional Qdrant client can be imported, without importing it."""
@@ -279,11 +271,7 @@ class QdrantBackend:
                     **({TENANT_PAYLOAD: tenant} if tenant else {}),
                     **({SCOPE_PAYLOAD: entry.scope} if entry.scope is not None else {}),
                     **({PATH_PAYLOAD: entry.path} if entry.path is not None else {}),
-                    **(
-                        {ORDINAL_PAYLOAD: entry.ordinal}
-                        if entry.ordinal is not None
-                        else {}
-                    ),
+                    **({ORDINAL_PAYLOAD: entry.ordinal} if entry.ordinal is not None else {}),
                 },
             )
             for entry in entries
@@ -487,9 +475,7 @@ class QdrantBackend:
         )
         if scope is not None:
             selector.must.append(  # type: ignore[union-attr]
-                models.FieldCondition(
-                    key=SCOPE_PAYLOAD, match=models.MatchValue(value=scope)
-                )
+                models.FieldCondition(key=SCOPE_PAYLOAD, match=models.MatchValue(value=scope))
             )
         if query and query.filters:
             for key, value in query.filters.items():
@@ -582,13 +568,16 @@ class QdrantBackend:
     # ------------------------------------------------------------------
 
     def _point_id(self, ref_id: str, tenant: str | None = None) -> str:
-        """Derive a team- and tenant-scoped Qdrant UUID for ``ref_id``."""
-        identity = json.dumps(
-            [self._team_id or "", tenant or "", ref_id],
-            ensure_ascii=True,
-            separators=(",", ":"),
-        )
-        return str(uuid.uuid5(_POINT_ID_NAMESPACE, identity))
+        """Derive the point id for ``ref_id`` under this backend's team and *tenant*.
+
+        Qdrant point ids must be an unsigned int or a UUID, so the id is
+        :func:`~akgentic.tool.vector_store.protocol.stable_object_id` — the
+        derivation both cluster backends share, and the one every existing point
+        was written under. Stable across re-ingest, and a team-scoped
+        collection keeps the team inside it, so one team never overwrites
+        another's point. ``ref_id`` itself stays in the payload for filtering.
+        """
+        return stable_object_id(self._team_id, tenant, ref_id)
 
     @staticmethod
     def _resolve_distance(config: VectorStoreParam) -> qmodels.Distance:
@@ -599,9 +588,7 @@ class QdrantBackend:
         if override is None:
             return models.Distance.COSINE
         distance = (
-            override
-            if isinstance(override, models.Distance)
-            else models.Distance(str(override))
+            override if isinstance(override, models.Distance) else models.Distance(str(override))
         )
         if distance != models.Distance.COSINE:
             msg = (
@@ -656,9 +643,7 @@ class QdrantBackend:
             raise ValueError(msg)
 
         must: list[qmodels.Condition] = [
-            models.FieldCondition(
-                key=TEAM_ID_PAYLOAD, match=models.MatchValue(value=self._team_id)
-            )
+            models.FieldCondition(key=TEAM_ID_PAYLOAD, match=models.MatchValue(value=self._team_id))
         ]
         must.extend(self._tenant_conditions(collection))
         return models.Filter(must=must)
@@ -684,9 +669,7 @@ class QdrantBackend:
         tenant = self._collection_tenants.get(collection) or self._tenant
         if not tenant:
             return []
-        return [
-            models.FieldCondition(key=TENANT_PAYLOAD, match=models.MatchValue(value=tenant))
-        ]
+        return [models.FieldCondition(key=TENANT_PAYLOAD, match=models.MatchValue(value=tenant))]
 
     def _check_collection(self, collection: str) -> None:
         """Raise ``ValueError`` if *collection* was never created via this backend.

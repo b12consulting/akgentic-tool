@@ -20,6 +20,7 @@ from akgentic.tool.vector_store.protocol import (
     check_path_prefix,
     check_shared_scope,
     collection_is_team_scoped,
+    stable_object_id,
 )
 from akgentic.tool.vector_store.registry import BackendContext, BackendSpec, register_backend
 
@@ -198,12 +199,15 @@ class WeaviateBackend:
             closes it.
         tenant: Optional default tenant ID for multi-tenancy.
         team_id: Owning team id. Stamped onto every object written through this
-            backend and used as the filter on every object it reads or removes.
-            **Required to query:** ``search`` and ``remove`` raise ``ValueError``
-            without one, rather than inventing an identity for the caller. It may
-            be omitted only to build an administrative backend for
-            ``list_collections`` and ``delete_by_team``, neither of which needs a
-            team.
+            backend, part of every object's id, and used as the filter on every
+            object it reads or removes on a team-scoped collection. **Required to
+            query a team-scoped collection:** ``search`` and ``remove`` there
+            raise ``ValueError`` without one, rather than inventing an identity
+            for the caller. It is omitted by a consumer with no team of its own —
+            the hosted workspace, whose shared collection is bounded by ``scope``
+            and whose objects stamp ``""`` — and to build an administrative
+            backend for ``list_collections`` and ``delete_by_team``, neither of
+            which needs a team.
     """
 
     def __init__(
@@ -303,6 +307,18 @@ class WeaviateBackend:
         entry from planning or the knowledge graph byte-identical to what it was
         before this dimension existed.
 
+        **Every object is written under a deterministic ``uuid``**, from
+        :func:`~akgentic.tool.vector_store.protocol.stable_object_id` over this
+        backend's team, the tenant the object is written to, and ``ref_id`` — the
+        derivation the Qdrant backend's point ids use. The client replaces an
+        object whose uuid already exists and mints a fresh UUIDv4 when none is
+        given (weaviate-client 4.16.2, ``weaviate/collections/batch/collection.py``),
+        so without it every re-add of a chunk left one more copy, within one
+        writer's lifetime as well as across two. On a team-scoped collection the
+        team is inside the id, so two teams writing one ``ref_id`` stay two
+        objects; on the shared collection a team-less writer's id carries ``""``
+        and every lifetime of the tree writes the one object.
+
         The batch context is opened here, on a handle fetched in this call, and
         left here — never stored on the instance, never shared between calls —
         because a shared batch object is the one thing the vendor says is not
@@ -318,12 +334,14 @@ class WeaviateBackend:
         """
         self._check_collection(collection)
         col = self._get_collection(collection)
+        tenant = self._effective_tenant(collection)
 
         with col.batch.dynamic() as batch:
             for entry in entries:
                 batch.add_object(
                     properties=self._object_properties(entry),
                     vector=entry.vector,
+                    uuid=stable_object_id(self._team_id, tenant, entry.ref_id),
                 )
 
     def _object_properties(self, entry: VectorEntry) -> dict[str, str | int]:
@@ -712,6 +730,15 @@ class WeaviateBackend:
             predicate = predicate & leg
         return predicate
 
+    def _effective_tenant(self, name: str) -> str | None:
+        """The tenant every operation on *name* runs under — the collection's, else the default.
+
+        One rule, read by :meth:`_get_collection` to choose the handle and by
+        :meth:`add` to derive each object's id, so the id always names the
+        tenant the object was actually written to.
+        """
+        return self._collection_tenants.get(name) or self._tenant
+
     def _get_collection(self, name: str) -> weaviate.collections.Collection:
         """Return the Weaviate collection handle, with tenant if applicable.
 
@@ -749,7 +776,7 @@ class WeaviateBackend:
         Returns:
             Weaviate collection object (optionally scoped to tenant).
         """
-        tenant = self._collection_tenants.get(name) or self._tenant
+        tenant = self._effective_tenant(name)
         cached = self._collection_handles.get((name, tenant))
         if cached is not None:
             return cached

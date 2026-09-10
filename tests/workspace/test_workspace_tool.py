@@ -1336,10 +1336,10 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
     """What the card hands the actors, and what the actor names therefore become.
 
     These use the fake orchestrator rather than a ``MagicMock``, because the
-    property under test is which **actor** each card resolves to —
-    ``getChildrenOrCreate`` keys on ``config.name`` alone, so a stand-in that
-    handed back one address for every name would make the whole suite pass
-    having exercised nothing.
+    property under test is which **actor** each card resolves to — the host
+    keys its registry on ``config.name`` alone, so a stand-in that handed back
+    one address for every name would make the whole suite pass having
+    exercised nothing.
     """
 
     def test_a_bare_card_anchors_the_team_tree_under_its_owner(
@@ -1376,8 +1376,8 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
         bob_card.observer(FakeActorToolObserver(orchestrator_proxy, "bob", user_id="bob"))
 
         assert alice_card.workspace._root != bob_card.workspace._root
-        assert workspace_actor_name("alice/notes") in orchestrator_proxy.children
-        assert workspace_actor_name("bob/notes") in orchestrator_proxy.children
+        assert workspace_actor_name("alice/notes") in orchestrator_proxy.hosted
+        assert workspace_actor_name("bob/notes") in orchestrator_proxy.hosted
 
     def test_two_exec_cards_on_two_workspaces_create_exactly_two_workspace_actors(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
@@ -1406,7 +1406,7 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
                 FakeActorToolObserver(orchestrator_proxy, name=leaf, user_id="alice")
             )
 
-        names = set(orchestrator_proxy.children)
+        names = set(orchestrator_proxy.hosted)
         assert names == {
             workspace_actor_name("alice/alpha"),
             workspace_actor_name("alice/beta"),
@@ -1492,138 +1492,78 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
             card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
 
 
-class TestTheDeclaredKeyListTravelsOnTheConfig:
-    """``WorkspaceConfig.metadata_keys`` — the join key a client attributes on.
+class TestTheConfigCarriesThePathAndNoKeyList:
+    """``WorkspaceConfig`` carries the resolved path, and no metadata key list.
 
-    The consumer is **another repo**: it compares this list against the agent
-    card's own ``workspace_metadata_keys`` by plain list equality. So the
-    assertions here are on the **wire**, never on the attribute — a field that
-    silently stopped being emitted would be invisible inside this package, and
-    an attribute read stays green with the field excluded from serialisation.
+    The key list used to travel on the config so a client could join an agent
+    to a metadata workspace; it reached the client on the ``#Workspace``
+    ``StartMessage``, which a hosted actor never emits. The client now reads the
+    ``WorkspaceAttached`` event instead, so the field was deleted — and a stored
+    record that still carries it must keep loading.
     """
 
     @staticmethod
-    def _emitted_config(proxy: FakeOrchestratorProxy) -> WorkspaceConfig:
-        """The one ``WorkspaceConfig`` the card handed ``getChildrenOrCreate``."""
+    def _bound_config(proxy: FakeOrchestratorProxy) -> WorkspaceConfig:
+        """The one ``WorkspaceConfig`` the card handed ``getResourceOrCreate``."""
         configs = [
-            config for actor_class, config in proxy.create_calls if actor_class is WorkspaceActor
+            call.config for call in proxy.resource_calls if call.actor_class is WorkspaceActor
         ]
         assert len(configs) == 1
         config = configs[0]
         assert isinstance(config, WorkspaceConfig)
         return config
 
-    def test_a_metadata_card_carries_its_declared_list_in_declaration_order(
+    def test_a_metadata_card_binds_its_resolved_path_and_no_key_list(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
     ) -> None:
         orchestrator_proxy.metadata = _CaseMetadata(customer_id="ACME", case_id="42")
         card = WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])
         card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
 
-        assert self._emitted_config(orchestrator_proxy).metadata_keys == [
-            "customer_id",
-            "case_id",
-        ]
+        config = self._bound_config(orchestrator_proxy)
+        assert config.workspace_path == "_meta/customer_id-ACME__case_id-42"
+        assert "metadata_keys" not in WorkspaceConfig.model_fields
+        assert "metadata_keys" not in config.model_dump()
 
-    def test_the_reversed_declaration_travels_reversed(
+    def test_a_repeated_key_still_dedupes_into_the_leaf(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
     ) -> None:
-        """Nothing normalises this side, so the other side has nothing to normalise."""
-        orchestrator_proxy.metadata = _CaseMetadata(customer_id="ACME", case_id="42")
-        card = WorkspaceTool(workspace_metadata_keys=["case_id", "customer_id"])
-        card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
-
-        assert self._emitted_config(orchestrator_proxy).metadata_keys == [
-            "case_id",
-            "customer_id",
-        ]
-
-    def test_the_config_carries_the_declared_list_not_the_leafs_deduped_one(
-        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
-    ) -> None:
-        """The asymmetry is deliberate, and it is what keeps the join exact.
-
-        The **leaf** must be a canonical directory name, so it dedupes. The
-        **config field** is compared against the agent card's own
-        ``workspace_metadata_keys``, which is the un-deduped declared list.
-        Normalising one side of a join and not the other is how a join starts
-        missing silently.
-        """
+        """The leaf is a canonical directory name, so the resolver dedupes it."""
         orchestrator_proxy.metadata = _CaseMetadata(customer_id="ACME")
         card = WorkspaceTool(workspace_metadata_keys=["customer_id", "customer_id"])
         card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
 
-        config = self._emitted_config(orchestrator_proxy)
-        assert config.metadata_keys == ["customer_id", "customer_id"]
-        # The path deduped; the join key did not.
-        assert config.workspace_path == "_meta/customer_id-ACME"
+        assert self._bound_config(orchestrator_proxy).workspace_path == "_meta/customer_id-ACME"
 
-    @pytest.mark.parametrize("card", [WorkspaceTool(), WorkspaceTool(workspace_id="notes")])
-    def test_a_card_declaring_no_keys_carries_an_empty_list(
-        self,
-        card: WorkspaceTool,
-        orchestrator_proxy: FakeOrchestratorProxy,
-        workspaces_root: Path,
-    ) -> None:
-        card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
-
-        assert self._emitted_config(orchestrator_proxy).metadata_keys == []
-
-    def test_the_list_survives_the_round_trip_the_wire_performs(self) -> None:
-        """``model_dump`` → validate back, in order — not ``config.metadata_keys``.
-
-        ``WorkspaceConfig`` is a ``BaseConfig`` and therefore serialises through
-        ``serialize_base_model``, which **skips any field carrying**
-        ``field_info.exclude``. An assertion on the attribute would stay green
-        with the field excluded, and the consumer in the other repo would see
-        nothing at all.
-        """
-        config = WorkspaceConfig(
-            name=workspace_actor_name("_meta/customer_id-ACME__case_id-42"),
-            role=WORKSPACE_ACTOR_ROLE,
-            workspace_path="_meta/customer_id-ACME__case_id-42",
-            metadata_keys=["customer_id", "case_id"],
-        )
-
-        dumped = config.model_dump()
-        assert dumped["metadata_keys"] == ["customer_id", "case_id"]
-
-        restored = WorkspaceConfig.model_validate(dumped)
-        assert restored.metadata_keys == ["customer_id", "case_id"]
-
-    def test_the_list_survives_the_message_that_carries_a_config_onto_the_stream(
-        self,
-    ) -> None:
-        """``StartMessage`` is the path a config actually takes to a client."""
-        config = WorkspaceConfig(
-            name=workspace_actor_name("_meta/customer_id-ACME__case_id-42"),
-            role=WORKSPACE_ACTOR_ROLE,
-            workspace_path="_meta/customer_id-ACME__case_id-42",
-            metadata_keys=["customer_id", "case_id"],
-        )
-
-        dumped = StartMessage(config=config).model_dump()
-        assert dumped["config"]["metadata_keys"] == ["customer_id", "case_id"]
-
-        restored = StartMessage.model_validate(dumped)
-        assert isinstance(restored.config, WorkspaceConfig)
-        assert restored.config.metadata_keys == ["customer_id", "case_id"]
-
-    def test_a_record_written_before_this_field_existed_still_loads(self) -> None:
-        """An **optional** field with a default breaks no persisted record.
-
-        The deliberate contrast with the ``workspace_name`` → ``workspace_path``
-        rename, which was *required* and made every event already written
-        undeserialisable. Nothing to shim here — and this pins that nobody later
-        "helps" by making the field required.
-        """
+    def test_a_config_record_still_carrying_the_key_list_loads(self) -> None:
+        """A removed field is harmless to stored records: the unknown key is ignored."""
         stored = {
-            "name": "#Workspace-u-alice/notes",
+            "name": "#Workspace-_meta/customer_id-ACME__case_id-42",
             "role": WORKSPACE_ACTOR_ROLE,
-            "workspace_path": "u-alice/notes",
+            "workspace_path": "_meta/customer_id-ACME__case_id-42",
+            "metadata_keys": ["customer_id", "case_id"],
         }
 
-        assert WorkspaceConfig.model_validate(stored).metadata_keys == []
+        restored = WorkspaceConfig.model_validate(stored)
+
+        assert restored.workspace_path == "_meta/customer_id-ACME__case_id-42"
+        assert "metadata_keys" not in restored.model_dump()
+
+    def test_a_start_message_written_with_the_key_list_still_replays(self) -> None:
+        """The persisted streams that carried the field are ``StartMessage``s — they must load."""
+        config = WorkspaceConfig(
+            name=workspace_actor_name("_meta/customer_id-ACME__case_id-42"),
+            role=WORKSPACE_ACTOR_ROLE,
+            workspace_path="_meta/customer_id-ACME__case_id-42",
+        )
+        dumped = StartMessage(config=config).model_dump()
+        dumped["config"]["metadata_keys"] = ["customer_id", "case_id"]
+
+        restored = StartMessage.model_validate(dumped)
+
+        assert isinstance(restored.config, WorkspaceConfig)
+        assert restored.config.workspace_path == "_meta/customer_id-ACME__case_id-42"
+        assert not hasattr(restored.config, "metadata_keys")
 
 
 class TestTheIdentityIsReadAsATypedAttribute:

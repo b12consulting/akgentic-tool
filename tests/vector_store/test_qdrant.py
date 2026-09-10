@@ -7,6 +7,8 @@ behaves.
 
 from __future__ import annotations
 
+import json
+import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -55,9 +57,7 @@ class TestEnvironment:
         monkeypatch.setenv(QDRANT_URL_ENV, "http://localhost:6333")
         require_qdrant_configured("KnowledgeGraphTool")  # does not raise
 
-    def test_require_raises_when_client_is_missing(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_require_raises_when_client_is_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(QDRANT_URL_ENV, "http://localhost:6333")
         with (
             patch(
@@ -233,9 +233,7 @@ class TestSearch:
         backend.create_collection("kg", VectorStoreParam())
         client.query_points.return_value = self._response()
 
-        backend.search(
-            "kg", [0.1, 0.2, 0.3], top_k=5, query=VectorQuery(params={"timeout": 3})
-        )
+        backend.search("kg", [0.1, 0.2, 0.3], top_k=5, query=VectorQuery(params={"timeout": 3}))
         assert client.query_points.call_args[1]["timeout"] == 3
 
 
@@ -303,9 +301,7 @@ class TestRegistry:
         finally:
             cache["close_all"]()
 
-    def test_the_factory_keys_a_portless_url_on_6333(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_the_factory_keys_a_portless_url_on_6333(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """``http://h`` and ``http://h:6333`` are one cluster, not two clients."""
         cache = qdrant_module.get_client.__globals__
 
@@ -519,3 +515,21 @@ class TestDeleteByTeamRefusesASharedCollection:
         backend.delete_by_team("planning", "team-gone")
 
         assert _keys(client.delete.call_args[1]["points_selector"].filter) == ["team_id"]
+
+
+class TestThePointIdDerivationIsUnchanged:
+    """Every point already on a cluster keeps its id: the derivation moved, it did not change."""
+
+    def test_a_fixed_triple_derives_the_id_it_always_did(self) -> None:
+        backend, _client = _make_backend(team_id="team-42")
+        identity = json.dumps(["team-42", "t1", "e1"], ensure_ascii=True, separators=(",", ":"))
+        expected = str(uuid.uuid5(uuid.UUID("6f9619ff-8b86-d011-b42d-00c04fc964ff"), identity))
+
+        assert backend._point_id("e1", "t1") == expected
+
+    def test_a_teamless_writer_derives_from_an_empty_team(self) -> None:
+        backend, _client = _make_backend(team_id=None)
+        identity = json.dumps(["", "", "e1"], ensure_ascii=True, separators=(",", ":"))
+        expected = str(uuid.uuid5(uuid.UUID("6f9619ff-8b86-d011-b42d-00c04fc964ff"), identity))
+
+        assert backend._point_id("e1") == expected

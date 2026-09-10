@@ -13,22 +13,27 @@ so.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from akgentic.core.agent_state import BaseState
+from akgentic.core import ActorDeadError
+from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE, VectorStoreActor
 from akgentic.tool.vector_store.embedding_actor import (
     EmbeddingError,
     EmbeddingRequest,
     EmbeddingResult,
     EmbeddingWorker,
 )
-from akgentic.tool.vector_store.protocol import VectorStoreParam
+from akgentic.tool.vector_store.protocol import (
+    CollectionStatus,
+    SearchHit,
+    SearchResult,
+    VectorStoreParam,
+)
 from akgentic.tool.vector_store.vector import VectorEntry
 from akgentic.tool.workspace.actor import (
     WORKSPACE_ACTOR_ROLE,
@@ -40,6 +45,7 @@ from akgentic.tool.workspace.documents.models import (
     EMBEDDING_STALE_AFTER_S,
     EXTRACTOR_VERSION,
     RAG_COLLECTION,
+    DocumentExtract,
     RagChunk,
     RagFile,
     RagStatus,
@@ -52,12 +58,21 @@ from akgentic.tool.workspace.documents.worker import (
     IndexRequest,
     IndexResult,
     IndexWorker,
+    index_worker_name,
 )
 from akgentic.tool.workspace.models import WorkspaceConfig, WorkspaceState, content_sha
 from akgentic.tool.workspace.readers import DocumentReader
 
 from tests.conftest import MockActorAddress
-from tests.workspace.conftest import DeadAddress, WORKSPACE_PATH
+from tests.workspace.conftest import WORKSPACE_PATH, DeltaStore, delta_recorder, factory_for
+from tests.workspace.test_rag_models import _RagFileWithExtraField
+
+_DOCUMENTS_LOGGER = "akgentic.tool.workspace.actor.documents"
+_UNAVAILABLE = "Retrieval indexing is not available for this workspace."
+_NO_HITS = (
+    "Nothing in the retrieval index matched that query. "
+    "Use workspace_rag_list to see which files are indexed."
+)
 
 ##
 ## Doubles
@@ -65,13 +80,20 @@ from tests.workspace.conftest import DeadAddress, WORKSPACE_PATH
 
 
 class FakeVectorStore:
-    """``#VectorStore`` as this actor uses it — three methods and an ordered log."""
+    """The store child as this actor uses it — four methods and an ordered log.
+
+    ``search`` answers from what ``add`` put in and ``remove`` took out, with no
+    similarity at all: every held entry in the asked scope is a hit at score
+    ``1.0``. That is enough for the restore specs, whose question is whether the
+    engine *holds* a chunk, not how well it matches.
+    """
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, Any]] = []
         self.create_error: Exception | None = None
         self.remove_error: Exception | None = None
         self.add_error: Exception | None = None
+        self.held: list[VectorEntry] = []
 
     def create_collection(self, name: str, config: VectorStoreParam) -> None:
         self.calls.append(("create", (name, config)))
@@ -82,6 +104,7 @@ class FakeVectorStore:
         self.calls.append(("add", (collection, list(entries))))
         if self.add_error is not None:
             raise self.add_error
+        self.held.extend(entries)
 
     def remove(
         self,
@@ -93,6 +116,33 @@ class FakeVectorStore:
         self.calls.append(("remove", (collection, list(ref_ids), scope)))
         if self.remove_error is not None:
             raise self.remove_error
+        gone = set(ref_ids)
+        self.held = [entry for entry in self.held if entry.ref_id not in gone]
+
+    def search(
+        self,
+        collection: str,
+        query_vector: list[float],
+        top_k: int,
+        scope: str | None = None,
+        path_prefix: str | None = None,
+    ) -> SearchResult:
+        self.calls.append(("search", (collection, top_k, scope, path_prefix)))
+        hits = [
+            SearchHit(
+                ref_type=entry.ref_type,
+                ref_id=entry.ref_id,
+                text=entry.text,
+                score=1.0,
+                scope=entry.scope,
+                path=entry.path,
+                ordinal=entry.ordinal,
+            )
+            for entry in self.held
+            if (scope is None or entry.scope == scope)
+            and (not path_prefix or (entry.path or "").startswith(path_prefix))
+        ]
+        return SearchResult(hits=hits[:top_k], status=CollectionStatus.READY)
 
     def kinds(self) -> list[str]:
         """The call log reduced to its verbs, in order."""
@@ -116,34 +166,16 @@ def _embedded(ref_id: str, path: str = "a.md", ordinal: int = 0) -> VectorEntry:
     )
 
 
-class StateSpy:
-    """Records every state-change notification, the shape 45-3's specs use."""
+class StaticEmbedder:
+    """The query leg's embedder, answering one fixed vector and never a network."""
 
     def __init__(self) -> None:
-        self.notifications: list[BaseState] = []
+        self.embeds: list[list[str]] = []
 
-    def notify_state_change(self, state: BaseState) -> None:
-        self.notifications.append(state)
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        self.embeds.append(list(texts))
+        return [[1.0, 0.0] for _ in texts]
 
-
-@contextmanager
-def _factory_for(backend: str, factory: object) -> Iterator[None]:
-    """Swap one registered backend's factory for the duration of a spec.
-
-    ``BackendSpec`` is a frozen dataclass, so the seam is a re-registration
-    rather than an attribute patch — the shape ``tests/vector_store/test_registry.py``
-    already uses.
-    """
-    from dataclasses import replace
-
-    from akgentic.tool.vector_store import registry
-
-    original = registry.get_backend_spec(backend)
-    registry.register_backend(replace(original, factory=factory), replace=True)
-    try:
-        yield
-    finally:
-        registry.register_backend(original, replace=True)
 
 class RagHarness:
     """Wires an inert actor to a fake vector store and a fake spawn path.
@@ -158,23 +190,27 @@ class RagHarness:
     def __init__(self, actor: WorkspaceActor) -> None:
         self.actor = actor
         self.vs = FakeVectorStore()
-        # ``DeadAddress`` rather than a plain stand-in: ``notify_state_change``
-        # reaches into ``ActorAddressImpl._actor_ref`` for anything it believes is
-        # alive, which no stand-in has. Reporting dead is the honest answer — there
-        # is no orchestrator behind this address — and it keeps the actor's own
-        # state notifications out of the way of what these specs are about.
-        self.orchestrator = DeadAddress("orchestrator")
-        self.vs_address: MockActorAddress | None = MockActorAddress("#VectorStore")
+        self.embedder = StaticEmbedder()
+        # The address ``createActor`` hands back for the store child, which
+        # ``_ask`` maps to the fake store. The actor is handed **no**
+        # orchestrator at all — ``install`` sets the slot to ``None`` — because
+        # that is what a hosted actor gets, and an ask to one is the trap
+        # ``_ask`` springs rather than a lookup it answers.
+        self.vs_address = MockActorAddress("#VectorStore-child")
+        self.store_configs: list[Any] = []
         self.requests: list[IndexRequest] = []
         self.embed_requests: list[EmbeddingRequest] = []
         self.worker_names: list[str] = []
         self.embed_worker_names: list[str] = []
         self.spawn_error: BaseException | None = None
         self.embed_spawn_error: BaseException | None = None
+        self.store_spawn_error: BaseException | None = None
+        self._monkeypatch: pytest.MonkeyPatch | None = None
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Point the actor's orchestrator, proxies and spawn path at this harness."""
-        self.actor._orchestrator = self.orchestrator
+        """Take the actor's orchestrator away and point its proxies and spawns here."""
+        self._monkeypatch = monkeypatch
+        self.actor._orchestrator = None
         monkeypatch.setattr(self.actor, "proxy_ask", self._ask)
         monkeypatch.setattr(self.actor, "proxy_tell", self._tell)
         monkeypatch.setattr(self.actor, "createActor", self._create)
@@ -193,13 +229,25 @@ class RagHarness:
             reader or DocumentReader(llm_client=None),
             collection or VectorStoreParam(backend="inmemory"),
         )
+        # ``enable_rag`` builds a real ``EmbeddingService`` from the card's param;
+        # a search in these specs must embed through the double, never a network.
+        if self.actor._embedder is not None:
+            self.actor._embedder = self.embedder
 
-    def watch(self) -> StateSpy:
-        """Attach a notification spy, discarding the attach-time notification."""
-        spy = StateSpy()
-        self.actor.state.observer(spy)
-        spy.notifications.clear()
-        return spy
+    @property
+    def store_names(self) -> list[str]:
+        """The name of every store child ``createActor`` was asked for, in order."""
+        return [config.name for config in self.store_configs]
+
+    def record_deltas(self) -> DeltaStore:
+        """Route every delta the actor sends from now on into a fresh :class:`DeltaStore`.
+
+        The host lookup answers ``None`` under this harness, so without the
+        recorder every persist is a silent no-op — the seam replaced is
+        ``_send_delta``, never ``proxy_tell``, which the harness already owns.
+        """
+        assert self._monkeypatch is not None, "install() the harness first"
+        return delta_recorder(self.actor, self._monkeypatch)
 
     ##
     ## Driving the pipeline
@@ -263,14 +311,10 @@ class RagHarness:
             )
         )
 
-    def error(
-        self, path: str, reason: str = "boom", collection: str = RAG_COLLECTION
-    ) -> None:
+    def error(self, path: str, reason: str = "boom", collection: str = RAG_COLLECTION) -> None:
         """Deliver one ``EmbeddingError``, as an ``#embed-`` worker would."""
         self.actor.receiveMsg_EmbeddingError(
-            EmbeddingError(
-                collection=collection, error=reason, request_id="r", request_ref=path
-            )
+            EmbeddingError(collection=collection, error=reason, request_id="r", request_ref=path)
         )
 
     def _sha_of(self, path: str) -> str:
@@ -282,8 +326,6 @@ class RagHarness:
     ## Proxy plumbing
     ##
     def _ask(self, address: Any, actor_type: Any = None, timeout: int | None = None) -> Any:
-        if address is self.orchestrator:
-            return SimpleNamespace(get_team_member=lambda name: self.vs_address)
         if address is self.vs_address:
             return self.vs
         raise AssertionError(f"unexpected ask target {address}")
@@ -298,6 +340,11 @@ class RagHarness:
 
     def _create(self, actor_class: Any, agent_id: Any = None, config: Any = None) -> Any:
         assert config is not None
+        if actor_class is VectorStoreActor:
+            if self.store_spawn_error is not None:
+                raise self.store_spawn_error
+            self.store_configs.append(config)
+            return self.vs_address
         if actor_class is EmbeddingWorker:
             if self.embed_spawn_error is not None:
                 raise self.embed_spawn_error
@@ -315,18 +362,23 @@ class RagHarness:
 ##
 
 
-@pytest.fixture
-def actor(workspace_tree: Path) -> WorkspaceActor:
-    """A started actor over the test workspace, with no actor thread."""
+def _started_actor(workspace_path: str) -> WorkspaceActor:
+    """A started actor over *workspace_path*, with no actor thread."""
     started = WorkspaceActor(
         config=WorkspaceConfig(
-            name=workspace_actor_name(WORKSPACE_PATH),
+            name=workspace_actor_name(workspace_path),
             role=WORKSPACE_ACTOR_ROLE,
-            workspace_path=WORKSPACE_PATH,
+            workspace_path=workspace_path,
         )
     )
     started.on_start()
     return started
+
+
+@pytest.fixture
+def actor(workspace_tree: Path) -> WorkspaceActor:
+    """A started actor over the test workspace, with no actor thread."""
+    return _started_actor(WORKSPACE_PATH)
 
 
 @pytest.fixture
@@ -373,10 +425,10 @@ class TestEnableRag:
         [(_, config)] = harness.vs.of("create")
         assert (config.backend, config.dimension) == ("inmemory", 3072)
 
-    def test_a_cluster_param_builds_a_backend_instead_of_looking_the_actor_up(
+    def test_a_cluster_param_builds_a_backend_instead_of_creating_a_child(
         self, harness: RagHarness, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """No lookup happens at all: the engine comes from the registered factory."""
+        """No child is created at all: the engine comes from the registered factory."""
         built: list[object] = []
         double = FakeVectorStore()
 
@@ -384,31 +436,34 @@ class TestEnableRag:
             built.append(context)
             return double
 
-        harness.vs_address = None  # a lookup would degrade; the factory must not
-
-        with _factory_for("weaviate", _factory):
+        with factory_for("weaviate", _factory):
             harness.enable(collection=VectorStoreParam(backend="weaviate", dimension=3072))
 
         assert len(built) == 1
-        assert built[0].team_id == str(harness.actor.team_id)
+        # The workspace's collection is shared and bounded by ``scope``; its
+        # auto-generated team id names no team, so the backend is handed none.
+        assert built[0].team_id is None
+        assert built[0].config.name == harness.actor.config.name
         assert harness.actor._vs_proxy is double
+        assert harness.store_names == []
         [(name, config)] = double.of("create")
         assert name == RAG_COLLECTION
         assert (config.backend, config.dimension) == ("weaviate", 3072)
 
     def test_a_cluster_factory_that_raises_degrades_without_raising(
-        self, harness: RagHarness, monkeypatch: pytest.MonkeyPatch,
+        self,
+        harness: RagHarness,
+        monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """A failed connect is the cluster path's version of a failed create_collection."""
-        import logging
 
         def _factory(_context: object) -> object:
             raise ValueError("unreachable")
 
         with (
-            _factory_for("weaviate", _factory),
-            caplog.at_level(logging.WARNING, logger="akgentic.tool.workspace.actor.documents"),
+            factory_for("weaviate", _factory),
+            caplog.at_level(logging.WARNING, logger=_DOCUMENTS_LOGGER),
         ):
             harness.enable(collection=VectorStoreParam(backend="weaviate"))
 
@@ -428,16 +483,93 @@ class TestEnableRag:
             "Retrieval indexing is not available for this workspace."
         )
 
-    def test_a_missing_vector_store_degrades_rather_than_raising(
-        self, harness: RagHarness, workspace_tree: Path
+    @pytest.mark.parametrize(
+        "outage",
+        [
+            RuntimeError("can't start new thread"),
+            ActorDeadError("the store child is not alive"),
+        ],
+        ids=["no-thread", "dead-child"],
+    )
+    def test_a_store_child_that_cannot_be_spawned_degrades_rather_than_raising(
+        self,
+        harness: RagHarness,
+        workspace_tree: Path,
+        caplog: pytest.LogCaptureFixture,
+        outage: Exception,
     ) -> None:
-        """``PlanActor`` raises here; this actor must not — it owns the write gate."""
-        harness.vs_address = None
+        """``PlanActor`` raises for a store it cannot reach; this actor owns the write gate.
 
-        harness.enable()  # must not raise
+        The premise used to be "the team's ``#VectorStore`` was not found"; now
+        that the store is this actor's own child, the reachable failures are the
+        two a spawn raises when the environment refuses it — no thread to start,
+        a child dead before its proxy is built — and each must degrade the same
+        way: one WARNING naming the workspace and the cause, no traceback, no
+        proxy, and the sentence from ``workspace_rag_index``.
+        """
+        harness.store_spawn_error = outage
+
+        with caplog.at_level(logging.WARNING, logger=_DOCUMENTS_LOGGER):
+            harness.enable()  # must not raise
 
         assert harness.actor._vs_proxy is None
-        assert harness.actor.index_paths("").startswith("Retrieval indexing is not available")
+        warnings = [
+            record
+            for record in caplog.records
+            if record.levelno == logging.WARNING and record.name == _DOCUMENTS_LOGGER
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert WORKSPACE_PATH in message
+        assert "could not create the in-memory vector store child" in message
+        assert str(outage) in message
+        assert warnings[0].exc_info is None
+        assert harness.actor.index_paths("") == _UNAVAILABLE
+
+    @pytest.mark.parametrize(
+        "defect",
+        [
+            TypeError("createActor() got an unexpected keyword argument 'config'"),
+            AttributeError("'VectorStoreConfig' object has no attribute 'name'"),
+        ],
+        ids=["type-error", "attribute-error"],
+    )
+    def test_a_defect_in_the_store_childs_spawn_is_not_reported_as_an_outage(
+        self,
+        harness: RagHarness,
+        workspace_tree: Path,
+        caplog: pytest.LogCaptureFixture,
+        defect: Exception,
+    ) -> None:
+        """A bug is not the environment: it propagates, and reaches the log with its traceback.
+
+        The other half of the spec above. An ``except Exception`` around the spawn
+        would turn this into the outage line — one sentence, the cause's message
+        and nothing else — and a configuration error would read, in production,
+        exactly like a host that ran out of threads. ``enable_rag`` still keeps
+        retrieval off, because this actor owns the write gate; what changes is
+        that the defect arrives with its type and its stack.
+        """
+        harness.store_spawn_error = defect
+
+        with pytest.raises(type(defect)):
+            harness.actor._resolve_store(VectorStoreParam(backend="inmemory"))
+
+        with caplog.at_level(logging.WARNING, logger=_DOCUMENTS_LOGGER):
+            harness.enable()  # enable_rag keeps its own contract: it never raises
+
+        assert harness.actor._vs_proxy is None
+        warnings = [
+            record
+            for record in caplog.records
+            if record.levelno == logging.WARNING and record.name == _DOCUMENTS_LOGGER
+        ]
+        assert len(warnings) == 1
+        assert "could not enable retrieval" in warnings[0].getMessage()
+        assert "could not create the in-memory vector store child" not in caplog.text
+        assert warnings[0].exc_info is not None
+        assert warnings[0].exc_info[1] is defect
+        assert harness.actor.index_paths("") == _UNAVAILABLE
 
     def test_a_failing_create_collection_degrades_rather_than_raising(
         self, harness: RagHarness
@@ -452,7 +584,7 @@ class TestEnableRag:
     def test_a_broken_proxy_never_raises_out_of_enable_rag(
         self, harness: RagHarness, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Everything in this method is wrapped, including the orchestrator ask."""
+        """Everything in this method is wrapped, including the proxy over the child."""
 
         def boom(*args: Any, **kwargs: Any) -> Any:
             raise RuntimeError("proxy is gone")
@@ -481,6 +613,229 @@ class TestEnableRag:
         harness.enable(params=WorkspaceRagIndex(chunk_chars=800))
 
         assert len(harness.vs.of("create")) == 1
+
+
+class TestTheStoreChild:
+    """The in-memory store is this actor's own child, created with no orchestrator."""
+
+    def test_a_workspace_with_no_orchestrator_indexes_a_document(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        """The hosted-style falsifier: no orchestrator anywhere, and the pipeline runs whole.
+
+        The harness answers no orchestrator ask — there is none to answer — so a
+        resolve that still went looking for the team's store would raise inside
+        ``enable_rag``, degrade, and leave every assertion below red.
+        """
+        assert harness.actor.orchestrator is None
+        write(workspace_tree, "a.md")
+
+        harness.enable()
+
+        assert harness.actor._vs_proxy is harness.vs
+        assert harness.actor.index_paths("") == (
+            "1 file(s) queued, 0 already current, 0 unsupported"
+        )
+        assert len(harness.worker_names) == 1
+        harness.report("a.md")
+        harness.result("a.md")
+        [(collection, entries)] = harness.vs.of("add")
+        assert collection == RAG_COLLECTION
+        assert [entry.ref_id for entry in entries] == ["e1"]
+        assert harness.actor.state.rag_index["a.md"].status is RagStatus.EMBEDDED
+
+    def test_enabling_on_an_in_memory_param_creates_exactly_one_child(
+        self, harness: RagHarness
+    ) -> None:
+        """The actor creates it — the card's ``create_calls`` no longer name it."""
+        harness.enable()
+
+        [config] = harness.store_configs
+        assert config.name == f"{VS_ACTOR_NAME}-{WORKSPACE_PATH}"
+        assert config.role == VS_ACTOR_ROLE
+
+    def test_enabling_on_a_cluster_param_creates_no_child(self, harness: RagHarness) -> None:
+        """The negative beside the positive above; the double being bound is the proof it ran."""
+        double = FakeVectorStore()
+
+        with factory_for("weaviate", lambda _context: double):
+            harness.enable(collection=VectorStoreParam(backend="weaviate", dimension=3072))
+
+        assert harness.actor._vs_proxy is double
+        assert harness.store_configs == []
+
+    def test_two_workspaces_create_two_differently_named_children(
+        self, workspace_tree: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The name carries the path, slash verbatim, so two trees cannot share one child."""
+        first = RagHarness(_started_actor(WORKSPACE_PATH))
+        first.install(monkeypatch)
+        second = RagHarness(_started_actor("u-bob/other-workspace"))
+        second.install(monkeypatch)
+
+        first.enable()
+        second.enable()
+
+        assert first.store_names == [f"{VS_ACTOR_NAME}-{WORKSPACE_PATH}"]
+        assert second.store_names == [f"{VS_ACTOR_NAME}-u-bob/other-workspace"]
+        assert first.store_names != second.store_names
+
+
+class TestRestoreOntoAnEmptyEngine:
+    """A restored ``EMBEDDED`` row is invisible on an empty in-memory engine until re-marked.
+
+    The restored document has **no body**, deliberately: with one, the keyword
+    leg would find the file whatever the engine holds, and the search would be
+    green for the wrong reason.
+    """
+
+    _BODY = "# A\n\nbody\n"
+
+    def _restored(self, harness: RagHarness, tree: Path) -> RagChunk:
+        """Restore one ``EMBEDDED`` row for ``a.md`` at the live digest, body evicted."""
+        sha = write(tree, "a.md", self._BODY)
+        now = datetime.now(UTC)
+        old = RagChunk(
+            chunk_id=chunk_id(WORKSPACE_PATH, "a.md", sha, 0),
+            ordinal=0,
+            start=0,
+            end=len(self._BODY),
+            heading_path=["A"],
+        )
+        restored = WorkspaceState()
+        restored.rag_index["a.md"] = RagFile(
+            path="a.md",
+            status=RagStatus.EMBEDDED,
+            indexed_sha=sha,
+            chunks=[old],
+            chunk_count=1,
+            updated_at=now,
+        )
+        restored.documents["a.md"] = DocumentExtract(
+            path="a.md",
+            source_sha=sha,
+            extractor_version=EXTRACTOR_VERSION,
+            markdown=None,
+            char_count=len(self._BODY),
+            extracted_at=now,
+        )
+        harness.actor.init_state(restored)
+        return old
+
+    def test_the_restored_row_is_requeued_and_invisible_to_a_search(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        """(a) re-marked with its chunk set kept, (b) the engine is asked and holds nothing."""
+        old = self._restored(harness, workspace_tree)
+
+        harness.enable()
+
+        row = harness.actor.state.rag_index["a.md"]
+        assert row.status is RagStatus.PENDING
+        assert (row.batches_expected, row.batches_landed) == (0, 0)
+        assert row.superseded_chunk_ids == []
+        assert row.chunks == [old]  # kept as provenance until the worker reports
+
+        assert harness.actor.rag_search("body") == _NO_HITS
+        assert harness.vs.kinds().count("search") == 1  # asked, and holding nothing
+        [rendered] = harness.actor.rag_snapshot(max_pending_shown=5).rows
+        assert rendered.status == "pending"
+
+    def test_the_restored_row_is_drained_re_indexed_and_nothing_is_removed(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        """(c) a worker is spawned, (d) the chunk is found again, (e) no ``remove`` ever.
+
+        The spawn is asserted, not only the end state: the harness accepts a
+        report for a run nobody issued, so without (c) a re-mark that never
+        happened would still walk to ``EMBEDDED`` below.
+        """
+        self._restored(harness, workspace_tree)
+
+        harness.enable()
+
+        assert harness.actor.index_paths("") == (
+            "0 file(s) queued, 1 already current, 0 unsupported"
+        )
+        assert harness.worker_names == [index_worker_name(WORKSPACE_PATH, "a.md")]
+        assert [request.path for request in harness.requests] == ["a.md"]
+
+        harness.report("a.md", extracted=True, markdown=self._BODY)
+        [chunk] = harness.actor.state.rag_index["a.md"].chunks
+        harness.result("a.md", entries=[_embedded(chunk.chunk_id)])
+        assert harness.actor.state.rag_index["a.md"].status is RagStatus.EMBEDDED
+        assert [entry.ref_id for entry in harness.vs.held] == [chunk.chunk_id]
+        answer = harness.actor.rag_search("body")
+        assert answer.startswith("a.md")
+        labels = ("(hybrid: ", "(semantic: ", "(keyword match)")
+        assert sum(answer.count(label) for label in labels) == 1
+        assert "(hybrid: " in answer or "(semantic: " in answer
+
+        assert harness.vs.of("remove") == []
+
+    def test_the_cluster_branch_re_marks_nothing_and_binds_the_double(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        """The engine kept its rows; the positive beside the negative is the bound double."""
+        self._restored(harness, workspace_tree)
+        double = FakeVectorStore()
+
+        with factory_for("weaviate", lambda _context: double):
+            harness.enable(collection=VectorStoreParam(backend="weaviate", dimension=3072))
+
+        assert harness.actor._vs_proxy is double
+        assert harness.store_configs == []
+        assert harness.actor.state.rag_index["a.md"].status is RagStatus.EMBEDDED
+        assert harness.actor.index_paths("") == (
+            "0 file(s) queued, 1 already current, 0 unsupported"
+        )
+        assert harness.worker_names == []
+
+    def test_the_re_mark_preserves_an_unknown_field(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        """Golden Rule #12: a copy-and-override, never a rebuild naming today's fields."""
+        sha = write(workspace_tree, "a.md", self._BODY)
+        restored = WorkspaceState()
+        restored.rag_index["a.md"] = _RagFileWithExtraField(
+            path="a.md",
+            status=RagStatus.EMBEDDED,
+            indexed_sha=sha,
+            updated_at=datetime.now(UTC),
+        )
+        harness.actor.init_state(restored)
+
+        harness.enable()
+
+        row = harness.actor.state.rag_index["a.md"]
+        assert row.status is RagStatus.PENDING
+        assert isinstance(row, _RagFileWithExtraField)
+        assert row.extra_field == "sentinel"
+
+    def test_the_re_mark_persists_once_and_a_fresh_index_not_at_all(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        """One delta however many rows moved; nothing moved is not a delta."""
+        self._restored(harness, workspace_tree)
+        first = harness.actor.state.rag_index["a.md"]
+        harness.actor.state.rag_index["b.md"] = first.model_copy(update={"path": "b.md"})
+        store = harness.record_deltas()
+
+        harness.enable()
+
+        statuses = {row.status for row in harness.actor.state.rag_index.values()}
+        assert statuses == {RagStatus.PENDING}
+        assert len(store.applied) == 1
+        assert store.keys_applied() == {"rag_index.a.md", "rag_index.b.md"}
+
+    def test_a_fresh_index_enables_without_a_delta(self, harness: RagHarness) -> None:
+        """The other half: no ``EMBEDDED`` row, nothing re-marked, nothing sent."""
+        store = harness.record_deltas()
+
+        harness.enable()
+
+        assert harness.actor._vs_proxy is harness.vs
+        assert store.applied == []
 
 
 ##
@@ -962,22 +1317,26 @@ class TestBatching:
         assert harness.actor.state.rag_index == {}
         assert harness.vs.of("add") == []
 
-    def test_only_the_final_transition_notifies(
+    def test_only_the_final_transition_persists(
         self, harness: RagHarness, workspace_tree: Path
     ) -> None:
-        """A 1,900-chunk document must cost one event, not thirty."""
+        """A 1,900-chunk document must cost one delta, not thirty."""
         harness.enable()
         write(workspace_tree, "big.md")
         harness.actor.index_paths("")
         harness.report("big.md", chunks=EMBED_BATCH_SIZE * 2 + 1)
-        spy = harness.watch()
+        assert harness.actor.state.rag_index["big.md"].batches_expected == 3
+        store = harness.record_deltas()
 
         harness.result("big.md")
         harness.result("big.md")
-        assert spy.notifications == []
+        assert store.applied == []
 
         harness.result("big.md")
-        assert len(spy.notifications) == 1
+        assert len(store.applied) == 1
+        [(_, _, delta)] = store.applied
+        assert delta.set["rag_index.big.md"]["status"] == RagStatus.EMBEDDED.value
+        assert delta.set["rag_index.big.md"]["batches_landed"] == 3
 
 
 class TestTheWriteSide:
@@ -995,10 +1354,8 @@ class TestTheWriteSide:
         from akgentic.tool.errors import RetriableError
 
         self._two_batches(harness, workspace_tree)
-        harness.vs.add_error = RetriableError(
-            "Collection 'workspace_chunks' does not exist"
-        )
-        spy = harness.watch()
+        harness.vs.add_error = RetriableError("Collection 'workspace_chunks' does not exist")
+        store = harness.record_deltas()
 
         harness.result("big.md")
 
@@ -1006,7 +1363,8 @@ class TestTheWriteSide:
         assert entry.status is RagStatus.FAILED
         assert "does not exist" in (entry.reason or "")
         assert entry.batches_landed == 0
-        assert len(spy.notifications) == 1
+        assert len(store.applied) == 1
+        assert store.keys_applied() == {"rag_index.big.md"}
         assert harness.vs.of("remove") == []
 
     def test_a_second_result_after_a_failed_write_is_dropped(
@@ -1019,27 +1377,28 @@ class TestTheWriteSide:
         harness.result("big.md")
         failed_at = harness.actor.state.rag_index["big.md"].updated_at
         harness.vs.add_error = None
-        spy = harness.watch()
+        store = harness.record_deltas()
 
         harness.result("big.md")
 
         entry = harness.actor.state.rag_index["big.md"]
         assert entry.status is RagStatus.FAILED
         assert entry.updated_at == failed_at
-        assert spy.notifications == []
+        assert store.applied == []
 
     def test_an_embedding_error_fails_the_file_the_same_way(
         self, harness: RagHarness, workspace_tree: Path
     ) -> None:
         self._two_batches(harness, workspace_tree)
-        spy = harness.watch()
+        store = harness.record_deltas()
 
         harness.error("big.md", reason="rate limited")
 
         entry = harness.actor.state.rag_index["big.md"]
         assert entry.status is RagStatus.FAILED
         assert entry.reason == "rate limited"
-        assert len(spy.notifications) == 1
+        assert len(store.applied) == 1
+        assert store.keys_applied() == {"rag_index.big.md"}
 
     def test_the_tell_proxy_is_gone(self, harness: RagHarness) -> None:
         """AC 16: one proxy, and every call through it is an ask."""
@@ -1329,38 +1688,40 @@ class TestTheGateMarksStale:
 
         assert harness.actor.state.rag_index["notes.md"].status is RagStatus.EMBEDDED
 
-    def test_a_tree_that_was_never_indexed_pays_no_notify(
+    def test_a_tree_that_was_never_indexed_pays_no_delta(
         self, harness: RagHarness, workspace_tree: Path
     ) -> None:
         """The common case, and it must stay free on the mutation path."""
-        spy = harness.watch()
+        store = harness.record_deltas()
 
         harness.actor.apply_write("alice", "fresh.md", "# New\n")
 
-        assert spy.notifications == []
+        assert (workspace_tree / "fresh.md").read_text(encoding="utf-8") == "# New\n"
+        assert store.applied == []
 
-    def test_marking_an_already_stale_file_notifies_nothing(
+    def test_marking_an_already_stale_file_sends_nothing(
         self, harness: RagHarness, workspace_tree: Path
     ) -> None:
-        """A no-op must not be an event."""
+        """A no-op must not be a delta."""
         self._indexed(harness, workspace_tree)
         harness.actor.mark_paths_stale(["notes.md"])
-        spy = harness.watch()
+        assert harness.actor.state.rag_index["notes.md"].status is RagStatus.STALE
+        store = harness.record_deltas()
 
         harness.actor.mark_paths_stale(["notes.md"])
 
-        assert spy.notifications == []
+        assert store.applied == []
 
-    def test_marking_an_unindexed_path_notifies_nothing(
+    def test_marking_an_unindexed_path_sends_nothing(
         self, harness: RagHarness, workspace_tree: Path
     ) -> None:
-        spy = harness.watch()
+        store = harness.record_deltas()
 
         harness.actor.mark_paths_stale(["never-indexed.md"])
 
-        assert spy.notifications == []
+        assert store.applied == []
 
-    def test_marking_a_real_change_notifies_exactly_once(
+    def test_marking_a_real_change_persists_exactly_once(
         self, harness: RagHarness, workspace_tree: Path
     ) -> None:
         """Once per call, however many paths moved."""
@@ -1369,11 +1730,12 @@ class TestTheGateMarksStale:
         harness.actor.index_paths("")
         harness.report("two.md")
         harness.result("two.md")
-        spy = harness.watch()
+        store = harness.record_deltas()
 
         harness.actor.mark_paths_stale(["one.md", "two.md"])
 
-        assert len(spy.notifications) == 1
+        assert len(store.applied) == 1
+        assert store.keys_applied() == {"rag_index.one.md", "rag_index.two.md"}
 
 
 ##
@@ -1476,10 +1838,9 @@ class TestRagSnapshot:
     def test_a_restored_snapshot_is_reaped_on_the_way_in(self, actor: WorkspaceActor) -> None:
         """``on_start`` cannot do it: it assigns a fresh state before any restore.
 
-        The resume hook is ``init_state`` — what ``akgentic-team``'s restorer
-        calls with the persisted snapshot — so that is where the bound is applied,
-        and this spec is what says the criterion's *intent* is met rather than its
-        letter.
+        The restore hook is ``init_state`` — what the ``WorkspaceHost`` tells
+        with the stored state on a get-or-create miss — so that is where an
+        abandoned row is re-queued.
         """
         restored = WorkspaceState()
         restored.rag_index["a.md"] = RagFile(
@@ -1493,10 +1854,16 @@ class TestRagSnapshot:
 
         assert actor.state.rag_index["a.md"].status is RagStatus.PENDING
 
-    def test_a_restored_snapshot_inside_the_bound_is_left_alone(
+    def test_a_restored_snapshot_inside_the_bound_is_requeued_too(
         self, actor: WorkspaceActor
     ) -> None:
-        """A restart during a live embed still has a signal that may arrive."""
+        """A restore has no signal left to wait for, however recent the row.
+
+        The ``#embed-`` workers were children of the previous actor and died
+        with it, so the reaper's bound — which tells a dead worker from a slow
+        one on a *running* actor — does not apply on the way in. This spec
+        pinned the opposite until story 51-4 made the stored index real.
+        """
         restored = WorkspaceState()
         restored.rag_index["a.md"] = RagFile(
             path="a.md",
@@ -1506,7 +1873,7 @@ class TestRagSnapshot:
 
         actor.init_state(restored)
 
-        assert actor.state.rag_index["a.md"].status is RagStatus.EMBEDDING
+        assert actor.state.rag_index["a.md"].status is RagStatus.PENDING
 
     def test_index_paths_does_run_the_reaper(
         self, harness: RagHarness, workspace_tree: Path

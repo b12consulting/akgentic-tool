@@ -65,9 +65,10 @@ extractor *produces* from unchanged source bytes.
 DEFAULT_MAX_DOCUMENTS = 32
 """Bound on the number of rows in ``WorkspaceState.documents``.
 
-Answers the **metadata** dimension: ~200 bytes per row, re-serialised in full by
-``model_dump_json()`` on every notify, growing for the life of the team. An
-uncapped map on a team singleton leaks exactly that way — the same reasoning
+Answers the **metadata** dimension: ~200 bytes per row, held for the life of the
+hosted actor, which outlives every team on its tree, and restored in full from
+the store on every get-or-create miss. An uncapped map there leaks exactly that
+way — the same reasoning
 :data:`~akgentic.tool.workspace.models.DEFAULT_MAX_TRACKED_WRITERS` records.
 
 This is the Weaviate / RAG-off default. A backend-derived override belongs at
@@ -221,9 +222,9 @@ class RagChunk(SerializableBaseModel):
     A chunk is a pair of offsets into the file's extracted Markdown and nothing
     else. There is no ``text`` field, no ``prefix`` field and no body of any
     kind: storing the text would duplicate the document inside the actor's state,
-    which is re-serialised on every notify, and would let the copy drift from the
-    extraction it claims to describe. The composed text is built at embed time
-    and handed straight to the vector store.
+    whose row is re-sent whole in every delta that names it, and would let the
+    copy drift from the extraction it claims to describe. The composed text is
+    built at embed time and handed straight to the vector store.
 
     Attributes:
         chunk_id: The chunk's identity, from :func:`chunk_id`. It is also the

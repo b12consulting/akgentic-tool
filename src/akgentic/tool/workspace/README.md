@@ -1,8 +1,8 @@
 # WorkspaceTool
 
-Team-scoped filesystem access for LLM agents: read, list, glob, grep, view images, write, edit,
-patch, delete, mkdir and run shell commands — every path anchored to one workspace root that
-nothing can escape.
+Filesystem access for LLM agents, one tree per resolved workspace path: read, list, glob, grep,
+view images, write, edit, patch, delete, mkdir and run shell commands — every path anchored to one
+workspace root that nothing can escape.
 
 ```python
 from akgentic.tool import WorkspaceTool
@@ -11,7 +11,7 @@ from akgentic.tool import WorkspaceTool
 | | |
 |---|---|
 | Module | `akgentic.tool.workspace.tool` |
-| Actor | `#Workspace-<scope>/<leaf>` — the **resolved two-segment path**, slash included, so two principals' `notes` are two actors over two trees. One singleton per **tree**, not per team. With `workspace_exec` on it also owns the tree's sandbox backend and the single worker thread that runs commands on it — no second actor |
+| Actor | `#Workspace-<scope>/<leaf>` — the **resolved two-segment path**, slash included, so two principals' `notes` are two actors over two trees. **Hosted**: one per tree per process, created by the process's `WorkspaceHost`, shared by every team whose cards resolve that path, and nobody's child — see *Lifetime* below. With `workspace_exec` on it also owns the tree's sandbox backend and the single worker thread that runs commands on it — no second actor |
 | Channels used | `TOOL_CALL` (11 callables, 13 with `workspace_exec`), `COMMAND` (`expand_media_refs`) |
 | Optional extras | `[docs]` for binary reads, `[vision]` for image resizing |
 | Environment | `AKGENTIC_WORKSPACES_ROOT` (default `./workspaces`) |
@@ -38,8 +38,9 @@ the file rather than consulting a record of who wrote it.
 Retrieval degrades further **within** itself: with the capability on and no store reachable, every
 retrieval callable answers one sentence rather than raising, and a search whose embedding call fails
 falls back to its keyword leg. ("No store reachable" means the backend this card's `vector_store`
-names could not be built — on the in-memory backend that is the `#VectorStore` actor, and on a
-cluster backend there is no actor at all, only a client that failed to connect.) That is deliberate rather than defensive — this actor owns the
+names could not be built — on the in-memory backend that is the workspace actor's own
+`#VectorStore-<scope>/<leaf>` child, which it creates for itself, and on a cluster backend there is
+no actor at all, only a client that failed to connect.) That is deliberate rather than defensive — this actor owns the
 write gate, and a misconfigured vector store must not be a way to take the gate down with it.
 
 ---
@@ -95,7 +96,7 @@ the **write** side: a command mutates the tree whatever it happens to be, so
 **The backend and the actor are both bound in `observer()`, not in `__init__`.** `observer()` makes
 **one** call to `resolve_workspace_path(...)` — the single place a workspace directory is derived —
 and hands the result down as an already-resolved value: a `Filesystem` rooted at
-`<AKGENTIC_WORKSPACES_ROOT>/<scope>/<leaf>`, the `#Workspace-<scope>/<leaf>` singleton that owns the
+`<AKGENTIC_WORKSPACES_ROOT>/<scope>/<leaf>`, the hosted `#Workspace-<scope>/<leaf>` actor that owns the
 tree, and — only if exec is enabled — the sandbox backend. Nothing below re-derives it, which is what
 makes it impossible for a backend to open a different directory from the one the gate and the journal
 are guarding. `resources` are seeded in between. Reading `card.workspace` before that raises
@@ -113,11 +114,27 @@ majority of `WorkspaceTool()` instances gain no round trip at wiring time.
 as the leaf. A fixed name would collapse them onto one actor owning one of the trees, silently. The
 sandbox backend needs no name of its own: it is held by the workspace actor whose tree it serves.
 
-**Two teams of the same principal sharing one `workspace_id` get two actors over one tree**, and
-their writes are therefore *not* ordered. They are still *checked*: the gate hashes the live file, so
-the collision is detected and refused rather than lost. This is a stated limit, not an oversight.
-Two teams of **different** principals do not share a tree at all: `notes` resolves under each owner's
-own scope. Sharing across principals is `workspace_metadata_keys`, and nothing else.
+**Two teams of the same principal sharing one `workspace_id` reach one actor**, because there is
+one actor per tree per process: their writes are ordered by its mailbox as well as checked by the
+gate, which hashes the live file. The first bind fixes the actor's configuration for every team on
+the tree. Two teams of **different** principals do not share a tree at all: `notes` resolves under
+each owner's own scope. Sharing across principals is `workspace_metadata_keys`, and nothing else.
+
+### Lifetime
+
+- **Attached by agents.** Every card binds through its team's orchestrator to the process's
+  `WorkspaceHost`, which gets or creates the tree's actor, and then attaches its agent as a holder.
+  No team owns the actor, and no team's teardown stops it.
+- **Reaped by liveness.** A sweep drops holders whose agents have stopped. After `reap_grace_s` with
+  no holder the actor stops itself, taking its in-memory store child and any live worker with it.
+  An `attach` during the grace cancels it, so a team stopping and an equivalent one starting keep
+  the same actor, journal and container.
+- **Restored on the next bind.** The extraction cache and the retrieval index are persisted, by
+  member-keyed delta, into the deployment's store through the host. The next bind after a reap or a
+  process restart starts a new actor restored from it. Rows that were mid-extraction or
+  mid-embedding when the old actor stopped are queued again.
+- **Cold without a store.** A deployment that registers no store with the host restores nothing:
+  the next actor starts with an empty cache and index, and re-indexes on demand.
 
 ---
 
@@ -194,9 +211,9 @@ way around the gate.
 - **A paginated read does not license a whole-file write.** `workspace_read(path, offset=…)` records
   that a *page* was seen. The way through is `workspace_edit` on a still-matching anchor, not a
   bigger `limit`.
-- **Observations do not survive a team resume.** They are actor instance state, not persisted. After
-  a resume the first write to any path is refused until it is re-read. That is the safe direction and
-  it is deliberate.
+- **Observations do not survive a restore** — a reap after the last holder left, or a process
+  restart. They are actor instance state, not persisted. After a restore the first write to any
+  path is refused until it is re-read. That is the safe direction and it is deliberate.
 
 ### What the gate catches that a registry would not
 
@@ -346,11 +363,11 @@ queued caller is polling its own run by construction; without it a head that wil
 strands the work behind it until some unrelated request happens along. It costs one clock read and
 one flag read.
 
-The queue is FIFO and nothing else. No priorities, no fairness weighting: a team singleton's queue
-that needs a scheduling policy is a design smell, not a feature. A queued entry belonging to an
-agent that has since stopped still **runs** — the actor holds no liveness signal it could ask, and
-guessing from an evicted display name would discard live work. Its output is simply never
-collected, which costs one command and loses nothing.
+The queue is FIFO and nothing else. No priorities, no fairness weighting: a tree's queue that
+needs a scheduling policy is a design smell, not a feature. A queued entry belonging to an agent
+that has since stopped is **discarded** at the next liveness sweep, which drops the stopped holder
+and everything the actor kept about it; a run that agent already had running is marked and
+completes on its own budget, and its output is simply never collected.
 
 **A run belongs to the agent that started it.** `workspace_exec_result` answers only the asking
 agent's runs: an id from somebody else comes back as the existing recoverable `UNKNOWN`, carrying
@@ -529,8 +546,10 @@ gone, and so is the read-path rule that used to return a dotfile ending in `.md`
 
 The cache is keyed by path and hits only when the entry was produced from *these* source bytes by
 *this* extractor version, so it can never serve a stale body: a changed file misses and re-extracts.
-It is bounded on two dimensions — a row count and a character total — because it is re-serialised
-into the team's event store on every fill. Over the character cap the least-recently-used entry
+It is persisted — each fill sends one member-keyed delta, carrying the entry it inserted and every
+entry the caps touched, through the `WorkspaceHost` to the deployment's store — and it is bounded on
+two dimensions, a row count and a character total, so the actor's state and the stored document stay
+bounded however many documents are read. Over the character cap the least-recently-used entry
 keeps its metadata and **drops its body**; over the row cap the entry goes entirely. Every byte is
 regenerable from the tree, so an eviction costs one re-extraction and never a wrong answer.
 
@@ -1052,10 +1071,11 @@ WorkspaceTool(
 
 Retrieval adds three things worth knowing before you turn it on. **Indexing spends embedding credits
 per file**, which is why all three capabilities are opt-in. **The in-memory vector backend keeps
-every vector inside the store's own state**, re-serialised on every notify, which is why enabling
-retrieval on that backend shrinks the extraction cache from 32 documents / 2 MB to 8 / 200 KB —
-2 MB of Markdown is roughly 1,900 chunks, and 1536 floats rendered as JSON is about 23 KB each.
-Weaviate keeps the vectors in the cluster and keeps the large caps. And **`workspace_rag_search`
+every vector in the workspace actor's own store child**, which is never persisted: its vectors are
+lost with the actor, and a restored tree re-embeds its indexed files on the next
+`workspace_rag_index`. Enabling retrieval on that backend shrinks the extraction cache from 32
+documents / 2 MB to 8 / 200 KB. A cluster backend keeps the vectors in the cluster and keeps the
+large caps. And **`workspace_rag_search`
 makes one embedding round trip on the mailbox turn of the actor that owns the write gate**: bounded
 to a single call, fully degrading, but it is the one external call this card puts on that thread.
 

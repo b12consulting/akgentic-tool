@@ -720,23 +720,34 @@ that every agent carrying the card talks to.
 Six ship in this package today: `#VectorStore`, `#PlanningTool`, `#KnowledgeGraphTool`,
 `#TeamActivity`, `#NotificationTool` and `#Workspace-<scope>/<leaf>`. The sandbox actor that
 used to sit beside the workspace actor is retired: `#Workspace` owns the tree's exec backend and
-runs commands on its own worker thread, so an exec-enabled team runs two actors, not three.
+runs commands on its own worker thread, so an exec-enabled tree runs one actor, not two.
+
+**`#Workspace` is the one tool actor that is not one per team.** It is **hosted**: one per workspace
+tree per process, created by the process's `WorkspaceHost` (a core `ResourceHost`) rather than by
+any team's orchestrator, shared by every team whose cards resolve the same path, nobody's child,
+outside the two-phase `#` teardown, reaped by itself once its last holder has stopped, and
+persisted by member-keyed delta through the host. Everything this section says about one-per-team
+actors — binding through `getChildrenOrCreate`, the team's event store, the teardown order — is
+true of the other five and not of it; see the
+[workspace README](src/akgentic/tool/workspace/README.md#lifetime).
 
 **`#VectorStore` is the exception among them: it exists only for a backend that keeps its data in
 actor state.** Today that means the in-memory backend. On a cluster the rows live in the cluster,
 so there is nothing for an actor to own and none is created — each consumer holds its own backend
 object and calls it directly. Whether the actor exists at all is the backend's answer, read from the
-`persists_in_actor_state` flag on its registered spec, not a card's.
+`persists_in_actor_state` flag on its registered spec, not a card's. The workspace's in-memory store
+is not the team's `#VectorStore` either: it is the workspace actor's own child,
+`#VectorStore-<scope>/<leaf>`, and stops with it.
 
 **Note the one name that carries a suffix.** Five of the six are one per *team*, and their name is
 a constant. The workspace actor is one per *workspace tree*, so its name is **built** from the
 workspace's resolved two-segment path — slash included — rather than being a literal. Two of them
 can coexist in one team, each owning its own directory, and two *principals* whose cards both say
 `workspace_id="notes"` get two actors over two trees because the name carries the scope as well as
-the leaf. `getChildrenOrCreate` keys on the name, so this is not cosmetic: a fixed name would
-collapse two trees onto one actor, silently. The unicity domain of an actor must equal the resource
-it owns — and the exec backend, which serves exactly that tree, is held by the workspace actor
-rather than named and created as an actor of its own.
+the leaf. The `WorkspaceHost`'s registry keys on the name, so this is not cosmetic: a fixed name
+would collapse two trees onto one actor, silently. The unicity domain of an actor must equal the
+resource it owns — and the exec backend, which serves exactly that tree, is held by the workspace
+actor rather than named and created as an actor of its own.
 
 ### One per team, and what that buys
 
@@ -756,10 +767,12 @@ anything you write, which is why a tool actor's methods can read-modify-write wi
 same one-thread property is why the next section exists: it also means a slow method blocks
 everyone queued behind it.
 
-**State that persists itself.** A tool actor's state reaches the team's event store without the
-tool arranging it — the actor calls `notify_state_change()`, and the framework snapshots the state
-and restores it when the team resumes. Persistence here is a property of being an actor, not
-something a tool implements.
+**State that persists itself.** A one-per-team tool actor's state reaches the team's event store
+without the tool arranging it — the actor calls `notify_state_change()`, and the framework
+snapshots the state and restores it when the team resumes. Persistence here is a property of being
+an actor, not something a tool implements. The hosted workspace is the exception: it has no team
+and no orchestrator, so it sends a member-keyed `StateDelta` for exactly what changed to its
+`WorkspaceHost`, whose store restores it on the next bind after a reap or a restart.
 
 ### Binding one: `getChildrenOrCreate`, never check-then-create
 
@@ -1043,8 +1056,9 @@ class covers both modes via a `read_only: bool` gate. All paths are anchored to
 `<user_id>/<team_id>` by default, `<user_id>/<workspace_id>` for a named one, and `_meta/<joined
 keys>` for the metadata-shared layout. Traversal out of that root is rejected.
 
-**A `#Workspace-<scope>/<leaf>` singleton owns the tree, and every mutation is refused unless the file
-is still what the writing agent last read.** Reads stay on the agent's own thread and are never
+**A hosted `#Workspace-<scope>/<leaf>` actor owns the tree — one per tree per process, shared by
+every team on it — and every mutation is refused unless the file is still what the writing agent
+last read.** Reads stay on the agent's own thread and are never
 serialized. A refusal is a `RetriableError`, so it lands in the model's next turn carrying a diff of
 what the write would have destroyed — the agent re-reads and redoes without anyone writing recovery
 logic. No digest, `expected` or `force` appears in any tool signature: the precondition is derived
@@ -1191,7 +1205,11 @@ strong semantic hit.
 Every object `WeaviateBackend` writes is stamped with the owning team's id (`team_id`, taken from
 the actor, never from a card), so `delete_by_team()` and `list_collections()` give a deployment the
 two primitives it needs to reap the vectors of a deleted team — otherwise unreachable, since
-nothing else on a Weaviate object says who produced it.
+nothing else on a Weaviate object says who produced it. **The exception is the shared workspace
+collection, `workspace_chunks`**: the hosted workspace belongs to no team, so its rows carry `""`,
+are bounded by the mandatory `scope` instead, and are never reaped by team. Every object's id is
+derived from its team, tenant and `ref_id` — the derivation Qdrant's point ids use — so a re-added
+row replaces the object instead of doubling it.
 
 Every consumer in a process reaches a cluster through **one shared client**, keyed on the backend and
 the connection it names (host, port, scheme, API key) and obtained with `get_client(key, connect)`

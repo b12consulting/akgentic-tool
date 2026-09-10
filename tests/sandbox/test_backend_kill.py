@@ -28,6 +28,7 @@ asserted **dead** after the kill, never merely by elapsed time.
 
 from __future__ import annotations
 
+import inspect
 import os
 import signal
 import subprocess
@@ -397,7 +398,7 @@ def test_docker_stop_kills_the_run_then_removes_the_container() -> None:
     — there is no filesystem here worth preserving between runs, and the only
     writes that outlive it are on the bind mount.
     """
-    docker = DockerBackend("t1")
+    docker = DockerBackend()
     docker.container_name = "akgentic-sandbox-0123456789ab"
     proc = MagicMock()
     order: list[str] = []
@@ -631,9 +632,6 @@ def test_an_unregistered_mode_raises_at_wiring_time() -> None:
 class _StubBackend:
     """A backend that runs nothing and says so in its result."""
 
-    def __init__(self, team_id: str = "") -> None:
-        self.team_id = team_id
-
     def start(self, workspace_path: str) -> None: ...
 
     def exec(self, cmd: str, cwd: str, timeout: float | None) -> ExecResult:
@@ -668,56 +666,46 @@ def test_an_injected_backend_is_what_resolve_mode_hands_out(
 
 
 # ---------------------------------------------------------------------------
-# 50-2 — one uniform constructor, and docker's two asserts become guards
+# 50-2 / 51-2 — one uniform constructor with no arguments, and docker's two
+# asserts become guards
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
     "backend_class", [LocalBackend, BwrapBackend, SeatbeltBackend, DockerBackend]
 )
-def test_every_backend_accepts_a_team_id(backend_class: type[Any]) -> None:
-    """All four take it, and it is stored, so the caller needs no type switch.
-
-    The registry holds classes and ``resolve_mode`` constructs from it, so a
-    backend that refused the keyword would make that one call site branch on the
-    mode it had just resolved — which is the thing having a registry is for.
-    """
-    backend = backend_class(team_id="team-42")
-
-    assert backend.team_id == "team-42"
-
-
-@pytest.mark.parametrize(
-    "backend_class", [LocalBackend, BwrapBackend, SeatbeltBackend, DockerBackend]
-)
-def test_every_backend_is_still_constructible_with_no_arguments(
+def test_every_backend_is_constructed_with_no_arguments_and_takes_no_team(
     backend_class: type[Any],
 ) -> None:
-    """The default is what keeps ``resolve_mode`` able to build one from the registry."""
-    assert backend_class().team_id == ""
+    """All four build from nothing, so the caller needs no type switch — and no team.
 
-
-def test_resolve_mode_carries_the_team_to_the_backend() -> None:
-    """The team reaches the backend by this path, and by no other.
-
-    **It no longer names the container.** The name became opaque and per
-    lifetime, because ``stop()`` removes the container and a name derived from
-    the team collides with its own predecessor on the next ``start()``. What is
-    asserted here is the wiring — ``resolve_mode``'s keyword reaches the
-    constructor — not a consequence the name no longer has.
+    The registry holds classes and ``resolve_mode`` constructs from it, so the
+    constructor is part of what registering a backend commits to. A hosted tree
+    is shared by several teams, and no backend depends on which one asked, so
+    the team id the constructor used to take is gone: passing one is a
+    ``TypeError``, and a backend carries no attribute for it.
     """
-    _mode, backend = resolve_mode("docker", team_id="team-42")
+    backend = backend_class()
 
-    assert isinstance(backend, DockerBackend)
-    assert backend.team_id == "team-42"
+    assert isinstance(backend, backend_class)
+    assert not hasattr(backend, "team_id")
+    with pytest.raises(TypeError):
+        backend_class(team_id="team-42")
 
 
-def test_resolve_mode_without_a_team_leaves_the_backend_teamless() -> None:
-    """The card's wiring call names no team and must not invent one."""
+def test_the_protocol_declares_a_constructor_with_no_arguments() -> None:
+    """What a deployment-registered backend must accept is nothing at all."""
+    assert list(inspect.signature(SandboxBackend.__init__).parameters) == ["self"]
+
+
+def test_resolve_mode_builds_the_backend_with_no_team() -> None:
+    """The wiring path passes no team, and has no keyword to pass one through."""
     _mode, backend = resolve_mode("docker")
 
     assert isinstance(backend, DockerBackend)
-    assert backend.team_id == ""
+    assert not hasattr(backend, "team_id")
+    with pytest.raises(TypeError):
+        resolve_mode("docker", team_id="team-42")  # type: ignore[call-arg]
 
 
 def test_an_unstarted_docker_release_returns_instead_of_raising() -> None:
@@ -729,7 +717,7 @@ def test_an_unstarted_docker_release_returns_instead_of_raising() -> None:
     the assert is stripped and the docker command runs carrying a literal
     ``None`` as the container name.
     """
-    backend = DockerBackend(team_id="team-42")
+    backend = DockerBackend()
     assert backend.container_name is None
 
     with patch("akgentic.tool.sandbox.docker.subprocess.run") as run:
@@ -740,7 +728,7 @@ def test_an_unstarted_docker_release_returns_instead_of_raising() -> None:
 
 def test_an_unstarted_docker_exec_raises_a_readable_error() -> None:
     """The other assert. A refusal a reader can act on, and one ``-O`` cannot strip."""
-    backend = DockerBackend(team_id="team-42")
+    backend = DockerBackend()
 
     with pytest.raises(RuntimeError, match="before start"):
         backend.exec("echo hi", "", None)

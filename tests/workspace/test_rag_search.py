@@ -15,10 +15,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from akgentic.tool.vector_store.actor import VectorStoreActor
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA, OVERFETCH
 from akgentic.tool.vector_store.backends.inmemory import InMemoryBackend
 from akgentic.tool.vector_store.protocol import VectorStoreParam, SearchResult
@@ -42,7 +42,7 @@ from akgentic.tool.workspace.models import WorkspaceConfig, WorkspaceState, cont
 from akgentic.tool.workspace.readers import DocumentReader
 
 from tests.conftest import MockActorAddress
-from tests.workspace.conftest import WORKSPACE_PATH, DeadAddress
+from tests.workspace.conftest import WORKSPACE_PATH, delta_recorder
 
 _UNAVAILABLE = "Retrieval indexing is not available for this workspace."
 _NO_HITS = (
@@ -146,19 +146,25 @@ class SearchEmbedder:
 
 
 class SearchHarness:
-    """An inert actor whose vector-store proxy is a :class:`SearchStore`."""
+    """An inert actor whose vector-store proxy is a :class:`SearchStore`.
+
+    The actor is handed **no** orchestrator: the store is its own child, so
+    ``createActor`` hands back an address ``_ask`` maps to the store, and an ask
+    to anything else is the trap ``_ask`` springs.
+    """
 
     def __init__(self, actor: WorkspaceActor, store: SearchStore) -> None:
         self.actor = actor
         self.store = store
         self.embedder = SearchEmbedder()
-        self.orchestrator = DeadAddress("orchestrator")
-        self.vs_address: MockActorAddress | None = MockActorAddress("#VectorStore")
+        self.vs_address = MockActorAddress("#VectorStore-child")
+        self.store_spawn_error: BaseException | None = None
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        self.actor._orchestrator = self.orchestrator
+        self.actor._orchestrator = None
         monkeypatch.setattr(self.actor, "proxy_ask", self._ask)
         monkeypatch.setattr(self.actor, "proxy_tell", self._tell)
+        monkeypatch.setattr(self.actor, "createActor", self._create)
 
     def enable(self) -> None:
         self.actor.enable_rag(
@@ -231,14 +237,18 @@ class SearchHarness:
         return sha
 
     def _ask(self, address: Any, actor_type: Any = None, timeout: int | None = None) -> Any:
-        if address is self.orchestrator:
-            return SimpleNamespace(get_team_member=lambda name: self.vs_address)
         if address is self.vs_address:
             return self.store
         raise AssertionError(f"unexpected ask target {address}")
 
     def _tell(self, address: Any, actor_type: Any = None) -> Any:
         return self.store
+
+    def _create(self, actor_class: Any, agent_id: Any = None, config: Any = None) -> Any:
+        if self.store_spawn_error is not None:
+            raise self.store_spawn_error
+        assert actor_class is VectorStoreActor, f"unexpected spawn of {actor_class}"
+        return self.vs_address
 
 
 def build_actor(workspace_path: str = WORKSPACE_PATH) -> WorkspaceActor:
@@ -297,13 +307,17 @@ def hit_count(answer: str) -> int:
 class TestDegradation:
     """Every failure mode answers a sentence and none of them raises."""
 
-    def test_a_workspace_with_no_vector_store_answers_the_sentence(
+    def test_a_workspace_whose_store_child_could_not_be_spawned_answers_the_sentence(
         self, workspace_tree: Path, monkeypatch: pytest.MonkeyPatch, store: SearchStore
     ) -> None:
-        """Retrieval was never enabled — the same sentence the indexer answers."""
+        """The child failed to spawn, so retrieval stayed off — the sentence the indexer answers."""
         harness = SearchHarness(build_actor(), store)
         harness.install(monkeypatch)
+        harness.store_spawn_error = RuntimeError("no actor system")
 
+        harness.enable()  # must not raise
+
+        assert harness.actor._vs_proxy is None
         assert harness.actor.rag_search("payment") == _UNAVAILABLE
 
     def test_an_actor_with_a_proxy_but_no_parameters_still_answers_the_sentence(
@@ -782,18 +796,18 @@ class TestTheFusionKnobs:
 
 
 class TestTheStateItNeverTouches:
-    """A search is a read: it must notify nothing and mutate nothing."""
+    """A search is a read: it must persist nothing and mutate nothing."""
 
-    def test_a_search_makes_no_state_notification(self, search: SearchHarness) -> None:
-        """A notify on a read path is a defect until a decision says otherwise."""
+    def test_a_search_sends_no_delta(
+        self, search: SearchHarness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A delta on a read path is a defect until a decision says otherwise."""
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
-        seen: list[Any] = []
-        search.actor.state.observer(SimpleNamespace(notify_state_change=seen.append))
-        seen.clear()
+        store = delta_recorder(search.actor, monkeypatch)
 
-        search.actor.rag_search("payment")
+        assert "invoice.md" in search.actor.rag_search("payment")
 
-        assert seen == []
+        assert store.applied == []
 
     def test_a_search_leaves_the_index_untouched(self, search: SearchHarness) -> None:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])

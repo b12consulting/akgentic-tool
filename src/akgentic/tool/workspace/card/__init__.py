@@ -47,7 +47,6 @@ from akgentic.tool.core import (
     _resolve,
 )
 from akgentic.tool.core.observer import ActorToolObserver
-from akgentic.tool.vector_store.actor import ensure_store_actor
 from akgentic.tool.vector_store.protocol import (
     VectorStoreParam,
     require_backend_configured,
@@ -83,7 +82,9 @@ from akgentic.tool.workspace.card.rag import RagFactories
 from akgentic.tool.workspace.card.read import ReadFactories
 from akgentic.tool.workspace.card.write import WriteFactories
 from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION, derived_document_caps
+from akgentic.tool.workspace.event import WorkspaceAttached
 from akgentic.tool.workspace.execution import ExecConfig, resolve_mode
+from akgentic.tool.workspace.host import WorkspaceHost
 from akgentic.tool.workspace.models import (
     Observation,
     WorkspaceConfig,
@@ -158,10 +159,9 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
     honest under the sequence model, and visible in the directory name. Values
     are percent-encoded, which is what keeps the join unforgeable.
 
-    The list travels onto the wire as
-    :attr:`~akgentic.tool.workspace.models.WorkspaceConfig.metadata_keys`, so a
-    client attributes an agent to a workspace by plain list equality against
-    this value, with nothing to normalise on either side.
+    The resolver reads this field and nothing else reads it: the actor's config
+    carries the resolved path, and a client learns which agent bound which tree
+    from the ``WorkspaceAttached`` event the bind emits, never from a key list.
 
     Mutually exclusive with :attr:`workspace_id` — see :meth:`_one_layout`.
     """
@@ -198,11 +198,13 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
     and out-of-band *detection*; leaving it off loosens the gate by nothing at
     all, because the gate is pure Python and independent.
 
-    Note what ``getChildrenOrCreate`` implies: the **first** card to create the
-    actor for a workspace decides its configuration, exactly as the observation
-    caps already do. A second card arriving with ``git_journal=False`` does not
-    turn off a journal that is already running, and a card arriving with it on
-    does not start one on an actor already built without it.
+    Note what the host's get-or-create implies: the **first** card to bind a
+    tree, **from any team**, decides its configuration, exactly as the
+    observation caps already do. A second card arriving with
+    ``git_journal=False`` does not turn off a journal that is already running,
+    and a card arriving with it on does not start one on an actor already built
+    without it. The host ignores ``config`` on a hit, and a tree shared by
+    several teams is the one tree whichever of them got there first.
     """
 
     workspace_exec: WorkspaceExec | bool = False
@@ -264,7 +266,8 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
 
     Three things read it besides the collection itself: it decides the
     backend-derived document caps below, it is what ``require_backend_configured``
-    checks, and it is what decides whether a store actor is created at all — all
+    checks, and — once announced to the workspace actor — it is what that actor
+    reads to decide whether to create its own in-memory store child at all. All
     three only when a retrieval capability is actually enabled.
     """
 
@@ -278,8 +281,8 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
     explicit catalog value always wins (ADR-045 §7), which is what these two
     fields exist for.
 
-    Note what ``getChildrenOrCreate`` implies, exactly as ``git_journal`` records:
-    the **first** card to create the actor for a workspace decides its
+    Note what the host's get-or-create implies, exactly as ``git_journal``
+    records: the **first** card to bind a tree, **from any team**, decides its
     configuration, so a second card arriving with different caps changes nothing.
     """
 
@@ -349,6 +352,10 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
                 it surfaces in front of the admin who caused it, rather than
                 silently collapsing several principals into one tree. It must
                 never be caught and turned into a fallback.
+            RuntimeError: If the process runs no ``WorkspaceHost`` — core's
+                refusal, forwarded unchanged. Whatever a failing ``attach``
+                raises propagates unchanged too. Neither may be caught, for the
+                same reason.
         """
         if observer.orchestrator is None:
             raise ValueError("WorkspaceTool requires access to the orchestrator.")
@@ -445,8 +452,8 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
 
         The order matters: this runs *after* ``_bind_workspace_actor``, because
         ``configure_exec`` travels over the tell proxy that method binds, and
-        after ``register_agent``, so the actor can already name this agent in a
-        refusal the first run causes.
+        after ``attach``, so the actor can already name this agent in a refusal
+        the first run causes.
 
         **``resolve_mode``'s instance is still dropped here, and that is
         correct**: this card does not run commands. What it needs from that call
@@ -471,25 +478,21 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
             return
         mode, _backend = resolve_mode(params.mode)
         self._announce_exec(
-            ExecConfig(
-                mode=mode,
-                team_id=str(observer.team_id),
-                workspace_path=workspace_path,
-                timeout_s=params.timeout_s,
-            )
+            ExecConfig(mode=mode, workspace_path=workspace_path, timeout_s=params.timeout_s)
         )
 
     def _announce_exec(self, config: ExecConfig) -> None:
         """Tell the actor which backend to run commands on — fire and forget.
 
-        Guarded exactly as :meth:`_register_agent_name` is, and for the same
-        reason: a stand-in proxy that does not carry the method, or an actor that
-        died between the get-or-create and this line, must not take the whole card
-        down. Unguarded, this one line was the harsher of two adjacent messages on
-        one binding path — the registration a line earlier already degrades.
+        Guarded, because a lost announcement degrades: a stand-in proxy that does
+        not carry the method, or an actor that died between the bind and this
+        line, costs an exec request refused for want of a backend — visible, and
+        recoverable by rebinding. A raise at wiring time is neither.
 
-        The degradation is an exec request refused for want of a backend: visible,
-        and recoverable by rebinding. A raise at wiring time is neither.
+        ``attach`` is deliberately **not** guarded like this, and the difference
+        is the point: a lost ``attach`` does not degrade, it leaves the actor
+        unaware that this agent holds it, which lets the liveness sweep reap a
+        tree an agent is still using — silently.
         """
         tell = self._workspace_tell
         if tell is None:
@@ -502,27 +505,51 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
     def _bind_workspace_actor(
         self, observer: ActorToolObserver, orchestrator: ActorAddress, workspace_path: str
     ) -> None:
-        """Bind the ``#Workspace-<workspace_path>`` singleton that owns this tree.
+        """Bind the ``#Workspace-<workspace_path>`` actor that owns this tree, then attach.
 
-        Get-or-create in one message (ADR-025): a check-then-create pair is a
-        TOCTOU window that produces two singletons over one tree, which is the
-        exact failure the pattern exists to prevent.
+        **Get-or-create on the process's ``WorkspaceHost``, forwarded by this
+        team's orchestrator.** ``getResourceOrCreate`` finds the one host of
+        exactly that class and asks it, in one message on the host's mailbox, for
+        the actor registered under ``config.name`` — so two cards from two teams
+        resolving one path at once cannot both create, and a check-then-create
+        TOCTOU window never opens. The actor is **nobody's child**: the host
+        starts it with no orchestrator and no parent, so it emits no
+        ``StartMessage`` and sits in no team's roster. On a hit the host returns
+        the live actor and ignores ``config``: the first bind fixes the tree's
+        configuration for every team on it.
 
-        The actor's name carries the resolved path, so two cards on different
-        workspaces in one team get two actors, each owning its own tree — the
-        unicity domain of the actor equals the resource it owns. Two principals
-        declaring the same ``workspace_id`` likewise get two actors, because
-        their paths differ in the scope segment.
+        The actor's name carries the resolved path and is the host's registry
+        key, so two cards on different trees get two actors and two cards on one
+        tree — from one team or from ten — get one. The unicity domain of the
+        actor is the tree it owns.
+
+        **The orchestrator emits the event, unread.** The card builds the
+        ``WorkspaceAttached`` payload naming **this agent**, and the orchestrator
+        wraps it in ``EventMessage`` on this team's own stream — one per
+        successful bind, a hit included. That is how a client learns which agent
+        bound which tree.
 
         Two proxies are bound over the one address: an ask proxy for mutations,
         which need the verdict, and a tell proxy for observations, which need
         nothing back.
 
-        The agent's **name** is registered here, once, over the tell proxy. What
-        the card can capture without an edge back to the agent is
-        ``agent_id`` — a UUID — and a journal authored by UUID, or a refusal
-        naming one, is a record nobody can read. This is the only new message the
-        journal adds, and it is O(1), once per card, never on the mutation path.
+        **Then ``attach``, over the ask proxy and unguarded.** It records this
+        agent as a holder — the actor's lifetime is its holders' — and its
+        display name, which is what the journal authors commits with and what a
+        refusal prints: a UUID is a record nobody can read. An ask, so the holder
+        is recorded before the bind returns and a failure is seen: a dead actor
+        fails the bind rather than leaving an agent holding a tree that does not
+        know it. The forward has already emitted this bind's ``WorkspaceAttached``
+        by then — core emits once the host answers, before the card can attach —
+        so a failed ``attach`` leaves that event on the team's stream for a bind
+        that then failed. The failure is still loud, since ``observer()`` raises,
+        but a reader of the stream must not take the event alone as proof that an
+        agent holds the tree.
+
+        **This method creates at most one actor, and only through the host.** The
+        in-memory vector store a retrieval card needs is the workspace actor's
+        own child, created by that actor when ``enable_rag`` reaches it and
+        stopped with it; the card creates no store actor for any backend.
 
         Args:
             observer: The owning agent, live at bind time.
@@ -534,29 +561,16 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
                 whose injectivity would have to be proved separately.
         """
         orchestrator_proxy = observer.proxy_ask(orchestrator, Orchestrator)
-        if self._rag_enabled():
-            # The store is created **here**, not in ``_announce_rag``, for one
-            # concrete reason: this method is the only one that holds an
-            # orchestrator proxy, and ``_announce_rag`` holds a tell proxy over
-            # the *workspace* actor instead. Threading an orchestrator proxy down
-            # to the announcement would buy nothing — this runs first, and the
-            # store only has to exist by the time ``enable_rag`` makes the
-            # workspace actor resolve it. A cluster backend creates nothing.
-            ensure_store_actor(self.vector_store, orchestrator_proxy)
         derived_documents, derived_chars = derived_document_caps(
             self.vector_store.backend, self._rag_enabled()
         )
-        workspace_addr = orchestrator_proxy.getChildrenOrCreate(
+        workspace_addr = orchestrator_proxy.getResourceOrCreate(
+            WorkspaceHost,
             WorkspaceActor,
             config=WorkspaceConfig(
                 name=workspace_actor_name(workspace_path),
                 role=WORKSPACE_ACTOR_ROLE,
                 workspace_path=workspace_path,
-                # The declared list, verbatim — not deduped, not sorted. The
-                # client joins on plain list equality against the agent card's
-                # own ``workspace_metadata_keys``, so normalising this side and
-                # not that one is how the join starts missing silently.
-                metadata_keys=self.workspace_metadata_keys,
                 git_journal=self.git_journal,
                 max_documents=(
                     self.max_documents if self.max_documents is not None else derived_documents
@@ -567,27 +581,15 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
                     else derived_chars
                 ),
             ),
+            event=WorkspaceAttached(
+                agent_id=observer.myAddress.agent_id, workspace_path=workspace_path
+            ),
         )
-        self._workspace_proxy = observer.proxy_ask(workspace_addr, WorkspaceActor)
+        workspace = observer.proxy_ask(workspace_addr, WorkspaceActor)
+        self._workspace_proxy = workspace
         self._workspace_tell = observer.proxy_tell(workspace_addr, WorkspaceActor)
         self._agent_id = str(observer.myAddress.agent_id)
-        self._register_agent_name(observer)
-
-    def _register_agent_name(self, observer: ActorToolObserver) -> None:
-        """Tell the actor this agent's display name — fire and forget.
-
-        Never raises: a harness that hands back a stand-in proxy without the
-        method, or an actor that is already gone, must not stop a card binding.
-        The consequence of a lost registration is that the journal and the
-        refusals fall back to the agent id, which is degraded and not broken.
-        """
-        proxy = self._workspace_tell
-        if proxy is None:
-            return
-        try:
-            proxy.register_agent(self._agent_id, str(observer.myAddress.name))
-        except Exception:
-            logger.debug("Could not register the agent's name with #Workspace", exc_info=True)
+        workspace.attach(observer.myAddress, str(observer.myAddress.name))
 
     def _observation_recorder(self) -> Callable[[str, bytes, bool], None]:
         """Build the closure a read closure uses to report what it saw.

@@ -7,6 +7,8 @@ and Pydantic models (``VectorStoreParam``, ``SearchHit``, ``SearchResult``,
 
 from __future__ import annotations
 
+import json
+import uuid
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, runtime_checkable
 
@@ -443,6 +445,52 @@ def check_shared_scope(collection: str, scope: str | None) -> None:
     """
     if scope is None and not collection_is_team_scoped(collection):
         raise ValueError(SHARED_SCOPE_REQUIRED.format(collection=collection))
+
+
+# ---------------------------------------------------------------------------
+# Row identity — one derivation, both cluster backends
+# ---------------------------------------------------------------------------
+
+STABLE_OBJECT_ID_NAMESPACE: Final[uuid.UUID] = uuid.UUID("6f9619ff-8b86-d011-b42d-00c04fc964ff")
+"""The ``uuid5`` namespace every cluster row id is derived under.
+
+Its value predates this module's ownership of it and **must never change**: every
+point already stored on a cluster was written under it, so a new namespace would
+orphan all of them and double every later re-add.
+"""
+
+
+def stable_object_id(team_id: str | None, tenant: str | None, ref_id: str) -> str:
+    """The id a row for *ref_id* is stored under — the same for the same triple, always.
+
+    A deterministic ``uuid5`` over ``[team_id or "", tenant or "", ref_id]``,
+    serialised as compact ASCII JSON so no separator inside a value can make two
+    triples collide. Both cluster backends store under it, and both clients
+    **replace** a row whose id already exists — so a re-add overwrites instead of
+    doubling, within one actor's lifetime and across two.
+
+    **The team is inside the id, which is what keeps two teams' rows apart on a
+    team-scoped collection**: equal ``ref_id``s from two teams are two rows. On a
+    shared collection the writer carries no team, the first element is ``""``, and
+    every lifetime of the tree writes the one row. The tenant is inside it too,
+    for the same reason one level down.
+
+    It lives here, beside :func:`check_path_prefix` and :data:`SHARED_COLLECTIONS`,
+    for their reason: so the two cluster backends cannot drift apart on what makes
+    a row the same row.
+
+    Args:
+        team_id: The writing backend's team, or ``None`` for a writer with none.
+        tenant: The tenant the row is written under, or ``None``.
+        ref_id: The caller's own identifier for the row.
+
+    Returns:
+        The id, as a UUID string.
+    """
+    identity = json.dumps(
+        [team_id or "", tenant or "", ref_id], ensure_ascii=True, separators=(",", ":")
+    )
+    return str(uuid.uuid5(STABLE_OBJECT_ID_NAMESPACE, identity))
 
 
 # ---------------------------------------------------------------------------

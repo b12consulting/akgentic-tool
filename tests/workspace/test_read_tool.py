@@ -767,7 +767,7 @@ def make_wired_tool(
         workspace_read=WorkspaceRead(document_reader=document_reader),
     )
     tool.observer(observer)
-    _address, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
+    _address, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
     assert isinstance(actor, WorkspaceActor)
     assert tool.workspace._root == workspace_tree.resolve()
     return tool, tool.workspace, actor

@@ -284,13 +284,13 @@ class SandboxBackend(Protocol):
 
     **What ``__init__`` is declared for is the other direction**: the registry
     holds ``type[SandboxBackend]`` and ``resolve_mode`` constructs from it, so
-    "constructible from a team id alone" is part of what registering a backend
+    "constructible with no arguments" is part of what registering a backend
     commits to, and a Protocol that did not say so would leave the one call site
     that builds one unable to be type-checked at all.
     """
 
-    def __init__(self, team_id: str = "") -> None:
-        """Build an unstarted backend for *team_id*. Only docker reads it."""
+    def __init__(self) -> None:
+        """Build an unstarted backend. Everything it needs arrives through :meth:`start`."""
         ...
 
     def start(self, workspace_path: str) -> None:
@@ -324,19 +324,15 @@ class ProcessBackend:
     :class:`SandboxBackend` itself — it implements neither ``start`` nor ``exec``,
     which is the whole of what distinguishes one backend from another.
 
-    **Every backend takes a** ``team_id``, **and three of the four ignore it.**
-    Only docker uses it — it names the container, which is a per-team execution
-    resource. The parameter is here rather than only on that one subclass so
-    that the caller building a backend from the registry has one uniform
-    constructor to call and never a type switch on the mode it just resolved.
-
-    Args:
-        team_id: The team this backend runs for. Defaulted, so a backend is
-            still constructible with no arguments.
+    **Every backend is constructed with no arguments**, so the caller building
+    one from the registry has one uniform constructor to call and never a type
+    switch on the mode it just resolved. The tree a backend runs in arrives
+    through ``start(workspace_path)``; nothing about the team that asked does,
+    because a hosted tree is shared by several teams and no backend depends on
+    which one asked.
     """
 
-    def __init__(self, team_id: str = "") -> None:
-        self.team_id = team_id
+    def __init__(self) -> None:
         self._lock = threading.Lock()
         self._running: subprocess.Popen[str] | None = None
         self._leads_a_group: bool = False

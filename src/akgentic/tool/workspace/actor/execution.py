@@ -88,6 +88,7 @@ class ExecMixin(_ExecBase):
     _queue: deque[QueuedExec]
     _run_errors: OrderedDict[str, str]
     _recent_runs: dict[str, OrderedDict[str, str]]
+    _discarded_run: str | None
     _journal: GitJournal
 
     if TYPE_CHECKING:
@@ -102,15 +103,15 @@ class ExecMixin(_ExecBase):
     def configure_exec(self, config: ExecConfig) -> None:
         """Build the backend commands will run on — **tell** path, once per card.
 
-        The actor cannot take this from :class:`WorkspaceConfig`, because
-        ``getChildrenOrCreate`` fixes that at creation and the card that creates
-        the actor for a workspace is routinely one with no exec capability at
-        all. So an exec-capable card announces itself here instead, at bind time,
-        exactly as :meth:`register_agent` does.
+        The actor cannot take this from :class:`WorkspaceConfig`, because the
+        first bind fixes that for every card on the tree and the card that binds
+        a tree first is routinely one with no exec capability at all. So an
+        exec-capable card announces itself here instead, at bind time, right
+        after its ``attach``.
 
         **This is the one place a backend is built**, and it is here because
-        :class:`ExecConfig` is the one place ``mode``, ``team_id``,
-        ``workspace_path`` and ``timeout_s`` all arrive together. Nothing is
+        :class:`ExecConfig` is the one place ``mode``, ``workspace_path`` and
+        ``timeout_s`` all arrive together. Nothing is
         probed, created or started by the construction: the container is
         provisioned by the worker thread on the first command.
 
@@ -120,6 +121,11 @@ class ExecMixin(_ExecBase):
         nobody left to stop it. So an *equal* config changes nothing at all, which
         is the common case and close to the only one; a *different* one stops the
         old runner and builds a new one.
+
+        **Equal across teams, by construction.** A hosted tree is bound by agents
+        of several teams, and :class:`ExecConfig` carries no team, so a second
+        team's card with the same settings announces an equal config and keeps
+        the running runner — its run in flight included.
 
         **A replacement mid-run is deliberately not guarded**, for the reason
         :meth:`_run_budget` gives about the same situation: two exec-capable
@@ -137,12 +143,12 @@ class ExecMixin(_ExecBase):
         reports the stopped backend's error, which is an answer its caller reads.
 
         Args:
-            config: The resolved backend and the ids to build payloads from.
+            config: The resolved backend, the tree, and the run budget.
         """
         if self._exec_config == config and self._runner is not None:
             return
         self._stop_runner()
-        _mode, backend = resolve_mode(config.mode, team_id=config.team_id)
+        _mode, backend = resolve_mode(config.mode)
         self._runner = ExecRunner(backend, config.workspace_path)
         self._exec_config = config
 
@@ -322,9 +328,16 @@ class ExecMixin(_ExecBase):
         that no longer holds the tree is handled in exactly one place
         (:meth:`_finish_run`) rather than here.
 
+        A fourth case comes first and is not one of the three: the report of a
+        run whose agent the liveness sweep dropped while it ran
+        (:meth:`_discard_report`).
+
         Args:
             report: What the worker produced for one run.
         """
+        if report.run_id == self._discarded_run:
+            self._discard_report(report.run_id)
+            return
         if report.error:
             self.fail(report.run_id, report.error)
             return
@@ -349,6 +362,79 @@ class ExecMixin(_ExecBase):
                 exit_code=report.result.exit_code,
             ),
         )
+
+    def _discard_report(self, run_id: str) -> None:
+        """Close out a swept agent's run without caching what it answered.
+
+        **What "discarded" means: the report reaches the actor, and nothing
+        about it is cached.** Neither ``deliver`` nor ``fail`` runs, so there is
+        no ``_slots`` entry — ``get(run_id)`` is ``None`` and no LRU slot is
+        spent — and no ``_run_errors`` entry; ``_in_flight`` is cleared here, as
+        those two would have. Nobody could collect the outcome anyway: the sweep
+        pruned the agent's ``_recent_runs``, so its polls answer ``UNKNOWN``, and
+        a slot nobody can reach is a slot taken from a run somebody can.
+
+        **What is not discarded is the tree's own record.** The run did write, so
+        :meth:`_finish_run` still commits the discovered write set under the
+        run's identity — by id, since the name was pruned with the holder — and
+        still hands the tree to the queue head. Dropping that commit would sweep
+        the run's files into the next agent's discovery, the misattribution the
+        out-of-band commit exists to prevent.
+
+        **The mark, not a membership test.** The sweep sets ``_discarded_run``
+        for the run holding the tree when its holder was dropped; testing
+        ``agent_id not in self._holders`` here instead would discard every run
+        started under an id that never attached. One scalar, overwritten by a
+        later sweep that marks a newer run: an earlier marked run reporting after
+        that is then delivered into a slot nobody collects — the cost a late
+        report of a lease-released run already has.
+
+        Args:
+            run_id: The marked run, now reporting.
+        """
+        self._discarded_run = None
+        self._in_flight.discard(run_id)
+        logger.info(
+            "Workspace %s: run %s reported after its agent was swept — outcome discarded",
+            self.config.workspace_path,
+            run_id,
+        )
+        self._finish_run(run_id)
+
+    def _drop_runs_of(self, agent_ids: list[str]) -> None:
+        """Prune the runs of agents the liveness sweep dropped; start none of theirs.
+
+        For each agent: its ``_recent_runs`` go, and with them every run id they
+        held out of ``_run_errors``, which is keyed by run id and reachable only
+        through them. Its queued runs leave the queue — a shell nobody is
+        waiting for must not start. Its **running** run is not killed: it is
+        marked, completes on its budget, and :meth:`_discard_report` closes it
+        out when it reports. Nothing here kills anything; teardown owns the one
+        kill path.
+
+        **Its ``_slots`` results are left to the LRU.** The deferred base has no
+        delete beyond expiry, and the entries are uncollectable once
+        ``_recent_runs`` is gone. That is bounded — ``MAX_TRACKED_RUNS`` per agent
+        against ``cache_capacity`` in total — and widening a base three packages
+        share to reclaim an already-capped cost is not worth it.
+
+        Args:
+            agent_ids: The agents the sweep just dropped. Empty is a no-op.
+        """
+        if not agent_ids:
+            return
+        dropped = set(agent_ids)
+        for agent_id in dropped:
+            for run_id in self._recent_runs.pop(agent_id, {}):
+                self._run_errors.pop(run_id, None)
+        # A filter over the existing entries, in place: no ``QueuedExec`` is
+        # rebuilt, so there is no field list here to fall out of date.
+        kept = [entry for entry in self._queue if entry.agent_id not in dropped]
+        self._queue.clear()
+        self._queue.extend(kept)
+        running = self._running
+        if running is not None and running.agent_id in dropped:
+            self._discarded_run = running.run_id
 
     def _run_budget(self) -> float:
         """The effective budget a run gets, from the bound card's configuration.
@@ -711,8 +797,8 @@ class ExecMixin(_ExecBase):
         is owned from the moment its id is issued, and an id issued but untracked
         would be one its own requester could not collect.
 
-        Capped for the reason every map on a team singleton is: an uncapped one
-        leaks for the life of the team. Losing the oldest entry now costs the
+        Capped for the reason every map on a tree singleton is: an uncapped one
+        leaks for the life of the tree. Losing the oldest entry now costs the
         ability to collect that run as well as the ability to correct a mistyped
         id, and that is accepted — the answer is a recoverable ``UNKNOWN``.
 

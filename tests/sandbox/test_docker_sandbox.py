@@ -61,15 +61,13 @@ def popen_mock(
     return proc
 
 
-def started_backend(
-    team_id: str = "team-1", container_name: str = "akgentic-sandbox-0123456789ab"
-) -> DockerBackend:
+def started_backend(container_name: str = "akgentic-sandbox-0123456789ab") -> DockerBackend:
     """A backend that believes its container is running, without a daemon.
 
     What ``start()`` would leave behind — the name — is set directly, so the
     ``exec()`` argv can be asserted with no ``docker run`` having happened.
     """
-    backend = DockerBackend(team_id)
+    backend = DockerBackend()
     backend.container_name = container_name
     return backend
 
@@ -102,13 +100,12 @@ def env_values(argv: list[str], prefix: str) -> list[str]:
 def start_and_capture(
     mock_run: MagicMock,
     *,
-    team_id: str = "team-1",
-    workspace_path: str | None = None,
+    workspace_path: str = "team-1",
 ) -> tuple[DockerBackend, list[str]]:
     """Start a backend against a mocked ``docker run`` and hand back its argv."""
     mock_run.return_value = MagicMock(stdout="abc123", stderr="", returncode=0)
-    backend = DockerBackend(team_id)
-    backend.start(team_id if workspace_path is None else workspace_path)
+    backend = DockerBackend()
+    backend.start(workspace_path)
     return backend, run_argv(mock_run)
 
 
@@ -307,7 +304,7 @@ def test_two_starts_on_one_backend_produce_two_different_names(
     one backend, which is what ``docker run --name`` refuses outright.
     """
     mock_run.return_value = MagicMock(stdout="abc123", stderr="", returncode=0)
-    backend = DockerBackend("team-1")
+    backend = DockerBackend()
 
     backend.start("team-1")
     first = backend.container_name
@@ -327,18 +324,17 @@ def test_the_name_is_a_function_of_nothing_the_caller_supplied(
     mock_which: MagicMock,
     mock_ensure: MagicMock,
 ) -> None:
-    """AC3: neither ``team_id`` nor ``workspace_path`` appears in the name.
+    """AC3: the ``workspace_path`` does not appear in the name, and nothing else can.
 
     A metadata leaf can carry a customer id, and a name that carried it would put
     it in every ``docker ps`` line on the host. The label is where the path goes.
+    The constructor takes no argument at all, so the path is the only value a
+    caller supplies.
     """
-    _backend, argv = start_and_capture(
-        mock_run, team_id="acme-team", workspace_path="u-alice/case-42"
-    )
+    _backend, argv = start_and_capture(mock_run, workspace_path="u-alice/case-42")
 
     name = value_after(argv, "--name")
     assert name.startswith(CONTAINER_NAME_PREFIX)
-    assert "acme-team" not in name
     assert "u-alice" not in name
     assert "case-42" not in name
     assert len(name) == len(CONTAINER_NAME_PREFIX) + 12
@@ -354,8 +350,8 @@ def test_two_backends_over_one_workspace_do_not_collide(
 ) -> None:
     """AC3: the collision that ``sandbox-{team_id}`` produced for two workspaces."""
     mock_run.return_value = MagicMock(stdout="abc123", stderr="", returncode=0)
-    first = DockerBackend("team-1")
-    second = DockerBackend("team-1")
+    first = DockerBackend()
+    second = DockerBackend()
 
     first.start("u-alice/notes")
     second.start("u-alice/notes")
@@ -412,7 +408,7 @@ def test_the_bind_mount_is_the_only_one_and_is_the_path_it_was_handed(
     one has writes that outlive the container.
     """
     monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
-    _backend, argv = start_and_capture(mock_run, team_id="t1", workspace_path="u-alice/notes")
+    _backend, argv = start_and_capture(mock_run, workspace_path="u-alice/notes")
 
     assert argv.count("-v") == 1
     assert value_after(argv, "-v") == f"{Path('./workspaces/u-alice/notes').resolve()}:/workspace"
@@ -589,14 +585,14 @@ def test_the_git_environment_is_complete_and_self_consistent(
 def test_resolved_image_defaults_to_sandbox_image(monkeypatch: pytest.MonkeyPatch) -> None:
     """_resolved_image() returns SANDBOX_IMAGE when AKGENTIC_SANDBOX_IMAGE is unset."""
     monkeypatch.delenv("AKGENTIC_SANDBOX_IMAGE", raising=False)
-    assert DockerBackend("team-test")._resolved_image() == SANDBOX_IMAGE
+    assert DockerBackend()._resolved_image() == SANDBOX_IMAGE
 
 
 def test_resolved_image_uses_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     """_resolved_image() returns AKGENTIC_SANDBOX_IMAGE when set."""
     monkeypatch.setenv("AKGENTIC_SANDBOX_IMAGE", "ghcr.io/myorg/akgentic-sandbox:v1.2")
     assert (
-        DockerBackend("team-test")._resolved_image() == "ghcr.io/myorg/akgentic-sandbox:v1.2"
+        DockerBackend()._resolved_image() == "ghcr.io/myorg/akgentic-sandbox:v1.2"
     )
 
 
@@ -629,7 +625,7 @@ def test_start_raises_before_anything_runs_when_docker_is_not_on_path(
     mock_which: MagicMock, mock_run: MagicMock
 ) -> None:
     """AC11: the guard precedes the image check, so no docker command is issued."""
-    backend = DockerBackend("team-1")
+    backend = DockerBackend()
 
     with pytest.raises(RuntimeError, match="docker CLI not found on PATH"):
         backend.start("team-1")
@@ -653,7 +649,7 @@ def test_a_failed_docker_run_leaves_the_backend_unstarted(
     address it.
     """
     mock_run.return_value = MagicMock(stdout="", stderr="no such image", returncode=125)
-    backend = DockerBackend("team-1")
+    backend = DockerBackend()
 
     with pytest.raises(RuntimeError, match="docker run failed"):
         backend.start("team-1")
@@ -673,7 +669,7 @@ def test_ensure_image_env_override_skips_all_docker(
     """AC12: AKGENTIC_SANDBOX_IMAGE set → no docker command at all."""
     monkeypatch.setenv("AKGENTIC_SANDBOX_IMAGE", "ghcr.io/myorg/akgentic-sandbox:v1.2")
 
-    DockerBackend("team-test")._ensure_image()
+    DockerBackend()._ensure_image()
 
     assert mock_run.call_count == 0
 
@@ -686,7 +682,7 @@ def test_ensure_image_skips_the_build_when_the_image_is_present(
     monkeypatch.delenv("AKGENTIC_SANDBOX_IMAGE", raising=False)
     mock_run.return_value = MagicMock(stdout="cached-id\n", returncode=0)
 
-    DockerBackend("team-test")._ensure_image()
+    DockerBackend()._ensure_image()
 
     assert mock_run.call_count == 1
     assert mock_run.call_args_list[0][0][0] == ["docker", "images", "-q", SANDBOX_IMAGE]
@@ -710,7 +706,7 @@ def test_an_absent_image_builds_under_an_explicit_budget_with_output_captured(
         MagicMock(stdout="", stderr="", returncode=0),  # docker build → success
     ]
 
-    DockerBackend("team-test")._ensure_image()
+    DockerBackend()._ensure_image()
 
     build_argv, build_kwargs = mock_run.call_args_list[1][0][0], mock_run.call_args_list[1][1]
     assert build_argv[:4] == ["docker", "build", "-t", SANDBOX_IMAGE]
@@ -736,7 +732,7 @@ def test_the_image_is_never_pulled(
         MagicMock(stdout="", stderr="", returncode=0),
     ]
 
-    DockerBackend("team-test")._ensure_image()
+    DockerBackend()._ensure_image()
 
     for call_item in mock_run.call_args_list:
         assert "pull" not in call_item[0][0]
@@ -756,7 +752,7 @@ def test_a_failed_build_raises_naming_both_remedies_and_the_stderr_tail(
     ]
 
     with pytest.raises(RuntimeError) as exc_info:
-        DockerBackend("team-test")._ensure_image()
+        DockerBackend()._ensure_image()
 
     message = str(exc_info.value)
     assert SANDBOX_IMAGE in message
@@ -783,7 +779,7 @@ def test_a_build_timeout_becomes_a_runtime_error_naming_the_budget(
     ]
 
     with pytest.raises(RuntimeError) as exc_info:
-        DockerBackend("team-test")._ensure_image()
+        DockerBackend()._ensure_image()
 
     message = str(exc_info.value)
     assert str(int(SANDBOX_IMAGE_BUILD_TIMEOUT_S)) in message
@@ -804,7 +800,7 @@ def test_stop_removes_the_container(mock_run: MagicMock) -> None:
     ``docker stop``'s ten-second SIGTERM grace on a container whose only purpose
     was to hold a process the caller has already given up on.
     """
-    backend = DockerBackend("team-1")
+    backend = DockerBackend()
     backend.container_name = "akgentic-sandbox-0123456789ab"
     mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
 
@@ -836,7 +832,7 @@ def test_stop_on_a_backend_that_never_started_issues_no_docker_command(
     The behaviour is asserted here; the ``-O`` claim rests on the guard being an
     ``if``, which is not something ``-O`` can strip.
     """
-    backend = DockerBackend("team-1")
+    backend = DockerBackend()
     assert backend.container_name is None
 
     backend.stop()  # must not raise
@@ -853,7 +849,7 @@ def test_stop_when_the_container_is_already_gone_does_not_raise_and_does_not_war
     ``caplog`` accumulates across a test's lifetime, so it is cleared
     immediately before the call and only the records that call produced are read.
     """
-    backend = DockerBackend("team-1")
+    backend = DockerBackend()
     backend.container_name = "akgentic-sandbox-0123456789ab"
     mock_run.return_value = MagicMock(
         stdout="",
@@ -875,7 +871,7 @@ def test_stop_warns_on_any_other_failure_and_still_does_not_raise(
     mock_run: MagicMock, caplog: pytest.LogCaptureFixture
 ) -> None:
     """AC17: a daemon that has gone away is a warning, and never a raise."""
-    backend = DockerBackend("team-1")
+    backend = DockerBackend()
     backend.container_name = "akgentic-sandbox-0123456789ab"
     mock_run.return_value = MagicMock(
         stdout="", stderr="Cannot connect to the Docker daemon", returncode=1
@@ -896,7 +892,7 @@ def test_stop_does_not_raise_when_docker_has_left_the_path_since_start(
     mock_run: MagicMock, caplog: pytest.LogCaptureFixture
 ) -> None:
     """AC17: ``subprocess.run`` raises ``FileNotFoundError`` there — an OSError."""
-    backend = DockerBackend("team-1")
+    backend = DockerBackend()
     backend.container_name = "akgentic-sandbox-0123456789ab"
     mock_run.side_effect = FileNotFoundError(2, "No such file or directory: 'docker'")
 
@@ -919,7 +915,7 @@ def test_stop_warns_when_the_removal_outlives_its_budget_and_does_not_raise(
     into ``on_stop``. The name is cleared regardless, so nothing retries a
     daemon that has already shown it will not answer.
     """
-    backend = DockerBackend("team-1")
+    backend = DockerBackend()
     backend.container_name = "akgentic-sandbox-0123456789ab"
     mock_run.side_effect = subprocess.TimeoutExpired(
         cmd=["docker", "rm", "-f"], timeout=DOCKER_RM_TIMEOUT_S
@@ -942,7 +938,7 @@ def test_stop_is_idempotent(mock_run: MagicMock) -> None:
     A retained name is a second ``docker rm -f`` after a container that is
     already gone, and — worse — an ``exec`` that can still address it.
     """
-    backend = DockerBackend("team-1")
+    backend = DockerBackend()
     backend.container_name = "akgentic-sandbox-0123456789ab"
     mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
 
@@ -959,7 +955,7 @@ def test_an_exec_after_stop_refuses_rather_than_addressing_a_removed_container(
     mock_run: MagicMock,
 ) -> None:
     """The consequence of clearing the name, stated as behaviour."""
-    backend = DockerBackend("team-1")
+    backend = DockerBackend()
     backend.container_name = "akgentic-sandbox-0123456789ab"
     mock_run.return_value = MagicMock(stdout="", stderr="", returncode=0)
 
@@ -988,7 +984,7 @@ def test_the_backend_knows_its_own_name_after_start(
     forgets it.
     """
     mock_run.return_value = MagicMock(stdout="abc123", stderr="", returncode=0)
-    backend = DockerBackend("team-1")
+    backend = DockerBackend()
 
     backend.start("team-1")
 

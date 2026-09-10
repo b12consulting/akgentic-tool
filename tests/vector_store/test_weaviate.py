@@ -1211,9 +1211,7 @@ class TestScopeSchemaAndStamping:
         mock_batch = _batch_for(mock_client)
 
         backend = _scoped_backend(mock_client)
-        backend.add(
-            "col1", [_entry_with(scope="ws-1", path="docs/report.md", ordinal=3)]
-        )
+        backend.add("col1", [_entry_with(scope="ws-1", path="docs/report.md", ordinal=3)])
 
         props = mock_batch.add_object.call_args[1]["properties"]
         assert props["scope"] == "ws-1"
@@ -1406,9 +1404,7 @@ class TestScopeReadBackOntoHits:
 
     def test_hit_carries_none_when_the_class_has_no_such_property(self) -> None:
         """A pre-existing Planning object reads back as three Nones, not 'None'."""
-        result = self._search_returning(
-            {"ref_type": "entity", "ref_id": "r1", "text": "hello"}
-        )
+        result = self._search_returning({"ref_type": "entity", "ref_id": "r1", "text": "hello"})
         hit = result.hits[0]
         assert hit.scope is None
         assert hit.path is None
@@ -1920,3 +1916,69 @@ class TestDeleteByTeamRefusesASharedCollection:
         backend = WeaviateBackend(client=client)  # no team_id
 
         assert sorted(backend.list_collections()) == ["planning", "workspace_chunks"]
+
+
+class TestEveryObjectHasAStableUuid:
+    """``add`` names each object by the shared derivation, so a re-add replaces it.
+
+    weaviate-client 4.16.2 replaces an object whose uuid already exists and mints
+    a fresh UUIDv4 when none is given, so the ``uuid`` keyword *is* the object's
+    identity. On a team-scoped collection the team is inside it, and so is the
+    tenant the object is actually written to.
+    """
+
+    @staticmethod
+    def _batch(mock_client: MagicMock) -> MagicMock:
+        collection = MagicMock()
+        mock_client.collections.get.return_value = collection
+        collection.with_tenant.return_value = collection
+        batch = MagicMock()
+        collection.batch.dynamic.return_value.__enter__ = MagicMock(return_value=batch)
+        collection.batch.dynamic.return_value.__exit__ = MagicMock(return_value=False)
+        return batch
+
+    def test_two_teams_writing_one_ref_id_to_planning_pass_two_uuids(self) -> None:
+        from akgentic.tool.vector_store.protocol import stable_object_id
+
+        _mock_weaviate, client = _install_mock_weaviate()
+        client.collections.exists.return_value = False
+        batch = self._batch(client)
+        first = _backend_with(client, "planning", team_id="team-a")
+        second = _backend_with(client, "planning", team_id="team-b")
+
+        first.add("planning", [_make_entry(ref_id="3")])
+        second.add("planning", [_make_entry(ref_id="3")])
+
+        uuids = [call.kwargs["uuid"] for call in batch.add_object.call_args_list]
+        assert uuids == [
+            stable_object_id("team-a", None, "3"),
+            stable_object_id("team-b", None, "3"),
+        ]
+        assert uuids[0] != uuids[1]
+
+    def test_the_uuid_names_the_tenant_the_object_is_written_to(self) -> None:
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam, stable_object_id
+
+        _mock_weaviate, client = _install_mock_weaviate()
+        client.collections.exists.return_value = False
+        batch = self._batch(client)
+        backend = WeaviateBackend(client=client, team_id="team-a")
+        backend.create_collection("planning", VectorStoreParam(tenant="tenant-1"))
+
+        backend.add("planning", [_make_entry(ref_id="3")])
+
+        [call] = batch.add_object.call_args_list
+        assert call.kwargs["uuid"] == stable_object_id("team-a", "tenant-1", "3")
+
+    def test_a_re_add_by_one_backend_passes_the_same_uuid(self) -> None:
+        _mock_weaviate, client = _install_mock_weaviate()
+        client.collections.exists.return_value = False
+        batch = self._batch(client)
+        backend = _backend_with(client, "planning", team_id="team-a")
+
+        backend.add("planning", [_make_entry(ref_id="3")])
+        backend.add("planning", [_make_entry(ref_id="3")])
+
+        first, second = batch.add_object.call_args_list
+        assert first.kwargs["uuid"] == second.kwargs["uuid"]

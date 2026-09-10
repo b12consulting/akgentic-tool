@@ -328,18 +328,19 @@ class TestTheSpawnPathIsReused:
 
         assert upload.requests[0].scope == WORKSPACE_PATH
 
-    def test_queueing_notifies_once_and_a_message_that_queued_nothing_notifies_not_at_all(
+    def test_queueing_persists_once_and_a_message_that_queued_nothing_sends_nothing(
         self, upload: RagHarness, workspace_tree: Path
     ) -> None:
-        """The notify follows the queueing, so an unusable notification is free."""
+        """The delta follows the queueing, so an unusable notification is free."""
         write(workspace_tree, "a.md")
-        spy = upload.watch()
+        store = upload.record_deltas()
 
         upload.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["nope.zip"]))
-        assert spy.notifications == []
+        assert store.applied == []
 
         upload.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["a.md"]))
-        assert len(spy.notifications) == 1
+        assert len(store.applied) == 1
+        assert store.keys_applied() == {"rag_index.a.md"}
 
 
 class TestTheCapabilityRefusal:
@@ -375,16 +376,16 @@ class TestTheCapabilityRefusal:
         """The reachable half-enabled state, and the one this branch really buys.
 
         ``enable_rag`` sets the chunking parameters and *then* tries to acquire the
-        proxy, so a workspace whose ``#VectorStore`` is missing or whose
+        proxy, so a workspace whose store child could not be spawned or whose
         ``create_collection`` failed ends up with parameters and no proxy — the
-        state ``test_a_missing_vector_store_degrades_rather_than_raising`` pins.
-        Treating that as "retrieval is on" would spawn workers whose ``add()``
-        calls go nowhere, leaving every file at ``EMBEDDING`` until the reaper
-        queues it again — and again, every ten minutes, for ever. Both halves are
-        required, which is why the branch tests both.
+        state ``test_a_store_child_that_cannot_be_spawned_degrades_rather_than_raising``
+        pins. Treating that as "retrieval is on" would spawn workers whose
+        ``add()`` calls go nowhere, leaving every file at ``EMBEDDING`` until the
+        reaper queues it again — and again, every ten minutes, for ever. Both
+        halves are required, which is why the branch tests both.
         """
         half = upload_without_retrieval
-        half.vs_address = None
+        half.store_spawn_error = RuntimeError("no actor system")
         half.enable()
         assert half.actor._rag_params is not None
         assert half.actor._vs_proxy is None
@@ -411,11 +412,11 @@ class TestTheCapabilityRefusal:
     ) -> None:
         """AC18's idempotence covers this path too, and here it protects data.
 
-        ``WorkspaceState`` is persisted, so a resume whose ``#VectorStore`` is
-        missing restores ``EMBEDDED`` rows onto a tree with no proxy. Re-queueing
-        one would move its chunk ids into ``superseded_chunk_ids`` that no proxy
-        will ever remove, drop the heading paths a search renders, and buy a
-        re-embedding of content that was already embedded.
+        ``WorkspaceState`` is persisted, so a resume before any retrieval card
+        enables restores ``EMBEDDED`` rows onto a tree with no proxy. Re-queueing
+        one here would move its chunk ids into ``superseded_chunk_ids`` that no
+        proxy will ever remove and drop the heading paths a search renders; the
+        rows stay as restored until an engine arrives.
         """
         harness = upload_without_retrieval
         sha = write(workspace_tree, "a.md")

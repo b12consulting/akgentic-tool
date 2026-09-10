@@ -16,6 +16,8 @@ import hashlib
 from enum import StrEnum
 from typing import Literal
 
+from pydantic import Field
+
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.core.utils.serializer import SerializableBaseModel
@@ -39,7 +41,7 @@ DEFAULT_MAX_TRACKED_WRITERS = 512
 Deliberately a separate constant from the observation cap: that one bounds one
 agent's paths, this one bounds the whole tree's, so a single number would be
 wrong at one end or the other. Both exist for the same reason — an uncapped map
-on a team singleton leaks for the life of the team.
+on a long-lived tree singleton leaks for the life of the tree.
 """
 
 MAX_REJECTION_DIFF_LINES = 200
@@ -111,6 +113,31 @@ A staging file this young is being written **now** by somebody, and with a
 would make the other team's ``os.replace`` raise, turning a healthy write into a
 refusal. Orphans, by contrast, are minutes or restarts old — no real value of
 this constant separates the two badly.
+"""
+
+DEFAULT_SWEEP_INTERVAL_S = 30.0
+"""How often a hosted ``#Workspace`` sweeps its holders for stopped agents.
+
+It is how stale a stopped holder may be before the tree notices, and nothing
+more: the sweep asks each holder's ``is_alive()`` and costs one pass over a map
+bounded by live agents. It is no longer than the orchestrator's 30 s stop
+backstop and a quarter of :data:`DEFAULT_REAP_GRACE_S`, so the grace is measured
+in whole ticks.
+"""
+
+DEFAULT_REAP_GRACE_S = 120.0
+"""How long a hosted ``#Workspace`` outlives its last holder before it stops itself.
+
+A hosted tree is outside a team's two-phase teardown, so the grace is what keeps
+it alive through a stopping team's last handlers — which is why it sits above
+the orchestrator's 30 s stop backstop (see :data:`DEFAULT_GIT_TIMEOUT_S`), and
+above a run's longest life, ``MAX_EXEC_BUDGET_S`` plus ``LEASE_GRACE_S``. It is
+also what lets a team stopping and an equivalent one starting a minute later
+find the same actor, journal and container rather than rebuild them.
+
+The grace is checked on each sweep tick rather than by a second timer, so the
+reap lands between ``reap_grace_s`` and ``reap_grace_s + sweep_interval_s``
+after the last holder stopped — never before.
 """
 
 GIT_DIR_SUFFIX = ".git"
@@ -258,29 +285,23 @@ class LastWrite(SerializableBaseModel):
 
 
 class WorkspaceConfig(BaseConfig):
-    """Configuration of the ``#Workspace-<workspace_path>`` singleton.
+    """Configuration of the ``#Workspace-<workspace_path>`` actor.
+
+    **No field names a team or a key list.** The actor is hosted and shared by
+    every team whose cards resolve its path, so nothing here may be one team's.
+    A client learns which agent bound which tree from the ``WorkspaceAttached``
+    event each bind emits; the metadata key list this config used to carry had
+    no reader once the actor stopped emitting a ``StartMessage``, and a stored
+    record still carrying it loads unchanged, because an unknown key is ignored.
 
     Attributes:
         workspace_path: The **already-resolved** two-segment path of the tree
             this actor owns — ``<scope>/<leaf>``, relative to the workspaces
-            root — and also the suffix of the actor's name.
-            ``getChildrenOrCreate`` keys on that name, so both come from this
-            one value; two cards on different workspaces cannot collapse onto
-            one actor owning one tree, and nothing here re-derives a directory
-            from a ``workspace_id`` or a team id.
-        metadata_keys: The key list the card declared, carried verbatim so a
-            client can attribute an agent to a workspace by plain list equality
-            against the agent card's own ``workspace_metadata_keys``, without
-            learning the leaf's encoding. Empty for the two per-user layouts.
-
-            **A field rather than a parser.** Values are percent-encoded, so the
-            leaf *could* be parsed back — but that teaches every client the wire
-            format, and a parser can drift from the encoder. A field cannot.
-
-            It is the **declared** list, not the deduped one the leaf is built
-            from: the client compares it against the card's list, and
-            normalising one side of a join and not the other is how a join
-            starts missing silently.
+            root — and also the suffix of the actor's name. The
+            ``WorkspaceHost`` keys its registry on that name, so both come from
+            this one value; two cards on different workspaces cannot collapse
+            onto one actor owning one tree, and nothing here re-derives a
+            directory from a ``workspace_id`` or a team id.
         max_observations_per_agent: Cap on the per-agent observation map.
         max_tracked_writers: Cap on the path-keyed last-writer map, which the
             gate consults only to name the other writer in a refusal.
@@ -295,39 +316,60 @@ class WorkspaceConfig(BaseConfig):
         git_journal: Whether to keep a git journal of accepted mutations. The
             gate is unaffected either way — it is pure Python and independent.
         git_timeout_s: Wall-clock budget for one ``git`` invocation.
+        sweep_interval_s: Seconds between two liveness sweeps of the holders —
+            see :data:`DEFAULT_SWEEP_INTERVAL_S`. Positive.
+        reap_grace_s: Seconds the actor outlives its last holder before it stops
+            itself — see :data:`DEFAULT_REAP_GRACE_S`. Positive. Neither field is
+            a card setting: the first bind fixes both, like every field here.
     """
 
     workspace_path: str
-    metadata_keys: list[str] = []
     max_observations_per_agent: int = DEFAULT_MAX_OBSERVATIONS_PER_AGENT
     max_tracked_writers: int = DEFAULT_MAX_TRACKED_WRITERS
     max_documents: int = DEFAULT_MAX_DOCUMENTS
     max_document_chars: int = DEFAULT_MAX_DOCUMENT_CHARS
     git_journal: bool = False
     git_timeout_s: float = DEFAULT_GIT_TIMEOUT_S
+    sweep_interval_s: float = Field(default=DEFAULT_SWEEP_INTERVAL_S, gt=0)
+    reap_grace_s: float = Field(default=DEFAULT_REAP_GRACE_S, gt=0)
+
+
+class SweepTick(SerializableBaseModel):
+    """Time for a hosted ``#Workspace`` to sweep its holders — no fields, no meaning beyond that.
+
+    Told by the actor's own timer thread, which does nothing else, and handled
+    on the actor's mailbox, so a sweep can never interleave with an ``attach``.
+    **Never a** ``Message``: ``Akgent.on_receive`` dispatches a plain model by
+    name with no telemetry sandwich, so a tick puts nothing on any stream and
+    costs no orchestrator anything — a hosted actor has none to tell.
+    """
 
 
 class WorkspaceState(BaseState):
     """Persisted actor state — the derived cache, and no observation data.
 
     What this state must **not** carry is the observation map: reads are the
-    majority of workspace traffic, and a snapshot per recorded read would put an
-    event-store write on the read path that ADR-036's NFR1 exists to keep free.
+    majority of workspace traffic, and a store write per recorded read would put
+    persistence on the read path that ADR-036's NFR1 exists to keep free.
     Observations live as a plain actor instance attribute and do not survive a
-    resume, which degrades towards *refusing* a later write rather than
-    accepting a stale one.
+    restore — a reap or a process restart — which degrades towards *refusing* a
+    later write rather than accepting a stale one.
 
-    What it does carry is *derived* data: the extracted-document cache, every
-    byte of which is regenerable from the tree. NFR1 is a property of the **read
-    path**, not of an empty state, and the rule the whole design rests on is
-    therefore about who notifies rather than about what is stored:
+    What it does carry is *derived* data: the extracted-document cache and the
+    retrieval index, every byte of which is regenerable from the tree. The hosted
+    actor persists it by member-keyed ``StateDelta`` told to its
+    ``WorkspaceHost`` (see :mod:`akgentic.tool.workspace.actor.documents`), and
+    the host's store restores it on the next get-or-create miss. NFR1 is a
+    property of the **read path**, not of an empty state, and the rule the whole
+    design rests on is therefore about who sends a delta rather than about what
+    is stored:
 
-    - a text read never notifies,
-    - a document-cache **hit** never notifies — it reorders the LRU in memory,
+    - a text read never sends one,
+    - a document-cache **hit** never sends one — it reorders the LRU in memory,
       so persisted recency lags live recency until the next fill, which is
       deliberate and harmless,
-    - a cache **fill** notifies exactly once, after the insert *and* the
-      eviction, amortised against the seconds of extraction that preceded it.
+    - a cache **fill** sends exactly one, after the insert *and* the eviction,
+      amortised against the seconds of extraction that preceded it.
 
     Attributes:
         documents: Workspace-relative path to its extracted Markdown, in

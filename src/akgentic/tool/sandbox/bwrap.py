@@ -36,8 +36,8 @@ class BwrapBackend(ProcessBackend):
     parent directories of the workspace) are invisible to the sandboxed process.
     """
 
-    def __init__(self, team_id: str = "") -> None:
-        super().__init__(team_id)
+    def __init__(self) -> None:
+        super().__init__()
         self.workspace_path: Path | None = None
         """The resolved host directory, set by :meth:`start`."""
 

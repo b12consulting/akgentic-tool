@@ -338,7 +338,7 @@ A backend is a plain class satisfying the `SandboxBackend` Protocol in `sandbox/
 
 | Method | Contract |
 |---|---|
-| `__init__(team_id: str = "")` | constructible from the registry with a team id alone; none of the four shipped backends reads it any more |
+| `__init__()` | constructible from the registry with no arguments; everything a backend needs arrives through `start` |
 | `start(workspace_path)` | provision for the already-resolved two-segment path — called once, lazily, on the worker thread before the first command; a failure is that run's reported error and the next run retries |
 | `exec(cmd, cwd, timeout) -> ExecResult` | tokenise with `validate_command(cmd)` and run; **must** hand `timeout` to the process, and **must** raise `subprocess.TimeoutExpired` when it expires — that is what becomes the agent's "too slow" answer |
 | `kill()` | end the run in flight, idempotent and best-effort; called from `#Workspace`'s thread at teardown |

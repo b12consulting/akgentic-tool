@@ -93,7 +93,7 @@ class TestTheJournalIsOutsideEveryMount:
     ) -> None:
         # The volume is built in start(), so it is asserted there rather than
         # on the exec argv.
-        backend = DockerBackend(tree_with_journal.name)
+        backend = DockerBackend()
         monkeypatch.setenv("AKGENTIC_WORKSPACES_ROOT", str(tree_with_journal.parent))
         monkeypatch.setattr(
             "akgentic.tool.sandbox.docker.shutil.which", lambda _cmd: "/usr/bin/docker"
