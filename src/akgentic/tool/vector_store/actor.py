@@ -149,8 +149,8 @@ class VectorStoreState(BaseState):
     Pydantic's default ``extra="ignore"`` drops the key — but its contents are
     not restored: the in-memory index it held starts empty and is regenerated
     from its source documents. Every released snapshot's slot holds collection
-    configs tagged with a class already deleted, so nothing loadable is lost
-    (ADR-049 *Migration*).
+    configs tagged with a class already deleted, so no released snapshot loses
+    an index it could have loaded (ADR-049 *Migration*).
     """
 
     backend_states: dict[str, dict[str, Any]] = Field(

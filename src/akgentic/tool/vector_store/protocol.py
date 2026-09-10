@@ -379,7 +379,7 @@ constructor or in per-instance state.** Three alternatives were weighed:
   :meth:`delete_by_team`'s guard has to bite.
 - **A flag on the backend constructor or ``BackendContext``** puts the declaration
   on the *wiring* rather than on the collection, and one backend instance serves
-  several collections on the actor's backstop path.
+  several collections through the store actor's per-backend cache.
 
 The one cost is a duplicated string: ``RAG_COLLECTION`` is declared in the
 workspace package, which ``vector_store`` may not import. A spec in

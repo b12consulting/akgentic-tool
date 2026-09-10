@@ -278,9 +278,9 @@ class TestRegistry:
     ) -> None:
         """Two backends for one cluster hold one client, obtained through the cache."""
         # The cache ``qdrant.py`` actually writes into. Reached through the bound
-        # function's globals rather than a fresh import: another spec file evicts
-        # ``client`` from ``sys.modules``, so importing it again would hand back a
-        # *different* module object with an empty cache.
+        # function's globals rather than a fresh import, so this spec does not depend
+        # on ``test_weaviate.py``'s fixture, which evicts ``client`` from ``sys.modules``
+        # around each of its own tests and puts the original back afterwards.
         cache = qdrant_module.get_client.__globals__
 
         monkeypatch.setenv(QDRANT_URL_ENV, "http://localhost:6333")

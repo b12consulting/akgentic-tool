@@ -157,11 +157,11 @@ def unregister_backend(name: str) -> None:
 def _ensure_builtins() -> None:
     """Import the built-in backend modules of ``akgentic.tool.vector_store.backends``.
 
-    Each module registers itself on import. Idempotent and lazy: importing the
-    backend modules here — rather than at registry import time — keeps the
-    registry free of any dependency on the backends and avoids an import cycle
-    (backends import ``protocol``, which imports this module). The Qdrant import
-    is tolerated, so a broken optional backend cannot break the other two.
+    Each module registers itself on import. Idempotent and lazy: importing them here, not at
+    registry import time, keeps the registry free of any dependency on the backends and avoids
+    an import cycle (backends import ``protocol``, which imports this module). The Qdrant
+    import is tolerated, but that isolates nothing today: the package root imports all three
+    unguarded, so a Qdrant module that fails to import fails the package import.
     """
     global _BUILTINS_LOADED
     if _BUILTINS_LOADED:
