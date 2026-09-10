@@ -143,6 +143,9 @@ after the last holder stopped — never before.
 GIT_DIR_SUFFIX = ".git"
 """Suffix of the sibling repository directory: workspace ``foo`` journals to ``foo.git``."""
 
+META_DIR_SUFFIX = ".akgentic"
+"""Suffix of the sibling metadata directory: workspace ``foo``'s lives at ``foo.akgentic``."""
+
 GITIGNORE_NAME = ".gitignore"
 
 OUT_OF_BAND_AUTHOR = "out-of-band"

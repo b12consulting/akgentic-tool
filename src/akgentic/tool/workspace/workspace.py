@@ -5,7 +5,9 @@ All path operations validate that the resolved path stays within the workspace r
 to prevent directory traversal attacks.
 
 The workspace root is derived from the ``AKGENTIC_WORKSPACES_ROOT`` environment
-variable (default: ``./workspaces``).
+variable (default: ``./workspaces``).  :func:`meta_dir_for` derives the metadata
+directory that sits **beside** each tree, from ``AKGENTIC_WORKSPACE_META_ROOT``
+when it is set and from the same workspaces root when it is not.
 
 :func:`resolve_workspace_path` also lives here — the **one** place a workspace
 directory is derived (ADR-048 Decision 5). It sits beside :func:`get_workspace`
@@ -26,7 +28,7 @@ from uuid import uuid4
 from pydantic import BaseModel
 
 from akgentic.core.utils.serializer import SerializableBaseModel
-from akgentic.tool.workspace.models import GIT_DIR_SUFFIX
+from akgentic.tool.workspace.models import GIT_DIR_SUFFIX, META_DIR_SUFFIX
 
 # Creation mode for a newly written file, before the process umask is applied by
 # the kernel.  Matching what a plain ``open(path, "wb")`` would request keeps the
@@ -355,6 +357,19 @@ class Filesystem:
         return self._validate_path(path).exists()
 
 
+def _workspaces_root() -> str:
+    """The base directory every workspace tree hangs off.
+
+    The ``./workspaces`` default is spelled **here and nowhere else**. Two
+    literals that have to agree is this module's own recurring defect — see
+    :data:`RESERVED_SCOPES` — and here it would be worse than usual: a metadata
+    directory derived from one default and a tree derived from the other would
+    not be siblings at all, which is the single property
+    :func:`meta_dir_for` exists to hold.
+    """
+    return os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
+
+
 def get_workspace(workspace_name: str) -> Filesystem:
     """Return a :class:`Filesystem` for *workspace_name* rooted at the configured base.
 
@@ -367,8 +382,49 @@ def get_workspace(workspace_name: str) -> Filesystem:
     Returns:
         A :class:`Filesystem` anchored at ``<AKGENTIC_WORKSPACES_ROOT>/<workspace_name>``.
     """
-    base_path = os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
-    return Filesystem(base_path=base_path, workspace_name=workspace_name)
+    return Filesystem(base_path=_workspaces_root(), workspace_name=workspace_name)
+
+
+def meta_dir_for(workspace_path: str) -> Path:
+    """Return the metadata directory belonging to the tree at *workspace_path*.
+
+    A **sibling** of the tree, never a child of it: workspace ``<scope>/notes``
+    owns ``<scope>/notes.akgentic``, exactly as it owns the journal's
+    ``<scope>/notes.git`` (:func:`~akgentic.tool.workspace.journal.git_dir_for`,
+    ADR-051 Decision 9).
+
+    **The placement is a containment rule, not a naming preference.**
+    :meth:`Filesystem._validate_path` rejects everything that does not resolve
+    inside the root, so a path beside the tree is a path no read capability can
+    name — not by ``workspace_list``, not by ``workspace_glob``, not by a
+    ``../`` traversal. Inside the tree it would be all of those, and one thing
+    worse than the journal already faces: the sandbox mounts the tree, so an
+    ``rm -rf`` from a sandboxed run could delete the exec lock guarding *that
+    very run* — the lock removed by the thing it exists to serialise, with
+    nothing raising.
+
+    **Nothing is created here.** The returned directory does not exist unless
+    something else made it; whichever caller first needs it creates it.
+
+    Args:
+        workspace_path: The two-segment ``<scope>/<leaf>`` path
+            :func:`get_workspace` takes — not a resolved root. The resolved root
+            alone cannot survive ``AKGENTIC_WORKSPACE_META_ROOT``, which
+            relocates the metadata *parent*: the scope segment has to be carried
+            across the move, and it is unrecoverable from an absolute path
+            without also knowing which workspaces root it came from.
+
+    Returns:
+        The absolute ``<parent>/<scope>/<leaf>.akgentic``, where ``<parent>`` is
+        ``AKGENTIC_WORKSPACE_META_ROOT`` when set and the workspaces root
+        otherwise.
+    """
+    # Derived in the ``git_dir_for`` shape — resolve the tree, then append the
+    # suffix to its name — because two derivations that drift give two metadata
+    # directories over one tree.
+    parent = os.environ.get("AKGENTIC_WORKSPACE_META_ROOT", _workspaces_root())
+    resolved = (Path(parent) / workspace_path).resolve()
+    return resolved.parent / f"{resolved.name}{META_DIR_SUFFIX}"
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +473,16 @@ _META_SAFE = frozenset(string.ascii_letters + string.digits + ".")
 # The usual filesystem limit for a single name, in **bytes** rather than
 # characters: a multibyte value blows it well before 255 characters.
 _MAX_LEAF_BYTES = 255
+
+# Every sibling directory a workspace owns beside its tree, mapped to what it
+# holds — one entry per derivation, each keyed on that derivation's **own**
+# constant rather than on a second literal that would have to agree with it.
+# ``leaf_segment`` refuses a leaf ending in any of them; see its docstring for
+# why a name clash here is a containment failure.
+_SIDECAR_SUFFIXES = {
+    GIT_DIR_SUFFIX: "journal",
+    META_DIR_SUFFIX: "metadata",
+}
 
 
 def _unusable_as_segment(value: str) -> bool:
@@ -473,31 +539,37 @@ def leaf_segment(value: str) -> str:
     Like :func:`user_segment` except in two places: ``_meta`` is **not** reserved
     here — ``_meta`` is a scope, and a workspace legitimately named ``_meta``
     under some principal collides with nothing — and a leaf may not end in
-    ``.git``.
+    ``.git`` or ``.akgentic``.
 
     A team id is a UUID, so it passes by construction. The two guards exist for
     the values that do not: a ``workspace_id`` an author types by hand, and a
     joined metadata leaf built out of business data.
 
-    **Why the ``.git`` suffix is a containment failure and not a name clash.**
-    The journal is a *sibling of the tree, in the same directory*:
-    ``git_dir_for`` returns ``<root>.git``, so ``workspace_id="notes"`` owns both
-    ``<scope>/notes`` and ``<scope>/notes.git``. A second card declaring
-    ``workspace_id="notes.git"`` therefore roots its **tree** at the first
-    workspace's **git repository**, and its agent lists, reads, writes and
-    deletes inside another workspace's history as ordinary in-tree activity —
-    ``Filesystem._validate_path`` rejects only what resolves *outside* the root,
-    and that root is a perfectly real directory. From the other side, the first
-    workspace's commits surface as files in the second's tree. Nothing raises.
-    It is the same failure the fixed two-segment depth removes, arriving through
-    a suffix instead of through a slash.
+    **Why these suffixes are a containment failure and not a name clash.** Both
+    of a workspace's sidecar directories are *siblings of the tree, in the same
+    directory*: ``git_dir_for`` returns ``<root>.git`` and :func:`meta_dir_for`
+    returns ``<root>.akgentic``, so ``workspace_id="notes"`` owns
+    ``<scope>/notes``, ``<scope>/notes.git`` and ``<scope>/notes.akgentic``. A
+    second card declaring ``workspace_id="notes.git"`` therefore roots its
+    **tree** at the first workspace's **git repository**, and its agent lists,
+    reads, writes and deletes inside another workspace's history as ordinary
+    in-tree activity — ``Filesystem._validate_path`` rejects only what resolves
+    *outside* the root, and that root is a perfectly real directory. From the
+    other side, the first workspace's commits surface as files in the second's
+    tree. Nothing raises. It is the same failure the fixed two-segment depth
+    removes, arriving through a suffix instead of through a slash.
+
+    ``workspace_id="notes.akgentic"`` is that failure again, over the directory
+    holding the exec lock, the document cache and the retrieval index — every
+    one of which is placed outside the tree *precisely* so that no agent can
+    reach it, and all of which this card would then hold as its own files.
 
     **Rejecting beats renaming.** No suffix-stripping and no relocate-and-log: a
     deployment that genuinely has a workspace named ``foo.git`` must be told, at
     team creation, in front of the admin who caused it. Silently moving somebody
     else's tree is the failure, not the remedy.
 
-    **The match is case-insensitive** although ``git_dir_for`` only ever emits
+    **The match is case-insensitive** although both derivations only ever emit
     lowercase, because macOS and Windows filesystems are case-insensitive by
     default: ``<scope>/notes.GIT`` and ``<scope>/notes.git`` are one directory
     there, so an exact-match guard would pass the collision straight through on
@@ -517,15 +589,16 @@ def leaf_segment(value: str) -> str:
 
     Raises:
         ValueError: If the value cannot be a single directory segment, or if it
-            ends in ``.git``.
+            ends in ``.git`` or ``.akgentic``.
     """
     if _unusable_as_segment(value):
         raise ValueError(f"workspace leaf is not usable as a directory name: {value!r}")
-    if value.lower().endswith(GIT_DIR_SUFFIX):
-        raise ValueError(
-            f"workspace leaf may not end in {GIT_DIR_SUFFIX!r}, which is another "
-            f"workspace's journal directory: {value!r}"
-        )
+    for suffix, owner in _SIDECAR_SUFFIXES.items():
+        if value.lower().endswith(suffix):
+            raise ValueError(
+                f"workspace leaf may not end in {suffix!r}, which is another "
+                f"workspace's {owner} directory: {value!r}"
+            )
     return value
 
 
