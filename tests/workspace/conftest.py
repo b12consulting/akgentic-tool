@@ -29,7 +29,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import pytest
 from pykka import ActorDeadError
@@ -55,6 +55,10 @@ from akgentic.tool.workspace.models import MutationOutcome, Observation, Workspa
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
 
 from tests.conftest import MockActorAddress
+
+if TYPE_CHECKING:
+    from akgentic.tool.vector_store.protocol import VectorStoreService
+    from akgentic.tool.vector_store.registry import BackendContext, BackendFactory
 
 WORKSPACE_NAME = "test-workspace"
 """The ``workspace_id`` the wired cards below share."""
@@ -1285,7 +1289,7 @@ def delta_recorder(
 
 
 @contextmanager
-def factory_for(backend: str, factory: Callable[[Any], Any]) -> Iterator[list[Any]]:
+def factory_for(backend: str, factory: BackendFactory) -> Iterator[list[BackendContext]]:
     """Swap one registered backend's factory for the duration of a spec, yielding its contexts.
 
     ``BackendSpec`` is a frozen dataclass, so the seam is a re-registration rather
@@ -1295,10 +1299,10 @@ def factory_for(backend: str, factory: Callable[[Any], Any]) -> Iterator[list[An
     """
     from akgentic.tool.vector_store import registry
 
-    contexts: list[Any] = []
+    contexts: list[BackendContext] = []
     original = registry.get_backend_spec(backend)
 
-    def _recording(context: Any) -> Any:
+    def _recording(context: BackendContext) -> VectorStoreService:
         contexts.append(context)
         return factory(context)
 

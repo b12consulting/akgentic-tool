@@ -349,23 +349,27 @@ class WorkspaceState(BaseState):
     """Persisted actor state — the derived cache, and no observation data.
 
     What this state must **not** carry is the observation map: reads are the
-    majority of workspace traffic, and a snapshot per recorded read would put an
-    event-store write on the read path that ADR-036's NFR1 exists to keep free.
+    majority of workspace traffic, and a store write per recorded read would put
+    persistence on the read path that ADR-036's NFR1 exists to keep free.
     Observations live as a plain actor instance attribute and do not survive a
-    resume, which degrades towards *refusing* a later write rather than
-    accepting a stale one.
+    restore — a reap or a process restart — which degrades towards *refusing* a
+    later write rather than accepting a stale one.
 
-    What it does carry is *derived* data: the extracted-document cache, every
-    byte of which is regenerable from the tree. NFR1 is a property of the **read
-    path**, not of an empty state, and the rule the whole design rests on is
-    therefore about who notifies rather than about what is stored:
+    What it does carry is *derived* data: the extracted-document cache and the
+    retrieval index, every byte of which is regenerable from the tree. The hosted
+    actor persists it by member-keyed ``StateDelta`` told to its
+    ``WorkspaceHost`` (see :mod:`akgentic.tool.workspace.actor.documents`), and
+    the host's store restores it on the next get-or-create miss. NFR1 is a
+    property of the **read path**, not of an empty state, and the rule the whole
+    design rests on is therefore about who sends a delta rather than about what
+    is stored:
 
-    - a text read never notifies,
-    - a document-cache **hit** never notifies — it reorders the LRU in memory,
+    - a text read never sends one,
+    - a document-cache **hit** never sends one — it reorders the LRU in memory,
       so persisted recency lags live recency until the next fill, which is
       deliberate and harmless,
-    - a cache **fill** notifies exactly once, after the insert *and* the
-      eviction, amortised against the seconds of extraction that preceded it.
+    - a cache **fill** sends exactly one, after the insert *and* the eviction,
+      amortised against the seconds of extraction that preceded it.
 
     Attributes:
         documents: Workspace-relative path to its extracted Markdown, in

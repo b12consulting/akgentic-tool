@@ -19,7 +19,6 @@ import ast
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
 
 import pytest
 from akgentic.core import ActorRegistry
@@ -401,9 +400,13 @@ class TestEveryDeltaIsMemberKeyed:
         )
 
         assert violations == []
-        # Every step but the enable (nothing to re-mark) sent something; none
-        # sent more than one delta per persist point it ran.
-        assert len(store.applied) >= 9
+        per_step = [after - before for before, after in zip([0, *counts[:-1]], counts, strict=True)]
+        # One delta per persist point the step ran, never more, and none for a
+        # step that wrote nothing. The enable re-marks nothing (no ``EMBEDDED``
+        # row yet). The index result runs two persist points — the worker's
+        # extraction is a fill, then the file's own transition — and the final
+        # batch carries the two non-final batches' counters in its one delta.
+        assert per_step == [1, 0, 1, 2, 1, 1, 1, 1, 1, 1]
         assert {key.partition(".")[0] for key in store.keys_applied()} == set(_MEMBERS)
 
     def test_the_whole_state_channel_is_silent(
@@ -903,7 +906,7 @@ def system(workspaces_root: Path) -> Iterator[ActorSystem]:
         assert ActorSystem.find_by_class(WorkspaceActor) == [], "a workspace outlived its test"
 
 
-def _host_proxy(system: ActorSystem) -> Any:
+def _host_proxy(system: ActorSystem) -> WorkspaceHost:
     [host] = ActorSystem.find_by_class(WorkspaceHost)
     return system.proxy_ask(host, WorkspaceHost)
 
