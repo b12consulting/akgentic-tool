@@ -710,36 +710,46 @@ class ExecMixin(_ExecBase):
 
         The four steps, and why they are in this order:
 
-        1. **give the tree back.** A team that stops mid-run must not leave its
-           marker behind: the next acquirer may be in another process, and
-           without this it would wait out the staleness window for a run that
-           ended the moment this actor did. It is first because it is the step
-           that outlives this process — the three below only tidy up inside it.
-        2. **kill the running subprocess.** This is what makes the drain that
+        1. **kill the running subprocess.** This is what makes the drain that
            follows cheap: after the kill a healthy child dies in milliseconds. It
            is also the only step that stops a command from outliving the team's
            teardown, so it must be *attempted*, never assumed.
-        3. **drain the executor**, bounded (see :meth:`_drain_executor`).
-        4. **release the backend.** Last, because for docker it is the only thing
-           that ends the process *inside* the container, so it must still happen
-           when step 3 gave up — see :meth:`ExecRunner.stop`.
+        2. **drain the executor**, bounded (see :meth:`_drain_executor`).
+        3. **release the backend.** For docker it is the only thing that ends the
+           process *inside* the container, so it must still happen when step 2
+           gave up — see :meth:`ExecRunner.stop`.
+        4. **give the tree back.** A team that stops mid-run must not leave its
+           marker behind: the next acquirer may be in another process, and
+           without this it would wait out the staleness window for a run that
+           ended the moment this actor did.
 
-        **Every step is wrapped separately**, and it matters most for the new
-        first one: a release that raised would otherwise skip the kill, the drain
-        and the backend release, leaving a live child, an undrained executor and
-        a container up.
+        **The release is LAST, and that is the same rule :meth:`_finish_run`
+        follows one path over.** The marker is what a *second process* decides
+        admission on, so releasing it while this process's child may still be
+        writing hands that process a tree it is not alone in — and the run it
+        then admits sweeps the dying child's files into a discovered commit
+        attributed to whoever asked next. Steps 1–3 are exactly what makes the
+        child stop writing, so nothing may release the tree in front of them.
+        Releasing early costs unbounded misattribution; releasing late costs at
+        most the seconds the kill and the drain take, against a staleness window
+        of ``budget + LEASE_GRACE_S``.
+
+        **Every step is wrapped separately**, which is what makes that ordering
+        free: :meth:`_teardown_step` swallows, so a step that raises cannot skip
+        the ones behind it in either arrangement, and the release is reached even
+        when the kill and the drain both fail.
 
         **A workspace with no exec capability never built a runner**, and no
-        branch of this is a special case for it: steps 2 and 4 are skipped, step
-        1 finds no run to release, and step 3 shuts down an executor that never
-        spawned a thread.
+        branch of this is a special case for it: steps 1 and 3 are skipped, step
+        2 shuts down an executor that never spawned a thread, and step 4 finds no
+        run to release.
         """
         runner = self._runner
-        self._teardown_step("releasing the exec lock", self._release_running_lock)
         if runner is not None:
             self._teardown_step("killing the running command", runner.kill)
         self._teardown_step("draining the exec worker", self._drain_executor)
         self._teardown_step("releasing the exec backend", self._stop_runner)
+        self._teardown_step("releasing the exec lock", self._release_running_lock)
 
     def _release_running_lock(self) -> None:
         """Give the tree back for whatever run this actor is holding, if any.

@@ -56,8 +56,10 @@ from akgentic.tool.workspace.execution import (
     ExecStatus,
     RunningExec,
     effective_budget,
+    exec_busy,
     format_status,
     in_progress,
+    lock_unavailable,
     new_run_id,
     poll_attempts_within,
     timed_out,
@@ -220,6 +222,30 @@ class _ReleaseObserver:
 
     def release(self, tree_key: str, run_id: str) -> None:
         self.clean_at_release.append(working_tree_is_clean(self._tree))
+        self._inner.release(tree_key, run_id)
+
+
+class _TeardownOrderLock:
+    """Wraps a real backend and records what the sandbox had done at ``release``.
+
+    The teardown counterpart of :class:`_ReleaseObserver`: by the time
+    ``on_stop`` returns every step has run, so presence proves nothing about
+    order. What is read here is the state the *child* is in at the moment the
+    marker goes back.
+    """
+
+    def __init__(self, inner: LockBackend, script: SandboxScript) -> None:
+        self._inner = inner
+        self._script = script
+        self.kills_at_release: list[int] = []
+        self.stopped_at_release: list[bool] = []
+
+    def acquire(self, tree_key: str, ticket: LockTicket) -> LockGrant:
+        return self._inner.acquire(tree_key, ticket)
+
+    def release(self, tree_key: str, run_id: str) -> None:
+        self.kills_at_release.append(self._script.kills)
+        self.stopped_at_release.append(("stop",) in self._script.events)
         self._inner.release(tree_key, run_id)
 
 
@@ -464,13 +490,23 @@ class TestTheCapability:
         # ``request_exec`` is an ASK: a raise here crosses the actor boundary
         # and reaches the agent as a crash rather than as an answer it can act
         # on. An unwritable metadata parent must be a refusal.
+        #
+        # It must be the ENVIRONMENT refusal, not the busy one, and asserting
+        # only the shared prefix would not tell them apart: the whole reason
+        # ``lock_unavailable`` exists beside ``exec_busy`` is that busy means
+        # "retry and it will work" while this means "retrying in a loop will
+        # not". A path that answered ``exec_busy()`` here would send the agent
+        # round that loop, so the distinguishing wording is what is asserted.
         _card, actor, _harness = exec_setup
         actor._lock = _RaisingLock()
 
         start = actor.request_exec(AGENT, "echo hi")
 
         assert not start.run_id
+        assert start.refusal == lock_unavailable()
         assert start.refusal.startswith("workspace busy")
+        assert "environment failure" in start.refusal
+        assert start.refusal != exec_busy()
         assert sandbox_script.commands == []
         assert actor._running is None
 
@@ -2802,6 +2838,14 @@ class TestTeardownIsOrderedAndBounded:
         # at all: a team that stops mid-run and leaves it behind locks the tree
         # for the next worker until the staleness window expires — and nothing
         # in that worker can tell the difference between "held" and "abandoned".
+        #
+        # **This is the REPORT path, not the teardown one**, and the distinction
+        # is worth stating because the name alone hides it: a real ``kill()``
+        # ends the blocked child, so the run reports inside the drain and
+        # ``_finish_run`` is what gives the marker back. Teardown's own release
+        # then finds nothing to do — which is why deleting it outright leaves
+        # this spec green. The guard that holds teardown to AC 12 is the wedged
+        # child below, where no report can arrive at all.
         _card, actor, harness = exec_setup
         start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
         assert exec_marker().is_file()  # the control: it really was taken
@@ -2815,23 +2859,68 @@ class TestTeardownIsOrderedAndBounded:
         # backend can take it at once.
         assert FileLockBackend().acquire(WORKSPACE_PATH, _ticket()).run_id
 
-    def test_a_release_that_raises_does_not_skip_the_kill_or_the_backend_release(
+    def test_a_wedged_run_gives_the_tree_back_at_teardown_and_only_then(
         self,
         exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         workspace_tree: Path,
     ) -> None:
-        # Every step is wrapped SEPARATELY, and the release is now the first of
-        # them — so a backend that raises here would, under one shared wrapper,
-        # leave a live child, an undrained executor and a container up.
+        # AC 12, guarded where the step is the ONLY thing that can satisfy it: a
+        # child that ignores the kill never returns, so no report arrives, so
+        # ``_finish_run`` never runs and the marker can only be given back by
+        # teardown. Remove the step and this goes red; the happy-path spec above
+        # does not.
+        #
+        # It also pins the ORDER, on the state at the moment of the release
+        # rather than on the end state — the only way to see it, since by the
+        # time ``on_stop`` returns every step has run either way. The marker is
+        # what a SECOND PROCESS decides admission on, so handing it back while
+        # this process's child may still be writing admits a run into a tree it
+        # is not alone in, and that run's own discovery sweeps the dying child's
+        # files into a commit attributed to whoever asked next — the
+        # misattribution ``commit_out_of_band`` exists to prevent, across a
+        # process boundary this time.
+        _card, actor, harness = exec_setup
+        sandbox_script.kill_releases = False  # the child that ignores the kill
+        observer = _TeardownOrderLock(actor._lock, sandbox_script)
+        actor._lock = observer
+        start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
+        assert exec_marker().is_file()
+
+        actor.on_stop()
+
+        assert ("exec-return", "echo head") not in sandbox_script.events, (
+            "the child returned, so this is no longer the wedged case"
+        )
+        assert observer.kills_at_release == [1], "the tree was given back before the kill"
+        assert observer.stopped_at_release == [True], (
+            "the tree was given back before the backend was stopped"
+        )
+        assert not exec_marker().exists()
+        assert FileLockBackend().acquire(WORKSPACE_PATH, _ticket()).run_id
+        sandbox_script.gate.set()
+        harness.join()
+
+    def test_a_release_that_raises_does_not_raise_past_on_stop(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+        workspace_tree: Path,
+    ) -> None:
+        # ``_release_lock`` swallows and ``_teardown_step`` wraps on top of it,
+        # so a filesystem error on the way out costs a marker left for staleness
+        # to reclaim — never a raise out of ``on_stop``, which would strand the
+        # base class's own teardown behind it. The kill and the backend stop
+        # precede the release and are asserted as the control: this spec is
+        # about the swallow, not about which step runs first.
         _card, actor, harness = exec_setup
         start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
         actor._lock = _RaisingLock()
         sandbox_script.gate.set()
 
         actor.on_stop()  # must not raise
-        harness.join()
 
+        harness.join()
         assert sandbox_script.kills == 1
         assert ("stop",) in sandbox_script.events
 

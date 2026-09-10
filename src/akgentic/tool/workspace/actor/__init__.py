@@ -230,8 +230,9 @@ class WorkspaceActor(
     reaches it and the host never stops it. A daemon timer tells it a
     :class:`~akgentic.tool.workspace.models.SweepTick` every ``sweep_interval_s``;
     the tick, on this mailbox, drops every holder whose actor has stopped and
-    prunes what the actor kept about it, and discards the queued runs nobody is
-    left to wait for. At zero holders a ``reap_grace_s`` grace starts, which an
+    prunes what the actor kept about it. A run that holder had *running* is not
+    killed: it is marked, completes on its budget, and gives the tree back when
+    it reports. At zero holders a ``reap_grace_s`` grace starts, which an
     ``attach`` cancels; the first tick at or past its end stops the actor through
     its own ``Akgent.stop`` — so ``stop_children`` takes the store child and any
     live worker down with it. **It tells the host nothing** (see :meth:`on_stop`):
