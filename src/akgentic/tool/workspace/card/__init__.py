@@ -352,6 +352,10 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
                 it surfaces in front of the admin who caused it, rather than
                 silently collapsing several principals into one tree. It must
                 never be caught and turned into a fallback.
+            RuntimeError: If the process runs no ``WorkspaceHost`` — core's
+                refusal, forwarded unchanged. Whatever a failing ``attach``
+                raises propagates unchanged too. Neither may be caught, for the
+                same reason.
         """
         if observer.orchestrator is None:
             raise ValueError("WorkspaceTool requires access to the orchestrator.")
@@ -535,7 +539,12 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
         refusal prints: a UUID is a record nobody can read. An ask, so the holder
         is recorded before the bind returns and a failure is seen: a dead actor
         fails the bind rather than leaving an agent holding a tree that does not
-        know it.
+        know it. The forward has already emitted this bind's ``WorkspaceAttached``
+        by then — core emits once the host answers, before the card can attach —
+        so a failed ``attach`` leaves that event on the team's stream for a bind
+        that then failed. The failure is still loud, since ``observer()`` raises,
+        but a reader of the stream must not take the event alone as proof that an
+        agent holds the tree.
 
         **This method creates at most one actor, and only through the host.** The
         in-memory vector store a retrieval card needs is the workspace actor's

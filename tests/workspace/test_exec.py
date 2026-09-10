@@ -2484,6 +2484,26 @@ class TestReplacingTheConfiguration:
         second_team = ExecConfig(mode="local", workspace_path=WORKSPACE_PATH, timeout_s=5.0)
         assert first_team == second_team
 
+    def test_a_config_record_still_carrying_a_team_loads_without_it(self) -> None:
+        """A record written before the team id was deleted must load, and drop it.
+
+        ``ExecConfig`` travels by tell and is not persisted today, so this pins
+        the unknown-key rule rather than a stored stream: a later
+        ``extra="forbid"`` would turn every caller still passing the old key
+        into a crash at bind, and this goes red first.
+        """
+        stored = {
+            "mode": "local",
+            "team_id": "team-42",
+            "workspace_path": WORKSPACE_PATH,
+            "timeout_s": 5.0,
+        }
+
+        restored = ExecConfig.model_validate(stored)
+
+        assert restored == ExecConfig(mode="local", workspace_path=WORKSPACE_PATH, timeout_s=5.0)
+        assert "team_id" not in restored.model_dump()
+
     def test_a_second_teams_exec_card_keeps_the_runner_with_a_run_in_flight(
         self,
         workspace_tree: Path,
