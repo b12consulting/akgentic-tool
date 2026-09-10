@@ -310,13 +310,13 @@ class DocumentsMixin(_DocumentsBase):
         """Turn retrieval on for this tree — **tell** path, once per card.
 
         The actor cannot take any of this from :class:`WorkspaceConfig`, because
-        ``getChildrenOrCreate`` fixes that at creation and the card that creates
-        the actor for a workspace is routinely one with no retrieval capability at
-        all. So a retrieval-capable card announces itself here instead, at bind
-        time, exactly as ``configure_exec`` and ``register_agent`` do. **The actor
-        never inspects a card**; it has no handle on one.
+        the first bind fixes that for every card on the tree and the card that
+        binds a tree first is routinely one with no retrieval capability at all.
+        So a retrieval-capable card announces itself here instead, at bind time,
+        exactly as ``configure_exec`` does. **The actor never inspects a card**;
+        it has no handle on one.
 
-        **First call wins.** Two agents on one team must not make one file chunk
+        **First call wins.** Two agents on one tree must not make one file chunk
         two ways, so a second call carrying different parameters emits one INFO
         line naming both and changes nothing. A second call carrying equal
         parameters is silent.

@@ -9,14 +9,24 @@ from __future__ import annotations
 import gc
 import inspect
 import threading
+import uuid
 import weakref
 from pathlib import Path
 from typing import Any
 
 import pytest
+from akgentic.core.utils import SerializableBaseModel
 from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
+from akgentic.tool.vector_store.protocol import VectorStoreParam
+from akgentic.tool.workspace.actor import (
+    WORKSPACE_ACTOR_ROLE,
+    WorkspaceActor,
+    workspace_actor_name,
+)
+from akgentic.tool.workspace.card.params import WorkspaceExec
+from akgentic.tool.workspace.event import WorkspaceAttached
+from akgentic.tool.workspace.host import WorkspaceHost
 from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION
 from akgentic.tool.workspace.models import Observation, WorkspaceConfig, content_sha
 from akgentic.tool.workspace.card.read import _paginate
@@ -25,6 +35,7 @@ from akgentic.tool.workspace.workspace import Filesystem
 
 from tests.workspace.conftest import (
     workspace_path_for,
+    DEFAULT_TEST_PRINCIPAL,
     HANDSHAKE_TIMEOUT_S,
     WORKSPACE_NAME,
     WORKSPACE_PATH,
@@ -34,10 +45,12 @@ from tests.workspace.conftest import (
     FailingProxy,
     FakeActorToolObserver,
     FakeOrchestratorProxy,
+    FakeWorkspaceHost,
     RecordingTellProxy,
     card_for,
     tool_named,
 )
+from tests.conftest import MockActorAddress
 
 BODY = "alpha\nbravo\ncharlie\ndelta\necho\n"
 
@@ -88,16 +101,20 @@ class TestSingleton:
         orchestrator_proxy: FakeOrchestratorProxy,
         wired_card: WorkspaceTool,
     ) -> None:
-        # Never a check-then-create pair: one message, per ADR-025.
-        assert len(orchestrator_proxy.create_calls) == 1
+        # Never a check-then-create pair: one message, per ADR-025 — now the
+        # forward to the host, and never the team's own child path beside it.
+        assert len(orchestrator_proxy.resource_calls) == 1
+        assert orchestrator_proxy.create_calls == []
 
     def test_the_config_name_carries_the_tool_actor_prefix(
         self,
         orchestrator_proxy: FakeOrchestratorProxy,
         wired_card: WorkspaceTool,
     ) -> None:
-        _, config = orchestrator_proxy.create_calls[0]
-        assert config.name.startswith("#")
+        # The prefix stays because the full name is the host's registry key and
+        # the store's scope, not because any team's teardown sees it.
+        [call] = orchestrator_proxy.resource_calls
+        assert call.config.name.startswith("#")
 
     def test_two_workspaces_in_one_team_get_two_actors(
         self,
@@ -111,8 +128,8 @@ class TestSingleton:
         shared_card = WorkspaceTool(workspace_id="shared")
         shared_card.observer(shared_observer)
 
-        assert workspace_actor_name(workspace_path_for("shared")) in orchestrator_proxy.children
-        assert workspace_actor_name(WORKSPACE_PATH) in orchestrator_proxy.children
+        assert workspace_actor_name(workspace_path_for("shared")) in orchestrator_proxy.hosted
+        assert workspace_actor_name(WORKSPACE_PATH) in orchestrator_proxy.hosted
         assert shared_card._workspace_proxy is not wired_card._workspace_proxy
 
     def test_the_actor_owns_the_tree_its_card_is_anchored_to(
@@ -597,3 +614,297 @@ class TestTheObservationIsATell:
 def test_the_actor_config_is_fully_serialisable(workspaces_root: Path) -> None:
     config = WorkspaceConfig(name="#Workspace-x", role="ToolActor", workspace_path="x")
     assert WorkspaceConfig.model_validate(config.model_dump()) == config
+
+
+# ---------------------------------------------------------------------------
+# Story 51-2: the card binds through the host's forward, then attaches
+# ---------------------------------------------------------------------------
+
+
+class _CaseMetadata(SerializableBaseModel):
+    """Stand-in team metadata — the resolver reads declared keys by attribute."""
+
+    customer_id: str | None = None
+    case_id: str | None = None
+
+
+def _card_shape(
+    shape: str,
+    orchestrator_proxy: FakeOrchestratorProxy,
+    request: pytest.FixtureRequest,
+) -> tuple[WorkspaceTool, str | None]:
+    """One of the five card shapes, and the path it resolves to (``None``: the team's own).
+
+    The bare card's path carries the observer's team id, which only exists once
+    the observer does, so the caller fills it in.
+    """
+    if shape == "bare":
+        return WorkspaceTool(), None
+    if shape == "named":
+        return WorkspaceTool(workspace_id=WORKSPACE_NAME), WORKSPACE_PATH
+    if shape == "metadata":
+        orchestrator_proxy.metadata = _CaseMetadata(customer_id="ACME", case_id="42")
+        card = WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])
+        return card, "_meta/customer_id-ACME__case_id-42"
+    if shape == "exec":
+        request.getfixturevalue("sandbox_script")
+        card = WorkspaceTool(
+            workspace_id=WORKSPACE_NAME, workspace_exec=WorkspaceExec(mode="local")
+        )
+        return card, WORKSPACE_PATH
+    assert shape == "rag"
+    pytest.importorskip("numpy", reason="the [vector_search] extra is not installed")
+    card = WorkspaceTool(
+        workspace_id=WORKSPACE_NAME,
+        workspace_rag_index=True,
+        vector_store=VectorStoreParam(backend="inmemory"),
+    )
+    return card, WORKSPACE_PATH
+
+
+class TestTheCardBindsThroughTheForward:
+    """One forward per bind, to exactly ``WorkspaceHost``, carrying the binding agent's event."""
+
+    @pytest.mark.parametrize("shape", ["bare", "named", "metadata", "exec", "rag"])
+    def test_every_card_shape_binds_once_through_the_workspace_host(
+        self,
+        shape: str,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspaces_root: Path,
+        request: pytest.FixtureRequest,
+    ) -> None:
+        card, path = _card_shape(shape, orchestrator_proxy, request)
+        observer = FakeActorToolObserver(orchestrator_proxy)
+        card.observer(observer)
+        if path is None:
+            path = f"{DEFAULT_TEST_PRINCIPAL}/{observer.team_id}"
+
+        [call] = orchestrator_proxy.resource_calls
+        assert call.host_class is WorkspaceHost
+        assert call.actor_class is WorkspaceActor
+        assert call.config.name == workspace_actor_name(path)
+        assert isinstance(call.config, WorkspaceConfig)
+        assert call.config.workspace_path == path
+        event = call.event
+        assert isinstance(event, WorkspaceAttached)
+        assert event.agent_id == observer.myAddress.agent_id
+        # The in-process type, which the wire cannot show: a string id
+        # serialises to the same string a UUID does.
+        assert isinstance(event.agent_id, uuid.UUID)
+        assert event.agent_id != observer.team_id
+        assert event.workspace_path == path
+        # Emitted unchanged — the very object the card built.
+        assert len(orchestrator_proxy.emitted) == 1
+        assert orchestrator_proxy.emitted[0] is event
+        # The negative beside the positive: the team's child path created no workspace.
+        assert WorkspaceActor not in [cls for cls, _config in orchestrator_proxy.create_calls]
+
+
+class _AskRecorder:
+    """An ask stand-in that records ``attach`` and forwards everything to the real actor."""
+
+    def __init__(self, target: WorkspaceActor) -> None:
+        self.target = target
+        self.attach_calls: list[tuple[object, str]] = []
+
+    def attach(self, agent: object, agent_name: str) -> None:
+        self.attach_calls.append((agent, agent_name))
+        self.target.attach(agent, agent_name)  # type: ignore[arg-type]
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.target, name)
+
+
+class _TellRecorder:
+    """A tell stand-in that records the name of every method reached through it."""
+
+    def __init__(self, target: WorkspaceActor) -> None:
+        self.target = target
+        self.names: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        self.names.append(name)
+        return getattr(self.target, name)
+
+
+def _hosted_ahead_of_the_card(
+    orchestrator_proxy: FakeOrchestratorProxy, max_tracked_writers: int | None = None
+) -> WorkspaceActor:
+    """Host the test workspace's actor before any card binds, so a bind is a hit on it."""
+    config = WorkspaceConfig(
+        name=workspace_actor_name(WORKSPACE_PATH),
+        role=WORKSPACE_ACTOR_ROLE,
+        workspace_path=WORKSPACE_PATH,
+    )
+    if max_tracked_writers is not None:
+        config = config.model_copy(update={"max_tracked_writers": max_tracked_writers})
+    orchestrator_proxy.host.get_or_create(WorkspaceActor, config)
+    _, actor = orchestrator_proxy.hosted[config.name]
+    assert isinstance(actor, WorkspaceActor)
+    return actor
+
+
+class TestAttachAbsorbsRegisterAgent:
+    """``attach`` records the holder and the name; ``register_agent`` is gone."""
+
+    def test_the_old_registration_is_gone_and_attach_is_there(self) -> None:
+        assert hasattr(WorkspaceActor, "attach")
+        assert not hasattr(WorkspaceActor, "register_agent")
+        assert not hasattr(WorkspaceTool, "_register_agent_name")
+
+    def test_attach_records_the_holder_and_the_name_under_the_agent_id(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        actor = _hosted_ahead_of_the_card(orchestrator_proxy)
+        address = MockActorAddress("builder")
+        key = str(address.agent_id)
+
+        actor.attach(address, "builder")
+
+        assert list(actor._holders) == [key]
+        assert actor._holders[key] is address
+        assert actor._name_of(key) == "builder"
+
+        # The same agent again overwrites: still one holder, the newer name.
+        actor.attach(address, "builder-2")
+        assert list(actor._holders) == [key]
+        assert actor._name_of(key) == "builder-2"
+
+        # A second agent is a second holder.
+        other = MockActorAddress("reviewer")
+        actor.attach(other, "reviewer")
+        assert set(actor._holders) == {key, str(other.agent_id)}
+        assert actor._holders[str(other.agent_id)] is other
+
+    def test_the_name_map_keeps_its_cap_and_the_holder_map_has_none(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """LRU on names, by ``move_to_end``; holders are bounded by live agents, not a cap."""
+        actor = _hosted_ahead_of_the_card(orchestrator_proxy, max_tracked_writers=2)
+        ann, bert, carl = (MockActorAddress(name) for name in ("ann", "bert", "carl"))
+
+        actor.attach(ann, "ann")
+        actor.attach(bert, "bert")
+        actor.attach(ann, "ann")  # refreshes ann's recency, so bert is now the oldest
+        actor.attach(carl, "carl")
+
+        assert actor._name_of(str(ann.agent_id)) == "ann"
+        assert actor._name_of(str(carl.agent_id)) == "carl"
+        assert actor._name_of(str(bert.agent_id)) == str(bert.agent_id)  # evicted: id fallback
+        assert set(actor._holders) == {str(a.agent_id) for a in (ann, bert, carl)}
+
+    def test_the_card_attaches_once_over_the_ask_proxy_and_never_over_the_tell(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        actor = _hosted_ahead_of_the_card(orchestrator_proxy)
+        ask = _AskRecorder(actor)
+        tell = _TellRecorder(actor)
+        observer = FakeActorToolObserver(
+            orchestrator_proxy, workspace_proxy=ask, workspace_tell_proxy=tell
+        )
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+
+        card.observer(observer)
+
+        assert ask.attach_calls == [(observer.myAddress, str(observer.myAddress.name))]
+        assert ask.attach_calls[0][0] is observer.myAddress
+        assert actor._holders == {str(observer.myAddress.agent_id): observer.myAddress}
+        assert "attach" not in tell.names
+        assert "register_agent" not in tell.names
+        # The tell recorder is genuinely wired: a read reports through it.
+        (workspace_tree / "notes.md").write_text(BODY, encoding="utf-8")
+        tool_named(card, "workspace_read")("notes.md")
+        assert "record_observation" in tell.names
+
+
+class TestAFailedAttachFailsTheBind:
+    """An unguarded ask: a lost ``attach`` would let the sweep reap a tree still in use."""
+
+    def test_the_attach_failure_reaches_the_caller_unchanged(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        error = RuntimeError("actor is dead")
+
+        class DeadAtBind:
+            def attach(self, agent: object, agent_name: str) -> None:
+                raise error
+
+        observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=DeadAtBind())
+
+        with pytest.raises(RuntimeError) as raised:
+            WorkspaceTool(workspace_id=WORKSPACE_NAME).observer(observer)
+
+        assert raised.value is error
+
+    def test_a_stand_in_alive_at_bind_binds(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """The positive beside it: the same shape, an ``attach`` that returns, binds."""
+        attached: list[str] = []
+
+        class AliveAtBind:
+            def attach(self, agent: object, agent_name: str) -> None:
+                attached.append(agent_name)
+
+        stand_in = AliveAtBind()
+        observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=stand_in)
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+
+        card.observer(observer)
+
+        assert attached == [str(observer.myAddress.name)]
+        assert card._workspace_proxy is stand_in
+
+
+class TestTwoTeamsSharingOneHost:
+    """Two fakes sharing one host are two teams in one process; unshared, they are not."""
+
+    def test_one_hosted_actor_two_events_two_holders(self, workspace_tree: Path) -> None:
+        host = FakeWorkspaceHost()
+        first_team = FakeOrchestratorProxy(host=host)
+        second_team = FakeOrchestratorProxy(host=host)
+        try:
+            alice = FakeActorToolObserver(first_team, name="alice")
+            bob = FakeActorToolObserver(second_team, name="bob")
+            assert alice.team_id != bob.team_id
+            assert alice.user_id == bob.user_id
+            alice_card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+            alice_card.observer(alice)
+            bob_card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+            bob_card.observer(bob)
+
+            assert list(host.registry) == [workspace_actor_name(WORKSPACE_PATH)]
+            [(_address, actor)] = host.registry.values()
+            assert first_team.emitted == [
+                WorkspaceAttached(agent_id=alice.myAddress.agent_id, workspace_path=WORKSPACE_PATH)
+            ]
+            assert second_team.emitted == [
+                WorkspaceAttached(agent_id=bob.myAddress.agent_id, workspace_path=WORKSPACE_PATH)
+            ]
+            assert set(actor._holders) == {
+                str(alice.myAddress.agent_id),
+                str(bob.myAddress.agent_id),
+            }
+        finally:
+            first_team.stop_all()
+            second_team.stop_all()
+
+    def test_the_control_two_unshared_hosts_give_two_actors(self, workspace_tree: Path) -> None:
+        """The same two cards, one host each: the sharing, not the card, collapses them."""
+        first_team = FakeOrchestratorProxy()
+        second_team = FakeOrchestratorProxy()
+        try:
+            alice = FakeActorToolObserver(first_team, name="alice")
+            bob = FakeActorToolObserver(second_team, name="bob")
+            alice_card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+            alice_card.observer(alice)
+            bob_card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+            bob_card.observer(bob)
+
+            name = workspace_actor_name(WORKSPACE_PATH)
+            assert list(first_team.hosted) == [name]
+            assert list(second_team.hosted) == [name]
+            assert first_team.hosted[name][1] is not second_team.hosted[name][1]
+        finally:
+            first_team.stop_all()
+            second_team.stop_all()

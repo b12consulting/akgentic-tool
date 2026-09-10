@@ -39,7 +39,7 @@ DEFAULT_MAX_TRACKED_WRITERS = 512
 Deliberately a separate constant from the observation cap: that one bounds one
 agent's paths, this one bounds the whole tree's, so a single number would be
 wrong at one end or the other. Both exist for the same reason — an uncapped map
-on a team singleton leaks for the life of the team.
+on a long-lived tree singleton leaks for the life of the tree.
 """
 
 MAX_REJECTION_DIFF_LINES = 200
@@ -258,29 +258,23 @@ class LastWrite(SerializableBaseModel):
 
 
 class WorkspaceConfig(BaseConfig):
-    """Configuration of the ``#Workspace-<workspace_path>`` singleton.
+    """Configuration of the ``#Workspace-<workspace_path>`` actor.
+
+    **No field names a team or a key list.** The actor is hosted and shared by
+    every team whose cards resolve its path, so nothing here may be one team's.
+    A client learns which agent bound which tree from the ``WorkspaceAttached``
+    event each bind emits; the metadata key list this config used to carry had
+    no reader once the actor stopped emitting a ``StartMessage``, and a stored
+    record still carrying it loads unchanged, because an unknown key is ignored.
 
     Attributes:
         workspace_path: The **already-resolved** two-segment path of the tree
             this actor owns — ``<scope>/<leaf>``, relative to the workspaces
-            root — and also the suffix of the actor's name.
-            ``getChildrenOrCreate`` keys on that name, so both come from this
-            one value; two cards on different workspaces cannot collapse onto
-            one actor owning one tree, and nothing here re-derives a directory
-            from a ``workspace_id`` or a team id.
-        metadata_keys: The key list the card declared, carried verbatim so a
-            client can attribute an agent to a workspace by plain list equality
-            against the agent card's own ``workspace_metadata_keys``, without
-            learning the leaf's encoding. Empty for the two per-user layouts.
-
-            **A field rather than a parser.** Values are percent-encoded, so the
-            leaf *could* be parsed back — but that teaches every client the wire
-            format, and a parser can drift from the encoder. A field cannot.
-
-            It is the **declared** list, not the deduped one the leaf is built
-            from: the client compares it against the card's list, and
-            normalising one side of a join and not the other is how a join
-            starts missing silently.
+            root — and also the suffix of the actor's name. The
+            ``WorkspaceHost`` keys its registry on that name, so both come from
+            this one value; two cards on different workspaces cannot collapse
+            onto one actor owning one tree, and nothing here re-derives a
+            directory from a ``workspace_id`` or a team id.
         max_observations_per_agent: Cap on the per-agent observation map.
         max_tracked_writers: Cap on the path-keyed last-writer map, which the
             gate consults only to name the other writer in a refusal.
@@ -298,7 +292,6 @@ class WorkspaceConfig(BaseConfig):
     """
 
     workspace_path: str
-    metadata_keys: list[str] = []
     max_observations_per_agent: int = DEFAULT_MAX_OBSERVATIONS_PER_AGENT
     max_tracked_writers: int = DEFAULT_MAX_TRACKED_WRITERS
     max_documents: int = DEFAULT_MAX_DOCUMENTS

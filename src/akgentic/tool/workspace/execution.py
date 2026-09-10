@@ -160,7 +160,7 @@ MAX_TRACKED_RUNS = 32
 """How many recent run ids are remembered per agent.
 
 Bounded for the same reason every other map on ``#Workspace`` is: an uncapped map
-on a team singleton leaks for the life of the team. It is what makes an unknown
+on a tree singleton leaks for the life of the tree. It is what makes an unknown
 run id *helpful* — a model that mistyped one reads the right one back — so the
 cap only has to cover a conversation's worth of runs, not a team's.
 """
@@ -413,16 +413,20 @@ class ExecConfig(SerializableBaseModel):
     """What an exec-capable card tells the actor once, at bind time.
 
     Deliberately not part of :class:`~akgentic.tool.workspace.models.WorkspaceConfig`.
-    ``getChildrenOrCreate`` fixes that config at creation, and the card that
-    creates the actor for a workspace is routinely a ``WorkspaceTool`` with no
-    exec capability at all — the actor would then be permanently unable to run
+    The first bind fixes that config for every card on the tree, and the card
+    that binds a tree first is routinely a ``WorkspaceTool`` with no exec
+    capability at all — the actor would then be permanently unable to run
     anything for the card that *does* have one.
+
+    **It carries no team.** A hosted tree is bound by agents of several teams,
+    each card announcing its own config, and nothing a backend does depends on
+    which team asked. A team id here would make two teams' otherwise identical
+    announcements unequal, and ``configure_exec`` replaces the runner on an
+    unequal config — one team's agent spawning would tear down another team's
+    run mid-flight.
 
     Attributes:
         mode: The resolved backend.
-        team_id: The team, which names the container. Kept because containers
-            are per-team execution resources, never because a directory is
-            derived from it.
         workspace_path: The card's **already-resolved** two-segment path, the
             only thing a backend needs to open the right tree. It replaces the
             raw ``workspace_id`` this model used to forward: a backend that
@@ -432,7 +436,6 @@ class ExecConfig(SerializableBaseModel):
     """
 
     mode: SandboxMode
-    team_id: str
     workspace_path: str
     timeout_s: float = DEFAULT_EXEC_TIMEOUT_S
 
@@ -590,7 +593,7 @@ def wait_out_the_turn(
         time.sleep(delay)
 
 
-def resolve_mode(mode: CardMode, *, team_id: str = "") -> tuple[SandboxMode, SandboxBackend]:
+def resolve_mode(mode: CardMode) -> tuple[SandboxMode, SandboxBackend]:
     """Turn a card's requested mode into a backend, warning where the host has none.
 
     Every wiring goes through this rather than probing for itself — a second
@@ -611,12 +614,13 @@ def resolve_mode(mode: CardMode, *, team_id: str = "") -> tuple[SandboxMode, San
     Constructing a backend is inert — nothing is probed, created or started until
     ``start()`` — so building one at wiring time and discarding it costs nothing.
 
+    Every registered backend is constructed with **no arguments** — the one
+    uniform constructor that lets this function build any of them from the
+    registry with no type switch on the mode it has just resolved. Everything a
+    backend needs arrives later, through ``start(workspace_path)``.
+
     Args:
         mode: What the card asked for, possibly ``"auto"``.
-        team_id: The team the backend will run for. Only ``DockerBackend`` reads
-            it, to name its container; the other three accept and ignore it, so
-            that this function has one uniform constructor to call and never a
-            type switch on the mode it has just resolved.
 
     Returns:
         The resolved mode and a fresh, unstarted backend for it.
@@ -643,7 +647,7 @@ def resolve_mode(mode: CardMode, *, team_id: str = "") -> tuple[SandboxMode, San
             DeprecationWarning,
             stacklevel=3,
         )
-    return resolved, SANDBOX_BACKEND_CLASSES[resolved](team_id=team_id)
+    return resolved, SANDBOX_BACKEND_CLASSES[resolved]()
 
 
 class ExecRunner:
@@ -755,8 +759,8 @@ class ExecRunner:
 
         **``start()`` is lazy, and that is a decision rather than an
         optimisation.** ``DockerBackend.start`` runs ``docker build``, which can
-        take minutes; ``configure_exec`` runs on the team singleton's own thread,
-        where every read, every mutation and every journal call in the team is
+        take minutes; ``configure_exec`` runs on the tree singleton's own thread,
+        where every read, every mutation and every journal call on the tree is
         serialised behind it. The container is created on the first command, not
         at bind time, and a workspace that never runs one provisions nothing.
 

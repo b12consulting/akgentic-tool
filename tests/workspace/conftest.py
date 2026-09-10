@@ -1,12 +1,13 @@
 """Fixtures and test doubles for the ``#Workspace`` actor and the recording read path.
 
 The doubles here reach the actor only through the public surface a card uses —
-``getChildrenOrCreate`` on a fake orchestrator, then ``proxy_ask``. The fake
-orchestrator holds the real actor instances, which is what lets the singleton
-test prove that an observation recorded through one card is visible through
-another. A handful of assertions do read a card's or an actor's private
-attribute where there is no public equivalent — which tree an actor took, which
-proxy a card bound — and they say so where they do it.
+``getResourceOrCreate`` on a fake orchestrator, which forwards to a fake
+``WorkspaceHost``, then ``proxy_ask``. The fake host holds the real actor
+instances, which is what lets the singleton test prove that an observation
+recorded through one card is visible through another. A handful of assertions
+do read a card's or an actor's private attribute where there is no public
+equivalent — which tree an actor took, which proxy a card bound — and they say
+so where they do it.
 
 Shaped after ``tests/notification/conftest.py``; deliberately a copy rather than
 an import, because a test package is not a library for other test packages.
@@ -26,7 +27,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, ClassVar
+from typing import Any, ClassVar, NamedTuple
 
 import pytest
 from pykka import ActorDeadError
@@ -41,6 +42,7 @@ from akgentic.tool.sandbox import SANDBOX_BACKEND_CLASSES
 from akgentic.tool.sandbox.backend import ExecResult, validate_command
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
 from akgentic.tool.workspace.execution import DEFAULT_EXEC_TIMEOUT_S, RunningExec
+from akgentic.tool.workspace.host import WorkspaceHost
 from akgentic.tool.workspace.journal import git_dir_for
 from akgentic.tool.workspace.models import MutationOutcome, Observation
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
@@ -199,8 +201,109 @@ class SilentAgent(Akgent[BaseConfig, BaseState]):
     """A do-nothing agent, used to mint a real (serializable) ``ActorAddress``."""
 
 
+def _start_actor(
+    actor_class: type[Akgent[Any, Any]], config: BaseConfig, live: bool, refs: list[Any]
+) -> tuple[ActorAddress, Any]:
+    """Create one actor with no orchestrator and no parent — live on a thread, or inert.
+
+    The second element is a live actor instance in the inert mode and a Pykka
+    proxy over one in the live mode — both answer the same calls.
+    """
+    if live:
+        ref = actor_class.start(config=config)
+        refs.append(ref)
+        return ActorAddressImpl(ref), ref.proxy()
+    actor = actor_class(config=config)
+    actor.on_start()
+    return MockActorAddress(config.name, config.role), actor
+
+
+def _stop_actors(refs: list[Any], entries: list[tuple[ActorAddress, Any]], live: bool) -> None:
+    """Stop every created actor **and its children** — live on its thread, inert in place.
+
+    The real orchestrator stops a member through ``Akgent.stop``, which runs
+    ``stop_children`` first; a bare ``ActorRef.stop()`` runs ``on_stop`` only.
+    Since the in-memory vector store became the workspace actor's own child,
+    the difference is a real thread: an inert actor whose ``enable_rag`` ran
+    has started one through ``createActor``, and stopping the parent any other
+    way leaves it alive until the interpreter refuses to exit.
+    """
+    for ref in refs:
+        if ref.is_alive():
+            try:
+                ref.proxy().stop().get(timeout=HANDSHAKE_TIMEOUT_S)
+            except ActorDeadError:
+                pass
+        ref.stop()
+    refs.clear()
+    if not live:
+        for _, actor in entries:
+            actor.stop_children()
+            actor.on_stop()
+
+
+class ResourceCall(NamedTuple):
+    """One ``getResourceOrCreate`` call, exactly as the card made it."""
+
+    host_class: type[Any]
+    actor_class: type[Akgent[Any, Any]]
+    config: BaseConfig
+    event: object
+
+
+class FakeWorkspaceHost:
+    """Core's ``ResourceHost`` get-or-create, and only that — shareable between orchestrators.
+
+    Owns the registry ``{config.name -> (address, actor)}``. A live entry is
+    returned whatever *actor_class* asks for and whatever *config* says, exactly
+    as core does; a dead one is replaced; a miss creates the actor with **no
+    orchestrator and no parent**, which is what a hosted actor is.
+
+    Two ``FakeOrchestratorProxy`` instances handed one of these are two teams in
+    one process: one registry, so one actor per path however many teams bind it.
+    """
+
+    def __init__(self, live: bool = False) -> None:
+        self.live = live
+        self.registry: dict[str, tuple[ActorAddress, Any]] = {}
+        self._refs: list[Any] = []
+
+    def get_or_create(
+        self, actor_class: type[Akgent[Any, Any]], config: BaseConfig
+    ) -> ActorAddress:
+        existing = self.registry.get(config.name)
+        if existing is not None and existing[0].is_alive():
+            return existing[0]
+        address, actor = _start_actor(actor_class, config, self.live, self._refs)
+        self.registry[config.name] = (address, actor)
+        return address
+
+    def actor_for(self, address: ActorAddress) -> Any:
+        """Return the hosted actor behind *address*, or ``None`` when it is unknown."""
+        for known_address, actor in self.registry.values():
+            if known_address is address:
+                return actor
+        return None
+
+    def stop_all(self) -> None:
+        """Stop every hosted actor and its children. Idempotent — a shared host is stopped twice."""
+        _stop_actors(self._refs, list(self.registry.values()), self.live)
+        self.registry.clear()
+
+
 class FakeOrchestratorProxy:
-    """Get-or-create singletons by config name, exactly as the orchestrator does.
+    """The orchestrator's two get-or-creates, exactly as core implements them.
+
+    ``getResourceOrCreate`` is the forward a workspace card binds through. It
+    mirrors core's three rules and only those: it records the call, refuses any
+    host class but ``WorkspaceHost`` with core's own text (so a card naming the
+    base host goes red here as it does against real core), and otherwise asks
+    :attr:`host` and appends the caller's event to :attr:`emitted` **unchanged**
+    — identity, on a hit as on a miss.
+
+    ``getChildrenOrCreate`` stays for team actors that are still children: it
+    is what :attr:`create_calls` records, so a workspace negative on that list
+    is a real negative only when paired with a positive on :attr:`resource_calls`.
 
     With *live* set, the actors it creates are genuinely started on their own
     thread and handed out behind a real ``ActorAddressImpl``. That is what lets a
@@ -208,11 +311,15 @@ class FakeOrchestratorProxy:
     mailbox rather than of a stand-in.
     """
 
-    def __init__(self, live: bool = False) -> None:
-        # The second element is a live actor instance in the inert mode and a
-        # Pykka proxy over one in the live mode — both answer the same calls.
+    def __init__(self, live: bool = False, host: FakeWorkspaceHost | None = None) -> None:
+        if host is not None and host.live != live:
+            raise ValueError("a shared host and its orchestrators must agree on live")
+        self.host = host if host is not None else FakeWorkspaceHost(live=live)
         self.children: dict[str, tuple[ActorAddress, Any]] = {}
         self.create_calls: list[tuple[type[Akgent[Any, Any]], BaseConfig]] = []
+        self.resource_calls: list[ResourceCall] = []
+        self.emitted: list[object] = []
+        """Every event this orchestrator emitted for a successful bind, in order."""
         self.live = live
         self._refs: list[Any] = []
         self.metadata: Any = None
@@ -224,25 +331,37 @@ class FakeOrchestratorProxy:
         """
         self.metadata_calls = 0
 
+    @property
+    def hosted(self) -> dict[str, tuple[ActorAddress, Any]]:
+        """The host's registry, ``{actor name -> (address, actor)}`` — where a workspace lives."""
+        return self.host.registry
+
+    def getResourceOrCreate(  # noqa: N802 — mirrors the orchestrator's method name
+        self,
+        host_class: type[Any],
+        actor_class: type[Akgent[Any, Any]],
+        config: BaseConfig,
+        event: object,
+    ) -> ActorAddress:
+        self.resource_calls.append(ResourceCall(host_class, actor_class, config, event))
+        if host_class is not WorkspaceHost:
+            raise RuntimeError(
+                f"No {host_class.__name__} is running in this process, so no resource can be bound."
+            )
+        address = self.host.get_or_create(actor_class, config)
+        self.emitted.append(event)
+        return address
+
     def getChildrenOrCreate(  # noqa: N802 — mirrors the orchestrator's method name
         self, actor_class: type[Akgent[Any, Any]], config: BaseConfig
     ) -> ActorAddress:
         self.create_calls.append((actor_class, config))
         existing = self.children.get(config.name)
         # A child that is no longer alive is skipped and replaced, exactly as
-        # the real orchestrator does — which is what makes "the next admission
-        # recreates the sandbox" observable through ``create_calls``.
+        # the real orchestrator does.
         if existing is not None and existing[0].is_alive():
             return existing[0]
-        if self.live:
-            ref = actor_class.start(config=config)
-            self._refs.append(ref)
-            address: ActorAddress = ActorAddressImpl(ref)
-            self.children[config.name] = (address, ref.proxy())
-            return address
-        actor = actor_class(config=config)
-        actor.on_start()
-        address = MockActorAddress(config.name, config.role)
+        address, actor = _start_actor(actor_class, config, self.live, self._refs)
         self.children[config.name] = (address, actor)
         return address
 
@@ -252,35 +371,17 @@ class FakeOrchestratorProxy:
         return self.metadata
 
     def actor_for(self, address: ActorAddress) -> Any:
-        """Return the actor behind *address*, or ``None`` when it is unknown."""
+        """Return the actor behind *address* — a child or a hosted one — or ``None``."""
         for known_address, actor in self.children.values():
             if known_address is address:
                 return actor
-        return None
+        return self.host.actor_for(address)
 
     def stop_all(self) -> None:
-        """Stop every created actor **and its children** — live on its thread, inert in place.
-
-        The real orchestrator stops a member through ``Akgent.stop``, which runs
-        ``stop_children`` first; a bare ``ActorRef.stop()`` runs ``on_stop`` only.
-        Since the in-memory vector store became the workspace actor's own child,
-        the difference is a real thread: an inert actor whose ``enable_rag`` ran
-        has started one through ``createActor``, and stopping the parent any other
-        way leaves it alive until the interpreter refuses to exit.
-        """
-        for ref in self._refs:
-            if ref.is_alive():
-                try:
-                    ref.proxy().stop().get(timeout=HANDSHAKE_TIMEOUT_S)
-                except ActorDeadError:
-                    pass
-            ref.stop()
-        self._refs.clear()
-        if not self.live:
-            for _, actor in self.children.values():
-                actor.stop_children()
-                actor.on_stop()
+        """Stop every child, then every hosted actor — each with its own children."""
+        _stop_actors(self._refs, list(self.children.values()), self.live)
         self.children.clear()
+        self.host.stop_all()
 
 
 class FakeActorToolObserver:
@@ -392,10 +493,17 @@ class CountingProxy:
 
 
 class FailingProxy:
-    """Raises on every recording call — a dead actor or an unreachable proxy."""
+    """Raises on every recording call — an actor that died after the bind.
+
+    ``attach`` succeeds: the card sends it on the ask proxy at bind, unguarded,
+    so a stand-in for "the actor was alive at bind" must accept it.
+    """
 
     def __init__(self) -> None:
         self.calls = 0
+
+    def attach(self, agent: ActorAddress, agent_name: str) -> None:
+        """The bind-time holder registration — the actor was alive then."""
 
     def record_observation(self, agent_id: str, path: str, observation: Observation) -> None:
         self.calls += 1
@@ -453,6 +561,9 @@ class BusyProxy:
         self.queued = threading.Event()
         self.release = threading.Event()
         self.calls: list[str] = []
+
+    def attach(self, agent: ActorAddress, agent_name: str) -> None:
+        """The bind-time holder registration — the actor was alive then."""
 
     def occupy(self) -> None:
         with self._lock:
@@ -526,8 +637,8 @@ def workspace_actor(
     orchestrator_proxy: FakeOrchestratorProxy,
     wired_card: WorkspaceTool,
 ) -> WorkspaceActor:
-    """The live singleton actor behind :func:`wired_card`."""
-    _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
+    """The live singleton actor behind :func:`wired_card`, read from the host's registry."""
+    _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
     assert isinstance(actor, WorkspaceActor)
     return actor
 
@@ -559,6 +670,19 @@ def card_for(
     card = WorkspaceTool(workspace_id=workspace_id, git_journal=git_journal)
     card.observer(observer)
     return card, observer
+
+
+def attached(actor: WorkspaceActor, name: str) -> str:
+    """Attach a fresh agent called *name* to *actor* and return the id its maps key on.
+
+    The id is ``str(address.agent_id)`` — the string a card sends on every
+    mutation and passes as a run's ``agent`` — so a spec that attaches through
+    this and then acts under the returned id exercises exactly the production
+    keying.
+    """
+    address = MockActorAddress(name)
+    actor.attach(address, name)
+    return str(address.agent_id)
 
 
 def tool_named(card: WorkspaceTool, name: str) -> Any:
@@ -692,15 +816,14 @@ class FakeBackend:
     is start a process.
 
     The script is a class attribute rather than a constructor argument because
-    ``resolve_mode`` constructs the backend itself, from the registry, with only
-    a ``team_id`` — which is the production path and the reason this fake is
+    ``resolve_mode`` constructs the backend itself, from the registry, with no
+    arguments at all — which is the production path and the reason this fake is
     reached at all.
     """
 
     script: ClassVar[SandboxScript] = SandboxScript()
 
-    def __init__(self, team_id: str = "") -> None:
-        self.team_id = team_id
+    def __init__(self) -> None:
         self.workspace_path: Path | None = None
 
     def start(self, workspace_path: str) -> None:

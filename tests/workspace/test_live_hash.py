@@ -195,6 +195,8 @@ class TestTheHashIsRead:
         # either: ``_slots`` is the deferred base's result cache, keyed by run id
         # and holding an ``ExecOutcome``, and ``_run_errors`` and ``_recent_runs``
         # are keyed by run id and agent id respectively and hold strings.
+        # ``_holders`` arrived with hosting: keyed by agent id, it holds the
+        # attached agents' addresses and nothing about any file.
         read(wired_card, "notes.md")
         mutate(wired_card, "workspace_write", "notes.md", "mine\n")
 
@@ -202,6 +204,7 @@ class TestTheHashIsRead:
             name: value for name, value in vars(workspace_actor).items() if isinstance(value, dict)
         }
         assert set(maps) == {
+            "_holders",
             "_observations",
             "_last_writers",
             "_agent_names",

@@ -26,6 +26,7 @@ defect this epic exists to remove.
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import uuid
@@ -35,14 +36,26 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 from akgentic.core import ActorRegistry
+from akgentic.core.actor_address import ActorAddress
 from akgentic.core.actor_system_impl import ActorSystem
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
+from akgentic.core.messages.orchestrator import EventMessage, StartMessage
 from akgentic.core.orchestrator import Orchestrator
+from akgentic.core.resource_host import ResourceHost
+from akgentic.core.utils.deserializer import deserialize_object
 from akgentic.core.utils.serializer import SerializableBaseModel
 
 from akgentic.tool.errors import RetriableError
+from akgentic.tool.workspace.actor import (
+    WORKSPACE_ACTOR_ROLE,
+    WorkspaceActor,
+    workspace_actor_name,
+)
+from akgentic.tool.workspace.event import WorkspaceAttached
+from akgentic.tool.workspace.host import WorkspaceHost
+from akgentic.tool.workspace.models import WorkspaceConfig
 from akgentic.tool.workspace.tool import WorkspaceTool
 from tests.workspace.conftest import tool_named
 
@@ -77,6 +90,10 @@ class Bind:
     path: PurePosixPath | None = None
     card: WorkspaceTool | None = None
     error: BaseException | None = None
+    orchestrator: ActorAddress | None = None
+    """The team's own orchestrator — whose stream the bind's event must land on."""
+    member: ActorAddress | None = None
+    """The member that bound — whose id the bind's event must name."""
 
 
 _BINDS: dict[str, Bind] = {}
@@ -183,11 +200,12 @@ def spawn_member(
         team_id=team_id,
         config=BaseConfig(name="@Orchestrator", role="Orchestrator"),
     )
+    record.orchestrator = orch_addr
     orch_proxy = system.proxy_ask(orch_addr, Orchestrator)
     if metadata is not None:
         orch_proxy.set_metadata(metadata)
 
-    orch_proxy.createActor(
+    record.member = orch_proxy.createActor(
         RecordingMember,
         config=MemberConfig(
             name=f"@Member-{bind_key}",
@@ -216,16 +234,46 @@ def bound(record: Bind) -> tuple[WorkspaceTool, PurePosixPath]:
     return record.card, record.path
 
 
+def _start_host(system: ActorSystem, host_class: type[ResourceHost], name: str) -> ActorAddress:
+    """Create one host the way wiring does: once, right after the system."""
+    return system.createActor(host_class, config=BaseConfig(name=name, role="ResourceHost"))
+
+
+def _tear_down(actor_system: ActorSystem) -> None:
+    """Stop everything, then prove no hosted workspace outlived the system."""
+    actor_system.shutdown(timeout=10)
+    ActorRegistry.stop_all()
+    _BINDS.clear()
+    assert ActorSystem.find_by_class(WorkspaceActor) == [], "a hosted workspace outlived its test"
+
+
 @pytest.fixture
 def system() -> Generator[ActorSystem, None, None]:
-    """A real actor system, torn down whatever the test did."""
+    """A real actor system with **both** hosts running, torn down whatever the test did.
+
+    The ``WorkspaceHost`` is what every card binds through. The base
+    ``ResourceHost`` beside it is the transitional infra wiring, and it is what
+    makes the host class observable: with only one host running, a card that
+    named the wrong class would fail on "no host" and never on routing.
+    """
     actor_system = ActorSystem()
     try:
+        _start_host(actor_system, WorkspaceHost, "#WorkspaceHost")
+        _start_host(actor_system, ResourceHost, "#ResourceHost")
         yield actor_system
     finally:
-        actor_system.shutdown(timeout=10)
-        ActorRegistry.stop_all()
-        _BINDS.clear()
+        _tear_down(actor_system)
+
+
+@pytest.fixture
+def base_only_system() -> Generator[ActorSystem, None, None]:
+    """A process wired with the base ``ResourceHost`` alone — infra's wiring until it switches."""
+    actor_system = ActorSystem()
+    try:
+        _start_host(actor_system, ResourceHost, "#ResourceHost")
+        yield actor_system
+    finally:
+        _tear_down(actor_system)
 
 
 ##
@@ -519,3 +567,220 @@ class TestCreateAndResumeResolveTheSamePath:
         assert "written-before" in str(
             tool_named(resumed_card, "workspace_read")("before.txt")
         )
+
+
+##
+## Story 51-2 — two teams, one tree: one hosted actor, two events
+##
+
+SHARED_PATH = "_meta/customer_id-ACME__case_id-42"
+"""The metadata tree both teams below resolve to."""
+
+# The envelope key set of the frontend's 52-2 wire fixture —
+# akgentic-frontend src/app/components/process/selectors/workspace-registry.selector.spec.ts:657-680
+# at 4f94179. Copied here, never read from the other repository. The sender's own
+# key set and the timestamp format are deliberately not pinned: the fixture is
+# derived rather than captured, it disagrees with core on both, and the fold
+# reads neither.
+FRONTEND_ENVELOPE_KEYS = frozenset(
+    {
+        "id",
+        "parent_id",
+        "team_id",
+        "timestamp",
+        "sender",
+        "recipient",
+        "display_type",
+        "__model__",
+        "event",
+    }
+)
+
+
+def _two_teams_on_one_tree(system: ActorSystem) -> tuple[Bind, Bind]:
+    """Two teams, two principals, two team ids, two orchestrators — one metadata tree."""
+    keys = ["customer_id", "case_id"]
+    first = spawn_member(
+        system,
+        bind_key="acme-a",
+        user_id="u-alice",
+        team_id=uuid.uuid4(),
+        metadata=CaseMetadata(customer_id="ACME", case_id="42"),
+        keys=keys,
+    )
+    second = spawn_member(
+        system,
+        bind_key="acme-b",
+        user_id="u-bob",
+        team_id=uuid.uuid4(),
+        metadata=CaseMetadata(customer_id="ACME", case_id="42"),
+        keys=keys,
+    )
+    return first, second
+
+
+def _stream_of(system: ActorSystem, record: Bind) -> list[object]:
+    """Everything on the member's own team's stream, in order."""
+    assert record.orchestrator is not None
+    return list(system.proxy_ask(record.orchestrator, Orchestrator).get_messages(None, None))
+
+
+def _attached_events(system: ActorSystem, record: Bind) -> list[EventMessage]:
+    """The ``EventMessage``s on the member's own team's stream carrying a ``WorkspaceAttached``."""
+    return [
+        message
+        for message in _stream_of(system, record)
+        if isinstance(message, EventMessage) and isinstance(message.event, WorkspaceAttached)
+    ]
+
+
+class TestTwoTeamsOnOneTreeShareOneHostedActor:
+    """The headline guard: hosting, observed across two real orchestrators.
+
+    What would have to be true for these to be false, and is reachable: a card
+    that binds through ``getChildrenOrCreate`` gives each orchestrator its own
+    child — two actors, and no event on either stream — and a card that names
+    the base ``ResourceHost`` puts the actor in the wrong registry, which the
+    base host running beside the ``WorkspaceHost`` makes observable.
+    """
+
+    def test_both_binds_succeed_and_exactly_one_actor_lives_in_the_workspace_hosts_registry(
+        self, system: ActorSystem, workspaces_root: Path
+    ) -> None:
+        first, second = _two_teams_on_one_tree(system)
+        _, first_path = bound(first)
+        _, second_path = bound(second)
+        assert first_path == second_path == PurePosixPath(SHARED_PATH)
+
+        [workspace] = ActorSystem.find_by_class(WorkspaceActor)
+
+        # Asked of the WorkspaceHost's OWN registry: a hit answers the same actor.
+        # Had the card bound through the base host, this ask is a miss, the
+        # WorkspaceHost constructs a second actor, and the count below is two.
+        [host] = ActorSystem.find_by_class(WorkspaceHost)
+        answered = system.proxy_ask(host, WorkspaceHost).getResourceOrCreate(
+            WorkspaceActor,
+            WorkspaceConfig(
+                name=workspace_actor_name(SHARED_PATH),
+                role=WORKSPACE_ACTOR_ROLE,
+                workspace_path=SHARED_PATH,
+            ),
+        )
+        assert answered.agent_id == workspace.agent_id
+        assert len(ActorSystem.find_by_class(WorkspaceActor)) == 1
+
+    def test_each_teams_stream_carries_one_event_naming_its_own_agent(
+        self, system: ActorSystem, workspaces_root: Path
+    ) -> None:
+        first, second = _two_teams_on_one_tree(system)
+        bound(first)
+        bound(second)
+
+        payload_ids = []
+        for record in (first, second):
+            assert record.member is not None
+            assert record.orchestrator is not None
+            [message] = _attached_events(system, record)
+            assert message.event == WorkspaceAttached(
+                agent_id=record.member.agent_id, workspace_path=SHARED_PATH
+            )
+            assert isinstance(message.event.agent_id, uuid.UUID)
+            # The envelope is the orchestrator's; the payload names the member.
+            assert message.sender is not None
+            assert message.sender.agent_id == record.orchestrator.agent_id
+            assert message.sender.agent_id != record.member.agent_id
+            payload_ids.append(message.event.agent_id)
+        assert payload_ids[0] != payload_ids[1]
+
+    def test_the_hosted_actor_is_in_no_team(
+        self, system: ActorSystem, workspaces_root: Path
+    ) -> None:
+        """No ``StartMessage``, no roster entry, no orchestrator — on either team."""
+        first, second = _two_teams_on_one_tree(system)
+        bound(first)
+        bound(second)
+        name = workspace_actor_name(SHARED_PATH)
+
+        for record in (first, second):
+            assert record.orchestrator is not None
+            assert record.member is not None
+            starts = [m for m in _stream_of(system, record) if isinstance(m, StartMessage)]
+            # The positive beside the negative: the member's own start IS there.
+            assert any(m.sender == record.member for m in starts)
+            assert [m for m in starts if isinstance(m.config, WorkspaceConfig)] == []
+            orchestrator = system.proxy_ask(record.orchestrator, Orchestrator)
+            assert orchestrator.get_team_member(record.member.name) is not None
+            assert orchestrator.get_team_member(name) is None
+
+        [workspace] = ActorSystem.find_by_class(WorkspaceActor)
+        assert system.proxy_ask(workspace, WorkspaceActor).orchestrator is None
+
+
+class TestTheWireShapeIsTheFrontends:
+    """A real serialisation of a real envelope, against the fold's contract."""
+
+    def test_the_serialised_envelope_and_payload(
+        self, system: ActorSystem, workspaces_root: Path
+    ) -> None:
+        first, second = _two_teams_on_one_tree(system)
+        bound(first)
+        bound(second)
+        assert first.member is not None
+        [message] = _attached_events(system, first)
+
+        wire = json.loads(message.model_dump_json())
+
+        assert set(wire) == FRONTEND_ENVELOPE_KEYS
+        assert wire["__model__"] == "akgentic.core.messages.orchestrator.EventMessage"
+        assert "content" not in wire
+        assert wire["recipient"] is None
+        assert wire["display_type"] == "other"
+        # Whole-dict equality: an extra field — a metadata key list — fails it.
+        assert wire["event"] == {
+            "__model__": "akgentic.tool.workspace.event.WorkspaceAttached",
+            "agent_id": str(first.member.agent_id),
+            "workspace_path": SHARED_PATH,
+        }
+        agent_id = wire["event"]["agent_id"]
+        assert str(uuid.UUID(agent_id)) == agent_id
+        assert agent_id != wire["sender"]["agent_id"]
+        assert wire["sender"]["__actor_type__"] == "akgentic.core.orchestrator.Orchestrator"
+
+    def test_the_envelope_round_trips_to_the_same_payload(
+        self, system: ActorSystem, workspaces_root: Path
+    ) -> None:
+        first, second = _two_teams_on_one_tree(system)
+        bound(first)
+        bound(second)
+        [message] = _attached_events(system, first)
+
+        restored = deserialize_object(json.loads(message.model_dump_json()))
+
+        assert isinstance(restored, EventMessage)
+        assert type(restored.event) is WorkspaceAttached
+        assert restored.event == message.event
+        assert isinstance(restored.event.agent_id, uuid.UUID)
+
+
+class TestABaseOnlyProcessFailsTheFirstBind:
+    """Infra's wiring until it switches: core's designed error, and nothing created."""
+
+    def test_the_bind_fails_loudly_and_creates_and_emits_nothing(
+        self, base_only_system: ActorSystem, workspaces_root: Path
+    ) -> None:
+        record = spawn_member(
+            base_only_system,
+            bind_key="base-only",
+            user_id="u-alice",
+            team_id=uuid.uuid4(),
+            metadata=CaseMetadata(customer_id="ACME", case_id="42"),
+            keys=["customer_id", "case_id"],
+        )
+
+        assert isinstance(record.error, RuntimeError)
+        assert "No WorkspaceHost is running" in str(record.error)
+        assert ActorSystem.find_by_class(WorkspaceActor) == []
+        stream = _stream_of(base_only_system, record)
+        # The stream was read: the member's own start is on it.
+        assert any(isinstance(message, StartMessage) for message in stream)
+        assert _attached_events(base_only_system, record) == []

@@ -1,4 +1,4 @@
-"""``#Workspace-<workspace_name>``: the team singleton that owns one workspace tree.
+"""``#Workspace-<workspace_name>``: the hosted singleton that owns one workspace tree.
 
 29-2 wired an actor that knew what everyone had read and decided nothing. This
 module is where it decides: every mutation now runs **here**, on the actor's own
@@ -25,13 +25,17 @@ this story the ask path hashes files, so a reader that waited on it would queue
 behind another agent's mutation hashing a large file — and an ask carries no
 timeout.
 
-**The name carries the workspace, and that is load-bearing.**
-``getChildrenOrCreate`` keys on the actor *name*, so a fixed ``#Workspace`` would
-collapse two cards carrying different ``workspace_id`` values onto one actor
-owning one of the two trees — silently, in a team where
-``WorkspaceTool(workspace_id="shared")`` is a documented configuration. The
-unicity domain of an actor must equal the resource it owns, and the resource is a
-tree. The ``#`` prefix stays: it is the orchestrator's two-phase-stop invariant.
+**The actor is hosted, not a team member.** Every card binds it through the
+process's ``WorkspaceHost``, forwarded by its own team's orchestrator: the host
+starts it with no orchestrator and no parent, so it is nobody's child, emits no
+``StartMessage``, and is shared by every team whose cards resolve its path. Agents
+``attach`` to it; teams do not own it.
+
+**The name carries the workspace, and that is load-bearing.** The host keys its
+registry on the actor *name*, so a fixed ``#Workspace`` would collapse two cards
+carrying different ``workspace_id`` values onto one actor owning one of the two
+trees — silently. The unicity domain of an actor must equal the resource it owns,
+and the resource is a tree.
 
 **Every accepted mutation is one commit, and the journal sits at the one place
 they converge.** :meth:`~akgentic.tool.workspace.actor.gate.GateMixin._journalled`
@@ -98,6 +102,8 @@ from akgentic.tool.workspace.models import (
 from akgentic.tool.workspace.workspace import Filesystem, get_workspace, is_staging_name
 
 if TYPE_CHECKING:
+    from akgentic.core.actor_address import ActorAddress
+
     # Runtime slots the retrieval pipeline fills. Under ``TYPE_CHECKING`` because
     # the vector store lives behind an optional extra and ``card.params`` closes
     # an import cycle through this very module — neither is needed to annotate a
@@ -123,8 +129,9 @@ logger = logging.getLogger(__name__)
 WORKSPACE_ACTOR_NAME = "#Workspace"
 """Base actor name. The live name appends the workspace — see :func:`workspace_actor_name`.
 
-The ``#`` prefix is the orchestrator's teardown invariant: it is what classifies
-the actor as a tool actor during the two-phase stop.
+The ``#`` prefix stays although no orchestrator's teardown sees a hosted actor any
+more: the full name is the ``WorkspaceHost``'s registry key and the store's scope,
+and a bare path as a scope would collide with nothing today and something tomorrow.
 """
 
 WORKSPACE_ACTOR_ROLE = "ToolActor"
@@ -172,7 +179,14 @@ class WorkspaceActor(
     ObservationMixin,
     DeferredResultActor[WorkspaceConfig, WorkspaceState, str, ExecOutcome],
 ):
-    """Team singleton owning one tree, the extraction cache, the observations, the gate.
+    """Hosted singleton owning one tree, the extraction cache, the observations, the gate.
+
+    One per resolved path per process, created by the ``WorkspaceHost`` and held
+    by the agents that ``attach`` to it, from any number of teams. **The first
+    bind fixes its configuration for every team on the tree**: the host ignores
+    ``config`` on a hit, so a later card that disagrees gets the tree as it was
+    created, with nothing raised — two cards disagreeing about one tree is a
+    catalog inconsistency, not something the host arbitrates.
 
     ``DocumentsMixin`` sits ahead of ``ExecMixin`` in the MRO, so anything it
     named ``deliver`` or ``fail`` would silently take over the deferred delivery
@@ -222,6 +236,7 @@ class WorkspaceActor(
         """
         self.state = WorkspaceState()
         super().on_start()
+        self._holders: dict[str, ActorAddress] = {}
         self._observations: dict[str, OrderedDict[str, Observation]] = {}
         self._last_writers: OrderedDict[str, LastWrite] = OrderedDict()
         self._agent_names: OrderedDict[str, str] = OrderedDict()
@@ -368,13 +383,13 @@ class WorkspaceActor(
         process cannot clean must not stop the team's workspace from starting.
 
         **A staging file younger than the grace window is left alone**, because
-        it is being written *now* and — with a ``workspace_id`` shared between
-        two teams, which is a supported configuration — by somebody who may not
-        be us. A tool actor's unicity domain is the team, so two teams over one
-        tree means two actors each sweeping the whole tree at start; unlinking
-        the other's staged file in the window between ``os.open`` and
-        ``os.replace`` turns their healthy write into a refusal. An orphan is
-        minutes or a restart old, so no realistic window confuses the two.
+        it is being written *now* and possibly by somebody who is not this
+        actor: an upload, resource seeding, or — on the multi-worker tiers,
+        where two processes can each host an actor over one tree — another
+        process's ``#Workspace``. Unlinking such a staged file in the window
+        between ``os.open`` and ``os.replace`` turns a healthy write into a
+        refusal. An orphan is minutes or a restart old, so no realistic window
+        confuses the two.
         """
         root = self._workspace._root
         cutoff = time.time() - STAGING_SWEEP_GRACE_S

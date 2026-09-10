@@ -116,11 +116,11 @@ class RagFactories:
     def _announce_rag(self) -> None:
         """Tell the actor to turn retrieval on for this tree — fire and forget.
 
-        The same shape as ``_announce_exec`` and ``_register_agent_name``, and for
-        the identical reason: ``getChildrenOrCreate`` fixes ``WorkspaceConfig`` at
-        creation, and the card that creates the actor for a workspace is routinely
-        one with no retrieval capability at all. **The actor does not inspect
-        cards** — it cannot, it has no handle on one — so a card tells it.
+        The same shape as ``_announce_exec``, and for the identical reason: the
+        first bind fixes ``WorkspaceConfig`` for every card on the tree, and the
+        card that binds a tree first is routinely one with no retrieval capability
+        at all. **The actor does not inspect cards** — it cannot, it has no handle
+        on one — so a card tells it.
 
         **It never raises.** A stand-in proxy that does not carry the method, or an
         actor that died between the get-or-create and this line, must not take the

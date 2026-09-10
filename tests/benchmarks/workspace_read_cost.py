@@ -92,6 +92,7 @@ from akgentic.tool.workspace.actor import (
     workspace_actor_name,
 )
 from akgentic.tool.workspace.edit import EditItem
+from akgentic.tool.workspace.host import WorkspaceHost
 from akgentic.tool.workspace.journal import git_dir_for
 from akgentic.tool.workspace.models import (
     MutationOutcome,
@@ -506,13 +507,14 @@ def _arm_patch(arm: str) -> Iterator[None]:
 class _SamplingWorkspaceActor(WorkspaceActor):
     """``#Workspace`` that samples **its own** mailbox depth at each turn boundary.
 
-    Installed by creating ``#Workspace-<workspace_id>`` through the orchestrator
-    *before* the first card wires. Every card then binds to it, because
-    ``Orchestrator.getChildrenOrCreate`` resolves an existing live child by
-    ``config.name`` and never by class. That is what keeps this benchmark clear
-    of the actor-internals rule: no ``ActorAddressImpl._actor_ref`` cast, no
-    patch of any production module — ``self.actor_inbox`` is this actor's own
-    pykka attribute, read on its own thread.
+    Installed by asking the process's ``WorkspaceHost`` for
+    ``#Workspace-<workspace_path>`` *before* the first card wires. Every card then
+    binds to it, because the host answers the actor registered under
+    ``config.name`` on a hit, whatever class the card's forward asks for. That is
+    what keeps this benchmark clear of the actor-internals rule: no
+    ``ActorAddressImpl._actor_ref`` cast, no patch of any production module —
+    ``self.actor_inbox`` is this actor's own pykka attribute, read on its own
+    thread.
 
     Recordings an accepted mutation makes for its own writer (``_accept`` calls
     ``record_observation`` in the same turn) are counted apart from read-path
@@ -993,12 +995,13 @@ def run_arm(spec: RunSpec, arm: str, base: Path) -> ArmRun:
     os.environ["AKGENTIC_WORKSPACES_ROOT"] = str(root)
     corpus = build_corpus(tree, spec)
     system = ActorSystem()
+    # Created once, right after the system, exactly as wiring does: every card
+    # binds its tree through this host, and nothing creates one lazily.
+    system.createActor(WorkspaceHost, config=BaseConfig(name="#WorkspaceHost", role="ResourceHost"))
     gate = _Gate(threading.Barrier(spec.agents + 1), threading.Event())
     try:
         with _arm_patch(arm), _gate_installed(gate):
-            return _drive(
-                system, spec, arm, workspace_id, workspace_path, corpus, gate, tree
-            )
+            return _drive(system, spec, arm, workspace_id, workspace_path, corpus, gate, tree)
     finally:
         gate.go.set()
         system.shutdown(timeout=SHUTDOWN_TIMEOUT_S)
@@ -1031,7 +1034,7 @@ def _drive(
         Orchestrator, config=BaseConfig(name="@Orchestrator", role="Orchestrator")
     )
     orch = system.proxy_ask(orch_addr, Orchestrator)
-    workspace = _install_sampling_actor(system, orch, workspace_path, journal)
+    workspace = _install_sampling_actor(system, workspace_path, journal)
     members = [
         _spawn_agent(orch, spec, arm, workspace_id, corpus, slot) for slot in range(spec.agents)
     ]
@@ -1052,16 +1055,17 @@ def _drive(
 
 
 def _install_sampling_actor(
-    system: ActorSystem, orch: Orchestrator, workspace_path: str, journal: bool
+    system: ActorSystem, workspace_path: str, journal: bool
 ) -> _SamplingWorkspaceActor:
-    """Create ``#Workspace-<id>`` as the instrumented subclass, before any card wires.
+    """Host ``#Workspace-<path>`` as the instrumented subclass, before any card wires.
 
-    Every card then binds to it by name. The proxy's ``bench_snapshot`` would not
-    resolve at all against a plain ``WorkspaceActor``, so a silent failure to
-    install would be an immediate error rather than a series of zeroes that
-    reads like good news.
+    Every card then binds to it by name, through the same host. The proxy's
+    ``bench_snapshot`` would not resolve at all against a plain
+    ``WorkspaceActor``, so a silent failure to install would be an immediate
+    error rather than a series of zeroes that reads like good news.
     """
-    address = orch.createActor(
+    [host] = ActorSystem.find_by_class(WorkspaceHost)
+    address = system.proxy_ask(host, WorkspaceHost).getResourceOrCreate(
         _SamplingWorkspaceActor,
         config=WorkspaceConfig(
             name=workspace_actor_name(workspace_path),

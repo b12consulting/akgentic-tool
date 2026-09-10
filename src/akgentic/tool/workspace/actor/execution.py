@@ -102,15 +102,15 @@ class ExecMixin(_ExecBase):
     def configure_exec(self, config: ExecConfig) -> None:
         """Build the backend commands will run on — **tell** path, once per card.
 
-        The actor cannot take this from :class:`WorkspaceConfig`, because
-        ``getChildrenOrCreate`` fixes that at creation and the card that creates
-        the actor for a workspace is routinely one with no exec capability at
-        all. So an exec-capable card announces itself here instead, at bind time,
-        exactly as :meth:`register_agent` does.
+        The actor cannot take this from :class:`WorkspaceConfig`, because the
+        first bind fixes that for every card on the tree and the card that binds
+        a tree first is routinely one with no exec capability at all. So an
+        exec-capable card announces itself here instead, at bind time, right
+        after its ``attach``.
 
         **This is the one place a backend is built**, and it is here because
-        :class:`ExecConfig` is the one place ``mode``, ``team_id``,
-        ``workspace_path`` and ``timeout_s`` all arrive together. Nothing is
+        :class:`ExecConfig` is the one place ``mode``, ``workspace_path`` and
+        ``timeout_s`` all arrive together. Nothing is
         probed, created or started by the construction: the container is
         provisioned by the worker thread on the first command.
 
@@ -120,6 +120,11 @@ class ExecMixin(_ExecBase):
         nobody left to stop it. So an *equal* config changes nothing at all, which
         is the common case and close to the only one; a *different* one stops the
         old runner and builds a new one.
+
+        **Equal across teams, by construction.** A hosted tree is bound by agents
+        of several teams, and :class:`ExecConfig` carries no team, so a second
+        team's card with the same settings announces an equal config and keeps
+        the running runner — its run in flight included.
 
         **A replacement mid-run is deliberately not guarded**, for the reason
         :meth:`_run_budget` gives about the same situation: two exec-capable
@@ -137,12 +142,12 @@ class ExecMixin(_ExecBase):
         reports the stopped backend's error, which is an answer its caller reads.
 
         Args:
-            config: The resolved backend and the ids to build payloads from.
+            config: The resolved backend, the tree, and the run budget.
         """
         if self._exec_config == config and self._runner is not None:
             return
         self._stop_runner()
-        _mode, backend = resolve_mode(config.mode, team_id=config.team_id)
+        _mode, backend = resolve_mode(config.mode)
         self._runner = ExecRunner(backend, config.workspace_path)
         self._exec_config = config
 
@@ -711,8 +716,8 @@ class ExecMixin(_ExecBase):
         is owned from the moment its id is issued, and an id issued but untracked
         would be one its own requester could not collect.
 
-        Capped for the reason every map on a team singleton is: an uncapped one
-        leaks for the life of the team. Losing the oldest entry now costs the
+        Capped for the reason every map on a tree singleton is: an uncapped one
+        leaks for the life of the tree. Losing the oldest entry now costs the
         ability to collect that run as well as the ability to correct a mistyped
         id, and that is accepted — the answer is a recoverable ``UNKNOWN``.
 

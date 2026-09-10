@@ -35,6 +35,7 @@ from pathlib import Path
 import pykka
 import pytest
 
+from akgentic.tool import workspace as workspace_package
 from akgentic.tool.vector_store.protocol import VectorStoreParam
 from akgentic.tool.workspace import actor as actor_package
 from akgentic.tool.workspace.actor import workspace_actor_name
@@ -161,6 +162,64 @@ class TestTheActorNeverReadsItsOrchestrator:
         assert missing == [], f"no longer on Akgent: {missing}"
 
 
+_WORKSPACE_PACKAGE_DIR = Path(workspace_package.__file__).parent
+"""The whole workspace package on disk — card, actor, and everything beside them."""
+
+_MINIMUM_WORKSPACE_MODULES = 25
+"""The package had 25 modules before story 51-2 added ``host.py`` and ``event.py``.
+A sweep that finds fewer walked a moved or emptied package, and found nothing."""
+
+
+def _workspace_modules() -> list[Path]:
+    """Every ``.py`` file anywhere under the workspace package, sorted for a stable report."""
+    return sorted(_WORKSPACE_PACKAGE_DIR.rglob("*.py"))
+
+
+def _workspace_dotted(path: Path) -> str:
+    """The import path of one module file of the workspace package."""
+    parts = path.relative_to(_WORKSPACE_PACKAGE_DIR).with_suffix("").parts
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join((workspace_package.__name__, *parts))
+
+
+def _child_binds(path: Path, root: Path) -> list[str]:
+    """Every ``.getChildrenOrCreate`` attribute in *path*, as ``file:line``."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return [
+        f"{path.relative_to(root)}:{node.lineno}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr == "getChildrenOrCreate"
+    ]
+
+
+class TestTheWorkspaceIsNeverBoundAsAChild:
+    """No ``getChildrenOrCreate`` anywhere in the workspace package: every bind is hosted."""
+
+    def test_no_module_of_the_workspace_package_calls_get_children_or_create(self) -> None:
+        modules = _workspace_modules()
+        assert len(modules) >= _MINIMUM_WORKSPACE_MODULES, (
+            f"the sweep found {len(modules)} module(s) under {_WORKSPACE_PACKAGE_DIR} — "
+            f"an empty or moved package would pass a canary that walks nothing"
+        )
+        for module in modules:
+            assert importlib.import_module(_workspace_dotted(module)) is not None
+        hits = [hit for module in modules for hit in _child_binds(module, _WORKSPACE_PACKAGE_DIR)]
+        assert hits == [], f"getChildrenOrCreate under workspace/: {hits}"
+
+    def test_the_walk_sees_a_call_and_ignores_the_prose(self, tmp_path: Path) -> None:
+        """The detector itself: a docstring or a comment naming it is not a call."""
+        module = tmp_path / "binding.py"
+        module.write_text(
+            "def bind(proxy):\n"
+            '    """getChildrenOrCreate in a docstring is not a call"""\n'
+            "    # proxy.getChildrenOrCreate in a comment is not one either\n"
+            "    return proxy.getChildrenOrCreate(object, config=None)\n",
+            encoding="utf-8",
+        )
+        assert _child_binds(module, tmp_path) == ["binding.py:4"]
+
+
 class TestAWorkspaceWithNoOrchestratorOwnsItsStore:
     """The hosted-style falsifier on real threads, through public API only."""
 
@@ -205,7 +264,7 @@ class TestAWorkspaceWithNoOrchestratorOwnsItsStore:
         assert config.name == f"{VS_ACTOR_NAME}-{WORKSPACE_PATH}"
         assert config.role == VS_ACTOR_ROLE
         assert store.orchestrator.get() is None
-        workspace_address, _workspace = threaded_orchestrator_proxy.children[
+        workspace_address, _workspace = threaded_orchestrator_proxy.hosted[
             workspace_actor_name(WORKSPACE_PATH)
         ]
         assert store.team_id.get() == workspace_address.team_id

@@ -1,7 +1,7 @@
-"""Who read what, who wrote what, and what an agent id is called (ADR-045 §1).
+"""Who holds the tree, who read what, who wrote what, and what an agent id is called.
 
-The two maps this mixin owns are the actor's memory of the team, and neither is
-persisted state: recording is not state (see
+The maps this mixin owns are the actor's memory of its agents (ADR-045 §1), and
+none is persisted state: recording is not state (see
 :class:`~akgentic.tool.workspace.models.WorkspaceState`). The observation map is
 keyed ``agent_id -> path -> Observation`` and each inner map is an
 :class:`~collections.OrderedDict`, which is the whole of the LRU — recording
@@ -16,6 +16,7 @@ the annotations below declare what this mixin consumes, they do not own it.
 from __future__ import annotations
 
 from collections import OrderedDict
+from typing import TYPE_CHECKING
 
 from akgentic.tool.workspace.journal import Identity
 from akgentic.tool.workspace.models import (
@@ -25,10 +26,14 @@ from akgentic.tool.workspace.models import (
     content_sha,
 )
 
+if TYPE_CHECKING:
+    from akgentic.core.actor_address import ActorAddress
+
 
 class ObservationMixin:
-    """The observation map, the last-writer map, and agent-name registration."""
+    """The holders, the observation map, the last-writer map, and agent names."""
 
+    _holders: dict[str, ActorAddress]
     _agent_names: OrderedDict[str, str]
     _observations: dict[str, OrderedDict[str, Observation]]
     _last_writers: OrderedDict[str, LastWrite]
@@ -36,28 +41,43 @@ class ObservationMixin:
     config: WorkspaceConfig
 
     ##
-    ## Identity — reached through the card's **tell** proxy, once, at bind time
+    ## Holders — reached through the card's **ask** proxy, once, at bind time
     ##
-    def register_agent(self, agent_id: str, name: str) -> None:
-        """Record the human-readable name behind *agent_id*.
+    def attach(self, agent: ActorAddress, agent_name: str) -> None:
+        """Record *agent* as a holder of this tree, and the name to print for it.
 
-        Fire-and-forget, sent once per card at bind time — O(1), never on the
-        mutation path. The actor holds ``agent_id`` because that is what the
-        card can capture without an edge back to the agent (ADR-030), but an
-        ``agent_id`` is a **UUID**: a journal authored by UUID satisfies the
-        letter of "the git log is the who-changed-what record" and defeats its
-        purpose, and a refusal reading *"last written by agent '3f2a…'"* tells a
-        model nothing it can act on.
+        Sent once per card, at bind, right after the host's forward returns this
+        actor's address — O(1), never on the mutation path. Both maps are keyed
+        by ``str(agent.agent_id)``, the same string the card sends on every
+        mutation and every per-agent map here uses.
 
-        Capped like the last-writer map, and for the same reason: an uncapped map
-        on a team singleton leaks for the life of the team. Losing a name is a
-        safe degradation — the id is used instead.
+        **The holder is what the actor's lifetime is made of.** A hosted
+        ``#Workspace`` is nobody's child, so no team's teardown stops it; it lives
+        while agents hold it, and the liveness sweep (story 51-3) drops a holder
+        whose actor has stopped. The holder map is therefore **not capped**: it is
+        bounded by live agents and pruned by that sweep. Nothing in this story
+        removes a holder, and a second ``attach`` from the same agent overwrites
+        its entry rather than adding one.
+
+        **The name is what the journal and the refusals print.** The card can
+        capture ``agent_id`` without an edge back to the agent (ADR-030), but an
+        id is a UUID: a journal authored by UUID satisfies the letter of "the git
+        log is the who-changed-what record" and defeats its purpose, and a refusal
+        reading *"last written by agent '3f2a…'"* tells a model nothing it can act
+        on. The name map **is** capped, like the last-writer map: losing a name is
+        a safe degradation — the id is printed instead.
+
+        **An ask, not a tell**, so the holder is recorded before the bind returns
+        and a failure is seen by the card, which lets it fail the bind: an agent
+        must never hold a tree that does not know it is held.
 
         Args:
-            agent_id: Identity of the agent, as a string.
-            name: Its configured, human-readable name.
+            agent: The binding agent's address.
+            agent_name: Its configured, human-readable name.
         """
-        self._agent_names[agent_id] = name
+        agent_id = str(agent.agent_id)
+        self._holders[agent_id] = agent
+        self._agent_names[agent_id] = agent_name
         self._agent_names.move_to_end(agent_id)
         while len(self._agent_names) > self.config.max_tracked_writers:
             self._agent_names.popitem(last=False)

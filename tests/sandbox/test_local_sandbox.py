@@ -435,7 +435,7 @@ def test_start_opens_exactly_the_path_it_was_handed(
     """
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
-    backend = LocalBackend(team_id="team-1")
+    backend = LocalBackend()
 
     backend.start("test")
 
@@ -455,7 +455,7 @@ def test_start_opens_a_two_segment_path_whole(
     """
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
-    backend = LocalBackend(team_id="team-1")
+    backend = LocalBackend()
 
     backend.start("u-alice/notes")
 
@@ -480,7 +480,7 @@ def test_the_sandbox_and_the_workspace_open_one_directory(
     workspace = get_workspace("test")
     workspace_tool_root = workspace._root.resolve()
 
-    backend = LocalBackend(team_id="team-1")
+    backend = LocalBackend()
     backend.start("test")
     sandbox_root = backend.workspace_path
 

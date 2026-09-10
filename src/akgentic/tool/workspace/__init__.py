@@ -67,6 +67,7 @@ from akgentic.tool.workspace.edit import (
     unified,
     write_and_diff,
 )
+from akgentic.tool.workspace.event import WorkspaceAttached
 from akgentic.tool.workspace.execution import (
     DEFAULT_EXEC_POLL_ATTEMPTS,
     DEFAULT_EXEC_POLL_DELAY_S,
@@ -97,6 +98,7 @@ from akgentic.tool.workspace.execution import (
     timed_out,
     wait_out_the_turn,
 )
+from akgentic.tool.workspace.host import WorkspaceHost
 from akgentic.tool.workspace.journal import (
     IDENTITY_DOMAIN,
     IDENTITY_FALLBACK,
@@ -229,7 +231,9 @@ __all__ = [
     "Observation",
     "Precondition",
     "WorkspaceActor",
+    "WorkspaceAttached",
     "WorkspaceConfig",
+    "WorkspaceHost",
     "WorkspaceState",
     "content_sha",
     "git_dir_for",

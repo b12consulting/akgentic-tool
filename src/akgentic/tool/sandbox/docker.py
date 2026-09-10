@@ -196,16 +196,10 @@ class DockerBackend(ProcessBackend):
     container, so any name that is a function of the team or the tree would
     collide with its own predecessor on the next ``start()`` and ``docker run
     --name`` refuses that outright.
-
-    Args:
-        team_id: Unused here, and kept. It is
-            :class:`~akgentic.tool.sandbox.backend.ProcessBackend`'s uniform
-            constructor and ``resolve_mode``'s keyword; this backend was its last
-            reader until the container name stopped carrying it.
     """
 
-    def __init__(self, team_id: str = "") -> None:
-        super().__init__(team_id)
+    def __init__(self) -> None:
+        super().__init__()
         self.container_name: str | None = None
         """The container this backend runs in, set by :meth:`start`."""
 

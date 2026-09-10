@@ -1,7 +1,7 @@
 """The card side of retrieval: the derived caps, the announcement, the registration.
 
 The caps are asserted on the ``WorkspaceConfig`` the card actually hands to
-``getChildrenOrCreate``, never on the helper in isolation — the helper being right
+``getResourceOrCreate``, never on the helper in isolation — the helper being right
 while the call site ignores it is precisely the failure this file exists to catch.
 """
 
@@ -42,12 +42,12 @@ from tests.workspace.conftest import (
 
 
 def workspace_config_of(orchestrator_proxy: FakeOrchestratorProxy) -> WorkspaceConfig:
-    """The ``WorkspaceConfig`` the card handed to ``getChildrenOrCreate``."""
-    for actor_class, config in orchestrator_proxy.create_calls:
-        if actor_class is WorkspaceActor:
-            assert isinstance(config, WorkspaceConfig)
-            return config
-    raise AssertionError("the card never created a workspace actor")
+    """The ``WorkspaceConfig`` the card handed to ``getResourceOrCreate``."""
+    for call in orchestrator_proxy.resource_calls:
+        if call.actor_class is WorkspaceActor:
+            assert isinstance(call.config, WorkspaceConfig)
+            return call.config
+    raise AssertionError("the card never bound a workspace actor")
 
 
 def bind(
@@ -236,6 +236,9 @@ class TestTheSearchCallable:
         seen: list[dict[str, Any]] = []
 
         class Recording:
+            def attach(self, agent: Any, agent_name: str) -> None:
+                """The bind-time holder registration — the actor was alive then."""
+
             def rag_search(self, query: str, **kwargs: Any) -> str:
                 seen.append({"query": query, **kwargs})
                 return "ok"
@@ -265,6 +268,9 @@ class TestTheSearchCallable:
         seen: list[int] = []
 
         class Recording:
+            def attach(self, agent: Any, agent_name: str) -> None:
+                """The bind-time holder registration — the actor was alive then."""
+
             def rag_search(self, query: str, **kwargs: Any) -> str:
                 seen.append(int(kwargs["top_k"]))
                 return "ok"
@@ -285,6 +291,9 @@ class TestTheSearchCallable:
         """It is an LLM-facing callable; a traceback is not an answer it can use."""
 
         class Gone:
+            def attach(self, agent: Any, agent_name: str) -> None:
+                """The bind-time holder registration — the actor was alive then."""
+
             def rag_search(self, query: str, **kwargs: Any) -> str:
                 raise RuntimeError("actor is dead")
 
@@ -485,9 +494,11 @@ class TestTheCardCreatesNoStoreActor:
             vector_store=VectorStoreParam(backend="inmemory"),
         )
 
-        created = [cls for cls, _config in orchestrator_proxy.create_calls]
-        assert created == [WorkspaceActor]
-        assert VectorStoreActor not in created
+        bound = [call.actor_class for call in orchestrator_proxy.resource_calls]
+        assert bound == [WorkspaceActor]
+        assert VectorStoreActor not in bound
+        # The card's own child path creates nothing at all — no store actor.
+        assert orchestrator_proxy.create_calls == []
         # The announcement still fires: it is what now triggers creation, on the actor.
         assert tell.enable_calls
 
@@ -506,8 +517,13 @@ class TestTheCardCreatesNoStoreActor:
             vector_store=VectorStoreParam(backend="weaviate"),
         )
 
+        # Kept on both lists: the bind happened (the positive), and neither the
+        # forward nor the child path named a store actor.
+        bound = [call.actor_class for call in orchestrator_proxy.resource_calls]
+        assert bound == [WorkspaceActor]
         created = [cls for cls, _config in orchestrator_proxy.create_calls]
         assert VectorStoreActor not in created
+        assert VectorStoreActor not in bound
 
     def test_a_retrieval_off_card_creates_no_store_actor(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
@@ -516,12 +532,15 @@ class TestTheCardCreatesNoStoreActor:
 
         bind(orchestrator_proxy, vector_store=VectorStoreParam(backend="inmemory"))
 
+        bound = [call.actor_class for call in orchestrator_proxy.resource_calls]
+        assert bound == [WorkspaceActor]
         created = [cls for cls, _config in orchestrator_proxy.create_calls]
         assert VectorStoreActor not in created
+        assert VectorStoreActor not in bound
 
 
 class TestTheBindTimeAnnouncement:
-    """``getChildrenOrCreate`` fixes the config; a capable card announces itself."""
+    """The first bind fixes the config; a capable card announces itself."""
 
     def test_a_retrieval_card_announces_itself(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
@@ -684,7 +703,7 @@ class TestTheProvider:
     """It never raises, and it is what the model actually sees each turn."""
 
     def _actor(self, orchestrator_proxy: FakeOrchestratorProxy) -> WorkspaceActor:
-        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
+        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         return actor
 
@@ -726,6 +745,9 @@ class TestTheProvider:
         """The ``ContextState`` contract: never raise, answer ``None`` instead."""
 
         class Gone:
+            def attach(self, agent: Any, agent_name: str) -> None:
+                """The bind-time holder registration — the actor was alive then."""
+
             def rag_snapshot(self, max_pending_shown: int) -> Any:
                 raise RuntimeError("actor is dead")
 
@@ -744,6 +766,9 @@ class TestTheProvider:
         seen: list[int] = []
 
         class Recording:
+            def attach(self, agent: Any, agent_name: str) -> None:
+                """The bind-time holder registration — the actor was alive then."""
+
             def rag_snapshot(self, max_pending_shown: int) -> Any:
                 seen.append(max_pending_shown)
                 return None
@@ -805,6 +830,9 @@ class TestTheCallablesThemselves:
         """The counts are the answer, which is why this leg is an ask."""
 
         class Counting:
+            def attach(self, agent: Any, agent_name: str) -> None:
+                """The bind-time holder registration — the actor was alive then."""
+
             def index_paths(self, path: str, force: bool) -> str:
                 return f"queued {path!r} force={force}"
 
@@ -820,6 +848,9 @@ class TestTheCallablesThemselves:
         """It is an LLM-facing callable; a traceback is not an answer it can use."""
 
         class Gone:
+            def attach(self, agent: Any, agent_name: str) -> None:
+                """The bind-time holder registration — the actor was alive then."""
+
             def index_paths(self, path: str, force: bool) -> str:
                 raise RuntimeError("actor is dead")
 
@@ -838,7 +869,7 @@ class TestTheCallablesThemselves:
         from datetime import UTC, datetime
 
         card, _ = bind(orchestrator_proxy, workspace_rag_list=True)
-        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
+        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         actor.state.rag_index["notes.md"] = RagFile(
             path="notes.md",
@@ -856,6 +887,9 @@ class TestTheCallablesThemselves:
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         class Gone:
+            def attach(self, agent: Any, agent_name: str) -> None:
+                """The bind-time holder registration — the actor was alive then."""
+
             def rag_snapshot(self, max_pending_shown: int) -> Any:
                 raise RuntimeError("actor is dead")
 

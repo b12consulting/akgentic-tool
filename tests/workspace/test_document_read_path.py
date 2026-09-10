@@ -103,6 +103,9 @@ class RaisingCacheProxy:
     def __init__(self) -> None:
         self.calls = 0
 
+    def attach(self, agent: object, agent_name: str) -> None:
+        """The bind-time holder registration — the actor was alive then; it died later."""
+
     def document_extract(self, path: str, source_sha: str, extractor_version: int) -> str | None:
         self.calls += 1
         raise RuntimeError("actor is dead")
@@ -126,7 +129,7 @@ def document_card(
         workspace_read=WorkspaceRead(document_reader=reader),
     )
     card.observer(observer)
-    entry = orchestrator_proxy.children.get(workspace_actor_name(WORKSPACE_PATH))
+    entry = orchestrator_proxy.hosted.get(workspace_actor_name(WORKSPACE_PATH))
     actor = entry[1] if entry is not None else None
     return card, actor if isinstance(actor, WorkspaceActor) else None
 
@@ -311,7 +314,7 @@ class TestTheReadPathStaysFree:
 
         # The attribute fetch is itself a mailbox turn, so it lands after both
         # fills: reaching the state at all proves they have been applied.
-        pykka_proxy = threaded_orchestrator_proxy.children[
+        pykka_proxy = threaded_orchestrator_proxy.hosted[
             workspace_actor_name(WORKSPACE_PATH)
         ][1]
         state = pykka_proxy.state.get(timeout=HANDSHAKE_TIMEOUT_S)
