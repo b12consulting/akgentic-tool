@@ -12,13 +12,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import akgentic.tool.vector_store.qdrant as qdrant_module
-from akgentic.tool.vector_store.protocol import VectorQuery, VectorStoreParam
-from akgentic.tool.vector_store.qdrant import (
+import akgentic.tool.vector_store.backends.qdrant as qdrant_module
+from akgentic.tool.vector_store.backends.qdrant import (
     QDRANT_URL_ENV,
     QdrantBackend,
     require_qdrant_configured,
 )
+from akgentic.tool.vector_store.protocol import VectorQuery, VectorStoreParam
 from akgentic.tool.vector_store.registry import BackendContext, get_backend_spec
 from akgentic.tool.vector_store.vector import VectorEntry
 
@@ -61,7 +61,7 @@ class TestEnvironment:
         monkeypatch.setenv(QDRANT_URL_ENV, "http://localhost:6333")
         with (
             patch(
-                "akgentic.tool.vector_store.qdrant.qdrant_dependencies_available",
+                "akgentic.tool.vector_store.backends.qdrant.qdrant_dependencies_available",
                 return_value=False,
             ),
             pytest.raises(ValueError, match=r"pip install akgentic-tool\[qdrant\]"),
@@ -331,8 +331,8 @@ class TestRegistry:
 
     def test_the_connect_builds_a_remote_client_only(self) -> None:
         """``url=`` is the remote path; the embedded modes are never reachable."""
+        from akgentic.tool.vector_store.backends.qdrant import _connect_qdrant
         from akgentic.tool.vector_store.client import ClusterKey
-        from akgentic.tool.vector_store.qdrant import _connect_qdrant
 
         with patch("qdrant_client.QdrantClient") as client_cls:
             _connect_qdrant(ClusterKey.from_url("qdrant", "https://q:6333", "k"))

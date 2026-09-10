@@ -7,8 +7,8 @@ import uuid
 import pytest
 from akgentic.core.actor_address import ActorAddress
 
-from akgentic.tool.vector_store.protocol import WEAVIATE_API_KEY_ENV, WEAVIATE_URL_ENV
-from akgentic.tool.vector_store.qdrant import QDRANT_API_KEY_ENV, QDRANT_URL_ENV
+from akgentic.tool.vector_store.backends.qdrant import QDRANT_API_KEY_ENV, QDRANT_URL_ENV
+from akgentic.tool.vector_store.backends.weaviate import WEAVIATE_API_KEY_ENV, WEAVIATE_URL_ENV
 
 
 @pytest.fixture(autouse=True)

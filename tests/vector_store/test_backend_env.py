@@ -12,14 +12,16 @@ from __future__ import annotations
 
 import pytest
 
-from akgentic.tool.vector_store.protocol import (
+from akgentic.tool.vector_store.backends.weaviate import (
     WEAVIATE_API_KEY_ENV,
     WEAVIATE_URL_ENV,
-    VectorStoreParam,
-    default_backend,
-    require_weaviate_configured,
     weaviate_api_key,
     weaviate_url,
+)
+from akgentic.tool.vector_store.protocol import (
+    VectorStoreParam,
+    default_backend,
+    require_backend_configured,
 )
 
 CLUSTER = "http://localhost:8080"
@@ -109,42 +111,46 @@ class TestDefaultBackend:
 # ---------------------------------------------------------------------------
 
 
-class TestRequireWeaviateConfigured:
-    """The guard consumer cards call at `observer()` time."""
+class TestNamingWeaviateWithoutACluster:
+    """The backend-agnostic guard consumer cards call at `observer()` time, asked for Weaviate.
+
+    `require_backend_configured` dispatches to the Weaviate module's own probe, whose message
+    is the one the deleted Weaviate-only guard raised, so every assertion here is unchanged.
+    """
 
     def test_raises_when_weaviate_is_named_without_a_cluster(self) -> None:
         with pytest.raises(ValueError, match=WEAVIATE_URL_ENV):
-            require_weaviate_configured(VectorStoreParam(backend="weaviate"), "PlanningTool")
+            require_backend_configured(VectorStoreParam(backend="weaviate"), "PlanningTool")
 
     def test_the_error_names_the_offending_card(self) -> None:
         with pytest.raises(ValueError, match="KnowledgeGraphTool"):
-            require_weaviate_configured(VectorStoreParam(backend="weaviate"), "KnowledgeGraphTool")
+            require_backend_configured(VectorStoreParam(backend="weaviate"), "KnowledgeGraphTool")
 
     def test_the_error_names_the_way_out(self) -> None:
         """A configuration error should say what to change, not only what is wrong."""
         with pytest.raises(ValueError, match="in-memory"):
-            require_weaviate_configured(VectorStoreParam(backend="weaviate"), "PlanningTool")
+            require_backend_configured(VectorStoreParam(backend="weaviate"), "PlanningTool")
 
     def test_an_empty_url_counts_as_no_cluster(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(WEAVIATE_URL_ENV, "")
         with pytest.raises(ValueError, match=WEAVIATE_URL_ENV):
-            require_weaviate_configured(VectorStoreParam(backend="weaviate"), "PlanningTool")
+            require_backend_configured(VectorStoreParam(backend="weaviate"), "PlanningTool")
 
     def test_passes_when_the_cluster_is_configured(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(WEAVIATE_URL_ENV, CLUSTER)
-        require_weaviate_configured(VectorStoreParam(backend="weaviate"), "PlanningTool")
+        require_backend_configured(VectorStoreParam(backend="weaviate"), "PlanningTool")
 
     def test_passes_for_inmemory_without_a_cluster(self) -> None:
-        require_weaviate_configured(VectorStoreParam(backend="inmemory"), "PlanningTool")
+        require_backend_configured(VectorStoreParam(backend="inmemory"), "PlanningTool")
 
     def test_a_defaulted_collection_never_trips_the_guard(self) -> None:
         """Without a cluster the default is already inmemory, so there is nothing to catch."""
-        require_weaviate_configured(VectorStoreParam(), "PlanningTool")
+        require_backend_configured(VectorStoreParam(), "PlanningTool")
 
     def test_an_api_key_alone_is_not_a_cluster(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(WEAVIATE_API_KEY_ENV, "secret")
         with pytest.raises(ValueError, match=WEAVIATE_URL_ENV):
-            require_weaviate_configured(VectorStoreParam(backend="weaviate"), "PlanningTool")
+            require_backend_configured(VectorStoreParam(backend="weaviate"), "PlanningTool")
 
 
 # ---------------------------------------------------------------------------

@@ -6,7 +6,7 @@ constraints client-side; these tests pin that behaviour.
 
 from __future__ import annotations
 
-from akgentic.tool.vector_store.inmemory import InMemoryBackend
+from akgentic.tool.vector_store.backends.inmemory import InMemoryBackend
 from akgentic.tool.vector_store.protocol import VectorQuery, VectorStoreParam
 from akgentic.tool.vector_store.vector import VectorEntry
 

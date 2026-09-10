@@ -100,9 +100,9 @@ def _connect_weaviate(key: ClusterKey) -> weaviate.WeaviateClient:
 def _weaviate_client(url: str, api_key: str | None = None) -> weaviate.WeaviateClient:
     """Return the process's shared client for the cluster *url* names.
 
-    The one entry point both callers use — the registered factory and the
-    actor's backstop accessor — so the key's shape and the connect keyword set
-    are written once.
+    The one entry point its callers use — the registered factory and a sweeper
+    built by hand — so the key's shape and the connect keyword set are written
+    once.
 
     Args:
         url: Cluster URL, e.g. ``http://localhost:8080``.
@@ -702,6 +702,10 @@ class WeaviateBackend:
         if scope is not None:
             legs.append(Filter.by_property(SCOPE_PROPERTY).equal(scope))
         if path_prefix is not None:
+            # ``check_path_prefix`` has already refused ``*`` and ``?`` for this reason:
+            # both are wildcards in Weaviate's ``Like`` operator, and the v4 filter API
+            # offers no escape, so a literal one in a prefix would widen the match here
+            # while the in-memory backend's ``str.startswith`` reads it literally.
             legs.append(Filter.by_property(PATH_PROPERTY).like(f"{path_prefix}*"))
         predicate = legs[0]
         for leg in legs[1:]:
@@ -761,21 +765,44 @@ class WeaviateBackend:
 # ---------------------------------------------------------------------------
 
 
+WEAVIATE_URL_ENV: Final[str] = "AKGENTIC_WEAVIATE_URL"
+"""Environment variable naming the Weaviate cluster.
+
+Connection settings are infrastructure, never card fields: a card persisted in a
+catalog would otherwise carry a cluster URL and an API key as plain configuration.
+**Exporting this is what turns Weaviate on.**
+"""
+
+WEAVIATE_API_KEY_ENV: Final[str] = "AKGENTIC_WEAVIATE_API_KEY"
+"""Environment variable holding the Weaviate API key. Optional — an unauthenticated
+cluster needs only the URL."""
+
+
+def weaviate_url() -> str | None:
+    """Return the configured Weaviate cluster URL, or ``None`` when unset.
+
+    An exported but *empty* variable counts as unset, so a deployment template that
+    always exports the name does not read as a cluster at ``""``.
+    """
+    import os
+
+    return os.environ.get(WEAVIATE_URL_ENV) or None
+
+
+def weaviate_api_key() -> str | None:
+    """Return the configured Weaviate API key, or ``None`` when unset."""
+    import os
+
+    return os.environ.get(WEAVIATE_API_KEY_ENV) or None
+
+
 def _weaviate_is_configured() -> bool:
     """Return whether a Weaviate cluster URL is exported."""
-    from akgentic.tool.vector_store.protocol import weaviate_url
-
     return weaviate_url() is not None
 
 
 def _require_weaviate(card_name: str) -> None:
     """Raise when Weaviate is named but no cluster URL is exported."""
-    from akgentic.tool.vector_store.protocol import (
-        WEAVIATE_API_KEY_ENV,
-        WEAVIATE_URL_ENV,
-        weaviate_url,
-    )
-
     if weaviate_url():
         return
     raise ValueError(
@@ -786,23 +813,22 @@ def _require_weaviate(card_name: str) -> None:
 
 
 def _make_weaviate_backend(context: BackendContext) -> WeaviateBackend:
-    """Build a :class:`WeaviateBackend` from the actor config / environment.
+    """Build a :class:`WeaviateBackend` from the environment.
 
-    Prefers connection settings already present on the ``VectorStoreConfig``
-    (injected by the tool card from the environment), falling back to reading the
-    environment directly so a hand-built context still resolves a cluster. The
+    Connection settings are read from the environment only, exactly as the Qdrant
+    factory reads its own: ``VectorStoreConfig`` carries no connection field. The
     resolved pair goes to :func:`get_client`, so every backend built for one
     cluster in this process shares its client.
-    """
-    from akgentic.tool.vector_store.protocol import weaviate_api_key, weaviate_url
 
-    cfg = context.config
-    url = getattr(cfg, "weaviate_url", None) or weaviate_url()
+    Raises:
+        ValueError: When :data:`WEAVIATE_URL_ENV` is not set, before the client
+            cache is touched.
+    """
+    url = weaviate_url()
     if not url:
-        msg = "weaviate_url is not configured; cannot build WeaviateBackend."
-        raise ValueError(msg)
-    api_key = getattr(cfg, "weaviate_api_key", None) or weaviate_api_key()
-    return WeaviateBackend(client=_weaviate_client(url, api_key), team_id=context.team_id)
+        raise ValueError(f"{WEAVIATE_URL_ENV} is not set; cannot build WeaviateBackend.")
+    client = _weaviate_client(url, weaviate_api_key())
+    return WeaviateBackend(client=client, team_id=context.team_id)
 
 
 register_backend(
@@ -813,7 +839,6 @@ register_backend(
         selectable_as_default=True,
         is_configured=_weaviate_is_configured,
         require_configured=_require_weaviate,
-        legacy_actor_accessor="_get_or_create_weaviate_backend",
     ),
     replace=True,
 )

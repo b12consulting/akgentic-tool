@@ -43,9 +43,9 @@ from akgentic.tool.knowledge_graph.models import (
     SearchQuery,
 )
 from akgentic.tool.vector_store.actor import VectorStoreActor
+from akgentic.tool.vector_store.backends.weaviate import WEAVIATE_URL_ENV
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA
 from akgentic.tool.vector_store.protocol import (
-    WEAVIATE_URL_ENV,
     VectorStoreParam,
     resolve_store_param,
 )

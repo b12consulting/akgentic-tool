@@ -6,7 +6,7 @@ import math
 
 import pytest
 
-from akgentic.tool.vector_store.inmemory import InMemoryBackend, _entry_matches
+from akgentic.tool.vector_store.backends.inmemory import InMemoryBackend, _entry_matches
 from akgentic.tool.vector_store.protocol import (
     PATH_PREFIX_REJECTED,
     CollectionStatus,

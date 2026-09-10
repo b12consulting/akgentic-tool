@@ -735,8 +735,8 @@ def _connect_qdrant(key: ClusterKey) -> QdrantClient:
 def _make_qdrant_backend(context: BackendContext) -> QdrantBackend:
     """Build a :class:`QdrantBackend` from the environment.
 
-    Unlike Weaviate, connection settings are read straight from the environment
-    (``VectorStoreConfig`` carries no Qdrant fields), so a Qdrant deployment
+    Like Weaviate, connection settings are read straight from the environment
+    (``VectorStoreConfig`` carries no connection field), so a Qdrant deployment
     needs only the ``AKGENTIC_QDRANT_*`` variables and no card changes. The
     resolved pair goes through the shared cache, so every backend built for one
     Qdrant cluster in this process holds one client — and none of them closes it.

@@ -164,16 +164,6 @@ class TestEnsureStoreActor:
         assert config.name == VS_ACTOR_NAME
         assert config.role == VS_ACTOR_ROLE
 
-    def test_the_config_sets_neither_connection_field(self) -> None:
-        """The actor it creates is the in-memory one, which needs neither."""
-        proxy = MagicMock()
-
-        ensure_store_actor(VectorStoreParam(backend="inmemory"), proxy)
-
-        config = proxy.getChildrenOrCreate.call_args.kwargs["config"]
-        assert config.weaviate_url is None
-        assert config.weaviate_api_key is None
-
     @pytest.mark.parametrize("backend", ["weaviate", "qdrant"])
     def test_a_cluster_backend_creates_nothing(self, backend: str) -> None:
         proxy = MagicMock()

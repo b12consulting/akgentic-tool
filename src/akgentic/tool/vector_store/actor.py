@@ -13,8 +13,7 @@ write that could not land raises (ADR-049 Decision 1).
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, TypeGuard, cast
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 from pydantic import Field
 
@@ -37,9 +36,7 @@ from akgentic.tool.vector_store.protocol import (
 from akgentic.tool.vector_store.registry import BackendContext, get_backend_spec
 
 if TYPE_CHECKING:
-    from akgentic.tool.vector_store.inmemory import InMemoryBackend
     from akgentic.tool.vector_store.vector import VectorEntry
-    from akgentic.tool.vector_store.weaviate import WeaviateBackend
 
 logger = logging.getLogger(__name__)
 
@@ -76,11 +73,11 @@ def ensure_store_actor(param: VectorStoreParam, orchestrator_proxy: Orchestrator
     idempotent per ADR-025, so three cards in one team each calling this resolve
     to the same actor and this helper keeps no bookkeeping of its own.
 
-    The config it builds sets **neither connection field**. The deleted card was
-    their only writer, and the actor this helper creates is the in-memory one by
-    construction — it needs no URL and no key. A caller who reaches the actor
-    with a cluster collection by hand still resolves, because
-    ``_make_weaviate_backend`` falls back to the environment.
+    The config it builds sets **no connection field**, because
+    ``VectorStoreConfig`` has none: the actor this helper creates is the
+    in-memory one by construction, and needs no URL and no key. A caller who
+    reaches the actor with a cluster collection by hand is served by that
+    backend's registered factory, which reads the environment.
 
     Args:
         param: The consumer's vector store configuration.
@@ -143,14 +140,19 @@ class PendingRequest(SerializableBaseModel):
 class VectorStoreState(BaseState):
     """Serialisable state for the vector store actor.
 
-    Holds a snapshot of the ``InMemoryBackend`` state (via ``get_state()`` /
-    ``restore_state()``) and per-collection lifecycle statuses.
+    Holds one snapshot per actor-state-backed backend, keyed by its registered
+    name (via ``get_state()`` / ``restore_state()``), and per-collection lifecycle
+    statuses.
+
+    **The legacy single-backend snapshot slot that preceded ``backend_states`` is
+    gone, and is not migrated.** A stored state that still carries it loads —
+    Pydantic's default ``extra="ignore"`` drops the key — but its contents are
+    not restored: the in-memory index it held starts empty and is regenerated
+    from its source documents. Every released snapshot's slot holds collection
+    configs tagged with a class already deleted, so nothing loadable is lost
+    (ADR-049 *Migration*).
     """
 
-    backend_state: dict[str, Any] = Field(
-        default_factory=dict,
-        description="Legacy serialisable snapshot from InMemoryBackend.get_state()",
-    )
     backend_states: dict[str, dict[str, Any]] = Field(
         default_factory=dict,
         description="Serialisable snapshots for registered actor-state-backed backends",
@@ -190,7 +192,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
     # ------------------------------------------------------------------
 
     def on_start(self) -> None:  # noqa: ANN201
-        """Initialise state, attach observer, and prepare the lazy backend slots.
+        """Initialise state, attach observer, and prepare the lazy backend map.
 
         There is no embedding service and no per-request bookkeeping here: a write
         arrives already embedded, is written on this turn, and is either done or
@@ -199,100 +201,26 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         """
         self.state = VectorStoreState()
         self.state.observer(self)
-        self._backend: InMemoryBackend | None = None
-        self._weaviate_backend: WeaviateBackend | None = None
         self._backends: dict[str, VectorStoreService] = {}
 
     # ------------------------------------------------------------------
     # Lazy initialisation
     # ------------------------------------------------------------------
 
-    def _get_or_create_backend(self) -> InMemoryBackend | None:
-        """Return the ``InMemoryBackend``, creating it lazily on first call.
-
-        If ``self.state.backend_state`` contains data the backend is restored
-        from the persisted snapshot.  Returns ``None`` when ``[vector_search]``
-        dependencies are missing.
-        """
-        if self._backend is not None:
-            return self._backend
-        try:
-            from akgentic.tool.vector_store.inmemory import InMemoryBackend
-
-            self._backend = InMemoryBackend()
-            if self.state.backend_state:
-                self._backend.restore_state(self.state.backend_state)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "[%s] Failed to initialize InMemoryBackend: %s",
-                self.config.name,
-                exc,
-            )
-            return None
-        return self._backend
-
-    def _get_or_create_weaviate_backend(self) -> WeaviateBackend | None:
-        """Return the ``WeaviateBackend``, creating it lazily on first call.
-
-        **A backstop, not a wired path.** After the store became a backend, no
-        consumer routes a cluster collection through this actor: a card whose
-        param names Weaviate creates no store actor at all and its consumer
-        talks to the backend directly. What remains is the caller who reaches
-        this actor with a cluster collection by hand, and for them this accessor
-        is what makes that a misconfiguration rather than a crash.
-
-        Obtains the process's shared client for ``self.config.weaviate_url`` and
-        ``self.config.weaviate_api_key`` through the same cache the registered
-        factory uses — one client per cluster per process, never one per actor —
-        and wraps it in a backend scoped to this team. Returns ``None`` when
-        ``weaviate-client`` is missing or the first connect to the cluster fails.
-
-        Neither connection field has a writer in ``src/`` any more, so a config
-        that carries one was built by hand; the factory's own environment
-        fallback covers the rest.
-
-        The owning team's id is taken from ``self.team_id`` — propagated by the
-        actor system, never configured — and stamped onto every object the
-        backend writes, so a deleted team's vectors stay findable.
-
-        This actor has no ``on_stop`` on purpose: the client is shared across
-        every team in the process, and one team stopping must not disconnect the
-        others. ``close_all()`` at process exit is the only closer.
-        """
-        if self._weaviate_backend is not None:
-            return self._weaviate_backend
-        try:
-            from akgentic.tool.vector_store.weaviate import WeaviateBackend, _weaviate_client
-
-            url = self.config.weaviate_url
-            if not url:
-                logger.warning(
-                    "[%s] weaviate_url not configured, cannot create WeaviateBackend",
-                    self.config.name,
-                )
-                return None
-            self._weaviate_backend = WeaviateBackend(
-                client=_weaviate_client(url, self.config.weaviate_api_key),
-                team_id=str(self.team_id),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "[%s] Failed to initialize WeaviateBackend: %s",
-                self.config.name,
-                exc,
-            )
-            return None
-        return self._weaviate_backend
-
-    def _get_backend(
-        self, name: str
-    ) -> InMemoryBackend | WeaviateBackend | VectorStoreService | None:
+    def _get_backend(self, name: str) -> VectorStoreService | None:
         """Return the backend registered under *name*, building it lazily.
 
-        Every backend resolves through its current :class:`BackendSpec`. Built-in
-        specs retain their pre-registry private accessors through a compatibility
-        hook; deliberately replacing either registration routes through the
-        replacement factory like any other third-party backend.
+        **Every backend is built here, one way: through its registered
+        :class:`BackendSpec` factory**, with this actor's config and team id. A
+        backend whose spec sets ``persists_in_actor_state`` is then restored from
+        its own ``backend_states`` snapshot. Nothing names a backend: a built-in
+        and a third-party registration take the same path.
+
+        The owning team's id is taken from ``self.team_id`` — propagated by the
+        actor system, never configured — so a cluster backend stamps it onto every
+        object it writes and a deleted team's vectors stay findable. This actor
+        has no ``on_stop`` on purpose: a cluster client is shared across every
+        team in the process, and one team stopping must not disconnect the others.
 
         Args:
             name: Backend identifier (a ``VectorStoreParam.backend`` value).
@@ -307,15 +235,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
             return existing
         try:
             spec = get_backend_spec(name)
-            if spec.legacy_actor_accessor:
-                accessor = cast(
-                    Callable[[], VectorStoreService | None],
-                    getattr(self, spec.legacy_actor_accessor),
-                )
-                return accessor()
-            backend = spec.factory(
-                BackendContext(config=self.config, team_id=str(self.team_id))
-            )
+            backend = spec.factory(BackendContext(config=self.config, team_id=str(self.team_id)))
             if spec.persists_in_actor_state:
                 self._restore_backend_state(name, backend)
         except Exception as exc:  # noqa: BLE001
@@ -348,8 +268,9 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
             return name == "inmemory"
 
     def _get_backend_for_collection(
-        self, collection: str,
-    ) -> InMemoryBackend | WeaviateBackend | VectorStoreService | None:
+        self,
+        collection: str,
+    ) -> VectorStoreService | None:
         """Return the correct backend for the given collection.
 
         Checks ``self.state.collection_configs`` for the collection's backend
@@ -372,9 +293,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
     def _restore_backend_state(self, name: str, backend: VectorStoreService) -> None:
         """Restore a factory-built actor-state-backed backend's saved snapshot.
 
-        Reads from the per-backend ``backend_states`` map. The built-in in-memory
-        backend restores from the legacy ``backend_state`` slot inside its own
-        accessor (:meth:`_get_or_create_backend`) and never reaches here.
+        Reads from the per-backend ``backend_states`` map.
         """
         if not _supports_actor_state(backend):
             msg = (
@@ -388,10 +307,8 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
     def _sync_backend_state(self, name: str, backend: VectorStoreService) -> None:
         """Copy an actor-state-backed backend's serialisable snapshot into state.
 
-        The built-in in-memory backend (``self._backend``) writes the legacy
-        ``backend_state`` slot for compatibility; every other actor-state-backed
-        backend — including a registered replacement for ``inmemory`` — writes the
-        per-backend ``backend_states`` map.
+        Every actor-state-backed backend, built-in or registered, writes the
+        per-backend ``backend_states`` map under its registered name.
         """
         if not _supports_actor_state(backend):
             msg = (
@@ -399,11 +316,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
                 "implement get_state() and restore_state()."
             )
             raise TypeError(msg)
-        snapshot = backend.get_state()
-        if name == "inmemory" and backend is self._backend:
-            self.state.backend_state = snapshot
-        else:
-            self.state.backend_states[name] = snapshot
+        self.state.backend_states[name] = backend.get_state()
 
     # ------------------------------------------------------------------
     # Proxy methods
@@ -422,9 +335,8 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         anything: this actor embeds nothing, so there is no second model for them
         to disagree with.
 
-        Routes to the appropriate backend based on ``config.backend``:
-        - ``"inmemory"``: delegates to ``InMemoryBackend``
-        - ``"weaviate"``: delegates to ``WeaviateBackend``
+        Routes through the registry by ``config.backend``: the collection is
+        created on whichever backend that name is registered to.
 
         **This method refuses; it does not degrade.** Both ways it used to
         swallow now raise ``RetriableError`` — a backend that could not be built,

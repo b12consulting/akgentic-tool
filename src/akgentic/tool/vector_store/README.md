@@ -114,17 +114,17 @@ An explicit param passes through **by identity**, so a param two cards share thr
 
 ### What is deliberately *not* here
 
-**Weaviate connection settings.** `VectorStoreConfig` carries `weaviate_url` and
-`weaviate_api_key`, but the card does not surface them: they are infrastructure, not something a
-catalog entry should carry. A card persisted in a catalog would otherwise store a cluster URL and
-an API key as plain configuration.
+**Cluster connection settings.** Neither a card nor `VectorStoreConfig` carries a cluster URL or
+an API key: they are infrastructure, not something a catalog entry should carry. A card persisted
+in a catalog would otherwise store a cluster URL and an API key as plain configuration.
+`VectorStoreConfig` declares no field beyond `BaseConfig`'s — the actor's name and role.
 
-The card reads them from the environment instead, at `observer()` time — `AKGENTIC_WEAVIATE_URL`
-and `AKGENTIC_WEAVIATE_API_KEY`. **Exporting a URL is what turns Weaviate on**; leave it unset and
-every collection stays on the in-memory backend, whatever a `VectorStoreParam` asks for (selecting
-`backend="weaviate"` without a URL logs a warning and leaves the backend unavailable). An exported
-but *empty* variable counts as unset — `or None` — so a deployment template that always exports
-the name does not read as a cluster at `""`.
+Each backend's registered factory reads its own pair from the environment instead —
+`AKGENTIC_WEAVIATE_URL` and `AKGENTIC_WEAVIATE_API_KEY` for Weaviate, `AKGENTIC_QDRANT_URL` and
+`AKGENTIC_QDRANT_API_KEY` for Qdrant. **Exporting a URL is what turns that cluster on**; leave it
+unset and a card that names no backend stays on the in-memory one, while a card that names the
+cluster fails its build (see below). An exported but *empty* variable counts as unset — `or None`
+— so a deployment template that always exports the name does not read as a cluster at `""`.
 
 **The team id.** Also not a field, and deliberately not configurable: it is `VectorStoreActor.team_id`,
 which the actor system propagates. A card cannot be trusted to say which team it belongs to —
@@ -187,8 +187,9 @@ PlanningTool(vector_store=VectorStoreParam(backend="weaviate"))  # with no URL e
 #   or drop the backend setting to use the in-memory index.
 ```
 
-`require_weaviate_configured` runs in each consumer card's `observer()`, **before any actor is
-created**, so the team fails to build rather than starting up half-wired. This is deliberately not
+`require_backend_configured` runs in each consumer card's `observer()`, **before any actor is
+created**, and asks the named backend's own `require_configured` probe — here the Weaviate
+module's — so the team fails to build rather than starting up half-wired. This is deliberately not
 a degradation: a card that says `weaviate` has asked for durable, shared, tenant-isolated storage,
 and an in-memory index is the wrong answer to a question the deployment already settled — silently
 substituting it loses data that everything downstream assumes is persisted.
@@ -201,13 +202,16 @@ resolved to `inmemory`, so there is nothing to contradict.
 > is the intended behaviour — the entry is asking for a cluster — but it is why an environment
 > promoting catalogs between tiers must export the variable in every tier that runs them.
 
-| Helper | Purpose |
-|---|---|
-| `weaviate_url()` | Cluster URL, or `None`. Empty counts as unset. |
-| `weaviate_api_key()` | API key, or `None`. |
-| `default_backend()` | Highest-priority provisioned backend from the registry; `"inmemory"` when none. |
-| `require_weaviate_configured(config, card_name)` | Raises `ValueError` when *config* names Weaviate and no URL is set. |
-| `require_backend_configured(config, card_name)` | Backend-agnostic guard: dispatches to the named backend's own `require_configured`. Prefer this in new consumer cards. |
+| Helper | Where | Purpose |
+|---|---|---|
+| `default_backend()` | package root | Highest-priority provisioned backend from the registry; `"inmemory"` when none. |
+| `require_backend_configured(config, card_name)` | package root | Backend-agnostic guard: dispatches to the named backend's own `require_configured`. |
+| `weaviate_url()` | `vector_store.backends.weaviate` | Weaviate cluster URL, or `None`. Empty counts as unset. |
+| `weaviate_api_key()` | `vector_store.backends.weaviate` | Weaviate API key, or `None`. |
+| `WEAVIATE_URL_ENV`, `WEAVIATE_API_KEY_ENV` | `vector_store.backends.weaviate` | The two variable names. |
+
+The Weaviate helpers live in the Weaviate backend module, not the package root, exactly as Qdrant's
+`qdrant_url()` / `qdrant_api_key()` live in its own: a backend's environment belongs to the backend.
 
 ---
 
@@ -456,12 +460,13 @@ sub-millisecond for 10 000 entries at 1536 dimensions. `remove` compacts the buf
 
 `WeaviateBackend` declares a `team_id` schema property alongside `ref_type` / `ref_id` / `text`
 (and, since the workspace dimension, `scope` / `path` / `ordinal`), and stamps it onto every
-object it writes. Unlike those three, `team_id` is always stamped. The value is the owning
-`VectorStoreActor`'s `team_id` — propagated by the actor system, never configured, never on a
-card:
+object it writes. Unlike those three, `team_id` is always stamped. The value is the `team_id` the
+registered factory is handed in its `BackendContext` — the owning team's id, propagated by the
+actor system, never configured, never on a card. The factory reads the cluster from the
+environment and builds:
 
 ```python
-WeaviateBackend(client=_weaviate_client(url, api_key), team_id=str(actor.team_id))
+WeaviateBackend(client=_weaviate_client(weaviate_url(), weaviate_api_key()), team_id=context.team_id)
 ```
 
 **Why it is there.** An in-memory collection dies with its actor; a Weaviate collection does not.
@@ -558,7 +563,7 @@ enforces that rather than trusting the loop to:
 ```python
 from akgentic.tool.vector_store import close_all
 from akgentic.tool.vector_store.protocol import collection_is_team_scoped
-from akgentic.tool.vector_store.weaviate import WeaviateBackend, _weaviate_client
+from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend, _weaviate_client
 
 backend = WeaviateBackend(client=_weaviate_client(WEAVIATE_URL, WEAVIATE_API_KEY))
 try:
@@ -602,9 +607,10 @@ uv add "akgentic-tool[qdrant]"          # qdrant-client   — only for backend="
 
 Without `[vector_search]` the consumer cards degrade to keyword-only search
 (`KnowledgeGraphTool` excepted: it checks the dependency in `observer()` and raises). Selecting
-`backend="weaviate"` without `[weaviate]`, or without a `weaviate_url`, leaves the backend
-unavailable. `backend="qdrant"` without `[qdrant]` or `AKGENTIC_QDRANT_URL` fails during consumer
-card construction with an actionable installation or configuration message.
+`backend="weaviate"` without `AKGENTIC_WEAVIATE_URL` fails during consumer card construction;
+without `[weaviate]` the failure comes when the backend is built, as an `ImportError` naming the
+extra. `backend="qdrant"` without `[qdrant]` or `AKGENTIC_QDRANT_URL` fails during consumer card
+construction with an actionable installation or configuration message.
 
 ### Recipes
 
@@ -652,7 +658,19 @@ from akgentic.tool.vector_store import (
     is_registered, available_backends, get_backend_spec,
     default_backend, resolve_default_backend, require_backend_configured,
 )
+
+# A backend's environment belongs to its own module, not the package root.
+from akgentic.tool.vector_store.backends.weaviate import (
+    WEAVIATE_URL_ENV, WEAVIATE_API_KEY_ENV, weaviate_url, weaviate_api_key,
+)
+from akgentic.tool.vector_store.backends.qdrant import (
+    QDRANT_URL_ENV, QDRANT_API_KEY_ENV, qdrant_url, qdrant_api_key,
+)
 ```
+
+The three backend modules live in `vector_store/backends/`, and each registers itself on import.
+Import the backend classes from the package root, which is their one public surface; the
+`backends` package itself exports nothing.
 
 Backend classes remain importable when their optional client is absent. Construction raises an
 `ImportError` with the corresponding extra to install. Qdrant consumer cards fail earlier through

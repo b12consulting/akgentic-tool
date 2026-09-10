@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from akgentic.tool.vector_store.actor import VectorStoreState
-from akgentic.tool.vector_store.inmemory import InMemoryBackend
+from akgentic.tool.vector_store.backends.inmemory import InMemoryBackend
 from akgentic.tool.vector_store.protocol import VectorStoreParam
 
 # Three of the four retired names belong to nothing else in the package, so they are

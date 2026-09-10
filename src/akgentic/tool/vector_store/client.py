@@ -67,9 +67,10 @@ makes, and each backend's answer is pinned by a test.
    an explicit ``path=`` (``:126``). ``_make_qdrant_backend`` passes ``url=`` and
    refuses without one, so the local mode is unreachable through this package.
 
-This module reads no environment variables. ``protocol.py`` owns
-``weaviate_url()`` and ``weaviate_api_key()``, ``qdrant.py`` owns its own pair,
-and each backend's factory resolves them and builds the key.
+This module reads no environment variables. Each backend module owns its own
+pair — ``backends/weaviate.py`` its ``weaviate_url()`` and ``weaviate_api_key()``,
+``backends/qdrant.py`` its own — and each backend's factory resolves them and
+builds the key.
 
 See ADR-049 §Decision 5 and §Open items (1) for the argument.
 """

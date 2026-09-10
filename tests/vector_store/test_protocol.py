@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from akgentic.core.agent_config import BaseConfig
 from pydantic import ValidationError
 
 from akgentic.tool.core.params import BaseToolParam
@@ -319,10 +320,9 @@ class TestSearchResult:
 class TestVectorStoreConfig:
     """Tests for VectorStoreConfig defaults and serialization."""
 
-    def test_default_values(self) -> None:
-        cfg = VectorStoreConfig()
-        assert cfg.weaviate_url is None
-        assert cfg.weaviate_api_key is None
+    def test_it_declares_no_field_beyond_base_config(self) -> None:
+        """The actor's name and role, nothing more: no embedding and no connection field."""
+        assert set(VectorStoreConfig.model_fields) == set(BaseConfig.model_fields)
 
     def test_the_two_embedding_fields_are_gone(self) -> None:
         """They were inert once the consumers took over embedding, and their
@@ -330,44 +330,43 @@ class TestVectorStoreConfig:
         assert "embedding_model" not in VectorStoreConfig.model_fields
         assert "embedding_provider" not in VectorStoreConfig.model_fields
 
-    def test_a_checkpoint_carrying_the_removed_keys_still_loads(self) -> None:
-        """A removed FIELD is dropped by ``extra='ignore'``; every survivor is intact."""
+    @pytest.mark.parametrize(
+        ("url", "api_key"),
+        [
+            (None, None),
+            ("http://localhost:8080", "secret-key-123"),
+        ],
+        ids=["null-as-stored", "populated"],
+    )
+    def test_a_stored_config_carrying_the_removed_keys_still_loads(
+        self, url: str | None, api_key: str | None
+    ) -> None:
+        """A removed FIELD is dropped by ``extra='ignore'``; the survivors are intact.
+
+        The first case is the exact shape of the stored ``StartMessage`` records: both
+        connection keys null, beside the two embedding keys an earlier story removed.
+        The second shows a populated legacy value is ignored as well, not only a null one.
+        """
         cfg = VectorStoreConfig.model_validate(
             {
                 "name": "#VectorStore",
                 "role": "ToolActor",
+                "weaviate_url": url,
+                "weaviate_api_key": api_key,
                 "embedding_model": "text-embedding-ada-002",
                 "embedding_provider": "azure",
-                "weaviate_url": "http://localhost:8080",
-                "weaviate_api_key": "secret-key-123",
             }
         )
-        assert not hasattr(cfg, "embedding_model")
-        assert not hasattr(cfg, "embedding_provider")
         assert cfg.name == "#VectorStore"
         assert cfg.role == "ToolActor"
-        assert cfg.weaviate_url == "http://localhost:8080"
-        assert cfg.weaviate_api_key == "secret-key-123"
+        dumped = cfg.model_dump()
+        removed_keys = ("weaviate_url", "weaviate_api_key", "embedding_model", "embedding_provider")
+        for removed in removed_keys:
+            assert not hasattr(cfg, removed), removed
+            assert removed not in dumped, removed
 
     def test_round_trip_serialization_defaults(self) -> None:
         cfg = VectorStoreConfig()
-        data = cfg.model_dump()
-        restored = VectorStoreConfig.model_validate(data)
-        assert restored == cfg
-
-    def test_all_optional_fields_populated(self) -> None:
-        cfg = VectorStoreConfig(
-            weaviate_url="http://localhost:8080",
-            weaviate_api_key="secret-key-123",
-        )
-        assert cfg.weaviate_url == "http://localhost:8080"
-        assert cfg.weaviate_api_key == "secret-key-123"
-
-    def test_round_trip_serialization_all_fields(self) -> None:
-        cfg = VectorStoreConfig(
-            weaviate_url="http://localhost:8080",
-            weaviate_api_key="secret-key-123",
-        )
         data = cfg.model_dump()
         restored = VectorStoreConfig.model_validate(data)
         assert restored == cfg

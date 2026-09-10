@@ -379,7 +379,6 @@ register_backend(
         factory=_make_inmemory_backend,
         persists_in_actor_state=True,
         selectable_as_default=False,
-        legacy_actor_accessor="_get_or_create_backend",
     ),
     replace=True,
 )

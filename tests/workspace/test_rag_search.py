@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA, OVERFETCH
-from akgentic.tool.vector_store.inmemory import InMemoryBackend
+from akgentic.tool.vector_store.backends.inmemory import InMemoryBackend
 from akgentic.tool.vector_store.protocol import VectorStoreParam, SearchResult
 from akgentic.tool.vector_store.vector import VectorEntry
 from akgentic.tool.workspace.actor import (
@@ -741,7 +741,7 @@ class TestThePathPrefixDecision:
 
     def test_the_in_memory_backend_treats_a_metacharacter_literally(self) -> None:
         """Half of the divergence the refusal exists for, pinned against real code."""
-        from akgentic.tool.vector_store.inmemory import _entry_matches
+        from akgentic.tool.vector_store.backends.inmemory import _entry_matches
 
         entry = VectorEntry(
             ref_type="workspace_chunk", ref_id="c", text="t", vector=[1.0], path="report?.md"

@@ -10,12 +10,12 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from akgentic.tool.vector_store.backends.qdrant import QDRANT_URL_ENV
 from akgentic.tool.vector_store.protocol import (
     SearchResult,
     VectorQuery,
     VectorStoreParam,
 )
-from akgentic.tool.vector_store.qdrant import QDRANT_URL_ENV
 from akgentic.tool.vector_store.registry import (
     BackendContext,
     BackendSpec,

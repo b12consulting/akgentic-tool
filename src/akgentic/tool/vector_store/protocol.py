@@ -7,7 +7,6 @@ and Pydantic models (``VectorStoreParam``, ``SearchHit``, ``SearchResult``,
 
 from __future__ import annotations
 
-import os
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, runtime_checkable
 
@@ -21,46 +20,14 @@ if TYPE_CHECKING:
     from akgentic.tool.vector_store.vector import VectorEntry
 
 
-# ---------------------------------------------------------------------------
-# Weaviate deployment, read from the environment
-# ---------------------------------------------------------------------------
-
-WEAVIATE_URL_ENV: Final[str] = "AKGENTIC_WEAVIATE_URL"
-"""Environment variable naming the Weaviate cluster.
-
-Connection settings are infrastructure, never card fields: a card persisted in a
-catalog would otherwise carry a cluster URL and an API key as plain configuration.
-**Exporting this is what turns Weaviate on.**
-"""
-
-WEAVIATE_API_KEY_ENV: Final[str] = "AKGENTIC_WEAVIATE_API_KEY"
-"""Environment variable holding the Weaviate API key. Optional — an unauthenticated
-cluster needs only the URL."""
-
-
-def weaviate_url() -> str | None:
-    """Return the configured Weaviate cluster URL, or ``None`` when unset.
-
-    An exported but *empty* variable counts as unset, so a deployment template that
-    always exports the name does not read as a cluster at ``""``.
-    """
-    return os.environ.get(WEAVIATE_URL_ENV) or None
-
-
-def weaviate_api_key() -> str | None:
-    """Return the configured Weaviate API key, or ``None`` when unset."""
-    return os.environ.get(WEAVIATE_API_KEY_ENV) or None
-
-
 def default_backend() -> str:
     """Return the backend a collection uses when its card names none.
 
     Delegates to :func:`akgentic.tool.vector_store.registry.resolve_default_backend`,
-    which consults every registered backend's ``is_configured()`` probe. With
-    only the built-in backends this preserves the historical rule — ``weaviate``
-    when a cluster URL is set, ``inmemory`` otherwise — while letting a
-    registered external backend (e.g. Qdrant) also claim the default when it,
-    and no earlier-registered backend, is the one the environment provisioned.
+    which consults every registered backend's ``is_configured()`` probe. The answer
+    is the first provisioned, default-selectable backend in registration order,
+    else the in-actor fallback — the backend that keeps its data in actor state and
+    needs no provisioning.
 
     Resolved per instantiation rather than at import, so a process that exports
     a backend's variables after the module loads — a test, a late-configured
@@ -147,16 +114,19 @@ class VectorStoreParam(SerializableBaseModel):
         default_factory=default_backend,
         description=(
             "Storage backend for this collection, matched against a registered "
-            "BackendSpec.name. Built-ins: 'inmemory' and 'weaviate' (plus 'qdrant' "
-            "when akgentic-tool[qdrant] is installed). Defaults to whichever backend "
-            "the environment has provisioned, else 'inmemory'. Custom backends can be "
-            "added via akgentic.tool.vector_store.registry.register_backend."
+            "BackendSpec.name; akgentic.tool.vector_store.registry.available_backends() "
+            "lists them. Defaults to whichever backend the environment has provisioned, "
+            "else the fallback that keeps its data in actor state. Custom backends can "
+            "be added via akgentic.tool.vector_store.registry.register_backend."
         ),
     )
     dimension: int = Field(default=1536, ge=1, description="Embedding vector dimensionality")
     tenant: str | None = Field(
         default=None,
-        description="Weaviate tenant ID for multi-tenancy (maps to workspace/team ID)",
+        description=(
+            "Deployment partition for a backend that supports multi-tenancy; each "
+            "backend maps it onto its own partitioning, and one without any ignores it."
+        ),
     )
     params: dict[str, Any] = Field(
         default_factory=dict,
@@ -209,46 +179,20 @@ def require_dimension_matches(param: VectorStoreParam, owner: str) -> None:
     )
 
 
-def require_weaviate_configured(config: VectorStoreParam, card_name: str) -> None:
-    """Raise when *config* asks for Weaviate and the environment has no cluster.
-
-    Called by a consumer card at ``observer()`` time, so the team fails to build
-    rather than starting up silently pointed at a process-local index. A card that
-    asks for Weaviate has asked for durable, shared, tenant-isolated storage; giving
-    it an in-memory index instead is not a degradation, it is the wrong answer to a
-    question the deployment already settled.
-
-    A card that names no backend never reaches here: :func:`default_backend` has
-    already resolved it to ``inmemory`` in that environment.
-
-    Args:
-        config: The collection configuration carried by the card.
-        card_name: Card class name, for the error message.
-
-    Raises:
-        ValueError: When ``config.backend == "weaviate"`` and no cluster URL is set.
-    """
-    if config.backend != "weaviate" or weaviate_url():
-        return
-    raise ValueError(
-        f"{card_name} configures backend='weaviate' but {WEAVIATE_URL_ENV} is not set. "
-        f"Export {WEAVIATE_URL_ENV} (and {WEAVIATE_API_KEY_ENV} for an authenticated "
-        f"cluster), or drop the backend setting to use the in-memory index."
-    )
-
-
 def require_backend_configured(config: VectorStoreParam, card_name: str) -> None:
     """Raise when *config* names a backend the environment has not provisioned.
 
-    The backend-agnostic generalisation of :func:`require_weaviate_configured`:
-    it looks up the registered backend named by ``config.backend`` and delegates
-    to that backend's ``require_configured`` probe. A consumer card calls this at
-    ``observer()`` time so a team that names a durable store — Weaviate, Qdrant,
-    a custom backend — fails to build rather than starting up silently pointed at
-    a process-local index.
+    It looks up the registered backend named by ``config.backend`` and asks that
+    backend's own ``require_configured`` probe. A consumer card calls this at
+    ``observer()`` time so a team that names a durable store — a cluster or a
+    custom backend — fails to build rather than starting up silently pointed at a
+    process-local index. A card that asks for a cluster has asked for durable,
+    shared, tenant-isolated storage; an in-memory index instead is not a
+    degradation, it is the wrong answer to a question the deployment already
+    settled.
 
-    The in-memory backend's probe is a no-op, so a card that names no backend
-    (already resolved to ``inmemory``) never raises.
+    The in-actor fallback's probe is a no-op, so a card that names no backend
+    (already resolved to the in-actor fallback) never raises.
 
     Args:
         config: The collection configuration carried by the card.
@@ -346,18 +290,19 @@ def resolve_store_param(value: VectorStoreParam | bool) -> VectorStoreParam | No
 # ---------------------------------------------------------------------------
 
 PATH_PREFIX_WILDCARDS: Final[str] = "*?"
-"""Characters a ``path_prefix`` may not contain, on either backend.
+"""Characters a ``path_prefix`` may not contain, on any backend.
 
-Both are legal in a POSIX filename and both are wildcards in Weaviate's ``Like``
-operator, which is what ``WeaviateBackend`` builds a prefix filter from; the
-in-memory backend uses ``str.startswith`` and treats them literally. The v4
-filter API offers no escape, so the same query would mean two different things
-depending on where the collection happens to live — and on ``remove()`` that is
-sharp rather than academic: a ``*`` widens a deletion on Weaviate and narrows it
-to nothing in memory.
+Both are legal in a POSIX filename. One registered backend compiles a prefix into
+a pattern operator in which ``*`` and ``?`` are wildcards and no escape exists;
+another compares strings and reads them literally. The same query would then mean
+two different things depending on where the collection happens to live — and on
+``remove()`` that is sharp rather than academic: a ``*`` widens a deletion on the
+pattern-matching backend and narrows it to nothing on the literal one. The rule
+protects every backend; the concrete evidence sits beside the code that builds
+the pattern.
 
-They live here, next to the protocol both backends implement, so the two cannot
-drift apart (ADR-045 §5).
+They live here, next to the protocol every backend implements, so the backends
+cannot drift apart (ADR-045 §5).
 """
 
 PATH_PREFIX_REJECTED: Final[str] = (
@@ -722,29 +667,21 @@ class ActorStateBackend(Protocol):
 
 
 class VectorStoreConfig(BaseConfig):
-    """Configuration for the vector store actor.
+    """Configuration for the vector store actor: its name and role, nothing more.
 
-    The two embedding fields are gone. They had been inert since the embedding
-    pipeline moved to the consumers, and their only writer was the deleted
-    ``VectorStoreTool``. A persisted config that still carries them loads
-    unchanged: Pydantic's default ``extra="ignore"`` drops an undeclared key, so
-    a removed *field* costs nothing (unlike a removed *class*, which the
+    It declares no field beyond ``BaseConfig``'s. The two embedding fields and the
+    two cluster connection fields are gone: the embedding fields had been inert
+    since the embedding pipeline moved to the consumers, and the connection fields
+    had no writer once the card that set them was deleted. A backend reads its
+    deployment from the environment, through its own factory.
+
+    A persisted config that still carries any of the four keys loads unchanged:
+    Pydantic's default ``extra="ignore"`` drops an undeclared key, so a removed
+    *field* costs nothing (unlike a removed *class*, which the
     ``SerializableBaseModel`` before-validator cannot resolve — see
-    :class:`~akgentic.tool.vector_store.actor.PendingRequest`).
+    :class:`~akgentic.tool.vector_store.actor.PendingRequest`). The value a stored
+    record carried is not read.
 
-    The two Weaviate connection fields stay, and now have **no writer in
-    ``src/``**: the card that set them is gone, and
-    :func:`~akgentic.tool.vector_store.actor.ensure_store_actor` builds an
-    in-memory store by construction, which needs neither.
-    ``_make_weaviate_backend`` falls back to the environment, so the backstop
-    path — a caller who reaches the actor with a cluster collection by hand —
-    still resolves. Deleting them is a separate decision, recorded as a
-    deferred finding rather than taken here.
+    The class itself stays here, under this name: stored ``StartMessage`` records
+    tag ``akgentic.tool.vector_store.protocol.VectorStoreConfig``.
     """
-
-    weaviate_url: str | None = Field(
-        default=None, description="Weaviate cluster URL"
-    )
-    weaviate_api_key: str | None = Field(
-        default=None, description="Weaviate API key"
-    )

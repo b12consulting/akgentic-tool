@@ -1680,9 +1680,12 @@ src/akgentic/tool/
     │   vector.py             # VectorEntry, EmbeddingService, VectorIndex
     │   │                     #   [optional: vector_search extra]
     │   protocol.py           # VectorStore Protocol, VectorStoreConfig, data models
-    │   inmemory.py           # InMemory backend
-    │   weaviate.py           # Weaviate backend [optional: weaviate extra]
-    │   qdrant.py             # Qdrant backend [optional: qdrant extra]
+    │   backends/             # The built-in backends; each self-registers on import.
+    │   │                     #   Import the classes from vector_store, not here
+    │   │   inmemory.py       # InMemory backend
+    │   │   weaviate.py       # Weaviate backend + its environment helpers
+    │   │                     #   [optional: weaviate extra]
+    │   │   └── qdrant.py     # Qdrant backend [optional: qdrant extra]
     │   client.py             # One client per cluster per process, keyed and closed
     │   registry.py           # Pluggable backend registry — BackendSpec, register_backend
     │   actor.py              # VectorStoreActor singleton + ensure_store_actor

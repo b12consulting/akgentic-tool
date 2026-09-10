@@ -1,7 +1,8 @@
 """Centralised vector storage service — protocols, models, and configuration.
 
 Re-exports all public types from ``protocol.py`` so consumers can import
-directly from ``akgentic.tool.vector_store``.
+directly from ``akgentic.tool.vector_store``. The backend classes are re-exported
+from the ``backends`` package; this module is their one public surface.
 """
 
 from __future__ import annotations
@@ -13,6 +14,9 @@ from akgentic.tool.vector_store.actor import (
     VectorStoreState,
     ensure_store_actor,
 )
+from akgentic.tool.vector_store.backends.inmemory import InMemoryBackend
+from akgentic.tool.vector_store.backends.qdrant import QdrantBackend
+from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
 from akgentic.tool.vector_store.client import ClusterKey, close_all, get_client
 from akgentic.tool.vector_store.embedding_actor import (
     EmbeddingError,
@@ -22,20 +26,8 @@ from akgentic.tool.vector_store.embedding_actor import (
     build_embedding_service,
     embedding_worker_name,
 )
-from akgentic.tool.vector_store.inmemory import InMemoryBackend
-
-try:
-    from akgentic.tool.vector_store.weaviate import WeaviateBackend
-except ImportError:
-    WeaviateBackend = None  # type: ignore[assignment,misc]
-try:
-    from akgentic.tool.vector_store.qdrant import QdrantBackend
-except ImportError:
-    QdrantBackend = None  # type: ignore[assignment,misc]
 from akgentic.tool.vector_store.protocol import (
     EMBEDDING_DIMENSIONS,
-    WEAVIATE_API_KEY_ENV,
-    WEAVIATE_URL_ENV,
     ActorStateBackend,
     CollectionStatus,
     EmbeddingProvider,
@@ -49,9 +41,6 @@ from akgentic.tool.vector_store.protocol import (
     needs_store_actor,
     require_backend_configured,
     require_dimension_matches,
-    require_weaviate_configured,
-    weaviate_api_key,
-    weaviate_url,
 )
 from akgentic.tool.vector_store.registry import (
     BackendContext,
@@ -75,8 +64,6 @@ from akgentic.tool.vector_store.vector import (  # noqa: F401
 
 __all__ = [
     "EMBEDDING_DIMENSIONS",
-    "WEAVIATE_API_KEY_ENV",
-    "WEAVIATE_URL_ENV",
     "ActorStateBackend",
     "BackendContext",
     "BackendSpec",
@@ -116,9 +103,6 @@ __all__ = [
     "register_backend",
     "require_backend_configured",
     "require_dimension_matches",
-    "require_weaviate_configured",
     "resolve_default_backend",
     "unregister_backend",
-    "weaviate_api_key",
-    "weaviate_url",
 ]
