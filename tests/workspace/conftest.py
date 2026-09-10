@@ -597,8 +597,18 @@ def _no_real_workspaces_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     and, since 29-4, runs ``git init`` there. That looks like nothing at all
     until it does. Tests that want a named base still request
     :func:`workspaces_root`, whose ``setenv`` runs after this one and wins.
+
+    ``AKGENTIC_WORKSPACE_META_ROOT`` is **unset** rather than pointed somewhere,
+    because the metadata directory's defining property is that it is a *sibling
+    of the tree*: a value here relocates its parent and there is no temporary
+    directory that keeps the sibling relation to whichever base a given test
+    chose. Left ambient it would break every placement assertion on a machine
+    that exports it, and — once a story creates the directory rather than only
+    naming it — write into the exported location. A test that wants the variable
+    sets it with ``monkeypatch``, which runs after this one and wins.
     """
     monkeypatch.setenv("AKGENTIC_WORKSPACES_ROOT", str(tmp_path / "unclaimed-workspaces"))
+    monkeypatch.delenv("AKGENTIC_WORKSPACE_META_ROOT", raising=False)
 
 
 @pytest.fixture

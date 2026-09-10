@@ -416,13 +416,23 @@ def meta_dir_for(workspace_path: str) -> Path:
 
     Returns:
         The absolute ``<parent>/<scope>/<leaf>.akgentic``, where ``<parent>`` is
-        ``AKGENTIC_WORKSPACE_META_ROOT`` when set and the workspaces root
-        otherwise.
+        ``AKGENTIC_WORKSPACE_META_ROOT`` when it carries a value and the
+        workspaces root otherwise — an **empty** value falls back rather than
+        being honoured, see below.
     """
     # Derived in the ``git_dir_for`` shape — resolve the tree, then append the
     # suffix to its name — because two derivations that drift give two metadata
     # directories over one tree.
-    parent = os.environ.get("AKGENTIC_WORKSPACE_META_ROOT", _workspaces_root())
+    #
+    # ``or`` rather than a ``get`` default, because an empty value is set: a
+    # compose file interpolating an unset variable, or a bare ``FOO=`` in an env
+    # file, both arrive here as ``""``. Honouring that would resolve the parent
+    # against the process cwd while the tree stayed under the workspaces root —
+    # the metadata directory detached from the tree it belongs to, with nothing
+    # raising. An empty ``AKGENTIC_WORKSPACES_ROOT`` is a different case and
+    # keeps its existing meaning (:func:`_workspaces_root`): there the tree and
+    # everything derived from it move together.
+    parent = os.environ.get("AKGENTIC_WORKSPACE_META_ROOT") or _workspaces_root()
     resolved = (Path(parent) / workspace_path).resolve()
     return resolved.parent / f"{resolved.name}{META_DIR_SUFFIX}"
 

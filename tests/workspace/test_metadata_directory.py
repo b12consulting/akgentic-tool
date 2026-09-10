@@ -325,6 +325,26 @@ class TestTheMetaRootRelocatesTheParent:
         assert meta == workspace_root_for(workspaces_root, META_LEAF).resolve()
         assert meta.parent == _tree_root().parent
 
+    def test_an_empty_value_falls_back_instead_of_being_honoured(
+        self, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``AKGENTIC_WORKSPACE_META_ROOT=`` is set, and must still fall back.
+
+        An empty value is how an unset variable arrives from a compose file
+        interpolating ``${...}``, or from a bare ``FOO=`` in an env file. Honoured
+        literally it would resolve the parent against the process working
+        directory while the tree stayed under the workspaces root — the metadata
+        directory detached from the tree whose exec lock, cache and index it
+        holds, and nothing raising. It is the one variable value for which
+        "sibling of the tree" and "what the variable says" disagree.
+        """
+        monkeypatch.setenv(META_ROOT_VAR, "")
+
+        meta = meta_dir_for(WORKSPACE_PATH)
+
+        assert meta == workspace_root_for(workspaces_root, META_LEAF).resolve()
+        assert meta.parent == _tree_root().parent
+
     def test_with_both_unset_the_parent_is_the_one_get_workspace_uses(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
