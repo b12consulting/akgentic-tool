@@ -50,16 +50,14 @@ from akgentic.core.utils.deserializer import deserialize_object
 from akgentic.core.utils.serializer import SerializableBaseModel
 
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.workspace.actor import (
-    WorkspaceActor,
-    workspace_actor_name,
-)
+from akgentic.tool.workspace.actor import workspace_actor_name
 from akgentic.tool.workspace.event import WorkspaceAttached
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
 from akgentic.tool.workspace.workspace import SHARED_KINDS_ENV
 from tests.workspace.conftest import (
     HANDSHAKE_TIMEOUT_S,
     SandboxScript,
+    live_workspace_actors,
     tool_named,
     wait_until,
 )
@@ -274,11 +272,11 @@ def bound(record: Bind) -> tuple[WorkspaceTool, PurePosixPath]:
 
 
 def _tear_down(actor_system: ActorSystem) -> None:
-    """Stop everything, then prove no hosted workspace outlived the system."""
+    """Stop everything, then prove no workspace actor outlived the system."""
     actor_system.shutdown(timeout=10)
     ActorRegistry.stop_all()
     _BINDS.clear()
-    assert ActorSystem.find_by_class(WorkspaceActor) == [], "a workspace outlived its test"
+    assert live_workspace_actors() == [], "a workspace outlived its test"
 
 
 @pytest.fixture
@@ -619,7 +617,7 @@ class TestThePlatformPermitsTheCardRequests:
         assert not (workspaces_root / "_shared").exists()
         assert not (workspaces_root / "u-alice" / "_meta").exists()
         assert list(workspaces_root.iterdir()) == []
-        assert ActorSystem.find_by_class(WorkspaceActor) == []
+        assert live_workspace_actors() == []
         # The member itself did start — the stream is not empty for a trivial
         # reason — and it carries no attach event.
         assert record.member is not None
@@ -830,7 +828,7 @@ class TestTwoTeamsOnOneTreeGetTwoActors:
         _, second_path = bound(second)
         assert first_path == second_path == PurePosixPath(SHARED_PATH)
 
-        workspaces = ActorSystem.find_by_class(WorkspaceActor)
+        workspaces = live_workspace_actors()
 
         # Two actors, one per team, both named for the one tree they share.
         assert len(workspaces) == 2
@@ -1006,14 +1004,7 @@ class TestAProcessWithNoHostBindsGatesAndMutates:
         assert record.error is None
         card, path = bound(record)
         assert path == PurePosixPath(OWN_METADATA_PATH)
-        # No resource host of **any** kind runs in this system — core's base
-        # included, which is the one this package could still have named — and
-        # the bind neither needed nor made one. Core's class is imported here
-        # and nowhere under ``src/``: that asymmetry is the assertion.
-        from akgentic.core.resource_host import ResourceHost
-
-        assert ActorSystem.find_by_class(ResourceHost) == []
-        assert len(ActorSystem.find_by_class(WorkspaceActor)) == 1
+        assert len(live_workspace_actors()) == 1
 
         # It gates: a create lands, and a second write to the same path without
         # a read between is refused exactly as it is anywhere else.
@@ -1077,7 +1068,7 @@ class TestTheTeamsTeardownTakesTheExecutorAndTheStoreDown:
         )
         card, path = bound(record)
         assert path == PurePosixPath(REAPED_PATH)
-        [workspace] = ActorSystem.find_by_class(WorkspaceActor)
+        [workspace] = live_workspace_actors()
         assert wait_until(lambda: len(pykka.ActorRegistry.get_by_class(VectorStoreActor)) == 1)
         [store_ref] = pykka.ActorRegistry.get_by_class(VectorStoreActor)
         # The runner is built and live: a run answers, and nothing has stopped it.
@@ -1106,7 +1097,7 @@ class TestTheTeamsTeardownTakesTheExecutorAndTheStoreDown:
         assert wait_until(lambda: not _exec_workers(REAPED_PATH)), (
             "the executor was never shut down"
         )
-        assert ActorSystem.find_by_class(WorkspaceActor) == []
+        assert live_workspace_actors() == []
 
 
 class TestActorSystemShutdownStillReachesTheWorkspace:
@@ -1134,7 +1125,7 @@ class TestActorSystemShutdownStillReachesTheWorkspace:
         )
         card, _ = bound(record)
         assert "ok" in str(tool_named(card, "workspace_exec")(cmd="echo hi"))
-        [workspace] = ActorSystem.find_by_class(WorkspaceActor)
+        [workspace] = live_workspace_actors()
         assert sandbox_script.stops == 0
 
         system.shutdown(timeout=10)
@@ -1142,6 +1133,6 @@ class TestActorSystemShutdownStillReachesTheWorkspace:
         assert not workspace.is_alive()
         assert sandbox_script.stops == 1
         assert ("stop",) in sandbox_script.events
-        assert ActorSystem.find_by_class(WorkspaceActor) == []
+        assert live_workspace_actors() == []
         name = workspace_actor_name(REAPED_PATH)
         assert [r.getMessage() for r in caplog.records if name in r.getMessage()] == []

@@ -31,7 +31,6 @@ from akgentic.core.agent_state import BaseState
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
 from akgentic.tool.workspace.execution import mutation_busy
 from akgentic.tool.workspace.models import WorkspaceConfig
-from akgentic.tool.workspace.tool import WorkspaceTool
 from tests.conftest import MockActorAddress
 from tests.workspace.conftest import (
     WORKSPACE_PATH,
@@ -244,31 +243,3 @@ class TestABoundCardKeepsItsTreeAliveIndefinitely:
         orchestrator_proxy.stop_all()
 
         assert name not in orchestrator_proxy.children
-
-
-class TestTheCardStillForwardsToNoHost:
-    """AC 2's structural half against the fake orchestrator's trap.
-
-    ``FakeOrchestratorProxy.getResourceOrCreate`` records and then raises, so a
-    card that forwarded to a host would fail the bind loudly rather than leave
-    this list quietly non-empty.
-    """
-
-    def test_binding_every_card_shape_forwards_to_no_host(
-        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
-    ) -> None:
-        card_for(orchestrator_proxy, "alice")
-        WorkspaceTool(workspace_id="test-workspace", read_only=True).observer(
-            card_for(orchestrator_proxy, "bob")[1]
-        )
-
-        assert orchestrator_proxy.resource_calls == []
-
-    def test_the_trap_is_not_vacuous(
-        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
-    ) -> None:
-        """Called directly, it raises and records — so an empty list above means something."""
-        with pytest.raises(RuntimeError, match="No resource host runs in this process"):
-            orchestrator_proxy.getResourceOrCreate(object, WorkspaceActor, None, None)
-
-        assert len(orchestrator_proxy.resource_calls) == 1

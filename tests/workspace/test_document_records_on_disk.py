@@ -69,6 +69,7 @@ from tests.workspace.conftest import (
     WORKSPACE_PATH,
     attach_store,
     factory_for,
+    live_workspace_actors,
     seed_extract,
     seed_row,
     stored_docs,
@@ -975,7 +976,7 @@ def system(workspaces_root: Path) -> Iterator[ActorSystem]:
     finally:
         actor_system.shutdown(timeout=10)
         ActorRegistry.stop_all()
-        assert ActorSystem.find_by_class(WorkspaceActor) == [], "a workspace outlived its test"
+        assert live_workspace_actors() == [], "a workspace outlived its test"
 
 
 def _create(system: ActorSystem, config: WorkspaceConfig) -> ActorAddress:

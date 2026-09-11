@@ -285,8 +285,8 @@ class TestTheCapability:
         # exactly one actor — the workspace's own, a team child again since
         # 52-5 — in a team that never asked for exec. Asserted as an equality
         # over the created list rather than as the absence of a name, so it
-        # cannot pass over an empty list; the empty ``resource_calls`` beside it
-        # is the negative that says this process forwards to no host at all.
+        # cannot pass over an empty list. A forward to a host is the strict type
+        # check's to catch: the core this package ships against has none.
         def explode() -> str:
             raise AssertionError("a card with exec off probed the host for a backend")
 
@@ -296,7 +296,6 @@ class TestTheCapability:
 
         created = [config.name for _cls, config in orchestrator_proxy.create_calls]
         assert created == [workspace_actor_name(WORKSPACE_PATH)]
-        assert orchestrator_proxy.resource_calls == []
 
     def test_read_only_creates_only_the_workspace_actor_too(
         self,
@@ -307,7 +306,6 @@ class TestTheCapability:
         exec_card_for(orchestrator_proxy, read_only=True)
         created = [config.name for _cls, config in orchestrator_proxy.create_calls]
         assert created == [workspace_actor_name(WORKSPACE_PATH)]
-        assert orchestrator_proxy.resource_calls == []
 
     def test_on_builds_a_runner_and_still_creates_only_the_workspace_actor(
         self,
@@ -317,8 +315,7 @@ class TestTheCapability:
         # What "on" buys is a backend on #Workspace itself, anchored to this
         # card's tree — and no second actor. Three actors per exec-enabled team
         # became two: the workspace and the agent. The created list is exactly
-        # the workspace, and nothing was forwarded to a host, so a second actor
-        # of any name reddens one or the other.
+        # the workspace, so a second actor of any name reddens it.
         _card, actor, _harness = exec_setup
 
         assert actor._runner is not None
@@ -326,7 +323,6 @@ class TestTheCapability:
         assert isinstance(actor._runner.backend, FakeBackend)
         created = [config.name for _cls, config in orchestrator_proxy.create_calls]
         assert created == [workspace_actor_name(WORKSPACE_PATH)]
-        assert orchestrator_proxy.resource_calls == []
 
     def test_two_workspaces_in_one_team_get_two_runners_on_their_own_trees(
         self,
@@ -521,7 +517,6 @@ class TestTheCapability:
 
         created = [config.name for _cls, config in orchestrator_proxy.create_calls]
         assert created == [workspace_actor_name(WORKSPACE_PATH)]
-        assert orchestrator_proxy.resource_calls == []
         names = {tool.__name__ for tool in card.get_tools()}
         assert "workspace_exec" not in names
 

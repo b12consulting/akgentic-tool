@@ -132,10 +132,9 @@ class TestSingleton:
         wired_card: WorkspaceTool,
     ) -> None:
         # Never a check-then-create pair: one message, per ADR-025 — the team\'s
-        # own child path again, and never the host forward beside it. The empty
-        # ``resource_calls`` is the whole of "this process needs no host".
+        # own child path again. A host forward beside it is the strict type
+        # check's to catch: the core this package ships against has none.
         assert len(orchestrator_proxy.create_calls) == 1
-        assert orchestrator_proxy.resource_calls == []
 
     def test_the_config_name_carries_the_tool_actor_prefix(
         self,
@@ -687,11 +686,12 @@ class TestTheCardBindsAsATeamChild:
     state the host existed to keep single has moved onto the tree, so there is
     nothing left for two actors over one tree to disagree about.
 
-    The two negatives are the point of the class: nothing forwards to a host
-    (``resource_calls`` stays empty — the fake orchestrator's forward records the
-    attempt and then raises, since 52-6 deleted the host it would have needed),
-    and nothing under ``workspace/card/`` so much as imports one. That pair is
-    ``akgentic-infra``\'s acceptance guard read from this side of the seam.
+    The two negatives are the point of the class: nothing forwards to a host,
+    and nothing under ``workspace/card/`` so much as imports one. The first is
+    the strict type check's since story 54-5 — the core this package ships
+    against has no forward to make — beside the one child create asserted
+    below. That pair is ``akgentic-infra``\'s acceptance guard read from this
+    side of the seam.
     """
 
     @pytest.mark.parametrize("shape", ["bare", "named", "metadata", "exec", "rag"])
@@ -717,9 +717,6 @@ class TestTheCardBindsAsATeamChild:
         assert config.name == workspace_actor_name(path)
         assert isinstance(config, WorkspaceConfig)
         assert config.workspace_path == path
-        # The negative beside the positive: no host was forwarded to, on any
-        # card shape, and this process runs none.
-        assert orchestrator_proxy.resource_calls == []
 
         [event] = [e for e in observer.events if isinstance(e, WorkspaceAttached)]
         assert event.agent_id == observer.myAddress.agent_id
