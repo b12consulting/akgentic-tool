@@ -114,8 +114,8 @@ this constant separates the two badly.
 GIT_DIR_SUFFIX = ".git"
 """Suffix of the sibling repository directory: workspace ``foo`` journals to ``foo.git``."""
 
-META_DIR_SUFFIX = ".akgentic"
-"""Suffix of the sibling metadata directory: workspace ``foo``'s lives at ``foo.akgentic``."""
+META_DIR_SUFFIX = ".index"
+"""Suffix of the sibling metadata directory: workspace ``foo``'s lives at ``foo.index``."""
 
 GITIGNORE_NAME = ".gitignore"
 

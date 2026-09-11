@@ -14,7 +14,7 @@ from akgentic.tool import WorkspaceTool
 | Actor | `#Workspace-<scope>/<kind>/<leaf>` — the **resolved three-segment path**, slashes included, so two principals' `notes` are two actors over two trees. An ordinary **team child**: created by its card through `getChildrenOrCreate`, in exactly one team's roster, stopped by that team's teardown. It owns **dispatch and no shared state** — with `workspace_exec` on, the tree's sandbox backend and the single worker thread that runs commands on it, plus the retrieval indexing pipeline. Two teams over one tree get two actors, and the tree orders them — see *Lifetime* below |
 | Channels used | `TOOL_CALL` (11 callables, 13 with `workspace_exec`), `COMMAND` (`expand_media_refs`) |
 | Optional extras | `[docs]` for binary reads, `[vision]` for image resizing |
-| Environment | `AKGENTIC_WORKSPACES_ROOT` (default `./workspaces`) · `AKGENTIC_WORKSPACE_META_ROOT` (default: the workspaces root; relocates only the `<leaf>.akgentic` siblings) · `AKGENTIC_WORKSPACE_SHARED_KINDS` (default unset, which permits **no** shared tree — see *Sharing a tree across principals*) · `AKGENTIC_LOCK_BACKEND` (default `file`) · `AKGENTIC_DOCUMENT_STORE` (default `yaml`). The last three are read on every bind, and a value they cannot use fails that bind |
+| Environment | `AKGENTIC_WORKSPACES_ROOT` (default `./workspaces`) · `AKGENTIC_WORKSPACE_META_ROOT` (default: the workspaces root; relocates only the `<leaf>.index` siblings) · `AKGENTIC_WORKSPACE_SHARED_KINDS` (default unset, which permits **no** shared tree — see *Sharing a tree across principals*) · `AKGENTIC_LOCK_BACKEND` (default `file`) · `AKGENTIC_DOCUMENT_STORE` (default `yaml`). The last three are read on every bind, and a value they cannot use fails that bind |
 | External tools | `git` (optional — the journal, see below), `rg` (optional — accelerates `workspace_grep`) |
 
 ---
@@ -885,20 +885,20 @@ $AKGENTIC_WORKSPACES_ROOT/                      # default ./workspaces
 │   ├── _team/
 │   │   ├── <team_id>/                          # the root every path is anchored to
 │   │   ├── <team_id>.git/                      # the journal — a SIBLING, never inside the root
-│   │   └── <team_id>.akgentic/                 # <meta> — a sibling too
+│   │   └── <team_id>.index/                 # <meta> — a sibling too
 │   ├── _id/
 │   │   ├── notes/                              # a named workspace: a second tree of alice's OWN
 │   │   ├── notes.git/
-│   │   └── notes.akgentic/
+│   │   └── notes.index/
 │   └── _meta/
 │       ├── customer_id-ACME__case_id-42/       # metadata-keyed, and still alice's own
 │       ├── customer_id-ACME__case_id-42.git/
-│       └── customer_id-ACME__case_id-42.akgentic/
+│       └── customer_id-ACME__case_id-42.index/
 └── _shared/                                    # reserved: trees no principal owns
     └── _meta/
         ├── customer_id-ACME/                   # workspace_sharable=True, permitted for `meta`
         ├── customer_id-ACME.git/
-        └── customer_id-ACME.akgentic/
+        └── customer_id-ACME.index/
 ```
 
 **Depth is fixed at three, and what that buys is that no workspace path is a proper prefix of
@@ -915,20 +915,20 @@ meet.
 **The reserved names are refused on both sides, or two cells collapse into one tree.**
 `user_segment` refuses a principal named `_shared` or any of the three kind names: a principal called
 `_shared` would *be* the shared cell. `leaf_segment` refuses the three kind names, and any leaf ending
-in `.git` or `.akgentic`, which would root one tree at another workspace's journal or metadata
+in `.git` or `.index`, which would root one tree at another workspace's journal or metadata
 directory. Both match **exactly**, never as a `_` prefix (an Azure AD `sub` is base64url, whose
 alphabet includes `_`), and **case-insensitively**, because macOS and Windows filesystems are.
 `_shared` is a legal **leaf**: at the third position it collides with nothing.
 
 **Two sibling directories sit beside every tree, never inside it**, in the same `<scope>/<kind>/`
-directory: `<leaf>.git`, the journal, and `<leaf>.akgentic`, the tree's metadata directory
+directory: `<leaf>.git`, the journal, and `<leaf>.index`, the tree's metadata directory
 (`<meta>`), which holds the exec lock, the `rag/` document records, the local vector backend's
 `index/` and the `locks/`. Being beside the tree is what keeps both out of every read capability and
 out of every sandbox mount: **neither is ever mounted**. `AKGENTIC_WORKSPACE_META_ROOT`, when it
-carries a value, relocates only the `.akgentic` parent, carrying the scope and kind segments with it
-(`$AKGENTIC_WORKSPACE_META_ROOT/alice/_id/notes.akgentic`). An **empty** value falls back to the
+carries a value, relocates only the `.index` parent, carrying the scope and kind segments with it
+(`$AKGENTIC_WORKSPACE_META_ROOT/alice/_id/notes.index`). An **empty** value falls back to the
 workspaces root rather than to the process's working directory, and the `.git` sibling never moves.
-**Whatever removes a tree must remove both siblings too.** `<leaf>.akgentic/rag/*.yaml` holds the
+**Whatever removes a tree must remove both siblings too.** `<leaf>.index/rag/*.yaml` holds the
 **extracted text** of every document the tree indexed, and `akgentic-infra`'s team deletion does not
 yet remove the siblings.
 

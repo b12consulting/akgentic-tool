@@ -110,7 +110,7 @@ workspace shares one `#Workspace-<scope>/<kind>/<leaf>`, and that actor holds ex
 one worker for its tree. Two exec-capable cards on two workspaces in one team get two workspace
 actors, two backends, and — on the docker backend — two containers, each mounting its own tree. Two
 **teams** on one tree get two actors as well, since the actor is a team child: the tree orders them,
-because the exec hold is an `O_EXCL` marker file in the tree's `<leaf>.akgentic` sibling rather than
+because the exec hold is an `O_EXCL` marker file in the tree's `<leaf>.index` sibling rather than
 state in either actor. The name
 carries the resolved path so that a second workspace can never be resolved onto the first one's
 actor.
@@ -224,7 +224,7 @@ $AKGENTIC_WORKSPACES_ROOT/            # default ./workspaces
     └── <kind>/                       # _team, _id or _meta
         ├── <leaf>/                   # created by backend.start(); cwd is resolved under it
         ├── <leaf>.git/               # the journal — outside every mount, deliberately
-        └── <leaf>.akgentic/          # <meta>: exec lock, rag/, index/, locks/ — likewise
+        └── <leaf>.index/          # <meta>: exec lock, rag/, index/, locks/ — likewise
 ```
 
 `<scope>/<kind>/<leaf>` is the three-segment path the card resolved: `<scope>/_team/<team_id>` for a
@@ -233,7 +233,7 @@ metadata-keyed one. The backend receives it already resolved and derives nothing
 
 The directory is created by `start()`, which the worker thread calls lazily before the first
 command; the resolved host path is held on the backend instance (`workspace_path`) and nowhere
-else. Only the tree is ever mounted — never the `.git` sibling, and never the `.akgentic` one.
+else. Only the tree is ever mounted — never the `.git` sibling, and never the `.index` one.
 
 ### Backend specifics
 

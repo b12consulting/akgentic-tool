@@ -389,7 +389,7 @@ def meta_dir_for(workspace_path: str) -> Path:
     """Return the metadata directory belonging to the tree at *workspace_path*.
 
     A **sibling** of the tree, never a child of it: workspace
-    ``<scope>/<kind>/notes`` owns ``<scope>/<kind>/notes.akgentic``, exactly as
+    ``<scope>/<kind>/notes`` owns ``<scope>/<kind>/notes.index``, exactly as
     it owns the journal's ``<scope>/<kind>/notes.git``
     (:func:`~akgentic.tool.workspace.journal.git_dir_for`, ADR-051 Decision 9).
     Both land in ``<scope>/<kind>/``, beside the tree, whatever the depth: the
@@ -419,7 +419,7 @@ def meta_dir_for(workspace_path: str) -> Path:
             from.
 
     Returns:
-        The absolute ``<parent>/<scope>/<kind>/<leaf>.akgentic``, where ``<parent>`` is
+        The absolute ``<parent>/<scope>/<kind>/<leaf>.index``, where ``<parent>`` is
         ``AKGENTIC_WORKSPACE_META_ROOT`` when it carries a value and the
         workspaces root otherwise — an **empty** value falls back rather than
         being honoured, see below.
@@ -661,7 +661,7 @@ def leaf_segment(value: str) -> str:
 
     Like :func:`user_segment` except in what it reserves: a leaf may not be one
     of the three **kind** names (``_team``, ``_id``, ``_meta``), and it may not
-    end in ``.git`` or ``.akgentic``. ``_shared`` is not reserved here — it is a
+    end in ``.git`` or ``.index``. ``_shared`` is not reserved here — it is a
     scope, and a leaf of that name sits at the third position, where it collides
     with nothing.
 
@@ -693,9 +693,9 @@ def leaf_segment(value: str) -> str:
     **Why these suffixes are a containment failure and not a name clash.** Both
     of a workspace's sidecar directories are *siblings of the tree, in the same
     directory*: ``git_dir_for`` returns ``<root>.git`` and :func:`meta_dir_for`
-    returns ``<root>.akgentic``, so ``workspace_id="notes"`` owns
+    returns ``<root>.index``, so ``workspace_id="notes"`` owns
     ``<scope>/_id/notes``, ``<scope>/_id/notes.git`` and
-    ``<scope>/_id/notes.akgentic``. A second card declaring
+    ``<scope>/_id/notes.index``. A second card declaring
     ``workspace_id="notes.git"`` therefore roots its **tree** at the first
     workspace's **git repository**, and its agent lists, reads, writes and
     deletes inside another workspace's history as ordinary in-tree activity —
@@ -705,7 +705,7 @@ def leaf_segment(value: str) -> str:
     It is the same failure the fixed three-segment depth removes, arriving
     through a suffix instead of through a slash.
 
-    ``workspace_id="notes.akgentic"`` is that failure again, over the directory
+    ``workspace_id="notes.index"`` is that failure again, over the directory
     holding the exec lock, the document cache and the retrieval index — every
     one of which is placed outside the tree *precisely* so that no agent can
     reach it, and all of which this card would then hold as its own files.
@@ -736,7 +736,7 @@ def leaf_segment(value: str) -> str:
     Raises:
         ValueError: If the value cannot be a single directory segment, if it is
             a kind name in any letter case, or if it ends in ``.git`` or
-            ``.akgentic``.
+            ``.index``.
     """
     if _unusable_as_segment(value):
         raise ValueError(f"workspace leaf is not usable as a directory name: {value!r}")
