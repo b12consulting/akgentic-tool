@@ -25,6 +25,7 @@ from pydantic import ValidationError
 from akgentic.tool.workspace import (
     EXEC_LOCK_FILENAME,
     LEASE_GRACE_S,
+    META_DIR_SUFFIX,
     FileLockBackend,
     LockBackend,
     LockGrant,
@@ -191,7 +192,7 @@ class TestTheMarkerIsASiblingOfTheTree:
         # workspace path, never a resolved root.
         FileLockBackend().acquire(TREE, ticket())
 
-        assert marker_path().parent.name == f"{Path(TREE).name}.akgentic"
+        assert marker_path().parent.name == f"{Path(TREE).name}{META_DIR_SUFFIX}"
         assert marker_path().parent.parent == tree_root.parent
 
 
