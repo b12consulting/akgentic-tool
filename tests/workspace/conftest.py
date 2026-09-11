@@ -274,9 +274,11 @@ class FakeOrchestratorProxy:
     Story 52-6 kept a ``getResourceOrCreate`` here as a trap against a host
     forward coming back; story 54-5 removed it, because no published core ever
     had that method. What guards the negative now is the strict type check
-    against the shipped core, which sees every line and not only the paths a spec
-    drives, and the :attr:`create_calls` positives beside it. A forward that
-    reached this fake unswallowed would raise ``AttributeError``.
+    against the shipped core, and the :attr:`create_calls` positives beside it.
+    The check sees every call made on a proxy typed ``Orchestrator`` — which is
+    how the card builds every one it holds — swallowed or not, and not only on
+    the paths a spec drives. A forward that reached this fake unswallowed would
+    raise ``AttributeError``.
 
     With *live* set, the actors it creates are genuinely started on their own
     thread and handed out behind a real ``ActorAddressImpl``. That is what lets a

@@ -285,8 +285,9 @@ class TestTheCapability:
         # exactly one actor — the workspace's own, a team child again since
         # 52-5 — in a team that never asked for exec. Asserted as an equality
         # over the created list rather than as the absence of a name, so it
-        # cannot pass over an empty list. A forward to a host is the strict type
-        # check's to catch: the core this package ships against has none.
+        # cannot pass over an empty list. A forward to a resource host is the
+        # strict type check's to catch: the core this package ships against has
+        # none.
         def explode() -> str:
             raise AssertionError("a card with exec off probed the host for a backend")
 

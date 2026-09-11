@@ -686,12 +686,15 @@ class TestTheCardBindsAsATeamChild:
     state the host existed to keep single has moved onto the tree, so there is
     nothing left for two actors over one tree to disagree about.
 
-    The two negatives are the point of the class: nothing forwards to a host,
-    and nothing under ``workspace/card/`` so much as imports one. The first is
-    the strict type check's since story 54-5 — the core this package ships
-    against has no forward to make — beside the one child create asserted
-    below. That pair is ``akgentic-infra``\'s acceptance guard read from this
-    side of the seam.
+    What this class asserts is the positive: exactly one ``WorkspaceActor``
+    create per bind, on every card shape, and one attach event. The two
+    negatives beside it — nothing forwards to a host, and nothing under
+    ``workspace/card/`` imports one — are no longer asserted here. Since story
+    54-5 the first is the strict type check's, because the core this package
+    ships against has no forward to make; the second is structural, because
+    neither this package's host module (``TestTheHostIsGoneFromTheModuleTree``)
+    nor core's exists to import. Together they are ``akgentic-infra``\'s
+    acceptance guard read from this side of the seam.
     """
 
     @pytest.mark.parametrize("shape", ["bare", "named", "metadata", "exec", "rag"])
