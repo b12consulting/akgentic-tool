@@ -77,6 +77,7 @@ from tests.workspace.conftest import (
     wait_until,
     watch_store,
     workspace_config,
+    workspace_path_for,
     workspace_root_for,
 )
 from tests.workspace.test_document_cache import _ExtractWithExtraField
@@ -951,8 +952,12 @@ class TestOnlyTheKnownFunctionsWriteARecord:
 ##
 ## AC 5, live — a second actor over the same tree reads what the first one wrote
 ##
-_LIVE_PATH = "u-alice/restored"
-"""The tree the live specs host — one per spec, since each spec has its own system."""
+_LIVE_PATH = workspace_path_for("restored")
+"""The tree the live specs host — one per spec, since each spec has its own system.
+
+Derived through the same helper as the ``tree`` each spec writes into, so the
+actor's path and the directory the spec seeds cannot disagree.
+"""
 
 
 @pytest.fixture

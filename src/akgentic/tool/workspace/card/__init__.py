@@ -180,25 +180,50 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
     # Read capability fields (formerly in WorkspaceReadTool)
     workspace_id: str | None = None
     workspace_metadata_keys: list[str] = []
-    """Metadata fields whose values key a workspace **shared** across teams and users.
+    """Metadata fields whose values key the workspace — the ``_meta`` kind.
 
     The third of three layouts (ADR-048 Decision 2). Declaring
     ``["customer_id", "case_id"]`` on a team whose metadata carries ``ACME`` and
-    ``42`` resolves to ``_meta/customer_id-ACME__case_id-42`` — under a reserved
-    scope rather than under anybody's principal, because sharing is the point.
+    ``42`` resolves to ``alice/_meta/customer_id-ACME__case_id-42`` for principal
+    ``alice``. **Per-principal, like the other two kinds**: every team of one
+    user carrying the same values reaches one tree, and another user's teams
+    reach another. It is shared across users only when the card also declares
+    :attr:`workspace_sharable`, which puts it at
+    ``_shared/_meta/customer_id-ACME__case_id-42``.
 
     **Keys are a sequence, not a set:** they are joined in declaration order, so
     the list reads as a refinement path from the coarsest scope down and
-    ``ls _meta/`` groups a customer's workspaces together. Two cards naming the
-    same keys in different orders therefore address different workspaces —
-    honest under the sequence model, and visible in the directory name. Values
-    are percent-encoded, which is what keeps the join unforgeable.
+    ``ls <scope>/_meta/`` groups a customer's workspaces together. Two cards
+    naming the same keys in different orders therefore address different
+    workspaces — honest under the sequence model, and visible in the directory
+    name. Values are percent-encoded, which is what keeps the join unforgeable.
 
     The resolver reads this field and nothing else reads it: the actor's config
     carries the resolved path, and a client learns which agent bound which tree
     from the ``WorkspaceAttached`` event the bind emits, never from a key list.
 
     Mutually exclusive with :attr:`workspace_id` — see :meth:`_one_layout`.
+    """
+    workspace_sharable: bool = False
+    """Whether this card's tree is shared across principals — ``False`` for every kind.
+
+    ``False`` puts the tree under the owning principal, ``alice/<kind>/<leaf>``;
+    ``True`` puts it under the reserved shared scope, ``_shared/<kind>/<leaf>``,
+    where every card declaring the same kind and leaf reaches the same tree.
+    Per-principal is the default for all three kinds, **metadata included**: a
+    tree is shared because its author wrote this, never as a side effect of which
+    layout field they filled in.
+
+    Orthogonal to :attr:`workspace_id` and :attr:`workspace_metadata_keys` —
+    valid with each of the three layouts, and not part of :meth:`_one_layout`.
+
+    **A plain ``bool`` with a real default, and it must stay one.** The card
+    round-trips through ``SerializableBaseModel`` on every team resume, and that
+    serializer emits every declared field whatever ``exclude_unset`` says — so a
+    design reading "did the author write this?" off ``model_fields_set`` answers
+    correctly on the first load and wrongly on every resume after it. That is the
+    defect story 52-4 shipped and fixed with ``backend_declared``. ``False`` is
+    ``False`` on both sides of a round trip: the value **is** the declaration.
     """
     workspace_read: WorkspaceRead | bool = True
     workspace_view: WorkspaceView | bool = True
@@ -375,7 +400,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
     # tells a model nothing it can act on. A plain string, so it is no more an
     # edge back to the agent than the id is.
     _agent_name: str = PrivateAttr(default="")
-    # The resolved two-segment path, kept because three runtime consumers need
+    # The resolved three-segment path, kept because three runtime consumers need
     # it after ``observer()`` has returned: the exec hold's tree key, the
     # metadata directory, and the journal.
     _workspace_path: str = PrivateAttr(default="")
@@ -564,7 +589,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         has just logged one.
 
         Args:
-            workspace_path: The resolved two-segment path, whose metadata
+            workspace_path: The resolved three-segment path, whose metadata
                 directory holds the commit lock.
         """
         assert self._workspace is not None
@@ -596,7 +621,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         the one the gate and the journal are guarding.
 
         Args:
-            workspace_path: The resolved two-segment path this card is anchored to.
+            workspace_path: The resolved three-segment path this card is anchored to.
 
         Returns:
             The resolved param, or ``None`` when this card enables no retrieval
@@ -704,7 +729,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
     def _resolve_path(
         self, observer: ActorToolObserver, orchestrator: ActorAddress
     ) -> PurePosixPath:
-        """Derive this card's two-segment workspace path, through the one resolver.
+        """Derive this card's three-segment workspace path, through the one resolver.
 
         ``observer.user_id`` is read as a **typed attribute**. A defaulted
         ``getattr`` would turn an observer that never received the identity into
@@ -735,6 +760,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
             team_id=str(observer.team_id),
             user_id=observer.user_id,
             metadata=metadata,
+            workspace_sharable=self.workspace_sharable,
         )
 
     def _enabled_exec(self) -> WorkspaceExec | None:
@@ -784,7 +810,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
 
         Args:
             observer: The owning agent, live at bind time.
-            workspace_path: The already-resolved two-segment path this card is
+            workspace_path: The already-resolved three-segment path this card is
                 anchored to. Passed down rather than re-derived, so the backend
                 cannot open a directory other than the one being gated.
 
@@ -927,7 +953,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         Args:
             observer: The owning agent, live at bind time.
             orchestrator: Address of the orchestrator.
-            workspace_path: The resolved two-segment path this card is anchored
+            workspace_path: The resolved three-segment path this card is anchored
                 to, carried into the actor's name verbatim — slash included.
                 Nothing parses an actor name, and the path is injective by
                 construction, so carrying it whole avoids a second encoding

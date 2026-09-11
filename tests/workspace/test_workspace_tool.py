@@ -87,9 +87,9 @@ def make_wired_tool(tmp_path: Path) -> tuple[WorkspaceTool, Filesystem]:
     ):
         actor = WorkspaceActor(
             config=WorkspaceConfig(
-                name=workspace_actor_name(f"{TEST_PRINCIPAL}/{observer.team_id}"),
+                name=workspace_actor_name(f"{TEST_PRINCIPAL}/_team/{observer.team_id}"),
                 role=WORKSPACE_ACTOR_ROLE,
-                workspace_path=f"{TEST_PRINCIPAL}/{observer.team_id}",
+                workspace_path=f"{TEST_PRINCIPAL}/_team/{observer.team_id}",
             )
         )
         actor.on_start()
@@ -1327,7 +1327,7 @@ class TestWorkspaceToolSeedResources:
 
 
 # ---------------------------------------------------------------------------
-# The two-segment layout at the card's own surface (ADR-048)
+# The three-segment layout at the card's own surface (ADR-048, ADR-052)
 # ---------------------------------------------------------------------------
 
 
@@ -1348,7 +1348,7 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
         card = WorkspaceTool()
         card.observer(observer)
 
-        expected = workspaces_root / "alice" / str(observer.team_id)
+        expected = workspaces_root / "alice" / "_team" / str(observer.team_id)
         assert card.workspace._root == expected.resolve()
 
     def test_a_named_card_anchors_that_name_under_its_owner(
@@ -1358,7 +1358,7 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
         card = WorkspaceTool(workspace_id="notes")
         card.observer(observer)
 
-        assert card.workspace._root == (workspaces_root / "alice" / "notes").resolve()
+        assert card.workspace._root == (workspaces_root / "alice" / "_id" / "notes").resolve()
 
     def test_two_principals_naming_one_workspace_get_two_trees_and_two_actors(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
@@ -1375,13 +1375,13 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
         bob_card.observer(FakeActorToolObserver(orchestrator_proxy, "bob", user_id="bob"))
 
         assert alice_card.workspace._root != bob_card.workspace._root
-        assert workspace_actor_name("alice/notes") in orchestrator_proxy.children
-        assert workspace_actor_name("bob/notes") in orchestrator_proxy.children
+        assert workspace_actor_name("alice/_id/notes") in orchestrator_proxy.children
+        assert workspace_actor_name("bob/_id/notes") in orchestrator_proxy.children
 
     def test_two_exec_cards_on_two_workspaces_create_exactly_two_workspace_actors(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
     ) -> None:
-        """AC 14: the actor name carries the full two-segment path, slash included.
+        """AC 14: the actor name carries the full three-segment path, slashes included.
 
         Nothing parses an actor name and the path is injective by construction,
         so it is carried whole rather than flattened through a second encoding
@@ -1396,7 +1396,7 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
         it cannot pass over an empty set either.
         """
         for leaf in ("alpha", "beta"):
-            (workspaces_root / "alice" / leaf).mkdir(parents=True, exist_ok=True)
+            (workspaces_root / "alice" / "_id" / leaf).mkdir(parents=True, exist_ok=True)
             card = WorkspaceTool(
                 workspace_id=leaf,
                 workspace_exec=WorkspaceExec(mode="local", poll_attempts=0),
@@ -1407,11 +1407,11 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
 
         names = set(orchestrator_proxy.children)
         assert names == {
-            workspace_actor_name("alice/alpha"),
-            workspace_actor_name("alice/beta"),
+            workspace_actor_name("alice/_id/alpha"),
+            workspace_actor_name("alice/_id/beta"),
         }
-        # The slash survives into the name verbatim — it is not escaped away.
-        assert "#Workspace-alice/alpha" in names
+        # The slashes survive into the name verbatim — they are not escaped away.
+        assert "#Workspace-alice/_id/alpha" in names
         # Stated as well as implied: the retired actor's prefix appears nowhere.
         assert not any(name.startswith("#SandboxActor") for name in names)
 
@@ -1427,9 +1427,10 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
 
         assert orchestrator_proxy.metadata_calls == 0
 
-    def test_a_metadata_card_asks_once_and_lands_under_the_reserved_scope(
+    def test_a_metadata_card_asks_once_and_lands_under_its_owner(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
     ) -> None:
+        """Per-principal by default, like every other kind — sharing is declared, not implied."""
         orchestrator_proxy.metadata = _CaseMetadata(customer_id="ACME", case_id="42")
         card = WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])
         card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
@@ -1437,7 +1438,7 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
         assert orchestrator_proxy.metadata_calls == 1
         assert (
             card.workspace._root
-            == (workspaces_root / "_meta" / "customer_id-ACME__case_id-42").resolve()
+            == (workspaces_root / "alice" / "_meta" / "customer_id-ACME__case_id-42").resolve()
         )
 
     def test_a_metadata_card_on_a_team_without_metadata_fails_binding(
@@ -1446,7 +1447,7 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
         """``observer()`` can now raise where it never did, and that is the decision.
 
         It fails team creation in front of the admin who caused it, rather than
-        silently un-sharing a workspace that was declared to be shared.
+        silently re-homing the tree onto a path the card never declared.
         """
         card = WorkspaceTool(workspace_metadata_keys=["customer_id"])
 
@@ -1520,7 +1521,7 @@ class TestTheConfigCarriesThePathAndNoKeyList:
         card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
 
         config = self._bound_config(orchestrator_proxy)
-        assert config.workspace_path == "_meta/customer_id-ACME__case_id-42"
+        assert config.workspace_path == "alice/_meta/customer_id-ACME__case_id-42"
         assert "metadata_keys" not in WorkspaceConfig.model_fields
         assert "metadata_keys" not in config.model_dump()
 
@@ -1532,7 +1533,9 @@ class TestTheConfigCarriesThePathAndNoKeyList:
         card = WorkspaceTool(workspace_metadata_keys=["customer_id", "customer_id"])
         card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
 
-        assert self._bound_config(orchestrator_proxy).workspace_path == "_meta/customer_id-ACME"
+        assert (
+            self._bound_config(orchestrator_proxy).workspace_path == "alice/_meta/customer_id-ACME"
+        )
 
     def test_a_config_record_still_carrying_the_key_list_loads(self) -> None:
         """A removed field is harmless to stored records: the unknown key is ignored."""
@@ -1598,4 +1601,4 @@ class TestTheIdentityIsReadAsATypedAttribute:
         card = WorkspaceTool(workspace_id="notes")
         card.observer(FakeActorToolObserver(orchestrator_proxy, user_id=None))
 
-        assert card.workspace._root == (workspaces_root / "anonymous" / "notes").resolve()
+        assert card.workspace._root == (workspaces_root / "anonymous" / "_id" / "notes").resolve()

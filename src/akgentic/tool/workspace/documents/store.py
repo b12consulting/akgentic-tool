@@ -182,7 +182,7 @@ class YamlDocumentStore:
         rejects.
 
         Args:
-            tree_key: The two-segment ``<scope>/<leaf>`` path
+            tree_key: The three-segment ``<scope>/<kind>/<leaf>`` path
                 :func:`~akgentic.tool.workspace.workspace.get_workspace` takes.
             path: Workspace-relative path of the source document.
 

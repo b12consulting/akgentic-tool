@@ -147,8 +147,8 @@ def workspace_actor_name(workspace_name: str) -> str:
     """Return the singleton actor name owning *workspace_name*.
 
     Args:
-        workspace_name: The **resolved** two-segment workspace path, exactly as
-            the card derived it and as ``Filesystem`` receives it. Its slash is
+        workspace_name: The **resolved** three-segment workspace path, exactly as
+            the card derived it and as ``Filesystem`` receives it. Its slashes are
             carried verbatim — nothing parses an actor name, and the path is
             injective by construction.
 

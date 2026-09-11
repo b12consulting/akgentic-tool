@@ -44,6 +44,7 @@ from tests.workspace.conftest import (
     tool_named,
     workspace_root_for,
 )
+from tests.workspace.test_workspace_path_resolution import SIX_CELLS, Cell, bind_cell
 
 META_ROOT_VAR = "AKGENTIC_WORKSPACE_META_ROOT"
 """The variable that relocates the metadata *parent*, and only that."""
@@ -275,11 +276,11 @@ class TestTheMetaRootRelocatesTheParent:
     def test_it_moves_the_parent_and_keeps_the_scope(
         self, workspaces_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``<meta-root>/<scope>/<leaf>.akgentic`` — the scope survives the move.
+        """``<meta-root>/<scope>/<kind>/<leaf>.akgentic`` — scope and kind survive the move.
 
-        It is why the resolver takes the two-segment path rather than a resolved
-        root: the scope cannot be recovered from an absolute path without also
-        knowing which workspaces root it came from.
+        It is why the resolver takes the three-segment path rather than a
+        resolved root: neither segment can be recovered from an absolute path
+        without also knowing which workspaces root it came from.
         """
         elsewhere = tmp_path / "meta-volume"
         monkeypatch.setenv(META_ROOT_VAR, str(elsewhere))
@@ -468,3 +469,62 @@ class TestALeafMayNotEndInTheMetadataSuffix:
             leaf_segment(f"notes{GIT_DIR_SUFFIX}")
         with pytest.raises(ValueError, match="metadata directory"):
             leaf_segment(f"notes{META_DIR_SUFFIX}")
+
+
+##
+## Epic 54, story 54-1 AC 9 — both siblings land beside every one of the six cells
+##
+
+
+def _cell_ids(cell: Cell) -> str:
+    return cell.name
+
+
+class TestBothSiblingsLandBesideEveryCell:
+    """``<leaf>.akgentic`` and ``<leaf>.git`` are children of ``<root>/<scope>/<kind>/``.
+
+    Neither ``meta_dir_for`` nor ``git_dir_for`` changed when the kind segment
+    arrived: both are "sibling of the resolved tree", and a three-segment tree
+    gives them the kind directory as a parent with no code change. These specs
+    pin that for every cell **as the card binds it**, against literal paths —
+    so a "fix" that dropped the kind, or a card deriving its metadata directory
+    some other way, goes red here.
+    """
+
+    @pytest.mark.parametrize("cell", SIX_CELLS, ids=_cell_ids)
+    def test_the_metadata_and_journal_siblings_share_the_trees_parent(
+        self, cell: Cell, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        card, expected, _observer = bind_cell(cell, orchestrator_proxy)
+        base = workspaces_root.resolve()
+        scope, kind, _leaf = expected.split("/")
+
+        meta = meta_dir_for(card._workspace_path)
+        git_dir = git_dir_for(card.workspace._root)
+
+        assert meta == Path(f"{base}/{expected}.akgentic")
+        assert card._meta_dir == meta
+        assert git_dir == Path(f"{base}/{expected}.git")
+        assert meta.parent == git_dir.parent == card.workspace._root.parent
+        assert meta.parent == base / scope / kind
+
+    @pytest.mark.parametrize("cell", SIX_CELLS, ids=_cell_ids)
+    def test_the_meta_root_carries_both_scope_and_kind_across_the_move(
+        self,
+        cell: Cell,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspaces_root: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``<meta_root>/<scope>/<kind>/<leaf>.akgentic`` — and the tree stays put."""
+        elsewhere = tmp_path / "meta-volume"
+        with monkeypatch.context() as patch:
+            patch.setenv(META_ROOT_VAR, str(elsewhere))
+            card, expected, _observer = bind_cell(cell, orchestrator_proxy)
+
+            meta = meta_dir_for(card._workspace_path)
+
+            assert meta == Path(f"{elsewhere.resolve()}/{expected}.akgentic")
+            assert card._meta_dir == meta
+            assert card.workspace._root == Path(f"{workspaces_root.resolve()}/{expected}")

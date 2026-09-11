@@ -32,8 +32,8 @@ class WorkspaceAttached:
         agent_id: The **binding agent**, never the envelope's sender. The
             envelope is sent by the orchestrator; this names the member whose
             card bound.
-        workspace_path: The resolved two-segment path the card bound, e.g.
-            ``"_meta/customer_id-ACME__case_id-42"``.
+        workspace_path: The resolved three-segment path the card bound, e.g.
+            ``"alice/_meta/customer_id-ACME__case_id-42"``.
     """
 
     agent_id: uuid.UUID

@@ -294,7 +294,7 @@ class SandboxBackend(Protocol):
         ...
 
     def start(self, workspace_path: str) -> None:
-        """Provision the backend for the already-resolved two-segment *workspace_path*."""
+        """Provision the backend for the already-resolved three-segment *workspace_path*."""
         ...
 
     def exec(self, cmd: str, cwd: str, timeout: float | None) -> ExecResult:

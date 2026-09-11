@@ -388,10 +388,13 @@ def get_workspace(workspace_name: str) -> Filesystem:
 def meta_dir_for(workspace_path: str) -> Path:
     """Return the metadata directory belonging to the tree at *workspace_path*.
 
-    A **sibling** of the tree, never a child of it: workspace ``<scope>/notes``
-    owns ``<scope>/notes.akgentic``, exactly as it owns the journal's
-    ``<scope>/notes.git`` (:func:`~akgentic.tool.workspace.journal.git_dir_for`,
-    ADR-051 Decision 9).
+    A **sibling** of the tree, never a child of it: workspace
+    ``<scope>/<kind>/notes`` owns ``<scope>/<kind>/notes.akgentic``, exactly as
+    it owns the journal's ``<scope>/<kind>/notes.git``
+    (:func:`~akgentic.tool.workspace.journal.git_dir_for`, ADR-051 Decision 9).
+    Both land in ``<scope>/<kind>/``, beside the tree, whatever the depth: the
+    rule is "sibling of the resolved tree", and it needed no change when the
+    kind segment was added.
 
     **The placement is a containment rule, not a naming preference.**
     :meth:`Filesystem._validate_path` rejects everything that does not resolve
@@ -407,15 +410,16 @@ def meta_dir_for(workspace_path: str) -> Path:
     something else made it; whichever caller first needs it creates it.
 
     Args:
-        workspace_path: The two-segment ``<scope>/<leaf>`` path
+        workspace_path: The three-segment ``<scope>/<kind>/<leaf>`` path
             :func:`get_workspace` takes — not a resolved root. The resolved root
             alone cannot survive ``AKGENTIC_WORKSPACE_META_ROOT``, which
-            relocates the metadata *parent*: the scope segment has to be carried
-            across the move, and it is unrecoverable from an absolute path
-            without also knowing which workspaces root it came from.
+            relocates the metadata *parent*: the scope and kind segments have to
+            be carried across the move, and they are unrecoverable from an
+            absolute path without also knowing which workspaces root it came
+            from.
 
     Returns:
-        The absolute ``<parent>/<scope>/<leaf>.akgentic``, where ``<parent>`` is
+        The absolute ``<parent>/<scope>/<kind>/<leaf>.akgentic``, where ``<parent>`` is
         ``AKGENTIC_WORKSPACE_META_ROOT`` when it carries a value and the
         workspaces root otherwise — an **empty** value falls back rather than
         being honoured, see below.
@@ -448,25 +452,56 @@ Not a gap to close: where there is no principal there is no isolation, by
 construction. A deployment that supplies no user id gets exactly one scope.
 """
 
-METADATA_SCOPE = "_meta"
-"""The ``<scope>`` a metadata-keyed workspace lives under.
+SHARED_SCOPE = "_shared"
+"""The ``<scope>`` of every tree a card declares ``workspace_sharable=True``.
 
-Shared across teams and across users — that is its purpose — so it sits under a
-reserved scope rather than under anybody's principal.
+The one scope that is not a principal: a tree under it belongs to nobody's
+user id, so every principal whose card declares the same kind and leaf reaches
+the same tree. Reserved against principals for exactly that reason — see
+:data:`RESERVED_SCOPES`.
 """
 
-RESERVED_SCOPES = frozenset({METADATA_SCOPE})
-"""Scopes no principal may occupy — reserved for the metadata layout.
+TEAM_KIND = "_team"
+"""The ``<kind>`` of a card that names no workspace: the leaf is the team id."""
 
-**Derived from :data:`METADATA_SCOPE`, never spelled again.** Two literals that
-have to agree is the defect this whole module removes, one scale down: a scope
-renamed in one of them and not the other would leave the metadata namespace
-open to a principal, which is a silent isolation failure.
+ID_KIND = "_id"
+"""The ``<kind>`` of a card declaring ``workspace_id``: the leaf is that name."""
+
+METADATA_KIND = "_meta"
+"""The ``<kind>`` of a card declaring ``workspace_metadata_keys``.
+
+``_meta`` is a **kind** now, never a scope: it says how the leaf was derived —
+from the team's metadata values — and nothing about who may reach the tree. A
+metadata tree is per-principal by default like any other; sharing is
+``workspace_sharable``'s to declare, not the kind's to imply.
+"""
+
+RESERVED_KINDS = frozenset({TEAM_KIND, ID_KIND, METADATA_KIND})
+"""The three ``<kind>`` names — refused as a leaf by :func:`leaf_segment`.
+
+**Derived from the three constants, never spelled again**, on the pattern of
+``_SIDECAR_SUFFIXES``: two literals that have to agree is the defect this whole
+module removes, one scale down.
+"""
+
+RESERVED_SCOPES = frozenset({SHARED_SCOPE}) | RESERVED_KINDS
+"""Scopes no principal may occupy: the shared scope, and every kind name.
+
+``_shared`` because a principal of that name would **be** the shared cell — its
+per-principal ``_shared/_id/notes`` is the shared ``_shared/_id/notes``. The kind
+names so that each reserved name means one thing at every position of a path,
+which is what lets a reader classify a tree from its shape alone.
+
+**Derived, never spelled again**, for the reason :data:`RESERVED_KINDS` is: a
+name renamed in one set and not the other would open a reserved namespace to a
+principal, which is a silent isolation failure.
 
 Matched **exactly**, never as a ``_`` prefix. The Azure AD ``sub`` is base64url
 and its alphabet includes ``_``, so reserving the whole underscore namespace
 would refuse roughly one user in sixty-four at team creation; a 43-character
-``sub`` never equals ``_meta``.
+``sub`` never equals ``_shared``. Matched **case-insensitively**, because macOS
+and Windows filesystems are: ``_SHARED/`` and ``_shared/`` are one directory
+there.
 """
 
 # The only shapes that are not a directory name. Everything else — emails, dots
@@ -528,17 +563,19 @@ def user_segment(user_id: str | None) -> str:
     Raises:
         ValueError: If the value cannot be a directory name (empty, leading
             ``.``, or containing ``/``, ``\\`` or NUL), or if it is a reserved
-            scope. Both are silent isolation failures if allowed through: the
-            empty string yields a hidden directory every affected user shares,
-            a ``/`` yields a nested path where two distinct ids alias, and
-            ``_meta`` lands a principal in the shared metadata namespace. The
-            empty case is reachable from an OIDC token carrying no ``sub``
+            scope in any letter case. Both are silent isolation failures if
+            allowed through: the empty string yields a hidden directory every
+            affected user shares, a ``/`` yields a nested path where two
+            distinct ids alias, and ``_shared`` lands a principal **in** the
+            shared cell — its per-principal ``_shared/_id/notes`` is the shared
+            ``_shared/_id/notes``, reachable by every card that declares it.
+            The empty case is reachable from an OIDC token carrying no ``sub``
             without anyone misbehaving, and it must still raise.
     """
     principal = ANONYMOUS if user_id is None else user_id
     if _unusable_as_segment(principal):
         raise ValueError(f"user_id is not usable as a workspace directory name: {principal!r}")
-    if principal in RESERVED_SCOPES:
+    if principal.lower() in RESERVED_SCOPES:
         raise ValueError(f"user_id may not be a reserved scope: {principal!r}")
     return principal
 
@@ -546,28 +583,49 @@ def user_segment(user_id: str | None) -> str:
 def leaf_segment(value: str) -> str:
     """The ``<leaf>`` segment — a ``workspace_id``, a team id, or a joined metadata key.
 
-    Like :func:`user_segment` except in two places: ``_meta`` is **not** reserved
-    here — ``_meta`` is a scope, and a workspace legitimately named ``_meta``
-    under some principal collides with nothing — and a leaf may not end in
-    ``.git`` or ``.akgentic``.
+    Like :func:`user_segment` except in what it reserves: a leaf may not be one
+    of the three **kind** names (``_team``, ``_id``, ``_meta``), and it may not
+    end in ``.git`` or ``.akgentic``. ``_shared`` is not reserved here — it is a
+    scope, and a leaf of that name sits at the third position, where it collides
+    with nothing.
 
-    A team id is a UUID, so it passes by construction. The two guards exist for
-    the values that do not: a ``workspace_id`` an author types by hand, and a
-    joined metadata leaf built out of business data.
+    A team id is a UUID, so it passes by construction, and a joined metadata
+    leaf always contains ``-``, so it never equals a kind name. The guards exist
+    for the values that do not pass by construction: a ``workspace_id`` an author
+    types by hand, and a joined metadata leaf built out of business data.
+
+    **Why a kind name is refused as a leaf — containment across depths, not a
+    collision.** Among three-segment paths a kind-named leaf meets nothing:
+    ``alice/_id/_team`` is the only path of that name. What it would reach is a
+    tree of a *different depth*. The only shorter path that can contain a
+    three-segment tree is ``<scope>/<kind>`` — a two-segment path whose leaf is a
+    kind name — and the layout this one replaced accepted exactly that:
+    ``workspace_id="_meta"`` resolved to ``alice/_meta``, a legal tree on disk
+    which is the **parent** of every ``alice/_meta/*`` tree minted now. An agent
+    anchored there reads and writes all of them as ordinary in-tree activity,
+    for the reason given below for the suffixes. Refusing kind names as leaves
+    means nothing from here on can mint such a path, and keeps each reserved name
+    meaning one thing at every position — which is what lets a reader classify a
+    tree from its shape. The trees already on disk are the migration's to find.
+
+    The kind match is **exact** — ``_teams``, ``_ids`` and ``_metadata`` are
+    ordinary names — and **case-insensitive**, for the reason the suffix match
+    below is.
 
     **Why these suffixes are a containment failure and not a name clash.** Both
     of a workspace's sidecar directories are *siblings of the tree, in the same
     directory*: ``git_dir_for`` returns ``<root>.git`` and :func:`meta_dir_for`
     returns ``<root>.akgentic``, so ``workspace_id="notes"`` owns
-    ``<scope>/notes``, ``<scope>/notes.git`` and ``<scope>/notes.akgentic``. A
-    second card declaring ``workspace_id="notes.git"`` therefore roots its
-    **tree** at the first workspace's **git repository**, and its agent lists,
-    reads, writes and deletes inside another workspace's history as ordinary
-    in-tree activity — ``Filesystem._validate_path`` rejects only what resolves
-    *outside* the root, and that root is a perfectly real directory. From the
-    other side, the first workspace's commits surface as files in the second's
-    tree. Nothing raises. It is the same failure the fixed two-segment depth
-    removes, arriving through a suffix instead of through a slash.
+    ``<scope>/_id/notes``, ``<scope>/_id/notes.git`` and
+    ``<scope>/_id/notes.akgentic``. A second card declaring
+    ``workspace_id="notes.git"`` therefore roots its **tree** at the first
+    workspace's **git repository**, and its agent lists, reads, writes and
+    deletes inside another workspace's history as ordinary in-tree activity —
+    ``Filesystem._validate_path`` rejects only what resolves *outside* the root,
+    and that root is a perfectly real directory. From the other side, the first
+    workspace's commits surface as files in the second's tree. Nothing raises.
+    It is the same failure the fixed three-segment depth removes, arriving
+    through a suffix instead of through a slash.
 
     ``workspace_id="notes.akgentic"`` is that failure again, over the directory
     holding the exec lock, the document cache and the retrieval index — every
@@ -581,9 +639,9 @@ def leaf_segment(value: str) -> str:
 
     **The match is case-insensitive** although both derivations only ever emit
     lowercase, because macOS and Windows filesystems are case-insensitive by
-    default: ``<scope>/notes.GIT`` and ``<scope>/notes.git`` are one directory
-    there, so an exact-match guard would pass the collision straight through on
-    the platform most of this is developed on.
+    default: ``<scope>/_id/notes.GIT`` and ``<scope>/_id/notes.git`` are one
+    directory there, so an exact-match guard would pass the collision straight
+    through on the platform most of this is developed on.
 
     **This does not make the journal's own guard redundant.** ``GitJournal``
     refuses to initialise when the root it was handed ends in ``.git``, and that
@@ -598,11 +656,17 @@ def leaf_segment(value: str) -> str:
         The leaf segment, unchanged.
 
     Raises:
-        ValueError: If the value cannot be a single directory segment, or if it
-            ends in ``.git`` or ``.akgentic``.
+        ValueError: If the value cannot be a single directory segment, if it is
+            a kind name in any letter case, or if it ends in ``.git`` or
+            ``.akgentic``.
     """
     if _unusable_as_segment(value):
         raise ValueError(f"workspace leaf is not usable as a directory name: {value!r}")
+    if value.lower() in RESERVED_KINDS:
+        raise ValueError(
+            f"workspace leaf may not be {value!r}, which is a reserved kind — a tree "
+            "of that name would contain every workspace of that kind"
+        )
     for suffix, owner in _SIDECAR_SUFFIXES.items():
         if value.lower().endswith(suffix):
             raise ValueError(
@@ -638,9 +702,9 @@ def _metadata_leaf(keys: list[str], metadata: SerializableBaseModel | None) -> s
     **Keys stay in declaration order** (ADR-048 Decision 3). The declaration is a
     *sequence*, not a set: it is an ordered refinement path whose first key is the
     coarsest scope, so ``["customer_id", "case_id"]`` yields
-    ``customer_id-ACME__case_id-42`` and ``ls _meta/`` groups a customer's
-    workspaces beside each other instead of scattering them under whichever key
-    happened to sort first.
+    ``customer_id-ACME__case_id-42`` and ``ls <scope>/_meta/`` groups a
+    customer's workspaces beside each other instead of scattering them under
+    whichever key happened to sort first.
 
     The trade, stated so nobody reads it as a defect: two cards naming the same
     keys in **different orders** address **different** workspaces. Under the
@@ -648,10 +712,10 @@ def _metadata_leaf(keys: list[str], metadata: SerializableBaseModel | None) -> s
     silent collision it is visible in the directory name.
 
     The prefix this creates is a **string** prefix between two *siblings*, never a
-    path prefix: ``_meta/customer_id-ACME`` and
-    ``_meta/customer_id-ACME__case_id-42`` are two leaves under one scope, and a
-    sibling cannot contain a sibling. Decision 1's antichain is about one path
-    *containing* another and is untouched here.
+    path prefix: ``<scope>/_meta/customer_id-ACME`` and
+    ``<scope>/_meta/customer_id-ACME__case_id-42`` are two leaves under one
+    ``<scope>/_meta``, and a sibling cannot contain a sibling. The antichain is
+    about one path *containing* another and is untouched here.
 
     Duplicates are removed keeping the **first** occurrence, so a repeated key
     adds no scope and names the tree it named once.
@@ -671,7 +735,7 @@ def _metadata_leaf(keys: list[str], metadata: SerializableBaseModel | None) -> s
 
     Raises:
         ValueError: If the team carries no metadata (falling back would silently
-            *un-share* a workspace declared to be shared), if a declared key is
+            re-home the tree onto a path the card never declared), if a declared key is
             not a field of the model (a typo must not resolve to a tree), if a
             value is ``None`` or empty (``case_id-`` would be a real directory
             shared by every team that left it blank), or if the joined leaf
@@ -715,47 +779,65 @@ def resolve_workspace_path(
     team_id: str,
     user_id: str | None,
     metadata: SerializableBaseModel | None,
+    workspace_sharable: bool,
 ) -> PurePosixPath:
-    """The workspace's two-segment path. The only place a path is derived.
+    """The workspace's three-segment path. The only place a path is derived.
 
-    ``<scope>`` answers *whose is this*, ``<leaf>`` answers *which of theirs*,
-    and the leaf is always a discriminator unique to one workspace — a team id,
-    a ``workspace_id``, or a joined metadata key, never a category:
+    ``<scope>`` answers *who may reach this*, ``<kind>`` answers *how was the
+    leaf derived*, and ``<leaf>`` answers *which one* — always a discriminator
+    unique to one workspace of that kind, never a category:
 
-    ==========================================  ==================================
-    Card                                        Path
-    ==========================================  ==================================
-    ``WorkspaceTool()``                         ``<user_segment(user_id)>/<team_id>``
-    ``WorkspaceTool(workspace_id="notes")``     ``<user_segment(user_id)>/notes``
-    ``WorkspaceTool(workspace_metadata_keys=…)``  ``_meta/customer_id-ACME__case_id-42``
-    ==========================================  ==================================
+    ==============================================  =============================
+    Card                                            Path
+    ==============================================  =============================
+    ``WorkspaceTool()``                             ``alice/_team/<team_id>``
+    ``WorkspaceTool(workspace_id="notes")``         ``alice/_id/notes``
+    ``WorkspaceTool(workspace_metadata_keys=…)``    ``alice/_meta/customer_id-ACME``
+    ``… workspace_sharable=True`` (each of above)   ``_shared/<kind>/<leaf>``
+    ==============================================  =============================
 
-    **Depth is fixed at two, and the invariant that buys is that no workspace
-    path is a prefix of another.** ``Filesystem._validate_path`` rejects only
-    paths resolving *outside* the root, so a workspace at ``ACME/`` would read
-    and write everything under ``ACME/42/`` as ordinary in-tree activity, with
-    the per-path write gate none the wiser. That is containment rather than a
-    name collision, and it is worse. At depth two with a unique leaf the
-    antichain holds by construction; an N-segment layout could be proved one
-    only by knowing every other workspace in the deployment.
+    ``alice`` is :func:`user_segment` of the principal. Per-principal is the
+    default for **every** kind, metadata included; ``workspace_sharable=True``
+    swaps the principal for :data:`SHARED_SCOPE` and changes nothing else.
 
-    The two card fields are mutually exclusive, enforced at card construction
-    rather than by precedence here (ADR-048 Decision 2).
+    **Depth is fixed at three, and the invariant that buys is that no workspace
+    path is a proper prefix of another.** No path of exactly three segments can
+    be a proper prefix of another, because a proper prefix has strictly fewer
+    segments. Fixed depth buys the property; two was never load-bearing, only
+    fixed. The hazard it removes is **containment**, not collision:
+    ``Filesystem._validate_path`` rejects only paths resolving *outside* the
+    root, so a workspace anchored at a parent would read and write everything
+    under a child's tree as ordinary in-tree activity, with the per-path write
+    gate none the wiser.
+
+    **``workspace_sharable`` is a request.** This resolver honours it for every
+    kind; whether a deployment permits a shared tree of a given kind is a
+    separate check at bind time.
+
+    The two layout fields are mutually exclusive, enforced at card construction
+    rather than by precedence here (ADR-048 Decision 2); ``workspace_sharable``
+    is orthogonal to both.
 
     Args:
         workspace_id: The card's named workspace, or ``None`` for the team's own.
-        workspace_metadata_keys: The metadata fields keying a shared workspace.
-            Empty for the two per-user layouts.
+        workspace_metadata_keys: The metadata fields keying the workspace. Empty
+            for the other two kinds.
         team_id: The owning team, used as the leaf when no name is declared.
         user_id: The owning principal, or ``None`` for an unauthenticated one.
+            Not consulted at all when *workspace_sharable* is set.
         metadata: The team's metadata, consulted only when keys are declared.
+        workspace_sharable: Whether the tree lives under the shared scope rather
+            than under the principal. **Required, with no default**: a caller
+            that does not know about sharing must fail here with a
+            ``TypeError``, not silently resolve a shared card's tree to a
+            per-principal path nobody else can see.
 
     Returns:
-        A relative two-segment path, to be joined to the workspaces root.
+        A relative three-segment path, to be joined to the workspaces root.
 
     Raises:
-        ValueError: On any input that cannot yield a safe two-segment path — see
-            :func:`user_segment`, :func:`leaf_segment` and the metadata
+        ValueError: On any input that cannot yield a safe three-segment path —
+            see :func:`user_segment`, :func:`leaf_segment` and the metadata
             conditions. **Never** a fallback: a raise out of card binding fails
             team creation in front of the admin who caused it, where a fallback
             would silently collapse several principals into one tree.
@@ -766,14 +848,18 @@ def resolve_workspace_path(
         # exists to remove. ``.`` is inside the encoder's safe set, so a
         # ``customer_id`` of ``x.git`` survives encoding whole and yields the leaf
         # ``customer_id-x.git``, which *is* the journal directory of
-        # ``_meta/customer_id-x``. The same collision as the hand-typed
+        # ``<scope>/_meta/customer_id-x``. The same collision as the hand-typed
         # ``workspace_id="notes.git"``, reached from business data rather than
         # from a card field anybody chose.
-        return PurePosixPath(METADATA_SCOPE) / leaf_segment(
-            _metadata_leaf(workspace_metadata_keys, metadata)
-        )
-    # Tested against ``None`` rather than for truthiness: a card carrying
-    # ``workspace_id=""`` named a workspace and got the name wrong, and falling
-    # through to the team id would answer that mistake silently.
-    named = team_id if workspace_id is None else workspace_id
-    return PurePosixPath(user_segment(user_id)) / leaf_segment(named)
+        kind, leaf = METADATA_KIND, _metadata_leaf(workspace_metadata_keys, metadata)
+    elif workspace_id is not None:
+        # Tested against ``None`` rather than for truthiness: a card carrying
+        # ``workspace_id=""`` named a workspace and got the name wrong, and
+        # falling through to the team id would answer that mistake silently.
+        kind, leaf = ID_KIND, workspace_id
+    else:
+        kind, leaf = TEAM_KIND, team_id
+    # The shared scope never consults the principal: a resolver must not refuse
+    # on an input it does not use.
+    scope = SHARED_SCOPE if workspace_sharable else user_segment(user_id)
+    return PurePosixPath(scope) / kind / leaf_segment(leaf)

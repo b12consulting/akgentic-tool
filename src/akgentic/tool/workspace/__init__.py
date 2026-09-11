@@ -155,8 +155,12 @@ from akgentic.tool.workspace.readers import (
 )
 from akgentic.tool.workspace.workspace import (
     ANONYMOUS,
-    METADATA_SCOPE,
+    ID_KIND,
+    METADATA_KIND,
+    RESERVED_KINDS,
     RESERVED_SCOPES,
+    SHARED_SCOPE,
+    TEAM_KIND,
     FileEntry,
     Filesystem,
     PathEscapeError,
@@ -172,8 +176,12 @@ from akgentic.tool.workspace.workspace import (
 
 __all__ = [
     "ANONYMOUS",
-    "METADATA_SCOPE",
+    "ID_KIND",
+    "METADATA_KIND",
+    "RESERVED_KINDS",
     "RESERVED_SCOPES",
+    "SHARED_SCOPE",
+    "TEAM_KIND",
     "DEFAULT_EXEC_POLL_ATTEMPTS",
     "DEFAULT_EXEC_POLL_DELAY_S",
     "DEFAULT_EXEC_TIMEOUT_S",

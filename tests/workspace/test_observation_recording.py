@@ -663,7 +663,7 @@ def _card_shape(
     if shape == "metadata":
         orchestrator_proxy.metadata = _CaseMetadata(customer_id="ACME", case_id="42")
         card = WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])
-        return card, "_meta/customer_id-ACME__case_id-42"
+        return card, f"{DEFAULT_TEST_PRINCIPAL}/_meta/customer_id-ACME__case_id-42"
     if shape == "exec":
         request.getfixturevalue("sandbox_script")
         card = WorkspaceTool(
@@ -706,7 +706,7 @@ class TestTheCardBindsAsATeamChild:
         observer = FakeActorToolObserver(orchestrator_proxy)
         card.observer(observer)
         if path is None:
-            path = f"{DEFAULT_TEST_PRINCIPAL}/{observer.team_id}"
+            path = f"{DEFAULT_TEST_PRINCIPAL}/_team/{observer.team_id}"
 
         workspace_creates = [
             config

@@ -118,14 +118,14 @@ class TestObserverWiring:
             tool.observer(observer)
 
     def test_observer_sets_workspace_under_the_owning_principal(self, tmp_path: Path) -> None:
-        """With no ``workspace_id`` the leaf is the team id — nested under its owner."""
+        """With no ``workspace_id`` the leaf is the team id — ``_team`` kind, under its owner."""
         team_id = uuid.uuid4()
         observer = make_observer(team_id=team_id)
         fs = Filesystem(str(tmp_path), str(team_id))
         tool = WorkspaceTool(read_only=True)
         with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs) as mock_gw:
             result = tool.observer(observer)
-            mock_gw.assert_called_once_with(f"{TEST_PRINCIPAL}/{team_id}")
+            mock_gw.assert_called_once_with(f"{TEST_PRINCIPAL}/_team/{team_id}")
             assert tool.workspace is fs
             assert result is tool
 
@@ -142,7 +142,7 @@ class TestObserverWiring:
         tool = WorkspaceTool(read_only=True, workspace_id="explicit-ws")
         with patch("akgentic.tool.workspace.card.get_workspace", return_value=fs) as mock_gw:
             tool.observer(observer)
-            mock_gw.assert_called_once_with(f"{TEST_PRINCIPAL}/explicit-ws")
+            mock_gw.assert_called_once_with(f"{TEST_PRINCIPAL}/_id/explicit-ws")
 
     def test_observer_returns_self(self, tmp_path: Path) -> None:
         team_id = uuid.uuid4()

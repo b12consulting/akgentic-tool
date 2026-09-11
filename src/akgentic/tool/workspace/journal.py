@@ -299,7 +299,7 @@ class GitJournal:
             meta_dir: The tree's metadata directory —
                 :func:`~akgentic.tool.workspace.workspace.meta_dir_for`'s answer
                 for this tree. **Passed in rather than derived**: that function
-                takes the two-segment workspace *path*, which this object has
+                takes the three-segment workspace *path*, which this object has
                 never been given and cannot recover from an absolute root once
                 ``AKGENTIC_WORKSPACE_META_ROOT`` has moved the parent. It is a
                 required argument rather than a defaulted one because what lives

@@ -53,6 +53,7 @@ from akgentic.tool.workspace.execution import DEFAULT_EXEC_TIMEOUT_S, RunningExe
 from akgentic.tool.workspace.journal import git_dir_for
 from akgentic.tool.workspace.models import MutationOutcome, Observation, WorkspaceConfig
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
+from akgentic.tool.workspace.workspace import ID_KIND
 from tests.conftest import MockActorAddress
 
 if TYPE_CHECKING:
@@ -65,30 +66,43 @@ WORKSPACE_NAME = "test-workspace"
 DEFAULT_TEST_PRINCIPAL = "u-alice"
 """The ``user_id`` the fake observer carries unless a test names another.
 
-Every workspace now resolves under its owner, so the trees the suite writes to
-live at ``<root>/u-alice/<leaf>``. :func:`workspace_root_for` builds that path so
-no test has to spell the layout out twice.
+Every workspace now resolves under its owner and its kind, so the trees the
+suite writes to live at ``<root>/u-alice/<kind>/<leaf>``. :func:`workspace_root_for`
+builds that path so no test has to spell the layout out twice.
 """
 
 
-WORKSPACE_PATH = f"{DEFAULT_TEST_PRINCIPAL}/{WORKSPACE_NAME}"
-"""What ``WORKSPACE_NAME`` **resolves** to — the two-segment path, not the leaf.
+WORKSPACE_PATH = f"{DEFAULT_TEST_PRINCIPAL}/{ID_KIND}/{WORKSPACE_NAME}"
+"""What ``WORKSPACE_NAME`` **resolves** to — the three-segment path, not the leaf.
 
-The distinction is the whole of ADR-048 in one line: ``WORKSPACE_NAME`` is what
-a card declares, and this is the directory and the actor-name suffix it reaches.
-Assertions about a tree or an actor name use this one; assertions about what an
-author wrote use the other.
+The distinction is the whole of the layout in one line: ``WORKSPACE_NAME`` is a
+``workspace_id`` a card declares, and this is the directory and the actor-name
+suffix it reaches. Assertions about a tree or an actor name use this one;
+assertions about what an author wrote use the other.
+
+These helpers are a convenience, not the specification: the six-cell literal
+table in ``test_workspace_path_resolution.py`` pins the layout independently of
+them, which is exactly why it does not use them.
 """
 
 
-def workspace_path_for(leaf: str, user_id: str = DEFAULT_TEST_PRINCIPAL) -> str:
-    """The two-segment path *leaf* resolves to for *user_id*."""
-    return f"{user_id}/{leaf}"
+def workspace_path_for(
+    leaf: str, user_id: str = DEFAULT_TEST_PRINCIPAL, kind: str = ID_KIND
+) -> str:
+    """The three-segment path *leaf* of *kind* resolves to for *user_id*.
+
+    *kind* defaults to ``ID_KIND`` because *leaf* is almost always a
+    ``workspace_id``; a caller resolving a **default** card — whose leaf is the
+    team id — passes ``TEAM_KIND`` explicitly.
+    """
+    return f"{user_id}/{kind}/{leaf}"
 
 
-def workspace_root_for(base: Path, leaf: str, user_id: str = DEFAULT_TEST_PRINCIPAL) -> Path:
-    """The on-disk root of the workspace *leaf* belonging to *user_id*."""
-    return base / user_id / leaf
+def workspace_root_for(
+    base: Path, leaf: str, user_id: str = DEFAULT_TEST_PRINCIPAL, kind: str = ID_KIND
+) -> Path:
+    """The on-disk root of the workspace *leaf* of *kind* belonging to *user_id*."""
+    return base / user_id / kind / leaf
 
 
 HANDSHAKE_TIMEOUT_S = 5.0

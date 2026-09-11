@@ -48,7 +48,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict
 
 from akgentic.tool.workspace.models import GIT_DIR_SUFFIX
-from akgentic.tool.workspace.workspace import METADATA_SCOPE, user_segment
+from akgentic.tool.workspace.workspace import METADATA_KIND, user_segment
 
 __all__ = [
     "MigrationConflictError",
@@ -292,7 +292,7 @@ def _leftover_entry(root: Path, name: str, scopes: set[str]) -> MigrationEntry:
     and refuse the run.
     """
     source = root / name
-    if name == METADATA_SCOPE or name in scopes:
+    if name == METADATA_KIND or name in scopes:
         return MigrationEntry(
             name=name,
             verdict=Verdict.SKIPPED,
