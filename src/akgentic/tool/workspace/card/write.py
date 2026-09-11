@@ -1,16 +1,28 @@
 """Mutation factories for :class:`WorkspaceTool` — write, delete, edit, patch, mkdir.
 
-A mutation is an ``ask`` to ``#Workspace``, which checks the live file against
-what this agent last observed and performs the write itself, in one mailbox turn
-(ADR-036 §1, §3). Nothing about the gate is visible in an LLM-facing signature.
+A mutation runs **on the card**, through :class:`~akgentic.tool.workspace.card.gate.CardGate`:
+it checks the live file against what this agent last observed and performs the
+write itself, inside one held ``fcntl.flock`` on the path (ADR-051 Decision 3).
+Nothing about the gate is visible in an LLM-facing signature.
+
+**Each closure captures the card, and that is allowed.** These closures used to
+capture a proxy and an id precisely so that they held no edge back to the owning
+agent (ADR-030); capturing ``self`` does not reintroduce one, because a
+``ToolCard`` holds its observer **weakly** through the base setter. A closure
+rooting the card therefore roots no stopped agent, and
+``tests/test_toolcard_weak_observer.py`` is the guard that would catch it if that
+ever stopped being true. A ``weakref`` dance around ``self`` here would be
+ceremony against a retention that does not exist.
 
 :class:`WriteFactories` is a **mixin**: it declares no Pydantic field, and the
-two names it consumes off ``self`` are declared under ``if TYPE_CHECKING:`` so
-they reach mypy without ever reaching Pydantic's field collection (ADR-045 §1).
+names it consumes off ``self`` are declared under ``if TYPE_CHECKING:`` so they
+reach mypy without ever reaching Pydantic's field collection (ADR-045 §1).
 
-:func:`_bound` lives here rather than beside either caller because both the
-mutation factories and the exec factories need it; ``card/execution.py`` imports
-it from this module, the one directional sibling edge inside ``card/``.
+:func:`_bound` stays here for the **exec** proxy: ``workspace_exec`` and
+``workspace_exec_result`` still ask the actor, which still owns the sandbox, and
+``card/execution.py`` imports this helper — the one directional sibling edge
+inside ``card/``. The mutations no longer use it; their own unbound state is a
+``Filesystem`` that was never resolved (``CardGate._tree``).
 """
 
 from __future__ import annotations
@@ -88,8 +100,21 @@ class WriteFactories:
     """
 
     if TYPE_CHECKING:
-        _agent_id: str
-        _workspace_proxy: WorkspaceActor | None
+        # Supplied by ``CardGate``; the MRO binds them at runtime. Declared here
+        # so mypy can check the calls, never defined.
+        def apply_write(self, path: str, content: str) -> MutationOutcome: ...
+
+        def apply_delete(self, path: str) -> MutationOutcome: ...
+
+        def apply_edit(
+            self, path: str, old_string: str, new_string: str, replace_all: bool = False
+        ) -> MutationOutcome: ...
+
+        def apply_multi_edit(self, edits: list[EditItem]) -> MutationOutcome: ...
+
+        def apply_patch(self, patch_text: str) -> MutationOutcome: ...
+
+        def apply_mkdir(self, path: str) -> MutationOutcome: ...
 
     def _write_factory(self, params: WorkspaceWrite) -> Callable[..., Any]:
         """Create the ``workspace_write`` tool callable.
@@ -100,8 +125,7 @@ class WriteFactories:
         Returns:
             Callable that writes content to a workspace file, through the actor.
         """
-        proxy = self._workspace_proxy
-        agent_id = self._agent_id
+        card = self
 
         def workspace_write(path: str, content: str) -> str:
             """Write content to a file in the team workspace.
@@ -122,7 +146,7 @@ class WriteFactories:
                 RetriableError: If the write is refused, or the path escapes the
                     workspace root.
             """
-            return _resolve_outcome(_bound(proxy).apply_write(agent_id, path, content))
+            return _resolve_outcome(card.apply_write(path, content))
 
         workspace_write.__doc__ = params.format_docstring(workspace_write.__doc__)
         return workspace_write
@@ -136,8 +160,7 @@ class WriteFactories:
         Returns:
             Callable that deletes a file from the workspace, through the actor.
         """
-        proxy = self._workspace_proxy
-        agent_id = self._agent_id
+        card = self
 
         def workspace_delete(path: str) -> str:
             """Delete a file from the team workspace.
@@ -156,7 +179,7 @@ class WriteFactories:
                 RetriableError: If the delete is refused, the path does not
                     exist, or it escapes the workspace root.
             """
-            return _resolve_outcome(_bound(proxy).apply_delete(agent_id, path))
+            return _resolve_outcome(card.apply_delete(path))
 
         workspace_delete.__doc__ = params.format_docstring(workspace_delete.__doc__)
         return workspace_delete
@@ -170,8 +193,7 @@ class WriteFactories:
         Returns:
             Callable that applies a surgical find-and-replace edit, through the actor.
         """
-        proxy = self._workspace_proxy
-        agent_id = self._agent_id
+        card = self
 
         def workspace_edit(
             path: str,
@@ -199,9 +221,7 @@ class WriteFactories:
                 RetriableError: If the edit is refused, the path does not exist,
                     or it escapes the workspace root.
             """
-            return _resolve_outcome(
-                _bound(proxy).apply_edit(agent_id, path, old_string, new_string, replace_all)
-            )
+            return _resolve_outcome(card.apply_edit(path, old_string, new_string, replace_all))
 
         workspace_edit.__doc__ = params.format_docstring(workspace_edit.__doc__)
         return workspace_edit
@@ -215,8 +235,7 @@ class WriteFactories:
         Returns:
             Callable that applies a batch of find-and-replace edits, through the actor.
         """
-        proxy = self._workspace_proxy
-        agent_id = self._agent_id
+        card = self
 
         def workspace_multi_edit(edits: list[EditItem]) -> str:
             """Apply a sequence of find-and-replace edits to workspace files.
@@ -235,7 +254,7 @@ class WriteFactories:
                 RetriableError: If any edit is refused, a target file does not
                     exist, or a path escapes the workspace root.
             """
-            return _resolve_outcome(_bound(proxy).apply_multi_edit(agent_id, edits))
+            return _resolve_outcome(card.apply_multi_edit(edits))
 
         workspace_multi_edit.__doc__ = params.format_docstring(workspace_multi_edit.__doc__)
         return workspace_multi_edit
@@ -249,8 +268,7 @@ class WriteFactories:
         Returns:
             Callable that applies a unified diff patch, through the actor.
         """
-        proxy = self._workspace_proxy
-        agent_id = self._agent_id
+        card = self
 
         def workspace_patch(patch_text: str) -> str:
             """Apply a unified diff patch to the team workspace.
@@ -270,7 +288,7 @@ class WriteFactories:
                 RetriableError: If a file's change is refused, or any path
                     escapes the workspace root.
             """
-            return _resolve_outcome(_bound(proxy).apply_patch(agent_id, patch_text))
+            return _resolve_outcome(card.apply_patch(patch_text))
 
         workspace_patch.__doc__ = params.format_docstring(workspace_patch.__doc__)
         return workspace_patch
@@ -284,8 +302,7 @@ class WriteFactories:
         Returns:
             Callable that creates a directory in the workspace, through the actor.
         """
-        proxy = self._workspace_proxy
-        agent_id = self._agent_id
+        card = self
 
         def workspace_mkdir(path: str) -> str:
             """Create a directory and all missing parents in the team workspace.
@@ -299,7 +316,7 @@ class WriteFactories:
             Raises:
                 RetriableError: If the path escapes the workspace root.
             """
-            return _resolve_outcome(_bound(proxy).apply_mkdir(agent_id, path))
+            return _resolve_outcome(card.apply_mkdir(path))
 
         workspace_mkdir.__doc__ = params.format_docstring(workspace_mkdir.__doc__)
         return workspace_mkdir

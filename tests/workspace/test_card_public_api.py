@@ -77,7 +77,6 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "IN_MEMORY_MAX_DOCUMENT_CHARS",
         "Identity",
         "LEASE_GRACE_S",
-        "LastWrite",
         "LockBackend",
         "LockGrant",
         "LockMarker",
@@ -245,6 +244,12 @@ _WORKSPACE_TOOL_FIELDS: frozenset[str] = frozenset(
         # Added by story 45-8, deliberately: the search capability. Twenty-two
         # names became twenty-three.
         "workspace_rag_search",
+        # Added by story 52-5, deliberately: the observation map moved onto the
+        # card, so the cap that bounds it did too. It was a ``WorkspaceConfig``
+        # field the card never set — unreachable from a catalog, because the
+        # first bind fixed the tree's configuration for everyone — and it is a
+        # declared field here. Twenty-three names became twenty-four.
+        "max_observations_per_agent",
     }
 )
 

@@ -46,11 +46,11 @@ from tests.workspace.conftest import (
 
 
 def workspace_config_of(orchestrator_proxy: FakeOrchestratorProxy) -> WorkspaceConfig:
-    """The ``WorkspaceConfig`` the card handed to ``getResourceOrCreate``."""
-    for call in orchestrator_proxy.resource_calls:
-        if call.actor_class is WorkspaceActor:
-            assert isinstance(call.config, WorkspaceConfig)
-            return call.config
+    """The ``WorkspaceConfig`` the card handed to ``getChildrenOrCreate``."""
+    for actor_class, config in orchestrator_proxy.create_calls:
+        if actor_class is WorkspaceActor:
+            assert isinstance(config, WorkspaceConfig)
+            return config
     raise AssertionError("the card never bound a workspace actor")
 
 
@@ -517,13 +517,13 @@ class TestTheCardCreatesNoStoreActor:
             vector_store=VectorStoreParam(backend="weaviate"),
         )
 
-        # Kept on both lists: the bind happened (the positive), and neither the
-        # forward nor the child path named a store actor.
-        bound = [call.actor_class for call in orchestrator_proxy.resource_calls]
-        assert bound == [WorkspaceActor]
+        # Kept as a positive with a negative beside it: the bind happened, and
+        # nothing it did named a store actor — on the child path or through a
+        # host, of which this process runs none.
         created = [cls for cls, _config in orchestrator_proxy.create_calls]
+        assert created == [WorkspaceActor]
         assert VectorStoreActor not in created
-        assert VectorStoreActor not in bound
+        assert orchestrator_proxy.resource_calls == []
 
     def test_a_retrieval_off_card_creates_no_store_actor(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
@@ -532,11 +532,10 @@ class TestTheCardCreatesNoStoreActor:
 
         bind(orchestrator_proxy, vector_store=VectorStoreParam(backend="inmemory"))
 
-        bound = [call.actor_class for call in orchestrator_proxy.resource_calls]
-        assert bound == [WorkspaceActor]
         created = [cls for cls, _config in orchestrator_proxy.create_calls]
+        assert created == [WorkspaceActor]
         assert VectorStoreActor not in created
-        assert VectorStoreActor not in bound
+        assert orchestrator_proxy.resource_calls == []
 
 
 class TestTheBindTimeAnnouncement:
@@ -722,7 +721,7 @@ class TestTheProvider:
     """It never raises, and it is what the model actually sees each turn."""
 
     def _actor(self, orchestrator_proxy: FakeOrchestratorProxy) -> WorkspaceActor:
-        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         return actor
 
@@ -892,7 +891,7 @@ class TestTheCallablesThemselves:
         from datetime import UTC, datetime
 
         card, _ = bind(orchestrator_proxy, workspace_rag_list=True)
-        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         seed_row(
             actor,
@@ -984,7 +983,7 @@ class TestTheCardBindsTheTeamsStore:
     ) -> None:
         """``getChildrenOrCreate`` is idempotent, so a team holds one store however
         many cards ask for one — which is the whole point of going back to it."""
-        from akgentic.tool.vector_store.actor import VectorStoreActor
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
 
         first, _ = bind(orchestrator_proxy, workspace_rag_index=True)
         second, _ = bind(orchestrator_proxy, workspace_rag_search=True)
@@ -992,7 +991,13 @@ class TestTheCardBindsTheTeamsStore:
         created = [cls for cls, _config in orchestrator_proxy.create_calls]
         assert created.count(VectorStoreActor) == 2  # asked twice
         assert len(store_configs_of(orchestrator_proxy)) == 2
-        assert len(orchestrator_proxy.children) == 1  # created once
+        # Created once, and the workspace beside it once: two cards on one tree
+        # in one team share both actors, which is what get-or-create buys.
+        assert created.count(VectorStoreActor) == 2
+        assert set(orchestrator_proxy.children) == {
+            VS_ACTOR_NAME,
+            workspace_actor_name(WORKSPACE_PATH),
+        }
         assert first._vector_store is second._vector_store
 
     def test_a_plain_card_creates_no_store_resolves_nothing_and_announces_nothing(
@@ -1005,11 +1010,17 @@ class TestTheCardBindsTheTeamsStore:
         would leave the slot ``None`` too, and the whole point is that a bare
         ``WorkspaceTool()`` — the overwhelming majority of them — costs nothing.
         """
+        from akgentic.tool.vector_store.actor import VectorStoreActor
+
         tell = RecordingTell()
 
         card, _ = bind(orchestrator_proxy, tell_proxy=tell)
 
-        assert orchestrator_proxy.create_calls == []
+        # The workspace's own bind is on this list since 52-5; nothing else is,
+        # which is what the absence of a store costs.
+        created = [cls for cls, _config in orchestrator_proxy.create_calls]
+        assert created == [WorkspaceActor]
+        assert VectorStoreActor not in created
         assert orchestrator_proxy.member_lookups == []
         assert "configure_vector_store" not in tell.calls
         assert card._vector_store is None

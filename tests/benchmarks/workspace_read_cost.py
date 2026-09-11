@@ -91,11 +91,9 @@ from akgentic.tool.workspace.actor import (
     WorkspaceActor,
     workspace_actor_name,
 )
-from akgentic.tool.workspace.edit import EditItem
 from akgentic.tool.workspace.host import WorkspaceHost
 from akgentic.tool.workspace.journal import git_dir_for
 from akgentic.tool.workspace.models import (
-    MutationOutcome,
     Observation,
     WorkspaceConfig,
     content_sha,
@@ -479,6 +477,73 @@ def _hash_only_recorder(_card: WorkspaceTool) -> _Recorder:
     return record
 
 
+@dataclass
+class _Recordings:
+    """How many observations each side of the card produced during one run.
+
+    **Card-side since story 52-5.** The observation map moved off ``#Workspace``
+    with the gate, so there is no longer a mailbox turn for the instrumented
+    actor to count these at — they are ordinary method calls on the card that
+    made them. The seam is the same one the arms already patch, which is what
+    keeps the instrument honest across all four.
+
+    Attributes:
+        reads: Recordings that arrived from a read closure.
+        mutations: Recordings an accepted mutation made for its own writer.
+            Counted apart, because ``_accept`` records in the same call and an
+            ``off`` arm would otherwise appear to record.
+    """
+
+    reads: int = 0
+    mutations: int = 0
+    in_mutation: bool = False
+
+    def reset(self) -> None:
+        """Drop everything the warm-up produced."""
+        self.reads = 0
+        self.mutations = 0
+        self.in_mutation = False
+
+
+@contextmanager
+def _count_recordings(counters: _Recordings) -> Iterator[None]:
+    """Count every observation the cards record, for the duration of one run.
+
+    Patched on ``WorkspaceTool`` rather than on an instance: a ``ToolCard`` is a
+    Pydantic model and refuses an attribute that is not a field, and the run
+    builds its cards through the shipped wiring where nothing hands this file an
+    instance to wrap.
+
+    Both patches **forward** to the real methods. A stub would leave every arm
+    recording nothing, which is exactly the state
+    :func:`_assert_arm_behaved` exists to distinguish from a correct ``off``.
+    """
+    real_record = WorkspaceTool.record_observation
+    real_accept = WorkspaceTool._accept
+
+    def record(card: WorkspaceTool, path: str, observation: Observation) -> None:
+        if counters.in_mutation:
+            counters.mutations += 1
+        else:
+            counters.reads += 1
+        real_record(card, path, observation)
+
+    def accept(card: WorkspaceTool, path: str, data: bytes) -> None:
+        counters.in_mutation = True
+        try:
+            real_accept(card, path, data)
+        finally:
+            counters.in_mutation = False
+
+    setattr(WorkspaceTool, "record_observation", record)
+    setattr(WorkspaceTool, "_accept", accept)
+    try:
+        yield
+    finally:
+        setattr(WorkspaceTool, "record_observation", real_record)
+        setattr(WorkspaceTool, "_accept", real_accept)
+
+
 @contextmanager
 def _arm_patch(arm: str) -> Iterator[None]:
     """Install the arm's recorder for the duration of one run.
@@ -516,18 +581,18 @@ class _SamplingWorkspaceActor(WorkspaceActor):
     ``self.actor_inbox`` is this actor's own pykka attribute, read on its own
     thread.
 
-    Recordings an accepted mutation makes for its own writer (``_accept`` calls
-    ``record_observation`` in the same turn) are counted apart from read-path
-    traffic, otherwise the ``off`` arm would appear to record.
+    **The turns it samples moved in story 52-5.** The six mutations and the
+    observation map went card-side, so neither is a turn on this mailbox any
+    more; what still arrives here from the shipped path is the stale-mark an
+    accepted mutation tells and the document-cache lookup a binary read asks.
+    Those are the turn boundaries, and they are the ones sampled. The
+    observation **counts** are card-side too — see :class:`_Recordings`.
     """
 
     def on_start(self) -> None:
         """Initialise the sampling state after the real actor's own start."""
         super().on_start()
         self._depths: list[int] = []
-        self._read_observations = 0
-        self._mutation_observations = 0
-        self._in_mutation = False
 
     ##
     ## Sampling — always on this actor's own thread
@@ -545,61 +610,18 @@ class _SamplingWorkspaceActor(WorkspaceActor):
             inbox = cast("queue.Queue[object]", self.actor_inbox)
             self._depths.append(inbox.qsize())
 
-    def _mutating(self, run: Callable[[], MutationOutcome]) -> MutationOutcome:
-        """Sample, then run one mutation with writer-side recording marked."""
+    ##
+    ## The turns this actor still serves.  Each is a turn boundary, so each samples.
+    ##
+    def mark_paths_stale(self, paths: list[str]) -> None:
+        """Sample, then delegate — the tell every accepted mutation sends."""
         self._sample_depth()
-        self._in_mutation = True
-        try:
-            return run()
-        finally:
-            self._in_mutation = False
+        super().mark_paths_stale(paths)
 
-    def record_observation(self, agent_id: str, path: str, observation: Observation) -> None:
-        """Count and sample a read-path recording, then record it for real."""
-        if self._in_mutation:
-            self._mutation_observations += 1
-        else:
-            self._sample_depth()
-            self._read_observations += 1
-        super().record_observation(agent_id, path, observation)
-
-    ##
-    ## The six mutations.  Each is a turn boundary, so each samples.
-    ##
-    def apply_write(self, agent_id: str, path: str, content: str) -> MutationOutcome:
-        """Sample, then delegate."""
-        return self._mutating(lambda: WorkspaceActor.apply_write(self, agent_id, path, content))
-
-    def apply_delete(self, agent_id: str, path: str) -> MutationOutcome:
-        """Sample, then delegate."""
-        return self._mutating(lambda: WorkspaceActor.apply_delete(self, agent_id, path))
-
-    def apply_edit(
-        self,
-        agent_id: str,
-        path: str,
-        old_string: str,
-        new_string: str,
-        replace_all: bool = False,
-    ) -> MutationOutcome:
-        """Sample, then delegate."""
-        return self._mutating(
-            lambda: WorkspaceActor.apply_edit(
-                self, agent_id, path, old_string, new_string, replace_all
-            )
-        )
-
-    def apply_multi_edit(self, agent_id: str, edits: list[EditItem]) -> MutationOutcome:
-        """Sample, then delegate."""
-        return self._mutating(lambda: WorkspaceActor.apply_multi_edit(self, agent_id, edits))
-
-    def apply_patch(self, agent_id: str, patch_text: str) -> MutationOutcome:
-        """Sample, then delegate."""
-        return self._mutating(lambda: WorkspaceActor.apply_patch(self, agent_id, patch_text))
-
-    def apply_mkdir(self, agent_id: str, path: str) -> MutationOutcome:
-        """Sample, then delegate."""
-        return self._mutating(lambda: WorkspaceActor.apply_mkdir(self, agent_id, path))
+    def document_extract(self, path: str, source_sha: str, version: str) -> str | None:
+        """Sample, then delegate — the ask every document read makes."""
+        self._sample_depth()
+        return super().document_extract(path, source_sha, version)
 
     ##
     ## The driver's two calls, both asks — so the second one is also the drain
@@ -607,15 +629,13 @@ class _SamplingWorkspaceActor(WorkspaceActor):
     def bench_reset(self) -> None:
         """Drop everything the warm-up produced, on the actor's own thread."""
         self._depths = []
-        self._read_observations = 0
-        self._mutation_observations = 0
 
     def bench_snapshot(self) -> ActorSnapshot:
         """Copy the series out. An ask, so every earlier tell has been processed."""
         return ActorSnapshot(
             depths=list(self._depths),
-            read_observations=self._read_observations,
-            mutation_observations=self._mutation_observations,
+            read_observations=0,  # filled card-side by the driver — see ``_Recordings``
+            mutation_observations=0,
             journal_enabled=self._journal.enabled,
         )
 
@@ -1034,38 +1054,52 @@ def _drive(
         Orchestrator, config=BaseConfig(name="@Orchestrator", role="Orchestrator")
     )
     orch = system.proxy_ask(orch_addr, Orchestrator)
-    workspace = _install_sampling_actor(system, workspace_path, journal)
-    members = [
-        _spawn_agent(orch, spec, arm, workspace_id, corpus, slot) for slot in range(spec.agents)
-    ]
-    for address in members:
-        system.proxy_tell(address, _BenchAgent).run_mix()
-    gate.ready.wait(timeout=GATE_TIMEOUT_S)
-    workspace.bench_reset()
-    gate.go.set()
-    results = [system.proxy_ask(address, _BenchAgent).results() for address in members]
-    # The drain. Every agent has stopped sending (its ``results()`` ask returned),
-    # and an ask sits behind every tell already on the mailbox — so when this
-    # returns, no observation is still in flight and the ``on`` arm cannot
-    # under-report its own traffic.
-    snapshot = workspace.bench_snapshot()
+    workspace = _install_sampling_actor(system, orch, workspace_path, journal)
+    counters = _Recordings()
+    with _count_recordings(counters):
+        members = [
+            _spawn_agent(orch, spec, arm, workspace_id, corpus, slot)
+            for slot in range(spec.agents)
+        ]
+        for address in members:
+            system.proxy_tell(address, _BenchAgent).run_mix()
+        gate.ready.wait(timeout=GATE_TIMEOUT_S)
+        workspace.bench_reset()
+        counters.reset()
+        gate.go.set()
+        results = [system.proxy_ask(address, _BenchAgent).results() for address in members]
+        # The drain. Every agent has stopped sending (its ``results()`` ask
+        # returned), and an ask sits behind every tell already on the mailbox —
+        # so when this returns, no stale-mark is still in flight and the ``on``
+        # arm cannot under-report its own traffic. The recordings themselves are
+        # card-side and synchronous, so they are already counted.
+        snapshot = workspace.bench_snapshot().model_copy(
+            update={
+                "read_observations": counters.reads,
+                "mutation_observations": counters.mutations,
+            }
+        )
     _assert_arm_behaved(arm, snapshot)
     assert_samples_complete(spec, results)
     return _summarise_run(arm, results, snapshot, tree, journal)
 
 
 def _install_sampling_actor(
-    system: ActorSystem, workspace_path: str, journal: bool
+    system: ActorSystem, orch: Orchestrator, workspace_path: str, journal: bool
 ) -> _SamplingWorkspaceActor:
-    """Host ``#Workspace-<path>`` as the instrumented subclass, before any card wires.
+    """Create ``#Workspace-<path>`` as the instrumented subclass, before any card wires.
 
-    Every card then binds to it by name, through the same host. The proxy's
-    ``bench_snapshot`` would not resolve at all against a plain
+    **Through the orchestrator, since story 52-5**: the card binds the workspace
+    as a team child again, so pre-registering it on the process's
+    ``WorkspaceHost`` would leave the cards to create a plain one of their own
+    beside it. Get-or-create is idempotent either way, so every card then binds
+    to this instance by name.
+
+    The proxy's ``bench_snapshot`` would not resolve at all against a plain
     ``WorkspaceActor``, so a silent failure to install would be an immediate
     error rather than a series of zeroes that reads like good news.
     """
-    [host] = ActorSystem.find_by_class(WorkspaceHost)
-    address = system.proxy_ask(host, WorkspaceHost).getResourceOrCreate(
+    address = orch.getChildrenOrCreate(
         _SamplingWorkspaceActor,
         config=WorkspaceConfig(
             name=workspace_actor_name(workspace_path),

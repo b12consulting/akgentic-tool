@@ -87,27 +87,27 @@ from akgentic.core.agent import Akgent
 from akgentic.tool.core.deferred import DeferredResultActor, DeferredWorker
 from akgentic.tool.workspace.actor.documents import DocumentsMixin
 from akgentic.tool.workspace.actor.execution import EXEC_CAPABILITY, ExecMixin
-from akgentic.tool.workspace.actor.gate import GateMixin
-from akgentic.tool.workspace.actor.observation import ObservationMixin
 from akgentic.tool.workspace.documents.store import DocumentStore
-from akgentic.tool.workspace.edit import EditMatcher
 from akgentic.tool.workspace.execution import (
     ExecConfig,
     ExecOutcome,
     ExecRunner,
     RunningExec,
 )
-from akgentic.tool.workspace.journal import GitJournal
+from akgentic.tool.workspace.journal import GitJournal, Identity
 from akgentic.tool.workspace.lock import LockBackend
 from akgentic.tool.workspace.models import (
     STAGING_SWEEP_GRACE_S,
-    LastWrite,
-    Observation,
     SweepTick,
     WorkspaceConfig,
     WorkspaceState,
 )
-from akgentic.tool.workspace.workspace import Filesystem, get_workspace, is_staging_name
+from akgentic.tool.workspace.workspace import (
+    Filesystem,
+    get_workspace,
+    is_staging_name,
+    meta_dir_for,
+)
 
 if TYPE_CHECKING:
     from akgentic.core.actor_address import ActorAddress
@@ -207,8 +207,6 @@ def _tell_tick(address: ActorAddress) -> None:
 class WorkspaceActor(
     DocumentsMixin,
     ExecMixin,
-    GateMixin,
-    ObservationMixin,
     DeferredResultActor[WorkspaceConfig, WorkspaceState, str, ExecOutcome],
     # Redundant for the MRO — ``DeferredResultActor`` already is an ``Akgent`` —
     # and load-bearing for the restore. A store rebuilds this actor's state
@@ -297,11 +295,7 @@ class WorkspaceActor(
         self._reap_deadline: float | None = None
         self._discarded_run: str | None = None
         self._holders: dict[str, ActorAddress] = {}
-        self._observations: dict[str, OrderedDict[str, Observation]] = {}
-        self._last_writers: OrderedDict[str, LastWrite] = OrderedDict()
         self._agent_names: OrderedDict[str, str] = OrderedDict()
-        self._touched: list[str] = []
-        self._matcher = EditMatcher()
         self._exec_config: ExecConfig | None = None
         self._runner: ExecRunner | None = None
         # One worker, unconditionally, for every workspace whether or not exec is
@@ -342,6 +336,7 @@ class WorkspaceActor(
             self._workspace._root,
             enabled=self.config.git_journal,
             timeout_s=self.config.git_timeout_s,
+            meta_dir=meta_dir_for(self.config.workspace_path),
         )
         if self._journal.initialise():
             self._journal.seed_gitignore(self._workspace.write)
@@ -423,6 +418,80 @@ class WorkspaceActor(
         self._close_sweep()
         self._teardown_exec()
         super().on_stop()
+
+    ##
+    ## Holders — reached through the card's **ask** proxy, once, at bind time
+    ##
+    def attach(self, agent: ActorAddress, agent_name: str) -> None:
+        """Record *agent* as a holder of this tree, and the name to print for it.
+
+        Sent once per card, at bind, right after the get-or-create returns this
+        actor's address — O(1), never on the mutation path. Both maps are keyed
+        by ``str(agent.agent_id)``, the same string the card sends with every
+        exec request.
+
+        **The holder is what the reap grace watches.** The liveness sweep fires
+        at zero holders, so an actor that nobody attached to is reaped
+        ``reap_grace_s`` after it starts — which is correct for an orphan and
+        catastrophic for a live tree. This call is the only thing that records a
+        holder; without it every workspace actor in a session stops two minutes
+        after the last bind, silently, taking its sandbox and its retrieval
+        pipeline with it. The holder map is **not capped**: it is bounded by live
+        agents and pruned by :meth:`_drop_dead_holders`, which drops a holder
+        **only** when its actor's ``is_alive()`` is false. A second ``attach``
+        from the same agent overwrites its entry rather than adding one.
+
+        **An attach cancels the reap grace**, and it is the one thing that does:
+        the first line clears the deadline. It runs on the actor's mailbox, so it
+        cannot interleave with a tick — a tick either ran before it, and the
+        deadline it set is cleared here, or runs after it and finds a holder.
+
+        **The name is what a refusal prints.** The card can capture ``agent_id``
+        without an edge back to the agent (ADR-030), but an id is a UUID: a
+        refusal reading *"agent '3f2a…'"* tells a model nothing it can act on.
+        The name map **is** capped, at ``max_tracked_writers``: losing a name is
+        a safe degradation — the id is printed instead.
+
+        **An ask, not a tell**, so the holder is recorded before the bind returns
+        and a failure is seen by the card, which lets it fail the bind: an agent
+        must never hold a tree that does not know it is held.
+
+        Args:
+            agent: The binding agent's address.
+            agent_name: Its configured, human-readable name.
+        """
+        self._reap_deadline = None
+        agent_id = str(agent.agent_id)
+        self._holders[agent_id] = agent
+        self._agent_names[agent_id] = agent_name
+        self._agent_names.move_to_end(agent_id)
+        while len(self._agent_names) > self.config.max_tracked_writers:
+            self._agent_names.popitem(last=False)
+
+    def _drop_dead_holders(self) -> list[str]:
+        """Drop every holder whose actor has stopped, and the name kept for it.
+
+        The one question asked is ``is_alive()`` — pykka's stopped flag, which
+        ``ActorAddressImpl`` also answers false for a collected actor, and which
+        never raises. It is not a health probe and must never become one: an
+        agent whose handler raised is still running, and still holds the tree.
+
+        Returns:
+            The dropped agent ids, for the exec side to prune its own maps by.
+        """
+        dropped = [agent_id for agent_id, agent in self._holders.items() if not agent.is_alive()]
+        for agent_id in dropped:
+            del self._holders[agent_id]
+            self._agent_names.pop(agent_id, None)
+        return dropped
+
+    def _name_of(self, agent_id: str) -> str:
+        """Return *agent_id*'s registered name, falling back to the id itself."""
+        return self._agent_names.get(agent_id) or agent_id
+
+    def _identity(self, agent_id: str) -> Identity:
+        """Compose the git identity for *agent_id*: name to read, id to distinguish."""
+        return Identity(self._name_of(agent_id), agent_id)
 
     ##
     ## Lifetime — the liveness sweep, the grace, and the self-stop

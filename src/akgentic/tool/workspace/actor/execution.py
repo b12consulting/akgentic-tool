@@ -37,7 +37,6 @@ from typing import TYPE_CHECKING
 from akgentic.tool.core.deferred import DeferredResultActor
 from akgentic.tool.sandbox.backend import ExecReport
 from akgentic.tool.workspace.execution import (
-    _BUSY_PREFIX,
     DEFAULT_EXEC_TIMEOUT_S,
     EXEC_SHUTDOWN_GRACE_S,
     LEASE_GRACE_S,
@@ -92,7 +91,9 @@ class ExecMixin(_ExecBase):
     _journal: GitJournal
 
     if TYPE_CHECKING:
-        # Supplied by ``ObservationMixin``; the MRO binds them at runtime.
+        # Supplied by ``WorkspaceActor`` itself, which owns the holder and name
+        # maps since the observation mixin went card-side. Declared here so mypy
+        # can check the calls, never defined.
         def _identity(self, agent_id: str) -> Identity: ...
 
         def _name_of(self, agent_id: str) -> str: ...
@@ -243,7 +244,12 @@ class ExecMixin(_ExecBase):
         try:
             grant = lock.acquire(
                 config.workspace_path,
-                LockTicket(agent_id=agent_id, cmd=cmd, budget_s=self._run_budget()),
+                LockTicket(
+                    agent_id=agent_id,
+                    agent_name=self._name_of(agent_id),
+                    cmd=cmd,
+                    budget_s=self._run_budget(),
+                ),
             )
         except Exception as exc:  # noqa: BLE001 — an ask path answers, it never crashes
             # An unwritable metadata parent, a full disk. This is an ``ask``: a
@@ -648,10 +654,13 @@ class ExecMixin(_ExecBase):
     def _holding_run(self) -> RunningExec | None:
         """Return the run genuinely holding the tree, releasing one that is wedged.
 
-        **The one place that decides whether a mutation may proceed**, and it is
-        a predicate rather than a message because its callers need the decision
-        and only one of them needs words. Exec no longer decides here — the lock
-        does — but exec still *calls* it, for the release below.
+        **It decides nothing any more; it releases.** Exec's admission is the
+        lock's, and a *mutation*'s refusal is now read card-side straight off the
+        marker — this actor's ``_running`` is one process's memory, and the
+        refusal has to be answerable by a process that never started the run.
+        What is left here is the one thing only this actor can do: notice that
+        its **own** run is wedged past its budget and give the tree back at once,
+        in memory and on disk together.
 
         **The release covers one case: a child that ignores the kill.** Every
         other exit reports, because the worker reports in a ``finally`` — a
@@ -815,48 +824,6 @@ class ExecMixin(_ExecBase):
         if pending is not None:
             futures.wait([pending], timeout=EXEC_SHUTDOWN_GRACE_S)
         self._executor.shutdown(wait=False, cancel_futures=True)
-
-    def _busy_refusal(self) -> str | None:
-        """Refuse a **mutation** while a run holds the tree, or allow it.
-
-        Fail fast, never stall. Ten seconds of silence inside a tool call is
-        indistinguishable from a hang and gives the model nothing to react to; an
-        immediate refusal naming the holder lets it read a file, answer the user,
-        or ask the holder. That is only affordable because the actor's thread is
-        free — the blocking call is on the sandbox's.
-
-        **This is the mutation message, and it is not the exec one.** Both
-        refusals now exist and they are deliberately different: this one names
-        the holder's run id and agent, and the exec refusal
-        (:func:`~akgentic.tool.workspace.execution.exec_busy`) names nobody.
-
-        Naming the id here is safe, and always was: it is uncollectable by
-        anyone but its owner (see :meth:`exec_status`), so it informs a human
-        reading the transcript without handing the model something to
-        mis-collect. What ADR-047 removed was an *exec* refusal publishing a
-        sibling call's id, which the model then collected as its own answer —
-        and a refused exec caller, unlike a refused mutation, has no id of its
-        own to be given instead. The exec refusal keeps naming nobody for that
-        reason, and could not name the holder anyway: it is rendered under a
-        ``LockBackend``, which has no access to ``_name_of``.
-
-        **One wording, over the same predicate the exec path decides on.** There
-        is no second message for a run past its budget: past the budget and the
-        grace the run no longer holds the tree at all — :meth:`_holding_run`
-        releases it — so the state that message described is not one a mutation
-        can arrive in any more.
-
-        Returns:
-            The refusal text, or ``None`` when the tree is free.
-        """
-        running = self._holding_run()
-        if running is None:
-            return None
-        return (
-            f"{_BUSY_PREFIX} — exec run {running.run_id} is in progress "
-            f"(agent '{self._name_of(running.agent_id)}'). Reads still work; retry the change "
-            f"once the run has finished."
-        )
 
     def _track_run(self, agent_id: str, run_id: str, cmd: str) -> None:
         """Remember *run_id* as one of *agent_id*'s recent runs, with its command.

@@ -19,18 +19,17 @@ from akgentic.tool.workspace.actor import (
     WorkspaceActor,
     workspace_actor_name,
 )
-from akgentic.tool.workspace.actor.gate import _preserve_endings
+from akgentic.tool.workspace.card.gate import _preserve_endings
+from akgentic.tool.workspace.card.params import WorkspaceExec
+from akgentic.tool.workspace.card.read import _normalize_glob_pattern
 from akgentic.tool.workspace.edit import EditItem
 from akgentic.tool.workspace.models import WorkspaceConfig
-from akgentic.tool.workspace.card.read import _normalize_glob_pattern
 from akgentic.tool.workspace.tool import (
     Resource,
     ResourceType,
     WorkspaceTool,
 )
-from akgentic.tool.workspace.card.params import WorkspaceExec
 from akgentic.tool.workspace.workspace import Filesystem, PathEscapeError, Workspace
-
 from tests.workspace.conftest import FakeActorToolObserver, FakeOrchestratorProxy
 
 
@@ -817,7 +816,7 @@ class TestRetriableErrorWorkspaceTool:
         # raised there will be caught by the outer except PermissionError handler.
         # It now runs on the actor, which is why the patch target moved modules.
         with patch(
-            "akgentic.tool.workspace.actor.gate.parse_patch",
+            "akgentic.tool.workspace.card.gate.parse_patch",
             side_effect=PathEscapeError("path escapes workspace root"),
         ):
             with pytest.raises(RetriableError, match="Path escapes workspace root"):
@@ -1376,8 +1375,8 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
         bob_card.observer(FakeActorToolObserver(orchestrator_proxy, "bob", user_id="bob"))
 
         assert alice_card.workspace._root != bob_card.workspace._root
-        assert workspace_actor_name("alice/notes") in orchestrator_proxy.hosted
-        assert workspace_actor_name("bob/notes") in orchestrator_proxy.hosted
+        assert workspace_actor_name("alice/notes") in orchestrator_proxy.children
+        assert workspace_actor_name("bob/notes") in orchestrator_proxy.children
 
     def test_two_exec_cards_on_two_workspaces_create_exactly_two_workspace_actors(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
@@ -1406,7 +1405,7 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
                 FakeActorToolObserver(orchestrator_proxy, name=leaf, user_id="alice")
             )
 
-        names = set(orchestrator_proxy.hosted)
+        names = set(orchestrator_proxy.children)
         assert names == {
             workspace_actor_name("alice/alpha"),
             workspace_actor_name("alice/beta"),
@@ -1504,9 +1503,9 @@ class TestTheConfigCarriesThePathAndNoKeyList:
 
     @staticmethod
     def _bound_config(proxy: FakeOrchestratorProxy) -> WorkspaceConfig:
-        """The one ``WorkspaceConfig`` the card handed ``getResourceOrCreate``."""
+        """The one ``WorkspaceConfig`` the card handed ``getChildrenOrCreate``."""
         configs = [
-            call.config for call in proxy.resource_calls if call.actor_class is WorkspaceActor
+            config for cls, config in proxy.create_calls if cls is WorkspaceActor
         ]
         assert len(configs) == 1
         config = configs[0]

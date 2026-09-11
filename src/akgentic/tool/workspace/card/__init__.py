@@ -7,30 +7,39 @@ The default ``read_only=False`` also includes write-side callables (``workspace_
 ``workspace_delete``, ``workspace_edit``, ``workspace_multi_edit``, ``workspace_patch``,
 ``workspace_mkdir``).
 
-**Reads and mutations take different routes.** A read runs on the calling agent's
-own thread against its own
-:class:`~akgentic.tool.workspace.workspace.Filesystem`, exactly as it always has,
-and reports what it saw to ``#Workspace`` through a fire-and-forget ``tell``. A
-mutation is an ``ask`` to ``#Workspace``, which checks the live file against that
-observation and performs the write itself, in one mailbox turn (ADR-036 §1, §3).
+**Reads and mutations both run here now.** A read runs on the calling agent's own
+thread against its own :class:`~akgentic.tool.workspace.workspace.Filesystem` and
+records what it saw in the card's own observation map. A mutation checks the live
+file against that observation and performs the write, inside an ``fcntl.flock``
+held on the path (ADR-051 Decision 3) — a lock on the *tree*, which is what two
+workers over one mounted volume share, rather than a mailbox, which is what one
+process has.
 
 Nothing about the gate is visible in an LLM-facing signature: the six mutation
 callables take exactly what they always took, and the precondition is derived
-server-side from what the actor observed. There is no digest, no ``expected``,
-and no ``force``.
+from what this agent observed. There is no digest, no ``expected``, and no
+``force``.
 
-The factory bodies live in the four sibling mixins — ``card/read.py``,
-``card/write.py``, ``card/execution.py``, ``card/rag.py`` — and the capability
-parameters in ``card/params.py``. What stays here is the card itself: its fields,
-``observer()`` with its private binding helpers, and the ``get_tools`` /
-``get_commands`` / ``get_context_states`` registration (ADR-045 §1).
+**A workspace binds, gates and mutates in a process running no host at all.**
+Nothing here calls ``getResourceOrCreate`` and nothing here imports
+``WorkspaceHost``, which is the seam ``akgentic-infra``'s community wiring needs.
+The actor that survives is an ordinary team child, and it owns what is genuinely
+per-process: the sandbox, the document reader, the retrieval pipeline.
+
+The factory bodies live in the five sibling mixins — ``card/read.py``,
+``card/write.py``, ``card/gate.py``, ``card/execution.py``, ``card/rag.py`` — and
+the capability parameters in ``card/params.py``. What stays here is the card
+itself: its fields, ``observer()`` with its private binding helpers, and the
+``get_tools`` / ``get_commands`` / ``get_context_states`` registration
+(ADR-045 §1).
 """
 
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from collections.abc import Callable
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
 
 from pydantic import Field, PrivateAttr, model_validator
@@ -68,6 +77,7 @@ from akgentic.tool.workspace.actor import (
     workspace_actor_name,
 )
 from akgentic.tool.workspace.card.execution import ExecFactories
+from akgentic.tool.workspace.card.gate import CardGate
 from akgentic.tool.workspace.card.params import (
     ExpandMediaRefs,
     Resource,
@@ -98,10 +108,17 @@ from akgentic.tool.workspace.card.write import WriteFactories
 from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION, derived_document_caps
 from akgentic.tool.workspace.documents.store import DocumentStore, resolve_document_store
 from akgentic.tool.workspace.event import WorkspaceAttached
-from akgentic.tool.workspace.execution import ExecConfig, resolve_mode
-from akgentic.tool.workspace.host import WorkspaceHost
+from akgentic.tool.workspace.execution import (
+    DEFAULT_EXEC_TIMEOUT_S,
+    ExecConfig,
+    effective_budget,
+    resolve_mode,
+)
+from akgentic.tool.workspace.journal import GitJournal
 from akgentic.tool.workspace.lock import LockBackend, resolve_lock_backend
 from akgentic.tool.workspace.models import (
+    DEFAULT_GIT_TIMEOUT_S,
+    DEFAULT_MAX_OBSERVATIONS_PER_AGENT,
     Observation,
     WorkspaceConfig,
     content_sha,
@@ -141,7 +158,7 @@ __all__ = [
 ]
 
 
-class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, ToolCard):
+class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagFactories, ToolCard):
     """Workspace access with configurable read-only or full read/write/delete/edit mode.
 
     Pass ``read_only=True`` to restrict to read-side tools only.  The default
@@ -155,8 +172,8 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
     - ``False``: binary reads raise ``ValueError`` with install hint.
     - ``DocumentReader(...)`` instance: custom extraction config (e.g. with LLM).
 
-    The four mixins carry the factory bodies and declare no Pydantic field, so
-    every field of this card is declared right here.
+    The five mixins carry the factory bodies and the gate, and declare no
+    Pydantic field, so every field of this card is declared right here.
     """
 
     # Read capability fields (formerly in WorkspaceReadTool)
@@ -297,6 +314,23 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
     derived from. All three only when a retrieval capability is actually enabled.
     """
 
+    max_observations_per_agent: int = DEFAULT_MAX_OBSERVATIONS_PER_AGENT
+    """Cap on the paths this agent's observation map remembers.
+
+    **A card field because the map is the card's** (ADR-051 Decision 2). It was a
+    ``WorkspaceConfig`` field while the actor held one map per agent — and was
+    unreachable from a catalog even then, because the card never set it and the
+    first bind fixed the tree's configuration for everybody. Here it is an
+    ordinary declared field: the agent whose reads fill the map is the agent
+    whose card declares the cap.
+
+    Only the **path** dimension is bounded, and there is no other dimension: one
+    card is one agent. Over the cap the least recently observed path is evicted,
+    which costs a *refused* write rather than a stale accepted one — a
+    correctness-preserving degradation, which is what makes an LRU safe here at
+    all.
+    """
+
     max_documents: int | None = None
     max_document_chars: int | None = None
     """Explicit overrides of the extraction cache's two caps.
@@ -330,6 +364,36 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
     _workspace_proxy: WorkspaceActor | None = PrivateAttr(default=None)
     _workspace_tell: WorkspaceActor | None = PrivateAttr(default=None)
     _agent_id: str = PrivateAttr(default="")
+    # The owning agent's display **name**, captured beside its id and for the
+    # same reason the actor's name map existed: a journal authored by UUID
+    # satisfies the letter of "the git log is the who-changed-what record" and
+    # defeats its purpose, and a refusal reading "last written by agent '3f2a…'"
+    # tells a model nothing it can act on. A plain string, so it is no more an
+    # edge back to the agent than the id is.
+    _agent_name: str = PrivateAttr(default="")
+    # The resolved two-segment path, kept because three runtime consumers need
+    # it after ``observer()`` has returned: the exec hold's tree key, the
+    # metadata directory, and the journal.
+    _workspace_path: str = PrivateAttr(default="")
+    # Where this tree's locks live — a **sibling** of the tree, so no read
+    # capability can name a lock file. ``None`` until the bind.
+    _meta_dir: Path | None = PrivateAttr(default=None)
+    # The journal is runtime state, never a serializable field: it holds a
+    # resolved git path and spawns subprocesses, and a ``ToolCard`` field holding
+    # one would not round-trip (Golden Rule 1b).
+    _journal: GitJournal | None = PrivateAttr(default=None)
+    # This agent's slice of what has been read, and nobody else's. An
+    # ``OrderedDict`` because it *is* the LRU. Never serialised: recording is not
+    # persisted state.
+    _observations: OrderedDict[str, Observation] = PrivateAttr(default_factory=OrderedDict)
+    # The paths the mutation in flight has changed, collected on the accept path
+    # for the commit and the stale-mark that follow it.
+    _touched: list[str] = PrivateAttr(default_factory=list)
+    # The effective run budget the exec hold's staleness window is measured
+    # against, derived once at bind from this card's own exec configuration —
+    # the same derivation ``ExecMixin._run_budget`` makes, so a mutation is never
+    # refused against a hold the next ``request_exec`` would take over.
+    _exec_budget_s: float = PrivateAttr(default=0.0)
     # Runtime state, never a serializable field: a backend is an object with a
     # method, and a ``ToolCard`` field holding one would not round-trip.
     _lock_backend: LockBackend | None = PrivateAttr(default=None)
@@ -393,10 +457,9 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
                 it surfaces in front of the admin who caused it, rather than
                 silently collapsing several principals into one tree. It must
                 never be caught and turned into a fallback.
-            RuntimeError: If the process runs no ``WorkspaceHost`` — core's
-                refusal, forwarded unchanged. Whatever a failing ``attach``
-                raises propagates unchanged too. Neither may be caught, for the
-                same reason.
+            RuntimeError: Whatever a failing ``attach`` raises, propagated
+                unchanged — an agent must never hold a tree that does not know
+                it is held. It must never be caught, for the same reason.
         """
         if observer.orchestrator is None:
             raise ValueError("WorkspaceTool requires access to the orchestrator.")
@@ -420,6 +483,9 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
             require_workspace_backend(self.vector_store, "WorkspaceTool")
         super().observer(observer)  # store the observer weakly via the base setter
         ws_path = str(self._resolve_path(observer, observer.orchestrator))
+        self._workspace_path = ws_path
+        self._meta_dir = meta_dir_for(ws_path)
+        self._exec_budget_s = self._mutation_budget()
         self._workspace = get_workspace(ws_path)
         # Unconditional, beside the filesystem and for the same reason: a bad
         # ``AKGENTIC_LOCK_BACKEND`` must fail the bind in front of the admin who
@@ -439,6 +505,11 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
         self._resolved_store = self._resolve_store_param(ws_path)
         self._seed_resources()
         self._bind_workspace_actor(observer, observer.orchestrator, ws_path)
+        # After the bind, because the actor's own ``on_start`` creates the
+        # repository and seeds ``.gitignore``; this journal opens the same
+        # repository to *commit* into rather than to create it. Before the first
+        # mutation, which is all the gate needs.
+        self._open_journal(ws_path)
         # Between the bind and the retrieval announcement, deliberately: the
         # actor must never be able to enable retrieval under a store it has not
         # been given, exactly as it must never admit a run under a hold it has
@@ -453,6 +524,55 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
         self._announce_vector_store()
         self._announce_rag()
         return self
+
+    def _mutation_budget(self) -> float:
+        """The run budget this card measures an exec hold's staleness against.
+
+        The same derivation
+        :meth:`~akgentic.tool.workspace.actor.execution.ExecMixin._run_budget`
+        makes, for the reason two spellings of one window would be two places
+        for a change to be applied once and missed once: a mutation refused
+        against a hold that the very next ``request_exec`` would take over is a
+        tree saying two things about itself at once.
+
+        **A card with exec off still has one**, and must: the hold it reads may
+        have been taken by a *different* card — or a different process — and a
+        read-only card still refuses mutations it does not have. The default
+        budget is what that card knows.
+        """
+        params = _resolve(self.workspace_exec, WorkspaceExec)
+        return effective_budget(params.timeout_s if params is not None else DEFAULT_EXEC_TIMEOUT_S)
+
+    def _open_journal(self, workspace_path: str) -> None:
+        """Open this card's view of the tree's git journal, or leave it inert.
+
+        **One journal object per card, over one repository per tree**, which is
+        the arrangement ADR-051 Decision 4 chose over routing commits through an
+        actor: the repository is on disk and shared by every process that mounts
+        the tree, so a single in-process owner could never have serialised the
+        writers that matter. What does serialise them is the journal's own
+        ``flock`` (:meth:`~akgentic.tool.workspace.journal.GitJournal._holding`).
+
+        ``initialise`` runs **only when the card asked for a journal**. With
+        ``git_journal=False`` the object is left un-initialised, which is the
+        same inert state ``initialise`` would put it in — every method a no-op —
+        minus a second "disabled by configuration" warning for a tree whose actor
+        has just logged one.
+
+        Args:
+            workspace_path: The resolved two-segment path, whose metadata
+                directory holds the commit lock.
+        """
+        assert self._workspace is not None
+        journal = GitJournal(
+            self._workspace._root,
+            enabled=self.git_journal,
+            timeout_s=DEFAULT_GIT_TIMEOUT_S,
+            meta_dir=meta_dir_for(workspace_path),
+        )
+        if self.git_journal:
+            journal.initialise()
+        self._journal = journal
 
     def _resolve_store_param(self, workspace_path: str) -> VectorStoreParam | None:
         """The author's ``vector_store`` with the backend resolved and the root stamped.
@@ -751,50 +871,51 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
     ) -> None:
         """Bind the ``#Workspace-<workspace_path>`` actor that owns this tree, then attach.
 
-        **Get-or-create on the process's ``WorkspaceHost``, forwarded by this
-        team's orchestrator.** ``getResourceOrCreate`` finds the one host of
-        exactly that class and asks it, in one message on the host's mailbox, for
-        the actor registered under ``config.name`` — so two cards from two teams
-        resolving one path at once cannot both create, and a check-then-create
-        TOCTOU window never opens. The actor is **nobody's child**: the host
-        starts it with no orchestrator and no parent, so it emits no
-        ``StartMessage`` and sits in no team's roster. On a hit the host returns
-        the live actor and ignores ``config``: the first bind fixes the tree's
-        configuration for every team on it.
+        **Get-or-create as a team child, which is where this bind started.** The
+        actor stopped being hosted because nothing shared lives on it any more:
+        the exec hold is a marker file, the document cache is YAML under
+        ``<meta>``, the retrieval index is files under ``<meta>``, and the write
+        gate is an ``fcntl.flock`` — every one of them on the tree, which is the
+        real unicity domain (ADR-051). Two teams over one tree therefore get two
+        actors again, and that is **correct rather than a regression**: the
+        arrangement epic 51 built existed to stop two actors sharing state, and
+        there is no shared state left for them to disagree about. What they still
+        own — a sandbox backend, a document reader, an embedding worker — is
+        per-process by nature and was never the thing being protected.
 
-        The actor's name carries the resolved path and is the host's registry
-        key, so two cards on different trees get two actors and two cards on one
-        tree — from one team or from ten — get one. The unicity domain of the
-        actor is the tree it owns.
+        The actor's name carries the resolved path, so two cards on different
+        trees get two actors and two cards of one team on one tree get one.
 
-        **The orchestrator emits the event, unread.** The card builds the
-        ``WorkspaceAttached`` payload naming **this agent**, and the orchestrator
-        wraps it in ``EventMessage`` on this team's own stream — one per
-        successful bind, a hit included. That is how a client learns which agent
-        bound which tree.
+        **The card emits the event itself, through ``notify_event``.** It used to
+        travel as ``getResourceOrCreate``'s ``event=`` argument, which is gone
+        with the forward. ``ToolObserver.notify_event`` is the base protocol's
+        own method for *"tools that only need to emit events"*, and
+        ``Akgent.notify_event`` wraps the payload in the same ``EventMessage`` on
+        the same team stream — so the envelope, the fan-out and the wire name are
+        unchanged and only the emitter moved. **Do not hand-build an
+        ``EventMessage`` here**: that would reimplement the envelope this seam
+        exists to avoid. One event per successful bind, naming this agent, which
+        is how a client's Workspace tab learns which agent bound which tree — and
+        if it silently stopped, nothing would raise and the tab would simply
+        render empty.
 
-        Two proxies are bound over the one address: an ask proxy for mutations,
-        which need the verdict, and a tell proxy for observations, which need
+        Two proxies are bound over the one address: an ask proxy for exec, which
+        needs the verdict, and a tell proxy for the retrieval signals, which need
         nothing back.
 
-        **Then ``attach``, over the ask proxy and unguarded.** It records this
-        agent as a holder — the actor's lifetime is its holders' — and its
-        display name, which is what the journal authors commits with and what a
-        refusal prints: a UUID is a record nobody can read. An ask, so the holder
-        is recorded before the bind returns and a failure is seen: a dead actor
-        fails the bind rather than leaving an agent holding a tree that does not
-        know it. The forward has already emitted this bind's ``WorkspaceAttached``
-        by then — core emits once the host answers, before the card can attach —
-        so a failed ``attach`` leaves that event on the team's stream for a bind
-        that then failed. The failure is still loud, since ``observer()`` raises,
-        but a reader of the stream must not take the event alone as proof that an
-        agent holds the tree.
+        **Then ``attach``, over the ask proxy and unguarded** — and it must
+        survive, because the liveness sweep and its reap grace do. They fire at
+        **zero holders**, and this call is the only thing that records one: stop
+        making it and every workspace actor reaps itself two minutes after the
+        last bind, mid-session, taking exec and retrieval down with it, silently.
+        An ask rather than a tell, so the holder is recorded before the bind
+        returns and a failure is seen: a dead actor fails the bind rather than
+        leaving an agent holding a tree that does not know it.
 
-        **This method creates at most one actor, and only through the host.** The
-        team's ``#VectorStore`` a retrieval card may need is created by
-        :meth:`_bind_vector_store`, further down and through the orchestrator, so
-        that it is shared with whatever planning or knowledge-graph card the team
-        also carries. Nothing about retrieval happens here.
+        **This method creates at most one actor.** The team's ``#VectorStore`` a
+        retrieval card may need is created by :meth:`_bind_vector_store`, further
+        down, so that it is shared with whatever planning or knowledge-graph card
+        the team also carries. Nothing about retrieval happens here.
 
         Args:
             observer: The owning agent, live at bind time.
@@ -809,8 +930,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
         derived_documents, derived_chars = derived_document_caps(
             self.vector_store.backend, self._rag_enabled()
         )
-        workspace_addr = orchestrator_proxy.getResourceOrCreate(
-            WorkspaceHost,
+        workspace_addr = orchestrator_proxy.getChildrenOrCreate(
             WorkspaceActor,
             config=WorkspaceConfig(
                 name=workspace_actor_name(workspace_path),
@@ -826,35 +946,35 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
                     else derived_chars
                 ),
             ),
-            event=WorkspaceAttached(
-                agent_id=observer.myAddress.agent_id, workspace_path=workspace_path
-            ),
         )
         workspace = observer.proxy_ask(workspace_addr, WorkspaceActor)
         self._workspace_proxy = workspace
         self._workspace_tell = observer.proxy_tell(workspace_addr, WorkspaceActor)
         self._agent_id = str(observer.myAddress.agent_id)
-        workspace.attach(observer.myAddress, str(observer.myAddress.name))
+        self._agent_name = str(observer.myAddress.name)
+        observer.notify_event(
+            WorkspaceAttached(agent_id=observer.myAddress.agent_id, workspace_path=workspace_path)
+        )
+        workspace.attach(observer.myAddress, self._agent_name)
 
     def _observation_recorder(self) -> Callable[[str, bytes, bool], None]:
         """Build the closure a read closure uses to report what it saw.
 
-        The **tell** proxy and the agent id are captured **here**, at
-        ``get_tools`` time, as a proxy to a different actor and a plain string.
-        Neither is an edge back to the owning agent, which is what keeps the read
-        closures free of the retention ADR-030 forbids.
+        **The card is captured here**, at ``get_tools`` time, and the map it
+        records into is the card's own. There is no message any more: the
+        observation and the gate that reads it are the same object, so a read
+        cannot queue behind another agent's mutation and a recording cannot be
+        lost in flight. That removes a whole failure mode rather than making one
+        faster — the old fire-and-forget ``tell`` was chosen precisely because
+        the alternative, an ask, could stall a read on a busy mailbox.
 
-        The tell is what makes "a read never waits on the actor" a property
-        rather than a hope — of a **text** read, which is what this recorder
-        serves. From epic 29 the actor hashes files on its ask path, so a read
-        that asked would queue behind another agent's mutation hashing a large
-        file; the ``except`` below would not save it, because a fail-open guard
-        covers a raising actor and a dead one, never a hung one.
+        Capturing ``self`` is not the retention ADR-030 forbids: a ``ToolCard``
+        holds its observer **weakly**, so a closure rooting the card roots no
+        stopped agent.
 
-        A **document** read is the one exception, and it is deliberate: it makes
-        one bounded ask through :meth:`_extract_lookup` (ADR-045 §3), against
-        O(1) dict work with no I/O behind it. It records no observation at all,
-        so it never reaches this closure.
+        A **document** read is the one read that records nothing at all — it
+        asks :meth:`_extract_lookup` for a cached extraction instead — so it
+        never reaches this closure.
 
         Returns:
             A callable taking the path, the file's raw bytes and whether the read
@@ -862,16 +982,11 @@ class WorkspaceTool(ReadFactories, WriteFactories, ExecFactories, RagFactories, 
             precondition, which the gate turns into a *refused* write — it must
             never turn into a failed read.
         """
-        proxy = self._workspace_tell
-        agent_id = self._agent_id
+        card = self
 
         def record(path: str, data: bytes, full: bool) -> None:
-            if proxy is None:
-                return  # harness shapes that wire a bare observer never bind one
             try:
-                proxy.record_observation(
-                    agent_id, path, Observation(sha=content_sha(data), full=full)
-                )
+                card.record_observation(path, Observation(sha=content_sha(data), full=full))
             except Exception:
                 # Deliberately blind: a lost precondition, never a lost read. The
                 # gate reads a missing observation as "you have not read this" and

@@ -1651,7 +1651,15 @@ class TestReportAttribution:
 
 
 class TestTheGateMarksStale:
-    """One direct call on ``self`` from the one point six mutations converge on."""
+    """The actor's half of the stale-mark: what ``mark_paths_stale`` does with a set.
+
+    **Re-pointed by decision.** The gate used to call this directly on ``self``
+    from ``_journalled``; it is card-side since 52-5 and arrives as a **tell**,
+    so this class now drives the receiving end with the sets a mutation would
+    send. The sending end — that every accepted mutation sends exactly the paths
+    it touched, deletes included, and that a refused one sends nothing — is
+    ``TestTheStaleMarkReachesTheIndex`` in ``test_write_gate.py``.
+    """
 
     def _indexed(self, harness: RagHarness, tree: Path, name: str = "notes.md") -> None:
         harness.enable()
@@ -1665,24 +1673,19 @@ class TestTheGateMarksStale:
         self, harness: RagHarness, workspace_tree: Path
     ) -> None:
         self._indexed(harness, workspace_tree)
-        harness.actor.record_observation(
-            "alice", "notes.md", _observation_of(workspace_tree / "notes.md")
-        )
 
-        harness.actor.apply_write("alice", "notes.md", "# Rewritten\n")
+        harness.actor.mark_paths_stale(["notes.md"])
 
         assert harness.rows["notes.md"].status is RagStatus.STALE
 
-    def test_an_accepted_delete_marks_the_file_stale(
+    def test_a_deleted_path_marks_stale_the_same_way(
         self, harness: RagHarness, workspace_tree: Path
     ) -> None:
-        """``_forget`` appends to the write set too, so deletes are covered for free."""
+        """A delete joins the write set too, so it arrives here as any write does."""
         self._indexed(harness, workspace_tree)
-        harness.actor.record_observation(
-            "alice", "notes.md", _observation_of(workspace_tree / "notes.md")
-        )
+        (workspace_tree / "notes.md").unlink()
 
-        harness.actor.apply_delete("alice", "notes.md")
+        harness.actor.mark_paths_stale(["notes.md"])
 
         assert harness.rows["notes.md"].status is RagStatus.STALE
 
@@ -1691,34 +1694,21 @@ class TestTheGateMarksStale:
     ) -> None:
         """Gate writes mark stale; uploads index. Auto-indexing every save would pay twice."""
         self._indexed(harness, workspace_tree)
-        harness.actor.record_observation(
-            "alice", "notes.md", _observation_of(workspace_tree / "notes.md")
-        )
         spawned = len(harness.requests)
 
-        harness.actor.apply_write("alice", "notes.md", "# Rewritten\n")
+        harness.actor.mark_paths_stale(["notes.md"])
 
         assert len(harness.requests) == spawned
-
-    def test_a_refused_mutation_marks_nothing(
-        self, harness: RagHarness, workspace_tree: Path
-    ) -> None:
-        """``_accept`` never ran, so there is no write set and nothing changed."""
-        self._indexed(harness, workspace_tree)
-
-        harness.actor.apply_write("alice", "notes.md", "# Rewritten\n")
-
-        assert harness.rows["notes.md"].status is RagStatus.EMBEDDED
 
     def test_a_tree_that_was_never_indexed_pays_no_delta(
         self, harness: RagHarness, workspace_tree: Path
     ) -> None:
         """The common case, and it must stay free on the mutation path."""
+        write(workspace_tree, "fresh.md")
         writes = harness.record_writes()
 
-        harness.actor.apply_write("alice", "fresh.md", "# New\n")
+        harness.actor.mark_paths_stale(["fresh.md"])
 
-        assert (workspace_tree / "fresh.md").read_text(encoding="utf-8") == "# New\n"
         assert writes.written == []
 
     def test_marking_an_already_stale_file_sends_nothing(

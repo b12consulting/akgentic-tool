@@ -1,8 +1,9 @@
-"""Behavioural tests for the ``#Workspace`` actor (story 29-2).
+"""Behavioural tests for the ``#Workspace`` actor.
 
-The actor is wired and observing in this story, and gates nothing — so what is
-asserted here is the observation map, its LRU bound, the fact that recording is
-not persisted state, and the startup sweep of orphaned staging files.
+The observation map left this actor with the gate in story 52-5 — one card, one
+agent, one map — so what it asserts now is the actor's name, the staging
+predicate and the startup sweep of orphaned staging files. The map's own
+behaviour, LRU included, is pinned card-side in ``test_observation_recording.py``.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+
 from akgentic.tool.workspace.actor import (
     WORKSPACE_ACTOR_NAME,
     WORKSPACE_ACTOR_ROLE,
@@ -22,20 +24,14 @@ from akgentic.tool.workspace.actor import (
 )
 from akgentic.tool.workspace.models import (
     STAGING_SWEEP_GRACE_S,
-    Observation,
     WorkspaceConfig,
     WorkspaceState,
-    content_sha,
 )
 from akgentic.tool.workspace.workspace import Filesystem, is_staging_name
-
-from tests.workspace.conftest import WORKSPACE_PATH, watch_store
-
-ALICE = "alice-id"
-BOB = "bob-id"
+from tests.workspace.conftest import WORKSPACE_PATH
 
 
-def start_actor(workspace_path: str = WORKSPACE_PATH, cap: int = 256) -> WorkspaceActor:
+def start_actor(workspace_path: str = WORKSPACE_PATH) -> WorkspaceActor:
     """Build and start an actor over *workspace_path*, without an actor thread.
 
     Takes the **resolved** two-segment path — what a card hands the actor — so
@@ -46,16 +42,10 @@ def start_actor(workspace_path: str = WORKSPACE_PATH, cap: int = 256) -> Workspa
             name=workspace_actor_name(workspace_path),
             role=WORKSPACE_ACTOR_ROLE,
             workspace_path=workspace_path,
-            max_observations_per_agent=cap,
         )
     )
     actor.on_start()
     return actor
-
-
-def observation(text: str, full: bool = True) -> Observation:
-    """An observation of *text*, hashed exactly as the read path hashes it."""
-    return Observation(sha=content_sha(text.encode()), full=full)
 
 
 # ---------------------------------------------------------------------------
@@ -73,104 +63,6 @@ class TestActorName:
 
     def test_base_name_is_the_prefix_of_every_derived_name(self) -> None:
         assert workspace_actor_name("team-1").startswith(WORKSPACE_ACTOR_NAME)
-
-
-# ---------------------------------------------------------------------------
-# AC7: the map, and the per-agent LRU cap
-# ---------------------------------------------------------------------------
-
-
-class TestObservationMap:
-    def test_records_and_reads_back(self, workspaces_root: Path) -> None:
-        actor = start_actor()
-        obs = observation("hello")
-        actor.record_observation(ALICE, "a.md", obs)
-        assert actor.observation_for(ALICE, "a.md") == obs
-
-    def test_unknown_agent_and_unknown_path_are_none(self, workspaces_root: Path) -> None:
-        actor = start_actor()
-        assert actor.observation_for(ALICE, "a.md") is None
-        actor.record_observation(ALICE, "a.md", observation("hello"))
-        assert actor.observation_for(ALICE, "other.md") is None
-        assert actor.observation_for(BOB, "a.md") is None
-
-    def test_two_agents_hold_independent_observations(self, workspaces_root: Path) -> None:
-        actor = start_actor()
-        actor.record_observation(ALICE, "a.md", observation("alice version"))
-        actor.record_observation(BOB, "a.md", observation("bob version"))
-        alice = actor.observation_for(ALICE, "a.md")
-        bob = actor.observation_for(BOB, "a.md")
-        assert alice is not None and bob is not None
-        assert alice.sha != bob.sha
-
-    def test_re_recording_replaces_rather_than_grows(self, workspaces_root: Path) -> None:
-        actor = start_actor(cap=3)
-        actor.record_observation(ALICE, "a.md", observation("v1"))
-        actor.record_observation(ALICE, "a.md", observation("v2"))
-        current = actor.observation_for(ALICE, "a.md")
-        assert current is not None
-        assert current.sha == content_sha(b"v2")
-
-    def test_cap_evicts_the_least_recently_used_path(self, workspaces_root: Path) -> None:
-        actor = start_actor(cap=3)
-        for name in ("a.md", "b.md", "c.md", "d.md"):
-            actor.record_observation(ALICE, name, observation(name))
-        assert actor.observation_for(ALICE, "a.md") is None
-        assert all(actor.observation_for(ALICE, n) is not None for n in ("b.md", "c.md", "d.md"))
-
-    def test_re_recording_refreshes_recency_rather_than_insertion_order(
-        self, workspaces_root: Path
-    ) -> None:
-        # Insertion order would evict "a.md"; recency must evict "b.md" instead.
-        actor = start_actor(cap=3)
-        for name in ("a.md", "b.md", "c.md"):
-            actor.record_observation(ALICE, name, observation(name))
-        actor.record_observation(ALICE, "a.md", observation("a.md refreshed"))
-        actor.record_observation(ALICE, "d.md", observation("d.md"))
-        assert actor.observation_for(ALICE, "b.md") is None
-        assert actor.observation_for(ALICE, "a.md") is not None
-
-    def test_a_lookup_does_not_refresh_recency(self, workspaces_root: Path) -> None:
-        actor = start_actor(cap=3)
-        for name in ("a.md", "b.md", "c.md"):
-            actor.record_observation(ALICE, name, observation(name))
-        actor.observation_for(ALICE, "a.md")
-        actor.record_observation(ALICE, "d.md", observation("d.md"))
-        assert actor.observation_for(ALICE, "a.md") is None
-
-    def test_the_cap_is_per_agent_not_global(self, workspaces_root: Path) -> None:
-        actor = start_actor(cap=2)
-        for name in ("a.md", "b.md"):
-            actor.record_observation(ALICE, name, observation(name))
-            actor.record_observation(BOB, name, observation(name))
-        assert actor.observation_for(ALICE, "a.md") is not None
-        assert actor.observation_for(BOB, "a.md") is not None
-
-
-# ---------------------------------------------------------------------------
-# AC8: recording is not persisted state
-# ---------------------------------------------------------------------------
-
-
-class TestRecordingIsNotPersistedState:
-    def test_recording_writes_no_record(self, workspaces_root: Path) -> None:
-        actor = start_actor()
-        writes = watch_store(actor)
-        actor.record_observation(ALICE, "a.md", observation("hello"))
-        assert actor.observation_for(ALICE, "a.md") is not None
-        assert writes.puts == []
-        assert writes.evicted == []
-
-    def test_recording_leaves_the_serialisable_state_untouched(self, workspaces_root: Path) -> None:
-        actor = start_actor()
-        actor.record_observation(ALICE, "a.md", observation("hello"))
-        assert actor.state.model_dump() == WorkspaceState().model_dump()
-
-    def test_state_round_trips_with_no_observation_data(self, workspaces_root: Path) -> None:
-        actor = start_actor()
-        actor.record_observation(ALICE, "a.md", observation("hello"))
-        restored = WorkspaceState.model_validate(actor.state.model_dump())
-        assert restored.model_dump() == WorkspaceState().model_dump()
 
 
 # ---------------------------------------------------------------------------
@@ -313,10 +205,10 @@ class TestStartupSweep:
         actor = start_actor()
 
         assert orphan.exists()
-        assert actor.observation_for(ALICE, "a.md") is None  # the actor started regardless
+        assert actor.config.workspace_path == WORKSPACE_PATH  # the actor started regardless
 
     def test_a_tree_with_nothing_to_sweep_starts_cleanly(self, workspace_tree: Path) -> None:
         (workspace_tree / "report.md").write_text("hello", encoding="utf-8")
         actor = start_actor()
-        actor.record_observation(ALICE, "report.md", observation("hello"))
-        assert actor.observation_for(ALICE, "report.md") is not None
+        assert (workspace_tree / "report.md").read_text(encoding="utf-8") == "hello"
+        assert actor.state.model_dump() == WorkspaceState().model_dump()

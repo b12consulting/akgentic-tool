@@ -55,8 +55,8 @@ from tests.workspace.conftest import (
     FakeOrchestratorProxy,
     MortalAddress,
     card_for,
+    children_ahead,
     fast_config,
-    hosted_ahead,
     wait_until,
 )
 
@@ -412,7 +412,7 @@ class TestAnAttachRestartsTheGrace:
     ) -> None:
         grace = 0.05
         # A 30 s interval, so the real timer never fires inside the spec.
-        actor = hosted_ahead(
+        actor = children_ahead(
             orchestrator_proxy,
             fast_config(WORKSPACE_PATH, sweep_interval_s=30.0, reap_grace_s=grace),
         )
@@ -556,11 +556,110 @@ class TestTheDefaults:
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         """The card never learns the two fields; a test sets them by creating the actor first."""
-        actor = hosted_ahead(orchestrator_proxy, fast_config(WORKSPACE_PATH))
+        actor = children_ahead(orchestrator_proxy, fast_config(WORKSPACE_PATH))
 
         _card, _observer = card_for(orchestrator_proxy, "alice")
 
-        _, bound = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+        _, bound = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert bound is actor
         assert bound.config.sweep_interval_s == FAST_SWEEP_INTERVAL_S
         assert bound.config.reap_grace_s == FAST_REAP_GRACE_S
+
+
+# ---------------------------------------------------------------------------
+# Story 52-5, AC 19: a bound card keeps its tree alive past the reap grace
+# ---------------------------------------------------------------------------
+
+
+class TestABoundCardKeepsItsTreeAlive:
+    """``attach`` survives the card's move, and this is what would notice if it did not.
+
+    **The failure it guards is delayed and silent, which is the whole reason it
+    exists.** The liveness sweep and the 120 s grace stay until 52-6; they fire
+    at *zero holders*, and the card's ``attach`` is the only thing that records
+    one. Drop that call and every workspace actor in a live session stops two
+    minutes after the last bind — taking its sandbox backend, its exec worker and
+    its retrieval pipeline with it — with nothing raised and nothing logged that
+    names the cause. No other spec in this suite would go red: the bind still
+    succeeds, the gate still gates, and the tree is only gone by the time anybody
+    runs a command.
+
+    **Mutation**: remove ``workspace.attach(...)`` from
+    ``WorkspaceTool._bind_workspace_actor``. Every spec below goes red — the
+    first immediately, on the holder count; the second after the grace, on the
+    actor being stopped.
+    """
+
+    def test_the_bind_records_this_agent_as_a_holder(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """Immediate half: the holder is there the moment ``observer()`` returns."""
+        card, observer = card_for(orchestrator_proxy, "alice")
+
+        _address, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
+
+        assert isinstance(actor, WorkspaceActor)
+        assert set(actor._holders) == {str(observer.myAddress.agent_id)}
+        # And the display name went with it, which is what a busy refusal prints.
+        assert actor._name_of(str(observer.myAddress.agent_id)) == str(observer.myAddress.name)
+        assert card._agent_id == str(observer.myAddress.agent_id)
+
+    def test_a_bound_card_that_does_nothing_outlives_the_grace(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """Delayed half, driven by ticks rather than by waiting out a real grace.
+
+        The actor is created ahead of the card with a fast grace, so the card's
+        bind is a hit on it — the only way a spec can watch a grace that is two
+        minutes long in production. Then more ticks than the grace is worth: with
+        a holder recorded, not one of them reaps.
+        """
+        actor = children_ahead(
+            orchestrator_proxy,
+            fast_config(WORKSPACE_PATH, sweep_interval_s=30.0, reap_grace_s=0.01),
+        )
+        # Both are held for the whole spec: the card holds its observer weakly,
+        # and an observer that went out of scope would take its agent with it —
+        # the holder would then be dropped for being *dead* rather than for
+        # never having been recorded, and this spec would fail for the wrong
+        # reason while an ``attach`` regression went unnoticed.
+        card, observer = card_for(orchestrator_proxy, "alice")
+        assert actor._holders == {str(observer.myAddress.agent_id): observer.myAddress}, (
+            "the bind recorded no holder — attach was not called"
+        )
+
+        for _ in range(5):
+            time.sleep(0.02)  # comfortably past a 0.01 s grace, every time
+            actor.receiveMsg_SweepTick(SweepTick())
+
+        assert actor._reap_deadline is None, "a grace started while a live agent held the tree"
+        assert actor._sweep_timer is not None, "the tree reaped itself under a live holder"
+        # And it is intact rather than merely un-stopped: the surfaces a reap
+        # would have taken down are still there.
+        assert actor._executor is not None
+        assert actor._workspace._root == workspace_tree.resolve()
+        assert card._workspace_proxy is not None
+
+    def test_the_same_tree_reaps_once_its_holder_stops(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """The positive control, without which the spec above proves nothing.
+
+        A sweep that had simply stopped reaping — a broken ``_grace_expired``, a
+        holder map nothing prunes — would pass the previous spec for entirely the
+        wrong reason. So the holder is stopped here and the reap must follow.
+        """
+        actor = children_ahead(
+            orchestrator_proxy,
+            fast_config(WORKSPACE_PATH, sweep_interval_s=30.0, reap_grace_s=0.01),
+        )
+        holder = MortalAddress("alice")
+        actor.attach(holder, "alice")
+
+        holder.dead = True
+        actor.receiveMsg_SweepTick(SweepTick())  # drops the holder, starts the grace
+        assert actor._holders == {}
+        assert actor._reap_deadline is not None
+        time.sleep(0.02)
+
+        assert actor._grace_expired() is True

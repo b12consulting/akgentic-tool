@@ -238,11 +238,11 @@ _BUSY_PREFIX = "workspace busy"
 
 Fixed wording because it is what an agent recognises across all seven refused
 operations — the six mutations and a second ``workspace_exec``. It lives here,
-beside the message functions, rather than on the actor mixin, because the two
-refusal families are now rendered in two different layers: the mutation one on
-the actor, which can name the holder, and the exec one under a
-:class:`~akgentic.tool.workspace.lock.LockBackend`, which cannot. One spelling of
-the prefix is what keeps them recognisably one family.
+beside the message functions, because the two refusal families are rendered for
+two different readers: the mutation one (:func:`mutation_busy`) names the holder,
+because the id it prints is uncollectable by anyone but its owner, and the exec
+one (:func:`exec_busy`) names nobody, because a refused exec caller would collect
+it. One spelling of the prefix is what keeps them recognisably one family.
 """
 
 
@@ -791,6 +791,39 @@ def exec_busy() -> str:
     return (
         f"{_BUSY_PREFIX} — another command is running in it, so yours was not started and "
         "nothing is lost. Reads still work; retry the command once the run has finished."
+    )
+
+
+def mutation_busy(run_id: str, agent_name: str) -> str:
+    """The one refusal a **mutation** gets while an exec run holds the tree.
+
+    The sibling of :func:`exec_busy`, and deliberately not the same message.
+    This one names the holder's run id and agent; that one names nobody. The
+    asymmetry is ADR-047's and it is about *collectability*: ``exec_status``
+    gates on ownership, so a foreign run id printed here is uncollectable by the
+    agent reading it and merely informs, where the same id in an *exec* refusal
+    was collected by a model as its own answer.
+
+    **The name, not the id.** The reader is a model choosing what to do next,
+    and *"agent '3f2a…'"* is something it can read and nothing it can act on —
+    the question ``WorkspaceActor.attach``'s docstring settled for the journal
+    and the refusals alike. The name travels in the marker
+    (:class:`~akgentic.tool.workspace.lock.LockMarker`) precisely so that this
+    text is the same in the process that took the hold and in one that only
+    found it on disk.
+
+    Args:
+        run_id: The run holding the tree.
+        agent_name: The holder's display name, or its id when the marker
+            carries no name — degraded, never broken.
+
+    Returns:
+        The refusal, whose text is the product and must not drift.
+    """
+    return (
+        f"{_BUSY_PREFIX} — exec run {run_id} is in progress "
+        f"(agent '{agent_name}'). Reads still work; retry the change "
+        f"once the run has finished."
     )
 
 

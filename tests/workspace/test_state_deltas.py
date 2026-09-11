@@ -64,15 +64,12 @@ from akgentic.tool.workspace.documents.worker import (
 )
 from akgentic.tool.workspace.host import WorkspaceHost
 from akgentic.tool.workspace.models import (
-    Observation,
     WorkspaceConfig,
-    WorkspaceState,
     content_sha,
 )
 from tests.workspace.conftest import (
     HANDSHAKE_TIMEOUT_S,
     WORKSPACE_PATH,
-    RecordingDocumentStore,
     attach_store,
     factory_for,
     fast_config,
@@ -88,6 +85,7 @@ from tests.workspace.conftest import (
 from tests.workspace.test_document_cache import _ExtractWithExtraField
 from tests.workspace.test_rag_models import _RagFileWithExtraField
 from tests.workspace.test_rag_pipeline import RagHarness, write
+
 
 class _EntryWithExtraField(DocumentEntry):
     """A stored record carrying a field the write path has never heard of.
@@ -220,11 +218,10 @@ def _drive_every_write_site(harness: RagHarness, tree: Path, checkpoint: object)
     assert _row_on_disk(actor, "b.md").status is RagStatus.FAILED
     checkpoint("an index failure")
 
-    target = tree / "a.md"
-    actor.record_observation(
-        "alice", "a.md", Observation(sha=content_sha(target.read_bytes()), full=True)
-    )
-    actor.apply_write("alice", "a.md", "# Rewritten\n")
+    # The gate is the card's since 52-5, and what reaches the actor is the
+    # stale-mark rather than the write — which is exactly the seam this spec
+    # cares about: the index row has to be on disk by the end of the turn.
+    actor.mark_paths_stale(["a.md"])
     assert _row_on_disk(actor, "a.md").status is RagStatus.STALE
     checkpoint("a gate write")
 

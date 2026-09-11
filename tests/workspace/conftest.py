@@ -679,8 +679,8 @@ def workspace_actor(
     orchestrator_proxy: FakeOrchestratorProxy,
     wired_card: WorkspaceTool,
 ) -> WorkspaceActor:
-    """The live singleton actor behind :func:`wired_card`, read from the host's registry."""
-    _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+    """The live actor behind :func:`wired_card`, read from the team's children."""
+    _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
     assert isinstance(actor, WorkspaceActor)
     return actor
 
@@ -739,17 +739,19 @@ def fast_config(workspace_path: str, **overrides: Any) -> WorkspaceConfig:
     return WorkspaceConfig(**fields)
 
 
-def hosted_ahead(
+def children_ahead(
     orchestrator_proxy: FakeOrchestratorProxy, config: WorkspaceConfig
 ) -> WorkspaceActor:
-    """Create *config*'s actor through the fake host before any card binds, and return it.
+    """Create *config*'s actor before any card binds, and return it.
 
-    The host ignores ``config`` on a hit, exactly as core's does, so a card that
-    binds afterwards gets this actor — with this config — rather than one built
-    from the card's own. Inert fixtures only: the actor is the instance itself.
+    Get-or-create ignores ``config`` on a hit, exactly as the real orchestrator
+    does, so a card that binds afterwards gets this actor — with this config —
+    rather than one built from the card's own. That is how a spec gives a tree a
+    fast sweep interval, which no card can set. Inert fixtures only: the actor is
+    the instance itself.
     """
-    address = orchestrator_proxy.host.get_or_create(WorkspaceActor, config)
-    actor = orchestrator_proxy.host.actor_for(address)
+    address = orchestrator_proxy.getChildrenOrCreate(WorkspaceActor, config)
+    actor = orchestrator_proxy.actor_for(address)
     assert isinstance(actor, WorkspaceActor)
     return actor
 
@@ -795,9 +797,14 @@ def mutate(card: WorkspaceTool, name: str, *args: Any, **kwargs: Any) -> str:
     return str(tool_named(card, name)(*args, **kwargs))
 
 
-def outcome_of(actor: WorkspaceActor, method: str, *args: Any) -> MutationOutcome:
-    """Call one of the actor's ``apply_*`` methods directly, for status assertions."""
-    result = getattr(actor, method)(*args)
+def outcome_of(card: WorkspaceTool, method: str, *args: Any) -> MutationOutcome:
+    """Call one of the **card's** ``apply_*`` methods directly, for status assertions.
+
+    The gate is the card's since story 52-5, so these go through the card rather
+    than the actor — and they carry no ``agent_id``, because card-side there is
+    exactly one agent and it is the card's own.
+    """
+    result = getattr(card, method)(*args)
     assert isinstance(result, MutationOutcome)
     return result
 

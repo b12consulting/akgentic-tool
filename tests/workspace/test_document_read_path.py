@@ -121,7 +121,7 @@ def document_card(
         workspace_read=WorkspaceRead(document_reader=reader),
     )
     card.observer(observer)
-    entry = orchestrator_proxy.hosted.get(workspace_actor_name(WORKSPACE_PATH))
+    entry = orchestrator_proxy.children.get(workspace_actor_name(WORKSPACE_PATH))
     actor = entry[1] if entry is not None else None
     return card, actor if isinstance(actor, WorkspaceActor) else None
 
@@ -295,7 +295,7 @@ class TestTheReadPathStaysFree:
         (workspace_tree / "a.pdf").write_bytes(b"the first report")
         (workspace_tree / "b.pdf").write_bytes(b"the second report")
         card, _actor = document_card(threaded_orchestrator_proxy, reader)
-        pykka_proxy = threaded_orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)][1]
+        pykka_proxy = threaded_orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)][1]
         recorder = RecordingDocumentStore()
         pykka_proxy.configure_document_store(recorder)
 

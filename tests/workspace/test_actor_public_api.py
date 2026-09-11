@@ -34,8 +34,6 @@ from akgentic.tool.core.deferred import DeferredResultActor
 from akgentic.tool.workspace.actor import WorkspaceActor
 from akgentic.tool.workspace.actor.documents import DocumentsMixin
 from akgentic.tool.workspace.actor.execution import ExecMixin
-from akgentic.tool.workspace.actor.gate import GateMixin
-from akgentic.tool.workspace.actor.observation import ObservationMixin
 
 _ACTOR_MODULE = "akgentic.tool.workspace.actor"
 
@@ -93,27 +91,67 @@ class TestActorModulePathStillResolves:
 class TestActorMro:
     """The base order is frozen, because ``super()`` walks it."""
 
-    def test_mro_is_exactly_the_four_mixins_then_the_deferred_base(self) -> None:
+    def test_mro_is_exactly_the_two_mixins_then_the_deferred_base(self) -> None:
         """``DocumentsMixin`` first, ``ExecMixin`` next: its ``deliver``/``fail``
-        must still reach the base."""
-        assert WorkspaceActor.__mro__[:6] == (
+        must still reach the base.
+
+        **Two mixins, not four.** Story 52-5 moved the gate and the observation
+        map onto the card, and the holder and name maps onto ``WorkspaceActor``
+        itself — so ``GateMixin`` and ``ObservationMixin`` are gone rather than
+        renamed, and a rebuilt one would show up here as an extra base.
+        """
+        assert WorkspaceActor.__mro__[:4] == (
             WorkspaceActor,
             DocumentsMixin,
             ExecMixin,
-            GateMixin,
-            ObservationMixin,
             DeferredResultActor,
         )
 
     def test_super_from_exec_mixin_reaches_the_deferred_base(self) -> None:
-        """The other three mixins define neither name, so the chain passes through.
+        """``DocumentsMixin`` defines neither name, so the chain passes through.
 
-        ``DocumentsMixin`` sits *ahead* of ``ExecMixin``, so a ``deliver`` or
-        ``fail`` on it would not merely break the chain — it would take over the
-        deferred delivery path outright.
+        It sits *ahead* of ``ExecMixin``, so a ``deliver`` or ``fail`` on it
+        would not merely break the chain — it would take over the deferred
+        delivery path outright.
         """
-        for mixin in (DocumentsMixin, GateMixin, ObservationMixin):
-            assert not _DELIBERATE_OVERRIDES & set(vars(mixin))
+        assert not _DELIBERATE_OVERRIDES & set(vars(DocumentsMixin))
+
+
+class TestTheGateLeftTheActor:
+    """The mutation and observation surface is the card's; ``attach`` stayed behind.
+
+    Not paperwork: the card reaches the actor through a **proxy**, and a proxy
+    forwards whatever name it is given. An ``apply_write`` still sitting on the
+    actor would be reachable, would gate against an observation map nobody fills
+    any more, and would answer — so the absence is the invariant, not the
+    presence of the card's own.
+    """
+
+    MOVED = (
+        "apply_write",
+        "apply_delete",
+        "apply_edit",
+        "apply_multi_edit",
+        "apply_patch",
+        "apply_mkdir",
+        "record_observation",
+        "observation_for",
+    )
+
+    def test_the_actor_answers_none_of_the_moved_names(self) -> None:
+        still_there = [name for name in self.MOVED if hasattr(WorkspaceActor, name)]
+        assert still_there == [], f"still on the actor after the move: {still_there}"
+
+    def test_the_card_answers_every_one_of_them(self) -> None:
+        """The other half: moved, not deleted. A typo here would pass the first test."""
+        from akgentic.tool.workspace.tool import WorkspaceTool
+
+        missing = [name for name in self.MOVED if not hasattr(WorkspaceTool, name)]
+        assert missing == [], f"moved off the actor and onto nothing: {missing}"
+
+    def test_attach_survives_on_the_actor(self) -> None:
+        """It records the holder the reap grace counts, so it cannot move card-side."""
+        assert hasattr(WorkspaceActor, "attach")
 
 
 class TestNoMixinShadowsTheDeferredBase:
@@ -122,14 +160,14 @@ class TestNoMixinShadowsTheDeferredBase:
     def test_mixins_shadow_exactly_the_two_deliberate_overrides(self) -> None:
         """A mixin defining ``cache_capacity`` would resize the LRU with no error."""
         declared: set[str] = set()
-        for mixin in (DocumentsMixin, ExecMixin, GateMixin, ObservationMixin):
+        for mixin in (DocumentsMixin, ExecMixin):
             declared |= {name for name in vars(mixin) if not name.startswith("__")}
         base_surface = set(dir(DeferredResultActor)) | set(_BASE_INSTANCE_ATTRS)
         assert declared & base_surface == set(_DELIBERATE_OVERRIDES)
 
     def test_the_guard_is_not_vacuous(self) -> None:
         """The intersection above is only meaningful if both sides are populated."""
-        for mixin in (DocumentsMixin, ExecMixin, GateMixin, ObservationMixin):
+        for mixin in (DocumentsMixin, ExecMixin):
             assert {name for name in vars(mixin) if not name.startswith("__")}
         assert {"cache_capacity", "negative_ttl_s", "get", "request"} <= set(
             dir(DeferredResultActor)
@@ -145,13 +183,13 @@ class TestNoMixinShadowsTheDeferredBase:
         would shadow the sibling's real method, because ``GateMixin`` precedes
         ``ObservationMixin`` in the MRO and declares seven of its names.
 
-        The intersection above cannot catch that: ``_accept``, ``_writer_of`` and
-        the rest are absent from ``DeferredResultActor``, so they are outside the
-        base surface it measures. Only the behavioural suite would notice, and
-        only by failing in bulk somewhere else entirely.
+        The intersection above cannot catch that: ``_identity``, ``_name_of``
+        and the rest are absent from ``DeferredResultActor``, so they are outside
+        the base surface it measures. Only the behavioural suite would notice,
+        and only by failing in bulk somewhere else entirely.
         """
         owners: dict[str, str] = {}
-        for mixin in (DocumentsMixin, ExecMixin, GateMixin, ObservationMixin):
+        for mixin in (DocumentsMixin, ExecMixin):
             for name in vars(mixin):
                 if name.startswith("__"):
                     continue
@@ -171,7 +209,7 @@ class TestNoMixinShadowsTheDeferredBase:
         *default* would land in both — and would then be the value every actor
         starts from, shared across the class.
         """
-        for mixin in (DocumentsMixin, ExecMixin, GateMixin, ObservationMixin):
+        for mixin in (DocumentsMixin, ExecMixin):
             for name in getattr(mixin, "__annotations__", {}):
                 assert name not in vars(mixin), (
                     f"{mixin.__name__}.{name} is annotated *and* assigned — a mixin "

@@ -47,8 +47,12 @@ logger = logging.getLogger(__name__)
 EXEC_LOCK_FILENAME = "exec.lock"
 """The marker's name under ``<meta>``, spelled once and only here.
 
-One tree, one marker: this story's hold is over the **whole** tree, exactly as
-the actor's lease was. Per-path locks are a different file and a later story.
+One tree, one marker: this hold is over the **whole** tree, exactly as the
+actor's lease was. The per-path write locks are a different mechanism in a
+different file — an ``fcntl.flock`` under ``<meta>/locks/``, taken and released
+inside one mutation (:mod:`akgentic.tool.workspace.card.gate`) — and the two must
+not be confused: this one fences a shell command whose write set is unknowable,
+those ones close a check-then-write window on a named path.
 """
 
 _MARKER_MODE = 0o600
@@ -67,6 +71,14 @@ class LockTicket(SerializableBaseModel):
     Attributes:
         agent_id: Who is asking, as a string. Recorded in the marker, so a
             human reading a wedged tree can see whose run took it.
+        agent_name: That agent's configured, human-readable name, recorded in
+            the marker beside the id. A **different process**'s mutation gate
+            reads the marker to refuse a write while this run holds the tree,
+            and it has no name map of its own to look the id up in — so the
+            name has to travel with the hold or the refusal degrades to a UUID,
+            which is something a model can read and nothing it can act on.
+            Optional and defaulted: an acquirer that has no name loses the name
+            and nothing else.
         cmd: The command, exactly as the agent gave it. Carried for a backend
             that wants to record or reject on it; the file backend records only
             the two ids, since the marker is read by a *different process* and a
@@ -79,6 +91,7 @@ class LockTicket(SerializableBaseModel):
     agent_id: str
     cmd: str
     budget_s: float
+    agent_name: str = ""
 
 
 class LockGrant(SerializableBaseModel):
@@ -123,19 +136,31 @@ class LockMarker(SerializableBaseModel):
         run_id: The run holding the tree. A release must quote it, which is what
             stops a release from stealing a hold it does not own.
         agent_id: Who started that run.
+        agent_name: That agent's display name, as its acquirer knew it.
+            **Optional and defaulted**, so a marker written before this field
+            existed still parses — the reader falls back to the id, which is the
+            same degradation an unregistered agent already got. It is here
+            because the reader of a marker is routinely a *different process*
+            from its writer, and the mutation refusal it composes is read by a
+            model deciding what to do next.
     """
 
     run_id: str
     agent_id: str
+    agent_name: str = ""
 
 
 @runtime_checkable
 class LockBackend(Protocol):
     """The exclusive hold over one tree, and the whole of it.
 
-    Two methods, and deliberately no third: there is no "am I still the holder"
-    question, because nothing refreshes a hold mid-run (see
-    :meth:`FileLockBackend.acquire`).
+    Three methods, and deliberately no **refresh**: there is no "am I still the
+    holder" question, because nothing refreshes a hold mid-run (see
+    :meth:`FileLockBackend.acquire`). :meth:`holder` is not that question — it
+    is "who holds this tree *now*", asked by a reader that never took the hold
+    and never will, so that a mutation gate in any process can refuse against
+    the tree's own on-disk state rather than against one actor's memory
+    (ADR-051 Decision 5).
 
     ``@runtime_checkable`` buys an ``isinstance`` check on **method names only**
     — not a signature, not an argument count, not a return type — exactly as
@@ -153,6 +178,20 @@ class LockBackend(Protocol):
 
     def release(self, tree_key: str, run_id: str) -> None:
         """Give the tree back, if *run_id* is what holds it."""
+        ...
+
+    def holder(self, tree_key: str, budget_s: float) -> LockMarker | None:
+        """Return the hold *tree_key* is genuinely under, or ``None``.
+
+        Read-only: it takes nothing, releases nothing and writes nothing.
+
+        *budget_s* is the run budget the staleness window is measured against,
+        and it is a parameter rather than a constant for the reason
+        :meth:`FileLockBackend.acquire` already takes it on its ticket — the
+        window is ``budget_s + LEASE_GRACE_S``, and only the caller knows what
+        budget runs on this tree get. A hold past it is not a hold: its run is
+        not going to answer, and mutations proceed.
+        """
         ...
 
 
@@ -215,7 +254,7 @@ class FileLockBackend:
         grant = self._claim(marker, ticket)
         if grant is not None:
             return grant
-        if not self._is_stale(marker, ticket):
+        if not self._is_stale(marker, ticket.budget_s):
             return LockGrant(refusal=exec_busy())
         logger.warning(
             "Workspace %s: taking over the exec lock at %s — it is past its budget and the "
@@ -272,6 +311,45 @@ class FileLockBackend:
             return
         marker.unlink(missing_ok=True)
 
+    def holder(self, tree_key: str, budget_s: float) -> LockMarker | None:
+        """Return the hold *tree_key* is under, or ``None`` — see :meth:`LockBackend.holder`.
+
+        **Nothing is created, taken or released here**, which is what makes it
+        safe to call on the mutation path: a workspace that has never run a
+        command has no metadata directory, and asking who holds it must not make
+        one.
+
+        Three ways the answer is ``None``, and all three mean "the tree is
+        free": there is no marker; the marker does not parse, so it is not one
+        this code wrote and nothing can be said about whose hold it is; or it is
+        past ``budget_s + LEASE_GRACE_S``, in which case its run is not going to
+        answer and :meth:`acquire` would take it over.
+
+        Args:
+            tree_key: The two-segment ``<scope>/<leaf>`` path.
+            budget_s: The effective run budget the staleness window is measured
+                against.
+
+        Returns:
+            The parsed marker, or ``None``.
+
+        Raises:
+            OSError: Whatever reading the marker raised. The caller decides what
+                a tree it cannot inspect means; it is never turned into a hold
+                here, because "I could not read it" and "somebody holds it" are
+                different answers.
+        """
+        marker = self._marker(tree_key)
+        try:
+            raw = marker.read_text()
+        except FileNotFoundError:
+            return None
+        try:
+            held = LockMarker.model_validate_json(raw)
+        except ValidationError:
+            return None
+        return None if self._is_stale(marker, budget_s) else held
+
     def _marker(self, tree_key: str) -> Path:
         """The marker belonging to *tree_key* — a sibling of the tree, never inside it."""
         return meta_dir_for(tree_key) / EXEC_LOCK_FILENAME
@@ -291,7 +369,13 @@ class FileLockBackend:
         run_id = new_run_id()
         try:
             with os.fdopen(fd, "w") as handle:
-                handle.write(LockMarker(run_id=run_id, agent_id=ticket.agent_id).model_dump_json())
+                handle.write(
+                    LockMarker(
+                        run_id=run_id,
+                        agent_id=ticket.agent_id,
+                        agent_name=ticket.agent_name,
+                    ).model_dump_json()
+                )
         except BaseException:
             # A half-written marker is one nothing can parse, so ``release``
             # would leave it for the staleness window rather than clear it —
@@ -302,7 +386,7 @@ class FileLockBackend:
             raise
         return LockGrant(run_id=run_id)
 
-    def _is_stale(self, marker: Path, ticket: LockTicket) -> bool:
+    def _is_stale(self, marker: Path, budget_s: float) -> bool:
         """Whether the existing marker is past the budget and the grace.
 
         A marker that vanished between the failed create and this ``stat`` is
@@ -313,12 +397,20 @@ class FileLockBackend:
         The grace is :data:`~akgentic.tool.workspace.execution.LEASE_GRACE_S`,
         derived rather than respelled: two literals for one window is two places
         for a change to be applied once and missed once.
+
+        **One predicate, two readers.** :meth:`acquire` asks it to decide a
+        takeover and :meth:`holder` asks it to decide a refusal, and they must
+        agree — a mutation refused against a hold that the very next
+        ``request_exec`` would take over is a tree that says two things about
+        itself at once. Hence the plain float rather than a ticket: the holder
+        query has no ticket to offer and inventing one would have been a second
+        spelling of the same window.
         """
         try:
             mtime = marker.stat().st_mtime
         except FileNotFoundError:
             return False
-        return time.time() - mtime > ticket.budget_s + LEASE_GRACE_S
+        return time.time() - mtime > budget_s + LEASE_GRACE_S
 
 
 LOCK_BACKEND_CLASSES: dict[str, type[LockBackend]] = {"file": FileLockBackend}

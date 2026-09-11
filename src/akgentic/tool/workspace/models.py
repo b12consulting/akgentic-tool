@@ -27,19 +27,20 @@ from akgentic.tool.workspace.documents.models import (
 )
 
 DEFAULT_MAX_OBSERVATIONS_PER_AGENT = 256
-"""Per-agent bound on the observation map.
+"""Default of ``WorkspaceTool.max_observations_per_agent``.
 
-Bounds the **path** dimension only — see ``WorkspaceActor.record_observation``
-for why the agent dimension is deliberately left unbounded.
+Bounds the **paths** one agent's card remembers having read. There is no second
+dimension to bound: one card belongs to one agent
+(:meth:`~akgentic.tool.workspace.card.gate.CardGate.record_observation`).
 """
 
 DEFAULT_MAX_TRACKED_WRITERS = 512
-"""Bound on the last-writer map, which is keyed by **path** across all agents.
+"""Bound on the actor's agent-name map, which is keyed by agent id.
 
 Deliberately a separate constant from the observation cap: that one bounds one
-agent's paths, this one bounds the whole tree's, so a single number would be
-wrong at one end or the other. Both exist for the same reason — an uncapped map
-on a long-lived tree singleton leaks for the life of the tree.
+agent's paths on one card, this one bounds the names one tree's actor has been
+told, across every agent that ever attached. Both exist for the same reason — an
+uncapped map on a long-lived tree actor leaks for the life of the tree.
 """
 
 MAX_REJECTION_DIFF_LINES = 200
@@ -267,24 +268,6 @@ class MutationOutcome(SerializableBaseModel):
     message: str
 
 
-class LastWrite(SerializableBaseModel):
-    """The agent behind the most recent accepted mutation of one path.
-
-    Attributes:
-        agent_id: Identity of the writing agent, as a string.
-        sha: Digest of the bytes that agent wrote.
-
-    The digest is what keeps attribution honest. A refusal may name this agent
-    only while the live file still hashes to ``sha``; once anything else has
-    touched the path, the last accepted writer is no longer the author of what
-    is on disk, and naming them would pin an out-of-band change — an upload, a
-    sandbox run, another team — on whichever agent happened to write last.
-    """
-
-    agent_id: str
-    sha: str
-
-
 class WorkspaceConfig(BaseConfig):
     """Configuration of the ``#Workspace-<workspace_path>`` actor.
 
@@ -303,9 +286,8 @@ class WorkspaceConfig(BaseConfig):
             this one value; two cards on different workspaces cannot collapse
             onto one actor owning one tree, and nothing here re-derives a
             directory from a ``workspace_id`` or a team id.
-        max_observations_per_agent: Cap on the per-agent observation map.
-        max_tracked_writers: Cap on the path-keyed last-writer map, which the
-            gate consults only to name the other writer in a refusal.
+        max_tracked_writers: Cap on the agent-name map, which the exec busy
+            refusal consults to name the holder rather than its UUID.
         max_documents: Cap on the number of cached extractions the document
             store holds for this tree. Over it, the least recently extracted
             body is dropped and its record removed when nothing else is left in
@@ -327,7 +309,6 @@ class WorkspaceConfig(BaseConfig):
     """
 
     workspace_path: str
-    max_observations_per_agent: int = DEFAULT_MAX_OBSERVATIONS_PER_AGENT
     max_tracked_writers: int = DEFAULT_MAX_TRACKED_WRITERS
     max_documents: int = DEFAULT_MAX_DOCUMENTS
     max_document_chars: int = DEFAULT_MAX_DOCUMENT_CHARS

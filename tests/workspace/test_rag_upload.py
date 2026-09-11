@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 from akgentic.core.utils.serializer import SerializableBaseModel
+
 from akgentic.tool.workspace.actor import WorkspaceActor
 from akgentic.tool.workspace.documents.models import (
     NewFileMessage,
@@ -25,9 +26,7 @@ from akgentic.tool.workspace.documents.models import (
     RagFile,
     RagStatus,
 )
-from akgentic.tool.workspace.models import MutationStatus
 from akgentic.tool.workspace.workspace import PathEscapeError
-
 from tests.workspace.conftest import WORKSPACE_PATH, seed_row, stored_rows
 from tests.workspace.test_rag_pipeline import RagHarness, write
 from tests.workspace.test_rag_search import build_actor
@@ -53,13 +52,16 @@ def upload_without_retrieval(workspace_tree: Path, monkeypatch: pytest.MonkeyPat
 
 
 def gate_still_works(actor: WorkspaceActor, probe: str) -> bool:
-    """Whether a real mutation still commits through this actor.
+    """Whether the actor still answers for its tree after a malformed message.
 
     Not decoration: the failure this exists to catch is an actor that survived a
-    malformed message and lost the thing it exists for.
+    malformed message and lost the thing it exists for. The **gate** moved
+    card-side in 52-5, so the probe is now the surface this actor still owns —
+    the retrieval index it is being asked to keep — driven the way a mutation's
+    stale-mark drives it.
     """
-    outcome = actor.apply_write("gate-probe", probe, "still here\n")
-    return outcome.status is MutationStatus.ACCEPTED
+    actor.mark_paths_stale([probe])
+    return actor._document_store is not None
 
 
 class TestTheMessageModel:

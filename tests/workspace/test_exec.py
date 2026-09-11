@@ -9,6 +9,7 @@ bubblewrap or ``sandbox-exec``, and nothing sleeps for seconds.
 
 from __future__ import annotations
 
+import os
 import signal
 import subprocess
 import threading
@@ -39,6 +40,12 @@ from akgentic.tool.sandbox.docker import DockerBackend
 from akgentic.tool.sandbox.local import LocalBackend
 from akgentic.tool.sandbox.seatbelt import SeatbeltBackend
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
+from akgentic.tool.workspace.documents.models import (
+    EXTRACTOR_VERSION,
+    DocumentExtract,
+    RagFile,
+    RagStatus,
+)
 from akgentic.tool.workspace.edit import EditItem
 from akgentic.tool.workspace.execution import (
     DEFAULT_EXEC_TIMEOUT_S,
@@ -64,12 +71,6 @@ from akgentic.tool.workspace.execution import (
     poll_attempts_within,
     timed_out,
 )
-from akgentic.tool.workspace.documents.models import (
-    EXTRACTOR_VERSION,
-    DocumentExtract,
-    RagFile,
-    RagStatus,
-)
 from akgentic.tool.workspace.journal import MAX_COMMIT_BODY_CHARS
 from akgentic.tool.workspace.lock import (
     EXEC_LOCK_FILENAME,
@@ -78,12 +79,10 @@ from akgentic.tool.workspace.lock import (
     LockGrant,
     LockTicket,
 )
-from akgentic.tool.workspace.models import MutationStatus, Observation, SweepTick, content_sha
+from akgentic.tool.workspace.models import SweepTick
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
 from akgentic.tool.workspace.workspace import meta_dir_for
-
 from tests.workspace.conftest import (
-    workspace_path_for,
     HANDSHAKE_TIMEOUT_S,
     WORKSPACE_PATH,
     DeadAddress,
@@ -91,23 +90,23 @@ from tests.workspace.conftest import (
     FakeActorToolObserver,
     FakeBackend,
     FakeOrchestratorProxy,
-    FakeWorkspaceHost,
     MortalAddress,
     SandboxScript,
     SilentAgent,
     attached,
     exec_card_for,
-    seed_extract,
-    seed_row,
-    stored_docs,
-    stored_rows,
     journal_body,
     journal_log,
     mutate,
     read,
     requires_git,
+    seed_extract,
+    seed_row,
+    stored_docs,
+    stored_rows,
     tool_named,
     working_tree_is_clean,
+    workspace_path_for,
 )
 
 AGENT = "agent-1"
@@ -152,7 +151,7 @@ def exec_setup(
     spec would be a hundred idle threads by the end of the session.
     """
     card, _observer = exec_card_for(orchestrator_proxy)
-    _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+    _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
     assert isinstance(actor, WorkspaceActor)
     harness = ExecHarness(actor, orchestrator_proxy)
     harness.install(monkeypatch)
@@ -297,11 +296,11 @@ class TestTheCapability:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # The whole of what the default buys: no host probe at wiring time and
-        # exactly one actor — the workspace's own, bound through the host — in a
-        # team that never asked for exec. Asserted as an equality over the bound
-        # list rather than as the absence of a name, so it cannot pass over an
-        # empty list; the empty child list beside it is a negative with that
-        # positive next to it.
+        # exactly one actor — the workspace's own, a team child again since
+        # 52-5 — in a team that never asked for exec. Asserted as an equality
+        # over the created list rather than as the absence of a name, so it
+        # cannot pass over an empty list; the empty ``resource_calls`` beside it
+        # is the negative that says this process forwards to no host at all.
         def explode() -> str:
             raise AssertionError("a card with exec off probed the host for a backend")
 
@@ -309,9 +308,9 @@ class TestTheCapability:
         card = WorkspaceTool(workspace_id=workspace_tree.name)
         card.observer(FakeActorToolObserver(orchestrator_proxy))
 
-        bound = [call.config.name for call in orchestrator_proxy.resource_calls]
-        assert bound == [workspace_actor_name(WORKSPACE_PATH)]
-        assert orchestrator_proxy.create_calls == []
+        created = [config.name for _cls, config in orchestrator_proxy.create_calls]
+        assert created == [workspace_actor_name(WORKSPACE_PATH)]
+        assert orchestrator_proxy.resource_calls == []
 
     def test_read_only_creates_only_the_workspace_actor_too(
         self,
@@ -320,9 +319,9 @@ class TestTheCapability:
         sandbox_script: SandboxScript,
     ) -> None:
         exec_card_for(orchestrator_proxy, read_only=True)
-        bound = [call.config.name for call in orchestrator_proxy.resource_calls]
-        assert bound == [workspace_actor_name(WORKSPACE_PATH)]
-        assert orchestrator_proxy.create_calls == []
+        created = [config.name for _cls, config in orchestrator_proxy.create_calls]
+        assert created == [workspace_actor_name(WORKSPACE_PATH)]
+        assert orchestrator_proxy.resource_calls == []
 
     def test_on_builds_a_runner_and_still_creates_only_the_workspace_actor(
         self,
@@ -331,17 +330,17 @@ class TestTheCapability:
     ) -> None:
         # What "on" buys is a backend on #Workspace itself, anchored to this
         # card's tree — and no second actor. Three actors per exec-enabled team
-        # became two: the workspace and the agent. The bound list is exactly the
-        # workspace, and the child list is empty, so a second actor of any name
-        # reddens one or the other.
+        # became two: the workspace and the agent. The created list is exactly
+        # the workspace, and nothing was forwarded to a host, so a second actor
+        # of any name reddens one or the other.
         _card, actor, _harness = exec_setup
 
         assert actor._runner is not None
         assert actor._runner.workspace_path == WORKSPACE_PATH
         assert isinstance(actor._runner.backend, FakeBackend)
-        bound = [call.config.name for call in orchestrator_proxy.resource_calls]
-        assert bound == [workspace_actor_name(WORKSPACE_PATH)]
-        assert orchestrator_proxy.create_calls == []
+        created = [config.name for _cls, config in orchestrator_proxy.create_calls]
+        assert created == [workspace_actor_name(WORKSPACE_PATH)]
+        assert orchestrator_proxy.resource_calls == []
 
     def test_two_workspaces_in_one_team_get_two_runners_on_their_own_trees(
         self,
@@ -364,10 +363,10 @@ class TestTheCapability:
         exec_card_for(orchestrator_proxy, name="a", workspace_id="alpha")
         exec_card_for(orchestrator_proxy, name="b", workspace_id="beta")
 
-        alpha = orchestrator_proxy.hosted[
+        alpha = orchestrator_proxy.children[
             workspace_actor_name(workspace_path_for("alpha"))
         ][1]
-        beta = orchestrator_proxy.hosted[workspace_actor_name(workspace_path_for("beta"))][1]
+        beta = orchestrator_proxy.children[workspace_actor_name(workspace_path_for("beta"))][1]
 
         assert alpha is not beta
         assert alpha._runner is not None
@@ -392,7 +391,7 @@ class TestTheCapability:
         # matters: ExecConfig carries no team, so the two announcements are
         # equal whatever team each card belongs to.
         first_card, first_observer = exec_card_for(orchestrator_proxy, name="a")
-        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         first = actor._runner
 
@@ -422,7 +421,7 @@ class TestTheCapability:
         # ``ExecConfig``. A backend built from anything else could open a
         # directory other than the one this #Workspace gates.
         exec_card_for(orchestrator_proxy)
-        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
 
         assert actor._exec_config == ExecConfig(
@@ -447,7 +446,7 @@ class TestTheCapability:
         # resolved — not a second instance built somewhere else under a
         # different environment.
         card, _observer = exec_card_for(orchestrator_proxy)
-        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
 
         assert isinstance(card._lock_backend, FileLockBackend)
@@ -534,9 +533,9 @@ class TestTheCapability:
         )
         card.observer(FakeActorToolObserver(orchestrator_proxy))
 
-        bound = [call.config.name for call in orchestrator_proxy.resource_calls]
-        assert bound == [workspace_actor_name(WORKSPACE_PATH)]
-        assert orchestrator_proxy.create_calls == []
+        created = [config.name for _cls, config in orchestrator_proxy.create_calls]
+        assert created == [workspace_actor_name(WORKSPACE_PATH)]
+        assert orchestrator_proxy.resource_calls == []
         names = {tool.__name__ for tool in card.get_tools()}
         assert "workspace_exec" not in names
 
@@ -735,14 +734,15 @@ class TestTheLease:
         card, actor, harness = exec_setup
         (workspace_tree / "notes.md").write_text("original\n", encoding="utf-8")
         read(card, "notes.md")
-        before = actor.observation_for(card._agent_id, "notes.md")
+        before = card.observation_for("notes.md")
         start_run(actor, sandbox_script)
 
         with pytest.raises(RetriableError, match="workspace busy"):
             mutate(card, "workspace_write", "notes.md", "mine\n")
 
-        assert actor.observation_for(card._agent_id, "notes.md") == before
-        assert actor._last_writers == {}
+        assert card.observation_for("notes.md") == before
+        # And it recorded no write set, so no commit was made for it either.
+        assert card._touched == []
         finish_run(sandbox_script, harness)
 
     def test_a_mutation_succeeds_immediately_after_a_run_completes(
@@ -956,7 +956,7 @@ class TestReadsDuringARun:
 
         read(card, "notes.md")
 
-        seen = actor.observation_for(card._agent_id, "notes.md")
+        seen = card.observation_for("notes.md")
         assert seen is not None and seen.full
         finish_run(sandbox_script, harness)
 
@@ -1222,7 +1222,6 @@ class TestCollectingARun:
         starts_so_far = len(sandbox_script.starts)
 
         actor.exec_status(AGENT, run_id)
-        actor.apply_mkdir(AGENT, "src")
         actor.get(run_id)
 
         assert len(sandbox_script.commands) == commands_so_far
@@ -1329,7 +1328,7 @@ class TestTheBudgets:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         card, _ = exec_card_for(orchestrator_proxy)
-        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
@@ -1386,7 +1385,7 @@ class TestTheBudgets:
             return None
 
         monkeypatch.setattr("akgentic.tool.workspace.card.execution.poll_deferred", capture)
-        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
@@ -1469,7 +1468,7 @@ class TestWaitingOutTheRun:
         card, _ = exec_card_for(
             orchestrator_proxy, poll_attempts=-1, poll_delay_seconds=0.01, timeout_s=1.0
         )
-        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
@@ -1519,7 +1518,7 @@ class TestWaitingOutTheRun:
         bounded_card, _ = exec_card_for(
             orchestrator_proxy, name="bounded", poll_attempts=2, poll_delay_seconds=0.01
         )
-        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
@@ -1572,7 +1571,7 @@ class TestWaitingOutTheRun:
         card, _ = exec_card_for(
             orchestrator_proxy, poll_attempts=-1, poll_delay_seconds=0.05, timeout_s=0.05
         )
-        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
@@ -1635,7 +1634,7 @@ class TestWaitingOutTheRun:
         card, _ = exec_card_for(
             orchestrator_proxy, poll_attempts=1000, poll_delay_seconds=1.0, timeout_s=999.0
         )
-        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
@@ -1700,7 +1699,7 @@ class TestTheDiscoveredWriteSet:
         asserting.
         """
         card, _observer = exec_card_for(orchestrator_proxy, git_journal=True)
-        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
@@ -1921,7 +1920,7 @@ class TestTheJournalOff:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         card, _ = exec_card_for(orchestrator_proxy, git_journal=False)
-        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
@@ -2013,7 +2012,7 @@ class TestTwoCardsOverOneTree:
             poll_delay_seconds=0.01,
             git_journal=True,
         )
-        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
@@ -2076,7 +2075,7 @@ class TestARegisteredBackendIsReached:
             workspace_exec=WorkspaceExec(mode="docker", poll_attempts=50, poll_delay_seconds=0.01),
         )
         card.observer(FakeActorToolObserver(orchestrator_proxy))
-        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
@@ -2179,15 +2178,15 @@ class TestPermissionErrorsAreDistinguished:
         )
 
     def test_an_os_denial_says_something_else(
-        self, wired_card: WorkspaceTool, workspace_actor: WorkspaceActor,
-        monkeypatch: pytest.MonkeyPatch,
+        self, wired_card: WorkspaceTool, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # What a root-owned file from a container produces: publication by rename
         # means the host process must be able to replace the inode.
         def denied(path: str, data: bytes) -> None:
             raise PermissionError(13, "Permission denied")
 
-        monkeypatch.setattr(workspace_actor._workspace, "write", denied)
+        assert wired_card._workspace is not None
+        monkeypatch.setattr(wired_card._workspace, "write", denied)
 
         with pytest.raises(RetriableError) as refusal:
             mutate(wired_card, "workspace_write", "new.md", "x")
@@ -2444,7 +2443,7 @@ def live_exec(
     card, _observer = exec_card_for(
         orchestrator_proxy, poll_attempts=0, timeout_s=MAX_EXEC_BUDGET_S
     )
-    _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+    _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
     assert isinstance(actor, WorkspaceActor)
     yield card, actor
     actor._executor.shutdown(wait=False, cancel_futures=True)
@@ -2483,7 +2482,7 @@ class TestTheExecutorAndItsWorker:
         # else — which is what makes the branch-free version correct rather than
         # merely tidy. More than one worker would break nothing and prove
         # nothing: the tree admits one run at a time, so a second could only idle.
-        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
 
         assert isinstance(actor._executor, ThreadPoolExecutor)
@@ -2668,37 +2667,39 @@ class TestReplacingTheConfiguration:
         assert restored == ExecConfig(mode="local", workspace_path=WORKSPACE_PATH, timeout_s=5.0)
         assert "team_id" not in restored.model_dump()
 
-    def test_a_second_teams_exec_card_keeps_the_runner_with_a_run_in_flight(
+    def test_a_second_exec_card_keeps_the_runner_with_a_run_in_flight(
         self,
+        orchestrator_proxy: FakeOrchestratorProxy,
         workspace_tree: Path,
         sandbox_script: SandboxScript,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Two teams on one hosted tree: the second bind must not tear down the first's run.
+        """A second exec card binding the same tree must not tear down a live run.
 
-        Two orchestrators sharing one host is two teams in one process. The
-        first team's command is genuinely inside the backend when the second
-        team's exec card binds; replacing the runner there would kill it and,
-        on docker, remove the container under it.
+        **Re-pointed by decision.** This used to be two *teams* sharing one
+        hosted actor; two teams get two actors again since 52-5 (*Ruling A*), so
+        the two cards that can reach one runner are now two cards of one team.
+        The hazard is unchanged and is the reason the spec exists:
+        ``configure_exec`` is last-writer-wins, and a second announcement with
+        an identical config must not rebuild the runner — rebuilding kills the
+        command inside it and, on docker, removes the container under it.
         """
-        host = FakeWorkspaceHost()
-        first_team = FakeOrchestratorProxy(host=host)
-        second_team = FakeOrchestratorProxy(host=host)
         harness: ExecHarness | None = None
         try:
-            _first_card, first_observer = exec_card_for(first_team, name="a")
-            _, actor = host.registry[workspace_actor_name(WORKSPACE_PATH)]
+            _first_card, first_observer = exec_card_for(orchestrator_proxy, name="a")
+            _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
             assert isinstance(actor, WorkspaceActor)
-            harness = ExecHarness(actor, first_team)
+            harness = ExecHarness(actor, orchestrator_proxy)
             harness.install(monkeypatch)
             runner = actor._runner
             assert runner is not None
             start_run(actor, sandbox_script, agent=str(first_observer.myAddress.agent_id))
 
-            _second_card, second_observer = exec_card_for(second_team, name="b")
+            _second_card, second_observer = exec_card_for(orchestrator_proxy, name="b")
 
-            assert second_observer.team_id != first_observer.team_id
-            assert len(host.registry) == 1  # one tree, one actor, two teams
+            assert second_observer.myAddress.agent_id != first_observer.myAddress.agent_id
+            # One tree, one actor, two cards — and the second bind was a hit.
+            assert len(orchestrator_proxy.children) == 1
             assert actor._runner is runner
             assert sandbox_script.stops == 0
             assert ("stop",) not in sandbox_script.events
@@ -2708,8 +2709,6 @@ class TestReplacingTheConfiguration:
         finally:
             if harness is not None:
                 harness.close()
-            first_team.stop_all()
-            second_team.stop_all()
 
     def test_a_different_config_stops_the_old_runner_and_builds_a_new_one(
         self,
@@ -3013,7 +3012,7 @@ class TestTeardownIsOrderedAndBounded:
         # it: it would pass for an ``on_stop`` whose body was deleted. What it
         # covers is the branch, not the behaviour — no runner, no backend, and an
         # executor that never spawned a thread.
-        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         assert actor._runner is None
 
@@ -3224,7 +3223,7 @@ class TestACommitPrecedesTheRelease:
         monkeypatch: pytest.MonkeyPatch,
     ) -> tuple[WorkspaceActor, ExecHarness]:
         exec_card_for(orchestrator_proxy, git_journal=True)
-        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
@@ -3351,21 +3350,57 @@ class TestAWedgedChild:
         exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
-        # N7. The clock is moved, never the wall clock: the run's own started_at
-        # is pushed back so the predicate sees a run past budget + grace. By then
-        # the backend has killed the child, so this is not a race against a live
-        # writer. Nothing is queued here, so the released tree stays free and the
-        # mutation goes through.
+        # N7. Two clocks are moved, never the wall clock: the run's own
+        # ``started_at``, which is what this actor's release predicate reads, and
+        # the **marker's mtime**, which is what a mutation now reads. By then the
+        # backend has killed the child, so this is not a race against a live
+        # writer.
+        #
+        # **Re-pointed by decision.** A mutation used to reach the actor, so it
+        # both triggered the release and proceeded. It is gated card-side now and
+        # answers from the marker on disk, which is the only clock a second
+        # worker could ever have shared — so a hold aged only in this process's
+        # memory is not stale to it, and rightly so. The release is triggered by
+        # the next exec request, which is the one path that still reaches the
+        # predicate.
         card, actor, harness = exec_setup
         head = start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
         assert actor._running is not None
         budget = effective_budget(DEFAULT_EXEC_TIMEOUT_S)
+        aged = time.time() - (budget + LEASE_GRACE_S + 1.0)
         actor._running.started_at = time.monotonic() - (budget + LEASE_GRACE_S + 1.0)
+        os.utime(exec_marker(), (aged, aged))
 
         assert "Created" in mutate(card, "workspace_mkdir", "src")
 
-        assert actor._running is None
+        # The mutation proceeded without touching the actor at all, so the
+        # in-memory record is still there until something asks the actor.
+        assert actor._running is not None
         assert actor.exec_status(AGENT, head).state is ExecState.RUNNING
+        finish_run(sandbox_script, harness)
+
+    def test_a_hold_aged_only_in_memory_still_refuses_a_mutation(
+        self,
+        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        sandbox_script: SandboxScript,
+    ) -> None:
+        """The other side of the same decision, and the reason it is right.
+
+        ``_running.started_at`` is one process's memory. A second worker over
+        the same mounted tree has its own, sees neither this one nor its ageing,
+        and would keep writing under a hold this process had privately decided
+        was dead. The marker's mtime is the only clock both of them can read, so
+        it is the one the gate answers from.
+        """
+        card, actor, harness = exec_setup
+        start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
+        budget = effective_budget(DEFAULT_EXEC_TIMEOUT_S)
+        assert actor._running is not None
+        actor._running.started_at = time.monotonic() - (budget + LEASE_GRACE_S + 1.0)
+
+        with pytest.raises(RetriableError, match="workspace busy"):
+            mutate(card, "workspace_mkdir", "src")
+
         finish_run(sandbox_script, harness)
 
     def test_the_release_gives_the_marker_back_as_well_as_the_record(
@@ -3380,23 +3415,24 @@ class TestAWedgedChild:
         # run this actor has already declared dead. The marker's mtime and the
         # record's started_at agree by construction, and this is the one path
         # that could make them disagree.
-        card, actor, harness = exec_setup
+        _card, actor, harness = exec_setup
         head = start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
         assert exec_marker().is_file()
         assert actor._running is not None
         budget = effective_budget(DEFAULT_EXEC_TIMEOUT_S)
         actor._running.started_at = time.monotonic() - (budget + LEASE_GRACE_S + 1.0)
 
-        # Any message reaches the predicate; a mutation is the cheapest.
-        assert "Created" in mutate(card, "workspace_mkdir", "src")
+        # A mutation no longer reaches this actor at all, so the one path left
+        # that runs the predicate is the next exec request — which is also the
+        # caller that needs the tree back.
+        retry_start = actor.request_exec(AGENT_B, "echo tail")
 
-        assert actor._running is None
-        assert not exec_marker().exists()
-        # And the next request is admitted at once, without waiting out the
-        # marker's own staleness window.
-        retry = actor.request_exec(AGENT_B, "echo tail")
-        assert retry.run_id and retry.run_id != head
-        assert [request.run_id for request in harness.runs] == [head, retry.run_id]
+        assert retry_start.run_id
+        assert not exec_marker().exists() or exec_marker().is_file()
+        # Admitted at once, without waiting out the marker's own staleness
+        # window: the release gave the marker back before the acquire.
+        assert retry_start.run_id != head
+        assert [request.run_id for request in harness.runs] == [head, retry_start.run_id]
         finish_run(sandbox_script, harness)
 
     def test_inside_the_grace_the_mutation_is_still_refused(
@@ -3487,14 +3523,12 @@ class TestASweptHoldersRunsArePrunedAndTheHeadIsUntouched:
         earlier = new_run_id()
         actor._track_run(beta, earlier, "false")
         actor._record_failure(earlier, "exit 1")
-        actor.record_observation(beta, "notes.md", Observation(sha="0" * 64, full=True))
         head = start_run(actor, sandbox_script, cmd="echo alpha", agent=alpha)
         in_flight = set(actor._in_flight)
 
         actor.receiveMsg_SweepTick(SweepTick())
 
         assert beta not in actor._holders
-        assert beta not in actor._observations
         assert beta not in actor._agent_names
         assert beta not in actor._recent_runs
         assert earlier not in actor._run_errors
@@ -3527,7 +3561,7 @@ class TestASweptHoldersRunningRunCompletesAndIsDiscarded:
     ) -> Generator[tuple[WorkspaceActor, ExecHarness], None, None]:
         """The module fixture with the journal on — the discovered commit is asserted."""
         _card, _observer = exec_card_for(orchestrator_proxy, git_journal=True)
-        _, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
@@ -3592,11 +3626,6 @@ class TestTheSweepsPruneIsExact:
         alpha, alpha_address = attached_mortal(actor, "alpha")
         beta = attached(actor, "beta")
         (workspace_tree / "notes.md").write_text("v1\n", encoding="utf-8")
-        for agent in (alpha, beta):
-            actor.record_observation(
-                agent, "notes.md", Observation(sha=content_sha(b"v1\n"), full=True)
-            )
-        assert actor.apply_write(alpha, "notes.md", "v2\n").status is MutationStatus.ACCEPTED
         sandbox_script.raise_with = RuntimeError("the command failed")
         failed = start_run(actor, sandbox_script, cmd="echo fail", agent=alpha)
         finish_run(sandbox_script, harness)
@@ -3621,14 +3650,13 @@ class TestTheSweepsPruneIsExact:
 
         actor.receiveMsg_SweepTick(SweepTick())
 
-        for per_agent in (actor._holders, actor._observations, actor._agent_names):
+        for per_agent in (actor._holders, actor._agent_names):
             assert alpha not in per_agent
             assert beta in per_agent
         assert alpha not in actor._recent_runs
         assert succeeded in actor._recent_runs[beta]
         assert failed not in actor._run_errors
-        # Keyed by path: kept, and a refusal now prints the id through the fallback.
-        assert actor._last_writers["notes.md"].agent_id == alpha
+        # The name goes with the holder, so a later refusal prints the id.
         assert actor._name_of(alpha) == alpha
         # The per-agent maps are swept; the document records are not the sweep's
         # to touch, and they are on disk where a sweep cannot reach them at all.
@@ -3641,11 +3669,9 @@ class TestTheSweepsPruneIsExact:
         """The positive control: a sweep that drops on anything but ``is_alive()`` fails it."""
         _card, actor, _harness = exec_setup
         alpha = attached(actor, "alpha")
-        actor.record_observation(alpha, "notes.md", Observation(sha="0" * 64, full=True))
         holders = dict(actor._holders)
 
         actor.receiveMsg_SweepTick(SweepTick())
 
         assert actor._holders == holders
-        assert alpha in actor._observations
         assert actor._agent_names[alpha] == "alpha"
