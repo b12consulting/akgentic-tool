@@ -40,13 +40,19 @@ from tests.workspace.conftest import (
     tool_named,
 )
 
-FORMER_SWEEP_INTERVAL_S = 0.05
-"""What a spec drives the actor at instead of waiting out the 30 s the sweep used.
+IDLE_WAIT_S = 0.2
+"""How long the behavioural half leaves a bound tree completely idle.
 
-The deleted sweep read its interval from ``WorkspaceConfig``, so a spec could set
-it short. There is no field to set any more, so "comfortably past a tick" is
-expressed as real elapsed time against an interval this small — the same shape
-51-3 used, without the configuration that no longer exists.
+**It is deliberately not the sweep's former interval, and naming it so would
+overclaim.** The deleted sweep defaulted to 30 s and read that from
+``WorkspaceConfig``, so 51-3 could set it short and then genuinely outlive
+several ticks. There is no field to set any more, so no wall-clock a spec can
+afford proves a 30 s timer is absent — which is exactly why the structural half
+carries that weight: ``test_starting_one_spawns_no_timer_thread`` measures
+``threading.enumerate()`` across the start, so a timer at *any* interval, under
+any name, armed from any helper, is caught. What this wait adds is the other
+direction — that an idle tree is not degraded by being idle — and 0.2 s is
+enough for that.
 """
 
 
@@ -116,7 +122,7 @@ class TestTheBindRegistersTheAgentsName:
         nothing it can act on, and that is the regression a bare-id degradation
         would be.
         """
-        card, observer = card_for(orchestrator_proxy, "alice")
+        _card, observer = card_for(orchestrator_proxy, "alice")
         actor = _actor_of(orchestrator_proxy)
         agent_id = str(observer.myAddress.agent_id)
         run_id = "r0000001"
@@ -126,7 +132,6 @@ class TestTheBindRegistersTheAgentsName:
 
         assert "agent 'alice'" in refusal
         assert agent_id not in refusal
-        assert card is not None
 
 
 class TestNothingSweepsAndNothingReaps:
@@ -198,17 +203,20 @@ class TestABoundCardKeepsItsTreeAliveIndefinitely:
 
     51-3's version had to hold a *holder* to stay alive past a grace. There is no
     grace to outlive, so what this asserts is what a user would notice: a card
-    bound to a tree that is then left completely idle still serves a mutation
-    long after the old sweep would have ticked several times.
+    bound to a tree that is then left completely idle still serves a mutation,
+    with every surface a reap would have taken down still in place. **It does not
+    claim to outlast the old 30 s tick** — see :data:`IDLE_WAIT_S`; the absence of
+    any timer is the structural half's job, and this is the half that says the
+    live path still works.
     """
 
-    def test_an_idle_tree_still_serves_a_mutation_well_past_a_former_tick(
+    def test_an_idle_tree_still_serves_a_mutation(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         card, _observer = card_for(orchestrator_proxy, "alice")
         actor = _actor_of(orchestrator_proxy)
 
-        time.sleep(FORMER_SWEEP_INTERVAL_S * 4)
+        time.sleep(IDLE_WAIT_S)
 
         # Intact rather than merely un-stopped: the surfaces a reap would have
         # taken down are all still there, and a write still lands on disk.
