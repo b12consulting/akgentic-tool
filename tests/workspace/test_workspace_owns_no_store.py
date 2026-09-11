@@ -1,4 +1,8 @@
-"""What the workspace actor must never do — and the two rules that stopped being rules.
+"""A workspace owns no vector store of its own — and the rules that stopped being rules.
+
+**Renamed from ``test_hosted_invariants.py`` by story 52-6.** Nothing is hosted,
+so the old name described the file by a mechanism that no longer exists; what it
+actually guards is the 52-4 store binding, which is what it is now called after.
 
 **Two spec classes were deleted here by story 52-5, by decision rather than by
 failure**, and the distinction is the whole reason this paragraph exists:
@@ -71,9 +75,8 @@ class TestAWorkspaceOwnsNoStoreOfItsOwn:
         """The store exists — once, in the team — and the workspace did not make it.
 
         ``FakeOrchestratorProxy`` in live mode starts the workspace with no
-        orchestrator at all, which is what ``ResourceHost`` does. So the one store
-        that exists cannot have come from it: a workspace that still spawned a
-        child would show two.
+        orchestrator at all, so the one store that exists cannot have come from
+        it: a workspace that still spawned a child would show two.
         """
         pytest.importorskip("numpy", reason="the [vector_search] extra is not installed")
         from akgentic.tool.vector_store.actor import (

@@ -14,11 +14,11 @@ __all__ = ["WorkspaceAttached"]
 class WorkspaceAttached:
     """An agent bound its card to the ``#Workspace`` that owns *workspace_path*.
 
-    Built by the binding card and handed to ``Orchestrator.getResourceOrCreate``,
-    which wraps it in core's ``EventMessage`` and emits it on the binding team's
-    own stream **unread**. One event per successful bind, **including a registry
-    hit**: two agents on one tree are two events and one actor. There is no
-    detach event.
+    Built and emitted by the binding card itself, through
+    ``ToolObserver.notify_event``, which wraps it in core's ``EventMessage`` and
+    puts it on the binding team's own stream **unread**. One event per successful
+    bind, **including a get-or-create hit**: two agents of one team on one tree
+    are two events and one actor. There is no detach event.
 
     **Keep it a module top-level class, in this module.** The serializer persists
     ``module.ClassName`` into every stored event, and replay resolves that string

@@ -16,7 +16,6 @@ import threading
 import time
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -40,12 +39,6 @@ from akgentic.tool.sandbox.docker import DockerBackend
 from akgentic.tool.sandbox.local import LocalBackend
 from akgentic.tool.sandbox.seatbelt import SeatbeltBackend
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
-from akgentic.tool.workspace.documents.models import (
-    EXTRACTOR_VERSION,
-    DocumentExtract,
-    RagFile,
-    RagStatus,
-)
 from akgentic.tool.workspace.edit import EditItem
 from akgentic.tool.workspace.execution import (
     DEFAULT_EXEC_TIMEOUT_S,
@@ -79,18 +72,15 @@ from akgentic.tool.workspace.lock import (
     LockGrant,
     LockTicket,
 )
-from akgentic.tool.workspace.models import SweepTick
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
 from akgentic.tool.workspace.workspace import meta_dir_for
 from tests.workspace.conftest import (
     HANDSHAKE_TIMEOUT_S,
     WORKSPACE_PATH,
-    DeadAddress,
     ExecHarness,
     FakeActorToolObserver,
     FakeBackend,
     FakeOrchestratorProxy,
-    MortalAddress,
     SandboxScript,
     SilentAgent,
     attached,
@@ -100,10 +90,6 @@ from tests.workspace.conftest import (
     mutate,
     read,
     requires_git,
-    seed_extract,
-    seed_row,
-    stored_docs,
-    stored_rows,
     tool_named,
     working_tree_is_clean,
     workspace_path_for,
@@ -3487,191 +3473,3 @@ class TestAWedgedChild:
         # "echo head" is absent: the late report committed nothing as its agent.
         assert discovered == ["echo tail"]
         assert actor.exec_status(AGENT, head).state is ExecState.DONE
-
-
-# ---------------------------------------------------------------------------
-# Story 51-3 — the liveness sweep's exec half: the dropped run and the prune
-# ---------------------------------------------------------------------------
-
-
-def attached_mortal(actor: WorkspaceActor, name: str) -> tuple[str, MortalAddress]:
-    """Attach a holder a spec can later stop, and return the id its maps key on."""
-    address = MortalAddress(name)
-    actor.attach(address, name)
-    return str(address.agent_id), address
-
-
-class TestASweptHoldersRunsArePrunedAndTheHeadIsUntouched:
-    """The sweep drops an agent's runs without touching the run holding the tree."""
-
-    def test_the_dropped_agents_runs_go_and_a_live_ones_still_runs(
-        self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
-        sandbox_script: SandboxScript,
-    ) -> None:
-        # The queued half of this spec went with the queue — a swept agent has
-        # nothing parked to be dropped any more. What survives is what mattered
-        # underneath it: the prune is exact, the run genuinely holding the tree
-        # is left alone, and a live agent's command still runs afterwards.
-        _card, actor, harness = exec_setup
-        alpha = attached(actor, "alpha")
-        dead = DeadAddress("beta")
-        actor.attach(dead, "beta")
-        beta = str(dead.agent_id)
-        gamma = attached(actor, "gamma")
-        # Beta has an earlier failed run, so the ``_run_errors`` prune is observable.
-        earlier = new_run_id()
-        actor._track_run(beta, earlier, "false")
-        actor._record_failure(earlier, "exit 1")
-        head = start_run(actor, sandbox_script, cmd="echo alpha", agent=alpha)
-        in_flight = set(actor._in_flight)
-
-        actor.receiveMsg_SweepTick(SweepTick())
-
-        assert beta not in actor._holders
-        assert beta not in actor._agent_names
-        assert beta not in actor._recent_runs
-        assert earlier not in actor._run_errors
-        assert actor._running is not None
-        assert actor._running.run_id == head
-        assert actor._in_flight == in_flight
-        assert actor.exec_status(beta, earlier).state is ExecState.UNKNOWN
-        assert {alpha, gamma} <= set(actor._holders)
-
-        finish_run(sandbox_script, harness)
-        run_gamma = actor.request_exec(gamma, "echo gamma").run_id
-        assert run_gamma
-        harness.join()
-
-        # Released and joined, so the backend has seen everything it ever will.
-        assert [cmd for cmd, _cwd in sandbox_script.commands] == ["echo alpha", "echo gamma"]
-        assert actor.exec_status(gamma, run_gamma).state is ExecState.DONE
-
-
-class TestASweptHoldersRunningRunCompletesAndIsDiscarded:
-    """Decision 9: a running run completes on its budget, and its report is not cached."""
-
-    @pytest.fixture
-    def journal_setup(
-        self,
-        orchestrator_proxy: FakeOrchestratorProxy,
-        workspace_tree: Path,
-        sandbox_script: SandboxScript,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> Generator[tuple[WorkspaceActor, ExecHarness], None, None]:
-        """The module fixture with the journal on — the discovered commit is asserted."""
-        _card, _observer = exec_card_for(orchestrator_proxy, git_journal=True)
-        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
-        assert isinstance(actor, WorkspaceActor)
-        harness = ExecHarness(actor, orchestrator_proxy)
-        harness.install(monkeypatch)
-        yield actor, harness
-        harness.close()
-
-    @requires_git
-    def test_the_run_is_not_killed_its_outcome_is_not_cached_and_the_tree_moves_on(
-        self,
-        journal_setup: tuple[WorkspaceActor, ExecHarness],
-        sandbox_script: SandboxScript,
-        workspace_tree: Path,
-    ) -> None:
-        actor, harness = journal_setup
-        alpha, alpha_address = attached_mortal(actor, "alpha")
-        beta = attached(actor, "beta")
-        sandbox_script.files_by_cmd = {"make alpha": [("alpha.txt", "a\n")]}
-        run_id = start_run(actor, sandbox_script, cmd="make alpha", agent=alpha)
-        assert actor.request_exec(beta, "echo beta").refusal  # alpha holds it
-        alpha_address.dead = True
-
-        actor.receiveMsg_SweepTick(SweepTick())
-
-        assert sandbox_script.kills == 0
-        assert actor._running is not None
-        assert actor._running.run_id == run_id
-        assert run_id in actor._in_flight
-        assert actor._discarded_run == run_id
-
-        finish_run(sandbox_script, harness)
-
-        # Joined first: the report has arrived, so ``None`` is an absence and not a wait.
-        assert actor._running is None
-        assert actor.get(run_id) is None
-        assert run_id not in actor._run_errors
-        assert run_id not in actor._in_flight
-        assert actor._discarded_run is None
-        assert actor.exec_status(alpha, run_id).state is ExecState.UNKNOWN
-        # The tree was given back — a discarded outcome still releases it — so
-        # beta's retry runs and answers as usual.
-        run_beta = actor.request_exec(beta, "echo beta").run_id
-        assert run_beta
-        harness.join()
-        assert [cmd for cmd, _cwd in sandbox_script.commands] == ["make alpha", "echo beta"]
-        assert actor.exec_status(beta, run_beta).state is ExecState.DONE
-        # The tree's own record is kept, authored by the id — the name went with the holder.
-        [commit] = [c for c in journal_log(workspace_tree) if "alpha.txt" in c.files]
-        assert commit.author_name == alpha
-        assert alpha in commit.author_email
-
-
-class TestTheSweepsPruneIsExact:
-    """Every per-agent map loses the swept agent; nothing keyed otherwise is touched."""
-
-    def test_the_agent_maps_lose_it_and_the_path_and_state_maps_keep_everything(
-        self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
-        sandbox_script: SandboxScript,
-        workspace_tree: Path,
-    ) -> None:
-        _card, actor, harness = exec_setup
-        alpha, alpha_address = attached_mortal(actor, "alpha")
-        beta = attached(actor, "beta")
-        (workspace_tree / "notes.md").write_text("v1\n", encoding="utf-8")
-        sandbox_script.raise_with = RuntimeError("the command failed")
-        failed = start_run(actor, sandbox_script, cmd="echo fail", agent=alpha)
-        finish_run(sandbox_script, harness)
-        sandbox_script.raise_with = None
-        succeeded = start_run(actor, sandbox_script, cmd="echo beta", agent=beta)
-        finish_run(sandbox_script, harness)
-        assert failed in actor._run_errors
-        seed_extract(actor, "report.pdf", DocumentExtract(
-            path="report.pdf",
-            source_sha="0" * 64,
-            extractor_version=EXTRACTOR_VERSION,
-            markdown="# report",
-            char_count=8,
-            extracted_at=datetime.now(UTC),
-        ))
-        seed_row(actor, "report.pdf", RagFile(
-            path="report.pdf", status=RagStatus.PENDING, updated_at=datetime.now(UTC)
-        ))
-        documents = stored_docs(actor)
-        rag_index = stored_rows(actor)
-        alpha_address.dead = True
-
-        actor.receiveMsg_SweepTick(SweepTick())
-
-        for per_agent in (actor._holders, actor._agent_names):
-            assert alpha not in per_agent
-            assert beta in per_agent
-        assert alpha not in actor._recent_runs
-        assert succeeded in actor._recent_runs[beta]
-        assert failed not in actor._run_errors
-        # The name goes with the holder, so a later refusal prints the id.
-        assert actor._name_of(alpha) == alpha
-        # The per-agent maps are swept; the document records are not the sweep's
-        # to touch, and they are on disk where a sweep cannot reach them at all.
-        assert stored_docs(actor) == documents
-        assert stored_rows(actor) == rag_index
-
-    def test_a_tick_that_finds_every_holder_alive_changes_nothing(
-        self, exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness]
-    ) -> None:
-        """The positive control: a sweep that drops on anything but ``is_alive()`` fails it."""
-        _card, actor, _harness = exec_setup
-        alpha = attached(actor, "alpha")
-        holders = dict(actor._holders)
-
-        actor.receiveMsg_SweepTick(SweepTick())
-
-        assert actor._holders == holders
-        assert actor._agent_names[alpha] == "alpha"

@@ -4,10 +4,11 @@
 and :class:`RagChunk`, chosen now on purpose.** ``serialize()`` stamps
 ``__model__ = "<module>.<name>"`` into every nested ``SerializableBaseModel``,
 and the deserializer resolves that literal string with ``import_module`` plus
-``getattr``. An extract — or an index row — persisted inside a
-``WorkspaceState`` snapshot therefore pins this module path in deployments this
-repository cannot see — the failure mode that forced ``workspace/tool.py`` to
-stay on disk as a shim. Nothing here moves afterwards.
+``getattr``. An extract — or an index row — persisted in a tree's metadata
+directory therefore pins this module path in deployments this repository cannot
+see, and a mounted tree written by an older release outlives every process that
+wrote it — the failure mode that forced ``workspace/tool.py`` to stay on disk as
+a shim. Nothing here moves afterwards.
 
 **This module adds no digest.** ``content_sha`` in
 :mod:`akgentic.tool.workspace.models` is the one definition of the digest in the

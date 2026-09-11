@@ -106,7 +106,6 @@ from akgentic.tool.workspace.execution import (
     resolve_mode,
     timed_out,
 )
-from akgentic.tool.workspace.host import WorkspaceHost
 from akgentic.tool.workspace.journal import (
     IDENTITY_DOMAIN,
     IDENTITY_FALLBACK,
@@ -144,9 +143,7 @@ from akgentic.tool.workspace.models import (
     MutationStatus,
     Observation,
     Precondition,
-    SweepTick,
     WorkspaceConfig,
-    WorkspaceState,
     content_sha,
     gitignore_seed,
 )
@@ -258,12 +255,9 @@ __all__ = [
     "MutationStatus",
     "Observation",
     "Precondition",
-    "SweepTick",
     "WorkspaceActor",
     "WorkspaceAttached",
     "WorkspaceConfig",
-    "WorkspaceHost",
-    "WorkspaceState",
     "content_sha",
     "git_dir_for",
     "gitignore_seed",

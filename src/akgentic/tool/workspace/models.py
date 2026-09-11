@@ -16,10 +16,7 @@ import hashlib
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import Field
-
 from akgentic.core.agent_config import BaseConfig
-from akgentic.core.agent_state import BaseState
 from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.workspace.documents.models import (
     DEFAULT_MAX_DOCUMENT_CHARS,
@@ -112,31 +109,6 @@ A staging file this young is being written **now** by somebody, and with a
 would make the other team's ``os.replace`` raise, turning a healthy write into a
 refusal. Orphans, by contrast, are minutes or restarts old — no real value of
 this constant separates the two badly.
-"""
-
-DEFAULT_SWEEP_INTERVAL_S = 30.0
-"""How often a hosted ``#Workspace`` sweeps its holders for stopped agents.
-
-It is how stale a stopped holder may be before the tree notices, and nothing
-more: the sweep asks each holder's ``is_alive()`` and costs one pass over a map
-bounded by live agents. It is no longer than the orchestrator's 30 s stop
-backstop and a quarter of :data:`DEFAULT_REAP_GRACE_S`, so the grace is measured
-in whole ticks.
-"""
-
-DEFAULT_REAP_GRACE_S = 120.0
-"""How long a hosted ``#Workspace`` outlives its last holder before it stops itself.
-
-A hosted tree is outside a team's two-phase teardown, so the grace is what keeps
-it alive through a stopping team's last handlers — which is why it sits above
-the orchestrator's 30 s stop backstop (see :data:`DEFAULT_GIT_TIMEOUT_S`), and
-above a run's longest life, ``MAX_EXEC_BUDGET_S`` plus ``LEASE_GRACE_S``. It is
-also what lets a team stopping and an equivalent one starting a minute later
-find the same actor, journal and container rather than rebuild them.
-
-The grace is checked on each sweep tick rather than by a second timer, so the
-reap lands between ``reap_grace_s`` and ``reap_grace_s + sweep_interval_s``
-after the last holder stopped — never before.
 """
 
 GIT_DIR_SUFFIX = ".git"
@@ -271,23 +243,26 @@ class MutationOutcome(SerializableBaseModel):
 class WorkspaceConfig(BaseConfig):
     """Configuration of the ``#Workspace-<workspace_path>`` actor.
 
-    **No field names a team or a key list.** The actor is hosted and shared by
-    every team whose cards resolve its path, so nothing here may be one team's.
-    A client learns which agent bound which tree from the ``WorkspaceAttached``
-    event each bind emits; the metadata key list this config used to carry had
-    no reader once the actor stopped emitting a ``StartMessage``, and a stored
-    record still carrying it loads unchanged, because an unknown key is ignored.
+    **No field names a team or a key list**, and that outlived the hosting it was
+    written for: two teams over one tree each get their own actor, so a field
+    naming one team's metadata would be read by the other team's actor as its
+    own. A client learns which agent bound which tree from the
+    ``WorkspaceAttached`` event each bind emits; the metadata key list this
+    config used to carry had no reader once the actor stopped emitting a
+    ``StartMessage``, and a stored record still carrying it loads unchanged,
+    because an unknown key is ignored.
 
     Attributes:
         workspace_path: The **already-resolved** two-segment path of the tree
             this actor owns — ``<scope>/<leaf>``, relative to the workspaces
-            root — and also the suffix of the actor's name. The
-            ``WorkspaceHost`` keys its registry on that name, so both come from
-            this one value; two cards on different workspaces cannot collapse
-            onto one actor owning one tree, and nothing here re-derives a
-            directory from a ``workspace_id`` or a team id.
-        max_tracked_writers: Cap on the agent-name map, which the exec busy
-            refusal consults to name the holder rather than its UUID.
+            root — and also the suffix of the actor's name. Get-or-create keys on
+            that name, so both come from this one value; two cards on different
+            workspaces cannot collapse onto one actor owning one tree, and
+            nothing here re-derives a directory from a ``workspace_id`` or a
+            team id.
+        max_tracked_writers: Cap on the agent-name map, which the git journal
+            and the exec busy refusal consult to name an agent rather than
+            print its UUID.
         max_documents: Cap on the number of cached extractions the document
             store holds for this tree. Over it, the least recently extracted
             body is dropped and its record removed when nothing else is left in
@@ -301,11 +276,6 @@ class WorkspaceConfig(BaseConfig):
         git_journal: Whether to keep a git journal of accepted mutations. The
             gate is unaffected either way — it is pure Python and independent.
         git_timeout_s: Wall-clock budget for one ``git`` invocation.
-        sweep_interval_s: Seconds between two liveness sweeps of the holders —
-            see :data:`DEFAULT_SWEEP_INTERVAL_S`. Positive.
-        reap_grace_s: Seconds the actor outlives its last holder before it stops
-            itself — see :data:`DEFAULT_REAP_GRACE_S`. Positive. Neither field is
-            a card setting: the first bind fixes both, like every field here.
     """
 
     workspace_path: str
@@ -314,44 +284,3 @@ class WorkspaceConfig(BaseConfig):
     max_document_chars: int = DEFAULT_MAX_DOCUMENT_CHARS
     git_journal: bool = False
     git_timeout_s: float = DEFAULT_GIT_TIMEOUT_S
-    sweep_interval_s: float = Field(default=DEFAULT_SWEEP_INTERVAL_S, gt=0)
-    reap_grace_s: float = Field(default=DEFAULT_REAP_GRACE_S, gt=0)
-
-
-class SweepTick(SerializableBaseModel):
-    """Time for a hosted ``#Workspace`` to sweep its holders — no fields, no meaning beyond that.
-
-    Told by the actor's own timer thread, which does nothing else, and handled
-    on the actor's mailbox, so a sweep can never interleave with an ``attach``.
-    **Never a** ``Message``: ``Akgent.on_receive`` dispatches a plain model by
-    name with no telemetry sandwich, so a tick puts nothing on any stream and
-    costs no orchestrator anything — a hosted actor has none to tell.
-    """
-
-
-class WorkspaceState(BaseState):
-    """Persisted actor state — and there is nothing left in it to persist.
-
-    It carried two mappings: the extracted-document cache and the retrieval
-    index. Both are now one file per source document under the tree's sibling
-    metadata directory, written through a
-    :class:`~akgentic.tool.workspace.documents.store.DocumentStore` (ADR-051
-    Decision 6), so a second process over the same mount reads the same records
-    with no shared memory and nothing here is sent to any host.
-
-    What this state must **not** carry, and never did, is the observation map:
-    reads are the majority of workspace traffic, and a write per recorded read
-    would put persistence on the read path that ADR-036's NFR1 exists to keep
-    free. Observations live as a plain actor instance attribute and do not
-    survive a process restart, which degrades towards *refusing* a later write
-    rather than accepting a stale one.
-
-    **NFR1 is a property of the read path, not of an empty state, and it still
-    holds** — now structurally rather than by a delta rule. A text read touches
-    no store, and a document-cache *hit* performs one ``get_document`` and no
-    write at all: there is no recency bookkeeping left for a read to do, because
-    recency is ``extract.extracted_at``, stamped at the fill.
-
-    The class itself survives this story with no fields of its own; deleting it
-    belongs with the actor it is the state of.
-    """

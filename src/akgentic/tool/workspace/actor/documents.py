@@ -81,12 +81,13 @@ from akgentic.tool.workspace.documents.models import (
     evict_document_bodies,
 )
 from akgentic.tool.workspace.documents.store import DocumentEntry, DocumentStore
-from akgentic.tool.workspace.models import WorkspaceConfig, WorkspaceState, content_sha
+from akgentic.tool.workspace.models import WorkspaceConfig, content_sha
 from akgentic.tool.workspace.readers import _MIME_MAP, TEXT_EXTENSIONS, DocumentReader
 from akgentic.tool.workspace.workspace import Filesystem
 
 if TYPE_CHECKING:
     from akgentic.core.agent import Akgent
+    from akgentic.core.agent_state import BaseState
     from akgentic.tool.vector_store.embedding_actor import EmbeddingError, EmbeddingResult
     from akgentic.tool.vector_store.protocol import (
         EmbeddingProvider,
@@ -99,12 +100,11 @@ if TYPE_CHECKING:
     from akgentic.tool.workspace.documents.worker import IndexFailure, IndexResult
 
     # The mixin consumes the actor's own surface — ``createActor``, the two proxy
-    # builders, ``myAddress``, ``config``, ``state`` and ``team_id``, and never
-    # its orchestrator: a hosted actor has none. Naming the base under
-    # ``if TYPE_CHECKING:`` is how ``ExecMixin`` already reaches its own; at
-    # runtime the mixin contributes only ``object``, so the MRO the actor
+    # builders, ``myAddress``, ``config``, ``state`` and ``team_id``. Naming the
+    # base under ``if TYPE_CHECKING:`` is how ``ExecMixin`` already reaches its
+    # own; at runtime the mixin contributes only ``object``, so the MRO the actor
     # declares is unchanged and nothing here shadows a sibling.
-    _DocumentsBase = Akgent[WorkspaceConfig, WorkspaceState]
+    _DocumentsBase = Akgent[WorkspaceConfig, BaseState]
 else:
     _DocumentsBase = object
 
@@ -142,8 +142,8 @@ start — ``createActor`` runs the child's constructor on this thread and then
 starts its loop. ``ActorDeadError`` is a child gone before its proxy could be
 built, which pykka checks eagerly, or this actor's orchestrator dying under the
 child's constructor, which builds a proxy over it and tells it a
-``StartMessage`` (never, once the workspace is hosted). Both are outages retrieval
-degrades through. A ``ValidationError`` from the config, a ``TypeError`` from a
+``StartMessage``. Both are outages retrieval degrades through. A
+``ValidationError`` from the config, a ``TypeError`` from a
 changed signature, an ``AttributeError`` in the store's constructor are defects,
 and :meth:`DocumentsMixin._resolve_store` lets them propagate.
 """
@@ -532,8 +532,8 @@ class DocumentsMixin(_DocumentsBase):
 
         **Nothing is re-marked here, and nothing is to be re-added.** An earlier
         shape put every ``EMBEDDED`` row back to ``PENDING`` the moment an
-        in-memory store child was created, because a child of a hosted actor has
-        no checkpoint and therefore held nothing the rows claimed. Both the rows
+        in-memory store child was created, because that child had no checkpoint
+        and therefore held nothing the rows claimed. Both the rows
         and the index are on disk now and outlive every engine, so that premise is
         gone and porting the rule would blank a good cache on every process start
         — one full re-extraction and re-embedding of every indexed file, charged

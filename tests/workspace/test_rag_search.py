@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from akgentic.core.agent_state import BaseState
 
 from akgentic.tool.vector_store.backends.inmemory import InMemoryBackend
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA, OVERFETCH
@@ -39,7 +40,7 @@ from akgentic.tool.workspace.documents.models import (
     chunk_id,
 )
 from akgentic.tool.workspace.documents.store import DocumentEntry, YamlDocumentStore
-from akgentic.tool.workspace.models import WorkspaceConfig, WorkspaceState, content_sha
+from akgentic.tool.workspace.models import WorkspaceConfig, content_sha
 from akgentic.tool.workspace.readers import DocumentReader
 from tests.conftest import MockActorAddress
 from tests.workspace.conftest import (
@@ -839,15 +840,22 @@ class TestTheDocumentStoreContract:
     """``rag_search`` reads records the store actually persists.
 
     The successor to the state-field contract: what used to be two declared
-    fields on ``WorkspaceState`` is one record on disk, and the claim worth
-    pinning is the same one — a half that were not persisted would empty on
+    fields on the actor's own state class is one record on disk, and the claim
+    worth pinning is the same one — a half that were not persisted would empty on
     every process start.
     """
 
     def test_neither_half_lives_on_the_actor_state_any_more(self) -> None:
-        """A field here would be a second, divergent copy of what is on disk."""
-        assert "documents" not in WorkspaceState.model_fields
-        assert "rag_index" not in WorkspaceState.model_fields
+        """A field here would be a second, divergent copy of what is on disk.
+
+        The state class itself went with the host in 52-6; the actor is
+        parameterised on core's ``BaseState``, which has no fields at all, so the
+        assertion is read off the type the actor actually carries rather than off
+        a class this package still owns.
+        """
+        assert "documents" not in BaseState.model_fields
+        assert "rag_index" not in BaseState.model_fields
+        assert BaseState.model_fields == {}
 
     def test_both_halves_are_fields_of_the_stored_record(self) -> None:
         assert {"extract", "row"} <= set(DocumentEntry.model_fields)

@@ -11,7 +11,7 @@ from akgentic.tool import WorkspaceTool
 | | |
 |---|---|
 | Module | `akgentic.tool.workspace.tool` |
-| Actor | `#Workspace-<scope>/<leaf>` — the **resolved two-segment path**, slash included, so two principals' `notes` are two actors over two trees. **Hosted**: one per tree per process, created by the process's `WorkspaceHost`, shared by every team whose cards resolve that path, and nobody's child — see *Lifetime* below. With `workspace_exec` on it also owns the tree's sandbox backend and the single worker thread that runs commands on it — no second actor |
+| Actor | `#Workspace-<scope>/<leaf>` — the **resolved two-segment path**, slash included, so two principals' `notes` are two actors over two trees. An ordinary **team child**: created by its card through `getChildrenOrCreate`, in exactly one team's roster, stopped by that team's teardown. It owns **dispatch and no shared state** — with `workspace_exec` on, the tree's sandbox backend and the single worker thread that runs commands on it, plus the retrieval indexing pipeline. Two teams over one tree get two actors, and the tree orders them — see *Lifetime* below |
 | Channels used | `TOOL_CALL` (11 callables, 13 with `workspace_exec`), `COMMAND` (`expand_media_refs`) |
 | Optional extras | `[docs]` for binary reads, `[vision]` for image resizing |
 | Environment | `AKGENTIC_WORKSPACES_ROOT` (default `./workspaces`) |
@@ -96,8 +96,8 @@ the **write** side: a command mutates the tree whatever it happens to be, so
 **The backend and the actor are both bound in `observer()`, not in `__init__`.** `observer()` makes
 **one** call to `resolve_workspace_path(...)` — the single place a workspace directory is derived —
 and hands the result down as an already-resolved value: a `Filesystem` rooted at
-`<AKGENTIC_WORKSPACES_ROOT>/<scope>/<leaf>`, the hosted `#Workspace-<scope>/<leaf>` actor that owns the
-tree, and — only if exec is enabled — the sandbox backend. Nothing below re-derives it, which is what
+`<AKGENTIC_WORKSPACES_ROOT>/<scope>/<leaf>`, the `#Workspace-<scope>/<leaf>` actor that dispatches for
+the tree, and — only if exec is enabled — the sandbox backend. Nothing below re-derives it, which is what
 makes it impossible for a backend to open a different directory from the one the gate and the journal
 are guarding. `resources` are seeded in between. Reading `card.workspace` before that raises
 `RuntimeError`; calling a mutation before it raises `RuntimeError` too, because there is deliberately
@@ -114,30 +114,35 @@ majority of `WorkspaceTool()` instances gain no round trip at wiring time.
 as the leaf. A fixed name would collapse them onto one actor owning one of the trees, silently. The
 sandbox backend needs no name of its own: it is held by the workspace actor whose tree it serves.
 
-**Two teams of the same principal sharing one `workspace_id` reach one actor**, because there is
-one actor per tree per process: their writes are ordered by its mailbox as well as checked by the
-gate, which hashes the live file. The first bind fixes the actor's configuration for every team on
-the tree. Two teams of **different** principals do not share a tree at all: `notes` resolves under
-each owner's own scope. Sharing across principals is `workspace_metadata_keys`, and nothing else.
+**Two teams of the same principal sharing one `workspace_id` reach one tree and two actors**, one
+per team — and their writes are still ordered, because the ordering is on the **tree**: an
+`fcntl.flock` held on the path for the whole check-and-write, and an `O_EXCL` marker for the whole of
+a run. That holds across two *processes* as well, which a mailbox never did. The first bind of a team
+fixes that team's actor's configuration. Two teams of **different** principals do not share a tree at
+all: `notes` resolves under each owner's own scope. Sharing across principals is
+`workspace_metadata_keys`, and nothing else.
 
 ### Lifetime
 
-- **Attached by agents.** Every card binds through its team's orchestrator to the process's
-  `WorkspaceHost`, which gets or creates the tree's actor, and then attaches its agent as a holder.
-  No team owns the actor, and no team's teardown stops it.
-- **Reaped by liveness.** A sweep drops holders whose agents have stopped. After `reap_grace_s` with
-  no holder the actor stops itself, taking its in-memory store child and any live worker with it.
-  An `attach` during the grace cancels it, so a team stopping and an equivalent one starting keep
-  the same actor, journal and container.
-- **Read back from the tree, not restored.** The extraction cache and the retrieval index are
+- **A team child, created by its card.** The card calls `getChildrenOrCreate` on its own team's
+  orchestrator and emits `WorkspaceAttached` on that team's stream itself. The actor is in exactly
+  one team's roster, and **that team's two-phase teardown is the only thing that stops it** — no
+  timer, no liveness sweep, no reap grace, no self-stop. Epic 51 needed all four because a hosted
+  actor sat outside every team's teardown; a team child has an owner.
+- **`attach` records the agent's name, and nothing else.** It is the only source for the name the
+  git journal authors a commit with and the name an exec busy refusal prints — an id is a UUID, and
+  *"agent '3f2a…'"* is something a model can read and nothing it can act on. Losing a name degrades
+  to printing the id; it never breaks either message.
+- **Read back from the tree, never handed over.** The extraction cache and the retrieval index are
   **files under the tree's sibling metadata directory** — one YAML record per source document under
-  `<meta>/rag/`, written on the turn that changes it (ADR-051 Decision 6). The next actor after a
-  reap or a process restart simply reads the same files; nothing is registered anywhere, nothing is
-  handed to it, and a second process over the same mount sees the same cache with no shared memory.
+  `<meta>/rag/`, written on the turn that changes it (ADR-051 Decision 6). A later actor, or a second
+  process over the same mount, simply reads the same files; nothing is registered anywhere, nothing
+  is handed to it, and there is no state to restore.
 - **Nothing is restored, so nothing can be lost by a cold deployment.** A row that a worker was
-  carrying when its process died is queued again by the reaper, which covers a crash in this process
-  and one in another with a single rule: an in-flight row older than the staleness bound that no
-  live worker in *this* process is carrying.
+  carrying when its process died is queued again by `reap_abandoned_rows`, which covers a crash in
+  this process and one in another with a single rule: an in-flight row older than the staleness
+  bound. The bound is what does the whole job — a row at `embedding` may belong to a worker that is
+  alive in another process, and only its age tells the two apart.
 
 ---
 
@@ -214,9 +219,9 @@ way around the gate.
 - **A paginated read does not license a whole-file write.** `workspace_read(path, offset=…)` records
   that a *page* was seen. The way through is `workspace_edit` on a still-matching anchor, not a
   bigger `limit`.
-- **Observations do not survive a restore** — a reap after the last holder left, or a process
-  restart. They are actor instance state, not persisted. After a restore the first write to any
-  path is refused until it is re-read. That is the safe direction and it is deliberate.
+- **Observations do not survive a process restart.** They are the card's own in-memory map, not
+  persisted. After a restart the first write to any path is refused until it is re-read. That is the
+  safe direction and it is deliberate.
 
 ### What the gate catches that a registry would not
 
@@ -382,9 +387,9 @@ Because the actor is passive — nothing releases on a timer — the wedge check
 never report keeps refusing mutations until some unrelated request happens along. It costs one clock
 read and one flag read.
 
-A run belonging to an agent that has since stopped is marked at the next liveness sweep and
-completes on its own budget; its output is simply never collected, and the tree is given back when
-it reports.
+A run belonging to an agent that has since stopped completes on its own budget and gives the tree
+back when it reports; its output is simply never collected. There is no sweep that notices the agent
+went — the agent and the actor belong to one team, so a teardown takes both.
 
 **A run belongs to the agent that started it.** `workspace_exec_result` answers only the asking
 agent's runs: an id from somebody else comes back as the existing recoverable `UNKNOWN`, carrying

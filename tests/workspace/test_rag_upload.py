@@ -421,8 +421,8 @@ class TestTheCapabilityRefusal:
     ) -> None:
         """AC18's idempotence covers this path too, and here it protects data.
 
-        ``WorkspaceState`` is persisted, so a resume before any retrieval card
-        enables restores ``EMBEDDED`` rows onto a tree with no proxy. Re-queueing
+        The rows are on disk, so a process starting before any retrieval card
+        enables reads back ``EMBEDDED`` rows onto a tree with no proxy. Re-queueing
         one here would move its chunk ids into ``superseded_chunk_ids`` that no
         proxy will ever remove and drop the heading paths a search renders; the
         rows stay as restored until an engine arrives.

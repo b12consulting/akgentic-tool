@@ -46,24 +46,19 @@ from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.core.messages.orchestrator import EventMessage, StartMessage
 from akgentic.core.orchestrator import Orchestrator
-from akgentic.core.resource_host import ResourceHost
 from akgentic.core.utils.deserializer import deserialize_object
 from akgentic.core.utils.serializer import SerializableBaseModel
 
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.actor import (
-    WORKSPACE_ACTOR_ROLE,
     WorkspaceActor,
     workspace_actor_name,
 )
 from akgentic.tool.workspace.event import WorkspaceAttached
-from akgentic.tool.workspace.host import WorkspaceHost
-from akgentic.tool.workspace.models import WorkspaceConfig
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
 from tests.workspace.conftest import (
     HANDSHAKE_TIMEOUT_S,
     SandboxScript,
-    fast_config,
     tool_named,
     wait_until,
 )
@@ -270,43 +265,28 @@ def bound(record: Bind) -> tuple[WorkspaceTool, PurePosixPath]:
     return record.card, record.path
 
 
-def _start_host(system: ActorSystem, host_class: type[ResourceHost], name: str) -> ActorAddress:
-    """Create one host the way wiring does: once, right after the system."""
-    return system.createActor(host_class, config=BaseConfig(name=name, role="ResourceHost"))
-
-
 def _tear_down(actor_system: ActorSystem) -> None:
     """Stop everything, then prove no hosted workspace outlived the system."""
     actor_system.shutdown(timeout=10)
     ActorRegistry.stop_all()
     _BINDS.clear()
-    assert ActorSystem.find_by_class(WorkspaceActor) == [], "a hosted workspace outlived its test"
+    assert ActorSystem.find_by_class(WorkspaceActor) == [], "a workspace outlived its test"
 
 
 @pytest.fixture
 def system() -> Generator[ActorSystem, None, None]:
-    """A real actor system with **both** hosts running, torn down whatever the test did.
+    """A real actor system running **no host of any kind**, torn down whatever the test did.
 
-    The ``WorkspaceHost`` is what every card binds through. The base
-    ``ResourceHost`` beside it is the transitional infra wiring, and it is what
-    makes the host class observable: with only one host running, a card that
-    named the wrong class would fail on "no host" and never on routing.
+    Story 52-6 collapsed two fixtures into this one. There used to be a system
+    with a ``WorkspaceHost`` and core's base ``ResourceHost`` beside it — which
+    made the host class observable, since a card that named the wrong one failed
+    on "no host" rather than on routing — and a ``base_only_system`` with the
+    base alone, standing for infra's wiring before it switched. Neither
+    distinction exists: this package declares no host, and every card binds its
+    actor as an ordinary team child.
     """
     actor_system = ActorSystem()
     try:
-        _start_host(actor_system, WorkspaceHost, "#WorkspaceHost")
-        _start_host(actor_system, ResourceHost, "#ResourceHost")
-        yield actor_system
-    finally:
-        _tear_down(actor_system)
-
-
-@pytest.fixture
-def base_only_system() -> Generator[ActorSystem, None, None]:
-    """A process wired with the base ``ResourceHost`` alone — infra's wiring until it switches."""
-    actor_system = ActorSystem()
-    try:
-        _start_host(actor_system, ResourceHost, "#ResourceHost")
         yield actor_system
     finally:
         _tear_down(actor_system)
@@ -683,9 +663,10 @@ class TestTwoTeamsOnOneTreeGetTwoActors:
 
     The assertions are inverted rather than dropped, and what they pin is what
     still has to be true: **the tree stays one tree**, each team gets its own
-    event naming its own agent, and — the negative that matters most — the
-    process needs no ``WorkspaceHost``, which is ``akgentic-infra`` story 69-1's
-    acceptance guard read from this side of the seam.
+    event naming its own agent, and each team's actor is in its own roster and no
+    other. The negative that used to sit beside them — the process needs no
+    ``WorkspaceHost`` — is structural since 52-6 deleted the class, and is pinned
+    by ``test_workspace_event.py`` instead.
     """
 
     def test_both_binds_succeed_and_each_team_gets_its_own_actor_on_one_tree(
@@ -702,20 +683,6 @@ class TestTwoTeamsOnOneTreeGetTwoActors:
         assert len(workspaces) == 2
         assert {address.name for address in workspaces} == {workspace_actor_name(SHARED_PATH)}
         assert workspaces[0].agent_id != workspaces[1].agent_id
-        # And the ``WorkspaceHost`` running in this system holds neither: the
-        # card forwarded to it not once, so its registry is still empty. Asked
-        # through its own ``getResourceOrCreate``, which answers a *miss* by
-        # constructing — so a miss is observable as the actor count going up.
-        [host] = ActorSystem.find_by_class(WorkspaceHost)
-        system.proxy_ask(host, WorkspaceHost).getResourceOrCreate(
-            WorkspaceActor,
-            WorkspaceConfig(
-                name=workspace_actor_name(SHARED_PATH),
-                role=WORKSPACE_ACTOR_ROLE,
-                workspace_path=SHARED_PATH,
-            ),
-        )
-        assert len(ActorSystem.find_by_class(WorkspaceActor)) == 3
 
     def test_the_tree_is_still_one_tree_and_the_gate_still_spans_both_teams(
         self, system: ActorSystem, workspaces_root: Path
@@ -756,8 +723,8 @@ class TestTwoTeamsOnOneTreeGetTwoActors:
             )
             assert isinstance(message.event.agent_id, uuid.UUID)
             # **The envelope's sender moved with the emitter, and the payload did
-            # not.** ``getResourceOrCreate`` used to emit from the orchestrator;
-            # the card emits through ``notify_event`` now, so ``sender`` is the
+            # not.** The orchestrator forward used to emit; the card emits
+            # through ``notify_event`` now, so ``sender`` is the
             # binding member — which is what the payload already named. The
             # frontend folds on the event, and the event is byte-identical.
             assert message.sender is not None
@@ -828,9 +795,9 @@ class TestTheWireShapeIsTheFrontends:
         assert str(uuid.UUID(agent_id)) == agent_id
         # The **payload** is what the frontend folds on and it is byte-identical
         # above. The envelope's ``sender`` moved with the emitter: it was the
-        # orchestrator while ``getResourceOrCreate`` emitted, and it is the
-        # binding member now that the card does — the same agent the payload
-        # already named, so the two agree rather than duplicating.
+        # orchestrator while the forward emitted, and it is the binding member
+        # now that the card does — the same agent the payload already named, so
+        # the two agree rather than duplicating.
         assert agent_id == wire["sender"]["agent_id"]
 
     def test_the_envelope_round_trips_to_the_same_payload(
@@ -849,25 +816,29 @@ class TestTheWireShapeIsTheFrontends:
         assert isinstance(restored.event.agent_id, uuid.UUID)
 
 
-class TestAProcessWithNoWorkspaceHostBindsGatesAndMutates:
-    """**Premise reversed by decision, and this is story 52-5's headline guard.**
+class TestAProcessWithNoHostBindsGatesAndMutates:
+    """**Premise reversed by decision: story 52-5's headline guard, kept by 52-6.**
 
-    It used to assert that a process running only the base ``ResourceHost``
-    **failed** the first bind with core's *"No WorkspaceHost is running"* — which
-    was correct while the card forwarded to one, and is exactly the error that
-    left two of ``akgentic-infra`` story 69-1's specs red waiting on this story.
+    It used to assert that a process running only core's base ``ResourceHost``
+    **failed** the first bind with *"No WorkspaceHost is running"* — which was
+    correct while the card forwarded to one, and is exactly the error that left
+    two of ``akgentic-infra`` story 69-1's specs red waiting on that story.
 
-    The card forwards to no host at all now, so the same process binds, gates and
+    The card forwards to no host at all, so the same process binds, gates and
     mutates. The three halves are asserted together on purpose: a bind that
     succeeded but gated nothing would pass a weaker spec, and the gate is the
     whole point of the seam.
+
+    **This is the guard that makes deleting ``WorkspaceHost`` safe**, and it is
+    unchanged in substance by that deletion — only the fixture is, since there is
+    no longer a second kind of system to distinguish this one from.
     """
 
     def test_the_bind_succeeds_gates_and_mutates_with_no_host_in_the_process(
-        self, base_only_system: ActorSystem, workspaces_root: Path
+        self, system: ActorSystem, workspaces_root: Path
     ) -> None:
         record = spawn_member(
-            base_only_system,
+            system,
             bind_key="base-only",
             user_id="u-alice",
             team_id=uuid.uuid4(),
@@ -878,9 +849,13 @@ class TestAProcessWithNoWorkspaceHostBindsGatesAndMutates:
         assert record.error is None
         card, path = bound(record)
         assert path == PurePosixPath(SHARED_PATH)
-        # No ``WorkspaceHost`` exists in this system at all — that is what
-        # ``base_only_system`` means — and the bind neither needed nor made one.
-        assert ActorSystem.find_by_class(WorkspaceHost) == []
+        # No resource host of **any** kind runs in this system — core's base
+        # included, which is the one this package could still have named — and
+        # the bind neither needed nor made one. Core's class is imported here
+        # and nowhere under ``src/``: that asymmetry is the assertion.
+        from akgentic.core.resource_host import ResourceHost
+
+        assert ActorSystem.find_by_class(ResourceHost) == []
         assert len(ActorSystem.find_by_class(WorkspaceActor)) == 1
 
         # It gates: a create lands, and a second write to the same path without
@@ -893,16 +868,16 @@ class TestAProcessWithNoWorkspaceHostBindsGatesAndMutates:
             tool_named(card, "workspace_write")("notes.md", "second\n")
 
         # And the event still reaches the team's stream, emitted by the member.
-        [message] = _attached_events(base_only_system, record)
+        [message] = _attached_events(system, record)
         assert message.event.workspace_path == SHARED_PATH
 
 
 ##
-## Story 51-3 — a tree nobody's team owns is still reclaimed, whole
+## Story 52-6 — the team's teardown reclaims the tree, whole
 ##
 
 REAPED_PATH = "u-alice/notes"
-"""What ``workspace_id="notes"`` resolves to for ``u-alice``; the specs below pre-create it."""
+"""What ``workspace_id="notes"`` resolves to for ``u-alice``; the name is 51-3's."""
 
 
 def _exec_workers(path: str) -> list[threading.Thread]:
@@ -910,30 +885,20 @@ def _exec_workers(path: str) -> list[threading.Thread]:
     return [t for t in threading.enumerate() if t.name.startswith(f"exec-{path}_")]
 
 
-def _host_ahead(system: ActorSystem, config: WorkspaceConfig) -> ActorAddress:
-    """Create *config*'s workspace through the real host before any card binds it.
+class TestTheTeamsTeardownTakesTheExecutorAndTheStoreDown:
+    """**Re-pointed from ``TestTheSelfStopTakesTheExecutorDownAndTheTeamTakesItsStore``.**
 
-    The host ignores ``config`` on a hit, so the member that binds afterwards
-    gets this actor — ticking at this config's speed — rather than one built
-    from its card's defaults.
-    """
-    [host] = ActorSystem.find_by_class(WorkspaceHost)
-    return system.proxy_ask(host, WorkspaceHost).getResourceOrCreate(WorkspaceActor, config)
+    51-3's version was driven by the grace: the only thing that could stop a
+    hosted workspace was its own sweep, so the spec pre-created the actor with a
+    fast config and waited for it to reap. The sweep, the grace and the self-stop
+    are all deleted, and what replaces them is the plainest possible answer — the
+    workspace is in its team's roster, so ``Orchestrator.stop`` reaches it.
 
-
-class TestTheSelfStopTakesTheExecutorDownAndTheTeamTakesItsStore:
-    """Driven by the grace, not by a fixture: the team stops and the tree reaps itself.
-
-    The only thing that stops the workspace here is its own sweep. The team's
-    teardown never reaches a hosted actor, and no fixture stops it before the
-    assertions run — a fixture already goes through ``Akgent.stop``, so a spec
-    that let one stop the actor could not tell the self-stop's path from it.
-
-    **The store is on the other side of that line now** (story 52-4): the card
-    creates it through the orchestrator, so it is the *team's* member and the
-    team's teardown is what ends it — while the exec runner and the executor
-    belong to the workspace and go with its self-reap. Both must happen, and the
-    spec keeps asserting both because the two owners are what the pair proves.
+    **What the spec asserts is unchanged, and it is the pair that matters**: one
+    teardown ends both owners. The store is the *team's* member since 52-4, the
+    exec runner and its worker thread belong to the workspace, and after the team
+    stops there must be neither — a backend left released by nobody is a
+    container nobody stops, which is exactly the leak a reap used to prevent.
     """
 
     def test_the_team_stops_the_store_and_the_workspace_reaps_with_its_backend(
@@ -944,7 +909,6 @@ class TestTheSelfStopTakesTheExecutorDownAndTheTeamTakesItsStore:
 
         assert pykka.ActorRegistry.get_by_class(VectorStoreActor) == []
         sandbox_script.gate.set()
-        workspace = _host_ahead(system, fast_config(REAPED_PATH))
         record = spawn_member(
             system,
             bind_key="reaped",
@@ -956,6 +920,7 @@ class TestTheSelfStopTakesTheExecutorDownAndTheTeamTakesItsStore:
         )
         card, path = bound(record)
         assert path == PurePosixPath(REAPED_PATH)
+        [workspace] = ActorSystem.find_by_class(WorkspaceActor)
         assert wait_until(lambda: len(pykka.ActorRegistry.get_by_class(VectorStoreActor)) == 1)
         [store_ref] = pykka.ActorRegistry.get_by_class(VectorStoreActor)
         # The runner is built and live: a run answers, and nothing has stopped it.
@@ -971,7 +936,9 @@ class TestTheSelfStopTakesTheExecutorDownAndTheTeamTakesItsStore:
         stopped = system.proxy_ask(record.orchestrator, Orchestrator).stop(5.0)
         assert stopped.wait(timeout=SPAWN_TIMEOUT_S), "the team never finished stopping"
 
-        assert wait_until(lambda: not workspace.is_alive()), "the workspace never reaped"
+        assert wait_until(lambda: not workspace.is_alive()), (
+            "the team stopped and its workspace actor outlived it"
+        )
         assert store_ref.actor_stopped.wait(timeout=HANDSHAKE_TIMEOUT_S), (
             "the team's vector store outlived the team that created it"
         )
@@ -985,7 +952,7 @@ class TestTheSelfStopTakesTheExecutorDownAndTheTeamTakesItsStore:
         assert ActorSystem.find_by_class(WorkspaceActor) == []
 
 
-class TestActorSystemShutdownStillReachesAHostedWorkspace:
+class TestActorSystemShutdownStillReachesTheWorkspace:
     def test_shutdown_runs_the_workspaces_on_stop_and_nothing_raises(
         self,
         system: ActorSystem,
@@ -993,11 +960,10 @@ class TestActorSystemShutdownStillReachesAHostedWorkspace:
         sandbox_script: SandboxScript,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Default config, so no tick fires: only ``ActorRegistry.stop_all`` can stop it.
+        """The other stop path: no team teardown, only ``ActorRegistry.stop_all``.
 
         ``stop_all`` is a graceful stop, so ``on_stop`` runs in full — the backend
-        is released — and nothing it does is logged as an error. It tells the
-        host nothing on this path either.
+        is released — and nothing it does is logged as an error.
         """
         caplog.set_level(logging.ERROR)
         sandbox_script.gate.set()

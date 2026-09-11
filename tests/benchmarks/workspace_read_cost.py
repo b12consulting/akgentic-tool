@@ -91,7 +91,6 @@ from akgentic.tool.workspace.actor import (
     WorkspaceActor,
     workspace_actor_name,
 )
-from akgentic.tool.workspace.host import WorkspaceHost
 from akgentic.tool.workspace.journal import git_dir_for
 from akgentic.tool.workspace.models import (
     Observation,
@@ -572,10 +571,10 @@ def _arm_patch(arm: str) -> Iterator[None]:
 class _SamplingWorkspaceActor(WorkspaceActor):
     """``#Workspace`` that samples **its own** mailbox depth at each turn boundary.
 
-    Installed by asking the process's ``WorkspaceHost`` for
-    ``#Workspace-<workspace_path>`` *before* the first card wires. Every card then
-    binds to it, because the host answers the actor registered under
-    ``config.name`` on a hit, whatever class the card's forward asks for. That is
+    Installed by creating ``#Workspace-<workspace_path>`` through the team's
+    orchestrator *before* the first card wires. Every card then binds to it,
+    because get-or-create answers the actor registered under ``config.name`` on a
+    hit, whatever class the caller asks for. That is
     what keeps this benchmark clear of the actor-internals rule: no
     ``ActorAddressImpl._actor_ref`` cast, no patch of any production module —
     ``self.actor_inbox`` is this actor's own pykka attribute, read on its own
@@ -1015,9 +1014,6 @@ def run_arm(spec: RunSpec, arm: str, base: Path) -> ArmRun:
     os.environ["AKGENTIC_WORKSPACES_ROOT"] = str(root)
     corpus = build_corpus(tree, spec)
     system = ActorSystem()
-    # Created once, right after the system, exactly as wiring does: every card
-    # binds its tree through this host, and nothing creates one lazily.
-    system.createActor(WorkspaceHost, config=BaseConfig(name="#WorkspaceHost", role="ResourceHost"))
     gate = _Gate(threading.Barrier(spec.agents + 1), threading.Event())
     try:
         with _arm_patch(arm), _gate_installed(gate):
@@ -1090,10 +1086,9 @@ def _install_sampling_actor(
     """Create ``#Workspace-<path>`` as the instrumented subclass, before any card wires.
 
     **Through the orchestrator, since story 52-5**: the card binds the workspace
-    as a team child again, so pre-registering it on the process's
-    ``WorkspaceHost`` would leave the cards to create a plain one of their own
-    beside it. Get-or-create is idempotent either way, so every card then binds
-    to this instance by name.
+    as a team child, so it has to be registered as one — anywhere else and the
+    cards would create a plain one of their own beside it. Get-or-create is
+    idempotent, so every card then binds to this instance by name.
 
     The proxy's ``bench_snapshot`` would not resolve at all against a plain
     ``WorkspaceActor``, so a silent failure to install would be an immediate

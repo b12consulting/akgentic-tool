@@ -15,7 +15,7 @@ renders through.
 and goes back to draining its mailbox; the worker tells the answer back to
 ``#Workspace`` itself. There is no second actor and no ``#defer-`` worker in
 between — the worker only ever sat in an ``ask`` waiting for that same
-subprocess, and the second actor cost a lifetime, a registry entry and a liveness
+subprocess, and the second actor cost a lifetime, a roster entry and a liveness
 check to keep in agreement with this one.
 
 **The module is named ``execution``, not ``exec``.** ``exec`` is a builtin, and a
@@ -386,17 +386,17 @@ class ExecConfig(SerializableBaseModel):
     """What an exec-capable card tells the actor once, at bind time.
 
     Deliberately not part of :class:`~akgentic.tool.workspace.models.WorkspaceConfig`.
-    The first bind fixes that config for every card on the tree, and the card
-    that binds a tree first is routinely a ``WorkspaceTool`` with no exec
-    capability at all — the actor would then be permanently unable to run
-    anything for the card that *does* have one.
+    The first card of a team to bind fixes that config for every later card of
+    that team on the tree, and the card that binds a tree first is routinely a
+    ``WorkspaceTool`` with no exec capability at all — the actor would then be
+    permanently unable to run anything for the card that *does* have one.
 
-    **It carries no team.** A hosted tree is bound by agents of several teams,
-    each card announcing its own config, and nothing a backend does depends on
-    which team asked. A team id here would make two teams' otherwise identical
-    announcements unequal, and ``configure_exec`` replaces the runner on an
-    unequal config — one team's agent spawning would tear down another team's
-    run mid-flight.
+    **It carries no team**, and that is still right now that the actor is a team
+    child: several cards of one team bind one tree, each announcing its own
+    config, and nothing a backend does depends on which agent asked. A team id
+    here would make two otherwise identical announcements unequal, and
+    ``configure_exec`` replaces the runner on an unequal config — one agent
+    binding would tear down another's run mid-flight.
 
     Attributes:
         mode: The resolved backend.

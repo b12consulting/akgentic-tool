@@ -96,9 +96,9 @@ class TestActorMro:
         must still reach the base.
 
         **Two mixins, not four.** Story 52-5 moved the gate and the observation
-        map onto the card, and the holder and name maps onto ``WorkspaceActor``
-        itself — so ``GateMixin`` and ``ObservationMixin`` are gone rather than
-        renamed, and a rebuilt one would show up here as an extra base.
+        map onto the card, and the agent-name map onto ``WorkspaceActor`` itself
+        — so ``GateMixin`` and ``ObservationMixin`` are gone rather than renamed,
+        and a rebuilt one would show up here as an extra base.
         """
         assert WorkspaceActor.__mro__[:4] == (
             WorkspaceActor,
@@ -150,8 +150,15 @@ class TestTheGateLeftTheActor:
         assert missing == [], f"moved off the actor and onto nothing: {missing}"
 
     def test_attach_survives_on_the_actor(self) -> None:
-        """It records the holder the reap grace counts, so it cannot move card-side."""
+        """Its holder half died with the sweep in 52-6; its name half cannot move card-side.
+
+        ``_agent_names`` is read by ``_name_of`` on the **actor's** thread, for
+        the git journal's author and for the exec busy refusal's holder name. A
+        card-side copy would be one agent's view of a map several agents fill.
+        """
         assert hasattr(WorkspaceActor, "attach")
+        assert hasattr(WorkspaceActor, "_name_of")
+        assert hasattr(WorkspaceActor, "_identity")
 
 
 class TestNoMixinShadowsTheDeferredBase:

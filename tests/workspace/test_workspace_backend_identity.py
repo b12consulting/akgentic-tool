@@ -43,7 +43,6 @@ from tests.workspace.conftest import (
     WORKSPACE_PATH,
     FakeActorToolObserver,
     FakeOrchestratorProxy,
-    FakeWorkspaceHost,
     factory_for,
 )
 
@@ -75,19 +74,26 @@ def _teams(
 ) -> list[uuid.UUID]:
     """Bind *count* teams' cards onto one tree and hand each one's backend to *use*.
 
-    One shared :class:`FakeWorkspaceHost`, so the teams genuinely land on the same
-    workspace actor — which is what makes "two teams, one tree" the case under
-    test rather than two unrelated trees. Each card builds its backend through its
-    own ``observer()`` and the real registered factory.
+    **One orchestrator per team, and they share nothing.** This used to pass one
+    ``FakeWorkspaceHost`` to both so that the two teams landed on the same
+    workspace actor. That stopped being what happens in 52-5 — the card binds a
+    team child, so two teams over one tree get two actors — and the host itself
+    is deleted in 52-6. Nothing here depended on the sharing: the case under test
+    is the point ids two teams derive for one tree, and what makes it "one tree"
+    is the identical ``workspace_id``, not a shared registry.
+
+    Each card builds its backend through its own ``observer()`` and the real
+    registered factory.
 
     Returns:
         Each binding team's id, in order.
     """
-    host = FakeWorkspaceHost()
+    teams: list[FakeOrchestratorProxy] = []
     team_ids: list[uuid.UUID] = []
     try:
         for index in range(count):
-            orchestrator_proxy = FakeOrchestratorProxy(host=host)
+            orchestrator_proxy = FakeOrchestratorProxy()
+            teams.append(orchestrator_proxy)
             observer = FakeActorToolObserver(orchestrator_proxy, name=f"agent-{index}")
             team_ids.append(observer.team_id)
             card = WorkspaceTool(
@@ -98,7 +104,8 @@ def _teams(
             assert backend is not None, "the card degraded instead of building a backend"
             use(backend)
     finally:
-        host.stop_all()
+        for team in teams:
+            team.stop_all()
     return team_ids
 
 

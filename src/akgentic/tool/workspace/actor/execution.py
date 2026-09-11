@@ -34,6 +34,7 @@ from concurrent import futures
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
+from akgentic.core.agent_state import BaseState
 from akgentic.tool.core.deferred import DeferredResultActor
 from akgentic.tool.sandbox.backend import ExecReport
 from akgentic.tool.workspace.execution import (
@@ -56,7 +57,7 @@ from akgentic.tool.workspace.execution import (
 )
 from akgentic.tool.workspace.journal import GitJournal, Identity
 from akgentic.tool.workspace.lock import LockBackend, LockTicket
-from akgentic.tool.workspace.models import WorkspaceConfig, WorkspaceState
+from akgentic.tool.workspace.models import WorkspaceConfig
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,7 @@ if TYPE_CHECKING:
     # there or it reports ``"deliver" undefined in superclass``. The MRO stays
     # consistent in both worlds: at runtime the mixin contributes only
     # ``object``, and the actor names the base itself.
-    _ExecBase = DeferredResultActor[WorkspaceConfig, WorkspaceState, str, ExecOutcome]
+    _ExecBase = DeferredResultActor[WorkspaceConfig, BaseState, str, ExecOutcome]
 else:
     _ExecBase = object
 
@@ -87,13 +88,12 @@ class ExecMixin(_ExecBase):
     _running: RunningExec | None
     _run_errors: OrderedDict[str, str]
     _recent_runs: dict[str, OrderedDict[str, str]]
-    _discarded_run: str | None
     _journal: GitJournal
 
     if TYPE_CHECKING:
-        # Supplied by ``WorkspaceActor`` itself, which owns the holder and name
-        # maps since the observation mixin went card-side. Declared here so mypy
-        # can check the calls, never defined.
+        # Supplied by ``WorkspaceActor`` itself, which owns the agent-name map
+        # since the observation mixin went card-side. Declared here so mypy can
+        # check the calls, never defined.
         def _identity(self, agent_id: str) -> Identity: ...
 
         def _name_of(self, agent_id: str) -> str: ...
@@ -145,9 +145,9 @@ class ExecMixin(_ExecBase):
         is the common case and close to the only one; a *different* one stops the
         old runner and builds a new one.
 
-        **Equal across teams, by construction.** A hosted tree is bound by agents
-        of several teams, and :class:`ExecConfig` carries no team, so a second
-        team's card with the same settings announces an equal config and keeps
+        **Equal across cards, by construction.** Several agents of one team bind
+        one tree, and :class:`ExecConfig` carries nothing agent-specific, so a
+        second card with the same settings announces an equal config and keeps
         the running runner — its run in flight included.
 
         **A replacement mid-run is deliberately not guarded**, for the reason
@@ -362,16 +362,15 @@ class ExecMixin(_ExecBase):
         that no longer holds the tree is handled in exactly one place
         (:meth:`_finish_run`) rather than here.
 
-        A fourth case comes first and is not one of the three: the report of a
-        run whose agent the liveness sweep dropped while it ran
-        (:meth:`_discard_report`).
+        There is no fourth case. There used to be — the report of a run whose
+        agent the liveness sweep had dropped while it ran, which was closed out
+        without caching an outcome nobody could collect. Nothing drops an agent
+        mid-run any more: the sweep is gone, and a stopping agent's team stops
+        this actor with it.
 
         Args:
             report: What the worker produced for one run.
         """
-        if report.run_id == self._discarded_run:
-            self._discard_report(report.run_id)
-            return
         if report.error:
             self.fail(report.run_id, report.error)
             return
@@ -396,74 +395,6 @@ class ExecMixin(_ExecBase):
                 exit_code=report.result.exit_code,
             ),
         )
-
-    def _discard_report(self, run_id: str) -> None:
-        """Close out a swept agent's run without caching what it answered.
-
-        **What "discarded" means: the report reaches the actor, and nothing
-        about it is cached.** Neither ``deliver`` nor ``fail`` runs, so there is
-        no ``_slots`` entry — ``get(run_id)`` is ``None`` and no LRU slot is
-        spent — and no ``_run_errors`` entry; ``_in_flight`` is cleared here, as
-        those two would have. Nobody could collect the outcome anyway: the sweep
-        pruned the agent's ``_recent_runs``, so its polls answer ``UNKNOWN``, and
-        a slot nobody can reach is a slot taken from a run somebody can.
-
-        **What is not discarded is the tree's own record.** The run did write, so
-        :meth:`_finish_run` still commits the discovered write set under the
-        run's identity — by id, since the name was pruned with the holder — and
-        still gives the tree back. Dropping that commit would sweep
-        the run's files into the next agent's discovery, the misattribution the
-        out-of-band commit exists to prevent.
-
-        **The mark, not a membership test.** The sweep sets ``_discarded_run``
-        for the run holding the tree when its holder was dropped; testing
-        ``agent_id not in self._holders`` here instead would discard every run
-        started under an id that never attached. One scalar, overwritten by a
-        later sweep that marks a newer run: an earlier marked run reporting after
-        that is then delivered into a slot nobody collects — the cost a late
-        report of a lease-released run already has.
-
-        Args:
-            run_id: The marked run, now reporting.
-        """
-        self._discarded_run = None
-        self._in_flight.discard(run_id)
-        logger.info(
-            "Workspace %s: run %s reported after its agent was swept — outcome discarded",
-            self.config.workspace_path,
-            run_id,
-        )
-        self._finish_run(run_id)
-
-    def _drop_runs_of(self, agent_ids: list[str]) -> None:
-        """Prune the runs of agents the liveness sweep dropped; start none of theirs.
-
-        For each agent: its ``_recent_runs`` go, and with them every run id they
-        held out of ``_run_errors``, which is keyed by run id and reachable only
-        through them. Its **running** run is not killed: it is marked, completes
-        on its budget, and :meth:`_discard_report` closes it out when it reports
-        — which is also what gives the tree back, so a swept agent's run releases
-        the hold exactly as a live agent's does. Nothing here kills anything;
-        teardown owns the one kill path.
-
-        **Its ``_slots`` results are left to the LRU.** The deferred base has no
-        delete beyond expiry, and the entries are uncollectable once
-        ``_recent_runs`` is gone. That is bounded — ``MAX_TRACKED_RUNS`` per agent
-        against ``cache_capacity`` in total — and widening a base three packages
-        share to reclaim an already-capped cost is not worth it.
-
-        Args:
-            agent_ids: The agents the sweep just dropped. Empty is a no-op.
-        """
-        if not agent_ids:
-            return
-        dropped = set(agent_ids)
-        for agent_id in dropped:
-            for run_id in self._recent_runs.pop(agent_id, {}):
-                self._run_errors.pop(run_id, None)
-        running = self._running
-        if running is not None and running.agent_id in dropped:
-            self._discarded_run = running.run_id
 
     def _run_budget(self) -> float:
         """The effective budget a run gets, from the bound card's configuration.

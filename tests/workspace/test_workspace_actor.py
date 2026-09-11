@@ -15,6 +15,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from akgentic.core.agent_state import BaseState
 
 from akgentic.tool.workspace.actor import (
     WORKSPACE_ACTOR_NAME,
@@ -25,7 +26,6 @@ from akgentic.tool.workspace.actor import (
 from akgentic.tool.workspace.models import (
     STAGING_SWEEP_GRACE_S,
     WorkspaceConfig,
-    WorkspaceState,
 )
 from akgentic.tool.workspace.workspace import Filesystem, is_staging_name
 from tests.workspace.conftest import WORKSPACE_PATH
@@ -211,4 +211,4 @@ class TestStartupSweep:
         (workspace_tree / "report.md").write_text("hello", encoding="utf-8")
         actor = start_actor()
         assert (workspace_tree / "report.md").read_text(encoding="utf-8") == "hello"
-        assert actor.state.model_dump() == WorkspaceState().model_dump()
+        assert actor.state.model_dump() == BaseState().model_dump()

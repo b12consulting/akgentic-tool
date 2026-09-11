@@ -1,11 +1,10 @@
 """Fixtures and test doubles for the ``#Workspace`` actor and the recording read path.
 
 The doubles here reach the actor only through the public surface a card uses —
-``getResourceOrCreate`` on a fake orchestrator, which forwards to a fake
-``WorkspaceHost``, then ``proxy_ask``. The fake host holds the real actor
-instances, which is what lets the singleton test prove that an observation
-recorded through one card is visible through another. A handful of assertions
-do read a card's or an actor's private attribute where there is no public
+``getChildrenOrCreate`` on a fake orchestrator, then ``proxy_ask``. The fake
+orchestrator holds the real actor instances, which is what lets a spec prove that
+two cards of one team over one tree reach one actor. A handful of assertions do
+read a card's or an actor's private attribute where there is no public
 equivalent — which tree an actor took, which proxy a card bound — and they say
 so where they do it.
 
@@ -29,17 +28,17 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
-from pykka import ActorDeadError
-
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.actor_address_impl import ActorAddressImpl
 from akgentic.core.agent import Akgent, AkgentType
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.core.resource_host import ResourceStore, StateDelta, resolve_state_type
+from pykka import ActorDeadError
+
 from akgentic.tool.core import ToolState
 from akgentic.tool.sandbox import SANDBOX_BACKEND_CLASSES
 from akgentic.tool.sandbox.backend import ExecResult, validate_command
@@ -51,11 +50,9 @@ from akgentic.tool.workspace.actor import (
 from akgentic.tool.workspace.documents.models import DocumentExtract, RagFile
 from akgentic.tool.workspace.documents.store import DocumentEntry, YamlDocumentStore
 from akgentic.tool.workspace.execution import DEFAULT_EXEC_TIMEOUT_S, RunningExec
-from akgentic.tool.workspace.host import WorkspaceHost
 from akgentic.tool.workspace.journal import git_dir_for
 from akgentic.tool.workspace.models import MutationOutcome, Observation, WorkspaceConfig
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
-
 from tests.conftest import MockActorAddress
 
 if TYPE_CHECKING:
@@ -255,68 +252,19 @@ def _stop_actors(refs: list[Any], entries: list[tuple[ActorAddress, Any]], live:
             actor.on_stop()
 
 
-class ResourceCall(NamedTuple):
-    """One ``getResourceOrCreate`` call, exactly as the card made it."""
-
-    host_class: type[Any]
-    actor_class: type[Akgent[Any, Any]]
-    config: BaseConfig
-    event: object
-
-
-class FakeWorkspaceHost:
-    """Core's ``ResourceHost`` get-or-create, and only that — shareable between orchestrators.
-
-    Owns the registry ``{config.name -> (address, actor)}``. A live entry is
-    returned whatever *actor_class* asks for and whatever *config* says, exactly
-    as core does; a dead one is replaced; a miss creates the actor with **no
-    orchestrator and no parent**, which is what a hosted actor is.
-
-    Two ``FakeOrchestratorProxy`` instances handed one of these are two teams in
-    one process: one registry, so one actor per path however many teams bind it.
-    """
-
-    def __init__(self, live: bool = False) -> None:
-        self.live = live
-        self.registry: dict[str, tuple[ActorAddress, Any]] = {}
-        self._refs: list[Any] = []
-
-    def get_or_create(
-        self, actor_class: type[Akgent[Any, Any]], config: BaseConfig
-    ) -> ActorAddress:
-        existing = self.registry.get(config.name)
-        if existing is not None and existing[0].is_alive():
-            return existing[0]
-        address, actor = _start_actor(actor_class, config, self.live, self._refs)
-        self.registry[config.name] = (address, actor)
-        return address
-
-    def actor_for(self, address: ActorAddress) -> Any:
-        """Return the hosted actor behind *address*, or ``None`` when it is unknown."""
-        for known_address, actor in self.registry.values():
-            if known_address is address:
-                return actor
-        return None
-
-    def stop_all(self) -> None:
-        """Stop every hosted actor and its children. Idempotent — a shared host is stopped twice."""
-        _stop_actors(self._refs, list(self.registry.values()), self.live)
-        self.registry.clear()
-
-
 class FakeOrchestratorProxy:
-    """The orchestrator's two get-or-creates, exactly as core implements them.
+    """The orchestrator's get-or-create, exactly as core implements it.
 
-    ``getResourceOrCreate`` is the forward a workspace card binds through. It
-    mirrors core's three rules and only those: it records the call, refuses any
-    host class but ``WorkspaceHost`` with core's own text (so a card naming the
-    base host goes red here as it does against real core), and otherwise asks
-    :attr:`host` and appends the caller's event to :attr:`emitted` **unchanged**
-    — identity, on a hit as on a miss.
+    ``getChildrenOrCreate`` is what a workspace card binds through, and what
+    :attr:`create_calls` records.
 
-    ``getChildrenOrCreate`` stays for team actors that are still children: it
-    is what :attr:`create_calls` records, so a workspace negative on that list
-    is a real negative only when paired with a positive on :attr:`resource_calls`.
+    ``getResourceOrCreate`` is kept **as a trap and nothing else** (story 52-6).
+    This package has no resource host any more — the module and the class are
+    deleted — so a card that reached for one could not work; the method records
+    the attempt on :attr:`resource_calls` and then raises, which turns
+    ``resource_calls == []`` from paperwork into a guard that goes red the moment
+    a host forward comes back. Deleting it instead would leave those nine
+    assertions asserting the absence of a method nothing could call.
 
     With *live* set, the actors it creates are genuinely started on their own
     thread and handed out behind a real ``ActorAddressImpl``. That is what lets a
@@ -324,13 +272,11 @@ class FakeOrchestratorProxy:
     mailbox rather than of a stand-in.
     """
 
-    def __init__(self, live: bool = False, host: FakeWorkspaceHost | None = None) -> None:
-        if host is not None and host.live != live:
-            raise ValueError("a shared host and its orchestrators must agree on live")
-        self.host = host if host is not None else FakeWorkspaceHost(live=live)
+    def __init__(self, live: bool = False) -> None:
         self.children: dict[str, tuple[ActorAddress, Any]] = {}
         self.create_calls: list[tuple[type[Akgent[Any, Any]], BaseConfig]] = []
-        self.resource_calls: list[ResourceCall] = []
+        self.resource_calls: list[tuple[Any, ...]] = []
+        """Every attempt to forward to a resource host — empty, or the suite is red."""
         self.emitted: list[object] = []
         """Every event this orchestrator emitted for a successful bind, in order."""
         self.live = live
@@ -351,26 +297,13 @@ class FakeOrchestratorProxy:
         negative that "retrieval off costs nothing" is asserted on.
         """
 
-    @property
-    def hosted(self) -> dict[str, tuple[ActorAddress, Any]]:
-        """The host's registry, ``{actor name -> (address, actor)}`` — where a workspace lives."""
-        return self.host.registry
-
-    def getResourceOrCreate(  # noqa: N802 — mirrors the orchestrator's method name
-        self,
-        host_class: type[Any],
-        actor_class: type[Akgent[Any, Any]],
-        config: BaseConfig,
-        event: object,
-    ) -> ActorAddress:
-        self.resource_calls.append(ResourceCall(host_class, actor_class, config, event))
-        if host_class is not WorkspaceHost:
-            raise RuntimeError(
-                f"No {host_class.__name__} is running in this process, so no resource can be bound."
-            )
-        address = self.host.get_or_create(actor_class, config)
-        self.emitted.append(event)
-        return address
+    def getResourceOrCreate(self, *args: Any) -> ActorAddress:  # noqa: N802 — mirrors core
+        """The trap. Record the attempt, then refuse it — no host exists to bind through."""
+        self.resource_calls.append(tuple(args))
+        raise RuntimeError(
+            "No resource host runs in this process: akgentic-tool deleted its own in "
+            "story 52-6, and the workspace actor is an ordinary team child."
+        )
 
     def getChildrenOrCreate(  # noqa: N802 — mirrors the orchestrator's method name
         self, actor_class: type[Akgent[Any, Any]], config: BaseConfig
@@ -388,10 +321,8 @@ class FakeOrchestratorProxy:
     def get_team_member(self, name: str) -> ActorAddress | None:  # noqa: N802 — mirrors core
         """Return the address registered under *name*, or ``None`` — core's own answer.
 
-        Only children are looked up: a hosted actor sits in no team's roster by
-        construction, so a workspace found here would be a wiring defect rather
-        than a lookup. ``None`` for a miss is what the real orchestrator answers
-        and what every caller branches on.
+        ``None`` for a miss is what the real orchestrator answers and what every
+        caller branches on.
         """
         self.member_lookups.append(name)
         existing = self.children.get(name)
@@ -403,17 +334,16 @@ class FakeOrchestratorProxy:
         return self.metadata
 
     def actor_for(self, address: ActorAddress) -> Any:
-        """Return the actor behind *address* — a child or a hosted one — or ``None``."""
+        """Return the child actor behind *address*, or ``None`` when it is unknown."""
         for known_address, actor in self.children.values():
             if known_address is address:
                 return actor
-        return self.host.actor_for(address)
+        return None
 
     def stop_all(self) -> None:
-        """Stop every child, then every hosted actor — each with its own children."""
+        """Stop every child, each with its own children."""
         _stop_actors(self._refs, list(self.children.values()), self.live)
         self.children.clear()
-        self.host.stop_all()
 
 
 class FakeActorToolObserver:
@@ -714,46 +644,21 @@ def card_for(
     return card, observer
 
 
-FAST_SWEEP_INTERVAL_S = 0.05
-"""The liveness sweep's interval in every spec that watches it tick — never a real default."""
+def workspace_config(workspace_path: str, **overrides: Any) -> WorkspaceConfig:
+    """A ``WorkspaceConfig`` for *workspace_path*, named and rolled as a card would.
 
-FAST_REAP_GRACE_S = 0.3
-"""The reap grace in those specs: six ticks, so "inside the grace" and "past it" are far apart."""
-
-
-def fast_config(workspace_path: str, **overrides: Any) -> WorkspaceConfig:
-    """A ``WorkspaceConfig`` for *workspace_path* whose sweep and grace run at test speed.
-
-    The card never learns the two fields — the first bind fixes them at their
-    defaults — so a spec that wants a tree to tick fast creates its actor through
-    the host with this config **before** any card binds.
+    The successor to 51-3's ``fast_config``, which existed only to give a tree a
+    sweep interval and a reap grace short enough for a spec to watch. Story 52-6
+    deleted both fields with the liveness sweep, so what is left is the naming
+    every spec that creates an actor ahead of a card needs anyway.
     """
     fields: dict[str, Any] = {
         "name": workspace_actor_name(workspace_path),
         "role": WORKSPACE_ACTOR_ROLE,
         "workspace_path": workspace_path,
-        "sweep_interval_s": FAST_SWEEP_INTERVAL_S,
-        "reap_grace_s": FAST_REAP_GRACE_S,
     }
     fields.update(overrides)
     return WorkspaceConfig(**fields)
-
-
-def children_ahead(
-    orchestrator_proxy: FakeOrchestratorProxy, config: WorkspaceConfig
-) -> WorkspaceActor:
-    """Create *config*'s actor before any card binds, and return it.
-
-    Get-or-create ignores ``config`` on a hit, exactly as the real orchestrator
-    does, so a card that binds afterwards gets this actor — with this config —
-    rather than one built from the card's own. That is how a spec gives a tree a
-    fast sweep interval, which no card can set. Inert fixtures only: the actor is
-    the instance itself.
-    """
-    address = orchestrator_proxy.getChildrenOrCreate(WorkspaceActor, config)
-    actor = orchestrator_proxy.actor_for(address)
-    assert isinstance(actor, WorkspaceActor)
-    return actor
 
 
 def wait_until(predicate: Callable[[], bool], timeout: float = HANDSHAKE_TIMEOUT_S) -> bool:

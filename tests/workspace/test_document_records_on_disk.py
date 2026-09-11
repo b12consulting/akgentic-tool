@@ -10,9 +10,9 @@ counted without anything reaching a disk, and a file that a second object can
 read cannot have stayed in memory.
 
 The live specs at the bottom keep the shape 51-4 gave them — a real
-``ActorSystem``, a real ``WorkspaceHost``, a real reap and a second actor over
-the same tree — and their claim is now simply that the second actor reads what
-the first one wrote, with **nothing registered anywhere** to carry it.
+``ActorSystem``, a real stop and a second actor over the same tree — and their
+claim is now simply that the second actor reads what the first one wrote, with
+**nothing registered anywhere** to carry it.
 
 **What went with the deltas, and why it is not a loss.** The classes that
 asserted a delta's *shape* (member-keyed, one per persist point, never the bare
@@ -23,9 +23,9 @@ eviction, a subclass survives the round trip, only the known functions write —
 are all re-pointed below, because deleting a test that guarded an invariant takes
 the invariant with it.
 
-(The module keeps its name so the epic's file table still finds it; what it
-guards is no longer a delta, and renaming it belongs with the rest of the
-vocabulary sweep in 52-6.)
+(Renamed from ``test_state_deltas.py`` in 52-6, the vocabulary sweep 52-3
+deferred to it: what it guards has not been a delta since 52-3, and a file named
+after a channel that no longer exists sends the next reader looking for one.)
 """
 
 from __future__ import annotations
@@ -39,8 +39,6 @@ import pytest
 from akgentic.core import ActorRegistry
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.actor_system_impl import ActorSystem
-from akgentic.core.agent_config import BaseConfig
-from akgentic.core.resource_host import ResourceHost
 
 from akgentic.tool.vector_store.protocol import VectorStoreParam
 from akgentic.tool.workspace.actor import (
@@ -62,7 +60,6 @@ from akgentic.tool.workspace.documents.worker import (
     EMBED_BATCH_SIZE,
     MAX_CONCURRENT_INDEX_WORKERS,
 )
-from akgentic.tool.workspace.host import WorkspaceHost
 from akgentic.tool.workspace.models import (
     WorkspaceConfig,
     content_sha,
@@ -72,7 +69,6 @@ from tests.workspace.conftest import (
     WORKSPACE_PATH,
     attach_store,
     factory_for,
-    fast_config,
     seed_extract,
     seed_row,
     stored_docs,
@@ -80,6 +76,7 @@ from tests.workspace.conftest import (
     stored_rows,
     wait_until,
     watch_store,
+    workspace_config,
     workspace_root_for,
 )
 from tests.workspace.test_document_cache import _ExtractWithExtraField
@@ -960,15 +957,15 @@ _LIVE_PATH = "u-alice/restored"
 
 @pytest.fixture
 def system(workspaces_root: Path) -> Iterator[ActorSystem]:
-    """A real actor system with both hosts, torn down whatever the spec did."""
+    """A real actor system running **no host of any kind**, torn down whatever the spec did.
+
+    51-4's version created a ``WorkspaceHost`` and core's base ``ResourceHost``
+    beside it, because the workspace was created through the first one. There is
+    no host in this package any more (52-6), so the actors below are created
+    directly and the fixture's only remaining job is the teardown assertion.
+    """
     actor_system = ActorSystem()
     try:
-        actor_system.createActor(
-            WorkspaceHost, config=BaseConfig(name="#WorkspaceHost", role="ResourceHost")
-        )
-        actor_system.createActor(
-            ResourceHost, config=BaseConfig(name="#ResourceHost", role="ResourceHost")
-        )
         yield actor_system
     finally:
         actor_system.shutdown(timeout=10)
@@ -976,15 +973,21 @@ def system(workspaces_root: Path) -> Iterator[ActorSystem]:
         assert ActorSystem.find_by_class(WorkspaceActor) == [], "a workspace outlived its test"
 
 
-def _host_proxy(system: ActorSystem) -> WorkspaceHost:
-    [host] = ActorSystem.find_by_class(WorkspaceHost)
-    return system.proxy_ask(host, WorkspaceHost)
+def _create(system: ActorSystem, config: WorkspaceConfig) -> ActorAddress:
+    """Start one workspace actor over *config*'s tree, through the public API."""
+    return system.createActor(WorkspaceActor, config=config)
 
 
-def _reaped(address: ActorAddress, config: WorkspaceConfig) -> bool:
-    """Wait for the nobody-attached actor at *address* to reap itself, within a bound."""
-    budget = config.reap_grace_s + 6 * config.sweep_interval_s + HANDSHAKE_TIMEOUT_S
-    return wait_until(lambda: not address.is_alive(), timeout=budget)
+def _stopped(system: ActorSystem, address: ActorAddress) -> bool:
+    """Stop the actor at *address* the way its team's teardown would, and wait for it.
+
+    51-4's predecessor waited out a **reap** here — the grace plus six sweep
+    ticks — because nothing else could end a hosted actor. The actor is an
+    ordinary team child now, so what ends it is a stop, and the claim under test
+    is unchanged: the records outlive the actor that wrote them.
+    """
+    system.proxy_ask(address, WorkspaceActor).stop()
+    return wait_until(lambda: not address.is_alive(), timeout=HANDSHAKE_TIMEOUT_S)
 
 
 def _fill_and_upload(system: ActorSystem, address: ActorAddress, tree: Path) -> str:
@@ -999,57 +1002,59 @@ def _fill_and_upload(system: ActorSystem, address: ActorAddress, tree: Path) -> 
 
 
 class TestTheDiskPathLive:
-    def test_a_fill_and_an_upload_survive_the_reap_into_a_new_actor(
+    def test_a_fill_and_an_upload_survive_the_actor_into_a_new_one(
         self, system: ActorSystem, workspaces_root: Path
     ) -> None:
         """The headline of the story, at full scale: **nothing is registered anywhere**.
 
-        51-4's version of this spec had to register a ``DeltaStore`` on the host
+        51-4's version of this spec had to register a ``DeltaStore`` on a host
         first, and what it proved was that the host's store carried the two
         records across the reap. Nothing carries them now: the second actor reads
-        the same files the first one wrote.
+        the same files the first one wrote, and the two share no memory at all —
+        the first is stopped before the second exists.
         """
-        config = fast_config(_LIVE_PATH)
-        address = _host_proxy(system).getResourceOrCreate(WorkspaceActor, config)
+        config = workspace_config(_LIVE_PATH)
+        address = _create(system, config)
         tree = workspace_root_for(workspaces_root, "restored")
 
         sha = _fill_and_upload(system, address, tree)
 
-        assert _reaped(address, config), "nobody attached, and the tree never reaped"
+        assert _stopped(system, address), "the actor never stopped"
 
-        renewed = _host_proxy(system).getResourceOrCreate(WorkspaceActor, config)
+        renewed = _create(system, config)
 
-        assert renewed.agent_id != address.agent_id, "the host answered the dead actor"
+        assert renewed.agent_id != address.agent_id, "the same actor came back"
         restored = system.proxy_ask(renewed, WorkspaceActor)
         restored.configure_document_store(YamlDocumentStore())
         assert restored.document_extract("doc.md", sha, EXTRACTOR_VERSION) == "# Body\n"
         rows = restored.rag_snapshot(20).rows
         assert [(row.path, row.status) for row in rows] == [("up.md", RagStatus.PENDING.value)]
 
-    def test_the_host_needs_no_store_registered_at_all(
+    def test_a_second_actor_reads_them_while_the_first_is_still_alive(
         self, system: ActorSystem, workspaces_root: Path
     ) -> None:
-        """**Deliberately inverted from 51-4**, which pinned that a cold host lost the fill.
+        """Two actors over one tree, at once — the arrangement 52-5 made legal.
 
-        A host with no store used to mean the records went nowhere, so a reap
-        emptied the cache. They go to the tree's own metadata directory now, so
-        the host's registration has nothing to do with it — which is what makes
-        this the same spec as the one above with the registration removed, and
-        why the one above no longer registers anything either.
+        Re-pointed from ``test_the_host_needs_no_store_registered_at_all``, whose
+        subject — a host with no store registered on it — is retired. What that
+        spec was really asserting is that no in-memory carrier is involved, and
+        the strongest form of that is now available and was not then: a **live**
+        second actor, sharing nothing with the first, reads the first one's
+        records off the tree.
         """
-        config = fast_config(_LIVE_PATH)
-        address = _host_proxy(system).getResourceOrCreate(WorkspaceActor, config)
+        config = workspace_config(_LIVE_PATH)
+        address = _create(system, config)
         tree = workspace_root_for(workspaces_root, "restored")
 
         sha = _fill_and_upload(system, address, tree)
 
-        assert address.is_alive(), "a fill on a cold host stopped the actor"
-        assert _reaped(address, config), "nobody attached, and the tree never reaped"
-        renewed = _host_proxy(system).getResourceOrCreate(WorkspaceActor, config)
-        assert renewed.agent_id != address.agent_id
-        restored = system.proxy_ask(renewed, WorkspaceActor)
-        restored.configure_document_store(YamlDocumentStore())
-        assert restored.document_extract("doc.md", sha, EXTRACTOR_VERSION) == "# Body\n"
+        assert address.is_alive(), "the fill stopped the actor"
+        second = _create(system, config)
+        assert second.agent_id != address.agent_id
+        assert address.is_alive(), "the first actor was displaced rather than joined"
+        reader = system.proxy_ask(second, WorkspaceActor)
+        reader.configure_document_store(YamlDocumentStore())
+        assert reader.document_extract("doc.md", sha, EXTRACTOR_VERSION) == "# Body\n"
 
 
 class TestNoStoreAtAll:

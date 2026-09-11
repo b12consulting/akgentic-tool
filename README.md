@@ -722,13 +722,14 @@ Six ship in this package today: `#VectorStore`, `#PlanningTool`, `#KnowledgeGrap
 used to sit beside the workspace actor is retired: `#Workspace` owns the tree's exec backend and
 runs commands on its own worker thread, so an exec-enabled tree runs one actor, not two.
 
-**`#Workspace` is the one tool actor that is not one per team.** It is **hosted**: one per workspace
-tree per process, created by the process's `WorkspaceHost` (a core `ResourceHost`) rather than by
-any team's orchestrator, shared by every team whose cards resolve the same path, nobody's child,
-outside the two-phase `#` teardown, reaped by itself once its last holder has stopped, and
-persisted by member-keyed delta through the host. Everything this section says about one-per-team
-actors — binding through `getChildrenOrCreate`, the team's event store, the teardown order — is
-true of the other five and not of it; see the
+**`#Workspace` is one per team like the other five, and one per *tree* within a team.** Epic 51 made
+it a hosted singleton so that one actor per tree could hold the exec lease, the document cache, the
+retrieval index and the write gate; epic 52 moved every one of those onto the tree itself — a marker
+file, YAML records under a metadata sibling, an `fcntl.flock` — so the actor holds **no shared
+state**, and the hosting was removed with the state that motivated it. What it still owns is
+dispatch: exec runs on its own worker thread, and the retrieval indexing pipeline whose workers
+report to its mailbox. **Two teams over one tree therefore get two actors, and that is correct** —
+the tree orders them, across two processes as well as two teams, which a mailbox never did. See the
 [workspace README](src/akgentic/tool/workspace/README.md#lifetime).
 
 **`#VectorStore` is the exception among them: it exists only for a backend that keeps its data in
@@ -736,15 +737,16 @@ actor state.** Today that means the in-memory backend. On a cluster the rows liv
 so there is nothing for an actor to own and none is created — each consumer holds its own backend
 object and calls it directly. Whether the actor exists at all is the backend's answer, read from the
 `persists_in_actor_state` flag on its registered spec, not a card's. The workspace's in-memory store
-is not the team's `#VectorStore` either: it is the workspace actor's own child,
-`#VectorStore-<scope>/<leaf>`, and stops with it.
+is the team's `#VectorStore`: since epic 52 the workspace card binds the team's store rather than
+creating a child of its own, so two trees in one team share one store and one workspace stopping
+cannot take the other's index down.
 
 **Note the one name that carries a suffix.** Five of the six are one per *team*, and their name is
 a constant. The workspace actor is one per *workspace tree*, so its name is **built** from the
 workspace's resolved two-segment path — slash included — rather than being a literal. Two of them
 can coexist in one team, each owning its own directory, and two *principals* whose cards both say
 `workspace_id="notes"` get two actors over two trees because the name carries the scope as well as
-the leaf. The `WorkspaceHost`'s registry keys on the name, so this is not cosmetic: a fixed name
+the leaf. Get-or-create keys on the name, so this is not cosmetic: a fixed name
 would collapse two trees onto one actor, silently. The unicity domain of an actor must equal the
 resource it owns — and the exec backend, which serves exactly that tree, is held by the workspace
 actor rather than named and created as an actor of its own.
@@ -770,9 +772,10 @@ everyone queued behind it.
 **State that persists itself.** A one-per-team tool actor's state reaches the team's event store
 without the tool arranging it — the actor calls `notify_state_change()`, and the framework
 snapshots the state and restores it when the team resumes. Persistence here is a property of being
-an actor, not something a tool implements. The hosted workspace is the exception: it has no team
-and no orchestrator, so it sends a member-keyed `StateDelta` for exactly what changed to its
-`WorkspaceHost`, whose store restores it on the next bind after a reap or a restart.
+an actor, not something a tool implements. `#Workspace` is the exception, and in the other
+direction: it persists **nothing** through its actor, because what it knows about a tree belongs to
+the tree — one YAML record per source document under the tree's metadata sibling, which a second
+actor, or a second process over the same mount, reads back with no handoff at all.
 
 ### Binding one: `getChildrenOrCreate`, never check-then-create
 
@@ -1056,10 +1059,10 @@ class covers both modes via a `read_only: bool` gate. All paths are anchored to
 `<user_id>/<team_id>` by default, `<user_id>/<workspace_id>` for a named one, and `_meta/<joined
 keys>` for the metadata-shared layout. Traversal out of that root is rejected.
 
-**A hosted `#Workspace-<scope>/<leaf>` actor owns the tree — one per tree per process, shared by
-every team on it — and every mutation is refused unless the file is still what the writing agent
-last read.** Reads stay on the agent's own thread and are never
-serialized. A refusal is a `RetriableError`, so it lands in the model's next turn carrying a diff of
+**Every mutation is refused unless the file is still what the writing agent last read**, and the
+check and the write happen together under an `fcntl.flock` held on the path — on the *tree*, so two
+teams and two processes over one mounted volume are ordered by the same thing. Reads stay on the
+agent's own thread and are never serialized. A refusal is a `RetriableError`, so it lands in the model's next turn carrying a diff of
 what the write would have destroyed — the agent re-reads and redoes without anyone writing recovery
 logic. No digest, `expected` or `force` appears in any tool signature: the precondition is derived
 server-side from what the agent was observed to read, and there is deliberately no bypass. Accepted
@@ -1206,8 +1209,9 @@ Every object `WeaviateBackend` writes is stamped with the owning team's id (`tea
 the actor, never from a card), so `delete_by_team()` and `list_collections()` give a deployment the
 two primitives it needs to reap the vectors of a deleted team — otherwise unreachable, since
 nothing else on a Weaviate object says who produced it. **The exception is the shared workspace
-collection, `workspace_chunks`**: the hosted workspace belongs to no team, so its rows carry `""`,
-are bounded by the mandatory `scope` instead, and are never reaped by team. Every object's id is
+collection, `workspace_chunks`**: a workspace row carries `""` for its team — deliberately, so that
+a row's identity does not move when the actor that wrote it is replaced — is bounded by the
+mandatory `scope` instead, and is never reaped by team. Every object's id is
 derived from its team, tenant and `ref_id` — the derivation Qdrant's point ids use — so a re-added
 row replaces the object instead of doubling it.
 

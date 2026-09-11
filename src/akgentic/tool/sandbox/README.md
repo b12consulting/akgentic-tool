@@ -266,8 +266,7 @@ macOS 10.15 and may be removed. Treat seatbelt as a developer-workstation backen
 ### The Docker container
 
 `docker` mode creates **one ephemeral container per workspace tree**, on the first command, and
-removes it (`docker rm -f`) when `#Workspace` stops — whether the team stopped or the actor was
-reclaimed. The container holds nothing worth keeping: its root is read-only, `/workspace` is the
+removes it (`docker rm -f`) when `#Workspace` stops, which is when its team's teardown reaches it. The container holds nothing worth keeping: its root is read-only, `/workspace` is the
 only bind mount and the only writes that outlive it, and its name (`akgentic-sandbox-<12 hex>`) is
 opaque, generated per `start()`, held on the backend instance and **persisted nowhere**. A reaper
 keys on the container's `akgentic.workspace_path=<scope>/<leaf>` label, never on the name.

@@ -21,10 +21,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.actor import WorkspaceActor
 from akgentic.tool.workspace.tool import WorkspaceTool
-
 from tests.workspace.conftest import (
     FakeActorToolObserver,
     FakeOrchestratorProxy,
@@ -209,12 +209,13 @@ class TestTheHashIsRead:
         # that could is the regression this guards — the list is exhaustive on
         # purpose, so adding one is a deliberate act.
         #
-        # The observation and last-writer maps left with the gate in 52-5. Of the
-        # five that remain, none holds file content: ``_slots`` is the deferred
-        # base's result cache, keyed by run id and holding an ``ExecOutcome``;
+        # The observation and last-writer maps left with the gate in 52-5, and
+        # the holder map went with the liveness sweep in 52-6. Of the four that
+        # remain, none holds file content: ``_slots`` is the deferred base's
+        # result cache, keyed by run id and holding an ``ExecOutcome``;
         # ``_run_errors`` and ``_recent_runs`` are keyed by run id and agent id
-        # and hold strings; ``_holders`` and ``_agent_names`` are keyed by agent
-        # id and hold addresses and display names.
+        # and hold strings; ``_agent_names`` is keyed by agent id and holds
+        # display names.
         read(wired_card, "notes.md")
         mutate(wired_card, "workspace_write", "notes.md", "mine\n")
 
@@ -222,7 +223,6 @@ class TestTheHashIsRead:
             name: value for name, value in vars(workspace_actor).items() if isinstance(value, dict)
         }
         assert set(maps) == {
-            "_holders",
             "_agent_names",
             "_slots",
             "_run_errors",

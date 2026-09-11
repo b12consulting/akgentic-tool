@@ -38,7 +38,6 @@ from akgentic.tool.workspace.documents.models import (
     derived_document_caps,
 )
 from akgentic.tool.workspace.models import WorkspaceConfig
-
 from tests.workspace.conftest import WORKSPACE_PATH, attach_store, seed_row, stored_rows
 
 # Recorded once, from a call made in a *different* process. A second call made
@@ -129,7 +128,8 @@ class TestChunksAreOffsets:
         ``model_config`` into every subclass's dict, so both spellings of that
         assertion are vacuous — ``DocumentExtract`` would pass them too. What a
         leaking type actually breaks is the round trip, and these rows are
-        persisted as JSON inside ``WorkspaceState`` and read back on resume.
+        persisted as JSON under the tree's metadata directory and read back by
+        the next process over the same mount.
         """
         chunk = RagChunk(
             chunk_id="c1", ordinal=3, start=10, end=40, heading_path=["A", "B"], header_start=1
@@ -137,7 +137,7 @@ class TestChunksAreOffsets:
         assert RagChunk.model_validate_json(chunk.model_dump_json()) == chunk
 
     def test_a_rag_file_round_trips_through_validation(self) -> None:
-        """It is persisted inside ``WorkspaceState`` and read back on resume."""
+        """It is persisted as a file under ``<meta>/rag/`` and read back from there."""
         original = RagFile(
             path="a.md",
             status=RagStatus.EMBEDDED,

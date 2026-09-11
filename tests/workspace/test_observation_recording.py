@@ -688,9 +688,10 @@ class TestTheCardBindsAsATeamChild:
     nothing left for two actors over one tree to disagree about.
 
     The two negatives are the point of the class: nothing forwards to a host
-    (``resource_calls`` stays empty), and nothing under ``workspace/card/`` so
-    much as imports one. That pair is ``akgentic-infra``\'s acceptance guard read
-    from this side of the seam.
+    (``resource_calls`` stays empty — the fake orchestrator's forward records the
+    attempt and then raises, since 52-6 deleted the host it would have needed),
+    and nothing under ``workspace/card/`` so much as imports one. That pair is
+    ``akgentic-infra``\'s acceptance guard read from this side of the seam.
     """
 
     @pytest.mark.parametrize("shape", ["bare", "named", "metadata", "exec", "rag"])
@@ -778,14 +779,21 @@ def _created_ahead_of_the_card(
 
 
 class TestAttachAbsorbsRegisterAgent:
-    """``attach`` records the holder and the name; ``register_agent`` is gone."""
+    """``attach`` records the name; ``register_agent`` is gone, and so is the holder half.
+
+    52-5 folded ``register_agent`` into ``attach``, which then did two jobs: it
+    recorded the agent as a *holder* for the liveness sweep to count, and it
+    recorded the name a refusal prints. 52-6 deleted the sweep, so only the
+    second job is left — and it is the load-bearing one. The holder assertions
+    are removed rather than weakened; the name assertions are untouched.
+    """
 
     def test_the_old_registration_is_gone_and_attach_is_there(self) -> None:
         assert hasattr(WorkspaceActor, "attach")
         assert not hasattr(WorkspaceActor, "register_agent")
         assert not hasattr(WorkspaceTool, "_register_agent_name")
 
-    def test_attach_records_the_holder_and_the_name_under_the_agent_id(
+    def test_attach_records_the_name_under_the_agent_id(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         actor = _created_ahead_of_the_card(orchestrator_proxy)
@@ -794,25 +802,22 @@ class TestAttachAbsorbsRegisterAgent:
 
         actor.attach(address, "builder")
 
-        assert list(actor._holders) == [key]
-        assert actor._holders[key] is address
         assert actor._name_of(key) == "builder"
 
-        # The same agent again overwrites: still one holder, the newer name.
+        # The same agent again overwrites: the newer name wins.
         actor.attach(address, "builder-2")
-        assert list(actor._holders) == [key]
         assert actor._name_of(key) == "builder-2"
 
-        # A second agent is a second holder.
+        # A second agent gets its own entry, and the first keeps its own.
         other = MockActorAddress("reviewer")
         actor.attach(other, "reviewer")
-        assert set(actor._holders) == {key, str(other.agent_id)}
-        assert actor._holders[str(other.agent_id)] is other
+        assert actor._name_of(str(other.agent_id)) == "reviewer"
+        assert actor._name_of(key) == "builder-2"
 
-    def test_the_name_map_keeps_its_cap_and_the_holder_map_has_none(
+    def test_the_name_map_keeps_its_cap(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
-        """LRU on names, by ``move_to_end``; holders are bounded by live agents, not a cap."""
+        """LRU on names, by ``move_to_end``. The holder map it was paired with is gone."""
         actor = _created_ahead_of_the_card(orchestrator_proxy, max_tracked_writers=2)
         ann, bert, carl = (MockActorAddress(name) for name in ("ann", "bert", "carl"))
 
@@ -824,7 +829,6 @@ class TestAttachAbsorbsRegisterAgent:
         assert actor._name_of(str(ann.agent_id)) == "ann"
         assert actor._name_of(str(carl.agent_id)) == "carl"
         assert actor._name_of(str(bert.agent_id)) == str(bert.agent_id)  # evicted: id fallback
-        assert set(actor._holders) == {str(a.agent_id) for a in (ann, bert, carl)}
 
     def test_the_card_attaches_once_over_the_ask_proxy_and_never_over_the_tell(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
@@ -841,7 +845,7 @@ class TestAttachAbsorbsRegisterAgent:
 
         assert ask.attach_calls == [(observer.myAddress, str(observer.myAddress.name))]
         assert ask.attach_calls[0][0] is observer.myAddress
-        assert actor._holders == {str(observer.myAddress.agent_id): observer.myAddress}
+        assert actor._name_of(str(observer.myAddress.agent_id)) == str(observer.myAddress.name)
         assert "attach" not in tell.names
         assert "register_agent" not in tell.names
         # The tell recorder is genuinely wired: an accepted mutation signals the
@@ -853,7 +857,7 @@ class TestAttachAbsorbsRegisterAgent:
 
 
 class TestAFailedAttachFailsTheBind:
-    """An unguarded ask: a lost ``attach`` would let the sweep reap a tree still in use."""
+    """An unguarded ask: a lost ``attach`` would leave the tree with no name for this agent."""
 
     def test_the_attach_failure_reaches_the_caller_unchanged(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
@@ -931,9 +935,9 @@ class TestTwoTeamsOnOneTree:
             assert bob.events == [
                 WorkspaceAttached(agent_id=bob.myAddress.agent_id, workspace_path=WORKSPACE_PATH)
             ]
-            # Each actor holds exactly its own binder, so neither reaps early.
-            assert set(first_actor._holders) == {str(alice.myAddress.agent_id)}
-            assert set(second_actor._holders) == {str(bob.myAddress.agent_id)}
+            # Each actor knows exactly its own binder's name, and not the other's.
+            assert first_actor._name_of(str(alice.myAddress.agent_id)) == "alice"
+            assert second_actor._name_of(str(bob.myAddress.agent_id)) == "bob"
         finally:
             first_team.stop_all()
             second_team.stop_all()

@@ -20,11 +20,12 @@ callables take exactly what they always took, and the precondition is derived
 from what this agent observed. There is no digest, no ``expected``, and no
 ``force``.
 
-**A workspace binds, gates and mutates in a process running no host at all.**
-Nothing here calls ``getResourceOrCreate`` and nothing here imports
-``WorkspaceHost``, which is the seam ``akgentic-infra``'s community wiring needs.
-The actor that survives is an ordinary team child, and it owns what is genuinely
-per-process: the sandbox, the document reader, the retrieval pipeline.
+**A workspace binds, gates and mutates in a process that hosts nothing.** There
+is no resource host in this package any more and nothing here forwards to one:
+the card creates its actor as an ordinary team child, which is the seam
+``akgentic-infra``'s community wiring needs. That actor owns what is genuinely
+per-process — the sandbox, the document reader, the retrieval pipeline — and no
+shared state at all.
 
 The factory bodies live in the five sibling mixins — ``card/read.py``,
 ``card/write.py``, ``card/gate.py``, ``card/execution.py``, ``card/rag.py`` — and
@@ -232,13 +233,15 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
     and out-of-band *detection*; leaving it off loosens the gate by nothing at
     all, because the gate is pure Python and independent.
 
-    Note what the host's get-or-create implies: the **first** card to bind a
-    tree, **from any team**, decides its configuration, exactly as the
-    observation caps already do. A second card arriving with
-    ``git_journal=False`` does not turn off a journal that is already running,
-    and a card arriving with it on does not start one on an actor already built
-    without it. The host ignores ``config`` on a hit, and a tree shared by
-    several teams is the one tree whichever of them got there first.
+    Note what get-or-create implies: the **first** card of a team to bind a tree
+    decides that team's actor's configuration, exactly as the document caps
+    already do. A second card arriving with ``git_journal=False`` does not turn
+    off a journal that is already running, and a card arriving with it on does
+    not start one on an actor already built without it — get-or-create ignores
+    ``config`` on a hit. Two teams over one tree get two actors and so may
+    disagree, and the tree survives that: the journal is a git repository on
+    disk, which the team that enabled it writes and the team that did not simply
+    leaves alone.
     """
 
     workspace_exec: WorkspaceExec | bool = False
@@ -341,9 +344,10 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
     explicit catalog value always wins (ADR-045 §7), which is what these two
     fields exist for.
 
-    Note what the host's get-or-create implies, exactly as ``git_journal``
-    records: the **first** card to bind a tree, **from any team**, decides its
-    configuration, so a second card arriving with different caps changes nothing.
+    Note what get-or-create implies, exactly as ``git_journal`` records: the
+    **first** card of a team to bind a tree decides that team's actor's
+    configuration, so a second card of the same team arriving with different
+    caps changes nothing.
     """
 
     # Private runtime state — not part of the serialised config.
@@ -622,8 +626,9 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         because there would be nothing for an actor to hold but a socket.
 
         **The team's real id is passed, and that is not the defect story 51-4
-        neutralised.** That fix passed ``None`` because a hosted workspace minted
-        a fresh id per lifetime, so the row identity moved and a re-add doubled;
+        neutralised.** That fix passed ``None`` because the workspace actor of
+        the day minted a fresh id per lifetime, so the row identity moved and a
+        re-add doubled;
         the identity no longer carries the team on a shared collection at all
         (:func:`~akgentic.tool.vector_store.protocol.row_object_id`), so the team
         is free to be what it is — and it has to be, since it is what a sweep and
@@ -854,9 +859,10 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         recoverable by rebinding. A raise at wiring time is neither.
 
         ``attach`` is deliberately **not** guarded like this, and the difference
-        is the point: a lost ``attach`` does not degrade, it leaves the actor
-        unaware that this agent holds it, which lets the liveness sweep reap a
-        tree an agent is still using — silently.
+        is the point: a lost announcement of a *backend* is recoverable by
+        rebinding, while a lost ``attach`` leaves the actor with no name for this
+        agent — so every commit it authors and every refusal that names it fall
+        back to a UUID, for the life of the tree, with nothing raised.
         """
         tell = self._workspace_tell
         if tell is None:
@@ -887,8 +893,8 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         trees get two actors and two cards of one team on one tree get one.
 
         **The card emits the event itself, through ``notify_event``.** It used to
-        travel as ``getResourceOrCreate``'s ``event=`` argument, which is gone
-        with the forward. ``ToolObserver.notify_event`` is the base protocol's
+        travel as an argument of the orchestrator forward this bind replaced,
+        which is gone. ``ToolObserver.notify_event`` is the base protocol's
         own method for *"tools that only need to emit events"*, and
         ``Akgent.notify_event`` wraps the payload in the same ``EventMessage`` on
         the same team stream — so the envelope, the fan-out and the wire name are
@@ -903,14 +909,15 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         needs the verdict, and a tell proxy for the retrieval signals, which need
         nothing back.
 
-        **Then ``attach``, over the ask proxy and unguarded** — and it must
-        survive, because the liveness sweep and its reap grace do. They fire at
-        **zero holders**, and this call is the only thing that records one: stop
-        making it and every workspace actor reaps itself two minutes after the
-        last bind, mid-session, taking exec and retrieval down with it, silently.
-        An ask rather than a tell, so the holder is recorded before the bind
-        returns and a failure is seen: a dead actor fails the bind rather than
-        leaving an agent holding a tree that does not know it.
+        **Then ``attach``, over the ask proxy and unguarded.** Its holder half
+        went with the liveness sweep in 52-6; what it still does is register
+        ``agent_id -> name``, which is the **only** source for the actor's
+        ``_name_of``. That map is what the git journal authors a commit with and
+        what the exec busy refusal names the holding agent by — stop making this
+        call and both degrade to a raw UUID that tells a model nothing it can act
+        on, silently and for the life of the tree. An ask rather than a tell, so
+        a dead actor fails the bind rather than leaving an agent bound to a tree
+        that never heard of it.
 
         **This method creates at most one actor.** The team's ``#VectorStore`` a
         retrieval card may need is created by :meth:`_bind_vector_store`, further
