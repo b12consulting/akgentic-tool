@@ -251,7 +251,7 @@ class DocumentsMixin(_DocumentsBase):
         handles, so neither case needs a branch of its own and neither can raise.
 
         The *tree_key* is resolved here — ``config.workspace_path``, the same
-        two-segment string ``_lock.acquire`` is given, never ``config.name``,
+        three-segment string ``_lock.acquire`` is given, never ``config.name``,
         which carries the ``#Workspace-`` prefix. Spelling it at every call site
         would be fifteen places for one to drift.
         """

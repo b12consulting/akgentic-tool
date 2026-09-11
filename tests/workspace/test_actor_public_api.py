@@ -29,11 +29,14 @@ from __future__ import annotations
 
 import importlib
 
+from akgentic.core import AgentCard
+
 import akgentic.tool.workspace as ws
 from akgentic.tool.core.deferred import DeferredResultActor
-from akgentic.tool.workspace.actor import WorkspaceActor
+from akgentic.tool.workspace.actor import WORKSPACE_ACTOR_ROLE, WorkspaceActor
 from akgentic.tool.workspace.actor.documents import DocumentsMixin
 from akgentic.tool.workspace.actor.execution import ExecMixin
+from akgentic.tool.workspace.models import WorkspaceConfig
 
 _ACTOR_MODULE = "akgentic.tool.workspace.actor"
 
@@ -115,6 +118,29 @@ class TestActorMro:
         delivery path outright.
         """
         assert not _DELIBERATE_OVERRIDES & set(vars(DocumentsMixin))
+
+    def test_the_explicit_akgent_base_is_what_types_a_dict_config(self) -> None:
+        """The MRO-redundant ``Akgent[WorkspaceConfig, BaseState]`` base, by what it buys.
+
+        Core's ``AgentCard`` coerces a dict ``config`` to the type a concrete
+        ``Akgent[Config, State]`` binding in the class's MRO names, and the one
+        inherited through ``DeferredResultActor`` carries type variables. Delete
+        the base as redundant and this config is a plain ``BaseConfig``, with
+        nothing else in the suite going red.
+        """
+        card = AgentCard(
+            description="a workspace actor",
+            skills=[],
+            agent_class=WorkspaceActor,
+            config={
+                "name": "#Workspace-u-alice/_id/notes",
+                "role": WORKSPACE_ACTOR_ROLE,
+                "workspace_path": "u-alice/_id/notes",
+            },
+        )
+
+        assert type(card.config) is WorkspaceConfig
+        assert card.config.workspace_path == "u-alice/_id/notes"
 
 
 class TestTheGateLeftTheActor:

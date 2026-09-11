@@ -400,7 +400,7 @@ class ExecConfig(SerializableBaseModel):
 
     Attributes:
         mode: The resolved backend.
-        workspace_path: The card's **already-resolved** two-segment path, the
+        workspace_path: The card's **already-resolved** three-segment path, the
             only thing a backend needs to open the right tree. It replaces the
             raw ``workspace_id`` this model used to forward: a backend that
             cannot re-derive the path cannot derive a different one, which is
@@ -558,7 +558,7 @@ class ExecRunner:
     Attributes:
         backend: The strategy commands run on. Read by teardown and by specs;
             never swapped after construction.
-        workspace_path: The already-resolved two-segment tree this runner's
+        workspace_path: The already-resolved three-segment tree this runner's
             backend is started on. One runner is anchored to one tree for its
             whole life — a runner whose tree could change is a backend that
             could open a directory other than the one its ``#Workspace`` gates.

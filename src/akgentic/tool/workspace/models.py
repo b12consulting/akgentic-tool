@@ -114,8 +114,8 @@ this constant separates the two badly.
 GIT_DIR_SUFFIX = ".git"
 """Suffix of the sibling repository directory: workspace ``foo`` journals to ``foo.git``."""
 
-META_DIR_SUFFIX = ".akgentic"
-"""Suffix of the sibling metadata directory: workspace ``foo``'s lives at ``foo.akgentic``."""
+META_DIR_SUFFIX = ".index"
+"""Suffix of the sibling metadata directory: workspace ``foo``'s lives at ``foo.index``."""
 
 GITIGNORE_NAME = ".gitignore"
 
@@ -253,8 +253,8 @@ class WorkspaceConfig(BaseConfig):
     because an unknown key is ignored.
 
     Attributes:
-        workspace_path: The **already-resolved** two-segment path of the tree
-            this actor owns — ``<scope>/<leaf>``, relative to the workspaces
+        workspace_path: The **already-resolved** three-segment path of the tree
+            this actor owns — ``<scope>/<kind>/<leaf>``, relative to the workspaces
             root — and also the suffix of the actor's name. Get-or-create keys on
             that name, so both come from this one value; two cards on different
             workspaces cannot collapse onto one actor owning one tree, and

@@ -269,7 +269,7 @@ class SearchHarness:
 def build_actor(workspace_path: str = WORKSPACE_PATH) -> WorkspaceActor:
     """A started actor over *workspace_path*, with no actor thread.
 
-    Takes the **resolved** two-segment path, which is what an actor is
+    Takes the **resolved** three-segment path, which is what an actor is
     configured with — the leaf alone would put it on a tree no card reaches.
     """
     started = WorkspaceActor(

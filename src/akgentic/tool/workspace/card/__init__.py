@@ -43,7 +43,7 @@ from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
 
-from pydantic import Field, PrivateAttr, model_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.orchestrator import Orchestrator
@@ -125,10 +125,14 @@ from akgentic.tool.workspace.models import (
     content_sha,
 )
 from akgentic.tool.workspace.workspace import (
+    SHARED_KINDS_ENV,
+    SHARED_SCOPE,
     Filesystem,
     get_workspace,
     meta_dir_for,
+    permitted_shared_kinds,
     resolve_workspace_path,
+    validate_workspace_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -179,26 +183,74 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
 
     # Read capability fields (formerly in WorkspaceReadTool)
     workspace_id: str | None = None
+    """The named workspace — the ``<leaf>`` of the ``_id`` kind — or ``None`` for the team's own.
+
+    ``WorkspaceTool(workspace_id="notes")`` resolves to ``alice/_id/notes`` for
+    principal ``alice``. The grammar is 1 to 128 characters, each an ASCII
+    letter, a digit, ``.``, ``_`` or ``-``, and not a kind name or a name ending
+    in ``.git`` or ``.index`` in any letter case
+    (:func:`~akgentic.tool.workspace.workspace.validate_workspace_id`).
+
+    **Refused at construction, catalog save and resume, not at bind** — see
+    :meth:`_workspace_id_rule` — so a name the platform cannot serve never
+    reaches a tree. Mutually exclusive with :attr:`workspace_metadata_keys`.
+    """
     workspace_metadata_keys: list[str] = []
-    """Metadata fields whose values key a workspace **shared** across teams and users.
+    """Metadata fields whose values key the workspace — the ``_meta`` kind.
 
     The third of three layouts (ADR-048 Decision 2). Declaring
     ``["customer_id", "case_id"]`` on a team whose metadata carries ``ACME`` and
-    ``42`` resolves to ``_meta/customer_id-ACME__case_id-42`` — under a reserved
-    scope rather than under anybody's principal, because sharing is the point.
+    ``42`` resolves to ``alice/_meta/customer_id-ACME__case_id-42`` for principal
+    ``alice``. **Per-principal, like the other two kinds**: every team of one
+    user carrying the same values reaches one tree, and another user's teams
+    reach another. It is shared across users only when the card also declares
+    :attr:`workspace_sharable`, which puts it at
+    ``_shared/_meta/customer_id-ACME__case_id-42``.
 
     **Keys are a sequence, not a set:** they are joined in declaration order, so
     the list reads as a refinement path from the coarsest scope down and
-    ``ls _meta/`` groups a customer's workspaces together. Two cards naming the
-    same keys in different orders therefore address different workspaces —
-    honest under the sequence model, and visible in the directory name. Values
-    are percent-encoded, which is what keeps the join unforgeable.
+    ``ls <scope>/_meta/`` groups a customer's workspaces together. Two cards
+    naming the same keys in different orders therefore address different
+    workspaces — honest under the sequence model, and visible in the directory
+    name. Values are percent-encoded, which is what keeps the join unforgeable.
 
     The resolver reads this field and nothing else reads it: the actor's config
     carries the resolved path, and a client learns which agent bound which tree
     from the ``WorkspaceAttached`` event the bind emits, never from a key list.
 
     Mutually exclusive with :attr:`workspace_id` — see :meth:`_one_layout`.
+    """
+    workspace_sharable: bool = False
+    """Whether this card's tree is shared across principals — ``False`` for every kind.
+
+    ``False`` puts the tree under the owning principal, ``alice/<kind>/<leaf>``;
+    ``True`` puts it under the reserved shared scope, ``_shared/<kind>/<leaf>``,
+    where every card declaring the same kind and leaf reaches the same tree.
+    Per-principal is the default for all three kinds, **metadata included**: a
+    tree is shared because its author wrote this, never as a side effect of which
+    layout field they filled in.
+
+    Orthogonal to :attr:`workspace_id` and :attr:`workspace_metadata_keys` —
+    valid with each of the three layouts, and not part of :meth:`_one_layout`.
+
+    **``True`` is a request, not a grant.** The permission is
+    ``AKGENTIC_WORKSPACE_SHARED_KINDS`` on the process that binds the agent,
+    which lists the kinds a deployment allows under ``_shared``; unset, it
+    allows none. A request that is not permitted **fails the bind** in
+    :meth:`observer`, naming the kind asked for and the kinds permitted — it is
+    never downgraded to a per-principal tree, because a card that asked for a
+    shared tree and quietly got a private one has had its meaning changed
+    without being told. Checked at bind rather than here, because a card is
+    validated in more places than it is bound, and only the binding process's
+    environment decides.
+
+    **A plain ``bool`` with a real default, and it must stay one.** The card
+    round-trips through ``SerializableBaseModel`` on every team resume, and that
+    serializer emits every declared field whatever ``exclude_unset`` says — so a
+    design reading "did the author write this?" off ``model_fields_set`` answers
+    correctly on the first load and wrongly on every resume after it. That is the
+    defect story 52-4 shipped and fixed with ``backend_declared``. ``False`` is
+    ``False`` on both sides of a round trip: the value **is** the declaration.
     """
     workspace_read: WorkspaceRead | bool = True
     workspace_view: WorkspaceView | bool = True
@@ -375,7 +427,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
     # tells a model nothing it can act on. A plain string, so it is no more an
     # edge back to the agent than the id is.
     _agent_name: str = PrivateAttr(default="")
-    # The resolved two-segment path, kept because three runtime consumers need
+    # The resolved three-segment path, kept because three runtime consumers need
     # it after ``observer()`` has returned: the exec hold's tree key, the
     # metadata directory, and the journal.
     _workspace_path: str = PrivateAttr(default="")
@@ -413,6 +465,29 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
     # that needs an actor, a freshly built client for one that does not. Runtime
     # state, so a ``PrivateAttr`` for the reason above.
     _vector_store: VectorStoreService | None = PrivateAttr(default=None)
+
+    @field_validator("workspace_id")
+    @classmethod
+    def _workspace_id_rule(cls, value: str | None) -> str | None:
+        """Refuse a ``workspace_id`` outside the one grammar, where the author writes it.
+
+        A field validator runs wherever the card is validated — construction,
+        the catalog's ``model_validate`` on save and load, and core's
+        ``deserialize_object`` on team resume — so a bad id fails in front of the
+        person who wrote it, and a stored card carrying one fails its resume
+        loudly rather than binding. No ``Field(pattern=...)``: a schema pattern
+        would carry the charset without the kind-name and suffix rules, a second
+        and partial copy of the grammar.
+
+        ``None`` passes through: it is every default card's value, and its dump
+        carries it **explicitly**, so every resume of a default card re-validates
+        it.
+
+        Raises:
+            ValueError: Whatever :func:`validate_workspace_id` raises; pydantic
+                reports it against the ``workspace_id`` field.
+        """
+        return None if value is None else validate_workspace_id(value)
 
     @model_validator(mode="after")
     def _one_layout(self) -> WorkspaceTool:
@@ -456,11 +531,15 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         Raises:
             ValueError: If ``observer.orchestrator`` is None, or if the workspace
                 path cannot be derived — an unusable ``user_id``, an unusable
-                ``workspace_id``, or any of the metadata conditions. That raise
-                fails card binding and therefore team creation, **deliberately**:
-                it surfaces in front of the admin who caused it, rather than
-                silently collapsing several principals into one tree. It must
-                never be caught and turned into a fallback.
+                ``workspace_id``, or any of the metadata conditions — or if this
+                process does not permit it: a shared tree whose kind
+                ``AKGENTIC_WORKSPACE_SHARED_KINDS`` does not list, or a malformed
+                value of that variable, which fails **every** bind, per-principal
+                ones included. That raise fails card binding and therefore team
+                creation, **deliberately**: it surfaces in front of the admin who
+                caused it, rather than silently collapsing several principals into
+                one tree — or silently handing a card that asked for a shared tree
+                a private one. It must never be caught and turned into a fallback.
             RuntimeError: Whatever a failing ``attach`` raises, propagated
                 unchanged — an agent must never hold a tree that does not know
                 it is held. It must never be caught, for the same reason.
@@ -486,7 +565,13 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
             # process, under rows that do not. See ``WORKSPACE_IN_MEMORY_REFUSED``.
             require_workspace_backend(self.vector_store, "WorkspaceTool")
         super().observer(observer)  # store the observer weakly via the base setter
-        ws_path = str(self._resolve_path(observer, observer.orchestrator))
+        path = self._resolve_path(observer, observer.orchestrator)
+        # Immediately after the resolve and before anything with a side effect:
+        # ``get_workspace`` creates the tree eagerly (``Filesystem.__init__``), so
+        # a gate any later would refuse the bind and still leave behind the very
+        # ``_shared`` directory it refused.
+        self._require_sharing_permitted(path)
+        ws_path = str(path)
         self._workspace_path = ws_path
         self._meta_dir = meta_dir_for(ws_path)
         self._exec_budget_s = self._mutation_budget()
@@ -564,7 +649,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         has just logged one.
 
         Args:
-            workspace_path: The resolved two-segment path, whose metadata
+            workspace_path: The resolved three-segment path, whose metadata
                 directory holds the commit lock.
         """
         assert self._workspace is not None
@@ -596,7 +681,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         the one the gate and the journal are guarding.
 
         Args:
-            workspace_path: The resolved two-segment path this card is anchored to.
+            workspace_path: The resolved three-segment path this card is anchored to.
 
         Returns:
             The resolved param, or ``None`` when this card enables no retrieval
@@ -704,7 +789,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
     def _resolve_path(
         self, observer: ActorToolObserver, orchestrator: ActorAddress
     ) -> PurePosixPath:
-        """Derive this card's two-segment workspace path, through the one resolver.
+        """Derive this card's three-segment workspace path, through the one resolver.
 
         ``observer.user_id`` is read as a **typed attribute**. A defaulted
         ``getattr`` would turn an observer that never received the identity into
@@ -735,6 +820,53 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
             team_id=str(observer.team_id),
             user_id=observer.user_id,
             metadata=metadata,
+            workspace_sharable=self.workspace_sharable,
+        )
+
+    def _require_sharing_permitted(self, path: PurePosixPath) -> None:
+        """Refuse a shared tree whose kind this process does not permit.
+
+        **The card requests, the platform permits.** ``workspace_sharable=True``
+        put *path* under ``_shared``; ``AKGENTIC_WORKSPACE_SHARED_KINDS`` on this
+        process says whether a shared tree of that kind may exist here at all.
+
+        The kind is read off the **resolved path's shape**, never re-derived
+        from this card's fields: kind selection lives in the resolver and
+        nowhere else, and the gate judges the tree that would actually be
+        created. It runs here, at bind, rather than in a ``model_validator``,
+        because it compares a field against the environment of the process that
+        creates the tree — and a card is validated in more places than it is
+        bound, the stateless API server's catalog write among them.
+
+        The variable is parsed **first and unconditionally**, before the scope
+        test, so a malformed value fails every bind — per-principal ones too — at
+        the first team start after the change, in front of the admin who made
+        it, exactly as :func:`resolve_lock_backend` does.
+
+        Args:
+            path: The three-segment path the resolver returned for this card.
+
+        Raises:
+            ValueError: If the variable is malformed, or if *path* is shared and
+                its kind is not permitted. Never a fallback to the per-principal
+                tree: a card that asked for a shared tree and quietly got a
+                private one has had its meaning changed without being told.
+        """
+        permitted = permitted_shared_kinds()
+        scope, kind, _leaf = path.parts
+        if scope != SHARED_SCOPE or kind in permitted:
+            return
+        requested = kind.removeprefix("_")
+        tokens = sorted(permitted_kind.removeprefix("_") for permitted_kind in permitted)
+        allowed = (
+            f"only {', '.join(repr(token) for token in tokens)}"
+            if tokens
+            else "none (it is unset or empty)"
+        )
+        raise ValueError(
+            f"WorkspaceTool requests a shared {requested!r} workspace ({path}), but "
+            f"{SHARED_KINDS_ENV} permits {allowed} on this process. Add {requested!r} to it "
+            "on the process that binds agents, or declare workspace_sharable=False."
         )
 
     def _enabled_exec(self) -> WorkspaceExec | None:
@@ -784,7 +916,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
 
         Args:
             observer: The owning agent, live at bind time.
-            workspace_path: The already-resolved two-segment path this card is
+            workspace_path: The already-resolved three-segment path this card is
                 anchored to. Passed down rather than re-derived, so the backend
                 cannot open a directory other than the one being gated.
 
@@ -927,7 +1059,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         Args:
             observer: The owning agent, live at bind time.
             orchestrator: Address of the orchestrator.
-            workspace_path: The resolved two-segment path this card is anchored
+            workspace_path: The resolved three-segment path this card is anchored
                 to, carried into the actor's name verbatim — slash included.
                 Nothing parses an actor name, and the path is injective by
                 construction, so carrying it whole avoids a second encoding

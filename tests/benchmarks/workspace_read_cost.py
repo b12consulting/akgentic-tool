@@ -99,7 +99,7 @@ from akgentic.tool.workspace.models import (
 )
 from akgentic.tool.workspace.readers import DocumentReader
 from akgentic.tool.workspace.tool import WorkspaceRead, WorkspaceTool
-from akgentic.tool.workspace.workspace import ANONYMOUS
+from akgentic.tool.workspace.workspace import ANONYMOUS, ID_KIND
 
 ##
 ## Arms
@@ -1005,9 +1005,10 @@ def run_arm(spec: RunSpec, arm: str, base: Path) -> ArmRun:
     workspace_id = f"bench-{uuid.uuid4().hex[:8]}"
     root = base / workspace_id
     # The benchmark's agents are created with no principal, so their cards
-    # resolve under the anonymous scope. The corpus has to be built where the
-    # cards will actually look, which is the resolved path and not the leaf.
-    workspace_path = f"{ANONYMOUS}/{workspace_id}"
+    # resolve under the anonymous scope and, naming a ``workspace_id``, under the
+    # ``_id`` kind. The corpus has to be built where the cards will actually
+    # look, which is the resolved path and not the leaf.
+    workspace_path = f"{ANONYMOUS}/{ID_KIND}/{workspace_id}"
     tree = root / workspace_path
     tree.mkdir(parents=True)
     previous_root = os.environ.get("AKGENTIC_WORKSPACES_ROOT")

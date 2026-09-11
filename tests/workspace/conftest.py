@@ -14,7 +14,6 @@ an import, because a test package is not a library for other test packages.
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import subprocess
@@ -31,12 +30,12 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
+from akgentic.core import ActorRegistry
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.actor_address_impl import ActorAddressImpl
 from akgentic.core.agent import Akgent, AkgentType
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
-from akgentic.core.resource_host import ResourceStore, StateDelta, resolve_state_type
 from pykka import ActorDeadError
 
 from akgentic.tool.core import ToolState
@@ -53,6 +52,7 @@ from akgentic.tool.workspace.execution import DEFAULT_EXEC_TIMEOUT_S, RunningExe
 from akgentic.tool.workspace.journal import git_dir_for
 from akgentic.tool.workspace.models import MutationOutcome, Observation, WorkspaceConfig
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
+from akgentic.tool.workspace.workspace import ID_KIND
 from tests.conftest import MockActorAddress
 
 if TYPE_CHECKING:
@@ -65,30 +65,43 @@ WORKSPACE_NAME = "test-workspace"
 DEFAULT_TEST_PRINCIPAL = "u-alice"
 """The ``user_id`` the fake observer carries unless a test names another.
 
-Every workspace now resolves under its owner, so the trees the suite writes to
-live at ``<root>/u-alice/<leaf>``. :func:`workspace_root_for` builds that path so
-no test has to spell the layout out twice.
+Every workspace now resolves under its owner and its kind, so the trees the
+suite writes to live at ``<root>/u-alice/<kind>/<leaf>``. :func:`workspace_root_for`
+builds that path so no test has to spell the layout out twice.
 """
 
 
-WORKSPACE_PATH = f"{DEFAULT_TEST_PRINCIPAL}/{WORKSPACE_NAME}"
-"""What ``WORKSPACE_NAME`` **resolves** to — the two-segment path, not the leaf.
+WORKSPACE_PATH = f"{DEFAULT_TEST_PRINCIPAL}/{ID_KIND}/{WORKSPACE_NAME}"
+"""What ``WORKSPACE_NAME`` **resolves** to — the three-segment path, not the leaf.
 
-The distinction is the whole of ADR-048 in one line: ``WORKSPACE_NAME`` is what
-a card declares, and this is the directory and the actor-name suffix it reaches.
-Assertions about a tree or an actor name use this one; assertions about what an
-author wrote use the other.
+The distinction is the whole of the layout in one line: ``WORKSPACE_NAME`` is a
+``workspace_id`` a card declares, and this is the directory and the actor-name
+suffix it reaches. Assertions about a tree or an actor name use this one;
+assertions about what an author wrote use the other.
+
+These helpers are a convenience, not the specification: the six-cell literal
+table in ``test_workspace_path_resolution.py`` pins the layout independently of
+them, which is exactly why it does not use them.
 """
 
 
-def workspace_path_for(leaf: str, user_id: str = DEFAULT_TEST_PRINCIPAL) -> str:
-    """The two-segment path *leaf* resolves to for *user_id*."""
-    return f"{user_id}/{leaf}"
+def workspace_path_for(
+    leaf: str, user_id: str = DEFAULT_TEST_PRINCIPAL, kind: str = ID_KIND
+) -> str:
+    """The three-segment path *leaf* of *kind* resolves to for *user_id*.
+
+    *kind* defaults to ``ID_KIND`` because *leaf* is almost always a
+    ``workspace_id``; a caller resolving a **default** card — whose leaf is the
+    team id — passes ``TEAM_KIND`` explicitly.
+    """
+    return f"{user_id}/{kind}/{leaf}"
 
 
-def workspace_root_for(base: Path, leaf: str, user_id: str = DEFAULT_TEST_PRINCIPAL) -> Path:
-    """The on-disk root of the workspace *leaf* belonging to *user_id*."""
-    return base / user_id / leaf
+def workspace_root_for(
+    base: Path, leaf: str, user_id: str = DEFAULT_TEST_PRINCIPAL, kind: str = ID_KIND
+) -> Path:
+    """The on-disk root of the workspace *leaf* of *kind* belonging to *user_id*."""
+    return base / user_id / kind / leaf
 
 
 HANDSHAKE_TIMEOUT_S = 5.0
@@ -258,13 +271,14 @@ class FakeOrchestratorProxy:
     ``getChildrenOrCreate`` is what a workspace card binds through, and what
     :attr:`create_calls` records.
 
-    ``getResourceOrCreate`` is kept **as a trap and nothing else** (story 52-6).
-    This package has no resource host any more — the module and the class are
-    deleted — so a card that reached for one could not work; the method records
-    the attempt on :attr:`resource_calls` and then raises, which turns
-    ``resource_calls == []`` from paperwork into a guard that goes red the moment
-    a host forward comes back. Deleting it instead would leave those nine
-    assertions asserting the absence of a method nothing could call.
+    Story 52-6 kept a ``getResourceOrCreate`` here as a trap against a host
+    forward coming back; story 54-5 removed it, because no published core ever
+    had that method. What guards the negative now is the strict type check
+    against the shipped core, and the :attr:`create_calls` positives beside it.
+    The check sees every call made on a proxy typed ``Orchestrator`` — which is
+    how the card builds every one it holds — swallowed or not, and not only on
+    the paths a spec drives. A forward that reached this fake unswallowed would
+    raise ``AttributeError``.
 
     With *live* set, the actors it creates are genuinely started on their own
     thread and handed out behind a real ``ActorAddressImpl``. That is what lets a
@@ -275,8 +289,6 @@ class FakeOrchestratorProxy:
     def __init__(self, live: bool = False) -> None:
         self.children: dict[str, tuple[ActorAddress, Any]] = {}
         self.create_calls: list[tuple[type[Akgent[Any, Any]], BaseConfig]] = []
-        self.resource_calls: list[tuple[Any, ...]] = []
-        """Every attempt to forward to a resource host — empty, or the suite is red."""
         self.emitted: list[object] = []
         """Every event this orchestrator emitted for a successful bind, in order."""
         self.live = live
@@ -296,14 +308,6 @@ class FakeOrchestratorProxy:
         it; a card with retrieval off must leave this list empty, which is the
         negative that "retrieval off costs nothing" is asserted on.
         """
-
-    def getResourceOrCreate(self, *args: Any) -> ActorAddress:  # noqa: N802 — mirrors core
-        """The trap. Record the attempt, then refuse it — no host exists to bind through."""
-        self.resource_calls.append(tuple(args))
-        raise RuntimeError(
-            "No resource host runs in this process: akgentic-tool deleted its own in "
-            "story 52-6, and the workspace actor is an ordinary team child."
-        )
 
     def getChildrenOrCreate(  # noqa: N802 — mirrors the orchestrator's method name
         self, actor_class: type[Akgent[Any, Any]], config: BaseConfig
@@ -669,6 +673,15 @@ def wait_until(predicate: Callable[[], bool], timeout: float = HANDSHAKE_TIMEOUT
             return True
         time.sleep(0.01)
     return predicate()
+
+
+def live_workspace_actors() -> list[ActorAddress]:
+    """Every live ``WorkspaceActor`` in this process, as addresses."""
+    return [
+        ActorAddressImpl(ref)
+        for ref in ActorRegistry.get_by_class(WorkspaceActor)
+        if ref.is_alive()
+    ]
 
 
 def attached(actor: WorkspaceActor, name: str) -> str:
@@ -1114,121 +1127,6 @@ def exec_card_for(
     )
     card.observer(observer)
     return card, observer
-
-
-##
-## The store a hosted workspace persists into — team 37-1's rules, in memory
-##
-def _split_key(key: str) -> tuple[str, str | None]:
-    """Split a delta key on its **first** dot: the state field, then the member key or ``None``.
-
-    Every later dot belongs to the member key, which is how ``documents.notes.v2.md``
-    addresses the member ``notes.v2.md`` rather than a three-level document.
-    """
-    field_name, dot, member = key.partition(".")
-    return field_name, (member if dot else None)
-
-
-def _conflicts(unset_key: str, set_key: str) -> bool:
-    """Whether an ``unset`` of *unset_key* and a ``set`` of *set_key* address overlapping paths."""
-    unset_field, unset_member = _split_key(unset_key)
-    set_field, set_member = _split_key(set_key)
-    if unset_field != set_field:
-        return False
-    return unset_member is None or set_member is None or unset_member == set_member
-
-
-class DeltaStore(ResourceStore):
-    """A ``ResourceStore`` that folds deltas into one document per ``(kind, scope)``.
-
-    The semantics of team 37-1's Mongo store, without the database: a key is split
-    on its first dot into a state field and a member key, a key with no dot is a
-    whole field, an ``unset`` that overlaps a ``set`` in the same delta is dropped
-    (``set`` wins), ``set`` stores the value as given and ``unset`` removes it.
-    ``load`` rebuilds through core's ``resolve_state_type``, exactly as the real
-    store does, so a restore through this double is a restore through the same
-    type route.
-
-    Each stored value goes through a JSON round trip on the way in. That is the
-    database boundary: nothing the actor still holds can alias a stored value,
-    and a value that is not JSON-safe fails here rather than at a real store.
-
-    Conformance by explicit inheritance, for 37-1's reason: ``runtime_checkable``
-    checks method presence only, and mypy sees a drifted signature here.
-    """
-
-    def __init__(self) -> None:
-        self.applied: list[tuple[type[Akgent[Any, Any]], str, StateDelta]] = []
-        """Every delta applied, in order, with the class and scope it was applied under."""
-        self.documents: dict[tuple[str, str], dict[str, Any]] = {}
-        self._lock = threading.Lock()
-
-    @staticmethod
-    def kind(actor_class: type[Akgent[Any, Any]]) -> str:
-        """The namespace a class's documents live under — module and qualified name."""
-        return f"{actor_class.__module__}.{actor_class.__qualname__}"
-
-    def apply(self, actor_class: type[Akgent[Any, Any]], scope: str, delta: StateDelta) -> None:
-        """Record *delta*, then fold it into the ``(kind, scope)`` document."""
-        with self._lock:
-            self.applied.append((actor_class, scope, delta))
-            if not delta.set and not delta.unset:
-                return
-            document = self.documents.setdefault((self.kind(actor_class), scope), {})
-            for key in delta.unset:
-                if any(_conflicts(key, set_key) for set_key in delta.set):
-                    continue
-                field_name, member = _split_key(key)
-                if member is None:
-                    document.pop(field_name, None)
-                elif isinstance(document.get(field_name), dict):
-                    document[field_name].pop(member, None)
-            for key, value in delta.set.items():
-                stored = json.loads(json.dumps(value))
-                field_name, member = _split_key(key)
-                if member is None:
-                    document[field_name] = stored
-                else:
-                    document.setdefault(field_name, {})[member] = stored
-
-    def load(self, actor_class: type[Akgent[Any, Any]], scope: str) -> BaseState | None:
-        """Rebuild the stored document as the state class *actor_class* declares."""
-        with self._lock:
-            document = self.documents.get((self.kind(actor_class), scope))
-            state_type = resolve_state_type(actor_class)
-            if document is None or state_type is None:
-                return None
-            return state_type.model_validate(json.loads(json.dumps(document)))
-
-    def keys_applied(self, scope: str | None = None) -> set[str]:
-        """Every ``set`` or ``unset`` key any delta named, optionally for one scope."""
-        with self._lock:
-            return {
-                key
-                for _, applied_scope, delta in self.applied
-                if scope is None or applied_scope == scope
-                for key in [*delta.set, *delta.unset]
-            }
-
-
-def delta_recorder(
-    actor: WorkspaceActor, monkeypatch: pytest.MonkeyPatch, store: DeltaStore | None = None
-) -> DeltaStore:
-    """Route *actor*'s outgoing deltas into a :class:`DeltaStore` instead of to a host.
-
-    The one seam the inert specs replace: ``_send_delta`` receives the scope the
-    actor chose and the delta it built, and this hands both to ``apply`` under
-    ``WorkspaceActor`` — what the host would pass, since the host takes the class
-    from its registry entry. ``raising`` stays on, so a renamed seam fails here
-    rather than leaving a recorder nothing ever calls.
-    """
-    recorded = store if store is not None else DeltaStore()
-
-    def _send(scope: str, delta: StateDelta) -> None:
-        recorded.apply(WorkspaceActor, scope, delta)
-
-    monkeypatch.setattr(actor, "_send_delta", _send)
-    return recorded
 
 
 @contextmanager

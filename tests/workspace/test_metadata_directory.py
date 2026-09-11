@@ -44,6 +44,7 @@ from tests.workspace.conftest import (
     tool_named,
     workspace_root_for,
 )
+from tests.workspace.test_workspace_path_resolution import SIX_CELLS, Cell, bind_cell
 
 META_ROOT_VAR = "AKGENTIC_WORKSPACE_META_ROOT"
 """The variable that relocates the metadata *parent*, and only that."""
@@ -120,7 +121,7 @@ def _hands_back_nothing(closure: Callable[..., object], *args: str) -> bool:
 
 
 class TestTheResolverPlacesItBesideTheTree:
-    """``meta_dir_for`` derives ``<root>.akgentic``, and derives it only."""
+    """``meta_dir_for`` derives ``<root>.index``, and derives it only."""
 
     def test_it_is_a_sibling_of_the_tree(self, workspaces_root: Path) -> None:
         """Same parent, the tree's name plus the suffix — and outside the tree.
@@ -242,8 +243,8 @@ class TestNoReadCapabilityCanReachIt:
     ) -> None:
         """The one read closure that names something outside the root, today.
 
-        ``workspace_glob("../<leaf>.akgentic/*")`` hands the agent back
-        ``../<leaf>.akgentic/exec.lock``: the closure resolves its ``path``
+        ``workspace_glob("../<leaf>.index/*")`` hands the agent back
+        ``../<leaf>.index/exec.lock``: the closure resolves its ``path``
         argument against the root and refuses an escape, but feeds ``pattern``
         straight to ``Path.glob``, and ``Path.relative_to`` is lexical, so a
         match above the root renders as a ``../`` path rather than raising.
@@ -275,11 +276,11 @@ class TestTheMetaRootRelocatesTheParent:
     def test_it_moves_the_parent_and_keeps_the_scope(
         self, workspaces_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``<meta-root>/<scope>/<leaf>.akgentic`` — the scope survives the move.
+        """``<meta-root>/<scope>/<kind>/<leaf>.index`` — scope and kind survive the move.
 
-        It is why the resolver takes the two-segment path rather than a resolved
-        root: the scope cannot be recovered from an absolute path without also
-        knowing which workspaces root it came from.
+        It is why the resolver takes the three-segment path rather than a
+        resolved root: neither segment can be recovered from an absolute path
+        without also knowing which workspaces root it came from.
         """
         elsewhere = tmp_path / "meta-volume"
         monkeypatch.setenv(META_ROOT_VAR, str(elsewhere))
@@ -395,12 +396,12 @@ class TestTheMetaRootRelocatesTheParent:
 
 
 class TestALeafMayNotEndInTheMetadataSuffix:
-    """``workspace_id="notes.akgentic"`` would root a tree on another workspace's metadata."""
+    """``workspace_id="notes.index"`` would root a tree on another workspace's metadata."""
 
     def test_a_leaf_ending_in_the_suffix_is_refused(self) -> None:
         """This story is what creates the collision, so this story closes it.
 
-        Once ``<leaf>.akgentic`` is a real sibling directory, a second card
+        Once ``<leaf>.index`` is a real sibling directory, a second card
         declaring it as a ``workspace_id`` roots its **tree** there and reads,
         writes and deletes another workspace's exec lock, document cache and
         index as ordinary in-tree activity. Nothing raises: ``_validate_path``
@@ -410,9 +411,22 @@ class TestALeafMayNotEndInTheMetadataSuffix:
         with pytest.raises(ValueError, match="metadata directory"):
             leaf_segment(f"notes{META_DIR_SUFFIX}")
 
-    @pytest.mark.parametrize("spelling", ["notes.AKGENTIC", "notes.Akgentic", "notes.aKgEnTiC"])
+    @pytest.mark.parametrize(
+        "spelling",
+        [
+            f"notes{META_DIR_SUFFIX.upper()}",  # notes.INDEX
+            f"notes{META_DIR_SUFFIX.title()}",  # notes.Index
+            f"notes{META_DIR_SUFFIX.title().swapcase()}",  # notes.iNDEX
+        ],
+    )
     def test_the_match_is_case_insensitive(self, spelling: str) -> None:
-        """macOS and Windows are case-insensitive by default, so these are one directory."""
+        """macOS and Windows are case-insensitive by default, so these are one directory.
+
+        Spelled from the constant, so a renamed suffix is still tested in the
+        cases it can actually take, and never in the lower case the plain
+        refusal above already covers.
+        """
+        assert spelling != f"notes{META_DIR_SUFFIX}"
         with pytest.raises(ValueError, match="metadata directory"):
             leaf_segment(spelling)
 
@@ -427,21 +441,25 @@ class TestALeafMayNotEndInTheMetadataSuffix:
     @pytest.mark.parametrize(
         "accepted",
         [
-            "akgentic",  # the suffix's letters, in the wrong place
-            "akgentic-notes",
-            "notes.akgentic.md",  # the suffix mid-name, which names no directory
-            "notes.akgent",  # a shorter ending that merely leads the same way
-            "notes.akgenticx",
+            META_DIR_SUFFIX.lstrip("."),  # the suffix's letters, in the wrong place
+            f"{META_DIR_SUFFIX.lstrip('.')}-notes",
+            f"notes{META_DIR_SUFFIX}.md",  # the suffix mid-name, which names no directory
+            f"notes{META_DIR_SUFFIX[:-1]}",  # a shorter ending that merely leads the same way
+            f"notes{META_DIR_SUFFIX}x",
         ],
     )
     def test_only_the_suffix_is_refused_never_the_substring(self, accepted: str) -> None:
-        """Over-refusing costs a real workspace its name, which is not a safer failure."""
+        """Over-refusing costs a real workspace its name, which is not a safer failure.
+
+        Spelled from the constant: literal near-misses of an old suffix would go
+        on passing after a rename while testing nothing near the new one.
+        """
         assert leaf_segment(accepted) == accepted
 
     def test_the_rule_is_spelled_once_against_the_resolvers_own_constant(self) -> None:
         """``meta_dir_for`` builds the directory from the constant; this guard refuses it.
 
-        A second ``".akgentic"`` literal in the guard is a rule that has to agree
+        A second ``".index"`` literal in the guard is a rule that has to agree
         with another one, and the two drift silently.
         """
         assert leaf_segment(f"notes{META_DIR_SUFFIX}x") == f"notes{META_DIR_SUFFIX}x"
@@ -468,3 +486,66 @@ class TestALeafMayNotEndInTheMetadataSuffix:
             leaf_segment(f"notes{GIT_DIR_SUFFIX}")
         with pytest.raises(ValueError, match="metadata directory"):
             leaf_segment(f"notes{META_DIR_SUFFIX}")
+
+
+##
+## Epic 54, story 54-1 AC 9 — both siblings land beside every one of the six cells
+##
+
+
+def _cell_ids(cell: Cell) -> str:
+    return cell.name
+
+
+class TestBothSiblingsLandBesideEveryCell:
+    """``<leaf>.index`` and ``<leaf>.git`` are children of ``<root>/<scope>/<kind>/``.
+
+    Neither ``meta_dir_for`` nor ``git_dir_for`` changed when the kind segment
+    arrived: both are "sibling of the resolved tree", and a three-segment tree
+    gives them the kind directory as a parent with no code change. These specs
+    pin that for every cell **as the card binds it**, against literal paths —
+    so a "fix" that dropped the kind, or a card deriving its metadata directory
+    some other way, goes red here.
+    """
+
+    @pytest.mark.parametrize("cell", SIX_CELLS, ids=_cell_ids)
+    def test_the_metadata_and_journal_siblings_share_the_trees_parent(
+        self,
+        cell: Cell,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspaces_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        card, expected, _observer = bind_cell(cell, orchestrator_proxy, monkeypatch)
+        base = workspaces_root.resolve()
+        scope, kind, _leaf = expected.split("/")
+
+        meta = meta_dir_for(card._workspace_path)
+        git_dir = git_dir_for(card.workspace._root)
+
+        assert meta == Path(f"{base}/{expected}.index")
+        assert card._meta_dir == meta
+        assert git_dir == Path(f"{base}/{expected}.git")
+        assert meta.parent == git_dir.parent == card.workspace._root.parent
+        assert meta.parent == base / scope / kind
+
+    @pytest.mark.parametrize("cell", SIX_CELLS, ids=_cell_ids)
+    def test_the_meta_root_carries_both_scope_and_kind_across_the_move(
+        self,
+        cell: Cell,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspaces_root: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``<meta_root>/<scope>/<kind>/<leaf>.index`` — and the tree stays put."""
+        elsewhere = tmp_path / "meta-volume"
+        with monkeypatch.context() as patch:
+            patch.setenv(META_ROOT_VAR, str(elsewhere))
+            card, expected, _observer = bind_cell(cell, orchestrator_proxy, monkeypatch)
+
+            meta = meta_dir_for(card._workspace_path)
+
+            assert meta == Path(f"{elsewhere.resolve()}/{expected}.index")
+            assert card._meta_dir == meta
+            assert card.workspace._root == Path(f"{workspaces_root.resolve()}/{expected}")

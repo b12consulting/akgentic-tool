@@ -236,7 +236,7 @@ class FileLockBackend:
         answer and not a case to loop over.
 
         Args:
-            tree_key: The two-segment ``<scope>/<leaf>`` path
+            tree_key: The three-segment ``<scope>/<kind>/<leaf>`` path
                 :func:`~akgentic.tool.workspace.workspace.get_workspace` takes —
                 the same string ``ExecConfig.workspace_path`` holds.
             ticket: Who is asking, with what, and under what budget.
@@ -326,7 +326,7 @@ class FileLockBackend:
         answer and :meth:`acquire` would take it over.
 
         Args:
-            tree_key: The two-segment ``<scope>/<leaf>`` path.
+            tree_key: The three-segment ``<scope>/<kind>/<leaf>`` path.
             budget_s: The effective run budget the staleness window is measured
                 against.
 

@@ -28,10 +28,12 @@ import akgentic.tool
 import akgentic.tool.workspace as ws
 
 # Captured verbatim from ``akgentic/tool/workspace/__init__.py``'s ``__all__``
-# before the move: 102 names, plus the four story 45-3 added and the six the
-# workspace path resolver adds (ADR-048 Decision 5). The package ships
-# on PyPI, so every one of them is a public import path somebody may already
-# depend on.
+# before the move: 102 names. It has grown since, one deliberate addition at a
+# time — among them the four story 45-3 added, the six the workspace path
+# resolver adds (ADR-048 Decision 5), the shared-kind permission's parser story
+# 54-2 adds, and the ``workspace_id`` grammar story 54-6 adds — to 149 names.
+# The package ships on PyPI, so every one of them is a public import path
+# somebody may already depend on.
 _WORKSPACE_ALL: frozenset[str] = frozenset(
     {
         "ANONYMOUS",
@@ -146,14 +148,20 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "exec_busy",
         "format_outcome",
         "format_status",
-        "METADATA_SCOPE",
+        "ID_KIND",
+        "METADATA_KIND",
+        "RESERVED_KINDS",
         "RESERVED_SCOPES",
+        "SHARED_SCOPE",
+        "TEAM_KIND",
         "get_workspace",
         "leaf_segment",
         "lock_unavailable",
         "meta_dir_for",
+        "permitted_shared_kinds",
         "resolve_workspace_path",
         "user_segment",
+        "validate_workspace_id",
         "git_dir_for",
         "gitignore_seed",
         "hunk_header",
@@ -212,6 +220,7 @@ _WORKSPACE_TOOL_FIELDS: frozenset[str] = frozenset(
     {
         "workspace_id",
         "workspace_metadata_keys",
+        "workspace_sharable",
         "workspace_read",
         "workspace_view",
         "workspace_list",

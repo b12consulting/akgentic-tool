@@ -50,7 +50,7 @@ from akgentic.tool.workspace.models import (
 )
 from akgentic.tool.workspace.readers import DocumentReader
 from akgentic.tool.workspace.tool import WorkspaceRead, WorkspaceTool, WorkspaceView
-from akgentic.tool.workspace.workspace import meta_dir_for
+from akgentic.tool.workspace.workspace import ID_KIND, meta_dir_for
 from tests.workspace.conftest import (
     DEFAULT_TEST_PRINCIPAL,
     WORKSPACE_NAME,
@@ -1365,10 +1365,10 @@ def test_a_stale_actor_state_never_leaks_a_repository_outside_the_tmp_tree(
     would otherwise have the actor run ``git init`` in the developer's own
     directory — which would look like nothing at all until it did.
     """
-    # The journal is the tree's sibling, which under the two-segment layout puts
-    # it inside the owning principal's directory rather than at the root — still
-    # a sibling, still outside the tree every path is anchored to.
-    scope = workspaces_root / DEFAULT_TEST_PRINCIPAL
+    # The journal is the tree's sibling, which under the three-segment layout
+    # puts it inside the owning principal's kind directory rather than at the
+    # root — still a sibling, still outside the tree every path is anchored to.
+    scope = workspaces_root / DEFAULT_TEST_PRINCIPAL / ID_KIND
     assert git_dir_for(workspaces_root / WORKSPACE_PATH).parent == scope
     assert list(scope.glob("*.git"))
     for candidate in scope.glob("*.git"):

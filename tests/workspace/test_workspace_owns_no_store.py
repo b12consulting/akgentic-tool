@@ -26,10 +26,10 @@ should find that sentence here rather than have to reconstruct it.
 
 What the deletion does **not** license is a silent loss of coverage. The
 invariant that replaced them is asserted from the other side, in
-``test_observation_recording.py``: the card binds as a child, once, and forwards
-to **no host at all** — ``resource_calls`` stays empty on every card shape, which
-is ``akgentic-infra`` story 69-1's acceptance guard read from this side of the
-seam.
+``test_observation_recording.py``: the card binds as a child, once, on every card
+shape, and forwards to **no host at all** — which the strict type check against
+the shipped core enforces, since that core has no host to forward to. That is
+``akgentic-infra`` story 69-1's acceptance guard read from this side of the seam.
 
 The live class below is untouched by any of that: a workspace still owns no
 vector store of its own.

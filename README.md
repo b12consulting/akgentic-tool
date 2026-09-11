@@ -718,7 +718,7 @@ any single tool call**, and the framework gives that state a home — a **tool a
 that every agent carrying the card talks to.
 
 Six ship in this package today: `#VectorStore`, `#PlanningTool`, `#KnowledgeGraphTool`,
-`#TeamActivity`, `#NotificationTool` and `#Workspace-<scope>/<leaf>`. The sandbox actor that
+`#TeamActivity`, `#NotificationTool` and `#Workspace-<scope>/<kind>/<leaf>`. The sandbox actor that
 used to sit beside the workspace actor is retired: `#Workspace` owns the tree's exec backend and
 runs commands on its own worker thread, so an exec-enabled tree runs one actor, not two.
 
@@ -743,10 +743,10 @@ cannot take the other's index down.
 
 **Note the one name that carries a suffix.** Five of the six are one per *team*, and their name is
 a constant. The workspace actor is one per *workspace tree*, so its name is **built** from the
-workspace's resolved two-segment path — slash included — rather than being a literal. Two of them
-can coexist in one team, each owning its own directory, and two *principals* whose cards both say
-`workspace_id="notes"` get two actors over two trees because the name carries the scope as well as
-the leaf. Get-or-create keys on the name, so this is not cosmetic: a fixed name
+workspace's resolved three-segment path — slashes included — rather than being a literal. Two of
+them can coexist in one team, each owning its own directory, and two *principals* whose cards both
+say `workspace_id="notes"` get two actors over two trees because the name carries the scope and the
+kind as well as the leaf. Get-or-create keys on the name, so this is not cosmetic: a fixed name
 would collapse two trees onto one actor, silently. The unicity domain of an actor must equal the
 resource it owns — and the exec backend, which serves exactly that tree, is held by the workspace
 actor rather than named and created as an actor of its own.
@@ -1055,9 +1055,16 @@ Read/write access to a shared team filesystem — `workspace_read`, `workspace_l
 `workspace_edit`, `workspace_multi_edit`, `workspace_patch`, `workspace_delete`,
 `workspace_mkdir` and (opt-in) `workspace_exec` / `workspace_exec_result` on the write side. One
 class covers both modes via a `read_only: bool` gate. All paths are anchored to
-`<AKGENTIC_WORKSPACES_ROOT>/<scope>/<leaf>` — a workspace is a two-segment path, scoped to its owner:
-`<user_id>/<team_id>` by default, `<user_id>/<workspace_id>` for a named one, and `_meta/<joined
-keys>` for the metadata-shared layout. Traversal out of that root is rejected.
+`<AKGENTIC_WORKSPACES_ROOT>/<scope>/<kind>/<leaf>` — a workspace is a three-segment path. The
+`<kind>` says how the leaf was derived: `_team/<team_id>` by default, `_id/<workspace_id>` for a
+named one, and `_meta/<joined keys>` for a metadata-keyed one. A `workspace_id` is 1 to 128
+characters of `[A-Za-z0-9._-]`, not a kind name and not ending in `.git` or `.index`; anything else
+is refused when the card is constructed — catalog save, team creation, resume — never at bind. The `<scope>` is the owning principal
+for all three, unless the card declares `workspace_sharable=True` **and** the platform permits that
+kind through `AKGENTIC_WORKSPACE_SHARED_KINDS`, which puts the tree under the reserved `_shared`
+scope. A shared request the platform does not permit fails the bind rather than falling back. See
+the [workspace README](src/akgentic/tool/workspace/README.md#where-the-files-live) for the six
+cells and the permission. Traversal out of that root is rejected.
 
 **Every mutation is refused unless the file is still what the writing agent last read**, and the
 check and the write happen together under an `fcntl.flock` held on the path — on the *tree*, so two
@@ -1074,8 +1081,9 @@ from akgentic.tool import WorkspaceTool
 
 WorkspaceTool()                                      # full access (default), journal off, exec off
 WorkspaceTool(read_only=True)                        # read tools only
-WorkspaceTool(workspace_id="scratch")                # a second tree of YOUR OWN: <user_id>/scratch
-WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])  # shared across teams AND users
+WorkspaceTool(workspace_id="scratch")                # a second tree of YOUR OWN: alice/_id/scratch
+WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])  # alice/_meta/…: still per-principal
+WorkspaceTool(workspace_id="notes", workspace_sharable=True)       # _shared/_id/notes, if "id" is permitted
 WorkspaceTool(workspace_exec=True)                   # + sandboxed shell over the same tree
 WorkspaceTool(git_journal=True)                      # + git history; the gate is unaffected either way
 WorkspaceTool(read_only=True, workspace_glob=False)  # fine-grained capability control
@@ -1784,11 +1792,10 @@ src/akgentic/tool/
         workspace.py          # Workspace Protocol, Filesystem (atomic write / write_many),
         │                     #   PathEscapeError, WriteEntry, get_workspace(), is_staging_name,
         │                     #   resolve_workspace_path() / user_segment() / leaf_segment() —
-        │                     #   the one place a two-segment workspace path is derived
-        migrate.py            # Operator script: move a pre-two-segment workspaces root under
-        │                     #   its owners. Not exported; run as a module, never imported
-        actor.py              # WorkspaceActor "#Workspace-<scope>/<leaf>" — the six gated
-        │                     #   mutations, the live-hash check, the lease, the staging sweep
+        │                     #   the one place a three-segment workspace path is derived —
+        │                     #   and permitted_shared_kinds(), the platform's sharing permission
+        actor/                # WorkspaceActor "#Workspace-<scope>/<kind>/<leaf>" — a team child
+        │                     #   owning one tree's dispatch: exec's worker, the RAG pipeline
         models.py             # Observation, MutationOutcome, LastWrite, WorkspaceConfig,
         │                     #   content_sha, the refusal texts and every cap
         journal.py            # GitJournal, Identity — linear history, out-of-band commits,

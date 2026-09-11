@@ -147,8 +147,8 @@ def workspace_actor_name(workspace_name: str) -> str:
     """Return the singleton actor name owning *workspace_name*.
 
     Args:
-        workspace_name: The **resolved** two-segment workspace path, exactly as
-            the card derived it and as ``Filesystem`` receives it. Its slash is
+        workspace_name: The **resolved** three-segment workspace path, exactly as
+            the card derived it and as ``Filesystem`` receives it. Its slashes are
             carried verbatim — nothing parses an actor name, and the path is
             injective by construction.
 
@@ -183,11 +183,11 @@ class WorkspaceActor(
     ExecMixin,
     DeferredResultActor[WorkspaceConfig, BaseState, str, ExecOutcome],
     # Redundant for the MRO — ``DeferredResultActor`` already is an ``Akgent`` —
-    # and load-bearing for the restore. A store rebuilds this actor's state
-    # through core's ``resolve_state_type``, which reads a direct
-    # ``Akgent[Config, State]`` binding only; the one inherited through
-    # ``DeferredResultActor`` carries type variables, so without this line the
-    # answer is ``None`` and every restore is empty.
+    # but not for what core reads off the class. ``AgentCard`` coerces a dict
+    # ``config`` to the agent class's config type, found by walking the MRO's
+    # ``__orig_bases__`` for a concrete ``Akgent[Config, State]`` binding; the one
+    # inherited through ``DeferredResultActor`` carries type variables, so without
+    # this line the answer is ``None`` and the config stays a plain ``BaseConfig``.
     Akgent[WorkspaceConfig, BaseState],
 ):
     """Team child owning one tree's exec dispatch and its RAG indexing pipeline.

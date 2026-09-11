@@ -69,6 +69,7 @@ from tests.workspace.conftest import (
     WORKSPACE_PATH,
     attach_store,
     factory_for,
+    live_workspace_actors,
     seed_extract,
     seed_row,
     stored_docs,
@@ -77,6 +78,7 @@ from tests.workspace.conftest import (
     wait_until,
     watch_store,
     workspace_config,
+    workspace_path_for,
     workspace_root_for,
 )
 from tests.workspace.test_document_cache import _ExtractWithExtraField
@@ -951,8 +953,12 @@ class TestOnlyTheKnownFunctionsWriteARecord:
 ##
 ## AC 5, live — a second actor over the same tree reads what the first one wrote
 ##
-_LIVE_PATH = "u-alice/restored"
-"""The tree the live specs host — one per spec, since each spec has its own system."""
+_LIVE_PATH = workspace_path_for("restored")
+"""The tree the live specs host — one per spec, since each spec has its own system.
+
+Derived through the same helper as the ``tree`` each spec writes into, so the
+actor's path and the directory the spec seeds cannot disagree.
+"""
 
 
 @pytest.fixture
@@ -970,7 +976,7 @@ def system(workspaces_root: Path) -> Iterator[ActorSystem]:
     finally:
         actor_system.shutdown(timeout=10)
         ActorRegistry.stop_all()
-        assert ActorSystem.find_by_class(WorkspaceActor) == [], "a workspace outlived its test"
+        assert live_workspace_actors() == [], "a workspace outlived its test"
 
 
 def _create(system: ActorSystem, config: WorkspaceConfig) -> ActorAddress:

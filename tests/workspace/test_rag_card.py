@@ -1,7 +1,7 @@
 """The card side of retrieval: the derived caps, the announcement, the registration.
 
 The caps are asserted on the ``WorkspaceConfig`` the card actually hands to
-``getResourceOrCreate``, never on the helper in isolation — the helper being right
+``getChildrenOrCreate``, never on the helper in isolation — the helper being right
 while the call site ignores it is precisely the failure this file exists to catch.
 """
 
@@ -518,12 +518,11 @@ class TestTheCardCreatesNoStoreActor:
         )
 
         # Kept as a positive with a negative beside it: the bind happened, and
-        # nothing it did named a store actor — on the child path or through a
-        # host, of which this process runs none.
+        # nothing it did named a store actor on the child path. There is no host
+        # path to name one on: the core this package ships against has none.
         created = [cls for cls, _config in orchestrator_proxy.create_calls]
         assert created == [WorkspaceActor]
         assert VectorStoreActor not in created
-        assert orchestrator_proxy.resource_calls == []
 
     def test_a_retrieval_off_card_creates_no_store_actor(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
@@ -535,7 +534,6 @@ class TestTheCardCreatesNoStoreActor:
         created = [cls for cls, _config in orchestrator_proxy.create_calls]
         assert created == [WorkspaceActor]
         assert VectorStoreActor not in created
-        assert orchestrator_proxy.resource_calls == []
 
 
 class TestTheBindTimeAnnouncement:

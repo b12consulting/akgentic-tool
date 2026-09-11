@@ -25,6 +25,7 @@ from pydantic import ValidationError
 from akgentic.tool.workspace import (
     EXEC_LOCK_FILENAME,
     LEASE_GRACE_S,
+    META_DIR_SUFFIX,
     FileLockBackend,
     LockBackend,
     LockGrant,
@@ -35,8 +36,8 @@ from akgentic.tool.workspace import (
 from akgentic.tool.workspace.workspace import meta_dir_for
 from tests.workspace.conftest import HANDSHAKE_TIMEOUT_S
 
-TREE = "alice/notes"
-"""The two-segment ``<scope>/<leaf>`` key every spec here locks."""
+TREE = "alice/_id/notes"
+"""The three-segment ``<scope>/<kind>/<leaf>`` key every spec here locks."""
 
 AGENT = "agent-1"
 AGENT_B = "agent-2"
@@ -188,10 +189,10 @@ class TestTheMarkerIsASiblingOfTheTree:
 
     def test_the_tree_key_is_the_same_string_get_workspace_takes(self, tree_root: Path) -> None:
         # ``meta_dir_for`` is consumed exactly as 52-1 shipped it: the
-        # two-segment path, never a resolved root.
+        # workspace path, never a resolved root.
         FileLockBackend().acquire(TREE, ticket())
 
-        assert marker_path().parent.name == f"{Path(TREE).name}.akgentic"
+        assert marker_path().parent.name == f"{Path(TREE).name}{META_DIR_SUFFIX}"
         assert marker_path().parent.parent == tree_root.parent
 
 

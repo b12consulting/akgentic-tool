@@ -24,7 +24,7 @@ GLOBALLY_RETIRED_NAMES = ("persistence", "save_collection", "load_collection")
 # ``workspace_path`` attribute on ``LocalBackend``, ``BwrapBackend`` and
 # ``SeatbeltBackend`` (``sandbox/local.py`` / ``bwrap.py`` / ``seatbelt.py``), an
 # unrelated name meaning the sandbox directory on the host, and ``workspace/``
-# carries the resolved two-segment path under the same name. It is swept only in
+# carries the resolved three-segment path under the same name. It is swept only in
 # the three packages the deleted mode reached.
 SCOPED_PACKAGES = ("vector_store", "knowledge_graph", "planning")
 SCOPED_RETIRED_NAMES = ("workspace_path",)

@@ -12,6 +12,7 @@ from akgentic.core.actor_address import ActorAddress
 
 from akgentic.tool.vector_store.backends.qdrant import QDRANT_API_KEY_ENV, QDRANT_URL_ENV
 from akgentic.tool.vector_store.backends.weaviate import WEAVIATE_API_KEY_ENV, WEAVIATE_URL_ENV
+from akgentic.tool.workspace.workspace import SHARED_KINDS_ENV
 
 #: The pid every ``popen_mock`` helper in this suite stamps on its fake process.
 MOCK_CHILD_PID = 4242
@@ -60,6 +61,30 @@ def _no_ambient_weaviate_cluster(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(WEAVIATE_API_KEY_ENV, raising=False)
     monkeypatch.delenv(QDRANT_URL_ENV, raising=False)
     monkeypatch.delenv(QDRANT_API_KEY_ENV, raising=False)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _no_ambient_shared_kinds() -> Iterator[None]:
+    """Hide a developer's or runner's exported shared-kind permission from every test.
+
+    ``WorkspaceTool.observer`` reads ``AKGENTIC_WORKSPACE_SHARED_KINDS`` at every
+    bind, so without this the suite means different things depending on whose
+    shell it runs in: an exported ``team,id,meta`` turns every "unset refuses"
+    spec red and makes every "permitted binds" spec vacuous, since it would bind
+    whether or not the spec granted anything.
+
+    Here rather than in ``tests/workspace/conftest.py`` because a
+    ``WorkspaceTool`` is bound outside that directory too. **Session-scoped**
+    because a function-scoped fixture is set up only after every wider-scoped
+    one: the read-cost smoke's module-scoped harness bound its team with the
+    shell's value still in place, and an exported malformed value errored all
+    five of its specs. The variable is ambient for the whole session, so it is
+    hidden for the whole session. Tests that want a permission grant it with
+    ``monkeypatch``, whose undo restores this fixture's "unset".
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delenv(SHARED_KINDS_ENV, raising=False)
+        yield
 
 
 class MockActorAddress(ActorAddress):
