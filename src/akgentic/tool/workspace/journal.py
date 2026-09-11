@@ -603,7 +603,11 @@ class GitJournal:
             yield
         finally:
             if handle is not None:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+                # Suppressed around the unlock alone, exactly as the per-path
+                # hold does it: a failing ``LOCK_UN`` must not skip the close and
+                # leak the descriptor, and closing releases the hold regardless.
+                with contextlib.suppress(OSError):
+                    fcntl.flock(handle, fcntl.LOCK_UN)
                 os.close(handle)
 
     def _commit(

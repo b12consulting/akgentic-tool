@@ -463,7 +463,12 @@ class CardGate:
 
         A metadata directory that cannot be created degrades to an unlocked
         mutation with one warning, rather than to a refused one: the tree is
-        still gated by the live hash, which is the correctness property.
+        still gated by the live hash, which is the correctness property, and the
+        same choice :meth:`_busy_refusal` makes for a metadata directory it
+        cannot read. Failing closed instead would wedge every mutation on a tree
+        whose ``<meta>`` went read-only mid-session, and the bytes a mutation
+        writes are safe either way — only the ordering between two writers is
+        lost, which is what was on offer before the lock existed at all.
         """
         meta_dir = self._meta_dir
         if not paths or meta_dir is None:
@@ -471,8 +476,16 @@ class CardGate:
             return
         handles: list[int] = []
         try:
-            for path in sorted(set(paths)):
-                handles.append(self._open_lock(lock_file_for(meta_dir, path)))
+            try:
+                for path in sorted(set(paths)):
+                    handles.append(self._open_lock(lock_file_for(meta_dir, path)))
+            except OSError:
+                logger.warning(
+                    "Workspace %s: could not take the path locks under %s — mutating unserialised",
+                    self._workspace_path,
+                    meta_dir / LOCKS_DIR_NAME,
+                    exc_info=True,
+                )
             yield
         finally:
             for handle in reversed(handles):

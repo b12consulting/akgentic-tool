@@ -254,6 +254,58 @@ class TestThePathLockIsCrossProcess:
         assert other != lock_path
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the directory mode this rests on")
+class TestALockThatCannotBeTakenDegradesRatherThanRaising:
+    """A ``<meta>`` that has gone read-only costs the *ordering*, never the write.
+
+    The same choice :meth:`CardGate._busy_refusal` makes for a metadata directory
+    it cannot read, and the one the journal's own hold makes: failing closed here
+    would wedge every mutation on the tree, and the gate's correctness does not
+    rest on the lock — it rests on the live hash, which is read from disk either
+    way. Unserialised is what the gate had before the lock existed at all.
+
+    Driven through a real ``chmod``, not a patched method: the failure this
+    degrades from is the operating system's, so the spec makes the operating
+    system produce it.
+    """
+
+    def test_a_write_still_lands_when_the_locks_directory_is_unwritable(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+        card.observer(FakeActorToolObserver(orchestrator_proxy, name="alice"))
+        # The first write creates the locks directory; the second needs a file
+        # inside it that does not exist yet, which is what the mode denies.
+        assert card.apply_write("first.md", "one\n").message == "Written: first.md"
+        locks_dir = lock_file_for(meta_dir_for(WORKSPACE_PATH), "first.md").parent
+        assert locks_dir.is_dir()
+
+        locks_dir.chmod(0o500)
+        try:
+            with caplog.at_level("WARNING"):
+                outcome = card.apply_write("second.md", "two\n")
+        finally:
+            locks_dir.chmod(0o700)
+
+        assert outcome.message == "Written: second.md"
+        assert (workspace_tree / "second.md").read_text(encoding="utf-8") == "two\n"
+        assert any("mutating unserialised" in record.message for record in caplog.records)
+
+    def test_the_same_write_under_a_writable_directory_takes_the_lock(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """The positive control: without it, a write that never locks would pass above."""
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+        card.observer(FakeActorToolObserver(orchestrator_proxy, name="alice"))
+
+        assert card.apply_write("second.md", "two\n").message == "Written: second.md"
+
+        assert lock_file_for(meta_dir_for(WORKSPACE_PATH), "second.md").is_file()
+
+
 class TestTheWritersRefreshHappensInsideTheHeldLock:
     """AC 9, and the obvious guard for it is **inert** — which is why this one exists.
 
