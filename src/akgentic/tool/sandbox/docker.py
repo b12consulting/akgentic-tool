@@ -26,17 +26,22 @@ from akgentic.tool.sandbox.backend import (
 
 logger = logging.getLogger(__name__)
 
-SANDBOX_IMAGE: str = "akgentic-sandbox:v2"
+SANDBOX_IMAGE: str = "akgentic-sandbox:v3"
 """The bundled image, tagged by revision rather than by ``latest``.
 
-The tag moved with the Dockerfile that relocated ``uv`` off ``/root``.
+**The tag moves with the Dockerfile, and it has to.**
 :meth:`DockerBackend._ensure_image` skips the build whenever *any* image carries
-the tag, so a host holding an image built from the previous file would have kept
-it for ever — and under ``--user <non-root>`` that image's ``uv`` sits behind
-Debian's mode-0700 ``/root`` and is unreachable. Moving the tag makes the check
-miss and the correct image get built. The cost is one build per host that had the
-old image, paid once; the old tag is left on disk, because this code must never
-remove an image it did not create.
+the tag, so a host holding an image built from an older file would keep it for
+ever. Moving the tag makes the check miss and the correct image get built. The
+cost is one build per host that had the old image, paid once; the old tag is left
+on disk, because this code must never remove an image it did not create.
+
+``v2`` moved ``uv`` off ``/root``, which Debian ships mode 0700 and a container
+under ``--user <non-root>`` therefore cannot read through. ``v3`` adds
+``libreoffice-java-common``: a JRE was already present by way of ``pdftk-java``,
+but ``javaldx`` — the helper LibreOffice launches to find it — ships separately,
+so every headless conversion printed *"failed to launch javaldx"* on an otherwise
+successful run.
 """
 
 SANDBOX_IMAGE_BUILD_TIMEOUT_S: float = 600.0
@@ -100,6 +105,30 @@ SANDBOX_HOME: str = "/home/agent"
 which is on the read-only root. So the backend has to decide what ``$HOME`` is
 before it can mount a writable one, and :meth:`DockerBackend._run_argv` sets
 ``-e HOME=`` and a ``--tmpfs`` from this one constant so the two cannot drift.
+"""
+
+SANDBOX_USER_NAME: str = "agent"
+"""The login name given to the host uid in the container's password database.
+
+**A numeric ``--user`` with no password-database entry is a wall, and it is not
+the read-only root.** Docker accepts ``--user 501:20`` happily, every file write
+works, and ``$HOME`` is a writable tmpfs — but ``getpwuid()`` answers nothing,
+and a tool that resolves its own configuration through the password database
+rather than through ``$HOME`` then fails outright.
+
+LibreOffice is the observed case: ``libreoffice --convert-to pdf`` exits **77**
+with *"User installation could not be completed"*. Measured one variable at a
+time on this image, with ``--read-only`` held constant across every run: the
+failing case succeeds unchanged as ``uid 0`` (which **is** in the file), succeeds
+with an explicit ``-env:UserInstallation`` under the same tmpfs ``$HOME``, and
+succeeds as the same numeric uid once this file is mounted. ``XDG_CONFIG_HOME``
+changes nothing. So the root being read-only is not what breaks it — the missing
+entry is, and the read-only root only means the failure is loud instead of a
+profile written somewhere nobody looks.
+
+This is the same gap :data:`SANDBOX_GIT_CONFIG` already works around for git,
+which needs an identity the entry would have supplied. One mounted file closes
+both, and the next tool that asks the same question.
 """
 
 TMPFS_MOUNT_OPTIONS: str = "rw,exec,mode=1777,size=512m"
@@ -185,10 +214,13 @@ class DockerBackend(ProcessBackend):
     resolved, joined and never re-derived, so the mounted directory is by
     construction the one the write gate and the journal are working on.
 
-    **The root is read only, and three further things are what make that
+    **The root is read only, and four further things are what make that
     usable.** ``--user`` matched to the host, a writable ``$HOME`` and ``/tmp``
-    on tmpfs, and git configured by environment. Two of the three is a wall
-    rather than a partial fix, so :meth:`_run_argv` builds them as one unit.
+    on tmpfs, git configured by environment, and a password database the host
+    uid appears in (:data:`SANDBOX_USER_NAME`). Three of the four is a wall
+    rather than a partial fix, so :meth:`_run_argv` builds them as one unit —
+    the last two exist because ``--user`` takes a *number*, and a tool that asks
+    who that is gets no answer without them.
 
     **The name is opaque and per lifetime.** Nothing parses it and nothing
     persists it; a reaper keys on :data:`WORKSPACE_PATH_LABEL` instead. The
@@ -202,6 +234,49 @@ class DockerBackend(ProcessBackend):
         super().__init__()
         self.container_name: str | None = None
         """The container this backend runs in, set by :meth:`start`."""
+        self._passwd_path: str | None = None
+        """Host path of the generated password file, mounted at ``/etc/passwd``.
+
+        Written by :meth:`start` and removed by :meth:`_release`, so its lifetime
+        is the container's. ``None`` before the first :meth:`start` and after
+        :meth:`stop`.
+        """
+
+    def _write_passwd_file(self) -> str:
+        """Write the password database this container runs with, and return its path.
+
+        **Three identities, written rather than inherited from the image.** The
+        agent's — the host uid the bind mount's files must belong to, whose
+        absence is the defect this exists for — plus ``root`` and ``nobody``,
+        which are the only two of Debian's baseline that can still mean anything
+        here. Everything else in an image's ``/etc/passwd`` describes a daemon:
+        ``www-data``, ``_apt``, ``lp``, ``news``. None of them can run, because
+        the root is read-only and the container is not root to begin with.
+
+        **This is a replacement, and the alternative was worse.** Appending to
+        the image's own file would preserve those names, but reading it costs a
+        second ``docker`` command in :meth:`start` — and *one* ``docker run`` and
+        nothing else is a property this backend deliberately has, won by deleting
+        the ``docker ps -a`` probe that used to precede it. Trading that for a
+        dozen daemon accounts nothing in a sandbox resolves is a bad exchange. If
+        a tool ever does need one of them, add the line here; do not reintroduce
+        the probe.
+
+        The agent's entry names :data:`SANDBOX_HOME` as its home directory, which
+        is the writable tmpfs — so a tool that asks the database where to put its
+        configuration is told the one place it can.
+        """
+        entries = (
+            "root:x:0:0:root:/root:/bin/bash\n"
+            f"{SANDBOX_USER_NAME}:x:{os.getuid()}:{os.getgid()}:"
+            f"{SANDBOX_USER_NAME}:{SANDBOX_HOME}:/bin/sh\n"
+            "nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
+        )
+        handle, path = tempfile.mkstemp(prefix="akgentic-sandbox-passwd-")
+        with os.fdopen(handle, "w", encoding="utf-8") as passwd_file:
+            passwd_file.write(entries)
+        os.chmod(path, 0o644)
+        return path
 
     def _resolved_image(self) -> str:
         """Image name for docker run: AKGENTIC_SANDBOX_IMAGE override or the default."""
@@ -290,6 +365,11 @@ class DockerBackend(ProcessBackend):
             "--tmpfs",
             f"{SANDBOX_HOME}:{TMPFS_MOUNT_OPTIONS}",
         ]
+        # The password database the numeric --user is otherwise absent from
+        # (SANDBOX_USER_NAME). Read-only, and skipped entirely when the image's own
+        # baseline could not be read — a partial passwd would be worse than none.
+        if self._passwd_path is not None:
+            argv += ["-v", f"{self._passwd_path}:/etc/passwd:ro"]
         # Git's *command* scope — see SANDBOX_GIT_CONFIG for why ``safe.directory``
         # is honoured here and cannot be set from a repository-local config. The
         # count is derived from the tuple rather than written out: git reads only
@@ -325,6 +405,7 @@ class DockerBackend(ProcessBackend):
         if shutil.which("docker") is None:
             raise RuntimeError("docker CLI not found on PATH — cannot start DockerBackend")
         self._ensure_image()
+        self._passwd_path = self._write_passwd_file()
         base = os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
         volume = f"{(Path(base) / workspace_path).resolve()}:/workspace"
         container_name = f"{CONTAINER_NAME_PREFIX}{uuid4().hex[:12]}"
@@ -413,6 +494,16 @@ class DockerBackend(ProcessBackend):
         may still be running; it carries :data:`WORKSPACE_PATH_LABEL`, which is
         what a host-side reaper keys on.
         """
+        passwd_path = self._passwd_path
+        self._passwd_path = None
+        if passwd_path is not None:
+            # Unlinked whether or not a container was ever created, and never raising:
+            # this runs inside on_stop, and a leaked temp file is not worth a teardown
+            # failure. The container holds its own bind-mounted copy until it is removed.
+            try:
+                os.unlink(passwd_path)
+            except OSError:
+                logger.debug("Could not remove %s.", passwd_path, exc_info=True)
         container_name = self.container_name
         if container_name is None:
             return

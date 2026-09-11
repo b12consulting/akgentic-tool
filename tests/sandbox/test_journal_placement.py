@@ -70,9 +70,7 @@ def captured_argv(
 
     # One target for all: the argv is built per backend but spawned in the one
     # place ``ProcessBackend`` starts a process from.
-    monkeypatch.setattr(
-        "akgentic.tool.sandbox.backend.subprocess.Popen", fake_popen(seen)
-    )
+    monkeypatch.setattr("akgentic.tool.sandbox.backend.subprocess.Popen", fake_popen(seen))
     backend.exec("echo hi", "", 1.0)
     assert len(seen) == 1
     return seen[0]
@@ -110,9 +108,17 @@ class TestTheJournalIsOutsideEveryMount:
         backend.start(tree_with_journal.name)
 
         run_argv = seen[-1]
-        volume = run_argv[run_argv.index("-v") + 1]
-        assert volume == f"{tree_with_journal}:/workspace"
-        assert str(git_dir_for(tree_with_journal)) not in volume
+        # EVERY bind mount, not the first one: the argv also carries the generated
+        # /etc/passwd, so reading `index("-v")` would assert about whichever of the
+        # two is written first. The invariant here is about the journal — no mount
+        # may expose <root>.git or the parent that holds it — and it is only worth
+        # anything if it is checked against all of them.
+        volumes = [run_argv[index + 1] for index, token in enumerate(run_argv) if token == "-v"]
+        workspace = [volume for volume in volumes if volume.endswith(":/workspace")]
+        assert workspace == [f"{tree_with_journal}:/workspace"]
+        for volume in volumes:
+            assert str(git_dir_for(tree_with_journal)) not in volume
+            assert str(tree_with_journal.parent) not in volume.split(":")[0] or volume in workspace
 
     def test_the_seatbelt_policy_makes_only_the_root_writable(
         self, tree_with_journal: Path, monkeypatch: pytest.MonkeyPatch

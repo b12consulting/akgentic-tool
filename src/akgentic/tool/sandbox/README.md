@@ -287,7 +287,7 @@ platform-dependent check. The same spec is meaningful on a Linux runner and iner
 
 ### The Docker image
 
-`docker` mode runs `akgentic-sandbox:v2` (the `SANDBOX_IMAGE` constant in `sandbox/docker.py`) —
+`docker` mode runs `akgentic-sandbox:v3` (the `SANDBOX_IMAGE` constant in `sandbox/docker.py`) —
 Python 3.12 with pytest/ruff/mypy, `uv` in `/usr/local/bin` where a non-root user can reach it, and
 Node.js 18. The image is **built automatically on first use** from the bundled `sandbox.Dockerfile`,
 under a ten-minute budget with its output captured; a failed or timed-out build fails that run with
@@ -303,13 +303,15 @@ To warm the cache manually:
 ```bash
 docker build \
   -f packages/akgentic-tool/src/akgentic/tool/sandbox/sandbox.Dockerfile \
-  -t akgentic-sandbox:v2 \
+  -t akgentic-sandbox:v3 \
   packages/akgentic-tool/src/akgentic/tool/sandbox
 ```
 
-The tag moved from `:latest` to `:v2` when `uv` was relocated off `/root`; a host that built the old
-tag keeps that image on disk until an operator removes it — this code never removes an image it did
-not create.
+**The tag moves whenever the Dockerfile does, and it has to:** `_ensure_image` skips the build
+whenever *any* image carries the tag, so a host holding an image built from an older file would keep
+it for ever. It moved from `:latest` to `:v2` when `uv` was relocated off `/root`, and to `:v3` when
+`libreoffice-java-common` was added. A host that built an older tag keeps that image on disk until an
+operator removes it — this code never removes an image it did not create.
 
 ### Registering another backend
 
