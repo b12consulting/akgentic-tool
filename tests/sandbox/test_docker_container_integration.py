@@ -64,9 +64,9 @@ pytestmark = [
 
 @pytest.fixture
 def tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """A two-segment workspace under a root the backend will resolve."""
+    """A three-segment workspace under a root the backend will resolve."""
     root = tmp_path / "workspaces"
-    workspace = root / "u-alice" / "notes"
+    workspace = root / "u-alice" / "_id" / "notes"
     workspace.mkdir(parents=True)
     monkeypatch.setenv("AKGENTIC_WORKSPACES_ROOT", str(root))
     return workspace
@@ -76,7 +76,7 @@ def tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def started(tree: Path) -> Iterator[DockerBackend]:
     """A real container, removed in a ``finally`` so a failing spec leaks nothing."""
     backend = DockerBackend()
-    backend.start("u-alice/notes")
+    backend.start("u-alice/_id/notes")
     try:
         yield backend
     finally:
@@ -289,7 +289,7 @@ def test_stop_actually_removes_the_container_and_a_second_stop_still_does_not_ra
     restart — the case where the container is gone before teardown reaches it.
     """
     backend = DockerBackend()
-    backend.start("u-alice/notes")
+    backend.start("u-alice/_id/notes")
     name = backend.container_name
     assert name is not None
 
@@ -317,7 +317,7 @@ def test_stop_actually_removes_the_container_and_a_second_stop_still_does_not_ra
 def test_a_container_removed_from_outside_does_not_make_stop_raise(tree: Path) -> None:
     """AC24: *already gone* is the outcome teardown asked for, not an error."""
     backend = DockerBackend()
-    backend.start("u-alice/notes")
+    backend.start("u-alice/_id/notes")
     name = backend.container_name
     assert name is not None
 
@@ -337,4 +337,4 @@ def test_the_label_is_readable_from_the_daemon(started: DockerBackend) -> None:
         text=True,
         timeout=30,
     )
-    assert inspected.stdout.strip() == "u-alice/notes"
+    assert inspected.stdout.strip() == "u-alice/_id/notes"

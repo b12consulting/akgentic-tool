@@ -9,7 +9,7 @@ no card here.
 | | |
 |---|---|
 | Module | `akgentic.tool.sandbox` |
-| Actor | **none.** `#Workspace-<scope>/<leaf>` owns one backend per tree and one single-worker executor; an exec-enabled team runs the workspace actor and the agent, and nothing else |
+| Actor | **none.** `#Workspace-<scope>/<kind>/<leaf>` owns one backend per tree and one single-worker executor; an exec-enabled team runs the workspace actor and the agent, and nothing else |
 | Channels used | `TOOL_CALL`, through `WorkspaceTool` |
 | Optional extras | none — `bwrap` / `sandbox-exec` / `docker` are host tools, not Python packages |
 | Environment | `AKGENTIC_WORKSPACES_ROOT`, `AKGENTIC_SANDBOX_IMAGE` |
@@ -36,7 +36,7 @@ ToolFactory([WorkspaceTool(workspace_id="proj-42", workspace_exec=True)], observ
 |---|---|
 | `exec_command(cmd, cwd="")` | `workspace_exec(cmd, cwd="")` + `workspace_exec_result(run_id)` |
 | `ExecTool(mode=…)` | `WorkspaceExec(mode=…)` |
-| `ExecTool(workspace_id=…)` | `WorkspaceTool(workspace_id=…)`, or `workspace_metadata_keys=[…]` for the shared layout |
+| `ExecTool(workspace_id=…)` | `WorkspaceTool(workspace_id=…)`, or `workspace_metadata_keys=[…]` for a metadata-keyed tree — per-principal like the other kinds; sharing across principals is `workspace_sharable=True`, where the platform permits it |
 | no budget, no journal | `WorkspaceExec(timeout_s=…, poll_attempts=…, poll_delay_seconds=…)`, `WorkspaceTool(git_journal=…)` |
 
 **Mind the other capabilities.** `WorkspaceTool`'s file capabilities default to `True`. A card that
@@ -105,22 +105,27 @@ calls it again with the concrete mode when the card announces its `ExecConfig`, 
 instance as the backend its worker thread runs on. A `mode` naming an unregistered backend raises
 `KeyError` — deliberately fail-fast, at team creation.
 
-**One backend per tree, many callers.** Every agent whose card resolves to one workspace shares one
-`#Workspace-<scope>/<leaf>`, and that actor holds exactly one backend and one worker for its tree.
-Two exec-capable cards on two workspaces in one team get two workspace actors, two backends, and —
-on the docker backend — two containers, each mounting its own tree. The name carries the resolved
-path so that a second workspace can never be resolved onto the first one's actor.
+**One backend per tree per team, many callers.** Every agent of one team whose card resolves to one
+workspace shares one `#Workspace-<scope>/<kind>/<leaf>`, and that actor holds exactly one backend and
+one worker for its tree. Two exec-capable cards on two workspaces in one team get two workspace
+actors, two backends, and — on the docker backend — two containers, each mounting its own tree. Two
+**teams** on one tree get two actors as well, since the actor is a team child: the tree orders them,
+because the exec hold is a marker file on the tree rather than state in either actor. The name
+carries the resolved path so that a second workspace can never be resolved onto the first one's
+actor.
 
 ### The directory
 
-A workspace is a relative path of **exactly two segments**, `<scope>/<leaf>`, and the card's
-`workspace_id` supplies the `<leaf>` only. The `<scope>` is the owning principal, and the card never
-chooses it.
+A workspace is a relative path of **exactly three segments**, `<scope>/<kind>/<leaf>`. The card's
+`workspace_id` supplies the `<leaf>` and, by being set, selects the `_id` kind; left at `None`, the
+kind is `_team` and the leaf is the team id. Neither chooses the `<scope>`: that is the owning
+principal, or the reserved `_shared` when the card also declares `workspace_sharable=True` and the
+platform permits the kind (see the [workspace README](../workspace/README.md#where-the-files-live)).
 
-| Value | Effect |
+| `workspace_id` | Effect, for principal `alice` |
 |---|---|
-| `None` *(default)* | `<user_id>/<team_id>` — the team's own tree, under its owner. |
-| any `str` | `<user_id>/<that string>` — a second tree of the **same** principal, not a tree shared with other principals. |
+| `None` *(default)* | `alice/_team/<team_id>` — the team's own tree, under its owner. |
+| any `str` | `alice/_id/<that string>` — a second tree of the **same** principal, not a tree shared with other principals. |
 
 The card resolves that path **once**, at bind time, and hands the result to `#Workspace` inside its
 `ExecConfig`; the actor passes it to `backend.start(workspace_path)` on the worker thread, before
@@ -214,18 +219,20 @@ propagates as an exception from the tool call: a tool call must always yield a t
 
 ```
 $AKGENTIC_WORKSPACES_ROOT/            # default ./workspaces
-└── <scope>/                          # the owning principal, or _meta for the shared layout
-    ├── <leaf>/                       # created by backend.start(); cwd is resolved under it
-    └── <leaf>.git/                   # the journal — outside every mount, deliberately
+└── <scope>/                          # the owning principal, or the reserved _shared
+    └── <kind>/                       # _team, _id or _meta
+        ├── <leaf>/                   # created by backend.start(); cwd is resolved under it
+        ├── <leaf>.git/               # the journal — outside every mount, deliberately
+        └── <leaf>.akgentic/          # <meta>: exec lock, rag/, index/, locks/ — likewise
 ```
 
-`<scope>/<leaf>` is the two-segment path the card resolved: `<user_id>/<team_id>` for a default card,
-`<user_id>/<workspace_id>` for a named one, `_meta/<joined keys>` for a metadata-shared one. The
-backend receives it already resolved and derives nothing.
+`<scope>/<kind>/<leaf>` is the three-segment path the card resolved: `<scope>/_team/<team_id>` for a
+default card, `<scope>/_id/<workspace_id>` for a named one, `<scope>/_meta/<joined keys>` for a
+metadata-keyed one. The backend receives it already resolved and derives nothing.
 
 The directory is created by `start()`, which the worker thread calls lazily before the first
 command; the resolved host path is held on the backend instance (`workspace_path`) and nowhere
-else. Only the tree is ever mounted — never the `.git` sibling.
+else. Only the tree is ever mounted — never the `.git` sibling, and never the `.akgentic` one.
 
 ### Backend specifics
 
@@ -269,7 +276,7 @@ macOS 10.15 and may be removed. Treat seatbelt as a developer-workstation backen
 removes it (`docker rm -f`) when `#Workspace` stops, which is when its team's teardown reaches it. The container holds nothing worth keeping: its root is read-only, `/workspace` is the
 only bind mount and the only writes that outlive it, and its name (`akgentic-sandbox-<12 hex>`) is
 opaque, generated per `start()`, held on the backend instance and **persisted nowhere**. A reaper
-keys on the container's `akgentic.workspace_path=<scope>/<leaf>` label, never on the name.
+keys on the container's `akgentic.workspace_path=<scope>/<kind>/<leaf>` label, never on the name.
 
 Three further flags are what make a read-only root usable, and they are applied together because
 two of the three is a wall: `--user <host uid>:<host gid>` so files written to the mount belong to
@@ -340,7 +347,7 @@ A backend is a plain class satisfying the `SandboxBackend` Protocol in `sandbox/
 | Method | Contract |
 |---|---|
 | `__init__()` | constructible from the registry with no arguments; everything a backend needs arrives through `start` |
-| `start(workspace_path)` | provision for the already-resolved two-segment path — called once, lazily, on the worker thread before the first command; a failure is that run's reported error and the next run retries |
+| `start(workspace_path)` | provision for the already-resolved three-segment path — called once, lazily, on the worker thread before the first command; a failure is that run's reported error and the next run retries |
 | `exec(cmd, cwd, timeout) -> ExecResult` | tokenise with `validate_command(cmd)` and run; **must** hand `timeout` to the process, and **must** raise `subprocess.TimeoutExpired` when it expires — that is what becomes the agent's "too slow" answer |
 | `kill()` | end the run in flight, idempotent and best-effort; called from `#Workspace`'s thread at teardown |
 | `stop()` | `kill()`, then release whatever `start()` provisioned; called last at teardown and when a card re-announces a different configuration |

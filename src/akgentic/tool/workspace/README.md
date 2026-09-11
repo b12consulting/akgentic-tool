@@ -11,10 +11,10 @@ from akgentic.tool import WorkspaceTool
 | | |
 |---|---|
 | Module | `akgentic.tool.workspace.tool` |
-| Actor | `#Workspace-<scope>/<leaf>` — the **resolved two-segment path**, slash included, so two principals' `notes` are two actors over two trees. An ordinary **team child**: created by its card through `getChildrenOrCreate`, in exactly one team's roster, stopped by that team's teardown. It owns **dispatch and no shared state** — with `workspace_exec` on, the tree's sandbox backend and the single worker thread that runs commands on it, plus the retrieval indexing pipeline. Two teams over one tree get two actors, and the tree orders them — see *Lifetime* below |
+| Actor | `#Workspace-<scope>/<kind>/<leaf>` — the **resolved three-segment path**, slashes included, so two principals' `notes` are two actors over two trees. An ordinary **team child**: created by its card through `getChildrenOrCreate`, in exactly one team's roster, stopped by that team's teardown. It owns **dispatch and no shared state** — with `workspace_exec` on, the tree's sandbox backend and the single worker thread that runs commands on it, plus the retrieval indexing pipeline. Two teams over one tree get two actors, and the tree orders them — see *Lifetime* below |
 | Channels used | `TOOL_CALL` (11 callables, 13 with `workspace_exec`), `COMMAND` (`expand_media_refs`) |
 | Optional extras | `[docs]` for binary reads, `[vision]` for image resizing |
-| Environment | `AKGENTIC_WORKSPACES_ROOT` (default `./workspaces`) |
+| Environment | `AKGENTIC_WORKSPACES_ROOT` (default `./workspaces`) · `AKGENTIC_WORKSPACE_META_ROOT` (default: the workspaces root; relocates only the `<leaf>.akgentic` siblings) · `AKGENTIC_WORKSPACE_SHARED_KINDS` (default unset, which permits **no** shared tree — see *Sharing a tree across principals*) |
 | External tools | `git` (optional — the journal, see below), `rg` (optional — accelerates `workspace_grep`) |
 
 ---
@@ -38,9 +38,11 @@ the file rather than consulting a record of who wrote it.
 Retrieval degrades further **within** itself: with the capability on and no store reachable, every
 retrieval callable answers one sentence rather than raising, and a search whose embedding call fails
 falls back to its keyword leg. ("No store reachable" means the backend this card's `vector_store`
-names could not be built — on the in-memory backend that is the workspace actor's own
-`#VectorStore-<scope>/<leaf>` child, which it creates for itself, and on a cluster backend there is
-no actor at all, only a client that failed to connect.) That is deliberate rather than defensive — this actor owns the
+names could not be built — on the default `local` backend that is the **team's** `#VectorStore`,
+which files the index under the tree's sibling metadata directory, and on a cluster backend there is
+no actor at all, only a client that failed to connect. The in-memory backend is not a workspace
+backend: a card that names it explicitly is refused at bind, and one that names no backend resolves
+to `local`.) That is deliberate rather than defensive — this actor owns the
 write gate, and a misconfigured vector store must not be a way to take the gate down with it.
 
 ---
@@ -49,9 +51,11 @@ write gate, and a misconfigured vector store must not be a way to take the gate 
 
 ```python
 class WorkspaceTool(ToolCard):
-    # Where the files live — two mutually exclusive ways to name the <leaf>
+    # Where the files live — two mutually exclusive ways to name the <leaf> (each selects
+    # its <kind>), plus one orthogonal flag that chooses the <scope>
     workspace_id: str | None = None
     workspace_metadata_keys: list[str] = []
+    workspace_sharable: bool = False
 
     # Read-side capabilities
     workspace_read: WorkspaceRead | bool = True
@@ -95,9 +99,12 @@ the **write** side: a command mutates the tree whatever it happens to be, so
 
 **The backend and the actor are both bound in `observer()`, not in `__init__`.** `observer()` makes
 **one** call to `resolve_workspace_path(...)` — the single place a workspace directory is derived —
-and hands the result down as an already-resolved value: a `Filesystem` rooted at
-`<AKGENTIC_WORKSPACES_ROOT>/<scope>/<leaf>`, the `#Workspace-<scope>/<leaf>` actor that dispatches for
-the tree, and — only if exec is enabled — the sandbox backend. Nothing below re-derives it, which is what
+and passes the result through the **sharing gate** before anything with a side effect: a shared
+path whose kind this process does not permit raises there, before `get_workspace` creates the tree
+(see *Sharing a tree across principals*). It then hands the result down as an already-resolved
+value: a `Filesystem` rooted at `<AKGENTIC_WORKSPACES_ROOT>/<scope>/<kind>/<leaf>`, the
+`#Workspace-<scope>/<kind>/<leaf>` actor that dispatches for the tree, and — only if exec is
+enabled — the sandbox backend. Nothing below re-derives it, which is what
 makes it impossible for a backend to open a different directory from the one the gate and the journal
 are guarding. `resources` are seeded in between. Reading `card.workspace` before that raises
 `RuntimeError`; calling a mutation before it raises `RuntimeError` too, because there is deliberately
@@ -110,17 +117,19 @@ majority of `WorkspaceTool()` instances gain no round trip at wiring time.
 
 **The actor's name carries the resolved path, and that is load-bearing.** Two cards with different
 `workspace_id` values in one team get **two** actors, each owning its own tree — and so do two
-*principals* whose cards both say `workspace_id="notes"`, because the name carries the scope as well
-as the leaf. A fixed name would collapse them onto one actor owning one of the trees, silently. The
+*principals* whose cards both say `workspace_id="notes"`, because the name carries the scope and the
+kind as well as the leaf. A fixed name would collapse them onto one actor owning one of the trees, silently. The
 sandbox backend needs no name of its own: it is held by the workspace actor whose tree it serves.
 
 **Two teams of the same principal sharing one `workspace_id` reach one tree and two actors**, one
 per team — and their writes are still ordered, because the ordering is on the **tree**: an
 `fcntl.flock` held on the path for the whole check-and-write, and an `O_EXCL` marker for the whole of
 a run. That holds across two *processes* as well, which a mailbox never did. The first bind of a team
-fixes that team's actor's configuration. Two teams of **different** principals do not share a tree at
-all: `notes` resolves under each owner's own scope. Sharing across principals is
-`workspace_metadata_keys`, and nothing else.
+fixes that team's actor's configuration. Two teams of **different** principals do not share a tree
+unless the card asks: `notes` resolves under each owner's own scope, `alice/_id/notes` and
+`bob/_id/notes`. Sharing across principals is `workspace_sharable=True`, valid with any of the three
+kinds and honoured only where the platform permits that kind — never `workspace_metadata_keys`,
+which is per-principal like the other two. See *Sharing a tree across principals*.
 
 ### Lifetime
 
@@ -227,10 +236,10 @@ way around the gate.
 
 The hash is read from disk on **every** check and never cached. That is what makes the gate correct
 against writers that never pass through the card at all: a frontend upload, a sandboxed command,
-ADR-026 resource seeding, and a second team of the same principal sharing the same `workspace_id`.
-None of the four announces itself; all four are caught, because the check consults the file. The
-narrowing of the fourth is a fact about the *layout*, not about the gate: the gate never knew which
-team wrote, and does not need to.
+ADR-026 resource seeding, and another team bound to the same tree — a team of the same principal on
+a per-principal tree, or a team of **any** principal on a `_shared` tree. None of the four announces
+itself; all four are caught, because the check consults the file. Who the fourth can be is a fact
+about the *layout*, not about the gate: the gate never knew which team wrote, and does not need to.
 
 ---
 
@@ -240,7 +249,7 @@ When `git` is available and `git_journal` is on, **every accepted mutation is on
 authored by the agent that made it.
 
 ```
-$ git --git-dir workspaces/$SCOPE/proj-42.git --work-tree workspaces/$SCOPE/proj-42 log --oneline
+$ git --git-dir workspaces/$SCOPE/_id/proj-42.git --work-tree workspaces/$SCOPE/_id/proj-42 log --oneline
 9c1f0aa exec: 3 files          (builder)
 41b0d3e out-of-band: changes from outside the tools   (out-of-band)
 a77e214 edit: src/main.py      (reviewer)
@@ -494,8 +503,9 @@ cannot argue with.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `workspace_id` | `str \| None` | `None` | The `<leaf>` — a directory name **under the caller's own principal**, not under the workspaces root, and the second half of the actor's name. `None` ⇒ the team id, so each team gets its own tree. A fixed string names a **second tree of your own**: two agents in one team can hold two separate trees, and two teams of the *same* principal reach one tree (checked by the gate, not ordered by an actor). It does **not** share across principals — two users declaring `notes` get `<alice>/notes` and `<bob>/notes`. For sharing that actually shares, use `workspace_metadata_keys`. |
-| `workspace_metadata_keys` | `list[str]` | `[]` | The `<leaf>` derived from the team's own metadata, under the reserved `_meta` scope: `["customer_id", "case_id"]` over `ACME` and `42` resolves to `_meta/customer_id-ACME__case_id-42`. This is the layout that is **shared across teams and across users** — which is why it sits under a reserved scope rather than under anybody's principal. Keys are a **sequence**: joined in declaration order, so the list reads as a refinement path from the coarsest scope down and `ls _meta/` groups a customer's trees together — the trade being that two cards naming the same keys in different orders address different workspaces, which is visible in the directory name rather than silent. Values are percent-encoded, which is what keeps the join unforgeable. The declared list also travels on the wire as `WorkspaceConfig.metadata_keys`, so a client attributes an agent to a workspace by plain list equality against this field, with nothing to normalise on either side. **Mutually exclusive with `workspace_id`** — declaring both is a `ValidationError` at card construction, not a precedence rule. Every failure is a hard error at bind time, never a fallback to a user path: no metadata on the team, a key that is not a field of the metadata model, a value that is `None` or empty, or a joined leaf over 255 bytes. |
+| `workspace_id` | `str \| None` | `None` | The `<leaf>` of the `_id` kind — a directory name **under the caller's own principal** by default, not under the workspaces root, and the tail of the actor's name. `None` ⇒ the `_team` kind, whose leaf is the team id, so each team gets its own tree. A fixed string names a **second tree of your own**: two agents in one team can hold two separate trees, and two teams of the *same* principal reach one tree (checked by the gate, not ordered by an actor). It does **not** share across principals on its own — two users declaring `notes` get `alice/_id/notes` and `bob/_id/notes`. For sharing that actually shares, add `workspace_sharable=True`, which the platform must permit for `id`. |
+| `workspace_metadata_keys` | `list[str]` | `[]` | The `<leaf>` derived from the team's own metadata, under the `_meta` kind: `["customer_id", "case_id"]` over `ACME` and `42` resolves to `alice/_meta/customer_id-ACME__case_id-42` for principal `alice`. **Per-principal by default, like the other two kinds**: every team of one principal carrying the same values reaches one tree, and another principal's teams reach another. It is shared across principals only with `workspace_sharable=True` (`_shared/_meta/…`), where the platform permits `meta` — the inverse of the old layout, which shared every metadata tree across principals implicitly. Keys are a **sequence**: joined in declaration order, so the list reads as a refinement path from the coarsest scope down and `ls <scope>/_meta/` groups a customer's trees together — the trade being that two cards naming the same keys in different orders address different workspaces, which is visible in the directory name rather than silent. Values are percent-encoded, which is what keeps the join unforgeable. Only the resolver reads this field: a client learns which tree an agent bound from the `WorkspaceAttached` event the bind emits, whose `workspace_path` is the full three-segment path, never from a key list. **Mutually exclusive with `workspace_id`** — declaring both is a `ValidationError` at card construction, not a precedence rule. Every failure is a hard error at bind time, never a fallback to a user path: no metadata on the team, a key that is not a field of the metadata model, a value that is `None` or empty, or a joined leaf over 255 bytes. |
+| `workspace_sharable` | `bool` | `False` | Whether the tree lives under the reserved shared scope, `_shared/<kind>/<leaf>`, instead of under the owning principal. Orthogonal to both layout fields and valid with all three kinds; not part of the mutual-exclusivity check. **A request, not a grant**: the bind fails unless `AKGENTIC_WORKSPACE_SHARED_KINDS` on the binding process permits the kind, and a refused request is never downgraded to the per-principal tree. A plain `bool`, so the value survives every catalog round trip. See *Sharing a tree across principals*. |
 | `read_only` | `bool` | `False` | `True` removes every write-side callable from the tool list, `workspace_exec` included. The read side is unaffected. |
 | `git_journal` | `bool` | `False` | Whether accepted mutations are recorded in the git journal. **Off by default**, because nothing in the system consumes the record: the gate re-hashes live and never consults it, and an agent's exec result carries only `exit_code`/`stdout`/`stderr`, so the journal is a human-facing audit trail you opt into. A plain field, not a capability param: it exposes no tool and nothing about it is expressible by a model. Turning it off loses history, attribution and out-of-band detection — it does **not** loosen the gate by one row. Read by the **first** card to create the actor for a workspace. |
 | `resources` | `list[Resource]` | `[]` | Files written into the workspace at `observer()` time, before the agent's first turn. Seeding is **idempotent**: a resource whose `file_name` already exists is skipped, so restoring a team never clobbers a file the agent has since edited. |
@@ -843,46 +853,99 @@ now returns only the failure — nothing was applied, so there is nothing to rep
 
 ### Where the files live
 
-**A workspace is a relative path of exactly two segments** — `<scope>/<leaf>`. `<scope>` answers
-*whose is this*, `<leaf>` answers *which of theirs*, and the leaf is always a discriminator unique to
-one workspace: a team id, a `workspace_id`, or a joined metadata key, never a category. There are
-three layouts and no fourth:
-
-| Card | Resolved path |
-|---|---|
-| `WorkspaceTool()` | `<user_id>/<team_id>` |
-| `WorkspaceTool(workspace_id="notes")` | `<user_id>/notes` |
-| `WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])` | `_meta/customer_id-ACME__case_id-42` |
+**A workspace is a relative path of exactly three segments**, joined to the workspaces root:
 
 ```
-$AKGENTIC_WORKSPACES_ROOT/                # default ./workspaces
-├── <user_id>/
-│   ├── <team_id>/                        # the root every path is anchored to
-│   ├── <team_id>.git/                    # the journal — a SIBLING, never inside the root
-│   ├── notes/                            # a named workspace: a second tree of your OWN
-│   └── notes.git/
-└── _meta/                                # reserved: the shared, metadata-keyed layout
-    ├── customer_id-ACME__case_id-42/
-    └── customer_id-ACME__case_id-42.git/
+<AKGENTIC_WORKSPACES_ROOT>/<scope>/<kind>/<leaf>
 ```
 
-**Depth is fixed at two, and what that buys is that no workspace path is a prefix of another.**
-`Filesystem._validate_path` rejects only paths resolving *outside* the root, so a workspace at
-`ACME/` would read and write everything under `ACME/42/` as ordinary in-tree activity, with the
-per-path write gate none the wiser. That is containment rather than a name collision, and it is
-worse. At depth two with a unique leaf the property holds by construction.
+- `<scope>` answers *who may reach this*: the owning principal's user id, or the reserved `_shared`.
+- `<kind>` answers *how the leaf was derived*: exactly one of `_team`, `_id` and `_meta`, chosen by
+  which layout field the card set.
+- `<leaf>` answers *which one*: the team id, the `workspace_id`, or the joined metadata key. It is
+  always a discriminator unique to one workspace of that kind, never a category.
+
+Two fields choose the kind and one flag chooses the scope, so there are six cells. For principal
+`alice`:
+
+| Card | `workspace_sharable=False` (default) | `workspace_sharable=True` |
+|---|---|---|
+| `WorkspaceTool()` | `alice/_team/<team_id>` | `_shared/_team/<team_id>` |
+| `WorkspaceTool(workspace_id="notes")` | `alice/_id/notes` | `_shared/_id/notes` |
+| `WorkspaceTool(workspace_metadata_keys=["customer_id"])` | `alice/_meta/customer_id-ACME` | `_shared/_meta/customer_id-ACME` |
+
+Per-principal is the default for **every** kind, metadata included. A shared cell exists only where
+the platform permits its kind (see *Sharing a tree across principals*, below), and the resolver never
+consults the principal for one.
+
+```
+$AKGENTIC_WORKSPACES_ROOT/                      # default ./workspaces
+├── alice/                                      # a principal's scope
+│   ├── _team/
+│   │   ├── <team_id>/                          # the root every path is anchored to
+│   │   ├── <team_id>.git/                      # the journal — a SIBLING, never inside the root
+│   │   └── <team_id>.akgentic/                 # <meta> — a sibling too
+│   ├── _id/
+│   │   ├── notes/                              # a named workspace: a second tree of alice's OWN
+│   │   ├── notes.git/
+│   │   └── notes.akgentic/
+│   └── _meta/
+│       ├── customer_id-ACME__case_id-42/       # metadata-keyed, and still alice's own
+│       ├── customer_id-ACME__case_id-42.git/
+│       └── customer_id-ACME__case_id-42.akgentic/
+└── _shared/                                    # reserved: trees no principal owns
+    └── _meta/
+        ├── customer_id-ACME/                   # workspace_sharable=True, permitted for `meta`
+        ├── customer_id-ACME.git/
+        └── customer_id-ACME.akgentic/
+```
+
+**Depth is fixed at three, and what that buys is that no workspace path is a proper prefix of
+another.** The invariant is load-bearing because violating it is **containment**, not a name
+collision: `Filesystem._validate_path` rejects only paths resolving *outside* the root, so a
+workspace anchored at a parent would read and write everything under a child's tree as ordinary
+in-tree activity, with the per-path write gate none the wiser. **Fixed depth is what buys the
+property.** No path of exactly three segments can be a proper prefix of another, because a proper
+prefix has strictly fewer segments. The previous layout's depth was never load-bearing, only fixed.
+The kind segment adds one thing more: it separates a user id from a workspace name, so
+`notes/_id/x` (a principal called `notes`) and `alice/_id/notes` (a workspace called `notes`) cannot
+meet.
+
+**The reserved names are refused on both sides, or two cells collapse into one tree.**
+`user_segment` refuses a principal named `_shared` or any of the three kind names: a principal called
+`_shared` would *be* the shared cell. `leaf_segment` refuses the three kind names, and any leaf ending
+in `.git` or `.akgentic`, which would root one tree at another workspace's journal or metadata
+directory. Both match **exactly**, never as a `_` prefix (an Azure AD `sub` is base64url, whose
+alphabet includes `_`), and **case-insensitively**, because macOS and Windows filesystems are.
+`_shared` is a legal **leaf**: at the third position it collides with nothing.
+
+**Two sibling directories sit beside every tree, never inside it**, in the same `<scope>/<kind>/`
+directory: `<leaf>.git`, the journal, and `<leaf>.akgentic`, the tree's metadata directory
+(`<meta>`), which holds the exec lock, the `rag/` document records, the local vector backend's
+`index/` and the `locks/`. Being beside the tree is what keeps both out of every read capability and
+out of every sandbox mount: **neither is ever mounted**. `AKGENTIC_WORKSPACE_META_ROOT`, when it
+carries a value, relocates only the `.akgentic` parent, carrying the scope and kind segments with it
+(`$AKGENTIC_WORKSPACE_META_ROOT/alice/_id/notes.akgentic`). An **empty** value falls back to the
+workspaces root rather than to the process's working directory, and the `.git` sibling never moves.
+**Whatever removes a tree must remove both siblings too.** `<leaf>.akgentic/rag/*.yaml` holds the
+**extracted text** of every document the tree indexed, and `akgentic-infra`'s team deletion does not
+yet remove the siblings.
+
+Layouts written by `akgentic-tool` 1.8.0 (two segments) or earlier (flat) are not read by this
+resolver: **no migration is provided**, and such trees are removed by hand.
 
 **Where there is no principal there is no isolation, by construction.** A team created through the
 SDK carries `user_id="cli"` and an HTTP deployment with no authentication configured carries
 `anonymous`, so every such team on one host shares that one scope. Team trees stay distinct anyway —
-`cli/<team_id>`, and a team id is unique — but a **named** workspace does not: `cli/notes` is one
-tree for every SDK-created team on that host. On a developer machine that is the desired behaviour;
-on a shared host reached without authentication it is the old flat namespace again, narrowed to one
-scope. Supplying a principal is the deployment's job.
+`cli/_team/<team_id>`, and a team id is unique — but a **named** workspace does not: `cli/_id/notes`
+is one tree for every SDK-created team on that host. On a developer machine that is the desired
+behaviour; on a shared host reached without authentication it is one namespace for everybody,
+narrowed to one scope. Supplying a principal is the deployment's job.
 
-The `<scope>` never reaches a client. The frontend sends and labels the **leaf** it read from the
-tool row — `notes`, a team id, or the joined metadata key — and the server recomputes the scope from
-the team's own card.
+**What the tool tells a client is the whole path.** Each bind emits
+`WorkspaceAttached(agent_id, workspace_path)` on the team's stream, and `workspace_path` is the full
+three-segment path, scope included: `alice/_meta/customer_id-ACME__case_id-42`. What a client does
+with it is the client's business.
 
 `Filesystem._validate_path` resolves each path against that root and rejects anything landing
 outside it with `PermissionError`, which the tools surface as `RetriableError`. The check is
@@ -899,106 +962,71 @@ ownership, extended attributes and hardlinks are not, because publishing by rena
 inode. That matters where the workspace is bind-mounted into a container running as another uid.
 Orphaned staging files left by a hard kill are swept once, at actor start.
 
-### Migrating a pre-48 workspaces root
+### Sharing a tree across principals
 
-A root written before the two-segment layout holds every workspace at the top level. Every one of
-them moves:
+**The card requests, the platform permits.** `workspace_sharable=True` on a card is a *request* to
+put its tree under `_shared`. `AKGENTIC_WORKSPACE_SHARED_KINDS` is the platform's *permission*: it
+names the kinds that may live there. Neither is enough alone. A card cannot make a tree shared on its
+own authority, and a platform that permits a kind shares nothing until a card asks.
 
-| Before | After |
+The variable takes comma-separated **bare** kind names: `team`, `id`, `meta`. Each token is stripped
+of surrounding whitespace and compared case-insensitively, and empty tokens are skipped. **Unset or
+empty means none**, so a deployment that has never heard of sharing cannot be given it by a card.
+
+| Value | Permits |
 |---|---|
-| `workspaces/<team_id>/` | `workspaces/<user_id>/<team_id>/` |
-| `workspaces/<team_id>.git/` | `workspaces/<user_id>/<team_id>.git/` |
-| `workspaces/<name>/` | `workspaces/<user_id>/<name>/`, **manually**, once per owning principal |
-| `workspaces/<name>.git/` | `workspaces/<user_id>/<name>.git/`, with its tree |
+| unset, `""`, `"  "`, `","` | nothing |
+| `meta` | `_meta` |
+| `id,meta`, `" id , META "` | `_id`, `_meta` |
+| `team,id,meta` | all three |
+| `metadata`, `_meta`, `all`, `*`, `id meta`, `meta,metadata` | **`ValueError`**: the whole value is refused |
 
-**The journal moves with its tree — both directories or neither.** The repository is the sibling
-`<name>.git` in the same directory as the tree, so a move that relocates only the tree loses that
-workspace's history *silently*: nothing raises, and the actor initialises an empty repository at the
-new sibling on next start.
+One unknown token refuses the **whole** value, so `meta,metadata` permits nothing rather than
+`meta`: a typo that silently permitted half a value would look like a working configuration. The
+separator is `,` and nothing else, so `id meta` is one unknown token. The value is parsed on
+**every** bind, so a malformed one fails **every** bind, per-principal ones included:
 
-#### Team workspaces — the script
-
-```bash
-# Dry run is the default: it prints the plan and changes nothing.
-python -m akgentic.tool.workspace.migrate --root ./workspaces --owners owners.json
-
-# Then apply it.
-python -m akgentic.tool.workspace.migrate --root ./workspaces --owners owners.json --apply
+```
+AKGENTIC_WORKSPACE_SHARED_KINDS names 'metadata', which is not a workspace kind; accepted, comma-separated: 'id', 'meta', 'team'
 ```
 
-`owners.json` is a flat object mapping team id to the owning user id:
+**It is read by the process that binds agents**: the worker in a department or enterprise
+deployment, the single process in community. It is read at every bind and **never cached**. The API
+server never reads it: the server calls the resolver on catalog writes, and a card must not be judged
+there against an allow-list that does not decide. That is also why the resolver itself reads no
+environment.
 
-```json
-{
-  "3f2b1c8e-0a4d-4c9a-9f3e-2b6d7c8a1e55": "2R0bQV8j9zX8CEsBl6APi7MXgAn4_laOa8vd9ZoIHIQ",
-  "b7c4e2a1-55d9-4f30-8a1b-9c0e6d4f2a77": "geoffroy.piroux@example.com"
-}
+**A request the process does not permit fails the bind, and is never downgraded.**
+`WorkspaceTool.observer()` checks the resolved path immediately after resolving it and before
+`get_workspace`, which creates the tree eagerly. So a refused bind creates no directory, no
+`#Workspace` actor and no `WorkspaceAttached` event, and the team fails to start in front of the admin
+who configured it:
+
+```
+WorkspaceTool requests a shared 'id' workspace (_shared/_id/notes), but AKGENTIC_WORKSPACE_SHARED_KINDS permits only 'meta' on this process. Add 'id' to it on the process that binds agents, or declare workspace_sharable=False.
 ```
 
-For a deployment with one principal for the whole root — the community and CLI tiers, where every
-team carries `cli` or `anonymous` — `--owner <user_id>` covers it in one flag and no file is needed:
+With nothing permitted, the middle of that message reads
+`permits none (it is unset or empty) on this process`. There is no fallback to the per-principal
+tree, because a card that asked for a shared tree and quietly got a private one would have had its
+meaning changed without being told.
 
-```bash
-python -m akgentic.tool.workspace.migrate --root ./workspaces --owner anonymous --apply
-```
+**The metadata default inverted.** A metadata tree used to be shared across principals implicitly,
+as a side effect of choosing `workspace_metadata_keys`. It is now per-principal (`alice/_meta/…`),
+like every other kind. A deployment that wants a metadata tree shared sets
+`AKGENTIC_WORKSPACE_SHARED_KINDS=meta` **and** marks those cards `workspace_sharable=True`. Both are
+needed, deliberately.
 
-**Where the mapping comes from.** Each team's owner is the `user_id` stored on that team's team
-record — one owner per team, no judgement involved. The script does **not** read those records:
-`akgentic-tool` may not import `akgentic-team`, so the lookup happens outside this package and its
-result is handed in. On an `akgentic-infra` server, `GET /teams` returns `team_id` and `user_id` for
-each team, but only for **the calling user's own** teams — so a root with several principals is
-built from the deployment's team store directly, one entry per team, rather than from one call.
+Two limits to know before permitting anything:
 
-**An unmapped team id is refused, never guessed.** The run reports it and exits non-zero without
-moving it. Defaulting to `anonymous` would file one user's tree under the shared anonymous scope,
-which is exactly the exposure the two-segment layout exists to close.
-
-What the plan says about each directory:
-
-| Verdict | Meaning |
-|---|---|
-| `MOVE` | a team id in the mapping — tree and journal move together |
-| `ALREADY_MIGRATED` | the source is gone and the destination is there: a previous run did it. Not a conflict, and it does not fail the run. If the tree moved but its journal is still at the root — a hand-migration, or a run killed between the two moves — the row says so, and that journal must be moved beside its tree by hand |
-| `CONFLICT` | the destination already exists. **The whole plan refuses**: nothing moves and the exit code is non-zero |
-| `UNMAPPED` | a team id absent from the mapping. Never moved; the run exits non-zero |
-| `MANUAL` | a named workspace, or a `.git` the mapping did not account for. Never touched — see below. The row distinguishes the two: a journal whose tree is beside it moves **with** that tree, while one standing alone cannot be placed at all |
-| `SKIPPED` | already a scope directory, not a workspace |
-
-The whole plan is validated before anything moves, so a collision is found while the root is still
-untouched rather than halfway through. Running the script twice over the same root is a clean no-op
-the second time.
-
-#### Named workspaces — the manual path
-
-The script never touches them, and that is deliberate: the mapping from a *name* to a principal
-exists nowhere on disk, and a wrong guess hands one user's files to another.
-
-For each named workspace, decide who owns it and move both directories:
-
-```bash
-mkdir -p workspaces/<user_id>
-mv workspaces/<name>      workspaces/<user_id>/<name>
-mv workspaces/<name>.git  workspaces/<user_id>/<name>.git   # if it exists
-```
-
-`<user_id>` is literally the value on that user's teams' records. Where a tree really was being
-shared by several principals, **copy** it once per principal — and treat that as a signal: a tree
-that genuinely needs sharing should move to `workspace_metadata_keys` instead of being copied,
-because copies diverge from the moment they are made. Replace
-`WorkspaceTool(workspace_id="acme-case-42")` with
-`WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])` on a team whose metadata carries
-those fields, and put the directory at `workspaces/_meta/customer_id-ACME__case_id-42`. The sharing
-is then declared rather than implied by everyone happening to type the same string.
-
-#### The RAG index must be rebuilt, and there is no script for it
-
-The retrieval index is scoped by the workspace path, so a moved workspace's chunks are still filed
-under the old scope. Re-index the tree after the move — `workspace_rag_index(force=True)` — and the
-old scope's chunks stay where they are until a scope-wide purge primitive exists.
-
-That costs re-embedding and no information: the index is derived data, and every chunk is recoverable
-from the tree. The stranded chunks are inert rather than cross-readable — no query ever issues a
-bare-leaf scope any more — so they leak storage and nothing else.
+- **Forwarding.** The department and enterprise tiers do not forward
+  `AKGENTIC_WORKSPACE_SHARED_KINDS` to their workers today. Leaving it unforwarded is **safe**,
+  because unset means none. A deployment that adopts sharing must forward it to the processes that
+  bind agents.
+- **Entitlement.** Nothing yet decides whether a principal may claim a given metadata value. Any team
+  carrying `{customer_id: ACME}` whose card declares a shared metadata tree reaches that tree. Until
+  an entitlement policy exists (ADR-052 Decision 5, owned by `akgentic-infra-auth`), leaving the
+  variable unset is the safe posture.
 
 ### Seeding files
 
@@ -1020,17 +1048,24 @@ Both fields are primitives, so a seeded resource round-trips through a catalog e
 ### Recipes
 
 ```python
-WorkspaceTool()                                   # <user_id>/<team_id>: this team's own tree
+WorkspaceTool()                                   # alice/_team/<team_id>: this team's own tree
 WorkspaceTool(read_only=True)                     # analyst: reads only
-WorkspaceTool(workspace_id="scratch")             # <user_id>/scratch: a second tree of YOUR OWN,
+WorkspaceTool(workspace_id="scratch")             # alice/_id/scratch: a second tree of YOUR OWN,
                                                   # not a tree shared with other principals
 WorkspaceTool(read_only=True, workspace_glob=False)  # drop one capability
 
-# Shared across teams AND across users, because the sharing is DECLARED: the leaf
-# is derived from the team's own metadata and lands under the reserved _meta scope,
-# e.g. _meta/customer_id-ACME__case_id-42 — declaration order, so `ls _meta/` groups
-# a customer's trees. Mutually exclusive with workspace_id.
+# Keyed by the team's own metadata, and still per-principal: every one of alice's
+# teams carrying the same values reaches alice/_meta/customer_id-ACME__case_id-42.
+# Declaration order, so `ls alice/_meta/` groups a customer's trees. Mutually
+# exclusive with workspace_id.
 WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])
+
+# Shared across principals, because the card REQUESTS it and the platform PERMITS
+# it: _shared/_meta/customer_id-ACME__case_id-42, reached by every principal whose
+# team carries those values. Needs AKGENTIC_WORKSPACE_SHARED_KINDS=meta on the
+# process that binds agents; without it the bind fails rather than handing the card
+# a private tree.
+WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"], workspace_sharable=True)
 
 # A coding agent: file tools and a shell over ONE tree, ONE gate, ONE history.
 # Exec used to be a second card sharing a workspace_id; it is a capability now,
@@ -1040,8 +1075,8 @@ WorkspaceTool(workspace_id="proj-42", workspace_exec=True)
 # Two agents, two trees, one team — two actors, each owning its own directory
 WorkspaceTool(workspace_id="proj-42"), WorkspaceTool(workspace_id="scratch")
 
-# No history: the gate still refuses every stale write
-WorkspaceTool(git_journal=True)
+# No history (the default, written out): the gate still refuses every stale write
+WorkspaceTool(git_journal=False)
 
 # Documents without the LLM fallback (no OpenAI credentials needed)
 WorkspaceTool(workspace_read=WorkspaceRead(document_reader=DocumentReader(llm_client=None)))
@@ -1049,7 +1084,7 @@ WorkspaceTool(workspace_read=WorkspaceRead(document_reader=DocumentReader(llm_cl
 # Ship full-resolution images to the model
 WorkspaceTool(workspace_view=WorkspaceView(max_dimension=0))
 
-# Retrieval over a document corpus at <user_id>/corpus — reachable by this
+# Retrieval over a document corpus at alice/_id/corpus — reachable by this
 # principal's other teams, and by nobody else's. The card's own vector_store
 # decides where the chunks live and whether a store actor is created at all;
 # if that store cannot be built, every retrieval callable answers a sentence
@@ -1065,8 +1100,8 @@ WorkspaceTool(
 # Search only — the model queries an index another card of the SAME principal
 # fills. Enabling any one of the three still turns retrieval on for the tree, so
 # this creates the collection and shrinks the extraction cache exactly as the
-# indexer would. Use workspace_metadata_keys instead to index a corpus that
-# several principals must share.
+# indexer would. To index a corpus several principals must share, add
+# workspace_sharable=True, which the platform must permit for `id`.
 WorkspaceTool(workspace_id="corpus", workspace_rag_search=True)
 
 # A durable shared index. Fails at wiring time if AKGENTIC_WEAVIATE_URL is unset,

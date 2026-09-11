@@ -682,7 +682,9 @@ def leaf_segment(value: str) -> str:
     for the reason given below for the suffixes. Refusing kind names as leaves
     means nothing from here on can mint such a path, and keeps each reserved name
     meaning one thing at every position — which is what lets a reader classify a
-    tree from its shape. The trees already on disk are the migration's to find.
+    tree from its shape. The two-segment layout shipped only in ``akgentic-tool``
+    1.8.0 and was never deployed, so no tree of that shape is expected, and none
+    is migrated.
 
     The kind match is **exact** — ``_teams``, ``_ids`` and ``_metadata`` are
     ordinary names — and **case-insensitive**, for the reason the suffix match
