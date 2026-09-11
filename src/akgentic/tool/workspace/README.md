@@ -54,7 +54,7 @@ write gate, and a misconfigured vector store must not be a way to take the gate 
 class WorkspaceTool(ToolCard):
     # Where the files live — two mutually exclusive ways to name the <leaf> (each selects
     # its <kind>), plus one orthogonal flag that chooses the <scope>
-    workspace_id: str | None = None
+    workspace_id: str | None = None             # [A-Za-z0-9._-]{1,128}, refused at construction
     workspace_metadata_keys: list[str] = []
     workspace_sharable: bool = False
 
@@ -504,7 +504,7 @@ cannot argue with.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `workspace_id` | `str \| None` | `None` | The `<leaf>` of the `_id` kind — a directory name **under the caller's own principal** by default, not under the workspaces root, and the tail of the actor's name. `None` ⇒ the `_team` kind, whose leaf is the team id, so each team gets its own tree. A fixed string names a **second tree of your own**: two agents in one team can hold two separate trees, and two teams of the *same* principal reach one tree (checked by the gate, not ordered by an actor). It does **not** share across principals on its own — two users declaring `notes` get `alice/_id/notes` and `bob/_id/notes`. For sharing that actually shares, add `workspace_sharable=True`, which the platform must permit for `id`. |
+| `workspace_id` | `str \| None` | `None` | The `<leaf>` of the `_id` kind — a directory name **under the caller's own principal** by default, not under the workspaces root, and the tail of the actor's name. `None` ⇒ the `_team` kind, whose leaf is the team id, so each team gets its own tree. A fixed string names a **second tree of your own**: two agents in one team can hold two separate trees, and two teams of the *same* principal reach one tree (checked by the gate, not ordered by an actor). It does **not** share across principals on its own — two users declaring `notes` get `alice/_id/notes` and `bob/_id/notes`. For sharing that actually shares, add `workspace_sharable=True`, which the platform must permit for `id`. **One grammar** (`validate_workspace_id`): 1 to 128 characters, each an ASCII letter, a digit, `.`, `_` or `-`, and not a kind name (`_team`, `_id`, `_meta`) or a name ending in `.git` or `.index`, in any letter case. **Refused at card construction (catalog save, team creation, resume), never at bind**, so a name the workspace routes cannot serve never gets a tree: `"Customer Notes"` is a `ValidationError` naming the value and the rule. |
 | `workspace_metadata_keys` | `list[str]` | `[]` | The `<leaf>` derived from the team's own metadata, under the `_meta` kind: `["customer_id", "case_id"]` over `ACME` and `42` resolves to `alice/_meta/customer_id-ACME__case_id-42` for principal `alice`. **Per-principal by default, like the other two kinds**: every team of one principal carrying the same values reaches one tree, and another principal's teams reach another. It is shared across principals only with `workspace_sharable=True` (`_shared/_meta/…`), where the platform permits `meta` — the inverse of the old layout, which shared every metadata tree across principals implicitly. Keys are a **sequence**: joined in declaration order, so the list reads as a refinement path from the coarsest scope down and `ls <scope>/_meta/` groups a customer's trees together — the trade being that two cards naming the same keys in different orders address different workspaces, which is visible in the directory name rather than silent. Values are percent-encoded, which is what keeps the join unforgeable. Only the resolver reads this field: a client learns which tree an agent bound from the `WorkspaceAttached` event the bind emits, whose `workspace_path` is the full three-segment path, never from a key list. **Mutually exclusive with `workspace_id`** — declaring both is a `ValidationError` at card construction, not a precedence rule. Every failure is a hard error at bind time, never a fallback to a user path: no metadata on the team, a key that is not a field of the metadata model, a value that is `None` or empty, or a joined leaf over 255 bytes. |
 | `workspace_sharable` | `bool` | `False` | Whether the tree lives under the reserved shared scope, `_shared/<kind>/<leaf>`, instead of under the owning principal. Orthogonal to both layout fields and valid with all three kinds; not part of the mutual-exclusivity check. **A request, not a grant**: the bind fails unless `AKGENTIC_WORKSPACE_SHARED_KINDS` on the binding process permits the kind, and a refused request is never downgraded to the per-principal tree. A plain `bool`, so the value survives every catalog round trip. See *Sharing a tree across principals*. |
 | `read_only` | `bool` | `False` | `True` removes every write-side callable from the tool list, `workspace_exec` included. The read side is unaffected. |
@@ -917,8 +917,13 @@ meet.
 `_shared` would *be* the shared cell. `leaf_segment` refuses the three kind names, and any leaf ending
 in `.git` or `.index`, which would root one tree at another workspace's journal or metadata
 directory. Both match **exactly**, never as a `_` prefix (an Azure AD `sub` is base64url, whose
-alphabet includes `_`), and **case-insensitively**, because macOS and Windows filesystems are.
+alphabet includes `_`), and **case-insensitively**, because macOS and Windows filesystems are —
+case-folded, so `_ſhared` (with a long s) is refused as well as `_SHARED`.
 `_shared` is a legal **leaf**: at the third position it collides with nothing.
+The suffix rule has an author-facing consequence: a `workspace_id` such as `search.index` is
+refused, because it is the index and metadata directory of workspace `search`, and the refusal says
+so — *workspace leaf may not end in '.index': 'search.index' would collide with the index and
+metadata directory that the workspace named 'search' keeps beside its tree.*
 
 **Two sibling directories sit beside every tree, never inside it**, in the same `<scope>/<kind>/`
 directory: `<leaf>.git`, the journal, and `<leaf>.index`, the tree's metadata directory

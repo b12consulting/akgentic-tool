@@ -607,10 +607,11 @@ _MAX_LEAF_BYTES = 255
 # holds — one entry per derivation, each keyed on that derivation's **own**
 # constant rather than on a second literal that would have to agree with it.
 # ``leaf_segment`` refuses a leaf ending in any of them; see its docstring for
-# why a name clash here is a containment failure.
+# why a name clash here is a containment failure. The owner is what the refusal
+# tells the admin the value would collide with.
 _SIDECAR_SUFFIXES = {
     GIT_DIR_SUFFIX: "journal",
-    META_DIR_SUFFIX: "metadata",
+    META_DIR_SUFFIX: "index and metadata",
 }
 
 
@@ -725,6 +726,12 @@ def leaf_segment(value: str) -> str:
     team creation, in front of the admin who caused it. Silently moving somebody
     else's tree is the failure, not the remedy.
 
+    **The refusal names the collision**, because the message is all the admin
+    gets. ``.index`` is an ordinary word, and ``search.index`` is a name somebody
+    will type; it is refused because it is where workspace ``search`` keeps its
+    exec lock, document records and retrieval index, and the message says so —
+    the suffix, the value, and the workspace whose sibling directory it is.
+
     **The match is case-insensitive** although both derivations only ever emit
     lowercase, because macOS and Windows filesystems are case-insensitive by
     default: ``<scope>/_id/notes.GIT`` and ``<scope>/_id/notes.git`` are one
@@ -765,11 +772,71 @@ def leaf_segment(value: str) -> str:
         )
     for suffix, owner in _SIDECAR_SUFFIXES.items():
         if folded.endswith(suffix):
+            # The stem is sliced off the value as written, not off the fold, and
+            # ``len(suffix)`` is exact there: the only characters folding to a
+            # single letter of ``.git`` or ``.index`` are their ASCII capitals, and
+            # no multi-character fold (sharp s to ``ss``, the ``st`` ligature to
+            # ``st``) spells two consecutive characters of either suffix.
             raise ValueError(
-                f"workspace leaf may not end in {suffix!r}, which is another "
-                f"workspace's {owner} directory: {value!r}"
+                f"workspace leaf may not end in {suffix!r}: {value!r} would collide with "
+                f"the {owner} directory that the workspace named "
+                f"{value[: -len(suffix)]!r} keeps beside its tree"
             )
     return value
+
+
+# The ``workspace_id`` declaration grammar. One constant for the bound, read by the
+# pattern and by the message alike: two ``128`` literals that must agree is this
+# module's recurring defect, one scale down.
+_MAX_WORKSPACE_ID_CHARS = 128
+_WORKSPACE_ID_RE = re.compile(rf"[A-Za-z0-9._-]{{1,{_MAX_WORKSPACE_ID_CHARS}}}")
+
+
+def validate_workspace_id(workspace_id: str) -> str:
+    """The grammar of a ``workspace_id`` — the one a card may declare, and nothing wider.
+
+    **A ``workspace_id`` has one grammar, and it lives on the card.**
+    ``WorkspaceTool`` runs this as a field validator, so an id the platform
+    cannot serve is refused where its author writes it — at card construction,
+    catalog save and team resume — rather than binding, getting a working tree
+    for its agents, and then answering 400 on every workspace route.
+    ``akgentic-infra``'s route guards its ``?workspace_id=`` leaf selector with
+    :func:`leaf_segment` instead, because that selector may also name a metadata
+    leaf or a team id.
+
+    **Strict for ``workspace_id`` alone.** 1 to 128 characters, each an ASCII
+    letter, a digit, ``.``, ``_`` or ``-``. :func:`leaf_segment` and
+    :func:`user_segment` keep their own, wider rules, because a metadata leaf
+    carries ``%`` after encoding and a scope carries an email. The charset also
+    makes an id immune to case folding by construction: nothing in it folds onto
+    anything but its own lowercase.
+
+    It **calls** :func:`leaf_segment` rather than copying it, so every leaf
+    rule — unusable segment, kind name, sidecar suffix — applies here by
+    construction, and one added later reaches ``workspace_id`` with no edit
+    here. The charset is checked first: it is the most useful message for the
+    commonest mistake, a space or an accent. ``fullmatch``, never ``match`` or a
+    ``^…$`` pattern, because ``$`` matches before a trailing newline and would
+    pass ``"notes\\n"``.
+
+    Args:
+        workspace_id: The candidate id.
+
+    Returns:
+        The id, unchanged — the same object, never normalised.
+
+    Raises:
+        ValueError: If the id breaks the charset or the length, naming the value
+            and the whole rule; or whatever :func:`leaf_segment` raises for it,
+            unwrapped, since each of those names the value and its rule already.
+    """
+    if _WORKSPACE_ID_RE.fullmatch(workspace_id) is None:
+        raise ValueError(
+            f"workspace_id {workspace_id!r} is not a valid workspace name: it must be 1 to "
+            f"{_MAX_WORKSPACE_ID_CHARS} characters, each a letter A-Z or a-z, a digit, "
+            "'.', '_' or '-'"
+        )
+    return leaf_segment(workspace_id)
 
 
 def _encode_metadata_value(value: str) -> str:
@@ -917,6 +984,13 @@ def resolve_workspace_path(
     The two layout fields are mutually exclusive, enforced at card construction
     rather than by precedence here (ADR-048 Decision 2); ``workspace_sharable``
     is orthogonal to both.
+
+    The leaf rule applied here is :func:`leaf_segment`, **not** the
+    ``workspace_id`` grammar. This resolver guards path safety, for every kind. The stricter
+    declaration grammar, :func:`validate_workspace_id`, is the card's: it refuses
+    a bad id at card construction, so every ``workspace_id`` a production caller
+    hands this function has already passed it, and it is deliberately not
+    applied a second time here.
 
     Args:
         workspace_id: The card's named workspace, or ``None`` for the team's own.

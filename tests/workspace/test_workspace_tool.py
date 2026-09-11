@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from akgentic.core.messages.orchestrator import StartMessage
 from akgentic.core.utils import SerializableBaseModel
+from pydantic import ValidationError
 
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.actor import (
@@ -1462,20 +1463,23 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
         with pytest.raises(ValueError, match="not usable as a workspace directory name"):
             card.observer(FakeActorToolObserver(orchestrator_proxy, user_id=""))
 
-    def test_a_workspace_named_after_a_journal_directory_fails_binding(
-        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
-    ) -> None:
-        """The refusal reaches the admin at team creation, not at the first write.
+    def test_a_workspace_named_after_a_journal_directory_fails_construction(self) -> None:
+        """The refusal reaches the admin when the card is written, not at the first write.
 
         ``notes.git`` is workspace ``notes``'s repository. Binding it would root
         this card's ``Filesystem`` at another workspace's history, and every read,
         write and delete after that is ordinary in-tree activity that raises
-        nothing — so the refusal has to happen here, where somebody is watching.
-        """
-        card = WorkspaceTool(workspace_id="notes.git")
+        nothing — so the refusal has to happen where somebody is watching.
 
-        with pytest.raises(ValueError, match="journal directory"):
-            card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
+        **Moved from bind to construction, by decision.** This spec used to build
+        the card and expect ``observer()`` to refuse it. The card now runs the
+        ``workspace_id`` grammar as a field validator, so the card never exists
+        and no bind is reached. The resolver's own bind-time refusal of the same
+        value is still pinned by
+        ``TestLeafSegment::test_it_refuses_rather_than_renaming``.
+        """
+        with pytest.raises(ValidationError, match="journal directory"):
+            WorkspaceTool(workspace_id="notes.git")
 
     def test_a_metadata_value_naming_a_journal_directory_fails_binding(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path

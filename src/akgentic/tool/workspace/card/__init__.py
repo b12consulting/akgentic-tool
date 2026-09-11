@@ -43,7 +43,7 @@ from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
 
-from pydantic import Field, PrivateAttr, model_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.orchestrator import Orchestrator
@@ -132,6 +132,7 @@ from akgentic.tool.workspace.workspace import (
     meta_dir_for,
     permitted_shared_kinds,
     resolve_workspace_path,
+    validate_workspace_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -182,6 +183,18 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
 
     # Read capability fields (formerly in WorkspaceReadTool)
     workspace_id: str | None = None
+    """The named workspace — the ``<leaf>`` of the ``_id`` kind — or ``None`` for the team's own.
+
+    ``WorkspaceTool(workspace_id="notes")`` resolves to ``alice/_id/notes`` for
+    principal ``alice``. The grammar is 1 to 128 characters, each an ASCII
+    letter, a digit, ``.``, ``_`` or ``-``, and not a kind name or a name ending
+    in ``.git`` or ``.index`` in any letter case
+    (:func:`~akgentic.tool.workspace.workspace.validate_workspace_id`).
+
+    **Refused at construction, catalog save and resume, not at bind** — see
+    :meth:`_workspace_id_rule` — so a name the platform cannot serve never
+    reaches a tree. Mutually exclusive with :attr:`workspace_metadata_keys`.
+    """
     workspace_metadata_keys: list[str] = []
     """Metadata fields whose values key the workspace — the ``_meta`` kind.
 
@@ -452,6 +465,29 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
     # that needs an actor, a freshly built client for one that does not. Runtime
     # state, so a ``PrivateAttr`` for the reason above.
     _vector_store: VectorStoreService | None = PrivateAttr(default=None)
+
+    @field_validator("workspace_id")
+    @classmethod
+    def _workspace_id_rule(cls, value: str | None) -> str | None:
+        """Refuse a ``workspace_id`` outside the one grammar, where the author writes it.
+
+        A field validator runs wherever the card is validated — construction,
+        the catalog's ``model_validate`` on save and load, and core's
+        ``deserialize_object`` on team resume — so a bad id fails in front of the
+        person who wrote it, and a stored card carrying one fails its resume
+        loudly rather than binding. No ``Field(pattern=...)``: a schema pattern
+        would carry the charset without the kind-name and suffix rules, a second
+        and partial copy of the grammar.
+
+        ``None`` passes through: it is every default card's value, and its dump
+        carries it **explicitly**, so every resume of a default card re-validates
+        it.
+
+        Raises:
+            ValueError: Whatever :func:`validate_workspace_id` raises; pydantic
+                reports it against the ``workspace_id`` field.
+        """
+        return None if value is None else validate_workspace_id(value)
 
     @model_validator(mode="after")
     def _one_layout(self) -> WorkspaceTool:

@@ -173,6 +173,7 @@ from akgentic.tool.workspace.workspace import (
     permitted_shared_kinds,
     resolve_workspace_path,
     user_segment,
+    validate_workspace_id,
 )
 
 __all__ = [
@@ -305,6 +306,7 @@ __all__ = [
     "permitted_shared_kinds",
     "resolve_workspace_path",
     "user_segment",
+    "validate_workspace_id",
     "ExpandMediaRefs",
     "Resource",
     "ResourceType",

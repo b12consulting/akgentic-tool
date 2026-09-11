@@ -1057,7 +1057,9 @@ Read/write access to a shared team filesystem — `workspace_read`, `workspace_l
 class covers both modes via a `read_only: bool` gate. All paths are anchored to
 `<AKGENTIC_WORKSPACES_ROOT>/<scope>/<kind>/<leaf>` — a workspace is a three-segment path. The
 `<kind>` says how the leaf was derived: `_team/<team_id>` by default, `_id/<workspace_id>` for a
-named one, and `_meta/<joined keys>` for a metadata-keyed one. The `<scope>` is the owning principal
+named one, and `_meta/<joined keys>` for a metadata-keyed one. A `workspace_id` is 1 to 128
+characters of `[A-Za-z0-9._-]`, not a kind name and not ending in `.git` or `.index`; anything else
+is refused when the card is constructed — catalog save, team creation, resume — never at bind. The `<scope>` is the owning principal
 for all three, unless the card declares `workspace_sharable=True` **and** the platform permits that
 kind through `AKGENTIC_WORKSPACE_SHARED_KINDS`, which puts the tree under the reserved `_shared`
 scope. A shared request the platform does not permit fails the bind rather than falling back. See
