@@ -1,9 +1,10 @@
 """The workspace's extracted-document cache, its splitter, and its retrieval index.
 
-The two maps themselves are fields on
-:class:`~akgentic.tool.workspace.models.WorkspaceState`; what lives here is what
-describes one entry of each and what bounds them. The actor-side lookup, fill and
-indexing pipeline are in :mod:`akgentic.tool.workspace.actor.documents`.
+The records themselves are files under the tree's sibling metadata directory,
+one per source document, written through a
+:class:`~akgentic.tool.workspace.documents.store.DocumentStore`; what lives here
+is what describes one entry of each and what bounds them. The actor-side lookup,
+fill and indexing pipeline are in :mod:`akgentic.tool.workspace.actor.documents`.
 :class:`~akgentic.tool.workspace.documents.splitter.BlockSplitter` turns a cached
 body into spans, and story 45-7's index turns those spans into identified,
 persisted chunks.

@@ -21,7 +21,6 @@ from unittest.mock import patch
 import pytest
 from pydantic import PrivateAttr
 
-from akgentic.core.resource_host import StateDelta
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
 from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION
@@ -33,10 +32,11 @@ from tests.workspace.conftest import (
     HANDSHAKE_TIMEOUT_S,
     WORKSPACE_NAME,
     WORKSPACE_PATH,
-    DeltaStore,
     FakeActorToolObserver,
     FakeOrchestratorProxy,
+    RecordingDocumentStore,
     read,
+    stored_docs,
 )
 
 
@@ -121,7 +121,7 @@ def document_card(
         workspace_read=WorkspaceRead(document_reader=reader),
     )
     card.observer(observer)
-    entry = orchestrator_proxy.hosted.get(workspace_actor_name(WORKSPACE_PATH))
+    entry = orchestrator_proxy.children.get(workspace_actor_name(WORKSPACE_PATH))
     actor = entry[1] if entry is not None else None
     return card, actor if isinstance(actor, WorkspaceActor) else None
 
@@ -218,7 +218,7 @@ class TestTheExtractorVersion:
         (workspace_tree / "report.pdf").write_bytes(b"the original report")
 
         read(card, "report.pdf")
-        assert actor.state.documents["report.pdf"].extractor_version == EXTRACTOR_VERSION
+        assert stored_docs(actor)["report.pdf"].extractor_version == EXTRACTOR_VERSION
 
         # The version is captured when the callable is built, so a new card is
         # what a deployment carrying a bumped constant would have.
@@ -227,7 +227,7 @@ class TestTheExtractorVersion:
         read(bumped, "report.pdf")
 
         assert reader.runs == ["the original report", "the original report"]
-        assert actor.state.documents["report.pdf"].extractor_version == EXTRACTOR_VERSION + 1
+        assert stored_docs(actor)["report.pdf"].extractor_version == EXTRACTOR_VERSION + 1
 
 
 # ---------------------------------------------------------------------------
@@ -270,56 +270,49 @@ class TestTheReadPathStaysFree:
         assert spy.lookups == ["report.pdf", "report.pdf"]
         assert spy.fills == ["report.pdf"]
 
-    def test_a_document_cache_hit_through_a_live_proxy_sends_no_delta(
+    def test_a_document_cache_hit_through_a_live_proxy_writes_nothing(
         self,
         threaded_orchestrator_proxy: FakeOrchestratorProxy,
         workspace_tree: Path,
-        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The no-delta property against a real actor thread and a real proxy.
+        """The no-write property against a real actor thread and a real proxy.
 
-        A hosted workspace persists only through the delta its fill site sends,
-        so a document read *would* persist per read if the lookup reached that
-        send. 45-4 is the first story to put a read on a proxy call, so this is
-        the story that could break it. Freeze it here, against the live shape —
+        A document read *would* write per read if the lookup reached a write
+        site. 45-4 is the first story to put a read on a proxy call, so this is
+        the story that could break it. Frozen here against the live shape —
         45-3's guard sits at the actor and cannot see this.
 
-        The recorder replaces the send on the **class**, because the actor lives
-        on its own thread behind a pykka proxy; it is installed before the fills,
-        which must each show up, so a recorder the actor never reaches cannot
-        make the hit look silent.
+        The recorder is announced through ``configure_document_store`` on the
+        actor's own thread, before the fills, which must each show up: a
+        recorder the actor never reached could not make the hit look silent.
 
-        **Two documents, and the hit is on the older one**, so the hit really
-        reorders the LRU — the in-memory write that is deliberately not a change.
+        **Two documents, and the hit is on the older one.** Under the LRU that
+        used to matter because the hit reordered; it no longer reorders, and the
+        second document stays so that a write on *any* path would still be
+        visible here.
         """
-        store = DeltaStore()
-
-        def _send(_actor: WorkspaceActor, scope: str, delta: StateDelta) -> None:
-            store.apply(WorkspaceActor, scope, delta)
-
-        monkeypatch.setattr(WorkspaceActor, "_send_delta", _send)
         reader = _StubDocumentReader()
         (workspace_tree / "a.pdf").write_bytes(b"the first report")
         (workspace_tree / "b.pdf").write_bytes(b"the second report")
         card, _actor = document_card(threaded_orchestrator_proxy, reader)
+        pykka_proxy = threaded_orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)][1]
+        recorder = RecordingDocumentStore()
+        pykka_proxy.configure_document_store(recorder)
 
-        read(card, "a.pdf")  # two misses, two fills — and a fill does persist
+        read(card, "a.pdf")  # two misses, two fills — and a fill does write
         read(card, "b.pdf")
 
         # The attribute fetch is itself a mailbox turn, so it lands after both
-        # fills: reaching the state at all proves they have been applied.
-        pykka_proxy = threaded_orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)][1]
-        state = pykka_proxy.state.get(timeout=HANDSHAKE_TIMEOUT_S)
-        assert list(state.documents) == ["a.pdf", "b.pdf"]
-        assert store.keys_applied() == {"documents.a.pdf", "documents.b.pdf"}
-        fills = len(store.applied)
+        # fills: reaching the actor at all proves they have been applied.
+        pykka_proxy.state.get(timeout=HANDSHAKE_TIMEOUT_S)
+        assert sorted(recorder.written) == ["a.pdf", "b.pdf"]
+        fills = len(recorder.puts)
 
         assert "the first report" in read(card, "a.pdf")
 
         assert reader.runs == ["the first report", "the second report"]  # a hit
         pykka_proxy.state.get(timeout=HANDSHAKE_TIMEOUT_S)  # the hit's turn has run
-        assert list(state.documents) == ["b.pdf", "a.pdf"]  # the LRU did reorder
-        assert len(store.applied) == fills
+        assert len(recorder.puts) == fills, "the cache hit wrote a record"
 
 
 # ---------------------------------------------------------------------------
@@ -402,9 +395,9 @@ class TestForceDocumentRegeneration:
         (workspace_tree / "report.pdf").write_bytes(b"the original report")
 
         read(card, "report.pdf")
-        entry_before = actor.state.documents["report.pdf"]
+        entry_before = stored_docs(actor)["report.pdf"]
         read(card, "report.pdf", force_document_regeneration=True)
-        entry_after = actor.state.documents["report.pdf"]
+        entry_after = stored_docs(actor)["report.pdf"]
 
         assert reader.runs == ["the original report", "the original report"]
         assert entry_after.markdown == entry_before.markdown
@@ -492,7 +485,7 @@ class TestTheSidecarIsGone:
 
         read(card, "report.pdf")
 
-        entry = actor.state.documents["report.pdf"]
+        entry = stored_docs(actor)["report.pdf"]
         assert entry.source_sha == content_sha(b"the original report")
         assert entry.markdown is not None and "the original report" in entry.markdown
         with patch.object(DocumentReader, "extract_text") as never:

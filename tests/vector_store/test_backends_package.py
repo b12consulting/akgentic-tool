@@ -25,7 +25,7 @@ from akgentic.tool.vector_store.registry import available_backends
 
 VECTOR_STORE = "akgentic.tool.vector_store"
 BACKENDS = f"{VECTOR_STORE}.backends"
-BUILT_IN_NAMES = ("inmemory", "weaviate", "qdrant")
+BUILT_IN_NAMES = ("inmemory", "local", "weaviate", "qdrant")
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +141,7 @@ def test_the_registry_loads_the_built_ins_from_the_backends_package() -> None:
     assert len(loaders) == 1, "registry.py must define _ensure_builtins exactly once"
     imports = [node for node in ast.walk(loaders[0]) if isinstance(node, ast.ImportFrom)]
 
-    assert len(imports) == 3, [ast.unparse(node) for node in imports]
+    assert len(imports) == 4, [ast.unparse(node) for node in imports]
     assert {node.module for node in imports} == {BACKENDS}
     names = {alias.name for node in imports for alias in node.names}
     assert names == set(BUILT_IN_NAMES)

@@ -60,11 +60,11 @@ def ensure_store_actor(param: VectorStoreParam, orchestrator_proxy: Orchestrator
     Called by a consumer card at ``observer()`` time, **before** it creates its
     own consumer actor: that actor looks the store up during its ``on_start``,
     so the store has to exist first. This is where ``VectorStoreTool.observer``'s
-    ``getChildrenOrCreate`` call went when the card was deleted — the planning
-    and knowledge-graph cards call it now, so a store's existence is decided by
-    the consumer that needs it rather than by a singleton card someone had to
-    remember to add. The workspace card does not: its actor creates an in-memory
-    store as its own child instead of sharing the team's.
+    ``getChildrenOrCreate`` call went when the card was deleted — the planning,
+    knowledge-graph and workspace cards call it now, so a store's existence is
+    decided by the consumer that needs it rather than by a singleton card someone
+    had to remember to add. Three cards in one team therefore share one
+    ``#VectorStore``, whichever backends they name.
 
     **A cluster backend returns without creating anything.** There is nothing
     for an actor to hold: the data is on the cluster and the consumer talks to
@@ -75,10 +75,11 @@ def ensure_store_actor(param: VectorStoreParam, orchestrator_proxy: Orchestrator
     to the same actor and this helper keeps no bookkeeping of its own.
 
     The config it builds sets **no connection field**, because
-    ``VectorStoreConfig`` has none: the actor this helper creates is the
-    in-memory one by construction, and needs no URL and no key. A caller who
-    reaches the actor with a cluster collection by hand is served by that
-    backend's registered factory, which reads the environment.
+    ``VectorStoreConfig`` has none: an actor holds no deployment settings at all.
+    Every backend it routes to is built by that backend's registered factory,
+    which reads what it needs from the environment and from the collection's own
+    param — a cluster URL, or the filesystem root a locally persisting index
+    hangs off.
 
     Args:
         param: The consumer's vector store configuration.
@@ -202,20 +203,27 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         """
         self.state = VectorStoreState()
         self.state.observer(self)
-        self._backends: dict[str, VectorStoreService] = {}
+        self._backends: dict[tuple[str, str | None], VectorStoreService] = {}
 
     # ------------------------------------------------------------------
     # Lazy initialisation
     # ------------------------------------------------------------------
 
-    def _get_backend(self, name: str) -> VectorStoreService | None:
-        """Return the backend registered under *name*, building it lazily.
+    def _get_backend(self, name: str, root: str | None = None) -> VectorStoreService | None:
+        """Return the backend registered under *name* over *root*, building it lazily.
 
         **Every backend is built here, one way: through its registered
-        :class:`BackendSpec` factory**, with this actor's config and team id. A
-        backend whose spec sets ``persists_in_actor_state`` is then restored from
-        its own ``backend_states`` snapshot. Nothing names a backend: a built-in
-        and a third-party registration take the same path.
+        :class:`BackendSpec` factory**, with this actor's config, team id and the
+        collection's root. A backend whose spec sets ``persists_in_actor_state``
+        is then restored from its own ``backend_states`` snapshot. Nothing names a
+        backend: a built-in and a third-party registration take the same path.
+
+        **The cache is keyed on the pair, not on the name.** One team may hold two
+        ``WorkspaceTool`` cards on two trees, and a locally persisting backend's
+        identity *is* its root — so a name-keyed cache would hand the second tree
+        the first tree's instance and write one tree's chunks into the other's
+        directory, silently. A backend with no filesystem passes ``None`` and its
+        entry is exactly the one it always had.
 
         The owning team's id is taken from ``self.team_id`` — propagated by the
         actor system, never configured — so a cluster backend stamps it onto every
@@ -225,18 +233,23 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
 
         Args:
             name: Backend identifier (a ``VectorStoreParam.backend`` value).
+            root: The collection's filesystem root, or ``None`` for a backend
+                that has none.
 
         Returns:
             The backend instance, or ``None`` when it cannot be built (missing
             dependency, misconfiguration, unknown name) — logged and swallowed so
             a routed operation degrades rather than raising.
         """
-        existing = self._backends.get(name)
+        key = (name, root)
+        existing = self._backends.get(key)
         if existing is not None:
             return existing
         try:
             spec = get_backend_spec(name)
-            backend = spec.factory(BackendContext(config=self.config, team_id=str(self.team_id)))
+            backend = spec.factory(
+                BackendContext(config=self.config, team_id=str(self.team_id), root=root)
+            )
             if spec.persists_in_actor_state:
                 self._restore_backend_state(name, backend)
         except Exception as exc:  # noqa: BLE001
@@ -247,7 +260,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
                 exc,
             )
             return None
-        self._backends[name] = backend
+        self._backends[key] = backend
         return backend
 
     def _persists_in_actor_state(self, name: str) -> bool:
@@ -275,7 +288,10 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         """Return the correct backend for the given collection.
 
         Checks ``self.state.collection_configs`` for the collection's backend
-        name and resolves it through :meth:`_get_backend`.
+        name **and its root** and resolves both through :meth:`_get_backend`.
+        Reading the root here rather than anywhere else is what makes the whole
+        param the per-collection channel: ``create_collection`` records the param
+        whole, and this is the one place it is read back.
 
         Args:
             collection: Collection name to look up.
@@ -285,7 +301,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
         """
         cfg_data = self.state.collection_configs.get(collection, {})
         backend_type = cfg_data.get("backend", "inmemory")
-        return self._get_backend(backend_type)
+        return self._get_backend(backend_type, cfg_data.get("root"))
 
     # ------------------------------------------------------------------
     # State synchronisation
@@ -386,7 +402,7 @@ class VectorStoreActor(Akgent[VectorStoreConfig, VectorStoreState]):
                 on ``add``: the fault is usually the environment, not the call.
         """
         require_dimension_matches(config, f"{self.config.name} collection '{name}'")
-        backend = self._get_backend(config.backend)
+        backend = self._get_backend(config.backend, config.root)
         if backend is None:
             msg = (
                 f"[{self.config.name}] no '{config.backend}' backend could be built; "

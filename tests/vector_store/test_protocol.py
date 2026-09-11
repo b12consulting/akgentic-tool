@@ -106,10 +106,12 @@ class TestVectorStoreParam:
         with pytest.raises(ValidationError):
             VectorStoreParam(dimension=-1)
 
-    def test_six_fields_in_order_with_their_defaults(self) -> None:
+    def test_eight_fields_in_order_with_their_defaults(self) -> None:
         """The whole shape: what every consumer carries when it names nothing."""
         assert list(VectorStoreParam.model_fields) == [
             "backend",
+            "backend_declared",
+            "root",
             "dimension",
             "tenant",
             "params",
@@ -119,12 +121,45 @@ class TestVectorStoreParam:
         param = VectorStoreParam()
         assert {name: getattr(param, name) for name in VectorStoreParam.model_fields} == {
             "backend": "inmemory",
+            "backend_declared": False,
+            "root": None,
             "dimension": 1536,
             "tenant": None,
             "params": {},
             "embedding_model": "text-embedding-3-small",
             "embedding_provider": "openai",
         }
+
+    def test_the_backend_declaration_is_recorded_once_and_survives_every_round_trip(
+        self,
+    ) -> None:
+        """``model_fields_set`` cannot answer this, which is why the field exists.
+
+        A whole-model ``@model_serializer`` emits every field and ignores
+        ``exclude_unset``, so one dump-and-revalidate makes every field look
+        authored. The flag is settled at the first construction and taken at its
+        word afterwards, so a param that named nothing still says so however many
+        times it has been stored and read back.
+        """
+        defaulted = VectorStoreParam()
+        declared = VectorStoreParam(backend="weaviate")
+        assert (defaulted.backend_declared, declared.backend_declared) == (False, True)
+
+        for _ in range(3):
+            defaulted = VectorStoreParam.model_validate(defaulted.model_dump())
+            declared = VectorStoreParam.model_validate(declared.model_dump())
+
+        # The naive discriminator really has been inflated by the trip.
+        assert "backend" in defaulted.model_fields_set
+        assert (defaulted.backend_declared, declared.backend_declared) == (False, True)
+
+    def test_a_payload_written_before_the_flag_existed_reads_as_undeclared(self) -> None:
+        """The lenient direction, on purpose: an old record keeps binding."""
+        legacy = VectorStoreParam.model_validate({"backend": "inmemory"})
+        assert legacy.backend_declared is True
+
+        older = VectorStoreParam.model_validate({"dimension": 1536})
+        assert older.backend_declared is False
 
     def test_embedding_model_round_trips(self) -> None:
         cfg = VectorStoreParam(dimension=3072, embedding_model="text-embedding-3-large")

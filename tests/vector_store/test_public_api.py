@@ -33,6 +33,7 @@ class TestPublicApi:
             "EmbeddingService",
             "EmbeddingWorker",
             "InMemoryBackend",
+            "LocalBackend",
             "QdrantBackend",
             "SearchHit",
             "SearchResult",

@@ -18,10 +18,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from akgentic.tool.vector_store.actor import VectorStoreActor
-from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA, OVERFETCH
+from akgentic.core.agent_state import BaseState
+
 from akgentic.tool.vector_store.backends.inmemory import InMemoryBackend
-from akgentic.tool.vector_store.protocol import VectorStoreParam, SearchResult
+from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA, OVERFETCH
+from akgentic.tool.vector_store.protocol import SearchResult, VectorStoreParam
 from akgentic.tool.vector_store.vector import VectorEntry
 from akgentic.tool.workspace.actor import (
     WORKSPACE_ACTOR_ROLE,
@@ -38,11 +39,20 @@ from akgentic.tool.workspace.documents.models import (
     RagStatus,
     chunk_id,
 )
-from akgentic.tool.workspace.models import WorkspaceConfig, WorkspaceState, content_sha
+from akgentic.tool.workspace.documents.store import DocumentEntry, YamlDocumentStore
+from akgentic.tool.workspace.models import WorkspaceConfig, content_sha
 from akgentic.tool.workspace.readers import DocumentReader
-
 from tests.conftest import MockActorAddress
-from tests.workspace.conftest import WORKSPACE_PATH, delta_recorder
+from tests.workspace.conftest import (
+    WORKSPACE_PATH,
+    attach_store,
+    drop_row,
+    seed_extract,
+    seed_row,
+    stored_docs,
+    stored_rows,
+    watch_store,
+)
 
 _UNAVAILABLE = "Retrieval indexing is not available for this workspace."
 _NO_HITS = (
@@ -148,9 +158,11 @@ class SearchEmbedder:
 class SearchHarness:
     """An inert actor whose vector-store proxy is a :class:`SearchStore`.
 
-    The actor is handed **no** orchestrator: the store is its own child, so
-    ``createActor`` hands back an address ``_ask`` maps to the store, and an ask
-    to anything else is the trap ``_ask`` springs.
+    The actor is handed **no** orchestrator, and resolves no store of its own:
+    the card announces one at bind time, so this harness announces the double
+    through ``configure_vector_store`` exactly as a card would. ``createActor``
+    is kept and pointed at a trap — a spawn from here is a regression, not a
+    path.
     """
 
     def __init__(self, actor: WorkspaceActor, store: SearchStore) -> None:
@@ -158,7 +170,6 @@ class SearchHarness:
         self.store = store
         self.embedder = SearchEmbedder()
         self.vs_address = MockActorAddress("#VectorStore-child")
-        self.store_spawn_error: BaseException | None = None
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self.actor._orchestrator = None
@@ -166,12 +177,19 @@ class SearchHarness:
         monkeypatch.setattr(self.actor, "proxy_tell", self._tell)
         monkeypatch.setattr(self.actor, "createActor", self._create)
 
-    def enable(self) -> None:
+    def enable(self, announce: bool = True) -> None:
+        """Announce the store, then retrieval — the card's order, always.
+
+        ``announce=False`` is the lost-announcement case: parameters set, no
+        proxy, which is the half-enabled state every degradation spec here needs.
+        """
+        if announce:
+            self.actor.configure_vector_store(self.store)
         self.actor.enable_rag(
             "alice",
             WorkspaceRagIndex(),
             DocumentReader(llm_client=None),
-            VectorStoreParam(backend="inmemory"),
+            VectorStoreParam(backend="weaviate"),
         )
         # ``enable_rag`` builds a real ``EmbeddingService`` from the card's param;
         # the query leg under test must go to the double instead.
@@ -218,22 +236,22 @@ class SearchHarness:
             if embedded:
                 self.store.store_chunk(identity, owner, path, ordinal, body[start:end])
         if owner == self.actor.config.workspace_path:
-            self.actor.state.rag_index[path] = RagFile(
+            seed_row(self.actor, path, RagFile(
                 path=path,
                 status=RagStatus.EMBEDDED,
                 indexed_sha=sha,
                 chunks=chunks,
                 chunk_count=len(chunks),
                 updated_at=datetime.now(UTC),
-            )
-            self.actor.state.documents[path] = DocumentExtract(
+            ))
+            seed_extract(self.actor, path, DocumentExtract(
                 path=path,
                 source_sha=sha,
                 extractor_version=EXTRACTOR_VERSION,
                 markdown=body if cache else None,
                 char_count=len(body),
                 extracted_at=datetime.now(UTC),
-            )
+            ))
         return sha
 
     def _ask(self, address: Any, actor_type: Any = None, timeout: int | None = None) -> Any:
@@ -245,10 +263,7 @@ class SearchHarness:
         return self.store
 
     def _create(self, actor_class: Any, agent_id: Any = None, config: Any = None) -> Any:
-        if self.store_spawn_error is not None:
-            raise self.store_spawn_error
-        assert actor_class is VectorStoreActor, f"unexpected spawn of {actor_class}"
-        return self.vs_address
+        raise AssertionError(f"the actor spawned {actor_class}; the card resolves the store")
 
 
 def build_actor(workspace_path: str = WORKSPACE_PATH) -> WorkspaceActor:
@@ -265,7 +280,8 @@ def build_actor(workspace_path: str = WORKSPACE_PATH) -> WorkspaceActor:
         )
     )
     started.on_start()
-    return started
+    # The card announces this at bind time; a directly built actor gets none.
+    return attach_store(started)
 
 
 @pytest.fixture
@@ -307,15 +323,20 @@ def hit_count(answer: str) -> int:
 class TestDegradation:
     """Every failure mode answers a sentence and none of them raises."""
 
-    def test_a_workspace_whose_store_child_could_not_be_spawned_answers_the_sentence(
+    def test_a_workspace_whose_store_was_never_announced_answers_the_sentence(
         self, workspace_tree: Path, monkeypatch: pytest.MonkeyPatch, store: SearchStore
     ) -> None:
-        """The child failed to spawn, so retrieval stayed off — the sentence the indexer answers."""
+        """**Cause re-pointed, invariant unchanged** (third time — see the story's Trap 1).
+
+        It was "the team's ``#VectorStore`` was not found", then "the child could
+        not be spawned", and it is now "the card announced no store". What the
+        spec guards has survived all three: retrieval stays off, ``enable_rag``
+        does not raise, and the search answers the unavailable sentence.
+        """
         harness = SearchHarness(build_actor(), store)
         harness.install(monkeypatch)
-        harness.store_spawn_error = RuntimeError("no actor system")
 
-        harness.enable()  # must not raise
+        harness.enable(announce=False)  # must not raise
 
         assert harness.actor._vs_proxy is None
         assert harness.actor.rag_search("payment") == _UNAVAILABLE
@@ -478,9 +499,9 @@ class TestTheKeywordLeg:
     ) -> None:
         """The two maps have different lifetimes; mismatched offsets belong to neither."""
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
-        stale = search.actor.state.documents["invoice.md"]
-        search.actor.state.documents["invoice.md"] = stale.model_copy(
-            update={"source_sha": "a-different-digest"}
+        stale = stored_docs(search.actor)["invoice.md"]
+        seed_extract(
+            search.actor, "invoice.md", stale.model_copy(update={"source_sha": "a-different-digest"})
         )
         search.embedder.embed_error = RuntimeError("vector leg off")
 
@@ -490,14 +511,14 @@ class TestTheKeywordLeg:
         self, search: SearchHarness
     ) -> None:
         """The cache and the index have different caps as well as different lifetimes."""
-        search.actor.state.documents["orphan.md"] = DocumentExtract(
+        seed_extract(search.actor, "orphan.md", DocumentExtract(
             path="orphan.md",
             source_sha="sha",
             extractor_version=EXTRACTOR_VERSION,
             markdown="A payment note.\n",
             char_count=16,
             extracted_at=datetime.now(UTC),
-        )
+        ))
         search.embedder.embed_error = RuntimeError("vector leg off")
 
         assert search.actor.rag_search("payment") == _NO_HITS
@@ -572,9 +593,11 @@ class TestTheRender:
     ) -> None:
         """``SearchHit.text`` is what survives an eviction; a slice is not."""
         search.index("invoice.md", _INVOICE, [_FIRST])
-        held = search.actor.state.documents["invoice.md"]
-        search.actor.state.documents["invoice.md"] = held.model_copy(
-            update={"markdown": _INVOICE.replace("net thirty", "REPLACED")}
+        held = stored_docs(search.actor)["invoice.md"]
+        seed_extract(
+            search.actor,
+            "invoice.md",
+            held.model_copy(update={"markdown": _INVOICE.replace("net thirty", "REPLACED")}),
         )
 
         answer = search.actor.rag_search("payment", top_k=1)
@@ -587,7 +610,7 @@ class TestTheRender:
     ) -> None:
         """The chunk text is still the answer, so a hit is never dropped for this."""
         search.index("invoice.md", _INVOICE, [_FIRST], cache=False)
-        search.actor.state.rag_index.pop("invoice.md")
+        drop_row(search.actor, "invoice.md")
 
         answer = search.actor.rag_search("payment")
 
@@ -709,7 +732,7 @@ class TestThePathPrefixDecision:
         assert "cannot contain" in answer
         assert answer != _UNAVAILABLE
 
-    @pytest.mark.parametrize("backend", ["inmemory", "weaviate"])
+    @pytest.mark.parametrize("backend", ["local", "inmemory", "weaviate"])
     def test_the_same_sentence_comes_back_whatever_the_backend(
         self,
         workspace_tree: Path,
@@ -717,29 +740,25 @@ class TestThePathPrefixDecision:
         monkeypatch: pytest.MonkeyPatch,
         backend: str,
     ) -> None:
-        """The refusal is at the caller, so the two backends cannot disagree."""
-        from dataclasses import replace
+        """The refusal is at the caller, so the backends cannot disagree.
 
-        from akgentic.tool.vector_store import registry
-
+        The double is announced rather than registered, because the actor no
+        longer reaches a factory at all — the card does. What the parametrisation
+        still buys is the *param*: three different backends named in the
+        collection, one refusal, proving the sentence is not derived from the
+        backend the param happens to name.
+        """
         harness = SearchHarness(build_actor(), store)
         harness.install(monkeypatch)
-        original = registry.get_backend_spec(backend)
-        # A cluster param resolves through the factory rather than the store
-        # actor, so the same double is installed there. ``BackendSpec`` is frozen,
-        # so the seam is a re-registration.
-        registry.register_backend(replace(original, factory=lambda _ctx: store), replace=True)
-        try:
-            harness.actor.enable_rag(
-                "alice",
-                WorkspaceRagIndex(),
-                DocumentReader(llm_client=None),
-                VectorStoreParam(backend=backend),
-            )
+        harness.actor.configure_vector_store(store)
+        harness.actor.enable_rag(
+            "alice",
+            WorkspaceRagIndex(),
+            DocumentReader(llm_client=None),
+            VectorStoreParam(backend=backend),
+        )
 
-            answers = {harness.actor.rag_search("payment", path_prefix="report?.md")}
-        finally:
-            registry.register_backend(original, replace=True)
+        answers = {harness.actor.rag_search("payment", path_prefix="report?.md")}
 
         assert len(answers) == 1
         assert "cannot contain" in answers.pop()
@@ -798,29 +817,55 @@ class TestTheFusionKnobs:
 class TestTheStateItNeverTouches:
     """A search is a read: it must persist nothing and mutate nothing."""
 
-    def test_a_search_sends_no_delta(
-        self, search: SearchHarness, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A delta on a read path is a defect until a decision says otherwise."""
+    def test_a_search_writes_nothing(self, search: SearchHarness) -> None:
+        """A write on a read path is a defect until a decision says otherwise."""
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
-        store = delta_recorder(search.actor, monkeypatch)
+        writes = watch_store(search.actor)
 
         assert "invoice.md" in search.actor.rag_search("payment")
 
-        assert store.applied == []
+        assert writes.puts == []
+        assert writes.evicted == []
 
     def test_a_search_leaves_the_index_untouched(self, search: SearchHarness) -> None:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
-        before = search.actor.state.rag_index["invoice.md"].model_copy(deep=True)
+        before = stored_rows(search.actor)["invoice.md"].model_copy(deep=True)
 
         search.actor.rag_search("payment")
 
-        assert search.actor.state.rag_index["invoice.md"] == before
+        assert stored_rows(search.actor)["invoice.md"] == before
 
 
-class TestTheWorkspaceStateContract:
-    """``rag_search`` reads two maps that the state actually declares."""
+class TestTheDocumentStoreContract:
+    """``rag_search`` reads records the store actually persists.
 
-    def test_both_maps_are_state_fields(self) -> None:
-        """A map that were not persisted would empty on every resume."""
-        assert {"documents", "rag_index"} <= set(WorkspaceState.model_fields)
+    The successor to the state-field contract: what used to be two declared
+    fields on the actor's own state class is one record on disk, and the claim
+    worth pinning is the same one — a half that were not persisted would empty on
+    every process start.
+    """
+
+    def test_neither_half_lives_on_the_actor_state_any_more(self) -> None:
+        """A field here would be a second, divergent copy of what is on disk.
+
+        The state class itself went with the host in 52-6; the actor is
+        parameterised on core's ``BaseState``, which has no fields at all, so the
+        assertion is read off the type the actor actually carries rather than off
+        a class this package still owns.
+        """
+        assert "documents" not in BaseState.model_fields
+        assert "rag_index" not in BaseState.model_fields
+        assert BaseState.model_fields == {}
+
+    def test_both_halves_are_fields_of_the_stored_record(self) -> None:
+        assert {"extract", "row"} <= set(DocumentEntry.model_fields)
+
+    def test_a_search_reads_both_halves_through_a_second_store_object(
+        self, search: SearchHarness
+    ) -> None:
+        """The keyword leg joins the two halves, so both must have reached disk."""
+        search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
+        entry = YamlDocumentStore().get_document(WORKSPACE_PATH, "invoice.md")
+        assert entry is not None
+        assert entry.extract is not None and entry.extract.markdown is not None
+        assert entry.row is not None and entry.row.chunks

@@ -19,11 +19,13 @@ The property that separates this design from a cache lives in
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
 import pytest
+
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.actor import WorkspaceActor
 from akgentic.tool.workspace.edit import EditItem
@@ -34,7 +36,6 @@ from akgentic.tool.workspace.models import (
 )
 from akgentic.tool.workspace.tool import WorkspaceTool
 from akgentic.tool.workspace.workspace import Filesystem
-
 from tests.workspace.conftest import (
     HANDSHAKE_TIMEOUT_S,
     WORKSPACE_NAME,
@@ -44,7 +45,9 @@ from tests.workspace.conftest import (
     mutate,
     outcome_of,
     read,
+    requires_git,
     tool_named,
+    workspace_path_for,
 )
 
 BODY = "alpha\nbravo\ncharlie\ndelta\n"
@@ -72,26 +75,52 @@ def bob(
 # ---------------------------------------------------------------------------
 
 
-class TestEveryMutationRunsOnTheActor:
-    def test_a_write_lands_in_the_actors_tree_not_the_cards(
+class TestEveryMutationRunsOnTheCardsResolvedTree:
+    """**Premise reversed by decision**: the card's own handle *is* the tree now.
+
+    This class used to point the card's handle at a decoy and assert the write
+    landed in the actor's real tree — the invariant that made "every mutation
+    runs on the actor" observable. The gate is the card's since 52-5, so that
+    sentence is no longer true and the assertion that carried it cannot be kept
+    as written. What survives is the half that still matters and is still a live
+    hazard: the mutation writes through the handle ``observer()`` **resolved**,
+    never one it derives for itself at call time (the lead's checklist, (b): the
+    consumer uses the object the card resolved).
+    """
+
+    def test_a_write_goes_through_the_handle_the_bind_resolved(
         self,
         orchestrator_proxy: FakeOrchestratorProxy,
         workspaces_root: Path,
         workspace_tree: Path,
     ) -> None:
-        # The card's own handle is pointed at a decoy directory while the actor
-        # keeps the real one. A closure that still called self.workspace would
-        # write into the decoy — nothing else can tell the two apart.
+        # The handle is swapped *after* the bind, so nothing about path
+        # resolution is patched: a gate that re-derived its own tree from the
+        # workspace id would ignore the swap and write into the real tree.
         decoy = Filesystem(str(workspaces_root), "decoy")
-        observer = FakeActorToolObserver(orchestrator_proxy)
-        with patch("akgentic.tool.workspace.card.get_workspace", return_value=decoy):
-            card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
-            card.observer(observer)
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+        card.observer(FakeActorToolObserver(orchestrator_proxy))
+        card._workspace = decoy
 
         assert mutate(card, "workspace_write", "only.md", "content\n") == "Written: only.md"
 
-        assert (workspace_tree / "only.md").exists()
-        assert not (decoy._root / "only.md").exists()
+        assert (decoy._root / "only.md").exists()
+        assert not (workspace_tree / "only.md").exists()
+
+    def test_the_bind_resolves_the_same_tree_the_actor_owns(
+        self,
+        wired_card: WorkspaceTool,
+        workspace_actor: WorkspaceActor,
+        workspace_tree: Path,
+    ) -> None:
+        """The positive beside it: card and actor are anchored to one directory.
+
+        Two handles over one tree is the arrangement the file lock exists for;
+        two handles over *two* trees would be a gate guarding nothing.
+        """
+        assert wired_card._workspace is not None
+        assert wired_card._workspace._root == workspace_tree.resolve()
+        assert workspace_actor._workspace._root == wired_card._workspace._root
 
     @pytest.mark.parametrize(
         ("name", "args"),
@@ -108,15 +137,41 @@ class TestEveryMutationRunsOnTheActor:
         workspace_tree: Path,
     ) -> None:
         # There is deliberately no ungated fallback: one would be a bypass of
-        # the gate reachable from any harness that skipped the binding.
-        wired_card._workspace_proxy = None
-        with pytest.raises(RuntimeError, match="workspace actor is not bound"):
-            tool_named(wired_card, name)(*args)
+        # the gate reachable from any harness that skipped the binding. The
+        # unbound state is card-side now — the ``Filesystem`` the bind resolves.
+        #
+        # The callable is taken *before* the handle is dropped, because
+        # ``get_tools`` builds the read factories too and they capture the same
+        # handle: nulling it first would fail in the factory and never reach the
+        # gate, which is the thing under test.
+        mutation = tool_named(wired_card, name)
+        wired_card._workspace = None
+        with pytest.raises(RuntimeError, match="workspace is not bound"):
+            mutation(*args)
         # The seeded .gitignore is the journal's, written at actor start and
         # before any agent existed; nothing else may have appeared.
         assert [
             entry.name for entry in workspace_tree.iterdir() if entry.name != GITIGNORE_NAME
         ] == []
+
+    def test_a_card_that_never_bound_at_all_refuses_the_same_way(
+        self, workspace_tree: Path
+    ) -> None:
+        """The unconstructed case, reached through the gate rather than a closure.
+
+        A card built and never handed an observer has no ``Filesystem``, no
+        metadata directory and no journal. Every one of those is optional to the
+        refusal except the first — and the first is what makes an ungated write
+        impossible rather than merely unlikely.
+        """
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+
+        with pytest.raises(RuntimeError, match="workspace is not bound"):
+            card.apply_write("fresh.md", "body\n")
+        with pytest.raises(RuntimeError, match="workspace is not bound"):
+            card.apply_mkdir("sub")
+
+        assert list(workspace_tree.iterdir()) == []
 
     def test_two_agents_creating_one_path_produce_one_winner(
         self,
@@ -441,20 +496,51 @@ class TestAnAcceptedMutationRefreshesItsWriter:
 
 
 class TestRejectionText:
+    @requires_git
     def test_it_names_the_agent_whose_write_is_on_disk(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        notes: Path,
+    ) -> None:
+        """The refusal names the agent, not a UUID — and the journal is where it reads it.
+
+        **Re-pointed, not weakened.** The name used to come from a
+        ``{path -> last writer}`` map on the actor: one process\'s memory, which
+        two workers over one mount held two of and neither could see the
+        other\'s. It now comes from the git journal, which is on the tree —
+        exactly the move ADR-051 Decision 4 makes. The assertion is unchanged,
+        because the *message* is unchanged: it is the product an agent reads,
+        and *"last written by agent \'3f2a…\'"* is something a model can read and
+        nothing it can act on.
+        """
+        alice, _alice_observer = card_for(orchestrator_proxy, "alice", git_journal=True)
+        bob, bob_observer = card_for(orchestrator_proxy, "bob", git_journal=True)
+        read(alice, "notes.md")
+        read(bob, "notes.md")
+        mutate(bob, "workspace_write", "notes.md", "bob's version\n")
+
+        with pytest.raises(RetriableError) as refusal:
+            mutate(alice, "workspace_write", "notes.md", "alice's version\n")
+
+        message = str(refusal.value)
+        assert "last written by agent 'bob'" in message
+        assert str(bob_observer.myAddress.agent_id) not in message
+
+    def test_with_no_journal_it_names_nobody_and_claims_nothing(
         self,
         wired_card: WorkspaceTool,
         bob: tuple[WorkspaceTool, FakeActorToolObserver],
         notes: Path,
     ) -> None:
-        """The refusal names the agent, not the UUID the actor keys it under.
+        """The second half of ADR-051 Decision 4, and it is not optional.
 
-        The card can only capture ``str(observer.myAddress.agent_id)`` without
-        holding an edge back to the agent, so what the actor has on hand is a
-        UUID — and *"last written by agent '3f2a…'"* is something a model can
-        read and nothing it can act on. The rejection message is the product.
+        Attribution is a best-effort extra that a journal pays for. Without one
+        there is no history, so a teammate\'s write and an upload are
+        indistinguishable — and claiming either would be a guess stated as a
+        fact. The refusal\'s actionable half is unchanged, which is the whole
+        point: every configuration gets that.
         """
-        bob_card, bob_observer = bob
+        bob_card, _bob_observer = bob
         read(wired_card, "notes.md")
         read(bob_card, "notes.md")
         mutate(bob_card, "workspace_write", "notes.md", "bob's version\n")
@@ -463,18 +549,10 @@ class TestRejectionText:
             mutate(wired_card, "workspace_write", "notes.md", "alice's version\n")
 
         message = str(refusal.value)
-        assert "last written by agent 'bob'" in message
-        assert str(bob_observer.myAddress.agent_id) not in message
-
-    def test_it_falls_back_to_the_id_for_an_agent_that_never_registered(
-        self, workspace_actor: WorkspaceActor, notes: Path
-    ) -> None:
-        # A harness that skipped the binding, or a name evicted from the cap:
-        # degraded, never broken. The refusal still names *someone*.
-        outcome = outcome_of(workspace_actor, "apply_write", "unregistered-id", "fresh.md", "a\n")
-        assert outcome.status is MutationStatus.ACCEPTED
-        refused = outcome_of(workspace_actor, "apply_write", "other-id", "fresh.md", "b\n")
-        assert "last written by agent 'unregistered-id'" in refused.message
+        assert "last written by agent" not in message
+        assert "came from outside" not in message
+        assert message.startswith("Refused to modify notes.md: it changed since you read it.")
+        assert "Read the file again" in message
 
     def test_a_refusal_always_says_what_to_do_next(
         self, wired_card: WorkspaceTool, notes: Path
@@ -874,7 +952,8 @@ class TestALostStagedFileIsARefusal:
         workspace_actor: WorkspaceActor,
         workspace_tree: Path,
     ) -> None:
-        tree = workspace_actor._workspace
+        tree = wired_card._workspace
+        assert tree is not None
         with patch.object(tree, "write", side_effect=FileNotFoundError("staged file gone")):
             with pytest.raises(RetriableError) as refusal:
                 mutate(wired_card, "workspace_write", "fresh.md", "body\n")
@@ -895,7 +974,8 @@ class TestALostStagedFileIsARefusal:
         for name, body in (("a.py", "x = 1\n"), ("b.py", "y = 2\n")):
             (workspace_tree / name).write_text(body, encoding="utf-8")
             read(wired_card, name)
-        tree = workspace_actor._workspace
+        tree = wired_card._workspace
+        assert tree is not None
 
         with patch.object(tree, "write_many", side_effect=FileNotFoundError("gone")):
             with pytest.raises(RetriableError, match="retry exactly the same change"):
@@ -914,7 +994,8 @@ class TestALostStagedFileIsARefusal:
         self, wired_card: WorkspaceTool, workspace_actor: WorkspaceActor, notes: Path
     ) -> None:
         read(wired_card, "notes.md")
-        tree = workspace_actor._workspace
+        tree = wired_card._workspace
+        assert tree is not None
         patch_text = "--- a/notes.md\n+++ b/notes.md\n@@ -1,2 +1,2 @@\n alpha\n-bravo\n+BRAVO\n"
 
         with patch.object(tree, "write_many", side_effect=FileNotFoundError("gone")):
@@ -1061,17 +1142,15 @@ class TestMkdirIsRoutedNotGated:
         assert mutate(wired_card, "workspace_mkdir", "src") == "Created: src"
         assert (workspace_tree / "src").is_dir()
 
-    def test_it_records_no_observation_and_no_writer(
+    def test_it_records_no_observation_and_touches_nothing(
         self,
         wired_card: WorkspaceTool,
-        workspace_actor: WorkspaceActor,
-        observer: FakeActorToolObserver,
     ) -> None:
         mutate(wired_card, "workspace_mkdir", "src")
-        agent_id = str(observer.myAddress.agent_id)
-        assert workspace_actor.observation_for(agent_id, "src") is None
-        # And no last-writer entry either — there is no content to attribute.
-        assert workspace_actor._last_writers.get("src") is None
+        assert wired_card.observation_for("src") is None
+        # And nothing in the write set either, so the journal makes no commit of
+        # its own: git does not track empty directories.
+        assert wired_card._touched == []
 
 
 # ---------------------------------------------------------------------------
@@ -1081,33 +1160,30 @@ class TestMkdirIsRoutedNotGated:
 
 class TestTheErrorContract:
     def test_an_accepted_outcome_carries_the_unchanged_confirmation(
-        self, workspace_actor: WorkspaceActor, workspace_tree: Path
+        self, wired_card: WorkspaceTool, workspace_tree: Path
     ) -> None:
-        outcome = outcome_of(workspace_actor, "apply_write", "solo", "new.md", "body\n")
+        outcome = outcome_of(wired_card, "apply_write", "new.md", "body\n")
         assert outcome.status is MutationStatus.ACCEPTED
         assert outcome.message == "Written: new.md"
 
     def test_a_missing_anchor_is_failed_not_rejected(
-        self, wired_card: WorkspaceTool, workspace_actor: WorkspaceActor, notes: Path
+        self, wired_card: WorkspaceTool, notes: Path
     ) -> None:
         read(wired_card, "notes.md")
-        agent_id = wired_card._agent_id
-        outcome = outcome_of(
-            workspace_actor, "apply_edit", agent_id, "notes.md", "absent", "x", False
-        )
+        outcome = outcome_of(wired_card, "apply_edit", "notes.md", "absent", "x", False)
         assert outcome.status is MutationStatus.FAILED
         assert outcome.message == "[ERROR] old_string not found in notes.md"
 
-    def test_a_gate_refusal_is_rejected(self, workspace_actor: WorkspaceActor, notes: Path) -> None:
-        outcome = outcome_of(workspace_actor, "apply_write", "solo", "notes.md", "mine\n")
+    def test_a_gate_refusal_is_rejected(self, wired_card: WorkspaceTool, notes: Path) -> None:
+        outcome = outcome_of(wired_card, "apply_write", "notes.md", "mine\n")
         assert outcome.status is MutationStatus.REJECTED
 
     def test_the_outcome_model_round_trips(
-        self, workspace_actor: WorkspaceActor, workspace_tree: Path
+        self, wired_card: WorkspaceTool, workspace_tree: Path
     ) -> None:
         from akgentic.tool.workspace.models import MutationOutcome
 
-        outcome = outcome_of(workspace_actor, "apply_mkdir", "solo", "sub")
+        outcome = outcome_of(wired_card, "apply_mkdir", "sub")
         assert MutationOutcome.model_validate(outcome.model_dump()) == outcome
 
 
@@ -1150,3 +1226,368 @@ class TestTheToolSurfaceIsUnchanged:
         # refusal exists on the read side at all.
         assert "alpha" in read(wired_card, "notes.md")
         assert "alpha" in read(wired_card, "notes.md")
+
+
+# ---------------------------------------------------------------------------
+# Story 52-5, AC 6: exactly one convergence point, and all six pass through it
+# ---------------------------------------------------------------------------
+
+
+class TestEveryMutationConvergesOnOnePoint:
+    """``_gated`` is the sole place the busy check, the commits and the lock live.
+
+    The reason this is structural rather than a comment: a *seventh* mutation
+    added later must not be able to forget any of them, and the one that fails
+    silently is the ``flock`` — a forgotten lock costs nothing in any test, and
+    then loses an update under load on a shared mount.
+
+    The enumeration is by **introspection**, so a mutation added tomorrow joins
+    it without anybody remembering to. A public ``apply_*`` that bypassed
+    ``_gated`` would appear in the list and fail.
+    """
+
+    CONVERGENCE = "_gated"
+
+    def _mutations(self) -> list[str]:
+        """Every public mutation the card exposes, found rather than listed."""
+        return sorted(
+            name
+            for name in dir(WorkspaceTool)
+            if name.startswith("apply_") and callable(getattr(WorkspaceTool, name))
+        )
+
+    def test_the_enumeration_finds_the_six_that_exist_today(self) -> None:
+        """The sweep is floored: one that found nothing would pass every check below."""
+        assert self._mutations() == [
+            "apply_delete",
+            "apply_edit",
+            "apply_mkdir",
+            "apply_multi_edit",
+            "apply_patch",
+            "apply_write",
+        ]
+
+    def test_every_mutation_reaches_the_convergence_point(
+        self, wired_card: WorkspaceTool, notes: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Called through the card, with the convergence point watched.
+
+        Each mutation is driven with arguments that reach the gate at all — the
+        refusals below are fine, because what is asserted is that the call
+        *arrived*, not what it decided.
+        """
+        from akgentic.tool.workspace.edit import EditItem
+
+        seen: list[str] = []
+        real = WorkspaceTool._gated
+
+        def watched(card: WorkspaceTool, capability: str, paths: Any, run: Any) -> Any:
+            seen.append(capability)
+            return real(card, capability, paths, run)
+
+        monkeypatch.setattr(WorkspaceTool, "_gated", watched)
+        arguments: dict[str, tuple[Any, ...]] = {
+            "apply_write": ("notes.md", "mine\n"),
+            "apply_delete": ("notes.md",),
+            "apply_edit": ("notes.md", "alpha", "ALPHA"),
+            "apply_multi_edit": ([EditItem(path="notes.md", old_string="a", new_string="b")],),
+            "apply_patch": (
+                "--- a/notes.md\n+++ b/notes.md\n@@ -1,2 +1,2 @@\n-alpha\n+A\n bravo\n",
+            ),
+            "apply_mkdir": ("sub",),
+        }
+        assert set(arguments) == set(self._mutations()), (
+            "a mutation was added without a case here — add one rather than "
+            "narrowing the enumeration to the ones that still have one"
+        )
+
+        for name in self._mutations():
+            getattr(wired_card, name)(*arguments[name])
+
+        assert sorted(seen) == sorted(["write", "delete", "edit", "multi_edit", "patch", "mkdir"])
+        assert len(seen) == len(self._mutations())
+
+    def test_the_convergence_point_is_one_method_and_it_holds_all_five_duties(self) -> None:
+        """The busy check, the two commits, the lock and the stale-mark, in one body.
+
+        Asserted on the **source of one method**, because the defect this
+        prevents is a duty quietly moving into the five callers where a sixth
+        would then be written without it.
+        """
+        import inspect
+
+        from akgentic.tool.workspace.card import gate as gate_module
+
+        body = inspect.getsource(gate_module.CardGate._gated)
+        for duty in ("_busy_refusal", "commit_out_of_band", "_hold", "commit_paths", "_mark_stale"):
+            assert duty in body, f"{duty} no longer converges in _gated"
+        # And no ``apply_*`` performs any of them for itself.
+        for name in self._mutations():
+            source = inspect.getsource(getattr(gate_module.CardGate, name))
+            assert "_busy_refusal" not in source
+            assert "commit_" not in source
+            assert "_hold(" not in source
+
+
+# ---------------------------------------------------------------------------
+# Story 52-5, AC 15: the stale-mark carries exactly the paths that changed
+# ---------------------------------------------------------------------------
+
+
+class _StaleRecorder:
+    """A tell proxy that records the stale-mark sets and forwards nothing else."""
+
+    def __init__(self) -> None:
+        self.sets: list[list[str]] = []
+
+    def mark_paths_stale(self, paths: list[str]) -> None:
+        self.sets.append(list(paths))
+
+    def __getattr__(self, name: str) -> Any:
+        def swallow(*args: Any, **kwargs: Any) -> None:
+            return None
+
+        return swallow
+
+
+class TestTheStaleMarkReachesTheIndex:
+    """Every accepted mutation signals the index with the paths it touched.
+
+    Deletes included — ``_forget`` appends to the write set for the same reason
+    ``_accept`` does, so a seventh mutation gets the signal for free.
+    """
+
+    def _card_with(
+        self, orchestrator_proxy: FakeOrchestratorProxy, recorder: _StaleRecorder
+    ) -> WorkspaceTool:
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+        card.observer(
+            FakeActorToolObserver(orchestrator_proxy, name="alice", workspace_tell_proxy=recorder)
+        )
+        return card
+
+    def test_a_write_signals_its_one_path(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        recorder = _StaleRecorder()
+        card = self._card_with(orchestrator_proxy, recorder)
+
+        card.apply_write("fresh.md", "body\n")
+
+        assert recorder.sets == [["fresh.md"]]
+
+    def test_a_delete_signals_the_path_it_removed(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        (workspace_tree / "notes.md").write_text("alpha\n", encoding="utf-8")
+        recorder = _StaleRecorder()
+        card = self._card_with(orchestrator_proxy, recorder)
+        read(card, "notes.md")
+
+        card.apply_delete("notes.md")
+
+        assert recorder.sets == [["notes.md"]]
+
+    def test_a_multi_edit_signals_every_file_it_wrote(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        from akgentic.tool.workspace.edit import EditItem
+
+        for name, body in (("a.py", "x = 1\n"), ("b.py", "y = 2\n")):
+            (workspace_tree / name).write_text(body, encoding="utf-8")
+        recorder = _StaleRecorder()
+        card = self._card_with(orchestrator_proxy, recorder)
+        read(card, "a.py")
+        read(card, "b.py")
+
+        card.apply_multi_edit(
+            [
+                EditItem(path="a.py", old_string="x = 1", new_string="x = 10"),
+                EditItem(path="b.py", old_string="y = 2", new_string="y = 20"),
+            ]
+        )
+
+        assert [sorted(paths) for paths in recorder.sets] == [["a.py", "b.py"]]
+
+    def test_a_patch_signals_what_it_created_and_what_it_deleted(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        (workspace_tree / "gone.md").write_text("bye\n", encoding="utf-8")
+        recorder = _StaleRecorder()
+        card = self._card_with(orchestrator_proxy, recorder)
+        read(card, "gone.md")
+
+        outcome = card.apply_patch(
+            "--- /dev/null\n+++ b/made.md\n@@ -0,0 +1 @@\n+hello\n"
+            "--- a/gone.md\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye\n"
+        )
+
+        assert outcome.status is MutationStatus.ACCEPTED, outcome.message
+        assert [sorted(paths) for paths in recorder.sets] == [["gone.md", "made.md"]]
+
+    def test_a_refused_mutation_signals_nothing(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        (workspace_tree / "notes.md").write_text("alpha\n", encoding="utf-8")
+        recorder = _StaleRecorder()
+        card = self._card_with(orchestrator_proxy, recorder)
+
+        outcome = card.apply_write("notes.md", "mine\n")
+
+        assert outcome.status is MutationStatus.REJECTED
+        assert recorder.sets == []
+
+    def test_a_lost_signal_never_fails_the_mutation(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """It degrades to a stale index row, which is recoverable; a raise is not."""
+
+        class Dead:
+            def mark_paths_stale(self, paths: list[str]) -> None:
+                raise RuntimeError("the actor is gone")
+
+            def __getattr__(self, name: str) -> Any:
+                return lambda *a, **k: None
+
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+        card.observer(
+            FakeActorToolObserver(orchestrator_proxy, name="alice", workspace_tell_proxy=Dead())
+        )
+
+        assert card.apply_write("fresh.md", "body\n").message == "Written: fresh.md"
+        assert (workspace_tree / "fresh.md").read_text(encoding="utf-8") == "body\n"
+
+
+# ---------------------------------------------------------------------------
+# Story 52-5, AC 13: nothing in the gate depends on the journal being enabled
+# ---------------------------------------------------------------------------
+
+
+class TestBothTablesAreIdenticalWithoutAJournal:
+    """Every verdict, both tables, with ``git_journal=False`` — byte for byte.
+
+    Cheap, and it catches a whole class in one place: the gate acquired a journal
+    object in this story, and the failure mode worth fearing is a verdict that
+    quietly starts depending on one. The journal is an **extra** that buys
+    history and attribution; with it off the refusal loses its middle line and
+    nothing else.
+
+    Driven as a table so the two configurations are compared rather than merely
+    both exercised: a row that answered differently with the journal on would
+    fail here even if both answers looked reasonable on their own.
+    """
+
+    ROWS: list[tuple[str, str]] = [
+        ("unread create", "create"),
+        ("unread overwrite", "read it before overwriting"),
+        ("whole-read overwrite", "accept"),
+        ("changed since read", "it changed since you read it"),
+        ("paginated overwrite", "a page is not a licence"),
+        ("deleted since read", "it was deleted since you read it"),
+        ("unread edit", "read it before editing"),
+        ("edit on a changed file", "accept"),
+        ("stale anchor", "no longer matches it exactly"),
+        ("missing anchor", "[ERROR] old_string not found"),
+        ("mkdir", "Created"),
+    ]
+
+    @staticmethod
+    def _told(call: Callable[[], Any]) -> str:
+        """What the agent is told — the returned string, or the refusal it raised."""
+        try:
+            return str(call())
+        except RetriableError as refused:
+            return str(refused)
+
+    def _verdict(self, card: WorkspaceTool, row: str, tree: Path) -> str:
+        """Drive one row and return what the agent is told, refusal or not."""
+        notes = tree / "notes.md"
+        if row == "unread create":
+            return self._told(lambda: mutate(card, "workspace_write", "brand-new.md", "body\n"))
+        if row == "mkdir":
+            return self._told(lambda: mutate(card, "workspace_mkdir", "sub"))
+        notes.write_text(BODY, encoding="utf-8")
+        if row in ("unread overwrite", "unread edit", "paginated overwrite"):
+            return self._unread_row(card, row)
+        read(card, "notes.md")
+        return self._observed_row(card, row, notes)
+
+    def _unread_row(self, card: WorkspaceTool, row: str) -> str:
+        """The three rows whose agent has not read the file whole."""
+        if row == "unread overwrite":
+            return self._told(lambda: mutate(card, "workspace_write", "notes.md", "mine\n"))
+        if row == "unread edit":
+            return self._told(lambda: mutate(card, "workspace_edit", "notes.md", "alpha", "A"))
+        assert row == "paginated overwrite"
+        read(card, "notes.md", limit=1)
+        return self._told(lambda: mutate(card, "workspace_write", "notes.md", "mine\n"))
+
+    def _observed_row(self, card: WorkspaceTool, row: str, notes: Path) -> str:
+        """The rows whose agent has read the file whole; some then lose it."""
+        if row == "whole-read overwrite":
+            return self._told(lambda: mutate(card, "workspace_write", "notes.md", "mine\n"))
+        if row == "missing anchor":
+            return self._told(lambda: mutate(card, "workspace_edit", "notes.md", "absent", "x"))
+        if row == "deleted since read":
+            notes.unlink()
+            return self._told(lambda: mutate(card, "workspace_write", "notes.md", "mine\n"))
+        # The remaining three all need the file to have moved behind the gate.
+        notes.write_text("wholly different\n", encoding="utf-8")
+        if row == "changed since read":
+            return self._told(lambda: mutate(card, "workspace_write", "notes.md", "mine\n"))
+        if row == "stale anchor":
+            return self._told(lambda: mutate(card, "workspace_edit", "notes.md", "alpha", "A"))
+        assert row == "edit on a changed file"
+        return self._told(lambda: mutate(card, "workspace_edit", "notes.md", "wholly", "W"))
+
+    @requires_git
+    @pytest.mark.parametrize(("row", "expected"), ROWS, ids=[row for row, _ in ROWS])
+    def test_the_verdict_is_the_same_with_the_journal_on_and_off(
+        self,
+        row: str,
+        expected: str,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspaces_root: Path,
+    ) -> None:
+        """Two trees, two cards, one row — and the actionable text must match.
+
+        The **provenance line is the one thing allowed to differ**, and it is
+        excluded by comparing the first and last lines rather than the whole
+        message: that line is the best-effort extra, and asserting it identical
+        would be asserting the opposite of ADR-051 Decision 4.
+        """
+        verdicts = {}
+        for journal in (True, False):
+            leaf = f"sweep-{row.replace(' ', '-')}-{'on' if journal else 'off'}"
+            tree = workspaces_root / workspace_path_for(leaf)
+            tree.mkdir(parents=True, exist_ok=True)
+            card, _observer = card_for(
+                orchestrator_proxy, f"alice-{leaf}", workspace_id=leaf, git_journal=journal
+            )
+            verdicts[journal] = self._verdict(card, row, tree)
+
+        on, off = verdicts[True], verdicts[False]
+        if expected in ("create", "accept"):
+            assert not on.startswith("Refused")
+            assert not off.startswith("Refused")
+        else:
+            assert expected in on, on
+            assert expected in off, off
+        on_lines, off_lines = on.splitlines(), off.splitlines()
+        assert on_lines[0] == off_lines[0]
+        assert on_lines[-1] == off_lines[-1]
+        # And the journal-off message is never the longer of the two: the extra
+        # a journal buys is a line, never a missing one.
+        assert len(off_lines) <= len(on_lines)
+
+    def test_a_card_with_no_journal_still_has_one_object_that_is_simply_off(
+        self, wired_card: WorkspaceTool
+    ) -> None:
+        """The degradation is a disabled journal, never a ``None`` nobody guarded.
+
+        Every ``GitJournal`` method is a no-op once the journal is off, which is
+        what lets the convergence point call it unconditionally.
+        """
+        assert wired_card._journal is not None
+        assert wired_card._journal.enabled is False
+        assert wired_card._journal.last_author("notes.md") is None

@@ -4,10 +4,11 @@
 and :class:`RagChunk`, chosen now on purpose.** ``serialize()`` stamps
 ``__model__ = "<module>.<name>"`` into every nested ``SerializableBaseModel``,
 and the deserializer resolves that literal string with ``import_module`` plus
-``getattr``. An extract — or an index row — persisted inside a
-``WorkspaceState`` snapshot therefore pins this module path in deployments this
-repository cannot see — the failure mode that forced ``workspace/tool.py`` to
-stay on disk as a shim. Nothing here moves afterwards.
+``getattr``. An extract — or an index row — persisted in a tree's metadata
+directory therefore pins this module path in deployments this repository cannot
+see, and a mounted tree written by an older release outlives every process that
+wrote it — the failure mode that forced ``workspace/tool.py`` to stay on disk as
+a shim. Nothing here moves afterwards.
 
 **This module adds no digest.** ``content_sha`` in
 :mod:`akgentic.tool.workspace.models` is the one definition of the digest in the
@@ -63,12 +64,12 @@ extractor *produces* from unchanged source bytes.
 """
 
 DEFAULT_MAX_DOCUMENTS = 32
-"""Bound on the number of rows in ``WorkspaceState.documents``.
+"""Bound on the number of cached extractions one tree's document store holds.
 
-Answers the **metadata** dimension: ~200 bytes per row, held for the life of the
-hosted actor, which outlives every team on its tree, and restored in full from
-the store on every get-or-create miss. An uncapped map there leaks exactly that
-way — the same reasoning
+Answers the **metadata** dimension: ~200 bytes per record, kept as a file under
+the tree's sibling metadata directory, which outlives every team on the tree and
+every process that ever bound it. Nothing sweeps that directory but this cap, so
+an uncapped cache grows there for as long as the tree exists — the same reasoning
 :data:`~akgentic.tool.workspace.models.DEFAULT_MAX_TRACKED_WRITERS` records.
 
 This is the Weaviate / RAG-off default. A backend-derived override belongs at
@@ -386,8 +387,9 @@ def evict_document_bodies(
 
     Pure: it takes a dict and two ints, and touches no actor, no ``self`` and no
     chunk structure. *documents* is mutated in place and iterated in insertion
-    order, which is the whole of the LRU — the fill site re-inserts on every
-    write and the lookup moves an entry to the end on every hit.
+    order, so **the caller owns the recency order** and this function only obeys
+    it. The caller builds the mapping sorted by ``extracted_at``, which is the
+    only stamp there is: a hit records nothing, because a read may not write.
 
     **Two caps, two different remedies**, because they answer two different
     pressures:
@@ -409,7 +411,9 @@ def evict_document_bodies(
     **A dropped body must not de-index its file.** Nothing anywhere may infer
     that a file is indexed, searchable, or absent from the index from the
     presence, the absence, or the body-state of an entry in this map. Index
-    membership lives in its own map and is keyed off that alone.
+    membership is the other half of the stored record and is read off that alone
+    — which is why the caller clears the extraction half rather than removing
+    the record whenever a row is left in it.
 
     Args:
         documents: The cache, mutated in place.

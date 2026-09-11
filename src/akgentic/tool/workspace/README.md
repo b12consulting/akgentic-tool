@@ -11,7 +11,7 @@ from akgentic.tool import WorkspaceTool
 | | |
 |---|---|
 | Module | `akgentic.tool.workspace.tool` |
-| Actor | `#Workspace-<scope>/<leaf>` — the **resolved two-segment path**, slash included, so two principals' `notes` are two actors over two trees. **Hosted**: one per tree per process, created by the process's `WorkspaceHost`, shared by every team whose cards resolve that path, and nobody's child — see *Lifetime* below. With `workspace_exec` on it also owns the tree's sandbox backend and the single worker thread that runs commands on it — no second actor |
+| Actor | `#Workspace-<scope>/<leaf>` — the **resolved two-segment path**, slash included, so two principals' `notes` are two actors over two trees. An ordinary **team child**: created by its card through `getChildrenOrCreate`, in exactly one team's roster, stopped by that team's teardown. It owns **dispatch and no shared state** — with `workspace_exec` on, the tree's sandbox backend and the single worker thread that runs commands on it, plus the retrieval indexing pipeline. Two teams over one tree get two actors, and the tree orders them — see *Lifetime* below |
 | Channels used | `TOOL_CALL` (11 callables, 13 with `workspace_exec`), `COMMAND` (`expand_media_refs`) |
 | Optional extras | `[docs]` for binary reads, `[vision]` for image resizing |
 | Environment | `AKGENTIC_WORKSPACES_ROOT` (default `./workspaces`) |
@@ -96,8 +96,8 @@ the **write** side: a command mutates the tree whatever it happens to be, so
 **The backend and the actor are both bound in `observer()`, not in `__init__`.** `observer()` makes
 **one** call to `resolve_workspace_path(...)` — the single place a workspace directory is derived —
 and hands the result down as an already-resolved value: a `Filesystem` rooted at
-`<AKGENTIC_WORKSPACES_ROOT>/<scope>/<leaf>`, the hosted `#Workspace-<scope>/<leaf>` actor that owns the
-tree, and — only if exec is enabled — the sandbox backend. Nothing below re-derives it, which is what
+`<AKGENTIC_WORKSPACES_ROOT>/<scope>/<leaf>`, the `#Workspace-<scope>/<leaf>` actor that dispatches for
+the tree, and — only if exec is enabled — the sandbox backend. Nothing below re-derives it, which is what
 makes it impossible for a backend to open a different directory from the one the gate and the journal
 are guarding. `resources` are seeded in between. Reading `card.workspace` before that raises
 `RuntimeError`; calling a mutation before it raises `RuntimeError` too, because there is deliberately
@@ -114,27 +114,35 @@ majority of `WorkspaceTool()` instances gain no round trip at wiring time.
 as the leaf. A fixed name would collapse them onto one actor owning one of the trees, silently. The
 sandbox backend needs no name of its own: it is held by the workspace actor whose tree it serves.
 
-**Two teams of the same principal sharing one `workspace_id` reach one actor**, because there is
-one actor per tree per process: their writes are ordered by its mailbox as well as checked by the
-gate, which hashes the live file. The first bind fixes the actor's configuration for every team on
-the tree. Two teams of **different** principals do not share a tree at all: `notes` resolves under
-each owner's own scope. Sharing across principals is `workspace_metadata_keys`, and nothing else.
+**Two teams of the same principal sharing one `workspace_id` reach one tree and two actors**, one
+per team — and their writes are still ordered, because the ordering is on the **tree**: an
+`fcntl.flock` held on the path for the whole check-and-write, and an `O_EXCL` marker for the whole of
+a run. That holds across two *processes* as well, which a mailbox never did. The first bind of a team
+fixes that team's actor's configuration. Two teams of **different** principals do not share a tree at
+all: `notes` resolves under each owner's own scope. Sharing across principals is
+`workspace_metadata_keys`, and nothing else.
 
 ### Lifetime
 
-- **Attached by agents.** Every card binds through its team's orchestrator to the process's
-  `WorkspaceHost`, which gets or creates the tree's actor, and then attaches its agent as a holder.
-  No team owns the actor, and no team's teardown stops it.
-- **Reaped by liveness.** A sweep drops holders whose agents have stopped. After `reap_grace_s` with
-  no holder the actor stops itself, taking its in-memory store child and any live worker with it.
-  An `attach` during the grace cancels it, so a team stopping and an equivalent one starting keep
-  the same actor, journal and container.
-- **Restored on the next bind.** The extraction cache and the retrieval index are persisted, by
-  member-keyed delta, into the deployment's store through the host. The next bind after a reap or a
-  process restart starts a new actor restored from it. Rows that were mid-extraction or
-  mid-embedding when the old actor stopped are queued again.
-- **Cold without a store.** A deployment that registers no store with the host restores nothing:
-  the next actor starts with an empty cache and index, and re-indexes on demand.
+- **A team child, created by its card.** The card calls `getChildrenOrCreate` on its own team's
+  orchestrator and emits `WorkspaceAttached` on that team's stream itself. The actor is in exactly
+  one team's roster, and **that team's two-phase teardown is the only thing that stops it** — no
+  timer, no liveness sweep, no reap grace, no self-stop. Epic 51 needed all four because a hosted
+  actor sat outside every team's teardown; a team child has an owner.
+- **`attach` records the agent's name, and nothing else.** It is the only source for the name the
+  git journal authors a commit with and the name an exec busy refusal prints — an id is a UUID, and
+  *"agent '3f2a…'"* is something a model can read and nothing it can act on. Losing a name degrades
+  to printing the id; it never breaks either message.
+- **Read back from the tree, never handed over.** The extraction cache and the retrieval index are
+  **files under the tree's sibling metadata directory** — one YAML record per source document under
+  `<meta>/rag/`, written on the turn that changes it (ADR-051 Decision 6). A later actor, or a second
+  process over the same mount, simply reads the same files; nothing is registered anywhere, nothing
+  is handed to it, and there is no state to restore.
+- **Nothing is restored, so nothing can be lost by a cold deployment.** A row that a worker was
+  carrying when its process died is queued again by `reap_abandoned_rows`, which covers a crash in
+  this process and one in another with a single rule: an in-flight row older than the staleness
+  bound. The bound is what does the whole job — a row at `embedding` may belong to a worker that is
+  alive in another process, and only its age tells the two apart.
 
 ---
 
@@ -211,9 +219,9 @@ way around the gate.
 - **A paginated read does not license a whole-file write.** `workspace_read(path, offset=…)` records
   that a *page* was seen. The way through is `workspace_edit` on a still-matching anchor, not a
   bigger `limit`.
-- **Observations do not survive a restore** — a reap after the last holder left, or a process
-  restart. They are actor instance state, not persisted. After a restore the first write to any
-  path is refused until it is re-read. That is the safe direction and it is deliberate.
+- **Observations do not survive a process restart.** They are the card's own in-memory map, not
+  persisted. After a restart the first write to any path is refused until it is re-read. That is the
+  safe direction and it is deliberate.
 
 ### What the gate catches that a registry would not
 
@@ -309,71 +317,85 @@ the duration of a run the tree is held **exclusively** by that run:
   nothing to react to, whereas a refusal naming the holder lets it read a file or answer the user;
 - every **read** keeps working, throughout. The price of that is honest: a read during a run may see
   a half-written build artefact;
-- a second `workspace_exec` is **queued, never refused**. It is handed a run id of its own and takes
-  the tree when the head releases it.
+- a second `workspace_exec` is **refused**, with a message naming nobody, and its caller retries.
 
-**Commands never refuse each other, and that is the whole of the queue.** A model emits several
-`workspace_exec` calls in one response and pydantic-ai runs them **concurrently**, so they race for
-the tree. Refusing the losers threw the work away and — worse — published the *winner's* run id in
-the refusal, which the model could then collect: an answer to a question it never asked, and one
-that was byte-indistinguishable from its own. So admission has a third answer:
+**The hold is a file, not a queue in one actor's memory.** A run takes an `O_EXCL` marker at
+`<meta>/exec.lock` — a *sibling* of the tree, so no read capability can name it and a sandboxed
+`rm -rf` cannot delete the lock guarding its own run. That placement is what makes it work where an
+actor cannot: pykka has no remote addressing and a workspace singleton is one instance per process,
+so two teams on two workers attached to one tree get two unsynchronised actors — while every
+multi-worker deployment mounts **one** volume into all of them. `O_EXCL` on that volume is exclusive
+exactly where the actor is not.
 
 | At `request_exec` | Answer | What exists for it |
 |---|---|---|
-| tree free | run id, `RUNNING` | the hold, and one request sent to the sandbox |
-| tree held | run id, `QUEUED` | **nothing** — the entry is inert bookkeeping |
-| queue full (`MAX_QUEUED_RUNS`) | a refusal naming **nobody** | — |
+| tree free | run id, `RUNNING` | the marker, the in-memory record, one command submitted to the worker |
+| tree held | a refusal naming **nobody** | — |
+| the lock could not be taken at all | a refusal naming **nobody**, and saying so | — |
 
 Three properties hold this together and none of them is optional:
 
-- **The run id is issued at enqueue time, in every branch.** A caller leaves `request_exec` holding
-  a handle to its *own* work whether or not the tree was free, so no message on this path can name
-  another agent's run.
-- **The hold and the clock are taken at dequeue.** A request handed to the sandbox at enqueue would
-  run out of order in the sandbox's own mailbox, and a clock started at enqueue would measure the
-  wait rather than the run. `#Workspace` sends the sandbox one command at a time, because only it
-  knows when the tree has been committed — a second run started before the first run's write set is
-  committed would sweep the first run's files into its own discovery.
-- **Only the head is on the sandbox**, which is what bounds teardown **on the actor side**: three
-  queued 15 s runs are 45 s of work but never more than one run's worth of liveness, comfortably
-  inside the orchestrator's 30 s stop backstop. `WorkspaceActor.on_stop` drops every queued entry —
-  they never ran and produced nothing to report. It says nothing about the **caller's** thread,
-  which waits out its turn on the agent's side of the boundary; see the accepted costs below.
+- **The run id comes from the grant**, so the id the agent holds and the id in the marker on disk are
+  one value by construction rather than by agreement. A caller leaves `request_exec` holding a handle
+  to its *own* work or holding nothing at all, so no message on this path can name another agent's
+  run.
+- **The refusal names no run and no agent.** A refusal that quoted the holder's id is precisely the
+  defect ADR-047 removed: a model emits several `workspace_exec` calls in one response, pydantic-ai
+  runs them **concurrently**, and a loser would read the winner's id out of its refusal and collect
+  it — an answer to a question it never asked, byte-indistinguishable from its own. A refused exec
+  caller has no id of its own to be given instead, so it is given nobody's. The backend rendering the
+  message has no access to the actor's display-name map either, so it could not do otherwise.
+- **One run at a time reaches the worker**, which is what bounds teardown on the actor side: never
+  more than one run's worth of liveness, comfortably inside the orchestrator's 30 s stop backstop.
+  `WorkspaceActor.on_stop` releases the marker for the run it was holding, so a team that stops
+  mid-run does not leave the tree locked for the next process to wait out.
+
+**There is no FIFO ordering any more, and that is a deliberate behaviour change.** Among several
+refused callers the first to **retry** wins, not the first to ask. The queue this replaced lived in
+one process's memory and could not have ordered waiters across workers without becoming a
+distributed scheduler. The cost is real and was taken knowingly: a refused `workspace_exec` raises
+`RetriableError`, which `akgentic-agent` turns into pydantic-ai's `ModelRetry`, so a parallel batch
+costs one LLM round trip per collision. "Restore the queue" is not the answer to a refusal seen in
+the wild — the retry is.
 
 **Every ordinary exit reports, so releasing the tree is ordinarily not a decision at all.** The
-sandbox's tell handler reports in a `finally`: a command that ran, one the budget killed, a backend
-that raised, a binary the allowlist refused — all four arrive as a report, and the report hands the
-tree on. Two cases have no report to wait for, and each releases the tree and **starts the queue
-head**:
+worker reports in a `finally`: a command that ran, one the budget killed, a backend that raised, a
+binary the allowlist refused — all four arrive as a report, and the report releases the marker.
+**The release happens after the discovered commit, never before.** The next acquirer may be in
+another process, so an early release hands an uncommitted tree to a discovery this process cannot
+see coming, and the finished run's files would land in somebody else's commit.
+
+Two cases have no report to wait for, and each releases the tree:
 
 | No report because | Noticed by | What happens |
 |---|---|---|
 | the **sandbox stopped** mid-run — no send primitive can see this, the request was delivered to an actor that was alive at the time | `workspace_exec_result`'s liveness check, the one place `is_alive` is consulted | the run is recorded `FAILED` naming the sandbox, **nothing is committed as its agent**, and the next admission resolves a *new* sandbox — the orchestrator skips a child that is no longer alive |
-| the **child ignored the kill** and is still running past `budget + LEASE_GRACE_S` | the next mutation or poll, against the run's own clock | the tree is handed on with one WARNING; the late report that may follow commits nothing and clears nothing, though its owner can still collect the outcome |
+| the **child ignored the kill** and is still running past `budget + LEASE_GRACE_S` | the next mutation, poll or exec request, against the run's own clock | the tree is given back — the in-memory record **and** the marker — with one WARNING; the late report that may follow commits nothing and clears nothing, though its owner can still collect the outcome |
 
-**A release drains the queue, and nothing overtakes it.** In both rows the queue **head** is started
-— not whichever request happened to notice. Only an empty queue lets the arriving request run
-immediately. Without that, the entries would sit with nothing scheduled to run them, and the next
-request to arrive would find the tree free and start itself, breaking FIFO on exactly the path the
-release created.
+**Two clocks describe that wedge, and they agree by construction.** The actor measures
+`started_at + budget + LEASE_GRACE_S` on the monotonic clock; a marker is stale at
+`mtime + budget + LEASE_GRACE_S` on the wall clock, and a stale marker is taken over by the next
+acquirer. They agree because **nothing refreshes the marker mid-run** — it is written once, at
+acquire, so its mtime *is* the run's start. Do not add a heartbeat: a refreshed mtime turns a
+bounded takeover into an unbounded one, and a child that ignores the kill is exactly the case that
+would never refresh. The wall clock is forced rather than chosen (an mtime is not comparable with
+`time.monotonic()`), so an NTP step or skew between two workers makes a takeover early or late by
+the skew — never a lost hold.
 
-Because the actor is passive — nothing releases on a timer — both checks also run on
-`workspace_exec_result`'s read path. That is the one message guaranteed to arrive, since every
-queued caller is polling its own run by construction; without it a head that will never report
-strands the work behind it until some unrelated request happens along. It costs one clock read and
-one flag read.
+Because the actor is passive — nothing releases on a timer — the wedge check also runs on
+`workspace_exec_result`'s read path and at the head of `request_exec`. Without it a run that will
+never report keeps refusing mutations until some unrelated request happens along. It costs one clock
+read and one flag read.
 
-The queue is FIFO and nothing else. No priorities, no fairness weighting: a tree's queue that
-needs a scheduling policy is a design smell, not a feature. A queued entry belonging to an agent
-that has since stopped is **discarded** at the next liveness sweep, which drops the stopped holder
-and everything the actor kept about it; a run that agent already had running is marked and
-completes on its own budget, and its output is simply never collected.
+A run belonging to an agent that has since stopped completes on its own budget and gives the tree
+back when it reports; its output is simply never collected. There is no sweep that notices the agent
+went — the agent and the actor belong to one team, so a teardown takes both.
 
 **A run belongs to the agent that started it.** `workspace_exec_result` answers only the asking
 agent's runs: an id from somebody else comes back as the existing recoverable `UNKNOWN`, carrying
 the *asker's* own recent ids. No new state was introduced for it — "exists but is not yours" is a
-distinction a model cannot act on differently. This is defence in depth rather than the fix: with
-the queue in place nothing publishes a foreign id any more. Ownership is read from a map capped at
+distinction a model cannot act on differently. This is defence in depth rather than the fix: no exec
+refusal publishes a foreign id any more. Ownership is read from a map capped at
 `MAX_TRACKED_RUNS = 32` **per agent**, so an agent past its 33rd run can no longer collect its
 oldest; the answer is a recoverable `UNKNOWN`, and the alternative — a second map keyed by run —
 would leak for the life of the team.
@@ -394,9 +416,10 @@ shared rendering, and the caller that knows the run is the one that names it.
 a refusal is a precondition failure that costs nothing to re-issue and that the agent can act on
 immediately (read the file, answer the user, ask the holder). Exec is the only operation whose write
 set is discovered after the fact, which is why it is the only one whose work would be *lost* by a
-refusal and therefore the only one worth a slot in a queue. Queuing mutations would buy nothing and
-would put a stale precondition in a deque. The busy refusal still names the holder's run id, which
-is safe precisely because that id is now uncollectable by anyone but its owner.
+refusal — but both are refusals now, and the two messages differ in one respect: **the mutation
+refusal names the holder's run id and agent, and the exec refusal names nobody.** Naming the id in a
+mutation refusal is safe precisely because that id is uncollectable by anyone but its owner, and it
+is what lets a human reading the transcript see who is holding the tree.
 
 Afterwards the write set is **discovered** — `git status --porcelain -uall` — and committed as one
 commit attributed to the requesting agent, with the command in the body. That is where multi-file
@@ -413,35 +436,26 @@ change, and ends by telling the model to come back on a next turn it does not ha
 held for the run's duration either way, so the *team* waits identically; only the requesting
 agent's turn count differs.
 
-**Under the default the wait covers your turn as well as your run**, so a command that had to queue
-still returns its own output on the call that asked for it — a batch behaves as if it had been
-issued one command at a time. That makes the poll **deadline-driven** rather than attempt-driven: a
-run at queue position `p` has at most `p + 1` run budgets left to wait, so that is the deadline, and
-it **re-arms on every queued look**, so a caller that is still advancing up the queue is never
-abandoned mid-climb — a run ahead costs its budget *plus* the grace and the sandbox resolve, so a
-deadline pinned to the position first seen gives a caller less time than its wait honestly takes.
-What bounds it is a separate **ceiling fixed on entry and never re-armed**,
-`(MAX_QUEUED_RUNS + 1) × run_budget + margin`: without it, a position that stopped decreasing would
-re-start the clock for ever. The `+ 1` is the caller's own run, the same arithmetic as the 1-based
-position — at the deepest legal slot you wait for the 16 ahead of you *and then for yourself*.
+**Under the default the wait covers the run**, resolved once at wiring time into the attempt count
+whose last look falls as late as it still can inside the effective run budget **plus** a report
+margin (~1 s). There is no turn to wait out any more: an admitted run starts immediately, and a
+command that was refused never got an id to wait on.
 
 The thread parked by that wait is the **caller's own tool thread**, never the actor's, and the
 mailbox goes on draining — so reads, mutations and other agents' polls are unaffected. On the
-ordinary path a poll costs **one clock read and one flag read**: the sandbox is alive, and the run
-is inside `budget + LEASE_GRACE_S`. It is not unconditionally O(1), and the difference is worth
-stating rather than glossing — a poll *can* fork git and send the queue head to the sandbox, but
-only on the two no-report paths above. That is the anomaly path, not the poll path, and the work is
-what the tree needs done by whoever arrives first: nothing releases on a timer, so the queued
-caller's own poll is the message guaranteed to arrive. Two costs come with it and are accepted: latency is serial (three 15 s commands mean the
-third result lands ~45 s in, which is the point), and a parked thread can outlive the orchestrator's
-30 s stop backstop during teardown — the same exposure one long run already has, not a new one.
+ordinary path a poll costs **one clock read and one flag read**: the run is inside
+`budget + LEASE_GRACE_S`. It is not unconditionally O(1), and the difference is worth stating rather
+than glossing — a poll *can* release a wedged run's hold, on the no-report path above. That is the
+anomaly path, not the poll path, and the work is what the tree needs done by whoever arrives first:
+nothing releases on a timer, so a caller's own poll is the message guaranteed to arrive. One cost
+comes with it and is accepted: a parked thread can outlive the orchestrator's 30 s stop backstop
+during teardown — the same exposure one long run already has, not a new one.
 
-A run that outlives even that deadline comes back saying it passed its budget and naming its id, and
-`workspace_exec_result('<id>')` collects the output whenever it does land; a run still queued at the
-deadline says so instead. That degraded path stops being the normal outcome but does not disappear —
-it is what answers a head that hangs past its budget. An id nothing was issued under, or one
-belonging to another agent, does not raise — it comes back with that agent's own recent run ids, so
-a mistyped one is correctable.
+A run that outlives that deadline comes back saying it passed its budget and naming its id, and
+`workspace_exec_result('<id>')` collects the output whenever it does land. That degraded path is not
+the normal outcome but does not disappear — it is what answers a run that hangs past its budget. An
+id nothing was issued under, or one belonging to another agent, does not raise — it comes back with
+that agent's own recent run ids, so a mistyped one is correctable.
 
 A **positive** `poll_attempts` is unchanged: it asked for an explicitly bounded look and still gets
 a run id when the count runs out.
@@ -450,7 +464,7 @@ a run id when the count runs out.
 
 | Setting | Meaning | Bounded by |
 |---|---|---|
-| `-1` (default) | wait out your **turn and** your run | a deadline, not a count: the effective run budget **plus** a report margin (~1 s), re-armed to `(p + 1)` budgets on every look while queued at position `p`, and clamped by a ceiling of `(MAX_QUEUED_RUNS + 1) × run_budget + margin` fixed on entry. So a command killed at its budget still arrives as a readable `exit_code: 124`, and one that had to queue still returns its own output |
+| `-1` (default) | wait out your run | the effective run budget **plus** a report margin (~1 s), resolved once at wiring into an attempt count. So a command killed at its budget still arrives as a readable `exit_code: 124` rather than as a timeout message |
 | a positive count | a bounded look, then a run id | the effective run budget alone — no margin |
 | `0` | no polling; the run id comes back immediately | — |
 
@@ -540,21 +554,28 @@ truncated. A missing path or a path escaping the root surfaces as `RetriableErro
 can correct itself.
 
 **Binary reads** (`.pdf`, `.docx`, `.xlsx`, `.xls`, `.pptx`, `.msg`, `.epub`, and image
-extensions) go through the `DocumentReader`, and the extracted Markdown is cached **in
-`#Workspace`'s state** — not in a file beside the source (ADR-045 §3). The sidecar it replaced is
-gone, and so is the read-path rule that used to return a dotfile ending in `.md` as plain text.
+extensions) go through the `DocumentReader`, and the extracted Markdown is cached in the tree's
+**sibling metadata directory** — never in a file beside the source (ADR-045 §3, ADR-051 Decision 6).
+The sidecar it replaced is gone, and so is the read-path rule that used to return a dotfile ending
+in `.md` as plain text. No read capability can name a cache file, because `<meta>` is beside the
+tree rather than inside it.
 
 The cache is keyed by path and hits only when the entry was produced from *these* source bytes by
 *this* extractor version, so it can never serve a stale body: a changed file misses and re-extracts.
-It is persisted — each fill sends one member-keyed delta, carrying the entry it inserted and every
-entry the caps touched, through the `WorkspaceHost` to the deployment's store — and it is bounded on
-two dimensions, a row count and a character total, so the actor's state and the stored document stay
-bounded however many documents are read. Over the character cap the least-recently-used entry
-keeps its metadata and **drops its body**; over the row cap the entry goes entirely. Every byte is
-regenerable from the tree, so an eviction costs one re-extraction and never a wrong answer.
+Each fill writes one YAML record, temp-then-`replace()`, so a torn write leaves the previous record
+intact. It is bounded on two dimensions, a row count and a character total, so the metadata
+directory stays bounded however many documents are read. Over the character cap the entry whose body
+was **least recently extracted** keeps its metadata and drops its body; over the row cap that entry
+loses its extraction outright. Every byte is regenerable from the tree, so an eviction costs one
+re-extraction and never a wrong answer.
 
-An evicted body does **not** de-index its file: index membership lives in its own map and is never
-inferred from this one.
+**Recency is `extracted_at`, stamped at the fill.** A cache *hit* refreshes nothing and writes
+nothing: a read must never write, which is the rule the whole design rests on, and the price is at
+most one extra re-extraction of a file that was read but not re-extracted.
+
+An eviction does **not** de-index its file. Both halves of a document live in one record, so the row
+cap clears the extraction half and leaves the index row exactly where it was; the record is removed
+outright only when there is no row left in it.
 
 #### `DocumentReader`
 
@@ -658,7 +679,7 @@ WorkspaceTool(
 | `expose` | `set[Channels]` | `{TOOL_CALL}` | Taking exec off this channel withholds both callables **and** skips the wiring entirely — no host probe, no sandbox actor. |
 | `mode` | `"local" \| "bwrap" \| "seatbelt" \| "docker" \| "auto"` | `"auto"` | The isolation backend. `"auto"` probes the host at wiring time (`bwrap` → `seatbelt` → `docker` → `local`) and warns when it falls through to `local`. A mode naming no registered backend raises `KeyError` at wiring time, deliberately. |
 | `timeout_s` | `float` | `15.0` | Budget for the **subprocess**, handed to the backend. Capped at `MAX_EXEC_BUDGET_S` (20 s), which sits below the orchestrator's 30 s stop backstop. |
-| `poll_attempts` | `int` | `-1` | How many times the agent's own thread looks for a result. `-1` is the sentinel for "wait out my turn **and** my run" — a deadline of the effective run budget plus a report margin, re-armed from the queue position on every look and clamped by a ceiling fixed on entry, so a queued command still returns its own output; a positive count is a bounded look clamped to that budget without the margin, and is unaffected by the queue; `0` opts out of polling and takes the run id immediately. Below `-1` is a validation error. |
+| `poll_attempts` | `int` | `-1` | How many times the agent's own thread looks for a result. `-1` is the sentinel for "wait out my run" — resolved at wiring into the count whose last look falls as late as it still can inside the effective run budget plus a report margin, so an ordinary command returns its own output and the model never sees a run id; a positive count is a bounded look clamped to that budget without the margin; `0` opts out of polling and takes the run id immediately. Below `-1` is a validation error. |
 | `poll_delay_seconds` | `float` | `0.5` | Seconds between those looks — the granularity of the wait, not its length. The length comes from `poll_attempts` resolved against the run budget, and can never outlast the run it waits for: past that point there is nothing left to wait for. |
 
 None of these reaches an LLM-facing signature: nothing lets a model name a mode, a timeout, or a
@@ -1071,9 +1092,10 @@ WorkspaceTool(
 
 Retrieval adds three things worth knowing before you turn it on. **Indexing spends embedding credits
 per file**, which is why all three capabilities are opt-in. **The in-memory vector backend keeps
-every vector in the workspace actor's own store child**, which is never persisted: its vectors are
-lost with the actor, and a restored tree re-embeds its indexed files on the next
-`workspace_rag_index`. Enabling retrieval on that backend shrinks the extraction cache from 32
+every vector in the workspace actor's own store child**, which is not persisted: its vectors are
+lost with the actor, while the index rows describing them are on disk and are not. Re-index the tree
+after a process restart on that backend — `workspace_rag_index(force=True)` — until the local vector
+backend lands. Enabling retrieval on that backend shrinks the extraction cache from 32
 documents / 2 MB to 8 / 200 KB. A cluster backend keeps the vectors in the cluster and keeps the
 large caps. And **`workspace_rag_search`
 makes one embedding round trip on the mailbox turn of the actor that owns the write gate**: bounded

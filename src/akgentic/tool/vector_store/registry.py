@@ -59,19 +59,27 @@ class BackendContext:
     stamp its objects for later team-scoped cleanup. No built-in factory reads
     ``config``; it stays as the seam a third-party factory may use.
 
-    ``team_id`` is ``None`` for a consumer with no team of its own — the hosted
-    workspace, one actor per tree shared by every team on it, whose rows live on
-    a shared collection bounded by ``scope`` — as well as for an administrative
-    backend. A cluster backend built with none stamps ``""`` and can still query
-    a shared collection, never a team-scoped one.
+    ``team_id`` is ``None`` for an **administrative** backend — a sweeper built to
+    call ``delete_by_team`` or ``list_collections``, which belongs to no team by
+    construction (ADR-046 §D2). It is the only remaining producer of ``None``:
+    every consumer now passes its real team, and a cluster backend built with
+    none stamps ``""`` and can still query a shared collection, never a
+    team-scoped one.
+
+    ``root`` is the filesystem directory a locally persisting backend hangs its
+    index off — the workspace's ``<meta>`` sibling. It is ``None`` for every
+    backend with no filesystem, which is all three of the others: an in-memory
+    index has nothing to write and a cluster owns its own storage.
 
     Attributes:
         config: The ``VectorStoreConfig`` of the owning ``VectorStoreActor``.
         team_id: Owning team id as a string, or ``None`` when unattributed.
+        root: Filesystem root for a backend that persists locally, else ``None``.
     """
 
     config: VectorStoreConfig
     team_id: str | None = None
+    root: str | None = None
 
 
 BackendFactory = Callable[[BackendContext], "VectorStoreService"]
@@ -106,6 +114,16 @@ class BackendSpec:
             mutation. Such backends must also satisfy the ``ActorStateBackend``
             protocol. ``False`` is for durable external stores that own their
             own persistence.
+        needs_actor: ``True`` for a backend that needs the team's store actor in
+            front of it **without** snapshotting into the actor's state. The two
+            questions were fused on ``persists_in_actor_state`` (ADR-049 Decision
+            1) because no backend separated them; the locally persisting index is
+            the first that does. Its data is on disk, so a snapshot would
+            serialise a whole numpy index into ``VectorStoreState`` on every
+            mutation — but a single actor still has to own the in-process matrix,
+            so an actor is required. :func:`~akgentic.tool.vector_store.protocol.needs_store_actor`
+            is the disjunction of the two; the default of ``False`` leaves every
+            existing backend's answer exactly as it was.
         selectable_as_default: Whether :func:`resolve_default_backend` may pick
             this backend when a collection names none. External stores set this
             ``True``; the in-memory fallback sets it ``False`` so it is only ever
@@ -121,6 +139,7 @@ class BackendSpec:
     name: str
     factory: BackendFactory
     persists_in_actor_state: bool = False
+    needs_actor: bool = False
     selectable_as_default: bool = True
     is_configured: Callable[[], bool] = field(default=lambda: True)
     require_configured: Callable[[str], None] = field(default=lambda _card_name: None)
@@ -174,6 +193,7 @@ def _ensure_builtins() -> None:
         return
     _BUILTINS_LOADED = True  # set first so a factory-triggered re-entry is a no-op
     from akgentic.tool.vector_store.backends import inmemory as _inmemory  # noqa: F401
+    from akgentic.tool.vector_store.backends import local as _local  # noqa: F401
     from akgentic.tool.vector_store.backends import weaviate as _weaviate  # noqa: F401
 
     try:

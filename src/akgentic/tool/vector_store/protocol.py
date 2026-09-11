@@ -12,7 +12,7 @@ import uuid
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol, runtime_checkable
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.utils.serializer import SerializableBaseModel
@@ -97,9 +97,15 @@ class VectorStoreParam(SerializableBaseModel):
     """How a tool reaches its vector store. One object, embedded by every consumer.
 
     ``PlanningTool``, ``KnowledgeGraphTool`` and ``WorkspaceTool`` each carry one
-    of these as a single field, so a store's five settings — backend, dimension,
-    tenant, embedding model and embedding provider — live in one place and a
-    reader learns one shape.
+    of these as a single field, so a store's six settings — backend, root,
+    dimension, tenant, embedding model and embedding provider — live in one place
+    and a reader learns one shape.
+
+    **``root`` is the one field a consumer derives rather than an author writing
+    it**, and it is declared here rather than on a card because it has to travel:
+    ``create_collection`` records the whole param, and the store actor reads the
+    backend and the root back out of that record when it builds the engine. A
+    consumer with no filesystem leaves it ``None``.
 
     **Not a ``BaseToolParam``.** That base carries ``instructions`` and ``expose``
     because it describes a capability the model can be shown; a vector store is
@@ -120,6 +126,27 @@ class VectorStoreParam(SerializableBaseModel):
             "lists them. Defaults to whichever backend the environment has provisioned, "
             "else the fallback that keeps its data in actor state. Custom backends can "
             "be added via akgentic.tool.vector_store.registry.register_backend."
+        ),
+    )
+    backend_declared: bool = Field(
+        default=False,
+        description=(
+            "Whether an author wrote 'backend' themselves rather than it being resolved "
+            "by default. Recorded once, at the first construction of the param, and "
+            "carried through every serialisation afterwards. A consumer that treats an "
+            "authored backend differently from a defaulted one must read this field and "
+            "never model_fields_set."
+        ),
+    )
+    root: str | None = Field(
+        default=None,
+        description=(
+            "Filesystem directory a file-persisting backend hangs its index off, "
+            "derived at bind time by the consumer that has a filesystem — the workspace "
+            "stamps its own <meta> sibling here — and ignored by every backend that has "
+            "none. A value written in a catalog is inert: the consumer overrides it "
+            "unconditionally, so nothing an author writes can point one tree's index at "
+            "another tree's directory."
         ),
     )
     dimension: int = Field(default=1536, ge=1, description="Embedding vector dimensionality")
@@ -145,6 +172,39 @@ class VectorStoreParam(SerializableBaseModel):
     embedding_provider: Literal["openai", "azure"] = Field(
         default="openai", description="Embedding API provider"
     )
+
+    @model_validator(mode="after")
+    def _record_whether_the_backend_was_declared(self) -> VectorStoreParam:
+        """Freeze "did the author name a backend" into a field, once.
+
+        **``model_fields_set`` cannot answer this, and the reason is structural.**
+        ``SerializableBaseModel`` declares a whole-model ``@model_serializer``
+        which emits **every** declared field — ``exclude_unset`` has no effect on
+        it — so one ``model_dump()`` / ``model_validate()`` round trip makes every
+        field look explicitly written. The agent-card store does exactly that round
+        trip on every team resume, so a card that named nothing would come back
+        looking as though its author had named the in-actor backend, and
+        :func:`~akgentic.tool.workspace.card.rag.require_workspace_backend` would
+        refuse a configuration that worked yesterday, blaming the author for a
+        value they never wrote.
+
+        The flag is therefore recorded at the **first** construction, where
+        ``model_fields_set`` is still honest, and preserved on every later one:
+        a param that already carries ``backend_declared`` — which every
+        round-tripped one does — is taken at its word rather than re-derived.
+
+        A payload persisted before this field existed carries no value and reads
+        ``False``, so an author's explicit in-actor backend written back then is
+        substituted rather than refused. That is the lenient direction on purpose:
+        an old record keeps working, and the refusal still meets every card
+        written since.
+
+        Returns:
+            This param, with :attr:`backend_declared` settled.
+        """
+        if "backend_declared" not in self.model_fields_set:
+            self.backend_declared = "backend" in self.model_fields_set
+        return self
 
 
 def require_dimension_matches(param: VectorStoreParam, owner: str) -> None:
@@ -187,8 +247,8 @@ def require_backend_configured(config: VectorStoreParam, card_name: str) -> None
     It looks up the registered backend named by ``config.backend`` and asks that
     backend's own ``require_configured`` probe. A consumer card calls this at
     ``observer()`` time so a team that names a durable store — a cluster or a
-    custom backend — fails to build rather than starting up silently pointed at a
-    process-local index. A card that asks for a cluster has asked for durable,
+    custom backend — fails to build rather than starting up silently pointed at an
+    index confined to one process. A card that asks for a cluster has asked for durable,
     shared, tenant-isolated storage; an in-memory index instead is not a
     degradation, it is the wrong answer to a question the deployment already
     settled.
@@ -209,15 +269,22 @@ def require_backend_configured(config: VectorStoreParam, card_name: str) -> None
 
 
 def needs_store_actor(param: VectorStoreParam) -> bool:
-    """Return whether this param's backend keeps its data inside an actor.
+    """Return whether this param's backend needs the team's store actor in front of it.
 
-    ``persists_in_actor_state`` answers a larger question than its name once
+    ``persists_in_actor_state`` answered a larger question than its name once
     suggested: not "should a mutation be snapshotted into actor state" but
     **does this backend need an actor at all** (ADR-049 Decision 1). In memory
     the actor's state *is* the database, so a store actor is what holds the
     data and one must exist. On a cluster the data lives elsewhere and an actor
     would hold nothing but a socket — there is nothing to name, look up, host,
     checkpoint or reap — so the consumer calls the backend's client directly.
+
+    **The two questions have since come apart, and this is their disjunction.**
+    A file-persisting backend keeps its index in files, so snapshotting it
+    into actor state would serialise a whole numpy matrix on every mutation — yet
+    one actor still has to own the in-process matrix, so an actor is required.
+    ``BackendSpec.needs_actor`` is that second answer, and a backend that
+    declares neither flag still gets exactly the behaviour it had.
 
     Both halves of the wiring ask this and must get the same answer: a consumer
     card at ``observer()`` time, deciding whether to create the store actor
@@ -232,14 +299,16 @@ def needs_store_actor(param: VectorStoreParam) -> bool:
         param: The vector store configuration carried by a consumer.
 
     Returns:
-        ``True`` when the named backend stores its data in actor state.
+        ``True`` when the named backend stores its data in actor state, or
+        declares that it needs an actor for another reason.
 
     Raises:
         ValueError: When ``param.backend`` names no registered backend. A card
             naming a backend nobody registered must fail the build rather than
             silently taking one of the two branches.
     """
-    return registry.get_backend_spec(param.backend).persists_in_actor_state
+    spec = registry.get_backend_spec(param.backend)
+    return spec.persists_in_actor_state or spec.needs_actor
 
 
 def resolve_store_param(value: VectorStoreParam | bool) -> VectorStoreParam | None:
@@ -491,6 +560,42 @@ def stable_object_id(team_id: str | None, tenant: str | None, ref_id: str) -> st
         [team_id or "", tenant or "", ref_id], ensure_ascii=True, separators=(",", ":")
     )
     return str(uuid.uuid5(STABLE_OBJECT_ID_NAMESPACE, identity))
+
+
+def row_object_id(collection: str, team_id: str | None, tenant: str | None, ref_id: str) -> str:
+    """The id a row is stored under, with the team dropped on a shared collection.
+
+    **The rule is per collection, not per caller**, and that is the whole reason
+    this function exists rather than each backend deciding. A shared collection
+    holds the chunks of a *filesystem path*: two teams indexing one tree must
+    write **one** row per chunk, so the writer's team may not enter the identity
+    — otherwise the same chunk is two points and every search returns it twice.
+    A team-scoped collection is the opposite case and keeps the team inside the
+    id, which is what stops one team's ``ref_id`` from overwriting another's.
+
+    The workspace used to reach this the long way round: its backend was built
+    with ``team_id=None``, so the first element was always ``""`` whoever wrote
+    it. That was a property of one wiring rather than of the collection, and it
+    ended the moment the card started passing its real team — which it must, so
+    the rows can still be *filtered* by team. Dropping the team here instead
+    moves the rule to where it can be stated once and read by both cluster
+    backends, which is the same reason :data:`SHARED_COLLECTIONS` and
+    :func:`check_path_prefix` live here.
+
+    The team is still **stamped** on the object either way: filtering and
+    sweeping need it, and only the identity derivation is affected.
+
+    Args:
+        collection: The collection the row is written into.
+        team_id: The writing backend's team, or ``None`` for a writer with none.
+        tenant: The tenant the row is written under, or ``None``.
+        ref_id: The caller's own identifier for the row.
+
+    Returns:
+        The id, as a UUID string.
+    """
+    scoped_team = team_id if collection_is_team_scoped(collection) else None
+    return stable_object_id(scoped_team, tenant, ref_id)
 
 
 # ---------------------------------------------------------------------------

@@ -15,7 +15,7 @@ renders through.
 and goes back to draining its mailbox; the worker tells the answer back to
 ``#Workspace`` itself. There is no second actor and no ``#defer-`` worker in
 between — the worker only ever sat in an ``ask`` waiting for that same
-subprocess, and the second actor cost a lifetime, a registry entry and a liveness
+subprocess, and the second actor cost a lifetime, a roster entry and a liveness
 check to keep in agreement with this one.
 
 **The module is named ``execution``, not ``exec``.** ``exec`` is a builtin, and a
@@ -33,8 +33,6 @@ from __future__ import annotations
 
 import logging
 import subprocess
-import time
-from collections.abc import Callable
 from enum import StrEnum
 from uuid import uuid4
 
@@ -165,20 +163,6 @@ run id *helpful* — a model that mistyped one reads the right one back — so t
 cap only has to cover a conversation's worth of runs, not a team's.
 """
 
-MAX_QUEUED_RUNS = 16
-"""How many runs may wait for the tree behind the one holding it.
-
-Bounded for the reason every other collection on ``#Workspace`` is: a team
-singleton's deque with no ceiling grows with whatever a model emits, and a model
-that has decided to emit commands in a loop will fill it faster than the head
-drains it. The refusal over the cap is the only exec refusal left, and it names
-nobody — which is what keeps it from reproducing the defect the queue removes.
-
-Generous rather than tight: the workload that produced the queue is a parallel
-batch of two or three probes, and a cap that a healthy batch could reach would
-turn an ordinary response into a retry.
-"""
-
 LEASE_GRACE_S = 5.0
 """How long past its budget a run keeps the mutation gate with nothing reported.
 
@@ -249,6 +233,18 @@ _UNCONFIGURED_MSG = (
     "This workspace has no execution backend configured — workspace_exec is not available here."
 )
 
+_BUSY_PREFIX = "workspace busy"
+"""Opening words of every refusal a held tree causes.
+
+Fixed wording because it is what an agent recognises across all seven refused
+operations — the six mutations and a second ``workspace_exec``. It lives here,
+beside the message functions, because the two refusal families are rendered for
+two different readers: the mutation one (:func:`mutation_busy`) names the holder,
+because the id it prints is uncollectable by anyone but its owner, and the exec
+one (:func:`exec_busy`) names nobody, because a refused exec caller would collect
+it. One spelling of the prefix is what keeps them recognisably one family.
+"""
+
 
 class ExecOutcome(SerializableBaseModel):
     """What a finished run produced.
@@ -272,17 +268,24 @@ class RunningExec(SerializableBaseModel):
     """The run that is holding the tree right now — the one mutation gate.
 
     ``#Workspace`` holds at most one of these at a time, in ``self._running``, and
-    its presence *is* the answer to "is the tree taken". There is no second flag
-    and no separate deadline: a report clears it, and a run wedged past
-    ``budget + LEASE_GRACE_S`` is released by the shared predicate that both the
-    mutation path and the admission path decide over.
+    its presence *is* the answer to "is the tree taken" for a **mutation**. There
+    is no second flag and no separate deadline: a report clears it, and a run
+    wedged past ``budget + LEASE_GRACE_S`` is released by the predicate the
+    mutation path decides over.
+
+    **The exec path decides on the marker file instead**, and the two agree
+    because nothing refreshes the marker mid-run: this record's ``started_at``
+    and the marker's mtime are the same moment, one clock over. What this record
+    still owns alone is the *prompt* release — a report closes the run out here
+    and gives the tree back at once, where the file could only be reclaimed by
+    staleness.
 
     Attributes:
-        run_id: The run holding it. A report is only allowed to clear the gate
-            when its run id matches — a late report from a released run must not
-            close out a newer one.
-        agent_id: Who requested the run. Named in every refusal it causes, and
-            who the discovered commit is attributed to.
+        run_id: The run holding it, and the id in the marker on disk. A report
+            is only allowed to clear the gate when its run id matches — a late
+            report from a released run must not close out a newer one.
+        agent_id: Who requested the run. Named in every mutation refusal it
+            causes, and who the discovered commit is attributed to.
         cmd: The command, kept for the discovered commit's body.
         started_at: Monotonic clock at the moment the work was submitted. The
             budget and the grace are both measured from here, and nothing
@@ -309,8 +312,10 @@ class ExecStart(SerializableBaseModel):
     guessing which of the two it holds.
 
     Attributes:
-        run_id: The issued id, when the run was accepted.
-        refusal: Why not, when it was not — the busy message, naming the holder.
+        run_id: The issued id, when the run was accepted. It comes from the
+            hold on the tree, so the id the agent holds and the id in the
+            marker on disk are one value by construction.
+        refusal: Why not, when it was not — the busy message, naming nobody.
     """
 
     run_id: str = ""
@@ -330,48 +335,21 @@ class ExecState(StrEnum):
     """Where a run is, from the point of view of an agent asking about it.
 
     ``DONE`` and ``FAILED`` are both *settled*: a caller polling for a result
-    stops on either. ``QUEUED``, ``RUNNING`` and ``UNKNOWN`` are not, and they
-    are deliberately distinct — the cache's ``get`` returns ``None`` for an
-    unknown key, an in-flight one and a negatively-cached one alike, so telling a
-    model "still running" about an id it invented would be a lie it cannot
-    recover from.
+    stops on either. ``RUNNING`` and ``UNKNOWN`` are not, and they are
+    deliberately distinct — the cache's ``get`` returns ``None`` for an unknown
+    key, an in-flight one and a negatively-cached one alike, so telling a model
+    "still running" about an id it invented would be a lie it cannot recover
+    from.
 
-    ``QUEUED`` is admission's third answer: the tree is held by somebody else, so
-    the command has not started and will. It must **not** be settled — a poller
-    that stopped on it would hand back a run id the caller never needed, on the
-    ordinary path where the head finishes in milliseconds.
+    There is no queued state, and there is nothing left for one to describe: a
+    command that finds the tree held is **refused**, so it never has a run id to
+    be asked about.
     """
 
     DONE = "done"
     FAILED = "failed"
-    QUEUED = "queued"
     RUNNING = "running"
     UNKNOWN = "unknown"
-
-
-class QueuedExec(SerializableBaseModel):
-    """One run waiting for the tree — inert bookkeeping, and nothing else.
-
-    **Nothing is sent and no clock is started for a queued entry**, and the
-    absence is the design rather than an omission: a request handed to the
-    sandbox at enqueue would run out of order, and a clock started at enqueue
-    would measure the wait instead of the run. Both happen at the dequeue, in
-    ``_start_run``, which is why this model carries neither.
-
-    Attributes:
-        run_id: The id issued to the requester at enqueue time. Its owner holds a
-            handle to its **own** work from the moment it asks, which is what
-            stops any message naming somebody else's run.
-        agent_id: Who asked, as a string. What the discovered commit is
-            attributed to once the entry runs.
-        cmd: The command string, exactly as the agent gave it.
-        cwd: Working directory below the workspace root.
-    """
-
-    run_id: str
-    agent_id: str
-    cmd: str
-    cwd: str = ""
 
 
 class ExecStatus(SerializableBaseModel):
@@ -387,10 +365,6 @@ class ExecStatus(SerializableBaseModel):
             tracking map, which is why it can only be filled for a run the asker
             owns. It is what makes a collected outcome nameable: without it the
             answer is byte-indistinguishable from any other run's.
-        queue_position: The run's 1-based place in the FIFO, on
-            :attr:`ExecState.QUEUED` only. ``1`` means "next to run when the head
-            finishes"; the running head is not in the queue and is never
-            position 0.
         recent_run_ids: This agent's recent runs, on :attr:`ExecState.UNKNOWN`
             only — what turns a mistyped id into a correctable one.
     """
@@ -400,7 +374,6 @@ class ExecStatus(SerializableBaseModel):
     outcome: ExecOutcome | None = None
     reason: str = ""
     command: str = ""
-    queue_position: int = 0
     recent_run_ids: list[str] = []
 
     @property
@@ -413,17 +386,17 @@ class ExecConfig(SerializableBaseModel):
     """What an exec-capable card tells the actor once, at bind time.
 
     Deliberately not part of :class:`~akgentic.tool.workspace.models.WorkspaceConfig`.
-    The first bind fixes that config for every card on the tree, and the card
-    that binds a tree first is routinely a ``WorkspaceTool`` with no exec
-    capability at all — the actor would then be permanently unable to run
-    anything for the card that *does* have one.
+    The first card of a team to bind fixes that config for every later card of
+    that team on the tree, and the card that binds a tree first is routinely a
+    ``WorkspaceTool`` with no exec capability at all — the actor would then be
+    permanently unable to run anything for the card that *does* have one.
 
-    **It carries no team.** A hosted tree is bound by agents of several teams,
-    each card announcing its own config, and nothing a backend does depends on
-    which team asked. A team id here would make two teams' otherwise identical
-    announcements unequal, and ``configure_exec`` replaces the runner on an
-    unequal config — one team's agent spawning would tear down another team's
-    run mid-flight.
+    **It carries no team**, and that is still right now that the actor is a team
+    child: several cards of one team bind one tree, each announcing its own
+    config, and nothing a backend does depends on which agent asked. A team id
+    here would make two otherwise identical announcements unequal, and
+    ``configure_exec`` replaces the runner on an unequal config — one agent
+    binding would tear down another's run mid-flight.
 
     Attributes:
         mode: The resolved backend.
@@ -503,94 +476,6 @@ def poll_attempts_within(attempts: int, delay: float, run_budget: float) -> int:
     if attempts * delay <= run_budget:
         return attempts
     return max(1, int(run_budget // delay))
-
-
-def wait_out_the_turn(
-    fetch: Callable[[], ExecStatus],
-    run_id: str,
-    run_budget: float,
-    delay: float,
-) -> str:
-    """Poll until the run settles, waiting out the **queue in front of it** as well.
-
-    The wait-out sentinel's loop, and the reason a batch of commands behaves as
-    if it had been issued one at a time: each call returns *its own* output.
-    Handing a queued caller a run id instead would be barely better than the
-    refusal the queue replaced — the model would still be left managing results
-    it never asked to manage.
-
-    **Deadline-driven, not attempt-driven**, because the wait is no longer a
-    property of the card alone: it depends on how many runs are ahead of this
-    one, which is only knowable per look. A run at queue position ``p`` has at
-    most ``p + 1`` run budgets left to wait — the ``p`` ahead of it, then its
-    own — so that is what the deadline is re-armed to on every queued look.
-
-    **The deadline re-arms on every queued look, and a separate ceiling fixed on
-    entry is what bounds it.** The two do different jobs and neither is
-    sufficient alone:
-
-    - **Re-arming keeps a caller that is still advancing alive.** A run ahead
-      costs its budget *plus* :data:`LEASE_GRACE_S` and the sandbox resolve, so
-      a deadline
-      fixed at the first look gives a caller at position 5 six budgets for work
-      that honestly takes more — and abandons it **while it is still moving up
-      the queue**, degrading to handoffs under exactly the load the queue exists
-      for. Re-arming from the current position cannot do that: each look buys
-      the time that position actually warrants.
-    - **The ceiling bounds the case re-arming cannot.** A position that never
-      decreases would otherwise re-start the clock for ever — reachable, because
-      a head whose child ignores the kill keeps the gate until something arrives
-      to release it. So ``(MAX_QUEUED_RUNS + 1) * run_budget +
-      EXEC_REPORT_MARGIN_S`` is computed **once, on entry, and never re-armed**,
-      and every deadline is clamped to it. That is what makes the worst case a
-      property of the code rather than of the happy path.
-
-    The ``+ 1`` is the caller's own run, and it is the same arithmetic as the
-    1-based ``queue_position``: at the deepest legal position the caller waits
-    for the :data:`MAX_QUEUED_RUNS` ahead of it **and then for itself**. A
-    ceiling of exactly ``MAX_QUEUED_RUNS * run_budget`` would abandon a
-    max-depth caller one budget before its own command finished.
-
-    **The thread parked here is the caller's own tool thread, never the actor's.**
-    ``exec_status`` is O(1) and the mailbox goes on draining, so nothing here
-    blocks reads, mutations, or another agent's poll. It does **not** bound
-    teardown: "only the head is on the sandbox" is a property of the actor side
-    and says nothing about a caller parked in this loop.
-
-    **Only the negative sentinel comes here.** A positive ``poll_attempts`` asked
-    for an explicitly bounded look and keeps ``poll_deferred``; ``0`` opts out of
-    polling entirely. ``poll_deferred`` is attempt-count-driven by construction
-    and shared with other cards, so it is left alone rather than widened for this
-    one caller.
-
-    Args:
-        fetch: Asks the actor where this run stands. Called once per look.
-        run_id: The caller's own run — never another agent's.
-        run_budget: The effective wall-clock budget of one run.
-        delay: Seconds between looks. Non-positive means a single look.
-
-    Returns:
-        The rendered outcome once the run settles, or — when the deadline goes
-        without one — the degraded handoff: :func:`queued` if it never started,
-        :func:`timed_out` if it did and overran.
-    """
-    start = time.monotonic()
-    ceiling = start + (MAX_QUEUED_RUNS + 1) * run_budget + EXEC_REPORT_MARGIN_S
-    deadline = start + run_budget + EXEC_REPORT_MARGIN_S
-    while True:
-        status = fetch()
-        if status.settled:
-            return format_status(status)
-        if status.state is ExecState.QUEUED:
-            turn = time.monotonic() + (status.queue_position + 1) * run_budget
-            deadline = min(turn + EXEC_REPORT_MARGIN_S, ceiling)
-        if delay <= 0 or time.monotonic() > deadline:
-            # A non-positive delay leaves no wall clock to divide, so it is one
-            # look and out — the reading ``poll_attempts_within`` already gives it.
-            if status.state is ExecState.QUEUED:
-                return queued(run_id, status.queue_position)
-            return timed_out(run_id, run_budget)
-        time.sleep(delay)
 
 
 def resolve_mode(mode: CardMode) -> tuple[SandboxMode, SandboxBackend]:
@@ -861,8 +746,6 @@ def format_status(status: ExecStatus) -> str:
         return format_outcome(status.outcome, run_id=status.run_id)
     if status.state is ExecState.FAILED:
         return f"Run {status.run_id} failed: {status.reason}"
-    if status.state is ExecState.QUEUED:
-        return queued(status.run_id, status.queue_position)
     if status.state is ExecState.RUNNING:
         return in_progress(status.run_id)
     known = ", ".join(status.recent_run_ids) or "none"
@@ -886,45 +769,61 @@ def in_progress(run_id: str) -> str:
     )
 
 
-def queued(run_id: str, position: int) -> str:
-    """The handoff for a run that has not started, because the tree is held.
+def exec_busy() -> str:
+    """Refusal for a second ``workspace_exec`` while a run holds the tree — naming nobody.
 
-    Shaped like :func:`in_progress` deliberately: same id echoed verbatim, same
-    pointer at ``workspace_exec_result``, so a model that already knows how to
-    act on one acts on this without learning a second protocol. What it adds is
-    the one fact the other cannot carry — the work has **not begun**, so nothing
-    has been lost and nothing needs re-issuing.
+    The one exec refusal there is, and the only message on this path that hands
+    back no run id at all. It names **no run and no agent** on purpose: a refusal
+    that quoted the holder's id is exactly the defect ADR-047 removed — a model's
+    parallel batch would read a sibling call's id out of it and collect that as
+    its own answer — and a refused exec caller is the one caller with no id of
+    its own to be given instead, so it must be given nobody's.
 
-    ``position`` is the **1-based place in the FIFO**: ``1`` means "next to run
-    when the head finishes". The running head is not in the queue, so a position
-    of ``0`` is never rendered for a queued run.
+    It is also what the layer can do rather than a restraint it exercises: this
+    is rendered under a :class:`~akgentic.tool.workspace.lock.LockBackend`, which
+    has only what is in the marker and no access to the actor's display-name map.
+    A refusal that named the holder would have to be built actor-side.
 
-    Args:
-        run_id: The queued run's id — the caller's own, in every branch.
-        position: Its 1-based place in the queue.
-
-    Returns:
-        What the agent reads back.
+    The **mutation** refusal is a different message and keeps naming the holder,
+    for the reason its own docstring gives: ``exec_status`` gates on ownership,
+    so a foreign run id is uncollectable.
     """
     return (
-        f"Run {run_id} is queued at position {position}: another command holds the workspace, so "
-        f"yours has not started yet. Nothing is lost — call workspace_exec_result('{run_id}') to "
-        "collect the output once it runs."
+        f"{_BUSY_PREFIX} — another command is running in it, so yours was not started and "
+        "nothing is lost. Reads still work; retry the command once the run has finished."
     )
 
 
-def queue_full() -> str:
-    """Refusal for a run the queue has no room for — naming nobody.
+def mutation_busy(run_id: str, agent_name: str) -> str:
+    """The one refusal a **mutation** gets while an exec run holds the tree.
 
-    The one exec refusal left, and the only message on this path that hands back
-    no run id at all. It names **no run and no agent** on purpose: a refusal that
-    quoted the holder's id is exactly the defect the queue exists to remove, and
-    a refusal is the one place an agent has no id of its own to be given instead.
+    The sibling of :func:`exec_busy`, and deliberately not the same message.
+    This one names the holder's run id and agent; that one names nobody. The
+    asymmetry is ADR-047's and it is about *collectability*: ``exec_status``
+    gates on ownership, so a foreign run id printed here is uncollectable by the
+    agent reading it and merely informs, where the same id in an *exec* refusal
+    was collected by a model as its own answer.
+
+    **The name, not the id.** The reader is a model choosing what to do next,
+    and *"agent '3f2a…'"* is something it can read and nothing it can act on —
+    the question ``WorkspaceActor.attach``'s docstring settled for the journal
+    and the refusals alike. The name travels in the marker
+    (:class:`~akgentic.tool.workspace.lock.LockMarker`) precisely so that this
+    text is the same in the process that took the hold and in one that only
+    found it on disk.
+
+    Args:
+        run_id: The run holding the tree.
+        agent_name: The holder's display name, or its id when the marker
+            carries no name — degraded, never broken.
+
+    Returns:
+        The refusal, whose text is the product and must not drift.
     """
     return (
-        f"Too many commands are already waiting for this workspace (the queue holds "
-        f"{MAX_QUEUED_RUNS}). Nothing was started. Retry once some of them have finished, or "
-        "collect the runs you already started first."
+        f"{_BUSY_PREFIX} — exec run {run_id} is in progress "
+        f"(agent '{agent_name}'). Reads still work; retry the change "
+        f"once the run has finished."
     )
 
 
@@ -946,6 +845,23 @@ def timed_out(run_id: str, budget_s: float) -> str:
         f"Run {run_id} passed its {budget_s:g}s budget without reporting, so there is no output "
         f"yet. It still holds the workspace. Nothing is lost — workspace_exec_result('{run_id}') "
         "collects the output whenever the run does report."
+    )
+
+
+def lock_unavailable() -> str:
+    """Refusal for a run whose hold could not be taken at all — a filesystem failure.
+
+    Distinct from :func:`exec_busy`, and the distinction is the one the agent
+    needs: busy means somebody is running a command and retrying will work,
+    while this means the workspace could not be locked — an unwritable metadata
+    parent, a full disk — and retrying will not, until an operator looks. It
+    opens with the same prefix because it is still the same family of "the tree
+    is not available to you", and it names nobody for the same reason.
+    """
+    return (
+        f"{_BUSY_PREFIX} — the workspace could not be locked for your command, so nothing was "
+        "started. This is an environment failure rather than a busy workspace: report it rather "
+        "than retrying in a loop."
     )
 
 

@@ -16,32 +16,28 @@ import hashlib
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import Field
-
 from akgentic.core.agent_config import BaseConfig
-from akgentic.core.agent_state import BaseState
 from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.workspace.documents.models import (
     DEFAULT_MAX_DOCUMENT_CHARS,
     DEFAULT_MAX_DOCUMENTS,
-    DocumentExtract,
-    RagFile,
 )
 
 DEFAULT_MAX_OBSERVATIONS_PER_AGENT = 256
-"""Per-agent bound on the observation map.
+"""Default of ``WorkspaceTool.max_observations_per_agent``.
 
-Bounds the **path** dimension only — see ``WorkspaceActor.record_observation``
-for why the agent dimension is deliberately left unbounded.
+Bounds the **paths** one agent's card remembers having read. There is no second
+dimension to bound: one card belongs to one agent
+(:meth:`~akgentic.tool.workspace.card.gate.CardGate.record_observation`).
 """
 
 DEFAULT_MAX_TRACKED_WRITERS = 512
-"""Bound on the last-writer map, which is keyed by **path** across all agents.
+"""Bound on the actor's agent-name map, which is keyed by agent id.
 
 Deliberately a separate constant from the observation cap: that one bounds one
-agent's paths, this one bounds the whole tree's, so a single number would be
-wrong at one end or the other. Both exist for the same reason — an uncapped map
-on a long-lived tree singleton leaks for the life of the tree.
+agent's paths on one card, this one bounds the names one tree's actor has been
+told, across every agent that ever attached. Both exist for the same reason — an
+uncapped map on a long-lived tree actor leaks for the life of the tree.
 """
 
 MAX_REJECTION_DIFF_LINES = 200
@@ -115,33 +111,11 @@ refusal. Orphans, by contrast, are minutes or restarts old — no real value of
 this constant separates the two badly.
 """
 
-DEFAULT_SWEEP_INTERVAL_S = 30.0
-"""How often a hosted ``#Workspace`` sweeps its holders for stopped agents.
-
-It is how stale a stopped holder may be before the tree notices, and nothing
-more: the sweep asks each holder's ``is_alive()`` and costs one pass over a map
-bounded by live agents. It is no longer than the orchestrator's 30 s stop
-backstop and a quarter of :data:`DEFAULT_REAP_GRACE_S`, so the grace is measured
-in whole ticks.
-"""
-
-DEFAULT_REAP_GRACE_S = 120.0
-"""How long a hosted ``#Workspace`` outlives its last holder before it stops itself.
-
-A hosted tree is outside a team's two-phase teardown, so the grace is what keeps
-it alive through a stopping team's last handlers — which is why it sits above
-the orchestrator's 30 s stop backstop (see :data:`DEFAULT_GIT_TIMEOUT_S`), and
-above a run's longest life, ``MAX_EXEC_BUDGET_S`` plus ``LEASE_GRACE_S``. It is
-also what lets a team stopping and an equivalent one starting a minute later
-find the same actor, journal and container rather than rebuild them.
-
-The grace is checked on each sweep tick rather than by a second timer, so the
-reap lands between ``reap_grace_s`` and ``reap_grace_s + sweep_interval_s``
-after the last holder stopped — never before.
-"""
-
 GIT_DIR_SUFFIX = ".git"
 """Suffix of the sibling repository directory: workspace ``foo`` journals to ``foo.git``."""
+
+META_DIR_SUFFIX = ".akgentic"
+"""Suffix of the sibling metadata directory: workspace ``foo``'s lives at ``foo.akgentic``."""
 
 GITIGNORE_NAME = ".gitignore"
 
@@ -266,130 +240,47 @@ class MutationOutcome(SerializableBaseModel):
     message: str
 
 
-class LastWrite(SerializableBaseModel):
-    """The agent behind the most recent accepted mutation of one path.
-
-    Attributes:
-        agent_id: Identity of the writing agent, as a string.
-        sha: Digest of the bytes that agent wrote.
-
-    The digest is what keeps attribution honest. A refusal may name this agent
-    only while the live file still hashes to ``sha``; once anything else has
-    touched the path, the last accepted writer is no longer the author of what
-    is on disk, and naming them would pin an out-of-band change — an upload, a
-    sandbox run, another team — on whichever agent happened to write last.
-    """
-
-    agent_id: str
-    sha: str
-
-
 class WorkspaceConfig(BaseConfig):
     """Configuration of the ``#Workspace-<workspace_path>`` actor.
 
-    **No field names a team or a key list.** The actor is hosted and shared by
-    every team whose cards resolve its path, so nothing here may be one team's.
-    A client learns which agent bound which tree from the ``WorkspaceAttached``
-    event each bind emits; the metadata key list this config used to carry had
-    no reader once the actor stopped emitting a ``StartMessage``, and a stored
-    record still carrying it loads unchanged, because an unknown key is ignored.
+    **No field names a team or a key list**, and that outlived the hosting it was
+    written for: two teams over one tree each get their own actor, so a field
+    naming one team's metadata would be read by the other team's actor as its
+    own. A client learns which agent bound which tree from the
+    ``WorkspaceAttached`` event each bind emits; the metadata key list this
+    config used to carry had no reader once the actor stopped emitting a
+    ``StartMessage``, and a stored record still carrying it loads unchanged,
+    because an unknown key is ignored.
 
     Attributes:
         workspace_path: The **already-resolved** two-segment path of the tree
             this actor owns — ``<scope>/<leaf>``, relative to the workspaces
-            root — and also the suffix of the actor's name. The
-            ``WorkspaceHost`` keys its registry on that name, so both come from
-            this one value; two cards on different workspaces cannot collapse
-            onto one actor owning one tree, and nothing here re-derives a
-            directory from a ``workspace_id`` or a team id.
-        max_observations_per_agent: Cap on the per-agent observation map.
-        max_tracked_writers: Cap on the path-keyed last-writer map, which the
-            gate consults only to name the other writer in a refusal.
-        max_documents: Cap on the number of rows in
-            :attr:`WorkspaceState.documents`. Over it, the least recently used
-            entry is removed outright.
+            root — and also the suffix of the actor's name. Get-or-create keys on
+            that name, so both come from this one value; two cards on different
+            workspaces cannot collapse onto one actor owning one tree, and
+            nothing here re-derives a directory from a ``workspace_id`` or a
+            team id.
+        max_tracked_writers: Cap on the agent-name map, which the git journal
+            and the exec busy refusal consult to name an agent rather than
+            print its UUID.
+        max_documents: Cap on the number of cached extractions the document
+            store holds for this tree. Over it, the least recently extracted
+            body is dropped and its record removed when nothing else is left in
+            it — an eviction never de-indexes a file, so a record still carrying
+            an index row survives with its extraction half cleared.
         max_document_chars: Cap on the characters held across the cached
-            extracts that still have a body. Over it, the least recently used
-            body is dropped and its metadata kept — a different remedy from the
-            row cap because it answers a different pressure
+            extracts that still have a body. Over it, the least recently
+            extracted body is dropped and its metadata kept — a different remedy
+            from the row cap because it answers a different pressure
             (:func:`~akgentic.tool.workspace.documents.models.evict_document_bodies`).
         git_journal: Whether to keep a git journal of accepted mutations. The
             gate is unaffected either way — it is pure Python and independent.
         git_timeout_s: Wall-clock budget for one ``git`` invocation.
-        sweep_interval_s: Seconds between two liveness sweeps of the holders —
-            see :data:`DEFAULT_SWEEP_INTERVAL_S`. Positive.
-        reap_grace_s: Seconds the actor outlives its last holder before it stops
-            itself — see :data:`DEFAULT_REAP_GRACE_S`. Positive. Neither field is
-            a card setting: the first bind fixes both, like every field here.
     """
 
     workspace_path: str
-    max_observations_per_agent: int = DEFAULT_MAX_OBSERVATIONS_PER_AGENT
     max_tracked_writers: int = DEFAULT_MAX_TRACKED_WRITERS
     max_documents: int = DEFAULT_MAX_DOCUMENTS
     max_document_chars: int = DEFAULT_MAX_DOCUMENT_CHARS
     git_journal: bool = False
     git_timeout_s: float = DEFAULT_GIT_TIMEOUT_S
-    sweep_interval_s: float = Field(default=DEFAULT_SWEEP_INTERVAL_S, gt=0)
-    reap_grace_s: float = Field(default=DEFAULT_REAP_GRACE_S, gt=0)
-
-
-class SweepTick(SerializableBaseModel):
-    """Time for a hosted ``#Workspace`` to sweep its holders — no fields, no meaning beyond that.
-
-    Told by the actor's own timer thread, which does nothing else, and handled
-    on the actor's mailbox, so a sweep can never interleave with an ``attach``.
-    **Never a** ``Message``: ``Akgent.on_receive`` dispatches a plain model by
-    name with no telemetry sandwich, so a tick puts nothing on any stream and
-    costs no orchestrator anything — a hosted actor has none to tell.
-    """
-
-
-class WorkspaceState(BaseState):
-    """Persisted actor state — the derived cache, and no observation data.
-
-    What this state must **not** carry is the observation map: reads are the
-    majority of workspace traffic, and a store write per recorded read would put
-    persistence on the read path that ADR-036's NFR1 exists to keep free.
-    Observations live as a plain actor instance attribute and do not survive a
-    restore — a reap or a process restart — which degrades towards *refusing* a
-    later write rather than accepting a stale one.
-
-    What it does carry is *derived* data: the extracted-document cache and the
-    retrieval index, every byte of which is regenerable from the tree. The hosted
-    actor persists it by member-keyed ``StateDelta`` told to its
-    ``WorkspaceHost`` (see :mod:`akgentic.tool.workspace.actor.documents`), and
-    the host's store restores it on the next get-or-create miss. NFR1 is a
-    property of the **read path**, not of an empty state, and the rule the whole
-    design rests on is therefore about who sends a delta rather than about what
-    is stored:
-
-    - a text read never sends one,
-    - a document-cache **hit** never sends one — it reorders the LRU in memory,
-      so persisted recency lags live recency until the next fill, which is
-      deliberate and harmless,
-    - a cache **fill** sends exactly one, after the insert *and* the eviction,
-      amortised against the seconds of extraction that preceded it.
-
-    Attributes:
-        documents: Workspace-relative path to its extracted Markdown, in
-            least-recently-used order — a plain ``dict`` preserves insertion
-            order, so the fill site's re-insert and the lookup's move-to-end are
-            the whole of the LRU. Bounded by ``max_documents`` and
-            ``max_document_chars`` on :class:`WorkspaceConfig`.
-        rag_index: Workspace-relative path to where that file stands in the
-            retrieval pipeline.
-
-            **This map is deliberately not governed by ``max_documents`` /
-            ``max_document_chars``.** Those two bound the *extraction cache*, and
-            an evicted body must not de-index its file: a search hit renders from
-            what the vector store holds, so an indexed file stays searchable with
-            no body in ``documents`` at all. Governing the index by the cache
-            caps would make ``max_documents`` a ceiling on the searchable corpus,
-            which is the opposite of what it is for. The index is bounded by the
-            tree — one row per candidate file, each a few hundred bytes plus its
-            offsets.
-    """
-
-    documents: dict[str, DocumentExtract] = {}
-    rag_index: dict[str, RagFile] = {}

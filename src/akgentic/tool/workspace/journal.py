@@ -57,6 +57,7 @@ point it would bite:
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import logging
 import os
 import re
@@ -93,6 +94,25 @@ control characters would otherwise produce one.
 
 IDENTITY_DOMAIN = "akgentic"
 """Domain of the synthetic author email. The local part is the agent's id."""
+
+LOCKS_DIR_NAME = "locks"
+"""The directory under ``<meta>`` holding every ``flock`` file of one tree.
+
+Shared with the per-path write locks
+(:mod:`akgentic.tool.workspace.card.gate`) — one directory, one idiom, two
+families of lock file, so nothing has to remember a second place to look.
+"""
+
+JOURNAL_LOCK_FILENAME = "journal"
+"""The one lock file every commit into one tree's repository contends on.
+
+**Not a git thing.** Git has ``index.lock`` and it is precisely the problem: two
+``git commit`` runs over one repository race for it, the loser exits non-zero,
+and :meth:`GitJournal._commit` reports that as a warning and drops the commit.
+The observable symptom of the defect is therefore *silence* — a commit that never
+existed — which is why the commits are serialised here instead of discovering the
+collision afterwards.
+"""
 
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _ANGLE_RE = re.compile(r"[<>]")
@@ -268,7 +288,7 @@ class GitJournal:
     are already on disk — stands.
     """
 
-    def __init__(self, root: Path, *, enabled: bool, timeout_s: float) -> None:
+    def __init__(self, root: Path, *, enabled: bool, timeout_s: float, meta_dir: Path) -> None:
         """Prepare a journal over *root*; nothing runs until :meth:`initialise`.
 
         Args:
@@ -276,11 +296,22 @@ class GitJournal:
             enabled: The card's ``git_journal``. False turns the journal off
                 before ``git`` is even looked for.
             timeout_s: Wall-clock budget for a single ``git`` invocation.
+            meta_dir: The tree's metadata directory —
+                :func:`~akgentic.tool.workspace.workspace.meta_dir_for`'s answer
+                for this tree. **Passed in rather than derived**: that function
+                takes the two-segment workspace *path*, which this object has
+                never been given and cannot recover from an absolute root once
+                ``AKGENTIC_WORKSPACE_META_ROOT`` has moved the parent. It is a
+                required argument rather than a defaulted one because what lives
+                under it is the commit lock, and a default that quietly put the
+                lock somewhere else would serialise nothing at all — which is
+                the exact failure shape this lock exists to remove.
         """
         self._root = root
         self._git_dir = git_dir_for(root)
         self._enabled = enabled
         self._timeout_s = timeout_s
+        self._lock_path = meta_dir / LOCKS_DIR_NAME / JOURNAL_LOCK_FILENAME
         self._git: str | None = None
 
     @property
@@ -352,7 +383,8 @@ class GitJournal:
             self._enabled = False
             return False
         self._git = resolved
-        return self._create_repository()
+        with self._holding():
+            return self._create_repository()
 
     def seed_gitignore(self, write: Callable[[str, bytes], None]) -> None:
         """Write the ignore file through the actor's own backend, only if absent.
@@ -458,11 +490,60 @@ class GitJournal:
             return
         self._commit(["-A"], identity, _subject(capability, paths), body=sanitise_command(detail))
 
+    def last_author(self, path: str) -> str | None:
+        """Name whoever last committed *path*, best-effort, or ``None``.
+
+        This is the whole of a refusal's attribution (ADR-051 Decision 4). The
+        gate keeps no map of who wrote what any more: one existed on the actor,
+        it was one process's memory, and two workers over one mounted tree held
+        two of them that could not see each other — so it named the wrong agent
+        exactly when the answer mattered.
+
+        **Why the answer is sound at the moment it is asked.** The mutation's
+        convergence point commits out-of-band dirt *before* the gate reads the
+        file, so by the time a refusal is being composed the live bytes are
+        committed under one of two identities: an agent's, or
+        :meth:`Identity.out_of_band`'s. There is no third state to guess at, and
+        nothing is inferred from a digest.
+
+        **Best-effort, and silence beats a guess.** A disabled journal, a git
+        that is not there, an empty history, a path git has never seen, a
+        non-zero exit — every one of them costs the attribution line and nothing
+        else. It never raises and never disables the journal: a refusal whose
+        actionable half is *"read it again and redo your change"* is complete
+        without knowing who else wrote.
+
+        Args:
+            path: Workspace-relative path.
+
+        Returns:
+            The committing author's name — an agent's display name, or
+            :data:`~akgentic.tool.workspace.models.OUT_OF_BAND_AUTHOR` — or
+            ``None`` when there is nothing to say.
+        """
+        if not self.enabled:
+            return None
+        result = self._run(["log", "-1", "--format=%an", "--", path])
+        if result is None or result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
+
     ##
     ## Everything below runs git
     ##
     def _create_repository(self) -> bool:
-        """Create or reuse the sibling repository, and prove it is not bare."""
+        """Create or reuse the sibling repository, and prove it is not bare.
+
+        **The caller holds the commit lock, and that is not belt and braces.**
+        ``git init`` on an existing repository is idempotent, but the
+        ``config core.bare false`` beside it is not: two processes binding one
+        tree at the same moment race for git's own ``config.lock``, the loser
+        exits non-zero, and this method reads that as *"the repository has no
+        work tree"* and calls :meth:`_disable` — turning that card's journal off
+        for its whole lifetime, over a collision that had nothing to do with the
+        repository's shape. Observed, not reasoned: an unserialised two-process
+        run reproduced it on the first attempt.
+        """
         created = self._run(["init", "-b", "master"])
         if created is None:
             return False
@@ -481,10 +562,74 @@ class GitJournal:
             return False
         return True
 
+    @contextlib.contextmanager
+    def _holding(self) -> Iterator[None]:
+        """Hold this tree's commit lock for the duration of the block.
+
+        The idiom is
+        :meth:`~akgentic.tool.vector_store.backends.local.LocalBackend._hold`'s,
+        deliberately identical: an exclusive ``flock`` on a lazily created file
+        under ``<meta>/locks/``, unlocked and closed in ``finally``. Two flock
+        idioms in one package is one more than anybody will keep in step.
+
+        **Taken here and nowhere below, and never around a path lock.** The
+        per-path write locks and this one must stay disjoint regions — a
+        mutation releases every path it held *before* it commits — because two
+        lock families acquired in two orders is the ordinary way a deadlock is
+        built, and a wedged mutation is worse than the attribution window that
+        keeps them apart.
+
+        A failure to take the lock is **not** a failure to commit: an
+        unwritable metadata parent degrades to an unserialised commit, which is
+        exactly the behaviour that existed before the lock, rather than to a
+        lost mutation. The bytes are already on disk either way.
+        """
+        handle: int | None = None
+        try:
+            self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = os.open(self._lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        except OSError:
+            logger.warning(
+                "Workspace %s: could not take the journal lock at %s — committing unserialised",
+                self._root.name,
+                self._lock_path,
+                exc_info=True,
+            )
+            if handle is not None:
+                os.close(handle)
+                handle = None
+        try:
+            yield
+        finally:
+            if handle is not None:
+                # Suppressed around the unlock alone, exactly as the per-path
+                # hold does it: a failing ``LOCK_UN`` must not skip the close and
+                # leak the descriptor, and closing releases the hold regardless.
+                with contextlib.suppress(OSError):
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+                os.close(handle)
+
     def _commit(
         self, add_args: list[str], identity: Identity, subject: str, body: str = ""
     ) -> None:
-        """Stage, then commit. A commit with nothing staged is a no-op, not a failure."""
+        """Stage, then commit, with every other committer on this tree held out.
+
+        **The whole staging-plus-committing pair runs under one hold**, not each
+        half: git's own ``index.lock`` covers a single invocation, and it is the
+        *pair* that is not atomic — an ``add`` from a second writer landing
+        between this one's ``add`` and its ``commit`` puts that writer's paths
+        into this commit, under this identity.
+
+        A commit with nothing staged is a no-op, not a failure.
+        """
+        with self._holding():
+            self._staged_commit(add_args, identity, subject, body)
+
+    def _staged_commit(
+        self, add_args: list[str], identity: Identity, subject: str, body: str
+    ) -> None:
+        """The two git invocations themselves — the caller holds the lock."""
         staged = self._run(["add", *add_args])
         if staged is None:
             return

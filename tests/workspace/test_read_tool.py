@@ -35,6 +35,7 @@ from tests.workspace.conftest import (
     WORKSPACE_PATH,
     FakeActorToolObserver,
     FakeOrchestratorProxy,
+    stored_docs,
 )
 
 # ---------------------------------------------------------------------------
@@ -767,7 +768,7 @@ def make_wired_tool(
         workspace_read=WorkspaceRead(document_reader=document_reader),
     )
     tool.observer(observer)
-    _address, actor = orchestrator_proxy.hosted[workspace_actor_name(WORKSPACE_PATH)]
+    _address, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
     assert isinstance(actor, WorkspaceActor)
     assert tool.workspace._root == workspace_tree.resolve()
     return tool, tool.workspace, actor
@@ -823,7 +824,7 @@ class TestBinaryFileReading:
 
         assert "# Report" in result
         assert sorted(p.name for p in fs._root.iterdir()) == before  # no sidecar, no file
-        assert actor.state.documents["report.pdf"].markdown == extracted
+        assert stored_docs(actor)["report.pdf"].markdown == extracted
 
     def test_a_cached_extract_is_served_without_re_extracting(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
@@ -856,7 +857,7 @@ class TestBinaryFileReading:
             result = read_fn("report.pdf", force_document_regeneration=True)
 
         assert "# Fresh Extract" in result
-        assert actor.state.documents["report.pdf"].markdown == extracted
+        assert stored_docs(actor)["report.pdf"].markdown == extracted
 
     def test_pass1_empty_no_llm_returns_placeholder(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
@@ -878,7 +879,7 @@ class TestBinaryFileReading:
         # because it is the case that reaches the LLM vision fallback. The
         # sidecar carried this property by writing the placeholder to disk; it
         # would otherwise have been dropped with the sidecar assertions.
-        assert actor.state.documents["scan.pdf"].markdown == placeholder
+        assert stored_docs(actor)["scan.pdf"].markdown == placeholder
 
     def test_pass1_empty_pass2_with_llm_returns_content(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
@@ -976,7 +977,7 @@ class TestBinaryFileReading:
             result = read_fn("docs/slides.pptx")
 
         assert "# Slides" in result
-        assert actor.state.documents["docs/slides.pptx"].markdown == extracted
+        assert stored_docs(actor)["docs/slides.pptx"].markdown == extracted
         assert list(docs_dir.iterdir()) == [docs_dir / "slides.pptx"]
 
     def test_unknown_extension_uses_text_path(

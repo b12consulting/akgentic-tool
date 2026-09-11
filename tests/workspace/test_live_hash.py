@@ -21,11 +21,19 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.actor import WorkspaceActor
 from akgentic.tool.workspace.tool import WorkspaceTool
-
-from tests.workspace.conftest import FakeActorToolObserver, mutate, read, tool_named
+from tests.workspace.conftest import (
+    FakeActorToolObserver,
+    FakeOrchestratorProxy,
+    card_for,
+    mutate,
+    read,
+    requires_git,
+    tool_named,
+)
 
 BODY = "alpha\nbravo\ncharlie\n"
 
@@ -135,19 +143,29 @@ class TestTheHashIsRead:
         )
         assert notes.read_text(encoding="utf-8") == "my version\n"
 
+    @requires_git
     def test_an_out_of_band_change_names_no_agent(
         self,
-        wired_card: WorkspaceTool,
+        orchestrator_proxy: FakeOrchestratorProxy,
         notes: Path,
     ) -> None:
-        # The path has a last writer on record — but the bytes on disk are no
-        # longer that writer's, so attributing them to it would be a lie.
-        read(wired_card, "notes.md")
-        mutate(wired_card, "workspace_write", "notes.md", "mine\n")
+        """The agent wrote it, then somebody else did — and the refusal says so.
+
+        **Re-pointed to a journalled card, not weakened.** The attribution used
+        to come from a ``{path -> writer, sha}`` map whose digest check is what
+        made it honest. It comes from the journal now, and honesty comes from
+        the ordering instead: the convergence point commits the out-of-band dirt
+        *before* the gate reads, so the bytes on disk are committed under
+        ``out-of-band`` by the time this refusal is composed. Same two branches,
+        same two sentences.
+        """
+        card, _observer = card_for(orchestrator_proxy, "alice", git_journal=True)
+        read(card, "notes.md")
+        mutate(card, "workspace_write", "notes.md", "mine\n")
         write_behind_the_actors_back(notes, "not from any agent\n")
 
         with pytest.raises(RetriableError) as refusal:
-            mutate(wired_card, "workspace_write", "notes.md", "mine again\n")
+            mutate(card, "workspace_write", "notes.md", "mine again\n")
 
         message = str(refusal.value)
         assert "came from outside the" in message
@@ -191,12 +209,13 @@ class TestTheHashIsRead:
         # that could is the regression this guards — the list is exhaustive on
         # purpose, so adding one is a deliberate act.
         #
-        # Four of the seven arrived with exec and none of them holds file content
-        # either: ``_slots`` is the deferred base's result cache, keyed by run id
-        # and holding an ``ExecOutcome``, and ``_run_errors`` and ``_recent_runs``
-        # are keyed by run id and agent id respectively and hold strings.
-        # ``_holders`` arrived with hosting: keyed by agent id, it holds the
-        # attached agents' addresses and nothing about any file.
+        # The observation and last-writer maps left with the gate in 52-5, and
+        # the holder map went with the liveness sweep in 52-6. Of the four that
+        # remain, none holds file content: ``_slots`` is the deferred base's
+        # result cache, keyed by run id and holding an ``ExecOutcome``;
+        # ``_run_errors`` and ``_recent_runs`` are keyed by run id and agent id
+        # and hold strings; ``_agent_names`` is keyed by agent id and holds
+        # display names.
         read(wired_card, "notes.md")
         mutate(wired_card, "workspace_write", "notes.md", "mine\n")
 
@@ -204,14 +223,33 @@ class TestTheHashIsRead:
             name: value for name, value in vars(workspace_actor).items() if isinstance(value, dict)
         }
         assert set(maps) == {
-            "_holders",
-            "_observations",
-            "_last_writers",
             "_agent_names",
             "_slots",
             "_run_errors",
             "_recent_runs",
         }
+
+    def test_the_card_holds_no_map_of_live_content_either(
+        self,
+        wired_card: WorkspaceTool,
+        notes: Path,
+    ) -> None:
+        """The same guard, on the object the gate actually runs on now.
+
+        The map that moved is the one that could most plausibly grow a content
+        cache, because it sits beside the hash: ``_observations`` holds a digest
+        and a boolean per path and **never bytes**. A ``{path -> content}``
+        entry appearing here would pass every behavioural spec above except the
+        ones in this module.
+        """
+        read(wired_card, "notes.md")
+        mutate(wired_card, "workspace_write", "notes.md", "mine\n")
+
+        observed = wired_card._observations["notes.md"]
+        assert set(type(observed).model_fields) == {"sha", "full"}
+        assert not any(
+            isinstance(value, bytes) for value in vars(observed).values()
+        )
 
 
 class TestSeedingIsNotGated:

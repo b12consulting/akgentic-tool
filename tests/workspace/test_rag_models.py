@@ -38,8 +38,7 @@ from akgentic.tool.workspace.documents.models import (
     derived_document_caps,
 )
 from akgentic.tool.workspace.models import WorkspaceConfig
-
-from tests.workspace.conftest import WORKSPACE_PATH
+from tests.workspace.conftest import WORKSPACE_PATH, attach_store, seed_row, stored_rows
 
 # Recorded once, from a call made in a *different* process. A second call made
 # here would agree with a namespace minted per process, which is exactly the
@@ -59,7 +58,8 @@ def _actor() -> WorkspaceActor:
         )
     )
     actor.on_start()
-    return actor
+    # The card announces this at bind time; a directly built actor gets none.
+    return attach_store(actor)
 
 
 class _RagFileWithExtraField(RagFile):
@@ -128,7 +128,8 @@ class TestChunksAreOffsets:
         ``model_config`` into every subclass's dict, so both spellings of that
         assertion are vacuous — ``DocumentExtract`` would pass them too. What a
         leaking type actually breaks is the round trip, and these rows are
-        persisted as JSON inside ``WorkspaceState`` and read back on resume.
+        persisted as JSON under the tree's metadata directory and read back by
+        the next process over the same mount.
         """
         chunk = RagChunk(
             chunk_id="c1", ordinal=3, start=10, end=40, heading_path=["A", "B"], header_start=1
@@ -136,7 +137,7 @@ class TestChunksAreOffsets:
         assert RagChunk.model_validate_json(chunk.model_dump_json()) == chunk
 
     def test_a_rag_file_round_trips_through_validation(self) -> None:
-        """It is persisted inside ``WorkspaceState`` and read back on resume."""
+        """It is persisted as a file under ``<meta>/rag/`` and read back from there."""
         original = RagFile(
             path="a.md",
             status=RagStatus.EMBEDDED,
@@ -191,13 +192,13 @@ class TestEveryTransitionIsACopy:
     def test_marking_stale_preserves_an_unknown_field(self, workspace_tree: object) -> None:
         """``mark_paths_stale`` is a status bump, and one of seven per indexed file."""
         actor = _actor()
-        actor.state.rag_index["a.md"] = _RagFileWithExtraField(
+        seed_row(actor, "a.md", _RagFileWithExtraField(
             path="a.md", status=RagStatus.EMBEDDED, updated_at=datetime.now(UTC)
-        )
+        ))
 
         actor.mark_paths_stale(["a.md"])
 
-        result = actor.state.rag_index["a.md"]
+        result = stored_rows(actor)["a.md"]
         assert result.status is RagStatus.STALE
         assert isinstance(result, _RagFileWithExtraField)
         assert result.extra_field == "sentinel"
@@ -206,17 +207,17 @@ class TestEveryTransitionIsACopy:
         """A second, structurally different transition — it moves four fields, not one."""
         actor = _actor()
         stale = datetime.now(UTC) - timedelta(seconds=EMBEDDING_STALE_AFTER_S + 1)
-        actor.state.rag_index["a.md"] = _RagFileWithExtraField(
+        seed_row(actor, "a.md", _RagFileWithExtraField(
             path="a.md",
             status=RagStatus.EMBEDDING,
             batches_expected=3,
             batches_landed=1,
             updated_at=stale,
-        )
+        ))
 
-        assert actor.reap_stale_embedding() is True
+        assert actor.reap_abandoned_rows() is True
 
-        result = actor.state.rag_index["a.md"]
+        result = stored_rows(actor)["a.md"]
         assert result.status is RagStatus.PENDING
         assert isinstance(result, _RagFileWithExtraField)
         assert result.extra_field == "sentinel"
@@ -233,39 +234,39 @@ class TestTheEmbeddingBound:
     def test_a_file_past_the_bound_is_queued_again(self, workspace_tree: object) -> None:
         """After a resume the vector store's requester map is gone with the request."""
         actor = _actor()
-        actor.state.rag_index["a.md"] = RagFile(
+        seed_row(actor, "a.md", RagFile(
             path="a.md",
             status=RagStatus.EMBEDDING,
             batches_expected=2,
             batches_landed=1,
             updated_at=datetime.now(UTC) - timedelta(seconds=EMBEDDING_STALE_AFTER_S + 1),
-        )
+        ))
 
-        assert actor.reap_stale_embedding() is True
+        assert actor.reap_abandoned_rows() is True
 
-        entry = actor.state.rag_index["a.md"]
+        entry = stored_rows(actor)["a.md"]
         assert entry.status is RagStatus.PENDING
         assert (entry.batches_expected, entry.batches_landed) == (0, 0)
 
     def test_a_file_just_inside_the_bound_does_not_move(self, workspace_tree: object) -> None:
         """A live embed must not be restarted underneath itself."""
         actor = _actor()
-        actor.state.rag_index["a.md"] = RagFile(
+        seed_row(actor, "a.md", RagFile(
             path="a.md",
             status=RagStatus.EMBEDDING,
             updated_at=datetime.now(UTC) - timedelta(seconds=EMBEDDING_STALE_AFTER_S - 5),
-        )
+        ))
 
-        assert actor.reap_stale_embedding() is False
-        assert actor.state.rag_index["a.md"].status is RagStatus.EMBEDDING
+        assert actor.reap_abandoned_rows() is False
+        assert stored_rows(actor)["a.md"].status is RagStatus.EMBEDDING
 
     def test_a_file_at_another_status_is_never_reaped(self, workspace_tree: object) -> None:
         """The bound is about a signal that is not coming, not about age."""
         actor = _actor()
         old = datetime.now(UTC) - timedelta(days=7)
-        actor.state.rag_index["a.md"] = RagFile(
+        seed_row(actor, "a.md", RagFile(
             path="a.md", status=RagStatus.FAILED, reason="boom", updated_at=old
-        )
+        ))
 
-        assert actor.reap_stale_embedding() is False
-        assert actor.state.rag_index["a.md"].status is RagStatus.FAILED
+        assert actor.reap_abandoned_rows() is False
+        assert stored_rows(actor)["a.md"].status is RagStatus.FAILED
