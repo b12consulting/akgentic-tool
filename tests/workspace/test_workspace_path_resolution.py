@@ -1122,7 +1122,14 @@ def _usable_scope(value: str) -> bool:
 
 
 def _usable_leaf(value: str) -> bool:
-    """Whether a card could legally carry *value* as a ``workspace_id`` or a team id."""
+    """Whether the resolver accepts *value* as a leaf — :func:`leaf_segment`'s rule.
+
+    Deliberately wider than the card's ``workspace_id`` grammar
+    (``validate_workspace_id``): the resolver guards path safety for every kind,
+    so this oracle, and the alphabet feeding it, keep ``%~ é@+=``. Narrowing
+    either to the card's charset would stop this property test proving anything
+    about the values the resolver actually receives from metadata and team ids.
+    """
     folded = value.casefold()
     return (
         _usable(value)

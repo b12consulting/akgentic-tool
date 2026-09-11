@@ -760,7 +760,8 @@ def leaf_segment(value: str) -> str:
     Raises:
         ValueError: If the value cannot be a single directory segment, if it is
             a kind name in any letter case, or if it ends in ``.git`` or
-            ``.index``.
+            ``.index`` in any letter case — naming the workspace whose sibling
+            directory it would collide with.
     """
     if _unusable_as_segment(value):
         raise ValueError(f"workspace leaf is not usable as a directory name: {value!r}")
