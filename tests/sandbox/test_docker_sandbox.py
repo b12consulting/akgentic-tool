@@ -397,7 +397,14 @@ def test_two_backends_over_one_workspace_do_not_collide(
 @patch("akgentic.tool.sandbox.docker.subprocess.run")
 @pytest.mark.parametrize(
     "workspace_path",
-    ["team-1", "u-alice/notes", "u-alice/customer_id-ACME__case_id-42"],
+    [
+        "team-1",
+        "u-alice/notes",
+        "u-alice/customer_id-ACME__case_id-42",
+        # The shape a card hands the backend now: two slashes, carried whole.
+        "u-alice/_id/notes",
+        "_shared/_meta/customer_id-ACME__case_id-42",
+    ],
 )
 def test_the_label_carries_the_workspace_path_verbatim(
     mock_run: MagicMock,

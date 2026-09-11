@@ -1,7 +1,7 @@
 """Tests for ``LocalBackend`` — subprocess-based sandbox execution.
 
 The backend is constructed directly: there is no actor to stand in for, so
-``start()`` is called with the two-segment path a card would resolve, and the
+``start()`` is called with the three-segment path a card would resolve, and the
 ``exec()`` specs point ``workspace_path`` at a temp directory when they want a
 specific tree rather than one under ``AKGENTIC_WORKSPACES_ROOT``.
 
@@ -445,10 +445,10 @@ def test_start_opens_exactly_the_path_it_was_handed(
     assert backend.workspace_path == expected.resolve()
 
 
-def test_start_opens_a_two_segment_path_whole(
+def test_start_opens_a_three_segment_path_whole(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The shape a card actually hands it: ``<scope>/<leaf>``, created in full.
+    """The shape a card actually hands it: ``<scope>/<kind>/<leaf>``, created in full.
 
     ``team-1`` appears nowhere in the result — the backend has no notion of who
     owns the tree, and that is the point.
@@ -457,9 +457,9 @@ def test_start_opens_a_two_segment_path_whole(
     monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
     backend = LocalBackend()
 
-    backend.start("u-alice/notes")
+    backend.start("u-alice/_id/notes")
 
-    expected = tmp_path / "workspaces" / "u-alice" / "notes"
+    expected = tmp_path / "workspaces" / "u-alice" / "_id" / "notes"
     assert expected.is_dir()
     assert backend.workspace_path == expected.resolve()
     assert not (tmp_path / "workspaces" / "team-1").exists()

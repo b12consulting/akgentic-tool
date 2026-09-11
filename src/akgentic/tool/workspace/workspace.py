@@ -664,8 +664,8 @@ def leaf_segment(value: str) -> str:
         raise ValueError(f"workspace leaf is not usable as a directory name: {value!r}")
     if value.lower() in RESERVED_KINDS:
         raise ValueError(
-            f"workspace leaf may not be {value!r}, which is a reserved kind — a tree "
-            "of that name would contain every workspace of that kind"
+            f"workspace leaf may not be {value!r}: it is a reserved kind name, and a "
+            "reserved name means one thing at every position of a workspace path"
         )
     for suffix, owner in _SIDECAR_SUFFIXES.items():
         if value.lower().endswith(suffix):
@@ -735,8 +735,8 @@ def _metadata_leaf(keys: list[str], metadata: SerializableBaseModel | None) -> s
 
     Raises:
         ValueError: If the team carries no metadata (falling back would silently
-            re-home the tree onto a path the card never declared), if a declared key is
-            not a field of the model (a typo must not resolve to a tree), if a
+            re-home the tree onto a path the card never declared), if a declared
+            key is not a field of the model (a typo must not resolve to a tree), if a
             value is ``None`` or empty (``case_id-`` would be a real directory
             shared by every team that left it blank), or if the joined leaf
             exceeds 255 bytes (truncating collides, and a collision here is an

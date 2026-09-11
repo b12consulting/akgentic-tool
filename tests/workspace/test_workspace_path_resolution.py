@@ -163,12 +163,19 @@ class TestTheSixCells:
         assert str(path) == cell.expected.format(team_id="team-9")
 
     def test_the_six_cells_are_six_distinct_paths(self) -> None:
-        """AC 7 — one input tuple, six declarations, six trees."""
+        """AC 7 — one input tuple, six declarations, six trees.
+
+        The team id is **equal to** the ``workspace_id`` here, deliberately: with
+        two different leaves the six paths would be distinct even with the kind
+        segment deleted, and the spec would prove nothing the kind is for. With
+        one shared leaf, only ``_team`` versus ``_id`` keeps a named workspace off
+        the team's own tree.
+        """
         paths = {
             resolve(
                 workspace_id=cell.workspace_id,
                 keys=list(cell.keys),
-                team_id="team-9",
+                team_id="notes",
                 user_id="alice",
                 metadata=CELL_METADATA,
                 sharable=cell.sharable,
@@ -177,6 +184,21 @@ class TestTheSixCells:
         }
 
         assert len(paths) == 6
+
+    def test_a_workspace_named_after_the_team_id_does_not_reach_the_teams_tree(self) -> None:
+        """The collision the kind segment removes, stated directly.
+
+        A team id is a UUID an author can read and type. Under two segments,
+        ``workspace_id=<that uuid>`` resolved to ``alice/<uuid>`` — the team's own
+        default tree. The kind keeps the two apart.
+        """
+        team_id = "11111111-2222-3333-4444-555555555555"
+
+        named = resolve(workspace_id=team_id, team_id=team_id, user_id="alice")
+        default = resolve(team_id=team_id, user_id="alice")
+
+        assert named == PurePosixPath(f"alice/_id/{team_id}")
+        assert default == PurePosixPath(f"alice/_team/{team_id}")
 
     def test_the_flag_is_required_so_an_unaware_caller_fails_loudly(self) -> None:
         """No default: a caller that does not know about sharing gets a ``TypeError``.
@@ -330,7 +352,7 @@ class TestUserSegment:
             "1f9e4c2a-7b3d-4e5f-8a9b-2c3d4e5f6a7b",
             # An API key's admin-supplied owner_id. `@` and `.` are legal in a
             # filename, so an email needs no encoding.
-            "geoffroy.piroux@weareyuma.com",
+            "alice@acme.example",
             # A team built through the SDK names no user.
             "cli",
         ],
@@ -357,7 +379,7 @@ class TestUserSegment:
             ".hidden",  # a dot-directory
             ".",
             "..",
-            "acme/geoffroy",  # an admin typing an org-scoped owner_id
+            "acme/alice",  # an admin typing an org-scoped owner_id
             "back\\slash",
             "nul\x00byte",
         ],
@@ -640,7 +662,7 @@ class TestPerUserLayouts:
 
     def test_an_unusable_principal_raises_out_of_the_resolver(self) -> None:
         with pytest.raises(ValueError, match="not usable as a workspace directory name"):
-            resolve(workspace_id="notes", user_id="acme/geoffroy")
+            resolve(workspace_id="notes", user_id="acme/alice")
 
 
 ##

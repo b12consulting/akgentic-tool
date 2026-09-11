@@ -34,7 +34,7 @@ from tests.workspace.conftest import WORKSPACE_PATH
 def start_actor(workspace_path: str = WORKSPACE_PATH) -> WorkspaceActor:
     """Build and start an actor over *workspace_path*, without an actor thread.
 
-    Takes the **resolved** two-segment path — what a card hands the actor — so
+    Takes the **resolved** three-segment path — what a card hands the actor — so
     the actor opens the tree the ``workspace_tree`` fixture created.
     """
     actor = WorkspaceActor(
