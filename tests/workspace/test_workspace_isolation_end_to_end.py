@@ -610,8 +610,11 @@ class TestThePlatformPermitsTheCardRequests:
         record = _spawn_the_shared_metadata_card(system)
 
         assert isinstance(record.error, ValueError), record.error
-        assert "'meta'" in str(record.error)
-        assert SHARED_KINDS_ENV in str(record.error)
+        # The gate's own phrase: a *parse* error also names the variable and
+        # lists ``'meta'`` among the accepted tokens, so those two substrings
+        # alone were satisfied by a parser that refused the empty value.
+        assert f"requests a shared 'meta' workspace ({HEADLINE_PATH})" in str(record.error)
+        assert f"{SHARED_KINDS_ENV} permits none" in str(record.error)
         # Neither the shared tree nor the fall-back's private one.
         assert not (workspaces_root / "_shared").exists()
         assert not (workspaces_root / "u-alice" / "_meta").exists()

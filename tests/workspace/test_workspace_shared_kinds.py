@@ -16,11 +16,13 @@ it through ``monkeypatch``.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from itertools import combinations
 from pathlib import Path, PurePosixPath
 
 import pytest
 
+import akgentic.tool.workspace.card as card_module
 from akgentic.tool.workspace.tool import WorkspaceTool
 from akgentic.tool.workspace.workspace import (
     ID_KIND,
@@ -52,6 +54,17 @@ TOKENS = ("team", "id", "meta")
 
 def _cell_ids(cell: Cell) -> str:
     return cell.name
+
+
+def _gate_refusal(token: str) -> str:
+    """The phrase only the bind-time gate writes — never the parser's error.
+
+    A refusal spec that matched only the variable's name or a quoted token would
+    also be satisfied by a *parse* error, which names the variable and lists every
+    accepted token: such a spec would pass whenever the parser refused the value,
+    whether or not the gate ever ran.
+    """
+    return f"requests a shared {token!r} workspace"
 
 
 def _parse(monkeypatch: pytest.MonkeyPatch, value: str) -> frozenset[str]:
@@ -201,9 +214,12 @@ class TestTheRefusalIsKindByKind:
             )
             assert card._workspace_path == expected
         else:
-            with pytest.raises(ValueError, match=SHARED_KINDS_ENV) as excinfo:
+            # The gate's own phrase, never a bare token or the variable's name: a
+            # parse error names the variable and lists every token too, so a
+            # value the parser refused would satisfy those and read as a pass.
+            with pytest.raises(ValueError) as excinfo:
                 bind_cell(cell, orchestrator_proxy, monkeypatch, shared_kinds=value)
-            assert repr(own_kind_token(cell)) in str(excinfo.value)
+            assert _gate_refusal(own_kind_token(cell)) in str(excinfo.value)
 
 
 ##
@@ -286,6 +302,13 @@ class TestARefusedBindCreatesNothing:
 ##
 
 
+class _ReverseIterating(frozenset[str]):
+    """A permitted set that iterates reverse-sorted: the order an unsorted rendering shows."""
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(sorted(frozenset.__iter__(self), reverse=True))
+
+
 class TestTheMessageNamesBothSides:
     """A refusal reading "sharing is not enabled" sends an admin to the wrong file."""
 
@@ -307,25 +330,58 @@ class TestTheMessageNamesBothSides:
             bind_cell(id_shared, orchestrator_proxy, monkeypatch, shared_kinds="meta")
 
         message = str(excinfo.value)
-        assert SHARED_KINDS_ENV in message
-        assert "'id'" in message
-        assert "'meta'" in message
-        assert "_shared/_id/notes" in message
+        assert f"{_gate_refusal('id')} (_shared/_id/notes)" in message
+        assert f"{SHARED_KINDS_ENV} permits only 'meta' on this process" in message
         assert "on the process that binds agents" in message
         assert "workspace_sharable=False" in message
 
-    def test_the_permitted_list_is_rendered_sorted(
+    def test_two_permitted_kinds_are_both_named(
         self,
         orchestrator_proxy: FakeOrchestratorProxy,
         workspaces_root: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """Through the real parse. The gate's phrase, not ``'meta', 'team'`` alone.
+
+        The parser's own error ends ``'id', 'meta', 'team'``, which contains
+        ``'meta', 'team'``: with that substring alone, a parser that refused the
+        two-token value passed this spec without the gate ever running.
+        """
         [id_shared] = [cell for cell in SHARED_CELLS if cell.name == "id-shared"]
 
         with pytest.raises(ValueError) as excinfo:
             bind_cell(id_shared, orchestrator_proxy, monkeypatch, shared_kinds="team,meta")
 
-        assert "'meta', 'team'" in str(excinfo.value)
+        message = str(excinfo.value)
+        assert _gate_refusal("id") in message
+        assert f"{SHARED_KINDS_ENV} permits only 'meta', 'team' on this process" in message
+
+    def test_the_permitted_list_is_rendered_sorted_whatever_the_set_iterates(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspaces_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Sorted, not the order the permitted set happens to iterate in.
+
+        A ``frozenset`` iterates in an order the process's hash seed chooses, so
+        with the real parse a lost ``sorted()`` goes red about one run in two —
+        a guard that passes half the time it should fail. Here the parse the gate
+        calls hands back a set that iterates **reverse**-sorted, so an unsorted
+        rendering reads ``'team', 'meta'`` every time. The bind is still the real
+        ``observer()``; only the iteration order is fixed.
+        """
+        [id_shared] = [cell for cell in SHARED_CELLS if cell.name == "id-shared"]
+        reverse_iterating = _ReverseIterating({TEAM_KIND, METADATA_KIND})
+        monkeypatch.setattr(card_module, "permitted_shared_kinds", lambda: reverse_iterating)
+        assert [kind.removeprefix("_") for kind in reverse_iterating] == ["team", "meta"]
+
+        with pytest.raises(ValueError) as excinfo:
+            bind_cell(id_shared, orchestrator_proxy, monkeypatch, shared_kinds=None)
+
+        assert f"{SHARED_KINDS_ENV} permits only 'meta', 'team' on this process" in str(
+            excinfo.value
+        )
 
     def test_nothing_permitted_says_none(
         self,

@@ -63,8 +63,8 @@ def _no_ambient_weaviate_cluster(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(QDRANT_API_KEY_ENV, raising=False)
 
 
-@pytest.fixture(autouse=True)
-def _no_ambient_shared_kinds(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.fixture(autouse=True, scope="session")
+def _no_ambient_shared_kinds() -> Iterator[None]:
     """Hide a developer's or runner's exported shared-kind permission from every test.
 
     ``WorkspaceTool.observer`` reads ``AKGENTIC_WORKSPACE_SHARED_KINDS`` at every
@@ -74,10 +74,17 @@ def _no_ambient_shared_kinds(monkeypatch: pytest.MonkeyPatch) -> None:
     whether or not the spec granted anything.
 
     Here rather than in ``tests/workspace/conftest.py`` because a
-    ``WorkspaceTool`` is bound outside that directory too. Tests that want a
-    permission grant it with ``monkeypatch``, which runs after this one and wins.
+    ``WorkspaceTool`` is bound outside that directory too. **Session-scoped**
+    because a function-scoped fixture is set up only after every wider-scoped
+    one: the read-cost smoke's module-scoped harness bound its team with the
+    shell's value still in place, and an exported malformed value errored all
+    five of its specs. The variable is ambient for the whole session, so it is
+    hidden for the whole session. Tests that want a permission grant it with
+    ``monkeypatch``, whose undo restores this fixture's "unset".
     """
-    monkeypatch.delenv(SHARED_KINDS_ENV, raising=False)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delenv(SHARED_KINDS_ENV, raising=False)
+        yield
 
 
 class MockActorAddress(ActorAddress):
