@@ -197,7 +197,7 @@ def test_a_script_can_be_executed_from_the_tmpfs_home(started: DockerBackend) ->
     ``--tmpfs`` this exact sequence fails with *Permission denied*.
     """
     result = started.exec(
-        f"sh -c 'printf \"#!/bin/sh\\necho ran\\n\" > {SANDBOX_HOME}/s.sh "
+        f'sh -c \'printf "#!/bin/sh\\necho ran\\n" > {SANDBOX_HOME}/s.sh '
         f"&& chmod +x {SANDBOX_HOME}/s.sh && {SANDBOX_HOME}/s.sh'",
         "",
         60.0,
@@ -240,10 +240,44 @@ def test_home_is_writable_and_is_the_directory_the_backend_chose(
     home = started.exec("sh -c 'echo $HOME'", "", 60.0)
     assert home.stdout.strip() == SANDBOX_HOME
 
-    written = started.exec(f"sh -c 'echo ok > {SANDBOX_HOME}/probe && cat {SANDBOX_HOME}/probe'",
-                           "", 60.0)
+    written = started.exec(
+        f"sh -c 'echo ok > {SANDBOX_HOME}/probe && cat {SANDBOX_HOME}/probe'", "", 60.0
+    )
     assert written.exit_code == 0, written.stderr
     assert written.stdout.strip() == "ok"
+
+
+def test_the_host_uid_resolves_in_the_password_database(started: DockerBackend) -> None:
+    """The numeric ``--user`` has an entry, and it names the writable ``$HOME``.
+
+    **Only a daemon can prove this, and an argv assertion cannot.** Whether NSS
+    answers for a uid is a fact about the mounted file and the C library, not
+    about the command line that mounted it.
+
+    The failure this closes is silent in the argv and loud at the tool:
+    ``libreoffice --convert-to`` exits **77** with *"User installation could not
+    be completed"* when ``getpwuid()`` answers nothing, because it resolves where
+    to put its profile through the password database rather than through
+    ``$HOME``. ``--read-only`` is not the cause — the same command succeeds as
+    ``uid 0`` under identical mounts, because root is in the file.
+
+    Asserted through ``getent`` rather than by converting a document: this pins
+    the mechanism directly, in a second rather than a minute, and any tool that
+    asks the same question is covered by the same entry.
+    """
+    entry = started.exec("sh -c 'getent passwd \"$(id -u)\"'", "", 60.0)
+    assert entry.exit_code == 0, f"the host uid has no passwd entry: {entry.stderr}"
+
+    fields = entry.stdout.strip().split(":")
+    assert fields[5] == SANDBOX_HOME, (
+        f"the entry must name the writable tmpfs as home, got {fields[5]!r} — "
+        "a tool that asks the database where to write would be sent to the read-only root"
+    )
+
+    # The baseline this file replaces is not restored wholesale, so pin the two
+    # entries that are kept deliberately rather than by inheritance.
+    assert started.exec("sh -c 'getent passwd root'", "", 60.0).exit_code == 0
+    assert started.exec("sh -c 'getent passwd nobody'", "", 60.0).exit_code == 0
 
 
 def test_stop_actually_removes_the_container_and_a_second_stop_still_does_not_raise(
@@ -298,7 +332,7 @@ def test_the_label_is_readable_from_the_daemon(started: DockerBackend) -> None:
     name = started.container_name
     assert name is not None
     inspected = subprocess.run(
-        ["docker", "inspect", "-f", "{{index .Config.Labels \"akgentic.workspace_path\"}}", name],
+        ["docker", "inspect", "-f", '{{index .Config.Labels "akgentic.workspace_path"}}', name],
         capture_output=True,
         text=True,
         timeout=30,

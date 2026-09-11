@@ -88,6 +88,25 @@ def value_after(argv: list[str], flag: str) -> str:
     return argv[argv.index(flag) + 1]
 
 
+def mounts(argv: list[str]) -> list[str]:
+    """Every ``-v`` value in *argv*, in order."""
+    return [argv[index + 1] for index, token in enumerate(argv) if token == "-v"]
+
+
+def workspace_mount(argv: list[str]) -> str:
+    """The one bind mount whose writes outlive the container.
+
+    Selected by its **container-side target**, never by position. The argv also
+    carries the generated ``/etc/passwd``, so ``argv.index("-v")`` would read
+    whichever of the two happens to be written first — a spec that passes today
+    and silently starts asserting about the wrong mount the moment their order
+    changes.
+    """
+    workspace = [mount for mount in mounts(argv) if mount.endswith(":/workspace")]
+    assert len(workspace) == 1, f"expected exactly one :/workspace mount, got {workspace}"
+    return workspace[0]
+
+
 def env_values(argv: list[str], prefix: str) -> list[str]:
     """Every ``-e <prefix>=<value>`` value in *argv*, in the order docker reads them."""
     return [
@@ -109,12 +128,18 @@ def start_and_capture(
     return backend, run_argv(mock_run)
 
 
-def expected_argv(container_name: str, volume: str, workspace_path: str) -> list[str]:
+def expected_argv(
+    container_name: str, volume: str, workspace_path: str, passwd_path: str
+) -> list[str]:
     """The complete vector ``start()`` must build, written out in order.
 
     A literal rather than a rebuild of the production expression: a helper that
     derived this the way the code does would agree with any change to the code,
     which is the whole failure this spec exists to catch.
+
+    ``passwd_path`` is the one value read back from the backend besides the
+    container name — it is a fresh temp file per start, so it cannot be written
+    out here, but its **position** can be and is.
     """
     return [
         "docker",
@@ -133,6 +158,8 @@ def expected_argv(container_name: str, volume: str, workspace_path: str) -> list
         f"/tmp:{TMPFS_OPTIONS}",
         "--tmpfs",
         f"/home/agent:{TMPFS_OPTIONS}",
+        "-v",
+        f"{passwd_path}:/etc/passwd:ro",
         "-e",
         "GIT_CONFIG_COUNT=3",
         "-e",
@@ -255,7 +282,8 @@ def test_start_builds_the_whole_argv_in_order(
 
     volume = f"{Path('./workspaces/team-1').resolve()}:/workspace"
     assert backend.container_name is not None
-    assert argv == expected_argv(backend.container_name, volume, "team-1")
+    assert backend._passwd_path is not None
+    assert argv == expected_argv(backend.container_name, volume, "team-1", backend._passwd_path)
 
 
 @patch.object(DockerBackend, "_ensure_image")
@@ -402,16 +430,20 @@ def test_the_bind_mount_is_the_only_one_and_is_the_path_it_was_handed(
     mock_ensure: MagicMock,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC5: exactly one ``-v``, and it is the resolved root joined to the path.
+    """AC5: one bind mount whose writes outlive the container, and it is the tree.
 
     The tmpfs mounts are writable and deliberately are *not* ``-v``: only this
-    one has writes that outlive the container.
+    one has writes that outlive the container. The generated ``/etc/passwd`` is
+    a ``-v`` too, so this asserts on the ``:/workspace`` mount specifically and
+    then pins that the passwd file is the *only* other one — a third mount
+    appearing unnoticed is the failure this guards.
     """
     monkeypatch.delenv("AKGENTIC_WORKSPACES_ROOT", raising=False)
-    _backend, argv = start_and_capture(mock_run, workspace_path="u-alice/notes")
+    backend, argv = start_and_capture(mock_run, workspace_path="u-alice/notes")
 
-    assert argv.count("-v") == 1
-    assert value_after(argv, "-v") == f"{Path('./workspaces/u-alice/notes').resolve()}:/workspace"
+    expected = f"{Path('./workspaces/u-alice/notes').resolve()}:/workspace"
+    assert workspace_mount(argv) == expected
+    assert sorted(mounts(argv)) == sorted([expected, f"{backend._passwd_path}:/etc/passwd:ro"])
 
 
 @patch.object(DockerBackend, "_ensure_image")
@@ -427,7 +459,7 @@ def test_the_bind_mount_uses_a_custom_workspaces_root(
     monkeypatch.setenv("AKGENTIC_WORKSPACES_ROOT", "/workspaces")
     _backend, argv = start_and_capture(mock_run)
 
-    assert value_after(argv, "-v") == "/workspaces/team-1:/workspace"
+    assert workspace_mount(argv) == "/workspaces/team-1:/workspace"
 
 
 @patch.object(DockerBackend, "_ensure_image")
@@ -443,7 +475,7 @@ def test_the_bind_mount_normalizes_a_trailing_slash_in_the_root(
     monkeypatch.setenv("AKGENTIC_WORKSPACES_ROOT", "/workspaces/")
     _backend, argv = start_and_capture(mock_run)
 
-    volume = value_after(argv, "-v")
+    volume = workspace_mount(argv)
     assert volume == "/workspaces/team-1:/workspace", (
         f"Volume mount must not contain double slash: got '{volume}'"
     )
@@ -591,9 +623,7 @@ def test_resolved_image_defaults_to_sandbox_image(monkeypatch: pytest.MonkeyPatc
 def test_resolved_image_uses_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     """_resolved_image() returns AKGENTIC_SANDBOX_IMAGE when set."""
     monkeypatch.setenv("AKGENTIC_SANDBOX_IMAGE", "ghcr.io/myorg/akgentic-sandbox:v1.2")
-    assert (
-        DockerBackend()._resolved_image() == "ghcr.io/myorg/akgentic-sandbox:v1.2"
-    )
+    assert DockerBackend()._resolved_image() == "ghcr.io/myorg/akgentic-sandbox:v1.2"
 
 
 @patch.object(DockerBackend, "_ensure_image")
