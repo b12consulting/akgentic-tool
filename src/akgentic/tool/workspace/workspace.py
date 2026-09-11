@@ -502,6 +502,11 @@ would refuse roughly one user in sixty-four at team creation; a 43-character
 ``sub`` never equals ``_shared``. Matched **case-insensitively**, because macOS
 and Windows filesystems are: ``_SHARED/`` and ``_shared/`` are one directory
 there.
+
+Case-insensitively means ``casefold()``, not ``lower()``. ``_shared`` spelled
+with U+017F LATIN SMALL LETTER LONG S is already lowercase, so ``lower()``
+leaves it alone and it would pass; ``casefold()`` maps it onto ``_shared``,
+which is also what APFS and NTFS open it as.
 """
 
 SHARED_KINDS_ENV = "AKGENTIC_WORKSPACE_SHARED_KINDS"
@@ -569,6 +574,9 @@ def permitted_shared_kinds() -> frozenset[str]:
         token = written.strip()
         if not token:
             continue
+        # ``lower()``, deliberately not ``casefold()``: this parses a permission, where
+        # folding could only grant more than the admin wrote (the reserved-name guards
+        # fold because there folding can only refuse more).
         kind = _SHARED_KIND_TOKENS.get(token.lower())
         if kind is None:
             accepted = ", ".join(repr(name) for name in sorted(_SHARED_KIND_TOKENS))
@@ -646,12 +654,14 @@ def user_segment(user_id: str | None) -> str:
             shared cell — its per-principal ``_shared/_id/notes`` is the shared
             ``_shared/_id/notes``, reachable by every card that declares it.
             The empty case is reachable from an OIDC token carrying no ``sub``
-            without anyone misbehaving, and it must still raise.
+            without anyone misbehaving, and it must still raise. "Any letter
+            case" is ``casefold()``, so a long-s ``_shared`` is refused as well
+            as ``_SHARED`` — see :data:`RESERVED_SCOPES`.
     """
     principal = ANONYMOUS if user_id is None else user_id
     if _unusable_as_segment(principal):
         raise ValueError(f"user_id is not usable as a workspace directory name: {principal!r}")
-    if principal.lower() in RESERVED_SCOPES:
+    if principal.casefold() in RESERVED_SCOPES:
         raise ValueError(f"user_id may not be a reserved scope: {principal!r}")
     return principal
 
@@ -721,6 +731,13 @@ def leaf_segment(value: str) -> str:
     directory there, so an exact-match guard would pass the collision straight
     through on the platform most of this is developed on.
 
+    **Both matches use** ``casefold()`` **rather than** ``lower()``, for the
+    reason :data:`RESERVED_SCOPES` gives: a letter that is already lowercase but
+    folds onto another — U+017F LATIN SMALL LETTER LONG S folds onto ``s`` — is
+    unchanged by ``lower()`` and is still one directory with its fold on those
+    volumes. No shipped kind name or suffix contains such a letter today; the
+    fold is computed once, here, so the first one added is covered with no edit.
+
     **This does not make the journal's own guard redundant.** ``GitJournal``
     refuses to initialise when the root it was handed ends in ``.git``, and that
     covers the layer this function cannot see: ``Filesystem`` and
@@ -740,13 +757,14 @@ def leaf_segment(value: str) -> str:
     """
     if _unusable_as_segment(value):
         raise ValueError(f"workspace leaf is not usable as a directory name: {value!r}")
-    if value.lower() in RESERVED_KINDS:
+    folded = value.casefold()
+    if folded in RESERVED_KINDS:
         raise ValueError(
             f"workspace leaf may not be {value!r}: it is a reserved kind name, and a "
             "reserved name means one thing at every position of a workspace path"
         )
     for suffix, owner in _SIDECAR_SUFFIXES.items():
-        if value.lower().endswith(suffix):
+        if folded.endswith(suffix):
             raise ValueError(
                 f"workspace leaf may not end in {suffix!r}, which is another "
                 f"workspace's {owner} directory: {value!r}"

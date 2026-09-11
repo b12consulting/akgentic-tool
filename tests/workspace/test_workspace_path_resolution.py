@@ -29,6 +29,7 @@ import pytest
 from akgentic.core.utils.serializer import SerializableBaseModel
 from pydantic import ValidationError
 
+from akgentic.tool.workspace import workspace as workspace_module
 from akgentic.tool.workspace.models import GIT_DIR_SUFFIX, META_DIR_SUFFIX
 from akgentic.tool.workspace.tool import WorkspaceTool
 from akgentic.tool.workspace.workspace import (
@@ -45,6 +46,10 @@ from akgentic.tool.workspace.workspace import (
     user_segment,
 )
 from tests.workspace.conftest import FakeActorToolObserver, FakeOrchestratorProxy
+
+# Spelled by escape, never pasted: an editor or a normaliser can rewrite the glyph
+# silently, and the specs using it would then prove nothing.
+LONG_S = chr(0x017F)  # LATIN SMALL LETTER LONG S
 
 # A stand-in for the team metadata model this package is not allowed to import.
 # The resolver reads declared keys off it by attribute and never learns its type,
@@ -479,6 +484,49 @@ class TestUserSegment:
         with pytest.raises(ValueError, match="reserved scope"):
             user_segment(spelling)
 
+    def test_a_long_s_principal_is_refused_because_the_match_case_folds(self) -> None:
+        """A long-s ``_shared`` **is** ``_shared/`` on a case-folding volume; ``lower()`` misses it.
+
+        U+017F is already lowercase, so ``lower()`` leaves it alone and only
+        ``casefold()`` maps it onto ``s``. The premise is asserted first: a Python
+        that changed either answer says so here, rather than the spec silently
+        proving nothing.
+        """
+        principal = f"_{LONG_S}hared"
+        assert principal.lower() == principal
+        assert principal.casefold() == "_shared"
+
+        with pytest.raises(ValueError, match="reserved scope"):
+            user_segment(principal)
+
+    def test_a_long_s_principal_is_refused_out_of_the_resolver(self) -> None:
+        principal = f"_{LONG_S}hared"
+        assert principal.lower() == principal
+        assert principal.casefold() == "_shared"
+
+        with pytest.raises(ValueError, match="reserved scope"):
+            resolve(workspace_id="notes", user_id=principal)
+
+    def test_a_long_s_principal_fails_the_bind_and_creates_nothing(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+    ) -> None:
+        """The agent-side path: the card's own bind, not only the resolver it calls.
+
+        Nothing may be left on disk. ``get_workspace`` creates the tree eagerly,
+        so a guard that let this principal through would leave its long-s
+        directory behind — which a case-folding volume opens as ``_shared``.
+        """
+        principal = f"_{LONG_S}hared"
+        assert principal.lower() == principal
+        assert principal.casefold() == "_shared"
+        card = WorkspaceTool(workspace_id="notes")
+        observer = FakeActorToolObserver(orchestrator_proxy, user_id=principal)
+
+        with pytest.raises(ValueError, match="reserved scope"):
+            card.observer(observer)
+
+        assert list(workspaces_root.iterdir()) == []
+
     @pytest.mark.parametrize(
         "accepted",
         [
@@ -560,6 +608,38 @@ class TestLeafSegment:
         """``alice/_META`` is ``alice/_meta`` on the platform this is developed on."""
         with pytest.raises(ValueError, match="reserved kind"):
             leaf_segment(spelling)
+
+    def test_the_kind_match_case_folds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``casefold()``, not ``lower()`` — observable only through a widened table.
+
+        No shipped kind name has a letter with a non-ASCII fold: ``_team``, ``_id``
+        and ``_meta`` carry no ``s``, so no real input tells the two comparisons
+        apart today. Widening :data:`RESERVED_KINDS` with ``_scratch`` makes the
+        fold observable now, rather than on the day a kind with an ``s`` is added.
+        """
+        leaf = f"_{LONG_S}cratch"
+        assert leaf.lower() == leaf
+        assert leaf.casefold() == "_scratch"
+        monkeypatch.setattr(workspace_module, "RESERVED_KINDS", RESERVED_KINDS | {"_scratch"})
+
+        with pytest.raises(ValueError, match="reserved kind"):
+            leaf_segment(leaf)
+
+    def test_the_suffix_match_case_folds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The same, for the sidecar suffixes — neither ``.git`` nor ``.index`` has an ``s``.
+
+        A ``.snap`` sidecar is invented for the purpose: the table is widened so
+        a suffix comparison put back to ``lower()`` goes red here, instead of
+        passing a long-s ``.snap`` leaf the day a real suffix carries that letter.
+        """
+        leaf = f"x.{LONG_S}nap"
+        assert leaf.lower() == leaf
+        assert leaf.casefold() == "x.snap"
+        widened = {**workspace_module._SIDECAR_SUFFIXES, ".snap": "snapshot"}
+        monkeypatch.setattr(workspace_module, "_SIDECAR_SUFFIXES", widened)
+
+        with pytest.raises(ValueError, match="snapshot"):
+            leaf_segment(leaf)
 
     @pytest.mark.parametrize(
         "accepted", ["_shared", "_shared2", "_teams", "_ids", "_i", "x_team", "_metadata"]
@@ -1038,16 +1118,16 @@ def _usable(value: str) -> bool:
 
 def _usable_scope(value: str) -> bool:
     """Whether a card could legally carry *value* as a principal."""
-    return _usable(value) and value.lower() not in RESERVED_SCOPES
+    return _usable(value) and value.casefold() not in RESERVED_SCOPES
 
 
 def _usable_leaf(value: str) -> bool:
     """Whether a card could legally carry *value* as a ``workspace_id`` or a team id."""
-    lowered = value.lower()
+    folded = value.casefold()
     return (
         _usable(value)
-        and lowered not in RESERVED_KINDS
-        and not lowered.endswith((GIT_DIR_SUFFIX, META_DIR_SUFFIX))
+        and folded not in RESERVED_KINDS
+        and not folded.endswith((GIT_DIR_SUFFIX, META_DIR_SUFFIX))
     )
 
 
