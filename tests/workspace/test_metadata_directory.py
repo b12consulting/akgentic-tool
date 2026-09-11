@@ -493,9 +493,13 @@ class TestBothSiblingsLandBesideEveryCell:
 
     @pytest.mark.parametrize("cell", SIX_CELLS, ids=_cell_ids)
     def test_the_metadata_and_journal_siblings_share_the_trees_parent(
-        self, cell: Cell, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+        self,
+        cell: Cell,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspaces_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        card, expected, _observer = bind_cell(cell, orchestrator_proxy)
+        card, expected, _observer = bind_cell(cell, orchestrator_proxy, monkeypatch)
         base = workspaces_root.resolve()
         scope, kind, _leaf = expected.split("/")
 
@@ -521,7 +525,7 @@ class TestBothSiblingsLandBesideEveryCell:
         elsewhere = tmp_path / "meta-volume"
         with monkeypatch.context() as patch:
             patch.setenv(META_ROOT_VAR, str(elsewhere))
-            card, expected, _observer = bind_cell(cell, orchestrator_proxy)
+            card, expected, _observer = bind_cell(cell, orchestrator_proxy, monkeypatch)
 
             meta = meta_dir_for(card._workspace_path)
 

@@ -28,10 +28,10 @@ import akgentic.tool
 import akgentic.tool.workspace as ws
 
 # Captured verbatim from ``akgentic/tool/workspace/__init__.py``'s ``__all__``
-# before the move: 102 names, plus the four story 45-3 added and the six the
-# workspace path resolver adds (ADR-048 Decision 5). The package ships
-# on PyPI, so every one of them is a public import path somebody may already
-# depend on.
+# before the move: 102 names, plus the four story 45-3 added, the six the
+# workspace path resolver adds (ADR-048 Decision 5), and the shared-kind
+# permission's parser story 54-2 adds. The package ships on PyPI, so every one
+# of them is a public import path somebody may already depend on.
 _WORKSPACE_ALL: frozenset[str] = frozenset(
     {
         "ANONYMOUS",
@@ -156,6 +156,7 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "leaf_segment",
         "lock_unavailable",
         "meta_dir_for",
+        "permitted_shared_kinds",
         "resolve_workspace_path",
         "user_segment",
         "git_dir_for",

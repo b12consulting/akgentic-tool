@@ -504,6 +504,82 @@ and Windows filesystems are: ``_SHARED/`` and ``_shared/`` are one directory
 there.
 """
 
+SHARED_KINDS_ENV = "AKGENTIC_WORKSPACE_SHARED_KINDS"
+"""The platform's permission for shared trees: which kinds may live under ``_shared``.
+
+``workspace_sharable=True`` on a card is a **request**; this variable is the
+**permission**. A card asking for a shared tree of a kind not listed here fails
+its bind, naming what it asked for and what is permitted, and is never quietly
+given a per-principal tree instead (``WorkspaceTool.observer``).
+
+The value is comma-separated bare kind names — ``team``, ``id``, ``meta`` —
+compared case-insensitively, with whitespace around each name ignored.
+**Unset or empty means none**: a deployment that has never heard of sharing
+cannot be given it by a card. See :func:`permitted_shared_kinds` for the parse.
+
+Read by the process that **binds agents** — the worker in a department or
+enterprise deployment, the single process in community — and never by the API
+server, which calls :func:`resolve_workspace_path` on a catalog write and must
+not judge a card against an allow-list that is not the one deciding.
+"""
+
+# Token → kind constant, **derived** from the kinds and never spelled again, on
+# the pattern of ``_SIDECAR_SUFFIXES`` and ``RESERVED_SCOPES``: the variable
+# names a kind as a word, so the token is the kind name without its underscore.
+# A fourth kind is permitted by name the day it is added, and no wildcard exists
+# to widen silently when it is.
+_SHARED_KIND_TOKENS: dict[str, str] = {kind.removeprefix("_"): kind for kind in RESERVED_KINDS}
+
+
+def permitted_shared_kinds() -> frozenset[str]:
+    """The kinds :data:`SHARED_KINDS_ENV` permits under ``_shared``, as kind constants.
+
+    Returns :data:`TEAM_KIND` / :data:`ID_KIND` / :data:`METADATA_KIND`, never
+    the tokens: the caller compares against a resolved path's ``<kind>`` segment.
+
+    The value is split on ``,`` and nothing else; each token is stripped, empty
+    tokens are skipped, and the rest are compared lower-cased against the bare
+    kind names. So ``" id , META "`` permits ``_id`` and ``_meta``, and ``""``,
+    ``"  "`` and ``","`` all permit nothing — exactly as unset does.
+
+    **Read at every call, never cached** — no ``functools.cache``, no module
+    global, no memo. Once per bind is one environment read and a split. A cache
+    is global mutable state that leaks between specs — story 53-1's first
+    attempt added one and six mocked specs went red because a real test had
+    populated it — and a process can legitimately see the variable change.
+
+    Returns:
+        The permitted kind constants; empty when the variable is unset or blank.
+
+    Raises:
+        ValueError: If any token is not a kind name — ``metadata``, ``_meta``,
+            ``all``, ``*``, or ``id meta`` (one token: the separator is ``,``
+            only). One bad token refuses the **whole** value: ``meta,metadata``
+            permits nothing rather than ``meta``, because a typo that silently
+            permitted half a value would look like a working configuration.
+    """
+    # A ``""`` default is correct here **only because** unset and empty mean the
+    # same thing — none. It is the distinction story 52-1's review found
+    # conflated for ``AKGENTIC_WORKSPACE_META_ROOT`` (:func:`meta_dir_for`):
+    # a compose file interpolating an unset ``${VAR}`` and a bare ``VAR=`` both
+    # arrive as ``""``, and there the two had to be told apart. Here they need not.
+    raw = os.environ.get(SHARED_KINDS_ENV, "")
+    permitted: set[str] = set()
+    for written in raw.split(","):
+        token = written.strip()
+        if not token:
+            continue
+        kind = _SHARED_KIND_TOKENS.get(token.lower())
+        if kind is None:
+            accepted = ", ".join(repr(name) for name in sorted(_SHARED_KIND_TOKENS))
+            raise ValueError(
+                f"{SHARED_KINDS_ENV} names {token!r}, which is not a workspace kind; "
+                f"accepted, comma-separated: {accepted}"
+            )
+        permitted.add(kind)
+    return frozenset(permitted)
+
+
 # The only shapes that are not a directory name. Everything else — emails, dots
 # mid-name, ``+``, ``=``, unicode — is a legal filename and goes in verbatim.
 _UNSAFE = re.compile(r"[/\\\x00]")
@@ -811,8 +887,12 @@ def resolve_workspace_path(
     gate none the wiser.
 
     **``workspace_sharable`` is a request.** This resolver honours it for every
-    kind; whether a deployment permits a shared tree of a given kind is a
-    separate check at bind time.
+    kind; whether a deployment permits a shared tree of a given kind is decided
+    by :data:`SHARED_KINDS_ENV`, checked in ``WorkspaceTool.observer`` against
+    the path returned here. This resolver **deliberately reads no environment**:
+    ``akgentic-infra`` calls it on the stateless API server, whose environment is
+    not the one that creates the tree, and a card must not be judged there
+    against an allow-list that does not decide.
 
     The two layout fields are mutually exclusive, enforced at card construction
     rather than by precedence here (ADR-048 Decision 2); ``workspace_sharable``

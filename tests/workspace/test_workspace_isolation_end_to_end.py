@@ -56,6 +56,7 @@ from akgentic.tool.workspace.actor import (
 )
 from akgentic.tool.workspace.event import WorkspaceAttached
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
+from akgentic.tool.workspace.workspace import SHARED_KINDS_ENV
 from tests.workspace.conftest import (
     HANDSHAKE_TIMEOUT_S,
     SandboxScript,
@@ -441,7 +442,7 @@ class TestTheMetadataCardSharesDeliberately:
     """
 
     def test_two_teams_with_the_same_key_values_reach_the_same_tree(
-        self, system: ActorSystem, workspaces_root: Path
+        self, system: ActorSystem, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """**This sharing is what the declaration is for — do not "fix" it.**
 
@@ -449,26 +450,32 @@ class TestTheMetadataCardSharesDeliberately:
         path. Everywhere else in this epic a shared tree is the defect; here it
         is the feature the card asked for, which is why it is pinned as tightly
         as the isolation is.
+
+        The platform permits ``meta`` around **both** spawns: each bind runs on
+        its member's own pykka thread inside ``on_start``, and ``os.environ`` is
+        process-wide, so the context covers a bind only if the spawn is inside it.
         """
         keys = ["customer_id", "case_id"]
-        first = spawn_member(
-            system,
-            bind_key="acme-a",
-            user_id="u-alice",
-            team_id=uuid.uuid4(),
-            metadata=CaseMetadata(customer_id="ACME", case_id="42"),
-            keys=keys,
-            sharable=True,
-        )
-        second = spawn_member(
-            system,
-            bind_key="acme-b",
-            user_id="u-bob",
-            team_id=uuid.uuid4(),
-            metadata=CaseMetadata(customer_id="ACME", case_id="42"),
-            keys=keys,
-            sharable=True,
-        )
+        with monkeypatch.context() as patch:
+            patch.setenv(SHARED_KINDS_ENV, "meta")
+            first = spawn_member(
+                system,
+                bind_key="acme-a",
+                user_id="u-alice",
+                team_id=uuid.uuid4(),
+                metadata=CaseMetadata(customer_id="ACME", case_id="42"),
+                keys=keys,
+                sharable=True,
+            )
+            second = spawn_member(
+                system,
+                bind_key="acme-b",
+                user_id="u-bob",
+                team_id=uuid.uuid4(),
+                metadata=CaseMetadata(customer_id="ACME", case_id="42"),
+                keys=keys,
+                sharable=True,
+            )
         first_card, first_path = bound(first)
         second_card, second_path = bound(second)
 
@@ -542,6 +549,80 @@ class TestTheMetadataCardSharesDeliberately:
         assert path_42 != path_43
         assert path_42 == PurePosixPath("u-alice/_meta/customer_id-ACME__case_id-42")
         assert path_43 == PurePosixPath("u-alice/_meta/customer_id-ACME__case_id-43")
+
+
+##
+## Story 54-2 — the platform permits, the card requests
+##
+
+HEADLINE_PATH = "_shared/_meta/customer_id-ACME__case_id-42"
+"""Where the one shared metadata declaration below lands — when the platform permits it."""
+
+
+def _spawn_the_shared_metadata_card(system: ActorSystem) -> Bind:
+    """The **one** declaration both headline specs bind, so the two cannot drift apart.
+
+    A sharable metadata card over ``customer_id=ACME, case_id=42`` for ``u-alice``,
+    spawned through real propagation. What differs between the two specs is the
+    platform's permission and nothing else.
+    """
+    return spawn_member(
+        system,
+        bind_key="headline",
+        user_id="u-alice",
+        team_id=uuid.uuid4(),
+        metadata=CaseMetadata(customer_id="ACME", case_id="42"),
+        keys=["customer_id", "case_id"],
+        sharable=True,
+    )
+
+
+class TestThePlatformPermitsTheCardRequests:
+    """The same card, both ways, over a real ``ActorSystem``.
+
+    ``workspace_sharable=True`` is the card's **request**, and
+    ``AKGENTIC_WORKSPACE_SHARED_KINDS`` on the binding process is the
+    **permission**. Permitted, the card binds the shared tree; unset, the bind
+    fails naming the kind and the variable — and it does not quietly bind the
+    per-principal ``u-alice/_meta/…`` instead, which is the fall-back this pair
+    exists to keep out.
+    """
+
+    def test_permitted_the_card_binds_the_shared_tree(
+        self, system: ActorSystem, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Around the spawn: the bind runs on the member's own thread in ``on_start``.
+        with monkeypatch.context() as patch:
+            patch.setenv(SHARED_KINDS_ENV, "meta")
+            record = _spawn_the_shared_metadata_card(system)
+
+        _card, path = bound(record)
+        assert path == PurePosixPath(HEADLINE_PATH)
+        assert (workspaces_root / HEADLINE_PATH).is_dir()
+        [message] = _attached_events(system, record)
+        assert message.event.workspace_path == HEADLINE_PATH
+
+    def test_unset_the_bind_fails_and_nothing_is_created(
+        self, system: ActorSystem, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv(SHARED_KINDS_ENV, raising=False)
+
+        record = _spawn_the_shared_metadata_card(system)
+
+        assert isinstance(record.error, ValueError), record.error
+        assert "'meta'" in str(record.error)
+        assert SHARED_KINDS_ENV in str(record.error)
+        # Neither the shared tree nor the fall-back's private one.
+        assert not (workspaces_root / "_shared").exists()
+        assert not (workspaces_root / "u-alice" / "_meta").exists()
+        assert list(workspaces_root.iterdir()) == []
+        assert ActorSystem.find_by_class(WorkspaceActor) == []
+        # The member itself did start — the stream is not empty for a trivial
+        # reason — and it carries no attach event.
+        assert record.member is not None
+        starts = [m for m in _stream_of(system, record) if isinstance(m, StartMessage)]
+        assert any(m.sender == record.member for m in starts)
+        assert _attached_events(system, record) == []
 
 
 ##
@@ -671,27 +752,36 @@ FRONTEND_ENVELOPE_KEYS = frozenset(
 )
 
 
-def _two_teams_on_one_tree(system: ActorSystem) -> tuple[Bind, Bind]:
-    """Two teams, two principals, two team ids, two orchestrators — one shared metadata tree."""
+def _two_teams_on_one_tree(
+    system: ActorSystem, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Bind, Bind]:
+    """Two teams, two principals, two team ids, two orchestrators — one shared metadata tree.
+
+    ``meta`` is permitted around **both** spawns, never ambient: each bind runs
+    on its member's own pykka thread in ``on_start``, and the variable is
+    process-wide, so a spawn outside the context would bind unpermitted.
+    """
     keys = ["customer_id", "case_id"]
-    first = spawn_member(
-        system,
-        bind_key="acme-a",
-        user_id="u-alice",
-        team_id=uuid.uuid4(),
-        metadata=CaseMetadata(customer_id="ACME", case_id="42"),
-        keys=keys,
-        sharable=True,
-    )
-    second = spawn_member(
-        system,
-        bind_key="acme-b",
-        user_id="u-bob",
-        team_id=uuid.uuid4(),
-        metadata=CaseMetadata(customer_id="ACME", case_id="42"),
-        keys=keys,
-        sharable=True,
-    )
+    with monkeypatch.context() as patch:
+        patch.setenv(SHARED_KINDS_ENV, "meta")
+        first = spawn_member(
+            system,
+            bind_key="acme-a",
+            user_id="u-alice",
+            team_id=uuid.uuid4(),
+            metadata=CaseMetadata(customer_id="ACME", case_id="42"),
+            keys=keys,
+            sharable=True,
+        )
+        second = spawn_member(
+            system,
+            bind_key="acme-b",
+            user_id="u-bob",
+            team_id=uuid.uuid4(),
+            metadata=CaseMetadata(customer_id="ACME", case_id="42"),
+            keys=keys,
+            sharable=True,
+        )
     return first, second
 
 
@@ -730,9 +820,9 @@ class TestTwoTeamsOnOneTreeGetTwoActors:
     """
 
     def test_both_binds_succeed_and_each_team_gets_its_own_actor_on_one_tree(
-        self, system: ActorSystem, workspaces_root: Path
+        self, system: ActorSystem, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        first, second = _two_teams_on_one_tree(system)
+        first, second = _two_teams_on_one_tree(system, monkeypatch)
         _, first_path = bound(first)
         _, second_path = bound(second)
         assert first_path == second_path == PurePosixPath(SHARED_PATH)
@@ -745,7 +835,7 @@ class TestTwoTeamsOnOneTreeGetTwoActors:
         assert workspaces[0].agent_id != workspaces[1].agent_id
 
     def test_the_tree_is_still_one_tree_and_the_gate_still_spans_both_teams(
-        self, system: ActorSystem, workspaces_root: Path
+        self, system: ActorSystem, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Why two actors is safe: the gate is the live file, not the actor.
 
@@ -753,7 +843,7 @@ class TestTwoTeamsOnOneTreeGetTwoActors:
         is refused — across two orchestrators, two actors and two cards that
         share nothing but the directory.
         """
-        first, second = _two_teams_on_one_tree(system)
+        first, second = _two_teams_on_one_tree(system, monkeypatch)
         alice_card, _ = bound(first)
         bob_card, _ = bound(second)
 
@@ -767,9 +857,9 @@ class TestTwoTeamsOnOneTreeGetTwoActors:
         assert (tree / "shared.md").read_text(encoding="utf-8") == "alice\n"
 
     def test_each_teams_stream_carries_one_event_naming_its_own_agent(
-        self, system: ActorSystem, workspaces_root: Path
+        self, system: ActorSystem, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        first, second = _two_teams_on_one_tree(system)
+        first, second = _two_teams_on_one_tree(system, monkeypatch)
         bound(first)
         bound(second)
 
@@ -793,7 +883,7 @@ class TestTwoTeamsOnOneTreeGetTwoActors:
         assert payload_ids[0] != payload_ids[1]
 
     def test_each_teams_actor_is_that_teams_own_member(
-        self, system: ActorSystem, workspaces_root: Path
+        self, system: ActorSystem, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """**Inverted.** It was in no team\'s roster; it is in its own team\'s and no other\'s.
 
@@ -802,7 +892,7 @@ class TestTwoTeamsOnOneTreeGetTwoActors:
         because the actor was in nobody\'s roster; it holds now because it is in
         exactly one.
         """
-        first, second = _two_teams_on_one_tree(system)
+        first, second = _two_teams_on_one_tree(system, monkeypatch)
         bound(first)
         bound(second)
         name = workspace_actor_name(SHARED_PATH)
@@ -830,9 +920,9 @@ class TestTheWireShapeIsTheFrontends:
     """A real serialisation of a real envelope, against the fold's contract."""
 
     def test_the_serialised_envelope_and_payload(
-        self, system: ActorSystem, workspaces_root: Path
+        self, system: ActorSystem, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        first, second = _two_teams_on_one_tree(system)
+        first, second = _two_teams_on_one_tree(system, monkeypatch)
         bound(first)
         bound(second)
         assert first.member is not None
@@ -861,9 +951,9 @@ class TestTheWireShapeIsTheFrontends:
         assert agent_id == wire["sender"]["agent_id"]
 
     def test_the_envelope_round_trips_to_the_same_payload(
-        self, system: ActorSystem, workspaces_root: Path
+        self, system: ActorSystem, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        first, second = _two_teams_on_one_tree(system)
+        first, second = _two_teams_on_one_tree(system, monkeypatch)
         bound(first)
         bound(second)
         [message] = _attached_events(system, first)

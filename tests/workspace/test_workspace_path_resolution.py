@@ -22,6 +22,7 @@ from __future__ import annotations
 import random
 import string
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -36,6 +37,7 @@ from akgentic.tool.workspace.workspace import (
     METADATA_KIND,
     RESERVED_KINDS,
     RESERVED_SCOPES,
+    SHARED_KINDS_ENV,
     SHARED_SCOPE,
     TEAM_KIND,
     leaf_segment,
@@ -121,24 +123,71 @@ CELL_METADATA = Metadata(customer_id="ACME")
 """The team metadata every cell is resolved against."""
 
 
-def bind_cell(
+class Permit(Enum):
+    """``bind_cell``'s default permission: exactly the kind the cell binds, if shared."""
+
+    OWN_KIND = "own-kind"
+
+
+def own_kind_token(cell: Cell) -> str:
+    """The ``AKGENTIC_WORKSPACE_SHARED_KINDS`` token for *cell*'s kind — a literal, per name.
+
+    Read off the cell's own literal name (``id-shared`` → ``id``) rather than
+    derived the way the source derives it, so a spec granting it cannot agree
+    with a derivation that drifted.
+    """
+    return cell.name.removesuffix("-shared")
+
+
+def unbound_cell(
     cell: Cell, orchestrator_proxy: FakeOrchestratorProxy
-) -> tuple[WorkspaceTool, str, FakeActorToolObserver]:
-    """Bind *cell*'s card through ``observer()`` for principal ``alice``.
+) -> tuple[WorkspaceTool, FakeActorToolObserver]:
+    """*cell*'s card and principal ``alice``'s observer, before any bind.
 
     ``user_id="alice"`` is set **explicitly** — never the fake's default
     principal and never ``None`` — so a shared cell's ``_shared`` is
     distinguishable from anything the fake would have supplied on its own. The
-    observer comes back with the card because the card holds it weakly.
+    team carries :data:`CELL_METADATA`, so a metadata cell resolves rather than
+    failing on "the team carries no metadata".
+
+    Separate from :func:`bind_cell` only so a spec about a **refused** bind can
+    hold the card and the observer afterwards: ``bind_cell`` cannot hand back
+    what it raised out of.
+    """
+    orchestrator_proxy.metadata = CELL_METADATA
+    return cell.card(), FakeActorToolObserver(orchestrator_proxy, user_id="alice")
+
+
+def bind_cell(
+    cell: Cell,
+    orchestrator_proxy: FakeOrchestratorProxy,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    shared_kinds: str | Permit | None = Permit.OWN_KIND,
+) -> tuple[WorkspaceTool, str, FakeActorToolObserver]:
+    """Bind *cell*'s card through ``observer()`` for principal ``alice``.
+
+    The observer comes back with the card because the card holds it weakly.
+
+    ``AKGENTIC_WORKSPACE_SHARED_KINDS`` is set through ``monkeypatch.context()``
+    around ``observer()`` **only**, and never ambient. By default a shared cell
+    permits exactly its own kind and a per-principal cell leaves the variable
+    unset; *shared_kinds* overrides that with a value to set (``""`` included)
+    or ``None`` to delete it.
 
     Returns:
         The bound card, the cell's literal path with the team id filled in, and
         the observer.
     """
-    orchestrator_proxy.metadata = CELL_METADATA
-    observer = FakeActorToolObserver(orchestrator_proxy, user_id="alice")
-    card = cell.card()
-    card.observer(observer)
+    card, observer = unbound_cell(cell, orchestrator_proxy)
+    if shared_kinds is Permit.OWN_KIND:
+        shared_kinds = own_kind_token(cell) if cell.sharable else None
+    with monkeypatch.context() as patch:
+        if shared_kinds is None:
+            patch.delenv(SHARED_KINDS_ENV, raising=False)
+        else:
+            patch.setenv(SHARED_KINDS_ENV, shared_kinds)
+        card.observer(observer)
     return card, cell.expected.format(team_id=observer.team_id), observer
 
 
@@ -227,9 +276,13 @@ class TestTheSixCellsBind:
 
     @pytest.mark.parametrize("cell", SIX_CELLS, ids=_cell_ids)
     def test_the_card_binds_its_cells_path_everywhere_it_hands_one(
-        self, cell: Cell, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+        self,
+        cell: Cell,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspaces_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        card, expected, _observer = bind_cell(cell, orchestrator_proxy)
+        card, expected, _observer = bind_cell(cell, orchestrator_proxy, monkeypatch)
 
         assert card._workspace_path == expected
         tree = workspaces_root / expected
@@ -239,10 +292,14 @@ class TestTheSixCellsBind:
 
     @pytest.mark.parametrize("cell", SIX_CELLS, ids=_cell_ids)
     def test_the_bind_creates_exactly_that_one_actor(
-        self, cell: Cell, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
+        self,
+        cell: Cell,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspaces_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """An equality over the created set — a second, wrong tree cannot hide beside it."""
-        _card, expected, _observer = bind_cell(cell, orchestrator_proxy)
+        _card, expected, _observer = bind_cell(cell, orchestrator_proxy, monkeypatch)
 
         assert set(orchestrator_proxy.children) == {f"#Workspace-{expected}"}
 
@@ -273,6 +330,7 @@ class TestSharableRoundTrip:
         sharable: bool,
         orchestrator_proxy: FakeOrchestratorProxy,
         workspaces_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         original = WorkspaceTool(workspace_id="notes", **declared)
         reloaded = WorkspaceTool.model_validate(original.model_dump())
@@ -282,10 +340,15 @@ class TestSharableRoundTrip:
         assert "workspace_sharable" in reloaded.model_fields_set
         assert reloaded.workspace_sharable is sharable
 
-        # Both observers held here: a card holds its observer weakly.
+        # Both observers held here: a card holds its observer weakly. ``id`` is
+        # the kind every row binds, so it is permitted around both binds — and a
+        # per-principal row still lands under ``alice``: a permission never
+        # makes a card shared.
         observers = [FakeActorToolObserver(orchestrator_proxy, user_id="alice") for _ in range(2)]
-        original.observer(observers[0])
-        reloaded.observer(observers[1])
+        with monkeypatch.context() as patch:
+            patch.setenv(SHARED_KINDS_ENV, "id")
+            original.observer(observers[0])
+            reloaded.observer(observers[1])
 
         literal = "_shared/_id/notes" if sharable else "alice/_id/notes"
         assert original._workspace_path == literal

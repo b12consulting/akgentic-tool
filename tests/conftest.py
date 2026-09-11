@@ -12,6 +12,7 @@ from akgentic.core.actor_address import ActorAddress
 
 from akgentic.tool.vector_store.backends.qdrant import QDRANT_API_KEY_ENV, QDRANT_URL_ENV
 from akgentic.tool.vector_store.backends.weaviate import WEAVIATE_API_KEY_ENV, WEAVIATE_URL_ENV
+from akgentic.tool.workspace.workspace import SHARED_KINDS_ENV
 
 #: The pid every ``popen_mock`` helper in this suite stamps on its fake process.
 MOCK_CHILD_PID = 4242
@@ -60,6 +61,23 @@ def _no_ambient_weaviate_cluster(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(WEAVIATE_API_KEY_ENV, raising=False)
     monkeypatch.delenv(QDRANT_URL_ENV, raising=False)
     monkeypatch.delenv(QDRANT_API_KEY_ENV, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_shared_kinds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hide a developer's or runner's exported shared-kind permission from every test.
+
+    ``WorkspaceTool.observer`` reads ``AKGENTIC_WORKSPACE_SHARED_KINDS`` at every
+    bind, so without this the suite means different things depending on whose
+    shell it runs in: an exported ``team,id,meta`` turns every "unset refuses"
+    spec red and makes every "permitted binds" spec vacuous, since it would bind
+    whether or not the spec granted anything.
+
+    Here rather than in ``tests/workspace/conftest.py`` because a
+    ``WorkspaceTool`` is bound outside that directory too. Tests that want a
+    permission grant it with ``monkeypatch``, which runs after this one and wins.
+    """
+    monkeypatch.delenv(SHARED_KINDS_ENV, raising=False)
 
 
 class MockActorAddress(ActorAddress):

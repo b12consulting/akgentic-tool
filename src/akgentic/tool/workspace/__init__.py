@@ -170,6 +170,7 @@ from akgentic.tool.workspace.workspace import (
     is_staging_name,
     leaf_segment,
     meta_dir_for,
+    permitted_shared_kinds,
     resolve_workspace_path,
     user_segment,
 )
@@ -301,6 +302,7 @@ __all__ = [
     "get_workspace",
     "leaf_segment",
     "meta_dir_for",
+    "permitted_shared_kinds",
     "resolve_workspace_path",
     "user_segment",
     "ExpandMediaRefs",
