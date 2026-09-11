@@ -14,7 +14,7 @@ from akgentic.tool import WorkspaceTool
 | Actor | `#Workspace-<scope>/<kind>/<leaf>` — the **resolved three-segment path**, slashes included, so two principals' `notes` are two actors over two trees. An ordinary **team child**: created by its card through `getChildrenOrCreate`, in exactly one team's roster, stopped by that team's teardown. It owns **dispatch and no shared state** — with `workspace_exec` on, the tree's sandbox backend and the single worker thread that runs commands on it, plus the retrieval indexing pipeline. Two teams over one tree get two actors, and the tree orders them — see *Lifetime* below |
 | Channels used | `TOOL_CALL` (11 callables, 13 with `workspace_exec`), `COMMAND` (`expand_media_refs`) |
 | Optional extras | `[docs]` for binary reads, `[vision]` for image resizing |
-| Environment | `AKGENTIC_WORKSPACES_ROOT` (default `./workspaces`) · `AKGENTIC_WORKSPACE_META_ROOT` (default: the workspaces root; relocates only the `<leaf>.akgentic` siblings) · `AKGENTIC_WORKSPACE_SHARED_KINDS` (default unset, which permits **no** shared tree — see *Sharing a tree across principals*) |
+| Environment | `AKGENTIC_WORKSPACES_ROOT` (default `./workspaces`) · `AKGENTIC_WORKSPACE_META_ROOT` (default: the workspaces root; relocates only the `<leaf>.akgentic` siblings) · `AKGENTIC_WORKSPACE_SHARED_KINDS` (default unset, which permits **no** shared tree — see *Sharing a tree across principals*) · `AKGENTIC_LOCK_BACKEND` (default `file`) · `AKGENTIC_DOCUMENT_STORE` (default `yaml`). The last three are read on every bind, and a value they cannot use fails that bind |
 | External tools | `git` (optional — the journal, see below), `rg` (optional — accelerates `workspace_grep`) |
 
 ---
@@ -38,11 +38,12 @@ the file rather than consulting a record of who wrote it.
 Retrieval degrades further **within** itself: with the capability on and no store reachable, every
 retrieval callable answers one sentence rather than raising, and a search whose embedding call fails
 falls back to its keyword leg. ("No store reachable" means the backend this card's `vector_store`
-names could not be built — on the default `local` backend that is the **team's** `#VectorStore`,
+names could not be built — on the `local` backend that is the **team's** `#VectorStore`,
 which files the index under the tree's sibling metadata directory, and on a cluster backend there is
 no actor at all, only a client that failed to connect. The in-memory backend is not a workspace
-backend: a card that names it explicitly is refused at bind, and one that names no backend resolves
-to `local`.) That is deliberate rather than defensive — this actor owns the
+backend: a card that names it explicitly is refused at bind, and a card that names no backend gets
+whichever one the environment provisions, with `local` standing in wherever that would have been
+the in-memory fallback.) That is deliberate rather than defensive — this actor owns the
 write gate, and a misconfigured vector store must not be a way to take the gate down with it.
 
 ---
@@ -1101,7 +1102,7 @@ WorkspaceTool(
 # fills. Enabling any one of the three still turns retrieval on for the tree, so
 # this creates the collection and shrinks the extraction cache exactly as the
 # indexer would. To index a corpus several principals must share, add
-# workspace_sharable=True, which the platform must permit for `id`.
+# workspace_sharable=True, which AKGENTIC_WORKSPACE_SHARED_KINDS must permit: id.
 WorkspaceTool(workspace_id="corpus", workspace_rag_search=True)
 
 # A durable shared index. Fails at wiring time if AKGENTIC_WEAVIATE_URL is unset,

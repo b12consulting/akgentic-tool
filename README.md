@@ -1081,7 +1081,7 @@ WorkspaceTool()                                      # full access (default), jo
 WorkspaceTool(read_only=True)                        # read tools only
 WorkspaceTool(workspace_id="scratch")                # a second tree of YOUR OWN: alice/_id/scratch
 WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])  # alice/_meta/…: still per-principal
-WorkspaceTool(workspace_id="notes", workspace_sharable=True)       # _shared/_id/notes, if `id` is permitted
+WorkspaceTool(workspace_id="notes", workspace_sharable=True)       # _shared/_id/notes, if "id" is permitted
 WorkspaceTool(workspace_exec=True)                   # + sandboxed shell over the same tree
 WorkspaceTool(git_journal=True)                      # + git history; the gate is unaffected either way
 WorkspaceTool(read_only=True, workspace_glob=False)  # fine-grained capability control

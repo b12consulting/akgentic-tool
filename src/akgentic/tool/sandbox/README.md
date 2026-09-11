@@ -110,7 +110,8 @@ workspace shares one `#Workspace-<scope>/<kind>/<leaf>`, and that actor holds ex
 one worker for its tree. Two exec-capable cards on two workspaces in one team get two workspace
 actors, two backends, and — on the docker backend — two containers, each mounting its own tree. Two
 **teams** on one tree get two actors as well, since the actor is a team child: the tree orders them,
-because the exec hold is a marker file on the tree rather than state in either actor. The name
+because the exec hold is an `O_EXCL` marker file in the tree's `<leaf>.akgentic` sibling rather than
+state in either actor. The name
 carries the resolved path so that a second workspace can never be resolved onto the first one's
 actor.
 
