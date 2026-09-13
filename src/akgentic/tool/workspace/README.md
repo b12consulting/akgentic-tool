@@ -903,7 +903,7 @@ $AKGENTIC_WORKSPACES_ROOT/                      # default ./workspaces
 
 **Depth is fixed at three, and what that buys is that no workspace path is a proper prefix of
 another.** The invariant is load-bearing because violating it is **containment**, not a name
-collision: `Filesystem._validate_path` rejects only paths resolving *outside* the root, so a
+collision: `Filesystem.resolve_path` rejects only paths resolving *outside* the root, so a
 workspace anchored at a parent would read and write everything under a child's tree as ordinary
 in-tree activity, with the per-path write gate none the wiser. **Fixed depth is what buys the
 property.** No path of exactly three segments can be a proper prefix of another, because a proper
@@ -953,7 +953,7 @@ narrowed to one scope. Supplying a principal is the deployment's job.
 three-segment path, scope included: `alice/_meta/customer_id-ACME__case_id-42`. What a client does
 with it is the client's business.
 
-`Filesystem._validate_path` resolves each path against that root and rejects anything landing
+`Filesystem.resolve_path` resolves each path against that root and rejects anything landing
 outside it with `PermissionError`, which the tools surface as `RetriableError`. The check is
 component-level (`Path.is_relative_to`), so a sibling workspace whose name shares a prefix —
 `team-1` vs `team-11` — cannot be reached. Symlinks are resolved before the check, so a symlink

@@ -294,7 +294,7 @@ class WorkspaceActor(
         self._workspace: Filesystem = get_workspace(self.config.workspace_path)
         self._sweep_staging_files()
         self._journal = GitJournal(
-            self._workspace._root,
+            self._workspace.root,
             enabled=self.config.git_journal,
             timeout_s=self.config.git_timeout_s,
             meta_dir=meta_dir_for(self.config.workspace_path),
@@ -439,7 +439,7 @@ class WorkspaceActor(
         refusal. An orphan is minutes or a restart old, so no realistic window
         confuses the two.
         """
-        root = self._workspace._root
+        root = self._workspace.root
         cutoff = time.time() - STAGING_SWEEP_GRACE_S
         staged: list[Path] = []
         with contextlib.suppress(OSError):

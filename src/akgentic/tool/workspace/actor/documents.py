@@ -1676,7 +1676,7 @@ class DocumentsMixin(_DocumentsBase):
                         path,
                     )
                     continue
-                # ``_digest`` reads through ``Filesystem``, whose ``_validate_path``
+                # ``_digest`` reads through ``Filesystem``, whose ``resolve_path``
                 # raises ``PathEscapeError`` — a ``PermissionError``, and therefore
                 # an ``OSError`` the digest already absorbs alongside a missing file.
                 sha = self._digest(path)

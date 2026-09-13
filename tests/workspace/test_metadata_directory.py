@@ -1,7 +1,7 @@
 """The metadata directory is a sibling of the tree, and nothing in the tree can name it.
 
 Guards for :func:`meta_dir_for` (ADR-051 Decision 9). The placement is the whole
-subject: ``Filesystem._validate_path`` refuses every path that does not resolve
+subject: ``Filesystem.resolve_path`` refuses every path that does not resolve
 *inside* the root, so a directory **beside** the tree is one no read capability
 can name and no sandboxed run can delete. Inside the tree it would be listable,
 globbable, greppable, readable — and removable by an ``rm -rf`` from the very run
@@ -62,12 +62,12 @@ META_LEAF = f"{WORKSPACE_NAME}{META_DIR_SUFFIX}"
 def _tree_root(workspace_path: str = WORKSPACE_PATH) -> Path:
     """The tree :func:`get_workspace` opens, read from the backend it returns.
 
-    ``Filesystem`` exposes no public root, and every assertion in this module is
-    about where the metadata directory sits **relative to that exact path**. A
-    second derivation spelled out in the test would be a second rule to keep in
-    step — which is the defect one resolver exists to remove.
+    Every assertion in this module is about where the metadata directory sits
+    **relative to that exact path**. A second derivation spelled out in the test
+    would be a second rule to keep in step — which is the defect one resolver
+    exists to remove.
     """
-    return get_workspace(workspace_path)._root
+    return get_workspace(workspace_path).root
 
 
 def _seeded_meta(workspace_path: str = WORKSPACE_PATH) -> Path:
@@ -228,36 +228,23 @@ class TestNoReadCapabilityCanReachIt:
         assert _hands_back_nothing(glob, "*", f"../{META_LEAF}")
         assert _hands_back_nothing(tool_named(card, "workspace_list"), f"../{META_LEAF}")
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "workspace_glob validates its `path` argument but not its `pattern`, so a "
-            "pattern carrying `..` enumerates outside the tree. Pre-existing and not "
-            "this story's to fix — `workspace/card/` is out of scope for 52-1 — but the "
-            "guard is written now so the day it is fixed this spec goes green and "
-            "strict=True forces its removal."
-        ),
-    )
     def test_a_traversal_pattern_reaches_it_through_glob(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
-        """The one read closure that names something outside the root, today.
+        """The read closure that named something outside the root — until story 55-1.
 
-        ``workspace_glob("../<leaf>.index/*")`` hands the agent back
-        ``../<leaf>.index/exec.lock``: the closure resolves its ``path``
-        argument against the root and refuses an escape, but feeds ``pattern``
+        ``workspace_glob("../<leaf>.index/*")`` handed the agent back
+        ``../<leaf>.index/exec.lock``: the closure resolved its ``path``
+        argument against the root and refused an escape, but fed ``pattern``
         straight to ``Path.glob``, and ``Path.relative_to`` is lexical, so a
-        match above the root renders as a ``../`` path rather than raising.
+        match above the root rendered as a ``../`` path rather than raising.
 
-        **Names only, never content.** ``workspace_read``, ``workspace_view``
-        and ``workspace_grep`` all go through ``_validate_path`` and refuse the
-        same string, so nothing inside the directory can be opened this way.
-
-        It is **not** a hole this story opens: the journal's ``<leaf>.git`` has
-        been enumerable the same way since it shipped, and the metadata
-        directory only inherits it. The remedy belongs to a story that can touch
-        ``workspace/card/read.py`` and cover the journal, the tree and the
-        ``path``/``pattern`` interaction together.
+        Written correctly and marked ``xfail(strict=True)`` when story 52-1 found
+        it — ``workspace/card/`` was out of that story's scope — so that the day
+        the closure obeyed the rule, ``strict`` would force the marker's removal.
+        That day is this one: ``pattern`` now goes through the same containment
+        rule as ``path``, and every match is filtered through
+        ``Filesystem.contains``. The marker is gone and the spec stands unmarked.
         """
         card, _observer = card_for(orchestrator_proxy, "alice")
         _seeded_meta()
@@ -404,7 +391,7 @@ class TestALeafMayNotEndInTheMetadataSuffix:
         Once ``<leaf>.index`` is a real sibling directory, a second card
         declaring it as a ``workspace_id`` roots its **tree** there and reads,
         writes and deletes another workspace's exec lock, document cache and
-        index as ordinary in-tree activity. Nothing raises: ``_validate_path``
+        index as ordinary in-tree activity. Nothing raises: ``resolve_path``
         refuses only what resolves outside the root, and that root is a real
         directory.
         """

@@ -690,7 +690,7 @@ class TestRetriableErrorReadTool:
         """workspace_list raises RetriableError when path escapes workspace root."""
         tool = make_tool(tmp_path)
         list_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_list")
-        with patch.object(tool.workspace, "_validate_path", side_effect=PermissionError("escaped")):
+        with patch.object(tool.workspace, "resolve_path", side_effect=PermissionError("escaped")):
             with pytest.raises(RetriableError, match="Path escapes workspace root"):
                 list_fn("some/path")
 

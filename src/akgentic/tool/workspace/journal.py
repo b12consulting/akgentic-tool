@@ -8,7 +8,7 @@ turn off (ADR-036 §4).
 **Three properties are load-bearing, and each one has a failure it prevents:**
 
 1. **The repository is a sibling of the tree, never inside it.**
-   ``Filesystem._validate_path`` refuses anything that is not
+   ``Filesystem.resolve_path`` refuses anything that is not
    ``is_relative_to(_root)``, so a ``.git`` *inside* the root would be listable
    by ``workspace_list``, matchable by ``workspace_glob``, greppable, readable —
    and mountable into a sandbox where ``git reset --hard`` destroys the journal.

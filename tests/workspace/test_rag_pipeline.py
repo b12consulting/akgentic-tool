@@ -1836,7 +1836,7 @@ class TestRagSnapshot:
 
         for name in ("read", "read_bytes", "list", "exists", "write", "delete", "mkdir"):
             monkeypatch.setattr(Filesystem, name, recorder(name))
-        monkeypatch.setattr(Filesystem, "_validate_path", recorder("_validate_path"))
+        monkeypatch.setattr(Filesystem, "resolve_path", recorder("resolve_path"))
         self._seed(actor, pending=2, embedded=2)
 
         state = actor.rag_snapshot(max_pending_shown=20)

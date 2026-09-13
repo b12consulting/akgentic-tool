@@ -71,25 +71,25 @@ class TestFilesystemConstruction:
 
 
 # ---------------------------------------------------------------------------
-# _validate_path
+# resolve_path
 # ---------------------------------------------------------------------------
 
 
 class TestValidatePath:
     def test_valid_relative_path_returns_resolved_path(self, tmp_path: Path) -> None:
         fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
-        result = fs._validate_path("foo/bar.txt")
+        result = fs.resolve_path("foo/bar.txt")
         assert result == (tmp_path / "team-1" / "foo" / "bar.txt").resolve()
 
     def test_traversal_raises_permission_error(self, tmp_path: Path) -> None:
         fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
         with pytest.raises(PermissionError, match="escapes workspace root"):
-            fs._validate_path("../../etc/passwd")
+            fs.resolve_path("../../etc/passwd")
 
     def test_traversal_via_double_dot_in_middle_raises(self, tmp_path: Path) -> None:
         fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
         with pytest.raises(PermissionError):
-            fs._validate_path("src/../../../../../../etc/hosts")
+            fs.resolve_path("src/../../../../../../etc/hosts")
 
     def test_sibling_workspace_name_prefix_raises(self, tmp_path: Path) -> None:
         """Sibling workspace 'team-11' must not pass validation for workspace 'team-1'.
@@ -104,13 +104,13 @@ class TestValidatePath:
         # Construct a path that resolves to the sibling workspace
         sibling_relative = "../team-11/secret.txt"
         with pytest.raises(PermissionError, match="escapes workspace root"):
-            fs._validate_path(sibling_relative)
+            fs.resolve_path(sibling_relative)
 
     def test_absolute_path_injection_raises(self, tmp_path: Path) -> None:
         """An absolute path supplied as the path argument must be rejected."""
         fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
         with pytest.raises(PermissionError, match="escapes workspace root"):
-            fs._validate_path("/etc/passwd")
+            fs.resolve_path("/etc/passwd")
 
 
 # ---------------------------------------------------------------------------

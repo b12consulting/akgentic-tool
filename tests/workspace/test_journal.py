@@ -129,7 +129,7 @@ class TestTheRepository:
     def test_it_is_a_sibling_of_the_tree_and_never_inside_it(
         self, wired_card: WorkspaceTool, workspace_tree: Path
     ) -> None:
-        # Structural, not filtered: Filesystem._validate_path refuses anything
+        # Structural, not filtered: Filesystem.resolve_path refuses anything
         # that is not relative to the root, so a repository placed here simply
         # does not resolve from inside the workspace.
         git_dir = git_dir_for(workspace_tree)

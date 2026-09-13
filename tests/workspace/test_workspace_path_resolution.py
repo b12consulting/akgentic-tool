@@ -657,7 +657,7 @@ class TestLeafSegment:
         The journal is a sibling of the tree in the same directory, so a card
         declaring this roots its own ``Filesystem`` at another workspace's
         history and reads, writes and deletes inside it as ordinary in-tree
-        activity. Nothing downstream raises: ``_validate_path`` refuses only what
+        activity. Nothing downstream raises: ``resolve_path`` refuses only what
         resolves *outside* the root, and that root is a real directory.
         """
         with pytest.raises(ValueError, match="journal directory"):
@@ -1188,7 +1188,7 @@ class TestTheShapeInvariant:
     def test_no_resolved_path_is_a_prefix_of_another(self) -> None:
         """Containment, not collision, is the hazard the fixed depth removes.
 
-        ``Filesystem._validate_path`` rejects only what resolves *outside* the
+        ``Filesystem.resolve_path`` rejects only what resolves *outside* the
         root, so a workspace at ``ACME/`` would read and write everything under
         ``ACME/42/`` as ordinary in-tree activity. At a fixed depth of three no
         path can be a proper prefix of another — a proper prefix has strictly

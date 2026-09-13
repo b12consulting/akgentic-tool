@@ -138,12 +138,58 @@ class Filesystem:
         self._root = (Path(base_path) / workspace_name).resolve()
         self._root.mkdir(parents=True, exist_ok=True)
 
-    def _validate_path(self, path: str) -> Path:
+    @property
+    def root(self) -> Path:
+        """The resolved absolute root of this workspace tree.
+
+        Read-only, and public because the private attribute was effectively part
+        of this class's contract while being spelled as if it were not: fourteen
+        call sites across the package reached ``backend._root``, and the one that
+        globbed it with a caller-supplied pattern skipped the containment check
+        entirely. A reader that needs the tree asks for it here; a reader that
+        needs to know whether something is *in* the tree asks :meth:`contains`,
+        which is the only place the comparison is written.
+        """
+        return self._root
+
+    def contains(self, candidate: Path) -> bool:
+        """Whether *candidate* lies under the root — the one containment comparison.
+
+        Takes a ``Path`` and answers, where :meth:`resolve_path` takes a
+        workspace-relative ``str`` and raises. Two shapes of caller, one rule:
+        the glob closures hold already-materialised paths and need a predicate,
+        and expressing that through :meth:`resolve_path` would mean computing a
+        relative path back to the root only to re-resolve it.
+
+        *candidate* is resolved first, so a symlink inside the tree pointing out
+        of it answers ``False``, and so does a path still carrying ``..``.
+
+        The comparison is :meth:`Path.is_relative_to` — **component-wise, never a
+        string prefix**. ``…/_id/team-11`` string-starts-with ``…/_id/team-1``
+        and is not inside it; a prefix test would hand one principal's agent the
+        neighbouring tree as ordinary in-tree activity.
+
+        Args:
+            candidate: Any path, resolved or not, absolute or relative to the
+                process working directory.
+
+        Returns:
+            True when the resolved candidate is the root or lies under it.
+        """
+        return candidate.resolve().is_relative_to(self._root)
+
+    def resolve_path(self, path: str) -> Path:
         """Resolve *path* relative to the workspace root and validate it.
 
-        Uses :meth:`Path.is_relative_to` (Python 3.9+) for component-level
-        comparison, which prevents false positives when a sibling workspace name
-        begins with the same characters (e.g. ``team-1`` vs ``team-11``).
+        Written in terms of :meth:`contains` rather than repeating its
+        comparison, because a second copy of this rule is what this package's
+        read closures had and is how one of them came to have none at all.
+
+        Args:
+            path: A workspace-relative path.
+
+        Returns:
+            The resolved absolute path, which need not exist.
 
         Raises:
             PathEscapeError: if the resolved path escapes the workspace root. It
@@ -152,7 +198,7 @@ class Filesystem:
                 OS-level denial on a path that is perfectly legal.
         """
         resolved = (self._root / path).resolve()
-        if not resolved.is_relative_to(self._root):
+        if not self.contains(resolved):
             raise PathEscapeError(f"Path '{path}' escapes workspace root")
         return resolved
 
@@ -163,7 +209,7 @@ class Filesystem:
             FileNotFoundError: if the file does not exist.
             PermissionError: if *path* escapes the workspace root.
         """
-        resolved = self._validate_path(path)
+        resolved = self.resolve_path(path)
         return resolved.read_bytes()
 
     def read_bytes(self, path: str) -> bytes:
@@ -173,7 +219,7 @@ class Filesystem:
             FileNotFoundError: if the file does not exist.
             PermissionError: if *path* escapes the workspace root.
         """
-        resolved = self._validate_path(path)
+        resolved = self.resolve_path(path)
         return resolved.read_bytes()
 
     def write(self, path: str, data: bytes) -> None:
@@ -277,7 +323,7 @@ class Filesystem:
         Raises:
             PermissionError: if *path* escapes the workspace root.
         """
-        resolved = self._validate_path(path)
+        resolved = self.resolve_path(path)
         resolved.parent.mkdir(parents=True, exist_ok=True)
         # The ".tmp" suffix is part of the shape three other things match on, and
         # the shape is what makes a staging file recognisable as one: the startup
@@ -309,7 +355,7 @@ class Filesystem:
             FileNotFoundError: if the file does not exist.
             PermissionError: if *path* escapes the workspace root.
         """
-        resolved = self._validate_path(path)
+        resolved = self.resolve_path(path)
         resolved.unlink()
 
     def list(self, path: str = "") -> list[FileEntry]:
@@ -321,7 +367,7 @@ class Filesystem:
         Raises:
             PermissionError: if *path* escapes the workspace root.
         """
-        resolved = self._validate_path(path) if path else self._root
+        resolved = self.resolve_path(path) if path else self._root
         entries: list[FileEntry] = []
         dirs: list[FileEntry] = []
         files: list[FileEntry] = []
@@ -343,7 +389,7 @@ class Filesystem:
         Raises:
             PermissionError: if *path* escapes the workspace root.
         """
-        resolved = self._validate_path(path)
+        resolved = self.resolve_path(path)
         resolved.mkdir(parents=True, exist_ok=True)
 
     def exists(self, path: str) -> bool:
@@ -354,7 +400,7 @@ class Filesystem:
         Raises:
             PermissionError: if *path* escapes the workspace root.
         """
-        return self._validate_path(path).exists()
+        return self.resolve_path(path).exists()
 
 
 def _workspaces_root() -> str:
@@ -397,7 +443,7 @@ def meta_dir_for(workspace_path: str) -> Path:
     kind segment was added.
 
     **The placement is a containment rule, not a naming preference.**
-    :meth:`Filesystem._validate_path` rejects everything that does not resolve
+    :meth:`Filesystem.resolve_path` rejects everything that does not resolve
     inside the root, so a path beside the tree is a path no read capability can
     name — not by ``workspace_list``, not by ``workspace_glob``, not by a
     ``../`` traversal. Inside the tree it would be all of those, and one thing
@@ -710,7 +756,7 @@ def leaf_segment(value: str) -> str:
     ``workspace_id="notes.git"`` therefore roots its **tree** at the first
     workspace's **git repository**, and its agent lists, reads, writes and
     deletes inside another workspace's history as ordinary in-tree activity —
-    ``Filesystem._validate_path`` rejects only what resolves *outside* the root,
+    ``Filesystem.resolve_path`` rejects only what resolves *outside* the root,
     and that root is a perfectly real directory. From the other side, the first
     workspace's commits surface as files in the second's tree. Nothing raises.
     It is the same failure the fixed three-segment depth removes, arriving
@@ -969,7 +1015,7 @@ def resolve_workspace_path(
     be a proper prefix of another, because a proper prefix has strictly fewer
     segments. Fixed depth buys the property; two was never load-bearing, only
     fixed. The hazard it removes is **containment**, not collision:
-    ``Filesystem._validate_path`` rejects only paths resolving *outside* the
+    ``Filesystem.resolve_path`` rejects only paths resolving *outside* the
     root, so a workspace anchored at a parent would read and write everything
     under a child's tree as ordinary in-tree activity, with the per-path write
     gate none the wiser.

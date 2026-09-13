@@ -654,7 +654,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         """
         assert self._workspace is not None
         journal = GitJournal(
-            self._workspace._root,
+            self._workspace.root,
             enabled=self.git_journal,
             timeout_s=DEFAULT_GIT_TIMEOUT_S,
             meta_dir=meta_dir_for(workspace_path),

@@ -38,12 +38,27 @@ from akgentic.tool.workspace.card.params import (
 )
 from akgentic.tool.workspace.models import PERM_ERR_MSG, content_sha
 from akgentic.tool.workspace.readers import _MIME_MAP, DocumentReader, MediaContent
+from akgentic.tool.workspace.workspace import PathEscapeError
 
 if TYPE_CHECKING:
     from akgentic.tool.workspace.workspace import Filesystem
 
 _PERM_ERR_MSG = PERM_ERR_MSG
 _REF_RE = _re.compile(r'!!"([^"]+)"|!!(\S+)')
+
+# The two refusals a media-ref token can be answered with, both in the family of
+# the three strings ``_expand_media_refs`` already emits and both deliberately
+# **not** the "no image found" one: an author told "no image found" for a
+# traversal reads it as *the file is missing* and rewrites the same path for ever,
+# which is the failure :class:`PathEscapeError` exists to prevent on the mutation
+# side.
+#
+# They are two rather than one because they answer different questions, and a
+# reader has to be able to tell which rule refused them.  The first is about the
+# pattern as written; the second is about where its matches landed, which is the
+# only thing that catches a symlink *inside* the tree pointing out of it.
+_REF_ESCAPE_MSG = "[Error: pattern escapes the workspace]"
+_REF_OUTSIDE_MSG = "[Error: match resolves outside the workspace]"
 _PILLOW_FMT: dict[str, str] = {
     ".png": "PNG",
     ".jpg": "JPEG",
@@ -53,6 +68,38 @@ _PILLOW_FMT: dict[str, str] = {
     ".bmp": "BMP",
 }
 _PILLOW_WARN_EMITTED: bool = False  # guards the one-time Pillow-absent warning
+
+
+def _pattern_escapes(pattern: str) -> bool:
+    """Whether a caller-supplied glob names something outside the tree *by shape*.
+
+    The three closures that take a pattern from an agent — the media refs,
+    ``workspace_glob`` and ``workspace_grep``'s ``include`` — ask this before
+    expanding it, and filter every match through
+    :meth:`~akgentic.tool.workspace.workspace.Filesystem.contains` afterwards.
+
+    **Why this is not a method on ``Filesystem``.** A *path* rule and a
+    *glob-pattern* rule are different questions: the backend answers "does this
+    resolve inside the tree", and a pattern has no single resolution until it is
+    expanded. The containment answer stays on ``Filesystem``, where every match
+    goes through it; the shape check lives here, beside the closures that need it.
+
+    **Why the absolute case is decided here rather than caught.**
+    ``Path.glob("/etc/*")`` raises ``NotImplementedError`` on CPython 3.12 and
+    ``ValueError`` on 3.13, and ``Path.rglob`` does the same out of
+    ``workspace_grep``. A refusal implemented as an ``except`` silently stops
+    guarding on an interpreter upgrade, and until then it escapes the COMMAND
+    channel uncaught.
+
+    Args:
+        pattern: A glob as an agent wrote it, already brace-expanded and
+            normalised where the caller does either.
+
+    Returns:
+        True when the pattern is absolute or carries a ``..`` component.
+    """
+    candidate = PurePosixPath(pattern)
+    return candidate.is_absolute() or ".." in candidate.parts
 
 
 def _maybe_resize(data: bytes, suffix: str, max_dim: int, root: Path, path: str) -> bytes:
@@ -332,6 +379,8 @@ class ReadFactories:
         - Document-only matches (extension in ``DocumentReader.extensions`` but NOT in
           ``_MIME_MAP``) → ``"!!name[=> Use workspace_read tool]"`` hint strings
         - No matches at all → ``"!!_pattern_[Error: no image found]"``
+        - A pattern that names anything outside the tree → the refusal string, and
+          nothing else (see :meth:`_expand_one_media_ref`)
 
         Pure-text prompts (no ``!!`` tokens) return ``[prompt]``.
 
@@ -359,35 +408,66 @@ class ReadFactories:
         for m in _REF_RE.finditer(prompt):
             if m.start() > last:
                 parts.append(prompt[last : m.start()])
-            pattern = m.group(1) or m.group(2)
-            all_matches = sorted(p for p in self.workspace._root.glob(pattern) if p.is_file())
-            image_matches = [p for p in all_matches if p.suffix.lower() in _MIME_MAP]
-            doc_matches = [
-                p
-                for p in all_matches
-                if p.suffix.lower() in DocumentReader.extensions
-                and p.suffix.lower() not in _MIME_MAP
-            ]
-            if image_matches:
-                for path in image_matches:
-                    try:
-                        data = path.read_bytes()
-                    except OSError:
-                        parts.append(f"!!{path.name}[Error: file unreadable]")
-                        continue
-                    parts.append(
-                        MediaContent(
-                            data=data,
-                            media_type=_MIME_MAP[path.suffix.lower()],
-                        )
-                    )
-            elif doc_matches:
-                for path in doc_matches:
-                    parts.append(f"!!{path.name}[=> Use workspace_read tool]")
-            else:
-                parts.append(f"!!{pattern}[Error: no image found in the workspace]")
+            parts.extend(self._expand_one_media_ref(m.group(1) or m.group(2)))
             last = m.end()
         parts.append(prompt[last:])
+        return parts
+
+    def _expand_one_media_ref(self, pattern: str) -> list[str | MediaContent]:
+        """What one ``!!`` token expands to — the containment rule's media-ref site.
+
+        The pattern arrives **verbatim from the agent's prompt**, so it is a
+        pattern and not a licence: it is refused when it is absolute, when it
+        carries a ``..`` component (:func:`_pattern_escapes`), or when any match
+        resolves outside the tree.
+
+        The third clause is the defence-in-depth one, and it is not redundant: a
+        symlink *inside* the tree pointing out of it satisfies both shape rules
+        and still escapes. It answers with its **own** refusal, because the two
+        rules refuse different things and a reader has to be able to tell which
+        one caught them — and because one message for both would let the shape
+        check be deleted with no spec going red, since every traversal that
+        matches anything would still be refused by the match test.
+
+        A token with any escaping match is refused **whole**, which is what every
+        other capability already does with such a path: ``Filesystem.read`` of
+        that symlink raises too.
+
+        A refusal emits the refusal string and nothing else. In particular the
+        document-hint branch is not reached, because ``!!name[=> Use
+        workspace_read tool]`` discloses a filename, and the journal sibling's
+        filenames were exactly what the audit's ``.git`` probe recovered.
+
+        Args:
+            pattern: One token's glob, as written.
+
+        Returns:
+            The parts this token contributes, in order.
+        """
+        if _pattern_escapes(pattern):
+            return [f"!!{pattern}{_REF_ESCAPE_MSG}"]
+        backend = self.workspace
+        all_matches = sorted(p for p in backend.root.glob(pattern) if p.is_file())
+        if any(not backend.contains(p) for p in all_matches):
+            return [f"!!{pattern}{_REF_OUTSIDE_MSG}"]
+        image_matches = [p for p in all_matches if p.suffix.lower() in _MIME_MAP]
+        doc_matches = [
+            p
+            for p in all_matches
+            if p.suffix.lower() in DocumentReader.extensions and p.suffix.lower() not in _MIME_MAP
+        ]
+        if not image_matches and not doc_matches:
+            return [f"!!{pattern}[Error: no image found in the workspace]"]
+        if not image_matches:
+            return [f"!!{path.name}[=> Use workspace_read tool]" for path in doc_matches]
+        parts: list[str | MediaContent] = []
+        for path in image_matches:
+            try:
+                data = path.read_bytes()
+            except OSError:
+                parts.append(f"!!{path.name}[Error: file unreadable]")
+                continue
+            parts.append(MediaContent(data=data, media_type=_MIME_MAP[path.suffix.lower()]))
         return parts
 
     def _read_factory(self, params: WorkspaceRead) -> Callable[..., Any]:
@@ -512,10 +592,7 @@ class ReadFactories:
                     workspace root.
             """
             try:
-                if path:
-                    resolved = backend._validate_path(path)
-                else:
-                    resolved = backend._root
+                resolved = backend.resolve_path(path) if path else backend.root
 
                 entries = backend.list(path)
                 if not entries:
@@ -566,21 +643,20 @@ class ReadFactories:
                 Includes truncation notice if more than max_results files matched.
 
             Raises:
-                RetriableError: If path escapes the workspace root.
+                RetriableError: If the path or the pattern escapes the workspace root.
             """
             try:
-                if path:
-                    search_root = (backend._root / path).resolve()
-                    if not search_root.is_relative_to(backend._root):
-                        raise PermissionError(f"Path '{path}' escapes workspace root")
-                else:
-                    search_root = backend._root
+                search_root = backend.resolve_path(path) if path else backend.root
                 seen: set[Path] = set()
                 raw_matches: list[Path] = []
                 for expanded_pattern in _expand_braces(pattern):
                     safe_pattern = _normalize_glob_pattern(expanded_pattern)
+                    # After both rewrites, never before: ``{..,src}/*`` is a legal
+                    # shape until ``_expand_braces`` has turned it into ``../*``.
+                    if _pattern_escapes(safe_pattern):
+                        raise PathEscapeError(f"Pattern '{safe_pattern}' escapes workspace root")
                     for m in search_root.glob(safe_pattern, case_sensitive=False):
-                        if m.is_file() and m not in seen:
+                        if m.is_file() and m not in seen and backend.contains(m):
                             seen.add(m)
                             raw_matches.append(m)
                 all_matches = sorted(
@@ -589,7 +665,7 @@ class ReadFactories:
                     reverse=True,
                 )
                 truncated = len(all_matches) > max_results
-                shown = [str(m.relative_to(backend._root)) for m in all_matches[:max_results]]
+                shown = [str(m.relative_to(backend.root)) for m in all_matches[:max_results]]
                 if not shown:
                     return "No files found."
                 result = "\n".join(shown)
@@ -631,27 +707,32 @@ class ReadFactories:
                 Formatted results grouped by file, or "No matches found."
 
             Raises:
-                RetriableError: If pattern is not a valid regex or path escapes workspace root.
+                RetriableError: If pattern is not a valid regex, or the path or the
+                    include glob escapes the workspace root.
             """
             try:
-                if path:
-                    search_root = (backend._root / path).resolve()
-                    if not search_root.is_relative_to(backend._root):
-                        raise PermissionError(f"Path '{path}' escapes workspace root")
-                else:
-                    search_root = backend._root
+                search_root = backend.resolve_path(path) if path else backend.root
+                # ``include`` reaches ``Path.rglob`` and then ``read_text`` on every
+                # candidate, so an unvalidated one leaks file *contents* rather than
+                # names.  Checked here, above both engines, because ``rg`` refuses a
+                # ``..`` glob of its own accord and the Python fallback does not —
+                # containment that depended on which binary is installed would be no
+                # containment at all.
+                if include and _pattern_escapes(include):
+                    raise PathEscapeError(f"Pattern '{include}' escapes workspace root")
 
                 raw_matches = _grep_rg(search_root, pattern, include, max_results)
                 if raw_matches is None:
                     raw_matches = _grep_python(
                         search_root, pattern, include, max_results, max_line_len
                     )
+                raw_matches = [match for match in raw_matches if backend.contains(match[0])]
 
                 if not raw_matches:
                     return "No matches found."
 
                 result_lines = [
-                    f"{fpath.relative_to(backend._root)}:{lineno}: {line}"
+                    f"{fpath.relative_to(backend.root)}:{lineno}: {line}"
                     for fpath, lineno, line in raw_matches
                 ]
                 return "\n".join(result_lines)
@@ -708,7 +789,7 @@ class ReadFactories:
                         f"Supported: {', '.join(sorted(_MIME_MAP))}. "
                         f"For documents, use workspace_read instead."
                     )
-                data = _maybe_resize(data, suffix, max_dim, backend._root, path)
+                data = _maybe_resize(data, suffix, max_dim, backend.root, path)
                 return BinaryContent(data=data, media_type=mime)
             except RetriableError:
                 raise
