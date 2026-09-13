@@ -572,7 +572,19 @@ class TestTheGrepIncludeGlobObeysTheRule:
     def test_the_two_engines_agree_on_an_escaping_include(
         self, card: WorkspaceTool, bait: Bait, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Whatever the answer is, it is the same one with and without ``rg``."""
+        """Whatever the answer is, it is the same one with and without ``rg``.
+
+        **Skipped rather than run when ``rg`` is absent.** Without the skip this
+        spec still passes on such a host — ``with_rg`` resolves to the Python
+        engine too, so it compares that engine with itself and proves nothing
+        while its name says otherwise. That is the failure mode the whole module
+        is written against: a check narrowed until it agrees. The sibling specs
+        skip loudly through ``grep_engine``; this one has to say so itself,
+        because it drives both engines from inside one test rather than through
+        that fixture.
+        """
+        if shutil.which("rg") is None:
+            pytest.skip("ripgrep is not installed on this host — the comparison would be vacuous")
         grep = tool_named(card, "workspace_grep")
         include = f"../{META_LEAF}/rag/*.yaml"
 
