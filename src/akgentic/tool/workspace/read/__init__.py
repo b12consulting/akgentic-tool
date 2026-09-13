@@ -1,4 +1,16 @@
-"""Read-side factories for :class:`WorkspaceTool` — read, list, glob, grep, view.
+"""The read capability of :class:`WorkspaceTool` — read, list, glob, grep, view.
+
+**This is what a capability module is**, and the four that follow copy the shape.
+It holds one capability whole: its closures, its parameters (``read/params.py``)
+and the private helpers only it uses. It may import the package **spine** —
+``workspace.py``, ``models.py``, ``readers.py``, ``event.py``, ``errors.py`` —
+and ``akgentic.tool.core``. It must import **no other capability**, and nothing
+under ``card/`` at all: importing ``card.anything`` executes ``card/__init__.py``,
+which pulls in the journal, the exec machinery, the RAG mixin, the vector-store
+registry and the actor. The rule is enforced by
+``tests/workspace/test_capability_import_closure.py``, which takes the transitive
+closure of this package's own imports from here and checks it against an
+allow-list — not by convention, and not by this paragraph.
 
 A read runs on the calling agent's own thread against its own
 :class:`~akgentic.tool.workspace.workspace.Filesystem` and reports what it saw
@@ -29,14 +41,14 @@ from typing import TYPE_CHECKING, Any
 from pydantic_ai.messages import BinaryContent
 
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.workspace.card.params import (
+from akgentic.tool.workspace.models import PERM_ERR_MSG, content_sha
+from akgentic.tool.workspace.read.params import (
     WorkspaceGlob,
     WorkspaceGrep,
     WorkspaceList,
     WorkspaceRead,
     WorkspaceView,
 )
-from akgentic.tool.workspace.models import PERM_ERR_MSG, content_sha
 from akgentic.tool.workspace.readers import _MIME_MAP, DocumentReader, MediaContent
 from akgentic.tool.workspace.workspace import PathEscapeError
 

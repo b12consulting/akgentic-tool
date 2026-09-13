@@ -34,10 +34,10 @@ from akgentic.tool.workspace.actor import (
     workspace_actor_name,
 )
 from akgentic.tool.workspace.card.params import WorkspaceExec
-from akgentic.tool.workspace.card.read import _paginate
 from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION
 from akgentic.tool.workspace.event import WorkspaceAttached
 from akgentic.tool.workspace.models import Observation, WorkspaceConfig, content_sha
+from akgentic.tool.workspace.read import _paginate
 from akgentic.tool.workspace.tool import WorkspaceTool
 from akgentic.tool.workspace.workspace import Filesystem
 from tests.conftest import MockActorAddress

@@ -13,6 +13,12 @@ not a rule that it must live in the façade.
 
 **The import edge runs one way.** This module imports from ``card/params.py``,
 which imports from no sibling at all; nothing here may be imported back into it.
+
+``WorkspaceRead`` comes from ``read/params.py``, where it is **defined**, rather
+than through ``card/params.py``'s re-export of it. That re-export exists for one
+purpose — keeping the module path stored ``__model__`` markers name resolving —
+and a production importer leaning on it would leave that compatibility path with
+no guard of its own.
 """
 
 from __future__ import annotations
@@ -26,8 +32,8 @@ from akgentic.tool.workspace.card.params import (
     WorkspaceRagIndex,
     WorkspaceRagList,
     WorkspaceRagSearch,
-    WorkspaceRead,
 )
+from akgentic.tool.workspace.read.params import WorkspaceRead
 from akgentic.tool.workspace.readers import DocumentReader
 
 if TYPE_CHECKING:

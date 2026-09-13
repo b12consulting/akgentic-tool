@@ -816,8 +816,8 @@ class TestTheMixinRules:
     def test_no_two_card_mixins_define_the_same_name(self) -> None:
         """A real definition on two bases lets the MRO pick a winner in silence."""
         from akgentic.tool.workspace.card.execution import ExecFactories
-        from akgentic.tool.workspace.card.read import ReadFactories
         from akgentic.tool.workspace.card.write import WriteFactories
+        from akgentic.tool.workspace.read import ReadFactories
 
         owners: dict[str, str] = {}
         for mixin in (ReadFactories, WriteFactories, ExecFactories, RagFactories):

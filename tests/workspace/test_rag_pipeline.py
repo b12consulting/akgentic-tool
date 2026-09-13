@@ -857,7 +857,7 @@ class TestCandidateDiscovery:
     def test_text_and_document_extensions_are_queued_and_the_rest_counted(
         self, harness: RagHarness, workspace_tree: Path
     ) -> None:
-        """The set arithmetic is the one ``card/read.py`` already draws."""
+        """The set arithmetic is the one ``read/`` already draws."""
         harness.enable()
         write(workspace_tree, "notes.md")
         write(workspace_tree, "data.csv", "a,b\n1,2\n")

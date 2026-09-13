@@ -27,12 +27,18 @@ the card creates its actor as an ordinary team child, which is the seam
 per-process — the sandbox, the document reader, the retrieval pipeline — and no
 shared state at all.
 
-The factory bodies live in the five sibling mixins — ``card/read.py``,
+The factory bodies live in five mixins. Four are still siblings —
 ``card/write.py``, ``card/gate.py``, ``card/execution.py``, ``card/rag.py`` — and
-the capability parameters in ``card/params.py``. What stays here is the card
-itself: its fields, ``observer()`` with its private binding helpers, and the
-``get_tools`` / ``get_commands`` / ``get_context_states`` registration
-(ADR-045 §1).
+the read capability has moved out to ``workspace/read/``, which carries its
+closures, its private helpers and its six parameters together; the four stories
+after it move the rest the same way. ``card/params.py`` holds the parameters of
+the capabilities that have not moved yet, re-exports the read capability's six so
+the module path stored records name keeps resolving, and owns ``Resource`` /
+``ResourceType`` outright.
+
+What stays here is the card itself: its fields, ``observer()`` with its private
+binding helpers, and the ``get_tools`` / ``get_commands`` /
+``get_context_states`` registration (ADR-045 §1).
 """
 
 from __future__ import annotations
@@ -80,23 +86,17 @@ from akgentic.tool.workspace.actor import (
 from akgentic.tool.workspace.card.execution import ExecFactories
 from akgentic.tool.workspace.card.gate import CardGate
 from akgentic.tool.workspace.card.params import (
-    ExpandMediaRefs,
     Resource,
     ResourceType,
     WorkspaceDelete,
     WorkspaceEdit,
     WorkspaceExec,
-    WorkspaceGlob,
-    WorkspaceGrep,
-    WorkspaceList,
     WorkspaceMkdir,
     WorkspaceMultiEdit,
     WorkspacePatch,
     WorkspaceRagIndex,
     WorkspaceRagList,
     WorkspaceRagSearch,
-    WorkspaceRead,
-    WorkspaceView,
     WorkspaceWrite,
 )
 from akgentic.tool.workspace.card.rag import (
@@ -104,7 +104,6 @@ from akgentic.tool.workspace.card.rag import (
     require_workspace_backend,
     workspace_backend,
 )
-from akgentic.tool.workspace.card.read import ReadFactories
 from akgentic.tool.workspace.card.write import WriteFactories
 from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION, derived_document_caps
 from akgentic.tool.workspace.documents.store import DocumentStore, resolve_document_store
@@ -123,6 +122,15 @@ from akgentic.tool.workspace.models import (
     Observation,
     WorkspaceConfig,
     content_sha,
+)
+from akgentic.tool.workspace.read import ReadFactories
+from akgentic.tool.workspace.read.params import (
+    ExpandMediaRefs,
+    WorkspaceGlob,
+    WorkspaceGrep,
+    WorkspaceList,
+    WorkspaceRead,
+    WorkspaceView,
 )
 from akgentic.tool.workspace.workspace import (
     SHARED_KINDS_ENV,

@@ -118,7 +118,7 @@ _INDEXABLE_EXTENSIONS: frozenset[str] = TEXT_EXTENSIONS | (
 Not invented here and deliberately not re-listed: it is exactly the extensions a
 read can already turn into text, minus the image formats. An OCR'd photograph is
 not what this index is for, and ``_MIME_MAP`` is already the set that names them.
-``card/read.py`` draws the same line for ``expand_media_refs``; a second copy of
+``read/`` draws the same line for ``expand_media_refs``; a second copy of
 either extension list would drift.
 """
 

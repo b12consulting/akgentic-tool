@@ -14,12 +14,12 @@ from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
 from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION
 from akgentic.tool.workspace.models import content_sha
-from akgentic.tool.workspace.readers import DocumentReader, MediaContent
-from akgentic.tool.workspace.card.read import (
+from akgentic.tool.workspace.read import (
     _expand_braces,
     _grep_python,
     _grep_rg,
 )
+from akgentic.tool.workspace.readers import DocumentReader, MediaContent
 from akgentic.tool.workspace.tool import (
     ExpandMediaRefs,
     WorkspaceGlob,
@@ -493,7 +493,7 @@ class TestWorkspaceGrep:
         root = tool.workspace._root
         (root / "main.py").write_text("import os\npass\n", encoding="utf-8")
         fn = tool.get_tools()[3]  # workspace_grep
-        with patch("akgentic.tool.workspace.card.read._grep_rg", return_value=None):
+        with patch("akgentic.tool.workspace.read._grep_rg", return_value=None):
             result = fn("import os")
         assert "main.py" in result
         assert "import os" in result
@@ -503,7 +503,7 @@ class TestWorkspaceGrep:
         root = tool.workspace._root
         (root / "x.py").write_text("nothing\n", encoding="utf-8")
         fn = tool.get_tools()[3]
-        with patch("akgentic.tool.workspace.card.read._grep_rg", return_value=None):
+        with patch("akgentic.tool.workspace.read._grep_rg", return_value=None):
             result = fn("xyzzy_not_found")
         assert result == "No matches found."
 
@@ -513,7 +513,7 @@ class TestWorkspaceGrep:
         (root / "a.py").write_text("needle\n", encoding="utf-8")
         (root / "b.txt").write_text("needle\n", encoding="utf-8")
         fn = tool.get_tools()[3]
-        with patch("akgentic.tool.workspace.card.read._grep_rg", return_value=None):
+        with patch("akgentic.tool.workspace.read._grep_rg", return_value=None):
             result = fn("needle", include="*.py")
         assert "a.py" in result
         assert "b.txt" not in result
@@ -531,8 +531,8 @@ class TestWorkspaceGrep:
         fake_match = (root / "x.py", 1, "import os")
         fn = tool.get_tools()[3]
         with (
-            patch("akgentic.tool.workspace.card.read._grep_rg", return_value=[fake_match]) as mock_rg,
-            patch("akgentic.tool.workspace.card.read._grep_python") as mock_py,
+            patch("akgentic.tool.workspace.read._grep_rg", return_value=[fake_match]) as mock_rg,
+            patch("akgentic.tool.workspace.read._grep_python") as mock_py,
         ):
             result = fn("import os")
         mock_rg.assert_called_once()
@@ -722,7 +722,7 @@ class TestRetriableErrorReadTool:
         # Write a file so grep actually tries to match
         (tool.workspace._root / "test.txt").write_text("hello", encoding="utf-8")
         grep_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_grep")
-        with patch("akgentic.tool.workspace.card.read._grep_rg", return_value=None):
+        with patch("akgentic.tool.workspace.read._grep_rg", return_value=None):
             with pytest.raises(RetriableError, match="Invalid regex pattern"):
                 grep_fn("[invalid")  # unclosed bracket — invalid regex
 

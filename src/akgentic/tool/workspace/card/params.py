@@ -7,6 +7,26 @@ is configured *with*, never what its callable is *called* with (ADR-020).
 
 No helper and no factory lives in this module: it is the leaf of ``card/``'s
 import graph, imported by every sibling and importing none of them (ADR-045 §1).
+
+**The read capability's six parameters are re-exported, not defined here.** They
+live in :mod:`akgentic.tool.workspace.read.params`, beside the closures they
+configure, because importing anything under ``card/`` executes
+``card/__init__.py`` and therefore every other capability — so a capability
+module that took its parameters from here would depend on all of them.
+
+The re-export is what keeps stored records readable. ``serialize_type`` stamps
+``f"{cls.__module__}.{cls.__name__}"`` into ``__model__`` on every
+``SerializableBaseModel``, and ``BaseToolParam`` is one, so every card a
+deployment persisted with a read parameter set explicitly carries
+``akgentic.tool.workspace.card.params.<Name>``. Reading it back is
+``import_module`` plus ``getattr`` on exactly that path
+(:func:`akgentic.core.utils.deserializer.import_class`); a path that has gone
+raises ``UnresolvableClassError``, which is how a stored team's tool card becomes
+a bad record rather than a card. ``workspace/tool.py`` is on disk for the same
+reason after an earlier decomposition.
+
+``Resource`` and ``ResourceType`` stay defined here: they are the card's own
+seeding vocabulary and belong to no capability.
 """
 
 from __future__ import annotations
@@ -24,69 +44,47 @@ from akgentic.tool.workspace.execution import (
     DEFAULT_EXEC_POLL_DELAY_S,
     DEFAULT_EXEC_TIMEOUT_S,
 )
-from akgentic.tool.workspace.readers import DocumentReader
+from akgentic.tool.workspace.read.params import (
+    ExpandMediaRefs,
+    WorkspaceGlob,
+    WorkspaceGrep,
+    WorkspaceList,
+    WorkspaceRead,
+    WorkspaceView,
+)
 
-
-class WorkspaceRead(BaseToolParam):
-    """Read a file from the team workspace with pagination support."""
-
-    expose: set[Channels] = {TOOL_CALL}
-    default_limit: int = 2000
-
-    force_document_regeneration: bool = False
-    """Default for the callable's parameter of the same name: ignore a **valid**
-    cached extraction and re-extract the document.
-
-    A forced read still fills the cache with what it extracted, so it costs one
-    extraction rather than turning caching off for that path.
-
-    The meaning is new in ADR-045. It used to mean "ignore a file that happens to
-    sit beside the source", which no notion of validity governed at all — the
-    thing it bypassed could never say whether it described the current bytes.
-    A cache entry can, so forcing now means overriding a *correct* answer, which
-    is a coherent thing to ask for and a rare thing to need."""
-
-    document_reader: DocumentReader | bool = True
-
-
-class WorkspaceList(BaseToolParam):
-    """List immediate children of a directory in the team workspace."""
-
-    expose: set[Channels] = {TOOL_CALL}
-    max_depth: int = 1  # 1 = flat list (default), 0 = unlimited, N = N levels deep
-
-
-class WorkspaceGlob(BaseToolParam):
-    """Find files matching a glob pattern in the team workspace."""
-
-    expose: set[Channels] = {TOOL_CALL}
-    max_results: int = 100
-
-
-class WorkspaceGrep(BaseToolParam):
-    """Search file contents by regex in the team workspace."""
-
-    expose: set[Channels] = {TOOL_CALL}
-    max_results: int = 100
-    max_line_length: int = 2000
-
-
-class ExpandMediaRefs(BaseToolParam):
-    """Expand ``!!glob_pattern`` tokens in a prompt into binary image content.
-
-    COMMAND channel only — never exposed as an LLM tool.
-    """
-
-    expose: set[Channels] = {COMMAND}
-
-
-class WorkspaceView(BaseToolParam):
-    """View an image file from the team workspace as binary content for LLM vision."""
-
-    expose: set[Channels] = {TOOL_CALL}
-    max_dimension: int = 1568
-    """Longest-side pixel cap. Images exceeding this are resized (aspect-ratio preserved, LANCZOS).
-    Set to 0 to disable resizing and return raw bytes."""
+# mypy strict implies ``no_implicit_reexport``, so the six re-exported names need
+# an explicit export to keep serving the module path stored records name.
+# ``__all__`` does it in six lines where ``X as X`` aliases would cost an import
+# statement each — the spelling ``workspace/tool.py`` already uses, and for the
+# same reason.
+#
+# **Nothing in this package imports the six from here.** ``card/__init__.py`` and
+# ``card/rag.py`` take them from ``read/params.py``, where they are defined, so
+# this re-export exists for exactly one purpose — the stored ``__model__`` markers
+# described above — and ``test_read_capability.py`` is what holds it in place. Were
+# production to import them from here instead, deleting the re-export would break
+# the package loudly and the compatibility path would have no guard of its own.
+__all__ = [
+    "ExpandMediaRefs",
+    "Resource",
+    "ResourceType",
+    "WorkspaceDelete",
+    "WorkspaceEdit",
+    "WorkspaceExec",
+    "WorkspaceGlob",
+    "WorkspaceGrep",
+    "WorkspaceList",
+    "WorkspaceMkdir",
+    "WorkspaceMultiEdit",
+    "WorkspacePatch",
+    "WorkspaceRagIndex",
+    "WorkspaceRagList",
+    "WorkspaceRagSearch",
+    "WorkspaceRead",
+    "WorkspaceView",
+    "WorkspaceWrite",
+]
 
 
 class WorkspaceWrite(BaseToolParam):

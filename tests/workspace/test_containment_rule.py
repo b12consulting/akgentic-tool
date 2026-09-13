@@ -31,7 +31,7 @@ from pathlib import Path
 
 import pytest
 
-import akgentic.tool.workspace.card.read as read_module
+import akgentic.tool.workspace.read as read_module
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.card import WorkspaceTool
 from akgentic.tool.workspace.models import GIT_DIR_SUFFIX, META_DIR_SUFFIX, PERM_ERR_MSG
@@ -316,7 +316,7 @@ class TestNothingReachesIntoTheFilesystem:
         """
         tree = ast.parse(Path(inspect.getfile(read_module)).read_text(encoding="utf-8"))
         copies = [
-            f"read.py:{node.lineno}"
+            f"read/__init__.py:{node.lineno}"
             for node in ast.walk(tree)
             if isinstance(node, ast.Attribute) and node.attr == "is_relative_to"
         ]

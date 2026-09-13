@@ -22,9 +22,9 @@ from akgentic.tool.workspace.actor import (
 )
 from akgentic.tool.workspace.card.gate import _preserve_endings
 from akgentic.tool.workspace.card.params import WorkspaceExec
-from akgentic.tool.workspace.card.read import _normalize_glob_pattern
 from akgentic.tool.workspace.edit import EditItem
 from akgentic.tool.workspace.models import WorkspaceConfig
+from akgentic.tool.workspace.read import _normalize_glob_pattern
 from akgentic.tool.workspace.tool import (
     Resource,
     ResourceType,
