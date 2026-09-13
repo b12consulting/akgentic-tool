@@ -20,7 +20,6 @@ from akgentic.tool.workspace.actor import (
     WorkspaceActor,
     workspace_actor_name,
 )
-from akgentic.tool.workspace.write.gate import _preserve_endings
 from akgentic.tool.workspace.card.params import WorkspaceExec
 from akgentic.tool.workspace.edit import EditItem
 from akgentic.tool.workspace.models import WorkspaceConfig
@@ -31,6 +30,7 @@ from akgentic.tool.workspace.tool import (
     WorkspaceTool,
 )
 from akgentic.tool.workspace.workspace import Filesystem, PathEscapeError, Workspace
+from akgentic.tool.workspace.write.gate import _preserve_endings
 from tests.workspace.conftest import FakeActorToolObserver, FakeOrchestratorProxy
 
 

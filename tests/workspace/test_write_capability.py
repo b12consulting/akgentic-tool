@@ -69,6 +69,18 @@ class TestTheLocksAreTakenInSortedPathOrder:
     is named ``path-<sha256 of the path>``, and a digest's sort order has nothing
     to do with its input's, so a spec asserting sorted *filenames* would assert
     nothing about the property it is named for.
+
+    **The two halves of ``sorted(set(paths))`` fail differently, and only one of
+    them fails as an assertion.** Dropping ``sorted`` reddens the equality below
+    in the ordinary way. Dropping ``set`` does not: a batch naming one path twice
+    then opens two descriptors on that path's lock file and takes an exclusive
+    ``flock`` on each, and the second blocks against the first **within the same
+    process**, forever. ``apply_multi_edit`` passes ``[item.path for item in
+    edits]`` straight through, so a duplicated path is an ordinary input and the
+    ``set`` is load-bearing for liveness rather than for tidiness —
+    :meth:`CardGate._hold`'s own docstring credits only the sorting. A reviewer
+    mutating this property should expect a **hung** run, not a red one; that hang
+    is the signal, not a flake.
     """
 
     @pytest.fixture

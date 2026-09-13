@@ -35,7 +35,6 @@ from pathlib import Path
 
 import pytest
 
-from akgentic.tool.workspace.write.gate import lock_file_for
 from akgentic.tool.workspace.execution import (
     DEFAULT_EXEC_TIMEOUT_S,
     LEASE_GRACE_S,
@@ -45,6 +44,7 @@ from akgentic.tool.workspace.execution import (
 from akgentic.tool.workspace.lock import FileLockBackend, LockTicket
 from akgentic.tool.workspace.tool import WorkspaceTool
 from akgentic.tool.workspace.workspace import meta_dir_for
+from akgentic.tool.workspace.write.gate import lock_file_for
 from tests.workspace.conftest import (
     WORKSPACE_NAME,
     WORKSPACE_PATH,

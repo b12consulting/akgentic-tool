@@ -95,13 +95,20 @@ CAPABILITY_CLOSURES: dict[str, frozenset[str]] = {
         f"{PACKAGE}.write",
         f"{PACKAGE}.write.gate",
         f"{PACKAGE}.write.params",
-        # Shared machinery, exactly as ``readers.py`` is for ``read/``: the
-        # facade re-exports it, the gate imports twelve names from it and six
-        # test modules use it directly. It is stated on this row rather than
-        # promoted into ``SPINE`` because promoting it would widen ``read/``'s
-        # allow-list, which this story must not do — an allow-list is cheapest
-        # when it is narrowest, and a later capability that needs it states it
-        # the same way.
+        # ``EditItem`` in the closures' signatures, and twelve more names in the
+        # gate. **On this row rather than in ``SPINE``, and the distinction is
+        # the one that decides where a later capability's shared module goes.**
+        # ``readers.py`` earns ``SPINE`` on the evidence: seven consumers in
+        # ``src/`` spread over four capabilities *and the spine itself*
+        # (``models.py`` imports it). ``edit.py`` has exactly two — this package
+        # and the facade's re-export — so it is not shared machinery at all; it
+        # is the write capability's own machinery, left in place only because
+        # moving it was out of this story's scope. Promoting it would hand five
+        # capabilities a permission none of them needs, and would make ``SPINE``
+        # — "the shared machinery every capability is allowed to stand on" —
+        # say something untrue. A later capability that genuinely needs it
+        # states it on its own row; promote it only once a second capability
+        # outside ``write/`` does.
         f"{PACKAGE}.edit",
         # ``Identity`` is constructed in ``_gated`` — the commit's author.
         # Runtime, so it is in both the closure and the direct-edge rule.
@@ -304,7 +311,7 @@ class TestTheSweepLooksAtTheRightThing:
 
 @pytest.mark.parametrize("capability", sorted(CAPABILITY_CLOSURES))
 class TestACapabilityDependsOnTheSpineAndNothingElse:
-    """One row per capability module; the four later stories add four more."""
+    """One row per capability module; the three later stories add three more."""
 
     def test_the_closure_is_inside_the_allow_list(
         self, capability: str, modules: dict[str, Path]
