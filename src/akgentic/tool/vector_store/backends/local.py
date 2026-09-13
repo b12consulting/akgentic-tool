@@ -65,6 +65,7 @@ from akgentic.tool.vector_store.protocol import (
     VectorStoreParam,
     check_path_prefix,
     check_shared_scope,
+    row_object_id,
 )
 from akgentic.tool.vector_store.registry import BackendContext, BackendSpec, register_backend
 from akgentic.tool.vector_store.vector import (
@@ -138,11 +139,17 @@ class LocalBackend:
             Never created here — :meth:`create_collection` and the writes below
             create what they need, lazily, exactly as ``FileLockBackend.acquire``
             does.
+        team_id: The owning team, propagated by the actor system, or ``None`` for
+            a writer with none. It enters a row's identity only on a
+            **team-scoped** collection — :func:`row_object_id` decides, never this
+            class — and is defaulted so a directly constructed backend still
+            behaves as one with no team, which is what it has always been.
     """
 
-    def __init__(self, root: str) -> None:
+    def __init__(self, root: str, team_id: str | None = None) -> None:
         _check_vector_search_dependencies()
         self._root = Path(root)
+        self._team_id = team_id
         self._lock = threading.Lock()
         self._collections: dict[str, VectorIndex] = {}
         self._configs: dict[str, VectorStoreParam] = {}
@@ -173,11 +180,29 @@ class LocalBackend:
             self._publish_locked(name)
 
     def add(self, collection: str, entries: list[VectorEntry]) -> None:
-        """Ingest embedding entries and publish the index they land in.
+        """Upsert embedding entries and publish the index they land in.
 
         Reloads first, under the same exclusive hold as the write, so a concurrent
         writer's rows are folded in rather than overwritten: read-modify-publish
         is one critical section, not three.
+
+        **An upsert, because ``VectorIndex.add`` appends.** The same row re-added
+        — by a second team indexing one tree, by a re-index at the same digest, by
+        a reaped row a second worker picks up — was a second row in the matrix.
+        Both cluster backends have stored under a deterministic id since
+        ``row_object_id`` landed and therefore *replace*; ``local`` is the backend
+        the two-teams case actually uses, and it was the one still appending.
+
+        **The identity is derived through
+        :func:`~akgentic.tool.vector_store.protocol.row_object_id`, never
+        re-invented here.** That function is where "what makes a row the same row"
+        is written once for every backend — it drops the team on a shared
+        collection and keeps it on a team-scoped one — and a second notion of
+        sameness inside this class is exactly the drift that let the two diverge.
+
+        The replacement is **entry-precise on ``scope``**, the way :meth:`remove`
+        already is: two entries may share a ``ref_id`` while belonging to two
+        workspaces, and a row of one scope must never be replaced by another's.
 
         Args:
             collection: Target collection name.
@@ -189,9 +214,49 @@ class LocalBackend:
         with self._lock, self._hold(collection, fcntl.LOCK_EX):
             self._refresh_locked(collection)
             index = self._get_index(collection)
+            incoming = {
+                (self._row_identity(collection, entry.ref_id), entry.scope) for entry in entries
+            }
+            # One removal for the whole batch rather than one per entry: the index
+            # compacts its backing matrix on every removal that matches, and an
+            # embedding batch is thirty entries.
+            index.remove(
+                {entry.ref_id for entry in entries},
+                matches=lambda stored: (
+                    (
+                        self._row_identity(collection, stored.ref_id),
+                        stored.scope,
+                    )
+                    in incoming
+                ),
+            )
             for entry in entries:
                 index.add(entry)
             self._publish_locked(collection)
+
+    def _row_identity(self, collection: str, ref_id: str) -> str:
+        """The id *ref_id* is stored under in *collection* — the shared derivation.
+
+        Mirrors ``QdrantBackend._point_id`` and the ``uuid=`` argument
+        ``WeaviateBackend.add`` passes, over this backend's team and the tenant
+        the collection was created with. The tenant is read off the stored config
+        rather than carried on the instance, because a config arrives per
+        collection through :meth:`create_collection`.
+
+        **On a team-scoped collection this can only speak for *this* backend's
+        team, and that is a stated limit.** A cluster stores under the id, so the
+        team inside it is what keeps two teams' rows apart; here the storage key is
+        the ``ref_id`` in the matrix and a stored :class:`VectorEntry` carries no
+        team at all, so a stored row's identity is re-derived under whichever team
+        is asking. It is unreachable today — ``local`` is never the default and its
+        only consumer is the workspace, over the **shared** ``workspace_chunks``,
+        where :func:`row_object_id` drops the team whoever writes and this is
+        exactly the right answer. Closing it means stamping the team on a stored
+        row, which is a ``VectorEntry`` field and a different story.
+        """
+        config = self._configs.get(collection)
+        tenant = config.tenant if config is not None else None
+        return row_object_id(collection, self._team_id, tenant, ref_id)
 
     def remove(
         self,
@@ -588,7 +653,7 @@ def _make_local_backend(context: BackendContext) -> LocalBackend:
     """
     if context.root is None:
         raise ValueError(_LOCAL_ROOT_REQUIRED)
-    return LocalBackend(root=context.root)
+    return LocalBackend(root=context.root, team_id=context.team_id)
 
 
 register_backend(

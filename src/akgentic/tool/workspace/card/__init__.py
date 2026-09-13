@@ -551,6 +551,10 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
                 caused it, rather than silently collapsing several principals into
                 one tree — or silently handing a card that asked for a shared tree
                 a private one. It must never be caught and turned into a fallback.
+                Also raised when this card's retrieval policy disagrees with the
+                one the tree publishes, or when that record cannot be read
+                (:func:`~akgentic.tool.workspace.card.rag.read_tree_policy`), for
+                the same reason and with the same prohibition.
             RuntimeError: Whatever a failing ``attach`` raises, propagated
                 unchanged — an agent must never hold a tree that does not know
                 it is held. It must never be caught, for the same reason.
@@ -603,6 +607,12 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         # client. Derived before the bind so the actor's config can be built from
         # the backend the collection will really use.
         self._resolved_store = self._resolve_store_param(ws_path)
+        # After the store param is resolved — the policy's chunking section is what
+        # this card would chunk with — and before anything with a side effect, so a
+        # refused bind seeds nothing, creates no actor and emits no
+        # ``WorkspaceAttached``. The same ordering discipline
+        # ``_require_sharing_permitted`` states one screen up.
+        self._require_tree_policy(ws_path, "WorkspaceTool")
         self._seed_resources()
         self._bind_workspace_actor(observer, observer.orchestrator, ws_path)
         # After the bind, because the actor's own ``on_start`` creates the
@@ -1083,7 +1093,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         """
         orchestrator_proxy = observer.proxy_ask(orchestrator, Orchestrator)
         derived_documents, derived_chars = derived_document_caps(
-            self.vector_store.backend, self._rag_enabled()
+            self._caps_backend(), self._rag_enabled()
         )
         workspace_addr = orchestrator_proxy.getChildrenOrCreate(
             WorkspaceActor,
@@ -1111,6 +1121,29 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
             WorkspaceAttached(agent_id=observer.myAddress.agent_id, workspace_path=workspace_path)
         )
         workspace.attach(observer.myAddress, self._agent_name)
+
+    def _caps_backend(self) -> str:
+        """The backend the document caps are derived from — the **resolved** one.
+
+        ``self.vector_store.backend`` is the *author's declaration*, and deriving
+        from it is wrong in the ordinary case rather than the exotic one:
+        ``VectorStoreParam.backend`` defaults to ``default_backend()``, which is
+        ``inmemory`` wherever no cluster is provisioned, while
+        :func:`~akgentic.tool.workspace.card.rag.workspace_backend` substitutes
+        ``local`` for an undeclared ``inmemory``. So every default retrieval card
+        in a community or development deployment was held to the small pair while
+        indexing into ``local``, which resolves to the large one.
+
+        **One derivation, read from where it is already resolved.**
+        ``_resolved_store`` was computed in ``observer()`` and carries exactly the
+        backend the collection is created under; it is ``None`` precisely when
+        retrieval is off, and
+        :func:`~akgentic.tool.workspace.documents.models.derived_document_caps`
+        then ignores the backend entirely, so the author's declaration is a safe
+        thing to hand it in that branch and there is nothing else to hand.
+        """
+        resolved = self._resolved_store
+        return resolved.backend if resolved is not None else self.vector_store.backend
 
     def _observation_recorder(self) -> Callable[[str, bytes, bool], None]:
         """Build the closure a read closure uses to report what it saw.

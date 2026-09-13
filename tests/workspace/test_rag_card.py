@@ -22,14 +22,18 @@ from akgentic.tool.workspace.card.params import (
     WorkspaceRagList,
     WorkspaceRagSearch,
 )
-from akgentic.tool.workspace.card.rag import RagFactories
+from akgentic.tool.workspace.card.rag import (
+    IN_ACTOR_BACKEND,
+    WORKSPACE_LOCAL_BACKEND,
+    RagFactories,
+    workspace_backend,
+)
 from akgentic.tool.workspace.documents.models import (
     DEFAULT_MAX_DOCUMENT_CHARS,
     DEFAULT_MAX_DOCUMENTS,
-    IN_MEMORY_MAX_DOCUMENT_CHARS,
-    IN_MEMORY_MAX_DOCUMENTS,
     RagFile,
     RagStatus,
+    derived_document_caps,
 )
 from akgentic.tool.workspace.models import WorkspaceConfig
 
@@ -191,18 +195,19 @@ class TestTheSearchCapability:
         [(_, announced, _, _)] = tell.enable_calls
         assert announced == WorkspaceRagIndex()
 
-    def test_a_search_only_card_also_derives_the_small_caps(
+    def test_a_search_only_card_also_derives_from_the_resolved_backend(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         """The second of the three sites that read the predicate.
 
-        The card names no backend, which is the only way its declaration is still
-        the in-actor one: naming it explicitly is refused at bind now (see
+        The card names no backend, so its declaration is the in-actor one and its
+        **resolved** backend is ``local`` — which is what the caps follow since
+        story 55-5. Naming the in-actor backend explicitly is refused at bind (see
         ``TestAWorkspaceMayNotRunOnTheInActorBackend``).
         """
         bind(orchestrator_proxy, workspace_rag_search=True)
 
-        assert workspace_config_of(orchestrator_proxy).max_documents == IN_MEMORY_MAX_DOCUMENTS
+        assert workspace_config_of(orchestrator_proxy).max_documents == DEFAULT_MAX_DOCUMENTS
 
     def test_a_search_only_card_naming_weaviate_with_no_cluster_fails_at_wiring(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
@@ -348,23 +353,38 @@ class TestTheSearchCallable:
 class TestTheDerivedCaps:
     """AC10: all three outcomes and the override, at the one construction site."""
 
-    def test_in_memory_with_retrieval_on_shrinks_the_cache(
+    def test_the_caps_come_from_the_backend_the_card_actually_indexes_into(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
-        """The caps are derived from the **author's** declaration, which is the
-        in-actor backend for a card that names none.
+        """Story 55-5 AC 6. The loose end this class used to record is now closed.
 
-        That the store the card then resolves is the file-backed one is a real
-        loose end rather than a property being asserted here: an index on disk is
-        not the ~44 MB re-serialisation the small caps exist for (ADR-045 §7). It
-        is out of this story's scope and recorded in epic 52's deferred findings.
+        ``VectorStoreParam.backend`` defaults to ``default_backend()``, which is
+        the in-actor one wherever no cluster is provisioned, and
+        :func:`workspace_backend` substitutes ``local`` for an **undeclared** one.
+        So deriving from the author's declaration held every default retrieval
+        card in a community or development deployment to the small pair while it
+        indexed into ``local`` — an index on disk, which is not the ~44 MB
+        re-serialisation those constants exist for (ADR-045 §7).
+
+        **The ordinary case, not an exotic one.** The audit's example was a card
+        *declaring* the in-actor backend, which ``require_workspace_backend``
+        refuses before the caps are ever built; this is the configuration nobody
+        has to write down.
         """
-        bind(orchestrator_proxy, workspace_rag_index=True)
+        card, _observer = bind(orchestrator_proxy, workspace_rag_index=True)
+
+        # Non-vacuity first: the declared and the resolved backend must actually
+        # differ here, or this spec would pass whichever one the derivation read.
+        assert card.vector_store.backend == IN_ACTOR_BACKEND
+        assert workspace_backend(card.vector_store) == WORKSPACE_LOCAL_BACKEND
 
         config = workspace_config_of(orchestrator_proxy)
+        assert (config.max_documents, config.max_document_chars) == derived_document_caps(
+            workspace_backend(card.vector_store), True
+        )
         assert (config.max_documents, config.max_document_chars) == (
-            IN_MEMORY_MAX_DOCUMENTS,
-            IN_MEMORY_MAX_DOCUMENT_CHARS,
+            DEFAULT_MAX_DOCUMENTS,
+            DEFAULT_MAX_DOCUMENT_CHARS,
         )
 
     def test_weaviate_with_retrieval_on_keeps_the_large_cache(
@@ -419,14 +439,14 @@ class TestTheDerivedCaps:
         config = workspace_config_of(orchestrator_proxy)
         assert (config.max_documents, config.max_document_chars) == (99, 12345)
 
-    def test_the_list_capability_alone_also_derives_the_small_caps(
+    def test_the_list_capability_alone_also_derives_from_the_resolved_backend(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         """Either capability turns retrieval on, and the caps follow retrieval."""
         bind(orchestrator_proxy, workspace_rag_list=True)
 
         config = workspace_config_of(orchestrator_proxy)
-        assert config.max_documents == IN_MEMORY_MAX_DOCUMENTS
+        assert config.max_documents == DEFAULT_MAX_DOCUMENTS
 
 
 class TestTheWeaviateCheck:

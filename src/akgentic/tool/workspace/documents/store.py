@@ -36,13 +36,29 @@ for the write and that is not an oversight: it is root-confined by design and
 therefore cannot reach ``<meta>``. This module writes its own atomic write,
 exactly as :class:`~akgentic.tool.workspace.lock.FileLockBackend` does.
 
-**There is no lock, and none is to be added.** Two agents contend only when
-reprocessing the *same* source document, and a lost update costs one
-re-extraction — which ADR-045 §C5 established this cache may cost, every byte
-here being derivable from the tree and disposable. What the concurrent case
-requires is not exclusion but **atomic replacement**: ``mkstemp`` plus
-``Path.replace()`` means a reader never sees a partial file, whichever writer
-wins. ``<meta>/exec.lock`` is the exec lock and is not for this.
+**Half of "there is no lock, and none is to be added" survives; half of it was
+false.** The surviving half is the **extraction cache**: two agents contend only
+when reprocessing the same source document, a lost update costs one
+re-extraction, and ADR-045 §C5 established this cache may cost exactly that,
+every byte here being derivable from the tree and disposable. For that half what
+the concurrent case requires is not exclusion but **atomic replacement** —
+``mkstemp`` plus ``Path.replace()`` means a reader never sees a partial file,
+whichever writer wins.
+
+The half that was false is the **index row** in the same file, and the argument
+never transferred to it. A row is not derivable and a lost update to one is not
+one re-extraction: two processes can both see an absent or ``PENDING`` row and
+both spawn an ``IndexWorker`` for one file — **two paid embedding runs** — and a
+whole-file replace can lose a ``superseded_chunk_ids`` list, **orphaning vectors
+that have already been paid for**, with nothing raised. The mailbox used to
+serialise this; nothing replaced it when the records moved to disk.
+
+So there **is** a lock now, and it is per document: :meth:`DocumentStore.hold`,
+an exclusive ``flock`` on ``<meta>/locks/record-<digest of path>``. Every
+read-modify-write of one document's row runs inside that document's hold; the
+extraction cache's writes deliberately do not, because that is the half the
+original argument genuinely covers. ``<meta>/exec.lock`` is the exec lock and is
+still not for this.
 
 **Imports run one way only** — this module imports ``documents/models.py`` for
 the two shipped record models and ``workspace/models.py`` / ``workspace.py`` for
@@ -55,19 +71,25 @@ are re-exported from ``workspace/__init__.py`` instead.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import yaml
 from pydantic import ValidationError
 
 from akgentic.core.utils.serializer import SerializableBaseModel
-from akgentic.tool.workspace.documents.models import DocumentExtract, RagFile
+from akgentic.tool.workspace.documents.models import DocumentExtract, RagFile, RagStatus
 from akgentic.tool.workspace.models import content_sha
 from akgentic.tool.workspace.workspace import meta_dir_for
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from contextlib import AbstractContextManager
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +102,24 @@ tree, which is how a cache silently stops hitting.
 
 DOCUMENT_FILE_SUFFIX = ".yaml"
 """Suffix of every file this store writes — and what :meth:`list_documents` globs."""
+
+LOCKS_DIR_NAME = "locks"
+"""The directory under ``<meta>`` holding one lock file per contended thing.
+
+**Spelled here rather than imported**, and it is one of three such spellings —
+``write/gate.py`` and ``vector_store/backends/local.py`` hold the others.
+Importing ``lock_file_for`` from the gate would make the retrieval capability
+import the **write** capability at runtime, which is worse than a third copy and
+is the same call this module already makes for its own ``_atomic_write``. A
+single spine helper for the family is a cross-capability decision, recorded as an
+open question rather than taken here.
+"""
+
+RECORD_LOCK_PREFIX = "record-"
+"""What a document record's lock file is named, before the digest of its path."""
+
+_LOCK_FILE_MODE = 0o600
+"""Owner-only, like every other lock file under ``<meta>``."""
 
 DEFAULT_DOCUMENT_STORE = "yaml"
 """What ``AKGENTIC_DOCUMENT_STORE`` resolves to when it is unset or empty."""
@@ -124,10 +164,27 @@ class DocumentEntry(SerializableBaseModel):
 class DocumentStore(Protocol):
     """Where one tree's document records live, and the whole of that surface.
 
-    Four methods: read one, write one, remove one, list them all. There is
-    deliberately no "write many" and no transaction — every caller writes one
-    document at a time on its own turn, which is what makes a torn write cost one
-    document rather than a batch.
+    Six methods: read one, write one, remove one, list them all, find the next
+    pending one, and hold one. There is deliberately no "write many" and no
+    transaction — every caller writes one document at a time on its own turn,
+    which is what makes a torn write cost one document rather than a batch.
+
+    **The atomicity contract is :meth:`hold`, and it is a requirement on the
+    backend rather than advice to the caller.** Every read-modify-write of one
+    document's *row* runs inside that document's hold, with the read taken
+    **inside** it — a hold around a decision made on an earlier read serialises
+    nothing. A backend that cannot serialise one document's read-modify-write
+    across processes is not a valid registry entry: without it two processes both
+    spawn an index worker for one file, which is two paid embedding runs, and a
+    ``superseded_chunk_ids`` list is lost in a whole-file replace, which orphans
+    vectors already paid for.
+
+    The **extraction** half is deliberately outside that rule — the batch
+    counters, ``cache_document``, the cache eviction and the stale-marking all
+    write without a hold. Once the spawn is exclusive, one process owns a file's
+    in-flight lifecycle, so those have a single writer for the duration; and a
+    cached extraction is derivable and disposable, which is the half of ADR-051
+    Decision 6's argument that survives.
 
     ``@runtime_checkable`` buys an ``isinstance`` check on **method names only**
     — not a signature, not an argument count, not a return type — exactly as
@@ -153,6 +210,35 @@ class DocumentStore(Protocol):
 
     def list_documents(self, tree_key: str) -> list[DocumentEntry]:
         """Return every readable record for *tree_key*, in no guaranteed order."""
+        ...
+
+    def next_pending(self, tree_key: str, exclude: frozenset[str]) -> DocumentEntry | None:
+        """Return one record whose row is ``PENDING`` and whose path is not excluded.
+
+        The filtered read the drain needs, so that spawning four workers no longer
+        costs four full listings of every record on the tree.
+
+        *exclude* is **required and has no default**: it is what terminates the
+        drain's loop after a claim is lost to another process, and a default would
+        let a caller omit it and spin. The same principle
+        ``resolve_workspace_path``'s ``workspace_sharable`` follows.
+
+        Args:
+            tree_key: The tree to look in.
+            exclude: Paths this caller has already tried and lost.
+
+        Returns:
+            One matching record, in no guaranteed order, or ``None``.
+        """
+        ...
+
+    def hold(self, tree_key: str, path: str) -> AbstractContextManager[None]:
+        """Hold *path*'s record exclusively, across processes, for the block.
+
+        See the class docstring: this is the Protocol's atomicity contract, not a
+        convenience. The hold is per **document**, so two files are worked on
+        concurrently and only one file's read-modify-write is serialised.
+        """
         ...
 
 
@@ -238,13 +324,100 @@ class YamlDocumentStore:
         glob's order is the file system's. Every caller that needs an order sorts
         for itself — eviction by ``extract.extracted_at``, the render by ``path``.
         """
-        directory = self._rag_dir(tree_key)
+        entries = [self._read(file) for file in self._record_files(tree_key)]
+        return [entry for entry in entries if entry is not None]
+
+    def next_pending(self, tree_key: str, exclude: frozenset[str]) -> DocumentEntry | None:
+        """Return the first ``PENDING`` record not in *exclude*, reading no further.
+
+        **It stops at the first match**, which is the whole of the saving: a drain
+        spawning one worker reads one record on a tree of a thousand rather than a
+        thousand. The order is the glob's and no caller may lean on it — the drain
+        asks for *a* pending path, never a particular one.
+
+        Args:
+            tree_key: The tree to look in.
+            exclude: Paths the caller has already tried and lost a claim on.
+
+        Returns:
+            One matching record, or ``None`` when there is none left.
+        """
+        for file in self._record_files(tree_key):
+            entry = self._read(file)
+            if entry is None or entry.path in exclude:
+                continue
+            if entry.row is not None and entry.row.status is RagStatus.PENDING:
+                return entry
+        return None
+
+    @contextlib.contextmanager
+    def hold(self, tree_key: str, path: str) -> Iterator[None]:
+        """Take *path*'s record lock exclusively, and release it whatever happens.
+
+        The eight lines are ``CardGate._hold`` / ``LocalBackend._hold``'s idiom,
+        **copied rather than imported** — see :data:`LOCKS_DIR_NAME` for why — on a
+        lazily created file that is unlocked and closed in ``finally`` and **never
+        unlinked**: unlinking would let a second process create a fresh inode and
+        take a hold that excludes nobody, which is the classic way a file lock
+        stops locking.
+
+        A ``<meta>`` whose locks directory cannot be created logs one WARNING and
+        yields unserialised, which is ``CardGate._hold``'s stated choice copied
+        rather than re-decided. Failing closed instead would wedge the whole
+        retrieval pipeline on a tree whose ``<meta>`` went read-only mid-session,
+        and the degradation is the behaviour that was on offer before this lock
+        existed at all.
+
+        Args:
+            tree_key: The tree the document belongs to.
+            path: Workspace-relative path of the source document.
+        """
+        handle: int | None = None
         try:
-            files = sorted(directory.glob(f"*{DOCUMENT_FILE_SUFFIX}"))
+            try:
+                lock_path = self._lock_file(tree_key, path)
+                lock_path.parent.mkdir(parents=True, exist_ok=True)
+                handle = os.open(lock_path, os.O_RDWR | os.O_CREAT, _LOCK_FILE_MODE)
+                fcntl.flock(handle, fcntl.LOCK_EX)
+            except OSError:
+                logger.warning(
+                    "Workspace %s: could not take the record lock for %s — proceeding unserialised",
+                    tree_key,
+                    path,
+                    exc_info=True,
+                )
+            yield
+        finally:
+            if handle is not None:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+                os.close(handle)
+
+    def _record_files(self, tree_key: str) -> list[Path]:
+        """Every record file under *tree_key*'s ``rag/`` directory, sorted.
+
+        A missing directory is an **empty list**, not an error: a workspace that
+        has never read a document has no directory, and that is the ordinary state
+        rather than a failure.
+        """
+        try:
+            return sorted(self._rag_dir(tree_key).glob(f"*{DOCUMENT_FILE_SUFFIX}"))
         except OSError:
             return []
-        entries = [self._read(file) for file in files]
-        return [entry for entry in entries if entry is not None]
+
+    def _lock_file(self, tree_key: str, path: str) -> Path:
+        """The lock file *path*'s record is contended on — a sibling of the tree.
+
+        Named by the same digest :meth:`_file` uses, **for safety rather than for
+        identity**: a workspace-relative path carries slashes and may be longer
+        than a filename may be. Two paths colliding would cost a spurious
+        serialisation and never a lost update.
+        """
+        return (
+            meta_dir_for(tree_key)
+            / LOCKS_DIR_NAME
+            / f"{RECORD_LOCK_PREFIX}{content_sha(path.encode())}"
+        )
 
     def _rag_dir(self, tree_key: str) -> Path:
         """The directory holding *tree_key*'s records — a sibling of the tree."""

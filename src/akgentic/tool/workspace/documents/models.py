@@ -147,6 +147,16 @@ def derived_document_caps(backend: str, rag_enabled: bool) -> tuple[int, int]:
     (ADR-045 §7): no vectors exist, so nothing is derived from the document cap,
     and lowering it would shrink a cache for a cost that is not being paid.
 
+    **The in-memory pair is currently unreachable through the workspace**, and
+    that is a consequence worth stating rather than a defect to act on here. The
+    workspace derives these from its *resolved* backend
+    (``WorkspaceTool._caps_backend``), ``workspace_backend`` substitutes ``local``
+    for an undeclared ``inmemory``, and ``require_workspace_backend`` refuses a
+    declared one — so every retrieval card on a tree gets 32 / 2,000,000 unless
+    its author declares otherwise. This function is generic and has other callers'
+    shapes to keep, and :data:`IN_MEMORY_MAX_DOCUMENTS` documents arithmetic worth
+    keeping, so neither is deleted or "simplified".
+
     Args:
         backend: The collection's configured backend — ``"inmemory"`` or
             ``"weaviate"``.

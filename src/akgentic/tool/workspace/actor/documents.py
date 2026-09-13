@@ -57,6 +57,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from math import ceil
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
@@ -86,6 +87,8 @@ from akgentic.tool.workspace.readers import _MIME_MAP, TEXT_EXTENSIONS, Document
 from akgentic.tool.workspace.workspace import Filesystem
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from akgentic.core.agent import Akgent
     from akgentic.core.agent_state import BaseState
     from akgentic.tool.vector_store.embedding_actor import EmbeddingError, EmbeddingResult
@@ -132,6 +135,27 @@ take the gate down with it.
 
 _CHUNK_REF_TYPE = "workspace_chunk"
 """``VectorEntry.ref_type`` for every chunk this package stores."""
+
+
+class _Spawn(Enum):
+    """What one claim attempt did, and why a boolean no longer says enough.
+
+    ``_spawn`` used to answer ``True``/``False`` and ``_drain`` stopped on any
+    ``False``. With two processes draining one tree, "somebody else claimed it"
+    became ordinary and has to *continue*, while a spawn that **raised** must
+    still stop the pass — a process that cannot start actors should not keep
+    trying to. One boolean cannot carry both.
+    """
+
+    STARTED = "started"
+    """A worker is running for the path, and this process is counting it."""
+
+    CLAIMED_ELSEWHERE = "claimed-elsewhere"
+    """The row moved between the pending read and the hold. Try the next path."""
+
+    FAILED = "failed"
+    """The spawn raised, or retrieval is not configured. Stop the pass."""
+
 
 _STORE_UNREACHABLE: tuple[type[Exception], ...] = (RuntimeError, ActorDeadError)
 """What the in-memory store child's spawn raises when the environment refuses it.
@@ -203,7 +227,7 @@ class DocumentsMixin(_DocumentsBase):
     _vs_proxy: VectorStoreService | None
     _vector_store: VectorStoreService | None
     _embedder: EmbeddingProvider | None
-    _index_active: set[str]
+    _index_workers: int
     _document_store: DocumentStore | None
 
     ##
@@ -284,6 +308,45 @@ class DocumentsMixin(_DocumentsBase):
         if store is None:
             return []
         return store.list_documents(self.config.workspace_path)
+
+    @contextlib.contextmanager
+    def _hold_record(self, path: str) -> Iterator[None]:
+        """Serialise *path*'s record against every other process, for the block.
+
+        The one place a ``tree_key`` is spelled for the hold, exactly as
+        :meth:`_entry` is for the read. An **unannounced store yields without a
+        hold**, deliberately and for :meth:`_entry`'s reason: every document path
+        already degrades to a miss when no card has announced a store, and a raise
+        here would be the one that took the actor down.
+
+        Args:
+            path: Workspace-relative path of the source document.
+        """
+        store = self._document_store
+        if store is None:
+            yield
+            return
+        with store.hold(self.config.workspace_path, path):
+            yield
+
+    def _next_pending(self, exclude: frozenset[str]) -> DocumentEntry | None:
+        """One record waiting to be claimed, or ``None`` — never a whole listing."""
+        store = self._document_store
+        if store is None:
+            return None
+        return store.next_pending(self.config.workspace_path, exclude)
+
+    def _release_worker_slot(self) -> None:
+        """Give back the slot one ``#index-`` worker was occupying in this process.
+
+        One spawn produces exactly one report — ``IndexResult`` or
+        ``IndexFailure`` — from a worker this actor created, so the count is
+        balanced by construction. The floor at zero is there because it is a
+        *count* rather than the set it replaced: an unknown path used to be a
+        harmless ``discard``, and nothing in a resource bound is worth taking the
+        gate's actor below zero over.
+        """
+        self._index_workers = max(0, self._index_workers - 1)
 
     def _forget_extract(self, path: str) -> None:
         """Drop *path*'s cached extraction, **keeping its index row**.
@@ -475,10 +538,20 @@ class DocumentsMixin(_DocumentsBase):
         exactly as ``configure_exec`` does. **The actor never inspects a card**;
         it has no handle on one.
 
-        **First call wins.** Two agents on one tree must not make one file chunk
-        two ways, so a second call carrying different parameters emits one INFO
-        line naming both and changes nothing. A second call carrying equal
-        parameters is silent.
+        **The arbitration is gone; the keep-first that remains is defensive.**
+        Deciding which chunking a tree uses is the *tree's* now, published at
+        ``<meta>/policy.yaml`` and enforced at bind: a card carrying different
+        parameters is refused there, naming both values, so no second card
+        carrying different parameters can reach this method through a bind at all
+        (:class:`~akgentic.tool.workspace.card.rag.TreePolicy`).
+
+        The branch is kept rather than deleted, and narrowly. This actor **must
+        never raise on a tell path** — it owns the write gate — so it cannot
+        enforce anything itself; and a route that bypassed the bind gate (a direct
+        ``enable_rag`` in a spec, a worker resolving a different ``<meta>`` root)
+        would otherwise silently re-chunk a tree mid-flight. So the assignment
+        stays idempotent, and what would have been an arbitration is one DEBUG
+        line saying where the decision actually lives.
 
         This is also where the collection is created — **lazily, and never in
         ``on_start``**: a workspace with retrieval off must never create one. It
@@ -498,9 +571,10 @@ class DocumentsMixin(_DocumentsBase):
         try:
             if self._rag_params is not None:
                 if self._rag_params != params:
-                    logger.info(
-                        "Workspace %s: retrieval is already configured by an earlier card; "
-                        "agent %s asked for %s and keeps %s",
+                    logger.debug(
+                        "Workspace %s: the tree's published policy record is the authority "
+                        "on chunking and this actor is already carrying it; agent %s "
+                        "reached enable_rag with %s past the bind gate and keeps %s",
                         self.config.workspace_path,
                         agent_id,
                         params,
@@ -657,10 +731,14 @@ class DocumentsMixin(_DocumentsBase):
             if sha is None:
                 unsupported += 1
                 continue
-            if self._is_accounted_for(candidate, sha, force):
-                current += 1
-                continue
-            self._enqueue(candidate, sha)
+            # The test and the write are one read-modify-write of one record, so
+            # they run inside that record's hold: without it an enqueue can race a
+            # claim in another process and reset a run that is already in flight.
+            with self._hold_record(candidate):
+                if self._is_accounted_for(candidate, sha, force):
+                    current += 1
+                    continue
+                self._enqueue(candidate, sha)
             queued += 1
         self._drain()
         return f"{queued} file(s) queued, {current} already current, {unsupported} unsupported"
@@ -721,38 +799,60 @@ class DocumentsMixin(_DocumentsBase):
         )
 
     def _drain(self) -> None:
-        """Spawn workers for ``PENDING`` files up to the concurrency cap.
+        """Spawn workers for ``PENDING`` files up to **this process's** concurrency cap.
 
         It writes rows for paths its caller never named — ``EXTRACTION`` or
         ``SPLITTING`` on a spawn, ``FAILED`` on a spawn that raised — and each of
         those reaches the disk on this turn, so it answers nothing and no caller
         has to guess whether it moved anything.
 
-        The listing is re-read on every pass rather than taken once, because
-        every spawn writes a row: iterating a snapshot would re-offer a path a
-        previous pass already moved out of ``PENDING``. It costs one directory
-        scan per spawn, bounded by the concurrency cap.
+        **One filtered read per spawn, not one full listing.** ``next_pending``
+        answers with the first waiting record it finds, so a tree of a thousand
+        documents costs one record read rather than a thousand. The read is
+        re-taken on every pass rather than snapshotted, because every spawn writes
+        a row and a snapshot would re-offer a path already moved out of
+        ``PENDING``.
+
+        ``tried`` is **local to this pass and never instance state**: it holds the
+        paths whose claim this process lost to another, so the loop moves on
+        instead of being offered the same still-``PENDING``-looking record for
+        ever. Instance state would carry a lost claim into the next call, where
+        the path may legitimately be pending again.
+
+        **A lost claim continues; a spawn that raised stops the pass.** "Somebody
+        else claimed it" is ordinary once two processes drain one tree. A spawn
+        that *raised* means this process cannot start actors, and it should not
+        keep trying to.
         """
         from akgentic.tool.workspace.documents.worker import (  # noqa: PLC0415 — cycle
             MAX_CONCURRENT_INDEX_WORKERS,
         )
 
-        while len(self._index_active) < MAX_CONCURRENT_INDEX_WORKERS:
-            waiting = next(
-                (
-                    entry.path
-                    for entry in self._entries()
-                    if entry.row is not None
-                    and entry.row.status is RagStatus.PENDING
-                    and entry.path not in self._index_active
-                ),
-                None,
-            )
-            if waiting is None or not self._spawn(waiting):
+        tried: set[str] = set()
+        while self._index_workers < MAX_CONCURRENT_INDEX_WORKERS:
+            waiting = self._next_pending(frozenset(tried))
+            if waiting is None:
                 return
+            outcome = self._spawn(waiting.path)
+            if outcome is _Spawn.FAILED:
+                return
+            if outcome is _Spawn.CLAIMED_ELSEWHERE:
+                tried.add(waiting.path)
 
-    def _spawn(self, path: str) -> bool:
-        """Start one ``#index-`` worker for *path*, or record why it could not start.
+    def _spawn(self, path: str) -> _Spawn:
+        """Claim *path* and start one ``#index-`` worker for it, under its record hold.
+
+        **The whole claim runs inside ``hold``, on a row re-read inside it.** That
+        re-read is the load-bearing line: a hold taken around a decision made on a
+        read from *before* it serialises nothing, and the shape without it passes
+        every sequential test while excluding nobody. Two processes draining one
+        tree would otherwise both see ``PENDING`` and both spawn a worker for one
+        file — two paid embedding runs.
+
+        **The spawn is inside the hold too**, and that is deliberate rather than
+        careless: a claim written and then not spawned is a row nobody carries
+        until the reaper finds it ten minutes later. ``createActor`` plus a tell
+        is microseconds, and no extraction, split or embedding happens behind it.
 
         The worker is spawned with ``createActor`` and handed everything it needs
         in one payload, including the card's extraction configuration. It is
@@ -765,6 +865,51 @@ class DocumentsMixin(_DocumentsBase):
         ``SPLITTING`` when the cache could supply one.
 
         Returns:
+            Which of the three things happened — see :class:`_Spawn`.
+        """
+        params, reader = self._rag_params, self._rag_reader
+        if params is None or reader is None:
+            return _Spawn.FAILED
+        with self._hold_record(path):
+            row = self._entry(path).row
+            # RE-READ INSIDE THE HOLD. ``next_pending`` offered this path while it
+            # was ``PENDING``; between that read and this hold another process may
+            # have claimed it, re-queued it at other bytes, or dropped it.
+            if row is None or row.indexed_sha is None or row.status is not RagStatus.PENDING:
+                return _Spawn.CLAIMED_ELSEWHERE
+            markdown = self.document_extract(path, row.indexed_sha, EXTRACTOR_VERSION)
+            if not self._start_index_worker(path, row.indexed_sha, markdown, params, reader):
+                return _Spawn.FAILED
+            self._index_workers += 1
+            self._put_row(
+                path,
+                row.model_copy(
+                    update={
+                        "status": (
+                            RagStatus.SPLITTING if markdown is not None else RagStatus.EXTRACTION
+                        ),
+                        "updated_at": datetime.now(UTC),
+                    }
+                ),
+            )
+        return _Spawn.STARTED
+
+    def _start_index_worker(
+        self,
+        path: str,
+        source_sha: str,
+        markdown: str | None,
+        params: WorkspaceRagIndex,
+        reader: DocumentReader,
+    ) -> bool:
+        """Create *path*'s worker and hand it its request, or fail the file.
+
+        Split out of :meth:`_spawn` so the claim there reads as the sequence it is
+        — re-read, decide, start, write. A spawn that raised leaves the file
+        ``FAILED`` on this turn rather than at ``PENDING`` for ever, and says so
+        to the caller, which stops the pass.
+
+        Returns:
             Whether a worker is now running for *path*.
         """
         from akgentic.tool.workspace.documents.worker import (  # noqa: PLC0415 — cycle
@@ -773,12 +918,7 @@ class DocumentsMixin(_DocumentsBase):
             index_worker_name,
         )
 
-        row = self._entry(path).row
-        params, reader = self._rag_params, self._rag_reader
-        if row is None or params is None or reader is None or row.indexed_sha is None:
-            return False
         scope = self.config.workspace_path
-        markdown = self.document_extract(path, row.indexed_sha, EXTRACTOR_VERSION)
         try:
             address = self.createActor(
                 IndexWorker, config=BaseConfig(name=index_worker_name(scope, path))
@@ -787,7 +927,7 @@ class DocumentsMixin(_DocumentsBase):
                 IndexRequest(
                     path=path,
                     scope=scope,
-                    source_sha=row.indexed_sha,
+                    source_sha=source_sha,
                     markdown=markdown,
                     params=params,
                     reader=reader,
@@ -795,18 +935,8 @@ class DocumentsMixin(_DocumentsBase):
             )
         except Exception as exc:
             logger.warning("Workspace %s: could not spawn an index worker for %s", scope, path)
-            self._fail(path, row.indexed_sha, f"{type(exc).__name__}: {exc}")
+            self._fail(path, source_sha, f"{type(exc).__name__}: {exc}")
             return False
-        self._index_active.add(path)
-        self._put_row(
-            path,
-            row.model_copy(
-                update={
-                    "status": RagStatus.SPLITTING if markdown is not None else RagStatus.EXTRACTION,
-                    "updated_at": datetime.now(UTC),
-                }
-            ),
-        )
         return True
 
     ##
@@ -899,7 +1029,7 @@ class DocumentsMixin(_DocumentsBase):
         ``_drain`` it frees a slot for spawns the next file, and that spawn's
         row reaches the disk on this turn like any other.
         """
-        self._index_active.discard(msg.path)
+        self._release_worker_slot()
         entry = self._live_entry(msg.path, msg.source_sha)
         if entry is None:
             self._drain()
@@ -1028,7 +1158,7 @@ class DocumentsMixin(_DocumentsBase):
     def receiveMsg_IndexFailure(self, msg: IndexFailure) -> None:  # noqa: N802
         """TELL, from a worker. Mark the file ``FAILED`` and free its slot."""
         try:
-            self._index_active.discard(msg.path)
+            self._release_worker_slot()
             if self._live_entry(msg.path, msg.source_sha) is not None:
                 self._fail(msg.path, msg.source_sha, msg.reason)
             self._drain()
@@ -1148,31 +1278,48 @@ class DocumentsMixin(_DocumentsBase):
         ``superseded_chunk_ids`` populated so a later re-index retries it, and
         never fails the file: the worst case is a few orphaned vectors, and the
         alternative is a file that is ``FAILED`` because of a cleanup.
+
+        **The two record touches run under the hold; ``proxy.remove`` does not.**
+        That is ``_gated``'s split, for its reason: a network call inside a
+        cross-process lock is how a lock becomes a bottleneck, and a doubled
+        ``remove`` is idempotent. With ``_enqueue``'s append and this clear both
+        serialised, the list cannot be lost — which is the whole of the orphan.
+
+        **The clear subtracts what was actually removed rather than blanking the
+        field**, because the list is not this call's to own: a concurrent
+        ``_enqueue`` on the next turn appends the ids *it* has just superseded,
+        and blanking would drop them with nothing removed and nothing raised.
+        Sequentially there is nothing to subtract and the field still ends empty.
         """
-        row = self._entry(path).row
+        with self._hold_record(path):
+            row = self._entry(path).row
+            if row is None or not row.superseded_chunk_ids:
+                return
+            owed = list(row.superseded_chunk_ids)
         proxy = self._vs_proxy
-        if row is None or proxy is None or not row.superseded_chunk_ids:
+        if proxy is None:
             return
         try:
-            proxy.remove(
-                RAG_COLLECTION,
-                row.superseded_chunk_ids,
-                scope=self.config.workspace_path,
-            )
+            proxy.remove(RAG_COLLECTION, owed, scope=self.config.workspace_path)
         except Exception as exc:
             logger.warning(
                 "Workspace %s: could not remove %d superseded chunk(s) of %s: %s — "
                 "they are kept for the next re-index to retry",
                 self.config.workspace_path,
-                len(row.superseded_chunk_ids),
+                len(owed),
                 path,
                 exc,
             )
             return
-        current = self._entry(path).row
-        if current is None:
-            return
-        self._put_row(path, current.model_copy(update={"superseded_chunk_ids": []}))
+        removed = set(owed)
+        with self._hold_record(path):
+            current = self._entry(path).row
+            if current is None:
+                return
+            remaining = [
+                stale_id for stale_id in current.superseded_chunk_ids if stale_id not in removed
+            ]
+            self._put_row(path, current.model_copy(update={"superseded_chunk_ids": remaining}))
 
     def _live_entry(self, path: str, source_sha: str) -> RagFile | None:
         """Return *path*'s row when it is still the one *source_sha* was indexing.
@@ -1232,20 +1379,33 @@ class DocumentsMixin(_DocumentsBase):
         ever: :meth:`_drain` spawns ``PENDING`` only and :meth:`_is_accounted_for`
         counts in-flight as current, so nothing else would ever move it.
 
-        **Two cases, one predicate**, which is what folded the restore re-queue
-        into this method. With the index in one actor's memory there was a moment
-        called "restore" at which every in-flight row was abandoned *by
-        construction*, and a separate hook re-queued them with no age bound. With
-        the index on disk there is no such moment — another process may be
-        working on one of these rows right now — so the discriminator is
-        ``_index_active``, which is per-process by construction: a path in it is
-        live **here** and is never reaped however old it is; a path not in it and
-        older than :data:`~akgentic.tool.workspace.documents.models.EMBEDDING_STALE_AFTER_S`
-        was abandoned by whoever had it, in this process or another.
+        **One predicate, and it is the age bound alone.** With the index in one
+        actor's memory there was a moment called "restore" at which every
+        in-flight row was abandoned *by construction*, and a separate hook
+        re-queued them with no age bound; folding that into this method left a
+        second discriminator beside the bound, ``_index_active``, exempting the
+        rows this process was carrying. That exemption is **deleted**, and the
+        deletion is a stated behaviour change rather than a tidy-up.
+
+        It was silently false for every worker in another process — the case the
+        records moved to disk to support — so it never answered the question it
+        looked like it answered. Honestly stated, the rule is: a row older than
+        :data:`~akgentic.tool.workspace.documents.models.EMBEDDING_STALE_AFTER_S`
+        is re-queued, in this process exactly as in another. What that costs is a
+        local worker still running past ten minutes being joined by a second one,
+        and the duplicate is harmless because
+        :func:`~akgentic.tool.workspace.documents.models.chunk_id` is
+        deterministic and every backend now **upserts** a row rather than
+        appending it.
 
         ``chunks`` and ``superseded_chunk_ids`` are kept — the superseded ids are
         still owed a removal, and the chunk set keeps the row's heading paths
         renderable until a worker replaces it.
+
+        **It keeps the full listing, unlike ``_drain``**, and legitimately: the
+        question it asks is about every row on the tree at once, so there is no
+        filtered read that would answer it. The render is the other such caller. A
+        remote ``DocumentStore`` would want a filtered form of this too.
 
         Returns:
             Whether any row was re-queued.
@@ -1257,7 +1417,7 @@ class DocumentsMixin(_DocumentsBase):
             row = entry.row
             if row is None or row.status not in _CARRIED_BY_A_WORKER:
                 continue
-            if row.updated_at >= cutoff or entry.path in self._index_active:
+            if row.updated_at >= cutoff:
                 continue
             self._put_row(entry.path, _requeued(row, now))
             requeued += 1
@@ -1717,8 +1877,10 @@ _CARRIED_BY_A_WORKER = _IN_FLIGHT - {RagStatus.PENDING}
 true.** There is no restore any more, and therefore no moment at which every row
 in one of these statuses is abandoned by construction: the records are on disk
 and another process may be working on one of them right now.
-:meth:`DocumentsMixin.reap_abandoned_rows` is what decides, and it needs two more
-facts than this set — the age bound and ``_index_active``.
+:meth:`DocumentsMixin.reap_abandoned_rows` is what decides, and it needs exactly
+one more fact than this set — the age bound. The per-process exemption that used
+to sit beside it is gone: it could only ever speak for workers in *this* process,
+which made it silently false for the case the records moved to disk to support.
 """
 
 

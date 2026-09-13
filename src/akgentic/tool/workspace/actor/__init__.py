@@ -286,7 +286,13 @@ class WorkspaceActor(
         self._vector_store: VectorStoreService | None = None
         self._vs_proxy: VectorStoreService | None = None
         self._embedder: EmbeddingProvider | None = None
-        self._index_active: set[str] = set()
+        # How many ``#index-`` workers **this process** is running, and nothing
+        # else. Not the set it replaced: "is this path being worked on?" and "is
+        # this path exempt from the reaper?" are questions about the *tree*, which
+        # another process can answer differently, and both are now answered from
+        # the row under its record hold. This is a resource bound on this process,
+        # never a de-duplicator.
+        self._index_workers: int = 0
         # Announced by the card at bind time, exactly as ``_lock`` is. Until
         # then the document cache misses and the index looks empty: an ordinary,
         # visible degradation, never a raise (ADR-051 Decision 6).

@@ -8,6 +8,14 @@ read a card's or an actor's private attribute where there is no public
 equivalent — which tree an actor took, which proxy a card bound — and they say
 so where they do it.
 
+**The child-process harness lives here too**, moved out of
+``test_gate_locks.py`` when a second and third module needed it. Cross-process
+properties need real second interpreters — a ``threading.Lock``, the GIL and one
+mailbox all provide exclusion inside one interpreter, so a single-process spec
+passes whether or not the file lock exists — and there is exactly one runner for
+them. Importing helpers out of another *test module* is not on offer, and neither
+is a second copy of the child runner.
+
 Shaped after ``tests/notification/conftest.py``; deliberately a copy rather than
 an import, because a test package is not a library for other test packages.
 """
@@ -17,6 +25,8 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
+import textwrap
 import threading
 import time
 import uuid
@@ -117,6 +127,105 @@ would leak into every other test that shells out.
 """
 
 requires_git = pytest.mark.skipif(not GIT_ON_PATH, reason="git is not on PATH")
+
+
+##
+## The child-process harness — one runner, for every cross-process spec
+##
+CHILD_TIMEOUT_S = 180.0
+"""Upper bound on a child — a failure budget, never a delay."""
+
+_PACKAGE_ROOT = str(Path(__file__).resolve().parents[2])
+"""The package root, so a child can import ``tests.workspace.conftest``."""
+
+CHILD_PRELUDE = f"""
+import os, sys, time
+sys.path.insert(0, {_PACKAGE_ROOT!r})
+from pathlib import Path
+from akgentic.tool.workspace.tool import WorkspaceTool
+from akgentic.tool.errors import RetriableError
+from tests.workspace.conftest import FakeActorToolObserver, FakeOrchestratorProxy
+
+
+def bind(name, **kwargs):
+    proxy = FakeOrchestratorProxy()
+    card = WorkspaceTool(workspace_id={WORKSPACE_NAME!r}, **kwargs)
+    card.observer(FakeActorToolObserver(proxy, name=name))
+    return card
+
+
+def barrier(meta, tag, count):
+    ready = Path(meta) / ("ready-" + tag)
+    ready.parent.mkdir(parents=True, exist_ok=True)
+    ready.write_text("x")
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if len(list(Path(meta).glob("ready-*"))) >= count:
+            return
+        time.sleep(0.005)
+    raise SystemExit("the barrier never completed")
+"""
+"""What every child script starts with — ``bind`` drives the **real card**.
+
+A child that constructed a ``WorkspaceTool`` and poked its private attributes
+would be testing the test file, so the prelude gives it the shipped bind and
+nothing else.
+"""
+
+
+@dataclass
+class ChildReport:
+    """One child's exit code and what it printed."""
+
+    code: int
+    out: str
+    err: str
+
+
+def run_child(script: Path, workspaces_root: Path, *args: str) -> ChildReport:
+    """Run *script* in a fresh interpreter, with this suite's workspaces root."""
+    done = subprocess.run(
+        [sys.executable, str(script), *args],
+        capture_output=True,
+        text=True,
+        timeout=CHILD_TIMEOUT_S,
+        env=_child_env(workspaces_root),
+        check=False,
+    )
+    return ChildReport(done.returncode, done.stdout.strip(), done.stderr.strip())
+
+
+def start_child(script: Path, workspaces_root: Path, *args: str) -> subprocess.Popen[str]:
+    """Start *script* in a fresh interpreter without waiting for it."""
+    return subprocess.Popen(
+        [sys.executable, str(script), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=_child_env(workspaces_root),
+    )
+
+
+def _child_env(workspaces_root: Path) -> dict[str, str]:
+    """This process's environment, pointed at the test's workspaces root.
+
+    ``AKGENTIC_WORKSPACE_META_ROOT`` is removed for
+    :func:`_no_real_workspaces_root`'s reason: the metadata directory's defining
+    property is that it is a *sibling* of the tree, and an ambient value relocates
+    its parent, so a child that inherited one would resolve a different ``<meta>``
+    from its parent and every lock in the suite would exclude nobody.
+    """
+    env = dict(os.environ)
+    env["AKGENTIC_WORKSPACES_ROOT"] = str(workspaces_root)
+    env.pop("AKGENTIC_WORKSPACE_META_ROOT", None)
+    return env
+
+
+def write_script(tmp_path: Path, name: str, body: str) -> Path:
+    """Write a child script made of the shared prelude plus *body*."""
+    script = tmp_path / name
+    script.write_text(CHILD_PRELUDE + textwrap.dedent(body), encoding="utf-8")
+    return script
 
 
 @dataclass
@@ -1251,11 +1360,22 @@ class RecordingDocumentStore:
     It delegates rather than faking, so a spec that reads back through
     :func:`stored_rows` sees exactly what the actor wrote.
 
+    **Both new methods are written by hand, never inherited.**
+    ``@runtime_checkable`` checks method *names* only, so a fake missing one still
+    passes ``isinstance`` and fails at the call; and delegating by ``__getattr__``
+    would record nothing, which is the whole point of the class.
+
     Attributes:
         puts: ``(tree_key, path)`` for every ``put_document``, in order.
         evicted: ``(tree_key, path)`` for every ``evict``, in order.
         gets: ``(tree_key, path)`` for every ``get_document``, in order.
         listings: ``tree_key`` for every ``list_documents``, in order.
+        pending_calls: ``(tree_key, exclude)`` for every ``next_pending``, in
+            order. What "the drain performs no full listing" is asserted on,
+            beside an empty :attr:`listings`.
+        holds: ``("enter" | "exit", path)`` for every hold, in order. A pair of
+            *positions*, so a spec can say a write happened **inside** one — which
+            a count cannot express at all.
     """
 
     def __init__(self) -> None:
@@ -1264,6 +1384,8 @@ class RecordingDocumentStore:
         self.evicted: list[tuple[str, str]] = []
         self.gets: list[tuple[str, str]] = []
         self.listings: list[str] = []
+        self.pending_calls: list[tuple[str, frozenset[str]]] = []
+        self.holds: list[tuple[str, str]] = []
 
     @property
     def written(self) -> list[str]:
@@ -1285,6 +1407,19 @@ class RecordingDocumentStore:
     def list_documents(self, tree_key: str) -> list[DocumentEntry]:
         self.listings.append(tree_key)
         return self._inner.list_documents(tree_key)
+
+    def next_pending(self, tree_key: str, exclude: frozenset[str]) -> DocumentEntry | None:
+        self.pending_calls.append((tree_key, exclude))
+        return self._inner.next_pending(tree_key, exclude)
+
+    @contextmanager
+    def hold(self, tree_key: str, path: str) -> Iterator[None]:
+        self.holds.append(("enter", path))
+        try:
+            with self._inner.hold(tree_key, path):
+                yield
+        finally:
+            self.holds.append(("exit", path))
 
 
 def watch_store(actor: WorkspaceActor) -> RecordingDocumentStore:

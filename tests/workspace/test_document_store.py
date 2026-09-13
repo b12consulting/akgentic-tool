@@ -14,6 +14,7 @@ isolation and only fails on the next full-suite run.
 from __future__ import annotations
 
 import hashlib
+import os
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -332,9 +333,7 @@ class TestEvictionAndUnreadableFiles:
         store = YamlDocumentStore()
         store.evict(TREE_KEY, "never-stored.md")
 
-    def test_a_file_that_does_not_parse_is_a_miss_and_is_left_in_place(
-        self, roots: Path
-    ) -> None:
+    def test_a_file_that_does_not_parse_is_a_miss_and_is_left_in_place(self, roots: Path) -> None:
         """Removing a file we cannot read is how a cache turns a bad parse into data loss."""
         store = YamlDocumentStore()
         store.put_document(TREE_KEY, DocumentEntry(path="a.md", extract=_extract("a.md")))
@@ -365,6 +364,177 @@ class TestEvictionAndUnreadableFiles:
     def test_listing_a_tree_with_no_directory_is_empty(self, roots: Path) -> None:
         """The ordinary state of a workspace that has never read a document."""
         assert YamlDocumentStore().list_documents(TREE_KEY) == []
+
+
+class TestTheFilteredRead:
+    """Story 55-5 AC 11 — ``next_pending``, so the drain stops listing everything.
+
+    **One process throughout, honestly.** This is a store method over files: it
+    filters, it excludes, it terminates. Spawning a subprocess to prove a filter
+    would be ceremony — the exclusion property the second interpreter is for lives
+    in ``test_record_lock.py``.
+    """
+
+    def test_it_returns_a_pending_record(self, roots: Path) -> None:
+        store = YamlDocumentStore()
+        store.put_document(
+            TREE_KEY, DocumentEntry(path="a.md", row=_row("a.md", RagStatus.PENDING))
+        )
+
+        found = store.next_pending(TREE_KEY, frozenset())
+
+        assert found is not None
+        assert found.path == "a.md"
+
+    def test_it_skips_every_other_status(self, roots: Path) -> None:
+        """Only ``PENDING`` is claimable — ``_drain`` spawns nothing else."""
+        store = YamlDocumentStore()
+        for status in RagStatus:
+            if status is RagStatus.PENDING:
+                continue
+            path = f"{status.value}.md"
+            store.put_document(TREE_KEY, DocumentEntry(path=path, row=_row(path, status)))
+
+        assert store.next_pending(TREE_KEY, frozenset()) is None
+
+    def test_it_skips_a_record_with_no_row_at_all(self, roots: Path) -> None:
+        """A file read but never queued has an extract and no row — not claimable."""
+        store = YamlDocumentStore()
+        store.put_document(TREE_KEY, DocumentEntry(path="a.md", extract=_extract("a.md")))
+
+        assert store.next_pending(TREE_KEY, frozenset()) is None
+
+    def test_excluding_the_only_candidate_answers_none(self, roots: Path) -> None:
+        """What terminates the drain's loop after a claim is lost to another process.
+
+        Without it the drain is offered the same still-``PENDING``-looking record
+        for ever — which is why *exclude* has no default.
+        """
+        store = YamlDocumentStore()
+        store.put_document(
+            TREE_KEY, DocumentEntry(path="a.md", row=_row("a.md", RagStatus.PENDING))
+        )
+
+        assert store.next_pending(TREE_KEY, frozenset({"a.md"})) is None
+
+    def test_excluding_one_of_two_answers_the_other(self, roots: Path) -> None:
+        """The positive control: an exclusion that excluded *everything* would
+        satisfy the spec above for entirely the wrong reason."""
+        store = YamlDocumentStore()
+        for path in ("a.md", "b.md"):
+            store.put_document(
+                TREE_KEY, DocumentEntry(path=path, row=_row(path, RagStatus.PENDING))
+            )
+
+        found = store.next_pending(TREE_KEY, frozenset({"a.md"}))
+
+        assert found is not None
+        assert found.path == "b.md"
+
+    def test_exclude_is_required(self) -> None:
+        """No default, so a caller cannot omit it and spin — the same principle
+        ``resolve_workspace_path``'s ``workspace_sharable`` follows."""
+        import inspect
+
+        parameter = inspect.signature(YamlDocumentStore.next_pending).parameters["exclude"]
+
+        assert parameter.default is inspect.Parameter.empty
+
+    def test_a_tree_with_no_directory_answers_none(self, roots: Path) -> None:
+        """A workspace that has never read a document has no ``rag/`` at all."""
+        assert YamlDocumentStore().next_pending(TREE_KEY, frozenset()) is None
+
+    def test_an_unreadable_file_is_skipped_rather_than_raised_over(self, roots: Path) -> None:
+        """One corrupt record must not stop the drain from finding the next one."""
+        store = YamlDocumentStore()
+        store.put_document(
+            TREE_KEY, DocumentEntry(path="a.md", row=_row("a.md", RagStatus.PENDING))
+        )
+        (_rag_dir() / "zzz.yaml").write_text("{[not yaml", encoding="utf-8")
+
+        found = store.next_pending(TREE_KEY, frozenset())
+
+        assert found is not None
+        assert found.path == "a.md"
+
+
+class TestTheRecordHoldInOneProcess:
+    """Story 55-5 AC 7 — the shape of ``hold``, with its exclusion left to the children.
+
+    **What is asserted here is deliberately not exclusion.** A ``flock`` is
+    per-open-file-description, so two holds in one interpreter say nothing about
+    what a second process can do — story 52-4 deleted ``fcntl.flock`` outright and
+    watched three single-process formulations stay green. The exclusion guard is
+    ``test_record_lock.py``'s, with real second interpreters. What one process can
+    honestly check is the placement, the per-document keying and the release.
+    """
+
+    def test_the_lock_file_is_a_sibling_of_the_tree(self, roots: Path) -> None:
+        """A lock inside the tree would be listable, readable and ``rm -rf``-able."""
+        store = YamlDocumentStore()
+
+        with store.hold(TREE_KEY, "a.md"):
+            locks = sorted((meta_dir_for(TREE_KEY) / "locks").iterdir())
+
+        assert [path.name for path in locks] == [f"record-{hashlib.sha256(b'a.md').hexdigest()}"]
+        assert not locks[0].is_relative_to(get_workspace(TREE_KEY).root)
+
+    def test_two_paths_get_two_files(self, roots: Path) -> None:
+        """One lock for the whole tree would serialise every document against
+        every other, which is a bottleneck rather than a correctness property."""
+        store = YamlDocumentStore()
+
+        with store.hold(TREE_KEY, "a.md"), store.hold(TREE_KEY, "b.md"):
+            names = {path.name for path in (meta_dir_for(TREE_KEY) / "locks").iterdir()}
+
+        assert len(names) == 2
+
+    def test_the_lock_file_survives_the_release(self, roots: Path) -> None:
+        """**Never unlinked.** A second process could otherwise create a fresh
+        inode and take a hold that excludes nobody."""
+        store = YamlDocumentStore()
+
+        with store.hold(TREE_KEY, "a.md"):
+            pass
+
+        assert (meta_dir_for(TREE_KEY) / "locks").is_dir()
+        assert list((meta_dir_for(TREE_KEY) / "locks").iterdir())
+
+    def test_a_raising_body_still_releases(self, roots: Path) -> None:
+        """A hold leaked by an exception would wedge the tree for every process."""
+        store = YamlDocumentStore()
+
+        with pytest.raises(RuntimeError), store.hold(TREE_KEY, "a.md"):
+            raise RuntimeError("boom")
+
+        # Re-taking it in this process proves only that the handle was closed, not
+        # that the lock excluded anything — which is all this spec claims.
+        with store.hold(TREE_KEY, "a.md"):
+            pass
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the directory mode this rests on")
+    def test_a_locks_directory_it_cannot_write_degrades_rather_than_raising(
+        self, roots: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``CardGate._hold``'s stated choice, copied rather than re-decided.
+
+        Failing closed would wedge the whole retrieval pipeline on a tree whose
+        ``<meta>`` went read-only mid-session, and unserialised is the behaviour
+        that was on offer before this lock existed at all.
+        """
+        store = YamlDocumentStore()
+        with store.hold(TREE_KEY, "first.md"):
+            pass
+        locks_dir = meta_dir_for(TREE_KEY) / "locks"
+
+        locks_dir.chmod(0o500)
+        try:
+            with caplog.at_level("WARNING"), store.hold(TREE_KEY, "second.md"):
+                pass
+        finally:
+            locks_dir.chmod(0o700)
+
+        assert any("proceeding unserialised" in record.message for record in caplog.records)
 
 
 class TestBackendSelectionIsSelfResolved:

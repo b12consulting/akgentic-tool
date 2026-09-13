@@ -670,6 +670,150 @@ class TestAReloadFollowsTheStamp:
 ##
 
 
+class TestARowIsUpsertedRatherThanAppended:
+    """Story 55-5 AC 13 — the row identity the two cluster backends already have.
+
+    ``VectorIndex.add`` appends, so the same ``ref_id`` re-added was a second row
+    in the matrix: by a second team indexing one tree, by a re-index at the same
+    digest, or by the duplicate run the reaper's deleted per-process exemption now
+    permits. Both cluster backends have stored under
+    :func:`~akgentic.tool.vector_store.protocol.row_object_id` since it landed and
+    therefore *replace*; ``local`` is the backend the two-teams case actually
+    uses, and it was the one still appending.
+
+    **Today the damage is bounded and the spec says so**: ``_map_search_hits`` and
+    ``_filtered_search`` both collapse by ``ref_id`` last-one-wins, so answers stay
+    correct. What the duplicate costs is index bloat and a wasted over-fetch
+    budget, which is what these assertions are about — the row count, never the
+    answer.
+
+    **One process throughout.** This is identity, not exclusion: what makes two
+    adds one row is the derivation, and a second interpreter would prove nothing
+    a second ``add`` does not.
+    """
+
+    def _rows(self, root: Path, collection: str = SHARED) -> list[dict[str, Any]]:
+        """Every stored row, straight off the disk — not what a search answers."""
+        rows = stored_metadata(root, collection)["entries"]
+        assert isinstance(rows, list)
+        return rows
+
+    def test_two_adds_of_one_entry_leave_one_row(self, tmp_path: Path) -> None:
+        built = backend_over(tmp_path, SHARED)
+
+        built.add(SHARED, [entry("c1")])
+        built.add(SHARED, [entry("c1")])
+
+        assert [row["ref_id"] for row in self._rows(tmp_path)] == ["c1"]
+
+    def test_a_second_instance_re_adding_leaves_one_row(self, tmp_path: Path) -> None:
+        """The two-teams case, through two objects — which is two processes' worth
+        of separation, for the reason this module's docstring gives."""
+        backend_over(tmp_path, SHARED).add(SHARED, [entry("c1")])
+
+        second = LocalBackend(root=str(tmp_path))
+        second.create_collection(SHARED, VectorStoreParam(dimension=2))
+        second.add(SHARED, [entry("c1")])
+
+        assert [row["ref_id"] for row in self._rows(tmp_path)] == ["c1"]
+
+    def test_the_replacement_is_what_the_second_add_wrote(self, tmp_path: Path) -> None:
+        """An upsert, not a "keep the first" — the newer row is the one that stays."""
+        built = backend_over(tmp_path, SHARED)
+
+        built.add(SHARED, [entry("c1", [1.0, 0.0], text="first")])
+        built.add(SHARED, [entry("c1", [0.0, 1.0], text="second")])
+
+        [row] = self._rows(tmp_path)
+        assert row["text"] == "second"
+        [hit] = built.search(SHARED, [0.0, 1.0], 5, scope=SCOPE).hits
+        assert hit.text == "second"
+
+    def test_two_scopes_sharing_a_ref_id_stay_two_rows(self, tmp_path: Path) -> None:
+        """**Entry-precise on ``scope``, the way ``remove`` already is.**
+
+        The shared collection holds every workspace's chunks, and two trees can
+        mint the same ``ref_id``. A replacement that matched on the id alone would
+        delete one workspace's row when another indexed — which is worse than the
+        bloat it set out to fix.
+        """
+        built = backend_over(tmp_path, SHARED)
+
+        built.add(SHARED, [entry("c1", scope="u-alice/notes")])
+        built.add(SHARED, [entry("c1", scope="u-bob/notes")])
+
+        assert sorted(row["scope"] for row in self._rows(tmp_path)) == [
+            "u-alice/notes",
+            "u-bob/notes",
+        ]
+        # Asserted on the **stored rows**, not on what a search answers: both hits
+        # carry one ``ref_id``, and ``_map_search_hits`` collapses by it
+        # last-one-wins, so a search cannot distinguish the two here at all. That
+        # collapse is why the duplicate was bloat rather than a wrong answer — and
+        # it is exactly what would make a search-based assertion vacuous.
+
+    def test_a_different_ref_id_is_still_added(self, tmp_path: Path) -> None:
+        """The positive control: a replacement that removed too much would leave
+        one row here and pass every spec above for entirely the wrong reason."""
+        built = backend_over(tmp_path, SHARED)
+
+        built.add(SHARED, [entry("c1")])
+        built.add(SHARED, [entry("c2")])
+
+        assert sorted(row["ref_id"] for row in self._rows(tmp_path)) == ["c1", "c2"]
+
+    def test_one_batch_carrying_a_repeat_is_not_self_defeating(self, tmp_path: Path) -> None:
+        """The removal is computed for the whole batch before anything is added, so
+        an entry cannot be removed by a later entry of its own batch."""
+        built = backend_over(tmp_path, SHARED)
+
+        built.add(SHARED, [entry("c1", text="first"), entry("c2"), entry("c1", text="second")])
+
+        assert sorted(row["ref_id"] for row in self._rows(tmp_path)) == ["c1", "c1", "c2"]
+
+    def test_two_teams_over_one_team_scoped_collection_still_collapse(self, tmp_path: Path) -> None:
+        """**A stated limit, guarded so it stays the shape it was argued for.**
+
+        :func:`row_object_id` keeps the team inside the id on a team-scoped
+        collection, which is what stops one team's ``ref_id`` from overwriting
+        another's on a cluster — where the id **is** the storage key. Here the
+        storage key is the ``ref_id`` in the matrix and a stored ``VectorEntry``
+        carries no team at all, so a stored row's identity is re-derived under
+        whichever team is asking. Two teams over one ``planning`` collection on one
+        root therefore end with one row.
+
+        It is unreachable today and is deliberately not fixed here: ``local``
+        declares ``selectable_as_default=False`` and the workspace is its only
+        consumer, over the **shared** ``workspace_chunks`` — where the team is
+        dropped from the derivation whoever writes, and collapsing is the right
+        answer. Closing it means stamping the team on a stored row, which is a
+        ``VectorEntry`` field and a different story.
+        """
+        first = LocalBackend(root=str(tmp_path), team_id="team-a")
+        first.create_collection(TEAM_SCOPED, VectorStoreParam(dimension=2))
+        first.add(TEAM_SCOPED, [entry("c1", scope=None, path=None, ordinal=None)])
+
+        second = LocalBackend(root=str(tmp_path), team_id="team-b")
+        second.create_collection(TEAM_SCOPED, VectorStoreParam(dimension=2))
+        second.add(TEAM_SCOPED, [entry("c1", scope=None, path=None, ordinal=None)])
+
+        assert len(self._rows(tmp_path, TEAM_SCOPED)) == 1
+
+    def test_the_factory_hands_the_backend_its_team(self, tmp_path: Path) -> None:
+        """Without it every ``local`` backend would carry no team at all, and the
+        derivation would silently be a different one from the cluster backends'."""
+        built = registry.get_backend_spec("local").factory(
+            BackendContext(
+                config=VectorStoreConfig(name="#VectorStore", role="ToolActor"),
+                team_id="team-a",
+                root=str(tmp_path),
+            )
+        )
+
+        assert isinstance(built, LocalBackend)
+        assert built._team_id == "team-a"
+
+
 class TestTheSharedCollectionRule:
     """A shared collection has no boundary but ``scope``, so it refuses without one."""
 

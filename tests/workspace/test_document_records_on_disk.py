@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -105,6 +106,11 @@ class _CapturingStore:
     The only way to ask what a writer *built*, as opposed to what survived being
     written: a YAML round trip normalises a subclass back to ``DocumentEntry``,
     so a read-back can never answer the copy-semantics question.
+
+    **The two methods story 55-5 added to the Protocol are written out by hand**,
+    as they are on ``RecordingDocumentStore``. ``@runtime_checkable`` checks
+    method *names* only — not a signature, not an argument count — so a fake
+    missing one still satisfies ``isinstance`` and fails at the call instead.
     """
 
     def __init__(self) -> None:
@@ -127,6 +133,24 @@ class _CapturingStore:
 
     def list_documents(self, tree_key: str) -> list[DocumentEntry]:
         return [entry for (key, _), entry in self._held.items() if key == tree_key]
+
+    def next_pending(self, tree_key: str, exclude: frozenset[str]) -> DocumentEntry | None:
+        for entry in self.list_documents(tree_key):
+            if entry.path in exclude or entry.row is None:
+                continue
+            if entry.row.status is RagStatus.PENDING:
+                return entry
+        return None
+
+    @contextmanager
+    def hold(self, tree_key: str, path: str) -> Iterator[None]:
+        """In-memory, so there is nothing to serialise and nothing to take.
+
+        Honest rather than lazy: this store holds a dict in one interpreter, and a
+        hold that excluded nothing is exactly what it has. Every cross-process
+        claim is guarded in ``test_record_lock.py``, against the real store.
+        """
+        yield
 
 
 _A_MARKDOWN = "# A\n\nbody\n"
@@ -341,7 +365,7 @@ class TestEveryWriteSiteIsOnDiskWhenTheTurnEnds:
         _fill_the_worker_slots(harness.actor)
         harness.actor.index_paths("")
         assert {row.status for row in stored_rows(harness.actor).values()} == {RagStatus.PENDING}
-        harness.actor._index_active.clear()
+        harness.actor._index_workers = 0
 
         harness.actor.index_paths("")
 
@@ -512,8 +536,15 @@ _UNTOUCHED = (RagStatus.PENDING, RagStatus.EMBEDDED, RagStatus.STALE, RagStatus.
 
 
 def _fill_the_worker_slots(actor: WorkspaceActor) -> None:
-    """Occupy every index-worker slot, so a queued row stays ``PENDING``."""
-    actor._index_active.update(f"busy-{n}.md" for n in range(MAX_CONCURRENT_INDEX_WORKERS))
+    """Occupy every index-worker slot, so a queued row stays ``PENDING``.
+
+    A **count** since story 55-5, because that is all the slots ever were: "how
+    many workers is *this process* running?" is the one of ``_index_active``'s
+    three questions that was genuinely per-process. The other two — is this path
+    being worked on, is it exempt from the reaper — are questions about the tree
+    and are answered from its row.
+    """
+    actor._index_workers = MAX_CONCURRENT_INDEX_WORKERS
 
 
 class TestTheReaperCoversEveryAbandonedRow:
@@ -524,8 +555,14 @@ class TestTheReaperCoversEveryAbandonedRow:
     spawns ``PENDING`` only and ``_is_accounted_for`` counts in-flight as
     current. What changed is that there is no longer a moment called "restore"
     at which every such row is abandoned by construction, because another
-    process may be working on one right now. ``_index_active`` is the
-    discriminator and the age bound is the other half.
+    process may be working on one right now.
+
+    **The age bound is the whole predicate since story 55-5.** The per-process
+    exemption that used to sit beside it — a path this actor had spawned for was
+    never reaped, however old — is deleted, because it could only ever speak for
+    workers in *this* process and was therefore silently false for the case the
+    records moved to disk to support. The behaviour change it buys is guarded
+    below rather than left implicit.
     """
 
     def test_every_abandoned_in_flight_row_goes_back_to_pending(
@@ -551,15 +588,31 @@ class TestTheReaperCoversEveryAbandonedRow:
             path = f"{status.value}.md"
             assert live[path] == rows[path], f"{path} moved when it should not have"
 
-    def test_a_row_a_live_worker_is_carrying_is_never_reaped(self, harness: RagHarness) -> None:
-        """``_index_active`` is per-process by construction: a path in it is live **here**."""
+    def test_a_row_this_process_is_carrying_is_reaped_past_the_bound(
+        self, harness: RagHarness
+    ) -> None:
+        """Story 55-5 AC 10: the per-process exemption is **deleted**, deliberately.
+
+        A worker of *this* process still running past the bound now has its row
+        re-queued exactly as a remote one does. That is the honest form of the
+        rule — the old one claimed to know which rows were live and could only
+        ever know it for one interpreter — and the duplicate run it may cause is
+        harmless, because ``chunk_id`` is deterministic and every backend now
+        upserts a row rather than appending it.
+
+        **One process is this spec's whole scope**, which is why it spawns none:
+        the rule being deleted was per-process, so one process is the entirety of
+        where it ever applied.
+        """
         ancient = datetime.now(UTC) - timedelta(days=7)
         seed_row(harness.actor, "extraction.md", _row(RagStatus.EXTRACTION, ancient))
-        harness.actor._index_active.add("extraction.md")
+        # A worker of this process is carrying it — the exact condition the old
+        # exemption keyed on.
+        harness.actor._index_workers = 1
 
-        assert harness.actor.reap_abandoned_rows() is False
+        assert harness.actor.reap_abandoned_rows() is True
 
-        assert _row_on_disk(harness.actor, "extraction.md").status is RagStatus.EXTRACTION
+        assert _row_on_disk(harness.actor, "extraction.md").status is RagStatus.PENDING
 
     def test_a_row_inside_the_bound_is_not_reaped(self, harness: RagHarness) -> None:
         """The near side of the bound — a predicate with the comparison inverted fails here."""
@@ -600,12 +653,15 @@ class TestTheReaperCoversEveryAbandonedRow:
             harness.enable(collection=VectorStoreParam(backend="weaviate"))
         harness.actor.index_paths("")
 
-        assert harness.actor._index_active == {
-            "pending.md",
-            "extraction.md",
-            "splitting.md",
-            "embedding.md",
-        }
+        # Four workers running, and the four rows that were stuck are the four
+        # that moved — the count alone would not say *which*, so both are read.
+        assert harness.actor._index_workers == MAX_CONCURRENT_INDEX_WORKERS
+        moved = stored_rows(harness.actor)
+        assert {
+            path
+            for path, row in moved.items()
+            if row.status in (RagStatus.EXTRACTION, RagStatus.SPLITTING)
+        } == {"pending.md", "extraction.md", "splitting.md", "embedding.md"}
 
     def test_a_subclass_row_survives_the_re_queue_whole(self, harness: RagHarness) -> None:
         """Golden Rule 12: a copy-and-override, never a rebuild naming today's fields."""

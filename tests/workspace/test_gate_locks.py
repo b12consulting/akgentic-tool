@@ -20,17 +20,19 @@ exclusion.
 and orchestrator fakes and call ``observer()``, so every child drives the shipped
 bind, the shipped gate and the shipped journal. A child that constructed a
 ``WorkspaceTool`` and poked its private attributes would be testing this file.
+
+The runner itself — the prelude, ``run_child``, ``start_child``,
+``write_script``, ``barrier`` — moved into ``conftest.py`` when
+``test_tree_policy.py`` and ``test_record_lock.py`` needed it too. Nothing else
+in this module changed with the move.
 """
 
 from __future__ import annotations
 
 import fcntl
 import os
-import subprocess
-import sys
 import textwrap
 import time
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -52,95 +54,19 @@ from akgentic.tool.workspace.tool import WorkspaceTool
 from akgentic.tool.workspace.workspace import meta_dir_for
 from akgentic.tool.workspace.write.gate import lock_file_for
 from tests.workspace.conftest import (
+    CHILD_TIMEOUT_S,
     WORKSPACE_NAME,
     WORKSPACE_PATH,
+    ChildReport,
     FakeActorToolObserver,
     FakeOrchestratorProxy,
     mutate,
     read,
     requires_git,
+    run_child,
+    start_child,
+    write_script,
 )
-
-CHILD_TIMEOUT_S = 180.0
-"""Upper bound on a child — a failure budget, never a delay."""
-
-_PACKAGE_ROOT = str(Path(__file__).resolve().parents[2])
-"""The package root, so a child can import ``tests.workspace.conftest``."""
-
-_PRELUDE = f"""
-import os, sys, time
-sys.path.insert(0, {_PACKAGE_ROOT!r})
-from pathlib import Path
-from akgentic.tool.workspace.tool import WorkspaceTool
-from akgentic.tool.errors import RetriableError
-from tests.workspace.conftest import FakeActorToolObserver, FakeOrchestratorProxy
-
-
-def bind(name, **kwargs):
-    proxy = FakeOrchestratorProxy()
-    card = WorkspaceTool(workspace_id={WORKSPACE_NAME!r}, **kwargs)
-    card.observer(FakeActorToolObserver(proxy, name=name))
-    return card
-
-
-def barrier(meta, tag, count):
-    ready = Path(meta) / ("ready-" + tag)
-    ready.parent.mkdir(parents=True, exist_ok=True)
-    ready.write_text("x")
-    deadline = time.time() + 60
-    while time.time() < deadline:
-        if len(list(Path(meta).glob("ready-*"))) >= count:
-            return
-        time.sleep(0.005)
-    raise SystemExit("the barrier never completed")
-"""
-
-
-@dataclass
-class ChildReport:
-    """One child's exit code and what it printed."""
-
-    code: int
-    out: str
-    err: str
-
-
-def run_child(script: Path, workspaces_root: Path, *args: str) -> ChildReport:
-    """Run *script* in a fresh interpreter, with this suite's workspaces root."""
-    env = dict(os.environ)
-    env["AKGENTIC_WORKSPACES_ROOT"] = str(workspaces_root)
-    env.pop("AKGENTIC_WORKSPACE_META_ROOT", None)
-    done = subprocess.run(
-        [sys.executable, str(script), *args],
-        capture_output=True,
-        text=True,
-        timeout=CHILD_TIMEOUT_S,
-        env=env,
-        check=False,
-    )
-    return ChildReport(done.returncode, done.stdout.strip(), done.stderr.strip())
-
-
-def start_child(script: Path, workspaces_root: Path, *args: str) -> subprocess.Popen[str]:
-    """Start *script* in a fresh interpreter without waiting for it."""
-    env = dict(os.environ)
-    env["AKGENTIC_WORKSPACES_ROOT"] = str(workspaces_root)
-    env.pop("AKGENTIC_WORKSPACE_META_ROOT", None)
-    return subprocess.Popen(
-        [sys.executable, str(script), *args],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-    )
-
-
-def write_script(tmp_path: Path, name: str, body: str) -> Path:
-    """Write a child script made of the shared prelude plus *body*."""
-    script = tmp_path / name
-    script.write_text(_PRELUDE + textwrap.dedent(body), encoding="utf-8")
-    return script
-
 
 # ---------------------------------------------------------------------------
 # AC 7 — the check→write window is closed by a real cross-process flock

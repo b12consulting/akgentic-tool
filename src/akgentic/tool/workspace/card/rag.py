@@ -1,4 +1,57 @@
-"""The retrieval capabilities' wiring: the three factories, the provider, the announcement.
+"""The retrieval capabilities' wiring: the three factories, the provider, the policy.
+
+**The tree owns its retrieval policy, and that record lives here.**
+:class:`TreePolicy` is written to ``<meta>/policy.yaml`` — a top-level file
+beside ``exec.lock``, not inside ``rag/`` (one file per *document*) and not
+inside ``locks/`` (lock files only). It carries the chunking parameter the whole
+tree is chunked with and the two document caps the whole tree is held to, which
+were per-actor state until this module got them: two teams over one tree get two
+actors, one ``<meta>/index/`` and one ``scope=``, and
+``chunk_id(scope, path, source_sha, ordinal)`` carries no team — so two chunkings
+minted rows into one collection and a hit resolved against the wrong offsets.
+
+**A disagreement raises; it never merges.** Silently winning, silently losing and
+"merging" are three spellings of the same defect, so a second binder whose
+chunking or caps differ from what the tree publishes fails its bind, naming both
+values (:data:`WORKSPACE_POLICY_REFUSED`). That raise fails card binding and
+therefore team creation, deliberately, exactly as the sharing gate's does; it
+must never be caught and turned into a fallback. A section the record does not
+carry is nothing to disagree with, so an absent one is filled rather than
+contested.
+
+**No migration is owed and none is written.** The three-segment layout shipped to
+nobody and no deployment holds workspace data worth keeping (ADR-052
+§Consequences). A ``<meta>`` with no ``policy.yaml`` is simply a tree whose policy
+has not been published yet; the next retrieval binder publishes it. There is no
+version field and no compatibility branch.
+
+**Only a binder that has retrieval on publishes; every binder is held to what is
+published.** The document caps govern the extraction cache, and that cache is
+filled from the **read** path, which needs no retrieval — so a tree can hold a
+cached extraction under a policy nobody published. Publishing at every bind would
+close that and would create ``<meta>`` for every tree that ever binds a card,
+reversing the laziness ``FileLockBackend.acquire`` and
+``YamlDocumentStore.put_document`` both argue for at length. Reversing two stated
+decisions to close a hole that only opens when an author hand-declares a cap is
+the wrong trade, so the limit is stated instead:
+
+    Two retrieval-off cards over one tree with *different declared*
+    ``max_documents`` still evict each other's extractions. Nothing is corrupted —
+    the cache is derivable and disposable (ADR-045 §C5) — and no index exists to
+    hold two chunkings. The moment either card enables retrieval, the record is
+    published and the disagreement is refused.
+
+**Why the record lives in this module rather than in a spine one.** ADR-053
+Decision 1 calls policy spine material, and it cannot be yet: ``TreePolicy``'s
+chunking field is typed :class:`WorkspaceRagIndex`, which lives in
+``card/params.py``, and importing anything under ``card/`` executes
+``card/__init__.py`` — so a spine module importing it would close a cycle with the
+very module that imports the spine. The ways out are all worse than the wart:
+moving :class:`WorkspaceRagIndex` is 55-6's territory, typing the section
+``dict[str, Any]`` is Golden Rule 1, and enumerating the chunking fields on
+:class:`TreePolicy` is the field-drift defect Golden Rule 12 exists for. When the
+retrieval capability becomes ``rag/``, the record moves with the capability that
+owns it.
 
 :class:`RagFactories` declares **no Pydantic field**. Every field stays on
 :class:`~akgentic.tool.workspace.card.WorkspaceTool` in ``card/__init__.py``,
@@ -23,9 +76,18 @@ no guard of its own.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import logging
+import os
+import tempfile
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import yaml
+from pydantic import ValidationError
+
+from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.core import ContextState, _resolve
 from akgentic.tool.vector_store.protocol import VectorStoreParam
 from akgentic.tool.workspace.card.params import (
@@ -35,9 +97,10 @@ from akgentic.tool.workspace.card.params import (
 )
 from akgentic.tool.workspace.read.params import WorkspaceRead
 from akgentic.tool.workspace.readers import DocumentReader
+from akgentic.tool.workspace.workspace import meta_dir_for
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
     from akgentic.tool.workspace.actor import WorkspaceActor
 
@@ -74,6 +137,273 @@ in-memory index leaves a persisted ``EMBEDDED`` row over an empty engine after
 every restart — the mismatch the deleted re-mark rule existed to repair
 (ADR-051 Decision 11).
 """
+
+
+POLICY_FILE_NAME = "policy.yaml"
+"""The tree's published retrieval policy, directly under ``<meta>``.
+
+**Top level, beside ``exec.lock``** — not under ``rag/``, which holds one file per
+*document*, and not under ``locks/``, which holds lock files. YAML, like the
+document records and for their reason: a human debugging a refused bind reads
+this file.
+"""
+
+POLICY_LOCK_NAME = "policy"
+"""The lock file publishers contend on, inside :data:`LOCKS_DIR_NAME`."""
+
+LOCKS_DIR_NAME = "locks"
+"""The directory under ``<meta>`` holding one lock file per contended thing.
+
+**Spelled here rather than imported**, and it is the third such spelling —
+``write/gate.py`` and ``vector_store/backends/local.py`` hold the other two.
+Importing the gate's would make the retrieval capability import the write
+capability at runtime, which is worse than a third copy. One spine helper for the
+family is a cross-capability decision, recorded in the story's Open Questions
+rather than taken here.
+"""
+
+WORKSPACE_POLICY_REFUSED = (
+    "{card} asks workspace {path} to use {section}={card_value!r}, but the tree's "
+    "published retrieval policy holds {section}={tree_value!r}. Two teams over one "
+    "tree share one index and one scope, so a second policy would chunk one file "
+    "two ways into one collection or evict the other's cached extractions — there "
+    "is no merge that is not one of those. Give this card the tree's value, or "
+    "point it at a different workspace_id. The published policy is {file}."
+)
+"""Why a second binder's policy is refused rather than merged or ignored.
+
+Composed from a module constant with placeholders, the shape
+:data:`WORKSPACE_IN_MEMORY_REFUSED` and ``_require_sharing_permitted``'s message
+already use, so a spec asserts through the constant and never against a
+hand-typed sentence.
+"""
+
+WORKSPACE_POLICY_UNREADABLE = (
+    "{card} cannot read workspace {path}'s published retrieval policy at {file}: "
+    "{reason}. The bind is refused and the file is left in place. A policy is "
+    "neither derivable from the tree nor reclaimable by staleness, so proceeding "
+    "would let this card impose its own policy on a tree that already had one. "
+    "Repair or remove the file, whichever its content says is right."
+)
+"""Why a policy file that does not parse refuses the bind.
+
+Deliberately the **opposite** call from :meth:`YamlDocumentStore._read`, which
+treats a bad parse as a miss because a record is derivable and disposable, and
+from :meth:`FileLockBackend.release`, which reclaims a marker by staleness. A
+policy has neither property.
+"""
+
+
+class TreePolicy(SerializableBaseModel):
+    """What every card binding one tree has to agree about.
+
+    **The chunking half is the shipped parameter stored whole, never its fields
+    enumerated.** A chunking field added tomorrow takes part in the comparison by
+    construction — Golden Rule 12's reasoning, applied to a comparison rather than
+    to a copy. The comparison itself iterates ``model_fields`` for the same
+    reason, so a *section* added tomorrow is compared too.
+
+    The two caps are ``int`` because that is what
+    :class:`~akgentic.tool.workspace.models.WorkspaceConfig` holds, and ``| None``
+    so that *absent* and *declared at today's default* stay distinguishable — the
+    distinction ``VectorStoreParam.backend_declared`` exists to keep.
+
+    Attributes:
+        chunking: The chunking parameter every card on this tree indexes with, or
+            ``None`` when no retrieval binder has published one yet.
+        max_documents: The extraction cache's row cap as an author declared it, or
+            ``None`` when nobody declared one.
+        max_document_chars: The same for the character cap.
+    """
+
+    chunking: WorkspaceRagIndex | None = None
+    max_documents: int | None = None
+    max_document_chars: int | None = None
+
+
+def policy_file_for(workspace_path: str) -> Path:
+    """The file *workspace_path*'s published policy lives in.
+
+    Derived through :func:`~akgentic.tool.workspace.workspace.meta_dir_for` so the
+    record lands beside the tree the gate and the journal are guarding, and so no
+    read capability can name it.
+    """
+    return meta_dir_for(workspace_path) / POLICY_FILE_NAME
+
+
+def read_tree_policy(workspace_path: str, card_name: str) -> TreePolicy | None:
+    """Return the policy *workspace_path* publishes, or ``None`` when it publishes none.
+
+    **Creates nothing**: no ``mkdir``, no touch, no ``<meta>``. A tree that has
+    never had a retrieval binder costs one ``stat`` on a file that does not exist.
+
+    Args:
+        workspace_path: The resolved three-segment path.
+        card_name: Card class name, for the error message.
+
+    Returns:
+        The published policy, or ``None`` when the file is absent.
+
+    Raises:
+        ValueError: When the file exists and cannot be read or does not parse.
+            See :data:`WORKSPACE_POLICY_UNREADABLE`.
+    """
+    file = policy_file_for(workspace_path)
+    try:
+        raw = file.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError(_unreadable(card_name, workspace_path, file, exc)) from exc
+    try:
+        return TreePolicy.model_validate(yaml.safe_load(raw))
+    except (yaml.YAMLError, ValidationError, TypeError) as exc:
+        raise ValueError(_unreadable(card_name, workspace_path, file, exc)) from exc
+
+
+def _unreadable(card_name: str, workspace_path: str, file: Path, exc: BaseException) -> str:
+    """Compose the refusal for a policy file that cannot be read."""
+    return WORKSPACE_POLICY_UNREADABLE.format(
+        card=card_name, path=workspace_path, file=file, reason=exc
+    )
+
+
+def agreed_tree_policy(
+    published: TreePolicy | None, declared: TreePolicy, workspace_path: str, card_name: str
+) -> TreePolicy:
+    """Return what the tree should hold once *declared* has been admitted, or refuse.
+
+    Three answers per section, and the sections are taken from ``model_fields`` so
+    one added tomorrow is compared without this function being edited:
+
+    - the tree carries nothing there → *declared*'s value fills it;
+    - the tree's value equals *declared*'s → nothing happens, silently;
+    - they differ → :class:`ValueError`, naming both.
+
+    **Disagreement is whole-section inequality.** The chunking section is one
+    model compared whole, so a card differing in any field of it — including one
+    added after this was written — is refused. A section *this card* leaves
+    ``None`` asks for nothing and can disagree with nothing.
+
+    Args:
+        published: What the tree already holds, or ``None`` when it holds nothing.
+        declared: What this card asks the tree to be.
+        workspace_path: The resolved three-segment path, for the error message.
+        card_name: Card class name, for the error message.
+
+    Returns:
+        The policy the tree should hold — *published* with the absent sections
+        this card fills, derived by ``model_copy(update=...)`` so a field added
+        tomorrow survives (Golden Rule 12).
+
+    Raises:
+        ValueError: On any disagreeing section. See :data:`WORKSPACE_POLICY_REFUSED`.
+    """
+    if published is None:
+        return declared
+    updates: dict[str, Any] = {}
+    for section in TreePolicy.model_fields:
+        mine = getattr(declared, section)
+        theirs = getattr(published, section)
+        if mine is None or mine == theirs:
+            continue
+        if theirs is None:
+            updates[section] = mine
+            continue
+        raise ValueError(
+            WORKSPACE_POLICY_REFUSED.format(
+                card=card_name,
+                path=workspace_path,
+                section=section,
+                card_value=mine,
+                tree_value=theirs,
+                file=policy_file_for(workspace_path),
+            )
+        )
+    return published.model_copy(update=updates)
+
+
+def publish_tree_policy(workspace_path: str, declared: TreePolicy, card_name: str) -> None:
+    """Admit *declared* into *workspace_path*'s published policy, under the lock.
+
+    A read-modify-write: the record is re-read **inside** the hold and written
+    temp-then-``replace()``, so two processes binding one tree at the same instant
+    produce one published policy and, where they disagree, exactly one refusal.
+    The re-read inside the hold is the load-bearing half — a hold taken around a
+    decision made on a read from *before* it serialises nothing.
+
+    Args:
+        workspace_path: The resolved three-segment path.
+        declared: What this card asks the tree to be.
+        card_name: Card class name, for the error message.
+
+    Raises:
+        ValueError: When the file does not parse, or when a section disagrees.
+    """
+    meta_dir = meta_dir_for(workspace_path)
+    with _policy_hold(meta_dir, workspace_path):
+        published = read_tree_policy(workspace_path, card_name)
+        agreed = agreed_tree_policy(published, declared, workspace_path, card_name)
+        if agreed != published:
+            _write_tree_policy(meta_dir / POLICY_FILE_NAME, agreed)
+
+
+@contextlib.contextmanager
+def _policy_hold(meta_dir: Path, workspace_path: str) -> Iterator[None]:
+    """Hold ``<meta>/locks/policy`` for the duration of the block.
+
+    The idiom is :meth:`~akgentic.tool.workspace.card.CardGate._hold`'s and
+    :meth:`~akgentic.tool.vector_store.backends.local.LocalBackend._hold`'s: an
+    exclusive ``flock`` on a lazily created file, unlocked and closed in
+    ``finally``, **never unlinked** — unlinking would let a second process create a
+    fresh inode and take a hold that excludes nobody.
+
+    A ``<meta>`` whose locks directory cannot be created logs one WARNING and
+    proceeds unserialised, which is ``CardGate._hold``'s stated choice copied
+    rather than re-decided: what is lost is the ordering between two simultaneous
+    first binds, and the comparison inside still runs against whatever is on disk.
+    """
+    handle: int | None = None
+    try:
+        try:
+            lock_path = meta_dir / LOCKS_DIR_NAME / POLICY_LOCK_NAME
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(handle, fcntl.LOCK_EX)
+        except OSError:
+            logger.warning(
+                "Workspace %s: could not take the policy lock under %s — publishing unserialised",
+                workspace_path,
+                meta_dir / LOCKS_DIR_NAME,
+                exc_info=True,
+            )
+        yield
+    finally:
+        if handle is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(handle, fcntl.LOCK_UN)
+            os.close(handle)
+
+
+def _write_tree_policy(target: Path, policy: TreePolicy) -> None:
+    """Dump *policy* to a temp file beside *target*, then replace it in one step.
+
+    ``YamlDocumentStore._atomic_write``'s shape — a copy rather than an import, so
+    this capability does not reach into the document store for eight lines. The
+    temp file is created **in the destination directory** so the replace is a
+    same-filesystem rename, which is what makes it atomic; any ``BaseException``
+    unlinks it before re-raising, so a failed write leaves the previous file
+    untouched and no debris behind.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=target.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            yaml.dump(policy.model_dump(mode="json"), handle, default_flow_style=False)
+        Path(tmp).replace(target)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
 
 
 def workspace_backend(param: VectorStoreParam) -> str:
@@ -147,6 +477,8 @@ class RagFactories:
         workspace_rag_search: WorkspaceRagSearch | bool
         workspace_read: WorkspaceRead | bool
         vector_store: VectorStoreParam
+        max_documents: int | None
+        max_document_chars: int | None
 
         _workspace_proxy: WorkspaceActor | None
         _workspace_tell: WorkspaceActor | None
@@ -200,8 +532,61 @@ class RagFactories:
         return configured if isinstance(configured, DocumentReader) else DocumentReader()
 
     ##
-    ## Bind time — one fire-and-forget announcement
+    ## Bind time — the tree's policy, then one fire-and-forget announcement
     ##
+    def _declared_policy(self) -> TreePolicy:
+        """What this card asks the tree's retrieval policy to be.
+
+        The chunking section is this card's contribution **only when retrieval is
+        on**: a card with no retrieval capability chunks nothing and has no
+        parameters to offer, so it leaves that section ``None`` and can neither
+        publish it nor disagree about it.
+
+        The two caps are the **author's declarations**, not the derived values. A
+        derived cap is a property of this bind — the resolved backend, on this
+        host — and publishing it would put a value nobody wrote on the tree, where
+        the next host's derivation would then be refused against it.
+        """
+        return TreePolicy(
+            chunking=self._rag_params() if self._rag_enabled() else None,
+            max_documents=self.max_documents,
+            max_document_chars=self.max_document_chars,
+        )
+
+    def _require_tree_policy(self, workspace_path: str, card_name: str) -> None:
+        """Agree with the tree's published policy, publishing it if retrieval is on.
+
+        Runs in ``observer()`` **after** the store param is resolved and **before**
+        anything with a side effect, so a refused bind seeds nothing, creates no
+        actor and emits no ``WorkspaceAttached`` — the ordering discipline
+        ``_require_sharing_permitted`` already states.
+
+        **Only a retrieval binder publishes; every binder reads.** A card with
+        retrieval off writes nothing and creates nothing — no ``mkdir``, no touch,
+        no ``<meta>`` — and a ``read`` of an absent record creates nothing either.
+        That is what keeps a default bind's disk footprint empty, which
+        ``test_the_tree_and_its_metadata_sibling_hold_exactly_this`` pins. It is
+        still *held to* what is published: its declared caps are compared, and a
+        disagreement refuses it.
+
+        Args:
+            workspace_path: The resolved three-segment path.
+            card_name: Card class name, for the error messages.
+
+        Raises:
+            ValueError: When the policy file does not parse, or when any section
+                of it disagrees with this card. It fails card binding and
+                therefore team creation, deliberately, and must never be caught
+                and turned into a fallback.
+        """
+        declared = self._declared_policy()
+        if self._rag_enabled():
+            publish_tree_policy(workspace_path, declared, card_name)
+            return
+        published = read_tree_policy(workspace_path, card_name)
+        if published is not None:
+            agreed_tree_policy(published, declared, workspace_path, card_name)
+
     def _announce_rag(self) -> None:
         """Tell the actor to turn retrieval on for this tree — fire and forget.
 
