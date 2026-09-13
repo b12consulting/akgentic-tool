@@ -128,8 +128,14 @@ CAPABILITY_CLOSURES: dict[str, frozenset[str]] = {
         # 55-7's.
         f"{PACKAGE}.actor",
     },
+    # **The first row with no non-spine entry at all**, and that is the finding
+    # rather than an omission. ``journal/`` imports exactly four names from
+    # ``models`` and nothing else in the package: no ``akgentic.tool.core``
+    # module, no sibling capability, under ``TYPE_CHECKING`` or otherwise. Where
+    # ``write/`` needs five, this needs none.
+    "journal": SPINE | {f"{PACKAGE}.journal"},
 }
-"""One row per capability module. The three stories after 55-3 add three more rows.
+"""One row per capability module. Stories 55-6 and 55-7 add the last two rows.
 
 The value is the complete allow-list for that capability's transitive closure:
 its own modules, plus the spine modules it genuinely needs.
@@ -139,6 +145,41 @@ non-spine entries show why. The runtime closure excludes annotation-only imports
 so ``lock`` and ``actor`` are not in it; the direct-edge rule includes them, so
 they must still be on the row. A ``TYPE_CHECKING`` import therefore keeps a module
 out of the *runtime* closure and never off the row.
+"""
+
+CAPABILITY_SPINE_REACH: dict[str, frozenset[str]] = {
+    "read": frozenset({f"{PACKAGE}.workspace", f"{PACKAGE}.models", f"{PACKAGE}.readers"}),
+    "write": frozenset({f"{PACKAGE}.workspace", f"{PACKAGE}.models", f"{PACKAGE}.readers"}),
+    # **Not the same triple, and that is the whole reason this dict exists.**
+    # ``journal/`` never reaches ``workspace.py``: it imports only ``models``,
+    # which imports ``documents.models`` and — inside a function — ``readers``,
+    # and none of those imports ``workspace``. ``readers`` is the interesting
+    # entry here rather than the obvious one: it is reached *only* through that
+    # in-function import, so a graph that followed no transitive edge would miss
+    # it while still satisfying a mere "non-empty" check.
+    "journal": frozenset({f"{PACKAGE}.models", f"{PACKAGE}.readers"}),
+}
+"""The spine modules each capability actually reaches — per row, never one literal.
+
+**Split out of the non-vacuity assertion below, which carried the triple inline
+and would have reddened the first correct row that differed.** The value had been
+read off ``read/``'s closure and then asserted of every capability, so it encoded
+one capability's dependencies as a property of all of them; ``journal/`` is the
+row that finds it, by not reaching ``workspace``.
+
+This is the second instance of that shape in this module — the first was
+:meth:`TestTheSweepLooksAtTheRightThing.test_the_closure_attributes_a_package_nobody_imports_by_name`,
+which was **de-parametrised** instead. The two fixes differ deliberately, and the
+distinction is which kind of claim was being made. That one asserts a property of
+:func:`_edges` that every row shares, so asserting it once is the honest form.
+*Which spine modules a capability reaches* genuinely differs per capability, so
+here the claim is real for every row and only the expected value is per-row. It
+becomes data.
+
+**Its keys must match :data:`CAPABILITY_CLOSURES`'s exactly**, and a sentinel
+below asserts it. Two dicts one story can update by half is the new way this
+guard can rot, and a row present in the first and missing from the second would
+assert nothing at all about that capability.
 """
 
 MINIMUM_MODULES_PARSED = 20
@@ -280,6 +321,20 @@ class TestTheSweepLooksAtTheRightThing:
         """An allow-list entry naming no module allows nothing and hides a typo."""
         assert SPINE <= set(modules)
 
+    def test_the_two_capability_tables_describe_the_same_capabilities(self) -> None:
+        """Key parity, because two tables are two things one story can update by half.
+
+        A capability present in :data:`CAPABILITY_CLOSURES` and missing from
+        :data:`CAPABILITY_SPINE_REACH` would have its containment checked and its
+        non-vacuity not checked at all — the assertion that stops an empty
+        closure from passing would be the one that went missing. The subscript in
+        that spec is deliberately direct rather than a ``.get(…, frozenset())``:
+        an empty ``frozenset`` is a subset of everything, so the defensive
+        spelling would pass silently and this sentinel is what reports the rot
+        instead.
+        """
+        assert set(CAPABILITY_CLOSURES) == set(CAPABILITY_SPINE_REACH)
+
     def test_the_closure_attributes_a_package_nobody_imports_by_name(
         self, modules: dict[str, Path]
     ) -> None:
@@ -311,7 +366,7 @@ class TestTheSweepLooksAtTheRightThing:
 
 @pytest.mark.parametrize("capability", sorted(CAPABILITY_CLOSURES))
 class TestACapabilityDependsOnTheSpineAndNothingElse:
-    """One row per capability module; the three later stories add three more."""
+    """One row per capability module; stories 55-6 and 55-7 add the last two."""
 
     def test_the_closure_is_inside_the_allow_list(
         self, capability: str, modules: dict[str, Path]
@@ -334,11 +389,17 @@ class TestACapabilityDependsOnTheSpineAndNothingElse:
         not as "non-empty": a closure holding only the capability's own modules
         would satisfy a mere emptiness check while proving the graph followed no
         edge at all.
+
+        **The expected value is per-row data**
+        (:data:`CAPABILITY_SPINE_REACH`), not one literal. It was one literal,
+        read off ``read/``'s closure, and ``journal/`` — which reaches ``models``
+        and ``readers`` but never ``workspace`` — is a correct row that would
+        have reddened it.
         """
         closure = _closure(_modules_under(capability, modules), modules)
 
         assert closure, f"{capability}/ has an empty closure — no edge was followed"
-        assert {f"{PACKAGE}.workspace", f"{PACKAGE}.models", f"{PACKAGE}.readers"} <= closure
+        assert CAPABILITY_SPINE_REACH[capability] <= closure
 
     def test_it_names_no_other_capability_even_in_an_annotation(
         self, capability: str, modules: dict[str, Path]

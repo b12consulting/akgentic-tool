@@ -41,6 +41,12 @@ from akgentic.tool.workspace.execution import (
     effective_budget,
     mutation_busy,
 )
+from akgentic.tool.workspace.journal import (
+    JOURNAL_LOCK_FILENAME,
+    LOCKS_DIR_NAME,
+    GitJournal,
+    Identity,
+)
 from akgentic.tool.workspace.lock import FileLockBackend, LockTicket
 from akgentic.tool.workspace.tool import WorkspaceTool
 from akgentic.tool.workspace.workspace import meta_dir_for
@@ -593,6 +599,124 @@ class TestTheJournalSurvivesTwoProcesses:
             "collision — if git has stopped using index.lock, this module's lock and "
             "the reasoning behind it need revisiting rather than deleting"
         )
+
+
+# ---------------------------------------------------------------------------
+# Story 55-4 AC 11 — an enabled card's commit runs inside the journal hold
+# ---------------------------------------------------------------------------
+
+
+@requires_git
+class TestAnEnabledCardCommitsInsideTheJournalHold:
+    """The link ``card → _gated → commit_paths → _commit → _holding``, asserted.
+
+    The class above proves the ``flock`` is load-bearing, and it proves it on
+    ``GitJournal`` objects its children build **directly**. That leaves the
+    shipped route into ``_holding`` unpinned: nothing asserted that a *card's*
+    accepted mutation reaches the hold at all. A commit that went out from under
+    it would lose exactly what that class measured — commits, silently — while
+    every spec there stayed green, because they never drive a card.
+
+    So this is the same probe shape as
+    :class:`TestTheWritersRefreshHappensInsideTheHeldLock`, pointed at the other
+    lock family: a second interpreter takes a non-blocking ``LOCK_EX`` on the
+    journal lock file at the moment ``_staged_commit`` runs, and a card is what
+    drives it, so the mutation path is the shipped one.
+
+    **``_staged_commit`` is the hook rather than ``_commit``** because its own
+    docstring says the caller holds the lock — the invariant under test is
+    stated there, so that is where a violation of it shows up.
+    """
+
+    _PROBE = """
+        import fcntl, os, sys
+
+        handle = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            print("ACQUIRED", flush=True)
+        except OSError:
+            print("BLOCKED", flush=True)
+        """
+
+    @staticmethod
+    def _lock_path() -> Path:
+        """The journal lock file, from the journal module's own two constants.
+
+        Never a literal. A spec that re-spelled this path would stay green
+        forever while probing a file nothing locks.
+        """
+        return meta_dir_for(WORKSPACE_PATH) / LOCKS_DIR_NAME / JOURNAL_LOCK_FILENAME
+
+    def _journalling_card(self, orchestrator_proxy: FakeOrchestratorProxy) -> WorkspaceTool:
+        """A bound card with the journal **on** — the only configuration that commits."""
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME, git_journal=True)
+        card.observer(FakeActorToolObserver(orchestrator_proxy, name="alice"))
+        return card
+
+    def _written_probe(self, tmp_path: Path) -> Path:
+        """The probe script on disk."""
+        probe = tmp_path / "journal_probe.py"
+        probe.write_text(textwrap.dedent(self._PROBE), encoding="utf-8")
+        return probe
+
+    def test_no_other_process_can_take_the_journal_lock_while_a_commit_runs(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspaces_root: Path,
+        workspace_tree: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A card's accepted write commits with every other committer held out.
+
+        **Asserted as "non-empty, and every entry ``BLOCKED``", never as
+        ``seen == ["BLOCKED"]``.** The class this copies wraps ``_accept``,
+        which runs once per published path; ``_staged_commit`` can run **twice**
+        in one mutation, because ``_gated`` calls ``commit_out_of_band`` before
+        ``commit_paths`` and the out-of-band commit is skipped only while the
+        tree happens to be clean. A list equality would make this spec depend on
+        that, which is a fact about the fixture and not about the lock. The
+        non-emptiness is what carries the non-vacuity instead, alongside the
+        positive control below.
+        """
+        card = self._journalling_card(orchestrator_proxy)
+        probe = self._written_probe(tmp_path)
+        seen: list[str] = []
+        real = GitJournal._staged_commit
+
+        def probing(
+            this: GitJournal, add_args: list[str], identity: Identity, subject: str, body: str
+        ) -> None:
+            seen.append(run_child(probe, workspaces_root, str(self._lock_path())).out)
+            real(this, add_args, identity, subject, body)
+
+        monkeypatch.setattr(GitJournal, "_staged_commit", probing)
+
+        assert card.apply_write("notes.md", "mine\n").message == "Written: notes.md"
+
+        assert seen, "no commit ran at all — the probe observed nothing"
+        assert set(seen) == {"BLOCKED"}, seen
+
+    def test_the_probe_can_take_the_journal_lock_once_the_mutation_has_finished(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspaces_root: Path,
+        workspace_tree: Path,
+        tmp_path: Path,
+    ) -> None:
+        """The positive control, and it is mandatory rather than decoration.
+
+        A probe that could never acquire — a mis-spelled path, a child that
+        always failed, a wrong flag — would make the spec above pass with the
+        hold deleted outright. So the same probe, on the same file, after the
+        mutation has released it, must come back ``ACQUIRED``.
+        """
+        card = self._journalling_card(orchestrator_proxy)
+        card.apply_write("notes.md", "mine\n")
+        probe = self._written_probe(tmp_path)
+
+        assert run_child(probe, workspaces_root, str(self._lock_path())).out == "ACQUIRED"
 
 
 # ---------------------------------------------------------------------------

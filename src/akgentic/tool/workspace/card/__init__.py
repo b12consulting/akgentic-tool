@@ -644,7 +644,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         return effective_budget(params.timeout_s if params is not None else DEFAULT_EXEC_TIMEOUT_S)
 
     def _open_journal(self, workspace_path: str) -> None:
-        """Open this card's view of the tree's git journal, or leave it inert.
+        """Open this card's view of the tree's git journal, or build none at all.
 
         **One journal object per card, over one repository per tree**, which is
         the arrangement ADR-051 Decision 4 chose over routing commits through an
@@ -653,16 +653,22 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         writers that matter. What does serialise them is the journal's own
         ``flock`` (:meth:`~akgentic.tool.workspace.journal.GitJournal._holding`).
 
-        ``initialise`` runs **only when the card asked for a journal**. With
-        ``git_journal=False`` the object is left un-initialised, which is the
-        same inert state ``initialise`` would put it in — every method a no-op —
-        minus a second "disabled by configuration" warning for a tree whose actor
-        has just logged one.
+        **A card that did not ask for a journal builds none**, and ``_journal``
+        stays ``None``. This method used to construct one unconditionally and
+        merely leave it un-initialised, on the argument that an inert object is
+        the same thing as no object with every method a no-op. It is not quite:
+        the point of an optional capability is that a reader can price it, and an
+        object built on every bind prices at *something* no matter how little it
+        does. The convergence point never needed it either — the three ``None``
+        guards in :mod:`akgentic.tool.workspace.write.gate` predate this change
+        and were always what made the degradation safe.
 
         Args:
             workspace_path: The resolved three-segment path, whose metadata
                 directory holds the commit lock.
         """
+        if not self.git_journal:
+            return
         assert self._workspace is not None
         journal = GitJournal(
             self._workspace.root,
@@ -670,8 +676,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
             timeout_s=DEFAULT_GIT_TIMEOUT_S,
             meta_dir=meta_dir_for(workspace_path),
         )
-        if self.git_journal:
-            journal.initialise()
+        journal.initialise()
         self._journal = journal
 
     def _resolve_store_param(self, workspace_path: str) -> VectorStoreParam | None:

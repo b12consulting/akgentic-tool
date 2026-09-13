@@ -1241,11 +1241,13 @@ class TestTheGateSurvivesWithoutGit:
             after_mutations = journal_warnings()
 
         # **The property AC8 asks for is per *mutation*, and it is unchanged:
-        # five writes add nothing.** What changed is the denominator. There are
-        # two journal objects over one tree since 52-5 — the card's, which every
-        # gated mutation commits through, and the actor's, which exec's
-        # discovered commit still uses — so a bind that turns the journal off
-        # says so once per object rather than once. At most one per journal, and
+        # five writes add nothing.** What changed is the denominator, and since
+        # 55-4 it depends on the mode. The actor's journal is built and
+        # initialised on every bind; the card's exists only when ``git_journal``
+        # is on. So ``card-disabled`` has one object and one warning — always the
+        # actor's, because the card never built anything to warn — and
+        # ``git-absent`` has two, the card's included, which is why the bound
+        # below is a range rather than a number. At most one per journal, and
         # never one per mutation, is what keeps a git-less host quiet.
         assert after_mutations == after_bind
         assert 1 <= after_bind <= 2

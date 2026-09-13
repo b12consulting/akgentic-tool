@@ -52,6 +52,27 @@ point it would bite:
   ``GIT_`` key before ours are set, and both configuration files are switched
   off with it — ``core.excludesFile`` and ``core.autocrlf`` change what a commit
   *contains*, not how it looks.
+
+**What this module is allowed to import, and what enforces it.** The journal is a
+capability module (ADR-053 Decision 1), so it holds the whole of the git
+capability and nothing else: :class:`GitJournal`, :class:`Identity`,
+:func:`git_dir_for`, the three sanitisers, the commit lock's two constants and
+``_holding`` itself. It may import the package's **spine** — and in practice
+imports four names from :mod:`akgentic.tool.workspace.models`, which is the whole
+of it. It must not import a sibling capability, the card, or the actor, under
+``if TYPE_CHECKING:`` any more than at runtime. That is not a convention anyone
+has to remember: ``tests/workspace/test_capability_import_closure.py`` carries a
+row for ``journal`` and computes the transitive closure statically, and the row
+is the first with no non-spine entry at all.
+
+**The stated limit: this module is findable and priceable, and it is not yet
+deletable.** Two reaches into it survive — ``write/gate.py`` constructs an
+:class:`Identity` in ``_gated`` at runtime, and ``actor/__init__.py`` and
+``actor/execution.py`` both import ``GitJournal, Identity``. Promoting
+``Identity`` and the sanitisers into the spine as *vocabulary* is the proposed
+answer, and it lives in story 55-3's Open Question 3 rather than here: taking it
+would re-point five facade imports and edit three modules other stories own,
+which is a larger change than the one that made this a module.
 """
 
 from __future__ import annotations

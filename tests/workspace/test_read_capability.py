@@ -176,11 +176,28 @@ class TestEnablingNothingCostsNothing:
     ) -> None:
         """``git_journal`` is off by default, so ``initialise`` never runs.
 
-        The row story 55-4 tightens: today a ``GitJournal`` object is still
-        constructed. Constructing one creates nothing, which is why the
-        observable — the absent sibling — is already its final value.
+        **This row is about ``initialise``, and only about it.** Story 55-4
+        removed the construction as well, and the assertion here did not move
+        by one character: constructing a ``GitJournal`` creates nothing, so the
+        absent sibling was never evidence for the construction and was already
+        at its final value. The construction has its own row below, because a
+        spec asserting both claims could go red for either reason.
         """
         assert not git_dir_for(workspace_tree).exists()
+
+    def test_it_builds_no_journal_at_all(self, read_only_card: WorkspaceTool) -> None:
+        """Not merely un-initialised — absent. The row story 55-4 added.
+
+        **A white-box assertion on the card's own ``PrivateAttr``, stated as
+        such because there is no black-box form of it to prefer.**
+        ``GitJournal.__init__`` assigns five attributes and derives two paths;
+        it opens nothing, creates nothing and logs nothing. So the construction
+        has no observable outside the card, and the only honest guard against
+        its return is the attribute itself. The mutation that restores the
+        unconditional construction is what makes this row load-bearing rather
+        than decorative.
+        """
+        assert read_only_card._journal is None
 
     def test_the_tree_and_its_metadata_sibling_hold_exactly_this(
         self, read_only_card: WorkspaceTool, workspace_tree: Path

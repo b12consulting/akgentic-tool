@@ -1580,14 +1580,29 @@ class TestBothTablesAreIdenticalWithoutAJournal:
         # a journal buys is a line, never a missing one.
         assert len(off_lines) <= len(on_lines)
 
-    def test_a_card_with_no_journal_still_has_one_object_that_is_simply_off(
-        self, wired_card: WorkspaceTool
-    ) -> None:
-        """The degradation is a disabled journal, never a ``None`` nobody guarded.
+    def test_a_card_with_no_journal_builds_none_at_all(self, wired_card: WorkspaceTool) -> None:
+        """**Premise reversed by decision** (ADR-053 Decision 1, story 55-4 AC 3).
 
-        Every ``GitJournal`` method is a no-op once the journal is off, which is
-        what lets the convergence point call it unconditionally.
+        The old spec asserted that a card without a journal still held one
+        object, simply disabled, and gave as its reason that every method being
+        a no-op is *"what lets the convergence point call it unconditionally"*.
+        That reason was already false when it was written: the convergence point
+        has never called it unconditionally. ``_gated`` reads ``self._journal``
+        into a local and guards ``is not None`` around both
+        ``commit_out_of_band`` and ``commit_paths``, and the authorship lookup
+        returns early on the same test — three guards, all of them older than
+        this change. So nothing depended on the object existing, and an optional
+        capability that builds something on every bind is one a reader cannot
+        price at zero.
+
+        **This is a white-box assertion on the card's own ``PrivateAttr``, and
+        there is no alternative to want.** ``GitJournal.__init__`` assigns five
+        attributes and derives two paths: it opens nothing, creates nothing and
+        logs nothing, so the construction has no observable outside the card.
+
+        Its behavioural half is not duplicated here. That a journal-off card
+        still accepts, still refuses with identical wording and still names
+        nobody is :class:`~tests.workspace.test_journal.TestTheGateSurvivesWithoutGit`'s,
+        in full.
         """
-        assert wired_card._journal is not None
-        assert wired_card._journal.enabled is False
-        assert wired_card._journal.last_author("notes.md") is None
+        assert wired_card._journal is None
