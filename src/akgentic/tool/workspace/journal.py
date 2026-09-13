@@ -99,7 +99,7 @@ LOCKS_DIR_NAME = "locks"
 """The directory under ``<meta>`` holding every ``flock`` file of one tree.
 
 Shared with the per-path write locks
-(:mod:`akgentic.tool.workspace.card.gate`) — one directory, one idiom, two
+(:mod:`akgentic.tool.workspace.write.gate`) — one directory, one idiom, two
 families of lock file, so nothing has to remember a second place to look.
 """
 

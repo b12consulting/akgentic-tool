@@ -20,7 +20,7 @@ from akgentic.tool.workspace.actor import (
     WorkspaceActor,
     workspace_actor_name,
 )
-from akgentic.tool.workspace.card.gate import _preserve_endings
+from akgentic.tool.workspace.write.gate import _preserve_endings
 from akgentic.tool.workspace.card.params import WorkspaceExec
 from akgentic.tool.workspace.edit import EditItem
 from akgentic.tool.workspace.models import WorkspaceConfig
@@ -817,7 +817,7 @@ class TestRetriableErrorWorkspaceTool:
         # raised there will be caught by the outer except PermissionError handler.
         # It now runs on the actor, which is why the patch target moved modules.
         with patch(
-            "akgentic.tool.workspace.card.gate.parse_patch",
+            "akgentic.tool.workspace.write.gate.parse_patch",
             side_effect=PathEscapeError("path escapes workspace root"),
         ):
             with pytest.raises(RetriableError, match="Path escapes workspace root"):

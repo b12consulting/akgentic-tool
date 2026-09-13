@@ -50,7 +50,7 @@ EXEC_LOCK_FILENAME = "exec.lock"
 One tree, one marker: this hold is over the **whole** tree, exactly as the
 actor's lease was. The per-path write locks are a different mechanism in a
 different file — an ``fcntl.flock`` under ``<meta>/locks/``, taken and released
-inside one mutation (:mod:`akgentic.tool.workspace.card.gate`) — and the two must
+inside one mutation (:mod:`akgentic.tool.workspace.write.gate`) — and the two must
 not be confused: this one fences a shell command whose write set is unknowable,
 those ones close a check-then-write window on a named path.
 """

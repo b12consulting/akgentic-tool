@@ -35,7 +35,7 @@ from pathlib import Path
 
 import pytest
 
-from akgentic.tool.workspace.card.gate import lock_file_for
+from akgentic.tool.workspace.write.gate import lock_file_for
 from akgentic.tool.workspace.execution import (
     DEFAULT_EXEC_TIMEOUT_S,
     LEASE_GRACE_S,

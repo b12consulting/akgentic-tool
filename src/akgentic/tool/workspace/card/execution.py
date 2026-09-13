@@ -4,11 +4,15 @@ Move-only with respect to the sandbox: nothing behind the exec surface changes
 here. The lease, the ``ExecWorker`` and the backend arrangement stay exactly
 where ADR-017 and ADR-036 §5 put them.
 
-**One directional sibling edge:** this module imports :func:`_bound` from
-``card/write.py``. The helper is used by both the mutation factories and the
-exec factories, and it belongs with the mutations; duplicating it would give the
-gate two spellings, and hoisting it into ``card/__init__.py`` would make a mixin
-module import the module that imports it — a cycle.
+**No sibling edge:** :func:`_bound` lives here. It used to sit beside the
+mutation factories, which had stopped using it — a mutation's unbound state is a
+:class:`~akgentic.tool.workspace.workspace.Filesystem` that was never resolved
+(``CardGate._tree``), and this module was its only caller. Keeping it there cost
+the write capability a **runtime** import of
+:mod:`akgentic.tool.workspace.actor`, purely for the annotation in its signature,
+which executes ``actor/__init__.py`` and with it the whole retrieval pipeline.
+The exec proxy is the only thing that still asks the actor for anything, so the
+helper belongs to the exec capability and travels with it.
 
 :class:`ExecFactories` is a **mixin**: it declares no Pydantic field, and the
 two names it consumes off ``self`` are declared under ``if TYPE_CHECKING:`` so
@@ -24,7 +28,6 @@ from akgentic.tool.core.deferred import poll_deferred
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.actor import WorkspaceActor
 from akgentic.tool.workspace.card.params import WorkspaceExec
-from akgentic.tool.workspace.card.write import _bound
 from akgentic.tool.workspace.execution import (
     ExecStatus,
     effective_budget,
@@ -33,6 +36,24 @@ from akgentic.tool.workspace.execution import (
     poll_attempts_within,
     timed_out,
 )
+
+_UNBOUND_MSG = (
+    "The workspace actor is not bound — a mutating WorkspaceTool must be wired "
+    "through observer() with a live orchestrator."
+)
+
+
+def _bound(proxy: WorkspaceActor | None) -> WorkspaceActor:
+    """Return the mutation proxy, refusing to fall back to an ungated write.
+
+    Raises:
+        RuntimeError: When the card was never wired to an orchestrator. There is
+            deliberately no ungated path to fall back to: one would be a bypass
+            of the gate reachable from any harness that skipped the binding.
+    """
+    if proxy is None:
+        raise RuntimeError(_UNBOUND_MSG)
+    return proxy
 
 
 def _settled_status(status: ExecStatus) -> ExecStatus | None:

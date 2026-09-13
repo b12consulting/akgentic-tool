@@ -1316,7 +1316,7 @@ class TestEveryMutationConvergesOnOnePoint:
         """
         import inspect
 
-        from akgentic.tool.workspace.card import gate as gate_module
+        from akgentic.tool.workspace.write import gate as gate_module
 
         body = inspect.getsource(gate_module.CardGate._gated)
         for duty in ("_busy_refusal", "commit_out_of_band", "_hold", "commit_paths", "_mark_stale"):

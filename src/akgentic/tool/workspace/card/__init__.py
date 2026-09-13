@@ -27,13 +27,14 @@ the card creates its actor as an ordinary team child, which is the seam
 per-process — the sandbox, the document reader, the retrieval pipeline — and no
 shared state at all.
 
-The factory bodies live in five mixins. Four are still siblings —
-``card/write.py``, ``card/gate.py``, ``card/execution.py``, ``card/rag.py`` — and
-the read capability has moved out to ``workspace/read/``, which carries its
-closures, its private helpers and its six parameters together; the four stories
-after it move the rest the same way. ``card/params.py`` holds the parameters of
-the capabilities that have not moved yet, re-exports the read capability's six so
-the module path stored records name keeps resolving, and owns ``Resource`` /
+The factory bodies live in five mixins. Two are still siblings —
+``card/execution.py`` and ``card/rag.py`` — and two capabilities have moved out:
+``workspace/read/`` and ``workspace/write/``, each carrying its closures, its
+private helpers and its six parameters together, with the mutation gate inside
+``write/`` because it is the write capability's. The three stories after them
+move the rest the same way. ``card/params.py`` holds the parameters of the
+capabilities that have not moved yet, re-exports both moved capabilities' twelve
+so the module paths stored records name keep resolving, and owns ``Resource`` /
 ``ResourceType`` outright.
 
 What stays here is the card itself: its fields, ``observer()`` with its private
@@ -84,27 +85,19 @@ from akgentic.tool.workspace.actor import (
     workspace_actor_name,
 )
 from akgentic.tool.workspace.card.execution import ExecFactories
-from akgentic.tool.workspace.card.gate import CardGate
 from akgentic.tool.workspace.card.params import (
     Resource,
     ResourceType,
-    WorkspaceDelete,
-    WorkspaceEdit,
     WorkspaceExec,
-    WorkspaceMkdir,
-    WorkspaceMultiEdit,
-    WorkspacePatch,
     WorkspaceRagIndex,
     WorkspaceRagList,
     WorkspaceRagSearch,
-    WorkspaceWrite,
 )
 from akgentic.tool.workspace.card.rag import (
     RagFactories,
     require_workspace_backend,
     workspace_backend,
 )
-from akgentic.tool.workspace.card.write import WriteFactories
 from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION, derived_document_caps
 from akgentic.tool.workspace.documents.store import DocumentStore, resolve_document_store
 from akgentic.tool.workspace.event import WorkspaceAttached
@@ -141,6 +134,16 @@ from akgentic.tool.workspace.workspace import (
     permitted_shared_kinds,
     resolve_workspace_path,
     validate_workspace_id,
+)
+from akgentic.tool.workspace.write import WriteFactories
+from akgentic.tool.workspace.write.gate import CardGate
+from akgentic.tool.workspace.write.params import (
+    WorkspaceDelete,
+    WorkspaceEdit,
+    WorkspaceMkdir,
+    WorkspaceMultiEdit,
+    WorkspacePatch,
+    WorkspaceWrite,
 )
 
 logger = logging.getLogger(__name__)

@@ -90,11 +90,48 @@ machinery and it stays in the spine.
 
 CAPABILITY_CLOSURES: dict[str, frozenset[str]] = {
     "read": SPINE | {f"{PACKAGE}.read", f"{PACKAGE}.read.params"},
+    "write": SPINE
+    | {
+        f"{PACKAGE}.write",
+        f"{PACKAGE}.write.gate",
+        f"{PACKAGE}.write.params",
+        # Shared machinery, exactly as ``readers.py`` is for ``read/``: the
+        # facade re-exports it, the gate imports twelve names from it and six
+        # test modules use it directly. It is stated on this row rather than
+        # promoted into ``SPINE`` because promoting it would widen ``read/``'s
+        # allow-list, which this story must not do — an allow-list is cheapest
+        # when it is narrowest, and a later capability that needs it states it
+        # the same way.
+        f"{PACKAGE}.edit",
+        # ``Identity`` is constructed in ``_gated`` — the commit's author.
+        # Runtime, so it is in both the closure and the direct-edge rule.
+        # Becomes 55-4's ``journal/``.
+        f"{PACKAGE}.journal",
+        # ``mutation_busy`` composes the busy refusal. Runtime, so both rules.
+        # Becomes 55-7's ``exec/``.
+        f"{PACKAGE}.execution",
+        # ``LockBackend`` annotates ``_lock_backend`` and nothing else. Becomes
+        # 55-7's. It is on this row because the direct-edge rule below counts a
+        # ``TYPE_CHECKING`` import too — moving it under one would take it out of
+        # the runtime closure and buy no row.
+        f"{PACKAGE}.lock",
+        # ``WorkspaceActor`` annotates ``_workspace_tell`` and nothing else, and
+        # is already imported under ``TYPE_CHECKING`` — so it is *not* in the
+        # runtime closure, and is here only for the direct-edge rule. Becomes
+        # 55-7's.
+        f"{PACKAGE}.actor",
+    },
 }
-"""One row per capability module. The four stories after 55-2 add four more rows.
+"""One row per capability module. The three stories after 55-3 add three more rows.
 
 The value is the complete allow-list for that capability's transitive closure:
 its own modules, plus the spine modules it genuinely needs.
+
+**The two assertions below read a row differently**, and ``write/``'s four
+non-spine entries show why. The runtime closure excludes annotation-only imports,
+so ``lock`` and ``actor`` are not in it; the direct-edge rule includes them, so
+they must still be on the row. A ``TYPE_CHECKING`` import therefore keeps a module
+out of the *runtime* closure and never off the row.
 """
 
 MINIMUM_MODULES_PARSED = 20

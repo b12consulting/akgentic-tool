@@ -28,7 +28,7 @@ DEFAULT_MAX_OBSERVATIONS_PER_AGENT = 256
 
 Bounds the **paths** one agent's card remembers having read. There is no second
 dimension to bound: one card belongs to one agent
-(:meth:`~akgentic.tool.workspace.card.gate.CardGate.record_observation`).
+(:meth:`~akgentic.tool.workspace.write.gate.CardGate.record_observation`).
 """
 
 DEFAULT_MAX_TRACKED_WRITERS = 512

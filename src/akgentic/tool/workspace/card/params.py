@@ -8,16 +8,17 @@ is configured *with*, never what its callable is *called* with (ADR-020).
 No helper and no factory lives in this module: it is the leaf of ``card/``'s
 import graph, imported by every sibling and importing none of them (ADR-045 §1).
 
-**The read capability's six parameters are re-exported, not defined here.** They
-live in :mod:`akgentic.tool.workspace.read.params`, beside the closures they
-configure, because importing anything under ``card/`` executes
+**Two capabilities' parameters are re-exported, not defined here.** The read
+capability's six live in :mod:`akgentic.tool.workspace.read.params` and the write
+capability's six in :mod:`akgentic.tool.workspace.write.params`, beside the
+closures they configure, because importing anything under ``card/`` executes
 ``card/__init__.py`` and therefore every other capability — so a capability
 module that took its parameters from here would depend on all of them.
 
 The re-export is what keeps stored records readable. ``serialize_type`` stamps
 ``f"{cls.__module__}.{cls.__name__}"`` into ``__model__`` on every
 ``SerializableBaseModel``, and ``BaseToolParam`` is one, so every card a
-deployment persisted with a read parameter set explicitly carries
+deployment persisted with a read or write parameter set explicitly carries
 ``akgentic.tool.workspace.card.params.<Name>``. Reading it back is
 ``import_module`` plus ``getattr`` on exactly that path
 (:func:`akgentic.core.utils.deserializer.import_class`); a path that has gone
@@ -52,19 +53,28 @@ from akgentic.tool.workspace.read.params import (
     WorkspaceRead,
     WorkspaceView,
 )
+from akgentic.tool.workspace.write.params import (
+    WorkspaceDelete,
+    WorkspaceEdit,
+    WorkspaceMkdir,
+    WorkspaceMultiEdit,
+    WorkspacePatch,
+    WorkspaceWrite,
+)
 
-# mypy strict implies ``no_implicit_reexport``, so the six re-exported names need
-# an explicit export to keep serving the module path stored records name.
-# ``__all__`` does it in six lines where ``X as X`` aliases would cost an import
-# statement each — the spelling ``workspace/tool.py`` already uses, and for the
-# same reason.
+# mypy strict implies ``no_implicit_reexport``, so the twelve re-exported names
+# need an explicit export to keep serving the module path stored records name.
+# ``__all__`` does it in twelve lines where ``X as X`` aliases would cost an
+# import statement each — the spelling ``workspace/tool.py`` already uses, and for
+# the same reason.
 #
-# **Nothing in this package imports the six from here.** ``card/__init__.py`` and
-# ``card/rag.py`` take them from ``read/params.py``, where they are defined, so
-# this re-export exists for exactly one purpose — the stored ``__model__`` markers
-# described above — and ``test_read_capability.py`` is what holds it in place. Were
-# production to import them from here instead, deleting the re-export would break
-# the package loudly and the compatibility path would have no guard of its own.
+# **Nothing in this package imports the twelve from here.** ``card/__init__.py``
+# and ``card/rag.py`` take them from ``read/params.py`` and ``write/params.py``,
+# where they are defined, so this re-export exists for exactly one purpose — the
+# stored ``__model__`` markers described above — and ``test_read_capability.py``
+# and ``test_write_capability.py`` are what hold it in place. Were production to
+# import them from here instead, deleting the re-export would break the package
+# loudly and the compatibility path would have no guard of its own.
 __all__ = [
     "ExpandMediaRefs",
     "Resource",
@@ -85,42 +95,6 @@ __all__ = [
     "WorkspaceView",
     "WorkspaceWrite",
 ]
-
-
-class WorkspaceWrite(BaseToolParam):
-    """Write content to a file in the team workspace."""
-
-    expose: set[Channels] = {TOOL_CALL}
-
-
-class WorkspaceDelete(BaseToolParam):
-    """Delete a file from the team workspace."""
-
-    expose: set[Channels] = {TOOL_CALL}
-
-
-class WorkspaceEdit(BaseToolParam):
-    """Apply a surgical find-and-replace edit to a workspace file."""
-
-    expose: set[Channels] = {TOOL_CALL}
-
-
-class WorkspaceMultiEdit(BaseToolParam):
-    """Apply a sequence of find-and-replace edits to workspace files."""
-
-    expose: set[Channels] = {TOOL_CALL}
-
-
-class WorkspacePatch(BaseToolParam):
-    """Apply a unified diff patch to the team workspace."""
-
-    expose: set[Channels] = {TOOL_CALL}
-
-
-class WorkspaceMkdir(BaseToolParam):
-    """Create a directory (and parents) in the team workspace."""
-
-    expose: set[Channels] = {TOOL_CALL}
 
 
 class WorkspaceExec(BaseToolParam):

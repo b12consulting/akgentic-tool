@@ -1,9 +1,29 @@
-"""Mutation factories for :class:`WorkspaceTool` — write, delete, edit, patch, mkdir.
+"""The write capability of :class:`WorkspaceTool` — write, delete, edit, patch, mkdir.
 
-A mutation runs **on the card**, through :class:`~akgentic.tool.workspace.card.gate.CardGate`:
-it checks the live file against what this agent last observed and performs the
-write itself, inside one held ``fcntl.flock`` on the path (ADR-051 Decision 3).
-Nothing about the gate is visible in an LLM-facing signature.
+It holds one capability whole: the six LLM-facing closures here, the mutation
+gate in ``write/gate.py`` — with the observation map and the refusal vocabulary
+that belong to it — and the capability's own parameters in ``write/params.py``.
+It may import the package **spine** — ``workspace.py``, ``models.py``,
+``edit.py``, ``event.py``, ``errors.py`` — and ``akgentic.tool.core``. It must
+import **no other capability**, and nothing under ``card/`` at all: importing
+``card.anything`` executes ``card/__init__.py``, which pulls in the journal, the
+exec machinery, the RAG mixin, the vector-store registry and the actor. The rule
+is enforced by ``tests/workspace/test_capability_import_closure.py``, which takes
+the transitive closure of this package's own imports and checks it against an
+allow-list — not by convention, and not by this paragraph. Four modules that
+become capabilities of their own later are on that allow-list with their reasons;
+the gate's docstring says what each is for.
+
+**The two modules are two because the grouping reads well** (ADR-053 Decision 1):
+the six closures are what an LLM sees, and the gate is what they converge on.
+Merging them would make one 1500-line module out of a split that already tells a
+reader which question they are asking.
+
+A mutation runs **on the card**, through
+:class:`~akgentic.tool.workspace.write.gate.CardGate`: it checks the live file
+against what this agent last observed and performs the write itself, inside one
+held ``fcntl.flock`` on the path (ADR-051 Decision 3). Nothing about the gate is
+visible in an LLM-facing signature.
 
 **Each closure captures the card, and that is allowed.** These closures used to
 capture a proxy and an id precisely so that they held no edge back to the owning
@@ -17,12 +37,6 @@ ceremony against a retention that does not exist.
 :class:`WriteFactories` is a **mixin**: it declares no Pydantic field, and the
 names it consumes off ``self`` are declared under ``if TYPE_CHECKING:`` so they
 reach mypy without ever reaching Pydantic's field collection (ADR-045 §1).
-
-:func:`_bound` stays here for the **exec** proxy: ``workspace_exec`` and
-``workspace_exec_result`` still ask the actor, which still owns the sandbox, and
-``card/execution.py`` imports this helper — the one directional sibling edge
-inside ``card/``. The mutations no longer use it; their own unbound state is a
-``Filesystem`` that was never resolved (``CardGate._tree``).
 """
 
 from __future__ import annotations
@@ -31,15 +45,6 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.workspace.actor import WorkspaceActor
-from akgentic.tool.workspace.card.params import (
-    WorkspaceDelete,
-    WorkspaceEdit,
-    WorkspaceMkdir,
-    WorkspaceMultiEdit,
-    WorkspacePatch,
-    WorkspaceWrite,
-)
 
 # Runtime import, not a ``TYPE_CHECKING`` one: ``EditItem`` appears in the
 # signature of ``workspace_multi_edit``, and pydantic-ai resolves a tool's
@@ -47,10 +52,13 @@ from akgentic.tool.workspace.card.params import (
 # it builds the JSON schema.
 from akgentic.tool.workspace.edit import EditItem
 from akgentic.tool.workspace.models import MutationOutcome, MutationStatus
-
-_UNBOUND_MSG = (
-    "The workspace actor is not bound — a mutating WorkspaceTool must be wired "
-    "through observer() with a live orchestrator."
+from akgentic.tool.workspace.write.params import (
+    WorkspaceDelete,
+    WorkspaceEdit,
+    WorkspaceMkdir,
+    WorkspaceMultiEdit,
+    WorkspacePatch,
+    WorkspaceWrite,
 )
 
 
@@ -75,19 +83,6 @@ def _resolve_outcome(outcome: MutationOutcome) -> str:
     if outcome.status is MutationStatus.REJECTED:
         raise RetriableError(outcome.message)
     return outcome.message
-
-
-def _bound(proxy: WorkspaceActor | None) -> WorkspaceActor:
-    """Return the mutation proxy, refusing to fall back to an ungated write.
-
-    Raises:
-        RuntimeError: When the card was never wired to an orchestrator. There is
-            deliberately no ungated path to fall back to: one would be a bypass
-            of the gate reachable from any harness that skipped the binding.
-    """
-    if proxy is None:
-        raise RuntimeError(_UNBOUND_MSG)
-    return proxy
 
 
 class WriteFactories:
