@@ -250,6 +250,18 @@ class TestStoredWriteParamsStillResolve:
         it is the pre-move record, which is the one that has to keep loading.
 
         Its non-vacuity is the two specs above: they prove the path is real.
+
+        **The comparison is the two cards, not their two dumps**, and that is a
+        correctness fix rather than a stylistic one. ``expose`` is a ``set``, so a
+        dump renders it as a list in *set-iteration* order; the restored card's
+        set is rebuilt from that list and iterates in its own order, and whether
+        the two agree depends on ``PYTHONHASHSEED``. The dump comparison therefore
+        failed on roughly one interpreter in four —
+        ``expose: ['tool_call', 'command']`` against ``['command', 'tool_call']``,
+        with every other key identical — for no behavioural reason at all.
+        Pydantic's own equality compares field values, where two equal sets are
+        equal whatever order they iterate in, and "an equal card" is what this
+        spec's name has always claimed to check.
         """
         stored = serialize(explicitly_configured_card)
         assert isinstance(stored, dict)
@@ -259,4 +271,4 @@ class TestStoredWriteParamsStillResolve:
         restored = deserialize_object(stored)
 
         assert isinstance(restored, WorkspaceTool)
-        assert restored.model_dump() == explicitly_configured_card.model_dump()
+        assert restored == explicitly_configured_card
