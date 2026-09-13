@@ -807,11 +807,13 @@ class DocumentsMixin(_DocumentsBase):
         has to guess whether it moved anything.
 
         **One filtered read per spawn, not one full listing.** ``next_pending``
-        answers with the first waiting record it finds, so a tree of a thousand
-        documents costs one record read rather than a thousand. The read is
-        re-taken on every pass rather than snapshotted, because every spawn writes
-        a row and a snapshot would re-offer a path already moved out of
-        ``PENDING``.
+        answers with the first waiting record it finds and reads no further, so a
+        pass that meets a waiting record early costs one record read on a tree of
+        a thousand. It is a short-circuit and not a bound: a pass offered nothing
+        still walks the directory. What it never does is build a thousand records
+        to pick one. The read is re-taken on every pass rather than snapshotted,
+        because every spawn writes a row and a snapshot would re-offer a path
+        already moved out of ``PENDING``.
 
         ``tried`` is **local to this pass and never instance state**: it holds the
         paths whose claim this process lost to another, so the loop moves on

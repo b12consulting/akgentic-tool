@@ -403,6 +403,46 @@ class TestEveryWriteSiteIsOnDiskWhenTheTurnEnds:
         assert row.superseded_chunk_ids == []
         assert harness.vs.of("remove"), "the superseded chunks were never removed"
 
+    def test_the_clear_takes_two_holds_and_never_one_across_the_removal(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        """AC 9's split, pinned through the recorder's hold **positions**.
+
+        ``_drop_superseded`` holds the record for the re-read, **releases** it for
+        ``proxy.remove``, and holds it again for the clear. One hold spanning the
+        round trip would still be correct and would make a *cross-process* lock
+        wait on a network call — which is exactly what ``_gated`` keeps the
+        journal commits outside the path locks to avoid, and what the method's own
+        docstring promises it does not do. Nothing asserted it: a count cannot
+        express "the removal happened between two holds", and a pair of positions
+        is what ``RecordingDocumentStore.holds`` exists to give.
+
+        The recorder is installed **after** the re-index is queued, so the holds
+        counted are the clear's own rather than the claim's.
+        """
+        harness.enable()
+        write(workspace_tree, "a.md")
+        harness.actor.index_paths("")
+        harness.report("a.md")
+        harness.result("a.md")
+        write(workspace_tree, "a.md", "# Changed\n")
+        harness.actor.index_paths("")
+        harness.report("a.md")
+        assert _row_on_disk(harness.actor, "a.md").superseded_chunk_ids
+        recorder = watch_store(harness.actor)
+
+        harness.result("a.md")
+
+        assert recorder.holds == [
+            ("enter", "a.md"),
+            ("exit", "a.md"),
+            ("enter", "a.md"),
+            ("exit", "a.md"),
+        ], recorder.holds
+        # Non-vacuity: the clear really ran inside those holds, so the shape above
+        # is the split and not an accident of two unrelated holds.
+        assert _row_on_disk(harness.actor, "a.md").superseded_chunk_ids == []
+
     def test_fail_through_an_index_failure(
         self, harness: RagHarness, workspace_tree: Path
     ) -> None:

@@ -170,14 +170,16 @@ class DocumentStore(Protocol):
     which is what makes a torn write cost one document rather than a batch.
 
     **The atomicity contract is :meth:`hold`, and it is a requirement on the
-    backend rather than advice to the caller.** Every read-modify-write of one
-    document's *row* runs inside that document's hold, with the read taken
-    **inside** it — a hold around a decision made on an earlier read serialises
-    nothing. A backend that cannot serialise one document's read-modify-write
-    across processes is not a valid registry entry: without it two processes both
-    spawn an index worker for one file, which is two paid embedding runs, and a
-    ``superseded_chunk_ids`` list is lost in a whole-file replace, which orphans
-    vectors already paid for.
+    backend rather than advice to the caller.** A read-modify-write of one
+    document's *row* that has to exclude another process runs inside that
+    document's hold, with the read taken **inside** it — a hold around a decision
+    made on an earlier read serialises nothing. A backend that cannot serialise
+    one document's read-modify-write across processes is not a valid registry
+    entry: without it two processes both spawn an index worker for one file,
+    which is two paid embedding runs, and a ``superseded_chunk_ids`` list is lost
+    in a whole-file replace, which orphans vectors already paid for. The two
+    contended sequences — the pending-spawn claim and the superseded clear — are
+    held; so is ``index_paths``' accounted-for/enqueue pair.
 
     The **extraction** half is deliberately outside that rule — the batch
     counters, ``cache_document``, the cache eviction and the stale-marking all
@@ -185,6 +187,22 @@ class DocumentStore(Protocol):
     in-flight lifecycle, so those have a single writer for the duration; and a
     cached extraction is derivable and disposable, which is the half of ADR-051
     Decision 6's argument that survives.
+
+    **Two row writes are outside it as well, and saying so is the point of
+    writing a contract down.** A worker's own report — the settle in
+    ``_on_index_result`` and the ``FAILED`` transition in ``_fail`` — reads the
+    row and writes it back without a hold, on the single-writer argument above.
+    That argument is now *almost* always true rather than always true: deleting
+    the reaper's per-process exemption means a row whose worker overruns the
+    stale bound can be re-queued and re-claimed elsewhere, so a concurrent
+    ``_enqueue`` can append superseded ids between that read and that write and
+    lose them. The window is two statements and the cost is orphaned vectors
+    rather than a wrong answer. It is not closed here because closing it is
+    surgery rather than a wrap: ``_on_index_result`` goes on to call
+    ``_drop_superseded``, which takes this hold, and ``_fail`` is itself called
+    from inside the claim's hold — so a hold added naively at either site
+    deadlocks against a second descriptor on the same file. It wants its own
+    red-first cross-process spec, and is recorded as a deferred finding.
 
     ``@runtime_checkable`` buys an ``isinstance`` check on **method names only**
     — not a signature, not an argument count, not a return type — exactly as
@@ -330,10 +348,14 @@ class YamlDocumentStore:
     def next_pending(self, tree_key: str, exclude: frozenset[str]) -> DocumentEntry | None:
         """Return the first ``PENDING`` record not in *exclude*, reading no further.
 
-        **It stops at the first match**, which is the whole of the saving: a drain
-        spawning one worker reads one record on a tree of a thousand rather than a
-        thousand. The order is the glob's and no caller may lean on it — the drain
-        asks for *a* pending path, never a particular one.
+        **It stops at the first match**, and short-circuiting is the whole of the
+        saving — not a bound. A drain that meets a waiting record early reads one
+        record on a tree of a thousand; one whose only pending path sorts last, or
+        which is offered nothing at all, still walks the directory, exactly as
+        :meth:`list_documents` does. What it never does is *build* the thousand,
+        and it never reads past the record it answers with. The order is the
+        glob's and no caller may lean on it — the drain asks for *a* pending path,
+        never a particular one.
 
         Args:
             tree_key: The tree to look in.
