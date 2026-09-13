@@ -21,7 +21,6 @@ from akgentic.tool.workspace.card.params import (
     WorkspaceRagIndex,
     WorkspaceRagList,
     WorkspaceRagSearch,
-    WorkspaceRead,
 )
 from akgentic.tool.workspace.card.rag import RagFactories
 from akgentic.tool.workspace.documents.models import (
@@ -33,6 +32,13 @@ from akgentic.tool.workspace.documents.models import (
     RagStatus,
 )
 from akgentic.tool.workspace.models import WorkspaceConfig
+
+# From where it is **defined**, not through ``card/params.py``'s re-export of it.
+# That re-export exists for one purpose — keeping the module path stored
+# ``__model__`` markers name resolving — and ``test_read_capability.py`` is its
+# only guard. An importer here would turn deleting it into a collection error
+# that interrupts the run before that guard ever executes.
+from akgentic.tool.workspace.read.params import WorkspaceRead
 from akgentic.tool.workspace.readers import DocumentReader
 from akgentic.tool.workspace.tool import WorkspaceTool
 from tests.workspace.conftest import (

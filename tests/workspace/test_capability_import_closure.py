@@ -236,6 +236,34 @@ class TestTheSweepLooksAtTheRightThing:
         """An allow-list entry naming no module allows nothing and hides a typo."""
         assert SPINE <= set(modules)
 
+    def test_the_closure_attributes_a_package_nobody_imports_by_name(
+        self, modules: dict[str, Path]
+    ) -> None:
+        """The parent-attribution rule, asserted rather than left to a mutation.
+
+        No module anywhere imports ``akgentic.tool.workspace.documents`` by name —
+        every reference is to ``documents.models``, ``documents.context`` or
+        ``documents.splitter``. The package is in ``read/``'s closure **only**
+        because importing one of those executes its ``__init__`` first, which is
+        the whole of the rule. A graph that recorded leaves alone would leave it
+        out, and would then answer "clean" for a capability that dragged in a
+        whole package through one of its submodules.
+
+        **Asserted once, on ``read``, and not per capability**, because it is a
+        property of :func:`_edges` — shared by every row — and not of any one
+        capability. Parametrised, it would assert of *each* later capability that
+        it reaches ``documents``, which is a fact about ``read/`` importing
+        ``models``. The first capability that legitimately never reaches it would
+        redden a guard that is working correctly, for a reason unconnected to
+        what the guard tests.
+        """
+        closure = _closure(_modules_under("read", modules), modules)
+
+        assert f"{PACKAGE}.documents" in closure, (
+            "the graph is recording leaves without their parent packages — "
+            "importing a submodule executes every parent __init__ on the way down"
+        )
+
 
 @pytest.mark.parametrize("capability", sorted(CAPABILITY_CLOSURES))
 class TestACapabilityDependsOnTheSpineAndNothingElse:
@@ -251,26 +279,6 @@ class TestACapabilityDependsOnTheSpineAndNothingElse:
         assert outside == set(), (
             f"{capability}/ reaches {sorted(outside)} — a capability module may import "
             f"the spine and its own modules, and nothing else"
-        )
-
-    def test_the_closure_attributes_a_package_nobody_imports_by_name(
-        self, capability: str, modules: dict[str, Path]
-    ) -> None:
-        """The parent-attribution rule, asserted rather than left to a mutation.
-
-        No module anywhere imports ``akgentic.tool.workspace.documents`` by name —
-        every reference is to ``documents.models``, ``documents.context`` or
-        ``documents.splitter``. The package is in the closure **only** because
-        importing one of those executes its ``__init__`` first, which is the whole
-        of the rule. A graph that recorded leaves alone would leave it out, and
-        would then answer "clean" for a capability that dragged in a whole
-        package through one of its submodules.
-        """
-        closure = _closure(_modules_under(capability, modules), modules)
-
-        assert f"{PACKAGE}.documents" in closure, (
-            "the graph is recording leaves without their parent packages — "
-            "importing a submodule executes every parent __init__ on the way down"
         )
 
     def test_the_closure_is_not_empty_and_reaches_the_spine(
