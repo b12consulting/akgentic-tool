@@ -711,9 +711,15 @@ class TestAnEnabledCardCommitsInsideTheJournalHold:
         always failed, a wrong flag — would make the spec above pass with the
         hold deleted outright. So the same probe, on the same file, after the
         mutation has released it, must come back ``ACQUIRED``.
+
+        **The mutation is asserted accepted first, and that is not ceremony.**
+        The probe opens the lock file ``O_CREAT``, so a rejected write — which
+        commits nothing and may leave no lock file at all — would still answer
+        ``ACQUIRED``, and the control would be green on a run that exercised no
+        hold to release.
         """
         card = self._journalling_card(orchestrator_proxy)
-        card.apply_write("notes.md", "mine\n")
+        assert card.apply_write("notes.md", "mine\n").message == "Written: notes.md"
         probe = self._written_probe(tmp_path)
 
         assert run_child(probe, workspaces_root, str(self._lock_path())).out == "ACQUIRED"
