@@ -1144,9 +1144,9 @@ lost with the actor, while the index rows describing them are on disk and are no
 after a process restart on that backend — `workspace_rag_index(force=True)` — until the local vector
 backend lands. Enabling retrieval on that backend shrinks the extraction cache from 32
 documents / 2 MB to 8 / 200 KB. A cluster backend keeps the vectors in the cluster and keeps the
-large caps. And **`workspace_rag_search`
-makes one embedding round trip on the mailbox turn of the actor that owns the write gate**: bounded
-to a single call, fully degrading, but it is the one external call this card puts on that thread.
+large caps. And **`workspace_rag_search` makes one embedding round trip and one store call per
+query**, both on the calling agent's own thread — bounded, fully degrading, and off the mailbox of
+the actor that owns the write gate, which is where they used to be.
 
 Measured on ten concurrent agents against a 27 MB tree (Apple M3 Max, Python 3.12):
 

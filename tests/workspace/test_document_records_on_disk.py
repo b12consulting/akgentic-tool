@@ -62,6 +62,8 @@ from akgentic.tool.workspace.models import (
     WorkspaceConfig,
     content_sha,
 )
+from akgentic.tool.workspace.rag.context import render_index_state
+from akgentic.tool.workspace.rag.search import search_documents
 from akgentic.tool.workspace.rag.worker import (
     EMBED_BATCH_SIZE,
     MAX_CONCURRENT_INDEX_WORKERS,
@@ -537,15 +539,16 @@ class TestTheTwoGapsTheNotifyCallsHad:
 
 
 class TestTheSnapshotIsARead:
-    def test_rag_snapshot_writes_nothing(
+    def test_the_snapshot_render_writes_nothing(
         self, harness: RagHarness, workspace_tree: Path
     ) -> None:
+        """Re-pointed in story 57-1: the render is card-side, the claim is the same."""
         harness.enable()
         write(workspace_tree, "a.md")
         harness.actor.index_paths("")
         writes = watch_store(harness.actor)
 
-        snapshot = harness.actor.rag_snapshot(max_pending_shown=20)
+        snapshot = render_index_state(cache_of(harness.actor), max_pending_shown=20)
 
         assert [row.path for row in snapshot.rows] == ["a.md"]
         assert writes.puts == []
@@ -1182,7 +1185,7 @@ class TestTheDiskPathLive:
         second_cache = _live_cache()
         restored.configure_document_cache(second_cache)
         assert second_cache.lookup("doc.md", sha, EXTRACTOR_VERSION) == "# Body\n"
-        rows = restored.rag_snapshot(20).rows
+        rows = render_index_state(second_cache, 20).rows
         assert [(row.path, row.status) for row in rows] == [("up.md", RagStatus.PENDING.value)]
 
     def test_a_second_actor_reads_them_while_the_first_is_still_alive(
@@ -1229,7 +1232,7 @@ class TestNoStoreAtAll:
         _drive_every_write_site_degraded(harness, workspace_tree)
 
         assert stored_entries(harness.actor) == {}
-        assert harness.actor.rag_snapshot(max_pending_shown=20).rows == []
+        assert render_index_state(_storeless_cache(), max_pending_shown=20).rows == []
         assert _storeless_cache().lookup("a.md", "any", EXTRACTOR_VERSION) is None
 
 
@@ -1257,8 +1260,10 @@ def _drive_every_write_site_degraded(harness: RagHarness, tree: Path) -> None:
     degraded.mark_paths_stale(["a.md"])
     degraded.fill("c.md", content_sha(b"c"), EXTRACTOR_VERSION, "c" * 60)
     assert actor.reap_abandoned_rows() is False
-    assert actor.rag_search("body") in {
-        "Retrieval indexing is not available for this workspace.",
+    # The read path over the same degraded cache: it must answer, not raise, and
+    # write nothing. Card-side since story 57-1, so it is driven the way the
+    # search closure drives it rather than through the actor.
+    assert search_documents(degraded, None, None, "body", top_k=5, scope=WORKSPACE_PATH) == (
         "Nothing in the retrieval index matched that query. "
-        "Use workspace_rag_list to see which files are indexed.",
-    }
+        "Use workspace_rag_list to see which files are indexed."
+    )

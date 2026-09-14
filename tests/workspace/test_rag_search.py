@@ -10,26 +10,28 @@ the test would have proved that the test filters.
 Embeddings are a fixed four-word bag rather than a network call, so a cosine
 ordering is deterministic and a spec can say which hit comes first.
 
-**The two legs run in two places, and the specs are driven accordingly.** The
-vector leg — the query embed and the ``search`` call — is the *card*'s, so every
-spec about it goes through ``tool_named(card, "workspace_rag_search")``, the exact
-callable an agent holds. The keyword leg, the fusion and the render are the
-*actor*'s, and the specs about the actor's own gates still call
-``actor.rag_search`` directly.
+**Both legs run in one place now, so every spec is driven through one callable.**
+``tool_named(card, "workspace_rag_search")`` is what an agent holds, and it is
+what these specs call. Story 57-1 took the keyword leg, the fusion and the render
+off ``#Workspace`` — they read the document records, which the card's own
+:class:`~akgentic.tool.workspace.documents.cache.DocumentCache` reaches without a
+mailbox — so there is no ``actor.rag_search`` left to drive and no split to
+reproduce here.
 
-:class:`SearchHarness` binds both: one inert actor, seeded through the document
-store, and a real :class:`WorkspaceTool` whose ``_workspace_proxy`` **is** that
-actor and whose resolved vector store **is** the double. So
-:meth:`SearchHarness.run` exercises the whole production path end to end, with no
-leg re-implemented here. The card takes the ``weaviate`` branch because that is
-the one that resolves a client with no store actor behind it — the shape where
-``search`` is a second round trip — and its factory is swapped through the
-registry's own seam.
+:class:`SearchHarness` still binds both halves, and the actor is still what the
+seeding helpers write through: one inert actor, seeded through the document
+store, and a real :class:`WorkspaceTool` whose resolved vector store **is** the
+double and whose own cache reads the very records ``seed_row`` / ``seed_extract``
+put on disk — :meth:`SearchHarness.bind_card` asserts the two resolved the same
+tree, which is what makes that true. So :meth:`SearchHarness.run` exercises the
+whole production path end to end, with no leg re-implemented here. The card takes
+the ``weaviate`` branch because that is the one that resolves a client with no
+store actor behind it — the shape where ``search`` is a second round trip — and
+its factory is swapped through the registry's own seam.
 
-**Where a spec drives the actor directly, that is deliberate and says so**: the
-unavailable gate, the actor's own prefix check and the fusion knobs are the
-actor's, and reaching them through the card would only add a leg that is not
-under test.
+**Where a spec calls a moved function directly, that is deliberate and says so**:
+the fusion module's own default for ``alpha`` is reachable from no production
+caller, because the closure always sends a float.
 """
 
 from __future__ import annotations
@@ -62,6 +64,7 @@ from akgentic.tool.workspace.documents.models import (
 from akgentic.tool.workspace.documents.store import DocumentEntry, YamlDocumentStore
 from akgentic.tool.workspace.models import WorkspaceConfig, content_sha
 from akgentic.tool.workspace.rag.params import WorkspaceRagIndex, WorkspaceRagSearch
+from akgentic.tool.workspace.rag.search import search_documents
 from akgentic.tool.workspace.readers import DocumentReader
 from akgentic.tool.workspace.tool import WorkspaceTool
 from tests.conftest import MockActorAddress
@@ -427,31 +430,55 @@ def hit_count(answer: str) -> int:
 class TestDegradation:
     """Every failure mode answers a sentence and none of them raises."""
 
-    def test_a_workspace_whose_store_was_never_announced_answers_the_sentence(
-        self, workspace_tree: Path, monkeypatch: pytest.MonkeyPatch, store: SearchStore
-    ) -> None:
-        """**Cause re-pointed, invariant unchanged** (third time — see the story's Trap 1).
-
-        It was "the team's ``#VectorStore`` was not found", then "the child could
-        not be spawned", and it is now "the card announced no store". What the
-        spec guards has survived all three: retrieval stays off, ``enable_rag``
-        does not raise, and the search answers the unavailable sentence.
-        """
-        harness = SearchHarness(build_actor(), store)
-        harness.install(monkeypatch)
-
-        harness.enable(announce=False)  # must not raise
-
-        assert harness.actor._vs_proxy is None
-        assert harness.actor.rag_search("payment") == _UNAVAILABLE
-
-    def test_an_actor_with_a_proxy_but_no_parameters_still_answers_the_sentence(
+    def test_a_card_that_resolved_no_engine_answers_the_sentence(
         self, search: SearchHarness
     ) -> None:
-        """Both halves of enablement are required; a half-enabled tree is degraded."""
-        search.actor._rag_params = None
+        """**Cause re-pointed, invariant unchanged** (fourth time — see Trap 1).
 
-        assert search.actor.rag_search("payment") == _UNAVAILABLE
+        It was "the team's ``#VectorStore`` was not found", then "the child could
+        not be spawned", then "the card announced no store", and it is now the
+        card's own :meth:`RagFactories._retrieval_bound` answering ``False``
+        because the engine is missing. What the spec guards has survived all four:
+        a tree with nothing to search answers the unavailable sentence.
+
+        This is one of the two terms of that predicate. The actor's gate it
+        reproduces was ``self._vs_proxy is None`` — "no store was announced" — and
+        the card is what announces it.
+        """
+        assert search.card is not None
+        search.card._vector_store = None
+
+        assert search.card._retrieval_bound() is False
+        assert search.run("payment") == _UNAVAILABLE
+
+    def test_a_card_with_an_engine_but_no_collection_param_answers_the_sentence(
+        self, search: SearchHarness
+    ) -> None:
+        """Both halves of enablement are required; a half-enabled tree is degraded.
+
+        The other term of :meth:`RagFactories._retrieval_bound`, reproducing the
+        actor's ``self._rag_params is None`` — no card ever announced
+        ``enable_rag``. ``_resolved_store`` is derived exactly when
+        ``_rag_enabled()`` holds and is the value ``_announce_rag`` sends, so its
+        absence is that absence.
+        """
+        assert search.card is not None
+        search.card._resolved_store = None
+
+        assert search.card._retrieval_bound() is False
+        assert search.run("payment") == _UNAVAILABLE
+
+    def test_a_card_that_never_bound_a_tree_answers_the_sentence(self) -> None:
+        """The first gate, in the position the ``None`` proxy used to hold.
+
+        ``_build_document_cache`` runs in ``observer()``, so a card that never
+        bound has no cache — which is what "never bound" *is*, card-side — and the
+        closure answers the sentence rather than raising.
+        """
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_rag_search=True)
+
+        assert card._document_cache is None
+        assert card._rag_search_factory(WorkspaceRagSearch())("payment") == _UNAVAILABLE
 
     def test_an_embed_that_raises_falls_back_to_the_keyword_leg(
         self, search: SearchHarness
@@ -518,15 +545,28 @@ class TestDegradation:
         assert "keyword match" in answer
         assert search.store.searches == []
 
-    def test_a_card_that_resolved_no_store_falls_back_to_the_keyword_leg(
+    def test_a_card_that_resolved_no_store_spends_nothing_before_the_sentence(
         self, search: SearchHarness
     ) -> None:
-        """The card's half of "no vector store": one warning, no embed, no search.
+        """**Rewritten in story 57-1, and it is not a weakened guard — read this.**
 
-        The actor's half — ``_vs_proxy is None`` — is the unavailable sentence
-        above and is a different answer, deliberately: there the tree has no
-        retrieval at all, here the tree has retrieval and this *card* could not
-        reach the engine.
+        It was ``test_a_card_that_resolved_no_store_falls_back_to_the_keyword_leg``
+        and it asserted ``"keyword match" in answer``. That assertion described a
+        state that **cannot occur in a real bind**: a card that resolved no store
+        beside an actor that has one. The split was an artefact of
+        :class:`SearchHarness`, which announces the store to the actor by hand. In
+        production a card that resolves no store announces none, so the actor
+        degrades too and the answer is the unavailable sentence — which is exactly
+        what the card's own gate now returns, directly, with no ask.
+
+        So the assertion follows the reality rather than the harness, and the gate
+        was **not** weakened to preserve the old answer.
+
+        What survives verbatim is the half that was always the point, and it is
+        stronger now: **nothing is spent.** The availability gate sits ahead of the
+        vector leg where the actor's sat behind it, so a degraded tree makes no
+        embedding call and no store call at all — the cost
+        ``_vector_hits``'s docstring used to record as unclosable.
         """
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
         assert search.card is not None
@@ -534,9 +574,30 @@ class TestDegradation:
 
         answer = search.run("payment")
 
-        assert "keyword match" in answer
+        assert answer == _UNAVAILABLE
         assert search.store.searches == []
         assert search.embedder.embeds == []
+
+    def test_a_degraded_tree_asked_with_a_wildcard_prefix_is_refused_for_the_prefix(
+        self, search: SearchHarness
+    ) -> None:
+        """The gate ordering, pinned — reversing two of them flips this answer.
+
+        The order is: cache absent → the wildcard check → availability → the legs.
+        Swap the middle two and a degraded tree asked with a wildcard prefix
+        answers *retrieval unavailable* instead of *the prefix is refused*, which
+        is a silent change of meaning with nothing else in the suite to catch it:
+        every other prefix spec runs against a tree that is **not** degraded, and
+        every other degradation spec passes no prefix.
+        """
+        assert search.card is not None
+        search.card._vector_store = None
+        assert search.card._retrieval_bound() is False
+
+        answer = search.run("payment", path_prefix="report*")
+
+        assert "cannot contain" in answer
+        assert answer != _UNAVAILABLE
 
     def test_no_hits_is_a_sentence_that_is_not_the_unavailable_one(
         self, search: SearchHarness
@@ -773,6 +834,39 @@ class TestTheRender:
 
         assert answer.startswith("invoice.md (semantic:")
 
+    def test_a_multi_hit_answer_renders_character_for_character(
+        self, search: SearchHarness
+    ) -> None:
+        """The whole answer as one string, so a drifted ordering is a diff.
+
+        **Story 57-1's shape guard.** Every other spec in this class asserts a
+        substring or a count, and a relocation can satisfy all of them while
+        reordering the blocks, changing the separator, or re-deriving a score
+        label. This pins the bytes.
+
+        The two scores are arithmetic rather than recorded observations. The
+        query ``payment refund`` is ``[0, 1, 0, 1]`` over the four-word
+        vocabulary. The first chunk carries "invoice" and "payment", so it is
+        ``[1, 1, 0, 0]`` — a cosine of ``1 / (sqrt(2) * sqrt(2)) = 0.50``. The
+        second carries "refund" alone, so it is ``[0, 0, 0, 1]`` — a cosine of
+        ``1 / sqrt(2) = 0.71``. The second therefore ranks first, and both labels
+        are ``hybrid`` because the keyword leg hits both. The text of each block
+        is ``SearchHit.text`` — the store's copy — stripped.
+        """
+        search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
+
+        answer = search.run("payment refund", top_k=2)
+
+        assert answer == (
+            "invoice.md > Invoice > Refunds (hybrid: 0.71)\n"
+            "A refund is issued on request.\n"
+            "\n"
+            "invoice.md > Invoice > Payment terms (hybrid: 0.50)\n"
+            "# Invoice\n"
+            "\n"
+            "Payment terms are net thirty."
+        )
+
     def test_hits_are_separated_by_a_blank_line(self, search: SearchHarness) -> None:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
 
@@ -903,34 +997,29 @@ class TestThePathPrefixDecision:
 
     @pytest.mark.parametrize("backend", ["local", "inmemory", "weaviate"])
     def test_the_same_sentence_comes_back_whatever_the_backend(
-        self,
-        workspace_tree: Path,
-        store: SearchStore,
-        monkeypatch: pytest.MonkeyPatch,
-        backend: str,
+        self, search: SearchHarness, backend: str
     ) -> None:
         """The refusal is at the caller, so the backends cannot disagree.
 
-        The double is announced rather than registered, because the actor no
-        longer reaches a factory at all — the card does. What the parametrisation
-        still buys is the *param*: three different backends named in the
-        collection, one refusal, proving the sentence is not derived from the
-        backend the param happens to name.
+        What the parametrisation buys is the *param*: three different backends
+        named in the resolved collection, one refusal, proving the sentence is not
+        derived from the backend the param happens to name. The param is set on
+        the bound card rather than declared on a fresh one because ``inmemory`` is
+        **refused at bind** for a workspace (``WORKSPACE_IN_MEMORY_REFUSED``), so
+        no card can be built naming it — and it is exactly the value a spec about
+        "the sentence does not depend on the backend" wants to include.
+
+        It reads a private attribute deliberately, in the shape this module
+        already uses for ``_vector_store``: the resolved param is not something an
+        author writes, and the closure re-captures it on every ``get_tools()``.
         """
-        harness = SearchHarness(build_actor(), store)
-        harness.install(monkeypatch)
-        harness.actor.configure_vector_store(store)
-        harness.actor.enable_rag(
-            "alice",
-            WorkspaceRagIndex(),
-            DocumentReader(llm_client=None),
-            VectorStoreParam(backend=backend),
-        )
+        assert search.card is not None
+        search.card._resolved_store = VectorStoreParam(backend=backend)
 
-        answers = {harness.actor.rag_search("payment", path_prefix="report?.md")}
+        answer = search.run("payment", path_prefix="report?.md")
 
-        assert len(answers) == 1
-        assert "cannot contain" in answers.pop()
+        assert "cannot contain" in answer
+        assert answer != _UNAVAILABLE
 
     def test_a_refused_prefix_never_reaches_the_backend(self, search: SearchHarness) -> None:
         """No embed is spent either — the refusal is the first thing that happens."""
@@ -970,18 +1059,26 @@ class TestTheFusionKnobs:
         assert WorkspaceRagSearch().alpha == DEFAULT_ALPHA
 
     def test_alpha_none_takes_the_module_default(self, search: SearchHarness) -> None:
-        """Driven on the **actor**, because that branch is only reachable there.
+        """Driven on :func:`search_documents`, because that branch is only reachable there.
 
         ``alpha`` is card configuration and the closure always sends a float, so
-        ``None`` reaches ``rag_search`` from no production caller at all — it is
-        the default of an internal ask, and this is the spec that says the default
-        agrees with the fusion module's.
+        ``None`` reaches the search from no production caller at all — it is the
+        default of the moved function's own signature, and this is the spec that
+        says that default agrees with the fusion module's.
         """
         search.index("invoice.md", _INVOICE, [_FIRST])
+        assert search.card is not None
+        cache = search.card._document_cache
+        assert cache is not None
 
-        assert search.actor.rag_search("payment", {}, alpha=None) == search.actor.rag_search(
-            "payment", {}, alpha=DEFAULT_ALPHA
+        defaulted = search_documents(
+            cache, None, None, "payment", top_k=5, scope=WORKSPACE_PATH, alpha=None
         )
+        explicit = search_documents(
+            cache, None, None, "payment", top_k=5, scope=WORKSPACE_PATH, alpha=DEFAULT_ALPHA
+        )
+
+        assert defaulted == explicit
 
     def test_pure_keyword_fusion_still_returns_the_keyword_hit(self, search: SearchHarness) -> None:
         """``alpha=0.0`` is pure keyword, and a vector-only hit then scores zero."""

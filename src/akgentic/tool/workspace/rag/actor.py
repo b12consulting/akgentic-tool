@@ -23,10 +23,14 @@ working for a card that enables neither exec nor retrieval and therefore creates
 no actor at all (ADR-053 Decision 6): the lookup, the fill, the eviction pass and
 the stale-marking a mutation causes are all
 :class:`~akgentic.tool.workspace.documents.cache.DocumentCache`'s, called
-directly by the card. What this module keeps is the ``#index-`` and ``#embed-``
-children a Pydantic card cannot parent, the reports they send back, and the
-search's keyword leg — and it reads and fills the same cache through the same
-object.
+directly by the card. What this module keeps is **indexing** — the ``#index-``
+and ``#embed-`` children a Pydantic card cannot parent, and the reports they send
+back — and it reads and fills the same cache through the same object.
+
+**A search and a listing are not here either, since story 57-1.** Both read the
+document records and nothing else, so both are the card's, in
+``rag/search.py`` and ``rag/context.py``, run on the calling agent's own thread
+(ADR-053 Decision 6). What is left on this mailbox is exactly what needs one.
 
 **There is exactly one writer of a row here, and it writes to disk on the turn it
 is called.** :meth:`DocumentsMixin._put_row` goes through the cache's own
@@ -56,15 +60,16 @@ bounded file reads while queueing and bounded calls to the store the card
 announced — which is a proxy over the team's ``#VectorStore`` or a cluster client
 with no actor behind it, never a child of this actor
 (:meth:`DocumentsMixin._resolve_store`) — and **no external round trip at all**.
-:meth:`DocumentsMixin.rag_search` used to embed the query on this thread and then
-call ``search`` on a store that may be a
-cluster client with no actor behind it, which made two network calls on one turn
-of the mailbox that owns the write gate; while either was in flight,
-``request_exec``, ``exec_status`` and every worker report queued behind it. Both
-now happen in :func:`~akgentic.tool.workspace.rag._vector_hits`, on the **calling
-agent's own thread** — which is already blocked waiting for that answer and
-blocks nobody else — and this method is handed the hits. Do not put a network
-call back on this turn. The two slow halves of indexing happen elsewhere too:
+``rag_search`` used to embed the query on this thread and then call ``search`` on
+a store that may be a cluster client with no actor behind it, which made two
+network calls on one turn of the mailbox that owns the write gate; while either
+was in flight, ``request_exec``, ``exec_status`` and every worker report queued
+behind it. Both happen in
+:func:`~akgentic.tool.workspace.rag.search.search_documents` now, on the
+**calling agent's own thread** — which is already blocked waiting for that answer
+and blocks nobody else — and so does the keyword half that was left here when
+they moved. Do not put a network call back on this turn, and do not bring a
+search back to it. The two slow halves of indexing happen elsewhere too:
 extraction and splitting in a ``#index-`` worker, embedding in an ``#embed-``
 worker, and each batch's ``add()`` lands on its own turn when its worker reports.
 Nothing here raises: an exception in a document handler would kill the actor
@@ -80,27 +85,21 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from math import ceil
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from akgentic.core.agent_config import BaseConfig
-from akgentic.tool.vector_store.protocol import (
-    PATH_PREFIX_REJECTED,
-    PATH_PREFIX_WILDCARDS,
-)
 from akgentic.tool.workspace.documents.cache import DocumentCache
 from akgentic.tool.workspace.documents.models import (
     EMBEDDING_STALE_AFTER_S,
     EXTRACTOR_VERSION,
     RAG_COLLECTION,
     NewFileMessage,
-    RagChunk,
     RagFile,
     RagStatus,
 )
 from akgentic.tool.workspace.documents.store import DocumentEntry
 from akgentic.tool.workspace.models import WorkspaceConfig, content_sha
-from akgentic.tool.workspace.rag.context import RagFileRow, RagIndexState
 from akgentic.tool.workspace.readers import _MIME_MAP, TEXT_EXTENSIONS, DocumentReader
 from akgentic.tool.workspace.workspace import Filesystem
 
@@ -111,7 +110,6 @@ if TYPE_CHECKING:
     from akgentic.core.agent_state import BaseState
     from akgentic.tool.vector_store.embedding_actor import EmbeddingError, EmbeddingResult
     from akgentic.tool.vector_store.protocol import (
-        SearchHit,
         VectorStoreParam,
         VectorStoreService,
     )
@@ -172,43 +170,6 @@ class _Spawn(Enum):
 
     FAILED = "failed"
     """The spawn raised, or retrieval is not configured. Stop the pass."""
-
-
-_NO_HITS = (
-    "Nothing in the retrieval index matched that query. "
-    "Use workspace_rag_list to see which files are indexed."
-)
-"""What a search answers when retrieval works and nothing matched.
-
-Deliberately **not** :data:`_UNAVAILABLE`: "nothing matched" and "nothing is
-indexed" are different problems with different next steps, and an agent handed
-one sentence for both would retry the query when it should have indexed the tree.
-"""
-
-_REJECTED_PREFIX = PATH_PREFIX_REJECTED
-"""The sentence a rejected prefix answers with, identical to what a backend raises.
-
-The characters and the sentence both live in ``vector_store/protocol.py``, beside
-the two backends that read a prefix differently, so this capability and the guard
-underneath it cannot drift apart. This layer **returns** the sentence rather than
-raising it: nothing in a document handler raises, and a wildcard is a mistake the
-agent can correct from the answer alone. Rejecting here as well as at the backend
-is deliberate defence in depth — the actor's answer is a sentence, the backend's
-is a ``ValueError``, and a caller that bypasses one still meets the other.
-"""
-
-
-class _KeywordMatch(NamedTuple):
-    """One chunk the keyword leg hit, with everything its render needs.
-
-    Carried because a keyword-only hit has no ``SearchHit`` behind it and would
-    otherwise have no text at all — which would make a keyword-only search, the
-    degraded mode this whole design turns on, render nothing.
-    """
-
-    path: str
-    chunk: RagChunk
-    text: str
 
 
 class DocumentsMixin(_DocumentsBase):
@@ -304,11 +265,15 @@ class DocumentsMixin(_DocumentsBase):
     def _entries(self) -> list[DocumentEntry]:
         """Every stored record for this tree, in no guaranteed order.
 
-        **One listing serves all three of its callers here** — the drain, the
-        render and the keyword leg — because one file carries both halves of a
-        document. Callers that need an order sort for themselves: a directory
-        glob's order is the file system's, and leaning on it is how a render
-        stops being stable across runs.
+        **One caller here since story 57-1** — :meth:`reap_abandoned_rows`, whose
+        question is about every row on the tree at once. The render and the
+        keyword leg were the other two, and both read the same listing card-side
+        now, through the same cache: one file carries both halves of a document,
+        so one listing still serves every reader of either half.
+
+        Callers that need an order sort for themselves: a directory glob's order
+        is the file system's, and leaning on it is how a render stops being stable
+        across runs.
         """
         return self._cache().entries()
 
@@ -1205,8 +1170,8 @@ class DocumentsMixin(_DocumentsBase):
         """Re-queue every in-flight row no live worker is carrying, and say if any moved.
 
         **Runs at the top of ``index_paths``, and never on a turn path** — not in
-        the context-state provider, not in ``rag_snapshot``, not in the gate. It
-        is a mutation, and one that fired on every turn of every agent carrying
+        the context-state provider, not in the snapshot render, not in the gate.
+        It is a mutation, and one that fired on every turn of every agent carrying
         the card would be both wasteful and a write from a render.
 
         **It is the backstop for every row a worker was carrying and no longer
@@ -1243,8 +1208,9 @@ class DocumentsMixin(_DocumentsBase):
 
         **It keeps the full listing, unlike ``_drain``**, and legitimately: the
         question it asks is about every row on the tree at once, so there is no
-        filtered read that would answer it. The render is the other such caller. A
-        remote ``DocumentStore`` would want a filtered form of this too.
+        filtered read that would answer it. The snapshot render is the other such
+        reader, card-side. A remote ``DocumentStore`` would want a filtered form
+        of this too.
 
         Returns:
             Whether any row was re-queued.
@@ -1269,251 +1235,6 @@ class DocumentsMixin(_DocumentsBase):
                 EMBEDDING_STALE_AFTER_S,
             )
         return requeued > 0
-
-    ##
-    ## workspace_rag_list — a render, and therefore free
-    ##
-    def rag_snapshot(self, max_pending_shown: int) -> RagIndexState:
-        """Return the index as rows, capped on ``PENDING`` only.
-
-        **No file access inside the tree, and no tree sweep**: this is asked once
-        per turn by every agent carrying the card, and a ``stat`` per candidate
-        file would put a tree walk on the hot path for a display. Reading
-        ``<meta>/rag/`` is not that — it is one directory scan plus one parse per
-        record, bounded by ``max_documents`` (32, or 8 when the vector backend is
-        in-memory). That is real where ``<meta>`` is on a network share, and it
-        has no mitigation on offer: the directory holds every cross-process lock,
-        so it lives beside the tree it belongs to and moves nowhere. **No
-        read-through cache is added here** either: it would be exactly the
-        in-memory state this move removes.
-
-        The rows are sorted by **path**, so the render is stable across runs. A
-        directory glob's order is the file system's, and a display that reordered
-        itself between two turns would look like the index had changed.
-
-        Everything that is not ``PENDING`` is always shown — those rows each say
-        something different. ``PENDING`` rows all say the same thing, so a
-        10,000-file tree would otherwise flood the context window with them.
-
-        Args:
-            max_pending_shown: How many ``PENDING`` rows to render.
-
-        Returns:
-            The state, never ``None`` and never raising.
-        """
-        rows: list[RagFileRow] = []
-        hidden = 0
-        pending_shown = 0
-        for entry in sorted(self._entries(), key=lambda stored: stored.path):
-            row = entry.row
-            if row is None:
-                continue
-            if row.status is RagStatus.PENDING:
-                if pending_shown >= max_pending_shown:
-                    hidden += 1
-                    continue
-                pending_shown += 1
-            rows.append(
-                RagFileRow(
-                    path=entry.path,
-                    status=row.status.value,
-                    chunk_count=row.chunk_count,
-                    reason=row.reason or "",
-                )
-            )
-        return RagIndexState(rows=rows, pending_hidden=hidden)
-
-    ##
-    ## workspace_rag_search — two legs, fused, and every failure degrades
-    ##
-    def rag_search(
-        self,
-        query: str,
-        hits: dict[str, SearchHit] | None = None,
-        top_k: int = 5,
-        path_prefix: str = "",
-        alpha: float | None = None,
-    ) -> str:
-        """Fuse the vector *hits* it is handed with its own keyword leg, and render.
-
-        Two legs, combined by the one fusion rule the package shares — but only
-        one of them runs here. The **vector** leg is the caller's: the query embed
-        and the scoped similarity search against ``workspace_chunks`` are two
-        external round trips, and they happen on the calling agent's own thread
-        inside :func:`~akgentic.tool.workspace.rag._vector_hits`, which is the
-        card's. What runs here is the half whose inputs are this actor's state and
-        nothing else: a case-insensitive term match over the extraction bodies it
-        already holds, the fusion, and the render that resolves each hit's heading
-        path through the rows on disk.
-
-        **That split is why this method makes no external call at all**, which is
-        what ``actor/__init__.py``'s "and never external" claims of every ask on
-        this thread. An embed here — let alone a ``search`` against a cluster
-        backend on the same turn — held every ``request_exec``, every
-        ``exec_status`` and every worker report behind an HTTP request.
-
-        The vector leg is **not** routed through
-        :func:`~akgentic.tool.vector_store.hybrid.semantic_scores`, and that is a
-        correctness requirement rather than a preference. That helper takes no
-        ``scope`` and no ``path_prefix``, and one ``workspace_chunks`` class holds
-        every workspace of every team — a search through it would return another
-        workspace's chunks. It also reduces its result to ``{ref_id: score}``,
-        discarding the ``SearchHit`` that carries the text a hit renders and the
-        ``path`` / ``ordinal`` its heading path is looked up by. ``fuse`` and the
-        two constants are what this module reuses.
-
-        **The unavailable gate stays here and is unchanged.** A tree with no store
-        announced, or with parameters never announced, answers the sentence
-        whatever the caller handed it.
-
-        **Every failure degrades and none of them raises.** A vector leg that
-        failed hands an empty mapping — it has already logged its own warning —
-        and the keyword leg answers alone. This actor owns the write gate, and a
-        retrieval capability that raised would be a way for a misconfigured
-        deployment to take it down.
-
-        Args:
-            query: What to look for, in natural language.
-            hits: ``{ref_id: hit}`` from the caller's vector leg, already filtered
-                by its score threshold. ``None`` means the caller ran no vector
-                leg, or ran one that degraded — the keyword leg then answers alone.
-            top_k: How many hits to render, applied **after** filtering.
-            path_prefix: Restrict the search to paths starting with this. Must not
-                contain ``*`` or ``?`` — see
-                :data:`~akgentic.tool.vector_store.protocol.PATH_PREFIX_WILDCARDS`.
-                Checked here as well as at the caller: this is an ask with a
-                public-shaped signature, and the gate must not depend on which
-                caller reached it.
-            alpha: Weight of the vector leg. ``None`` takes the fusion module's
-                own default, which is the value the Weaviate client sends.
-
-        Returns:
-            The rendered hits, or one of the three sentences: retrieval
-            unavailable, the prefix refused, or nothing matched.
-        """
-        from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA, fuse
-
-        if self._vs_proxy is None or self._rag_params is None:
-            return _UNAVAILABLE
-        if any(character in path_prefix for character in PATH_PREFIX_WILDCARDS):
-            return _REJECTED_PREFIX
-        budget = max(top_k, 1)
-        hits = hits or {}
-        matches = self._keyword_leg(query, path_prefix)
-        fused = fuse(
-            list(matches),
-            {ref_id: hit.score for ref_id, hit in hits.items()},
-            alpha=DEFAULT_ALPHA if alpha is None else alpha,
-        )
-        rendered: list[str] = []
-        for ref_id, score in sorted(fused.items(), key=lambda item: item[1], reverse=True):
-            line = self._render_hit(score, hits.get(ref_id), matches.get(ref_id))
-            if line is not None:
-                rendered.append(line)
-            if len(rendered) >= budget:
-                break
-        return "\n\n".join(rendered) if rendered else _NO_HITS
-
-    def _keyword_leg(self, query: str, path_prefix: str) -> dict[str, _KeywordMatch]:
-        """Return the chunks whose own slice of their document carries a query term.
-
-        Case-insensitive, over the bodies this actor already holds — no file is
-        read and no chunk text is stored anywhere, because a chunk is a pair of
-        offsets into an extraction and never a copy of one.
-
-        **An evicted body contributes nothing and is never sliced** (ADR-045 §3,
-        §4). The search degrades toward vector-only for that file and is never
-        wrong; the file stays ``EMBEDDED`` and its vector hits still render from
-        the store's own copy of the text. This is what makes ``max_documents`` a
-        bound on the extraction cache rather than on the searchable corpus — and
-        it bounds no state of this actor's at all any more: it is a field of the
-        :class:`~akgentic.tool.workspace.documents.cache.DocumentCache` the card
-        builds, applied over the records on disk.
-
-        **A body that is not the one the offsets were cut from is skipped too.**
-        The two halves have different lifetimes even inside one record: a file
-        re-read after a change holds a new body while its row still describes the
-        old chunk boundaries, and slicing one with the other yields text that
-        belongs to neither. The offsets of such a row are provenance, exactly as
-        an evicted file's are.
-
-        The keys are ``chunk_id``s — the key space ``fuse`` combines on, and what
-        ``SearchHit.ref_id`` carries. It is an **indicator** and not a score: a
-        flat substring match is equally good everywhere, which is why ``fuse``
-        does not normalise this leg.
-        """
-        terms = query.lower().split()
-        matches: dict[str, _KeywordMatch] = {}
-        if not terms:
-            return matches
-        for entry in self._entries():
-            extract, row = entry.extract, entry.row
-            if extract is None or extract.markdown is None:
-                continue
-            if path_prefix and not entry.path.startswith(path_prefix):
-                continue
-            if row is None or row.indexed_sha != extract.source_sha:
-                continue
-            body = extract.markdown
-            lowered = body.lower()
-            for chunk in row.chunks:
-                if any(term in lowered[chunk.start : chunk.end] for term in terms):
-                    matches[chunk.chunk_id] = _KeywordMatch(
-                        path=entry.path, chunk=chunk, text=body[chunk.start : chunk.end]
-                    )
-        return matches
-
-    def _render_hit(
-        self, score: float, hit: SearchHit | None, match: _KeywordMatch | None
-    ) -> str | None:
-        """Render one fused hit — path, heading path, score label, and the text.
-
-        **The text comes from** ``SearchHit.text`` **whenever there is a hit**,
-        never from a slice of the cached body: that is what keeps a file whose
-        body was evicted searchable and renderable. A keyword-only hit has no
-        ``SearchHit`` behind it, and its text is its own slice — which is present
-        by construction, since matching it is what put it here.
-
-        Args:
-            score: The fused score, unused in the label and kept for the caller's
-                ordering. See :func:`_score_label` for what is actually shown.
-            hit: The vector hit, or ``None`` for a keyword-only match.
-            match: The keyword match, or ``None`` for a vector-only hit.
-
-        Returns:
-            The rendered block, or ``None`` when neither leg supplied anything —
-            which the caller skips without spending a result slot.
-        """
-        chunk: RagChunk | None
-        if match is not None:
-            path, chunk = match.path, match.chunk
-            text = hit.text if hit is not None else match.text
-        elif hit is not None:
-            path = hit.path or ""
-            chunk = self._chunk_at(path, hit.ordinal)
-            text = hit.text
-        else:
-            return None
-        heading = " > ".join(chunk.heading_path) if chunk is not None else ""
-        location = f"{path} > {heading}" if heading else (path or "(unknown file)")
-        return f"{location} ({_score_label(hit, match)})\n{text.strip()}"
-
-    def _chunk_at(self, path: str, ordinal: int | None) -> RagChunk | None:
-        """Return *path*'s chunk at *ordinal* — one dict lookup, and no reverse map.
-
-        Story 45-6 put ``path`` and ``ordinal`` on ``SearchHit`` precisely so that
-        this is O(1). A hit whose ``path`` or ``ordinal`` is missing, or whose
-        ordinal is out of range, resolves to ``None`` and renders with an empty
-        heading path rather than being dropped — the chunk text is still the
-        answer.
-        """
-        if not path or ordinal is None:
-            return None
-        row = self._entry(path).row
-        if row is None or not 0 <= ordinal < len(row.chunks):
-            return None
-        chunk = row.chunks[ordinal]
-        return chunk if chunk.ordinal == ordinal else None
 
     ##
     ## The upload handler — reachable from outside the framework
@@ -1645,19 +1366,6 @@ class DocumentsMixin(_DocumentsBase):
             if sha is not None:
                 found.append((path, sha))
         return found
-
-
-def _score_label(hit: SearchHit | None, match: _KeywordMatch | None) -> str:
-    """Describe how one chunk was found, for its rendered line.
-
-    The shape ``PlanningTool`` established and the house convention records: the
-    number shown is the **raw** cosine score, which is the only absolute one — a
-    fused score is normalised against the rest of one result set and means nothing
-    outside it.
-    """
-    if hit is None:
-        return "keyword match"
-    return f"{'hybrid' if match is not None else 'semantic'}: {hit.score:.2f}"
 
 
 _IN_FLIGHT = frozenset(

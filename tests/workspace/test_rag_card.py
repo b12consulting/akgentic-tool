@@ -267,27 +267,30 @@ class TestTheSearchCapability:
 class TestTheSearchCallable:
     """The card runs the vector leg; the actor is handed its hits and the knobs."""
 
-    def test_it_forwards_the_cards_knobs_to_the_actor(
-        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    def test_it_forwards_the_cards_knobs_to_the_search(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """What crosses to the actor, by equality — so a sixth argument reddens it.
+        """What reaches the search, by equality — so a sixth argument reddens it.
 
-        **``score_threshold`` is deliberately absent.** It bounds the *vector* leg,
-        which is the card's now, so it is spent here and never travels; an actor
-        that still took it would be carrying a knob it cannot apply. ``alpha`` is
-        the fusion knob and the fusion is the actor's, so that one does travel.
+        **Re-pointed in story 57-1, from the actor to the moved function.** It
+        recorded what crossed a mailbox; nothing crosses one now, so it records
+        what the closure hands
+        :func:`~akgentic.tool.workspace.rag.search.search_documents` instead. The
+        knobs and their values are unchanged, and ``score_threshold`` has joined
+        them: it bounds the vector leg, which used to be spent in the closure
+        itself and is now spent one call further in.
         """
         seen: list[dict[str, Any]] = []
 
-        class Recording:
-            def attach(self, agent: Any, agent_name: str) -> None:
-                """The bind-time holder registration — the actor was alive then."""
+        def recording(cache: Any, store: Any, resolved: Any, query: str, **kwargs: Any) -> str:
+            seen.append({"query": query, **kwargs})
+            return "ok"
 
-            def rag_search(self, query: str, hits: Any = None, **kwargs: Any) -> str:
-                seen.append({"query": query, "hits": hits, **kwargs})
-                return "ok"
-
-        observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=Recording())
+        monkeypatch.setattr("akgentic.tool.workspace.rag.search_documents", recording)
+        observer = FakeActorToolObserver(orchestrator_proxy)
         card = WorkspaceTool(
             workspace_id=WORKSPACE_NAME,
             workspace_rag_search=WorkspaceRagSearch(top_k=3, alpha=0.4, score_threshold=0.2),
@@ -298,32 +301,29 @@ class TestTheSearchCallable:
         assert seen == [
             {
                 "query": "terms",
-                # This card names no vector store, so the card's own vector leg
-                # degrades to an empty mapping — one warning, and the actor's
-                # keyword leg answers alone. The argument is still *sent*, which
-                # is what this row pins.
-                "hits": {},
                 "top_k": 3,
+                "scope": WORKSPACE_PATH,
                 "path_prefix": "docs/",
                 "alpha": 0.4,
+                "score_threshold": 0.2,
             }
         ]
 
     def test_the_callables_own_top_k_overrides_the_cards(
-        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The budget is the one knob the model may set per call."""
         seen: list[int] = []
 
-        class Recording:
-            def attach(self, agent: Any, agent_name: str) -> None:
-                """The bind-time holder registration — the actor was alive then."""
+        def recording(cache: Any, store: Any, resolved: Any, query: str, **kwargs: Any) -> str:
+            seen.append(int(kwargs["top_k"]))
+            return "ok"
 
-            def rag_search(self, query: str, hits: Any = None, **kwargs: Any) -> str:
-                seen.append(int(kwargs["top_k"]))
-                return "ok"
-
-        observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=Recording())
+        monkeypatch.setattr("akgentic.tool.workspace.rag.search_documents", recording)
+        observer = FakeActorToolObserver(orchestrator_proxy)
         card = WorkspaceTool(
             workspace_id=WORKSPACE_NAME, workspace_rag_search=WorkspaceRagSearch(top_k=3)
         )
@@ -333,19 +333,19 @@ class TestTheSearchCallable:
 
         assert seen == [9]
 
-    def test_it_degrades_to_a_sentence_when_the_actor_raises(
-        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    def test_it_degrades_to_a_sentence_when_the_search_raises(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """It is an LLM-facing callable; a traceback is not an answer it can use."""
 
-        class Gone:
-            def attach(self, agent: Any, agent_name: str) -> None:
-                """The bind-time holder registration — the actor was alive then."""
+        def explodes(cache: Any, store: Any, resolved: Any, query: str, **kwargs: Any) -> str:
+            raise RuntimeError("the records could not be read")
 
-            def rag_search(self, query: str, hits: Any = None, **kwargs: Any) -> str:
-                raise RuntimeError("actor is dead")
-
-        observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=Gone())
+        monkeypatch.setattr("akgentic.tool.workspace.rag.search_documents", explodes)
+        observer = FakeActorToolObserver(orchestrator_proxy)
         card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_rag_search=True)
         card.observer(observer)
 
@@ -354,7 +354,7 @@ class TestTheSearchCallable:
         )
 
     def test_an_unbound_card_answers_the_sentence_rather_than_raising(self) -> None:
-        """A harness that wires a bare observer binds no proxy at all."""
+        """A harness that wires a bare observer builds no cache at all."""
         card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_rag_search=True)
 
         assert card._rag_search_factory(WorkspaceRagSearch())("terms") == (
@@ -812,19 +812,25 @@ class TestTheProvider:
         assert state is not None
         assert state.render_full() == "No workspace files are indexed for retrieval."
 
-    def test_it_returns_none_when_the_actor_is_unreachable(
-        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    def test_it_returns_none_when_the_render_raises(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The ``ContextState`` contract: never raise, answer ``None`` instead."""
+        """The ``ContextState`` contract: never raise, answer ``None`` instead.
 
-        class Gone:
-            def attach(self, agent: Any, agent_name: str) -> None:
-                """The bind-time holder registration — the actor was alive then."""
+        Re-pointed in story 57-1: the failure it stood for was an actor that had
+        died, and the provider reaches no actor now. What can still fail is the
+        render itself — an unreadable record directory — and the contract is the
+        same.
+        """
 
-            def rag_snapshot(self, max_pending_shown: int) -> Any:
-                raise RuntimeError("actor is dead")
+        def explodes(cache: Any, max_pending_shown: int) -> Any:
+            raise RuntimeError("the records could not be read")
 
-        observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=Gone())
+        monkeypatch.setattr("akgentic.tool.workspace.rag.render_index_state", explodes)
+        observer = FakeActorToolObserver(orchestrator_proxy)
         card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_rag_list=True)
         card.observer(observer)
 
@@ -833,20 +839,20 @@ class TestTheProvider:
         assert provider() is None
 
     def test_the_card_cap_reaches_the_snapshot(
-        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """``max_pending_shown`` is captured at ``get_context_states`` time."""
         seen: list[int] = []
 
-        class Recording:
-            def attach(self, agent: Any, agent_name: str) -> None:
-                """The bind-time holder registration — the actor was alive then."""
+        def recording(cache: Any, max_pending_shown: int) -> Any:
+            seen.append(max_pending_shown)
+            return None
 
-            def rag_snapshot(self, max_pending_shown: int) -> Any:
-                seen.append(max_pending_shown)
-                return None
-
-        observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=Recording())
+        monkeypatch.setattr("akgentic.tool.workspace.rag.render_index_state", recording)
+        observer = FakeActorToolObserver(orchestrator_proxy)
         card = WorkspaceTool(
             workspace_id=WORKSPACE_NAME,
             workspace_rag_list=WorkspaceRagList(max_pending_shown=7),
@@ -960,17 +966,19 @@ class TestTheCallablesThemselves:
         assert "notes.md" in rendered
         assert "4 chunk(s)" in rendered
 
-    def test_the_list_command_degrades_when_the_actor_raises(
-        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    def test_the_list_command_degrades_when_the_render_raises(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        class Gone:
-            def attach(self, agent: Any, agent_name: str) -> None:
-                """The bind-time holder registration — the actor was alive then."""
+        """Re-pointed in story 57-1: no actor is reached, but a read can still fail."""
 
-            def rag_snapshot(self, max_pending_shown: int) -> Any:
-                raise RuntimeError("actor is dead")
+        def explodes(cache: Any, max_pending_shown: int) -> Any:
+            raise RuntimeError("the records could not be read")
 
-        observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=Gone())
+        monkeypatch.setattr("akgentic.tool.workspace.rag.render_index_state", explodes)
+        observer = FakeActorToolObserver(orchestrator_proxy)
         card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_rag_list=True)
         card.observer(observer)
 

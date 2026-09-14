@@ -59,9 +59,12 @@ seven rules apply in full. The blocking sandbox call is off this thread — on
 Everything the ask path still does is bounded — one file read, one write, a few
 short-lived ``git`` forks under an explicit timeout — and never external. The last
 exception was ``rag_search``, which embedded a query and then searched a store
-that may be a cluster client; both halves moved onto the calling agent's own
-thread, and ``tests/workspace/test_rag_search_off_the_mailbox.py`` is what holds
-the sentence to its word rather than leaving it a claim.
+that may be a cluster client. **There is no ``rag_search`` here at all now**: a
+search reads the document records, which is not dispatch, so the whole of it —
+both legs, the fusion and the render — is the card's, in ``rag/search.py``, and
+the snapshot render is in ``rag/context.py`` beside the models it builds.
+``tests/workspace/test_rag_search_off_the_mailbox.py`` is what holds the sentence
+to its word rather than leaving it a claim.
 
 **The class is assembled from two per-concern mixins, and each one lives under
 its own capability** (ADR-053 Decision 1): the retrieval pipeline in

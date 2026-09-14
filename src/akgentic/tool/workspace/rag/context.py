@@ -6,17 +6,26 @@ the whole table into the system prompt on every change would invalidate the
 cached prompt prefix each time. So it is a :class:`ContextState` instead: the
 first turn sees the table, every later turn sees only what moved.
 
-Nothing here reads the tree, opens a file or touches an actor. The rows arrive
-already shaped from ``#Workspace``'s own dict, which is the whole reason a
-per-turn render can be free.
+**Nothing here touches an actor, and nothing here reads the tree.**
+:func:`render_index_state` reads the tree's *metadata* — one directory scan of
+``<meta>/rag/`` plus one parse per record, bounded by ``max_documents`` — through
+the :class:`~akgentic.tool.workspace.documents.cache.DocumentCache` its caller
+already holds. That is the whole of its I/O, it happens on the calling agent's own
+thread, and it is where the render lives because rendering rows into
+:class:`RagIndexState` is this module's subject. A snapshot is not a search and is
+deliberately not filed under one.
 """
 
 from __future__ import annotations
 
-from typing import Self
+from typing import TYPE_CHECKING, Self
 
 from akgentic.core.utils import SerializableBaseModel
 from akgentic.tool.core import ContextState
+from akgentic.tool.workspace.documents.models import RagStatus
+
+if TYPE_CHECKING:
+    from akgentic.tool.workspace.documents.cache import DocumentCache
 
 __all__ = ["RagFileRow", "RagIndexState"]
 
@@ -111,6 +120,58 @@ class RagIndexState(ContextState):
         if self.pending_hidden != previous.pending_hidden:
             parts.append(f"{self.pending_hidden} more pending.")
         return " ".join(parts) if parts else None
+
+
+def render_index_state(cache: DocumentCache, max_pending_shown: int) -> RagIndexState:
+    """Return *cache*'s records as rows, capped on ``PENDING`` only.
+
+    **No file access inside the tree, and no tree sweep**: this is taken once per
+    turn by every agent carrying the card, and a ``stat`` per candidate file would
+    put a tree walk on the hot path for a display. Reading ``<meta>/rag/`` is not
+    that — it is one directory scan plus one parse per record, bounded by
+    ``max_documents`` (32, or 8 when the vector backend is in-memory). That is
+    real where ``<meta>`` is on a network share, and it has no mitigation on
+    offer: the directory holds every cross-process lock, so it lives beside the
+    tree it belongs to and moves nowhere. **No read-through cache is added here**
+    either: it would be exactly the in-memory state the records-on-disk move
+    removed.
+
+    The rows are sorted by **path**, so the render is stable across runs. A
+    directory glob's order is the file system's, and a display that reordered
+    itself between two turns would look like the index had changed.
+
+    Everything that is not ``PENDING`` is always shown — those rows each say
+    something different. ``PENDING`` rows all say the same thing, so a
+    10,000-file tree would otherwise flood the context window with them.
+
+    Args:
+        cache: This tree's document records.
+        max_pending_shown: How many ``PENDING`` rows to render.
+
+    Returns:
+        The state, never ``None`` and never raising.
+    """
+    rows: list[RagFileRow] = []
+    hidden = 0
+    pending_shown = 0
+    for entry in sorted(cache.entries(), key=lambda stored: stored.path):
+        row = entry.row
+        if row is None:
+            continue
+        if row.status is RagStatus.PENDING:
+            if pending_shown >= max_pending_shown:
+                hidden += 1
+                continue
+            pending_shown += 1
+        rows.append(
+            RagFileRow(
+                path=entry.path,
+                status=row.status.value,
+                chunk_count=row.chunk_count,
+                reason=row.reason or "",
+            )
+        )
+    return RagIndexState(rows=rows, pending_hidden=hidden)
 
 
 def _row_line(row: RagFileRow) -> str:

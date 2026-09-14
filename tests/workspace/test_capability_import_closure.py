@@ -204,6 +204,15 @@ CAPABILITY_CLOSURES: dict[str, frozenset[str]] = {
         f"{PACKAGE}.rag.actor",
         f"{PACKAGE}.rag.context",
         f"{PACKAGE}.rag.params",
+        # Measured, story 57-1, one mutation at a time: the search itself — both
+        # legs, the fusion and the render — as its own module. Removing it reddens
+        # **both** ``test_the_closure_is_inside_the_allow_list`` (it is one of this
+        # capability's own modules, so it is a closure root) **and**
+        # ``test_it_names_no_other_capability_even_in_an_annotation``
+        # (``rag/__init__.py`` imports it at module scope). That is the asymmetry
+        # with ``rag.actor`` one row up, which reddens only the first because no
+        # sibling under ``rag/`` imports it — the assembly point does.
+        f"{PACKAGE}.rag.search",
         f"{PACKAGE}.rag.splitter",
         f"{PACKAGE}.rag.worker",
         # ``RagFactories._rag_reader`` resolves the card's extraction

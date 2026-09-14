@@ -52,6 +52,7 @@ from akgentic.tool.workspace.documents.models import (
     chunk_id,
 )
 from akgentic.tool.workspace.models import WorkspaceConfig, content_sha
+from akgentic.tool.workspace.rag.context import render_index_state
 from akgentic.tool.workspace.rag.params import WorkspaceRagIndex
 from akgentic.tool.workspace.rag.worker import (
     EMBED_BATCH_SIZE,
@@ -1764,7 +1765,17 @@ class TestTheGateMarksStale:
 
 
 class TestRagSnapshot:
-    """A render, and therefore free — no file access of any kind."""
+    """A render over the records — no file access *inside the tree*, of any kind.
+
+    **Re-pointed in story 57-1, subject unchanged.** These are record-content
+    specs: what the cap does, what is always shown, how the rows are ordered,
+    what a render must not mutate. They called ``actor.rag_snapshot`` because the
+    render lived on the actor; it lives in ``rag/context.py`` now, beside the
+    models it builds, and is called over the same
+    :class:`~akgentic.tool.workspace.documents.cache.DocumentCache` the actor was
+    announced. The records are seeded through the actor exactly as before, and
+    ``cache_of`` is the object both sides read them through.
+    """
 
     def _seed(self, actor: WorkspaceActor, pending: int, embedded: int) -> None:
         now = datetime.now(UTC)
@@ -1790,7 +1801,7 @@ class TestRagSnapshot:
         """A 10,000-file tree must not flood the context window with identical rows."""
         self._seed(actor, pending=10, embedded=2)
 
-        state = actor.rag_snapshot(max_pending_shown=3)
+        state = render_index_state(cache_of(actor), max_pending_shown=3)
 
         assert state.pending_hidden == 7
         assert sum(1 for row in state.rows if row.status == "pending") == 3
@@ -1799,7 +1810,7 @@ class TestRagSnapshot:
         """Those rows each say something different; pending rows all say the same."""
         self._seed(actor, pending=50, embedded=6)
 
-        state = actor.rag_snapshot(max_pending_shown=1)
+        state = render_index_state(cache_of(actor), max_pending_shown=1)
 
         assert sum(1 for row in state.rows if row.status == "embedded") == 6
 
@@ -1815,7 +1826,7 @@ class TestRagSnapshot:
             ),
         )
 
-        [row] = actor.rag_snapshot(max_pending_shown=5).rows
+        [row] = render_index_state(cache_of(actor), max_pending_shown=5).rows
         assert (row.status, row.reason) == ("failed", "rate limited")
 
     def test_the_snapshot_performs_no_file_access_at_all(
@@ -1848,7 +1859,7 @@ class TestRagSnapshot:
         monkeypatch.setattr(Filesystem, "resolve_path", recorder("resolve_path"))
         self._seed(actor, pending=2, embedded=2)
 
-        state = actor.rag_snapshot(max_pending_shown=20)
+        state = render_index_state(cache_of(actor), max_pending_shown=20)
 
         assert touched == [], f"the snapshot touched the filesystem: {touched}"
         assert len(state.rows) == 4
@@ -1865,7 +1876,7 @@ class TestRagSnapshot:
             ),
         )
 
-        actor.rag_snapshot(max_pending_shown=20)
+        render_index_state(cache_of(actor), max_pending_shown=20)
 
         assert stored_rows(actor)["a.md"].status is RagStatus.EMBEDDING
 
@@ -1879,7 +1890,7 @@ class TestRagSnapshot:
         for name in ("zebra.md", "alpha.md", "middle.md"):
             seed_row(actor, name, RagFile(path=name, status=RagStatus.EMBEDDED, updated_at=now))
 
-        state = actor.rag_snapshot(max_pending_shown=20)
+        state = render_index_state(cache_of(actor), max_pending_shown=20)
 
         assert [row.path for row in state.rows] == ["alpha.md", "middle.md", "zebra.md"]
 

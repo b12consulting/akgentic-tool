@@ -1,11 +1,20 @@
 """The retrieval capability of :class:`WorkspaceTool` — index, list, search.
 
-It holds one capability whole: the three factories and the search's external leg,
-its parameters (``rag/params.py``), the splitter (``rag/splitter.py``), the
-context state (``rag/context.py``), the index worker (``rag/worker.py``), the
-actor-side pipeline (``rag/actor.py``) and the tree-policy record. It may import
-the package **spine** — ``workspace.py``, ``models.py``, ``readers.py``,
-``event.py`` — plus ``akgentic.tool.core`` and ``akgentic.tool.vector_store``.
+It holds one capability whole: the three factories, its parameters
+(``rag/params.py``), the splitter (``rag/splitter.py``), the context state and
+its render (``rag/context.py``), the search itself (``rag/search.py``), the index
+worker (``rag/worker.py``), the actor-side indexing pipeline (``rag/actor.py``)
+and the tree-policy record. It may import the package **spine** —
+``workspace.py``, ``models.py``, ``readers.py``, ``event.py`` — plus
+``akgentic.tool.core`` and ``akgentic.tool.vector_store``.
+
+**Two of the three callables reach no actor at all.** A search and a listing read
+the document records through the
+:class:`~akgentic.tool.workspace.documents.cache.DocumentCache` this card built
+in ``observer()``, on the calling agent's own thread; only
+``workspace_rag_index`` is an ask, because queueing a file for indexing is
+dispatch and the pipeline's children need a mailbox to report to (ADR-053
+Decision 6).
 
 **``documents/`` is not spine and is named here on this capability's own row.**
 It stopped being spine in story 55-8, when the two document caps left
@@ -150,12 +159,13 @@ from akgentic.tool.vector_store.protocol import (
     PATH_PREFIX_WILDCARDS,
     VectorStoreParam,
 )
-from akgentic.tool.workspace.documents.models import RAG_COLLECTION
+from akgentic.tool.workspace.rag.context import render_index_state
 from akgentic.tool.workspace.rag.params import (
     WorkspaceRagIndex,
     WorkspaceRagList,
     WorkspaceRagSearch,
 )
+from akgentic.tool.workspace.rag.search import search_documents
 from akgentic.tool.workspace.read.params import WorkspaceRead
 from akgentic.tool.workspace.readers import DocumentReader
 from akgentic.tool.workspace.workspace import meta_dir_for
@@ -163,24 +173,33 @@ from akgentic.tool.workspace.workspace import meta_dir_for
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-    from akgentic.tool.vector_store.protocol import SearchHit, VectorStoreService
+    from akgentic.tool.vector_store.protocol import VectorStoreService
     from akgentic.tool.workspace.actor import WorkspaceActor
+    from akgentic.tool.workspace.documents.cache import DocumentCache
 
 logger = logging.getLogger(__name__)
 
 _UNAVAILABLE = "Retrieval indexing is not available for this workspace."
-"""What all three callables answer when the actor cannot be reached.
+"""What all three callables answer when this card has no retrieval to offer.
 
-Deliberately the same sentence the actor itself returns in degraded mode: an
-agent should not have to tell "no vector store is wired" apart from "the proxy is
-gone", because its next step is the same in both.
+Deliberately one sentence for every cause: an agent should not have to tell "no
+vector store is wired" apart from "this card never bound a tree" or "the actor is
+gone", because its next step is the same in all three. ``rag/actor.py`` returns
+the identical sentence from ``index_paths``, which is the one callable still
+behind a mailbox.
 """
 
 _REJECTED_PREFIX = PATH_PREFIX_REJECTED
 """What a search answers for a ``path_prefix`` carrying ``*`` or ``?``.
 
-The **same constant** ``rag/actor.py`` aliases, so the two checks — the one here,
-ahead of any spend, and the mixin's own — cannot drift into two sentences.
+The characters and the sentence both live in ``vector_store/protocol.py``, beside
+the two backends that read a prefix differently, so this capability and the guard
+underneath it cannot drift apart. This layer **returns** the sentence rather than
+raising it: a wildcard is a mistake the agent can correct from the answer alone.
+
+**One copy, since story 57-1.** ``rag/actor.py`` aliased the same constant, as
+defence in depth for an ask with a public-shaped signature; no such ask exists any
+more, and a second copy would be a second sentence waiting to drift.
 """
 
 IN_ACTOR_BACKEND = "inmemory"
@@ -533,99 +552,10 @@ def require_workspace_backend(param: VectorStoreParam, card_name: str) -> None:
         )
 
 
-def _vector_hits(
-    store: VectorStoreService | None,
-    resolved: VectorStoreParam | None,
-    query: str,
-    top_k: int,
-    scope: str,
-    path_prefix: str,
-    score_threshold: float,
-) -> dict[str, SearchHit]:
-    """Embed *query* and search the collection **within this workspace only**.
-
-    **This is the whole external half of a search, and it runs on the calling
-    agent's thread.** Both round trips are here — the embed, and the ``search``
-    that on a cluster backend is a second HTTP call — because moving only the
-    embed would leave the actor's turn holding one of them, and a guard written
-    against the embedder alone would go vacuous the moment it did.
-
-    The ``scope`` predicate is mandatory on every workspace query (ADR-045 §5,
-    §7) and both predicates go to the backend, so the ``top_k`` budget is never
-    spent on another scope's objects. The call over-fetches by ``OVERFETCH``
-    because fusion reorders and the actor drops what it cannot resolve.
-
-    **One gate the card does not have and the actor does, and it costs.** The
-    actor only searched once ``create_collection`` had succeeded; this function
-    has no such signal, so a search against a collection that was never created
-    reaches the backend and raises. The raise lands in the ``except`` below,
-    yields an empty mapping and one warning — the existing *every failure
-    degrades* contract rather than a new hole.
-
-    What is new is the **price of a degraded tree**. The actor's unavailable gate
-    is reached only after this function has run, so when the actor is degraded —
-    ``create_collection`` failed, or retrieval parameters were never announced —
-    every query now spends one embed and one ``search`` and then has both
-    discarded, because the actor answers its sentence whatever it was handed.
-    Before the vector leg moved it spent nothing. The answer is byte-identical;
-    the cost is not. Closing it needs a signal the card does not have, and the
-    only cheap source of one is an ask to the actor before every search — which
-    is the mailbox dependency this split exists to remove.
-
-    **It never raises**, including out of building the embedder, which imports an
-    optional extra.
-
-    Args:
-        store: The engine the card resolved, or ``None`` when it resolved none.
-        resolved: The card's resolved collection param, whose model and provider
-            the query is embedded through, or ``None``.
-        query: What to look for, in natural language.
-        top_k: The result budget, already clamped by the caller.
-        scope: The resolved workspace path every query is scoped to.
-        path_prefix: The caller's prefix, already checked for metacharacters.
-        score_threshold: Minimum **raw** cosine score, applied before fusion.
-
-    Returns:
-        ``{ref_id: hit}`` for the hits at or above *score_threshold*, or an empty
-        mapping on any failure.
-    """
-    if store is None or resolved is None:
-        logger.warning("Workspace %s: no vector store — searching on the keyword leg alone", scope)
-        return {}
-    try:
-        from akgentic.tool.vector_store.embedding_actor import (  # noqa: PLC0415 — optional extra
-            build_embedding_service,
-        )
-        from akgentic.tool.vector_store.hybrid import OVERFETCH  # noqa: PLC0415 — optional extra
-
-        embedder = build_embedding_service(resolved.embedding_model, resolved.embedding_provider)
-        vectors = embedder.embed([query])
-        if not vectors:
-            logger.warning(
-                "Workspace %s: embedding a search query returned nothing — keyword only", scope
-            )
-            return {}
-        result = store.search(
-            RAG_COLLECTION,
-            vectors[0],
-            top_k * OVERFETCH,
-            scope=scope,
-            path_prefix=path_prefix or None,
-        )
-    except Exception:
-        logger.warning(
-            "Workspace %s: the vector leg of a search failed — keyword only",
-            scope,
-            exc_info=True,
-        )
-        return {}
-    return {hit.ref_id: hit for hit in result.hits if hit.score >= score_threshold}
-
-
 class RagFactories:
     """The three retrieval factories and their binding.
 
-    Declares no Pydantic field: the five names below are what the card supplies,
+    Declares no Pydantic field: the names below are what the card supplies,
     declared under ``if TYPE_CHECKING:`` so mypy sees them and Pydantic does not.
     """
 
@@ -646,6 +576,11 @@ class RagFactories:
         # ``observer()``, which runs before ``get_tools()``.
         _vector_store: VectorStoreService | None
         _workspace_path: str
+        # The records a search and a listing read, built by the card on **every**
+        # bind — actor or no actor — which is what lets both answer without one.
+        # The import above it is ``TYPE_CHECKING``-only: it is a parameter type
+        # here and is never constructed by this module.
+        _document_cache: DocumentCache | None
 
     ##
     ## Enablement — one predicate, because three sites have to agree on it
@@ -670,6 +605,34 @@ class RagFactories:
             or _resolve(self.workspace_rag_list, WorkspaceRagList) is not None
             or _resolve(self.workspace_rag_search, WorkspaceRagSearch) is not None
         )
+
+    def _retrieval_bound(self) -> bool:
+        """Whether this bind actually produced something to search.
+
+        **The card-side reproduction of the gate the actor used to hold**, which
+        was ``self._vs_proxy is None or self._rag_params is None`` — and a search
+        that had to ask for it was the mailbox dependency story 57-1 removed. Read
+        at ``get_tools()`` time, which is after ``observer()`` has run, exactly as
+        the three values beside it are.
+
+        Two terms, because the actor's were two. ``_resolved_store`` is derived
+        exactly when :meth:`_rag_enabled` holds and is the param ``_announce_rag``
+        sends, so it stands for "no card ever announced ``enable_rag``";
+        ``_vector_store`` is the engine ``_bind_vector_store`` resolved, so it
+        stands for "no store was announced". Either one ``None`` means the actor
+        would have degraded, and one term would not reproduce both.
+
+        **The actor's gate had a third term this cannot see, and that is an
+        accepted behaviour change.** ``_vs_proxy`` was also ``None`` when
+        ``create_collection`` *raised*, and no card-side signal reports that: the
+        only cheap source of one is an ask before every search. So a tree whose
+        collection failed to be created now answers from the keyword leg over the
+        records on disk — which exist regardless of the vector collection — or
+        that nothing matched, rather than that retrieval is unavailable. Neither
+        answer is wrong and the trade is deliberate: the alternative is a mailbox
+        round trip on every search, carrying one boolean.
+        """
+        return self._vector_store is not None and self._resolved_store is not None
 
     def _rag_params(self) -> WorkspaceRagIndex:
         """The chunking configuration this card contributes.
@@ -789,32 +752,46 @@ class RagFactories:
     def _rag_search_factory(self, params: WorkspaceRagSearch) -> Callable[..., Any]:
         """Create the ``workspace_rag_search`` callable.
 
-        **Two legs, and they run in two places.** The *vector* leg — the query
-        embed and the ``search`` call — runs here, on the calling agent's own
-        thread, because its inputs are the card's: the engine this card resolved
-        in ``observer()``, the collection param it derived, and the workspace path
-        it resolved once and hands to everything. The *keyword* leg, the fusion
-        and the render stay on the actor, because their inputs are actor state —
-        the extraction bodies, the chunk offsets and nothing else.
+        **Both legs run here, on the calling agent's own thread, and no part of a
+        search reaches a mailbox.** The *vector* leg's inputs are the card's — the
+        engine this card resolved in ``observer()``, the collection param it
+        derived, the workspace path it resolved once — and so are the *keyword*
+        leg's: it reads the document records through the
+        :class:`~akgentic.tool.workspace.documents.cache.DocumentCache` this card
+        built, which is the same object the actor reads them through. The ask that
+        used to carry the second half was justified as "their inputs are actor
+        state", and that was false; what it cost was a search queueing behind
+        ``request_exec``, ``exec_status`` and every index worker's report, for work
+        that is file reading (ADR-053 Decision 6).
 
-        **Why the caller's thread and not a child actor.** ``rag_search`` is an
-        *ask*: the calling agent is blocked on its answer for the whole call, so a
-        child would only move the block — the actor would wait for the child's
-        report and the mailbox would be held exactly as long. The only shape that
-        frees the mailbox for an ask is a deferred/poll protocol, and
-        ``#Workspace``'s :class:`~akgentic.tool.core.deferred.DeferredResultActor`
-        holds **exec** outcomes; putting a search through it would evict a running
-        agent's exec result and mis-type the cache's value — the argument
-        ``rag/worker.py`` and ``EmbeddingWorker`` both already make about that
-        mechanism. The calling agent's thread is already blocked for the duration
-        and blocks nobody else, which is where the two round trips belong. Two
-        agents searching concurrently now embed concurrently instead of
-        serialising on one mailbox.
+        **Why the caller's thread and not a child actor.** A search is an *ask*:
+        the calling agent is blocked on its answer for the whole call, so a child
+        would only move the block — the actor would wait for the child's report and
+        the mailbox would be held exactly as long. The only shape that frees a
+        mailbox for an ask is a deferred/poll protocol, and ``#Workspace``'s
+        :class:`~akgentic.tool.core.deferred.DeferredResultActor` holds **exec**
+        outcomes; putting a search through it would evict a running agent's exec
+        result and mis-type the cache's value — the argument ``rag/worker.py`` and
+        ``EmbeddingWorker`` both already make about that mechanism. The calling
+        agent's thread is already blocked for the duration and blocks nobody else.
+        Two agents of one team searching concurrently now genuinely search
+        concurrently, instead of serialising on one mailbox.
 
-        The three values are read **at ``get_tools()`` time**, which is after
-        ``observer()`` has run, so ``_vector_store``, ``_resolved_store`` and
-        ``_workspace_path`` are all populated by the time the closure captures
-        them.
+        **The order of the three gates below is load-bearing and is pinned by a
+        spec.** A ``None`` cache is "this card never bound a tree", which is the
+        position the ``None`` proxy held before — ``_build_document_cache`` runs in
+        ``observer()``, so an unbound card has neither. The wildcard check comes
+        next, so a refused prefix costs nothing at all whatever the tree's state.
+        The availability gate comes last of the three, and it now sits **ahead of
+        the vector leg** where the actor's sat behind it: that changes no answer
+        and closes a cost the vector leg's own docstring used to record as
+        unclosable, because a degraded tree spent one embed and one ``search`` per
+        query and discarded both. Swapping the middle two would silently flip what
+        a degraded tree answers to a wildcard prefix.
+
+        The values are read **at ``get_tools()`` time**, which is after
+        ``observer()`` has run, so the cache, the engine, the collection param and
+        the workspace path are all populated by the time the closure captures them.
 
         Args:
             params: The result budget and the two fusion knobs, captured here so
@@ -823,10 +800,11 @@ class RagFactories:
         Returns:
             The callable, which never raises.
         """
-        proxy = self._workspace_proxy
+        cache = self._document_cache
         store = self._vector_store
         resolved = self._resolved_store
         scope = self._workspace_path
+        available = self._retrieval_bound()
         top_k, alpha, threshold = params.top_k, params.alpha, params.score_threshold
 
         def workspace_rag_search(query: str, top_k: int = top_k, path_prefix: str = "") -> str:
@@ -847,24 +825,25 @@ class RagFactories:
                 The matching passages with their file, heading path and score, or
                 a sentence saying that nothing matched.
             """
-            if proxy is None:
-                return _UNAVAILABLE
+            if cache is None:
+                return _UNAVAILABLE  # harness shapes that wire a bare observer never bind one
             # Ahead of the embed and the search, so a refused prefix costs
             # nothing at all — no round trip and no embedding credit.
             if any(character in path_prefix for character in PATH_PREFIX_WILDCARDS):
                 return _REJECTED_PREFIX
-            hits = _vector_hits(
-                store, resolved, query, max(top_k, 1), scope, path_prefix, threshold
-            )
+            if not available:
+                return _UNAVAILABLE
             try:
-                return str(
-                    proxy.rag_search(
-                        query,
-                        hits,
-                        top_k=top_k,
-                        path_prefix=path_prefix,
-                        alpha=alpha,
-                    )
+                return search_documents(
+                    cache,
+                    store,
+                    resolved,
+                    query,
+                    top_k=top_k,
+                    scope=scope,
+                    path_prefix=path_prefix,
+                    alpha=alpha,
+                    score_threshold=threshold,
                 )
             except Exception:
                 logger.debug("Could not search the retrieval index", exc_info=True)
@@ -924,13 +903,19 @@ class RagFactories:
         rendered in full rather than as a delta — a person asking for the list
         wants the list, not what changed since last turn.
 
+        **It renders with no actor at all**, over the records this card's own
+        cache reads: a listing is a render, not dispatch, so a retrieval-off tree
+        and a tree whose actor died both still answer (ADR-053 Decision 6). The
+        degraded case is a ``None`` cache — this card never bound a tree — and its
+        answer is the sentence, exactly where a ``None`` proxy used to give it.
+
         Args:
             params: The render cap.
 
         Returns:
             The callable, which never raises.
         """
-        proxy = self._workspace_proxy
+        cache = self._document_cache
         cap = params.max_pending_shown
 
         def workspace_rag_list() -> str:
@@ -940,10 +925,10 @@ class RagFactories:
                 One line per file, with a tail counting the pending files the cap
                 left out.
             """
-            if proxy is None:
-                return _UNAVAILABLE
+            if cache is None:
+                return _UNAVAILABLE  # harness shapes that wire a bare observer never bind one
             try:
-                return str(proxy.rag_snapshot(cap).render_full())
+                return str(render_index_state(cache, cap).render_full())
             except Exception:
                 logger.debug("Could not render the retrieval index", exc_info=True)
                 return _UNAVAILABLE
@@ -956,26 +941,29 @@ class RagFactories:
     ) -> Callable[[], ContextState | None]:
         """Create the ``LLM_CONTEXT`` provider for the retrieval index.
 
-        **One bounded ask, and no I/O of any kind behind it.** This runs on every
-        turn of every agent carrying the card, so a ``stat`` per candidate — let
-        alone a tree walk — would put the filesystem on the hot path for a
-        display. ``rag_snapshot`` is O(n) dict work over rows that already exist.
+        **No mailbox, and no tree walk.** This runs on every turn of every agent
+        carrying the card, and it used to be an ask — so a display queued behind
+        exec dispatch and every index worker's report. It is one directory scan of
+        ``<meta>/rag/`` and one parse per record now, bounded by
+        ``max_documents``, on the calling agent's own thread; no file **inside**
+        the tree is opened and no ``stat`` per candidate is spent, which is the
+        property that keeps the filesystem off the hot path.
 
         Args:
             params: The render cap, captured here at ``get_context_states`` time.
 
         Returns:
-            A provider that returns ``None`` — never raises — when the actor is
-            unavailable, which is the ``ContextState`` contract.
+            A provider that returns ``None`` — never raises — when this card
+            bound no tree, which is the ``ContextState`` contract.
         """
-        proxy = self._workspace_proxy
+        cache = self._document_cache
         cap = params.max_pending_shown
 
         def provider() -> ContextState | None:
-            if proxy is None:
+            if cache is None:
                 return None  # harness shapes that wire a bare observer never bind one
             try:
-                return proxy.rag_snapshot(cap)
+                return render_index_state(cache, cap)
             except Exception:
                 logger.debug("Could not read the retrieval index", exc_info=True)
                 return None
