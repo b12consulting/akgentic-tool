@@ -547,12 +547,21 @@ def _metadata_of(entry: VectorEntry) -> dict[str, Any]:
 def _atomic_write(target: Path, payload: bytes) -> None:
     """Write *payload* to a temp file beside *target*, then replace it in one step.
 
-    The same shape ``YamlDocumentStore._atomic_write`` and ``FileLockBackend``
-    use — a copy rather than an import, because those live in the workspace
-    package and this one may not import it. The temp file is created **in the
-    destination directory** so the replace is a same-filesystem rename, which is
-    what makes it atomic; any ``BaseException`` unlinks it before re-raising, so
-    an interrupted write leaves the previous file intact and no debris behind.
+    The same shape ``akgentic.tool.workspace.locks.atomic_write`` has — **a copy
+    rather than an import, because that lives in the workspace package and this
+    one may not import it.** The edge runs one way: ``workspace`` imports this
+    package, and nothing here may import ``workspace`` back.
+
+    It would not collapse onto that helper even if the import were allowed. This
+    one writes **bytes** and ``fsync``s them, because what it replaces is a vector
+    index whose loss is not recoverable from anything else on disk; the workspace
+    helper writes text without one. Folding them together would need a parameter
+    per difference, for one caller each.
+
+    The temp file is created **in the destination directory** so the replace is a
+    same-filesystem rename, which is what makes it atomic; any ``BaseException``
+    unlinks it before re-raising, so an interrupted write leaves the previous file
+    intact and no debris behind.
     """
     fd, tmp = tempfile.mkstemp(dir=target.parent, suffix=".tmp")
     try:

@@ -33,8 +33,9 @@ read capability can name a cache file and no ``rm -rf`` from inside a sandboxed
 run can reach one.
 :meth:`~akgentic.tool.workspace.workspace.Filesystem._stage` is **not** reusable
 for the write and that is not an oversight: it is root-confined by design and
-therefore cannot reach ``<meta>``. This module writes its own atomic write,
-exactly as :class:`~akgentic.tool.workspace.lock.FileLockBackend` does.
+therefore cannot reach ``<meta>``. The write goes through
+:func:`~akgentic.tool.workspace.locks.atomic_write` instead, which every
+capability that replaces a file under ``<meta>`` shares.
 
 **Half of "there is no lock, and none is to be added" survives; half of it was
 false.** The surviving half is the **extraction cache**: two agents contend only
@@ -72,10 +73,8 @@ are re-exported from ``workspace/__init__.py`` instead.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import logging
 import os
-import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -83,6 +82,7 @@ import yaml
 from pydantic import ValidationError
 
 from akgentic.core.utils.serializer import SerializableBaseModel
+from akgentic.tool.workspace import locks
 from akgentic.tool.workspace.documents.models import DocumentExtract, RagFile, RagStatus
 from akgentic.tool.workspace.models import content_sha
 from akgentic.tool.workspace.workspace import meta_dir_for
@@ -103,23 +103,8 @@ tree, which is how a cache silently stops hitting.
 DOCUMENT_FILE_SUFFIX = ".yaml"
 """Suffix of every file this store writes — and what :meth:`list_documents` globs."""
 
-LOCKS_DIR_NAME = "locks"
-"""The directory under ``<meta>`` holding one lock file per contended thing.
-
-**Spelled here rather than imported**, and it is one of three such spellings —
-``write/gate.py`` and ``vector_store/backends/local.py`` hold the others.
-Importing ``lock_file_for`` from the gate would make the retrieval capability
-import the **write** capability at runtime, which is worse than a third copy and
-is the same call this module already makes for its own ``_atomic_write``. A
-single spine helper for the family is a cross-capability decision, recorded as an
-open question rather than taken here.
-"""
-
 RECORD_LOCK_PREFIX = "record-"
 """What a document record's lock file is named, before the digest of its path."""
-
-_LOCK_FILE_MODE = 0o600
-"""Owner-only, like every other lock file under ``<meta>``."""
 
 DEFAULT_DOCUMENT_STORE = "yaml"
 """What ``AKGENTIC_DOCUMENT_STORE`` resolves to when it is unset or empty."""
@@ -376,12 +361,10 @@ class YamlDocumentStore:
     def hold(self, tree_key: str, path: str) -> Iterator[None]:
         """Take *path*'s record lock exclusively, and release it whatever happens.
 
-        The eight lines are ``CardGate._hold`` / ``LocalBackend._hold``'s idiom,
-        **copied rather than imported** — see :data:`LOCKS_DIR_NAME` for why — on a
-        lazily created file that is unlocked and closed in ``finally`` and **never
-        unlinked**: unlinking would let a second process create a fresh inode and
-        take a hold that excludes nobody, which is the classic way a file lock
-        stops locking.
+        The hold itself is :func:`akgentic.tool.workspace.locks.hold`'s. What
+        stays here is the file this family contends on — :meth:`_lock_file`
+        composes :data:`RECORD_LOCK_PREFIX` with a digest of the path, one lock
+        file per record.
 
         A ``<meta>`` whose locks directory cannot be created logs one WARNING and
         yields unserialised, which is ``CardGate._hold``'s stated choice copied
@@ -394,26 +377,17 @@ class YamlDocumentStore:
             tree_key: The tree the document belongs to.
             path: Workspace-relative path of the source document.
         """
-        handle: int | None = None
-        try:
-            try:
-                lock_path = self._lock_file(tree_key, path)
-                lock_path.parent.mkdir(parents=True, exist_ok=True)
-                handle = os.open(lock_path, os.O_RDWR | os.O_CREAT, _LOCK_FILE_MODE)
-                fcntl.flock(handle, fcntl.LOCK_EX)
-            except OSError:
-                logger.warning(
-                    "Workspace %s: could not take the record lock for %s — proceeding unserialised",
-                    tree_key,
-                    path,
-                    exc_info=True,
-                )
+
+        def warn(exc: OSError) -> None:
+            logger.warning(
+                "Workspace %s: could not take the record lock for %s — proceeding unserialised",
+                tree_key,
+                path,
+                exc_info=exc,
+            )
+
+        with locks.hold([self._lock_file(tree_key, path)], on_failure=warn):
             yield
-        finally:
-            if handle is not None:
-                with contextlib.suppress(OSError):
-                    fcntl.flock(handle, fcntl.LOCK_UN)
-                os.close(handle)
 
     def _record_files(self, tree_key: str) -> list[Path]:
         """Every record file under *tree_key*'s ``rag/`` directory, sorted.
@@ -437,7 +411,7 @@ class YamlDocumentStore:
         """
         return (
             meta_dir_for(tree_key)
-            / LOCKS_DIR_NAME
+            / locks.LOCKS_DIR_NAME
             / f"{RECORD_LOCK_PREFIX}{content_sha(path.encode())}"
         )
 
@@ -474,24 +448,14 @@ class YamlDocumentStore:
     def _atomic_write(target: Path, entry: DocumentEntry) -> None:
         """Dump *entry* to a temp file beside *target*, then replace it in one step.
 
-        Mirrors ``YamlEventStore._atomic_write`` in ``akgentic-team`` — the same
-        shape, not an import: that is another submodule, and a cross-submodule
-        import is what Golden Rule 4 forbids.
-
-        The temp file is created **in the destination directory** so the replace
-        is a same-filesystem rename, which is what makes it atomic. Any
-        ``BaseException`` — a serialisation failure, a full disk, a
-        ``KeyboardInterrupt`` between the two — unlinks it before re-raising, so
-        a failed write leaves no debris for :meth:`list_documents` to trip over.
+        The replace is :func:`akgentic.tool.workspace.locks.atomic_write`'s; what
+        stays here is the **rendering**. The spine takes text and knows nothing
+        about YAML, so the entry becomes a string first — ``yaml.dump`` with no
+        stream returns exactly the bytes it would otherwise have written to one.
         """
-        fd, tmp = tempfile.mkstemp(dir=target.parent, suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w") as handle:
-                yaml.dump(entry.model_dump(mode="json"), handle, default_flow_style=False)
-            Path(tmp).replace(target)
-        except BaseException:
-            Path(tmp).unlink(missing_ok=True)
-            raise
+        locks.atomic_write(
+            target, yaml.dump(entry.model_dump(mode="json"), default_flow_style=False)
+        )
 
 
 DOCUMENT_STORE_CLASSES: dict[str, type[DocumentStore]] = {"yaml": YamlDocumentStore}

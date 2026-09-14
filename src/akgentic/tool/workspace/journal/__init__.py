@@ -89,7 +89,6 @@ deletable from ``write/`` but not yet from a bind.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import logging
 import os
 import shutil
@@ -98,6 +97,7 @@ import tempfile
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
+from akgentic.tool.workspace.locks import LOCKS_DIR_NAME, hold
 from akgentic.tool.workspace.models import (
     GIT_DIR_SUFFIX,
     GITIGNORE_NAME,
@@ -107,14 +107,6 @@ from akgentic.tool.workspace.models import (
 )
 
 logger = logging.getLogger(__name__)
-
-LOCKS_DIR_NAME = "locks"
-"""The directory under ``<meta>`` holding every ``flock`` file of one tree.
-
-Shared with the per-path write locks
-(:mod:`akgentic.tool.workspace.write.gate`) — one directory, one idiom, two
-families of lock file, so nothing has to remember a second place to look.
-"""
 
 JOURNAL_LOCK_FILENAME = "journal"
 """The one lock file every commit into one tree's repository contends on.
@@ -506,11 +498,11 @@ class GitJournal:
     def _holding(self) -> Iterator[None]:
         """Hold this tree's commit lock for the duration of the block.
 
-        The idiom is
-        :meth:`~akgentic.tool.vector_store.backends.local.LocalBackend._hold`'s,
-        deliberately identical: an exclusive ``flock`` on a lazily created file
-        under ``<meta>/locks/``, unlocked and closed in ``finally``. Two flock
-        idioms in one package is one more than anybody will keep in step.
+        The hold itself is :func:`akgentic.tool.workspace.locks.hold`'s. What
+        stays here is the file this family contends on —
+        :data:`JOURNAL_LOCK_FILENAME`, one per tree — and the rule below about
+        where the hold may be taken from, which is a property of this call site
+        rather than of the helper.
 
         **Taken here and nowhere below, and never around a path lock.** The
         per-path write locks and this one must stay disjoint regions — a
@@ -524,31 +516,17 @@ class GitJournal:
         exactly the behaviour that existed before the lock, rather than to a
         lost mutation. The bytes are already on disk either way.
         """
-        handle: int | None = None
-        try:
-            self._lock_path.parent.mkdir(parents=True, exist_ok=True)
-            handle = os.open(self._lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-            fcntl.flock(handle, fcntl.LOCK_EX)
-        except OSError:
+
+        def warn(exc: OSError) -> None:
             logger.warning(
                 "Workspace %s: could not take the journal lock at %s — committing unserialised",
                 self._root.name,
                 self._lock_path,
-                exc_info=True,
+                exc_info=exc,
             )
-            if handle is not None:
-                os.close(handle)
-                handle = None
-        try:
+
+        with hold([self._lock_path], on_failure=warn):
             yield
-        finally:
-            if handle is not None:
-                # Suppressed around the unlock alone, exactly as the per-path
-                # hold does it: a failing ``LOCK_UN`` must not skip the close and
-                # leak the descriptor, and closing releases the hold regardless.
-                with contextlib.suppress(OSError):
-                    fcntl.flock(handle, fcntl.LOCK_UN)
-                os.close(handle)
 
     def _commit(
         self, add_args: list[str], identity: Identity, subject: str, body: str = ""

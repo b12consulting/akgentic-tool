@@ -72,6 +72,15 @@ SPINE = frozenset(
         # ``akgentic.tool.errors``, outside this package, so it is never a node in
         # this graph at all. Only the package's own modules are.
         f"{PACKAGE}.event",
+        # The one ``flock`` idiom, shared by four capabilities' four lock families
+        # since story 57-2 and importing nothing but the standard library. It earns
+        # ``SPINE`` on the same evidence ``readers.py`` does — consumers spread
+        # across several capabilities rather than one — and it is the entry whose
+        # *absence* is measurable: removing it from this set reddens both
+        # assertions below for ``write``, ``journal`` and ``rag``, and neither one
+        # for ``read`` or ``execution``. Adding it reddens nothing, because an
+        # extra permitted entry never reddens a subset test.
+        f"{PACKAGE}.locks",
         f"{PACKAGE}.models",
         f"{PACKAGE}.readers",
         f"{PACKAGE}.workspace",
@@ -293,8 +302,22 @@ out of the *runtime* closure and never off the row.
 """
 
 CAPABILITY_SPINE_REACH: dict[str, frozenset[str]] = {
+    # **No ``locks`` entry, and that is measured rather than assumed.** ``read/``
+    # takes no ``flock`` at all, so adding it here goes red immediately — this is
+    # an ``EXPECTED <= closure`` assertion, which reports a row claiming a reach
+    # the capability does not have.
     "read": frozenset({f"{PACKAGE}.workspace", f"{PACKAGE}.models", f"{PACKAGE}.readers"}),
-    "write": frozenset({f"{PACKAGE}.workspace", f"{PACKAGE}.models", f"{PACKAGE}.readers"}),
+    # ``locks`` joins the three here: ``CardGate._hold`` calls it on every gated
+    # mutation. Removing this entry reddens nothing (a subset assertion), which is
+    # why the closure row above carries the observable instead.
+    "write": frozenset(
+        {
+            f"{PACKAGE}.locks",
+            f"{PACKAGE}.models",
+            f"{PACKAGE}.readers",
+            f"{PACKAGE}.workspace",
+        }
+    ),
     # **Not the same triple, and that is the whole reason this dict exists.**
     # ``journal/`` never reaches ``workspace.py``: it imports only ``models``,
     # which imports ``documents.models`` and — inside a function — ``readers``,
@@ -302,7 +325,7 @@ CAPABILITY_SPINE_REACH: dict[str, frozenset[str]] = {
     # entry here rather than the obvious one: it is reached *only* through that
     # in-function import, so a graph that followed no transitive edge would miss
     # it while still satisfying a mere "non-empty" check.
-    "journal": frozenset({f"{PACKAGE}.models", f"{PACKAGE}.readers"}),
+    "journal": frozenset({f"{PACKAGE}.locks", f"{PACKAGE}.models", f"{PACKAGE}.readers"}),
     # The widest of the four, and stated in full rather than trimmed to match the
     # others: ``rag/`` reaches ``workspace`` (``meta_dir_for``, ``get_workspace``),
     # ``readers`` (the extraction configuration), ``documents.models`` (the
@@ -320,6 +343,7 @@ CAPABILITY_SPINE_REACH: dict[str, frozenset[str]] = {
             f"{PACKAGE}.documents.cache",
             f"{PACKAGE}.documents.models",
             f"{PACKAGE}.documents.store",
+            f"{PACKAGE}.locks",
             f"{PACKAGE}.models",
             f"{PACKAGE}.readers",
             f"{PACKAGE}.workspace",
@@ -371,16 +395,20 @@ assert nothing at all about that capability.
 MINIMUM_MODULES_PARSED = 20
 """Below this the sweep is looking at the wrong directory, not at a clean package.
 
-Calibrated for **this package**, which holds 31 modules. Story 55-1's sibling
+Calibrated for **this package**, which holds 33 modules — counted from the sweep
+itself rather than by adding one to the number that was here. The previous figure
+said 31 while 32 were on disk, so incrementing it would have published an
+inherited off-by-one as a fact; a count nobody measures is how a number stops
+meaning anything. Story 55-1's sibling
 sweep uses 40 because it walks the whole of ``src/akgentic/tool/``; carrying that
 number over to a root of this size would fail a correct sweep, which is the
 opposite of what a sentinel is for.
 
 **The floor does not move when the package grows.** It is deliberately below the
 smallest correct sweep, not a number chosen to pass: story 55-6 took the count
-from 27 to 29 and story 55-8 to 31, and this stayed at 20 throughout, which is
-the whole point of a floor. Story 55-9 moved a module without changing the count,
-which is what a move does.
+from 27 to 29, story 55-8 to 31 and story 57-2 to 33, and this stayed at 20
+throughout, which is the whole point of a floor. Story 55-9 moved a module
+without changing the count, which is what a move does.
 """
 
 

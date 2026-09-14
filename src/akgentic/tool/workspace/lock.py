@@ -110,11 +110,18 @@ EXEC_LOCK_FILENAME = "exec.lock"
 """The marker's name under ``<meta>``, spelled once and only here.
 
 One tree, one marker: this hold is over the **whole** tree, exactly as the
-actor's lease was. The per-path write locks are a different mechanism in a
-different file — an ``fcntl.flock`` under ``<meta>/locks/``, taken and released
-inside one mutation (:mod:`akgentic.tool.workspace.write.gate`) — and the two must
-not be confused: this one fences a shell command whose write set is unknowable,
-those ones close a check-then-write window on a named path.
+actor's lease was. The ``flock`` families are a different mechanism in different
+files — an ``fcntl.flock`` under ``<meta>/locks/``, taken and released inside one
+operation, whose idiom lives in :mod:`akgentic.tool.workspace.locks` and whose
+four lock files belong to the write, journal, document-record and tree-policy
+capabilities. The two must not be confused: this one fences a shell command whose
+write set is unknowable, those ones close a check-then-write window on a named
+thing.
+
+**This marker is a fifth mechanism, not a fifth family.** It is an ``O_EXCL``
+file directly under ``<meta>``, not a ``flock`` under ``<meta>/locks/``, so it
+does not go through that spine and is not reclaimed the same way — it is released
+by staleness rather than by a descriptor closing.
 """
 
 _MARKER_MODE = 0o600

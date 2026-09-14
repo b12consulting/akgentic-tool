@@ -142,10 +142,7 @@ compatibility path with no guard of its own.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import logging
-import os
-import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -159,6 +156,7 @@ from akgentic.tool.vector_store.protocol import (
     PATH_PREFIX_WILDCARDS,
     VectorStoreParam,
 )
+from akgentic.tool.workspace.locks import LOCKS_DIR_NAME, atomic_write, hold
 from akgentic.tool.workspace.rag.context import render_index_state
 from akgentic.tool.workspace.rag.params import (
     WorkspaceRagIndex,
@@ -238,17 +236,6 @@ this file.
 
 POLICY_LOCK_NAME = "policy"
 """The lock file publishers contend on, inside :data:`LOCKS_DIR_NAME`."""
-
-LOCKS_DIR_NAME = "locks"
-"""The directory under ``<meta>`` holding one lock file per contended thing.
-
-**Spelled here rather than imported**, and it is the third such spelling —
-``write/gate.py`` and ``vector_store/backends/local.py`` hold the other two.
-Importing the gate's would make the retrieval capability import the write
-capability at runtime, which is worse than a third copy. One spine helper for the
-family is a cross-capability decision, recorded in the story's Open Questions
-rather than taken here.
-"""
 
 WORKSPACE_POLICY_REFUSED = (
     "{card} asks workspace {path} to use {section}={card_value!r}, but the tree's "
@@ -440,58 +427,45 @@ def publish_tree_policy(workspace_path: str, declared: TreePolicy, card_name: st
 def _policy_hold(meta_dir: Path, workspace_path: str) -> Iterator[None]:
     """Hold ``<meta>/locks/policy`` for the duration of the block.
 
-    The idiom is :meth:`~akgentic.tool.workspace.card.CardGate._hold`'s and
-    :meth:`~akgentic.tool.vector_store.backends.local.LocalBackend._hold`'s: an
-    exclusive ``flock`` on a lazily created file, unlocked and closed in
-    ``finally``, **never unlinked** — unlinking would let a second process create a
-    fresh inode and take a hold that excludes nobody.
+    The hold itself is :func:`akgentic.tool.workspace.locks.hold`'s. What stays
+    here is the file this family contends on — :data:`POLICY_LOCK_NAME`, one per
+    tree, which is what makes the policy lock its own family rather than the
+    document records' or the gate's.
 
     A ``<meta>`` whose locks directory cannot be created logs one WARNING and
-    proceeds unserialised, which is ``CardGate._hold``'s stated choice copied
-    rather than re-decided: what is lost is the ordering between two simultaneous
+    proceeds unserialised: what is lost is the ordering between two simultaneous
     first binds, and the comparison inside still runs against whatever is on disk.
     """
-    handle: int | None = None
-    try:
-        try:
-            lock_path = meta_dir / LOCKS_DIR_NAME / POLICY_LOCK_NAME
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            handle = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
-            fcntl.flock(handle, fcntl.LOCK_EX)
-        except OSError:
-            logger.warning(
-                "Workspace %s: could not take the policy lock under %s — publishing unserialised",
-                workspace_path,
-                meta_dir / LOCKS_DIR_NAME,
-                exc_info=True,
-            )
+
+    def warn(exc: OSError) -> None:
+        logger.warning(
+            "Workspace %s: could not take the policy lock under %s — publishing unserialised",
+            workspace_path,
+            meta_dir / LOCKS_DIR_NAME,
+            exc_info=exc,
+        )
+
+    with hold([meta_dir / LOCKS_DIR_NAME / POLICY_LOCK_NAME], on_failure=warn):
         yield
-    finally:
-        if handle is not None:
-            with contextlib.suppress(OSError):
-                fcntl.flock(handle, fcntl.LOCK_UN)
-            os.close(handle)
 
 
 def _write_tree_policy(target: Path, policy: TreePolicy) -> None:
     """Dump *policy* to a temp file beside *target*, then replace it in one step.
 
-    ``YamlDocumentStore._atomic_write``'s shape — a copy rather than an import, so
-    this capability does not reach into the document store for eight lines. The
-    temp file is created **in the destination directory** so the replace is a
-    same-filesystem rename, which is what makes it atomic; any ``BaseException``
-    unlinks it before re-raising, so a failed write leaves the previous file
-    untouched and no debris behind.
+    The replace is :func:`akgentic.tool.workspace.locks.atomic_write`'s; what
+    stays here is the **rendering** and the ``mkdir``. The spine takes text and
+    knows nothing about YAML, so the policy becomes a string first — ``yaml.dump``
+    with no stream returns exactly the bytes it would otherwise have written to
+    one.
+
+    **The ``mkdir`` is this caller's, not the spine's.** A first bind publishes a
+    policy into a ``<meta>`` that may not exist yet, whereas the document store
+    creates its directory at its own call site long before it writes. Two callers
+    that disagreed about the ``mkdir`` still disagree; putting it in the spine
+    would make one of them do it twice and hide where the directory comes from.
     """
     target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=target.parent, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w") as handle:
-            yaml.dump(policy.model_dump(mode="json"), handle, default_flow_style=False)
-        Path(tmp).replace(target)
-    except BaseException:
-        Path(tmp).unlink(missing_ok=True)
-        raise
+    atomic_write(target, yaml.dump(policy.model_dump(mode="json"), default_flow_style=False))
 
 
 def workspace_backend(param: VectorStoreParam) -> str:

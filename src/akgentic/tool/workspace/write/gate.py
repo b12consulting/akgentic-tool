@@ -39,10 +39,8 @@ without ever reaching Pydantic's field collection (ADR-045 §1).
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import hashlib
 import logging
-import os
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
@@ -66,6 +64,7 @@ from akgentic.tool.workspace.edit import (
     write_and_diff,
 )
 from akgentic.tool.workspace.lock import LockBackend, mutation_busy
+from akgentic.tool.workspace.locks import LOCKS_DIR_NAME, hold
 from akgentic.tool.workspace.models import (
     MAX_REJECTION_DIFF_LINES,
     OUT_OF_BAND_AUTHOR,
@@ -97,14 +96,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-LOCKS_DIR_NAME = "locks"
-"""The directory under ``<meta>`` holding one lock file per contended path."""
-
 PATH_LOCK_PREFIX = "path-"
 """What a path's lock file is named, before the digest of the path itself."""
-
-_LOCK_FILE_MODE = 0o600
-"""Mode a lock file is created with — nothing outside the owner needs it."""
 
 _MATCHER = EditMatcher()
 """The anchor cascade, shared by every card in the process.
@@ -443,19 +436,15 @@ class CardGate:
 
     @contextlib.contextmanager
     def _hold(self, paths: Sequence[str]) -> Iterator[None]:
-        """Hold every lock in *paths* for the duration of the block.
+        """Hold every path's lock for the duration of the block.
 
-        The idiom is
-        :meth:`~akgentic.tool.vector_store.backends.local.LocalBackend._hold`'s:
-        an exclusive ``flock`` on a lazily created file, unlocked and closed in
-        ``finally``, never unlinked — unlinking would let a second process
-        create a fresh inode and take a hold that excludes nobody, which is the
-        classic way a file lock stops locking.
-
-        **Acquired in sorted path order, and that is what makes a deadlock
-        impossible.** Two agents that both touch ``a.md`` and ``b.md`` take them
-        in the same order whatever order their patches name them in, so neither
-        can hold one while waiting for the other's.
+        The hold itself is :func:`akgentic.tool.workspace.locks.hold`'s — the
+        ``flock`` under ``<meta>/locks/``, the sorted acquisition order that
+        makes a deadlock impossible, and the never-unlink rule are argued there.
+        What stays here is **which** files this family contends on:
+        :func:`lock_file_for` composes :data:`PATH_LOCK_PREFIX` with a digest of
+        the path, and that is what makes the write locks their own family rather
+        than anybody else's.
 
         **This, not ``O_EXCL``, is what makes two agents creating one path
         produce one winner.** ``Filesystem._stage`` publishes by rename and
@@ -465,7 +454,9 @@ class CardGate:
         shown and refuses.
 
         An empty *paths* takes nothing: ``mkdir`` has no content and therefore
-        no check-then-write window to close.
+        no check-then-write window to close. A card with no metadata directory
+        likewise takes nothing — a card-lifecycle condition rather than a
+        locking one, which is why it is decided here and not in the helper.
 
         A metadata directory that cannot be created degrades to an unlocked
         mutation with one warning, rather than to a refused one: the tree is
@@ -480,36 +471,22 @@ class CardGate:
         if not paths or meta_dir is None:
             yield
             return
-        handles: list[int] = []
-        try:
-            try:
-                for path in sorted(set(paths)):
-                    handles.append(self._open_lock(lock_file_for(meta_dir, path)))
-            except OSError:
-                logger.warning(
-                    "Workspace %s: could not take the path locks under %s — mutating unserialised",
-                    self._workspace_path,
-                    meta_dir / LOCKS_DIR_NAME,
-                    exc_info=True,
-                )
-            yield
-        finally:
-            for handle in reversed(handles):
-                with contextlib.suppress(OSError):
-                    fcntl.flock(handle, fcntl.LOCK_UN)
-                os.close(handle)
 
-    @staticmethod
-    def _open_lock(lock_path: Path) -> int:
-        """Create *lock_path* if absent, take its exclusive ``flock``, return the fd."""
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        handle = os.open(lock_path, os.O_RDWR | os.O_CREAT, _LOCK_FILE_MODE)
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX)
-        except BaseException:
-            os.close(handle)
-            raise
-        return handle
+        def warn(exc: OSError) -> None:
+            logger.warning(
+                "Workspace %s: could not take the path locks under %s — mutating unserialised",
+                self._workspace_path,
+                meta_dir / LOCKS_DIR_NAME,
+                exc_info=exc,
+            )
+
+        # **Sorted and de-duplicated here, on the workspace paths**, not left to
+        # the helper. The spine sorts the lock files it is handed, which is what
+        # guarantees one global acquisition order across every caller; this sort
+        # is over the *paths*, which is what this capability's own contract is
+        # stated in — one ``lock_file_for`` per distinct path, in path order.
+        with hold([lock_file_for(meta_dir, path) for path in sorted(set(paths))], on_failure=warn):
+            yield
 
     ##
     ## The six mutations — each one thin, all six through one point
