@@ -1,4 +1,30 @@
-"""The retrieval capabilities' wiring: the three factories, the provider, the policy.
+"""The retrieval capability of :class:`WorkspaceTool` — index, list, search.
+
+It holds one capability whole: the three factories and the search's external leg,
+its parameters (``rag/params.py``), the splitter (``rag/splitter.py``), the
+context state (``rag/context.py``), the index worker (``rag/worker.py``) and the
+tree-policy record. It may import the package **spine** — ``workspace.py``,
+``models.py``, ``readers.py``, ``event.py``, ``documents/`` — plus
+``akgentic.tool.core`` and ``akgentic.tool.vector_store``. It must import nothing
+under ``card/`` at all: importing ``card.anything`` executes ``card/__init__.py``,
+which pulls in the journal, the exec machinery, the vector-store registry and the
+actor. The rule is enforced by
+``tests/workspace/test_capability_import_closure.py``, which takes the transitive
+closure of this package's own imports and checks it against an allow-list — not
+by convention, and not by this paragraph.
+
+**It names one other capability, and that is admitted rather than hidden.**
+:meth:`RagFactories._rag_reader` resolves the card's extraction configuration,
+which is nested inside ``WorkspaceRead.document_reader``, so ``rag/`` imports
+``read/params.py``. It is benign in a way ``write/``'s old dependency on
+``journal/`` was not: ``read/`` is the *always-available* capability, present in
+every bind, so depending on it is depending on machinery that is there anyway.
+The structural answer — an extraction-configuration vocabulary at the spine — is
+a cross-capability decision for the ADR, not a story's to take.
+
+So the stated limit is this: ``rag/`` is **deletable** without touching another
+capability, and it is **not standalone** — it names ``read/``, which is always
+present.
 
 **The tree owns its retrieval policy, and that record lives here.**
 :class:`TreePolicy` is written to ``<meta>/policy.yaml`` — a top-level file
@@ -42,16 +68,28 @@ the wrong trade, so the limit is stated instead:
     published and the disagreement is refused.
 
 **Why the record lives in this module rather than in a spine one.** ADR-053
-Decision 1 calls policy spine material, and it cannot be yet: ``TreePolicy``'s
-chunking field is typed :class:`WorkspaceRagIndex`, which lives in
-``card/params.py``, and importing anything under ``card/`` executes
-``card/__init__.py`` — so a spine module importing it would close a cycle with the
-very module that imports the spine. The ways out are all worse than the wart:
-moving :class:`WorkspaceRagIndex` is 55-6's territory, typing the section
+Decision 1 calls policy spine material, and the obstacle to that has not
+dissolved — it has **reversed direction**, and is now stronger than it was.
+``TreePolicy``'s chunking field is typed :class:`WorkspaceRagIndex`. While that
+class lived in ``card/params.py``, a spine ``workspace/policy.py`` importing it
+would have closed a cycle with the very module that imports the spine. Now that
+it lives in ``rag/params.py``, no cycle closes — instead the **spine would import
+a capability**, which puts ``rag`` into every capability's transitive closure and
+therefore into the allow-list every capability stands on. That is exactly the
+rot this story removed by taking the splitter and the context state out of it.
+The other ways out are unchanged and still worse: typing the section
 ``dict[str, Any]`` is Golden Rule 1, and enumerating the chunking fields on
-:class:`TreePolicy` is the field-drift defect Golden Rule 12 exists for. When the
-retrieval capability becomes ``rag/``, the record moves with the capability that
-owns it.
+:class:`TreePolicy` is the field-drift defect Golden Rule 12 exists for.
+
+**One consequence, stated rather than left to be discovered.**
+:meth:`RagFactories._require_tree_policy` runs on **every** bind, retrieval-off
+included — every binder is held to what the tree publishes — so a retrieval-off
+bind executes a method defined under ``rag/``. That is not a regression of
+"enabling nothing costs nothing": :class:`RagFactories` is a mixin on
+:class:`~akgentic.tool.workspace.card.WorkspaceTool` whatever the fields say, the
+card is the assembler and is deliberately not attributed by the closure guard,
+and the cost is the one ``stat`` on an absent file that
+:func:`read_tree_policy` already argues for.
 
 :class:`RagFactories` declares **no Pydantic field**. Every field stays on
 :class:`~akgentic.tool.workspace.card.WorkspaceTool` in ``card/__init__.py``,
@@ -64,14 +102,15 @@ tidy-minded: ``card/__init__.py`` is already the longest module in the package,
 and the exec pair is the precedent for what a capability's wiring looks like —
 not a rule that it must live in the façade.
 
-**The import edge runs one way.** This module imports from ``card/params.py``,
-which imports from no sibling at all; nothing here may be imported back into it.
+**The import edge runs one way.** ``card/params.py`` re-exports this capability's
+three parameters from ``rag/params.py``; nothing here imports back through that
+re-export, or through anything else under ``card/``.
 
-``WorkspaceRead`` comes from ``read/params.py``, where it is **defined**, rather
-than through ``card/params.py``'s re-export of it. That re-export exists for one
-purpose — keeping the module path stored ``__model__`` markers name resolving —
-and a production importer leaning on it would leave that compatibility path with
-no guard of its own.
+:class:`WorkspaceRead` comes from ``read/params.py``, where it is **defined**,
+rather than through ``card/params.py``'s re-export of it. That re-export exists
+for one purpose — keeping the module path stored ``__model__`` markers name
+resolving — and a production importer leaning on it would leave that
+compatibility path with no guard of its own.
 """
 
 from __future__ import annotations
@@ -89,8 +128,13 @@ from pydantic import ValidationError
 
 from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.core import ContextState, _resolve
-from akgentic.tool.vector_store.protocol import VectorStoreParam
-from akgentic.tool.workspace.card.params import (
+from akgentic.tool.vector_store.protocol import (
+    PATH_PREFIX_REJECTED,
+    PATH_PREFIX_WILDCARDS,
+    VectorStoreParam,
+)
+from akgentic.tool.workspace.documents.models import RAG_COLLECTION
+from akgentic.tool.workspace.rag.params import (
     WorkspaceRagIndex,
     WorkspaceRagList,
     WorkspaceRagSearch,
@@ -102,6 +146,7 @@ from akgentic.tool.workspace.workspace import meta_dir_for
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
+    from akgentic.tool.vector_store.protocol import SearchHit, VectorStoreService
     from akgentic.tool.workspace.actor import WorkspaceActor
 
 logger = logging.getLogger(__name__)
@@ -112,6 +157,14 @@ _UNAVAILABLE = "Retrieval indexing is not available for this workspace."
 Deliberately the same sentence the actor itself returns in degraded mode: an
 agent should not have to tell "no vector store is wired" apart from "the proxy is
 gone", because its next step is the same in both.
+"""
+
+_REJECTED_PREFIX = PATH_PREFIX_REJECTED
+"""What a search answers for a ``path_prefix`` carrying ``*`` or ``?``.
+
+The **same constant** ``actor/documents.py`` aliases, so the two checks — the
+one here, ahead of any spend, and the actor's own, which this story leaves
+untouched — cannot drift into two sentences.
 """
 
 IN_ACTOR_BACKEND = "inmemory"
@@ -464,6 +517,85 @@ def require_workspace_backend(param: VectorStoreParam, card_name: str) -> None:
         )
 
 
+def _vector_hits(
+    store: VectorStoreService | None,
+    resolved: VectorStoreParam | None,
+    query: str,
+    top_k: int,
+    scope: str,
+    path_prefix: str,
+    score_threshold: float,
+) -> dict[str, SearchHit]:
+    """Embed *query* and search the collection **within this workspace only**.
+
+    **This is the whole external half of a search, and it runs on the calling
+    agent's thread.** Both round trips are here — the embed, and the ``search``
+    that on a cluster backend is a second HTTP call — because moving only the
+    embed would leave the actor's turn holding one of them, and a guard written
+    against the embedder alone would go vacuous the moment it did.
+
+    The ``scope`` predicate is mandatory on every workspace query (ADR-045 §5,
+    §7) and both predicates go to the backend, so the ``top_k`` budget is never
+    spent on another scope's objects. The call over-fetches by ``OVERFETCH``
+    because fusion reorders and the actor drops what it cannot resolve.
+
+    **One gate the card does not have and the actor does.** The actor only
+    searched once ``create_collection`` had succeeded; a card-side search against
+    a collection that was never created reaches the backend and raises. That is
+    the existing contract — *every failure degrades* — rather than a new hole:
+    the raise lands in the ``except`` below, yields an empty mapping and one
+    warning, and the keyword leg answers alone.
+
+    **It never raises**, including out of building the embedder, which imports an
+    optional extra.
+
+    Args:
+        store: The engine the card resolved, or ``None`` when it resolved none.
+        resolved: The card's resolved collection param, whose model and provider
+            the query is embedded through, or ``None``.
+        query: What to look for, in natural language.
+        top_k: The result budget, already clamped by the caller.
+        scope: The resolved workspace path every query is scoped to.
+        path_prefix: The caller's prefix, already checked for metacharacters.
+        score_threshold: Minimum **raw** cosine score, applied before fusion.
+
+    Returns:
+        ``{ref_id: hit}`` for the hits at or above *score_threshold*, or an empty
+        mapping on any failure.
+    """
+    if store is None or resolved is None:
+        logger.warning("Workspace %s: no vector store — searching on the keyword leg alone", scope)
+        return {}
+    try:
+        from akgentic.tool.vector_store.embedding_actor import (  # noqa: PLC0415 — optional extra
+            build_embedding_service,
+        )
+        from akgentic.tool.vector_store.hybrid import OVERFETCH  # noqa: PLC0415 — optional extra
+
+        embedder = build_embedding_service(resolved.embedding_model, resolved.embedding_provider)
+        vectors = embedder.embed([query])
+        if not vectors:
+            logger.warning(
+                "Workspace %s: embedding a search query returned nothing — keyword only", scope
+            )
+            return {}
+        result = store.search(
+            RAG_COLLECTION,
+            vectors[0],
+            top_k * OVERFETCH,
+            scope=scope,
+            path_prefix=path_prefix or None,
+        )
+    except Exception:
+        logger.warning(
+            "Workspace %s: the vector leg of a search failed — keyword only",
+            scope,
+            exc_info=True,
+        )
+        return {}
+    return {hit.ref_id: hit for hit in result.hits if hit.score >= score_threshold}
+
+
 class RagFactories:
     """The three retrieval factories and their binding.
 
@@ -484,6 +616,10 @@ class RagFactories:
         _workspace_tell: WorkspaceActor | None
         _agent_id: str
         _resolved_store: VectorStoreParam | None
+        # The three the search closure's vector leg reads. All resolved in
+        # ``observer()``, which runs before ``get_tools()``.
+        _vector_store: VectorStoreService | None
+        _workspace_path: str
 
     ##
     ## Enablement — one predicate, because three sites have to agree on it
@@ -627,11 +763,32 @@ class RagFactories:
     def _rag_search_factory(self, params: WorkspaceRagSearch) -> Callable[..., Any]:
         """Create the ``workspace_rag_search`` callable.
 
-        A thin **ask**, and the whole of the search runs on the actor — every one
-        of its four inputs lives there and none of them lives here. The extraction
-        bodies the keyword leg scans, the chunk offsets it maps them through, the
-        vector-store proxy and the workspace name that scopes every query are all
-        actor state; a card holds a proxy and a configuration.
+        **Two legs, and they run in two places.** The *vector* leg — the query
+        embed and the ``search`` call — runs here, on the calling agent's own
+        thread, because its inputs are the card's: the engine this card resolved
+        in ``observer()``, the collection param it derived, and the workspace path
+        it resolved once and hands to everything. The *keyword* leg, the fusion
+        and the render stay on the actor, because their inputs are actor state —
+        the extraction bodies, the chunk offsets and nothing else.
+
+        **Why the caller's thread and not a child actor.** ``rag_search`` is an
+        *ask*: the calling agent is blocked on its answer for the whole call, so a
+        child would only move the block — the actor would wait for the child's
+        report and the mailbox would be held exactly as long. The only shape that
+        frees the mailbox for an ask is a deferred/poll protocol, and
+        ``#Workspace``'s :class:`~akgentic.tool.core.deferred.DeferredResultActor`
+        holds **exec** outcomes; putting a search through it would evict a running
+        agent's exec result and mis-type the cache's value — the argument
+        ``rag/worker.py`` and ``EmbeddingWorker`` both already make about that
+        mechanism. The calling agent's thread is already blocked for the duration
+        and blocks nobody else, which is where the two round trips belong. Two
+        agents searching concurrently now embed concurrently instead of
+        serialising on one mailbox.
+
+        The three values are read **at ``get_tools()`` time**, which is after
+        ``observer()`` has run, so ``_vector_store``, ``_resolved_store`` and
+        ``_workspace_path`` are all populated by the time the closure captures
+        them.
 
         Args:
             params: The result budget and the two fusion knobs, captured here so
@@ -641,6 +798,9 @@ class RagFactories:
             The callable, which never raises.
         """
         proxy = self._workspace_proxy
+        store = self._vector_store
+        resolved = self._resolved_store
+        scope = self._workspace_path
         top_k, alpha, threshold = params.top_k, params.alpha, params.score_threshold
 
         def workspace_rag_search(query: str, top_k: int = top_k, path_prefix: str = "") -> str:
@@ -663,14 +823,21 @@ class RagFactories:
             """
             if proxy is None:
                 return _UNAVAILABLE
+            # Ahead of the embed and the search, so a refused prefix costs
+            # nothing at all — no round trip and no embedding credit.
+            if any(character in path_prefix for character in PATH_PREFIX_WILDCARDS):
+                return _REJECTED_PREFIX
+            hits = _vector_hits(
+                store, resolved, query, max(top_k, 1), scope, path_prefix, threshold
+            )
             try:
                 return str(
                     proxy.rag_search(
                         query,
+                        hits,
                         top_k=top_k,
                         path_prefix=path_prefix,
                         alpha=alpha,
-                        score_threshold=threshold,
                     )
                 )
             except Exception:

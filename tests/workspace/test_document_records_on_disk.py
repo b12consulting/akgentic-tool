@@ -57,13 +57,13 @@ from akgentic.tool.workspace.documents.models import (
     RagStatus,
 )
 from akgentic.tool.workspace.documents.store import DocumentEntry, YamlDocumentStore
-from akgentic.tool.workspace.documents.worker import (
-    EMBED_BATCH_SIZE,
-    MAX_CONCURRENT_INDEX_WORKERS,
-)
 from akgentic.tool.workspace.models import (
     WorkspaceConfig,
     content_sha,
+)
+from akgentic.tool.workspace.rag.worker import (
+    EMBED_BATCH_SIZE,
+    MAX_CONCURRENT_INDEX_WORKERS,
 )
 from tests.workspace.conftest import (
     HANDSHAKE_TIMEOUT_S,

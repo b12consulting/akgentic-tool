@@ -17,7 +17,7 @@ import pytest
 
 from akgentic.tool.core import COMMAND, TOOL_CALL
 from akgentic.tool.workspace import BlockSplitter, Span, TextSplitter, WorkspaceRagIndex
-from akgentic.tool.workspace.documents.splitter import pack_blocks, parse_blocks
+from akgentic.tool.workspace.rag.splitter import pack_blocks, parse_blocks
 
 # --------------------------------------------------------------------------- #
 # Fixtures — module-level constants, each small enough to read in a failure.

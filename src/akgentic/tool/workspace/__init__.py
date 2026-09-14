@@ -35,16 +35,11 @@ from akgentic.tool.workspace.documents import (
     IN_MEMORY_MAX_DOCUMENT_CHARS,
     IN_MEMORY_MAX_DOCUMENTS,
     RAG_COLLECTION,
-    BlockSplitter,
     DocumentExtract,
     NewFileMessage,
     RagChunk,
     RagFile,
-    RagFileRow,
-    RagIndexState,
     RagStatus,
-    Span,
-    TextSplitter,
     derived_document_caps,
 )
 
@@ -147,6 +142,13 @@ from akgentic.tool.workspace.models import (
     content_sha,
     gitignore_seed,
 )
+
+# The five retrieval names below come from ``rag/``, where they are **defined**,
+# rather than from ``documents/``, which re-exported them until the retrieval
+# capability became a module of its own. The façade may name a capability
+# directly — it is the façade, and not a capability.
+from akgentic.tool.workspace.rag.context import RagFileRow, RagIndexState
+from akgentic.tool.workspace.rag.splitter import BlockSplitter, Span, TextSplitter
 from akgentic.tool.workspace.readers import (
     TEXT_EXTENSIONS,
     DocumentReader,

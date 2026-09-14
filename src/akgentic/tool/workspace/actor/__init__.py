@@ -62,7 +62,11 @@ The deferred-result mechanism (ADR-033) is **engaged** from story 29-5, and its
 seven rules apply in full: the blocking sandbox call happens in a ``#defer-``
 worker, never on this thread. Everything the ask path still does is bounded — one
 file read, one write, a few short-lived ``git`` forks under an explicit timeout —
-and never external.
+and never external. The last exception was ``rag_search``, which embedded a query
+and then searched a store that may be a cluster client; both halves moved onto
+the calling agent's own thread, and
+``tests/workspace/test_rag_search_off_the_mailbox.py`` is what holds the sentence
+to its word rather than leaving it a claim.
 
 **The class is assembled from four per-concern mixins** (ADR-045 §1): the
 extraction cache in :mod:`~akgentic.tool.workspace.actor.documents`, the
@@ -111,15 +115,14 @@ if TYPE_CHECKING:
     from akgentic.core.actor_address import ActorAddress
 
     # Runtime slots the retrieval pipeline fills. Under ``TYPE_CHECKING`` because
-    # the vector store lives behind an optional extra and ``card.params`` closes
-    # an import cycle through this very module — neither is needed to annotate a
+    # the vector store lives behind an optional extra — not needed to annotate a
     # ``None`` at start.
     from akgentic.tool.vector_store.protocol import (
         EmbeddingProvider,
         VectorStoreParam,
         VectorStoreService,
     )
-    from akgentic.tool.workspace.card.params import WorkspaceRagIndex
+    from akgentic.tool.workspace.rag.params import WorkspaceRagIndex
     from akgentic.tool.workspace.readers import DocumentReader
 
 __all__ = [

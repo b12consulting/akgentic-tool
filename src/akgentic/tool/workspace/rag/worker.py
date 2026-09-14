@@ -7,6 +7,37 @@ it. This module is where they happen instead: one short-lived actor per file,
 which reads, extracts, splits, composes the chunk texts, reports once and stops
 itself.
 
+**It is not merged with**
+:class:`~akgentic.tool.vector_store.embedding_actor.EmbeddingWorker`, and the
+ruling is recorded here because this is the module a reader asking the question
+lands in. Three reasons, each checked against the code rather than against a
+planning document:
+
+- **The cardinality is not 1:1.** This worker is one child per **file**;
+  ``EmbeddingWorker`` is one child per **batch of** :data:`EMBED_BATCH_SIZE`
+  **chunks**. An 800-page document is ~1,900 chunks and therefore ~30 embedding
+  children. "One child per file" would turn thirty requests of which one can fail
+  into one request that fails whole — the exact arithmetic
+  :data:`EMBED_BATCH_SIZE`'s own docstring exists to state — and would hold every
+  batch's vectors in one worker instead of landing each on its own mailbox turn.
+- **This worker cannot hold them.** It stops itself the instant it reports (see
+  below), so it could neither hold the embedding workers it would have to spawn
+  nor take their reports; and the actor is the only place that can hold
+  ``batches_expected`` consistently with the row it counts for.
+- **``EmbeddingWorker`` is not this package's to absorb.** It lives in
+  ``vector_store/``, is in ``akgentic.tool.vector_store.__all__``, and its module
+  is the home of ``build_embedding_service`` — the single place the worker
+  timeout budget is chosen.
+
+**One correction to the reason usually given for the third point.** It is said
+that ``EmbeddingWorker`` is shared with the knowledge-graph and planning paths.
+Measured: ``knowledge_graph/kg_actor.py`` and ``planning/planning_actor.py``
+import **``build_embedding_service``**, not the worker, and the only site that
+spawns an ``EmbeddingWorker`` anywhere in ``src/`` is
+``DocumentsMixin._spawn_embedding``. The sharing that survives is the *module and
+the timeout budget*, not the spawn — still decisive, and that is the form to
+carry forward.
+
 **It is a plain :class:`~akgentic.core.agent.Akgent`, not a ``DeferredWorker``.**
 The trap either way is the **report channel**, not the base class:
 ``DeferredWorker`` reports through ``parent.deliver(key, value)`` /
@@ -33,14 +64,18 @@ telemetry sandwich only for ``Message`` instances, and consumers derive "who is
 working" from exactly those two — so a ``Message`` payload would surface every
 transient worker as a busy team member.
 
-**This module is deliberately absent from ``documents/__init__.py``.** It imports
-:class:`~akgentic.tool.workspace.card.params.WorkspaceRagIndex` at runtime,
-because that class is a Pydantic *field type* here and a string annotation cannot
-serve; importing ``card.params`` executes ``card/__init__.py``, which imports
-``workspace.actor``, which imports ``actor/documents.py``, which imports this
-package. Re-exporting it from the package façade would close that cycle. The one
-production caller imports it inside the method that spawns — the same shape
-``DocumentsMixin`` uses for the embedding worker.
+**The cycle this module used to be kept out of a façade for is gone.** It needs
+:class:`~akgentic.tool.workspace.rag.params.WorkspaceRagIndex` at runtime, because
+that class is a Pydantic *field type* here and a string annotation cannot serve.
+While that class lived in ``card/params.py`` the import executed
+``card/__init__.py``, which imports ``workspace.actor``, which imports
+``actor/documents.py``, which imported ``documents/`` — so ``documents/__init__.py``
+could not re-export this module without closing the cycle at import time. The
+parameter is a sibling now and no cycle exists: ``rag/__init__.py`` is free to
+name this module and ``documents/`` no longer knows it at all.
+
+The one remaining function-level import here is :meth:`IndexWorker._report`'s of
+``WorkspaceActor``, which is a genuine cycle and stays where it is.
 """
 
 from __future__ import annotations
@@ -48,16 +83,20 @@ from __future__ import annotations
 import hashlib
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from akgentic.core.utils.serializer import SerializableBaseModel
-from akgentic.tool.workspace.card.params import WorkspaceRagIndex
 from akgentic.tool.workspace.documents.models import RagChunk, chunk_id
-from akgentic.tool.workspace.documents.splitter import BlockSplitter, TextSplitter
+from akgentic.tool.workspace.rag.params import WorkspaceRagIndex
+from akgentic.tool.workspace.rag.splitter import BlockSplitter, TextSplitter
 from akgentic.tool.workspace.readers import DocumentReader
 from akgentic.tool.workspace.workspace import get_workspace
+
+if TYPE_CHECKING:
+    from akgentic.tool.workspace.actor import WorkspaceActor
 
 __all__ = [
     "EMBED_BATCH_SIZE",
@@ -386,17 +425,28 @@ class IndexWorker(Akgent[BaseConfig, BaseState]):
         finished extraction into a traceback: there is nobody left to record it
         against, and this worker is about to stop either way.
 
+        **The actor is named under ``TYPE_CHECKING`` and never imported at
+        runtime**, and that is the one line of this module the move changed. It
+        used to pass ``WorkspaceActor`` to ``proxy_tell``, whose second argument
+        core's own docstring calls a "type hint for return typing (not used at
+        runtime)" — ``ProxyWrapper`` is built from the address alone. So the
+        import bought nothing at runtime and cost this capability an executed
+        edge into ``actor/__init__.py``, and through it into ``journal/``,
+        ``lock/`` and the exec machinery: seven modules in the closure guard's
+        allow-list, every one of them reached only to pass an ignored argument.
+        The ``cast`` keeps mypy's view of the proxy exactly as it was. It is the
+        pattern ``actor/documents.py`` and ``rag/__init__.py`` already use to name
+        each other without depending on each other.
+
         Args:
             payload: The result or the failure.
         """
-        from akgentic.tool.workspace.actor import WorkspaceActor  # noqa: PLC0415 — cycle
-
         parent = self._parent
         if parent is None:
             logger.warning("[%s] no parent address — the index report is dropped", self.config.name)
             return
         try:
-            proxy = self.proxy_tell(parent, WorkspaceActor)
+            proxy = cast("WorkspaceActor", self.proxy_tell(parent))
             if isinstance(payload, IndexResult):
                 proxy.receiveMsg_IndexResult(payload)
             else:

@@ -7,27 +7,18 @@ while the call site ignores it is precisely the failure this file exists to catc
 
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 from typing import Any
 
 import pytest
 from akgentic.core.agent_config import BaseConfig
+from akgentic.core.utils import deserialize_object, import_class, serialize
 
 from akgentic.tool.core import COMMAND, LLM_CONTEXT, TOOL_CALL
 from akgentic.tool.vector_store import registry
 from akgentic.tool.vector_store.protocol import VectorStoreParam
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
-from akgentic.tool.workspace.card.params import (
-    WorkspaceRagIndex,
-    WorkspaceRagList,
-    WorkspaceRagSearch,
-)
-from akgentic.tool.workspace.card.rag import (
-    IN_ACTOR_BACKEND,
-    WORKSPACE_LOCAL_BACKEND,
-    RagFactories,
-    workspace_backend,
-)
 from akgentic.tool.workspace.documents.models import (
     DEFAULT_MAX_DOCUMENT_CHARS,
     DEFAULT_MAX_DOCUMENTS,
@@ -36,6 +27,17 @@ from akgentic.tool.workspace.documents.models import (
     derived_document_caps,
 )
 from akgentic.tool.workspace.models import WorkspaceConfig
+from akgentic.tool.workspace.rag import (
+    IN_ACTOR_BACKEND,
+    WORKSPACE_LOCAL_BACKEND,
+    RagFactories,
+    workspace_backend,
+)
+from akgentic.tool.workspace.rag.params import (
+    WorkspaceRagIndex,
+    WorkspaceRagList,
+    WorkspaceRagSearch,
+)
 
 # From where it is **defined**, not through ``card/params.py``'s re-export of it.
 # That re-export exists for one purpose — keeping the module path stored
@@ -249,20 +251,26 @@ class TestTheSearchCapability:
 
 
 class TestTheSearchCallable:
-    """A thin ask, and the card's configured values travel with it."""
+    """The card runs the vector leg; the actor is handed its hits and the knobs."""
 
     def test_it_forwards_the_cards_knobs_to_the_actor(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
-        """The whole search runs on the actor; the card supplies configuration."""
+        """What crosses to the actor, by equality — so a sixth argument reddens it.
+
+        **``score_threshold`` is deliberately absent.** It bounds the *vector* leg,
+        which is the card's now, so it is spent here and never travels; an actor
+        that still took it would be carrying a knob it cannot apply. ``alpha`` is
+        the fusion knob and the fusion is the actor's, so that one does travel.
+        """
         seen: list[dict[str, Any]] = []
 
         class Recording:
             def attach(self, agent: Any, agent_name: str) -> None:
                 """The bind-time holder registration — the actor was alive then."""
 
-            def rag_search(self, query: str, **kwargs: Any) -> str:
-                seen.append({"query": query, **kwargs})
+            def rag_search(self, query: str, hits: Any = None, **kwargs: Any) -> str:
+                seen.append({"query": query, "hits": hits, **kwargs})
                 return "ok"
 
         observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=Recording())
@@ -276,10 +284,14 @@ class TestTheSearchCallable:
         assert seen == [
             {
                 "query": "terms",
+                # This card names no vector store, so the card's own vector leg
+                # degrades to an empty mapping — one warning, and the actor's
+                # keyword leg answers alone. The argument is still *sent*, which
+                # is what this row pins.
+                "hits": {},
                 "top_k": 3,
                 "path_prefix": "docs/",
                 "alpha": 0.4,
-                "score_threshold": 0.2,
             }
         ]
 
@@ -293,7 +305,7 @@ class TestTheSearchCallable:
             def attach(self, agent: Any, agent_name: str) -> None:
                 """The bind-time holder registration — the actor was alive then."""
 
-            def rag_search(self, query: str, **kwargs: Any) -> str:
+            def rag_search(self, query: str, hits: Any = None, **kwargs: Any) -> str:
                 seen.append(int(kwargs["top_k"]))
                 return "ok"
 
@@ -316,7 +328,7 @@ class TestTheSearchCallable:
             def attach(self, agent: Any, agent_name: str) -> None:
                 """The bind-time holder registration — the actor was alive then."""
 
-            def rag_search(self, query: str, **kwargs: Any) -> str:
+            def rag_search(self, query: str, hits: Any = None, **kwargs: Any) -> str:
                 raise RuntimeError("actor is dead")
 
         observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=Gone())
@@ -1408,3 +1420,122 @@ class TestTheStoreResolutionDegradesRatherThanFailingTheBind:
         assert len(warnings) == 1
         assert "weaviate" in warnings[0].getMessage()
         assert "cluster unreachable" in warnings[0].getMessage()
+
+
+##
+## A card a deployment already persisted with a retrieval parameter still loads
+##
+
+STORED_MARKER_MODULE = "akgentic.tool.workspace.card.params"
+"""The module path a deployment's stored retrieval parameters carry in ``__model__``.
+
+**Captured by serializing a configured card on the working tree, not transcribed
+from a design document** — the discipline ``test_read_capability.py`` and
+``test_write_capability.py`` already follow for their own six.
+
+``serialize_base_model`` stamps ``f"{cls.__module__}.{cls.__name__}"`` on every
+:class:`~akgentic.core.utils.SerializableBaseModel`, and ``BaseToolParam`` is one,
+so every card written since the card decomposition with a retrieval parameter set
+explicitly carries this literal string. Reading one back is ``import_module`` plus
+``getattr`` on exactly it
+(:func:`akgentic.core.utils.deserializer.import_class`); a path that has gone
+raises ``UnresolvableClassError``, which turns a stored team's tool card into a bad
+record rather than a card.
+
+So the three retrieval parameters keep resolving *here* whatever module actually
+defines them — and the specs below are written so that the same source asserts the
+same thing before and after they move into ``rag/params.py``.
+"""
+
+RETRIEVAL_PARAM_NAMES = ["WorkspaceRagIndex", "WorkspaceRagList", "WorkspaceRagSearch"]
+"""The three parameters of the retrieval capability, by the name a marker can carry."""
+
+
+@pytest.fixture
+def explicitly_configured_card() -> WorkspaceTool:
+    """A card carrying two retrieval parameters the author set by hand.
+
+    Two rather than one, and two *different* capabilities of the three: a marker is
+    stamped per nested model, so a single one could be preserved by an accident
+    that a second would expose.
+    """
+    return WorkspaceTool(
+        workspace_id=WORKSPACE_NAME,
+        workspace_rag_index=WorkspaceRagIndex(chunk_chars=800),
+        workspace_rag_search=WorkspaceRagSearch(top_k=3),
+    )
+
+
+class TestStoredRetrievalParamsStillResolve:
+    """The persisted ``__model__`` markers, end to end through core's own path."""
+
+    def test_every_retrieval_param_resolves_through_the_stored_module_path(self) -> None:
+        """``import_module`` + ``getattr``, exactly as ``import_class`` does it.
+
+        ``hasattr`` on the package would not catch this: the mechanism that keeps
+        these three resolving once they are defined elsewhere is a **re-export**,
+        which only an import of this precise module path exercises.
+        """
+        module = importlib.import_module(STORED_MARKER_MODULE)
+        for name in RETRIEVAL_PARAM_NAMES:
+            assert getattr(module, name, None) is not None, (
+                f"{STORED_MARKER_MODULE}.{name} no longer resolves — every card "
+                f"persisted with that parameter set explicitly carries that literal string"
+            )
+
+    def test_the_stored_path_serves_the_same_classes_the_card_uses(self) -> None:
+        """A second definition would deserialise into a class nothing else uses.
+
+        A re-export satisfies this; a copy of the class body, which is the tempting
+        way to "keep the path working", does not.
+        """
+        stored = importlib.import_module(STORED_MARKER_MODULE)
+        facade = importlib.import_module("akgentic.tool.workspace")
+        for name in RETRIEVAL_PARAM_NAMES:
+            assert getattr(stored, name) is getattr(facade, name)
+
+    def test_a_freshly_dumped_card_carries_markers_that_resolve(
+        self, explicitly_configured_card: WorkspaceTool
+    ) -> None:
+        """Whatever module a parameter lives in, the path a dump stamps must import back.
+
+        This is the row that legitimately *changes* with the move — a dump names
+        wherever the class is defined — so it is written as the invariant rather
+        than as a literal: the stamped path resolves, and to the very class the card
+        is holding.
+        """
+        dumped = serialize(explicitly_configured_card)
+        assert isinstance(dumped, dict)
+
+        for field in ("workspace_rag_index", "workspace_rag_search"):
+            marker = dumped[field]["__model__"]
+            assert import_class(marker) is type(getattr(explicitly_configured_card, field))
+
+    def test_a_record_written_before_the_move_still_validates_into_an_equal_card(
+        self, explicitly_configured_card: WorkspaceTool
+    ) -> None:
+        """The end-to-end property, on the literal a deployment's database holds.
+
+        The markers are rewritten to :data:`STORED_MARKER_MODULE` rather than left
+        as the dump produced them, so this spec asserts the **same thing before and
+        after** the parameters move: on the un-moved tree the rewrite is a no-op and
+        the record is exactly what a deployment stored; afterwards it is the
+        pre-move record, which is the one that has to keep loading.
+
+        Its non-vacuity is the two specs above: they prove the path is real.
+
+        **The comparison is the two cards, not their two dumps.** ``expose`` is a
+        ``set``, so a dump renders it as a list in *set-iteration* order and whether
+        two such lists agree depends on ``PYTHONHASHSEED``; pydantic's own equality
+        compares field values, where two equal sets are equal whatever order they
+        iterate in.
+        """
+        stored = serialize(explicitly_configured_card)
+        assert isinstance(stored, dict)
+        stored["workspace_rag_index"]["__model__"] = f"{STORED_MARKER_MODULE}.WorkspaceRagIndex"
+        stored["workspace_rag_search"]["__model__"] = f"{STORED_MARKER_MODULE}.WorkspaceRagSearch"
+
+        restored = deserialize_object(stored)
+
+        assert isinstance(restored, WorkspaceTool)
+        assert restored == explicitly_configured_card

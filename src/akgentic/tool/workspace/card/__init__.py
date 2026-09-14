@@ -27,14 +27,15 @@ the card creates its actor as an ordinary team child, which is the seam
 per-process — the sandbox, the document reader, the retrieval pipeline — and no
 shared state at all.
 
-The factory bodies live in five mixins. Two are still siblings —
-``card/execution.py`` and ``card/rag.py`` — and two capabilities have moved out:
-``workspace/read/`` and ``workspace/write/``, each carrying its closures, its
-private helpers and its six parameters together, with the mutation gate inside
-``write/`` because it is the write capability's. The three stories after them
-move the rest the same way. ``card/params.py`` holds the parameters of the
-capabilities that have not moved yet, re-exports both moved capabilities' twelve
-so the module paths stored records name keep resolving, and owns ``Resource`` /
+The factory bodies live in five mixins. One is still a sibling —
+``card/execution.py`` — and three capabilities have moved out:
+``workspace/read/``, ``workspace/write/`` and ``workspace/rag/``, each carrying
+its closures, its private helpers and its parameters together, with the mutation
+gate inside ``write/`` because it is the write capability's and the tree-policy
+record inside ``rag/`` because it is typed on the retrieval capability's own
+parameter. The story after them moves exec the same way. ``card/params.py`` holds
+``WorkspaceExec``, re-exports the three moved capabilities' fifteen parameters so
+the module paths stored records name keep resolving, and owns ``Resource`` /
 ``ResourceType`` outright.
 
 What stays here is the card itself: its fields, ``observer()`` with its private
@@ -89,14 +90,6 @@ from akgentic.tool.workspace.card.params import (
     Resource,
     ResourceType,
     WorkspaceExec,
-    WorkspaceRagIndex,
-    WorkspaceRagList,
-    WorkspaceRagSearch,
-)
-from akgentic.tool.workspace.card.rag import (
-    RagFactories,
-    require_workspace_backend,
-    workspace_backend,
 )
 from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION, derived_document_caps
 from akgentic.tool.workspace.documents.store import DocumentStore, resolve_document_store
@@ -115,6 +108,16 @@ from akgentic.tool.workspace.models import (
     Observation,
     WorkspaceConfig,
     content_sha,
+)
+from akgentic.tool.workspace.rag import (
+    RagFactories,
+    require_workspace_backend,
+    workspace_backend,
+)
+from akgentic.tool.workspace.rag.params import (
+    WorkspaceRagIndex,
+    WorkspaceRagList,
+    WorkspaceRagSearch,
 )
 from akgentic.tool.workspace.read import ReadFactories
 from akgentic.tool.workspace.read.params import (
@@ -553,7 +556,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
                 a private one. It must never be caught and turned into a fallback.
                 Also raised when this card's retrieval policy disagrees with the
                 one the tree publishes, or when that record cannot be read
-                (:func:`~akgentic.tool.workspace.card.rag.read_tree_policy`), for
+                (:func:`~akgentic.tool.workspace.rag.read_tree_policy`), for
                 the same reason and with the same prohibition.
             RuntimeError: Whatever a failing ``attach`` raises, propagated
                 unchanged — an agent must never hold a tree that does not know
@@ -1129,7 +1132,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         from it is wrong in the ordinary case rather than the exotic one:
         ``VectorStoreParam.backend`` defaults to ``default_backend()``, which is
         ``inmemory`` wherever no cluster is provisioned, while
-        :func:`~akgentic.tool.workspace.card.rag.workspace_backend` substitutes
+        :func:`~akgentic.tool.workspace.rag.workspace_backend` substitutes
         ``local`` for an undeclared ``inmemory``. So every default retrieval card
         in a community or development deployment was held to the small pair while
         indexing into ``local``, which resolves to the large one.

@@ -40,11 +40,15 @@ already covers.
 
 Everything on the ask path here is O(1)/O(n) dict work on the actor thread, plus
 bounded file reads while queueing and bounded proxy calls to the store child —
-including, on :meth:`DocumentsMixin.rag_search`, **one query embed per call**.
-That is the one external round trip this package puts on the gate's own thread.
-It is bounded (one call, not thirty) and every one of its failure modes degrades
-to the keyword leg, which is what makes it acceptable rather than a defect. Do not
-add a second network call to that turn. The two slow halves happen elsewhere:
+and **no external round trip at all**. :meth:`DocumentsMixin.rag_search` used to
+embed the query on this thread and then call ``search`` on a store that may be a
+cluster client with no actor behind it, which made two network calls on one turn
+of the mailbox that owns the write gate; while either was in flight,
+``request_exec``, ``exec_status`` and every worker report queued behind it. Both
+now happen in :func:`~akgentic.tool.workspace.rag._vector_hits`, on the **calling
+agent's own thread** — which is already blocked waiting for that answer and
+blocks nobody else — and this method is handed the hits. Do not put a network
+call back on this turn. The two slow halves of indexing happen elsewhere too:
 extraction and splitting in a ``#index-`` worker, embedding in an ``#embed-``
 worker, and each batch's ``add()`` lands on its own turn when its worker reports.
 Nothing here raises: an exception in a document handler would kill the actor
@@ -69,7 +73,6 @@ from akgentic.tool.vector_store.protocol import (
     PATH_PREFIX_REJECTED,
     PATH_PREFIX_WILDCARDS,
 )
-from akgentic.tool.workspace.documents.context import RagFileRow, RagIndexState
 from akgentic.tool.workspace.documents.models import (
     EMBEDDING_STALE_AFTER_S,
     EXTRACTOR_VERSION,
@@ -83,6 +86,7 @@ from akgentic.tool.workspace.documents.models import (
 )
 from akgentic.tool.workspace.documents.store import DocumentEntry, DocumentStore
 from akgentic.tool.workspace.models import WorkspaceConfig, content_sha
+from akgentic.tool.workspace.rag.context import RagFileRow, RagIndexState
 from akgentic.tool.workspace.readers import _MIME_MAP, TEXT_EXTENSIONS, DocumentReader
 from akgentic.tool.workspace.workspace import Filesystem
 
@@ -93,14 +97,13 @@ if TYPE_CHECKING:
     from akgentic.core.agent_state import BaseState
     from akgentic.tool.vector_store.embedding_actor import EmbeddingError, EmbeddingResult
     from akgentic.tool.vector_store.protocol import (
-        EmbeddingProvider,
         SearchHit,
         VectorStoreParam,
         VectorStoreService,
     )
     from akgentic.tool.vector_store.vector import VectorEntry
-    from akgentic.tool.workspace.card.params import WorkspaceRagIndex
-    from akgentic.tool.workspace.documents.worker import IndexFailure, IndexResult
+    from akgentic.tool.workspace.rag.params import WorkspaceRagIndex
+    from akgentic.tool.workspace.rag.worker import IndexFailure, IndexResult
 
     # The mixin consumes the actor's own surface — ``createActor``, the two proxy
     # builders, ``myAddress``, ``config``, ``state`` and ``team_id``. Naming the
@@ -226,7 +229,10 @@ class DocumentsMixin(_DocumentsBase):
     _rag_collection: VectorStoreParam | None
     _vs_proxy: VectorStoreService | None
     _vector_store: VectorStoreService | None
-    _embedder: EmbeddingProvider | None
+    # ``_embedder`` is deliberately **absent**. The actor's own query leg was the
+    # only thing that ever read it, and that leg is the card's now; the slot
+    # itself still exists on ``WorkspaceActor``, unread, and goes with the rest of
+    # the retrieval state when the mixin is split.
     _index_workers: int
     _document_store: DocumentStore | None
 
@@ -543,7 +549,7 @@ class DocumentsMixin(_DocumentsBase):
         ``<meta>/policy.yaml`` and enforced at bind: a card carrying different
         parameters is refused there, naming both values, so no second card
         carrying different parameters can reach this method through a bind at all
-        (:class:`~akgentic.tool.workspace.card.rag.TreePolicy`).
+        (:class:`~akgentic.tool.workspace.rag.TreePolicy`).
 
         The branch is kept rather than deleted, and narrowly. This actor **must
         never raise on a tell path** — it owns the write gate — so it cannot
@@ -593,7 +599,7 @@ class DocumentsMixin(_DocumentsBase):
             )
 
     def _acquire_vs_proxy(self) -> None:
-        """Resolve the storage engine, bind it and the embedder, create the collection.
+        """Resolve the storage engine, create the collection, and bind it.
 
         **The slot holds a ``VectorStoreService``, not necessarily a proxy.** A
         backend that needs an actor is reached through a proxy over the team's
@@ -622,28 +628,27 @@ class DocumentsMixin(_DocumentsBase):
         row on one turn, which is what made it a tell before the embedding
         pipeline moved to this actor.
 
-        The embedder is built here too, from the card's own ``VectorStoreParam``:
-        it is what the query leg embeds through, and every worker this actor spawns
-        is handed the same param's model and provider.
+        **No embedder is built here any more.** One was, from the card's own
+        ``VectorStoreParam``, because the query leg embedded on this thread; that
+        leg is the card's now and builds its own from the same param, so a second
+        one here would be an object nobody reads. Every worker this actor spawns
+        is still handed that param's model and provider, which is the only thing
+        the embedding budget ever travelled as.
 
         **Every outage drops to degraded mode.** A store that was never announced
         and a ``create_collection`` that fails each log one WARNING and leave
         ``_vs_proxy`` ``None``, so ``workspace_rag_index`` answers a sentence;
         anything unexpected propagates to :meth:`enable_rag`, which keeps
         retrieval off and logs it with its traceback. The order is
-        ``create_collection``, embedder, bind — so a store whose
-        ``create_collection`` fails is simply not bound, and the card that
-        announced it is unaffected. This actor also owns the write gate, so a
-        missing store must never be fatal here the way it is
-        for planning. **The up-front gate is no longer what protects a file from
-        parking at ``EMBEDDING``**: the write happens on this actor's own turn
+        ``create_collection`` then bind — so a store whose ``create_collection``
+        fails is simply not bound, and the card that announced it is unaffected.
+        This actor also owns the write gate, so a missing store must never be
+        fatal here the way it is for planning. **The up-front gate is no longer
+        what protects a file from parking at ``EMBEDDING``**: the write happens
+        on this actor's own turn
         inside a ``try``, so an ask that raises settles the file ``FAILED`` with
         the reason there and then.
         """
-        from akgentic.tool.vector_store.embedding_actor import (  # noqa: PLC0415 — optional extra
-            build_embedding_service,
-        )
-
         if self._rag_collection is None:
             logger.warning(
                 "Workspace %s: no collection configured — retrieval stays in degraded mode",
@@ -663,9 +668,6 @@ class DocumentsMixin(_DocumentsBase):
                 exc,
             )
             return
-        self._embedder = build_embedding_service(
-            self._rag_collection.embedding_model, self._rag_collection.embedding_provider
-        )
         self._vs_proxy = store
 
     def _resolve_store(self) -> VectorStoreService | None:
@@ -826,7 +828,7 @@ class DocumentsMixin(_DocumentsBase):
         that *raised* means this process cannot start actors, and it should not
         keep trying to.
         """
-        from akgentic.tool.workspace.documents.worker import (  # noqa: PLC0415 — cycle
+        from akgentic.tool.workspace.rag.worker import (  # noqa: PLC0415 — see _batch_size
             MAX_CONCURRENT_INDEX_WORKERS,
         )
 
@@ -914,7 +916,7 @@ class DocumentsMixin(_DocumentsBase):
         Returns:
             Whether a worker is now running for *path*.
         """
-        from akgentic.tool.workspace.documents.worker import (  # noqa: PLC0415 — cycle
+        from akgentic.tool.workspace.rag.worker import (  # noqa: PLC0415 — see _batch_size
             IndexRequest,
             IndexWorker,
             index_worker_name,
@@ -1519,18 +1521,30 @@ class DocumentsMixin(_DocumentsBase):
     def rag_search(
         self,
         query: str,
+        hits: dict[str, SearchHit] | None = None,
         top_k: int = 5,
         path_prefix: str = "",
         alpha: float | None = None,
-        score_threshold: float = 0.0,
     ) -> str:
-        """Search the indexed chunks and render the best *top_k*.
+        """Fuse the vector *hits* it is handed with its own keyword leg, and render.
 
-        Two legs, combined by the one fusion rule the package shares: a **scoped**
-        similarity search against ``workspace_chunks``, and a case-insensitive term
-        match over the extraction bodies this actor already holds.
+        Two legs, combined by the one fusion rule the package shares — but only
+        one of them runs here. The **vector** leg is the caller's: the query embed
+        and the scoped similarity search against ``workspace_chunks`` are two
+        external round trips, and they happen on the calling agent's own thread
+        inside :func:`~akgentic.tool.workspace.rag._vector_hits`, which is the
+        card's. What runs here is the half whose inputs are this actor's state and
+        nothing else: a case-insensitive term match over the extraction bodies it
+        already holds, the fusion, and the render that resolves each hit's heading
+        path through the rows on disk.
 
-        **The vector leg is run here rather than through**
+        **That split is why this method makes no external call at all**, which is
+        what ``actor/__init__.py``'s "and never external" claims of every ask on
+        this thread. An embed here — let alone a ``search`` against a cluster
+        backend on the same turn — held every ``request_exec``, every
+        ``exec_status`` and every worker report behind an HTTP request.
+
+        The vector leg is **not** routed through
         :func:`~akgentic.tool.vector_store.hybrid.semantic_scores`, and that is a
         correctness requirement rather than a preference. That helper takes no
         ``scope`` and no ``path_prefix``, and one ``workspace_chunks`` class holds
@@ -1538,25 +1552,32 @@ class DocumentsMixin(_DocumentsBase):
         workspace's chunks. It also reduces its result to ``{ref_id: score}``,
         discarding the ``SearchHit`` that carries the text a hit renders and the
         ``path`` / ``ordinal`` its heading path is looked up by. ``fuse`` and the
-        two constants are what this module reuses; only the leg that needs a
-        filter is local.
+        two constants are what this module reuses.
 
-        **Every failure degrades and none of them raises.** No proxy, an ``embed``
-        that raises or returns nothing, a ``search`` that raises: each yields an
-        empty vector mapping, one warning, and the keyword leg alone. This actor
-        owns the write gate, and a retrieval capability that raised would be a way
-        for a misconfigured deployment to take it down.
+        **The unavailable gate stays here and is unchanged.** A tree with no store
+        announced, or with parameters never announced, answers the sentence
+        whatever the caller handed it.
+
+        **Every failure degrades and none of them raises.** A vector leg that
+        failed hands an empty mapping — it has already logged its own warning —
+        and the keyword leg answers alone. This actor owns the write gate, and a
+        retrieval capability that raised would be a way for a misconfigured
+        deployment to take it down.
 
         Args:
             query: What to look for, in natural language.
+            hits: ``{ref_id: hit}`` from the caller's vector leg, already filtered
+                by its score threshold. ``None`` means the caller ran no vector
+                leg, or ran one that degraded — the keyword leg then answers alone.
             top_k: How many hits to render, applied **after** filtering.
             path_prefix: Restrict the search to paths starting with this. Must not
                 contain ``*`` or ``?`` — see
                 :data:`~akgentic.tool.vector_store.protocol.PATH_PREFIX_WILDCARDS`.
+                Checked here as well as at the caller: this is an ask with a
+                public-shaped signature, and the gate must not depend on which
+                caller reached it.
             alpha: Weight of the vector leg. ``None`` takes the fusion module's
                 own default, which is the value the Weaviate client sends.
-            score_threshold: Minimum **raw** cosine score for a vector hit,
-                applied before normalisation so it keeps its absolute meaning.
 
         Returns:
             The rendered hits, or one of the three sentences: retrieval
@@ -1569,7 +1590,7 @@ class DocumentsMixin(_DocumentsBase):
         if any(character in path_prefix for character in PATH_PREFIX_WILDCARDS):
             return _REJECTED_PREFIX
         budget = max(top_k, 1)
-        hits = self._vector_leg(query, budget, path_prefix, score_threshold)
+        hits = hits or {}
         matches = self._keyword_leg(query, path_prefix)
         fused = fuse(
             list(matches),
@@ -1584,54 +1605,6 @@ class DocumentsMixin(_DocumentsBase):
             if len(rendered) >= budget:
                 break
         return "\n\n".join(rendered) if rendered else _NO_HITS
-
-    def _vector_leg(
-        self, query: str, top_k: int, path_prefix: str, score_threshold: float
-    ) -> dict[str, SearchHit]:
-        """Embed *query* and search the collection **within this workspace only**.
-
-        The ``scope`` predicate is mandatory on every workspace query (ADR-045 §5,
-        §7) and both predicates go to the backend, so the ``top_k`` budget is never
-        spent on another scope's objects. The call over-fetches by ``OVERFETCH``
-        because fusion reorders and the caller drops what it cannot resolve.
-
-        Returns:
-            ``{ref_id: hit}`` for the hits at or above *score_threshold*, or an
-            empty mapping on any failure.
-        """
-        from akgentic.tool.vector_store.hybrid import OVERFETCH
-
-        proxy = self._vs_proxy
-        embedder = self._embedder
-        if proxy is None or embedder is None:
-            logger.warning(
-                "Workspace %s: no vector store — searching on the keyword leg alone",
-                self.config.workspace_path,
-            )
-            return {}
-        try:
-            vectors = embedder.embed([query])
-            if not vectors:
-                logger.warning(
-                    "Workspace %s: embedding a search query returned nothing — keyword only",
-                    self.config.workspace_path,
-                )
-                return {}
-            result = proxy.search(
-                RAG_COLLECTION,
-                vectors[0],
-                top_k * OVERFETCH,
-                scope=self.config.workspace_path,
-                path_prefix=path_prefix or None,
-            )
-        except Exception:
-            logger.warning(
-                "Workspace %s: the vector leg of a search failed — keyword only",
-                self.config.workspace_path,
-                exc_info=True,
-            )
-            return {}
-        return {hit.ref_id: hit for hit in result.hits if hit.score >= score_threshold}
 
     def _keyword_leg(self, query: str, path_prefix: str) -> dict[str, _KeywordMatch]:
         """Return the chunks whose own slice of their document carries a query term.
@@ -1919,12 +1892,20 @@ def _requeued(entry: RagFile, now: datetime) -> RagFile:
 
 
 def _batch_size() -> int:
-    """Return ``EMBED_BATCH_SIZE``, imported where the cycle cannot bite.
+    """Return ``EMBED_BATCH_SIZE``, read here rather than duplicated.
 
-    ``documents/worker.py`` imports ``card.params`` at runtime, and ``card`` imports
-    this actor package — so the constant cannot be reached from this module's
-    import block. It is read here rather than duplicated, so there is one value.
+    **The cycle these three function-level imports existed for is gone, and they
+    stay function-level anyway.** ``documents/worker.py`` imported ``card.params``
+    at runtime and ``card`` imports this actor package, so the constant could not
+    be reached from this module's import block at all. The worker is
+    ``rag/worker.py`` now and takes its parameter from ``rag/params.py``, so
+    hoisting the three would work — this module already imports ``rag.context``
+    at the top, which executes the same package ``__init__``.
+
+    Hoisting them is an optimisation with a real import-order risk and no
+    behaviour to gain, so it is not taken here. The ``# noqa`` comments say what
+    they are now rather than repeating a cycle that no longer exists.
     """
-    from akgentic.tool.workspace.documents.worker import EMBED_BATCH_SIZE  # noqa: PLC0415 — cycle
+    from akgentic.tool.workspace.rag.worker import EMBED_BATCH_SIZE  # noqa: PLC0415 — see above
 
     return EMBED_BATCH_SIZE

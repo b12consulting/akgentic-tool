@@ -531,7 +531,7 @@ class TestTheSlotCountIsAResourceBoundNotADeDuplicator:
 
     def test_the_count_bounds_the_pass(self, harness: RagHarness, workspace_tree: Path) -> None:
         """A process already at its cap spawns nothing more."""
-        from akgentic.tool.workspace.documents.worker import MAX_CONCURRENT_INDEX_WORKERS
+        from akgentic.tool.workspace.rag.worker import MAX_CONCURRENT_INDEX_WORKERS
 
         harness.enable()
         _queued_rows(["alpha.md"])

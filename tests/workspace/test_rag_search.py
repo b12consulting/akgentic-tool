@@ -1,4 +1,4 @@
-"""``workspace_rag_search`` on the actor: two legs, fusion, the render, degradation.
+"""``workspace_rag_search``: two legs, fusion, the render, degradation.
 
 The vector store double here wraps a **real** :class:`InMemoryBackend` rather than
 returning a canned hit list, and that is what makes the scope-isolation spec worth
@@ -9,6 +9,27 @@ the test would have proved that the test filters.
 
 Embeddings are a fixed four-word bag rather than a network call, so a cosine
 ordering is deterministic and a spec can say which hit comes first.
+
+**The two legs run in two places, and the specs are driven accordingly.** The
+vector leg — the query embed and the ``search`` call — is the *card*'s, so every
+spec about it goes through ``tool_named(card, "workspace_rag_search")``, the exact
+callable an agent holds. The keyword leg, the fusion and the render are the
+*actor*'s, and the specs about the actor's own gates still call
+``actor.rag_search`` directly.
+
+:class:`SearchHarness` binds both: one inert actor, seeded through the document
+store, and a real :class:`WorkspaceTool` whose ``_workspace_proxy`` **is** that
+actor and whose resolved vector store **is** the double. So
+:meth:`SearchHarness.run` exercises the whole production path end to end, with no
+leg re-implemented here. The card takes the ``weaviate`` branch because that is
+the one that resolves a client with no store actor behind it — the shape where
+``search`` is a second round trip — and its factory is swapped through the
+registry's own seam.
+
+**Where a spec drives the actor directly, that is deliberate and says so**: the
+unavailable gate, the actor's own prefix check and the fusion knobs are the
+actor's, and reaching them through the card would only add a leg that is not
+under test.
 """
 
 from __future__ import annotations
@@ -29,7 +50,6 @@ from akgentic.tool.workspace.actor import (
     WorkspaceActor,
     workspace_actor_name,
 )
-from akgentic.tool.workspace.card.params import WorkspaceRagIndex, WorkspaceRagSearch
 from akgentic.tool.workspace.documents.models import (
     EXTRACTOR_VERSION,
     RAG_COLLECTION,
@@ -41,17 +61,25 @@ from akgentic.tool.workspace.documents.models import (
 )
 from akgentic.tool.workspace.documents.store import DocumentEntry, YamlDocumentStore
 from akgentic.tool.workspace.models import WorkspaceConfig, content_sha
+from akgentic.tool.workspace.rag.params import WorkspaceRagIndex, WorkspaceRagSearch
 from akgentic.tool.workspace.readers import DocumentReader
+from akgentic.tool.workspace.tool import WorkspaceTool
 from tests.conftest import MockActorAddress
 from tests.workspace.conftest import (
+    WORKSPACE_NAME,
     WORKSPACE_PATH,
+    FakeActorToolObserver,
+    FakeOrchestratorProxy,
     attach_store,
     drop_row,
+    factory_for,
     seed_extract,
     seed_row,
     stored_docs,
     stored_rows,
+    tool_named,
     watch_store,
+    workspace_path_for,
 )
 
 _UNAVAILABLE = "Retrieval indexing is not available for this workspace."
@@ -156,13 +184,20 @@ class SearchEmbedder:
 
 
 class SearchHarness:
-    """An inert actor whose vector-store proxy is a :class:`SearchStore`.
+    """An inert actor, and a real card whose proxy is that actor.
 
     The actor is handed **no** orchestrator, and resolves no store of its own:
     the card announces one at bind time, so this harness announces the double
     through ``configure_vector_store`` exactly as a card would. ``createActor``
     is kept and pointed at a trap — a spawn from here is a regression, not a
     path.
+
+    :meth:`bind_card` adds the other half. The vector leg of a search is the
+    card's now, so a spec about it has to go through a **real**
+    :class:`WorkspaceTool`: one bound with this harness's actor as its
+    ``_workspace_proxy`` and this harness's double as its resolved vector store.
+    :meth:`run` is then the callable an agent actually holds, and nothing about
+    either leg is re-implemented here.
     """
 
     def __init__(self, actor: WorkspaceActor, store: SearchStore) -> None:
@@ -170,6 +205,12 @@ class SearchHarness:
         self.store = store
         self.embedder = SearchEmbedder()
         self.vs_address = MockActorAddress("#VectorStore-child")
+        self.card: WorkspaceTool | None = None
+        self._observer: FakeActorToolObserver | None = None
+        """Held: a card holds its observer weakly, and a dropped one is collected."""
+        self._orchestrator_proxy: FakeOrchestratorProxy | None = None
+        self._monkeypatch: pytest.MonkeyPatch | None = None
+        self._workspace_id = WORKSPACE_NAME
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self.actor._orchestrator = None
@@ -191,9 +232,67 @@ class SearchHarness:
             DocumentReader(llm_client=None),
             VectorStoreParam(backend="weaviate"),
         )
-        # ``enable_rag`` builds a real ``EmbeddingService`` from the card's param;
-        # the query leg under test must go to the double instead.
-        self.actor._embedder = self.embedder
+
+    def bind_card(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        monkeypatch: pytest.MonkeyPatch,
+        workspace_id: str = WORKSPACE_NAME,
+        **search_params: Any,
+    ) -> WorkspaceTool:
+        """Bind a real card over this harness's actor and store, and return it.
+
+        The ``weaviate`` branch is taken deliberately: it is the one where
+        ``needs_store_actor`` is false and the card resolves a **client** through
+        the registry's factory, which is the shape the story's search leg is
+        about. The factory is swapped through ``factory_for``, the registry's own
+        seam, so the card's resolution code runs unmodified.
+
+        ``build_embedding_service`` is replaced at its **source module**, which is
+        where the capability's function-level import finds it; the double records
+        every text it is handed.
+        """
+        monkeypatch.setenv("AKGENTIC_WEAVIATE_URL", "https://cluster.example")
+        monkeypatch.setattr(
+            "akgentic.tool.vector_store.embedding_actor.build_embedding_service",
+            lambda model, provider: self.embedder,
+        )
+        observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=self.actor)
+        card = WorkspaceTool(
+            workspace_id=workspace_id,
+            workspace_rag_search=WorkspaceRagSearch(**search_params),
+            vector_store=VectorStoreParam(backend="weaviate"),
+        )
+        with factory_for("weaviate", lambda _context: self.store):
+            card.observer(observer)
+        assert card._workspace_path == self.actor.config.workspace_path, (
+            "the card and its actor resolved different trees — the scope predicate "
+            "this harness exists to exercise would filter everything out"
+        )
+        self.card = card
+        self._observer = observer
+        self._orchestrator_proxy = orchestrator_proxy
+        self._monkeypatch = monkeypatch
+        self._workspace_id = workspace_id
+        return card
+
+    def run(self, query: str, **kwargs: Any) -> str:
+        """Search through the card's own callable — both legs, production path."""
+        assert self.card is not None, "bind_card first"
+        return str(tool_named(self.card, "workspace_rag_search")(query, **kwargs))
+
+    def run_with(self, query: str, **search_params: Any) -> str:
+        """Search through a card configured with *search_params*.
+
+        The two knobs a caller cannot pass per call — ``alpha`` and
+        ``score_threshold`` — are card configuration, so a spec about either
+        rebinds rather than reaching past the closure.
+        """
+        assert self._orchestrator_proxy is not None and self._monkeypatch is not None
+        card = self.bind_card(
+            self._orchestrator_proxy, self._monkeypatch, self._workspace_id, **search_params
+        )
+        return str(tool_named(card, "workspace_rag_search")(query))
 
     def index(
         self,
@@ -291,12 +390,16 @@ def store() -> SearchStore:
 
 @pytest.fixture
 def search(
-    workspace_tree: Path, store: SearchStore, monkeypatch: pytest.MonkeyPatch
+    workspace_tree: Path,
+    store: SearchStore,
+    orchestrator_proxy: FakeOrchestratorProxy,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> SearchHarness:
-    """A harness with retrieval already enabled — the case every search assumes."""
+    """A harness with retrieval enabled and a card bound — what a search assumes."""
     built = SearchHarness(build_actor(), store)
     built.install(monkeypatch)
     built.enable()
+    built.bind_card(orchestrator_proxy, monkeypatch)
     return built
 
 
@@ -356,7 +459,7 @@ class TestDegradation:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
         search.embedder.embed_error = RuntimeError("the embedding provider is down")
 
-        answer = search.actor.rag_search("payment")
+        answer = search.run("payment")
 
         assert "invoice.md" in answer
         assert "keyword match" in answer
@@ -367,7 +470,7 @@ class TestDegradation:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
         search.embedder.embed_returns = []
 
-        answer = search.actor.rag_search("payment")
+        answer = search.run("payment")
 
         assert "keyword match" in answer
         assert search.store.searches == []
@@ -378,7 +481,7 @@ class TestDegradation:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
         search.store.search_error = RuntimeError("cluster unreachable")
 
-        answer = search.actor.rag_search("payment")
+        answer = search.run("payment")
 
         assert "keyword match" in answer
 
@@ -388,7 +491,51 @@ class TestDegradation:
         """This actor owns the write gate; a retrieval failure must not reach it."""
         search.store.search_error = RuntimeError("cluster unreachable")
 
-        search.actor.rag_search("nothing is indexed at all")  # must not raise
+        search.run("nothing is indexed at all")  # must not raise
+
+    def test_an_embedder_that_cannot_even_be_built_falls_back_to_the_keyword_leg(
+        self, search: SearchHarness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``build_embedding_service`` imports the ``[vector_search]`` extra.
+
+        **The successor to ``test_rag_pipeline.py``'s row of the same name**, which
+        guarded ``enable_rag`` against a failing build back when the actor was the
+        one building an embedder. It no longer builds one, so that row would have
+        gone vacuous; the property is real and belongs where the build now happens.
+        """
+        search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
+
+        def _explodes(model: str, provider: str) -> object:
+            raise RuntimeError("the vector_search extra is not installed")
+
+        monkeypatch.setattr(
+            "akgentic.tool.vector_store.embedding_actor.build_embedding_service", _explodes
+        )
+
+        answer = search.run("payment")  # must not raise
+
+        assert "keyword match" in answer
+        assert search.store.searches == []
+
+    def test_a_card_that_resolved_no_store_falls_back_to_the_keyword_leg(
+        self, search: SearchHarness
+    ) -> None:
+        """The card's half of "no vector store": one warning, no embed, no search.
+
+        The actor's half — ``_vs_proxy is None`` — is the unavailable sentence
+        above and is a different answer, deliberately: there the tree has no
+        retrieval at all, here the tree has retrieval and this *card* could not
+        reach the engine.
+        """
+        search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
+        assert search.card is not None
+        search.card._vector_store = None
+
+        answer = search.run("payment")
+
+        assert "keyword match" in answer
+        assert search.store.searches == []
+        assert search.embedder.embeds == []
 
     def test_no_hits_is_a_sentence_that_is_not_the_unavailable_one(
         self, search: SearchHarness
@@ -396,7 +543,7 @@ class TestDegradation:
         """ "Nothing matched" and "nothing is indexed" have different next steps."""
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND], embedded=False)
 
-        answer = search.actor.rag_search("bicycles")
+        answer = search.run("bicycles")
 
         assert answer == _NO_HITS
         assert answer != _UNAVAILABLE
@@ -404,13 +551,18 @@ class TestDegradation:
 
 
 class TestTheVectorLeg:
-    """It is scoped, over-fetched, and thresholded on the raw cosine."""
+    """It is scoped, over-fetched, and thresholded on the raw cosine.
+
+    **Driven through the card**, because that is where the leg runs now. Every
+    assertion below is byte-identical to the one it replaced: what moved is *where
+    the call is made*, not *what the backend receives*.
+    """
 
     def test_every_query_carries_the_workspace_as_its_scope(self, search: SearchHarness) -> None:
         """One ``workspace_chunks`` class holds every workspace of every team."""
         search.index("invoice.md", _INVOICE, [_FIRST])
 
-        search.actor.rag_search("payment")
+        search.run("payment")
 
         [(collection, _, scope, _prefix)] = search.store.searches
         assert (collection, scope) == (RAG_COLLECTION, WORKSPACE_PATH)
@@ -421,7 +573,7 @@ class TestTheVectorLeg:
         """``None`` filters nothing; ``""`` would be a predicate the backend applies."""
         search.index("invoice.md", _INVOICE, [_FIRST])
 
-        search.actor.rag_search("payment")
+        search.run("payment")
 
         assert search.store.searches[0][3] is None
 
@@ -429,7 +581,7 @@ class TestTheVectorLeg:
         """The predicate goes to the store, so the budget is not spent locally."""
         search.index("reports/invoice.md", _INVOICE, [_FIRST])
 
-        search.actor.rag_search("payment", path_prefix="reports/")
+        search.run("payment", path_prefix="reports/")
 
         assert search.store.searches[0][3] == "reports/"
 
@@ -438,7 +590,7 @@ class TestTheVectorLeg:
     ) -> None:
         search.index("invoice.md", _INVOICE, [_FIRST])
 
-        search.actor.rag_search("payment", top_k=5)
+        search.run("payment", top_k=5)
 
         assert search.store.searches[0][1] == 5 * OVERFETCH
 
@@ -447,11 +599,15 @@ class TestTheVectorLeg:
 
         The body is not cached, so the keyword leg contributes nothing and what
         the threshold drops is the whole of the answer.
+
+        The threshold is **card configuration** rather than a call argument — it
+        always was, and the closure spent it on the actor before this story and
+        spends it on its own leg after — so the two cases are two cards.
         """
         search.index("holiday.md", "Holiday policy\n", [(0, 15, ["Holiday"])], cache=False)
 
-        kept = search.actor.rag_search("holiday", score_threshold=0.0)
-        dropped = search.actor.rag_search("holiday", score_threshold=1.5)
+        kept = search.run_with("holiday", score_threshold=0.0)
+        dropped = search.run_with("holiday", score_threshold=1.5)
 
         assert "holiday.md" in kept
         assert dropped == _NO_HITS
@@ -464,7 +620,7 @@ class TestTheKeywordLeg:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
         search.embedder.embed_error = RuntimeError("vector leg off")
 
-        assert "invoice.md" in search.actor.rag_search("PAYMENT")
+        assert "invoice.md" in search.run("PAYMENT")
 
     def test_an_evicted_body_contributes_nothing_and_is_never_sliced(
         self, search: SearchHarness
@@ -478,7 +634,7 @@ class TestTheKeywordLeg:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND], cache=False)
         search.embedder.embed_error = RuntimeError("vector leg off")
 
-        answer = search.actor.rag_search("payment")  # must not raise
+        answer = search.run("payment")  # must not raise
 
         assert answer == _NO_HITS
 
@@ -488,7 +644,7 @@ class TestTheKeywordLeg:
         """This is what keeps ``max_documents`` a bound on state, not on the corpus."""
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND], cache=False)
 
-        answer = search.actor.rag_search("payment")
+        answer = search.run("payment")
 
         assert "invoice.md" in answer
         assert "Payment terms are net thirty." in answer
@@ -505,7 +661,7 @@ class TestTheKeywordLeg:
         )
         search.embedder.embed_error = RuntimeError("vector leg off")
 
-        assert search.actor.rag_search("payment") == _NO_HITS
+        assert search.run("payment") == _NO_HITS
 
     def test_a_cached_path_absent_from_the_index_is_skipped_rather_than_raising(
         self, search: SearchHarness
@@ -521,7 +677,7 @@ class TestTheKeywordLeg:
         ))
         search.embedder.embed_error = RuntimeError("vector leg off")
 
-        assert search.actor.rag_search("payment") == _NO_HITS
+        assert search.run("payment") == _NO_HITS
 
     def test_only_the_chunk_whose_own_slice_carries_the_term_is_hit(
         self, search: SearchHarness
@@ -530,7 +686,7 @@ class TestTheKeywordLeg:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
         search.embedder.embed_error = RuntimeError("vector leg off")
 
-        answer = search.actor.rag_search("refund")
+        answer = search.run("refund")
 
         assert "Refunds" in answer
         assert "Payment terms" not in answer
@@ -541,7 +697,7 @@ class TestTheKeywordLeg:
         search.index("notes/invoice.md", _INVOICE, [_FIRST])
         search.embedder.embed_error = RuntimeError("vector leg off")
 
-        answer = search.actor.rag_search("payment", path_prefix="reports/")
+        answer = search.run("payment", path_prefix="reports/")
 
         assert "reports/invoice.md" in answer
         assert "notes/invoice.md" not in answer
@@ -551,7 +707,7 @@ class TestTheKeywordLeg:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
         search.embedder.embed_error = RuntimeError("vector leg off")
 
-        assert search.actor.rag_search("   ") == _NO_HITS
+        assert search.run("   ") == _NO_HITS
 
 
 class TestTheRender:
@@ -560,14 +716,14 @@ class TestTheRender:
     def test_a_hit_renders_its_path_and_heading_path(self, search: SearchHarness) -> None:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
 
-        answer = search.actor.rag_search("payment", top_k=1)
+        answer = search.run("payment", top_k=1)
 
         assert answer.startswith("invoice.md > Invoice > Payment terms (")
 
     def test_a_keyword_only_hit_is_labelled_as_one(self, search: SearchHarness) -> None:
         search.index("invoice.md", _INVOICE, [_FIRST], embedded=False)
 
-        assert "(keyword match)" in search.actor.rag_search("payment")
+        assert "(keyword match)" in search.run("payment")
 
     def test_a_vector_only_hit_is_labelled_semantic_with_its_raw_cosine(
         self, search: SearchHarness
@@ -581,12 +737,12 @@ class TestTheRender:
         """
         search.index("invoice.md", _INVOICE, [_FIRST], cache=False)
 
-        assert "(semantic: 0.71)" in search.actor.rag_search("payment")
+        assert "(semantic: 0.71)" in search.run("payment")
 
     def test_a_hit_confirmed_by_both_legs_is_labelled_hybrid(self, search: SearchHarness) -> None:
         search.index("invoice.md", _INVOICE, [_FIRST])
 
-        assert "(hybrid: " in search.actor.rag_search("payment", top_k=1)
+        assert "(hybrid: " in search.run("payment", top_k=1)
 
     def test_the_text_of_a_hit_comes_from_the_store_and_not_from_the_cache(
         self, search: SearchHarness
@@ -600,7 +756,7 @@ class TestTheRender:
             held.model_copy(update={"markdown": _INVOICE.replace("net thirty", "REPLACED")}),
         )
 
-        answer = search.actor.rag_search("payment", top_k=1)
+        answer = search.run("payment", top_k=1)
 
         assert "net thirty" in answer
         assert "REPLACED" not in answer
@@ -612,14 +768,14 @@ class TestTheRender:
         search.index("invoice.md", _INVOICE, [_FIRST], cache=False)
         drop_row(search.actor, "invoice.md")
 
-        answer = search.actor.rag_search("payment")
+        answer = search.run("payment")
 
         assert answer.startswith("invoice.md (semantic:")
 
     def test_hits_are_separated_by_a_blank_line(self, search: SearchHarness) -> None:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
 
-        answer = search.actor.rag_search("payment refund", top_k=2)
+        answer = search.run("payment refund", top_k=2)
 
         assert hit_count(answer) == 2
         assert "\n\n" in answer
@@ -631,14 +787,14 @@ class TestTopK:
     def test_the_render_is_cut_to_top_k(self, search: SearchHarness) -> None:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
 
-        answer = search.actor.rag_search("payment refund", top_k=1)
+        answer = search.run("payment refund", top_k=1)
 
         assert hit_count(answer) == 1
 
     def test_a_larger_budget_returns_both(self, search: SearchHarness) -> None:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
 
-        answer = search.actor.rag_search("payment refund", top_k=5)
+        answer = search.run("payment refund", top_k=5)
 
         assert hit_count(answer) == 2
 
@@ -648,7 +804,7 @@ class TestTopK:
         """``top_k * OVERFETCH`` at zero would ask the backend for no rows at all."""
         search.index("invoice.md", _INVOICE, [_FIRST])
 
-        answer = search.actor.rag_search("payment", top_k=0)
+        answer = search.run("payment", top_k=0)
 
         assert "invoice.md" in answer
         assert search.store.searches[0][1] == OVERFETCH
@@ -678,26 +834,38 @@ class TestScopeIsolation:
                 "payment payment payment",
             )
 
-        answer = search.actor.rag_search("payment", top_k=5)
+        answer = search.run("payment", top_k=5)
 
         assert "theirs.md" not in answer
         assert "mine.md" in answer
 
     def test_the_other_workspace_sees_only_its_own(
-        self, workspace_tree: Path, store: SearchStore, monkeypatch: pytest.MonkeyPatch
+        self,
+        workspace_tree: Path,
+        store: SearchStore,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Symmetry, so the spec is about the predicate and not about one ordering."""
+        """Symmetry, so the spec is about the predicate and not about one ordering.
+
+        The second workspace's card is bound with ``workspace_id="other-workspace"``
+        so its resolved path — and therefore the ``scope`` its vector leg sends —
+        is the one its actor was built for. A card on the first tree would have
+        proved nothing about the predicate.
+        """
         mine = SearchHarness(build_actor(), store)
         mine.install(monkeypatch)
         mine.enable()
+        mine.bind_card(orchestrator_proxy, monkeypatch)
         mine.index("mine.md", _INVOICE, [_FIRST])
 
-        theirs = SearchHarness(build_actor("other-workspace"), store)
+        theirs = SearchHarness(build_actor(workspace_path_for("other-workspace")), store)
         theirs.install(monkeypatch)
         theirs.enable()
+        theirs.bind_card(orchestrator_proxy, monkeypatch, "other-workspace")
         theirs.index("theirs.md", _INVOICE, [_FIRST])
 
-        answer = theirs.actor.rag_search("payment", top_k=5)
+        answer = theirs.run("payment", top_k=5)
 
         assert "theirs.md" in answer
         assert "mine.md" not in answer
@@ -727,7 +895,7 @@ class TestThePathPrefixDecision:
     def test_a_prefix_carrying_a_metacharacter_is_refused(
         self, search: SearchHarness, prefix: str
     ) -> None:
-        answer = search.actor.rag_search("payment", path_prefix=prefix)
+        answer = search.run("payment", path_prefix=prefix)
 
         assert "cannot contain" in answer
         assert answer != _UNAVAILABLE
@@ -767,7 +935,7 @@ class TestThePathPrefixDecision:
         """No embed is spent either — the refusal is the first thing that happens."""
         search.index("invoice.md", _INVOICE, [_FIRST])
 
-        search.actor.rag_search("payment", path_prefix="report*")
+        search.run("payment", path_prefix="report*")
 
         assert search.store.searches == []
         assert search.embedder.embeds == []
@@ -788,7 +956,7 @@ class TestThePathPrefixDecision:
         """The refusal must not spread to the ordinary case it exists to protect."""
         search.index("reports/invoice.md", _INVOICE, [_FIRST])
 
-        answer = search.actor.rag_search("payment", path_prefix="reports/")
+        answer = search.run("payment", path_prefix="reports/")
 
         assert "reports/invoice.md" in answer
 
@@ -797,21 +965,28 @@ class TestTheFusionKnobs:
     """``alpha`` and ``score_threshold`` reach the rule the package shares."""
 
     def test_the_cards_default_alpha_is_the_fusion_modules_own(self) -> None:
-        """The literal in ``card/params.py`` is written out to avoid an import edge."""
+        """The literal in ``rag/params.py`` is written out to avoid an import edge."""
         assert WorkspaceRagSearch().alpha == DEFAULT_ALPHA
 
     def test_alpha_none_takes_the_module_default(self, search: SearchHarness) -> None:
+        """Driven on the **actor**, because that branch is only reachable there.
+
+        ``alpha`` is card configuration and the closure always sends a float, so
+        ``None`` reaches ``rag_search`` from no production caller at all — it is
+        the default of an internal ask, and this is the spec that says the default
+        agrees with the fusion module's.
+        """
         search.index("invoice.md", _INVOICE, [_FIRST])
 
-        assert search.actor.rag_search("payment", alpha=None) == search.actor.rag_search(
-            "payment", alpha=DEFAULT_ALPHA
+        assert search.actor.rag_search("payment", {}, alpha=None) == search.actor.rag_search(
+            "payment", {}, alpha=DEFAULT_ALPHA
         )
 
     def test_pure_keyword_fusion_still_returns_the_keyword_hit(self, search: SearchHarness) -> None:
         """``alpha=0.0`` is pure keyword, and a vector-only hit then scores zero."""
         search.index("invoice.md", _INVOICE, [_FIRST])
 
-        assert "invoice.md" in search.actor.rag_search("payment", alpha=0.0)
+        assert "invoice.md" in search.run_with("payment", alpha=0.0)
 
 
 class TestTheStateItNeverTouches:
@@ -822,7 +997,7 @@ class TestTheStateItNeverTouches:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
         writes = watch_store(search.actor)
 
-        assert "invoice.md" in search.actor.rag_search("payment")
+        assert "invoice.md" in search.run("payment")
 
         assert writes.puts == []
         assert writes.evicted == []
@@ -831,7 +1006,7 @@ class TestTheStateItNeverTouches:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
         before = stored_rows(search.actor)["invoice.md"].model_copy(deep=True)
 
-        search.actor.rag_search("payment")
+        search.run("payment")
 
         assert stored_rows(search.actor)["invoice.md"] == before
 

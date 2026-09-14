@@ -184,7 +184,7 @@ class VectorStoreParam(SerializableBaseModel):
         field look explicitly written. The agent-card store does exactly that round
         trip on every team resume, so a card that named nothing would come back
         looking as though its author had named the in-actor backend, and
-        :func:`~akgentic.tool.workspace.card.rag.require_workspace_backend` would
+        :func:`~akgentic.tool.workspace.rag.require_workspace_backend` would
         refuse a configuration that worked yesterday, blaming the author for a
         value they never wrote.
 

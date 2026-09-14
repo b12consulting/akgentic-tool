@@ -41,7 +41,6 @@ from akgentic.tool.workspace.actor import (
     WorkspaceActor,
     workspace_actor_name,
 )
-from akgentic.tool.workspace.card.params import WorkspaceRagIndex
 from akgentic.tool.workspace.documents.models import (
     EMBEDDING_STALE_AFTER_S,
     EXTRACTOR_VERSION,
@@ -52,7 +51,9 @@ from akgentic.tool.workspace.documents.models import (
     RagStatus,
     chunk_id,
 )
-from akgentic.tool.workspace.documents.worker import (
+from akgentic.tool.workspace.models import WorkspaceConfig, content_sha
+from akgentic.tool.workspace.rag.params import WorkspaceRagIndex
+from akgentic.tool.workspace.rag.worker import (
     EMBED_BATCH_SIZE,
     MAX_CONCURRENT_INDEX_WORKERS,
     IndexFailure,
@@ -60,7 +61,6 @@ from akgentic.tool.workspace.documents.worker import (
     IndexResult,
     IndexWorker,
 )
-from akgentic.tool.workspace.models import WorkspaceConfig, content_sha
 from akgentic.tool.workspace.readers import DocumentReader
 from tests.conftest import MockActorAddress
 from tests.workspace.conftest import (
@@ -566,22 +566,42 @@ class TestEnableRag:
         harness.actor.configure_vector_store(harness.vs)
         assert harness.actor._resolve_store() is harness.vs
 
-    def test_a_failing_embedder_never_raises_out_of_enable_rag(
+    def test_enable_rag_builds_no_embedder_at_all(
         self, harness: RagHarness, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """**Premise re-pointed (was: a broken proxy).**
+        """**Premise re-pointed a second time, and inverted** (AC 10).
 
-        ``_acquire_vs_proxy`` no longer builds a proxy, but it still builds an
-        embedder, and everything it does is inside one ``try``. A raise there
-        must leave retrieval off rather than taking the actor down.
+        It was "a broken proxy", then "a failing embedder build must leave
+        retrieval off". ``_acquire_vs_proxy`` built an ``EmbeddingService``
+        because ``rag_search`` embedded on this thread; the query leg is the
+        card's now, so a build here would be an object nobody reads. Asserting
+        that it *degrades* would have gone **vacuous** — the call it degrades on
+        is gone — so the row asserts the stronger fact instead: the call is never
+        made, and retrieval still comes up.
+
+        The stand-in raises to state the intent, but the raise cannot be the
+        assertion: ``enable_rag`` catches everything, so a build that did happen
+        would be swallowed into a WARNING and the spec would pass.
+        :attr:`calls` is what carries the property.
+
+        The degradation property the old row guarded is not lost — it moved with
+        the code, to ``test_rag_search.py``'s
+        ``test_an_embedder_that_cannot_even_be_built_falls_back_to_the_keyword_leg``.
         """
         from akgentic.tool.vector_store import embedding_actor
 
-        monkeypatch.setattr(embedding_actor, "build_embedding_service", _explodes)
+        calls: list[tuple[str, str]] = []
+
+        def _tripwire(model: str, provider: str) -> Any:
+            calls.append((model, provider))
+            raise AssertionError("the actor built an embedder")
+
+        monkeypatch.setattr(embedding_actor, "build_embedding_service", _tripwire)
 
         harness.enable()  # must not raise
 
-        assert harness.actor._vs_proxy is None
+        assert calls == []
+        assert harness.actor._vs_proxy is harness.vs
 
     def test_a_failing_create_collection_degrades_rather_than_raising(
         self, harness: RagHarness

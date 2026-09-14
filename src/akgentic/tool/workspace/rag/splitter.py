@@ -26,13 +26,13 @@ Nothing here touches an actor, a message or the filesystem: two pure functions, 
 Protocol, and the class that composes them.
 
 **The import edge runs one way.**
-:class:`~akgentic.tool.workspace.card.params.WorkspaceRagIndex` is imported under
-``TYPE_CHECKING`` only, and that is load-bearing rather than stylistic:
-``card/__init__.py`` imports :mod:`akgentic.tool.workspace.documents.models`,
-which executes this package's ``__init__`` first — so a runtime import of
-``card.params`` from here would close a cycle whose winner depends on which
-package is imported first. The annotation is a string, the runtime edge does not
-exist, and the packer reads ``params.chunk_chars`` without needing the class.
+:class:`~akgentic.tool.workspace.rag.params.WorkspaceRagIndex` is imported under
+``TYPE_CHECKING`` only. The cycle that used to make that load-bearing is gone —
+the parameter is a sibling in this capability now, not a module under ``card/``
+— but the annotation-only form is kept: it is a string annotation the packer
+never needs the class for, and importing ``rag/params.py`` from here would
+execute ``rag/__init__.py``, which imports this module. A capability's leaf
+modules stay leaves.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ from akgentic.core.utils.serializer import SerializableBaseModel
 if TYPE_CHECKING:
     from markdown_it.token import Token
 
-    from akgentic.tool.workspace.card.params import WorkspaceRagIndex
+    from akgentic.tool.workspace.rag.params import WorkspaceRagIndex
 
 __all__ = ["BlockSplitter", "Span", "TextSplitter"]
 

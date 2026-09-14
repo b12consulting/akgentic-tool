@@ -35,13 +35,20 @@ to get wrong to pass:
   deny-list passes silently for the module nobody thought to forbid.
 
 **The runtime graph excludes ``if TYPE_CHECKING:`` imports, deliberately**, and
-:class:`TestNoCapabilityNamesAnother` closes the gap that opens. Such an import
-never executes, closes no cycle and costs nothing at bind — which is exactly why
-``documents/splitter.py`` and ``actor/documents.py`` use one to name
-``WorkspaceRagIndex`` without taking on ``card/``. Counting it would condemn the
-package's own recommended pattern. So the runtime closure ignores it, and a
-second, narrower rule then forbids a capability module from naming another
-capability in **any** import, annotation-only ones included.
+:meth:`TestACapabilityDependsOnTheSpineAndNothingElse.test_it_names_no_other_capability_even_in_an_annotation`
+closes the gap that opens. Such an import never executes, closes no cycle and
+costs nothing at bind — which is exactly why ``rag/splitter.py`` and
+``actor/documents.py`` use one to name each other's types without taking the
+other on. Counting it would condemn the package's own recommended pattern. So the
+runtime closure ignores it, and a second, narrower rule then forbids a capability
+module from naming another capability in **any** import, annotation-only ones
+included.
+
+**A function-level import is a runtime import here, and that is not a gap.** It
+executes when the method runs, so :func:`_runtime_imports` counts it, and it
+should: ``IndexWorker._report``'s import of ``WorkspaceActor`` put seven modules
+into ``rag/``'s closure — three of them capabilities — for an argument
+``proxy_tell`` ignores. The guard is what found it.
 """
 
 from __future__ import annotations
@@ -69,23 +76,34 @@ SPINE = frozenset(
         f"{PACKAGE}.readers",
         f"{PACKAGE}.workspace",
         # Reached transitively: ``models`` imports ``documents.models`` for the
-        # extraction constants, which attributes the ``documents`` package, whose
-        # ``__init__`` pulls in its context and splitter modules. It deliberately
-        # does **not** import ``documents/worker.py`` — the one module there that
-        # imports ``card.params`` — and says so in its own docstring.
+        # extraction constants, which attributes the ``documents`` package. Those
+        # two, and nothing else under ``documents/``: the extraction cache is
+        # genuinely shared by the read and retrieval capabilities, so it stays
+        # shared (ADR-053 Decision 1), while ``documents/store.py`` is reached by
+        # neither capability's closure.
         f"{PACKAGE}.documents",
-        f"{PACKAGE}.documents.context",
         f"{PACKAGE}.documents.models",
-        f"{PACKAGE}.documents.splitter",
     }
 )
 """The shared machinery every capability is allowed to stand on.
 
 ``readers.py`` is in here rather than inside ``read/`` even though the read
-closures are its heaviest consumer: ``card/rag.py``, ``actor/documents.py``,
-``documents/worker.py``, ``card/params.py`` and ``models.py`` all use it too, and
-``akgentic-agent`` imports ``MediaContent`` from its deep path. It is shared
-machinery and it stays in the spine.
+closures are its heaviest consumer: ``rag/__init__.py``, ``actor/documents.py``,
+``rag/worker.py`` and ``models.py`` all use it too, and ``akgentic-agent`` imports
+``MediaContent`` from its deep path. It is shared machinery and it stays in the
+spine.
+
+**It shrank by two when the retrieval capability became a module**, and that is
+the structural observable of story 55-6 rather than a tidy-up.
+``documents.context`` and ``documents.splitter`` were retrieval machinery sitting
+in the allow-list *every* capability stands on — so ``journal/``, which has
+nothing whatever to do with retrieval, was permitted to reach both. They were
+there because ``workspace/models.py`` takes two cap constants from
+``documents/models.py``, and importing that executed ``documents/__init__.py``,
+which re-exported the splitter and the context state. Moving those two modules
+into ``rag/`` and dropping the re-exports broke the chain. The claim "a capability
+the card does not enable costs nothing" was, at the static level, partly false
+until then.
 """
 
 CAPABILITY_CLOSURES: dict[str, frozenset[str]] = {
@@ -134,8 +152,46 @@ CAPABILITY_CLOSURES: dict[str, frozenset[str]] = {
     # module, no sibling capability, under ``TYPE_CHECKING`` or otherwise. Where
     # ``write/`` needs five, this needs none.
     "journal": SPINE | {f"{PACKAGE}.journal"},
+    "rag": SPINE
+    | {
+        f"{PACKAGE}.rag",
+        f"{PACKAGE}.rag.context",
+        f"{PACKAGE}.rag.params",
+        f"{PACKAGE}.rag.splitter",
+        f"{PACKAGE}.rag.worker",
+        # ``RagFactories._rag_reader`` resolves the card's extraction
+        # configuration, which is nested inside ``WorkspaceRead.document_reader``
+        # — so the capability that extracts depends on the capability that reads.
+        #
+        # **This is a capability naming another capability, admitted deliberately
+        # and different in kind from ``write/``'s ``journal`` entry.** ``read/`` is
+        # the *always-available* capability, present in every bind, so depending
+        # on it is depending on machinery that is there anyway; ``write/``'s
+        # dependency was on a **default-off** capability, which is why ``Identity``
+        # is moving to the spine and why nothing analogous is owed here. Moving
+        # ``_rag_reader`` into ``card/__init__.py`` to shorten this row would be
+        # reorganising to satisfy the map, and would grow the longest module in
+        # the package.
+        f"{PACKAGE}.read",
+        f"{PACKAGE}.read.params",
+        # ``WorkspaceActor`` annotates ``RagFactories``'s two proxy slots and is
+        # the type ``IndexWorker._report`` casts its reply proxy to. Both are
+        # ``TYPE_CHECKING`` imports, so this is **not** in the runtime closure and
+        # is on the row only for the direct-edge rule — exactly ``write/``'s
+        # ``actor`` entry.
+        #
+        # It was briefly a *runtime* entry, and the measurement is worth
+        # recording: ``IndexWorker._report`` imported ``WorkspaceActor`` inside
+        # the method purely to pass it to ``proxy_tell``, whose second argument
+        # core ignores. That one executed import put ``actor``, ``actor.documents``,
+        # ``actor.execution``, ``documents.store``, ``execution``, ``journal`` and
+        # ``lock`` into this closure — seven modules, none of them a real
+        # dependency of retrieval, and three of them capabilities. Naming the
+        # actor under ``TYPE_CHECKING`` instead removed all seven.
+        f"{PACKAGE}.actor",
+    },
 }
-"""One row per capability module. Stories 55-6 and 55-7 add the last two rows.
+"""One row per capability module. Story 55-7 adds the last one.
 
 The value is the complete allow-list for that capability's transitive closure:
 its own modules, plus the spine modules it genuinely needs.
@@ -158,6 +214,21 @@ CAPABILITY_SPINE_REACH: dict[str, frozenset[str]] = {
     # in-function import, so a graph that followed no transitive edge would miss
     # it while still satisfying a mere "non-empty" check.
     "journal": frozenset({f"{PACKAGE}.models", f"{PACKAGE}.readers"}),
+    # The widest of the four, and stated in full rather than trimmed to match the
+    # others: ``rag/`` reaches ``workspace`` (``meta_dir_for``, ``get_workspace``),
+    # ``readers`` (the extraction configuration), ``documents.models`` (the
+    # collection name, the chunk record and the id rule) and, through ``read/``,
+    # ``models``. Listing all five is what makes this row report a graph that
+    # silently narrowed.
+    "rag": frozenset(
+        {
+            f"{PACKAGE}.documents",
+            f"{PACKAGE}.documents.models",
+            f"{PACKAGE}.models",
+            f"{PACKAGE}.readers",
+            f"{PACKAGE}.workspace",
+        }
+    ),
 }
 """The spine modules each capability actually reaches — per row, never one literal.
 
@@ -185,10 +256,14 @@ assert nothing at all about that capability.
 MINIMUM_MODULES_PARSED = 20
 """Below this the sweep is looking at the wrong directory, not at a clean package.
 
-Calibrated for **this package**, which holds 27 modules. Story 55-1's sibling
+Calibrated for **this package**, which holds 29 modules. Story 55-1's sibling
 sweep uses 40 because it walks the whole of ``src/akgentic/tool/``; carrying that
-number over to a 27-module root would fail a correct sweep, which is the opposite
-of what a sentinel is for.
+number over to a root of this size would fail a correct sweep, which is the
+opposite of what a sentinel is for.
+
+**The floor does not move when the package grows.** It is deliberately below the
+smallest correct sweep, not a number chosen to pass: story 55-6 took the count
+from 27 to 29 and this stayed at 20, which is the whole point of a floor.
 """
 
 
@@ -321,6 +396,36 @@ class TestTheSweepLooksAtTheRightThing:
         """An allow-list entry naming no module allows nothing and hides a typo."""
         assert SPINE <= set(modules)
 
+    def test_no_spine_entry_lies_under_a_capability_directory(
+        self, modules: dict[str, Path]
+    ) -> None:
+        """The guard for the rot story 55-6 removed, rather than a restatement of it.
+
+        ``documents.context`` and ``documents.splitter`` sat in :data:`SPINE` while
+        they were retrieval machinery, so every capability — ``journal/`` included
+        — was allowed to reach the splitter and the retrieval context state. It was
+        not a typo in the row; it was the shape of the package, and it made "a
+        capability the card does not enable costs nothing" partly false at the
+        static level.
+
+        This is green today. What it is for is the *next* time a row will not go
+        green: promoting a capability module into the spine to satisfy one entry is
+        the cheap fix, it is exactly what the epic's traps forbid, and it would
+        otherwise pass every assertion in this module while meaning the opposite of
+        what they claim.
+        """
+        offenders = {
+            entry
+            for entry in SPINE
+            for capability in CAPABILITY_CLOSURES
+            if entry == f"{PACKAGE}.{capability}" or entry.startswith(f"{PACKAGE}.{capability}.")
+        }
+
+        assert offenders == set(), (
+            f"{sorted(offenders)} are capability modules in SPINE — the allow-list "
+            f"every capability stands on must not carry any one capability's code"
+        )
+
     def test_the_two_capability_tables_describe_the_same_capabilities(self) -> None:
         """Key parity, because two tables are two things one story can update by half.
 
@@ -341,12 +446,12 @@ class TestTheSweepLooksAtTheRightThing:
         """The parent-attribution rule, asserted rather than left to a mutation.
 
         No module anywhere imports ``akgentic.tool.workspace.documents`` by name —
-        every reference is to ``documents.models``, ``documents.context`` or
-        ``documents.splitter``. The package is in ``read/``'s closure **only**
-        because importing one of those executes its ``__init__`` first, which is
-        the whole of the rule. A graph that recorded leaves alone would leave it
-        out, and would then answer "clean" for a capability that dragged in a
-        whole package through one of its submodules.
+        every reference is to ``documents.models`` or ``documents.store``. The
+        package is in ``read/``'s closure **only** because importing one of those
+        executes its ``__init__`` first, which is the whole of the rule. A graph
+        that recorded leaves alone would leave it out, and would then answer
+        "clean" for a capability that dragged in a whole package through one of
+        its submodules.
 
         **Asserted once, on ``read``, and not per capability**, because it is a
         property of :func:`_edges` — shared by every row — and not of any one
@@ -366,7 +471,7 @@ class TestTheSweepLooksAtTheRightThing:
 
 @pytest.mark.parametrize("capability", sorted(CAPABILITY_CLOSURES))
 class TestACapabilityDependsOnTheSpineAndNothingElse:
-    """One row per capability module; stories 55-6 and 55-7 add the last two."""
+    """One row per capability module; story 55-7 adds the last one."""
 
     def test_the_closure_is_inside_the_allow_list(
         self, capability: str, modules: dict[str, Path]
@@ -415,10 +520,10 @@ class TestACapabilityDependsOnTheSpineAndNothingElse:
 
         **Direct edges only, and deliberately so** — this is not the transitive
         closure with a wider filter. Following annotation edges transitively runs
-        straight into ``documents/splitter.py``'s ``TYPE_CHECKING`` import of
-        ``card.params``, which is the package's own recommended cycle-breaker and
-        is nothing to do with the capability under test. The transitive question
-        is the runtime closure's, and it is answered above.
+        straight into ``actor/documents.py``'s ``TYPE_CHECKING`` import of
+        ``rag.params``, which is the package's own recommended cycle-breaker and is
+        nothing to do with the capability under test. The transitive question is
+        the runtime closure's, and it is answered above.
         """
         own = _modules_under(capability, modules)
         named = {

@@ -305,7 +305,7 @@ class TestTheSpawnPathIsReused:
         self, upload: RagHarness, workspace_tree: Path
     ) -> None:
         """Files beyond the cap stay ``PENDING`` — which is what ``PENDING`` means."""
-        from akgentic.tool.workspace.documents.worker import MAX_CONCURRENT_INDEX_WORKERS
+        from akgentic.tool.workspace.rag.worker import MAX_CONCURRENT_INDEX_WORKERS
 
         names = [f"f{index}.md" for index in range(MAX_CONCURRENT_INDEX_WORKERS + 2)]
         for name in names:

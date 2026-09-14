@@ -26,8 +26,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from akgentic.tool.workspace.card.params import WorkspaceRagIndex
-from akgentic.tool.workspace.card.rag import (
+from akgentic.tool.workspace.rag import (
     LOCKS_DIR_NAME,
     POLICY_FILE_NAME,
     POLICY_LOCK_NAME,
@@ -38,6 +37,7 @@ from akgentic.tool.workspace.card.rag import (
     policy_file_for,
     read_tree_policy,
 )
+from akgentic.tool.workspace.rag.params import WorkspaceRagIndex
 from akgentic.tool.workspace.tool import WorkspaceTool
 from akgentic.tool.workspace.workspace import meta_dir_for
 from tests.workspace.conftest import (
@@ -219,7 +219,7 @@ class TestASecondProcessIsHeldToWhatTheFirstPublished:
     """
 
     _PUBLISH = """
-        from akgentic.tool.workspace.card.params import WorkspaceRagIndex
+        from akgentic.tool.workspace.rag.params import WorkspaceRagIndex
 
         card = bind("first", workspace_rag_index=WorkspaceRagIndex(chunk_chars=777))
         print("published", flush=True)
@@ -511,7 +511,7 @@ class TestTwoProcessesPublishingAtOnce:
             tmp_path,
             workspaces_root,
             """
-            from akgentic.tool.workspace.card.params import WorkspaceRagIndex
+            from akgentic.tool.workspace.rag.params import WorkspaceRagIndex
 
             tag = sys.argv[1]
             sizes = {"a": 700, "b": 900}
