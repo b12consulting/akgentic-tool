@@ -74,8 +74,11 @@ could not re-export this module without closing the cycle at import time. The
 parameter is a sibling now and no cycle exists: ``rag/__init__.py`` is free to
 name this module and ``documents/`` no longer knows it at all.
 
-The one remaining function-level import here is :meth:`IndexWorker._report`'s of
-``WorkspaceActor``, which is a genuine cycle and stays where it is.
+**No import in this module is function-level, and that is the second thing the
+move changed.** :meth:`IndexWorker._report` used to import ``WorkspaceActor``
+inside the method to hand it to ``proxy_tell``, which ignores it; the actor is
+named under ``TYPE_CHECKING`` and ``cast`` instead, and :meth:`IndexWorker._report`
+records what that cost while it executed.
 """
 
 from __future__ import annotations

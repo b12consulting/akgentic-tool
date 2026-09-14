@@ -539,12 +539,22 @@ def _vector_hits(
     spent on another scope's objects. The call over-fetches by ``OVERFETCH``
     because fusion reorders and the actor drops what it cannot resolve.
 
-    **One gate the card does not have and the actor does.** The actor only
-    searched once ``create_collection`` had succeeded; a card-side search against
-    a collection that was never created reaches the backend and raises. That is
-    the existing contract — *every failure degrades* — rather than a new hole:
-    the raise lands in the ``except`` below, yields an empty mapping and one
-    warning, and the keyword leg answers alone.
+    **One gate the card does not have and the actor does, and it costs.** The
+    actor only searched once ``create_collection`` had succeeded; this function
+    has no such signal, so a search against a collection that was never created
+    reaches the backend and raises. The raise lands in the ``except`` below,
+    yields an empty mapping and one warning — the existing *every failure
+    degrades* contract rather than a new hole.
+
+    What is new is the **price of a degraded tree**. The actor's unavailable gate
+    is reached only after this function has run, so when the actor is degraded —
+    ``create_collection`` failed, or retrieval parameters were never announced —
+    every query now spends one embed and one ``search`` and then has both
+    discarded, because the actor answers its sentence whatever it was handed.
+    Before the vector leg moved it spent nothing. The answer is byte-identical;
+    the cost is not. Closing it needs a signal the card does not have, and the
+    only cheap source of one is an ask to the actor before every search — which
+    is the mailbox dependency this split exists to remove.
 
     **It never raises**, including out of building the embedder, which imports an
     optional extra.
