@@ -52,9 +52,12 @@ misses and the index looks empty, which is visible and recoverable by rebinding.
 over no store rather than a ``None`` every delegate would have to branch on.
 
 Everything on the ask path here is O(1)/O(n) dict work on the actor thread, plus
-bounded file reads while queueing and bounded proxy calls to the store child —
-and **no external round trip at all**. :meth:`DocumentsMixin.rag_search` used to
-embed the query on this thread and then call ``search`` on a store that may be a
+bounded file reads while queueing and bounded calls to the store the card
+announced — which is a proxy over the team's ``#VectorStore`` or a cluster client
+with no actor behind it, never a child of this actor
+(:meth:`DocumentsMixin._resolve_store`) — and **no external round trip at all**.
+:meth:`DocumentsMixin.rag_search` used to embed the query on this thread and then
+call ``search`` on a store that may be a
 cluster client with no actor behind it, which made two network calls on one turn
 of the mailbox that owns the write gate; while either was in flight,
 ``request_exec``, ``exec_status`` and every worker report queued behind it. Both
@@ -218,12 +221,14 @@ class DocumentsMixin(_DocumentsBase):
     deferred delivery path or resize the exec LRU, because this mixin precedes
     ``ExecMixin`` and ``DeferredResultActor`` in the MRO.
 
-    **The seven slots below are annotated here and assigned in
+    **The seven retrieval slots below are annotated here and assigned in
     ``WorkspaceActor.on_start``**, which is ``ExecMixin``'s arrangement for its
     own eight rather than a divergence: this mixin has no ``on_start`` and adds
-    nothing to the chain. There is no ``_embedder`` among them and none is coming
-    back — the actor's own query leg was the only reader it ever had, and that leg
-    is the card's.
+    nothing to the chain. ``_workspace`` is the eighth annotation and is not one
+    of the seven — it is the tree itself, owned by the actor and read by the card
+    side too. There is no ``_embedder`` among them and none is coming back — the
+    actor's own query leg was the only reader it ever had, and that leg is the
+    card's.
     """
 
     _workspace: Filesystem

@@ -967,9 +967,13 @@ is caught rather than laundered.
 :mod:`akgentic.tool.workspace.documents.cache` when the extraction cache went
 card-side, so the walk below now reads that module — and every actor-side module
 is asserted to hold *no* writer at all, which is a stronger claim than the
-inventory it used to make there. "Actor-side" is two modules since story 55-9:
-the actor package itself, and :mod:`akgentic.tool.workspace.rag.actor`, where the
-retrieval pipeline lives.
+inventory it used to make there. "Actor-side" is **three** modules: the actor
+package itself, :mod:`akgentic.tool.workspace.rag.actor`, where the retrieval
+pipeline lives, and :mod:`akgentic.tool.workspace.execution.actor`, which holds
+the other mixin the class composes. Each of the three is named by import, because
+each of the two mixins left the ``actor/`` directory in turn — exec in 55-7,
+retrieval in 55-9 — and a walk over that directory would silently stop covering
+whichever one moved out.
 """
 
 
@@ -1033,23 +1037,25 @@ class TestOnlyTheKnownFunctionsWriteARecord:
         the inventory above complete: a writer added to actor-side code tomorrow
         would be invisible to a walk that only reads ``cache.py``.
 
-        **It follows the mixin rather than the directory.** Story 55-9 moved the
-        retrieval pipeline out of ``actor/documents.py`` and into ``rag/actor.py``,
-        under the capability that owns it, so the subjects are named by import —
-        the actor package, and the module the mixin now lives in — rather than by
-        globbing one directory. Globbing ``actor/`` alone would still pass, over a
-        package that no longer holds the pipeline the claim is about: exactly the
-        narrowing this suite keeps finding, and the reason the floor below names
-        both files.
+        **It follows the mixins rather than the directory, and there are two of
+        them.** Both left ``actor/`` in turn — exec in story 55-7, retrieval in
+        55-9 — so a walk over that directory covers whichever has not moved yet
+        and silently stops covering the one that has. **Measured, not argued:** a
+        record write injected into ``rag/actor.py`` leaves a walk of ``actor/``
+        alone green, and so did one injected into ``execution/actor.py`` while
+        only the retrieval mixin was named here. Both are named by import below,
+        and the floor asserts their parent directories, so a third mixin moving in
+        or out is a change to this list rather than a silent narrowing.
         """
         from akgentic.tool.workspace import actor as actor_package
-        from akgentic.tool.workspace.rag import actor as mixin_module
+        from akgentic.tool.workspace.execution import actor as exec_mixin_module
+        from akgentic.tool.workspace.rag import actor as rag_mixin_module
 
         package = Path(str(actor_package.__file__)).parent
-        mixin = Path(str(mixin_module.__file__))
-        modules = [*sorted(package.glob("*.py")), mixin]
+        mixins = [Path(str(rag_mixin_module.__file__)), Path(str(exec_mixin_module.__file__))]
+        modules = [*sorted(package.glob("*.py")), *mixins]
         assert {module.name for module in modules} >= {"__init__.py", "actor.py"}
-        assert mixin.parent.name == "rag"
+        assert {mixin.parent.name for mixin in mixins} == {"rag", "execution"}
 
         writers = {
             writer
