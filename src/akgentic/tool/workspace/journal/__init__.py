@@ -74,16 +74,22 @@ builds at runtime is exactly what put ``journal`` on ``write/``'s runtime
 allow-list row. They live in :mod:`akgentic.tool.workspace.models` now, as
 package vocabulary (ADR-053 Consequences).
 
-**The stated limit, and what is left of it.** ``write/`` no longer reaches this
-module at runtime at all: its one surviving reference is a ``GitJournal``
-annotation, which the runtime import graph excludes by design, and
-``tests/workspace/test_capability_import_closure.py`` asserts that absence
+**The stated limit, and what is left of it.** Neither ``write/`` nor the actor
+reaches this module at runtime any more. ``write/``'s one surviving reference is
+a ``GitJournal`` annotation, which the runtime import graph excludes by design,
+and ``tests/workspace/test_capability_import_closure.py`` asserts that absence
 directly rather than leaving it to an allow-list that an extra permitted entry
-would never redden. What remains is the **actor**, which still constructs a
-:class:`GitJournal` and calls ``initialise()`` on every bind whether or not the
-card asked for one — the source of the single warning a read-only bind logs.
-That construction is story 55-8's to remove, and until it does, this module is
-deletable from ``write/`` but not yet from a bind.
+would never redden. The actor used to construct a :class:`GitJournal` of its own
+and ``initialise()`` it; it now receives the card's through
+``configure_journal``, names this module in a ``TYPE_CHECKING`` annotation on the
+exec mixin and nowhere else, and resolves nothing (ADR-053 Decision 6).
+
+So this module is deletable from a bind: a card with ``git_journal`` off opens no
+journal, the actor builds none, and every consumer is guarded on a ``None`` it
+degrades past without raising. What the exec mixin's annotation records is a real
+residual rather than an oversight — a discovered commit genuinely depends on the
+journal — and closing it would mean a journal Protocol in the spine, which is a
+decision rather than a story's to take.
 """
 
 from __future__ import annotations

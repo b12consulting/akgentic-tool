@@ -368,25 +368,29 @@ class WorkspaceConfig(BaseConfig):
             workspaces cannot collapse onto one actor owning one tree, and
             nothing here re-derives a directory from a ``workspace_id`` or a
             team id.
-        max_tracked_writers: Cap on the agent-name map, which the git journal
-            and the exec busy refusal consult to name an agent rather than
-            print its UUID.
-        git_journal: Whether to keep a git journal of accepted mutations. The
-            gate is unaffected either way — it is pure Python and independent.
-        git_timeout_s: Wall-clock budget for one ``git`` invocation.
+    **Nothing else is here, and every absence is the same fix.** The two document
+    caps left first, then ``git_journal``, ``git_timeout_s`` and
+    ``max_tracked_writers``. All of them reached this config through
+    ``getChildrenOrCreate``, which ignores ``config`` on a hit — so the first card
+    of a team to bind a tree fixed them for every later card of that team,
+    silently.
 
-    **The two document caps are no longer here**, and their absence is a fix
-    rather than a tidy-up. They reached this config through ``getChildrenOrCreate``,
-    which ignores ``config`` on a hit — so the first card of a team to bind a tree
-    fixed the caps for every later card of that team, silently. They now travel on
-    the :class:`~akgentic.tool.workspace.documents.cache.DocumentCache` the card
-    builds and announces, which is last-writer-wins like every other announcement,
-    and the card is where they are derived from the backend the collection really
-    resolves to. A stored record still carrying them loads unchanged: an unknown
-    key is ignored.
+    The caps now travel on the
+    :class:`~akgentic.tool.workspace.documents.cache.DocumentCache` the card
+    builds and announces, and the journal travels the same way, on the
+    :class:`~akgentic.tool.workspace.journal.GitJournal` the card opens and hands
+    over through
+    :meth:`~akgentic.tool.workspace.execution.actor.ExecMixin.configure_journal`.
+    Both are last-writer-wins like every other announcement, and the card is
+    where each is derived — the caps from the backend the collection really
+    resolves to, the journal from the card's own ``git_journal`` field. The other
+    two needed no successor: ``git_timeout_s`` was set by nothing and the card
+    already passes :data:`DEFAULT_GIT_TIMEOUT_S` itself, and
+    ``max_tracked_writers`` was set by no production caller, so the cap loop reads
+    :data:`DEFAULT_MAX_TRACKED_WRITERS` — the constant it defaulted to — directly.
+
+    A stored record still carrying any of them loads unchanged: an unknown key is
+    ignored.
     """
 
     workspace_path: str
-    max_tracked_writers: int = DEFAULT_MAX_TRACKED_WRITERS
-    git_journal: bool = False
-    git_timeout_s: float = DEFAULT_GIT_TIMEOUT_S

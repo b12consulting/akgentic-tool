@@ -288,7 +288,7 @@ in these situations:
 
 | Condition | Deliberate? |
 |---|---|
-| `git_journal=False` on the card that created the actor | yes |
+| `git_journal=False` on the card — and, for a tree's shared exec runs, on the card that bound **last** | yes |
 | `git` is not on `PATH` | yes — an environment fact |
 | The workspace is itself named `<name>.git`, colliding with workspace `<name>`'s journal | no — an operator mistake |
 | A sibling `<name>.git` exists and is **not** a repository (it is another workspace's tree) | no — refusing here costs one workspace's history; not refusing scatters git internals through another team's tree |
@@ -304,8 +304,15 @@ care about the last three, check the logs when a workspace is created. **The gat
 every one of the five cases** — no failure in the journal can fail a mutation, because the bytes are
 already on disk by the time a commit is attempted.
 
-Note also that the **first** card to create the actor for a workspace decides its configuration. A
-second card arriving with `git_journal=False` does not turn off a journal that is already running.
+Note also that among the cards of one team on one tree, the **last** one to bind decides what that
+team's shared exec runs are recorded in. Each card keeps its own journal, so its own mutations follow
+its own `git_journal`; what the last bind settles is only the actor's, which is what an `exec` run's
+discovered commit goes into. A second card arriving with `git_journal=False` therefore *does* turn
+the actor's journal off, and rebinding the card that wants one turns it back on.
+
+That is deliberate, and it replaced the opposite rule. The flag used to travel on the actor's
+configuration, which get-or-create ignores on a hit — so whichever card bound first decided for every
+later card of the team, silently and with no way to correct it short of tearing the team down.
 
 ---
 
@@ -513,7 +520,7 @@ cannot argue with.
 | `workspace_metadata_keys` | `list[str]` | `[]` | The `<leaf>` derived from the team's own metadata, under the `_meta` kind: `["customer_id", "case_id"]` over `ACME` and `42` resolves to `alice/_meta/customer_id-ACME__case_id-42` for principal `alice`. **Per-principal by default, like the other two kinds**: every team of one principal carrying the same values reaches one tree, and another principal's teams reach another. It is shared across principals only with `workspace_sharable=True` (`_shared/_meta/…`), where the platform permits `meta` — the inverse of the old layout, which shared every metadata tree across principals implicitly. Keys are a **sequence**: joined in declaration order, so the list reads as a refinement path from the coarsest scope down and `ls <scope>/_meta/` groups a customer's trees together — the trade being that two cards naming the same keys in different orders address different workspaces, which is visible in the directory name rather than silent. Values are percent-encoded, which is what keeps the join unforgeable. Only the resolver reads this field: a client learns which tree an agent bound from the `WorkspaceAttached` event the bind emits, whose `workspace_path` is the full three-segment path, never from a key list. **Mutually exclusive with `workspace_id`** — declaring both is a `ValidationError` at card construction, not a precedence rule. Every failure is a hard error at bind time, never a fallback to a user path: no metadata on the team, a key that is not a field of the metadata model, a value that is `None` or empty, or a joined leaf over 255 bytes. |
 | `workspace_sharable` | `bool` | `False` | Whether the tree lives under the reserved shared scope, `_shared/<kind>/<leaf>`, instead of under the owning principal. Orthogonal to both layout fields and valid with all three kinds; not part of the mutual-exclusivity check. **A request, not a grant**: the bind fails unless `AKGENTIC_WORKSPACE_SHARED_KINDS` on the binding process permits the kind, and a refused request is never downgraded to the per-principal tree. A plain `bool`, so the value survives every catalog round trip. See *Sharing a tree across principals*. |
 | `read_only` | `bool` | `False` | `True` removes every write-side callable from the tool list, `workspace_exec` included. The read side is unaffected. |
-| `git_journal` | `bool` | `False` | Whether accepted mutations are recorded in the git journal. **Off by default**, because nothing in the system consumes the record: the gate re-hashes live and never consults it, and an agent's exec result carries only `exit_code`/`stdout`/`stderr`, so the journal is a human-facing audit trail you opt into. A plain field, not a capability param: it exposes no tool and nothing about it is expressible by a model. Turning it off loses history, attribution and out-of-band detection — it does **not** loosen the gate by one row. Read by the **first** card to create the actor for a workspace. |
+| `git_journal` | `bool` | `False` | Whether accepted mutations are recorded in the git journal. **Off by default**, because nothing in the system consumes the record: the gate re-hashes live and never consults it, and an agent's exec result carries only `exit_code`/`stdout`/`stderr`, so the journal is a human-facing audit trail you opt into. A plain field, not a capability param: it exposes no tool and nothing about it is expressible by a model. Turning it off loses history, attribution and out-of-band detection — it does **not** loosen the gate by one row. Each card keeps its own journal; for the exec runs a team's cards share, the **last** card to bind decides. |
 | `resources` | `list[Resource]` | `[]` | Files written into the workspace at `observer()` time, before the agent's first turn. Seeding is **idempotent**: a resource whose `file_name` already exists is skipped, so restoring a team never clobbers a file the agent has since edited. |
 | `workspace_read` | `WorkspaceRead \| bool` | `True` | Read a file with line-number pagination. |
 | `workspace_view` | `WorkspaceView \| bool` | `True` | Return an image as `BinaryContent` for the model's vision endpoint. |

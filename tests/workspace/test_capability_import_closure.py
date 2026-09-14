@@ -280,10 +280,19 @@ CAPABILITY_CLOSURES: dict[str, frozenset[str]] = {
         # the row only for the direct-edge rule. Exactly ``write/``'s ``actor``
         # entry, and exactly the edge story 55-3 removed from ``write/``.
         f"{PACKAGE}.actor",
-        # ``GitJournal`` types ``_journal`` in the mixin, under ``TYPE_CHECKING``.
-        # **Stated as a known residual rather than removed**: an exec run's
-        # discovered commit is a real dependency of this capability on the journal
-        # capability, and the epic's deletability guard is scoped to ``write/``.
+        # ``GitJournal`` types ``_journal`` and ``configure_journal``'s parameter
+        # in the mixin, both under ``TYPE_CHECKING``. **Stated as a known residual
+        # rather than removed**: an exec run's discovered commit is a real
+        # dependency of this capability on the journal capability, and the epic's
+        # deletability guard is scoped to ``write/``.
+        #
+        # Story 57-3 added the tell and predicted this entry would stay; the
+        # prediction was checked by deleting the entry and watching the
+        # direct-edge assertion redden with
+        # ``execution/ names ['akgentic.tool.workspace.journal']``. The actor's
+        # own **runtime** import of the journal went in the same story and moved
+        # nothing here, because the actor is an assembly point rather than a
+        # capability and reaches these rows only under ``TYPE_CHECKING``.
         # Closing it means a journal Protocol at the spine, which is one ADR
         # decision and not a story's to take.
         f"{PACKAGE}.journal",

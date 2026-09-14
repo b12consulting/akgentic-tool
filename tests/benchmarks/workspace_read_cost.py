@@ -1051,7 +1051,7 @@ def _drive(
         Orchestrator, config=BaseConfig(name="@Orchestrator", role="Orchestrator")
     )
     orch = system.proxy_ask(orch_addr, Orchestrator)
-    workspace = _install_sampling_actor(system, orch, workspace_path, journal)
+    workspace = _install_sampling_actor(system, orch, workspace_path)
     counters = _Recordings()
     with _count_recordings(counters):
         members = [
@@ -1081,7 +1081,7 @@ def _drive(
 
 
 def _install_sampling_actor(
-    system: ActorSystem, orch: Orchestrator, workspace_path: str, journal: bool
+    system: ActorSystem, orch: Orchestrator, workspace_path: str
 ) -> _SamplingWorkspaceActor:
     """Create ``#Workspace-<path>`` as the instrumented subclass, before any card wires.
 
@@ -1093,6 +1093,13 @@ def _install_sampling_actor(
     The proxy's ``bench_snapshot`` would not resolve at all against a plain
     ``WorkspaceActor``, so a silent failure to install would be an immediate
     error rather than a series of zeroes that reads like good news.
+
+    **The journal is not passed here, and since story 57-3 it cannot be.**
+    ``WorkspaceConfig`` holds ``workspace_path`` alone; the actor is announced
+    its journal by whichever agent's card binds, from that card's own
+    ``git_journal``. ``bench_snapshot``'s ``journal_enabled`` therefore reports
+    what the cards actually wired rather than what this call asked for — which is
+    the stronger reading of the same number.
     """
     address = orch.getChildrenOrCreate(
         _SamplingWorkspaceActor,
@@ -1100,7 +1107,6 @@ def _install_sampling_actor(
             name=workspace_actor_name(workspace_path),
             role=WORKSPACE_ACTOR_ROLE,
             workspace_path=workspace_path,
-            git_journal=journal,
         ),
     )
     workspace = system.proxy_ask(address, _SamplingWorkspaceActor)

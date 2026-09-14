@@ -28,6 +28,7 @@ from akgentic.core.utils import SerializableBaseModel
 
 from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.errors import RetriableError
+from akgentic.tool.workspace import actor as workspace_actor_module
 from akgentic.tool.workspace.actor import (
     WORKSPACE_ACTOR_ROLE,
     WorkspaceActor,
@@ -797,17 +798,30 @@ class _TellRecorder:
         return getattr(self.target, name)
 
 
-def _created_ahead_of_the_card(
-    orchestrator_proxy: FakeOrchestratorProxy, max_tracked_writers: int | None = None
-) -> WorkspaceActor:
+def _cap_the_name_map(monkeypatch: pytest.MonkeyPatch, cap: int) -> None:
+    """Shrink the agent-name map's cap for one spec, where ``attach`` reads it.
+
+    The cap was a ``WorkspaceConfig`` field until story 57-3, which found that no
+    production caller ever set it and made ``attach`` read
+    ``DEFAULT_MAX_TRACKED_WRITERS`` directly. It is patched **on the actor
+    module** rather than on ``models``: the name is bound by value at import, so
+    patching the definition would leave ``attach`` reading the original 512 and
+    the spec asserting nothing.
+
+    A ``model_copy(update={"max_tracked_writers": …})`` would do the same damage
+    more quietly — Pydantic sets an ignored attribute for an unknown key, with no
+    error.
+    """
+    monkeypatch.setattr(workspace_actor_module, "DEFAULT_MAX_TRACKED_WRITERS", cap)
+
+
+def _created_ahead_of_the_card(orchestrator_proxy: FakeOrchestratorProxy) -> WorkspaceActor:
     """Create the test workspace's actor before any card binds, so a bind is a hit on it."""
     config = WorkspaceConfig(
         name=workspace_actor_name(WORKSPACE_PATH),
         role=WORKSPACE_ACTOR_ROLE,
         workspace_path=WORKSPACE_PATH,
     )
-    if max_tracked_writers is not None:
-        config = config.model_copy(update={"max_tracked_writers": max_tracked_writers})
     orchestrator_proxy.getChildrenOrCreate(WorkspaceActor, config)
     _, actor = orchestrator_proxy.children[config.name]
     assert isinstance(actor, WorkspaceActor)
@@ -851,10 +865,14 @@ class TestAttachAbsorbsRegisterAgent:
         assert actor._name_of(key) == "builder-2"
 
     def test_the_name_map_keeps_its_cap(
-        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """LRU on names, by ``move_to_end``. The holder map it was paired with is gone."""
-        actor = _created_ahead_of_the_card(orchestrator_proxy, max_tracked_writers=2)
+        _cap_the_name_map(monkeypatch, 2)
+        actor = _created_ahead_of_the_card(orchestrator_proxy)
         ann, bert, carl = (MockActorAddress(name) for name in ("ann", "bert", "carl"))
 
         actor.attach(ann, "ann")
@@ -889,6 +907,11 @@ class TestAttachAbsorbsRegisterAgent:
         # into the card\'s own map — and since story 55-8 neither does a
         # mutation, whose stale-mark is a direct call on the card\'s cache.)
         assert "configure_lock" in tell.names
+        # The journal announcement rides the same proxy, and it is sent even
+        # though this card asked for no journal: an announcement that skipped a
+        # ``None`` would leave the first card of a team deciding the journal for
+        # every later one, which is the hazard story 57-3 removed.
+        assert "configure_journal" in tell.names
         (workspace_tree / "notes.md").write_text(BODY, encoding="utf-8")
         tool_named(card, "workspace_write")("fresh.md", "body\n")
         assert "mark_paths_stale" not in tell.names

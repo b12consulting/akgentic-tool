@@ -2000,6 +2000,15 @@ class TestTwoCardsOverOneTree:
         # Two agents sharing one workspace share one #Workspace and one sandbox,
         # yet every run is journalled under the agent that requested it — the
         # author is carried by the run, not by the actor.
+        #
+        # **Both cards ask for the journal, and since story 57-3 they have to.**
+        # Bob's used to leave it off and still get a journalled run, because
+        # ``git_journal`` travelled on ``WorkspaceConfig`` and get-or-create
+        # ignores ``config`` on a hit — so alice, binding first, decided for
+        # both. The journal is announced now and the last bind wins, so a bob who
+        # wanted none would turn alice's off. That disagreement is its own guard,
+        # in ``test_journal.py``; this row is about **authorship**, and it keeps
+        # the two cards agreeing so the property it asserts is the only variable.
         alice, _ = exec_card_for(
             orchestrator_proxy,
             name="alice",
@@ -2012,7 +2021,11 @@ class TestTwoCardsOverOneTree:
         harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
         bob, _ = exec_card_for(
-            orchestrator_proxy, name="bob", poll_attempts=50, poll_delay_seconds=0.01
+            orchestrator_proxy,
+            name="bob",
+            poll_attempts=50,
+            poll_delay_seconds=0.01,
+            git_journal=True,
         )
 
         sandbox_script.gate.set()

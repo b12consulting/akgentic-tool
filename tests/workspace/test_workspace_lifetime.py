@@ -28,6 +28,7 @@ from pathlib import Path
 import pytest
 from akgentic.core.agent_state import BaseState
 
+from akgentic.tool.workspace import actor as workspace_actor_module
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
 from akgentic.tool.workspace.lock import mutation_busy
 from akgentic.tool.workspace.models import WorkspaceConfig
@@ -92,12 +93,22 @@ class TestTheBindRegistersTheAgentsName:
         assert actor._name_of("never-attached") == "never-attached"
 
     def test_the_name_map_still_keeps_its_cap(
-        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """LRU by ``move_to_end``: the least recently recorded name is the one dropped."""
+        """LRU by ``move_to_end``: the least recently recorded name is the one dropped.
+
+        The cap is patched where ``attach`` reads it — on the actor module, which
+        binds the constant by value at import. It was a ``WorkspaceConfig`` field
+        until story 57-3 found that no production caller set it; a
+        ``model_copy(update=...)`` naming the removed key would now set an
+        attribute nothing reads, leaving this row green against a deleted LRU.
+        """
         card_for(orchestrator_proxy, "alice", workspace_exec=True)
         actor = _actor_of(orchestrator_proxy)
-        actor.config = actor.config.model_copy(update={"max_tracked_writers": 2})
+        monkeypatch.setattr(workspace_actor_module, "DEFAULT_MAX_TRACKED_WRITERS", 2)
         ann, bert, carl = (MockActorAddress(name) for name in ("ann", "bert", "carl"))
 
         actor.attach(ann, "ann")

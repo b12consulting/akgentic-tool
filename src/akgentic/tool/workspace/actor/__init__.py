@@ -96,11 +96,14 @@ from akgentic.tool.workspace.execution import (
     RunningExec,
 )
 from akgentic.tool.workspace.execution.actor import EXEC_CAPABILITY, ExecMixin
-from akgentic.tool.workspace.journal import GitJournal
 from akgentic.tool.workspace.lock import LockBackend
-from akgentic.tool.workspace.models import Identity, WorkspaceConfig
+from akgentic.tool.workspace.models import (
+    DEFAULT_MAX_TRACKED_WRITERS,
+    Identity,
+    WorkspaceConfig,
+)
 from akgentic.tool.workspace.rag.actor import DocumentsMixin
-from akgentic.tool.workspace.workspace import Filesystem, get_workspace, meta_dir_for
+from akgentic.tool.workspace.workspace import Filesystem, get_workspace
 
 if TYPE_CHECKING:
     from akgentic.core.actor_address import ActorAddress
@@ -176,11 +179,17 @@ class WorkspaceActor(
     6), and not otherwise: a read-only or read/write card binds a tree, seeds it,
     sweeps it, opens its journal and gates every mutation without one of these
     existing at all. One per resolved path per team where it does exist, created
-    by its card through ``getChildrenOrCreate``. **The first card of a team to bind fixes the
-    configuration every later card of that team gets on the tree**: get-or-create
-    ignores ``config`` on a hit, so a second card that disagrees gets the actor as
-    it was created, with nothing raised — two cards of one team disagreeing about
-    one tree is a catalog inconsistency, not something a lookup arbitrates.
+    by its card through ``getChildrenOrCreate``.
+
+    **Get-or-create still ignores ``config`` on a hit, and there is no longer
+    anything in the config for that to decide.** It held the document caps, then
+    ``git_journal``, ``git_timeout_s`` and ``max_tracked_writers``, and every one
+    of them made the *first* card of a team to bind a tree settle the question
+    for every later card of that team, silently. What is left is
+    ``workspace_path``, which the actor's own name is derived from — so two cards
+    that disagreed about it would not hit one actor at all; they would get two.
+    Everything a later card can legitimately differ on now arrives by
+    announcement, where the last writer wins and a rebind is the remedy.
 
     **Its team owns its lifetime, and nothing else does.** It is in exactly one
     team's roster, so that team's two-phase teardown stops it like any other tool
@@ -220,7 +229,7 @@ class WorkspaceActor(
     """
 
     def on_start(self) -> None:
-        """Initialise state, take the tree handle, and open the journal if there is one.
+        """Initialise state and take the tree handle. Nothing here is resolved.
 
         ``self.state`` is assigned *before* ``super().on_start()`` because
         ``DeferredResultActor.on_start`` touches ``self.state`` on its first
@@ -229,9 +238,9 @@ class WorkspaceActor(
         rather than a guarantee, and it is why this comment exists rather than
         silence.
 
-        **Two duties left this method**, because they are not dispatch and this
-        actor is only created when something dispatches (ADR-053 Decision 6).
-        The staging sweep is
+        **Every duty has left this method**, because none of them was dispatch
+        and this actor is only created when something dispatches (ADR-053
+        Decision 6). The staging sweep is
         :func:`~akgentic.tool.workspace.workspace.sweep_staging_files`, called
         from the card's ``observer()``; seeding ``.gitignore`` and making the
         initial out-of-band commit are the card's ``_open_journal``. A card with
@@ -241,10 +250,20 @@ class WorkspaceActor(
         write, seed before the first commit) is now satisfied inside
         ``observer()`` rather than here.
 
-        **What is left is still gated.** The journal is built only when
-        ``git_journal`` is on, mirroring the card's own ``_open_journal``. It used
-        to be constructed and ``initialise``d on every bind whatever the setting,
-        which is where the one WARNING a read-only bind logged came from.
+        **The journal was the last of them, and it is gone rather than gated.**
+        This method used to construct a *second*
+        :class:`~akgentic.tool.workspace.journal.GitJournal` over the repository
+        the card had already opened — same root, same ``<meta>``, same timeout —
+        and ``initialise()`` it, so one bind of one card forked ``git init``
+        twice for one tree. The card announces its own object through
+        :meth:`~akgentic.tool.workspace.execution.actor.ExecMixin.configure_journal`
+        now, which is also what lets a later card of the same team turn the
+        journal off: get-or-create ignores ``config`` on a hit, so anything
+        reaching this actor through :class:`WorkspaceConfig` is fixed by
+        whichever card bound first.
+
+        What is left is assignment. Every slot below is either a container this
+        actor owns or a ``None`` waiting for an announcement.
         """
         self.state = BaseState()
         super().on_start()
@@ -298,15 +317,11 @@ class WorkspaceActor(
         # visible degradation, never a raise (ADR-051 Decision 6).
         self._document_cache: DocumentCache | None = None
         self._workspace: Filesystem = get_workspace(self.config.workspace_path)
-        self._journal: GitJournal | None = None
-        if self.config.git_journal:
-            self._journal = GitJournal(
-                self._workspace.root,
-                enabled=self.config.git_journal,
-                timeout_s=self.config.git_timeout_s,
-                meta_dir=meta_dir_for(self.config.workspace_path),
-            )
-            self._journal.initialise()
+        # Announced by the card at bind time, exactly as ``_lock`` is, and always
+        # before the sandbox bind that makes a run admissible: this actor opens
+        # no repository of its own, so until the announcement lands there is
+        # nothing for a discovered commit to go into.
+        self._journal = None
 
     def worker_class(self) -> type[DeferredWorker]:
         """Never called: nothing here is spawned through ``request()``.
@@ -389,10 +404,16 @@ class WorkspaceActor(
         :meth:`_name_of` falls back to the id, so losing a name degrades the two
         messages rather than breaking either.
 
-        It **is** capped, at ``max_tracked_writers``, because it is the one map
-        here that grows with every agent that ever bound rather than with the
-        runs in flight. Recording refreshes recency; the least recently recorded
-        name is dropped over the cap.
+        It **is** capped, at :data:`~akgentic.tool.workspace.models.DEFAULT_MAX_TRACKED_WRITERS`,
+        because it is the one map here that grows with every agent that ever
+        bound rather than with the runs in flight. Recording refreshes recency;
+        the least recently recorded name is dropped over the cap.
+
+        The cap is the constant rather than a config field. It was one, and no
+        production caller ever set it: the single ``WorkspaceConfig`` the card
+        builds never passed it, so every tree ran on the default — while
+        get-or-create's ignored ``config`` meant a card that *did* set it would
+        have been obeyed or ignored depending on whether it bound first.
 
         It still takes the whole address rather than the id alone: the id is
         derived here so that one caller cannot key the map differently from
@@ -410,7 +431,7 @@ class WorkspaceActor(
         agent_id = str(agent.agent_id)
         self._agent_names[agent_id] = agent_name
         self._agent_names.move_to_end(agent_id)
-        while len(self._agent_names) > self.config.max_tracked_writers:
+        while len(self._agent_names) > DEFAULT_MAX_TRACKED_WRITERS:
             self._agent_names.popitem(last=False)
 
     def _name_of(self, agent_id: str) -> str:

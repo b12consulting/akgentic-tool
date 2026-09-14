@@ -298,15 +298,29 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
     and out-of-band *detection*; leaving it off loosens the gate by nothing at
     all, because the gate is pure Python and independent.
 
-    Note what get-or-create implies: the **first** card of a team to bind a tree
-    decides that team's actor's configuration, exactly as the document caps
-    already do. A second card arriving with ``git_journal=False`` does not turn
-    off a journal that is already running, and a card arriving with it on does
-    not start one on an actor already built without it — get-or-create ignores
-    ``config`` on a hit. Two teams over one tree get two actors and so may
-    disagree, and the tree survives that: the journal is a git repository on
-    disk, which the team that enabled it writes and the team that did not simply
-    leaves alone.
+    **The LAST card of a team to bind a tree decides that team's actor's
+    journal**, exactly as the document caps do. This field used to travel on
+    :class:`~akgentic.tool.workspace.models.WorkspaceConfig`, which reaches the
+    actor through ``getChildrenOrCreate`` — and get-or-create ignores ``config``
+    on a hit, so the **first** card to bind decided for every later card of that
+    team, silently. It now travels on the journal object the card opens and
+    announces, which is last-writer-wins like every other announcement.
+
+    The cost of that, stated rather than discovered: a ``git_journal=False`` card
+    binding last turns the journal off for every exec run dispatched through that
+    actor, including runs from a sibling card that asked for one. It is
+    recoverable by rebinding, and it is the trade worth taking — a team whose
+    cards disagree about an audit trail should not have the answer decided by
+    bind order, and refusing the bind outright would fail a team over a setting
+    that loses no correctness (ADR-051 Decision 4 makes the journal explicitly
+    optional).
+
+    **Each card keeps its own journal object regardless**, so a card's own
+    mutations are recorded according to its own field; what the last bind decides
+    is only what the shared actor's exec runs go into. Two teams over one tree get
+    two actors and so may disagree, and the tree survives that: the journal is a
+    git repository on disk, which the team that enabled it writes and the team
+    that did not simply leaves alone.
     """
 
     workspace_exec: WorkspaceExec | bool = False
@@ -409,10 +423,11 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
     explicit catalog value always wins (ADR-045 §7), which is what these two
     fields exist for.
 
-    Note what get-or-create implies, exactly as ``git_journal`` records: the
-    **first** card of a team to bind a tree decides that team's actor's
-    configuration, so a second card of the same team arriving with different
-    caps changes nothing.
+    The **last** card of a team to bind a tree decides that team's caps, exactly
+    as ``git_journal`` records for the journal: the caps travel on the announced
+    :class:`~akgentic.tool.workspace.documents.cache.DocumentCache` rather than
+    through get-or-create, which ignores ``config`` on a hit and would have let
+    whichever card bound first decide for all of them.
     """
 
     # Private runtime state — not part of the serialised config.
@@ -656,6 +671,10 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         # ``_seed_resources`` must both precede the first commit (29-4). Before
         # the first mutation, which is all the gate needs.
         self._open_journal(ws_path)
+        # Immediately after the one journal is built, and before ``_bind_sandbox``
+        # below can make a run admissible: the actor must never be able to admit
+        # a run before it knows what that run's discovered commit goes into.
+        self._announce_journal()
         # Between the bind and the retrieval announcement, deliberately: the
         # actor must never be able to enable retrieval under a store it has not
         # been given, exactly as it must never admit a run under a hold it has
@@ -1031,6 +1050,49 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         except Exception:
             logger.debug("Could not announce the exec lock backend to #Workspace", exc_info=True)
 
+    def _announce_journal(self) -> None:
+        """Hand the actor this card's journal — **including ``None``** — fire and forget.
+
+        **It must run before :meth:`_bind_sandbox`, and that is an invariant
+        rather than a convenience.** It is the same one :meth:`_announce_lock`
+        states about :meth:`_announce_exec`: the sandbox bind is what makes a run
+        admissible, and the actor must never be able to admit a run before it
+        knows what that run's discovered commit goes into.
+
+        **Unlike the other four announcements, this one does not return early on
+        a ``None`` object, and the difference is deliberate.**
+        :meth:`_announce_lock`, :meth:`_announce_exec`,
+        :meth:`_announce_vector_store` and :meth:`_announce_document_cache` all
+        skip a missing object, because for them the actor's ``None`` and a lost
+        announcement mean the same thing. Here they do not: ``git_journal`` used
+        to travel on :class:`~akgentic.tool.workspace.models.WorkspaceConfig`
+        through ``getChildrenOrCreate``, which ignores ``config`` on a hit, so the
+        **first** card of a team to bind a tree fixed the actor's journal for
+        every later card of that team. A card that asks for no journal has to be
+        able to say so; an announcement that skipped ``None`` would leave
+        first-card-wins standing under a new mechanism, invisibly, because the
+        second card's *off* would simply never arrive.
+
+        The next reader's instinct will be to make this consistent with the other
+        four. That change is the defect, and
+        ``tests/workspace/test_journal.py``'s two-card disagreement rows are what
+        catch it.
+
+        Guarded exactly as the other four are, and it degrades the same way:
+        without the announcement the actor keeps whatever it last heard — at
+        worst no journal at all, which costs the out-of-band commit before a run
+        and the discovered commit after it. Both consumers are ``None``-guarded,
+        so nothing raises, and a rebind recovers it. A raise at wiring time would
+        be neither visible nor recoverable.
+        """
+        tell = self._workspace_tell
+        if tell is None:
+            return
+        try:
+            tell.configure_journal(self._journal)
+        except Exception:
+            logger.debug("Could not announce the git journal to #Workspace", exc_info=True)
+
     def _build_document_cache(self) -> DocumentCache:
         """This card's view of the tree's document records, with both caps resolved.
 
@@ -1182,7 +1244,6 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
                 name=workspace_actor_name(workspace_path),
                 role=WORKSPACE_ACTOR_ROLE,
                 workspace_path=workspace_path,
-                git_journal=self.git_journal,
             ),
         )
         workspace = observer.proxy_ask(workspace_addr, WorkspaceActor)

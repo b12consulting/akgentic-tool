@@ -72,13 +72,15 @@ EXEC_CAPABILITY = "exec"
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    # ``GitJournal`` types ``_journal`` and nothing else — both uses at runtime
-    # are attribute calls on the instance the actor supplies. Naming it here
-    # rather than importing it keeps the **journal capability** out of exec's
-    # runtime closure, which is what ADR-053's "a capability's code is deletable"
-    # asks for; it stays on exec's allow-list row, because the direct-edge rule
-    # counts an annotation too. That residual is real and stated: a discovered
-    # commit is a genuine dependency of an exec run on the journal.
+    # ``GitJournal`` types the ``_journal`` slot and ``configure_journal``'s
+    # parameter, and nothing else — every use at runtime is an attribute call on
+    # the instance the card announced. Naming it here rather than importing it
+    # keeps the **journal capability** out of exec's runtime closure, which is
+    # what ADR-053's "a capability's code is deletable" asks for; it stays on
+    # exec's allow-list row, because the direct-edge rule counts an annotation
+    # too — measured under story 57-3 by removing the row entry and watching the
+    # direct-edge assertion go red. That residual is real and stated: a
+    # discovered commit is a genuine dependency of an exec run on the journal.
     from akgentic.tool.workspace.journal import GitJournal
 
     # ``deliver`` and ``fail`` call ``super()``, which resolves against this
@@ -102,11 +104,13 @@ class ExecMixin(_ExecBase):
     _running: RunningExec | None
     _run_errors: OrderedDict[str, str]
     _recent_runs: dict[str, OrderedDict[str, str]]
-    # ``None`` when the tree has no journal, which is the default. The actor built
-    # one unconditionally until story 55-8 and merely left it disabled; the shape
-    # here now matches the card's, where ``write/gate.py`` has always guarded a
-    # ``GitJournal | None``. Both uses below are guarded for the same reason the
-    # gate's three are: no commit is worth failing a run over.
+    # ``None`` until a card announces one, and for good if none of the team's
+    # cards asked for a journal — which is the default. The actor built one
+    # unconditionally until story 55-8 gated it and 57-3 removed it outright; the
+    # shape here now matches the card's, where ``write/gate.py`` has always
+    # guarded a ``GitJournal | None``. Both uses below are guarded for the same
+    # reason the gate's three are: no commit is worth failing a run over, and the
+    # window before the announcement lands degrades the same way.
     _journal: GitJournal | None
 
     if TYPE_CHECKING:
@@ -141,6 +145,37 @@ class ExecMixin(_ExecBase):
             backend: What ``acquire`` and ``release`` are called on.
         """
         self._lock = backend
+
+    def configure_journal(self, journal: GitJournal | None) -> None:
+        """Receive the tree's journal — **tell** path, at bind time.
+
+        Built card-side, in ``observer()``'s ``_open_journal``, and announced
+        here, because the card is where every other self-resolved runtime object
+        is built (ADR-051 Decision 8) and the actor resolves nothing (ADR-053
+        Decision 6). It lands on this mixin rather than on the actor because the
+        journal's only two actor-side consumers are here — the out-of-band commit
+        before a run and the discovered commit after it — and a capability owns
+        its own code (ADR-053 Decision 1). ``configure_lock`` sits here for the
+        same reason although the hold is read by the gate too.
+
+        **``None`` is a value, not a no-op, and that is the point.** The actor
+        used to take ``git_journal`` off :class:`WorkspaceConfig`, which reaches
+        it through ``getChildrenOrCreate`` — and get-or-create ignores ``config``
+        on a hit, so the first card of a team to bind a tree fixed the journal
+        for every later card of that team, silently. Announcing ``None`` is what
+        lets a second card turn a journal *off*; an announcement that skipped it
+        would preserve first-card-wins under a new mechanism.
+
+        Last writer wins, like :meth:`configure_lock` and
+        :meth:`configure_exec`. Nothing is released or torn down on a
+        replacement: a ``GitJournal`` owns no descriptor between calls — its
+        ``flock`` is taken on a fresh one per commit and dropped at block exit —
+        so dropping a reference to one costs nothing.
+
+        Args:
+            journal: The card's journal, or ``None`` when it asked for none.
+        """
+        self._journal = journal
 
     def configure_exec(self, config: ExecConfig) -> None:
         """Build the backend commands will run on — **tell** path, once per card.
