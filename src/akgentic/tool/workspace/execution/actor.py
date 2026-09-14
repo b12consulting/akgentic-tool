@@ -18,11 +18,18 @@ The blocking call happens on ``#Workspace``'s own single worker thread, never on
 the actor's thread and no longer on a second actor's. Everything this module does
 on the ask path is O(1) plus the journal's bounded git calls.
 
-**Two modules are called ``execution`` and they are not the same one.**
-:mod:`akgentic.tool.workspace.execution` holds the exec models, ``ExecRunner``
-and the sandbox edge; this module holds the mixin that drives them. The
-dependency runs one way — this module imports **from** that one — and every
-import here is absolute so the two never blur.
+**This module and its package root are not the same thing.**
+:mod:`akgentic.tool.workspace.execution` — ``execution/__init__.py`` — holds the
+exec models, ``ExecRunner`` and the sandbox edge; this module holds the mixin
+that drives them. The dependency runs one way, this module importing **from**
+that one, and every import here is absolute so the two never blur.
+
+The package root keeps the models rather than the factories, which is a stated
+deviation from ``read/`` and ``write/``: exec has three siblings where they had
+one, and ``akgentic.tool.workspace.execution`` is a dotted path imported by name
+from four modules outside this capability — so keeping the biggest, most-imported
+unit at the root leaves every one of those imports working unchanged, with no
+re-export list to maintain under ``no_implicit_reexport`` (ADR-053 Decision 1).
 """
 
 from __future__ import annotations
@@ -40,7 +47,6 @@ from akgentic.tool.sandbox.backend import ExecReport
 from akgentic.tool.workspace.execution import (
     DEFAULT_EXEC_TIMEOUT_S,
     EXEC_SHUTDOWN_GRACE_S,
-    LEASE_GRACE_S,
     MAX_TRACKED_RUNS,
     TIMED_OUT_EXIT_CODE,
     ExecConfig,
@@ -55,9 +61,8 @@ from akgentic.tool.workspace.execution import (
     resolve_mode,
     unconfigured,
 )
-from akgentic.tool.workspace.journal import GitJournal, Identity
-from akgentic.tool.workspace.lock import LockBackend, LockTicket
-from akgentic.tool.workspace.models import WorkspaceConfig
+from akgentic.tool.workspace.lock import LEASE_GRACE_S, LockBackend, LockTicket
+from akgentic.tool.workspace.models import Identity, WorkspaceConfig
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +71,15 @@ EXEC_CAPABILITY = "exec"
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    # ``GitJournal`` types ``_journal`` and nothing else — both uses at runtime
+    # are attribute calls on the instance the actor supplies. Naming it here
+    # rather than importing it keeps the **journal capability** out of exec's
+    # runtime closure, which is what ADR-053's "a capability's code is deletable"
+    # asks for; it stays on exec's allow-list row, because the direct-edge rule
+    # counts an annotation too. That residual is real and stated: a discovered
+    # commit is a genuine dependency of an exec run on the journal.
+    from akgentic.tool.workspace.journal import GitJournal
 
     # ``deliver`` and ``fail`` call ``super()``, which resolves against this
     # mixin's own bases — ``(object,)`` at runtime. mypy needs the real base

@@ -9,6 +9,7 @@ bubblewrap or ``sandbox-exec``, and nothing sleeps for seconds.
 
 from __future__ import annotations
 
+import importlib
 import os
 import signal
 import subprocess
@@ -25,6 +26,7 @@ import pytest
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
+from akgentic.core.utils import deserialize_object, import_class, serialize
 from pydantic import ValidationError
 
 from akgentic.tool.errors import RetriableError
@@ -44,10 +46,8 @@ from akgentic.tool.workspace.execution import (
     DEFAULT_EXEC_TIMEOUT_S,
     EXEC_REPORT_MARGIN_S,
     EXEC_SHUTDOWN_GRACE_S,
-    LEASE_GRACE_S,
     MAX_EXEC_BUDGET_S,
     MAX_TRACKED_RUNS,
-    RUN_ID_CHARS,
     TIMED_OUT_EXIT_CODE,
     ExecConfig,
     ExecOutcome,
@@ -56,26 +56,30 @@ from akgentic.tool.workspace.execution import (
     ExecStatus,
     RunningExec,
     effective_budget,
-    exec_busy,
     format_status,
     in_progress,
     lock_unavailable,
-    new_run_id,
     poll_attempts_within,
     timed_out,
 )
-from akgentic.tool.workspace.journal import MAX_COMMIT_BODY_CHARS
 from akgentic.tool.workspace.lock import (
     EXEC_LOCK_FILENAME,
+    LEASE_GRACE_S,
+    RUN_ID_CHARS,
     FileLockBackend,
     LockBackend,
     LockGrant,
     LockTicket,
+    exec_busy,
+    meta_root_mismatch,
+    new_run_id,
 )
+from akgentic.tool.workspace.models import MAX_COMMIT_BODY_CHARS
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
-from akgentic.tool.workspace.workspace import meta_dir_for
+from akgentic.tool.workspace.workspace import meta_dir_for, meta_root
 from tests.workspace.conftest import (
     HANDSHAKE_TIMEOUT_S,
+    WORKSPACE_NAME,
     WORKSPACE_PATH,
     ExecHarness,
     FakeActorToolObserver,
@@ -90,9 +94,11 @@ from tests.workspace.conftest import (
     mutate,
     read,
     requires_git,
+    run_child,
     tool_named,
     working_tree_is_clean,
     workspace_path_for,
+    write_script,
 )
 
 AGENT = "agent-1"
@@ -1366,7 +1372,7 @@ class TestTheBudgets:
             seen.append((attempts, delay))
             return None
 
-        monkeypatch.setattr("akgentic.tool.workspace.card.execution.poll_deferred", capture)
+        monkeypatch.setattr("akgentic.tool.workspace.execution.card.poll_deferred", capture)
         _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         harness = ExecHarness(actor, orchestrator_proxy)
@@ -1487,7 +1493,7 @@ class TestWaitingOutTheRun:
         # real, rather than being handed the message directly.
         monkeypatch.setattr("akgentic.tool.workspace.execution.EXEC_REPORT_MARGIN_S", 0.0)
         monkeypatch.setattr(
-            "akgentic.tool.workspace.card.execution.poll_deferred",
+            "akgentic.tool.workspace.execution.card.poll_deferred",
             lambda fetch, attempts, delay: None,
         )
         waiting_card, _ = exec_card_for(
@@ -3469,3 +3475,219 @@ class TestAWedgedChild:
         # "echo head" is absent: the late report committed nothing as its agent.
         assert discovered == ["echo tail"]
         assert actor.exec_status(AGENT, head).state is ExecState.DONE
+
+
+##
+## AC 10 — a card a deployment already persisted with an explicit exec parameter
+## still loads after ``WorkspaceExec`` moves beside the closures it configures
+##
+
+STORED_MARKER_MODULE = "akgentic.tool.workspace.card.params"
+"""The module path a deployment's stored ``WorkspaceExec`` carries in ``__model__``.
+
+Captured by serializing a configured card on the working tree, never transcribed
+from a design document — ``test_read_capability.py``'s discipline, and for its
+reason.
+
+``serialize_type`` stamps ``f"{cls.__module__}.{cls.__name__}"`` on every
+:class:`~akgentic.core.utils.SerializableBaseModel`, and ``BaseToolParam`` is one,
+so every card written since the card decomposition with ``workspace_exec`` set to
+an explicit :class:`WorkspaceExec` carries this literal string. Reading one back
+is ``import_module`` plus ``getattr`` on exactly it
+(:func:`akgentic.core.utils.deserializer.import_class`); a path that has gone
+raises ``UnresolvableClassError``, which turns a stored team's tool card into a
+bad record rather than a card.
+
+**Nothing in ``src/`` and nothing in ``tests/`` imports ``WorkspaceExec`` through
+this path.** That is deliberate and it is what makes the specs below the only
+thing holding the re-export up: a test module importing through it would turn a
+deleted re-export into a *collection* error, so the specs written to catch the
+loss would never run at all.
+"""
+
+EXEC_PARAM_NAME = "WorkspaceExec"
+"""The one parameter of the exec capability, by the name a marker can carry."""
+
+
+@pytest.fixture
+def explicitly_configured_exec_card() -> WorkspaceTool:
+    """A card whose ``workspace_exec`` an author set by hand.
+
+    A non-default field value, so the round trip below compares something: a
+    parameter left at its defaults would validate back equal even from a class
+    the card never held.
+    """
+    return WorkspaceTool(
+        workspace_id=WORKSPACE_NAME,
+        workspace_exec=WorkspaceExec(mode="local", timeout_s=7.0),
+    )
+
+
+class TestStoredExecParamsStillResolve:
+    """The persisted ``__model__`` marker, end to end through core's own path."""
+
+    def test_the_exec_param_resolves_through_the_stored_module_path(self) -> None:
+        """``import_module`` + ``getattr``, exactly as ``import_class`` does it.
+
+        ``hasattr`` on the package would not catch this: the mechanism that keeps
+        the name resolving once it is defined elsewhere is a **re-export**, which
+        only an import of this precise module path exercises.
+        """
+        module = importlib.import_module(STORED_MARKER_MODULE)
+
+        assert getattr(module, EXEC_PARAM_NAME, None) is not None, (
+            f"{STORED_MARKER_MODULE}.{EXEC_PARAM_NAME} no longer resolves — every card "
+            f"persisted with that parameter set explicitly carries that literal string"
+        )
+
+    def test_the_stored_path_serves_the_same_class_the_card_uses(self) -> None:
+        """A second definition would deserialise into a class nothing else uses.
+
+        A re-export satisfies this; a copy of the class body, which is the
+        tempting way to "keep the path working", does not.
+        """
+        stored = importlib.import_module(STORED_MARKER_MODULE)
+        facade = importlib.import_module("akgentic.tool.workspace")
+
+        assert getattr(stored, EXEC_PARAM_NAME) is getattr(facade, EXEC_PARAM_NAME)
+
+    def test_a_freshly_dumped_card_carries_a_marker_that_resolves(
+        self, explicitly_configured_exec_card: WorkspaceTool
+    ) -> None:
+        """Whatever module the parameter lives in, the path a dump stamps must import back.
+
+        This is the row that legitimately *changes* with the move — a dump names
+        wherever the class is defined — so it is written as the invariant rather
+        than as a literal: the stamped path resolves, and to the very class the
+        card is holding.
+        """
+        dumped = serialize(explicitly_configured_exec_card)
+        assert isinstance(dumped, dict)
+
+        marker = dumped["workspace_exec"]["__model__"]
+
+        assert import_class(marker) is type(explicitly_configured_exec_card.workspace_exec)
+
+    def test_a_record_written_before_the_move_still_validates_into_an_equal_card(
+        self, explicitly_configured_exec_card: WorkspaceTool
+    ) -> None:
+        """The end-to-end property, on the literal a deployment's database holds.
+
+        The marker is rewritten to :data:`STORED_MARKER_MODULE` rather than left
+        as the dump produced it, so this spec asserts the **same thing before and
+        after** the parameter moves: on the un-moved tree the rewrite is a no-op
+        and the record is exactly what a deployment stored; afterwards it is the
+        pre-move record, which is the one that has to keep loading.
+
+        Its non-vacuity is the two specs above: they prove the path is real.
+        """
+        stored = serialize(explicitly_configured_exec_card)
+        assert isinstance(stored, dict)
+        stored["workspace_exec"]["__model__"] = f"{STORED_MARKER_MODULE}.{EXEC_PARAM_NAME}"
+
+        restored = deserialize_object(stored)
+
+        assert isinstance(restored, WorkspaceTool)
+        assert restored.model_dump() == explicitly_configured_exec_card.model_dump()
+
+
+##
+## AC 6 — two processes, ONE marker file, two metadata roots
+##
+
+_MISMATCH_CHILD = """
+from akgentic.tool.errors import RetriableError
+from akgentic.tool.workspace.tool import WorkspaceExec
+from tests.workspace.conftest import tool_named
+
+card = bind("child", workspace_exec=WorkspaceExec(mode="local", poll_attempts=0))
+try:
+    print("RAN " + tool_named(card, "workspace_exec")("echo hi"), flush=True)
+except RetriableError as exc:
+    print("REFUSED " + str(exc), flush=True)
+"""
+"""A second interpreter that binds the real card and asks to run a command.
+
+Driven through ``workspace_exec`` rather than through ``request_exec``, because
+what the guard has to produce is the sentence the **agent** reads: the closure
+raises :class:`RetriableError` carrying the grant's refusal verbatim, so a
+refusal composed correctly and then swallowed somewhere between the backend and
+the tool would still redden this.
+"""
+
+
+def alias_meta_root(tmp_path: Path, workspaces_root: Path) -> Path:
+    """A second metadata root reaching the **same** ``<meta>`` as *workspaces_root*.
+
+    ``<alias>/<scope>/<kind>`` is a symlink to the real ``<scope>/<kind>``, so
+    ``meta_dir_for`` — which resolves the joined path before taking its parent —
+    answers one directory under both roots, while
+    :func:`~akgentic.tool.workspace.workspace.meta_root` answers two different
+    values. That is the production shape (one volume, two mount points) reduced
+    to something a test can build on any filesystem.
+
+    **It is the only shape where the stamp has anything to compare against.** Two
+    genuinely disjoint roots produce two marker files: both processes acquire,
+    neither ever sees the other's marker, and nothing is refused — the bug
+    faithfully reproduced and invisible to any marker-based check
+    (:attr:`~akgentic.tool.workspace.lock.LockMarker.meta_root`). A spec built
+    that way goes green for the wrong reason.
+    """
+    scope, kind, _leaf = WORKSPACE_PATH.split("/")
+    alias = tmp_path / "meta-alias"
+    (alias / scope).mkdir(parents=True)
+    (alias / scope / kind).symlink_to(workspaces_root / scope / kind, target_is_directory=True)
+    return alias
+
+
+class TestAMarkerFromAnotherMetadataRootRefusesTheRun:
+    """B1, across two interpreters — one process cannot disagree with itself."""
+
+    def test_the_child_is_refused_and_the_refusal_names_both_roots(
+        self, workspaces_root: Path, workspace_tree: Path, tmp_path: Path
+    ) -> None:
+        """The parent holds the tree; the child resolves a different root and is refused.
+
+        Both halves are red before the change: with no root in the marker, and
+        with a root nothing compares, the child reads the ordinary
+        :func:`~akgentic.tool.workspace.lock.exec_busy` sentence — which says the
+        workspace is busy, invites a retry, and is exactly the wrong thing to
+        tell an operator whose two workers are excluding nobody.
+        """
+        alias = alias_meta_root(tmp_path, workspaces_root)
+        holder = FileLockBackend().acquire(
+            WORKSPACE_PATH, LockTicket(agent_id=AGENT, cmd="echo parent", budget_s=60.0)
+        )
+        assert holder.run_id, holder.refusal
+        # One marker file, reached under both roots — the property the whole
+        # harness exists to produce, asserted rather than assumed.
+        assert (meta_dir_for(WORKSPACE_PATH) / EXEC_LOCK_FILENAME).is_file()
+
+        script = write_script(tmp_path, "mismatched_root.py", _MISMATCH_CHILD)
+        report = run_child(script, workspaces_root, meta_root=alias)
+
+        assert report.code == 0, report
+        expected = meta_root_mismatch(str(meta_root()), str(alias.resolve()))
+        assert report.out == f"REFUSED {expected}"
+        assert str(meta_root()) in report.out
+        assert str(alias.resolve()) in report.out
+
+    def test_a_child_sharing_the_root_gets_the_ordinary_busy_refusal(
+        self, workspaces_root: Path, workspace_tree: Path, tmp_path: Path
+    ) -> None:
+        """The non-vacuity of the spec above, and it is not optional.
+
+        Without it, a backend that answered the mismatch sentence to *every*
+        refused acquirer would be green up there — so the assertion would be
+        about a second process existing rather than about the two disagreeing.
+        """
+        holder = FileLockBackend().acquire(
+            WORKSPACE_PATH, LockTicket(agent_id=AGENT, cmd="echo parent", budget_s=60.0)
+        )
+        assert holder.run_id, holder.refusal
+
+        script = write_script(tmp_path, "shared_root.py", _MISMATCH_CHILD)
+        report = run_child(script, workspaces_root)
+
+        assert report.code == 0, report
+        assert report.out == f"REFUSED {exec_busy()}"

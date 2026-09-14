@@ -128,17 +128,27 @@ CAPABILITY_CLOSURES: dict[str, frozenset[str]] = {
         # states it on its own row; promote it only once a second capability
         # outside ``write/`` does.
         f"{PACKAGE}.edit",
-        # ``Identity`` is constructed in ``_gated`` — the commit's author.
-        # Runtime, so it is in both the closure and the direct-edge rule.
-        # Becomes 55-4's ``journal/``.
+        # ``GitJournal`` types ``_journal`` under ``TYPE_CHECKING`` and nothing
+        # else — **annotation-only since story 55-7 moved ``Identity`` into the
+        # spine**, which is what took the journal out of this capability's
+        # *runtime* closure. It stays on the row because the direct-edge rule
+        # below counts an annotation too, so removing it reddens exactly one of
+        # the two assertions.
+        #
+        # There is no ``execution`` entry any more, and its absence is the
+        # structural observable of story 55-7 rather than a tidy-up: the busy
+        # refusal ``_busy_refusal`` composes is ``lock.mutation_busy`` now, so
+        # nothing under ``write/`` names the exec capability at all. An allow-list
+        # cannot report that — an extra *permitted* entry never reddens a subset
+        # test — so :class:`TestTheDeletabilityClaimIsObservable` asserts it
+        # directly.
         f"{PACKAGE}.journal",
-        # ``mutation_busy`` composes the busy refusal. Runtime, so both rules.
-        # Becomes 55-7's ``exec/``.
-        f"{PACKAGE}.execution",
-        # ``LockBackend`` annotates ``_lock_backend`` and nothing else. Becomes
-        # 55-7's. It is on this row because the direct-edge rule below counts a
-        # ``TYPE_CHECKING`` import too — moving it under one would take it out of
-        # the runtime closure and buy no row.
+        # ``LockBackend`` annotates ``_lock_backend`` and ``mutation_busy`` is
+        # called on every refused mutation, so this is a **runtime** entry now
+        # rather than the annotation-only one it was. The hold is the tree's
+        # state and is read whether or not exec is enabled, which is the whole
+        # argument for ``lock.py`` staying in the spine while ``execution/``
+        # became a capability.
         f"{PACKAGE}.lock",
         # ``WorkspaceActor`` annotates ``_workspace_tell`` and nothing else, and
         # is already imported under ``TYPE_CHECKING`` — so it is *not* in the
@@ -190,8 +200,40 @@ CAPABILITY_CLOSURES: dict[str, frozenset[str]] = {
         # actor under ``TYPE_CHECKING`` instead removed all seven.
         f"{PACKAGE}.actor",
     },
+    "execution": SPINE
+    | {
+        f"{PACKAGE}.execution",
+        f"{PACKAGE}.execution.actor",
+        f"{PACKAGE}.execution.card",
+        f"{PACKAGE}.execution.params",
+        # ``LEASE_GRACE_S``, ``LockTicket`` and ``LockBackend`` in the mixin, and
+        # ``_BUSY_PREFIX`` in the package root's ``lock_unavailable``. **Runtime,
+        # and not a defect to remove**: ``lock.py`` is the spine's vocabulary of
+        # the hold, and it is where this capability's own lease grace, run-id mint
+        # and two busy refusals now live — precisely so that the spine never has
+        # to import back into ``execution/``.
+        #
+        # **Not predicted by the story that added this row; measured.** The story
+        # expected the six entries around it and no seventh. Transcribing its list
+        # would have produced a row that was wrong in the safe direction — too
+        # narrow — and reddened a correct capability.
+        f"{PACKAGE}.lock",
+        # ``WorkspaceActor`` annotates ``_bound``'s signature and the
+        # ``_workspace_proxy`` declaration in ``execution/card.py``, both under
+        # ``TYPE_CHECKING``, so this is **not** in the runtime closure and is on
+        # the row only for the direct-edge rule. Exactly ``write/``'s ``actor``
+        # entry, and exactly the edge story 55-3 removed from ``write/``.
+        f"{PACKAGE}.actor",
+        # ``GitJournal`` types ``_journal`` in the mixin, under ``TYPE_CHECKING``.
+        # **Stated as a known residual rather than removed**: an exec run's
+        # discovered commit is a real dependency of this capability on the journal
+        # capability, and the epic's deletability guard is scoped to ``write/``.
+        # Closing it means a journal Protocol at the spine, which is one ADR
+        # decision and not a story's to take.
+        f"{PACKAGE}.journal",
+    },
 }
-"""One row per capability module. Story 55-7 adds the last one.
+"""One row per capability module — all five of them since story 55-7.
 
 The value is the complete allow-list for that capability's transitive closure:
 its own modules, plus the spine modules it genuinely needs.
@@ -221,6 +263,22 @@ CAPABILITY_SPINE_REACH: dict[str, frozenset[str]] = {
     # ``models``. Listing all five is what makes this row report a graph that
     # silently narrowed.
     "rag": frozenset(
+        {
+            f"{PACKAGE}.documents",
+            f"{PACKAGE}.documents.models",
+            f"{PACKAGE}.models",
+            f"{PACKAGE}.readers",
+            f"{PACKAGE}.workspace",
+        }
+    ),
+    # The same five as ``rag/``, reached by a different route and stated in full
+    # rather than trimmed to match: ``execution/`` gets to ``workspace`` through
+    # ``lock.py``'s ``meta_dir_for`` and ``meta_root``, to ``models`` through both
+    # the mixin's ``WorkspaceConfig`` and its ``Identity``, and to ``readers``
+    # only through ``models.gitignore_seed``'s in-function import — the entry a
+    # graph that followed no transitive edge would miss while still satisfying a
+    # mere "non-empty" check.
+    "execution": frozenset(
         {
             f"{PACKAGE}.documents",
             f"{PACKAGE}.documents.models",
@@ -471,7 +529,7 @@ class TestTheSweepLooksAtTheRightThing:
 
 @pytest.mark.parametrize("capability", sorted(CAPABILITY_CLOSURES))
 class TestACapabilityDependsOnTheSpineAndNothingElse:
-    """One row per capability module; story 55-7 adds the last one."""
+    """One row per capability module — all five of them since story 55-7."""
 
     def test_the_closure_is_inside_the_allow_list(
         self, capability: str, modules: dict[str, Path]
@@ -537,3 +595,64 @@ class TestACapabilityDependsOnTheSpineAndNothingElse:
             f"{capability}/ names {sorted(outside)} — including under TYPE_CHECKING, "
             f"a capability module may name only the spine and its own modules"
         )
+
+
+class TestTheDeletabilityClaimIsObservable:
+    """ADR-053's Consequences, asserted instead of asserted-about.
+
+    *"A capability's code is deletable, which is the test of whether this layout
+    is real."* For ``journal/`` and ``execution/`` that was **false** until story
+    55-7: ``write/gate.py`` constructed an ``Identity`` out of the journal and
+    composed its busy refusal out of the exec module, both at runtime, on every
+    accepted mutation. Delete either directory and the write capability — the
+    default-on one — stopped importing.
+
+    **Why this is not the deny-list the module docstring forbids.** That rule is
+    about how a capability's closure is *bounded*: an allow-list catches the
+    module nobody thought to forbid, and a deny-list passes silently for it. This
+    spec bounds nothing. It is a named claim about two named capabilities, and it
+    exists because the allow-list **cannot** make it: containment asserts
+    ``closure - allowed == set()``, so an entry that is permitted and no longer
+    needed is invisible — ``journal`` could silently return to ``write/``'s
+    runtime closure tomorrow and every assertion above would stay green. The
+    allow-list still runs on every row, unchanged; this runs beside it, and its
+    subject is named by the claim rather than by a list somebody has to remember
+    to extend.
+    """
+
+    def test_the_write_capability_reaches_neither_at_runtime(
+        self, modules: dict[str, Path]
+    ) -> None:
+        """The two default-off capabilities ``write/`` used to drag in with it.
+
+        ``GitJournal`` still **types** ``_journal`` and ``WorkspaceActor`` still
+        types ``_workspace_tell``, both under ``TYPE_CHECKING`` — which is why
+        ``journal`` is still on ``write/``'s allow-list row and why this is the
+        *runtime* closure rather than the direct-edge set. An annotation executes
+        nothing, closes no cycle and costs nothing at bind; it is not a reason a
+        directory cannot be deleted.
+        """
+        closure = _closure(_modules_under("write", modules), modules)
+
+        assert f"{PACKAGE}.journal" not in closure, (
+            "write/ imports the journal capability at runtime again — deleting "
+            "journal/ would break the default-on mutation path, which is the "
+            "deletability claim ADR-053 rests on"
+        )
+        assert f"{PACKAGE}.execution" not in closure, (
+            "write/ imports the exec capability at runtime again — the mutation "
+            "busy refusal belongs to lock.py, in the spine, precisely so that it "
+            "does not"
+        )
+
+    def test_the_names_it_denies_are_real_modules(self, modules: dict[str, Path]) -> None:
+        """Non-vacuity, and it is the whole risk of an assertion shaped like this.
+
+        Two ``not in`` assertions over a misspelled dotted name pass for ever and
+        prove nothing — the shape ``test_exec.py::TestTheCapability`` already
+        refuses for absence assertions over a registered-name list. So the two
+        subjects are checked to exist, here, where a rename that moved either
+        capability would otherwise leave the guard green and empty.
+        """
+        assert f"{PACKAGE}.journal" in modules
+        assert f"{PACKAGE}.execution" in modules

@@ -65,15 +65,14 @@ from akgentic.tool.workspace.edit import (
     unified,
     write_and_diff,
 )
-from akgentic.tool.workspace.execution import mutation_busy
-from akgentic.tool.workspace.journal import GitJournal, Identity
-from akgentic.tool.workspace.lock import LockBackend
+from akgentic.tool.workspace.lock import LockBackend, mutation_busy
 from akgentic.tool.workspace.models import (
     MAX_REJECTION_DIFF_LINES,
     OUT_OF_BAND_AUTHOR,
     PERM_ERR_MSG,
     PUBLISH_LOST_MSG,
     WRITE_DENIED_MSG,
+    Identity,
     MutationOutcome,
     MutationStatus,
     Observation,
@@ -88,6 +87,7 @@ from akgentic.tool.workspace.workspace import (
 
 if TYPE_CHECKING:
     from akgentic.tool.workspace.actor import WorkspaceActor
+    from akgentic.tool.workspace.journal import GitJournal
 
 logger = logging.getLogger(__name__)
 

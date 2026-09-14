@@ -14,6 +14,22 @@ which executes ``actor/__init__.py`` and with it the whole retrieval pipeline.
 The exec proxy is the only thing that still asks the actor for anything, so the
 helper belongs to the exec capability and travels with it.
 
+**The actor is now named under ``if TYPE_CHECKING:`` here for that same reason,
+one layer along.** ``WorkspaceActor`` appears in exactly two annotations —
+:func:`_bound`'s signature and the ``_workspace_proxy`` declaration — and this
+module carries ``from __future__ import annotations``, so neither is ever
+evaluated. A runtime import would have dragged the actor, and through it the
+retrieval pipeline, into the exec capability's runtime closure for nothing at
+all. It stays on the capability's allow-list row, because the direct-edge rule
+counts an annotation too.
+
+**``WorkspaceExec`` comes from ``execution/params.py``, never through
+``card/params.py``'s re-export**, and that is load-bearing rather than tidy:
+importing a submodule executes its parents, so a runtime
+``from …card.params import WorkspaceExec`` here would attribute the whole
+``card`` package to exec's closure — and close a real cycle, since
+``card/__init__.py`` imports :class:`ExecFactories` from this module.
+
 :class:`ExecFactories` is a **mixin**: it declares no Pydantic field, and the
 two names it consumes off ``self`` are declared under ``if TYPE_CHECKING:`` so
 they reach mypy without ever reaching Pydantic's field collection (ADR-045 §1).
@@ -26,8 +42,6 @@ from typing import TYPE_CHECKING, Any
 
 from akgentic.tool.core.deferred import poll_deferred
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.workspace.actor import WorkspaceActor
-from akgentic.tool.workspace.card.params import WorkspaceExec
 from akgentic.tool.workspace.execution import (
     ExecStatus,
     effective_budget,
@@ -36,6 +50,10 @@ from akgentic.tool.workspace.execution import (
     poll_attempts_within,
     timed_out,
 )
+from akgentic.tool.workspace.execution.params import WorkspaceExec
+
+if TYPE_CHECKING:
+    from akgentic.tool.workspace.actor import WorkspaceActor
 
 _UNBOUND_MSG = (
     "The workspace actor is not bound — a mutating WorkspaceTool must be wired "

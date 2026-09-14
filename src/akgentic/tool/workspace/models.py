@@ -13,6 +13,7 @@ working gate right up until nobody can overwrite anything (ADR-036 §3).
 from __future__ import annotations
 
 import hashlib
+import re
 from enum import StrEnum
 from typing import Literal
 
@@ -122,6 +123,29 @@ GITIGNORE_NAME = ".gitignore"
 OUT_OF_BAND_AUTHOR = "out-of-band"
 """Author of every commit no agent in this team is responsible for."""
 
+MAX_COMMIT_BODY_CHARS = 500
+"""Cap on the agent-supplied text a commit body may carry.
+
+The command string is the one place untrusted input reaches the journal. A
+control character would end the subject line early and an unbounded string would
+put a whole heredoc into the log, so it is stripped and clipped — and the message
+travels through ``-F <file>``, never interpolated into an argument.
+"""
+
+IDENTITY_FALLBACK = "unknown-agent"
+"""Stands in for an identity that sanitises to nothing.
+
+Neither git identity field may be empty, and an agent whose whole name is
+control characters would otherwise produce one.
+"""
+
+IDENTITY_DOMAIN = "akgentic"
+"""Domain of the synthetic author email. The local part is the agent's id."""
+
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_ANGLE_RE = re.compile(r"[<>]")
+_EMAIL_LOCAL_RE = re.compile(r"[^A-Za-z0-9._-]")
+
 _EXEC_DEBRIS = ("__pycache__/", "*.pyc", ".venv/", "node_modules/")
 
 
@@ -162,6 +186,86 @@ def gitignore_seed() -> str:
         "",
     ]
     return "\n".join(lines)
+
+
+def sanitise_name(value: str) -> str:
+    """Return *value* usable as a git identity **name**.
+
+    Control characters and angle brackets are removed: a newline would end the
+    identity line and ``<`` would open the email field, so either lets an agent
+    id say something other than a name.
+
+    Args:
+        value: An agent's display name or id — untrusted text.
+
+    Returns:
+        The cleaned name, or :data:`IDENTITY_FALLBACK` when nothing survives.
+    """
+    cleaned = _ANGLE_RE.sub("", _CONTROL_RE.sub("", value)).strip()
+    return cleaned or IDENTITY_FALLBACK
+
+
+def sanitise_command(value: str) -> str:
+    """Return *value* usable as commit-body text.
+
+    Args:
+        value: An agent-supplied command string — untrusted text.
+
+    Returns:
+        The command with control characters collapsed to spaces and the whole
+        clipped to :data:`MAX_COMMIT_BODY_CHARS`, or ``""`` when nothing
+        survives. A body is optional, so an empty result is simply no body.
+    """
+    cleaned = " ".join(_CONTROL_RE.sub(" ", value).split())
+    if len(cleaned) > MAX_COMMIT_BODY_CHARS:
+        cleaned = cleaned[:MAX_COMMIT_BODY_CHARS] + " …"
+    return cleaned
+
+
+def sanitise_email_local(value: str) -> str:
+    """Return *value* usable as the local part of a git identity **email**.
+
+    Args:
+        value: An agent's id — untrusted text.
+
+    Returns:
+        The cleaned local part, or :data:`IDENTITY_FALLBACK` when nothing
+        survives.
+    """
+    cleaned = _EMAIL_LOCAL_RE.sub("-", value).strip("-")
+    return cleaned or IDENTITY_FALLBACK
+
+
+class Identity:
+    """Who a commit is attributed to, as two already-sanitised fields.
+
+    Built from an agent's registered display name and its id: the name is what a
+    human reads in the log, the id is what makes two agents sharing a name
+    distinguishable. An unregistered agent falls back to its id as the name —
+    degraded, never broken.
+
+    **Here rather than in** :mod:`akgentic.tool.workspace.journal`, **and the move
+    is what makes that module deletable.** It is the commit's author, so the
+    journal is its heaviest reader — but it is constructed on every accepted
+    mutation by :mod:`akgentic.tool.workspace.write.gate`, which is a *different*
+    capability and a default-on one, and by the actor. A default-off capability's
+    module holding a name a default-on one builds at runtime is what kept
+    ``journal`` on ``write/``'s runtime allow-list row: delete ``journal/`` and
+    the write gate stopped importing. The precedent for the home is the existing
+    traffic, not convenience — ``journal/`` already takes four names from this
+    module, and :meth:`out_of_band` is built from one of them.
+    """
+
+    __slots__ = ("email", "name")
+
+    def __init__(self, name: str, email_local: str) -> None:
+        self.name = sanitise_name(name)
+        self.email = f"{sanitise_email_local(email_local)}@{IDENTITY_DOMAIN}"
+
+    @classmethod
+    def out_of_band(cls) -> Identity:
+        """The identity for changes no agent in this team made."""
+        return cls(OUT_OF_BAND_AUTHOR, OUT_OF_BAND_AUTHOR)
 
 
 Precondition = str | Literal["absent"]

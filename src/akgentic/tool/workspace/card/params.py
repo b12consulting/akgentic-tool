@@ -15,13 +15,16 @@ leaf of the *card's* own graph in the sense that matters: it imports no other
 module under ``card/``, so a sibling may take its parameters from here without
 depending on the façade.
 
-**Three capabilities' parameters are re-exported, not defined here.** The read
+**Four capabilities' parameters are re-exported, not defined here.** The read
 capability's six live in :mod:`akgentic.tool.workspace.read.params`, the write
-capability's six in :mod:`akgentic.tool.workspace.write.params` and the retrieval
-capability's three in :mod:`akgentic.tool.workspace.rag.params`, each beside the
-closures they configure, because importing anything under ``card/`` executes
+capability's six in :mod:`akgentic.tool.workspace.write.params`, the retrieval
+capability's three in :mod:`akgentic.tool.workspace.rag.params` and the exec
+capability's one in :mod:`akgentic.tool.workspace.execution.params`, each beside
+the closures they configure, because importing anything under ``card/`` executes
 ``card/__init__.py`` and therefore every other capability — so a capability
-module that took its parameters from here would depend on all of them.
+module that took its parameters from here would depend on all of them. For exec
+that is not merely a dependency but a **cycle**: ``card/__init__.py`` imports
+``ExecFactories`` from ``execution/card.py``.
 
 The re-export is what keeps stored records readable. ``serialize_type`` stamps
 ``f"{cls.__module__}.{cls.__name__}"`` into ``__model__`` on every
@@ -43,16 +46,8 @@ from __future__ import annotations
 import base64
 from enum import StrEnum
 
-from pydantic import Field
-
 from akgentic.core.utils import SerializableBaseModel
-from akgentic.tool.core import TOOL_CALL, BaseToolParam, Channels
-from akgentic.tool.sandbox.backend import CardMode
-from akgentic.tool.workspace.execution import (
-    DEFAULT_EXEC_POLL_ATTEMPTS,
-    DEFAULT_EXEC_POLL_DELAY_S,
-    DEFAULT_EXEC_TIMEOUT_S,
-)
+from akgentic.tool.workspace.execution.params import WorkspaceExec
 from akgentic.tool.workspace.rag.params import (
     WorkspaceRagIndex,
     WorkspaceRagList,
@@ -75,20 +70,21 @@ from akgentic.tool.workspace.write.params import (
     WorkspaceWrite,
 )
 
-# mypy strict implies ``no_implicit_reexport``, so the fifteen re-exported names
+# mypy strict implies ``no_implicit_reexport``, so the sixteen re-exported names
 # need an explicit export to keep serving the module path stored records name.
-# ``__all__`` does it in fifteen lines where ``X as X`` aliases would cost an
+# ``__all__`` does it in sixteen lines where ``X as X`` aliases would cost an
 # import statement each — the spelling ``workspace/tool.py`` already uses, and for
 # the same reason.
 #
-# **Nothing in this package imports the fifteen from here.** ``card/__init__.py``
+# **Nothing in this package imports the sixteen from here.** ``card/__init__.py``
 # and every capability module take them from ``read/params.py``,
-# ``write/params.py`` and ``rag/params.py``, where they are defined, so this
-# re-export exists for exactly one purpose — the stored ``__model__`` markers
-# described above — and ``test_read_capability.py``, ``test_write_capability.py``
-# and ``test_rag_card.py`` are what hold it in place. Were production to import
-# them from here instead, deleting the re-export would break the package loudly
-# and the compatibility path would have no guard of its own.
+# ``write/params.py``, ``rag/params.py`` and ``execution/params.py``, where they
+# are defined, so this re-export exists for exactly one purpose — the stored
+# ``__model__`` markers described above — and ``test_read_capability.py``,
+# ``test_write_capability.py``, ``test_rag_card.py`` and ``test_exec.py`` are what
+# hold it in place. Were production to import them from here instead, deleting the
+# re-export would break the package loudly and the compatibility path would have
+# no guard of its own.
 __all__ = [
     "ExpandMediaRefs",
     "Resource",
@@ -109,50 +105,6 @@ __all__ = [
     "WorkspaceView",
     "WorkspaceWrite",
 ]
-
-
-class WorkspaceExec(BaseToolParam):
-    """Run a sandboxed shell command against the team workspace.
-
-    Configuration only — nothing here duplicates an argument of the callables it
-    enables. The two budgets it carries are two different things and are easy to
-    conflate:
-
-    - ``timeout_s`` bounds the **subprocess**, and reaches
-      ``subprocess.run(timeout=...)`` in the backend. It is clamped to the
-      :data:`~akgentic.tool.workspace.execution.MAX_EXEC_BUDGET_S`, which sits
-      below the orchestrator's stop backstop.
-    - ``poll_attempts`` × ``poll_delay_seconds`` bounds how long the **agent's
-      own thread** waits inside the tool call. It cannot extend the first:
-      raising it buys more looking, never more running.
-
-    ``poll_attempts`` has three settings, and each is bounded by a different
-    thing:
-
-    - ``-1`` (the default) — **wait out the run.** Resolved at wiring time to
-      the count whose wait is the longest still fitting the *effective run
-      budget* (``effective_budget(timeout_s)``) plus
-      :data:`~akgentic.tool.workspace.execution.EXEC_REPORT_MARGIN_S`, so the
-      wait covers the sandbox's report and not merely the command. The common
-      case then returns the command's own output and the model never sees a run
-      id.
-    - a **positive count** — a bounded look of ``count × poll_delay_seconds``,
-      clamped to the effective run budget and **without** the margin. Exhausting
-      it hands back a run id.
-    - ``0`` — no polling at all: the run id comes back immediately.
-
-    Anything below ``-1`` is a validation error rather than a second spelling of
-    the sentinel.
-
-    A run that outlives the wait is collected with ``workspace_exec_result``; it
-    never outlives ``timeout_s``.
-    """
-
-    expose: set[Channels] = {TOOL_CALL}
-    mode: CardMode = "auto"
-    timeout_s: float = DEFAULT_EXEC_TIMEOUT_S
-    poll_attempts: int = Field(default=DEFAULT_EXEC_POLL_ATTEMPTS, ge=-1)
-    poll_delay_seconds: float = DEFAULT_EXEC_POLL_DELAY_S
 
 
 class ResourceType(StrEnum):

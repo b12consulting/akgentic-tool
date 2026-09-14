@@ -22,9 +22,24 @@ That supersedes ADR-047's queue, which lived in one process's memory and could
 not have ordered waiters across workers without becoming a distributed
 scheduler. It is a deliberate product behaviour, not a regression.
 
+**This module is the whole vocabulary of the hold, and that is what keeps it in
+the spine.** The lease grace, the run-id mint and the two busy refusals used to
+live in ``execution.py``; they are here because ``execution/`` is a capability
+module now (ADR-053 Decision 1) and a **spine module may not import a
+capability** — doing so would drag exec into every other capability's import
+closure, which is the precise defect story 55-6 removed for retrieval. The hold
+itself is shared machinery by the same evidence ``readers.py`` earned the spine
+on: :meth:`holder` is read on **every** mutation in **every** process whether or
+not exec is enabled (:mod:`akgentic.tool.workspace.write.gate`), and
+``card/__init__.py`` resolves a backend unconditionally at bind as an
+admin-facing fail-fast.
+
 **Imports run one way only** — this module imports ``workspace.py`` for
-:func:`meta_dir_for` and ``execution.py`` for the grace, the id and the refusal
-text. Neither may import this one, or the pair becomes a cycle.
+:func:`meta_dir_for` and :func:`meta_root`, and nothing else in the package. The
+direction with ``execution`` is now the other way round: ``execution.py`` imports
+:data:`_BUSY_PREFIX` from here for its own ``lock_unavailable``. Neither
+``workspace.py`` nor ``execution.py`` may import back into this module's callers,
+or a pair becomes a cycle.
 """
 
 from __future__ import annotations
@@ -35,14 +50,61 @@ import os
 import time
 from pathlib import Path
 from typing import Protocol, runtime_checkable
+from uuid import uuid4
 
 from pydantic import ValidationError, model_validator
 
 from akgentic.core.utils.serializer import SerializableBaseModel
-from akgentic.tool.workspace.execution import LEASE_GRACE_S, exec_busy, new_run_id
-from akgentic.tool.workspace.workspace import meta_dir_for
+from akgentic.tool.workspace.workspace import meta_dir_for, meta_root
 
 logger = logging.getLogger(__name__)
+
+LEASE_GRACE_S = 5.0
+"""How long past its budget a run keeps the mutation gate with nothing reported.
+
+One use, and it covers one case: a child that ignores the kill. Every ordinary
+exit reports — a command that ran, a command the budget killed, a backend that
+raised, an allowlist refusal — because the sandbox's handler reports in a
+``finally``. What no report can cover is a subprocess still alive after its
+budget, since the thread waiting on it is not free to say so.
+
+So the gate is released **without** a report once the run is this far past its
+budget, checked lazily by the next mutation: no timer, no extra thread. By then
+the backend has killed the child, so the release is not a race against a live
+writer — and the late report that may still arrive commits nothing and clears
+nothing, because by then the tree may hold somebody else's work.
+
+Measured from the moment the run actually started, which is the moment the work
+was submitted: a submit onto an idle single-worker executor is O(1), so nothing
+slow sits between admission and the command. A cold container backend spends its
+provisioning inside the worker's own lazy ``start()``, which is inside the run
+this clock is measuring — deliberately, because that provisioning is time the
+command really does take.
+"""
+
+RUN_ID_CHARS = 8
+"""Length of a run id, in hex characters.
+
+The id is a token an LLM has to copy back on a later turn, which is the same
+hazard the design refuses to accept for a content digest — admitted here only
+because the outcome has to be addressable at all. Short is the first of the three
+mitigations; the other two are echoing it in the handoff message and making an
+unknown id list the agent's recent ones instead of raising.
+"""
+
+_BUSY_PREFIX = "workspace busy"
+"""Opening words of every refusal a held tree causes.
+
+Fixed wording because it is what an agent recognises across all seven refused
+operations — the six mutations and a second ``workspace_exec``. It lives here,
+beside the message functions, because the two refusal families are rendered for
+two different readers: the mutation one (:func:`mutation_busy`) names the holder,
+because the id it prints is uncollectable by anyone but its owner, and the exec
+one (:func:`exec_busy`) names nobody, because a refused exec caller would collect
+it. One spelling of the prefix is what keeps them recognisably one family — which
+is why :func:`~akgentic.tool.workspace.execution.lock_unavailable` imports it
+from here rather than respelling it beside itself.
+"""
 
 EXEC_LOCK_FILENAME = "exec.lock"
 """The marker's name under ``<meta>``, spelled once and only here.
@@ -63,6 +125,100 @@ DEFAULT_LOCK_BACKEND = "file"
 
 LOCK_BACKEND_ENV = "AKGENTIC_LOCK_BACKEND"
 """Environment variable naming the registry entry to build."""
+
+
+def new_run_id() -> str:
+    """Return a fresh run id — short, and never reused."""
+    return uuid4().hex[:RUN_ID_CHARS]
+
+
+def exec_busy() -> str:
+    """Refusal for a second ``workspace_exec`` while a run holds the tree — naming nobody.
+
+    The one exec refusal there is, and the only message on this path that hands
+    back no run id at all. It names **no run and no agent** on purpose: a refusal
+    that quoted the holder's id is exactly the defect ADR-047 removed — a model's
+    parallel batch would read a sibling call's id out of it and collect that as
+    its own answer — and a refused exec caller is the one caller with no id of
+    its own to be given instead, so it must be given nobody's.
+
+    It is also what the layer can do rather than a restraint it exercises: this
+    is rendered under a :class:`LockBackend`, which has only what is in the marker
+    and no access to the actor's display-name map. A refusal that named the holder
+    would have to be built actor-side.
+
+    The **mutation** refusal is a different message and keeps naming the holder,
+    for the reason its own docstring gives: ``exec_status`` gates on ownership,
+    so a foreign run id is uncollectable.
+    """
+    return (
+        f"{_BUSY_PREFIX} — another command is running in it, so yours was not started and "
+        "nothing is lost. Reads still work; retry the command once the run has finished."
+    )
+
+
+def mutation_busy(run_id: str, agent_name: str) -> str:
+    """The one refusal a **mutation** gets while an exec run holds the tree.
+
+    The sibling of :func:`exec_busy`, and deliberately not the same message.
+    This one names the holder's run id and agent; that one names nobody. The
+    asymmetry is ADR-047's and it is about *collectability*: ``exec_status``
+    gates on ownership, so a foreign run id printed here is uncollectable by the
+    agent reading it and merely informs, where the same id in an *exec* refusal
+    was collected by a model as its own answer.
+
+    **The name, not the id.** The reader is a model choosing what to do next,
+    and *"agent '3f2a…'"* is something it can read and nothing it can act on —
+    the question ``WorkspaceActor.attach``'s docstring settled for the journal
+    and the refusals alike. The name travels in the marker (:class:`LockMarker`)
+    precisely so that this text is the same in the process that took the hold and
+    in one that only found it on disk.
+
+    Args:
+        run_id: The run holding the tree.
+        agent_name: The holder's display name, or its id when the marker
+            carries no name — degraded, never broken.
+
+    Returns:
+        The refusal, whose text is the product and must not drift.
+    """
+    return (
+        f"{_BUSY_PREFIX} — exec run {run_id} is in progress "
+        f"(agent '{agent_name}'). Reads still work; retry the change "
+        f"once the run has finished."
+    )
+
+
+def meta_root_mismatch(marker_root: str, resolved_root: str) -> str:
+    """Refusal for a live hold written under a **different** metadata root.
+
+    The third member of the family, and the only one that is not about a
+    workspace somebody is legitimately using: a marker naming a root this process
+    does not resolve means the two processes are not excluding each other at all,
+    so the hold it describes is not a hold over anything this process shares. It
+    opens with the same prefix because it is still "the tree is not available to
+    you", and it names **both** roots because neither one alone tells an operator
+    which of the two workers is misconfigured.
+
+    It names no run and no agent, for :func:`exec_busy`'s reason: the reader is a
+    refused exec caller, and it is the one caller that would collect an id it was
+    given.
+
+    Args:
+        marker_root: The metadata root recorded in the marker on disk.
+        resolved_root: The metadata root this process resolved
+            (:func:`~akgentic.tool.workspace.workspace.meta_root`).
+
+    Returns:
+        The refusal, whose text is the product and must not drift.
+    """
+    return (
+        f"{_BUSY_PREFIX} — the hold on this workspace was written under the metadata root "
+        f"{marker_root!r}, and this process resolved {resolved_root!r}. Two workers sharing a "
+        "tree must resolve the same one or they exclude nobody, so your command was not "
+        "started and nothing is lost. This is a deployment misconfiguration rather than a busy "
+        "workspace: report it rather than retrying in a loop."
+    )
 
 
 class LockTicket(SerializableBaseModel):
@@ -109,7 +265,7 @@ class LockGrant(SerializableBaseModel):
             is known by everywhere — so the id an agent holds and the id in the
             marker are the same value by construction, not by agreement.
         refusal: Why not, when it was not. It names **no** run and **no** agent
-            (see :func:`~akgentic.tool.workspace.execution.exec_busy`).
+            (see :func:`exec_busy`).
     """
 
     run_id: str = ""
@@ -143,11 +299,32 @@ class LockMarker(SerializableBaseModel):
             because the reader of a marker is routinely a *different process*
             from its writer, and the mutation refusal it composes is read by a
             model deciding what to do next.
+        meta_root: The metadata root this marker was written under —
+            :func:`~akgentic.tool.workspace.workspace.meta_root`'s answer in the
+            writing process (ADR-053 Decision 5). **Optional and defaulted**, for
+            *agent_name*'s reason and with the same consequence: a marker written
+            before this field existed still parses, and an empty value means
+            *unknown*, never *mismatched*. A marker carrying ``""`` is never
+            refused.
+
+            **What comparing it can and cannot catch, stated rather than left to
+            be discovered.** A root recorded *inside* a marker is only comparable
+            by a process that can **read** that marker, so this catches a
+            disagreement exactly where two processes reach **one marker file** —
+            one volume mounted at two paths, a symlinked path segment, a relative
+            root resolved from two working directories. Two genuinely **disjoint**
+            metadata roots produce **two** marker files, each invisible to the
+            other, and no marker-based check can ever see that: both processes
+            acquire, both believe they hold the tree, and nothing is refused. That
+            half closes through configuration — every worker sharing a tree
+            resolving one root — and not here. An agent who believes this stamp
+            covers the disjoint case stops looking for the fix that would.
     """
 
     run_id: str
     agent_id: str
     agent_name: str = ""
+    meta_root: str = ""
 
 
 @runtime_checkable
@@ -191,6 +368,14 @@ class LockBackend(Protocol):
         window is ``budget_s + LEASE_GRACE_S``, and only the caller knows what
         budget runs on this tree get. A hold past it is not a hold: its run is
         not going to answer, and mutations proceed.
+
+        The answer is the whole marker, so it carries the metadata root the hold
+        was written under (:attr:`LockMarker.meta_root`, ADR-053 Decision 5)
+        along with the run and the agent. **What the mutation gate does with that
+        is nothing**, deliberately: a mutation is refused by any live hold, with
+        the same :func:`mutation_busy` text, and a second refusal there would make
+        a misconfiguration refuse every *mutation* as well as every *run* — which
+        is wider than the decision that put the root in the marker.
         """
         ...
 
@@ -235,6 +420,13 @@ class FileLockBackend:
         is a refusal — somebody else won the takeover, which is the correct
         answer and not a case to loop over.
 
+        **Staleness is decided first, and a mismatched root is only looked at on
+        a marker that is genuinely live.** A stale marker is taken over whatever
+        root it names — refusing one would wedge the tree for ever, with no path
+        back that does not involve deleting a file by hand, and a misconfigured
+        deployment would then be unrecoverable rather than merely unserialised.
+        The order is the behaviour, not an implementation detail.
+
         Args:
             tree_key: The three-segment ``<scope>/<kind>/<leaf>`` path
                 :func:`~akgentic.tool.workspace.workspace.get_workspace` takes —
@@ -255,7 +447,7 @@ class FileLockBackend:
         if grant is not None:
             return grant
         if not self._is_stale(marker, ticket.budget_s):
-            return LockGrant(refusal=exec_busy())
+            return LockGrant(refusal=self._live_refusal(marker))
         logger.warning(
             "Workspace %s: taking over the exec lock at %s — it is past its budget and the "
             "grace with nothing released, so its run is not going to answer.",
@@ -354,6 +546,43 @@ class FileLockBackend:
         """The marker belonging to *tree_key* — a sibling of the tree, never inside it."""
         return meta_dir_for(tree_key) / EXEC_LOCK_FILENAME
 
+    def _live_refusal(self, marker: Path) -> str:
+        """Why a live marker refuses this acquirer — busy, or a root disagreement.
+
+        Reached **only** for a marker :meth:`_is_stale` has already answered
+        ``False`` for, which is what keeps a mismatched *stale* marker
+        reclaimable (see :meth:`acquire`).
+
+        Three ways the answer is the ordinary busy refusal, and all three mean
+        "somebody holds this tree and the two of us agree on where the hold
+        lives": the marker does not parse, so it is not one this code wrote and
+        nothing can be said about the root it was written under; it carries no
+        root, so it predates the field and *unknown* is not *mismatched*; or the
+        root it carries is this process's own.
+
+        Args:
+            marker: The existing marker file.
+
+        Returns:
+            The refusal text, composed through the module's own message
+            functions and never spelled here.
+        """
+        try:
+            held = LockMarker.model_validate_json(marker.read_text())
+        except (OSError, ValidationError):
+            return exec_busy()
+        resolved = str(meta_root())
+        if not held.meta_root or held.meta_root == resolved:
+            return exec_busy()
+        logger.warning(
+            "Workspace hold at %s was written under metadata root %s, but this process "
+            "resolved %s — the two are not excluding each other. Refusing the run.",
+            marker,
+            held.meta_root,
+            resolved,
+        )
+        return meta_root_mismatch(held.meta_root, resolved)
+
     def _claim(self, marker: Path, ticket: LockTicket) -> LockGrant | None:
         """Create *marker* exclusively and fill it, or answer ``None`` if it exists.
 
@@ -361,6 +590,11 @@ class FileLockBackend:
         either wins or raises, with no window between a check and a write for a
         second acquirer to fit into. A ``marker.exists()`` test followed by a
         write would pass every sequential test and serialise nothing at all.
+
+        The metadata root is stamped from :func:`meta_root` and never from a
+        re-derivation of its chain: a stamp computed one way and compared another
+        would refuse every run on a correctly configured deployment, which is the
+        failure mode of a guard rather than of a tree.
         """
         try:
             fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _MARKER_MODE)
@@ -374,6 +608,7 @@ class FileLockBackend:
                         run_id=run_id,
                         agent_id=ticket.agent_id,
                         agent_name=ticket.agent_name,
+                        meta_root=str(meta_root()),
                     ).model_dump_json()
                 )
         except BaseException:
@@ -394,7 +629,7 @@ class FileLockBackend:
         a hold that has just been released is a refusal the caller retries
         through, not a takeover of a file that no longer exists.
 
-        The grace is :data:`~akgentic.tool.workspace.execution.LEASE_GRACE_S`,
+        The grace is :data:`LEASE_GRACE_S`,
         derived rather than respelled: two literals for one window is two places
         for a change to be applied once and missed once.
 

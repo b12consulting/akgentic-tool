@@ -431,6 +431,37 @@ def get_workspace(workspace_name: str) -> Filesystem:
     return Filesystem(base_path=_workspaces_root(), workspace_name=workspace_name)
 
 
+def meta_root() -> Path:
+    """The resolved parent every tree's metadata directory hangs off.
+
+    **The one derivation of the metadata root**, and it is public because a
+    second reader now exists: :meth:`~akgentic.tool.workspace.lock.FileLockBackend.acquire`
+    stamps this value into the marker it writes, so that a process finding a
+    marker written under a *different* root can say so instead of excluding
+    nobody. Two spellings of the chain below is precisely the defect
+    :func:`_workspaces_root`'s docstring already names, one scale up: a marker
+    stamped from one derivation and compared against another would refuse every
+    run on a correctly configured deployment.
+
+    ``or`` rather than a ``get`` default, because an empty value is set: a
+    compose file interpolating an unset variable, or a bare ``FOO=`` in an env
+    file, both arrive here as ``""``. Honouring that would resolve the parent
+    against the process cwd while the tree stayed under the workspaces root —
+    the metadata directory detached from the tree it belongs to, with nothing
+    raising. An empty ``AKGENTIC_WORKSPACES_ROOT`` is a different case and keeps
+    its existing meaning (:func:`_workspaces_root`): there the tree and
+    everything derived from it move together.
+
+    Returns:
+        ``AKGENTIC_WORKSPACE_META_ROOT`` when it carries a value and the
+        workspaces root otherwise, resolved absolute — so that two spellings of
+        one directory (a relative path, a symlinked segment) answer one value
+        here rather than two.
+    """
+    parent = os.environ.get("AKGENTIC_WORKSPACE_META_ROOT") or _workspaces_root()
+    return Path(parent).resolve()
+
+
 def meta_dir_for(workspace_path: str) -> Path:
     """Return the metadata directory belonging to the tree at *workspace_path*.
 
@@ -465,25 +496,17 @@ def meta_dir_for(workspace_path: str) -> Path:
             from.
 
     Returns:
-        The absolute ``<parent>/<scope>/<kind>/<leaf>.index``, where ``<parent>`` is
-        ``AKGENTIC_WORKSPACE_META_ROOT`` when it carries a value and the
-        workspaces root otherwise — an **empty** value falls back rather than
-        being honoured, see below.
+        The absolute ``<parent>/<scope>/<kind>/<leaf>.index``, where ``<parent>``
+        is :func:`meta_root`'s answer — an **empty**
+        ``AKGENTIC_WORKSPACE_META_ROOT`` falls back rather than being honoured,
+        for the reason that function gives.
     """
     # Derived in the ``git_dir_for`` shape — resolve the tree, then append the
     # suffix to its name — because two derivations that drift give two metadata
-    # directories over one tree.
-    #
-    # ``or`` rather than a ``get`` default, because an empty value is set: a
-    # compose file interpolating an unset variable, or a bare ``FOO=`` in an env
-    # file, both arrive here as ``""``. Honouring that would resolve the parent
-    # against the process cwd while the tree stayed under the workspaces root —
-    # the metadata directory detached from the tree it belongs to, with nothing
-    # raising. An empty ``AKGENTIC_WORKSPACES_ROOT`` is a different case and
-    # keeps its existing meaning (:func:`_workspaces_root`): there the tree and
-    # everything derived from it move together.
-    parent = os.environ.get("AKGENTIC_WORKSPACE_META_ROOT") or _workspaces_root()
-    resolved = (Path(parent) / workspace_path).resolve()
+    # directories over one tree. The parent comes from :func:`meta_root` rather
+    # than from a second copy of its chain, so the root a marker is *stamped*
+    # with and the root a marker is *found* under are one value.
+    resolved = (meta_root() / workspace_path).resolve()
     return resolved.parent / f"{resolved.name}{META_DIR_SUFFIX}"
 
 

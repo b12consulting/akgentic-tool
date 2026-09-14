@@ -33,9 +33,14 @@ from akgentic.tool.workspace.actor import (
     WorkspaceActor,
     workspace_actor_name,
 )
-from akgentic.tool.workspace.card.params import WorkspaceExec
 from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION
 from akgentic.tool.workspace.event import WorkspaceAttached
+
+# From where it is **defined**, never through ``card/params.py``'s re-export:
+# ``test_exec.py`` is what holds that re-export in place, so a spec importing
+# through it would turn a deleted re-export into a collection error and the
+# guards written to catch the loss would never run at all.
+from akgentic.tool.workspace.execution.params import WorkspaceExec
 from akgentic.tool.workspace.models import Observation, WorkspaceConfig, content_sha
 from akgentic.tool.workspace.read import _paginate
 from akgentic.tool.workspace.tool import WorkspaceTool

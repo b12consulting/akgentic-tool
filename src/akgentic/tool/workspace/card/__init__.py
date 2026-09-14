@@ -27,16 +27,16 @@ the card creates its actor as an ordinary team child, which is the seam
 per-process — the sandbox, the document reader, the retrieval pipeline — and no
 shared state at all.
 
-The factory bodies live in five mixins. One is still a sibling —
-``card/execution.py`` — and three capabilities have moved out:
-``workspace/read/``, ``workspace/write/`` and ``workspace/rag/``, each carrying
-its closures, its private helpers and its parameters together, with the mutation
-gate inside ``write/`` because it is the write capability's and the tree-policy
-record inside ``rag/`` because it is typed on the retrieval capability's own
-parameter. The story after them moves exec the same way. ``card/params.py`` holds
-``WorkspaceExec``, re-exports the three moved capabilities' fifteen parameters so
-the module paths stored records name keep resolving, and owns ``Resource`` /
-``ResourceType`` outright.
+The factory bodies live in five mixins, and **no capability's code is under
+``card/`` any more**: ``workspace/read/``, ``workspace/write/``,
+``workspace/rag/`` and ``workspace/execution/`` each carry their closures, their
+private helpers and their parameters together — with the mutation gate inside
+``write/`` because it is the write capability's, the tree-policy record inside
+``rag/`` because it is typed on the retrieval capability's own parameter, and the
+exec factories inside ``execution/`` beside the models and the mixin they drive.
+``card/params.py`` re-exports all sixteen of those parameters so the module paths
+stored records name keep resolving, and owns ``Resource`` / ``ResourceType``
+outright.
 
 What stays here is the card itself: its fields, ``observer()`` with its private
 binding helpers, and the ``get_tools`` / ``get_commands`` /
@@ -85,12 +85,7 @@ from akgentic.tool.workspace.actor import (
     WorkspaceActor,
     workspace_actor_name,
 )
-from akgentic.tool.workspace.card.execution import ExecFactories
-from akgentic.tool.workspace.card.params import (
-    Resource,
-    ResourceType,
-    WorkspaceExec,
-)
+from akgentic.tool.workspace.card.params import Resource, ResourceType
 from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION, derived_document_caps
 from akgentic.tool.workspace.documents.store import DocumentStore, resolve_document_store
 from akgentic.tool.workspace.event import WorkspaceAttached
@@ -100,6 +95,8 @@ from akgentic.tool.workspace.execution import (
     effective_budget,
     resolve_mode,
 )
+from akgentic.tool.workspace.execution.card import ExecFactories
+from akgentic.tool.workspace.execution.params import WorkspaceExec
 from akgentic.tool.workspace.journal import GitJournal
 from akgentic.tool.workspace.lock import LockBackend, resolve_lock_backend
 from akgentic.tool.workspace.models import (
@@ -642,7 +639,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         """The run budget this card measures an exec hold's staleness against.
 
         The same derivation
-        :meth:`~akgentic.tool.workspace.actor.execution.ExecMixin._run_budget`
+        :meth:`~akgentic.tool.workspace.execution.actor.ExecMixin._run_budget`
         makes, for the reason two spellings of one window would be two places
         for a change to be applied once and missed once: a mutation refused
         against a hold that the very next ``request_exec`` would take over is a

@@ -55,24 +55,35 @@ point it would bite:
 
 **What this module is allowed to import, and what enforces it.** The journal is a
 capability module (ADR-053 Decision 1), so it holds the whole of the git
-capability and nothing else: :class:`GitJournal`, :class:`Identity`,
-:func:`git_dir_for`, the three sanitisers, the commit lock's two constants and
-``_holding`` itself. It may import the package's **spine** — and in practice
-imports four names from :mod:`akgentic.tool.workspace.models`, which is the whole
-of it. It must not import a sibling capability, the card, or the actor, under
-``if TYPE_CHECKING:`` any more than at runtime. That is not a convention anyone
-has to remember: ``tests/workspace/test_capability_import_closure.py`` carries a
-row for ``journal`` and computes the transitive closure statically, and the row
-is the first with no non-spine entry at all.
+capability and nothing else: :class:`GitJournal`, :func:`git_dir_for`, the commit
+lock's two constants and ``_holding`` itself. It may import the package's
+**spine** — and in practice imports five names from
+:mod:`akgentic.tool.workspace.models`, which is the whole of it. It must not
+import a sibling capability, the card, or the actor, under ``if TYPE_CHECKING:``
+any more than at runtime. That is not a convention anyone has to remember:
+``tests/workspace/test_capability_import_closure.py`` carries a row for
+``journal`` and computes the transitive closure statically, and the row is the
+first with no non-spine entry at all.
 
-**The stated limit: this module is findable and priceable, and it is not yet
-deletable.** Two reaches into it survive — ``write/gate.py`` constructs an
-:class:`Identity` in ``_gated`` at runtime, and ``actor/__init__.py`` and
-``actor/execution.py`` both import ``GitJournal, Identity``. Promoting
-``Identity`` and the sanitisers into the spine as *vocabulary* is the proposed
-answer, and it lives in story 55-3's Open Question 3 rather than here: taking it
-would re-point five facade imports and edit three modules other stories own,
-which is a larger change than the one that made this a module.
+**:class:`Identity` and the three sanitisers are no longer here**, and their
+absence is what this module's own deletability rests on. They are the commit's
+author, so this is their heaviest reader — but ``write/gate.py`` constructs one
+on **every accepted mutation**, and that is a different capability and a
+default-on one. A default-off capability's module holding a name a default-on one
+builds at runtime is exactly what put ``journal`` on ``write/``'s runtime
+allow-list row. They live in :mod:`akgentic.tool.workspace.models` now, as
+package vocabulary (ADR-053 Consequences).
+
+**The stated limit, and what is left of it.** ``write/`` no longer reaches this
+module at runtime at all: its one surviving reference is a ``GitJournal``
+annotation, which the runtime import graph excludes by design, and
+``tests/workspace/test_capability_import_closure.py`` asserts that absence
+directly rather than leaving it to an allow-list that an extra permitted entry
+would never redden. What remains is the **actor**, which still constructs a
+:class:`GitJournal` and calls ``initialise()`` on every bind whether or not the
+card asked for one — the source of the single warning a read-only bind logs.
+That construction is story 55-8's to remove, and until it does, this module is
+deletable from ``write/`` but not yet from a bind.
 """
 
 from __future__ import annotations
@@ -81,7 +92,6 @@ import contextlib
 import fcntl
 import logging
 import os
-import re
 import shutil
 import subprocess
 import tempfile
@@ -91,30 +101,12 @@ from pathlib import Path
 from akgentic.tool.workspace.models import (
     GIT_DIR_SUFFIX,
     GITIGNORE_NAME,
-    OUT_OF_BAND_AUTHOR,
+    Identity,
     gitignore_seed,
+    sanitise_command,
 )
 
 logger = logging.getLogger(__name__)
-
-MAX_COMMIT_BODY_CHARS = 500
-"""Cap on the agent-supplied text a commit body may carry.
-
-The command string is the one place untrusted input reaches the journal. A
-control character would end the subject line early and an unbounded string would
-put a whole heredoc into the log, so it is stripped and clipped — and the message
-travels through ``-F <file>``, never interpolated into an argument.
-"""
-
-IDENTITY_FALLBACK = "unknown-agent"
-"""Stands in for an identity that sanitises to nothing.
-
-Neither git identity field may be empty, and an agent whose whole name is
-control characters would otherwise produce one.
-"""
-
-IDENTITY_DOMAIN = "akgentic"
-"""Domain of the synthetic author email. The local part is the agent's id."""
 
 LOCKS_DIR_NAME = "locks"
 """The directory under ``<meta>`` holding every ``flock`` file of one tree.
@@ -134,10 +126,6 @@ The observable symptom of the defect is therefore *silence* — a commit that ne
 existed — which is why the commits are serialised here instead of discovering the
 collision afterwards.
 """
-
-_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
-_ANGLE_RE = re.compile(r"[<>]")
-_EMAIL_LOCAL_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 
 def _scrubbed_env() -> dict[str, str]:
@@ -230,75 +218,6 @@ def git_dir_for(root: Path) -> Path:
         The sibling ``<root>.git`` — outside the tree by construction.
     """
     return root.parent / f"{root.name}{GIT_DIR_SUFFIX}"
-
-
-def sanitise_name(value: str) -> str:
-    """Return *value* usable as a git identity **name**.
-
-    Control characters and angle brackets are removed: a newline would end the
-    identity line and ``<`` would open the email field, so either lets an agent
-    id say something other than a name.
-
-    Args:
-        value: An agent's display name or id — untrusted text.
-
-    Returns:
-        The cleaned name, or :data:`IDENTITY_FALLBACK` when nothing survives.
-    """
-    cleaned = _ANGLE_RE.sub("", _CONTROL_RE.sub("", value)).strip()
-    return cleaned or IDENTITY_FALLBACK
-
-
-def sanitise_command(value: str) -> str:
-    """Return *value* usable as commit-body text.
-
-    Args:
-        value: An agent-supplied command string — untrusted text.
-
-    Returns:
-        The command with control characters collapsed to spaces and the whole
-        clipped to :data:`MAX_COMMIT_BODY_CHARS`, or ``""`` when nothing
-        survives. A body is optional, so an empty result is simply no body.
-    """
-    cleaned = " ".join(_CONTROL_RE.sub(" ", value).split())
-    if len(cleaned) > MAX_COMMIT_BODY_CHARS:
-        cleaned = cleaned[:MAX_COMMIT_BODY_CHARS] + " …"
-    return cleaned
-
-
-def sanitise_email_local(value: str) -> str:
-    """Return *value* usable as the local part of a git identity **email**.
-
-    Args:
-        value: An agent's id — untrusted text.
-
-    Returns:
-        The cleaned local part, or :data:`IDENTITY_FALLBACK` when nothing
-        survives.
-    """
-    cleaned = _EMAIL_LOCAL_RE.sub("-", value).strip("-")
-    return cleaned or IDENTITY_FALLBACK
-
-
-class Identity:
-    """Who a commit is attributed to, as two already-sanitised fields.
-
-    Built from an agent's registered display name and its id: the name is what a
-    human reads in the log, the id is what makes two agents sharing a name
-    distinguishable. An unregistered agent falls back to its id as the name —
-    degraded, never broken.
-    """
-
-    __slots__ = ("email", "name")
-
-    def __init__(self, name: str, email_local: str) -> None:
-        self.name = sanitise_name(name)
-        self.email = f"{sanitise_email_local(email_local)}@{IDENTITY_DOMAIN}"
-
-    @classmethod
-    def out_of_band(cls) -> Identity:
-        """The identity for changes no agent in this team made."""
-        return cls(OUT_OF_BAND_AUTHOR, OUT_OF_BAND_AUTHOR)
 
 
 class GitJournal:

@@ -6,9 +6,30 @@ set is unknowable before it runs and only partly guessable after. So exec is
 **fenced** rather than gated — an exclusive lease over the tree for the duration
 of the run — and git is what tells us afterwards what it did (ADR-036 §5).
 
-This module holds everything exec needs that is not the gate itself: the models
-crossing the actor boundary, the budgets, and the one formatter ``workspace_exec``
-renders through.
+This package is the exec capability (ADR-053 Decision 1): ``card.py`` holds the
+two factories, ``actor.py`` the mixin that drives the run, ``params.py`` the one
+parameter a card configures it with, and **this module** — the package root —
+everything exec needs that is not the gate itself: the models crossing the actor
+boundary, the budgets, and the one formatter ``workspace_exec`` renders through.
+
+**The root holds the models rather than the factories**, unlike ``read/`` and
+``write/``, and the deviation is stated rather than silent. Those two had one
+sibling to place; exec has three, and ``akgentic.tool.workspace.execution`` is a
+dotted path imported by name from ``card/params.py``, ``execution/params.py`` and
+two sandbox test modules. Keeping the biggest, most-imported unit at the root
+leaves every one of those imports working unchanged, with no re-export list to
+maintain under ``no_implicit_reexport`` — the case ADR-053 Decision 1 covers with
+*"a story that would split a cohesive module to satisfy the map should keep the
+module and say why."*
+
+**What is no longer here, and why.** The lease grace, the run-id mint and the two
+busy refusals moved into :mod:`akgentic.tool.workspace.lock`, which stays in the
+spine. The write gate reads the hold on **every** mutation whether or not exec is
+enabled, so a lock module under this package would put exec in the write
+capability's closure for ever — and a spine module may not import a capability,
+which is why the vocabulary had to travel to the lock rather than the lock to the
+vocabulary. ``lock_unavailable`` below still opens with the shared busy prefix,
+imported from there so that one spelling keeps the family recognisable.
 
 **The blocking call happens on ``#Workspace``'s own single worker thread**, and
 :class:`ExecRunner` is what owns it. ``#Workspace`` submits one command at a time
@@ -34,7 +55,6 @@ from __future__ import annotations
 import logging
 import subprocess
 from enum import StrEnum
-from uuid import uuid4
 
 from pydantic import model_validator
 
@@ -48,6 +68,7 @@ from akgentic.tool.sandbox.backend import (
     SandboxMode,
     validate_command,
 )
+from akgentic.tool.workspace.lock import _BUSY_PREFIX
 
 logger = logging.getLogger(__name__)
 
@@ -163,29 +184,6 @@ run id *helpful* — a model that mistyped one reads the right one back — so t
 cap only has to cover a conversation's worth of runs, not a team's.
 """
 
-LEASE_GRACE_S = 5.0
-"""How long past its budget a run keeps the mutation gate with nothing reported.
-
-One use, and it covers one case: a child that ignores the kill. Every ordinary
-exit reports — a command that ran, a command the budget killed, a backend that
-raised, an allowlist refusal — because the sandbox's handler reports in a
-``finally``. What no report can cover is a subprocess still alive after its
-budget, since the thread waiting on it is not free to say so.
-
-So the gate is released **without** a report once the run is this far past its
-budget, checked lazily by the next mutation: no timer, no extra thread. By then
-the backend has killed the child, so the release is not a race against a live
-writer — and the late report that may still arrive commits nothing and clears
-nothing, because by then the tree may hold somebody else's work.
-
-Measured from the moment the run actually started, which is the moment the work
-was submitted: a submit onto an idle single-worker executor is O(1), so nothing
-slow sits between admission and the command. A cold container backend spends its
-provisioning inside the worker's own lazy ``start()``, which is inside the run
-this clock is measuring — deliberately, because that provisioning is time the
-command really does take.
-"""
-
 EXEC_SHUTDOWN_GRACE_S = 3.0
 """How long teardown waits for the killed run's worker to return.
 
@@ -216,34 +214,12 @@ becomes three seconds of teardown latency. The group kill closed the root cause
 for what a shell forks; the bound stays for what the group cannot reach.
 """
 
-RUN_ID_CHARS = 8
-"""Length of a run id, in hex characters.
-
-The id is a token an LLM has to copy back on a later turn, which is the same
-hazard the design refuses to accept for a content digest — admitted here only
-because the outcome has to be addressable at all. Short is the first of the three
-mitigations; the other two are echoing it in the handoff message and making an
-unknown id list the agent's recent ones instead of raising.
-"""
-
 TIMED_OUT_EXIT_CODE = 124
 """Exit code reported for a command its budget killed, following ``timeout(1)``."""
 
 _UNCONFIGURED_MSG = (
     "This workspace has no execution backend configured — workspace_exec is not available here."
 )
-
-_BUSY_PREFIX = "workspace busy"
-"""Opening words of every refusal a held tree causes.
-
-Fixed wording because it is what an agent recognises across all seven refused
-operations — the six mutations and a second ``workspace_exec``. It lives here,
-beside the message functions, because the two refusal families are rendered for
-two different readers: the mutation one (:func:`mutation_busy`) names the holder,
-because the id it prints is uncollectable by anyone but its owner, and the exec
-one (:func:`exec_busy`) names nobody, because a refused exec caller would collect
-it. One spelling of the prefix is what keeps them recognisably one family.
-"""
 
 
 class ExecOutcome(SerializableBaseModel):
@@ -411,11 +387,6 @@ class ExecConfig(SerializableBaseModel):
     mode: SandboxMode
     workspace_path: str
     timeout_s: float = DEFAULT_EXEC_TIMEOUT_S
-
-
-def new_run_id() -> str:
-    """Return a fresh run id — short, and never reused."""
-    return uuid4().hex[:RUN_ID_CHARS]
 
 
 def poll_attempts_within(attempts: int, delay: float, run_budget: float) -> int:
@@ -769,64 +740,6 @@ def in_progress(run_id: str) -> str:
     )
 
 
-def exec_busy() -> str:
-    """Refusal for a second ``workspace_exec`` while a run holds the tree — naming nobody.
-
-    The one exec refusal there is, and the only message on this path that hands
-    back no run id at all. It names **no run and no agent** on purpose: a refusal
-    that quoted the holder's id is exactly the defect ADR-047 removed — a model's
-    parallel batch would read a sibling call's id out of it and collect that as
-    its own answer — and a refused exec caller is the one caller with no id of
-    its own to be given instead, so it must be given nobody's.
-
-    It is also what the layer can do rather than a restraint it exercises: this
-    is rendered under a :class:`~akgentic.tool.workspace.lock.LockBackend`, which
-    has only what is in the marker and no access to the actor's display-name map.
-    A refusal that named the holder would have to be built actor-side.
-
-    The **mutation** refusal is a different message and keeps naming the holder,
-    for the reason its own docstring gives: ``exec_status`` gates on ownership,
-    so a foreign run id is uncollectable.
-    """
-    return (
-        f"{_BUSY_PREFIX} — another command is running in it, so yours was not started and "
-        "nothing is lost. Reads still work; retry the command once the run has finished."
-    )
-
-
-def mutation_busy(run_id: str, agent_name: str) -> str:
-    """The one refusal a **mutation** gets while an exec run holds the tree.
-
-    The sibling of :func:`exec_busy`, and deliberately not the same message.
-    This one names the holder's run id and agent; that one names nobody. The
-    asymmetry is ADR-047's and it is about *collectability*: ``exec_status``
-    gates on ownership, so a foreign run id printed here is uncollectable by the
-    agent reading it and merely informs, where the same id in an *exec* refusal
-    was collected by a model as its own answer.
-
-    **The name, not the id.** The reader is a model choosing what to do next,
-    and *"agent '3f2a…'"* is something it can read and nothing it can act on —
-    the question ``WorkspaceActor.attach``'s docstring settled for the journal
-    and the refusals alike. The name travels in the marker
-    (:class:`~akgentic.tool.workspace.lock.LockMarker`) precisely so that this
-    text is the same in the process that took the hold and in one that only
-    found it on disk.
-
-    Args:
-        run_id: The run holding the tree.
-        agent_name: The holder's display name, or its id when the marker
-            carries no name — degraded, never broken.
-
-    Returns:
-        The refusal, whose text is the product and must not drift.
-    """
-    return (
-        f"{_BUSY_PREFIX} — exec run {run_id} is in progress "
-        f"(agent '{agent_name}'). Reads still work; retry the change "
-        f"once the run has finished."
-    )
-
-
 def timed_out(run_id: str, budget_s: float) -> str:
     """The answer when a wait-out-the-run poll ran out — the run overran its budget.
 
@@ -851,7 +764,8 @@ def timed_out(run_id: str, budget_s: float) -> str:
 def lock_unavailable() -> str:
     """Refusal for a run whose hold could not be taken at all — a filesystem failure.
 
-    Distinct from :func:`exec_busy`, and the distinction is the one the agent
+    Distinct from :func:`~akgentic.tool.workspace.lock.exec_busy`, and the
+    distinction is the one the agent
     needs: busy means somebody is running a command and retrying will work,
     while this means the workspace could not be locked — an unwritable metadata
     parent, a full disk — and retrying will not, until an operator looks. It

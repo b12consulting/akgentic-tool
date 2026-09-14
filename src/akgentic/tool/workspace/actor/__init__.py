@@ -72,7 +72,7 @@ to its word rather than leaving it a claim.
 extraction cache in :mod:`~akgentic.tool.workspace.actor.documents`, the
 observation and last-writer maps in :mod:`~akgentic.tool.workspace.actor.observation`,
 the gate and the six mutations in :mod:`~akgentic.tool.workspace.actor.gate`, and
-the lease and the deferred surface in :mod:`~akgentic.tool.workspace.actor.execution`.
+the lease and the deferred surface in :mod:`~akgentic.tool.workspace.execution.actor`.
 Each body is the same code with the same ``self``; what stays here is the class
 itself, ``on_start``, ``worker_class``, the startup staging sweep ``on_start``
 calls, and the agent-name map that gives a commit and a busy refusal a name to
@@ -93,7 +93,6 @@ from akgentic.core.agent import Akgent
 from akgentic.core.agent_state import BaseState
 from akgentic.tool.core.deferred import DeferredResultActor, DeferredWorker
 from akgentic.tool.workspace.actor.documents import DocumentsMixin
-from akgentic.tool.workspace.actor.execution import EXEC_CAPABILITY, ExecMixin
 from akgentic.tool.workspace.documents.store import DocumentStore
 from akgentic.tool.workspace.execution import (
     ExecConfig,
@@ -101,9 +100,14 @@ from akgentic.tool.workspace.execution import (
     ExecRunner,
     RunningExec,
 )
-from akgentic.tool.workspace.journal import GitJournal, Identity
+from akgentic.tool.workspace.execution.actor import EXEC_CAPABILITY, ExecMixin
+from akgentic.tool.workspace.journal import GitJournal
 from akgentic.tool.workspace.lock import LockBackend
-from akgentic.tool.workspace.models import STAGING_SWEEP_GRACE_S, WorkspaceConfig
+from akgentic.tool.workspace.models import (
+    STAGING_SWEEP_GRACE_S,
+    Identity,
+    WorkspaceConfig,
+)
 from akgentic.tool.workspace.workspace import (
     Filesystem,
     get_workspace,
@@ -231,7 +235,7 @@ class WorkspaceActor(
     either** — ``cache_capacity`` is a class attribute with a default, so a mixin
     defining one would resize the LRU with no error and no log line.
 
-    :meth:`~akgentic.tool.workspace.actor.execution.ExecMixin.exec_status`
+    :meth:`~akgentic.tool.workspace.execution.actor.ExecMixin.exec_status`
     **does** read ``_in_flight``, and that is deliberate: a run is running iff it
     is in flight, and the earlier prohibition forced the question onto a map with
     a different capacity, which answered ``RUNNING`` for settled runs. Reading an
@@ -351,7 +355,7 @@ class WorkspaceActor(
         """Take exec down in its stated order, then chain to the base.
 
         The four exec steps and the reasoning behind their order live in
-        :meth:`~akgentic.tool.workspace.actor.execution.ExecMixin._teardown_exec`,
+        :meth:`~akgentic.tool.workspace.execution.actor.ExecMixin._teardown_exec`,
         beside the exec code they tear down: cancel the queued runs, kill the
         running subprocess, drain the worker under a bound, release the backend.
 

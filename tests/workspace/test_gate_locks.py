@@ -37,19 +37,19 @@ from pathlib import Path
 
 import pytest
 
-from akgentic.tool.workspace.execution import (
-    DEFAULT_EXEC_TIMEOUT_S,
-    LEASE_GRACE_S,
-    effective_budget,
-    mutation_busy,
-)
+from akgentic.tool.workspace.execution import DEFAULT_EXEC_TIMEOUT_S, effective_budget
 from akgentic.tool.workspace.journal import (
     JOURNAL_LOCK_FILENAME,
     LOCKS_DIR_NAME,
     GitJournal,
-    Identity,
 )
-from akgentic.tool.workspace.lock import FileLockBackend, LockTicket
+from akgentic.tool.workspace.lock import (
+    LEASE_GRACE_S,
+    FileLockBackend,
+    LockTicket,
+    mutation_busy,
+)
+from akgentic.tool.workspace.models import Identity
 from akgentic.tool.workspace.tool import WorkspaceTool
 from akgentic.tool.workspace.workspace import meta_dir_for
 from akgentic.tool.workspace.write.gate import lock_file_for
@@ -388,7 +388,8 @@ class TestTheWritersRefreshHappensInsideTheHeldLock:
 
 _JOURNAL_CHILD = """
 import contextlib
-from akgentic.tool.workspace.journal import GitJournal, Identity
+from akgentic.tool.workspace.journal import GitJournal
+from akgentic.tool.workspace.models import Identity
 
 root, meta, tag, mode, rounds = (
     Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4], int(sys.argv[5])

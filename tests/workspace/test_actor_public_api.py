@@ -7,9 +7,10 @@ asserts is what the move preserved rather than what the move produced.
 refactor that *preserves* the dotted path: ``akgentic.tool.workspace.actor``
 resolves to the package exactly as it resolved to the module. Nothing therefore
 breaks loudly — which is why this file exists. The name that would vanish in
-silence is ``EXEC_CAPABILITY``: it is public on the module, it moves out to
-``actor/execution.py``, and ``workspace/__init__.py``'s ``__all__`` does not
-carry it, so no other guard would notice its loss.
+silence is ``EXEC_CAPABILITY``: it is public on the module, it moved out to the
+exec mixin — ``actor/execution.py`` then, ``execution/actor.py`` since story 55-7
+made exec a capability package — and ``workspace/__init__.py``'s ``__all__`` does
+not carry it, so no other guard would notice its loss.
 
 The other two failure modes are silent by construction:
 
@@ -35,7 +36,7 @@ import akgentic.tool.workspace as ws
 from akgentic.tool.core.deferred import DeferredResultActor
 from akgentic.tool.workspace.actor import WORKSPACE_ACTOR_ROLE, WorkspaceActor
 from akgentic.tool.workspace.actor.documents import DocumentsMixin
-from akgentic.tool.workspace.actor.execution import ExecMixin
+from akgentic.tool.workspace.execution.actor import ExecMixin
 from akgentic.tool.workspace.models import WorkspaceConfig
 
 _ACTOR_MODULE = "akgentic.tool.workspace.actor"

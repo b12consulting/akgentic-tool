@@ -182,31 +182,35 @@ class ChildReport:
     err: str
 
 
-def run_child(script: Path, workspaces_root: Path, *args: str) -> ChildReport:
+def run_child(
+    script: Path, workspaces_root: Path, *args: str, meta_root: Path | None = None
+) -> ChildReport:
     """Run *script* in a fresh interpreter, with this suite's workspaces root."""
     done = subprocess.run(
         [sys.executable, str(script), *args],
         capture_output=True,
         text=True,
         timeout=CHILD_TIMEOUT_S,
-        env=_child_env(workspaces_root),
+        env=_child_env(workspaces_root, meta_root),
         check=False,
     )
     return ChildReport(done.returncode, done.stdout.strip(), done.stderr.strip())
 
 
-def start_child(script: Path, workspaces_root: Path, *args: str) -> subprocess.Popen[str]:
+def start_child(
+    script: Path, workspaces_root: Path, *args: str, meta_root: Path | None = None
+) -> subprocess.Popen[str]:
     """Start *script* in a fresh interpreter without waiting for it."""
     return subprocess.Popen(
         [sys.executable, str(script), *args],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        env=_child_env(workspaces_root),
+        env=_child_env(workspaces_root, meta_root),
     )
 
 
-def _child_env(workspaces_root: Path) -> dict[str, str]:
+def _child_env(workspaces_root: Path, meta_root: Path | None = None) -> dict[str, str]:
     """This process's environment, pointed at the test's workspaces root.
 
     ``AKGENTIC_WORKSPACE_META_ROOT`` is removed for
@@ -214,10 +218,26 @@ def _child_env(workspaces_root: Path) -> dict[str, str]:
     property is that it is a *sibling* of the tree, and an ambient value relocates
     its parent, so a child that inherited one would resolve a different ``<meta>``
     from its parent and every lock in the suite would exclude nobody.
+
+    **The pop stays, and *meta_root* is an opt-in rather than its removal.** Every
+    other cross-process spec in this package depends on parent and child
+    resolving one ``<meta>``, so a harness that merely stopped popping would make
+    all of them silently conditional on the developer's own environment. A spec
+    that wants the two to disagree — story 55-7's, which is the only one there is
+    — says so here, explicitly, and gets a value that overrides the pop rather
+    than one that leaks in.
+
+    Args:
+        workspaces_root: The base every tree in this test hangs off.
+        meta_root: The metadata root to give the child, or ``None`` to leave the
+            variable unset so the child derives ``<meta>`` from *workspaces_root*
+            exactly as its parent does.
     """
     env = dict(os.environ)
     env["AKGENTIC_WORKSPACES_ROOT"] = str(workspaces_root)
     env.pop("AKGENTIC_WORKSPACE_META_ROOT", None)
+    if meta_root is not None:
+        env["AKGENTIC_WORKSPACE_META_ROOT"] = str(meta_root)
     return env
 
 

@@ -29,7 +29,7 @@ import pytest
 from akgentic.core.agent_state import BaseState
 
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
-from akgentic.tool.workspace.execution import mutation_busy
+from akgentic.tool.workspace.lock import mutation_busy
 from akgentic.tool.workspace.models import WorkspaceConfig
 from tests.conftest import MockActorAddress
 from tests.workspace.conftest import (

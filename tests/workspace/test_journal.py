@@ -35,18 +35,15 @@ from akgentic.tool.workspace.actor import (
     workspace_actor_name,
 )
 from akgentic.tool.workspace.edit import EditItem
-from akgentic.tool.workspace.journal import (
-    IDENTITY_DOMAIN,
-    IDENTITY_FALLBACK,
-    GitJournal,
-    Identity,
-    git_dir_for,
-    sanitise_email_local,
-)
+from akgentic.tool.workspace.journal import GitJournal, git_dir_for
 from akgentic.tool.workspace.models import (
     GITIGNORE_NAME,
+    IDENTITY_DOMAIN,
+    IDENTITY_FALLBACK,
     OUT_OF_BAND_AUTHOR,
+    Identity,
     WorkspaceConfig,
+    sanitise_email_local,
 )
 from akgentic.tool.workspace.readers import DocumentReader
 from akgentic.tool.workspace.tool import WorkspaceRead, WorkspaceTool, WorkspaceView
