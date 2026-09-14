@@ -35,8 +35,8 @@ not exec is enabled (:mod:`akgentic.tool.workspace.write.gate`), and
 admin-facing fail-fast.
 
 **Imports run one way only** — this module imports ``workspace.py`` for
-:func:`meta_dir_for`, and nothing else in the package. The
-direction with ``execution`` is now the other way round: ``execution.py`` imports
+:func:`meta_dir_for`, and nothing else in the package. The direction with
+``execution`` is now the other way round: ``execution.py`` imports
 :data:`_BUSY_PREFIX` from here for its own ``lock_unavailable``. Neither
 ``workspace.py`` nor ``execution.py`` may import back into this module's callers,
 or a pair becomes a cycle.
