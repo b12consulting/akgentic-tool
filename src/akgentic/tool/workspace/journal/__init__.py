@@ -238,13 +238,13 @@ class GitJournal:
             timeout_s: Wall-clock budget for a single ``git`` invocation.
             meta_dir: The tree's metadata directory —
                 :func:`~akgentic.tool.workspace.workspace.meta_dir_for`'s answer
-                for this tree. **Passed in rather than derived**: that function
-                takes the three-segment workspace *path*, which this object has
-                never been given and cannot recover from an absolute root once
-                ``AKGENTIC_WORKSPACE_META_ROOT`` has moved the parent. It is a
-                required argument rather than a defaulted one because what lives
-                under it is the commit lock, and a default that quietly put the
-                lock somewhere else would serialise nothing at all — which is
+                for this tree. **Passed in rather than derived**: the commit lock
+                must land in the same ``<meta>`` the rest of this tree's metadata
+                uses, and that function takes the three-segment workspace *path*,
+                which this object has never been given — the caller is the one
+                object that has already resolved it. It is a required argument
+                rather than a defaulted one because a default that quietly put
+                the lock somewhere else would serialise nothing at all, which is
                 the exact failure shape this lock exists to remove.
         """
         self._root = root

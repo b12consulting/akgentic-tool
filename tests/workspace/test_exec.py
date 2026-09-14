@@ -71,12 +71,11 @@ from akgentic.tool.workspace.lock import (
     LockGrant,
     LockTicket,
     exec_busy,
-    meta_root_mismatch,
     new_run_id,
 )
 from akgentic.tool.workspace.models import MAX_COMMIT_BODY_CHARS
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
-from akgentic.tool.workspace.workspace import meta_dir_for, meta_root
+from akgentic.tool.workspace.workspace import meta_dir_for
 from tests.workspace.conftest import (
     HANDSHAKE_TIMEOUT_S,
     WORKSPACE_NAME,
@@ -3628,10 +3627,10 @@ class TestStoredExecParamsStillResolve:
 
 
 ##
-## AC 6 — two processes, ONE marker file, two metadata roots
+## Guard 1, the exec half — two processes, one tree, nothing configurable between them
 ##
 
-_MISMATCH_CHILD = """
+_EXEC_CHILD = """
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.tool import WorkspaceExec
 from tests.workspace.conftest import tool_named
@@ -3652,77 +3651,31 @@ the tool would still redden this.
 """
 
 
-def alias_meta_root(tmp_path: Path, workspaces_root: Path) -> Path:
-    """A second metadata root reaching the **same** ``<meta>`` as *workspaces_root*.
+class TestTheExecHoldIsCrossProcess:
+    """One tree, two interpreters, one hold — with nothing configurable between them."""
 
-    ``<alias>/<scope>/<kind>`` is a symlink to the real ``<scope>/<kind>``, so
-    ``meta_dir_for`` — which resolves the joined path before taking its parent —
-    answers one directory under both roots, while
-    :func:`~akgentic.tool.workspace.workspace.meta_root` answers two different
-    values. That is the production shape (one volume, two mount points) reduced
-    to something a test can build on any filesystem.
-
-    **It is the only shape where the stamp has anything to compare against.** Two
-    genuinely disjoint roots produce two marker files: both processes acquire,
-    neither ever sees the other's marker, and nothing is refused — the bug
-    faithfully reproduced and invisible to any marker-based check
-    (:attr:`~akgentic.tool.workspace.lock.LockMarker.meta_root`). A spec built
-    that way goes green for the wrong reason.
-    """
-    scope, kind, _leaf = WORKSPACE_PATH.split("/")
-    alias = tmp_path / "meta-alias"
-    (alias / scope).mkdir(parents=True)
-    (alias / scope / kind).symlink_to(workspaces_root / scope / kind, target_is_directory=True)
-    return alias
-
-
-class TestAMarkerFromAnotherMetadataRootRefusesTheRun:
-    """B1, across two interpreters — one process cannot disagree with itself."""
-
-    def test_the_child_is_refused_and_the_refusal_names_both_roots(
+    def test_a_second_process_asking_to_run_gets_the_busy_refusal(
         self, workspaces_root: Path, workspace_tree: Path, tmp_path: Path
     ) -> None:
-        """The parent holds the tree; the child resolves a different root and is refused.
+        """The parent holds the tree; a **different interpreter** is refused by it.
 
-        Both halves are red before the change: with no root in the marker, and
-        with a root nothing compares, the child reads the ordinary
-        :func:`~akgentic.tool.workspace.lock.exec_busy` sentence — which says the
-        workspace is busy, invites a retry, and is exactly the wrong thing to
-        tell an operator whose two workers are excluding nobody.
+        This is the property the metadata directory's placement buys and the
+        reason it is derived from the workspaces root alone: the child is told
+        where trees live and nothing else, resolves the same ``<meta>`` because
+        there is no second thing to resolve it from, finds the parent's marker
+        there, and reads back the sentence an agent reads.
+
+        An in-process pair would prove none of it — two backends in one
+        interpreter share a heap, and the whole point of the marker is that they
+        need not.
         """
-        alias = alias_meta_root(tmp_path, workspaces_root)
         holder = FileLockBackend().acquire(
             WORKSPACE_PATH, LockTicket(agent_id=AGENT, cmd="echo parent", budget_s=60.0)
         )
         assert holder.run_id, holder.refusal
-        # One marker file, reached under both roots — the property the whole
-        # harness exists to produce, asserted rather than assumed.
         assert (meta_dir_for(WORKSPACE_PATH) / EXEC_LOCK_FILENAME).is_file()
 
-        script = write_script(tmp_path, "mismatched_root.py", _MISMATCH_CHILD)
-        report = run_child(script, workspaces_root, meta_root=alias)
-
-        assert report.code == 0, report
-        expected = meta_root_mismatch(str(meta_root()), str(alias.resolve()))
-        assert report.out == f"REFUSED {expected}"
-        assert str(meta_root()) in report.out
-        assert str(alias.resolve()) in report.out
-
-    def test_a_child_sharing_the_root_gets_the_ordinary_busy_refusal(
-        self, workspaces_root: Path, workspace_tree: Path, tmp_path: Path
-    ) -> None:
-        """The non-vacuity of the spec above, and it is not optional.
-
-        Without it, a backend that answered the mismatch sentence to *every*
-        refused acquirer would be green up there — so the assertion would be
-        about a second process existing rather than about the two disagreeing.
-        """
-        holder = FileLockBackend().acquire(
-            WORKSPACE_PATH, LockTicket(agent_id=AGENT, cmd="echo parent", budget_s=60.0)
-        )
-        assert holder.run_id, holder.refusal
-
-        script = write_script(tmp_path, "shared_root.py", _MISMATCH_CHILD)
+        script = write_script(tmp_path, "second_process.py", _EXEC_CHILD)
         report = run_child(script, workspaces_root)
 
         assert report.code == 0, report

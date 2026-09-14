@@ -40,14 +40,13 @@ TREE_KEY = "scope-a/notes"
 
 @pytest.fixture
 def roots(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    """Point both roots at *tmp_path* for the duration of one spec.
+    """Point the workspaces root at *tmp_path* for the duration of one spec.
 
-    Both, not one: ``meta_dir_for`` falls back to the workspaces root when no
-    metadata root is set, and a spec that pinned only one of them would resolve
-    the other against the process's working directory — the developer's checkout.
+    One variable is the whole of it: ``meta_dir_for`` derives ``<meta>`` from
+    this root and from nothing else, so pinning it puts the records under
+    ``<trees>/…/<leaf>.index/rag/`` rather than in the developer's checkout.
     """
     monkeypatch.setenv("AKGENTIC_WORKSPACES_ROOT", str(tmp_path / "trees"))
-    monkeypatch.setenv("AKGENTIC_WORKSPACE_META_ROOT", str(tmp_path / "meta"))
     return tmp_path
 
 

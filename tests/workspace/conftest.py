@@ -188,62 +188,44 @@ class ChildReport:
     err: str
 
 
-def run_child(
-    script: Path, workspaces_root: Path, *args: str, meta_root: Path | None = None
-) -> ChildReport:
+def run_child(script: Path, workspaces_root: Path, *args: str) -> ChildReport:
     """Run *script* in a fresh interpreter, with this suite's workspaces root."""
     done = subprocess.run(
         [sys.executable, str(script), *args],
         capture_output=True,
         text=True,
         timeout=CHILD_TIMEOUT_S,
-        env=_child_env(workspaces_root, meta_root),
+        env=_child_env(workspaces_root),
         check=False,
     )
     return ChildReport(done.returncode, done.stdout.strip(), done.stderr.strip())
 
 
-def start_child(
-    script: Path, workspaces_root: Path, *args: str, meta_root: Path | None = None
-) -> subprocess.Popen[str]:
+def start_child(script: Path, workspaces_root: Path, *args: str) -> subprocess.Popen[str]:
     """Start *script* in a fresh interpreter without waiting for it."""
     return subprocess.Popen(
         [sys.executable, str(script), *args],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        env=_child_env(workspaces_root, meta_root),
+        env=_child_env(workspaces_root),
     )
 
 
-def _child_env(workspaces_root: Path, meta_root: Path | None = None) -> dict[str, str]:
+def _child_env(workspaces_root: Path) -> dict[str, str]:
     """This process's environment, pointed at the test's workspaces root.
 
-    ``AKGENTIC_WORKSPACE_META_ROOT`` is removed for
-    :func:`_no_real_workspaces_root`'s reason: the metadata directory's defining
-    property is that it is a *sibling* of the tree, and an ambient value relocates
-    its parent, so a child that inherited one would resolve a different ``<meta>``
-    from its parent and every lock in the suite would exclude nobody.
-
-    **The pop stays, and *meta_root* is an opt-in rather than its removal.** Every
-    other cross-process spec in this package depends on parent and child
-    resolving one ``<meta>``, so a harness that merely stopped popping would make
-    all of them silently conditional on the developer's own environment. A spec
-    that wants the two to disagree — story 55-7's, which is the only one there is
-    — says so here, explicitly, and gets a value that overrides the pop rather
-    than one that leaks in.
+    The workspaces root is the **only** thing a child is told about where the
+    tree's metadata lives, because it is the only thing there is: ``<meta>`` is
+    derived from it and from nothing else. That is what makes the cross-process
+    specs prove a property rather than a harness convention — parent and child
+    reach one ``<meta>`` with nothing configurable between them.
 
     Args:
         workspaces_root: The base every tree in this test hangs off.
-        meta_root: The metadata root to give the child, or ``None`` to leave the
-            variable unset so the child derives ``<meta>`` from *workspaces_root*
-            exactly as its parent does.
     """
     env = dict(os.environ)
     env["AKGENTIC_WORKSPACES_ROOT"] = str(workspaces_root)
-    env.pop("AKGENTIC_WORKSPACE_META_ROOT", None)
-    if meta_root is not None:
-        env["AKGENTIC_WORKSPACE_META_ROOT"] = str(meta_root)
     return env
 
 
@@ -687,18 +669,8 @@ def _no_real_workspaces_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     and, since 29-4, runs ``git init`` there. That looks like nothing at all
     until it does. Tests that want a named base still request
     :func:`workspaces_root`, whose ``setenv`` runs after this one and wins.
-
-    ``AKGENTIC_WORKSPACE_META_ROOT`` is **unset** rather than pointed somewhere,
-    because the metadata directory's defining property is that it is a *sibling
-    of the tree*: a value here relocates its parent and there is no temporary
-    directory that keeps the sibling relation to whichever base a given test
-    chose. Left ambient it would break every placement assertion on a machine
-    that exports it, and — once a story creates the directory rather than only
-    naming it — write into the exported location. A test that wants the variable
-    sets it with ``monkeypatch``, which runs after this one and wins.
     """
     monkeypatch.setenv("AKGENTIC_WORKSPACES_ROOT", str(tmp_path / "unclaimed-workspaces"))
-    monkeypatch.delenv("AKGENTIC_WORKSPACE_META_ROOT", raising=False)
 
 
 @pytest.fixture

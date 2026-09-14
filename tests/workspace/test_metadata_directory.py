@@ -12,10 +12,10 @@ Two habits run through every spec here:
 - the resolver **creates nothing**, so a guard about reaching the directory has
   to create it first. A path that cannot be reached because nothing is there
   would prove nothing at all;
-- neither the workspaces root nor the metadata root is ever spelled twice. What
-  a test compares against is what :func:`get_workspace` itself resolved, because
-  two derivations that drift give two metadata directories over one tree — and a
-  test carrying the second one would agree with the defect.
+- the workspaces root is never spelled twice. What a test compares against is
+  what :func:`get_workspace` itself resolved, because two derivations that drift
+  give two metadata directories over one tree — and a test carrying the second
+  one would agree with the defect.
 """
 
 from __future__ import annotations
@@ -46,11 +46,8 @@ from tests.workspace.conftest import (
 )
 from tests.workspace.test_workspace_path_resolution import SIX_CELLS, Cell, bind_cell
 
-META_ROOT_VAR = "AKGENTIC_WORKSPACE_META_ROOT"
-"""The variable that relocates the metadata *parent*, and only that."""
-
 WORKSPACES_ROOT_VAR = "AKGENTIC_WORKSPACES_ROOT"
-"""The variable it falls back to — the one the trees themselves hang off."""
+"""The one variable the placement reads — the one the trees themselves hang off."""
 
 LOCK_NAME = "exec.lock"
 """A stand-in for what 52-2 will put in the directory. Any name would do."""
@@ -86,8 +83,7 @@ def _escape_forms(meta: Path, root: Path) -> list[str]:
 
     The traversal form is spelled literally because that is what an agent types;
     the ``relpath`` form is the same thing computed, which keeps the list correct
-    when ``AKGENTIC_WORKSPACE_META_ROOT`` has moved the directory somewhere a
-    single ``..`` no longer reaches. The absolute form is the one an agent
+    for any tree whatever its depth. The absolute form is the one an agent
     reaches for when the relative ones are refused.
     """
     return [
@@ -253,102 +249,38 @@ class TestNoReadCapabilityCanReachIt:
 
 
 ##
-## AC 5 and AC 6 — the parent, relocated and defaulted
+## AC 1 and AC 2 — the parent is the workspaces root, derived once
 ##
 
 
-class TestTheMetaRootRelocatesTheParent:
-    """``AKGENTIC_WORKSPACE_META_ROOT`` moves the parent and carries the scope."""
+class TestTheParentIsTheWorkspacesRoot:
+    """``<meta>`` hangs off ``AKGENTIC_WORKSPACES_ROOT``, and off nothing else."""
 
-    def test_it_moves_the_parent_and_keeps_the_scope(
-        self, workspaces_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """``<meta-root>/<scope>/<kind>/<leaf>.index`` — scope and kind survive the move.
-
-        It is why the resolver takes the three-segment path rather than a
-        resolved root: neither segment can be recovered from an absolute path
-        without also knowing which workspaces root it came from.
-        """
-        elsewhere = tmp_path / "meta-volume"
-        monkeypatch.setenv(META_ROOT_VAR, str(elsewhere))
-
-        meta = meta_dir_for(WORKSPACE_PATH)
-
-        assert meta == workspace_root_for(elsewhere, META_LEAF).resolve()
-
-    def test_the_tree_does_not_move_with_it(
-        self, workspaces_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The variable is about metadata. A tree that followed it would be a data loss."""
-        elsewhere = tmp_path / "meta-volume"
-        monkeypatch.setenv(META_ROOT_VAR, str(elsewhere))
-
-        root = _tree_root()
-
-        assert root == workspace_root_for(workspaces_root, WORKSPACE_NAME).resolve()
-        assert not root.is_relative_to(elsewhere.resolve())
-
-    def test_unreachability_survives_the_relocation(
-        self, workspaces_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Further away is not weaker: every path naming it is still refused."""
-        monkeypatch.setenv(META_ROOT_VAR, str(tmp_path / "meta-volume"))
-        workspace = get_workspace(WORKSPACE_PATH)
-        meta = _seeded_meta()
-        root = _tree_root()
-
-        assert not meta.is_relative_to(root)
-        for path in _escape_forms(meta, root):
-            with pytest.raises(PathEscapeError):
-                workspace.read(path)
-
-    def test_unset_it_falls_back_to_the_workspaces_root(
-        self, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """With only ``AKGENTIC_WORKSPACES_ROOT`` set, ``<meta>`` lands beside the tree."""
-        monkeypatch.delenv(META_ROOT_VAR, raising=False)
-
+    def test_the_parent_is_the_workspaces_root(self, workspaces_root: Path) -> None:
+        """With ``AKGENTIC_WORKSPACES_ROOT`` set, ``<meta>`` lands beside the tree."""
         meta = meta_dir_for(WORKSPACE_PATH)
 
         assert meta == workspace_root_for(workspaces_root, META_LEAF).resolve()
         assert meta.parent == _tree_root().parent
 
-    def test_an_empty_value_falls_back_instead_of_being_honoured(
-        self, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """``AKGENTIC_WORKSPACE_META_ROOT=`` is set, and must still fall back.
-
-        An empty value is how an unset variable arrives from a compose file
-        interpolating ``${...}``, or from a bare ``FOO=`` in an env file. Honoured
-        literally it would resolve the parent against the process working
-        directory while the tree stayed under the workspaces root — the metadata
-        directory detached from the tree whose exec lock, cache and index it
-        holds, and nothing raising. It is the one variable value for which
-        "sibling of the tree" and "what the variable says" disagree.
-        """
-        monkeypatch.setenv(META_ROOT_VAR, "")
-
-        meta = meta_dir_for(WORKSPACE_PATH)
-
-        assert meta == workspace_root_for(workspaces_root, META_LEAF).resolve()
-        assert meta.parent == _tree_root().parent
-
-    def test_with_both_unset_the_parent_is_the_one_get_workspace_uses(
+    def test_the_parent_is_the_one_get_workspace_uses(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Compared against ``get_workspace``'s own root, never a second literal.
 
         A ``"./workspaces"`` spelled here would agree with a resolver that had
         drifted from :func:`get_workspace`, which is precisely the failure the
-        shared ``_workspaces_root`` exists to prevent.
+        shared ``_workspaces_root`` exists to prevent. It is also what a **second
+        derivation** goes red against, whatever that second derivation is spelled
+        as: the answer has to be this tree's own parent, not a directory that
+        merely looks plausible.
 
-        ``chdir`` is not decoration: with both variables unset the default is
+        ``chdir`` is not decoration: with the variable unset the default is
         relative to the working directory, and ``get_workspace`` **creates** the
         tree it resolves — without this the spec would write into the developer's
         own checkout.
         """
         monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv(META_ROOT_VAR, raising=False)
         monkeypatch.delenv(WORKSPACES_ROOT_VAR, raising=False)
 
         root = _tree_root()
@@ -357,24 +289,6 @@ class TestTheMetaRootRelocatesTheParent:
         assert meta.parent == root.parent
         assert meta.name == f"{root.name}{META_DIR_SUFFIX}"
         assert not meta.is_relative_to(root)
-
-    def test_the_journal_is_not_moved_by_the_variable(
-        self, workspaces_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The journal has its own placement rule, and this variable is not part of it.
-
-        Both directories are siblings of the tree, which is exactly why somebody
-        reading the new variable would expect it to move them together.
-        """
-        elsewhere = tmp_path / "meta-volume"
-        monkeypatch.setenv(META_ROOT_VAR, str(elsewhere))
-        root = _tree_root()
-
-        git_dir = git_dir_for(root)
-
-        assert git_dir.parent == root.parent
-        assert git_dir.name == f"{root.name}{GIT_DIR_SUFFIX}"
-        assert not git_dir.is_relative_to(elsewhere.resolve())
 
 
 ##
@@ -515,24 +429,3 @@ class TestBothSiblingsLandBesideEveryCell:
         assert git_dir == Path(f"{base}/{expected}.git")
         assert meta.parent == git_dir.parent == card.workspace._root.parent
         assert meta.parent == base / scope / kind
-
-    @pytest.mark.parametrize("cell", SIX_CELLS, ids=_cell_ids)
-    def test_the_meta_root_carries_both_scope_and_kind_across_the_move(
-        self,
-        cell: Cell,
-        orchestrator_proxy: FakeOrchestratorProxy,
-        workspaces_root: Path,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """``<meta_root>/<scope>/<kind>/<leaf>.index`` — and the tree stays put."""
-        elsewhere = tmp_path / "meta-volume"
-        with monkeypatch.context() as patch:
-            patch.setenv(META_ROOT_VAR, str(elsewhere))
-            card, expected, _observer = bind_cell(cell, orchestrator_proxy, monkeypatch)
-
-            meta = meta_dir_for(card._workspace_path)
-
-            assert meta == Path(f"{elsewhere.resolve()}/{expected}.index")
-            assert card._meta_dir == meta
-            assert card.workspace._root == Path(f"{workspaces_root.resolve()}/{expected}")

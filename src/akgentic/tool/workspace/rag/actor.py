@@ -1281,14 +1281,11 @@ class DocumentsMixin(_DocumentsBase):
         file would put a tree walk on the hot path for a display. Reading
         ``<meta>/rag/`` is not that — it is one directory scan plus one parse per
         record, bounded by ``max_documents`` (32, or 8 when the vector backend is
-        in-memory). That is real where the metadata root is a network share, and
-        it has no mitigation on offer: ADR-051 Decision 9 once suggested pointing
-        ``AKGENTIC_WORKSPACE_META_ROOT`` at a tmpfs for exactly this, and ADR-053
-        Decision 5 **withdrew** that suggestion — the directory holds every
-        cross-process lock, so a per-machine filesystem silently deletes the
-        exclusion two workers over one tree depend on. **No read-through cache is
-        added here** either: it would be exactly the in-memory state this move
-        removes.
+        in-memory). That is real where ``<meta>`` is on a network share, and it
+        has no mitigation on offer: the directory holds every cross-process lock,
+        so it lives beside the tree it belongs to and moves nowhere. **No
+        read-through cache is added here** either: it would be exactly the
+        in-memory state this move removes.
 
         The rows are sorted by **path**, so the render is stable across runs. A
         directory glob's order is the file system's, and a display that reordered

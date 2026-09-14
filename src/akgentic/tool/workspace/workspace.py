@@ -6,8 +6,9 @@ to prevent directory traversal attacks.
 
 The workspace root is derived from the ``AKGENTIC_WORKSPACES_ROOT`` environment
 variable (default: ``./workspaces``).  :func:`meta_dir_for` derives the metadata
-directory that sits **beside** each tree, from ``AKGENTIC_WORKSPACE_META_ROOT``
-when it is set and from the same workspaces root when it is not.
+directory that sits **beside** each tree from that same root and from nothing
+else, so two processes that reach one tree reach one metadata directory by
+construction rather than by two variables agreeing.
 
 :func:`resolve_workspace_path` also lives here — the **one** place a workspace
 directory is derived (ADR-048 Decision 5). It sits beside :func:`get_workspace`
@@ -511,37 +512,6 @@ def get_workspace(workspace_name: str) -> Filesystem:
     return Filesystem(base_path=_workspaces_root(), workspace_name=workspace_name)
 
 
-def meta_root() -> Path:
-    """The resolved parent every tree's metadata directory hangs off.
-
-    **The one derivation of the metadata root**, and it is public because a
-    second reader now exists: :meth:`~akgentic.tool.workspace.lock.FileLockBackend.acquire`
-    stamps this value into the marker it writes, so that a process finding a
-    marker written under a *different* root can say so instead of excluding
-    nobody. Two spellings of the chain below is precisely the defect
-    :func:`_workspaces_root`'s docstring already names, one scale up: a marker
-    stamped from one derivation and compared against another would refuse every
-    run on a correctly configured deployment.
-
-    ``or`` rather than a ``get`` default, because an empty value is set: a
-    compose file interpolating an unset variable, or a bare ``FOO=`` in an env
-    file, both arrive here as ``""``. Honouring that would resolve the parent
-    against the process cwd while the tree stayed under the workspaces root —
-    the metadata directory detached from the tree it belongs to, with nothing
-    raising. An empty ``AKGENTIC_WORKSPACES_ROOT`` is a different case and keeps
-    its existing meaning (:func:`_workspaces_root`): there the tree and
-    everything derived from it move together.
-
-    Returns:
-        ``AKGENTIC_WORKSPACE_META_ROOT`` when it carries a value and the
-        workspaces root otherwise, resolved absolute — so that two spellings of
-        one directory (a relative path, a symlinked segment) answer one value
-        here rather than two.
-    """
-    parent = os.environ.get("AKGENTIC_WORKSPACE_META_ROOT") or _workspaces_root()
-    return Path(parent).resolve()
-
-
 def meta_dir_for(workspace_path: str) -> Path:
     """Return the metadata directory belonging to the tree at *workspace_path*.
 
@@ -568,25 +538,19 @@ def meta_dir_for(workspace_path: str) -> Path:
 
     Args:
         workspace_path: The three-segment ``<scope>/<kind>/<leaf>`` path
-            :func:`get_workspace` takes — not a resolved root. The resolved root
-            alone cannot survive ``AKGENTIC_WORKSPACE_META_ROOT``, which
-            relocates the metadata *parent*: the scope and kind segments have to
-            be carried across the move, and they are unrecoverable from an
-            absolute path without also knowing which workspaces root it came
-            from.
+            :func:`get_workspace` takes — not a resolved root. The scope and
+            kind segments are this resolver's own vocabulary, and every caller
+            holds the path already.
 
     Returns:
-        The absolute ``<parent>/<scope>/<kind>/<leaf>.index``, where ``<parent>``
-        is :func:`meta_root`'s answer — an **empty**
-        ``AKGENTIC_WORKSPACE_META_ROOT`` falls back rather than being honoured,
-        for the reason that function gives.
+        The absolute ``<workspaces root>/<scope>/<kind>/<leaf>.index``.
     """
     # Derived in the ``git_dir_for`` shape — resolve the tree, then append the
     # suffix to its name — because two derivations that drift give two metadata
-    # directories over one tree. The parent comes from :func:`meta_root` rather
-    # than from a second copy of its chain, so the root a marker is *stamped*
-    # with and the root a marker is *found* under are one value.
-    resolved = (meta_root() / workspace_path).resolve()
+    # directories over one tree. ``_workspaces_root`` is read here and nowhere
+    # else on this path: a second copy of the chain, however spelled, is how the
+    # sibling stops being a sibling.
+    resolved = (Path(_workspaces_root()) / workspace_path).resolve()
     return resolved.parent / f"{resolved.name}{META_DIR_SUFFIX}"
 
 
@@ -713,10 +677,10 @@ def permitted_shared_kinds() -> frozenset[str]:
             permitted half a value would look like a working configuration.
     """
     # A ``""`` default is correct here **only because** unset and empty mean the
-    # same thing — none. It is the distinction story 52-1's review found
-    # conflated for ``AKGENTIC_WORKSPACE_META_ROOT`` (:func:`meta_dir_for`):
-    # a compose file interpolating an unset ``${VAR}`` and a bare ``VAR=`` both
-    # arrive as ``""``, and there the two had to be told apart. Here they need not.
+    # same thing — none. The two are not always one: a compose file interpolating
+    # an unset ``${VAR}`` and a bare ``VAR=`` both arrive as ``""``, and a
+    # variable whose empty value would mean something other than its absence has
+    # to tell them apart. This one need not.
     raw = os.environ.get(SHARED_KINDS_ENV, "")
     permitted: set[str] = set()
     for written in raw.split(","):

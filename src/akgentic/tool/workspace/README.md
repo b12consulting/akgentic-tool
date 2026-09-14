@@ -14,7 +14,7 @@ from akgentic.tool import WorkspaceTool
 | Actor | `#Workspace-<scope>/<kind>/<leaf>` — the **resolved three-segment path**, slashes included, so two principals' `notes` are two actors over two trees. **Created only when the card enables a capability that dispatches** — `workspace_exec`, or one of the three `workspace_rag_*` fields; a read-only or read/write card creates none at all. Where one does exist it is an ordinary **team child**: made by its card through `getChildrenOrCreate`, in exactly one team's roster, stopped by that team's teardown. It owns **dispatch and no shared state** — with `workspace_exec` on, the tree's sandbox backend and the single worker thread that runs commands on it, plus the retrieval indexing pipeline. Two teams over one tree get two actors, and the tree orders them — see *Lifetime* below |
 | Channels used | `TOOL_CALL` (11 callables, 13 with `workspace_exec`), `COMMAND` (`expand_media_refs`) |
 | Optional extras | `[docs]` for binary reads, `[vision]` for image resizing |
-| Environment | `AKGENTIC_WORKSPACES_ROOT` (default `./workspaces`) · `AKGENTIC_WORKSPACE_META_ROOT` (default: the workspaces root; relocates only the `<leaf>.index` siblings) · `AKGENTIC_WORKSPACE_SHARED_KINDS` (default unset, which permits **no** shared tree — see *Sharing a tree across principals*) · `AKGENTIC_LOCK_BACKEND` (default `file`) · `AKGENTIC_DOCUMENT_STORE` (default `yaml`). The last three are read on every bind, and a value they cannot use fails that bind |
+| Environment | `AKGENTIC_WORKSPACES_ROOT` (default `./workspaces`) · `AKGENTIC_WORKSPACE_SHARED_KINDS` (default unset, which permits **no** shared tree — see *Sharing a tree across principals*) · `AKGENTIC_LOCK_BACKEND` (default `file`) · `AKGENTIC_DOCUMENT_STORE` (default `yaml`). The last three are read on every bind, and a value they cannot use fails that bind |
 | External tools | `git` (optional — the journal, see below), `rg` (optional — accelerates `workspace_grep`) |
 
 ---
@@ -934,10 +934,7 @@ metadata directory that the workspace named 'search' keeps beside its tree.*
 directory: `<leaf>.git`, the journal, and `<leaf>.index`, the tree's metadata directory
 (`<meta>`), which holds the exec lock, the `rag/` document records, the local vector backend's
 `index/` and the `locks/`. Being beside the tree is what keeps both out of every read capability and
-out of every sandbox mount: **neither is ever mounted**. `AKGENTIC_WORKSPACE_META_ROOT`, when it
-carries a value, relocates only the `.index` parent, carrying the scope and kind segments with it
-(`$AKGENTIC_WORKSPACE_META_ROOT/alice/_id/notes.index`). An **empty** value falls back to the
-workspaces root rather than to the process's working directory, and the `.git` sibling never moves.
+out of every sandbox mount: **neither is ever mounted**.
 **Whatever removes a tree must remove both siblings too.** `<leaf>.index/rag/*.yaml` holds the
 **extracted text** of every document the tree indexed, and `akgentic-infra`'s team deletion does not
 yet remove the siblings.

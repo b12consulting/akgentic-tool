@@ -35,7 +35,7 @@ not exec is enabled (:mod:`akgentic.tool.workspace.write.gate`), and
 admin-facing fail-fast.
 
 **Imports run one way only** — this module imports ``workspace.py`` for
-:func:`meta_dir_for` and :func:`meta_root`, and nothing else in the package. The
+:func:`meta_dir_for`, and nothing else in the package. The
 direction with ``execution`` is now the other way round: ``execution.py`` imports
 :data:`_BUSY_PREFIX` from here for its own ``lock_unavailable``. Neither
 ``workspace.py`` nor ``execution.py`` may import back into this module's callers,
@@ -55,7 +55,7 @@ from uuid import uuid4
 from pydantic import ValidationError, model_validator
 
 from akgentic.core.utils.serializer import SerializableBaseModel
-from akgentic.tool.workspace.workspace import meta_dir_for, meta_root
+from akgentic.tool.workspace.workspace import meta_dir_for
 
 logger = logging.getLogger(__name__)
 
@@ -189,38 +189,6 @@ def mutation_busy(run_id: str, agent_name: str) -> str:
     )
 
 
-def meta_root_mismatch(marker_root: str, resolved_root: str) -> str:
-    """Refusal for a live hold written under a **different** metadata root.
-
-    The third member of the family, and the only one that is not about a
-    workspace somebody is legitimately using: a marker naming a root this process
-    does not resolve means the two processes are not excluding each other at all,
-    so the hold it describes is not a hold over anything this process shares. It
-    opens with the same prefix because it is still "the tree is not available to
-    you", and it names **both** roots because neither one alone tells an operator
-    which of the two workers is misconfigured.
-
-    It names no run and no agent, for :func:`exec_busy`'s reason: the reader is a
-    refused exec caller, and it is the one caller that would collect an id it was
-    given.
-
-    Args:
-        marker_root: The metadata root recorded in the marker on disk.
-        resolved_root: The metadata root this process resolved
-            (:func:`~akgentic.tool.workspace.workspace.meta_root`).
-
-    Returns:
-        The refusal, whose text is the product and must not drift.
-    """
-    return (
-        f"{_BUSY_PREFIX} — the hold on this workspace was written under the metadata root "
-        f"{marker_root!r}, and this process resolved {resolved_root!r}. Two workers sharing a "
-        "tree must resolve the same one or they exclude nobody, so your command was not "
-        "started and nothing is lost. This is a deployment misconfiguration rather than a busy "
-        "workspace: report it rather than retrying in a loop."
-    )
-
-
 class LockTicket(SerializableBaseModel):
     """What an acquirer offers about the run it wants to start.
 
@@ -299,32 +267,11 @@ class LockMarker(SerializableBaseModel):
             because the reader of a marker is routinely a *different process*
             from its writer, and the mutation refusal it composes is read by a
             model deciding what to do next.
-        meta_root: The metadata root this marker was written under —
-            :func:`~akgentic.tool.workspace.workspace.meta_root`'s answer in the
-            writing process (ADR-053 Decision 5). **Optional and defaulted**, for
-            *agent_name*'s reason and with the same consequence: a marker written
-            before this field existed still parses, and an empty value means
-            *unknown*, never *mismatched*. A marker carrying ``""`` is never
-            refused.
-
-            **What comparing it can and cannot catch, stated rather than left to
-            be discovered.** A root recorded *inside* a marker is only comparable
-            by a process that can **read** that marker, so this catches a
-            disagreement exactly where two processes reach **one marker file** —
-            one volume mounted at two paths, a symlinked path segment, a relative
-            root resolved from two working directories. Two genuinely **disjoint**
-            metadata roots produce **two** marker files, each invisible to the
-            other, and no marker-based check can ever see that: both processes
-            acquire, both believe they hold the tree, and nothing is refused. That
-            half closes through configuration — every worker sharing a tree
-            resolving one root — and not here. An agent who believes this stamp
-            covers the disjoint case stops looking for the fix that would.
     """
 
     run_id: str
     agent_id: str
     agent_name: str = ""
-    meta_root: str = ""
 
 
 @runtime_checkable
@@ -369,13 +316,10 @@ class LockBackend(Protocol):
         budget runs on this tree get. A hold past it is not a hold: its run is
         not going to answer, and mutations proceed.
 
-        The answer is the whole marker, so it carries the metadata root the hold
-        was written under (:attr:`LockMarker.meta_root`, ADR-053 Decision 5)
-        along with the run and the agent. **What the mutation gate does with that
-        is nothing**, deliberately: a mutation is refused by any live hold, with
-        the same :func:`mutation_busy` text, and a second refusal there would make
-        a misconfiguration refuse every *mutation* as well as every *run* — which
-        is wider than the decision that put the root in the marker.
+        The answer is the whole marker rather than the run id alone, because the
+        mutation gate composes :func:`mutation_busy` out of the run **and** the
+        agent name, and the marker is where a process that never took the hold
+        finds both.
         """
         ...
 
@@ -420,12 +364,10 @@ class FileLockBackend:
         is a refusal — somebody else won the takeover, which is the correct
         answer and not a case to loop over.
 
-        **Staleness is decided first, and a mismatched root is only looked at on
-        a marker that is genuinely live.** A stale marker is taken over whatever
-        root it names — refusing one would wedge the tree for ever, with no path
-        back that does not involve deleting a file by hand, and a misconfigured
-        deployment would then be unrecoverable rather than merely unserialised.
-        The order is the behaviour, not an implementation detail.
+        **A marker that is not stale refuses, and one that is stale is taken
+        over** — there is no third answer. Refusing a stale marker would wedge
+        the tree for ever, with no path back that does not involve deleting a
+        file by hand.
 
         Args:
             tree_key: The three-segment ``<scope>/<kind>/<leaf>`` path
@@ -447,7 +389,7 @@ class FileLockBackend:
         if grant is not None:
             return grant
         if not self._is_stale(marker, ticket.budget_s):
-            return LockGrant(refusal=self._live_refusal(marker))
+            return LockGrant(refusal=exec_busy())
         logger.warning(
             "Workspace %s: taking over the exec lock at %s — it is past its budget and the "
             "grace with nothing released, so its run is not going to answer.",
@@ -546,43 +488,6 @@ class FileLockBackend:
         """The marker belonging to *tree_key* — a sibling of the tree, never inside it."""
         return meta_dir_for(tree_key) / EXEC_LOCK_FILENAME
 
-    def _live_refusal(self, marker: Path) -> str:
-        """Why a live marker refuses this acquirer — busy, or a root disagreement.
-
-        Reached **only** for a marker :meth:`_is_stale` has already answered
-        ``False`` for, which is what keeps a mismatched *stale* marker
-        reclaimable (see :meth:`acquire`).
-
-        Three ways the answer is the ordinary busy refusal, and all three mean
-        "somebody holds this tree and the two of us agree on where the hold
-        lives": the marker does not parse, so it is not one this code wrote and
-        nothing can be said about the root it was written under; it carries no
-        root, so it predates the field and *unknown* is not *mismatched*; or the
-        root it carries is this process's own.
-
-        Args:
-            marker: The existing marker file.
-
-        Returns:
-            The refusal text, composed through the module's own message
-            functions and never spelled here.
-        """
-        try:
-            held = LockMarker.model_validate_json(marker.read_text())
-        except (OSError, ValidationError):
-            return exec_busy()
-        resolved = str(meta_root())
-        if not held.meta_root or held.meta_root == resolved:
-            return exec_busy()
-        logger.warning(
-            "Workspace hold at %s was written under metadata root %s, but this process "
-            "resolved %s — the two are not excluding each other. Refusing the run.",
-            marker,
-            held.meta_root,
-            resolved,
-        )
-        return meta_root_mismatch(held.meta_root, resolved)
-
     def _claim(self, marker: Path, ticket: LockTicket) -> LockGrant | None:
         """Create *marker* exclusively and fill it, or answer ``None`` if it exists.
 
@@ -590,11 +495,6 @@ class FileLockBackend:
         either wins or raises, with no window between a check and a write for a
         second acquirer to fit into. A ``marker.exists()`` test followed by a
         write would pass every sequential test and serialise nothing at all.
-
-        The metadata root is stamped from :func:`meta_root` and never from a
-        re-derivation of its chain: a stamp computed one way and compared another
-        would refuse every run on a correctly configured deployment, which is the
-        failure mode of a guard rather than of a tree.
         """
         try:
             fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _MARKER_MODE)
@@ -608,7 +508,6 @@ class FileLockBackend:
                         run_id=run_id,
                         agent_id=ticket.agent_id,
                         agent_name=ticket.agent_name,
-                        meta_root=str(meta_root()),
                     ).model_dump_json()
                 )
         except BaseException:

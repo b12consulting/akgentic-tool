@@ -31,11 +31,9 @@ from akgentic.tool.workspace import (
     LockGrant,
     LockMarker,
     LockTicket,
-    exec_busy,
     resolve_lock_backend,
 )
-from akgentic.tool.workspace.lock import meta_root_mismatch
-from akgentic.tool.workspace.workspace import meta_dir_for, meta_root
+from akgentic.tool.workspace.workspace import meta_dir_for
 from tests.workspace.conftest import HANDSHAKE_TIMEOUT_S
 
 TREE = "alice/_id/notes"
@@ -55,14 +53,12 @@ Never waited out: every spec that needs a stale marker sets its mtime directly.
 def tree_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point the workspaces root at a temporary directory, and make the tree.
 
-    ``monkeypatch`` for every environment variable, without exception: all three
-    of ``AKGENTIC_WORKSPACES_ROOT``, ``AKGENTIC_WORKSPACE_META_ROOT`` and
-    ``AKGENTIC_LOCK_BACKEND`` are read at call time, so a leaked value silently
-    changes another module's tests.
+    ``monkeypatch`` for every environment variable, without exception: both
+    ``AKGENTIC_WORKSPACES_ROOT`` and ``AKGENTIC_LOCK_BACKEND`` are read at call
+    time, so a leaked value silently changes another module's tests.
     """
     root = tmp_path / "workspaces"
     monkeypatch.setenv("AKGENTIC_WORKSPACES_ROOT", str(root))
-    monkeypatch.delenv("AKGENTIC_WORKSPACE_META_ROOT", raising=False)
     tree = root / TREE
     tree.mkdir(parents=True)
     return tree
@@ -172,18 +168,12 @@ class TestTheMarkerIsASiblingOfTheTree:
         assert not meta_dir_for(TREE).exists()
 
     def test_an_acquire_creates_the_directory_and_the_marker(self, tree_root: Path) -> None:
-        """The whole of the on-disk state, compared as one model.
-
-        The expected marker carries :func:`meta_root`'s answer rather than a
-        second derivation of the chain it reads, which is the property ADR-053
-        Decision 5 rests on: a stamp computed one way here and another way in
-        ``acquire`` would refuse every run on a correctly configured deployment.
-        """
+        """The whole of the on-disk state, compared as one model."""
         grant = FileLockBackend().acquire(TREE, ticket())
 
         assert grant.run_id
         assert marker_path().is_file()
-        assert held() == LockMarker(run_id=grant.run_id, agent_id=AGENT, meta_root=str(meta_root()))
+        assert held() == LockMarker(run_id=grant.run_id, agent_id=AGENT)
 
     def test_the_marker_is_outside_the_tree_the_capabilities_can_reach(
         self, tree_root: Path
@@ -265,9 +255,7 @@ class TestAStaleMarkerIsTakenOver:
 
         assert second.run_id
         assert second.run_id != first.run_id
-        assert held() == LockMarker(
-            run_id=second.run_id, agent_id=AGENT_B, meta_root=str(meta_root())
-        )
+        assert held() == LockMarker(run_id=second.run_id, agent_id=AGENT_B)
 
     def test_inside_the_window_the_next_acquirer_is_refused(self, tree_root: Path) -> None:
         # The near side of the boundary, asserted so that dropping the grace
@@ -340,80 +328,6 @@ class TestAStaleMarkerIsTakenOver:
         age_marker(BUDGET_S + LEASE_GRACE_S + 1)
 
         assert FileLockBackend().acquire(TREE, ticket(AGENT_B)).run_id
-
-
-# ---------------------------------------------------------------------------
-# 55-7 AC5 — staleness is decided BEFORE the root, and a stale mismatched
-# marker is reclaimed rather than refused
-# ---------------------------------------------------------------------------
-
-FOREIGN_ROOT = "/somewhere/else/meta"
-"""A metadata root this process could not possibly have resolved.
-
-**The marker is written by hand, and that is forced rather than lazy.** One
-interpreter reads one environment and resolves one root, so two
-:class:`FileLockBackend` objects here agree by construction — a process cannot
-disagree with itself. What these two specs pin is the *ordering* inside
-``acquire``, which is decidable from a marker on disk; the cross-process property
-itself is proven in ``test_exec.py`` with a real second interpreter, because
-nothing in this module can fail the way a misconfigured deployment does.
-"""
-
-
-def plant_foreign_marker(run_id: str = "deadbeef") -> None:
-    """Write a marker naming :data:`FOREIGN_ROOT`, as another worker would have."""
-    marker_path().parent.mkdir(parents=True, exist_ok=True)
-    marker_path().write_text(
-        LockMarker(run_id=run_id, agent_id=AGENT, meta_root=FOREIGN_ROOT).model_dump_json()
-    )
-
-
-class TestAMismatchedRootIsWeighedAfterStaleness:
-    def test_a_stale_marker_is_reclaimed_whatever_root_it_names(self, tree_root: Path) -> None:
-        """The ordering is the behaviour, not an implementation note.
-
-        Refusing a *stale* marker on a root mismatch would wedge the tree for
-        ever: nothing ever takes it over, so nothing ever rewrites it, and the
-        only way back is deleting a file by hand on the volume. A deployment that
-        was merely unserialised would become unrecoverable, which is strictly
-        worse than the defect the stamp exists to report.
-        """
-        plant_foreign_marker()
-        age_marker(BUDGET_S + LEASE_GRACE_S + 1)
-
-        granted = FileLockBackend().acquire(TREE, ticket(AGENT_B))
-
-        assert granted.run_id, granted.refusal
-        assert held().meta_root == str(meta_root())
-
-    def test_a_live_marker_naming_another_root_refuses_and_names_both(
-        self, tree_root: Path
-    ) -> None:
-        """The non-vacuity of the spec above: the same marker, inside the window.
-
-        Without it, ``test_a_stale_marker_is_reclaimed_whatever_root_it_names``
-        would still be green for a backend that never compared roots at all.
-        """
-        plant_foreign_marker()
-
-        refused = FileLockBackend().acquire(TREE, ticket(AGENT_B))
-
-        assert not refused.run_id
-        assert refused.refusal == meta_root_mismatch(FOREIGN_ROOT, str(meta_root()))
-
-    def test_a_marker_carrying_no_root_is_the_ordinary_busy_refusal(self, tree_root: Path) -> None:
-        """Unknown is not mismatched — a marker written before the field existed.
-
-        Defaulted exactly as ``agent_name`` is, and for the same reason: an older
-        writer's marker still parses, and refusing it would turn a rolling
-        upgrade into an outage.
-        """
-        marker_path().parent.mkdir(parents=True, exist_ok=True)
-        marker_path().write_text(LockMarker(run_id="deadbeef", agent_id=AGENT).model_dump_json())
-
-        refused = FileLockBackend().acquire(TREE, ticket(AGENT_B))
-
-        assert refused.refusal == exec_busy()
 
 
 # ---------------------------------------------------------------------------

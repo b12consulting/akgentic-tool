@@ -317,7 +317,7 @@ CAPABILITY_SPINE_REACH: dict[str, frozenset[str]] = {
         }
     ),
     # Three, not the five it was: ``execution/`` gets to ``workspace`` through
-    # ``lock.py``'s ``meta_dir_for`` and ``meta_root``, to ``models`` through both
+    # ``lock.py``'s ``meta_dir_for``, to ``models`` through both
     # the mixin's ``WorkspaceConfig`` and its ``Identity``, and to ``readers``
     # only through ``models.gitignore_seed``'s in-function import — the entry a
     # graph that followed no transitive edge would miss while still satisfying a
