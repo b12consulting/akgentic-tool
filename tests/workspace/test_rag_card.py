@@ -265,7 +265,7 @@ class TestTheSearchCapability:
 
 
 class TestTheSearchCallable:
-    """The card runs the vector leg; the actor is handed its hits and the knobs."""
+    """The card runs the whole search; no actor is handed anything (story 57-1)."""
 
     def test_it_forwards_the_cards_knobs_to_the_search(
         self,

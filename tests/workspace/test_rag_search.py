@@ -551,22 +551,29 @@ class TestDegradation:
         """**Rewritten in story 57-1, and it is not a weakened guard — read this.**
 
         It was ``test_a_card_that_resolved_no_store_falls_back_to_the_keyword_leg``
-        and it asserted ``"keyword match" in answer``. That assertion described a
-        state that **cannot occur in a real bind**: a card that resolved no store
-        beside an actor that has one. The split was an artefact of
-        :class:`SearchHarness`, which announces the store to the actor by hand. In
-        production a card that resolves no store announces none, so the actor
-        degrades too and the answer is the unavailable sentence — which is exactly
-        what the card's own gate now returns, directly, with no ask.
+        and it asserted ``"keyword match" in answer``. That assertion described the
+        *harness*: :class:`SearchHarness` announces the store to the actor by hand,
+        so a card that resolved none sat beside an actor that has one. The common
+        production shape has no such split — a card that resolves no store
+        announces none (``_announce_vector_store`` returns early), the actor
+        degrades too, and the answer is the unavailable sentence, which is exactly
+        what the card's own gate now returns directly and with no ask.
 
         So the assertion follows the reality rather than the harness, and the gate
         was **not** weakened to preserve the old answer.
 
-        What survives verbatim is the half that was always the point, and it is
-        stronger now: **nothing is spent.** The availability gate sits ahead of the
-        vector leg where the actor's sat behind it, so a degraded tree makes no
-        embedding call and no store call at all — the cost
-        ``_vector_hits``'s docstring used to record as unclosable.
+        **One production shape does reach the old state, and the answer changes
+        there.** ``_bind_vector_store`` catches every resolution failure and leaves
+        ``_vector_store`` at ``None`` with a WARNING saying *retrieval stays off
+        for this card*; a sibling card of the same team may still have announced a
+        store, and that card used to borrow the actor's keyword leg through the
+        announcement. It answers the sentence now — the warning's own words made
+        true. See :meth:`RagFactories._retrieval_bound`.
+
+        The two spend assertions are kept rather than claimed as new: they were
+        already green before this move, because ``_vector_hits`` short-circuits on
+        the very condition the gate now tests. They pin that the hoisted gate did
+        not *start* spending something.
         """
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
         assert search.card is not None

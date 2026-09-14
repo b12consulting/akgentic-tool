@@ -630,7 +630,20 @@ class RagFactories:
         records on disk — which exist regardless of the vector collection — or
         that nothing matched, rather than that retrieval is unavailable. Neither
         answer is wrong and the trade is deliberate: the alternative is a mailbox
-        round trip on every search, carrying one boolean.
+        round trip on every search, carrying one boolean. **That state also still
+        spends** one embed and one failing ``search`` per query, exactly as it did
+        before the move; what changed is that the result is used instead of being
+        discarded behind the actor's sentence.
+
+        **A second state answers differently, and it is reachable.**
+        :meth:`~akgentic.tool.workspace.card.WorkspaceTool._bind_vector_store`
+        catches every resolution failure and leaves ``_vector_store`` at ``None``
+        with one WARNING saying *retrieval stays off for this card*. In a team
+        whose other card resolved a store and announced it, such a card used to
+        reach the actor's keyword leg through that sibling's announcement; it now
+        answers the sentence. That is the warning's own words made true rather
+        than a regression — but it is a second behaviour change, so it is named
+        here instead of being left to be discovered.
         """
         return self._vector_store is not None and self._resolved_store is not None
 
@@ -783,11 +796,16 @@ class RagFactories:
         ``observer()``, so an unbound card has neither. The wildcard check comes
         next, so a refused prefix costs nothing at all whatever the tree's state.
         The availability gate comes last of the three, and it now sits **ahead of
-        the vector leg** where the actor's sat behind it: that changes no answer
-        and closes a cost the vector leg's own docstring used to record as
-        unclosable, because a degraded tree spent one embed and one ``search`` per
-        query and discarded both. Swapping the middle two would silently flip what
-        a degraded tree answers to a wildcard prefix.
+        the vector leg** where the actor's sat behind it. That changes no answer,
+        and it saves the keyword leg's directory scan and parse on a degraded
+        tree — but it saves **no round trip**, and a claim that it did stood here
+        until review measured it: the gate's two terms are exactly what
+        :func:`~akgentic.tool.workspace.rag.search._vector_hits` already
+        short-circuits on, for free. The spend that docstring recorded as
+        unclosable belongs to the *other* degraded state — ``create_collection``
+        raised — which this gate does not cover and which still pays it; see
+        :meth:`_retrieval_bound`. Swapping the middle two gates would silently
+        flip what a degraded tree answers to a wildcard prefix.
 
         The values are read **at ``get_tools()`` time**, which is after
         ``observer()`` has run, so the cache, the engine, the collection param and

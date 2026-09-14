@@ -171,14 +171,22 @@ def _vector_hits(
     because fusion reorders and the caller drops what it cannot resolve.
 
     **A collection that was never created is the one failure with no gate ahead
-    of it**, and it costs nothing now. The actor used to search only once
-    ``create_collection`` had succeeded; no card-side signal reproduces that, so a
-    search against a collection that was never created reaches the backend and
-    raises. The raise lands in the ``except`` below, yields an empty mapping and
-    one warning — the existing *every failure degrades* contract rather than a new
-    hole. What is **not** paid for any more is the degraded tree: the caller's
-    availability gate now runs ahead of this function rather than after it, so a
-    tree with no store and no parameters spends no embed and no ``search`` at all.
+    of it.** The actor used to search only once ``create_collection`` had
+    succeeded; no card-side signal reproduces that, so a search against a
+    collection that was never created reaches the backend and raises. The raise
+    lands in the ``except`` below, yields an empty mapping and one warning — the
+    existing *every failure degrades* contract rather than a new hole. It is also
+    the one state that **still spends**: one embed and one failing ``search`` per
+    query, as it did before the move. What changed is what becomes of the result —
+    the keyword leg answers over the records on disk, where the actor's gate used
+    to discard both round trips and answer its sentence instead.
+
+    **The caller's availability gate ahead of this function saves no round
+    trip**, and the docstring this one replaces claimed that it did. That gate is
+    ``store is not None and resolved is not None`` — precisely the condition the
+    first branch below already short-circuits on, for free. What the hoist saves
+    is the keyword leg's directory scan and parse on a degraded tree, which is
+    worth having and is not an embed.
 
     **It never raises**, including out of building the embedder, which imports an
     optional extra.
