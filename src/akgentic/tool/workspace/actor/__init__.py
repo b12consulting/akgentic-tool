@@ -63,13 +63,16 @@ that may be a cluster client; both halves moved onto the calling agent's own
 thread, and ``tests/workspace/test_rag_search_off_the_mailbox.py`` is what holds
 the sentence to its word rather than leaving it a claim.
 
-**The class is assembled from two per-concern mixins** (ADR-045 §1): the
-retrieval pipeline in :mod:`~akgentic.tool.workspace.actor.documents`, and the
-lease and the deferred surface in
+**The class is assembled from two per-concern mixins, and each one lives under
+its own capability** (ADR-053 Decision 1): the retrieval pipeline in
+:mod:`~akgentic.tool.workspace.rag.actor`, the lease and the deferred surface in
 :mod:`~akgentic.tool.workspace.execution.actor`. Each body is the same code with
 the same ``self``; what stays here is the class itself, ``on_start``,
 ``worker_class``, and the agent-name map that gives a commit and a busy refusal a
-name to print.
+name to print. **This package therefore holds exactly one module**, and that is
+the finished shape of the epic rather than a way-station: importing a mixin from
+the capability that owns it is the assembly point doing its job, which is why
+either capability's directory can still be deleted without touching the other.
 """
 
 from __future__ import annotations
@@ -82,7 +85,6 @@ from typing import TYPE_CHECKING
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_state import BaseState
 from akgentic.tool.core.deferred import DeferredResultActor, DeferredWorker
-from akgentic.tool.workspace.actor.documents import DocumentsMixin
 from akgentic.tool.workspace.documents.cache import DocumentCache
 from akgentic.tool.workspace.execution import (
     ExecConfig,
@@ -94,6 +96,7 @@ from akgentic.tool.workspace.execution.actor import EXEC_CAPABILITY, ExecMixin
 from akgentic.tool.workspace.journal import GitJournal
 from akgentic.tool.workspace.lock import LockBackend
 from akgentic.tool.workspace.models import Identity, WorkspaceConfig
+from akgentic.tool.workspace.rag.actor import DocumentsMixin
 from akgentic.tool.workspace.workspace import Filesystem, get_workspace, meta_dir_for
 
 if TYPE_CHECKING:
@@ -102,11 +105,7 @@ if TYPE_CHECKING:
     # Runtime slots the retrieval pipeline fills. Under ``TYPE_CHECKING`` because
     # the vector store lives behind an optional extra — not needed to annotate a
     # ``None`` at start.
-    from akgentic.tool.vector_store.protocol import (
-        EmbeddingProvider,
-        VectorStoreParam,
-        VectorStoreService,
-    )
+    from akgentic.tool.vector_store.protocol import VectorStoreParam, VectorStoreService
     from akgentic.tool.workspace.rag.params import WorkspaceRagIndex
     from akgentic.tool.workspace.readers import DocumentReader
 
@@ -159,6 +158,16 @@ class WorkspaceActor(
     Akgent[WorkspaceConfig, BaseState],
 ):
     """Team child owning one tree's exec dispatch and its RAG indexing pipeline.
+
+    **A per-team dispatch context that exists only when something dispatches.** It
+    owns a sandbox run whose report must land somewhere, and the index/embed
+    children a Pydantic card cannot parent. It holds the agent-name map those two
+    print, and the deferred result cache the exec half keys on. Nothing else. Its
+    unicity domain is ``(team, tree)``, and two actors over one tree is the design.
+
+    That sentence is the end of a five-story arc and the file tree now agrees with
+    it: every capability's actor-side code sits under the capability, and this
+    package holds the class and nothing more.
 
     **Created only when the card enables exec or retrieval** (ADR-053 Decision
     6), and not otherwise: a read-only or read/write card binds a tree, seeds it,
@@ -257,6 +266,15 @@ class WorkspaceActor(
         self._lock: LockBackend | None = None
         self._run_errors: OrderedDict[str, str] = OrderedDict()
         self._recent_runs: dict[str, OrderedDict[str, str]] = {}
+        # The seven retrieval slots below are annotated on ``DocumentsMixin``, in
+        # ``rag/actor.py``, and assigned here — which is exactly what ``ExecMixin``
+        # does with its own eight. **The assignments stay in this method
+        # deliberately**: moving them would mean giving a mixin an ``on_start`` and
+        # inserting it into the chain, against the ordering ``self.state`` before
+        # ``super().on_start()`` above states explicitly, and for no measured gain.
+        # The actor is the assembly point — the role ``card/__init__.py`` plays for
+        # the factory mixins — and an assembly point naming what it assembles is
+        # not a capability leak.
         self._rag_params: WorkspaceRagIndex | None = None
         self._rag_reader: DocumentReader | None = None
         self._rag_collection: VectorStoreParam | None = None
@@ -265,7 +283,6 @@ class WorkspaceActor(
         # until the announcement lands there is nothing to enable retrieval over.
         self._vector_store: VectorStoreService | None = None
         self._vs_proxy: VectorStoreService | None = None
-        self._embedder: EmbeddingProvider | None = None
         # How many ``#index-`` workers **this process** is running, and nothing
         # else. Not the set it replaced: "is this path being worked on?" and "is
         # this path exempt from the reaper?" are questions about the *tree*, which

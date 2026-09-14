@@ -6,8 +6,9 @@ one per source document, written through a
 is what describes one entry of each, what bounds them, and — in
 :mod:`akgentic.tool.workspace.documents.cache` — the one read-modify-write both
 sides go through. The indexing **pipeline** is in
-:mod:`akgentic.tool.workspace.actor.documents`; the lookup and the fill are not,
-and have not been since the actor became dispatch (ADR-053 Decision 6).
+:mod:`akgentic.tool.workspace.rag.actor`, under the capability that owns it; the
+lookup and the fill are not, and have not been since the actor became dispatch
+(ADR-053 Decision 6).
 
 **This package is shared by two capabilities, which is why it is not one.** The
 extraction cache is filled and read on the **read** path — ``card/__init__.py``

@@ -37,9 +37,9 @@ to get wrong to pass:
 **The runtime graph excludes ``if TYPE_CHECKING:`` imports, deliberately**, and
 :meth:`TestACapabilityDependsOnTheSpineAndNothingElse.test_it_names_no_other_capability_even_in_an_annotation`
 closes the gap that opens. Such an import never executes, closes no cycle and
-costs nothing at bind — which is exactly why ``rag/splitter.py`` and
-``actor/documents.py`` use one to name each other's types without taking the
-other on. Counting it would condemn the package's own recommended pattern. So the
+costs nothing at bind — which is exactly why ``rag/__init__.py`` and
+``execution/card.py`` both use one to name ``WorkspaceActor`` without taking the
+actor on. Counting it would condemn the package's own recommended pattern. So the
 runtime closure ignores it, and a second, narrower rule then forbids a capability
 module from naming another capability in **any** import, annotation-only ones
 included.
@@ -80,7 +80,7 @@ SPINE = frozenset(
 """The shared machinery every capability is allowed to stand on.
 
 ``readers.py`` is in here rather than inside ``read/`` even though the read
-closures are its heaviest consumer: ``rag/__init__.py``, ``actor/documents.py``,
+closures are its heaviest consumer: ``rag/__init__.py``, ``rag/actor.py``,
 ``rag/worker.py`` and ``models.py`` all use it too, and ``akgentic-agent`` imports
 ``MediaContent`` from its deep path. It is shared machinery and it stays in the
 spine.
@@ -184,8 +184,24 @@ CAPABILITY_CLOSURES: dict[str, frozenset[str]] = {
         # spine stopped naming the documents package at all when the two document
         # caps left ``WorkspaceConfig``.
         f"{PACKAGE}.documents",
+        # Measured, story 55-9: ``rag/actor.py`` imports ``DocumentCache`` and
+        # ``DocumentEntry`` at module scope, so both are edge targets from a module
+        # under this capability. Removing either **reddens both**
+        # ``test_the_closure_is_inside_the_allow_list`` and
+        # ``test_it_names_no_other_capability_even_in_an_annotation``, run one at a
+        # time. ``documents.cache`` was not predicted by the story at all — it
+        # arrived card-side in 55-8 and the pipeline reaches the cache through it.
+        f"{PACKAGE}.documents.cache",
         f"{PACKAGE}.documents.models",
+        f"{PACKAGE}.documents.store",
         f"{PACKAGE}.rag",
+        # Measured, story 55-9: the mixin's own module. It is a **closure root**,
+        # so removing it reddens ``test_the_closure_is_inside_the_allow_list``;
+        # it reddens the direct-edge spec **not at all**, because no sibling under
+        # ``rag/`` imports it — ``actor/__init__.py`` does, and the actor is the
+        # assembly point rather than a capability. That asymmetry is the
+        # allow-list rule read off this row rather than inherited from another.
+        f"{PACKAGE}.rag.actor",
         f"{PACKAGE}.rag.context",
         f"{PACKAGE}.rag.params",
         f"{PACKAGE}.rag.splitter",
@@ -214,8 +230,9 @@ CAPABILITY_CLOSURES: dict[str, frozenset[str]] = {
         # It was briefly a *runtime* entry, and the measurement is worth
         # recording: ``IndexWorker._report`` imported ``WorkspaceActor`` inside
         # the method purely to pass it to ``proxy_tell``, whose second argument
-        # core ignores. That one executed import put ``actor``, ``actor.documents``,
-        # ``actor.execution``, ``documents.store``, ``execution``, ``journal`` and
+        # core ignores. That one executed import put ``actor``, the mixin module
+        # that was then ``actor.documents``, ``actor.execution``,
+        # ``documents.store``, ``execution``, ``journal`` and
         # ``lock`` into this closure — seven modules, none of them a real
         # dependency of retrieval, and three of them capabilities. Naming the
         # actor under ``TYPE_CHECKING`` instead removed all seven.
@@ -281,12 +298,19 @@ CAPABILITY_SPINE_REACH: dict[str, frozenset[str]] = {
     # others: ``rag/`` reaches ``workspace`` (``meta_dir_for``, ``get_workspace``),
     # ``readers`` (the extraction configuration), ``documents.models`` (the
     # collection name, the chunk record and the id rule) and, through ``read/``,
-    # ``models``. Listing all five is what makes this row report a graph that
-    # silently narrowed.
+    # ``models``.
+    #
+    # **It grew by two in story 55-9, and the row is widened rather than left
+    # generous.** ``rag/actor.py`` brought ``documents.store`` and
+    # ``documents.cache`` with it, and this table exists to report a graph that
+    # silently narrows: listing every module the row actually reaches is what
+    # makes a later narrowing visible, where a shorter row would absorb it.
     "rag": frozenset(
         {
             f"{PACKAGE}.documents",
+            f"{PACKAGE}.documents.cache",
             f"{PACKAGE}.documents.models",
+            f"{PACKAGE}.documents.store",
             f"{PACKAGE}.models",
             f"{PACKAGE}.readers",
             f"{PACKAGE}.workspace",
@@ -338,14 +362,16 @@ assert nothing at all about that capability.
 MINIMUM_MODULES_PARSED = 20
 """Below this the sweep is looking at the wrong directory, not at a clean package.
 
-Calibrated for **this package**, which holds 29 modules. Story 55-1's sibling
+Calibrated for **this package**, which holds 31 modules. Story 55-1's sibling
 sweep uses 40 because it walks the whole of ``src/akgentic/tool/``; carrying that
 number over to a root of this size would fail a correct sweep, which is the
 opposite of what a sentinel is for.
 
 **The floor does not move when the package grows.** It is deliberately below the
 smallest correct sweep, not a number chosen to pass: story 55-6 took the count
-from 27 to 29 and this stayed at 20, which is the whole point of a floor.
+from 27 to 29 and story 55-8 to 31, and this stayed at 20 throughout, which is
+the whole point of a floor. Story 55-9 moved a module without changing the count,
+which is what a move does.
 """
 
 
@@ -608,9 +634,9 @@ class TestACapabilityDependsOnTheSpineAndNothingElse:
 
         **Direct edges only, and deliberately so** — this is not the transitive
         closure with a wider filter. Following annotation edges transitively runs
-        straight into ``actor/documents.py``'s ``TYPE_CHECKING`` import of
-        ``rag.params``, which is the package's own recommended cycle-breaker and is
-        nothing to do with the capability under test. The transitive question is
+        straight into ``rag/__init__.py``'s ``TYPE_CHECKING`` import of
+        ``WorkspaceActor``, which is the package's own recommended cycle-breaker and
+        is nothing to do with the capability under test. The transitive question is
         the runtime closure's, and it is answered above.
         """
         own = _modules_under(capability, modules)

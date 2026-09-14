@@ -35,9 +35,9 @@ from akgentic.core import AgentCard
 import akgentic.tool.workspace as ws
 from akgentic.tool.core.deferred import DeferredResultActor
 from akgentic.tool.workspace.actor import WORKSPACE_ACTOR_ROLE, WorkspaceActor
-from akgentic.tool.workspace.actor.documents import DocumentsMixin
 from akgentic.tool.workspace.execution.actor import ExecMixin
 from akgentic.tool.workspace.models import WorkspaceConfig
+from akgentic.tool.workspace.rag.actor import DocumentsMixin
 
 _ACTOR_MODULE = "akgentic.tool.workspace.actor"
 

@@ -165,8 +165,9 @@ class SearchEmbedder:
     """The consumer's own embedding service — the query leg no longer goes to the store.
 
     The vector store embeds nothing after story 49-3, so the double that used to
-    carry ``embed`` beside ``search`` is split in two and this half is installed on
-    the actor as ``_embedder``.
+    carry ``embed`` beside ``search`` is split in two and this half stands in for
+    ``build_embedding_service`` on the **card's** side. The actor has no embedder
+    slot at all — it had one, unread, until story 55-9 deleted it.
     """
 
     def __init__(self) -> None:

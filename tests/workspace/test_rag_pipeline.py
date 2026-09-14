@@ -76,7 +76,7 @@ from tests.workspace.conftest import (
     watch_store,
 )
 
-_DOCUMENTS_LOGGER = "akgentic.tool.workspace.actor.documents"
+_DOCUMENTS_LOGGER = "akgentic.tool.workspace.rag.actor"
 _UNAVAILABLE = "Retrieval indexing is not available for this workspace."
 _NO_HITS = (
     "Nothing in the retrieval index matched that query. "
@@ -175,17 +175,6 @@ def _embedded(ref_id: str, path: str = "a.md", ordinal: int = 0) -> VectorEntry:
     )
 
 
-class StaticEmbedder:
-    """The query leg's embedder, answering one fixed vector and never a network."""
-
-    def __init__(self) -> None:
-        self.embeds: list[list[str]] = []
-
-    def embed(self, texts: list[str]) -> list[list[float]]:
-        self.embeds.append(list(texts))
-        return [[1.0, 0.0] for _ in texts]
-
-
 def _explodes(*args: Any, **kwargs: Any) -> Any:
     """Raise whatever it is called with — a seam a spec asserts is never reached."""
     raise RuntimeError("this seam must not be reached")
@@ -204,7 +193,6 @@ class RagHarness:
     def __init__(self, actor: WorkspaceActor) -> None:
         self.actor = actor
         self.vs = FakeVectorStore()
-        self.embedder = StaticEmbedder()
         # The actor is handed **no** orchestrator at all — ``install`` sets the
         # slot to ``None`` — because that is what a hosted actor gets, and an ask
         # to one is the trap ``_ask`` springs rather than a lookup it answers.
@@ -270,10 +258,6 @@ class RagHarness:
             reader or DocumentReader(llm_client=None),
             collection or VectorStoreParam(backend="local", root=str(self.index_root)),
         )
-        # ``enable_rag`` builds a real ``EmbeddingService`` from the card's param;
-        # a search in these specs must embed through the double, never a network.
-        if self.actor._embedder is not None:
-            self.actor._embedder = self.embedder
 
     @property
     def store_names(self) -> list[str]:

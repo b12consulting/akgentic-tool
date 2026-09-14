@@ -142,7 +142,7 @@ class TestWhatTheWorkerIs:
 
         A module-level ``IndexError`` hides the builtin from its definition to the
         end of the module and everywhere it is imported — including
-        ``actor/documents.py``, whose ``_chunk_at`` is an ordinal lookup. A later
+        ``rag/actor.py``, whose ``_chunk_at`` is an ordinal lookup. A later
         ``except IndexError:`` there would raise ``TypeError`` at runtime instead
         of catching, and mypy would not complain. Ruff's ``A`` rules are not
         selected in this package, so this spec is the gate.

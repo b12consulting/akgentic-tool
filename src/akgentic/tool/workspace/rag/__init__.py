@@ -2,13 +2,23 @@
 
 It holds one capability whole: the three factories and the search's external leg,
 its parameters (``rag/params.py``), the splitter (``rag/splitter.py``), the
-context state (``rag/context.py``), the index worker (``rag/worker.py``) and the
-tree-policy record. It may import the package **spine** — ``workspace.py``,
-``models.py``, ``readers.py``, ``event.py``, ``documents/`` — plus
-``akgentic.tool.core`` and ``akgentic.tool.vector_store``. It must import nothing
-under ``card/`` at all: importing ``card.anything`` executes ``card/__init__.py``,
-which pulls in the journal, the exec machinery, the vector-store registry and the
-actor. The rule is enforced by
+context state (``rag/context.py``), the index worker (``rag/worker.py``), the
+actor-side pipeline (``rag/actor.py``) and the tree-policy record. It may import
+the package **spine** — ``workspace.py``, ``models.py``, ``readers.py``,
+``event.py`` — plus ``akgentic.tool.core`` and ``akgentic.tool.vector_store``.
+
+**``documents/`` is not spine and is named here on this capability's own row.**
+It stopped being spine in story 55-8, when the two document caps left
+``WorkspaceConfig`` and ``workspace/models.py`` stopped naming the package at all.
+What this capability reaches is stated per module rather than as a directory:
+``documents.models`` for the records and the id rule, and — since the pipeline
+moved in — ``documents.store`` for a ``DocumentEntry`` and ``documents.cache``
+for the object the card announces. Reaching any *other* module of that package
+would be a new entry on the row and the guard would say so.
+
+It must import nothing under ``card/`` at all: importing ``card.anything``
+executes ``card/__init__.py``, which pulls in the journal, the exec machinery, the
+vector-store registry and the actor. The rule is enforced by
 ``tests/workspace/test_capability_import_closure.py``, which takes the transitive
 closure of this package's own imports and checks it against an allow-list — not
 by convention, and not by this paragraph.
@@ -25,6 +35,13 @@ a cross-capability decision for the ADR, not a story's to take.
 So the stated limit is this: ``rag/`` is **deletable** without touching another
 capability, and it is **not standalone** — it names ``read/``, which is always
 present.
+
+**``actor/__init__.py`` imports ``rag/actor.py``, and the deletability sentence
+survives it.** The actor is the *assembly point*, not a capability — the role
+``card/__init__.py`` plays for :class:`RagFactories` — so its import is the same
+edge in the other direction and neither one is a capability depending on another.
+Deleting this directory means the assembly point stops composing a mixin it no
+longer has, which is what "deletable" has always meant here.
 
 **The tree owns its retrieval policy, and that record lives here.**
 :class:`TreePolicy` is written to ``<meta>/policy.yaml`` — a top-level file
@@ -162,9 +179,8 @@ gone", because its next step is the same in both.
 _REJECTED_PREFIX = PATH_PREFIX_REJECTED
 """What a search answers for a ``path_prefix`` carrying ``*`` or ``?``.
 
-The **same constant** ``actor/documents.py`` aliases, so the two checks — the
-one here, ahead of any spend, and the actor's own, which this story leaves
-untouched — cannot drift into two sentences.
+The **same constant** ``rag/actor.py`` aliases, so the two checks — the one here,
+ahead of any spend, and the mixin's own — cannot drift into two sentences.
 """
 
 IN_ACTOR_BACKEND = "inmemory"

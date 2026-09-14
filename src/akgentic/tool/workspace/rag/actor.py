@@ -1,6 +1,13 @@
-"""The retrieval index — files on disk, not maps in memory.
+"""The retrieval pipeline — the actor-side half of this capability.
 
-**What this actor knows about a document lives in a file, not in its state.**
+**This is the retrieval capability's mixin, and it lives under the capability**
+(ADR-053 Decision 6), exactly as :mod:`akgentic.tool.workspace.execution.actor`
+holds exec's. :class:`~akgentic.tool.workspace.actor.WorkspaceActor` imports
+:class:`DocumentsMixin` from here and composes it; that import is the assembly
+point doing its job and not a capability leak, which is why ``rag/`` stays
+deletable without touching another capability.
+
+**What this module knows about a document lives in a file, not in actor state.**
 Both halves of one document — the cached extraction and the retrieval row — are
 one :class:`~akgentic.tool.workspace.documents.store.DocumentEntry` under
 ``<meta>/rag/``, reached through the
@@ -10,16 +17,16 @@ mount therefore reads the same cache with no shared memory, and nothing here
 sends a delta to anybody: the two state fields, both dirty sets, ``_persist``,
 ``_send_delta`` and the restore hook they existed for are gone.
 
-**The extraction cache itself is not here any more, and that is this story's
-whole point.** Filling and reading an extraction is not dispatch, so it must keep
+**The extraction cache is not here, and what is left is precisely what needs a
+mailbox.** Filling and reading an extraction is not dispatch, so it has to keep
 working for a card that enables neither exec nor retrieval and therefore creates
-no actor at all (ADR-053 Decision 6). The lookup, the fill, the eviction pass and
+no actor at all (ADR-053 Decision 6): the lookup, the fill, the eviction pass and
 the stale-marking a mutation causes are all
 :class:`~akgentic.tool.workspace.documents.cache.DocumentCache`'s, called
-directly by the card. What is left here is the pipeline that genuinely needs a
-mailbox — the ``#index-`` and ``#embed-`` children a Pydantic card cannot parent,
-and the reports they send back — which reads and fills the same cache through the
-same object.
+directly by the card. What this module keeps is the ``#index-`` and ``#embed-``
+children a Pydantic card cannot parent, the reports they send back, and the
+search's keyword leg — and it reads and fills the same cache through the same
+object.
 
 **There is exactly one writer of a row here, and it writes to disk on the turn it
 is called.** :meth:`DocumentsMixin._put_row` goes through the cache's own
@@ -73,7 +80,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 from uuid import uuid4
 
-from akgentic.core import ActorDeadError
 from akgentic.core.agent_config import BaseConfig
 from akgentic.tool.vector_store.protocol import (
     PATH_PREFIX_REJECTED,
@@ -165,21 +171,6 @@ class _Spawn(Enum):
     """The spawn raised, or retrieval is not configured. Stop the pass."""
 
 
-_STORE_UNREACHABLE: tuple[type[Exception], ...] = (RuntimeError, ActorDeadError)
-"""What the in-memory store child's spawn raises when the environment refuses it.
-
-Exactly two, read off what ``Akgent.createActor`` and ``proxy_ask`` can raise on
-this path. ``RuntimeError`` is ``threading.Thread.start`` finding no thread to
-start — ``createActor`` runs the child's constructor on this thread and then
-starts its loop. ``ActorDeadError`` is a child gone before its proxy could be
-built, which pykka checks eagerly, or this actor's orchestrator dying under the
-child's constructor, which builds a proxy over it and tells it a
-``StartMessage``. Both are outages retrieval degrades through. A
-``ValidationError`` from the config, a ``TypeError`` from a
-changed signature, an ``AttributeError`` in the store's constructor are defects,
-and :meth:`DocumentsMixin._resolve_store` lets them propagate.
-"""
-
 _NO_HITS = (
     "Nothing in the retrieval index matched that query. "
     "Use workspace_rag_list to see which files are indexed."
@@ -218,7 +209,7 @@ class _KeywordMatch(NamedTuple):
 
 
 class DocumentsMixin(_DocumentsBase):
-    """The extraction cache and the retrieval index, over a ``DocumentStore``.
+    """The retrieval pipeline, over the cache the card announced.
 
     Declares no Pydantic field and no state field: everything it uses is owned by
     the actor and initialised in its ``on_start``, and what it *persists* lives on
@@ -226,6 +217,13 @@ class DocumentsMixin(_DocumentsBase):
     ``fail`` or ``cache_capacity``, any of which would silently take over the
     deferred delivery path or resize the exec LRU, because this mixin precedes
     ``ExecMixin`` and ``DeferredResultActor`` in the MRO.
+
+    **The seven slots below are annotated here and assigned in
+    ``WorkspaceActor.on_start``**, which is ``ExecMixin``'s arrangement for its
+    own eight rather than a divergence: this mixin has no ``on_start`` and adds
+    nothing to the chain. There is no ``_embedder`` among them and none is coming
+    back — the actor's own query leg was the only reader it ever had, and that leg
+    is the card's.
     """
 
     _workspace: Filesystem
@@ -234,10 +232,6 @@ class DocumentsMixin(_DocumentsBase):
     _rag_collection: VectorStoreParam | None
     _vs_proxy: VectorStoreService | None
     _vector_store: VectorStoreService | None
-    # ``_embedder`` is deliberately **absent**. The actor's own query leg was the
-    # only thing that ever read it, and that leg is the card's now; the slot
-    # itself still exists on ``WorkspaceActor``, unread, and goes with the rest of
-    # the retrieval state when the mixin is split.
     _index_workers: int
     _document_cache: DocumentCache | None
 
@@ -396,7 +390,10 @@ class DocumentsMixin(_DocumentsBase):
         ``on_start``**: a workspace with retrieval off must never create one. It
         follows ``PlanActor._acquire_vs_proxy`` with one deliberate divergence:
         where that actor *raises* when the team's store is absent, this one logs
-        and degrades when its own store child cannot be spawned. A missing vector
+        and degrades when no card has announced it a store. **It spawns no store
+        child and never did on this path** — :meth:`_resolve_store` says so in as
+        many words, and the constant that used to name what such a spawn raises
+        went with the last reader of it. A missing vector
         store is a configuration error for a planning tool, whose whole purpose
         it is; here it must never be fatal, because this actor also owns the
         write gate.

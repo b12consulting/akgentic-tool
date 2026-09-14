@@ -965,9 +965,11 @@ is caught rather than laundered.
 
 **It follows the writers rather than the directory.** The five of them moved into
 :mod:`akgentic.tool.workspace.documents.cache` when the extraction cache went
-card-side, so the walk below now reads that module — and the actor package is
-asserted to hold *no* writer at all, which is a stronger claim than the inventory
-it used to make there.
+card-side, so the walk below now reads that module — and every actor-side module
+is asserted to hold *no* writer at all, which is a stronger claim than the
+inventory it used to make there. "Actor-side" is two modules since story 55-9:
+the actor package itself, and :mod:`akgentic.tool.workspace.rag.actor`, where the
+retrieval pipeline lives.
 """
 
 
@@ -1024,18 +1026,30 @@ class TestOnlyTheKnownFunctionsWriteARecord:
             "forget_extract",
         }
 
-    def test_the_actor_package_writes_no_record_of_its_own(self) -> None:
-        """The actor reaches the disk through the cache or not at all.
+    def test_no_actor_side_module_writes_a_record_of_its_own(self) -> None:
+        """Actor-side code reaches the disk through the cache or not at all.
 
         Stronger than the per-function inventory it replaced, and it is what keeps
-        the inventory above complete: a writer added under ``actor/`` tomorrow
+        the inventory above complete: a writer added to actor-side code tomorrow
         would be invisible to a walk that only reads ``cache.py``.
+
+        **It follows the mixin rather than the directory.** Story 55-9 moved the
+        retrieval pipeline out of ``actor/documents.py`` and into ``rag/actor.py``,
+        under the capability that owns it, so the subjects are named by import —
+        the actor package, and the module the mixin now lives in — rather than by
+        globbing one directory. Globbing ``actor/`` alone would still pass, over a
+        package that no longer holds the pipeline the claim is about: exactly the
+        narrowing this suite keeps finding, and the reason the floor below names
+        both files.
         """
         from akgentic.tool.workspace import actor as actor_package
+        from akgentic.tool.workspace.rag import actor as mixin_module
 
         package = Path(str(actor_package.__file__)).parent
-        modules = sorted(package.glob("*.py"))
-        assert {module.name for module in modules} >= {"__init__.py", "documents.py"}
+        mixin = Path(str(mixin_module.__file__))
+        modules = [*sorted(package.glob("*.py")), mixin]
+        assert {module.name for module in modules} >= {"__init__.py", "actor.py"}
+        assert mixin.parent.name == "rag"
 
         writers = {
             writer

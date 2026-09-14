@@ -68,8 +68,8 @@ transient worker as a busy team member.
 :class:`~akgentic.tool.workspace.rag.params.WorkspaceRagIndex` at runtime, because
 that class is a Pydantic *field type* here and a string annotation cannot serve.
 While that class lived in ``card/params.py`` the import executed
-``card/__init__.py``, which imports ``workspace.actor``, which imports
-``actor/documents.py``, which imported ``documents/`` — so ``documents/__init__.py``
+``card/__init__.py``, which imports ``workspace.actor``, which imports this
+capability's ``rag/actor.py``, which imports ``documents/`` — so ``documents/__init__.py``
 could not re-export this module without closing the cycle at import time. The
 parameter is a sibling now and no cycle exists: ``rag/__init__.py`` is free to
 name this module and ``documents/`` no longer knows it at all.
@@ -286,7 +286,7 @@ class IndexFailure(SerializableBaseModel):
     vector store's worker reports failure with. **Named ``…Failure`` rather than
     ``…Error`` because ``IndexError`` is a builtin**, and a payload by that name
     would shadow it from its definition to the end of this module and throughout
-    ``actor/documents.py``, which imports it — so a later ``except IndexError:``
+    ``rag/actor.py``, which imports it — so a later ``except IndexError:``
     beside an ordinal lookup would raise ``TypeError`` instead of catching, with
     no complaint from mypy. ``EmbeddingError``, the model this mirrors, shadows
     nothing; the mirror is in the shape, not in the letter of the name.
@@ -438,8 +438,8 @@ class IndexWorker(Akgent[BaseConfig, BaseState]):
         ``lock/`` and the exec machinery: seven modules in the closure guard's
         allow-list, every one of them reached only to pass an ignored argument.
         The ``cast`` keeps mypy's view of the proxy exactly as it was. It is the
-        pattern ``actor/documents.py`` and ``rag/__init__.py`` already use to name
-        each other without depending on each other.
+        pattern ``rag/actor.py`` and ``rag/__init__.py`` already use to name a
+        type without taking on an executed edge to it.
 
         Args:
             payload: The result or the failure.
