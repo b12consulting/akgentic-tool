@@ -38,7 +38,13 @@ from akgentic.tool.workspace.documents.models import (
     derived_document_caps,
 )
 from akgentic.tool.workspace.models import WorkspaceConfig
-from tests.workspace.conftest import WORKSPACE_PATH, attach_store, seed_row, stored_rows
+from tests.workspace.conftest import (
+    WORKSPACE_PATH,
+    attach_store,
+    cache_of,
+    seed_row,
+    stored_rows,
+)
 
 # Recorded once, from a call made in a *different* process. A second call made
 # here would agree with a namespace minted per process, which is exactly the
@@ -196,7 +202,7 @@ class TestEveryTransitionIsACopy:
             path="a.md", status=RagStatus.EMBEDDED, updated_at=datetime.now(UTC)
         ))
 
-        actor.mark_paths_stale(["a.md"])
+        cache_of(actor).mark_paths_stale(["a.md"])
 
         result = stored_rows(actor)["a.md"]
         assert result.status is RagStatus.STALE

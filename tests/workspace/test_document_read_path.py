@@ -1,37 +1,40 @@
-"""``workspace_read``'s document branch, against ``#Workspace``'s state cache (45-4).
+"""``workspace_read``'s document branch, against the card's own extraction cache.
 
-``test_document_cache.py`` addresses the actor directly; this file drives the
+``test_document_cache.py`` addresses the cache directly; this file drives the
 **read path** — the card's two closures, the digest it takes over the source
 bytes, and what the tree looks like afterwards.
 
 The headline is one spec: a document whose source has been *replaced* reads as
-the replacement. The sidecar this story deletes was keyed on the source
-**filename**, so it served the old extraction for ever; the cache is keyed on the
-source **bytes**, so a replacement is a miss. Everything else here defends the
-cost of that: a text read still asks the actor nothing, a hit still notifies
-nothing, and a document read now writes nothing to the tree at all.
+the replacement. The sidecar 45-4 deleted was keyed on the source **filename**,
+so it served the old extraction for ever; the cache is keyed on the source
+**bytes**, so a replacement is a miss. Everything else here defends the cost of
+that: a text read still touches the cache not at all, a hit still writes nothing,
+and a document read writes nothing to the tree at all.
+
+**No card here creates an actor, and none needs to.** The lookup and the fill
+were an ask and a tell over the ``#Workspace`` proxy until story 55-8; they are
+direct calls on the card's own
+:class:`~akgentic.tool.workspace.documents.cache.DocumentCache` now, which is what
+keeps them working on the read/write cards that have no actor at all.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 from unittest.mock import patch
 
 import pytest
 from pydantic import PrivateAttr
 
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
+from akgentic.tool.workspace.documents.cache import DocumentCache
 from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION
 from akgentic.tool.workspace.models import content_sha
 from akgentic.tool.workspace.readers import DocumentReader
 from akgentic.tool.workspace.tool import WorkspaceRead, WorkspaceTool
-
 from tests.workspace.conftest import (
-    HANDSHAKE_TIMEOUT_S,
     WORKSPACE_NAME,
-    WORKSPACE_PATH,
     FakeActorToolObserver,
     FakeOrchestratorProxy,
     RecordingDocumentStore,
@@ -62,68 +65,79 @@ class _StubDocumentReader(DocumentReader):
         return f"# extracted\n{body}\n" + "filler " * 20
 
 
-class SpyingAskProxy:
-    """Counts the cache calls a read makes and forwards everything to the actor.
+class SpyingCache(DocumentCache):
+    """Counts the cache calls a read makes and does everything a cache does.
 
-    The property NFR1 needs is *how many asks a read makes*, which cannot be
-    inferred from the resulting state: a text read and a document hit both leave
-    the map untouched.
+    The property NFR1 needs is *how many cache calls a read makes*, which cannot
+    be inferred from the resulting state: a text read and a document hit both
+    leave the records untouched.
+
+    A subclass rather than a wrapper, because the card calls two methods on this
+    object and a wrapper that forwarded only those two would be agreeing with the
+    code rather than testing it — a third call added tomorrow would go straight
+    through a ``__getattr__`` and be counted nowhere.
     """
 
-    def __init__(self, target: WorkspaceActor) -> None:
-        self.target = target
+    def __init__(self, inner: DocumentCache) -> None:
+        super().__init__(inner.store, inner.tree_key, inner.max_documents, inner.max_document_chars)
         self.lookups: list[str] = []
         self.fills: list[str] = []
 
-    def document_extract(self, path: str, source_sha: str, extractor_version: int) -> str | None:
+    def lookup(self, path: str, source_sha: str, extractor_version: int) -> str | None:
         self.lookups.append(path)
-        return self.target.document_extract(path, source_sha, extractor_version)
+        return super().lookup(path, source_sha, extractor_version)
 
-    def cache_document(
-        self, path: str, source_sha: str, extractor_version: int, markdown: str
-    ) -> None:
+    def fill(self, path: str, source_sha: str, extractor_version: int, markdown: str) -> None:
         self.fills.append(path)
-        self.target.cache_document(path, source_sha, extractor_version, markdown)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.target, name)
+        super().fill(path, source_sha, extractor_version, markdown)
 
 
-class RaisingCacheProxy:
-    """A proxy whose every cache call fails — a dead actor, from the card's side."""
+class RaisingCache(DocumentCache):
+    """A cache whose every call fails — an unreadable metadata directory, say.
 
-    def __init__(self) -> None:
+    The predecessor of this double was a dead *actor*, which is no longer a way
+    the extraction cache can fail: the card calls it directly. What is left is
+    the store underneath refusing, and the rule is unchanged — every failure is a
+    miss, never a failed read.
+    """
+
+    def __init__(self, inner: DocumentCache) -> None:
+        super().__init__(inner.store, inner.tree_key, inner.max_documents, inner.max_document_chars)
         self.calls = 0
 
-    def attach(self, agent: object, agent_name: str) -> None:
-        """The bind-time holder registration — the actor was alive then; it died later."""
-
-    def document_extract(self, path: str, source_sha: str, extractor_version: int) -> str | None:
+    def lookup(self, path: str, source_sha: str, extractor_version: int) -> str | None:
         self.calls += 1
-        raise RuntimeError("actor is dead")
+        raise RuntimeError("the record store is unreadable")
 
-    def cache_document(
-        self, path: str, source_sha: str, extractor_version: int, markdown: str
-    ) -> None:
+    def fill(self, path: str, source_sha: str, extractor_version: int, markdown: str) -> None:
         self.calls += 1
-        raise RuntimeError("actor is dead")
+        raise RuntimeError("the record store is unreadable")
 
 
 def document_card(
     orchestrator_proxy: FakeOrchestratorProxy,
     reader: DocumentReader,
-    workspace_proxy: object | None = None,
-) -> tuple[WorkspaceTool, WorkspaceActor | None]:
-    """A card that can read documents, plus the actor behind it when there is one."""
-    observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=workspace_proxy)
+    wrap: Callable[[DocumentCache], DocumentCache] | None = None,
+) -> tuple[WorkspaceTool, DocumentCache]:
+    """A card that can read documents, plus the cache it fills and reads.
+
+    **No actor is created and none is wanted**: a card that enables neither exec
+    nor retrieval creates none since story 55-8, and the extraction cache is this
+    card's own object. *wrap* replaces that object after the bind — which is what
+    the doubles above are for, and it works because the read closures capture the
+    cache at ``get_tools`` time, on the call the read itself makes.
+    """
+    observer = FakeActorToolObserver(orchestrator_proxy)
     card = WorkspaceTool(
         workspace_id=WORKSPACE_NAME,
         workspace_read=WorkspaceRead(document_reader=reader),
     )
     card.observer(observer)
-    entry = orchestrator_proxy.children.get(workspace_actor_name(WORKSPACE_PATH))
-    actor = entry[1] if entry is not None else None
-    return card, actor if isinstance(actor, WorkspaceActor) else None
+    assert orchestrator_proxy.create_calls == [], "a read/write card created an actor"
+    assert card._document_cache is not None
+    if wrap is not None:
+        card._document_cache = wrap(card._document_cache)
+    return card, card._document_cache
 
 
 def tree_snapshot(tree: Path) -> dict[str, bytes]:
@@ -149,7 +163,7 @@ class TestAStaleSourceIsAMiss:
         # way for an agent to discover it was reading a file that no longer
         # exists. The cache is keyed on the bytes, so the replacement is a miss.
         reader = _StubDocumentReader()
-        card, _actor = document_card(orchestrator_proxy, reader)
+        card, _cache = document_card(orchestrator_proxy, reader)
         source = workspace_tree / "report.pdf"
 
         source.write_bytes(b"the original report")
@@ -169,7 +183,7 @@ class TestAStaleSourceIsAMiss:
         # collapse into "always re-extract": a file rewritten with what it
         # already held has not changed, whatever its mtime now says.
         reader = _StubDocumentReader()
-        card, _actor = document_card(orchestrator_proxy, reader)
+        card, _cache = document_card(orchestrator_proxy, reader)
         source = workspace_tree / "report.pdf"
 
         source.write_bytes(b"the original report")
@@ -186,7 +200,7 @@ class TestAStaleSourceIsAMiss:
         # source: the read fails at ``backend.read`` before any lookup. Under
         # the sidecar the extraction of a deleted file was served for ever.
         reader = _StubDocumentReader()
-        card, _actor = document_card(orchestrator_proxy, reader)
+        card, _cache = document_card(orchestrator_proxy, reader)
         source = workspace_tree / "report.pdf"
         source.write_bytes(b"the original report")
         read(card, "report.pdf")
@@ -213,21 +227,20 @@ class TestTheExtractorVersion:
         # closure carrying a different version simply stops hitting them. This
         # is the remedy backlog row 46 needs, and the story bumps nothing.
         reader = _StubDocumentReader()
-        card, actor = document_card(orchestrator_proxy, reader)
-        assert actor is not None
+        card, cache = document_card(orchestrator_proxy, reader)
         (workspace_tree / "report.pdf").write_bytes(b"the original report")
 
         read(card, "report.pdf")
-        assert stored_docs(actor)["report.pdf"].extractor_version == EXTRACTOR_VERSION
+        assert stored_docs(cache)["report.pdf"].extractor_version == EXTRACTOR_VERSION
 
         # The version is captured when the callable is built, so a new card is
         # what a deployment carrying a bumped constant would have.
         monkeypatch.setattr("akgentic.tool.workspace.card.EXTRACTOR_VERSION", EXTRACTOR_VERSION + 1)
-        bumped, _actor = document_card(orchestrator_proxy, reader)
+        bumped, _cache = document_card(orchestrator_proxy, reader)
         read(bumped, "report.pdf")
 
         assert reader.runs == ["the original report", "the original report"]
-        assert stored_docs(actor)["report.pdf"].extractor_version == EXTRACTOR_VERSION + 1
+        assert stored_docs(cache)["report.pdf"].extractor_version == EXTRACTOR_VERSION + 1
 
 
 # ---------------------------------------------------------------------------
@@ -236,82 +249,78 @@ class TestTheExtractorVersion:
 
 
 class TestTheReadPathStaysFree:
-    def test_a_text_read_asks_the_actor_nothing(
+    def test_a_text_read_touches_the_cache_not_at_all(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
-        # The document branch's one ask must not leak onto the text branch,
+        # The document branch's one lookup must not leak onto the text branch,
         # which is the majority of workspace traffic. Hoisting the hash and the
         # lookup above the branch is the tidying that would do it.
         reader = _StubDocumentReader()
-        _seed, actor = document_card(orchestrator_proxy, reader)  # creates the actor
-        assert actor is not None
-        spy = SpyingAskProxy(actor)
-        spied, _actor = document_card(orchestrator_proxy, reader, workspace_proxy=spy)
+        spied, cache = document_card(orchestrator_proxy, reader, wrap=SpyingCache)
+        assert isinstance(cache, SpyingCache)
         (workspace_tree / "notes.md").write_text("alpha\nbravo\n", encoding="utf-8")
 
         assert "alpha" in read(spied, "notes.md")
 
-        assert spy.lookups == []
-        assert spy.fills == []
+        assert cache.lookups == []
+        assert cache.fills == []
 
     def test_a_document_read_makes_exactly_one_lookup_and_one_fill(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         reader = _StubDocumentReader()
-        _seed, actor = document_card(orchestrator_proxy, reader)  # creates the actor
-        assert actor is not None
-        spy = SpyingAskProxy(actor)
-        spied, _actor = document_card(orchestrator_proxy, reader, workspace_proxy=spy)
+        spied, cache = document_card(orchestrator_proxy, reader, wrap=SpyingCache)
+        assert isinstance(cache, SpyingCache)
         (workspace_tree / "report.pdf").write_bytes(b"the original report")
 
         read(spied, "report.pdf")  # a miss: one lookup, one fill
         read(spied, "report.pdf")  # a hit: one lookup, no fill
 
-        assert spy.lookups == ["report.pdf", "report.pdf"]
-        assert spy.fills == ["report.pdf"]
+        assert cache.lookups == ["report.pdf", "report.pdf"]
+        assert cache.fills == ["report.pdf"]
 
-    def test_a_document_cache_hit_through_a_live_proxy_writes_nothing(
+    def test_a_document_cache_hit_writes_nothing_at_all(
         self,
-        threaded_orchestrator_proxy: FakeOrchestratorProxy,
+        orchestrator_proxy: FakeOrchestratorProxy,
         workspace_tree: Path,
     ) -> None:
-        """The no-write property against a real actor thread and a real proxy.
+        """The no-write property against the real card and a recording store.
 
         A document read *would* write per read if the lookup reached a write
-        site. 45-4 is the first story to put a read on a proxy call, so this is
-        the story that could break it. Frozen here against the live shape —
-        45-3's guard sits at the actor and cannot see this.
+        site. 45-4 was the first story to put a read on a cache call, so this is
+        the shape that could break it.
 
-        The recorder is announced through ``configure_document_store`` on the
-        actor's own thread, before the fills, which must each show up: a
-        recorder the actor never reached could not make the hit look silent.
+        **It used to be driven through a live actor thread and a real pykka
+        proxy**, because the lookup was an ask. Story 55-8 took that mailbox out
+        of the read path entirely, so there is no proxy left to drive it through
+        and the honest form is the card calling its own cache. The claim is
+        unchanged and the evidence is stronger: the recorder counts what reached
+        the *disk*, with nothing asynchronous between the read and the count.
 
-        **Two documents, and the hit is on the older one.** Under the LRU that
-        used to matter because the hit reordered; it no longer reorders, and the
-        second document stays so that a write on *any* path would still be
-        visible here.
+        **Two documents, and the hit is on the older one**, so a write on *any*
+        path would still be visible here.
         """
         reader = _StubDocumentReader()
         (workspace_tree / "a.pdf").write_bytes(b"the first report")
         (workspace_tree / "b.pdf").write_bytes(b"the second report")
-        card, _actor = document_card(threaded_orchestrator_proxy, reader)
-        pykka_proxy = threaded_orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)][1]
         recorder = RecordingDocumentStore()
-        pykka_proxy.configure_document_store(recorder)
+        card, cache = document_card(
+            orchestrator_proxy,
+            reader,
+            wrap=lambda inner: DocumentCache(
+                recorder, inner.tree_key, inner.max_documents, inner.max_document_chars
+            ),
+        )
 
         read(card, "a.pdf")  # two misses, two fills — and a fill does write
         read(card, "b.pdf")
 
-        # The attribute fetch is itself a mailbox turn, so it lands after both
-        # fills: reaching the actor at all proves they have been applied.
-        pykka_proxy.state.get(timeout=HANDSHAKE_TIMEOUT_S)
         assert sorted(recorder.written) == ["a.pdf", "b.pdf"]
         fills = len(recorder.puts)
 
         assert "the first report" in read(card, "a.pdf")
 
         assert reader.runs == ["the first report", "the second report"]  # a hit
-        pykka_proxy.state.get(timeout=HANDSHAKE_TIMEOUT_S)  # the hit's turn has run
         assert len(recorder.puts) == fills, "the cache hit wrote a record"
 
 
@@ -325,7 +334,7 @@ class TestNothingIsWrittenToTheTree:
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         reader = _StubDocumentReader()
-        card, _actor = document_card(orchestrator_proxy, reader)
+        card, _cache = document_card(orchestrator_proxy, reader)
         (workspace_tree / "report.pdf").write_bytes(b"the original report")
         before = tree_snapshot(workspace_tree)
 
@@ -338,7 +347,7 @@ class TestNothingIsWrittenToTheTree:
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         reader = _StubDocumentReader()
-        card, _actor = document_card(orchestrator_proxy, reader)
+        card, _cache = document_card(orchestrator_proxy, reader)
         docs = workspace_tree / "docs"
         docs.mkdir()
         (docs / "slides.pptx").write_bytes(b"PK the deck")
@@ -366,7 +375,7 @@ class TestNothingIsWrittenToTheTree:
         state document.
         """
         reader = _StubDocumentReader()
-        card, _actor = document_card(orchestrator_proxy, reader)
+        card, _cache = document_card(orchestrator_proxy, reader)
         (workspace_tree / ".photo.png.1568.png").write_bytes(b"resized image bytes")
 
         result = read(card, ".photo.png.1568.png")
@@ -390,14 +399,13 @@ class TestForceDocumentRegeneration:
         # source", which no notion of validity governed. This one overrides a
         # correct answer — and still leaves the cache filled, not emptied.
         reader = _StubDocumentReader()
-        card, actor = document_card(orchestrator_proxy, reader)
-        assert actor is not None
+        card, cache = document_card(orchestrator_proxy, reader)
         (workspace_tree / "report.pdf").write_bytes(b"the original report")
 
         read(card, "report.pdf")
-        entry_before = stored_docs(actor)["report.pdf"]
+        entry_before = stored_docs(cache)["report.pdf"]
         read(card, "report.pdf", force_document_regeneration=True)
-        entry_after = stored_docs(actor)["report.pdf"]
+        entry_after = stored_docs(cache)["report.pdf"]
 
         assert reader.runs == ["the original report", "the original report"]
         assert entry_after.markdown == entry_before.markdown
@@ -408,7 +416,7 @@ class TestForceDocumentRegeneration:
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         reader = _StubDocumentReader()
-        card, _actor = document_card(orchestrator_proxy, reader)
+        card, _cache = document_card(orchestrator_proxy, reader)
         (workspace_tree / "report.pdf").write_bytes(b"the original report")
 
         assert "the original report" in read(card, "report.pdf", force_document_regeneration=True)
@@ -420,16 +428,15 @@ class TestForceDocumentRegeneration:
 
 
 class TestTheCacheDegradesToAMiss:
-    def test_a_card_with_no_proxy_reads_correctly_and_never_hits(
+    def test_a_card_with_no_cache_reads_correctly_and_never_hits(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
-        # A harness shape that binds no actor. Reaching for the private
-        # attributes is the only way to produce it: ``observer()`` always binds,
-        # and the point is what the closures do when the binding is absent.
+        # A harness shape that never built one. Reaching for the private
+        # attribute is the only way to produce it: ``observer()`` always builds a
+        # cache, and the point is what the closures do when it is absent.
         reader = _StubDocumentReader()
-        card, _actor = document_card(orchestrator_proxy, reader)
-        card._workspace_proxy = None
-        card._workspace_tell = None
+        card, _cache = document_card(orchestrator_proxy, reader)
+        card._document_cache = None
         (workspace_tree / "report.pdf").write_bytes(b"the original report")
 
         assert "the original report" in read(card, "report.pdf")
@@ -437,19 +444,19 @@ class TestTheCacheDegradesToAMiss:
 
         assert reader.runs == ["the original report"] * 2  # every read is a miss
 
-    def test_a_raising_proxy_reads_correctly_and_never_hits(
+    def test_a_raising_cache_reads_correctly_and_never_hits(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         reader = _StubDocumentReader()
-        raising = RaisingCacheProxy()
-        card, _actor = document_card(orchestrator_proxy, reader, workspace_proxy=raising)
+        card, cache = document_card(orchestrator_proxy, reader, wrap=RaisingCache)
+        assert isinstance(cache, RaisingCache)
         (workspace_tree / "report.pdf").write_bytes(b"the original report")
 
         assert "the original report" in read(card, "report.pdf")
         assert "the original report" in read(card, "report.pdf")
 
         assert reader.runs == ["the original report"] * 2
-        assert raising.calls == 4  # two lookups and two fills, all refused
+        assert cache.calls == 4  # two lookups and two fills, all refused
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +471,7 @@ class TestTheSidecarIsGone:
         # A tree that predates this story still holds these. They are inert: the
         # read extracts from the source and leaves the leftover untouched.
         reader = _StubDocumentReader()
-        card, _actor = document_card(orchestrator_proxy, reader)
+        card, _cache = document_card(orchestrator_proxy, reader)
         (workspace_tree / "report.pdf").write_bytes(b"the original report")
         leftover = workspace_tree / ".report.pdf.md"
         leftover.write_text("# stale extraction from another era", encoding="utf-8")
@@ -475,17 +482,16 @@ class TestTheSidecarIsGone:
         assert "another era" not in result
         assert leftover.read_text(encoding="utf-8") == "# stale extraction from another era"
 
-    def test_the_extraction_is_reachable_only_through_the_actor(
+    def test_the_extraction_is_reachable_only_through_the_cache(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         reader = _StubDocumentReader()
-        card, actor = document_card(orchestrator_proxy, reader)
-        assert actor is not None
+        card, cache = document_card(orchestrator_proxy, reader)
         (workspace_tree / "report.pdf").write_bytes(b"the original report")
 
         read(card, "report.pdf")
 
-        entry = stored_docs(actor)["report.pdf"]
+        entry = stored_docs(cache)["report.pdf"]
         assert entry.source_sha == content_sha(b"the original report")
         assert entry.markdown is not None and "the original report" in entry.markdown
         with patch.object(DocumentReader, "extract_text") as never:

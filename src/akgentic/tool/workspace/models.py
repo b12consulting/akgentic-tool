@@ -19,10 +19,14 @@ from typing import Literal
 
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.utils.serializer import SerializableBaseModel
-from akgentic.tool.workspace.documents.models import (
-    DEFAULT_MAX_DOCUMENT_CHARS,
-    DEFAULT_MAX_DOCUMENTS,
-)
+
+# **This module no longer imports anything from ``documents/``**, and the absence
+# is structural rather than tidy. It took the two document caps from
+# ``documents/models.py`` to default two ``WorkspaceConfig`` fields; those fields
+# went with the caps onto the announced ``DocumentCache``, so the import went too
+# — and with it the only reason the ``read/``, ``write/`` and ``journal/``
+# capabilities reached the documents package at all. They reached it through this
+# spine module, never by naming it.
 
 DEFAULT_MAX_OBSERVATIONS_PER_AGENT = 256
 """Default of ``WorkspaceTool.max_observations_per_agent``.
@@ -367,24 +371,22 @@ class WorkspaceConfig(BaseConfig):
         max_tracked_writers: Cap on the agent-name map, which the git journal
             and the exec busy refusal consult to name an agent rather than
             print its UUID.
-        max_documents: Cap on the number of cached extractions the document
-            store holds for this tree. Over it, the least recently extracted
-            body is dropped and its record removed when nothing else is left in
-            it — an eviction never de-indexes a file, so a record still carrying
-            an index row survives with its extraction half cleared.
-        max_document_chars: Cap on the characters held across the cached
-            extracts that still have a body. Over it, the least recently
-            extracted body is dropped and its metadata kept — a different remedy
-            from the row cap because it answers a different pressure
-            (:func:`~akgentic.tool.workspace.documents.models.evict_document_bodies`).
         git_journal: Whether to keep a git journal of accepted mutations. The
             gate is unaffected either way — it is pure Python and independent.
         git_timeout_s: Wall-clock budget for one ``git`` invocation.
+
+    **The two document caps are no longer here**, and their absence is a fix
+    rather than a tidy-up. They reached this config through ``getChildrenOrCreate``,
+    which ignores ``config`` on a hit — so the first card of a team to bind a tree
+    fixed the caps for every later card of that team, silently. They now travel on
+    the :class:`~akgentic.tool.workspace.documents.cache.DocumentCache` the card
+    builds and announces, which is last-writer-wins like every other announcement,
+    and the card is where they are derived from the backend the collection really
+    resolves to. A stored record still carrying them loads unchanged: an unknown
+    key is ignored.
     """
 
     workspace_path: str
     max_tracked_writers: int = DEFAULT_MAX_TRACKED_WRITERS
-    max_documents: int = DEFAULT_MAX_DOCUMENTS
-    max_document_chars: int = DEFAULT_MAX_DOCUMENT_CHARS
     git_journal: bool = False
     git_timeout_s: float = DEFAULT_GIT_TIMEOUT_S

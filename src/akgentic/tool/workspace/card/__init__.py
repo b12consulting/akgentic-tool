@@ -86,6 +86,7 @@ from akgentic.tool.workspace.actor import (
     workspace_actor_name,
 )
 from akgentic.tool.workspace.card.params import Resource, ResourceType
+from akgentic.tool.workspace.documents.cache import DocumentCache
 from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION, derived_document_caps
 from akgentic.tool.workspace.documents.store import DocumentStore, resolve_document_store
 from akgentic.tool.workspace.event import WorkspaceAttached
@@ -133,6 +134,7 @@ from akgentic.tool.workspace.workspace import (
     meta_dir_for,
     permitted_shared_kinds,
     resolve_workspace_path,
+    sweep_staging_files,
     validate_workspace_id,
 )
 from akgentic.tool.workspace.write import WriteFactories
@@ -468,6 +470,11 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
     # methods, and a serializable field holding one would not round-trip
     # (Golden Rule 1b).
     _document_store: DocumentStore | None = PrivateAttr(default=None)
+    # The card's own view of those records — the extraction cache the read path
+    # fills and reads, the stale-mark an accepted mutation applies, and both
+    # document caps. Built on every bind, whether or not this card creates an
+    # actor, and announced to the actor when there is one.
+    _document_cache: DocumentCache | None = PrivateAttr(default=None)
     # The author's ``vector_store`` with the backend resolved and this tree's
     # ``<meta>`` stamped into ``root`` — derived at bind, never written back onto
     # the field, so a stored card still says what its author wrote.
@@ -580,6 +587,13 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
             # process, under rows that do not. See ``WORKSPACE_IN_MEMORY_REFUSED``.
             require_workspace_backend(self.vector_store, "WorkspaceTool")
         super().observer(observer)  # store the observer weakly via the base setter
+        # Captured before anything that could branch on the actor, because the
+        # write gate reads both directly for the journal's commit author. They
+        # used to be set inside ``_bind_workspace_actor``, which now runs for
+        # some cards and not others — leaving them there would author every
+        # commit of a read/write card as an empty identity, silently.
+        self._agent_id = str(observer.myAddress.agent_id)
+        self._agent_name = str(observer.myAddress.name)
         path = self._resolve_path(observer, observer.orchestrator)
         # Immediately after the resolve and before anything with a side effect:
         # ``get_workspace`` creates the tree eagerly (``Filesystem.__init__``), so
@@ -591,6 +605,12 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         self._meta_dir = meta_dir_for(ws_path)
         self._exec_budget_s = self._mutation_budget()
         self._workspace = get_workspace(ws_path)
+        # Immediately after the tree handle and before anything writes into the
+        # tree — before ``_seed_resources`` and before the journal's first commit
+        # — which is 29-4's ordering argument reaching the card. It was the
+        # actor's ``on_start``; a card that creates no actor still has to sweep,
+        # because nothing else ever removes an orphaned staging file.
+        sweep_staging_files(self._workspace, ws_path)
         # Unconditional, beside the filesystem and for the same reason: a bad
         # ``AKGENTIC_LOCK_BACKEND`` must fail the bind in front of the admin who
         # set it, not at the first command. Constructing one creates nothing —
@@ -613,18 +633,34 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         # ``WorkspaceAttached``. The same ordering discipline
         # ``_require_sharing_permitted`` states one screen up.
         self._require_tree_policy(ws_path, "WorkspaceTool")
+        # Built before the bind so the actor can be handed it, and holding the
+        # caps this card derived: they used to travel through the actor's config,
+        # where get-or-create fixed them for a team at whichever card bound first.
+        self._document_cache = self._build_document_cache()
         self._seed_resources()
         self._bind_workspace_actor(observer, observer.orchestrator, ws_path)
-        # After the bind, because the actor's own ``on_start`` creates the
-        # repository and seeds ``.gitignore``; this journal opens the same
-        # repository to *commit* into rather than to create it. Before the first
-        # mutation, which is all the gate needs.
+        # **One event per successful bind, actor or no actor.** It used to be
+        # emitted inside the bind above, which now runs for some cards and not
+        # others; a client's Workspace tab folds this event to learn which agent
+        # bound which tree, and losing it raises nothing and renders an empty tab
+        # (ADR-051 Decision 10). ``notify_event`` rather than a hand-built
+        # ``EventMessage``: the envelope, the fan-out and the wire name are the
+        # base protocol's, and reimplementing them is what this seam avoids.
+        observer.notify_event(
+            WorkspaceAttached(agent_id=observer.myAddress.agent_id, workspace_path=ws_path)
+        )
+        # **Its position in this sequence is unchanged**, and only the reason is.
+        # It used to run after the bind because the actor's ``on_start`` created
+        # the repository and seeded ``.gitignore``; it now does both itself, for
+        # every card, and still runs here because the sweep above and
+        # ``_seed_resources`` must both precede the first commit (29-4). Before
+        # the first mutation, which is all the gate needs.
         self._open_journal(ws_path)
         # Between the bind and the retrieval announcement, deliberately: the
         # actor must never be able to enable retrieval under a store it has not
         # been given, exactly as it must never admit a run under a hold it has
         # not been given.
-        self._announce_document_store()
+        self._announce_document_cache()
         self._bind_sandbox(observer, ws_path)
         self._bind_vector_store(observer, observer.orchestrator)
         # Before ``_announce_rag``, and that ordering is the invariant: the actor
@@ -673,6 +709,16 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         guards in :mod:`akgentic.tool.workspace.write.gate` predate this change
         and were always what made the degradation safe.
 
+        **It creates the repository, seeds ``.gitignore`` and makes the initial
+        out-of-band commit.** All three were the actor's ``on_start``, and the
+        actor is only created when a capability that dispatches is enabled
+        (ADR-053 Decision 6) — so a ``git_journal=True`` card with neither exec
+        nor retrieval got a repository from this method and then no ``.gitignore``
+        and no first commit, which is a journal that records the metadata sidecars
+        it exists to ignore. Seeding before the commit is the second half of
+        29-4's ordering, and the staging sweep at the top of ``observer()`` is the
+        first.
+
         Args:
             workspace_path: The resolved three-segment path, whose metadata
                 directory holds the commit lock.
@@ -686,7 +732,9 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
             timeout_s=DEFAULT_GIT_TIMEOUT_S,
             meta_dir=meta_dir_for(workspace_path),
         )
-        journal.initialise()
+        if journal.initialise():
+            journal.seed_gitignore(self._workspace.write)
+            journal.commit_out_of_band()
         self._journal = journal
 
     def _resolve_store_param(self, workspace_path: str) -> VectorStoreParam | None:
@@ -983,30 +1031,61 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         except Exception:
             logger.debug("Could not announce the exec lock backend to #Workspace", exc_info=True)
 
-    def _announce_document_store(self) -> None:
-        """Tell the actor where this tree's document records live — fire and forget.
+    def _build_document_cache(self) -> DocumentCache:
+        """This card's view of the tree's document records, with both caps resolved.
+
+        **The card owns the extraction cache now, and calls it directly.** It was
+        reached through the actor — an ask for a lookup, a tell for a fill — and
+        the actor is only created when a capability that dispatches is enabled
+        (ADR-053 Decision 6). Gating the cache on that would have left the common
+        read path with no cache at all, which the document store's own docstring
+        already warned about; so the cache came card-side instead, where a plain
+        read/write card reaches it with no mailbox in the way.
+
+        The caps are derived here rather than handed to the actor's config: the
+        same :func:`~akgentic.tool.workspace.documents.models.derived_document_caps`
+        call over :meth:`_caps_backend`, with an explicit catalog value always
+        winning (ADR-045 §7). Through the config they went via get-or-create,
+        which ignores ``config`` on a hit — so the first card of a team to bind
+        fixed the caps for every later card of that team.
+
+        Returns:
+            The cache, over the store resolved in :meth:`observer`.
+        """
+        derived_documents, derived_chars = derived_document_caps(
+            self._caps_backend(), self._rag_enabled()
+        )
+        return DocumentCache(
+            self._document_store,
+            self._workspace_path,
+            self.max_documents if self.max_documents is not None else derived_documents,
+            (self.max_document_chars if self.max_document_chars is not None else derived_chars),
+        )
+
+    def _announce_document_cache(self) -> None:
+        """Hand the actor this card's cache — fire and forget, and only if there is one.
 
         Guarded exactly as :meth:`_announce_lock` is, and it degrades the same
-        way: without a store the actor's document cache misses and
+        way: without a cache the actor's lookups miss and
         ``workspace_rag_index`` answers its existing unavailable sentence —
         visible, and recoverable by rebinding. A raise at wiring time is neither,
         and this card's other twenty capabilities are file operations that have
         nothing to do with retrieval.
 
-        **Unconditional, unlike the lock's announcement.** The store is not a
-        retrieval capability: ``document_extract`` serves every read that goes
-        through the extractor, whether or not any card on this tree ever enables
-        an index. A card that gated this on ``_rag_enabled()`` would leave the
-        common read path with no cache at all.
+        **Unconditional in the sense that matters, and a no-op when there is no
+        actor.** The cache itself is built on every bind, because it serves every
+        read that goes through the extractor; what is conditional is only whether
+        there is a mailbox to tell about it. A card that creates no actor still
+        fills and reads the same cache — it simply calls it.
         """
         tell = self._workspace_tell
-        store = self._document_store
-        if tell is None or store is None:
+        cache = self._document_cache
+        if tell is None or cache is None:
             return
         try:
-            tell.configure_document_store(store)
+            tell.configure_document_cache(cache)
         except Exception:
-            logger.debug("Could not announce the document store to #Workspace", exc_info=True)
+            logger.debug("Could not announce the document cache to #Workspace", exc_info=True)
 
     def _announce_exec(self, config: ExecConfig) -> None:
         """Tell the actor which backend to run commands on — fire and forget.
@@ -1033,7 +1112,23 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
     def _bind_workspace_actor(
         self, observer: ActorToolObserver, orchestrator: ActorAddress, workspace_path: str
     ) -> None:
-        """Bind the ``#Workspace-<workspace_path>`` actor that owns this tree, then attach.
+        """Bind the ``#Workspace-<workspace_path>`` actor — if this card dispatches.
+
+        **It returns having done nothing at all unless a capability that
+        dispatches is enabled** (ADR-053 Decision 6): ``workspace_exec``, or one
+        of the three ``workspace_rag_*`` fields. A read-only or read/write card
+        creates no actor, and the four duties that used to be reached through one
+        — the agent identity, the extraction cache, the stale-mark and the
+        staging sweep — are all card-side now, because none of them needs a
+        mailbox. What does is a sandbox run whose report must land somewhere and
+        the index/embed children a Pydantic card cannot parent. Nothing else.
+
+        **The predicate is the two that already exist, combined**, and it is
+        spelled once. :meth:`_enabled_exec` is not ``self.workspace_exec``: it
+        already excludes ``read_only`` and a non-``TOOL_CALL`` channel, so
+        ``WorkspaceTool(workspace_exec=True, read_only=True)`` registers no exec
+        callable, binds no sandbox — and creates no actor. A third predicate here
+        is the disagreement ``_enabled_exec`` was written to end.
 
         **Get-or-create as a team child, which is where this bind started.** The
         actor stopped being hosted because nothing shared lives on it any more:
@@ -1049,19 +1144,6 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
 
         The actor's name carries the resolved path, so two cards on different
         trees get two actors and two cards of one team on one tree get one.
-
-        **The card emits the event itself, through ``notify_event``.** It used to
-        travel as an argument of the orchestrator forward this bind replaced,
-        which is gone. ``ToolObserver.notify_event`` is the base protocol's
-        own method for *"tools that only need to emit events"*, and
-        ``Akgent.notify_event`` wraps the payload in the same ``EventMessage`` on
-        the same team stream — so the envelope, the fan-out and the wire name are
-        unchanged and only the emitter moved. **Do not hand-build an
-        ``EventMessage`` here**: that would reimplement the envelope this seam
-        exists to avoid. One event per successful bind, naming this agent, which
-        is how a client's Workspace tab learns which agent bound which tree — and
-        if it silently stopped, nothing would raise and the tab would simply
-        render empty.
 
         Two proxies are bound over the one address: an ask proxy for exec, which
         needs the verdict, and a tell proxy for the retrieval signals, which need
@@ -1091,10 +1173,9 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
                 construction, so carrying it whole avoids a second encoding
                 whose injectivity would have to be proved separately.
         """
+        if self._enabled_exec() is None and not self._rag_enabled():
+            return
         orchestrator_proxy = observer.proxy_ask(orchestrator, Orchestrator)
-        derived_documents, derived_chars = derived_document_caps(
-            self._caps_backend(), self._rag_enabled()
-        )
         workspace_addr = orchestrator_proxy.getChildrenOrCreate(
             WorkspaceActor,
             config=WorkspaceConfig(
@@ -1102,24 +1183,11 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
                 role=WORKSPACE_ACTOR_ROLE,
                 workspace_path=workspace_path,
                 git_journal=self.git_journal,
-                max_documents=(
-                    self.max_documents if self.max_documents is not None else derived_documents
-                ),
-                max_document_chars=(
-                    self.max_document_chars
-                    if self.max_document_chars is not None
-                    else derived_chars
-                ),
             ),
         )
         workspace = observer.proxy_ask(workspace_addr, WorkspaceActor)
         self._workspace_proxy = workspace
         self._workspace_tell = observer.proxy_tell(workspace_addr, WorkspaceActor)
-        self._agent_id = str(observer.myAddress.agent_id)
-        self._agent_name = str(observer.myAddress.name)
-        observer.notify_event(
-            WorkspaceAttached(agent_id=observer.myAddress.agent_id, workspace_path=workspace_path)
-        )
         workspace.attach(observer.myAddress, self._agent_name)
 
     def _caps_backend(self) -> str:
@@ -1185,12 +1253,14 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         return record
 
     def _extract_lookup(self) -> Callable[[str, str], str | None]:
-        """Build the closure a document read uses to ask for a cached extraction.
+        """Build the closure a document read uses to look up a cached extraction.
 
-        An **ask**, because the answer is the whole point: the caller extracts
-        when there is nothing to serve. It is the one place a read waits on the
-        actor, and what makes that acceptable is what is behind it — a dict
-        lookup and an LRU reorder, no I/O, and no notify.
+        **A direct call, not an ask.** This used to be the one place a read
+        waited on the actor's mailbox, which meant a document read could queue
+        behind another agent's indexing turn. The cache is card-side now
+        (ADR-053 Decision 6), so the read performs one ``get_document`` on its
+        own thread and blocks nobody — a latency win, not only a move, and the
+        reason a card that creates no actor still has a working cache at all.
 
         :data:`EXTRACTOR_VERSION` is captured **here**, at ``get_tools`` time,
         exactly as the agent id is above. The extractor a miss would run is a
@@ -1204,14 +1274,14 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
             never raises: every failure degrades to a miss, which costs one
             extraction and can never be a wrong answer.
         """
-        proxy = self._workspace_proxy
+        cache = self._document_cache
         version = EXTRACTOR_VERSION
 
         def lookup(path: str, source_sha: str) -> str | None:
-            if proxy is None:
+            if cache is None:
                 return None  # harness shapes that wire a bare observer never bind one
             try:
-                return proxy.document_extract(path, source_sha, version)
+                return cache.lookup(path, source_sha, version)
             except Exception:
                 # Fail open, towards the pre-cache behaviour: a miss re-extracts
                 # from the tree, which is where every byte came from anyway.
@@ -1223,25 +1293,27 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
     def _extract_recorder(self) -> Callable[[str, str, str], None]:
         """Build the closure a document read uses to fill the extraction cache.
 
-        A **tell**, because nothing comes back and a slow actor must not hold a
-        read that has already produced its answer. The split against
-        :meth:`_extract_lookup` is a correctness requirement, not a style
-        choice: collapsing both onto one proxy either makes a fill blocking or
-        makes a lookup answerless.
+        A direct call, like :meth:`_extract_lookup` and for the same reason. The
+        two used to be a tell and an ask over two proxies — a split that was a
+        correctness requirement while a mailbox was in the way, because
+        collapsing them onto one proxy would have made either the fill blocking
+        or the lookup answerless. With the cache card-side there is no mailbox
+        and no split to keep: the fill is one read-modify-write of one file on
+        the thread that just spent seconds extracting the document.
 
         Returns:
             A callable taking the path, the digest of the source bytes and the
             extracted Markdown. It never raises: a lost fill is a cache that did
             not grow, never a failed read.
         """
-        proxy = self._workspace_tell
+        cache = self._document_cache
         version = EXTRACTOR_VERSION
 
         def remember(path: str, source_sha: str, markdown: str) -> None:
-            if proxy is None:
+            if cache is None:
                 return  # harness shapes that wire a bare observer never bind one
             try:
-                proxy.cache_document(path, source_sha, version, markdown)
+                cache.fill(path, source_sha, version, markdown)
             except Exception:
                 logger.debug("Could not fill the document cache for %s", path, exc_info=True)
 

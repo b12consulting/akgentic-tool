@@ -86,7 +86,13 @@ from akgentic.tool.workspace.workspace import (
 )
 
 if TYPE_CHECKING:
-    from akgentic.tool.workspace.actor import WorkspaceActor
+    # **No ``WorkspaceActor`` here any more**, and that is this capability's own
+    # deletability claim becoming true a second time. ``_mark_stale`` was the last
+    # thing under ``write/`` that named the actor — through the tell proxy it sent
+    # ``mark_paths_stale`` on — and it calls the card's own ``DocumentCache``
+    # instead since the actor became dispatch-only. The write capability now names
+    # the spine, the shared documents package, and nothing else.
+    from akgentic.tool.workspace.documents.cache import DocumentCache
     from akgentic.tool.workspace.journal import GitJournal
 
 logger = logging.getLogger(__name__)
@@ -322,7 +328,7 @@ class CardGate:
         # Every one of these is a real ``PrivateAttr`` — or, for the cap, a real
         # field — on ``WorkspaceTool``. Declared, never defined.
         _workspace: Filesystem | None
-        _workspace_tell: WorkspaceActor | None
+        _document_cache: DocumentCache | None
         _agent_id: str
         _agent_name: str
         _workspace_path: str
@@ -613,19 +619,27 @@ class CardGate:
         return mutation_busy(held.run_id, held.agent_name or held.agent_id)
 
     def _mark_stale(self, paths: list[str]) -> None:
-        """Tell the actor which paths an accepted mutation changed — fire and forget.
+        """Mark the paths an accepted mutation changed — on this thread, swallowing.
 
-        A **tell**: the mutation is already on disk and nothing comes back, so a
-        slow or dead actor must not hold the agent's turn open. It marks stale
-        and does not re-index, because an agent mid-task rewrites the same file
-        repeatedly and indexing each accepted write would spend embedding
-        credits on every save.
+        **A direct call on the card's own cache, not a tell to an actor.** It was
+        the latter until the actor became dispatch-only (ADR-053 Decision 6):
+        invalidating an index row is not dispatch, and a read/write card — which
+        now creates no actor at all — must keep doing it, because *two teams on
+        one tree is the normal case*. A write card that quietly stopped marking a
+        tree another team indexes would leave that team answering from stale
+        chunks with nothing raised.
+
+        Still swallowed, and still after the bytes are on disk: the mutation has
+        already succeeded, and a lost ``STALE`` degrades to a stale index row that
+        the next accepted mutation re-applies. It marks and does not re-index,
+        because an agent mid-task rewrites the same file repeatedly and indexing
+        each accepted write would spend embedding credits on every save.
         """
-        tell = self._workspace_tell
-        if tell is None:
+        cache = self._document_cache
+        if cache is None:
             return
         try:
-            tell.mark_paths_stale(paths)
+            cache.mark_paths_stale(paths)
         except Exception:
             logger.debug("Could not mark %s stale for retrieval", paths, exc_info=True)
 

@@ -11,19 +11,22 @@ never ``name not in names`` — the vocabulary ``test_exec.py::TestTheCapability
 already uses, and for its stated reason: an absence assertion passes over an
 empty list, so a bind that registered nothing at all would satisfy it.
 
-**Two rows this module deliberately does not claim**, because they are not this
+**One row this module deliberately does not claim**, because it is not this
 story's to change:
 
-- a read-only bind still creates the ``#Workspace`` actor. Removing it belongs to
-  story 55-7, which turns the actor into dispatch; until then the honest
-  assertion is that **exactly one** actor is created and it is that one.
 - a read-only bind still constructs a :class:`GitJournal` object. It initialises
   nothing and creates no repository, so the observable — no ``<leaf>.git`` on
   disk — is already what it will be after story 55-4 removes the construction.
 
-Neither carries an ``xfail`` marker. Story 55-1 removed this package's last
-strict-xfail tripwire, and a second one would redden the suite the day 55-7 lands
-rather than the day someone wants it to.
+It carries no ``xfail`` marker. Story 55-1 removed this package's last
+strict-xfail tripwire, and a second one would redden the suite the day its owner
+lands rather than the day someone wants it to.
+
+**The actor bullet that sat beside it is gone, and story 55-8 is where it went.**
+A read-only bind created the ``#Workspace`` actor while the actor still held the
+extraction cache, the stale-mark and the staging sweep; all three are card-side
+now, so the actor is created only by a card that dispatches and the honest
+assertion below is an equality against the **empty** list.
 
 **Two resolutions that run unconditionally are not counted as cost**, because
 they are deliberate: ``resolve_lock_backend()`` and ``resolve_document_store()``
@@ -41,7 +44,6 @@ from typing import Any
 import pytest
 from akgentic.core.utils import deserialize_object, import_class, serialize
 
-from akgentic.tool.workspace.actor import workspace_actor_name
 from akgentic.tool.workspace.card import WorkspaceTool
 from akgentic.tool.workspace.journal import git_dir_for
 
@@ -149,16 +151,22 @@ class TestEnablingNothingCostsNothing:
         """``workspace_rag_list`` is what puts a provider here, and it is off."""
         assert read_only_card.get_context_states() == []
 
-    def test_it_creates_exactly_one_actor(
+    def test_it_creates_no_actor_at_all(
         self, read_only_card: WorkspaceTool, orchestrator_proxy: FakeOrchestratorProxy
     ) -> None:
-        """The tree's own ``#Workspace`` and nothing else — no ``#VectorStore``.
+        """Not the tree's own ``#Workspace``, and not a ``#VectorStore`` either.
 
-        The row story 55-7 tightens: today the actor is created, and the claim
-        this guard makes is that it is the *only* one.
+        The row story 55-8 tightened. It used to claim the ``#Workspace`` actor
+        was the *only* one created, which was the honest reading while the actor
+        still owned the extraction cache; it owns nothing a read card needs now,
+        so nothing is created.
+
+        Still an **equality** over the created list rather than a ``not in``: the
+        expected value is the empty list, and an absence assertion passes over one
+        whatever the bind did.
         """
         created = [config.name for _cls, config in orchestrator_proxy.create_calls]
-        assert created == [workspace_actor_name(WORKSPACE_PATH)]
+        assert created == []
 
     def test_it_resolves_no_vector_backend(
         self,

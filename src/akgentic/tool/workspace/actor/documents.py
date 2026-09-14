@@ -1,42 +1,48 @@
-"""The extraction cache and the retrieval index — files on disk, not maps in memory.
+"""The retrieval index — files on disk, not maps in memory.
 
 **What this actor knows about a document lives in a file, not in its state.**
 Both halves of one document — the cached extraction and the retrieval row — are
 one :class:`~akgentic.tool.workspace.documents.store.DocumentEntry` under
-``<meta>/rag/``, written through a
-:class:`~akgentic.tool.workspace.documents.store.DocumentStore` the card
-announces at bind time (ADR-051 Decision 6). A second process over the same
+``<meta>/rag/``, reached through the
+:class:`~akgentic.tool.workspace.documents.cache.DocumentCache` the card builds
+and announces at bind time (ADR-051 Decision 6). A second process over the same
 mount therefore reads the same cache with no shared memory, and nothing here
 sends a delta to anybody: the two state fields, both dirty sets, ``_persist``,
 ``_send_delta`` and the restore hook they existed for are gone.
 
-**There are exactly two writers, and each one writes to disk on the turn it is
-called.** :meth:`DocumentsMixin._put_row` is the only writer of a row;
-:meth:`DocumentsMixin.cache_document` is the only writer of an extraction. Both
-read the entry, copy it with the one half that changes, and put it back — never
-a field-by-field rebuild (Golden Rule 12). There is **no dirty set and no
-batching**: the ``batches_landed`` counter that deliberately persisted nothing on
-its own turn now writes, which costs ``ceil(chunks / EMBED_BATCH_SIZE)`` rewrites
-of one file and is accepted deliberately. The alternative is in-memory
-write-behind state, which is exactly what moving to files removes, and the
-counter has to survive a crash or its file parks at ``EMBEDDING`` until the
-reaper.
+**The extraction cache itself is not here any more, and that is this story's
+whole point.** Filling and reading an extraction is not dispatch, so it must keep
+working for a card that enables neither exec nor retrieval and therefore creates
+no actor at all (ADR-053 Decision 6). The lookup, the fill, the eviction pass and
+the stale-marking a mutation causes are all
+:class:`~akgentic.tool.workspace.documents.cache.DocumentCache`'s, called
+directly by the card. What is left here is the pipeline that genuinely needs a
+mailbox — the ``#index-`` and ``#embed-`` children a Pydantic card cannot parent,
+and the reports they send back — which reads and fills the same cache through the
+same object.
+
+**There is exactly one writer of a row here, and it writes to disk on the turn it
+is called.** :meth:`DocumentsMixin._put_row` goes through the cache's own
+``put_row``, which reads the entry, copies it with the one half that changes, and
+puts it back — never a field-by-field rebuild (Golden Rule 12). There is **no
+dirty set and no batching**: the ``batches_landed`` counter that deliberately
+persisted nothing on its own turn now writes, which costs
+``ceil(chunks / EMBED_BATCH_SIZE)`` rewrites of one file and is accepted
+deliberately. The alternative is in-memory write-behind state, which is exactly
+what moving to files removes, and the counter has to survive a crash or its file
+parks at ``EMBEDDING`` until the reaper.
 
 **The rule that survives, unchanged and load-bearing: a read writes nothing.**
 Reads are the majority of workspace traffic, and a document-cache **hit** is a
-read: it performs one ``get_document`` and no write at all. The LRU reorder a hit
-used to perform in memory is deleted with the map it reordered — recency is
-``extract.extracted_at``, stamped at the fill and read off the disk by the
-eviction pass. A write on a *read* path — of any kind, in any of these methods —
-is a defect until a decision says otherwise.
+read: it performs one ``get_document`` and no write at all. A write on a *read*
+path — of any kind, in any of these methods — is a defect until a decision says
+otherwise.
 
-**``self._document_store is None`` is an ordinary state and every path degrades through
+**An unannounced cache is an ordinary state and every path degrades through
 it**, never an ``assert`` and never a raise: a lost announcement means the cache
 misses and the index looks empty, which is visible and recoverable by rebinding.
-The card builds a store unconditionally in ``observer()``, so ``None`` is
-reachable only in harness shapes that wire a bare observer and in the window
-before the announcement lands — the two cases ``_workspace_proxy is None``
-already covers.
+:meth:`DocumentsMixin._cache` is where that is said once — it hands back a cache
+over no store rather than a ``None`` every delegate would have to branch on.
 
 Everything on the ask path here is O(1)/O(n) dict work on the actor thread, plus
 bounded file reads while queueing and bounded proxy calls to the store child —
@@ -73,18 +79,17 @@ from akgentic.tool.vector_store.protocol import (
     PATH_PREFIX_REJECTED,
     PATH_PREFIX_WILDCARDS,
 )
+from akgentic.tool.workspace.documents.cache import DocumentCache
 from akgentic.tool.workspace.documents.models import (
     EMBEDDING_STALE_AFTER_S,
     EXTRACTOR_VERSION,
     RAG_COLLECTION,
-    DocumentExtract,
     NewFileMessage,
     RagChunk,
     RagFile,
     RagStatus,
-    evict_document_bodies,
 )
-from akgentic.tool.workspace.documents.store import DocumentEntry, DocumentStore
+from akgentic.tool.workspace.documents.store import DocumentEntry
 from akgentic.tool.workspace.models import WorkspaceConfig, content_sha
 from akgentic.tool.workspace.rag.context import RagFileRow, RagIndexState
 from akgentic.tool.workspace.readers import _MIME_MAP, TEXT_EXTENSIONS, DocumentReader
@@ -234,15 +239,15 @@ class DocumentsMixin(_DocumentsBase):
     # itself still exists on ``WorkspaceActor``, unread, and goes with the rest of
     # the retrieval state when the mixin is split.
     _index_workers: int
-    _document_store: DocumentStore | None
+    _document_cache: DocumentCache | None
 
     ##
-    ## The store — four helpers, and the only place a ``tree_key`` is spelled
+    ## The store — six delegates onto the cache the card announced
     ##
     def configure_vector_store(self, store: VectorStoreService) -> None:
         """Take the engine the card resolved — **tell** path, last writer wins.
 
-        The shape ``configure_lock`` and ``configure_document_store`` already
+        The shape ``configure_lock`` and ``configure_document_cache`` already
         have. It lands **before** ``enable_rag``, which is what makes it
         impossible for this actor to turn retrieval on under a store it has not
         been given; the card orders the two announcements and this method holds
@@ -258,89 +263,69 @@ class DocumentsMixin(_DocumentsBase):
         """
         self._vector_store = store
 
-    def configure_document_store(self, backend: DocumentStore) -> None:
-        """Take the store the card resolved — **tell** path, last writer wins.
+    def configure_document_cache(self, cache: DocumentCache) -> None:
+        """Take the cache the card built — **tell** path, last writer wins.
 
         The shape ``configure_exec`` and ``configure_lock`` already have: the card
-        builds the backend in ``observer()`` and announces it here, so this actor
+        builds the object in ``observer()`` and announces it here, so this actor
         never inspects a card and never resolves configuration of its own. A
         second announcement from a second card simply replaces the first; two
-        cards on one tree resolve the same backend from the same environment, so
+        cards on one tree resolve the same store from the same environment, so
         there is nothing for a first-call-wins rule to protect.
 
+        **It carries the two document caps as well as the store**, which is what
+        retired ``WorkspaceConfig.max_documents`` and ``max_document_chars``.
+        Those travelled through get-or-create, so the first card of a team to
+        bind fixed them for every later card of that team, with nothing raised;
+        an announcement is last-writer-wins like every other one here.
+
         Args:
-            backend: Where this tree's document records live.
+            cache: This tree's records, its two caps, and the store behind them.
         """
-        self._document_store = backend
+        self._document_cache = cache
+
+    def _cache(self) -> DocumentCache:
+        """The announced cache, or an empty stand-in over no store.
+
+        **A missing announcement is an ordinary state and must stay one.** Every
+        document path already degrades to a miss when no card has announced a
+        store, and the six delegates below would each need the same ``None``
+        branch to say so; handing back a cache whose store is ``None`` says it
+        once, in the one place that knows the tree key.
+        """
+        cache = self._document_cache
+        if cache is not None:
+            return cache
+        return DocumentCache(None, self.config.workspace_path, 0, 0)
 
     def _entry(self, path: str) -> DocumentEntry:
-        """Return *path*'s stored record, or a fresh empty one.
-
-        **A miss and an unannounced store are the same answer**, deliberately: a
-        fresh record with both halves absent is what every caller here already
-        handles, so neither case needs a branch of its own and neither can raise.
-
-        The *tree_key* is resolved here — ``config.workspace_path``, the same
-        three-segment string ``_lock.acquire`` is given, never ``config.name``,
-        which carries the ``#Workspace-`` prefix. Spelling it at every call site
-        would be fifteen places for one to drift.
-        """
-        store = self._document_store
-        if store is None:
-            return DocumentEntry(path=path)
-        return store.get_document(self.config.workspace_path, path) or DocumentEntry(path=path)
-
-    def _save(self, entry: DocumentEntry) -> None:
-        """Write *entry* whole, or do nothing when no store has been announced."""
-        store = self._document_store
-        if store is None:
-            return
-        store.put_document(self.config.workspace_path, entry)
+        """Return *path*'s stored record, or a fresh empty one."""
+        return self._cache().entry(path)
 
     def _entries(self) -> list[DocumentEntry]:
         """Every stored record for this tree, in no guaranteed order.
 
-        **One listing serves all three of its callers** — the drain, the render
-        and the keyword leg — because one file carries both halves of a document.
-        The two-map shape needed two scans and a join; this needs neither, and
-        the join ``_keyword_leg`` performs is now between two fields of one
-        record rather than between two mappings with different lifetimes.
-
-        Callers that need an order sort for themselves: a directory glob's order
-        is the file system's, and leaning on it is how a render stops being
-        stable across runs.
+        **One listing serves all three of its callers here** — the drain, the
+        render and the keyword leg — because one file carries both halves of a
+        document. Callers that need an order sort for themselves: a directory
+        glob's order is the file system's, and leaning on it is how a render
+        stops being stable across runs.
         """
-        store = self._document_store
-        if store is None:
-            return []
-        return store.list_documents(self.config.workspace_path)
+        return self._cache().entries()
 
     @contextlib.contextmanager
     def _hold_record(self, path: str) -> Iterator[None]:
         """Serialise *path*'s record against every other process, for the block.
 
-        The one place a ``tree_key`` is spelled for the hold, exactly as
-        :meth:`_entry` is for the read. An **unannounced store yields without a
-        hold**, deliberately and for :meth:`_entry`'s reason: every document path
-        already degrades to a miss when no card has announced a store, and a raise
-        here would be the one that took the actor down.
-
         Args:
             path: Workspace-relative path of the source document.
         """
-        store = self._document_store
-        if store is None:
-            yield
-            return
-        with store.hold(self.config.workspace_path, path):
+        with self._cache().hold(path):
             yield
 
     def _next_pending(self, exclude: frozenset[str]) -> DocumentEntry | None:
         """One record waiting to be claimed, or ``None`` — never a whole listing."""
-        store = self._document_store
-        if store is None:
-            return None
-        return store.next_pending(self.config.workspace_path, exclude)
+        return self._cache().next_pending(exclude)
 
     def _release_worker_slot(self) -> None:
         """Give back the slot one ``#index-`` worker was occupying in this process.
@@ -354,176 +339,24 @@ class DocumentsMixin(_DocumentsBase):
         """
         self._index_workers = max(0, self._index_workers - 1)
 
-    def _forget_extract(self, path: str) -> None:
-        """Drop *path*'s cached extraction, **keeping its index row**.
-
-        The record is removed outright only when there is no row to keep. That is
-        the on-disk form of the rule the two maps used to hold structurally: the
-        caps bound the *extraction cache*, and
-        :func:`~akgentic.tool.workspace.documents.models.evict_document_bodies`
-        states it directly — a dropped body must not de-index its file. With both
-        halves in one file, unlinking on the row cap would de-index every file it
-        evicted, so the row cap drops the half it is a cap on and the file
-        survives for the half it is not.
-        """
-        entry = self._entry(path)
-        if entry.row is None:
-            store = self._document_store
-            if store is not None:
-                store.evict(self.config.workspace_path, path)
-            return
-        self._save(entry.model_copy(update={"extract": None}))
-
-    ##
-    ## The extraction cache — lookup (ask) and fill (tell)
-    ##
-    def document_extract(self, path: str, source_sha: str, extractor_version: int) -> str | None:
-        """Return the cached Markdown for *path*, or ``None`` on any miss.
-
-        A hit requires all four of: the entry exists, it was produced from these
-        source bytes, it was produced by this extractor, and its body is still
-        present. Four distinct reasons to miss, one answer — the caller
-        re-extracts, which is correct in every one of them.
-
-        **One ``get_document`` and no listing, and a hit writes nothing at all.**
-        The LRU reorder this used to perform is deleted with the map it
-        reordered: recency is ``extract.extracted_at``, stamped at the fill and
-        read off the disk by the eviction pass, so there is nothing for a hit to
-        record. That keeps the read path free, which is the rule this method has
-        always been the load-bearing case of.
-
-        Args:
-            path: Workspace-relative path of the source file.
-            source_sha: Digest of the source bytes the caller just read.
-            extractor_version: The extractor the caller would run on a miss.
-
-        Returns:
-            The cached Markdown, or ``None``.
-        """
-        extract = self._entry(path).extract
-        if (
-            extract is None
-            or extract.source_sha != source_sha
-            or extract.extractor_version != extractor_version
-            or extract.markdown is None
-        ):
-            return None
-        return extract.markdown
-
-    def cache_document(
-        self, path: str, source_sha: str, extractor_version: int, markdown: str
-    ) -> None:
-        """Cache *markdown* as the extraction of *path*, then apply both caps.
-
-        **The write reaches the disk on this turn**, and so does every eviction
-        it causes. There is no dirty set to ride on and no delta to amortise
-        against: the fill costs one read-modify-write of one file, which is
-        nothing beside the seconds of extraction that preceded it.
-
-        The **row half is preserved by construction** —
-        ``model_copy(update={"extract": ...})`` over the stored record — so a
-        re-fill can never de-index a file it was only re-reading, and a field
-        added to :class:`~akgentic.tool.workspace.documents.store.DocumentEntry`
-        tomorrow survives (Golden Rule 12).
-
-        ``char_count`` is computed here rather than taken as a parameter, so it
-        cannot disagree with the body it describes. Recency needs no bookkeeping:
-        ``extracted_at`` is stamped here, and the eviction pass sorts on it.
-
-        Args:
-            path: Workspace-relative path of the source file.
-            source_sha: Digest of the source bytes this body was extracted from.
-            extractor_version: The extractor that produced this body.
-            markdown: The extracted body.
-        """
-        extract = DocumentExtract(
-            path=path,
-            source_sha=source_sha,
-            extractor_version=extractor_version,
-            markdown=markdown,
-            char_count=len(markdown),
-            extracted_at=datetime.now(UTC),
-        )
-        self._save(self._entry(path).model_copy(update={"extract": extract}))
-        self._apply_document_caps(path)
-
-    def _apply_document_caps(self, filled: str) -> None:
-        """Bring the cache back under both caps, least recently extracted first.
-
-        The recency order is ``extract.extracted_at`` read off the disk, **not**
-        whatever order the directory glob returned — a glob's order is the file
-        system's, and evicting on it would evict an arbitrary document while
-        looking exactly like an LRU.
-
-        :func:`~akgentic.tool.workspace.documents.models.evict_document_bodies`
-        is consumed **unchanged**: the same signature, the same two caps and the
-        same flat return. What changed is only how its verdict is applied — a
-        path it removed from the mapping lost its whole entry to the row cap and
-        goes through :meth:`_forget_extract`; a path still present whose
-        ``markdown`` it nulled is written back with the body dropped and its row
-        untouched.
-
-        Args:
-            filled: The path whose fill triggered this, for the log line.
-        """
-        entries = {entry.path: entry for entry in sorted(self._entries(), key=_extracted_at)}
-        documents = {
-            path: entry.extract for path, entry in entries.items() if entry.extract is not None
-        }
-        evicted = evict_document_bodies(
-            documents,
-            max_documents=self.config.max_documents,
-            max_document_chars=self.config.max_document_chars,
-        )
-        for path in evicted:
-            remaining = documents.get(path)
-            if remaining is None:
-                self._forget_extract(path)
-            else:
-                self._save(entries[path].model_copy(update={"extract": remaining}))
-        if evicted:
-            # One line per fill, never one per path, and DEBUG rather than INFO:
-            # on a workspace sitting at either cap this fires on every fill, and
-            # the question it answers — "why does this document keep
-            # re-extracting?" — is a debugging question. It is also the only
-            # evidence an entry-cap eviction ever happened, since the body is
-            # gone by the time anything else could look.
-            #
-            # "evicted" covers both remedies deliberately: the return is a flat
-            # list of paths and cannot say whether a path lost its whole entry
-            # or only its body (45-3's frozen shape).
-            # The paths are passed through rather than joined here: at either cap
-            # this line runs on every fill, and an eager join would build the
-            # string even with DEBUG off. ``%s`` over the list defers all of it.
-            logger.debug(
-                "Filling the document cache for %s evicted (entry removed or body dropped): %s",
-                filled,
-                evicted,
-            )
-
     ##
     ## The one row writer
     ##
     def _put_row(self, path: str, row: RagFile) -> None:
         """Write *row* as *path*'s index half, on this turn.
 
-        **The only writer of a row**, which is what makes the write inventory
-        structural rather than remembered: a write that bypasses this is a write
-        no reader of the store can attribute, and the suite's ``ast`` canary
-        refuses one.
-
-        The extraction half is preserved by construction —
-        ``model_copy(update={"row": ...})`` over the stored record — so a status
-        transition can never blank a cached body, and a field added to
-        :class:`~akgentic.tool.workspace.documents.store.DocumentEntry` tomorrow
-        survives (Golden Rule 12).
+        The only writer of a row on this side, and it writes through the one
+        writer there is —
+        :meth:`~akgentic.tool.workspace.documents.cache.DocumentCache.put_row`,
+        where the extraction half is preserved by construction and the suite's
+        ``ast`` canary looks.
 
         Args:
             path: Workspace-relative path the row describes.
             row: The row, already derived by ``model_copy(update=...)`` or built
                 fresh — never rebuilt by naming fields.
         """
-        self._save(self._entry(path).model_copy(update={"row": row}))
+        self._cache().put_row(path, row)
 
     ##
     ## Retrieval — enabling it, and the collection that is created lazily
@@ -677,7 +510,7 @@ class DocumentsMixin(_DocumentsBase):
         child, names no backend, calls no factory and asks no orchestrator — the
         card resolved all of that in ``observer()`` and handed the object over
         through :meth:`configure_vector_store`, which is the shape
-        ``configure_lock`` and ``configure_document_store`` already have
+        ``configure_lock`` and ``configure_document_cache`` already have
         (ADR-051 Decision 8). Whether the object is a proxy over the team's
         ``#VectorStore`` or a cluster client is invisible here and must stay so:
         the four methods this actor calls are the ``VectorStoreService`` protocol
@@ -881,7 +714,7 @@ class DocumentsMixin(_DocumentsBase):
             # have claimed it, re-queued it at other bytes, or dropped it.
             if row is None or row.indexed_sha is None or row.status is not RagStatus.PENDING:
                 return _Spawn.CLAIMED_ELSEWHERE
-            markdown = self.document_extract(path, row.indexed_sha, EXTRACTOR_VERSION)
+            markdown = self._cache().lookup(path, row.indexed_sha, EXTRACTOR_VERSION)
             if not self._start_index_worker(path, row.indexed_sha, markdown, params, reader):
                 return _Spawn.FAILED
             self._index_workers += 1
@@ -1042,7 +875,7 @@ class DocumentsMixin(_DocumentsBase):
             # The worker did the extraction, so the cache learns from it — a fill
             # like any other, and the one write in this method that is not the
             # file's own transition.
-            self.cache_document(msg.path, msg.source_sha, EXTRACTOR_VERSION, msg.markdown)
+            self._cache().fill(msg.path, msg.source_sha, EXTRACTOR_VERSION, msg.markdown)
         if len(msg.texts) != len(msg.chunks):
             self._fail(msg.path, msg.source_sha, "the worker returned mismatched chunks and texts")
             self._drain()
@@ -1435,34 +1268,6 @@ class DocumentsMixin(_DocumentsBase):
             )
         return requeued > 0
 
-    def mark_paths_stale(self, paths: list[str]) -> None:
-        """Mark every indexed path in *paths* ``STALE`` — and re-index none of them.
-
-        Called **directly on ``self``** from the one point the six mutations
-        converge on, never as a cross-actor tell: there is no message to drop, no
-        ordering question, and no chance of arriving after the target stopped.
-
-        **It marks and returns.** An agent mid-task rewrites the same file
-        repeatedly, and auto-indexing every accepted write would spend embedding
-        credits on every save and queue workers behind a file that is about to
-        change again. Gate writes mark stale; uploads index.
-
-        It writes **only when it actually changes a status**, so a tree that has
-        never been indexed pays one lookup per mutated path and no write at all —
-        which is the common case, and must stay cheap.
-
-        Args:
-            paths: The mutation's own write set.
-        """
-        now = datetime.now(UTC)
-        for path in paths:
-            row = self._entry(path).row
-            if row is None or row.status is RagStatus.STALE:
-                continue
-            self._put_row(
-                path, row.model_copy(update={"status": RagStatus.STALE, "updated_at": now})
-            )
-
     ##
     ## workspace_rag_list — a render, and therefore free
     ##
@@ -1725,6 +1530,16 @@ class DocumentsMixin(_DocumentsBase):
         It returns ``None`` and the sender does not wait. The frontend's upload
         must not block on extraction, and a 500-page PDF must not hold an HTTP
         request open; progress is observed through ``workspace_rag_list``.
+
+        **Its documented "records and does not spawn" path is unreachable today,
+        and that is a consequence to know rather than a regression to repair.**
+        A tree with no retrieval capability has no actor at all since story 55-8,
+        so a notification naming it reaches nobody — and no sender exists outside
+        this package to send one anyway (verified across ``akgentic-infra``, both
+        deployment tiers, ``-agent``, ``-catalog`` and the frontend). The branch
+        stays because the *first* card on a tree may enable indexing while a later
+        one does not, which is the case it was written for; it is not a reason to
+        keep an actor alive for a card that dispatches nothing.
         """
         try:
             self._on_new_files(msg)
@@ -1861,20 +1676,6 @@ one more fact than this set — the age bound. The per-process exemption that us
 to sit beside it is gone: it could only ever speak for workers in *this* process,
 which made it silently false for the case the records moved to disk to support.
 """
-
-
-def _extracted_at(entry: DocumentEntry) -> datetime:
-    """Sort key for the eviction pass — when *entry*'s body was last extracted.
-
-    **This is where recency lives now.** The map's insertion order used to be the
-    LRU, refreshed by a fill and by a hit; on disk there is no order at all, so
-    the stamp the fill already wrote is the only honest one. An entry with no
-    body sorts oldest, which is correct: it has nothing left for either cap to
-    reclaim, so it must never displace one that has.
-    """
-    if entry.extract is None:
-        return datetime.min.replace(tzinfo=UTC)
-    return entry.extract.extracted_at
 
 
 def _requeued(entry: RagFile, now: datetime) -> RagFile:

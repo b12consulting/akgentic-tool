@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
+from akgentic.tool.workspace.documents.cache import DocumentCache
 from akgentic.tool.workspace.documents.models import EXTRACTOR_VERSION
 from akgentic.tool.workspace.models import content_sha
 from akgentic.tool.workspace.read import (
@@ -29,10 +29,8 @@ from akgentic.tool.workspace.tool import (
     WorkspaceTool,
 )
 from akgentic.tool.workspace.workspace import Filesystem
-
 from tests.workspace.conftest import (
     WORKSPACE_NAME,
-    WORKSPACE_PATH,
     FakeActorToolObserver,
     FakeOrchestratorProxy,
     stored_docs,
@@ -743,23 +741,27 @@ def make_wired_tool(
     orchestrator_proxy: FakeOrchestratorProxy,
     workspace_tree: Path,
     document_reader: DocumentReader | bool = True,
-) -> tuple[WorkspaceTool, Filesystem, WorkspaceActor]:
-    """Wire a read-only card onto *workspace_tree* with a real actor behind it.
+) -> tuple[WorkspaceTool, Filesystem, DocumentCache]:
+    """Wire a read-only card onto *workspace_tree* and hand back its own cache.
 
-    The card and the actor resolve **the same directory**: both call
-    ``get_workspace(WORKSPACE_NAME)`` and the ``workspaces_root`` fixture behind
-    *workspace_tree* points that at the temporary base. Patching only the card's
-    resolver — which is what this helper used to do — would leave the two on
-    different trees the moment the actor is real.
+    **There is no actor behind it, and that is the subject rather than a
+    simplification.** A read-only card enables nothing that dispatches, so since
+    story 55-8 it creates none — and the extraction cache these specs exercise is
+    the card's own object, reached with no mailbox in the way.
+
+    The card resolves the directory once: ``get_workspace(WORKSPACE_NAME)``
+    against the temporary base the ``workspaces_root`` fixture behind
+    *workspace_tree* points at.
 
     The observer is a genuine :class:`FakeActorToolObserver` rather than a
-    ``MagicMock``. A mock behind ``proxy_ask`` returns a ``MagicMock`` from
-    ``document_extract``, which is truthy and is not a ``str``: every document
-    read would be a bogus cache "hit" carrying a mock into pagination.
+    ``MagicMock``, for a reason that outlived the proxy it was written about: a
+    mock anywhere on the lookup path answers with a ``MagicMock``, which is truthy
+    and is not a ``str``, so every document read would be a bogus cache "hit"
+    carrying a mock into pagination.
 
     Returns:
         The card, its own ``Filesystem`` — so the ``fs._root`` call sites below
-        are unchanged — and the live actor that owns the extraction cache.
+        are unchanged — and the cache that holds the extractions.
     """
     observer = FakeActorToolObserver(orchestrator_proxy)
     tool = WorkspaceTool(
@@ -768,21 +770,20 @@ def make_wired_tool(
         workspace_read=WorkspaceRead(document_reader=document_reader),
     )
     tool.observer(observer)
-    _address, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
-    assert isinstance(actor, WorkspaceActor)
+    assert orchestrator_proxy.create_calls == [], "a read-only card created an actor"
+    cache = tool._document_cache
+    assert cache is not None
     assert tool.workspace._root == workspace_tree.resolve()
-    return tool, tool.workspace, actor
+    return tool, tool.workspace, cache
 
 
-def cache_the_extract(actor: WorkspaceActor, tree: Path, path: str, body: str) -> None:
-    """Pre-fill the actor's cache with *body* as the extraction of *path*.
+def cache_the_extract(cache: DocumentCache, tree: Path, path: str, body: str) -> None:
+    """Pre-fill *cache* with *body* as the extraction of *path*.
 
     The digest is taken over the file's **current** bytes, which is what makes
     the entry valid — the read path recomputes exactly that.
     """
-    actor.cache_document(
-        path, content_sha((tree / path).read_bytes()), EXTRACTOR_VERSION, body
-    )
+    cache.fill(path, content_sha((tree / path).read_bytes()), EXTRACTOR_VERSION, body)
 
 
 # ---------------------------------------------------------------------------
@@ -797,7 +798,7 @@ class TestBinaryFileReading:
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         """AC 1: workspace_read on binary ext with document_reader=False -> ValueError."""
-        tool, fs, _actor = make_wired_tool(
+        tool, fs, _cache = make_wired_tool(
             orchestrator_proxy, workspace_tree, document_reader=False
         )
         pdf_path = fs._root / "report.pdf"
@@ -812,7 +813,7 @@ class TestBinaryFileReading:
     ) -> None:
         """A miss extracts, returns the body, fills the actor — and writes no file."""
         reader = DocumentReader()
-        tool, fs, actor = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
+        tool, fs, cache = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
         pdf_path = fs._root / "report.pdf"
         pdf_path.write_bytes(b"%PDF fake content")
         before = sorted(p.name for p in fs._root.iterdir())
@@ -824,16 +825,16 @@ class TestBinaryFileReading:
 
         assert "# Report" in result
         assert sorted(p.name for p in fs._root.iterdir()) == before  # no sidecar, no file
-        assert stored_docs(actor)["report.pdf"].markdown == extracted
+        assert stored_docs(cache)["report.pdf"].markdown == extracted
 
     def test_a_cached_extract_is_served_without_re_extracting(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         """A valid entry + force_document_regeneration=False -> no extraction."""
         reader = DocumentReader()
-        tool, fs, actor = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
+        tool, fs, cache = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
         (fs._root / "report.pdf").write_bytes(b"%PDF fake")
-        cache_the_extract(actor, fs._root, "report.pdf", "# Cached Content\nline two")
+        cache_the_extract(cache, fs._root, "report.pdf", "# Cached Content\nline two")
 
         with patch.object(DocumentReader, "extract_text") as mock_extract:
             read_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_read")
@@ -847,9 +848,9 @@ class TestBinaryFileReading:
     ) -> None:
         """force=True ignores a **valid** entry, re-extracts, and re-fills it."""
         reader = DocumentReader()
-        tool, fs, actor = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
+        tool, fs, cache = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
         (fs._root / "report.pdf").write_bytes(b"%PDF fake")
-        cache_the_extract(actor, fs._root, "report.pdf", "# Old Cache")
+        cache_the_extract(cache, fs._root, "report.pdf", "# Old Cache")
 
         extracted = "# Fresh Extract\n" + "y" * 60
         with patch.object(DocumentReader, "extract_text", return_value=extracted):
@@ -857,14 +858,14 @@ class TestBinaryFileReading:
             result = read_fn("report.pdf", force_document_regeneration=True)
 
         assert "# Fresh Extract" in result
-        assert stored_docs(actor)["report.pdf"].markdown == extracted
+        assert stored_docs(cache)["report.pdf"].markdown == extracted
 
     def test_pass1_empty_no_llm_returns_placeholder(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         """AC 5: Pass 1 empty + no LLM -> placeholder returned, and cached."""
         reader = DocumentReader(llm_client=None)
-        tool, fs, actor = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
+        tool, fs, cache = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
         pdf_path = fs._root / "scan.pdf"
         pdf_path.write_bytes(b"%PDF image only")
 
@@ -879,14 +880,14 @@ class TestBinaryFileReading:
         # because it is the case that reaches the LLM vision fallback. The
         # sidecar carried this property by writing the placeholder to disk; it
         # would otherwise have been dropped with the sidecar assertions.
-        assert stored_docs(actor)["scan.pdf"].markdown == placeholder
+        assert stored_docs(cache)["scan.pdf"].markdown == placeholder
 
     def test_pass1_empty_pass2_with_llm_returns_content(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         """AC 6: Pass 1 empty + LLM configured -> Pass 2 invoked, content returned."""
         reader = DocumentReader(llm_client="openai", llm_model="gpt-4o")
-        tool, fs, _actor = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
+        tool, fs, _cache = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
         pdf_path = fs._root / "scan.pdf"
         pdf_path.write_bytes(b"%PDF image only")
 
@@ -902,7 +903,7 @@ class TestBinaryFileReading:
     ) -> None:
         """AC 7: Both passes return empty -> placeholder returned."""
         reader = DocumentReader(llm_client="openai")
-        tool, fs, _actor = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
+        tool, fs, _cache = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
         img_path = fs._root / "photo.png"
         img_path.write_bytes(b"\x89PNG fake")
 
@@ -918,7 +919,7 @@ class TestBinaryFileReading:
     ) -> None:
         """AC 8: Text extension -> DocumentReader never invoked."""
         reader = DocumentReader()
-        tool, fs, _actor = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
+        tool, fs, _cache = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
         txt_path = fs._root / "notes.txt"
         txt_path.write_text("Hello, world!", encoding="utf-8")
 
@@ -945,7 +946,7 @@ class TestBinaryFileReading:
         it must not be read as evidence that the deletion was safe.
         """
         reader = DocumentReader()
-        tool, fs, _actor = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
+        tool, fs, _cache = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
         leftover = fs._root / ".report.pdf.md"
         leftover.write_text("# Sidecar Content", encoding="utf-8")
 
@@ -966,7 +967,7 @@ class TestBinaryFileReading:
         key depends on where the file sits on disk.
         """
         reader = DocumentReader()
-        tool, fs, actor = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
+        tool, fs, cache = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
         docs_dir = fs._root / "docs"
         docs_dir.mkdir()
         (docs_dir / "slides.pptx").write_bytes(b"PK fake pptx")
@@ -977,7 +978,7 @@ class TestBinaryFileReading:
             result = read_fn("docs/slides.pptx")
 
         assert "# Slides" in result
-        assert stored_docs(actor)["docs/slides.pptx"].markdown == extracted
+        assert stored_docs(cache)["docs/slides.pptx"].markdown == extracted
         assert list(docs_dir.iterdir()) == [docs_dir / "slides.pptx"]
 
     def test_unknown_extension_uses_text_path(
@@ -985,7 +986,7 @@ class TestBinaryFileReading:
     ) -> None:
         """Unknown extension falls through to UTF-8 decode path."""
         reader = DocumentReader()
-        tool, fs, _actor = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
+        tool, fs, _cache = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
         file_path = fs._root / "data.custom"
         file_path.write_text("custom format data", encoding="utf-8")
 
@@ -998,7 +999,7 @@ class TestBinaryFileReading:
     ) -> None:
         """Binary file that doesn't exist -> RetriableError (not ValueError)."""
         reader = DocumentReader()
-        tool, _fs, _actor = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
+        tool, _fs, _cache = make_wired_tool(orchestrator_proxy, workspace_tree, reader)
 
         read_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_read")
         with pytest.raises(RetriableError, match="File not found: missing.pdf"):

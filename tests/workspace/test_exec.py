@@ -288,12 +288,13 @@ class TestTheCapability:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # The whole of what the default buys: no host probe at wiring time and
-        # exactly one actor — the workspace's own, a team child again since
-        # 52-5 — in a team that never asked for exec. Asserted as an equality
-        # over the created list rather than as the absence of a name, so it
-        # cannot pass over an empty list. A forward to a resource host is the
-        # strict type check's to catch: the core this package ships against has
-        # none.
+        # **no actor at all** in a team that never asked for exec — since story
+        # 55-8 the workspace's own is created only by a card that dispatches.
+        # Asserted as an equality over the created list rather than as the
+        # absence of a name, because the expected value *is* the empty list and
+        # an absence assertion would pass over it whatever the bind did. A
+        # forward to a resource host is the strict type check's to catch: the
+        # core this package ships against has none.
         def explode() -> str:
             raise AssertionError("a card with exec off probed the host for a backend")
 
@@ -302,17 +303,24 @@ class TestTheCapability:
         card.observer(FakeActorToolObserver(orchestrator_proxy))
 
         created = [config.name for _cls, config in orchestrator_proxy.create_calls]
-        assert created == [workspace_actor_name(WORKSPACE_PATH)]
+        assert created == []
 
-    def test_read_only_creates_only_the_workspace_actor_too(
+    def test_read_only_creates_no_actor_either(
         self,
         orchestrator_proxy: FakeOrchestratorProxy,
         workspace_tree: Path,
         sandbox_script: SandboxScript,
     ) -> None:
+        """``read_only=True`` turns exec off, and with it the actor.
+
+        The row Trap 2b of story 55-8 calls the one that bites: ``workspace_exec``
+        is *truthy* on this card and the capability is off, so a gate spelled on
+        the field rather than on ``_enabled_exec()`` would create an actor for a
+        card that registers no exec callable and binds no sandbox.
+        """
         exec_card_for(orchestrator_proxy, read_only=True)
         created = [config.name for _cls, config in orchestrator_proxy.create_calls]
-        assert created == [workspace_actor_name(WORKSPACE_PATH)]
+        assert created == []
 
     def test_on_builds_a_runner_and_still_creates_only_the_workspace_actor(
         self,
@@ -510,8 +518,8 @@ class TestTheCapability:
     ) -> None:
         # The two halves of the capability have to agree on what "on" means. A
         # card that takes exec off the tool channel registers no callable, so it
-        # must not resolve a backend, warn about the fallback, or create any
-        # actor beyond the workspace's own.
+        # must not resolve a backend, warn about the fallback, or create an actor
+        # at all — the second half of Trap 2b's row, reached by the other door.
         def explode() -> str:
             raise AssertionError("a card with exec off the tool channel probed the host")
 
@@ -523,7 +531,7 @@ class TestTheCapability:
         card.observer(FakeActorToolObserver(orchestrator_proxy))
 
         created = [config.name for _cls, config in orchestrator_proxy.create_calls]
-        assert created == [workspace_actor_name(WORKSPACE_PATH)]
+        assert created == []
         names = {tool.__name__ for tool in card.get_tools()}
         assert "workspace_exec" not in names
 
@@ -2462,7 +2470,7 @@ class TestTheExecutorAndItsWorker:
     """AC 1, 2, 9, 10 — one worker per workspace, and what runs on it."""
 
     def test_every_workspace_owns_one_single_worker_executor(
-        self, wired_card: WorkspaceTool, orchestrator_proxy: FakeOrchestratorProxy
+        self, dispatching_card: WorkspaceTool, orchestrator_proxy: FakeOrchestratorProxy
     ) -> None:
         # AC1. Created unconditionally, exec capability or not: a
         # ThreadPoolExecutor spawns no thread until the first submit, so a
@@ -2994,12 +3002,18 @@ class TestTeardownIsOrderedAndBounded:
         assert actor._executor._inner._shutdown  # type: ignore[attr-defined]
 
     def test_on_stop_on_a_workspace_that_never_ran_a_command_does_nothing(
-        self, wired_card: WorkspaceTool, orchestrator_proxy: FakeOrchestratorProxy
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         # AC18. **Inert on its own** and worth nothing without AC 12–17 beside
         # it: it would pass for an ``on_stop`` whose body was deleted. What it
         # covers is the branch, not the behaviour — no runner, no backend, and an
         # executor that never spawned a thread.
+        #
+        # **A retrieval card, because that is now the only shape that has an
+        # actor without a sandbox**: since story 55-8 a plain card creates no
+        # actor at all, and an exec card binds the runner this spec needs absent.
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_rag_list=True)
+        card.observer(FakeActorToolObserver(orchestrator_proxy))
         _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
         assert actor._runner is None
@@ -3444,15 +3458,37 @@ class TestAWedgedChild:
         assert actor._running.run_id == head
         finish_run(sandbox_script, harness)
 
+    @pytest.fixture
+    def journalled_setup(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        sandbox_script: SandboxScript,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> tuple[WorkspaceTool, WorkspaceActor, ExecHarness]:
+        """The module fixture with the journal on.
+
+        The one spec below asserts what a *discovered commit* named, and since
+        story 55-8 the actor builds no ``GitJournal`` at all unless the card asked
+        for one — so the card has to ask, rather than the spec depending on an
+        object that used to exist whatever the setting said.
+        """
+        card, _observer = exec_card_for(orchestrator_proxy, git_journal=True)
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
+        assert isinstance(actor, WorkspaceActor)
+        harness = ExecHarness(actor, orchestrator_proxy)
+        harness.install(monkeypatch)
+        return card, actor, harness
+
     def test_the_late_report_commits_nothing_and_clears_nothing(
         self,
-        exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
+        journalled_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # N8. Its outcome is still cached, so its owner collects it — what the
         # late report must not do is touch the tree or the newer run's hold.
-        _card, actor, harness = exec_setup
+        _card, actor, harness = journalled_setup
         head = start_run(actor, sandbox_script, cmd="echo head", agent=AGENT)
         assert actor._running is not None
         budget = effective_budget(DEFAULT_EXEC_TIMEOUT_S)

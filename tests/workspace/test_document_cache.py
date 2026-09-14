@@ -46,15 +46,15 @@ from akgentic.tool.workspace.documents.models import (
     RagStatus,
     evict_document_bodies,
 )
-from akgentic.tool.workspace.documents.store import DocumentEntry, YamlDocumentStore
+from akgentic.tool.workspace.documents.store import YamlDocumentStore
 from akgentic.tool.workspace.models import WorkspaceConfig, content_sha
 from akgentic.tool.workspace.tool import WorkspaceTool
-
 from tests.workspace.conftest import (
     WORKSPACE_PATH,
     FakeActorToolObserver,
     RecordingDocumentStore,
     attach_store,
+    cache_of,
     read,
     seed_extract,
     seed_row,
@@ -74,14 +74,13 @@ def start_actor(
             name=workspace_actor_name(WORKSPACE_PATH),
             role=WORKSPACE_ACTOR_ROLE,
             workspace_path=WORKSPACE_PATH,
-            max_documents=max_documents,
-            max_document_chars=max_document_chars,
         )
     )
     actor.on_start()
-    # A directly built actor is handed no store — resolving one is the card's
-    # job. This stands in for the bind.
-    return attach_store(actor)
+    # A directly built actor is handed no cache — building one is the card's
+    # job. This stands in for the bind, and carries the two caps that used to be
+    # ``WorkspaceConfig`` fields.
+    return attach_store(actor, max_documents, max_document_chars)
 
 
 def sha_of(text: str) -> str:
@@ -97,7 +96,7 @@ def fill(
     version: int = EXTRACTOR_VERSION,
 ) -> None:
     """Cache *body* as the extraction of *path*, whose source is *source*."""
-    actor.cache_document(path, sha_of(source if source is not None else path), version, body)
+    cache_of(actor).fill(path, sha_of(source if source is not None else path), version, body)
 
 
 def look_up(
@@ -107,7 +106,7 @@ def look_up(
     version: int = EXTRACTOR_VERSION,
 ) -> str | None:
     """The ask 45-4 will make: the Markdown on a hit, ``None`` on any miss."""
-    return actor.document_extract(path, sha_of(source if source is not None else path), version)
+    return cache_of(actor).lookup(path, sha_of(source if source is not None else path), version)
 
 
 def a_row(path: str) -> RagFile:
@@ -244,13 +243,15 @@ class TestTheCardResolvesTheStoreAndTheActorUsesIt:
     """
 
     def test_the_actor_is_given_the_cards_own_document_store(
-        self, wired_card: WorkspaceTool, workspace_actor: WorkspaceActor
+        self, dispatching_card: WorkspaceTool, workspace_actor: WorkspaceActor
     ) -> None:
         # The object the actor caches through must be the one the card resolved
         # from the environment — not a second instance built somewhere else, and
-        # not a default standing in for a backend a deployment registered.
-        assert isinstance(wired_card._document_store, YamlDocumentStore)
-        assert workspace_actor._document_store is wired_card._document_store
+        # not a default standing in for a backend a deployment registered. Since
+        # story 55-8 it travels inside the ``DocumentCache`` the card announces,
+        # so the identity asserted is the cache's rather than the slot's.
+        assert isinstance(dispatching_card._document_store, YamlDocumentStore)
+        assert cache_of(workspace_actor).store is dispatching_card._document_store
 
     def test_an_unknown_document_store_fails_at_wiring_time(
         self,

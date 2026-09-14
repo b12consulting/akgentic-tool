@@ -47,6 +47,7 @@ from akgentic.tool.workspace.actor import (
     WorkspaceActor,
     workspace_actor_name,
 )
+from akgentic.tool.workspace.documents.cache import DocumentCache
 from akgentic.tool.workspace.documents.models import (
     EMBEDDING_STALE_AFTER_S,
     EXTRACTOR_VERSION,
@@ -69,6 +70,7 @@ from tests.workspace.conftest import (
     HANDSHAKE_TIMEOUT_S,
     WORKSPACE_PATH,
     attach_store,
+    cache_of,
     factory_for,
     live_workspace_actors,
     seed_extract,
@@ -164,13 +166,12 @@ def _capped_actor(max_documents: int = 3, max_document_chars: int = 100) -> Work
             name=workspace_actor_name(WORKSPACE_PATH),
             role=WORKSPACE_ACTOR_ROLE,
             workspace_path=WORKSPACE_PATH,
-            max_documents=max_documents,
-            max_document_chars=max_document_chars,
         )
     )
     actor.on_start()
     # The card announces this at bind time; a directly built actor gets none.
-    return attach_store(actor)
+    # The caps travel on the cache since story 55-8, not in the config.
+    return attach_store(actor, max_documents, max_document_chars)
 
 
 @pytest.fixture
@@ -244,17 +245,17 @@ def _drive_every_write_site(harness: RagHarness, tree: Path, checkpoint: object)
     # The gate is the card's since 52-5, and what reaches the actor is the
     # stale-mark rather than the write — which is exactly the seam this spec
     # cares about: the index row has to be on disk by the end of the turn.
-    actor.mark_paths_stale(["a.md"])
+    cache_of(actor).mark_paths_stale(["a.md"])
     assert _row_on_disk(actor, "a.md").status is RagStatus.STALE
     checkpoint("a gate write")
 
-    actor.cache_document("c.md", content_sha(b"c"), EXTRACTOR_VERSION, "c" * 60)
+    cache_of(actor).fill("c.md", content_sha(b"c"), EXTRACTOR_VERSION, "c" * 60)
     checkpoint("a fill under both caps")
-    actor.cache_document("d.md", content_sha(b"d"), EXTRACTOR_VERSION, "d" * 50)
+    cache_of(actor).fill("d.md", content_sha(b"d"), EXTRACTOR_VERSION, "d" * 50)
     assert stored_docs(actor)["a.md"].markdown is None, "the char cap dropped no body"
     assert stored_docs(actor)["c.md"].markdown is None, "the char cap dropped one body"
     checkpoint("a fill that drops two bodies by the char cap")
-    actor.cache_document("e.md", content_sha(b"e"), EXTRACTOR_VERSION, "e" * 10)
+    cache_of(actor).fill("e.md", content_sha(b"e"), EXTRACTOR_VERSION, "e" * 10)
     # ``a.md`` keeps its record because it keeps its **row** — an eviction may
     # never de-index a file — but its extraction half is gone.
     assert "a.md" not in stored_docs(actor), "the row cap dropped no extraction"
@@ -361,7 +362,7 @@ class TestEveryWriteSiteIsOnDiskWhenTheTurnEnds:
         harness.enable()
         write(workspace_tree, "raw.md")
         cached_sha = write(workspace_tree, "cached.md")
-        harness.actor.cache_document("cached.md", cached_sha, EXTRACTOR_VERSION, "# Cached\n")
+        cache_of(harness.actor).fill("cached.md", cached_sha, EXTRACTOR_VERSION, "# Cached\n")
         _fill_the_worker_slots(harness.actor)
         harness.actor.index_paths("")
         assert {row.status for row in stored_rows(harness.actor).values()} == {RagStatus.PENDING}
@@ -496,7 +497,7 @@ class TestEveryWriteSiteIsOnDiskWhenTheTurnEnds:
         harness.report("a.md")
         harness.result("a.md")
 
-        harness.actor.mark_paths_stale(["a.md"])
+        cache_of(harness.actor).mark_paths_stale(["a.md"])
 
         assert _row_on_disk(harness.actor, "a.md").status is RagStatus.STALE
 
@@ -764,7 +765,7 @@ class TestEvictionOrdersByExtractedAt:
         for name, minutes in (("m.md", 2), ("z.md", 1), ("a.md", 3)):
             seed_extract(actor, name, self._extract(name, base, minutes))
 
-        actor.cache_document("d.md", content_sha(b"d"), EXTRACTOR_VERSION, "d")
+        cache_of(actor).fill("d.md", content_sha(b"d"), EXTRACTOR_VERSION, "d")
 
         assert "z.md" not in stored_docs(actor), "the oldest extraction survived"
         assert set(stored_docs(actor)) == {"a.md", "m.md", "d.md"}
@@ -781,7 +782,7 @@ class TestEvictionOrdersByExtractedAt:
                 update={"markdown": name[0] * 60, "char_count": 60}
             ))
 
-        actor.cache_document("c.md", content_sha(b"c"), EXTRACTOR_VERSION, "c")
+        cache_of(actor).fill("c.md", content_sha(b"c"), EXTRACTOR_VERSION, "c")
 
         docs = stored_docs(actor)
         assert docs["z.md"].markdown is None, "the oldest body survived"
@@ -797,7 +798,7 @@ class TestEvictionOrdersByExtractedAt:
             path="a.md", status=RagStatus.EMBEDDED, indexed_sha="x", updated_at=base
         ))
 
-        actor.cache_document("b.md", content_sha(b"b"), EXTRACTOR_VERSION, "b")
+        cache_of(actor).fill("b.md", content_sha(b"b"), EXTRACTOR_VERSION, "b")
 
         survivor = _on_disk(actor, "a.md")
         assert survivor.extract is None
@@ -813,7 +814,7 @@ class TestEvictionOrdersByExtractedAt:
             path="a.md", status=RagStatus.EMBEDDED, indexed_sha="x", updated_at=base
         ))
 
-        actor.cache_document("b.md", content_sha(b"b"), EXTRACTOR_VERSION, "b" * 60)
+        cache_of(actor).fill("b.md", content_sha(b"b"), EXTRACTOR_VERSION, "b" * 60)
 
         survivor = _on_disk(actor, "a.md")
         assert survivor.extract is not None and survivor.extract.markdown is None
@@ -824,7 +825,7 @@ class TestEvictionOrdersByExtractedAt:
     ) -> None:
         actor = _capped_actor(max_documents=10, max_document_chars=100)
 
-        actor.cache_document("huge.md", content_sha(b"h"), EXTRACTOR_VERSION, "h" * 150)
+        cache_of(actor).fill("huge.md", content_sha(b"h"), EXTRACTOR_VERSION, "h" * 150)
 
         assert stored_docs(actor)["huge.md"].markdown is None
         assert stored_docs(actor)["huge.md"].char_count == 150
@@ -849,7 +850,7 @@ class TestAMemberSurvivesTheStoreWhole:
             path="a.md", status=RagStatus.EMBEDDED, updated_at=datetime.now(UTC)
         ))
 
-        harness.actor.mark_paths_stale(["a.md"])
+        cache_of(harness.actor).mark_paths_stale(["a.md"])
 
         row = _row_on_disk(harness.actor, "a.md")
         assert isinstance(row, _RagFileWithExtraField)
@@ -869,7 +870,7 @@ class TestAMemberSurvivesTheStoreWhole:
             extracted_at=datetime.now(UTC),
         ))
 
-        actor.cache_document("b.md", content_sha(b"b"), EXTRACTOR_VERSION, "b" * 50)
+        cache_of(actor).fill("b.md", content_sha(b"b"), EXTRACTOR_VERSION, "b" * 50)
 
         restored = stored_docs(actor)["a.md"]
         assert isinstance(restored, _ExtractWithExtraField)
@@ -900,10 +901,10 @@ class TestAMemberSurvivesTheStoreWhole:
         """
         actor = _capped_actor()
         captured = _CapturingStore()
-        actor.configure_document_store(captured)
+        actor.configure_document_cache(DocumentCache(captured, WORKSPACE_PATH, 3, 100))
         captured.seed(WORKSPACE_PATH, _EntryWithExtraField(path="a.md"))
 
-        actor._put_row("a.md", RagFile(
+        cache_of(actor).put_row("a.md", RagFile(
             path="a.md", status=RagStatus.PENDING, updated_at=datetime.now(UTC)
         ))
 
@@ -918,10 +919,10 @@ class TestAMemberSurvivesTheStoreWhole:
         """The same rule at the other writer, for the same reason."""
         actor = _capped_actor()
         captured = _CapturingStore()
-        actor.configure_document_store(captured)
+        actor.configure_document_cache(DocumentCache(captured, WORKSPACE_PATH, 3, 100))
         captured.seed(WORKSPACE_PATH, _EntryWithExtraField(path="a.md"))
 
-        actor.cache_document("a.md", content_sha(b"a"), EXTRACTOR_VERSION, "# body")
+        cache_of(actor).fill("a.md", content_sha(b"a"), EXTRACTOR_VERSION, "# body")
 
         written = captured.written[0]
         assert isinstance(written, _EntryWithExtraField), "an enumerated rebuild dropped the field"
@@ -955,12 +956,18 @@ class TestAMemberSurvivesTheStoreWhole:
 ##
 ## The write-site canary, one layer down: who is allowed to write a record
 ##
-_WRITE_HELPERS = frozenset({"_save", "put_document", "evict"})
-"""Every expression that can put a record on disk from inside the actor package.
+_WRITE_HELPERS = frozenset({"save", "put_document", "evict"})
+"""Every expression that can put a record on disk.
 
-``_save`` is the mixin's own one-line wrapper; the other two are the store's own
-methods, named so that a site reaching past ``_save`` straight to
-``self._document_store`` is caught rather than laundered.
+``save`` is the cache's own one-line wrapper; the other two are the store's own
+methods, named so that a site reaching past ``save`` straight to ``self.store``
+is caught rather than laundered.
+
+**It follows the writers rather than the directory.** The five of them moved into
+:mod:`akgentic.tool.workspace.documents.cache` when the extraction cache went
+card-side, so the walk below now reads that module — and the actor package is
+asserted to hold *no* writer at all, which is a stronger claim than the inventory
+it used to make there.
 """
 
 
@@ -994,18 +1001,36 @@ def _record_writers(source: str) -> list[str]:
 
 
 class TestOnlyTheKnownFunctionsWriteARecord:
-    """The write inventory is structural: a write outside these four is unaccounted for.
+    """The write inventory is structural: a write outside these five is unaccounted for.
 
-    Two of them are the story's two writers proper — ``_put_row`` for a row and
-    ``cache_document`` for an extraction. Two more are the eviction pass and the
-    helper it removes through, which write only what ``evict_document_bodies``
-    has already decided. The fifth is ``_save`` itself, the one-line wrapper the
-    other four go through: it is here because the walk sees the call inside its
-    own body, and leaving it out would mean a spec that agreed with the code by
-    exception rather than by rule.
+    Two of them are the writers proper — ``put_row`` for a row and ``fill`` for an
+    extraction. Two more are the eviction pass and the helper it removes through,
+    which write only what ``evict_document_bodies`` has already decided. The fifth
+    is ``save`` itself, the one-line wrapper the other four go through: it is here
+    because the walk sees the call inside its own body, and leaving it out would
+    mean a spec that agreed with the code by exception rather than by rule.
     """
 
-    def test_the_record_writers_under_workspace_actor_are_exactly_five(self) -> None:
+    def test_the_record_writers_in_the_cache_are_exactly_five(self) -> None:
+        from akgentic.tool.workspace.documents import cache as cache_module
+
+        source = Path(str(cache_module.__file__)).read_text(encoding="utf-8")
+
+        assert set(_record_writers(source)) == {
+            "save",  # the one-line wrapper the other four go through
+            "put_row",
+            "fill",
+            "apply_caps",
+            "forget_extract",
+        }
+
+    def test_the_actor_package_writes_no_record_of_its_own(self) -> None:
+        """The actor reaches the disk through the cache or not at all.
+
+        Stronger than the per-function inventory it replaced, and it is what keeps
+        the inventory above complete: a writer added under ``actor/`` tomorrow
+        would be invisible to a walk that only reads ``cache.py``.
+        """
         from akgentic.tool.workspace import actor as actor_package
 
         package = Path(str(actor_package.__file__)).parent
@@ -1018,27 +1043,21 @@ class TestOnlyTheKnownFunctionsWriteARecord:
             for writer in _record_writers(module.read_text(encoding="utf-8"))
         }
 
-        assert writers == {
-            "_save",  # the one-line wrapper the other four go through
-            "_put_row",
-            "cache_document",
-            "_apply_document_caps",
-            "_forget_extract",
-        }
+        assert writers == set()
 
     def test_the_walk_sees_a_write_through_the_helper_and_past_it(self) -> None:
         """The positive control, including the shape that bypasses ``_save``."""
         source = (
             "def reads(self):\n"
-            "    a = self._document_store.get_document('k', 'p')\n"
-            "    b = self._document_store.list_documents('k')\n"
-            "def saves(self): self._save(entry)\n"
-            "def bypasses(self): self._document_store.put_document('k', entry)\n"
-            "def removes(self): self._document_store.evict('k', 'p')\n"
+            "    a = self.store.get_document('k', 'p')\n"
+            "    b = self.store.list_documents('k')\n"
+            "def saves(self): self.save(entry)\n"
+            "def bypasses(self): self.store.put_document('k', entry)\n"
+            "def removes(self): self.store.evict('k', 'p')\n"
             "def nested(self):\n"
             "    if True:\n"
-            "        self._save(entry)\n"
-            "'''self._save(entry) in a docstring is not a write'''\n"
+            "        self.save(entry)\n"
+            "'''self.save(entry) in a docstring is not a write'''\n"
         )
 
         assert sorted(_record_writers(source)) == sorted(
@@ -1092,12 +1111,25 @@ def _stopped(system: ActorSystem, address: ActorAddress) -> bool:
     return wait_until(lambda: not address.is_alive(), timeout=HANDSHAKE_TIMEOUT_S)
 
 
+def _live_cache() -> DocumentCache:
+    """A cache over ``_LIVE_PATH``, on its own fresh store object every time."""
+    return DocumentCache(YamlDocumentStore(), _LIVE_PATH, 32, 2_000_000)
+
+
 def _fill_and_upload(system: ActorSystem, address: ActorAddress, tree: Path) -> str:
-    """One cache fill and one upload with retrieval off, through a real proxy."""
+    """One cache fill and one upload with retrieval off, over one live tree.
+
+    **The fill is the card's, the upload is the actor's**, which is the split
+    story 55-8 made: the extraction cache no longer goes through a mailbox, so a
+    spec that drove it through the proxy would be driving a method that has no
+    business existing. Both halves still land in the same record on disk, which is
+    the whole claim.
+    """
     proxy = system.proxy_ask(address, WorkspaceActor)
-    proxy.configure_document_store(YamlDocumentStore())
+    cache = _live_cache()
+    proxy.configure_document_cache(cache)
     sha = content_sha(b"the source bytes")
-    proxy.cache_document("doc.md", sha, EXTRACTOR_VERSION, "# Body\n")
+    cache.fill("doc.md", sha, EXTRACTOR_VERSION, "# Body\n")
     (tree / "up.md").write_text("# Uploaded\n", encoding="utf-8")
     proxy.receiveMsg_NewFileMessage(NewFileMessage(paths=["up.md"], source="upload"))
     return sha
@@ -1127,8 +1159,9 @@ class TestTheDiskPathLive:
 
         assert renewed.agent_id != address.agent_id, "the same actor came back"
         restored = system.proxy_ask(renewed, WorkspaceActor)
-        restored.configure_document_store(YamlDocumentStore())
-        assert restored.document_extract("doc.md", sha, EXTRACTOR_VERSION) == "# Body\n"
+        second_cache = _live_cache()
+        restored.configure_document_cache(second_cache)
+        assert second_cache.lookup("doc.md", sha, EXTRACTOR_VERSION) == "# Body\n"
         rows = restored.rag_snapshot(20).rows
         assert [(row.path, row.status) for row in rows] == [("up.md", RagStatus.PENDING.value)]
 
@@ -1155,8 +1188,9 @@ class TestTheDiskPathLive:
         assert second.agent_id != address.agent_id
         assert address.is_alive(), "the first actor was displaced rather than joined"
         reader = system.proxy_ask(second, WorkspaceActor)
-        reader.configure_document_store(YamlDocumentStore())
-        assert reader.document_extract("doc.md", sha, EXTRACTOR_VERSION) == "# Body\n"
+        second_cache = _live_cache()
+        reader.configure_document_cache(second_cache)
+        assert second_cache.lookup("doc.md", sha, EXTRACTOR_VERSION) == "# Body\n"
 
 
 class TestNoStoreAtAll:
@@ -1170,13 +1204,18 @@ class TestNoStoreAtAll:
         gate, and a document path that could take it down is the defect the
         degradation exists to prevent.
         """
-        harness.actor._document_store = None
+        harness.actor._document_cache = None
 
         _drive_every_write_site_degraded(harness, workspace_tree)
 
         assert stored_entries(harness.actor) == {}
         assert harness.actor.rag_snapshot(max_pending_shown=20).rows == []
-        assert harness.actor.document_extract("a.md", "any", EXTRACTOR_VERSION) is None
+        assert _storeless_cache().lookup("a.md", "any", EXTRACTOR_VERSION) is None
+
+
+def _storeless_cache() -> DocumentCache:
+    """A cache that was never handed a store — every path degrades, none raises."""
+    return DocumentCache(None, WORKSPACE_PATH, 3, 100)
 
 
 def _drive_every_write_site_degraded(harness: RagHarness, tree: Path) -> None:
@@ -1187,13 +1226,16 @@ def _drive_every_write_site_degraded(harness: RagHarness, tree: Path) -> None:
     a "skip the checks" flag is a driver that can silently stop checking.
     """
     actor = harness.actor
+    # The two card-side sites, driven over a cache that was never given a store —
+    # the card's own form of the degradation the actor is in.
+    degraded = _storeless_cache()
     write(tree, "a.md", "# A\n\nbody\n")
     write(tree, "b.md", "# B\n\nother\n")
     actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["a.md", "b.md"], source="upload"))
     harness.enable()
     actor.index_paths("")
-    actor.mark_paths_stale(["a.md"])
-    actor.cache_document("c.md", content_sha(b"c"), EXTRACTOR_VERSION, "c" * 60)
+    degraded.mark_paths_stale(["a.md"])
+    degraded.fill("c.md", content_sha(b"c"), EXTRACTOR_VERSION, "c" * 60)
     assert actor.reap_abandoned_rows() is False
     assert actor.rag_search("body") in {
         "Retrieval indexing is not available for this workspace.",

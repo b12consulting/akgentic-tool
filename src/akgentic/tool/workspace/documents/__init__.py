@@ -3,17 +3,21 @@
 The records themselves are files under the tree's sibling metadata directory,
 one per source document, written through a
 :class:`~akgentic.tool.workspace.documents.store.DocumentStore`; what lives here
-is what describes one entry of each and what bounds them. The actor-side lookup,
-fill and indexing pipeline are in :mod:`akgentic.tool.workspace.actor.documents`.
+is what describes one entry of each, what bounds them, and — in
+:mod:`akgentic.tool.workspace.documents.cache` — the one read-modify-write both
+sides go through. The indexing **pipeline** is in
+:mod:`akgentic.tool.workspace.actor.documents`; the lookup and the fill are not,
+and have not been since the actor became dispatch (ADR-053 Decision 6).
 
 **This package is shared by two capabilities, which is why it is not one.** The
 extraction cache is filled and read on the **read** path — ``card/__init__.py``
-resolves the store unconditionally at bind and the read closures call
-``document_extract`` / ``cache_document`` — while the chunk records and the
-collection name serve retrieval, and ``workspace/models.py`` takes two cap
-constants from :mod:`akgentic.tool.workspace.documents.models`. Code genuinely
-shared by two capabilities stays shared (ADR-053 Decision 1), so it stays here
-rather than being forced under one owner.
+resolves the store unconditionally at bind, builds a
+:class:`~akgentic.tool.workspace.documents.cache.DocumentCache` over it and calls
+that object directly, whether or not this card ever creates an actor — while the
+chunk records and the collection name serve retrieval, and ``workspace/models.py``
+takes two cap constants from :mod:`akgentic.tool.workspace.documents.models`. Code
+genuinely shared by two capabilities stays shared (ADR-053 Decision 1), so it
+stays here rather than being forced under one owner.
 
 **The retrieval-only halves have left.** The splitter, the retrieval context
 state and the index worker are the retrieval capability's and live in

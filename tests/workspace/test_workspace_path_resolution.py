@@ -106,11 +106,21 @@ class Cell:
     expected: str
 
     def card(self) -> WorkspaceTool:
-        """The card this cell declares."""
+        """The card this cell declares.
+
+        **``workspace_exec`` is on and it is load-bearing here**, not decoration:
+        since story 55-8 only a card that dispatches creates an actor, and two
+        specs below read the resolved path out of the actor's *name* — which is
+        the strongest available witness that the path the card resolved is the
+        path the tree, the gate and the journal are all anchored to. A plain card
+        would leave those two asserting over an empty set of children, which is
+        the absence assertion this module's own discipline forbids.
+        """
         return WorkspaceTool(
             workspace_id=self.workspace_id,
             workspace_metadata_keys=list(self.keys),
             workspace_sharable=self.sharable,
+            workspace_exec=True,
         )
 
 

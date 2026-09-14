@@ -53,6 +53,7 @@ from tests.workspace.conftest import (
     WORKSPACE_PATH,
     FakeActorToolObserver,
     FakeOrchestratorProxy,
+    cache_of,
     card_for,
     tool_named,
     workspace_path_for,
@@ -131,10 +132,26 @@ class TestSingleton:
         with pytest.raises(RetriableError, match="read it before overwriting"):
             tool_named(bob_card, "workspace_write")("notes.md", "bob was here\n")
 
-    def test_the_actor_is_obtained_with_one_get_or_create_call(
+    def test_a_plain_card_creates_no_actor_at_all(
         self,
         orchestrator_proxy: FakeOrchestratorProxy,
         wired_card: WorkspaceTool,
+    ) -> None:
+        """Story 55-8, and the row this class used to make the opposite of.
+
+        A read/write card dispatches nothing — no sandbox run to report, no index
+        or embed child to parent — so it creates no actor. An equality over the
+        created list rather than a ``not in``: an absence assertion passes over an
+        empty list, which is exactly the state under test.
+        """
+        assert orchestrator_proxy.create_calls == []
+        assert wired_card._workspace_proxy is None
+        assert wired_card._workspace_tell is None
+
+    def test_the_actor_is_obtained_with_one_get_or_create_call(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        dispatching_card: WorkspaceTool,
     ) -> None:
         # Never a check-then-create pair: one message, per ADR-025 — the team\'s
         # own child path again. A host forward beside it is the strict type
@@ -144,7 +161,7 @@ class TestSingleton:
     def test_the_config_name_carries_the_tool_actor_prefix(
         self,
         orchestrator_proxy: FakeOrchestratorProxy,
-        wired_card: WorkspaceTool,
+        dispatching_card: WorkspaceTool,
     ) -> None:
         # The prefix is what the orchestrator\'s two-phase stop classifies on.
         [(_cls, config)] = orchestrator_proxy.create_calls
@@ -153,18 +170,19 @@ class TestSingleton:
     def test_two_workspaces_in_one_team_get_two_actors(
         self,
         orchestrator_proxy: FakeOrchestratorProxy,
-        wired_card: WorkspaceTool,
+        dispatching_card: WorkspaceTool,
         workspaces_root: Path,
     ) -> None:
         # The card's workspace is the actor's unicity domain: a second card on a
-        # different tree must not be handed the first tree's actor.
+        # different tree must not be handed the first tree's actor. Both cards
+        # dispatch, because that is what gives either one an actor to compare.
         shared_observer = FakeActorToolObserver(orchestrator_proxy, name="bob")
-        shared_card = WorkspaceTool(workspace_id="shared")
+        shared_card = WorkspaceTool(workspace_id="shared", workspace_exec=True)
         shared_card.observer(shared_observer)
 
         assert workspace_actor_name(workspace_path_for("shared")) in orchestrator_proxy.children
         assert workspace_actor_name(WORKSPACE_PATH) in orchestrator_proxy.children
-        assert shared_card._workspace_proxy is not wired_card._workspace_proxy
+        assert shared_card._workspace_proxy is not dispatching_card._workspace_proxy
 
     def test_the_actor_owns_the_tree_its_card_is_anchored_to(
         self,
@@ -345,7 +363,7 @@ class TestSilentCapabilities:
         # would be a false observation, whatever the read cost to produce.
         source = b"%PDF-1.4 not really a pdf"
         (workspace_tree / "report.pdf").write_bytes(source)
-        workspace_actor.cache_document(
+        cache_of(workspace_actor).fill(
             "report.pdf", content_sha(source), EXTRACTOR_VERSION, "extracted"
         )
 
@@ -533,29 +551,34 @@ class TestTheObservationIsATell:
         workspace_tree: Path,
     ) -> None:
         observer = FakeActorToolObserver(orchestrator_proxy)
-        WorkspaceTool(workspace_id=WORKSPACE_NAME).observer(observer)
+        WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_exec=True).observer(observer)
 
         assert len(observer.ask_targets) == 1
         assert observer.tell_targets == observer.ask_targets
 
-    def test_an_accepted_mutation_tells_the_index_what_it_touched(
+    def test_an_accepted_mutation_sends_the_actor_nothing_at_all(
         self,
         orchestrator_proxy: FakeOrchestratorProxy,
         workspace_actor: WorkspaceActor,
         seeded_tree: Path,
     ) -> None:
-        """The one message a mutation still sends, and it is a **tell**.
+        """**The last message a mutation sent is gone**, and nothing replaced it.
 
-        The verdict is the card\'s own now, so nothing is asked; what the actor
-        still has to hear is which paths went stale for retrieval, and that
-        needs no answer.
+        The verdict has been the card\'s since 52-5, so nothing was asked; the
+        stale-mark was the one remaining tell, and story 55-8 made it a direct
+        call on the card\'s own cache — because a read/write card creates no actor
+        to send it to, and a tree another team indexes still has to be
+        invalidated.
+
+        Asserted through a live actor and a recording tell proxy anyway: a
+        mutation that quietly started sending something again would show up here.
         """
         telling = _TellRecorder(workspace_actor)
         card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
         card.observer(FakeActorToolObserver(orchestrator_proxy, workspace_tell_proxy=telling))
 
         assert tool_named(card, "workspace_write")("fresh.md", "body\n") == "Written: fresh.md"
-        assert "mark_paths_stale" in telling.names
+        assert telling.names == []
 
     def test_the_widened_protocol_is_satisfied_by_the_suites_observer(
         self, observer: FakeActorToolObserver
@@ -716,15 +739,23 @@ class TestTheCardBindsAsATeamChild:
         if path is None:
             path = f"{DEFAULT_TEST_PRINCIPAL}/_team/{observer.team_id}"
 
+        # **The actor is created only by the two shapes that dispatch** (story
+        # 55-8), and the event by all five. Asserted as an equality over the
+        # created configs rather than a membership test, because for three of
+        # these shapes the expected value is the empty list and ``not in`` would
+        # pass over it whatever the bind did.
         workspace_creates = [
             config
             for cls, config in orchestrator_proxy.create_calls
             if cls is WorkspaceActor
         ]
-        [config] = workspace_creates
-        assert config.name == workspace_actor_name(path)
-        assert isinstance(config, WorkspaceConfig)
-        assert config.workspace_path == path
+        if shape in {"exec", "rag"}:
+            [config] = workspace_creates
+            assert config.name == workspace_actor_name(path)
+            assert isinstance(config, WorkspaceConfig)
+            assert config.workspace_path == path
+        else:
+            assert workspace_creates == []
 
         [event] = [e for e in observer.events if isinstance(e, WorkspaceAttached)]
         assert event.agent_id == observer.myAddress.agent_id
@@ -844,7 +875,7 @@ class TestAttachAbsorbsRegisterAgent:
         observer = FakeActorToolObserver(
             orchestrator_proxy, workspace_proxy=ask, workspace_tell_proxy=tell
         )
-        card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_exec=True)
 
         card.observer(observer)
 
@@ -853,12 +884,14 @@ class TestAttachAbsorbsRegisterAgent:
         assert actor._name_of(str(observer.myAddress.agent_id)) == str(observer.myAddress.name)
         assert "attach" not in tell.names
         assert "register_agent" not in tell.names
-        # The tell recorder is genuinely wired: an accepted mutation signals the
-        # index through it. (A *read* no longer sends anything at all — it
-        # records into the card's own map.)
+        # The tell recorder is genuinely wired: an exec card announces its hold
+        # and its backend through it. (A *read* sends nothing at all — it records
+        # into the card\'s own map — and since story 55-8 neither does a
+        # mutation, whose stale-mark is a direct call on the card\'s cache.)
+        assert "configure_lock" in tell.names
         (workspace_tree / "notes.md").write_text(BODY, encoding="utf-8")
         tool_named(card, "workspace_write")("fresh.md", "body\n")
-        assert "mark_paths_stale" in tell.names
+        assert "mark_paths_stale" not in tell.names
 
 
 class TestAFailedAttachFailsTheBind:
@@ -876,7 +909,7 @@ class TestAFailedAttachFailsTheBind:
         observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=DeadAtBind())
 
         with pytest.raises(RuntimeError) as raised:
-            WorkspaceTool(workspace_id=WORKSPACE_NAME).observer(observer)
+            WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_exec=True).observer(observer)
 
         assert raised.value is error
 
@@ -892,7 +925,9 @@ class TestAFailedAttachFailsTheBind:
 
         stand_in = AliveAtBind()
         observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=stand_in)
-        card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+        # Exec on: ``attach`` is inside the actor branch, so a card that creates
+        # no actor never reaches it and this pair would assert nothing.
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_exec=True)
 
         card.observer(observer)
 
@@ -922,9 +957,10 @@ class TestTwoTeamsOnOneTree:
             bob = FakeActorToolObserver(second_team, name="bob")
             assert alice.team_id != bob.team_id
             assert alice.user_id == bob.user_id
-            alice_card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+            # Both dispatch, because two *actors* is what this spec counts.
+            alice_card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_exec=True)
             alice_card.observer(alice)
-            bob_card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+            bob_card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_exec=True)
             bob_card.observer(bob)
 
             name = workspace_actor_name(WORKSPACE_PATH)

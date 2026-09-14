@@ -17,10 +17,12 @@ because that is the only other function that turns a name into a tree.
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import re
 import shutil
 import string
+import time
 from pathlib import Path, PurePosixPath
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
@@ -28,7 +30,13 @@ from uuid import uuid4
 from pydantic import BaseModel
 
 from akgentic.core.utils.serializer import SerializableBaseModel
-from akgentic.tool.workspace.models import GIT_DIR_SUFFIX, META_DIR_SUFFIX
+from akgentic.tool.workspace.models import (
+    GIT_DIR_SUFFIX,
+    META_DIR_SUFFIX,
+    STAGING_SWEEP_GRACE_S,
+)
+
+logger = logging.getLogger(__name__)
 
 # Creation mode for a newly written file, before the process umask is applied by
 # the kernel.  Matching what a plain ``open(path, "wb")`` would request keeps the
@@ -41,11 +49,10 @@ _DEFAULT_FILE_MODE = 0o666
 # a long target name whole would fail writes that used to succeed.
 _STAGED_NAME_BUDGET = 255 - 38
 
-# The staging name ``write`` publishes from, and the predicate that recognises
-# one afterwards.  They sit together because they are two halves of one shape:
-# ``#Workspace`` sweeps orphaned staging files at start, and a reader-side
-# pattern that drifted from the writer would either miss them or delete a
-# legitimate file.
+# The staging name ``write`` publishes from, the predicate that recognises one
+# afterwards, and the sweep that removes the orphans.  They sit together because
+# they are three halves of one shape: a reader-side pattern that drifted from the
+# writer would either miss an orphan or delete a legitimate file.
 _STAGED_NAME_TEMPLATE = ".{stem}.{token}.tmp"
 _STAGED_NAME_RE = re.compile(r"^\..+\.[0-9a-f]{32}\.tmp$")
 
@@ -64,6 +71,79 @@ def is_staging_name(name: str) -> bool:
         True for the ``.<name>.<32 hex digits>.tmp`` shape, False otherwise.
     """
     return _STAGED_NAME_RE.match(name) is not None
+
+
+def _is_sweepable_orphan(entry: Path, cutoff: float) -> bool:
+    """Whether *entry* is a staging file old enough to have been abandoned.
+
+    Args:
+        entry: A path found under the workspace root.
+        cutoff: The mtime below which a staging file counts as orphaned.
+
+    Returns:
+        True only for a regular file carrying the full staging shape and last
+        modified before *cutoff*. A failed ``stat`` answers False: an entry this
+        process cannot inspect is one it must not delete.
+    """
+    if not is_staging_name(entry.name):
+        return False
+    try:
+        return entry.is_file() and entry.stat().st_mtime < cutoff
+    except OSError:
+        return False
+
+
+def sweep_staging_files(workspace: Filesystem, workspace_path: str) -> None:
+    """Delete staging files an interrupted write left behind, anywhere in the tree.
+
+    :meth:`Filesystem.write` publishes by rename from ``.<name>.<32 hex>.tmp`` in
+    the target's own directory. A process killed between the two steps leaves one
+    behind for good, and **nothing else ever removes one**.
+
+    **It runs once per bind now, not once per team.** It was the ``#Workspace``
+    actor's ``on_start``, and the actor is only created when a capability that
+    dispatches is enabled (ADR-053 Decision 6) — so leaving it there would mean a
+    plain read/write card, the commonest shape there is, never swept a tree at
+    all. The price is one ``rglob`` per card bind rather than per team, which is
+    the same per-bind tree work ``_seed_resources`` already does on the adjacent
+    line of ``observer()``. A once-per-tree marker would be new machinery for a
+    janitor, and buying it is not worth a file that survives for ever without it.
+
+    **The ordering it must keep is 29-4's**: it runs *before* anything writes into
+    the tree — before the resources are seeded and before the journal's initial
+    commit — or the first commit records the orphans and then deletes them.
+
+    The sweep matches the full staging shape, so a user's own ``.notes.tmp``
+    survives. Every failure is suppressed: a directory this process cannot clean
+    must not stop a team's workspace from binding.
+
+    **A staging file younger than the grace window is left alone**, because it is
+    being written *now* and possibly by somebody else: an upload, resource
+    seeding, a sandbox run, or — on the multi-worker tiers — another process over
+    the same mount. Unlinking such a staged file in the window between
+    ``os.open`` and ``os.replace`` turns a healthy write into a refusal. An orphan
+    is minutes or a restart old, so no realistic window confuses the two.
+
+    Args:
+        workspace: The tree handle, already resolved.
+        workspace_path: The resolved three-segment path, for the log line.
+    """
+    root = workspace.root
+    cutoff = time.time() - STAGING_SWEEP_GRACE_S
+    staged: list[Path] = []
+    with contextlib.suppress(OSError):
+        staged = [entry for entry in root.rglob("*") if _is_sweepable_orphan(entry, cutoff)]
+    removed = 0
+    for entry in staged:
+        with contextlib.suppress(OSError):
+            entry.unlink()
+            removed += 1
+    if removed:
+        logger.info(
+            "Workspace %s: swept %d orphaned staging file(s) at bind",
+            workspace_path,
+            removed,
+        )
 
 
 class PathEscapeError(PermissionError):

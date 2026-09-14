@@ -1375,9 +1375,11 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
         ``#Workspace`` actor. They now differ in the scope segment, so neither
         can reach the other's tree by naming it.
         """
-        alice_card = WorkspaceTool(workspace_id="notes")
+        # Both dispatch, because the actor name is half of what this spec reads
+        # and since story 55-8 a plain card creates no actor to name.
+        alice_card = WorkspaceTool(workspace_id="notes", workspace_exec=True)
         alice_card.observer(FakeActorToolObserver(orchestrator_proxy, "alice", user_id="alice"))
-        bob_card = WorkspaceTool(workspace_id="notes")
+        bob_card = WorkspaceTool(workspace_id="notes", workspace_exec=True)
         bob_card.observer(FakeActorToolObserver(orchestrator_proxy, "bob", user_id="bob"))
 
         assert alice_card.workspace._root != bob_card.workspace._root
@@ -1513,7 +1515,11 @@ class TestTheConfigCarriesThePathAndNoKeyList:
 
     @staticmethod
     def _bound_config(proxy: FakeOrchestratorProxy) -> WorkspaceConfig:
-        """The one ``WorkspaceConfig`` the card handed ``getChildrenOrCreate``."""
+        """The one ``WorkspaceConfig`` the card handed ``getChildrenOrCreate``.
+
+        The cards below enable exec, because a config only exists where an actor
+        does and since story 55-8 a plain card creates neither.
+        """
         configs = [
             config for cls, config in proxy.create_calls if cls is WorkspaceActor
         ]
@@ -1526,7 +1532,9 @@ class TestTheConfigCarriesThePathAndNoKeyList:
         self, orchestrator_proxy: FakeOrchestratorProxy, workspaces_root: Path
     ) -> None:
         orchestrator_proxy.metadata = _CaseMetadata(customer_id="ACME", case_id="42")
-        card = WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])
+        card = WorkspaceTool(
+            workspace_metadata_keys=["customer_id", "case_id"], workspace_exec=True
+        )
         card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
 
         config = self._bound_config(orchestrator_proxy)
@@ -1539,7 +1547,9 @@ class TestTheConfigCarriesThePathAndNoKeyList:
     ) -> None:
         """The leaf is a canonical directory name, so the resolver dedupes it."""
         orchestrator_proxy.metadata = _CaseMetadata(customer_id="ACME")
-        card = WorkspaceTool(workspace_metadata_keys=["customer_id", "customer_id"])
+        card = WorkspaceTool(
+            workspace_metadata_keys=["customer_id", "customer_id"], workspace_exec=True
+        )
         card.observer(FakeActorToolObserver(orchestrator_proxy, user_id="alice"))
 
         assert (

@@ -38,6 +38,7 @@ from pathlib import Path
 
 import pytest
 
+from akgentic.tool.workspace.documents.cache import DocumentCache
 from akgentic.tool.workspace.documents.models import RagChunk, RagFile, RagStatus
 from akgentic.tool.workspace.documents.store import DocumentEntry, YamlDocumentStore
 from akgentic.tool.workspace.models import content_sha
@@ -465,7 +466,9 @@ class TestTheDrainReadsOneRecordAtATime:
         harness.enable()
         _queued_rows(["alpha.md", "beta.md"])
         stealer = _ClaimStealer()
-        harness.actor.configure_document_store(stealer)
+        harness.actor.configure_document_cache(
+            DocumentCache(stealer, harness.actor.config.workspace_path, 32, 2_000_000)
+        )
 
         harness.actor._drain()
 
@@ -488,7 +491,9 @@ class TestTheDrainReadsOneRecordAtATime:
         harness.enable()
         _queued_rows(["alpha.md", "beta.md"])
         stealer = _ClaimStealer(steal_every=True)
-        harness.actor.configure_document_store(stealer)
+        harness.actor.configure_document_cache(
+            DocumentCache(stealer, harness.actor.config.workspace_path, 32, 2_000_000)
+        )
 
         harness.actor._drain()
 

@@ -66,6 +66,20 @@ def workspace_config_of(orchestrator_proxy: FakeOrchestratorProxy) -> WorkspaceC
     raise AssertionError("the card never bound a workspace actor")
 
 
+def document_caps_of(card: WorkspaceTool) -> tuple[int, int]:
+    """The two caps this card derived, read off the cache it built.
+
+    They travelled on ``WorkspaceConfig`` until story 55-8, which is exactly the
+    defect: get-or-create ignores ``config`` on a hit, so the first card of a team
+    to bind fixed both for every later card of that team. They are on the
+    announced :class:`~akgentic.tool.workspace.documents.cache.DocumentCache` now,
+    which is last-writer-wins — and which a card with no actor also has.
+    """
+    cache = card._document_cache
+    assert cache is not None, "the card built no document cache"
+    return cache.max_documents, cache.max_document_chars
+
+
 def bind(
     orchestrator_proxy: FakeOrchestratorProxy,
     tell_proxy: object | None = None,
@@ -207,9 +221,9 @@ class TestTheSearchCapability:
         story 55-5. Naming the in-actor backend explicitly is refused at bind (see
         ``TestAWorkspaceMayNotRunOnTheInActorBackend``).
         """
-        bind(orchestrator_proxy, workspace_rag_search=True)
+        card, _observer = bind(orchestrator_proxy, workspace_rag_search=True)
 
-        assert workspace_config_of(orchestrator_proxy).max_documents == DEFAULT_MAX_DOCUMENTS
+        assert document_caps_of(card)[0] == DEFAULT_MAX_DOCUMENTS
 
     def test_a_search_only_card_naming_weaviate_with_no_cluster_fails_at_wiring(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
@@ -390,11 +404,10 @@ class TestTheDerivedCaps:
         assert card.vector_store.backend == IN_ACTOR_BACKEND
         assert workspace_backend(card.vector_store) == WORKSPACE_LOCAL_BACKEND
 
-        config = workspace_config_of(orchestrator_proxy)
-        assert (config.max_documents, config.max_document_chars) == derived_document_caps(
+        assert document_caps_of(card) == derived_document_caps(
             workspace_backend(card.vector_store), True
         )
-        assert (config.max_documents, config.max_document_chars) == (
+        assert document_caps_of(card) == (
             DEFAULT_MAX_DOCUMENTS,
             DEFAULT_MAX_DOCUMENT_CHARS,
         )
@@ -408,14 +421,13 @@ class TestTheDerivedCaps:
         # A card naming Weaviate with no cluster fails at wiring, which is its own
         # spec below; here the cluster exists so the caps are what is under test.
         monkeypatch.setenv("AKGENTIC_WEAVIATE_URL", "https://cluster.example")
-        bind(
+        card, _observer = bind(
             orchestrator_proxy,
             workspace_rag_index=True,
             vector_store=VectorStoreParam(backend="weaviate"),
         )
 
-        config = workspace_config_of(orchestrator_proxy)
-        assert (config.max_documents, config.max_document_chars) == (
+        assert document_caps_of(card) == (
             DEFAULT_MAX_DOCUMENTS,
             DEFAULT_MAX_DOCUMENT_CHARS,
         )
@@ -429,10 +441,11 @@ class TestTheDerivedCaps:
         is inside the same ``_rag_enabled()`` guard as the two ``require_*`` calls,
         because a card that will never open a store owes it no obligation.
         """
-        bind(orchestrator_proxy, vector_store=VectorStoreParam(backend="inmemory"))
+        card, _observer = bind(
+            orchestrator_proxy, vector_store=VectorStoreParam(backend="inmemory")
+        )
 
-        config = workspace_config_of(orchestrator_proxy)
-        assert (config.max_documents, config.max_document_chars) == (
+        assert document_caps_of(card) == (
             DEFAULT_MAX_DOCUMENTS,
             DEFAULT_MAX_DOCUMENT_CHARS,
         )
@@ -441,24 +454,22 @@ class TestTheDerivedCaps:
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         """ "An explicit catalog value always wins" is what the two fields are for."""
-        bind(
+        card, _observer = bind(
             orchestrator_proxy,
             workspace_rag_index=True,
             max_documents=99,
             max_document_chars=12345,
         )
 
-        config = workspace_config_of(orchestrator_proxy)
-        assert (config.max_documents, config.max_document_chars) == (99, 12345)
+        assert document_caps_of(card) == (99, 12345)
 
     def test_the_list_capability_alone_also_derives_from_the_resolved_backend(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         """Either capability turns retrieval on, and the caps follow retrieval."""
-        bind(orchestrator_proxy, workspace_rag_list=True)
+        card, _observer = bind(orchestrator_proxy, workspace_rag_list=True)
 
-        config = workspace_config_of(orchestrator_proxy)
-        assert config.max_documents == DEFAULT_MAX_DOCUMENTS
+        assert document_caps_of(card)[0] == DEFAULT_MAX_DOCUMENTS
 
 
 class TestTheWeaviateCheck:
@@ -569,8 +580,12 @@ class TestTheCardCreatesNoStoreActor:
 
         bind(orchestrator_proxy, vector_store=VectorStoreParam(backend="inmemory"))
 
+        # **Nothing at all is created.** The store actor was never this card's to
+        # create with retrieval off; the workspace actor stopped being created
+        # too in story 55-8, because a card enabling neither exec nor retrieval
+        # dispatches nothing.
         created = [cls for cls, _config in orchestrator_proxy.create_calls]
-        assert created == [WorkspaceActor]
+        assert created == []
         assert VectorStoreActor not in created
 
 
@@ -611,9 +626,9 @@ class TestTheBindTimeAnnouncement:
 
         bind(orchestrator_proxy, tell_proxy=tell, workspace_rag_index=True)
 
-        assert "configure_document_store" in tell.calls
+        assert "configure_document_cache" in tell.calls
         assert "enable_rag" in tell.calls
-        assert tell.calls.index("configure_document_store") < tell.calls.index("enable_rag")
+        assert tell.calls.index("configure_document_cache") < tell.calls.index("enable_rag")
 
     def test_a_card_with_retrieval_off_announces_nothing(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
@@ -1052,10 +1067,11 @@ class TestTheCardBindsTheTeamsStore:
 
         card, _ = bind(orchestrator_proxy, tell_proxy=tell)
 
-        # The workspace's own bind is on this list since 52-5; nothing else is,
-        # which is what the absence of a store costs.
+        # **Nothing is created at all.** The workspace's own bind was on this
+        # list from 52-5 until 55-8 gated it on a capability that dispatches; a
+        # bare ``WorkspaceTool()`` enables none, so the equality is the empty one.
         created = [cls for cls, _config in orchestrator_proxy.create_calls]
-        assert created == [WorkspaceActor]
+        assert created == []
         assert VectorStoreActor not in created
         assert orchestrator_proxy.member_lookups == []
         assert "configure_vector_store" not in tell.calls

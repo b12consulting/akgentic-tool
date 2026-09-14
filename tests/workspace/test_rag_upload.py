@@ -27,7 +27,7 @@ from akgentic.tool.workspace.documents.models import (
     RagStatus,
 )
 from akgentic.tool.workspace.workspace import PathEscapeError
-from tests.workspace.conftest import WORKSPACE_PATH, seed_row, stored_rows
+from tests.workspace.conftest import WORKSPACE_PATH, cache_of, seed_row, stored_rows
 from tests.workspace.test_rag_pipeline import RagHarness, write
 from tests.workspace.test_rag_search import build_actor
 
@@ -60,8 +60,8 @@ def gate_still_works(actor: WorkspaceActor, probe: str) -> bool:
     the retrieval index it is being asked to keep — driven the way a mutation's
     stale-mark drives it.
     """
-    actor.mark_paths_stale([probe])
-    return actor._document_store is not None
+    cache_of(actor).mark_paths_stale([probe])
+    return actor._document_cache is not None
 
 
 class TestTheMessageModel:
@@ -278,7 +278,7 @@ class TestTheAsymmetryWithTheGate:
         assert stored_rows(upload.actor)["written.md"].status is RagStatus.EMBEDDED
 
         upload.actor.receiveMsg_NewFileMessage(NewFileMessage(paths=["uploaded.md"]))
-        upload.actor.mark_paths_stale(["written.md"])
+        cache_of(upload.actor).mark_paths_stale(["written.md"])
 
         assert stored_rows(upload.actor)["uploaded.md"].status is not RagStatus.STALE
         assert stored_rows(upload.actor)["written.md"].status is RagStatus.STALE
@@ -293,7 +293,7 @@ class TestTheAsymmetryWithTheGate:
         upload.result("written.md")
         before = len(upload.requests)
 
-        upload.actor.mark_paths_stale(["written.md"])
+        cache_of(upload.actor).mark_paths_stale(["written.md"])
 
         assert len(upload.requests) == before
 

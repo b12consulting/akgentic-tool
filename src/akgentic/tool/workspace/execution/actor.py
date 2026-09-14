@@ -102,7 +102,12 @@ class ExecMixin(_ExecBase):
     _running: RunningExec | None
     _run_errors: OrderedDict[str, str]
     _recent_runs: dict[str, OrderedDict[str, str]]
-    _journal: GitJournal
+    # ``None`` when the tree has no journal, which is the default. The actor built
+    # one unconditionally until story 55-8 and merely left it disabled; the shape
+    # here now matches the card's, where ``write/gate.py`` has always guarded a
+    # ``GitJournal | None``. Both uses below are guarded for the same reason the
+    # gate's three are: no commit is worth failing a run over.
+    _journal: GitJournal | None
 
     if TYPE_CHECKING:
         # Supplied by ``WorkspaceActor`` itself, which owns the agent-name map
@@ -322,7 +327,8 @@ class ExecMixin(_ExecBase):
             cwd: Working directory below the workspace root.
             config: The budget to start it under.
         """
-        self._journal.commit_out_of_band()
+        if self._journal is not None:
+            self._journal.commit_out_of_band()
         self._running = RunningExec(
             run_id=run_id,
             agent_id=agent_id,
@@ -558,9 +564,10 @@ class ExecMixin(_ExecBase):
             )
             return
         self._running = None
-        self._journal.commit_discovered(
-            self._identity(running.agent_id), EXEC_CAPABILITY, detail=running.cmd
-        )
+        if self._journal is not None:
+            self._journal.commit_discovered(
+                self._identity(running.agent_id), EXEC_CAPABILITY, detail=running.cmd
+            )
         self._release_lock(run_id)
 
     def _release_lock(self, run_id: str) -> None:

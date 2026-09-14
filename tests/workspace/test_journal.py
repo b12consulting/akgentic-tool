@@ -159,6 +159,10 @@ class TestTheRepository:
                 name=workspace_actor_name(WORKSPACE_PATH),
                 role=WORKSPACE_ACTOR_ROLE,
                 workspace_path=WORKSPACE_PATH,
+                # Explicit, because the actor builds no journal at all without it
+                # since story 55-8 — and a restart that opened none could not
+                # threaten a history it never touched.
+                git_journal=True,
             )
         )
         second.on_start()
@@ -200,6 +204,7 @@ class TestTheRepository:
         actor.on_start()
 
         # The journal is off — no second repository, no seeded ignore file.
+        assert actor._journal is not None
         assert not actor._journal.enabled
         assert not (workspaces_root / workspace_path_for("shared.git.git")).exists()
         assert not (tree / GITIGNORE_NAME).exists()
@@ -263,6 +268,7 @@ class TestTheRepository:
         )
         second.on_start()
 
+        assert second._journal is not None
         assert second._journal.enabled
 
 
@@ -370,7 +376,6 @@ class TestOneMutationOneCommit:
         workspace_tree: Path,
         notes: Path,
         monkeypatch: pytest.MonkeyPatch,
-        workspace_actor: WorkspaceActor,
     ) -> None:
         """AC2b — staging is by explicit pathspec, never a bare ``git add -A``.
 
@@ -378,9 +383,13 @@ class TestOneMutationOneCommit:
         otherwise be swept into that agent's commit and attributed to it. A gated
         mutation knows exactly which paths it wrote, which is precisely the
         difference from exec (29-5), which has to discover its write set.
+
+        The journal patched is the **card's**: the gate commits through that one,
+        and this card creates no actor to have a second.
         """
         read(wired_card, "notes.md")
-        journal = workspace_actor._journal
+        journal = wired_card._journal
+        assert journal is not None
         original = journal.commit_paths
 
         def intrude(paths: Any, identity: Any, capability: str) -> None:
@@ -407,7 +416,6 @@ class TestARefusalIsNotRecorded:
         self,
         wired_card: WorkspaceTool,
         notes: Path,
-        workspace_actor: WorkspaceActor,
         workspace_tree: Path,
     ) -> str:
         """The tip once the fixture's own file has been absorbed as ``out-of-band``.
@@ -415,7 +423,8 @@ class TestARefusalIsNotRecorded:
         Settling first is what makes "HEAD did not move" mean *the refusal added
         nothing*, rather than *the tree happened to be clean*.
         """
-        workspace_actor._journal.commit_out_of_band()
+        assert wired_card._journal is not None
+        wired_card._journal.commit_out_of_band()
         return journal_log(workspace_tree)[-1].sha
 
     def test_an_unread_whole_file_write(
@@ -567,7 +576,6 @@ class TestAPartPublishedBatchIsNeverCommitted:
     def test_a_staging_failure_on_the_second_file_leaves_the_first_and_the_log_alone(
         self,
         wired_card: WorkspaceTool,
-        workspace_actor: WorkspaceActor,
         workspace_tree: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -581,7 +589,8 @@ class TestAPartPublishedBatchIsNeverCommitted:
         for name, body in (("a.py", "x = 1\n"), ("b.py", "y = 2\n")):
             (workspace_tree / name).write_text(body, encoding="utf-8")
             read(wired_card, name)
-        workspace_actor._journal.commit_out_of_band()
+        assert wired_card._journal is not None
+        wired_card._journal.commit_out_of_band()
         head = journal_log(workspace_tree)[-1].sha
 
         tree = wired_card._workspace
@@ -630,8 +639,129 @@ class _StubDocumentReader(DocumentReader):
         return "# extracted\n" + "body text " * 20
 
 
+class TestTheActorsOwnJournalIsGatedToo:
+    """AC 12 — an actor that **is** created builds no ``GitJournal`` when the card said no.
+
+    **The card this uses must create an actor, and that is the whole subject of
+    the row.** The actor built one unconditionally and called ``initialise()``,
+    whose disabled branch logs a WARNING — which is where the one warning a
+    read-only bind used to come from. Story 55-4 removed the *card*'s
+    unconditional construction, 55-8 removed the *actor*'s.
+
+    **The way this row can pass for the wrong reason**, named because it is one
+    mutation away: drive it with a default read-only card and story 55-8's
+    creation rule has already deleted the actor, so restoring the unconditional
+    construction reddens nothing and the row is vacuous. Measured both ways —
+    ``test_a_read_only_bind_is_silent_for_the_other_reason`` below is the half
+    that would stay green under that mutation, and is kept beside this one so the
+    difference is visible rather than remembered.
+    """
+
+    @staticmethod
+    def _journal_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+        return [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "akgentic.tool.workspace.journal"
+        ]
+
+    def test_a_dispatching_card_with_the_journal_off_builds_none_and_warns_not_at_all(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger="akgentic.tool.workspace.journal"):
+            card = WorkspaceTool(
+                workspace_id=WORKSPACE_NAME, git_journal=False, workspace_exec=True
+            )
+            card.observer(FakeActorToolObserver(orchestrator_proxy, name="alice"))
+
+        # Non-vacuity: this card really does create the actor whose journal is
+        # under test. Without it the two assertions below are about nothing.
+        [(_cls, config)] = orchestrator_proxy.create_calls
+        assert config.name == workspace_actor_name(WORKSPACE_PATH)
+        _address, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
+        assert isinstance(actor, WorkspaceActor)
+
+        assert actor._journal is None
+        assert self._journal_warnings(caplog) == []
+        assert not git_dir_for(workspace_tree).exists()
+
+    def test_a_read_only_bind_is_silent_for_the_other_reason(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The half that proves the row above is not vacuous.
+
+        This bind is silent because it creates **no actor at all**, not because
+        the actor's journal is gated — so it stays green under the mutation that
+        reddens the row above, and reddens under the creation rule's own.
+        """
+        with caplog.at_level(logging.WARNING, logger="akgentic.tool.workspace.journal"):
+            card = WorkspaceTool(workspace_id=WORKSPACE_NAME, git_journal=False)
+            card.observer(FakeActorToolObserver(orchestrator_proxy, name="alice"))
+
+        assert orchestrator_proxy.create_calls == []
+        assert self._journal_warnings(caplog) == []
+
+
+class TestAJournalWithNoActor:
+    """Story 55-8: a journal card that dispatches nothing still gets the whole journal.
+
+    ``wired_card`` here enables ``git_journal`` and nothing else, so since 55-8 it
+    creates **no actor at all** — and the repository, the seeded ``.gitignore``,
+    the initial out-of-band commit and the commit author were all reached through
+    one before. Every one of them is the card's now.
+    """
+
+    def test_the_bind_creates_no_actor(
+        self, wired_card: WorkspaceTool, orchestrator_proxy: FakeOrchestratorProxy
+    ) -> None:
+        """Non-vacuity for the two rows below, and an equality over the empty list.
+
+        Without it, both would keep passing on a bind that quietly created an
+        actor again and had it do the work — which is precisely what they are
+        meant to prove has stopped.
+        """
+        assert orchestrator_proxy.create_calls == []
+
+    def test_a_commit_is_authored_by_the_agents_name_not_an_empty_identity(
+        self, wired_card: WorkspaceTool, workspace_tree: Path, notes: Path
+    ) -> None:
+        """AC 5, read out of ``git log`` rather than off a private attribute.
+
+        ``_agent_id`` and ``_agent_name`` were captured **inside** the actor bind;
+        leaving them there would author every commit of a card like this one as
+        ``Identity("", "")`` — silently, because an empty author is a valid commit.
+        """
+        read(wired_card, "notes.md")
+        mutate(wired_card, "workspace_write", "notes.md", "alice's version\n")
+
+        mine = commits_by(workspace_tree, "alice")
+        assert [commit.files for commit in mine] == [["notes.md"]]
+        assert mine[0].author_email == alice_email(wired_card)
+        assert wired_card._agent_name == "alice"
+
+    def test_the_repository_the_gitignore_and_the_first_commit_are_all_there(
+        self, wired_card: WorkspaceTool, workspace_tree: Path
+    ) -> None:
+        """AC 13. ``seed_gitignore`` and the initial ``commit_out_of_band`` had
+        exactly one production caller — the actor's ``on_start`` — so a card like
+        this one got a repository and neither of the other two."""
+        assert (git_dir_for(workspace_tree) / "HEAD").is_file()
+        assert (workspace_tree / GITIGNORE_NAME).exists()
+        assert journal_log(workspace_tree), "the initial out-of-band commit is missing"
+
+
 class TestTheSeededIgnoreFile:
     def test_it_is_written_at_init(self, wired_card: WorkspaceTool, workspace_tree: Path) -> None:
+        """**Green for a different reason since story 55-8**: the card seeds it.
+
+        It was the actor's ``on_start``, and this card creates no actor.
+        """
         assert (workspace_tree / GITIGNORE_NAME).exists()
 
     def test_an_existing_one_is_never_overwritten(
@@ -1126,8 +1256,15 @@ class TestTheCardField:
     def test_it_reaches_the_actor_config(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
+        """The field travels to the actor — for a card that has one.
+
+        ``workspace_exec`` is what gives this card an actor at all since story
+        55-8. It is the *other* field's value that is under test, and asking for
+        a dispatching card is what keeps this row from asserting over an empty
+        list of creations — which would pass whatever the field did.
+        """
         observer = FakeActorToolObserver(orchestrator_proxy, name="alice")
-        card = WorkspaceTool(workspace_id=WORKSPACE_NAME, git_journal=False)
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME, git_journal=False, workspace_exec=True)
         card.observer(observer)
         config = orchestrator_proxy.create_calls[-1][1]
         assert isinstance(config, WorkspaceConfig)
@@ -1216,6 +1353,7 @@ class TestTheGateSurvivesWithoutGit:
                 "which",
                 lambda cmd, *a, **k: None if cmd == "git" else real_which(cmd, *a, **k),
             )
+
         def journal_warnings() -> int:
             return len(
                 [
@@ -1238,16 +1376,16 @@ class TestTheGateSurvivesWithoutGit:
             after_mutations = journal_warnings()
 
         # **The property AC8 asks for is per *mutation*, and it is unchanged:
-        # five writes add nothing.** What changed is the denominator, and since
-        # 55-4 it depends on the mode. The actor's journal is built and
-        # initialised on every bind; the card's exists only when ``git_journal``
-        # is on. So ``card-disabled`` has one object and one warning — always the
-        # actor's, because the card never built anything to warn — and
-        # ``git-absent`` has two, the card's included, which is why the bound
-        # below is a range rather than a number. At most one per journal, and
-        # never one per mutation, is what keeps a git-less host quiet.
+        # five writes add nothing.** What changed is the denominator, twice.
+        # 55-4 stopped the *card* building a journal it would not use; 55-8
+        # stopped the *actor* being created at all for a card like this one, and
+        # gated the journal it used to build unconditionally. So
+        # ``card-disabled`` is now **silent**: there is no journal object
+        # anywhere to warn, which is the whole of what "off costs nothing" means.
+        # ``git-absent`` still has exactly the card's one, from ``initialise``
+        # finding no ``git``.
         assert after_mutations == after_bind
-        assert 1 <= after_bind <= 2
+        assert after_bind == (0 if mode == "card-disabled" else 1)
 
     def test_the_whole_file_table_is_unchanged(
         self, journal_off: WorkspaceTool, off_notes: Path

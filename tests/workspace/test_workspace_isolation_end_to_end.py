@@ -754,13 +754,18 @@ FRONTEND_ENVELOPE_KEYS = frozenset(
 
 
 def _two_teams_on_one_tree(
-    system: ActorSystem, monkeypatch: pytest.MonkeyPatch
+    system: ActorSystem, monkeypatch: pytest.MonkeyPatch, *, exec_local: bool = False
 ) -> tuple[Bind, Bind]:
     """Two teams, two principals, two team ids, two orchestrators — one shared metadata tree.
 
     ``meta`` is permitted around **both** spawns, never ambient: each bind runs
     on its member's own pykka thread in ``on_start``, and the variable is
     process-wide, so a spawn outside the context would bind unpermitted.
+
+    *exec_local* is what makes each bind create an actor at all, since story 55-8
+    gates that on a capability which dispatches. It is off by default because
+    most specs here are about which *directory* a card reaches, which is a
+    question the actor has nothing to do with.
     """
     keys = ["customer_id", "case_id"]
     with monkeypatch.context() as patch:
@@ -773,6 +778,7 @@ def _two_teams_on_one_tree(
             metadata=CaseMetadata(customer_id="ACME", case_id="42"),
             keys=keys,
             sharable=True,
+            exec_local=exec_local,
         )
         second = spawn_member(
             system,
@@ -782,6 +788,7 @@ def _two_teams_on_one_tree(
             metadata=CaseMetadata(customer_id="ACME", case_id="42"),
             keys=keys,
             sharable=True,
+            exec_local=exec_local,
         )
     return first, second
 
@@ -823,7 +830,9 @@ class TestTwoTeamsOnOneTreeGetTwoActors:
     def test_both_binds_succeed_and_each_team_gets_its_own_actor_on_one_tree(
         self, system: ActorSystem, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        first, second = _two_teams_on_one_tree(system, monkeypatch)
+        # Both members dispatch, because since story 55-8 that is what creates an
+        # actor at all — and an actor is what this spec counts.
+        first, second = _two_teams_on_one_tree(system, monkeypatch, exec_local=True)
         _, first_path = bound(first)
         _, second_path = bound(second)
         assert first_path == second_path == PurePosixPath(SHARED_PATH)
@@ -893,7 +902,7 @@ class TestTwoTeamsOnOneTreeGetTwoActors:
         because the actor was in nobody\'s roster; it holds now because it is in
         exactly one.
         """
-        first, second = _two_teams_on_one_tree(system, monkeypatch)
+        first, second = _two_teams_on_one_tree(system, monkeypatch, exec_local=True)
         bound(first)
         bound(second)
         name = workspace_actor_name(SHARED_PATH)
@@ -999,6 +1008,9 @@ class TestAProcessWithNoHostBindsGatesAndMutates:
             team_id=uuid.uuid4(),
             metadata=CaseMetadata(customer_id="ACME", case_id="42"),
             keys=["customer_id", "case_id"],
+            # So the bind creates an actor: the count below is part of the claim,
+            # and a plain card has had none since story 55-8.
+            exec_local=True,
         )
 
         assert record.error is None

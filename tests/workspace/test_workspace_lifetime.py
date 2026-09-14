@@ -75,7 +75,7 @@ class TestTheBindRegistersTheAgentsName:
     def test_the_bind_records_the_name_under_this_agents_id(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
-        card, observer = card_for(orchestrator_proxy, "alice")
+        card, observer = card_for(orchestrator_proxy, "alice", workspace_exec=True)
         actor = _actor_of(orchestrator_proxy)
         agent_id = str(observer.myAddress.agent_id)
 
@@ -86,7 +86,7 @@ class TestTheBindRegistersTheAgentsName:
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         """Losing a name degrades the two messages; it never breaks either."""
-        card_for(orchestrator_proxy, "alice")
+        card_for(orchestrator_proxy, "alice", workspace_exec=True)
         actor = _actor_of(orchestrator_proxy)
 
         assert actor._name_of("never-attached") == "never-attached"
@@ -95,7 +95,7 @@ class TestTheBindRegistersTheAgentsName:
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         """LRU by ``move_to_end``: the least recently recorded name is the one dropped."""
-        card_for(orchestrator_proxy, "alice")
+        card_for(orchestrator_proxy, "alice", workspace_exec=True)
         actor = _actor_of(orchestrator_proxy)
         actor.config = actor.config.model_copy(update={"max_tracked_writers": 2})
         ann, bert, carl = (MockActorAddress(name) for name in ("ann", "bert", "carl"))
@@ -121,7 +121,7 @@ class TestTheBindRegistersTheAgentsName:
         nothing it can act on, and that is the regression a bare-id degradation
         would be.
         """
-        _card, observer = card_for(orchestrator_proxy, "alice")
+        _card, observer = card_for(orchestrator_proxy, "alice", workspace_exec=True)
         actor = _actor_of(orchestrator_proxy)
         agent_id = str(observer.myAddress.agent_id)
         run_id = "r0000001"
@@ -171,7 +171,7 @@ class TestNothingSweepsAndNothingReaps:
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         """AC 7, from the outside: the deferred machinery reads ``self.state`` and finds one."""
-        card_for(orchestrator_proxy, "alice")
+        card_for(orchestrator_proxy, "alice", workspace_exec=True)
         actor = _actor_of(orchestrator_proxy)
 
         assert type(actor.state) is BaseState
@@ -192,7 +192,7 @@ class TestNothingSweepsAndNothingReaps:
         """
         before = set(threading.enumerate())
 
-        card_for(orchestrator_proxy, "alice")
+        card_for(orchestrator_proxy, "alice", workspace_exec=True)
 
         assert set(threading.enumerate()) - before == set()
 
@@ -212,7 +212,7 @@ class TestABoundCardKeepsItsTreeAliveIndefinitely:
     def test_an_idle_tree_still_serves_a_mutation(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
-        card, _observer = card_for(orchestrator_proxy, "alice")
+        card, _observer = card_for(orchestrator_proxy, "alice", workspace_exec=True)
         actor = _actor_of(orchestrator_proxy)
 
         time.sleep(IDLE_WAIT_S)
@@ -236,7 +236,7 @@ class TestABoundCardKeepsItsTreeAliveIndefinitely:
         The actor is in exactly one team's children, so the team's teardown
         reaches it — which is the whole of its lifetime now.
         """
-        card_for(orchestrator_proxy, "alice")
+        card_for(orchestrator_proxy, "alice", workspace_exec=True)
         name = workspace_actor_name(WORKSPACE_PATH)
         assert name in orchestrator_proxy.children
 

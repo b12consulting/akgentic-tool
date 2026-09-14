@@ -1,99 +1,89 @@
 """``#Workspace-<workspace_name>``: the team child that owns one workspace tree's dispatch.
 
-29-2 wired an actor that knew what everyone had read and decided nothing. This
-module is where it decides: every mutation now runs **here**, on the actor's own
-tree handle, and only after the live file still matches what the writing agent
-observed (ADR-036 §3).
+**This actor is dispatch, and nothing else** (ADR-053 Decision 6). It is created
+only when a capability that dispatches is enabled — ``workspace_exec``, or one of
+the three retrieval fields. A read-only or read/write card, which is the
+overwhelming majority of them, creates no actor at all and loses nothing: what a
+mailbox is genuinely needed for is a sandbox run whose report has to land
+somewhere, and the ``#index-`` / ``#embed-`` children a Pydantic card cannot
+parent.
 
-**The check and the write are one mailbox turn.** Returning a verdict and letting
-the agent write would reopen the window the gate exists to close — between the
-answer and the write, a third agent can land a mutation. That is why the
-mutation helpers moved into :mod:`akgentic.tool.workspace.edit` and why this
-actor performs real file I/O rather than adjudicating from a distance.
+**Mutations do not run here.** 29-2 wired an actor that knew what everyone had
+read, and 29-3 made it decide; since story 52-5 the gate, the six mutation bodies
+and the observation map are all **card-side**, in
+:mod:`akgentic.tool.workspace.write.gate`. The lock that makes a check and a
+write one unit is an ``fcntl.flock`` on the path — a lock on the *tree*, which is
+what two workers over one mounted volume share, where a mailbox is only what one
+process has. Reads do not come here either: a read runs on the calling agent's
+own thread against its own ``Filesystem``, and records what it saw in the card's
+own map.
 
-**The hash is read from disk on every check, never cached.** A
-``{path -> current_sha}`` map would pass almost every test written against this
-module and fail exactly one: the file written behind the actor's back. That case
-is not exotic — it is the frontend upload, resource seeding, a sandbox run, and a
-second team sharing a ``workspace_id``. Four writers that never call this actor,
-all caught for free, because the check consults the *file* rather than a record
-of who wrote it. Do not optimise this into a cache.
-
-**Reads never come here for content.** They report what they saw through a
-fire-and-forget ``tell`` and go straight to the agent's own ``Filesystem``. From
-this story the ask path hashes files, so a reader that waited on it would queue
-behind another agent's mutation hashing a large file — and an ask carries no
-timeout.
+**The hash is read from disk on every check, never cached** — a rule that is
+still load-bearing and is now the **gate's**, stated where the gate lives. A
+``{path -> current_sha}`` map would pass almost every test written against it and
+fail exactly one: the file written behind its back. That case is not exotic — it
+is the frontend upload, resource seeding, a sandbox run, and a second team
+sharing a ``workspace_id``.
 
 **The actor is an ordinary team child, and it holds no shared state** (ADR-051).
 Its card creates it through ``getChildrenOrCreate``, so it belongs to exactly one
 team and that team's teardown is the only thing that stops it. Two teams over one
 tree therefore get two actors, which is correct rather than a regression: the
-exec hold is a lock file, the document cache and the retrieval index are files
-under ``<meta>``, and the write gate is an ``fcntl.flock`` — every shared thing is
-on the tree, where the filesystem serialises it across processes as well as
-teams. What is left here is **dispatch** over per-process resources: the sandbox
-backend and its worker thread, the document reader, and the RAG indexing pipeline
-whose ``IndexWorker`` and ``EmbeddingWorker`` children need a mailbox to report
-to. That is the finished shape, not a leftover.
+exec hold is a lock file, the document records are files under ``<meta>``, and the
+write gate is an ``fcntl.flock`` — every shared thing is on the tree, where the
+filesystem serialises it across processes as well as teams. What is left here is
+**dispatch** over per-process resources: the sandbox backend and its worker
+thread, the document reader, and the RAG indexing pipeline whose ``IndexWorker``
+and ``EmbeddingWorker`` children need a mailbox to report to. That is the
+finished shape, not a leftover.
 
 **The name carries the workspace, and that is load-bearing.** Get-or-create keys
 on the actor *name*, so a fixed ``#Workspace`` would collapse two cards of one
 team carrying different ``workspace_id`` values onto one actor owning one of the
-two trees — silently. The unicity domain of an actor must equal the resource it
-owns, and the resource is a tree.
-
-**Every accepted mutation is one commit, and the journal sits at the one place
-they converge.** :meth:`~akgentic.tool.workspace.actor.gate.GateMixin._journalled`
-wraps all six ``apply_*`` bodies, so the out-of-band commit happens before any of
-them touches disk and the agent's own commit happens after exactly one of them
-succeeds. A seventh mutation added later cannot forget it, because there is
-nowhere else to put one.
+two trees — silently. **The unicity domain is ``(team, tree)``, and that is
+correct**: one actor per team over a shared tree carries no correctness meaning,
+because nothing shared is held here. Do not read the name rule as a claim that
+two actors over one tree is a bug. It is the design.
 
 **Exec is fenced, not gated, and that is the whole difference.** Every other
-writer here says what it is about to do, so the gate can check a precondition
-against the file it names. A shell command cannot, so ``workspace_exec`` takes an
+writer says what it is about to do, so the gate can check a precondition against
+the file it names. A shell command cannot, so ``workspace_exec`` takes an
 exclusive lease over the tree instead, and its write set is *discovered*
 afterwards from ``git status --porcelain -uall`` (ADR-036 §5). A mutation
 arriving under that lease is refused immediately, naming the holder; reads are
 untouched and keep working throughout.
 
 The deferred-result mechanism (ADR-033) is **engaged** from story 29-5, and its
-seven rules apply in full: the blocking sandbox call happens in a ``#defer-``
-worker, never on this thread. Everything the ask path still does is bounded — one
-file read, one write, a few short-lived ``git`` forks under an explicit timeout —
-and never external. The last exception was ``rag_search``, which embedded a query
-and then searched a store that may be a cluster client; both halves moved onto
-the calling agent's own thread, and
-``tests/workspace/test_rag_search_off_the_mailbox.py`` is what holds the sentence
-to its word rather than leaving it a claim.
+seven rules apply in full. The blocking sandbox call is off this thread — on
+``ExecRunner``'s own single worker since story 47-2, not in a ``#defer-`` worker.
+Everything the ask path still does is bounded — one file read, one write, a few
+short-lived ``git`` forks under an explicit timeout — and never external. The last
+exception was ``rag_search``, which embedded a query and then searched a store
+that may be a cluster client; both halves moved onto the calling agent's own
+thread, and ``tests/workspace/test_rag_search_off_the_mailbox.py`` is what holds
+the sentence to its word rather than leaving it a claim.
 
-**The class is assembled from four per-concern mixins** (ADR-045 §1): the
-extraction cache in :mod:`~akgentic.tool.workspace.actor.documents`, the
-observation and last-writer maps in :mod:`~akgentic.tool.workspace.actor.observation`,
-the gate and the six mutations in :mod:`~akgentic.tool.workspace.actor.gate`, and
-the lease and the deferred surface in :mod:`~akgentic.tool.workspace.execution.actor`.
-Each body is the same code with the same ``self``; what stays here is the class
-itself, ``on_start``, ``worker_class``, the startup staging sweep ``on_start``
-calls, and the agent-name map that gives a commit and a busy refusal a name to
-print.
+**The class is assembled from two per-concern mixins** (ADR-045 §1): the
+retrieval pipeline in :mod:`~akgentic.tool.workspace.actor.documents`, and the
+lease and the deferred surface in
+:mod:`~akgentic.tool.workspace.execution.actor`. Each body is the same code with
+the same ``self``; what stays here is the class itself, ``on_start``,
+``worker_class``, and the agent-name map that gives a commit and a busy refusal a
+name to print.
 """
 
 from __future__ import annotations
 
-import contextlib
 import logging
-import time
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_state import BaseState
 from akgentic.tool.core.deferred import DeferredResultActor, DeferredWorker
 from akgentic.tool.workspace.actor.documents import DocumentsMixin
-from akgentic.tool.workspace.documents.store import DocumentStore
+from akgentic.tool.workspace.documents.cache import DocumentCache
 from akgentic.tool.workspace.execution import (
     ExecConfig,
     ExecOutcome,
@@ -103,17 +93,8 @@ from akgentic.tool.workspace.execution import (
 from akgentic.tool.workspace.execution.actor import EXEC_CAPABILITY, ExecMixin
 from akgentic.tool.workspace.journal import GitJournal
 from akgentic.tool.workspace.lock import LockBackend
-from akgentic.tool.workspace.models import (
-    STAGING_SWEEP_GRACE_S,
-    Identity,
-    WorkspaceConfig,
-)
-from akgentic.tool.workspace.workspace import (
-    Filesystem,
-    get_workspace,
-    is_staging_name,
-    meta_dir_for,
-)
+from akgentic.tool.workspace.models import Identity, WorkspaceConfig
+from akgentic.tool.workspace.workspace import Filesystem, get_workspace, meta_dir_for
 
 if TYPE_CHECKING:
     from akgentic.core.actor_address import ActorAddress
@@ -165,26 +146,6 @@ def workspace_actor_name(workspace_name: str) -> str:
     return f"{WORKSPACE_ACTOR_NAME}-{workspace_name}"
 
 
-def _is_sweepable_orphan(entry: Path, cutoff: float) -> bool:
-    """Whether *entry* is a staging file old enough to have been abandoned.
-
-    Args:
-        entry: A path found under the workspace root.
-        cutoff: The mtime below which a staging file counts as orphaned.
-
-    Returns:
-        True only for a regular file carrying the full staging shape and last
-        modified before *cutoff*. A failed ``stat`` answers False: an entry this
-        process cannot inspect is one it must not delete.
-    """
-    if not is_staging_name(entry.name):
-        return False
-    try:
-        return entry.is_file() and entry.stat().st_mtime < cutoff
-    except OSError:
-        return False
-
-
 class WorkspaceActor(
     DocumentsMixin,
     ExecMixin,
@@ -199,8 +160,11 @@ class WorkspaceActor(
 ):
     """Team child owning one tree's exec dispatch and its RAG indexing pipeline.
 
-    One per resolved path per team, created by its card through
-    ``getChildrenOrCreate``. **The first card of a team to bind fixes the
+    **Created only when the card enables exec or retrieval** (ADR-053 Decision
+    6), and not otherwise: a read-only or read/write card binds a tree, seeds it,
+    sweeps it, opens its journal and gates every mutation without one of these
+    existing at all. One per resolved path per team where it does exist, created
+    by its card through ``getChildrenOrCreate``. **The first card of a team to bind fixes the
     configuration every later card of that team gets on the tree**: get-or-create
     ignores ``config`` on a hit, so a second card that disagrees gets the actor as
     it was created, with nothing raised — two cards of one team disagreeing about
@@ -244,10 +208,7 @@ class WorkspaceActor(
     """
 
     def on_start(self) -> None:
-        """Initialise state, take the tree handle, sweep staging files, open the journal.
-
-        **The order is load-bearing and there is only one correct one**, and two
-        different orderings are being satisfied at once.
+        """Initialise state, take the tree handle, and open the journal if there is one.
 
         ``self.state`` is assigned *before* ``super().on_start()`` because
         ``DeferredResultActor.on_start`` touches ``self.state`` on its first
@@ -256,10 +217,22 @@ class WorkspaceActor(
         rather than a guarantee, and it is why this comment exists rather than
         silence.
 
-        Everything after it keeps 29-4's order: sweeping *after* the initial
-        commit would commit orphaned staging files and then delete them, and
-        seeding ``.gitignore`` after that commit would leave the sidecars inside
-        it.
+        **Two duties left this method**, because they are not dispatch and this
+        actor is only created when something dispatches (ADR-053 Decision 6).
+        The staging sweep is
+        :func:`~akgentic.tool.workspace.workspace.sweep_staging_files`, called
+        from the card's ``observer()``; seeding ``.gitignore`` and making the
+        initial out-of-band commit are the card's ``_open_journal``. A card with
+        neither exec nor retrieval enabled has no actor to run them, and every
+        one of them still has to happen — an orphaned staging file that nothing
+        removes survives for ever, and 29-4's ordering argument (sweep before any
+        write, seed before the first commit) is now satisfied inside
+        ``observer()`` rather than here.
+
+        **What is left is still gated.** The journal is built only when
+        ``git_journal`` is on, mirroring the card's own ``_open_journal``. It used
+        to be constructed and ``initialise``d on every bind whatever the setting,
+        which is where the one WARNING a read-only bind logged came from.
         """
         self.state = BaseState()
         super().on_start()
@@ -303,18 +276,17 @@ class WorkspaceActor(
         # Announced by the card at bind time, exactly as ``_lock`` is. Until
         # then the document cache misses and the index looks empty: an ordinary,
         # visible degradation, never a raise (ADR-051 Decision 6).
-        self._document_store: DocumentStore | None = None
+        self._document_cache: DocumentCache | None = None
         self._workspace: Filesystem = get_workspace(self.config.workspace_path)
-        self._sweep_staging_files()
-        self._journal = GitJournal(
-            self._workspace.root,
-            enabled=self.config.git_journal,
-            timeout_s=self.config.git_timeout_s,
-            meta_dir=meta_dir_for(self.config.workspace_path),
-        )
-        if self._journal.initialise():
-            self._journal.seed_gitignore(self._workspace.write)
-            self._journal.commit_out_of_band()
+        self._journal: GitJournal | None = None
+        if self.config.git_journal:
+            self._journal = GitJournal(
+                self._workspace.root,
+                enabled=self.config.git_journal,
+                timeout_s=self.config.git_timeout_s,
+                meta_dir=meta_dir_for(self.config.workspace_path),
+            )
+            self._journal.initialise()
 
     def worker_class(self) -> type[DeferredWorker]:
         """Never called: nothing here is spawned through ``request()``.
@@ -333,10 +305,11 @@ class WorkspaceActor(
         ``receiveMsg_EmbeddingError`` rather than through ``deliver`` / ``fail`` —
         which here are the **exec** result cache. Routing it through ``request()``
         would put a batch of vectors into that cache and evict a running agent's
-        exec outcome. The second actor spawned outside ``request()`` is the
-        in-memory ``VectorStoreActor`` child — a storage engine this actor asks,
-        not a worker that reports — created in the same way and stopped with
-        this actor through ``stop_children``.
+        exec outcome. **It is the only actor spawned outside ``request()``**: the
+        team's ``#VectorStore`` is not this actor's child and never was — the card
+        creates it so that a planning or knowledge-graph card of the same team
+        shares it, and ``_resolve_store`` says outright that this actor receives a
+        store and creates no child.
 
         Raising rather than returning a never-spawned stub: a stub would be dead
         code carrying a ``produce`` nobody runs, and the next reader would have to
@@ -427,44 +400,3 @@ class WorkspaceActor(
     def _identity(self, agent_id: str) -> Identity:
         """Compose the git identity for *agent_id*: name to read, id to distinguish."""
         return Identity(self._name_of(agent_id), agent_id)
-
-    ##
-    ## Startup housekeeping
-    ##
-    def _sweep_staging_files(self) -> None:
-        """Delete staging files an interrupted write left behind, anywhere in the tree.
-
-        ``Filesystem.write`` publishes by rename from ``.<name>.<32 hex>.tmp`` in
-        the target's own directory. A process killed between the two steps leaves
-        one behind for good, and nothing else ever removes it.
-
-        The sweep runs **at actor start only** — never on a timer, never per
-        mutation — and matches the full staging shape, so a user's own
-        ``.notes.tmp`` survives. Every failure is suppressed: a directory this
-        process cannot clean must not stop the team's workspace from starting.
-
-        **A staging file younger than the grace window is left alone**, because
-        it is being written *now* and possibly by somebody who is not this
-        actor: an upload, resource seeding, or — on the multi-worker tiers,
-        where two processes can each host an actor over one tree — another
-        process's ``#Workspace``. Unlinking such a staged file in the window
-        between ``os.open`` and ``os.replace`` turns a healthy write into a
-        refusal. An orphan is minutes or a restart old, so no realistic window
-        confuses the two.
-        """
-        root = self._workspace.root
-        cutoff = time.time() - STAGING_SWEEP_GRACE_S
-        staged: list[Path] = []
-        with contextlib.suppress(OSError):
-            staged = [entry for entry in root.rglob("*") if _is_sweepable_orphan(entry, cutoff)]
-        removed = 0
-        for entry in staged:
-            with contextlib.suppress(OSError):
-                entry.unlink()
-                removed += 1
-        if removed:
-            logger.info(
-                "Workspace %s: swept %d orphaned staging file(s) at start",
-                self.config.workspace_path,
-                removed,
-            )

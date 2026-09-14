@@ -580,12 +580,20 @@ class _SamplingWorkspaceActor(WorkspaceActor):
     ``self.actor_inbox`` is this actor's own pykka attribute, read on its own
     thread.
 
-    **The turns it samples moved in story 52-5.** The six mutations and the
-    observation map went card-side, so neither is a turn on this mailbox any
-    more; what still arrives here from the shipped path is the stale-mark an
-    accepted mutation tells and the document-cache lookup a binary read asks.
-    Those are the turn boundaries, and they are the ones sampled. The
-    observation **counts** are card-side too — see :class:`_Recordings`.
+    **The turns it samples moved in 52-5 and then ran out in 55-8.** The six
+    mutations and the observation map went card-side first; the stale-mark and
+    the document-cache lookup — the last two turns the shipped read and write
+    paths still put on this mailbox — went card-side with the extraction cache
+    when the actor became dispatch-only (ADR-053 Decision 6).
+
+    **So the depth series is now empty by construction, and that is the
+    measurement rather than a broken harness.** A read or a mutation reaches no
+    mailbox at all: there is nothing to queue behind, on any team size. The
+    sampler is kept — it costs nothing and it is what would report a turn
+    reappearing on this path — and the two overrides that used to call it are
+    gone with the methods they overrode. The observation **counts** are card-side
+    too, see :class:`_Recordings`, and they are what the read path is measured
+    by now.
     """
 
     def on_start(self) -> None:
@@ -610,17 +618,9 @@ class _SamplingWorkspaceActor(WorkspaceActor):
             self._depths.append(inbox.qsize())
 
     ##
-    ## The turns this actor still serves.  Each is a turn boundary, so each samples.
+    ## The turns this actor still serves on the read and write paths: none.
+    ## ``_sample_depth`` is called by whatever is added here next; nothing is.
     ##
-    def mark_paths_stale(self, paths: list[str]) -> None:
-        """Sample, then delegate — the tell every accepted mutation sends."""
-        self._sample_depth()
-        super().mark_paths_stale(paths)
-
-    def document_extract(self, path: str, source_sha: str, version: str) -> str | None:
-        """Sample, then delegate — the ask every document read makes."""
-        self._sample_depth()
-        return super().document_extract(path, source_sha, version)
 
     ##
     ## The driver's two calls, both asks — so the second one is also the drain
@@ -635,7 +635,7 @@ class _SamplingWorkspaceActor(WorkspaceActor):
             depths=list(self._depths),
             read_observations=0,  # filled card-side by the driver — see ``_Recordings``
             mutation_observations=0,
-            journal_enabled=self._journal.enabled,
+            journal_enabled=self._journal is not None and self._journal.enabled,
         )
 
 
@@ -1055,8 +1055,7 @@ def _drive(
     counters = _Recordings()
     with _count_recordings(counters):
         members = [
-            _spawn_agent(orch, spec, arm, workspace_id, corpus, slot)
-            for slot in range(spec.agents)
+            _spawn_agent(orch, spec, arm, workspace_id, corpus, slot) for slot in range(spec.agents)
         ]
         for address in members:
             system.proxy_tell(address, _BenchAgent).run_mix()

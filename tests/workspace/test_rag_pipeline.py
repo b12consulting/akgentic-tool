@@ -67,6 +67,7 @@ from tests.workspace.conftest import (
     WORKSPACE_PATH,
     RecordingDocumentStore,
     attach_store,
+    cache_of,
     factory_for,
     seed_extract,
     seed_row,
@@ -232,8 +233,12 @@ class RagHarness:
         self._monkeypatch = monkeypatch
         self.actor._orchestrator = None
         # A card would announce this at bind time; a directly built actor gets
-        # none, and every document path would silently degrade to a miss.
-        attach_store(self.actor)
+        # none, and every document path would silently degrade to a miss. **Only
+        # when the actor has none**: a caller that built the actor with small caps
+        # announced a cache carrying them, and re-announcing here would silently
+        # put the production defaults back.
+        if self.actor._document_cache is None:
+            attach_store(self.actor)
         monkeypatch.setattr(self.actor, "proxy_ask", self._ask)
         monkeypatch.setattr(self.actor, "proxy_tell", self._tell)
         monkeypatch.setattr(self.actor, "createActor", self._create)
@@ -1053,7 +1058,7 @@ class TestTheSpawnSide:
         """The worker then only splits — which is what ``SPLITTING`` records."""
         harness.enable()
         sha = write(workspace_tree, "notes.md")
-        harness.actor.cache_document("notes.md", sha, EXTRACTOR_VERSION, "# Cached\n\nBody.\n")
+        cache_of(harness.actor).fill("notes.md", sha, EXTRACTOR_VERSION, "# Cached\n\nBody.\n")
 
         harness.actor.index_paths("")
 
@@ -1584,7 +1589,7 @@ class TestReportAttribution:
 
         harness.report("report.md", markdown="# From the worker\n", extracted=True)
 
-        assert harness.actor.document_extract("report.md", sha, EXTRACTOR_VERSION) == (
+        assert cache_of(harness.actor).lookup("report.md", sha, EXTRACTOR_VERSION) == (
             "# From the worker\n"
         )
 
@@ -1694,7 +1699,7 @@ class TestTheGateMarksStale:
     ) -> None:
         self._indexed(harness, workspace_tree)
 
-        harness.actor.mark_paths_stale(["notes.md"])
+        cache_of(harness.actor).mark_paths_stale(["notes.md"])
 
         assert harness.rows["notes.md"].status is RagStatus.STALE
 
@@ -1705,7 +1710,7 @@ class TestTheGateMarksStale:
         self._indexed(harness, workspace_tree)
         (workspace_tree / "notes.md").unlink()
 
-        harness.actor.mark_paths_stale(["notes.md"])
+        cache_of(harness.actor).mark_paths_stale(["notes.md"])
 
         assert harness.rows["notes.md"].status is RagStatus.STALE
 
@@ -1716,7 +1721,7 @@ class TestTheGateMarksStale:
         self._indexed(harness, workspace_tree)
         spawned = len(harness.requests)
 
-        harness.actor.mark_paths_stale(["notes.md"])
+        cache_of(harness.actor).mark_paths_stale(["notes.md"])
 
         assert len(harness.requests) == spawned
 
@@ -1727,7 +1732,7 @@ class TestTheGateMarksStale:
         write(workspace_tree, "fresh.md")
         writes = harness.record_writes()
 
-        harness.actor.mark_paths_stale(["fresh.md"])
+        cache_of(harness.actor).mark_paths_stale(["fresh.md"])
 
         assert writes.written == []
 
@@ -1736,11 +1741,11 @@ class TestTheGateMarksStale:
     ) -> None:
         """A no-op must not be a delta."""
         self._indexed(harness, workspace_tree)
-        harness.actor.mark_paths_stale(["notes.md"])
+        cache_of(harness.actor).mark_paths_stale(["notes.md"])
         assert harness.rows["notes.md"].status is RagStatus.STALE
         writes = harness.record_writes()
 
-        harness.actor.mark_paths_stale(["notes.md"])
+        cache_of(harness.actor).mark_paths_stale(["notes.md"])
 
         assert writes.written == []
 
@@ -1749,7 +1754,7 @@ class TestTheGateMarksStale:
     ) -> None:
         writes = harness.record_writes()
 
-        harness.actor.mark_paths_stale(["never-indexed.md"])
+        cache_of(harness.actor).mark_paths_stale(["never-indexed.md"])
 
         assert writes.written == []
 
@@ -1764,7 +1769,7 @@ class TestTheGateMarksStale:
         harness.result("two.md")
         writes = harness.record_writes()
 
-        harness.actor.mark_paths_stale(["one.md", "two.md"])
+        cache_of(harness.actor).mark_paths_stale(["one.md", "two.md"])
 
         assert sorted(writes.written) == ["one.md", "two.md"]
 

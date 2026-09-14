@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -28,6 +29,9 @@ import pytest
 
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.actor import WorkspaceActor
+from akgentic.tool.workspace.documents.cache import DocumentCache
+from akgentic.tool.workspace.documents.models import RagFile, RagStatus
+from akgentic.tool.workspace.documents.store import YamlDocumentStore
 from akgentic.tool.workspace.edit import EditItem
 from akgentic.tool.workspace.models import (
     GITIGNORE_NAME,
@@ -1334,20 +1338,22 @@ class TestEveryMutationConvergesOnOnePoint:
 # ---------------------------------------------------------------------------
 
 
-class _StaleRecorder:
-    """A tell proxy that records the stale-mark sets and forwards nothing else."""
+class _StaleRecorder(DocumentCache):
+    """A cache that records the stale-mark sets and does everything else normally.
 
-    def __init__(self) -> None:
+    It was a *tell proxy* until story 55-8, because the stale-mark was a message
+    to the ``#Workspace`` actor. It is a direct call on the card's own cache now,
+    which is what keeps a read/write card — one that creates no actor at all —
+    invalidating a tree another team indexes.
+    """
+
+    def __init__(self, inner: DocumentCache) -> None:
+        super().__init__(inner.store, inner.tree_key, inner.max_documents, inner.max_document_chars)
         self.sets: list[list[str]] = []
 
     def mark_paths_stale(self, paths: list[str]) -> None:
         self.sets.append(list(paths))
-
-    def __getattr__(self, name: str) -> Any:
-        def swallow(*args: Any, **kwargs: Any) -> None:
-            return None
-
-        return swallow
+        super().mark_paths_stale(paths)
 
 
 class TestTheStaleMarkReachesTheIndex:
@@ -1358,19 +1364,51 @@ class TestTheStaleMarkReachesTheIndex:
     """
 
     def _card_with(
-        self, orchestrator_proxy: FakeOrchestratorProxy, recorder: _StaleRecorder
-    ) -> WorkspaceTool:
+        self, orchestrator_proxy: FakeOrchestratorProxy
+    ) -> tuple[WorkspaceTool, _StaleRecorder]:
         card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
-        card.observer(
-            FakeActorToolObserver(orchestrator_proxy, name="alice", workspace_tell_proxy=recorder)
+        card.observer(FakeActorToolObserver(orchestrator_proxy, name="alice"))
+        # Non-vacuity for every row below: this is a plain read/write card, and
+        # since story 55-8 it creates no actor — so what they watch is the
+        # card-side call, not a tell that happens to have an actor behind it.
+        assert orchestrator_proxy.create_calls == []
+        assert card._document_cache is not None
+        recorder = _StaleRecorder(card._document_cache)
+        card._document_cache = recorder
+        return card, recorder
+
+    def test_a_write_through_a_card_with_no_actor_marks_an_indexed_path_stale(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """AC 9 end to end, on the disk rather than on a recorder.
+
+        **Two teams on one tree is the normal case**, so a write card on a tree
+        another team indexes has to keep invalidating it. Driven through the real
+        card and read back through a second store object, so what is asserted is
+        the row that reached the disk.
+        """
+        card, _recorder = self._card_with(orchestrator_proxy)
+        cache = DocumentCache(YamlDocumentStore(), card._workspace_path, 32, 2_000_000)
+        cache.put_row(
+            "fresh.md",
+            RagFile(
+                path="fresh.md",
+                status=RagStatus.EMBEDDED,
+                indexed_sha="whatever",
+                updated_at=datetime.now(UTC),
+            ),
         )
-        return card
+
+        assert card.apply_write("fresh.md", "body\n").message == "Written: fresh.md"
+
+        reader = DocumentCache(YamlDocumentStore(), card._workspace_path, 32, 2_000_000)
+        row = reader.entry("fresh.md").row
+        assert row is not None and row.status is RagStatus.STALE
 
     def test_a_write_signals_its_one_path(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
-        recorder = _StaleRecorder()
-        card = self._card_with(orchestrator_proxy, recorder)
+        card, recorder = self._card_with(orchestrator_proxy)
 
         card.apply_write("fresh.md", "body\n")
 
@@ -1380,8 +1418,7 @@ class TestTheStaleMarkReachesTheIndex:
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         (workspace_tree / "notes.md").write_text("alpha\n", encoding="utf-8")
-        recorder = _StaleRecorder()
-        card = self._card_with(orchestrator_proxy, recorder)
+        card, recorder = self._card_with(orchestrator_proxy)
         read(card, "notes.md")
 
         card.apply_delete("notes.md")
@@ -1395,8 +1432,7 @@ class TestTheStaleMarkReachesTheIndex:
 
         for name, body in (("a.py", "x = 1\n"), ("b.py", "y = 2\n")):
             (workspace_tree / name).write_text(body, encoding="utf-8")
-        recorder = _StaleRecorder()
-        card = self._card_with(orchestrator_proxy, recorder)
+        card, recorder = self._card_with(orchestrator_proxy)
         read(card, "a.py")
         read(card, "b.py")
 
@@ -1413,8 +1449,7 @@ class TestTheStaleMarkReachesTheIndex:
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         (workspace_tree / "gone.md").write_text("bye\n", encoding="utf-8")
-        recorder = _StaleRecorder()
-        card = self._card_with(orchestrator_proxy, recorder)
+        card, recorder = self._card_with(orchestrator_proxy)
         read(card, "gone.md")
 
         outcome = card.apply_patch(
@@ -1429,8 +1464,7 @@ class TestTheStaleMarkReachesTheIndex:
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         (workspace_tree / "notes.md").write_text("alpha\n", encoding="utf-8")
-        recorder = _StaleRecorder()
-        card = self._card_with(orchestrator_proxy, recorder)
+        card, recorder = self._card_with(orchestrator_proxy)
 
         outcome = card.apply_write("notes.md", "mine\n")
 
@@ -1442,17 +1476,13 @@ class TestTheStaleMarkReachesTheIndex:
     ) -> None:
         """It degrades to a stale index row, which is recoverable; a raise is not."""
 
-        class Dead:
+        class Dead(DocumentCache):
             def mark_paths_stale(self, paths: list[str]) -> None:
-                raise RuntimeError("the actor is gone")
-
-            def __getattr__(self, name: str) -> Any:
-                return lambda *a, **k: None
+                raise RuntimeError("the record store is unreachable")
 
         card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
-        card.observer(
-            FakeActorToolObserver(orchestrator_proxy, name="alice", workspace_tell_proxy=Dead())
-        )
+        card.observer(FakeActorToolObserver(orchestrator_proxy, name="alice"))
+        card._document_cache = Dead(None, card._workspace_path, 32, 2_000_000)
 
         assert card.apply_write("fresh.md", "body\n").message == "Written: fresh.md"
         assert (workspace_tree / "fresh.md").read_text(encoding="utf-8") == "body\n"

@@ -56,7 +56,13 @@ from akgentic.tool.workspace.actor import (
     WorkspaceActor,
     workspace_actor_name,
 )
-from akgentic.tool.workspace.documents.models import DocumentExtract, RagFile
+from akgentic.tool.workspace.documents.cache import DocumentCache
+from akgentic.tool.workspace.documents.models import (
+    DEFAULT_MAX_DOCUMENT_CHARS,
+    DEFAULT_MAX_DOCUMENTS,
+    DocumentExtract,
+    RagFile,
+)
 from akgentic.tool.workspace.documents.store import DocumentEntry, YamlDocumentStore
 from akgentic.tool.workspace.execution import DEFAULT_EXEC_TIMEOUT_S, RunningExec
 from akgentic.tool.workspace.journal import git_dir_for
@@ -738,11 +744,32 @@ def wired_card(
 
 
 @pytest.fixture
+def dispatching_card(
+    observer: FakeActorToolObserver,
+    workspace_tree: Path,
+) -> WorkspaceTool:
+    """A card that creates an actor — the plain one does not, since story 55-8.
+
+    **Its own fixture rather than a widened :func:`wired_card`.** ``wired_card``
+    is a plain read/write card used at some four hundred call sites, and it is
+    what asserts that the ordinary shape creates no actor; giving it exec would
+    make every one of those specs bind a sandbox they never asked for.
+
+    ``workspace_exec`` rather than retrieval, because it is the cheaper of the
+    two dispatching capabilities: retrieval resolves a vector backend and looks
+    the team's ``#VectorStore`` up.
+    """
+    card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_exec=True)
+    card.observer(observer)
+    return card
+
+
+@pytest.fixture
 def workspace_actor(
     orchestrator_proxy: FakeOrchestratorProxy,
-    wired_card: WorkspaceTool,
+    dispatching_card: WorkspaceTool,
 ) -> WorkspaceActor:
-    """The live actor behind :func:`wired_card`, read from the team's children."""
+    """The live actor behind :func:`dispatching_card`, read from the team's children."""
     _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
     assert isinstance(actor, WorkspaceActor)
     return actor
@@ -761,6 +788,7 @@ def card_for(
     name: str,
     workspace_id: str = WORKSPACE_NAME,
     git_journal: bool = False,
+    workspace_exec: bool = False,
 ) -> tuple[WorkspaceTool, FakeActorToolObserver]:
     """Wire a second (or third) agent's card onto the same workspace.
 
@@ -769,10 +797,14 @@ def card_for(
 
     ``git_journal`` mirrors the card's own default, which is off. A test about
     the journal opts in explicitly, so the suite never depends on a default it
-    is not asserting.
+    is not asserting. ``workspace_exec`` is the same shape and exists for the
+    same reason: since story 55-8 it is what decides whether the bind creates an
+    actor at all, so a spec about the actor asks for it in as many words.
     """
     observer = FakeActorToolObserver(orchestrator_proxy, name=name)
-    card = WorkspaceTool(workspace_id=workspace_id, git_journal=git_journal)
+    card = WorkspaceTool(
+        workspace_id=workspace_id, git_journal=git_journal, workspace_exec=workspace_exec
+    )
     card.observer(observer)
     return card, observer
 
@@ -1294,43 +1326,78 @@ def factory_for(backend: str, factory: BackendFactory) -> Iterator[list[BackendC
 # memory. It is also exactly the shape story 52-3's AC 13 asks for.
 
 
-def attach_store(actor: WorkspaceActor) -> WorkspaceActor:
-    """Announce a document store to *actor*, exactly as a bound card does.
+def attach_store(
+    actor: WorkspaceActor,
+    max_documents: int = DEFAULT_MAX_DOCUMENTS,
+    max_document_chars: int = DEFAULT_MAX_DOCUMENT_CHARS,
+) -> WorkspaceActor:
+    """Announce a document cache to *actor*, exactly as a bound card does.
 
     A directly constructed actor gets none — ``on_start`` leaves the slot
-    ``None``, because resolving one is the card's job and an actor that resolved
-    its own would be reading configuration nobody handed it. Every fixture that
+    ``None``, because building one is the card's job and an actor that built its
+    own would be reading configuration nobody handed it. Every fixture that
     builds an actor by hand therefore stands in for the card here.
+
+    **The two caps arrive with the cache, not in the config.** They were
+    ``WorkspaceConfig`` fields until story 55-8 moved the extraction cache
+    card-side; a spec that wants a small cap passes it here.
     """
-    actor.configure_document_store(YamlDocumentStore())
+    actor.configure_document_cache(
+        DocumentCache(
+            YamlDocumentStore(),
+            actor.config.workspace_path,
+            max_documents,
+            max_document_chars,
+        )
+    )
     return actor
 
 
-def store_of(actor: WorkspaceActor) -> YamlDocumentStore:
-    """A second store object over *actor*'s tree — never the one it was given."""
+def cache_of(actor: WorkspaceActor) -> DocumentCache:
+    """The cache *actor* was announced — where a spec reaches its records.
+
+    ``mark_paths_stale`` and the extraction cache are this object's since story
+    55-8; the actor holds one rather than being one.
+    """
+    cache = actor._document_cache
+    assert cache is not None, "the actor was never announced a document cache"
+    return cache
+
+
+def store_of(target: WorkspaceActor | DocumentCache) -> YamlDocumentStore:
+    """A second store object over *target*'s tree — never the one it was given."""
     return YamlDocumentStore()
 
 
-def stored_entries(actor: WorkspaceActor) -> dict[str, DocumentEntry]:
-    """Every record on disk for *actor*'s tree, keyed by path."""
+def tree_key_of(target: WorkspaceActor | DocumentCache) -> str:
+    """The three-segment path *target* addresses records by.
+
+    Both shapes are accepted because both are legitimate subjects since story
+    55-8: a spec about the retrieval pipeline holds an actor, and one about the
+    extraction cache holds the card's cache and no actor at all.
+    """
+    return target.tree_key if isinstance(target, DocumentCache) else target.config.workspace_path
+
+
+def stored_entries(target: WorkspaceActor | DocumentCache) -> dict[str, DocumentEntry]:
+    """Every record on disk for *target*'s tree, keyed by path."""
     return {
-        entry.path: entry
-        for entry in store_of(actor).list_documents(actor.config.workspace_path)
+        entry.path: entry for entry in store_of(target).list_documents(tree_key_of(target))
     }
 
 
-def stored_rows(actor: WorkspaceActor) -> dict[str, RagFile]:
+def stored_rows(target: WorkspaceActor | DocumentCache) -> dict[str, RagFile]:
     """The retrieval index as the disk holds it — the former ``state.rag_index``."""
     return {
-        path: entry.row for path, entry in stored_entries(actor).items() if entry.row is not None
+        path: entry.row for path, entry in stored_entries(target).items() if entry.row is not None
     }
 
 
-def stored_docs(actor: WorkspaceActor) -> dict[str, DocumentExtract]:
+def stored_docs(target: WorkspaceActor | DocumentCache) -> dict[str, DocumentExtract]:
     """The extraction cache as the disk holds it — the former ``state.documents``."""
     return {
         path: entry.extract
-        for path, entry in stored_entries(actor).items()
+        for path, entry in stored_entries(target).items()
         if entry.extract is not None
     }
 
@@ -1445,9 +1512,19 @@ class RecordingDocumentStore:
 def watch_store(actor: WorkspaceActor) -> RecordingDocumentStore:
     """Give *actor* a recording store and hand the recorder back.
 
-    Announced through ``configure_document_store`` rather than assigned, so the
-    spec exercises the same tell path a card uses.
+    Announced through ``configure_document_cache`` rather than assigned, so the
+    spec exercises the same tell path a card uses. The caps it is announced under
+    are whatever *actor* already holds, so swapping the store in mid-spec does not
+    silently reset a cap the spec set.
     """
     recorder = RecordingDocumentStore()
-    actor.configure_document_store(recorder)
+    current = actor._document_cache
+    actor.configure_document_cache(
+        DocumentCache(
+            recorder,
+            actor.config.workspace_path,
+            current.max_documents if current is not None else DEFAULT_MAX_DOCUMENTS,
+            current.max_document_chars if current is not None else DEFAULT_MAX_DOCUMENT_CHARS,
+        )
+    )
     return recorder

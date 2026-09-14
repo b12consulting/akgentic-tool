@@ -75,14 +75,6 @@ SPINE = frozenset(
         f"{PACKAGE}.models",
         f"{PACKAGE}.readers",
         f"{PACKAGE}.workspace",
-        # Reached transitively: ``models`` imports ``documents.models`` for the
-        # extraction constants, which attributes the ``documents`` package. Those
-        # two, and nothing else under ``documents/``: the extraction cache is
-        # genuinely shared by the read and retrieval capabilities, so it stays
-        # shared (ADR-053 Decision 1), while ``documents/store.py`` is reached by
-        # neither capability's closure.
-        f"{PACKAGE}.documents",
-        f"{PACKAGE}.documents.models",
     }
 )
 """The shared machinery every capability is allowed to stand on.
@@ -92,6 +84,16 @@ closures are its heaviest consumer: ``rag/__init__.py``, ``actor/documents.py``,
 ``rag/worker.py`` and ``models.py`` all use it too, and ``akgentic-agent`` imports
 ``MediaContent`` from its deep path. It is shared machinery and it stays in the
 spine.
+
+**It shrank by two more in story 55-8, and those two are the same shape as
+55-6's.** ``documents`` and ``documents.models`` were here because
+``workspace/models.py`` imported two cap constants from the second to default two
+``WorkspaceConfig`` fields — so *every* capability, ``journal/`` included, was
+allowed to reach the documents package through one spine module that named it for
+an unrelated reason. Those fields went card-side with the extraction cache, the
+import went with them, and the two entries are now stated on the rows that
+genuinely reach them: ``rag/``, which imports the records, and ``write/``, which
+names the cache the stale-mark calls.
 
 **It shrank by two when the retrieval capability became a module**, and that is
 the structural observable of story 55-6 rather than a tidy-up.
@@ -150,11 +152,23 @@ CAPABILITY_CLOSURES: dict[str, frozenset[str]] = {
         # argument for ``lock.py`` staying in the spine while ``execution/``
         # became a capability.
         f"{PACKAGE}.lock",
-        # ``WorkspaceActor`` annotates ``_workspace_tell`` and nothing else, and
-        # is already imported under ``TYPE_CHECKING`` — so it is *not* in the
-        # runtime closure, and is here only for the direct-edge rule. Becomes
-        # 55-7's.
-        f"{PACKAGE}.actor",
+        # ``DocumentCache`` annotates ``_document_cache`` under ``TYPE_CHECKING``
+        # and nothing else — the stale-mark an accepted mutation applies is a
+        # plain method call, which is no import at all — so neither entry is in
+        # the runtime closure and both are here for the direct-edge rule. The
+        # package entry rides on the submodule: importing
+        # ``documents.cache`` executes ``documents/__init__`` on the way down.
+        #
+        # **There is no ``actor`` entry any more, and that is story 55-8's
+        # structural observable.** ``_mark_stale`` was the last thing under
+        # ``write/`` that named the actor — it told ``mark_paths_stale`` over the
+        # tell proxy — and the actor is only created by a card that dispatches,
+        # which a write card does not. Removing the entry reddens nothing, which
+        # is the point: an extra *permitted* entry never reddens a subset test, so
+        # :class:`TestTheDeletabilityClaimIsObservable` asserts the absence
+        # directly.
+        f"{PACKAGE}.documents",
+        f"{PACKAGE}.documents.cache",
     },
     # **The first row with no non-spine entry at all**, and that is the finding
     # rather than an omission. ``journal/`` imports exactly four names from
@@ -164,6 +178,13 @@ CAPABILITY_CLOSURES: dict[str, frozenset[str]] = {
     "journal": SPINE | {f"{PACKAGE}.journal"},
     "rag": SPINE
     | {
+        # The records themselves, and the package they live in. **On this row
+        # since story 55-8 rather than in ``SPINE``**: the retrieval capability is
+        # the one that genuinely reads a ``RagFile`` and mints a chunk id, and the
+        # spine stopped naming the documents package at all when the two document
+        # caps left ``WorkspaceConfig``.
+        f"{PACKAGE}.documents",
+        f"{PACKAGE}.documents.models",
         f"{PACKAGE}.rag",
         f"{PACKAGE}.rag.context",
         f"{PACKAGE}.rag.params",
@@ -271,17 +292,20 @@ CAPABILITY_SPINE_REACH: dict[str, frozenset[str]] = {
             f"{PACKAGE}.workspace",
         }
     ),
-    # The same five as ``rag/``, reached by a different route and stated in full
-    # rather than trimmed to match: ``execution/`` gets to ``workspace`` through
+    # Three, not the five it was: ``execution/`` gets to ``workspace`` through
     # ``lock.py``'s ``meta_dir_for`` and ``meta_root``, to ``models`` through both
     # the mixin's ``WorkspaceConfig`` and its ``Identity``, and to ``readers``
     # only through ``models.gitignore_seed``'s in-function import — the entry a
     # graph that followed no transitive edge would miss while still satisfying a
     # mere "non-empty" check.
+    #
+    # **It lost ``documents`` and ``documents.models`` in story 55-8**, and the
+    # row is narrowed rather than left generous: it reached both only because
+    # ``models.py`` imported two cap constants for ``WorkspaceConfig`` fields that
+    # no longer exist. A row that kept claiming them would be a reach this
+    # capability does not have, and this table exists to report exactly that.
     "execution": frozenset(
         {
-            f"{PACKAGE}.documents",
-            f"{PACKAGE}.documents.models",
             f"{PACKAGE}.models",
             f"{PACKAGE}.readers",
             f"{PACKAGE}.workspace",
@@ -504,22 +528,28 @@ class TestTheSweepLooksAtTheRightThing:
         """The parent-attribution rule, asserted rather than left to a mutation.
 
         No module anywhere imports ``akgentic.tool.workspace.documents`` by name —
-        every reference is to ``documents.models`` or ``documents.store``. The
-        package is in ``read/``'s closure **only** because importing one of those
-        executes its ``__init__`` first, which is the whole of the rule. A graph
-        that recorded leaves alone would leave it out, and would then answer
-        "clean" for a capability that dragged in a whole package through one of
-        its submodules.
+        every reference is to ``documents.models``, ``documents.store`` or
+        ``documents.cache``. The package is in ``rag/``'s closure **only** because
+        importing one of those executes its ``__init__`` first, which is the whole
+        of the rule. A graph that recorded leaves alone would leave it out, and
+        would then answer "clean" for a capability that dragged in a whole package
+        through one of its submodules.
 
-        **Asserted once, on ``read``, and not per capability**, because it is a
-        property of :func:`_edges` — shared by every row — and not of any one
-        capability. Parametrised, it would assert of *each* later capability that
-        it reaches ``documents``, which is a fact about ``read/`` importing
-        ``models``. The first capability that legitimately never reaches it would
-        redden a guard that is working correctly, for a reason unconnected to
-        what the guard tests.
+        **Asserted once, and not per capability**, because it is a property of
+        :func:`_edges` — shared by every row — and not of any one capability.
+        Parametrised, it would assert of *each* capability that it reaches
+        ``documents``, and three of them do not.
+
+        **Read off ``rag`` rather than ``read``, since story 55-8.** It was
+        ``read``, which reached the package transitively through
+        ``workspace/models.py``'s import of the two document caps; those caps went
+        card-side with the extraction cache and the import went with them, so
+        ``read/`` legitimately never reaches ``documents`` any more — exactly the
+        case this docstring warned would redden a working guard. ``rag/`` imports
+        ``documents.models`` outright, which is the same rule read off a different
+        row.
         """
-        closure = _closure(_modules_under("read", modules), modules)
+        closure = _closure(_modules_under("rag", modules), modules)
 
         assert f"{PACKAGE}.documents" in closure, (
             "the graph is recording leaves without their parent packages — "
@@ -625,12 +655,11 @@ class TestTheDeletabilityClaimIsObservable:
     ) -> None:
         """The two default-off capabilities ``write/`` used to drag in with it.
 
-        ``GitJournal`` still **types** ``_journal`` and ``WorkspaceActor`` still
-        types ``_workspace_tell``, both under ``TYPE_CHECKING`` — which is why
-        ``journal`` is still on ``write/``'s allow-list row and why this is the
-        *runtime* closure rather than the direct-edge set. An annotation executes
-        nothing, closes no cycle and costs nothing at bind; it is not a reason a
-        directory cannot be deleted.
+        ``GitJournal`` still **types** ``_journal`` under ``TYPE_CHECKING`` —
+        which is why ``journal`` is still on ``write/``'s allow-list row and why
+        this is the *runtime* closure rather than the direct-edge set. An
+        annotation executes nothing, closes no cycle and costs nothing at bind; it
+        is not a reason a directory cannot be deleted.
         """
         closure = _closure(_modules_under("write", modules), modules)
 
@@ -645,6 +674,33 @@ class TestTheDeletabilityClaimIsObservable:
             "does not"
         )
 
+    def test_the_write_capability_no_longer_names_the_actor_at_all(
+        self, modules: dict[str, Path]
+    ) -> None:
+        """Story 55-8, and it is a **direct-edge** claim rather than a runtime one.
+
+        ``write/gate.py`` annotated ``_workspace_tell`` as a ``WorkspaceActor``
+        and sent ``mark_paths_stale`` over it on every accepted mutation. The
+        stale-mark is a direct call on the card's own ``DocumentCache`` now,
+        because a read/write card creates no actor — so nothing under ``write/``
+        names the actor, under ``TYPE_CHECKING`` or otherwise.
+
+        The allow-list cannot report this: removing a permitted-and-unneeded entry
+        reddens no subset test, which is exactly why the entry was removed *and*
+        this assertion added in the same change.
+        """
+        own = _modules_under("write", modules)
+        named = {
+            target
+            for name in own
+            for target in _edges(name, modules[name], set(modules), annotations_too=True)
+        }
+
+        assert f"{PACKAGE}.actor" not in named, (
+            "write/ names the workspace actor again — the mutation gate is "
+            "card-side and the actor is dispatch-only, so a write card has none"
+        )
+
     def test_the_names_it_denies_are_real_modules(self, modules: dict[str, Path]) -> None:
         """Non-vacuity, and it is the whole risk of an assertion shaped like this.
 
@@ -656,3 +712,4 @@ class TestTheDeletabilityClaimIsObservable:
         """
         assert f"{PACKAGE}.journal" in modules
         assert f"{PACKAGE}.execution" in modules
+        assert f"{PACKAGE}.actor" in modules
