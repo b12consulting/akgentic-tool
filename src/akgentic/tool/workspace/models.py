@@ -100,10 +100,18 @@ is exactly as it left it, then redoing work that was already correct.
 DEFAULT_GIT_TIMEOUT_S = 15.0
 """Wall-clock budget for a single ``git`` invocation.
 
-Comfortably below the orchestrator's 30 s stop backstop, because every
-invocation runs on the actor's single thread — the one every mutation in the
-team shares. A budget above the backstop would let one hung fork outlive the
-teardown that is trying to reclaim it.
+Comfortably below the orchestrator's 30 s stop backstop. A budget above the
+backstop would let one hung fork outlive the teardown that is trying to reclaim
+it.
+
+**Two threads spend this budget on one journal object, since story 57-3.** The
+card's gate runs a commit on the binding agent's own thread, and an exec run's
+discovered commit runs on the actor's mailbox thread — against the very same
+:class:`~akgentic.tool.workspace.journal.GitJournal`, because the card now
+announces the one it opened rather than the actor building a second. So a
+timeout that disables the journal on either path disables it on both, which is
+the right answer for one repository and is why the budget has to stay well
+inside the teardown window on both.
 """
 
 STAGING_SWEEP_GRACE_S = 30.0

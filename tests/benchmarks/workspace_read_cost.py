@@ -251,7 +251,10 @@ class ActorSnapshot(SerializableBaseModel):
         read_observations: Recordings that arrived from a read closure.
         mutation_observations: Recordings an accepted mutation made for its own
             writer, which are not read-path traffic and are counted apart.
-        journal_enabled: Whether the git journal was actually running.
+        journal_enabled: Whether this arm's tree actually got a journal — read
+            from the sibling repository on disk, because since story 57-3 the
+            actor holds only the journal a dispatching card announced and these
+            agents' cards dispatch nothing.
     """
 
     depths: list[int]
@@ -630,12 +633,27 @@ class _SamplingWorkspaceActor(WorkspaceActor):
         self._depths = []
 
     def bench_snapshot(self) -> ActorSnapshot:
-        """Copy the series out. An ask, so every earlier tell has been processed."""
+        """Copy the series out. An ask, so every earlier tell has been processed.
+
+        **``journal_enabled`` is read off the disk, not off ``self._journal``.**
+        Since story 57-3 the actor opens no repository of its own and is
+        *announced* the card's — and this benchmark's agents carry a read-only
+        card, which dispatches nothing, creates no actor of its own and
+        therefore never announces anything. ``self._journal`` would be ``None``
+        in every arm, including the journal arm, and
+        :func:`_assert_arm_behaved` would refuse a run that behaved correctly.
+        The sibling repository is the observable that survived the move: a
+        ``git_journal=True`` card creates it in ``_open_journal`` and a card with
+        the journal off creates nothing, so the signal still separates the arms
+        in **both** directions. Each arm builds a fresh tree under a fresh
+        ``AKGENTIC_WORKSPACES_ROOT``, so no earlier arm's repository can leak
+        into a later one's answer.
+        """
         return ActorSnapshot(
             depths=list(self._depths),
             read_observations=0,  # filled card-side by the driver — see ``_Recordings``
             mutation_observations=0,
-            journal_enabled=self._journal is not None and self._journal.enabled,
+            journal_enabled=git_dir_for(self._workspace.root).is_dir(),
         )
 
 
@@ -1095,11 +1113,12 @@ def _install_sampling_actor(
     error rather than a series of zeroes that reads like good news.
 
     **The journal is not passed here, and since story 57-3 it cannot be.**
-    ``WorkspaceConfig`` holds ``workspace_path`` alone; the actor is announced
-    its journal by whichever agent's card binds, from that card's own
-    ``git_journal``. ``bench_snapshot``'s ``journal_enabled`` therefore reports
-    what the cards actually wired rather than what this call asked for — which is
-    the stronger reading of the same number.
+    ``WorkspaceConfig`` holds ``workspace_path`` alone; an actor is announced its
+    journal by a *dispatching* card, and this benchmark's agents carry a
+    read-only card that creates no actor and announces nothing. So this actor's
+    ``_journal`` stays ``None`` in every arm, and ``bench_snapshot`` reads the
+    arm's journal off the sibling repository the cards' own ``_open_journal``
+    creates instead.
     """
     address = orch.getChildrenOrCreate(
         _SamplingWorkspaceActor,

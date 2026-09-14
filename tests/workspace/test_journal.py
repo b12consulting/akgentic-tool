@@ -862,7 +862,6 @@ class TestTheActorsJournalIsTheCardsOwnObject:
         assert actor._journal is None
 
 
-@requires_git
 class TestTwoCardsOfOneTeamThatDisagree:
     """AC 8 — the guard this story exists for: the LAST card to bind decides.
 
@@ -888,7 +887,6 @@ class TestTwoCardsOfOneTeamThatDisagree:
         actor: WorkspaceActor,
         script: SandboxScript,
         harness: ExecHarness,
-        workspace_tree: Path,
     ) -> None:
         """Dispatch one run that writes a file, and wait for its report."""
         script.files = [("built.txt", "out\n")]
@@ -913,7 +911,7 @@ class TestTwoCardsOfOneTeamThatDisagree:
         harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
         before = [commit.sha for commit in journal_log(workspace_tree)]
-        self._run_and_join(actor, sandbox_script, harness, workspace_tree)
+        self._run_and_join(actor, sandbox_script, harness)
         assert [commit.sha for commit in journal_log(workspace_tree)] == before
 
     def test_a_journal_on_card_binding_second_turns_the_actors_journal_on(
@@ -934,7 +932,7 @@ class TestTwoCardsOfOneTeamThatDisagree:
         # … and the observable: the run's write set is recorded.
         harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
-        self._run_and_join(actor, sandbox_script, harness, workspace_tree)
+        self._run_and_join(actor, sandbox_script, harness)
         assert journal_log(workspace_tree)[-1].subject == "exec: built.txt"
 
 
