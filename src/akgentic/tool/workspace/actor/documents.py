@@ -1426,8 +1426,10 @@ class DocumentsMixin(_DocumentsBase):
         §4). The search degrades toward vector-only for that file and is never
         wrong; the file stays ``EMBEDDED`` and its vector hits still render from
         the store's own copy of the text. This is what makes ``max_documents`` a
-        bound on the size of the actor's state rather than on the searchable
-        corpus.
+        bound on the extraction cache rather than on the searchable corpus — and
+        it bounds no state of this actor's at all any more: it is a field of the
+        :class:`~akgentic.tool.workspace.documents.cache.DocumentCache` the card
+        builds, applied over the records on disk.
 
         **A body that is not the one the offsets were cut from is skipped too.**
         The two halves have different lifetimes even inside one record: a file

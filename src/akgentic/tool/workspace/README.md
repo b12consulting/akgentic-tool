@@ -11,7 +11,7 @@ from akgentic.tool import WorkspaceTool
 | | |
 |---|---|
 | Module | `akgentic.tool.workspace.tool` |
-| Actor | `#Workspace-<scope>/<kind>/<leaf>` — the **resolved three-segment path**, slashes included, so two principals' `notes` are two actors over two trees. An ordinary **team child**: created by its card through `getChildrenOrCreate`, in exactly one team's roster, stopped by that team's teardown. It owns **dispatch and no shared state** — with `workspace_exec` on, the tree's sandbox backend and the single worker thread that runs commands on it, plus the retrieval indexing pipeline. Two teams over one tree get two actors, and the tree orders them — see *Lifetime* below |
+| Actor | `#Workspace-<scope>/<kind>/<leaf>` — the **resolved three-segment path**, slashes included, so two principals' `notes` are two actors over two trees. **Created only when the card enables a capability that dispatches** — `workspace_exec`, or one of the three `workspace_rag_*` fields; a read-only or read/write card creates none at all. Where one does exist it is an ordinary **team child**: made by its card through `getChildrenOrCreate`, in exactly one team's roster, stopped by that team's teardown. It owns **dispatch and no shared state** — with `workspace_exec` on, the tree's sandbox backend and the single worker thread that runs commands on it, plus the retrieval indexing pipeline. Two teams over one tree get two actors, and the tree orders them — see *Lifetime* below |
 | Channels used | `TOOL_CALL` (11 callables, 13 with `workspace_exec`), `COMMAND` (`expand_media_refs`) |
 | Optional extras | `[docs]` for binary reads, `[vision]` for image resizing |
 | Environment | `AKGENTIC_WORKSPACES_ROOT` (default `./workspaces`) · `AKGENTIC_WORKSPACE_META_ROOT` (default: the workspaces root; relocates only the `<leaf>.index` siblings) · `AKGENTIC_WORKSPACE_SHARED_KINDS` (default unset, which permits **no** shared tree — see *Sharing a tree across principals*) · `AKGENTIC_LOCK_BACKEND` (default `file`) · `AKGENTIC_DOCUMENT_STORE` (default `yaml`). The last three are read on every bind, and a value they cannot use fails that bind |
@@ -104,8 +104,8 @@ and passes the result through the **sharing gate** before anything with a side e
 path whose kind this process does not permit raises there, before `get_workspace` creates the tree
 (see *Sharing a tree across principals*). It then hands the result down as an already-resolved
 value: a `Filesystem` rooted at `<AKGENTIC_WORKSPACES_ROOT>/<scope>/<kind>/<leaf>`, the
-`#Workspace-<scope>/<kind>/<leaf>` actor that dispatches for the tree, and — only if exec is
-enabled — the sandbox backend. Nothing below re-derives it, which is what
+`#Workspace-<scope>/<kind>/<leaf>` actor that dispatches for the tree — only if exec or retrieval is
+enabled, because nothing else needs a mailbox — and, only if exec is enabled, the sandbox backend. Nothing below re-derives it, which is what
 makes it impossible for a backend to open a different directory from the one the gate and the journal
 are guarding. `resources` are seeded in between. Reading `card.workspace` before that raises
 `RuntimeError`; calling a mutation before it raises `RuntimeError` too, because there is deliberately
@@ -134,8 +134,13 @@ which is per-principal like the other two. See *Sharing a tree across principals
 
 ### Lifetime
 
-- **A team child, created by its card.** The card calls `getChildrenOrCreate` on its own team's
-  orchestrator and emits `WorkspaceAttached` on that team's stream itself. The actor is in exactly
+- **A team child, created by its card — when its card dispatches.** `observer()` calls
+  `getChildrenOrCreate` on its own team's orchestrator only when `_enabled_exec()` or
+  `_rag_enabled()` says something needs a mailbox; a read-only or read/write card binds, seeds,
+  sweeps, opens its journal and gates every mutation with no actor at all. **`WorkspaceAttached` is
+  emitted on that team's stream by every successful bind either way** — it names the agent that
+  bound the tree, not the actor, so it left the actor branch when the creation became conditional.
+  Where an actor exists it is in exactly
   one team's roster, and **that team's two-phase teardown is the only thing that stops it** — no
   timer, no liveness sweep, no reap grace, no self-stop. Epic 51 needed all four because a hosted
   actor sat outside every team's teardown; a team child has an owner.
@@ -966,7 +971,11 @@ complete previous file or the complete new one, never to a prefix. Same-director
 load-bearing — `os.replace` is atomic only within one filesystem. Permission bits are preserved;
 ownership, extended attributes and hardlinks are not, because publishing by rename replaces the
 inode. That matters where the workspace is bind-mounted into a container running as another uid.
-Orphaned staging files left by a hard kill are swept once, at actor start.
+Orphaned staging files left by a hard kill are swept once per card bind, in `observer()` — before
+anything writes into the tree, and whether or not that card creates an actor. It was the actor's
+`on_start` until the actor became dispatch-only, which would have left the commonest card shape
+sweeping nothing; a staging file younger than the grace window is left alone, because it belongs to
+a write that is still in flight.
 
 ### Sharing a tree across principals
 

@@ -182,8 +182,8 @@ class DocumentStore(Protocol):
     held; so is ``index_paths``' accounted-for/enqueue pair.
 
     The **extraction** half is deliberately outside that rule — the batch
-    counters, ``cache_document``, the cache eviction and the stale-marking all
-    write without a hold. Once the spawn is exclusive, one process owns a file's
+    counters, ``DocumentCache.fill``, the cache eviction and the stale-marking
+    all write without a hold. Once the spawn is exclusive, one process owns a file's
     in-flight lifecycle, so those have a single writer for the duration; and a
     cached extraction is derivable and disposable, which is the half of ADR-051
     Decision 6's argument that survives.
