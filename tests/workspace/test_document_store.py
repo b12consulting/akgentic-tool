@@ -229,7 +229,23 @@ class TestOneProcessWritesAndAnotherReads:
 
 
 class TestATornWriteLeavesThePreviousFile:
-    """AC 6 — temp-then-replace, and no debris when the write dies part-way."""
+    """AC 6 — a record that fails to serialise does not destroy the previous one.
+
+    **Since story 57-2 this no longer reaches the temp-then-replace path, and the
+    change is silent rather than red.** Both specs provoke the failure by making
+    ``yaml.dump`` raise, and ``_atomic_write`` now renders its YAML *before*
+    calling :func:`akgentic.tool.workspace.locks.atomic_write` — so the throw
+    happens before any temp file is created, and the ``*.tmp`` assertion below is
+    satisfied by a path that never makes one. Measured: with the spine replaced by
+    a straight ``target.write_text``, every spec in this class and in
+    :class:`TestConcurrentPutsEndWithOneWholeFile` stays **green**.
+
+    They are kept because what they still assert is true and worth holding — a
+    serialisation failure leaves the good record intact and drops no debris into
+    ``list_documents``' glob. The atomicity itself is guarded where it now lives,
+    in ``test_locks_spine.py::TestTheSpineAtomicWriteLeavesNoPartialFile``, which
+    injects at the replace — the one point where a fully written temp file exists.
+    """
 
     def test_the_previous_file_survives_a_failed_write(
         self, roots: Path, monkeypatch: pytest.MonkeyPatch
@@ -273,7 +289,18 @@ class TestATornWriteLeavesThePreviousFile:
 
 
 class TestConcurrentPutsEndWithOneWholeFile:
-    """AC 7 — no lock; atomic replacement is what the concurrent case requires."""
+    """AC 7 — no lock; two concurrent fills end with one whole record, not a blend.
+
+    **Two threads in one interpreter cannot demonstrate the atomicity they need**,
+    and that is measured rather than reasoned: with
+    :func:`akgentic.tool.workspace.locks.atomic_write` replaced by a straight
+    ``target.write_text``, this spec stays **green**. What it genuinely pins is the
+    *absence of a lock* — that two fills neither deadlock nor raise — and that the
+    surviving record comes from one writer rather than being blended.
+
+    The replace being atomic is guarded in
+    ``test_locks_spine.py::TestTheSpineAtomicWriteLeavesNoPartialFile``.
+    """
 
     def test_two_threads_leave_one_whole_entry(self, roots: Path) -> None:
         """A lost update costs one recompute; a blended or truncated file would not."""

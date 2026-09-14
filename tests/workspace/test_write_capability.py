@@ -60,27 +60,32 @@ from tests.workspace.conftest import (
 class TestTheLocksAreTakenInSortedPathOrder:
     """``_hold``'s ``sorted(set(paths))``, which nothing asserted until now.
 
-    The docstring on :meth:`CardGate._hold` calls sorted acquisition "*what makes
-    a deadlock impossible*" — two agents touching the same two files take them in
-    the same order whatever order their own batch names them in — and the audit
-    cites the line. No spec did.
-
     **Asserted on the ``path`` argument, never on the lock filename.** A lock file
     is named ``path-<sha256 of the path>``, and a digest's sort order has nothing
     to do with its input's, so a spec asserting sorted *filenames* would assert
-    nothing about the property it is named for.
+    nothing about the *path* order this one is named for.
 
-    **The two halves of ``sorted(set(paths))`` fail differently, and only one of
-    them fails as an assertion.** Dropping ``sorted`` reddens the equality below
-    in the ordinary way. Dropping ``set`` does not: a batch naming one path twice
-    then opens two descriptors on that path's lock file and takes an exclusive
-    ``flock`` on each, and the second blocks against the first **within the same
-    process**, forever. ``apply_multi_edit`` passes ``[item.path for item in
-    edits]`` straight through, so a duplicated path is an ordinary input and the
-    ``set`` is load-bearing for liveness rather than for tidiness —
-    :meth:`CardGate._hold`'s own docstring credits only the sorting. A reviewer
-    mutating this property should expect a **hung** run, not a red one; that hang
-    is the signal, not a flake.
+    **Since story 57-2 this pins a call contract, not the acquisition order, and
+    the difference is worth stating where it will be read.** ``_hold`` now hands
+    its lock files to :func:`akgentic.tool.workspace.locks.hold`, which sorts and
+    de-duplicates them itself — so acquisition happens in lock-file order, and
+    that single global order across all four families is what makes a deadlock
+    impossible. What the gate's own ``sorted(set(paths))`` still guarantees is
+    what the spy below sees: one ``lock_file_for`` per distinct path, in path
+    order. The spine's order has its own guard, in
+    ``test_locks_spine.py::TestTheSpineTakesLocksInSortedOrder``, because this
+    spec cannot see it.
+
+    **The two halves of ``sorted(set(paths))`` both fail as assertions now.**
+    Dropping either reddens the equality below in the ordinary way, in about
+    forty seconds. That is a change from what this docstring said before 57-2:
+    dropping ``set`` used to hang, because a batch naming one path twice opened
+    two descriptors on one lock file and the second ``flock`` blocked against the
+    first within this process. The spine de-duplicates, so it no longer does —
+    measured. ``apply_multi_edit`` passes ``[item.path for item in edits]``
+    straight through, so a duplicated path is still an ordinary input, and the
+    de-duplication is still load-bearing for liveness; it is simply the **spine's**
+    now, and guarded there on a joined thread with a budget.
     """
 
     @pytest.fixture

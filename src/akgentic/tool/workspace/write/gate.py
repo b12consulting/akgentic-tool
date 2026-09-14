@@ -480,11 +480,19 @@ class CardGate:
                 exc_info=exc,
             )
 
-        # **Sorted and de-duplicated here, on the workspace paths**, not left to
-        # the helper. The spine sorts the lock files it is handed, which is what
-        # guarantees one global acquisition order across every caller; this sort
-        # is over the *paths*, which is what this capability's own contract is
-        # stated in — one ``lock_file_for`` per distinct path, in path order.
+        # **The spine decides the acquisition order; this sort does not.** The
+        # helper sorts and de-duplicates the lock files it is handed, and that —
+        # one global order over lock-file paths, shared by all four families — is
+        # what makes a deadlock impossible. A lock file is named
+        # ``path-<sha256 of the path>``, so sorting here by *workspace* path and
+        # sorting there by lock file are two different orders, and the spine's is
+        # the one that takes effect.
+        #
+        # What this line still buys is one ``lock_file_for`` per distinct path,
+        # in path order — this capability's own stated call contract, which
+        # ``test_write_capability.py::TestTheLocksAreTakenInSortedPathOrder``
+        # pins by spying on ``lock_file_for``. Removing it reddens that spec and
+        # nothing else: measured, not assumed.
         with hold([lock_file_for(meta_dir, path) for path in sorted(set(paths))], on_failure=warn):
             yield
 

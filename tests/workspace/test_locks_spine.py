@@ -25,6 +25,8 @@ from __future__ import annotations
 import ast
 import os
 import textwrap
+import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -56,6 +58,46 @@ _PERMITTED_IMPORTS = {
     "typing",
 }
 """What the spine may name. Everything here ships with CPython."""
+
+_HOLD_BUDGET_S = 5.0
+"""How long a correct hold may take before the run is called hung.
+
+A failure bound rather than a delay: a spine that de-duplicates crosses it in
+microseconds, and one that does not never crosses it at all. Matched to
+``conftest.HANDSHAKE_TIMEOUT_S`` because it is the same kind of budget.
+"""
+
+
+def _held_within_budget(
+    lock_paths: list[Path], on_failure: Callable[[OSError], None], inside: Callable[[], None]
+) -> bool:
+    """Take *lock_paths*, run *inside*, release — on a joined thread with a budget.
+
+    **Every spec that hands the spine a repeated path goes through here**, and the
+    reason is that the alternative is a hang rather than a failure. Dropping the
+    spine's ``set()`` makes the second ``LOCK_EX`` on one file block against this
+    process's own first hold, forever; called directly, such a spec never returns
+    and never asserts. This package configures **no pytest timeout** — there is no
+    ``[tool.pytest.ini_options]`` and no ``addopts`` — so nothing would interrupt
+    it either: the run would sit until CI's own job limit and report a timeout
+    instead of the defect.
+
+    A daemon thread so a genuinely wedged hold cannot keep the interpreter alive,
+    and the return value rather than an exception so the caller names what the
+    budget means for the property it is testing.
+    """
+    finished = threading.Event()
+
+    def take() -> None:
+        with locks.hold(lock_paths, on_failure=on_failure):
+            inside()
+        finished.set()
+
+    worker = threading.Thread(target=take, daemon=True)
+    worker.start()
+    took = finished.wait(_HOLD_BUDGET_S)
+    worker.join(_HOLD_BUDGET_S)
+    return took
 
 
 def _locks_source() -> str:
@@ -445,8 +487,18 @@ class TestTheSpineTakesLocksInSortedOrder:
         given, and the duplicate the only one that distinguishes ``set(...)``
         from a plain list — a duplicate that reached ``flock`` twice would block
         this process against its own hold.
+
+        **Eight distinct paths, not three, and the number is the guard rather
+        than a flourish.** With ``sorted()`` deleted the spine iterates the
+        ``set`` instead, whose order follows ``str`` hashing and therefore
+        ``PYTHONHASHSEED`` — so on a short batch it can come out sorted *by
+        luck* and leave this spec green against the very mutation it exists to
+        catch. Measured on three paths: green on 5 of 20 seeds. Eight distinct
+        paths put that coincidence at ``1/8!``, which is what makes a red run
+        here mean the sort is gone rather than that the seed was kind.
         """
-        given = [tmp_path / "c", tmp_path / "a", tmp_path / "b", tmp_path / "a"]
+        letters = "hbfadgce"
+        given = [tmp_path / letter for letter in letters] + [tmp_path / letters[0]]
         seen: list[Path] = []
         original = locks._open_lock
 
@@ -459,8 +511,11 @@ class TestTheSpineTakesLocksInSortedOrder:
         def warn(exc: OSError) -> None:
             raise AssertionError(f"no lock should have failed: {exc}")
 
-        with locks.hold(given, on_failure=warn):
-            pass
+        # Bounded, because this batch names one path twice: a spine that stopped
+        # de-duplicating would block here against its own hold rather than fail.
+        assert _held_within_budget(given, warn, lambda: None), (
+            "the hold never returned within the budget — the repeated path reached flock twice"
+        )
 
         assert seen == sorted(set(given))
         # Non-vacuity: the spy saw something, and not merely the order given.
@@ -527,18 +582,34 @@ class TestNoDescriptorSurvivesAFailedAcquisition:
         assert self._open_descriptors() == before
 
     def test_a_repeated_path_is_taken_once(self, tmp_path: Path) -> None:
-        """De-duplication is load-bearing, not tidiness.
+        """De-duplication is load-bearing for **liveness**, not tidiness.
 
         A second ``LOCK_EX`` on a second descriptor for one file blocks against
-        this process's own first hold. Without the ``set()`` this test hangs
-        rather than fails, which is why the descriptor count is asserted: it shows
-        one file was opened once, not twice.
+        this process's own first hold, forever. ``apply_multi_edit`` passes
+        ``[item.path for item in edits]`` straight through, so a batch naming one
+        path twice is an ordinary input rather than an exotic one.
+
+        **The hold runs on a joined thread with a budget, and that is what makes
+        the mutation bounded.** Called directly, a spine without ``set()`` would
+        hang here rather than fail — and this package configures no pytest
+        timeout, so nothing would stop it: the run would sit until CI's own job
+        limit and report a timeout rather than this defect. The budget is a
+        failure bound, not a delay; a correct spine crosses it in microseconds.
+
+        The descriptor count carries the other half — that the one file was
+        opened **once**, not twice — which a liveness check alone would not see.
         """
         repeated = tmp_path / "same"
+        before = self._open_descriptors()
+        during: list[int] = []
 
         def warn(exc: OSError) -> None:
             raise AssertionError(f"no lock should have failed: {exc}")
 
-        before = self._open_descriptors()
-        with locks.hold([repeated, repeated, repeated], on_failure=warn):
-            assert self._open_descriptors() == before + 1
+        assert _held_within_budget(
+            [repeated, repeated, repeated], warn, lambda: during.append(self._open_descriptors())
+        ), (
+            "the hold never returned within the budget — a repeated path reached "
+            "flock twice and this process blocked against its own hold"
+        )
+        assert during == [before + 1], during
