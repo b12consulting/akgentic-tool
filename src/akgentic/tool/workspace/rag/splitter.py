@@ -1,8 +1,12 @@
 """Markdown to embeddable chunks, in two phases: parse to blocks, pack blocks.
 
 **Phase 1 — :func:`parse_blocks`.** ``markdown-it-py`` gives every block token a
-``.map`` of ``[start_line, end_line]``; a line-start index turns that into
-character offsets. What comes back is one :class:`Span` per structural block,
+``.map`` of ``[start_line, end_line]``;
+:func:`~akgentic.tool.workspace.lines.line_starts` turns that into character
+offsets. That index is the spine's rather than this module's, and deliberately:
+the read path numbers the same document's lines for the agent's gutter, and while
+the two counted breaks differently a line number minted here named a different
+region there. What comes back is one :class:`Span` per structural block,
 with a table and a fenced block each arriving as **one atomic block** — the
 property no character-recursive splitter can have.
 
@@ -43,6 +47,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from markdown_it import MarkdownIt
 
 from akgentic.core.utils.serializer import SerializableBaseModel
+from akgentic.tool.workspace.lines import line_starts
 
 if TYPE_CHECKING:
     from markdown_it.token import Token
@@ -58,20 +63,6 @@ dependency to get it — a missed boundary costs one slightly worse cut, because
 the whitespace fallback catches everything this misses."""
 
 _WHITESPACE = re.compile(r"\s+")
-
-_LINE_BREAK = re.compile(r"\r\n?|\n")
-"""A line break **as the parser counts them** — its own ``NEWLINES_RE``.
-
-Deliberately not ``str.splitlines``, which is the wider definition: it also
-breaks on ``\\v``, ``\\f``, ``\\x1c``-``\\x1e``, ``\\x85``, ``\\u2028`` and
-``\\u2029``, none of which start a line for ``markdown-it``. One of those in the
-document and the two disagree about how many lines there are, so every token map
-past it indexes the wrong line and every offset after it is silently wrong.
-
-It is not a theoretical hazard: ``python-pptx`` renders a soft line break
-(``<a:br>``) as a vertical tab, so every extracted deck with a wrapped title
-carries several.
-"""
 
 _NON_BLOCK_TYPES = frozenset({"heading_open", "hr"})
 """Level-0 mapped tokens that are **not** blocks.
@@ -152,26 +143,6 @@ def _parser() -> MarkdownIt:
     produces our input, so the dialect is ours to fix rather than guess.
     """
     return MarkdownIt("commonmark").enable("table")
-
-
-def _line_starts(text: str) -> list[int]:
-    """Character offset of the start of every line, plus ``len(text)``.
-
-    Lines are counted with :data:`_LINE_BREAK` — the parser's own definition —
-    because this list is indexed by *the parser's* line numbers. Any wider
-    definition puts the two out of step and every offset after the first extra
-    break is wrong; see :data:`_LINE_BREAK` for which characters do that and
-    where they come from.
-
-    The result ends at ``len(text)``, so a token's exclusive ``map[1]`` always
-    indexes in range — including for a document with no trailing newline. No
-    clamp, which would hide a real indexing bug.
-    """
-    starts = [0]
-    starts.extend(match.end() for match in _LINE_BREAK.finditer(text))
-    if starts[-1] != len(text):
-        starts.append(len(text))
-    return starts
 
 
 def _trimmed(start: int, end: int, markdown: str) -> tuple[int, int] | None:
@@ -282,7 +253,7 @@ def parse_blocks(markdown: str) -> list[Span]:
         One span per block, in document order. Heading lines are covered by no
         span, and neither are the blank lines between blocks.
     """
-    starts = _line_starts(markdown)
+    starts = line_starts(markdown)
     blocks: list[Span] = []
     path: list[str] = []
     depths: list[int] = []
@@ -324,7 +295,7 @@ def _structure(span: Span, markdown: str) -> tuple[str, list[int], tuple[int, in
     if markdown[origin : span.start].strip():
         origin = span.start
     text = markdown[origin : span.end]
-    starts = _line_starts(text)
+    starts = line_starts(text)
     tokens = _parser().parse(text)
     kind = next((t.type for t in tokens if t.level == 0 and t.map is not None), "")
     rows = [t.map for t in tokens if t.type == "tr_open" and t.map is not None]
