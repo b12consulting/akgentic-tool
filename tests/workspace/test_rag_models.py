@@ -289,11 +289,11 @@ class TestEveryTransitionIsACopy:
     def test_re_queueing_a_path_preserves_an_unknown_field(self, workspace_tree: object) -> None:
         """The transition this story edits, and the widest of the three.
 
-        ``_enqueue``'s re-queue branch moves nine fields, which is exactly the
-        shape that invites a hand-enumerated rebuild: every field is named
-        anyway, so naming the last two looks like no extra cost. It is, and the
-        cost falls on the field added after it — here, on ``extra_field``, which
-        no write path has ever heard of.
+        ``_enqueue``'s re-queue branch moves ten of ``RagFile``'s eleven fields,
+        which is exactly the shape that invites a hand-enumerated rebuild: all but
+        one is named anyway, so naming the last looks like no extra cost. It is,
+        and the cost falls on the field added after it — here, on ``extra_field``,
+        which no write path has ever heard of.
 
         The new stamp is asserted beside the survival, so the case pins both
         halves of what this branch now does.

@@ -599,10 +599,18 @@ def _locate(chunks: list[Span], markdown: str) -> list[Span]:
     opens at ``0`` and ends at ``len(markdown)``.
 
     **``end`` is decremented and that is not cosmetic.** The bounds are half-open,
-    so a chunk ending flush at a break — ``end`` on the first character of the
-    next line — would otherwise be named by the line it does not touch at all.
-    Every span :func:`_trimmed` produces is non-empty, so ``end - 1`` is always a
-    real character of the chunk.
+    so ``end`` is one past the chunk's last character, and the reachable way that
+    names the wrong line is a document with **no trailing break**: ``line_starts``
+    ends at ``len(markdown)``, so the last chunk's ``end`` *is* an entry of
+    ``starts`` and ``bisect_right(starts, end)`` answers one line past the last
+    one the document has. Measured rather than predicted — that mutation reddens
+    seven rows of ``TestTheLineRange`` and only on the unterminated fixture.
+
+    A chunk ending *flush at a break* — the case this reads as at first glance —
+    cannot occur at all: :func:`_trimmed` never leaves a span ending on
+    whitespace, and every chunk's ``end`` comes through it, whether by
+    :func:`_piece`, by :func:`_join`'s last unit or by :func:`_merge_short_chunks`.
+    That is also why ``end - 1`` is always a real character of the chunk.
 
     ``line_starts`` is computed **once** for the document, not once per chunk.
     """
