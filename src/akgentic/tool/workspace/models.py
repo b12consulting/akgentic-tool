@@ -13,33 +13,36 @@ working gate right up until nobody can overwrite anything (ADR-036 §3).
 from __future__ import annotations
 
 import hashlib
+import re
 from enum import StrEnum
 from typing import Literal
 
 from akgentic.core.agent_config import BaseConfig
-from akgentic.core.agent_state import BaseState
 from akgentic.core.utils.serializer import SerializableBaseModel
-from akgentic.tool.workspace.documents.models import (
-    DEFAULT_MAX_DOCUMENT_CHARS,
-    DEFAULT_MAX_DOCUMENTS,
-    DocumentExtract,
-    RagFile,
-)
+
+# **This module no longer imports anything from ``documents/``**, and the absence
+# is structural rather than tidy. It took the two document caps from
+# ``documents/models.py`` to default two ``WorkspaceConfig`` fields; those fields
+# went with the caps onto the announced ``DocumentCache``, so the import went too
+# — and with it the only reason the ``read/``, ``write/`` and ``journal/``
+# capabilities reached the documents package at all. They reached it through this
+# spine module, never by naming it.
 
 DEFAULT_MAX_OBSERVATIONS_PER_AGENT = 256
-"""Per-agent bound on the observation map.
+"""Default of ``WorkspaceTool.max_observations_per_agent``.
 
-Bounds the **path** dimension only — see ``WorkspaceActor.record_observation``
-for why the agent dimension is deliberately left unbounded.
+Bounds the **paths** one agent's card remembers having read. There is no second
+dimension to bound: one card belongs to one agent
+(:meth:`~akgentic.tool.workspace.write.gate.CardGate.record_observation`).
 """
 
 DEFAULT_MAX_TRACKED_WRITERS = 512
-"""Bound on the last-writer map, which is keyed by **path** across all agents.
+"""Bound on the actor's agent-name map, which is keyed by agent id.
 
 Deliberately a separate constant from the observation cap: that one bounds one
-agent's paths, this one bounds the whole tree's, so a single number would be
-wrong at one end or the other. Both exist for the same reason — an uncapped map
-on a team singleton leaks for the life of the team.
+agent's paths on one card, this one bounds the names one tree's actor has been
+told, across every agent that ever attached. Both exist for the same reason — an
+uncapped map on a long-lived tree actor leaks for the life of the tree.
 """
 
 MAX_REJECTION_DIFF_LINES = 200
@@ -97,10 +100,18 @@ is exactly as it left it, then redoing work that was already correct.
 DEFAULT_GIT_TIMEOUT_S = 15.0
 """Wall-clock budget for a single ``git`` invocation.
 
-Comfortably below the orchestrator's 30 s stop backstop, because every
-invocation runs on the actor's single thread — the one every mutation in the
-team shares. A budget above the backstop would let one hung fork outlive the
-teardown that is trying to reclaim it.
+Comfortably below the orchestrator's 30 s stop backstop. A budget above the
+backstop would let one hung fork outlive the teardown that is trying to reclaim
+it.
+
+**Two threads spend this budget on one journal object, since story 57-3.** The
+card's gate runs a commit on the binding agent's own thread, and an exec run's
+discovered commit runs on the actor's mailbox thread — against the very same
+:class:`~akgentic.tool.workspace.journal.GitJournal`, because the card now
+announces the one it opened rather than the actor building a second. So a
+timeout that disables the journal on either path disables it on both, which is
+the right answer for one repository and is why the budget has to stay well
+inside the teardown window on both.
 """
 
 STAGING_SWEEP_GRACE_S = 30.0
@@ -116,10 +127,36 @@ this constant separates the two badly.
 GIT_DIR_SUFFIX = ".git"
 """Suffix of the sibling repository directory: workspace ``foo`` journals to ``foo.git``."""
 
+META_DIR_SUFFIX = ".index"
+"""Suffix of the sibling metadata directory: workspace ``foo``'s lives at ``foo.index``."""
+
 GITIGNORE_NAME = ".gitignore"
 
 OUT_OF_BAND_AUTHOR = "out-of-band"
 """Author of every commit no agent in this team is responsible for."""
+
+MAX_COMMIT_BODY_CHARS = 500
+"""Cap on the agent-supplied text a commit body may carry.
+
+The command string is the one place untrusted input reaches the journal. A
+control character would end the subject line early and an unbounded string would
+put a whole heredoc into the log, so it is stripped and clipped — and the message
+travels through ``-F <file>``, never interpolated into an argument.
+"""
+
+IDENTITY_FALLBACK = "unknown-agent"
+"""Stands in for an identity that sanitises to nothing.
+
+Neither git identity field may be empty, and an agent whose whole name is
+control characters would otherwise produce one.
+"""
+
+IDENTITY_DOMAIN = "akgentic"
+"""Domain of the synthetic author email. The local part is the agent's id."""
+
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_ANGLE_RE = re.compile(r"[<>]")
+_EMAIL_LOCAL_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 _EXEC_DEBRIS = ("__pycache__/", "*.pyc", ".venv/", "node_modules/")
 
@@ -161,6 +198,86 @@ def gitignore_seed() -> str:
         "",
     ]
     return "\n".join(lines)
+
+
+def sanitise_name(value: str) -> str:
+    """Return *value* usable as a git identity **name**.
+
+    Control characters and angle brackets are removed: a newline would end the
+    identity line and ``<`` would open the email field, so either lets an agent
+    id say something other than a name.
+
+    Args:
+        value: An agent's display name or id — untrusted text.
+
+    Returns:
+        The cleaned name, or :data:`IDENTITY_FALLBACK` when nothing survives.
+    """
+    cleaned = _ANGLE_RE.sub("", _CONTROL_RE.sub("", value)).strip()
+    return cleaned or IDENTITY_FALLBACK
+
+
+def sanitise_command(value: str) -> str:
+    """Return *value* usable as commit-body text.
+
+    Args:
+        value: An agent-supplied command string — untrusted text.
+
+    Returns:
+        The command with control characters collapsed to spaces and the whole
+        clipped to :data:`MAX_COMMIT_BODY_CHARS`, or ``""`` when nothing
+        survives. A body is optional, so an empty result is simply no body.
+    """
+    cleaned = " ".join(_CONTROL_RE.sub(" ", value).split())
+    if len(cleaned) > MAX_COMMIT_BODY_CHARS:
+        cleaned = cleaned[:MAX_COMMIT_BODY_CHARS] + " …"
+    return cleaned
+
+
+def sanitise_email_local(value: str) -> str:
+    """Return *value* usable as the local part of a git identity **email**.
+
+    Args:
+        value: An agent's id — untrusted text.
+
+    Returns:
+        The cleaned local part, or :data:`IDENTITY_FALLBACK` when nothing
+        survives.
+    """
+    cleaned = _EMAIL_LOCAL_RE.sub("-", value).strip("-")
+    return cleaned or IDENTITY_FALLBACK
+
+
+class Identity:
+    """Who a commit is attributed to, as two already-sanitised fields.
+
+    Built from an agent's registered display name and its id: the name is what a
+    human reads in the log, the id is what makes two agents sharing a name
+    distinguishable. An unregistered agent falls back to its id as the name —
+    degraded, never broken.
+
+    **Here rather than in** :mod:`akgentic.tool.workspace.journal`, **and the move
+    is what makes that module deletable.** It is the commit's author, so the
+    journal is its heaviest reader — but it is constructed on every accepted
+    mutation by :mod:`akgentic.tool.workspace.write.gate`, which is a *different*
+    capability and a default-on one, and by the actor. A default-off capability's
+    module holding a name a default-on one builds at runtime is what kept
+    ``journal`` on ``write/``'s runtime allow-list row: delete ``journal/`` and
+    the write gate stopped importing. The precedent for the home is the existing
+    traffic, not convenience — ``journal/`` already takes four names from this
+    module, and :meth:`out_of_band` is built from one of them.
+    """
+
+    __slots__ = ("email", "name")
+
+    def __init__(self, name: str, email_local: str) -> None:
+        self.name = sanitise_name(name)
+        self.email = f"{sanitise_email_local(email_local)}@{IDENTITY_DOMAIN}"
+
+    @classmethod
+    def out_of_band(cls) -> Identity:
+        """The identity for changes no agent in this team made."""
+        return cls(OUT_OF_BAND_AUTHOR, OUT_OF_BAND_AUTHOR)
 
 
 Precondition = str | Literal["absent"]
@@ -239,115 +356,49 @@ class MutationOutcome(SerializableBaseModel):
     message: str
 
 
-class LastWrite(SerializableBaseModel):
-    """The agent behind the most recent accepted mutation of one path.
-
-    Attributes:
-        agent_id: Identity of the writing agent, as a string.
-        sha: Digest of the bytes that agent wrote.
-
-    The digest is what keeps attribution honest. A refusal may name this agent
-    only while the live file still hashes to ``sha``; once anything else has
-    touched the path, the last accepted writer is no longer the author of what
-    is on disk, and naming them would pin an out-of-band change — an upload, a
-    sandbox run, another team — on whichever agent happened to write last.
-    """
-
-    agent_id: str
-    sha: str
-
-
 class WorkspaceConfig(BaseConfig):
-    """Configuration of the ``#Workspace-<workspace_path>`` singleton.
+    """Configuration of the ``#Workspace-<workspace_path>`` actor.
+
+    **No field names a team or a key list**, and that outlived the hosting it was
+    written for: two teams over one tree each get their own actor, so a field
+    naming one team's metadata would be read by the other team's actor as its
+    own. A client learns which agent bound which tree from the
+    ``WorkspaceAttached`` event each bind emits; the metadata key list this
+    config used to carry had no reader once the actor stopped emitting a
+    ``StartMessage``, and a stored record still carrying it loads unchanged,
+    because an unknown key is ignored.
 
     Attributes:
-        workspace_path: The **already-resolved** two-segment path of the tree
-            this actor owns — ``<scope>/<leaf>``, relative to the workspaces
-            root — and also the suffix of the actor's name.
-            ``getChildrenOrCreate`` keys on that name, so both come from this
-            one value; two cards on different workspaces cannot collapse onto
-            one actor owning one tree, and nothing here re-derives a directory
-            from a ``workspace_id`` or a team id.
-        metadata_keys: The key list the card declared, carried verbatim so a
-            client can attribute an agent to a workspace by plain list equality
-            against the agent card's own ``workspace_metadata_keys``, without
-            learning the leaf's encoding. Empty for the two per-user layouts.
+        workspace_path: The **already-resolved** three-segment path of the tree
+            this actor owns — ``<scope>/<kind>/<leaf>``, relative to the workspaces
+            root — and also the suffix of the actor's name. Get-or-create keys on
+            that name, so both come from this one value; two cards on different
+            workspaces cannot collapse onto one actor owning one tree, and
+            nothing here re-derives a directory from a ``workspace_id`` or a
+            team id.
+    **Nothing else is here, and every absence is the same fix.** The two document
+    caps left first, then ``git_journal``, ``git_timeout_s`` and
+    ``max_tracked_writers``. All of them reached this config through
+    ``getChildrenOrCreate``, which ignores ``config`` on a hit — so the first card
+    of a team to bind a tree fixed them for every later card of that team,
+    silently.
 
-            **A field rather than a parser.** Values are percent-encoded, so the
-            leaf *could* be parsed back — but that teaches every client the wire
-            format, and a parser can drift from the encoder. A field cannot.
+    The caps now travel on the
+    :class:`~akgentic.tool.workspace.documents.cache.DocumentCache` the card
+    builds and announces, and the journal travels the same way, on the
+    :class:`~akgentic.tool.workspace.journal.GitJournal` the card opens and hands
+    over through
+    :meth:`~akgentic.tool.workspace.execution.actor.ExecMixin.configure_journal`.
+    Both are last-writer-wins like every other announcement, and the card is
+    where each is derived — the caps from the backend the collection really
+    resolves to, the journal from the card's own ``git_journal`` field. The other
+    two needed no successor: ``git_timeout_s`` was set by nothing and the card
+    already passes :data:`DEFAULT_GIT_TIMEOUT_S` itself, and
+    ``max_tracked_writers`` was set by no production caller, so the cap loop reads
+    :data:`DEFAULT_MAX_TRACKED_WRITERS` — the constant it defaulted to — directly.
 
-            It is the **declared** list, not the deduped one the leaf is built
-            from: the client compares it against the card's list, and
-            normalising one side of a join and not the other is how a join
-            starts missing silently.
-        max_observations_per_agent: Cap on the per-agent observation map.
-        max_tracked_writers: Cap on the path-keyed last-writer map, which the
-            gate consults only to name the other writer in a refusal.
-        max_documents: Cap on the number of rows in
-            :attr:`WorkspaceState.documents`. Over it, the least recently used
-            entry is removed outright.
-        max_document_chars: Cap on the characters held across the cached
-            extracts that still have a body. Over it, the least recently used
-            body is dropped and its metadata kept — a different remedy from the
-            row cap because it answers a different pressure
-            (:func:`~akgentic.tool.workspace.documents.models.evict_document_bodies`).
-        git_journal: Whether to keep a git journal of accepted mutations. The
-            gate is unaffected either way — it is pure Python and independent.
-        git_timeout_s: Wall-clock budget for one ``git`` invocation.
+    A stored record still carrying any of them loads unchanged: an unknown key is
+    ignored.
     """
 
     workspace_path: str
-    metadata_keys: list[str] = []
-    max_observations_per_agent: int = DEFAULT_MAX_OBSERVATIONS_PER_AGENT
-    max_tracked_writers: int = DEFAULT_MAX_TRACKED_WRITERS
-    max_documents: int = DEFAULT_MAX_DOCUMENTS
-    max_document_chars: int = DEFAULT_MAX_DOCUMENT_CHARS
-    git_journal: bool = False
-    git_timeout_s: float = DEFAULT_GIT_TIMEOUT_S
-
-
-class WorkspaceState(BaseState):
-    """Persisted actor state — the derived cache, and no observation data.
-
-    What this state must **not** carry is the observation map: reads are the
-    majority of workspace traffic, and a snapshot per recorded read would put an
-    event-store write on the read path that ADR-036's NFR1 exists to keep free.
-    Observations live as a plain actor instance attribute and do not survive a
-    resume, which degrades towards *refusing* a later write rather than
-    accepting a stale one.
-
-    What it does carry is *derived* data: the extracted-document cache, every
-    byte of which is regenerable from the tree. NFR1 is a property of the **read
-    path**, not of an empty state, and the rule the whole design rests on is
-    therefore about who notifies rather than about what is stored:
-
-    - a text read never notifies,
-    - a document-cache **hit** never notifies — it reorders the LRU in memory,
-      so persisted recency lags live recency until the next fill, which is
-      deliberate and harmless,
-    - a cache **fill** notifies exactly once, after the insert *and* the
-      eviction, amortised against the seconds of extraction that preceded it.
-
-    Attributes:
-        documents: Workspace-relative path to its extracted Markdown, in
-            least-recently-used order — a plain ``dict`` preserves insertion
-            order, so the fill site's re-insert and the lookup's move-to-end are
-            the whole of the LRU. Bounded by ``max_documents`` and
-            ``max_document_chars`` on :class:`WorkspaceConfig`.
-        rag_index: Workspace-relative path to where that file stands in the
-            retrieval pipeline.
-
-            **This map is deliberately not governed by ``max_documents`` /
-            ``max_document_chars``.** Those two bound the *extraction cache*, and
-            an evicted body must not de-index its file: a search hit renders from
-            what the vector store holds, so an indexed file stays searchable with
-            no body in ``documents`` at all. Governing the index by the cache
-            caps would make ``max_documents`` a ceiling on the searchable corpus,
-            which is the opposite of what it is for. The index is bounded by the
-            tree — one row per candidate file, each a few hundred bytes plus its
-            offsets.
-    """
-
-    documents: dict[str, DocumentExtract] = {}
-    rag_index: dict[str, RagFile] = {}

@@ -43,8 +43,12 @@ from akgentic.tool.knowledge_graph.models import (
     SearchQuery,
 )
 from akgentic.tool.vector_store.actor import VectorStoreActor
+from akgentic.tool.vector_store.backends.weaviate import WEAVIATE_URL_ENV
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA
-from akgentic.tool.vector_store.protocol import WEAVIATE_URL_ENV, CollectionConfig
+from akgentic.tool.vector_store.protocol import (
+    VectorStoreParam,
+    resolve_store_param,
+)
 
 # ---------------------------------------------------------------------------
 # Mock helpers
@@ -170,6 +174,7 @@ class MockActorToolObserver:
         actor.state = KnowledgeGraphState()
         actor.state.observer(actor)
         actor._vs_proxy = None
+        actor._embedder = None
         actor._state_event_seq = 0
         self._kg_actor = actor
         kg_addr = MockActorAddress(KG_ACTOR_NAME, KG_ACTOR_ROLE)
@@ -287,8 +292,8 @@ class TestKnowledgeGraphToolObserver:
         with pytest.raises(ValueError, match="orchestrator"):
             tool.observer(observer)
 
-    def test_observer_creates_only_kg_actor_via_get_children_or_create(self) -> None:
-        """Story 10-9: observer() creates ONLY KnowledgeGraphActor, not VectorStoreActor."""
+    def test_observer_creates_the_store_then_the_kg_actor(self) -> None:
+        """An in-memory card creates the store first, then the actor that looks it up."""
         tool = KnowledgeGraphTool()
         observer = MockActorToolObserver()
         addr = MockActorAddress(KG_ACTOR_NAME, KG_ACTOR_ROLE)
@@ -296,37 +301,43 @@ class TestKnowledgeGraphToolObserver:
 
         tool.observer(observer)
 
-        # Only KnowledgeGraphActor is created here; VectorStoreTool owns VectorStoreActor.
-        assert observer._orchestrator_proxy.getChildrenOrCreate.call_count == 1
+        classes = [
+            call.args[0]
+            for call in observer._orchestrator_proxy.getChildrenOrCreate.call_args_list
+        ]
+        assert classes == [VectorStoreActor, KnowledgeGraphActor]
 
-    def test_observer_does_not_create_vector_store_actor(self) -> None:
-        """Story 10-9 AC-4: VectorStoreActor is never the class arg to getChildrenOrCreate."""
-        tool = KnowledgeGraphTool()
+    def test_a_cluster_card_creates_no_store_actor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cluster backend gets no actor: only KnowledgeGraphActor is created."""
+        monkeypatch.setenv(WEAVIATE_URL_ENV, "http://localhost:8080")
+        tool = KnowledgeGraphTool(vector_store=VectorStoreParam(backend="weaviate"))
         observer = MockActorToolObserver()
         kg_addr = MockActorAddress(KG_ACTOR_NAME, KG_ACTOR_ROLE)
         observer._orchestrator_proxy.getChildrenOrCreate.return_value = kg_addr
 
         tool.observer(observer)
 
-        for call in observer._orchestrator_proxy.getChildrenOrCreate.call_args_list:
-            actor_cls = call.args[0] if call.args else call.kwargs.get("actor_class")
-            assert actor_cls is not VectorStoreActor, (
-                "KnowledgeGraphTool.observer() must not create VectorStoreActor"
-            )
-        # And the only remaining call is for KnowledgeGraphActor.
-        last_cls = observer._orchestrator_proxy.getChildrenOrCreate.call_args.args[0]
-        assert last_cls is KnowledgeGraphActor
+        classes = [
+            call.args[0]
+            for call in observer._orchestrator_proxy.getChildrenOrCreate.call_args_list
+        ]
+        assert classes == [KnowledgeGraphActor]
+        assert VectorStoreActor not in classes
 
-    def test_observer_passes_kg_config_with_default_vector_store(self) -> None:
-        """AC-4: vector_store=True (default) is propagated into KnowledgeGraphConfig."""
-        tool = KnowledgeGraphTool()  # default vector_store=True
+    def test_observer_passes_kg_config_with_the_default_param(self) -> None:
+        """The card's VectorStoreParam is propagated into KnowledgeGraphConfig."""
+        tool = KnowledgeGraphTool()
         captured: list[KnowledgeGraphConfig] = []
 
         mock_proxy = MagicMock()
 
         def capture(actor_cls: type, config: object = None) -> MagicMock:
-            assert isinstance(config, KnowledgeGraphConfig)
-            captured.append(config)
+            # The card creates the store actor first when its backend needs one,
+            # so only the consumer's own config is captured here.
+            if isinstance(config, KnowledgeGraphConfig):
+                captured.append(config)
             return MagicMock()
 
         mock_proxy.getChildrenOrCreate.side_effect = capture
@@ -337,18 +348,20 @@ class TestKnowledgeGraphToolObserver:
         tool.observer(mock_observer)
 
         assert len(captured) == 1
-        assert captured[0].vector_store is True
+        assert captured[0].vector_store == VectorStoreParam()
 
-    def test_observer_propagates_vector_store_false(self) -> None:
-        """AC-4: vector_store=False flows into KnowledgeGraphConfig."""
-        tool = KnowledgeGraphTool(vector_store=False)
+    def test_observer_propagates_a_custom_param(self) -> None:
+        """A non-default VectorStoreParam flows into KnowledgeGraphConfig."""
+        tool = KnowledgeGraphTool(vector_store=VectorStoreParam(tenant="kg-tenant"))
         captured: list[KnowledgeGraphConfig] = []
 
         mock_proxy = MagicMock()
 
         def capture(actor_cls: type, config: object = None) -> MagicMock:
-            assert isinstance(config, KnowledgeGraphConfig)
-            captured.append(config)
+            # The card creates the store actor first when its backend needs one,
+            # so only the consumer's own config is captured here.
+            if isinstance(config, KnowledgeGraphConfig):
+                captured.append(config)
             return MagicMock()
 
         mock_proxy.getChildrenOrCreate.side_effect = capture
@@ -359,18 +372,34 @@ class TestKnowledgeGraphToolObserver:
         tool.observer(mock_observer)
 
         assert len(captured) == 1
-        assert captured[0].vector_store is False
+        assert captured[0].vector_store.tenant == "kg-tenant"
 
-    def test_observer_propagates_vector_store_named_string(self) -> None:
-        """AC-4 / AC-10: vector_store="<name>" flows into KnowledgeGraphConfig."""
-        tool = KnowledgeGraphTool(vector_store="#VectorStore-RAG")
+    def test_observer_refuses_the_old_lookup_shape(self) -> None:
+        """A named-actor string is a validation error; a bool is the opt-out.
+
+        Only the *string* half of the old ``bool | str`` field stays dead: it
+        addressed a ``VectorStoreActor`` by name, and that lookup no longer
+        exists. The boolean half is the opt-out, and it validates.
+        """
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            KnowledgeGraphTool(vector_store="#VectorStore-RAG")  # type: ignore[arg-type]
+
+        assert KnowledgeGraphTool(vector_store=True).vector_store is True
+        assert KnowledgeGraphTool(vector_store=False).vector_store is False
+
+    def test_a_named_string_never_reaches_a_config(self) -> None:
+        tool = KnowledgeGraphTool(vector_store=VectorStoreParam())
         captured: list[KnowledgeGraphConfig] = []
 
         mock_proxy = MagicMock()
 
         def capture(actor_cls: type, config: object = None) -> MagicMock:
-            assert isinstance(config, KnowledgeGraphConfig)
-            captured.append(config)
+            # The card creates the store actor first when its backend needs one,
+            # so only the consumer's own config is captured here.
+            if isinstance(config, KnowledgeGraphConfig):
+                captured.append(config)
             return MagicMock()
 
         mock_proxy.getChildrenOrCreate.side_effect = capture
@@ -381,14 +410,14 @@ class TestKnowledgeGraphToolObserver:
         tool.observer(mock_observer)
 
         assert len(captured) == 1
-        assert captured[0].vector_store == "#VectorStore-RAG"
+        assert isinstance(captured[0].vector_store, VectorStoreParam)
 
 
 class TestKnowledgeGraphToolDependsOn:
     """Story 10-9 AC-1: depends_on declaration + vector_store field."""
 
-    def test_depends_on_is_vector_store_tool(self) -> None:
-        assert KnowledgeGraphTool().depends_on == ["VectorStoreTool"]
+    def test_depends_on_is_empty(self) -> None:
+        assert KnowledgeGraphTool().depends_on == []
 
     def test_depends_on_not_a_pydantic_field(self) -> None:
         assert "depends_on" not in KnowledgeGraphTool.model_fields
@@ -397,30 +426,30 @@ class TestKnowledgeGraphToolDependsOn:
         dump = KnowledgeGraphTool().model_dump()
         assert "depends_on" not in dump
 
-    def test_vector_store_field_default_true(self) -> None:
+    def test_vector_store_field_accepts_a_param_or_a_bool(self) -> None:
         tool = KnowledgeGraphTool()
         assert tool.vector_store is True
         assert "vector_store" in KnowledgeGraphTool.model_fields
+        assert (
+            KnowledgeGraphTool.model_fields["vector_store"].annotation
+            == VectorStoreParam | bool
+        )
+        assert "collection" not in KnowledgeGraphTool.model_fields
 
     def test_vector_store_appears_in_model_dump(self) -> None:
+        """The default dumps as the bool the author would have written."""
         dump = KnowledgeGraphTool().model_dump()
         assert "vector_store" in dump
         assert dump["vector_store"] is True
+        assert isinstance(
+            KnowledgeGraphTool(vector_store=VectorStoreParam()).model_dump()["vector_store"],
+            dict,
+        )
 
-    def test_vector_store_roundtrip_true(self) -> None:
-        tool = KnowledgeGraphTool(vector_store=True)
+    def test_vector_store_roundtrip(self) -> None:
+        tool = KnowledgeGraphTool(vector_store=VectorStoreParam(tenant="t1"))
         reloaded = KnowledgeGraphTool.model_validate(tool.model_dump())
-        assert reloaded.vector_store is True
-
-    def test_vector_store_roundtrip_false(self) -> None:
-        tool = KnowledgeGraphTool(vector_store=False)
-        reloaded = KnowledgeGraphTool.model_validate(tool.model_dump())
-        assert reloaded.vector_store is False
-
-    def test_vector_store_roundtrip_string(self) -> None:
-        tool = KnowledgeGraphTool(vector_store="#VectorStore-RAG")
-        reloaded = KnowledgeGraphTool.model_validate(tool.model_dump())
-        assert reloaded.vector_store == "#VectorStore-RAG"
+        assert reloaded.vector_store.tenant == "t1"
 
 
 class TestKnowledgeGraphToolReadOnly:
@@ -767,57 +796,72 @@ class TestSummaryStateConfig:
 
 
 # ===========================================================================
-# Story 10-10 — KnowledgeGraphTool.collection field + observer propagation
+# Story 10-10 — KnowledgeGraphTool.vector_store field + observer propagation
 # ===========================================================================
 
 
 class TestKnowledgeGraphToolCollectionField:
-    """AC-1: KnowledgeGraphTool.collection is a CollectionConfig field."""
+    """AC-1: KnowledgeGraphTool.vector_store is a VectorStoreParam field."""
 
-    def test_default_collection_is_default_collection_config(self) -> None:
-        """Default ``collection`` matches a freshly-constructed ``CollectionConfig()``."""
+    def test_the_default_resolves_to_a_default_param(self) -> None:
+        """The default is ``True``, and ``True`` resolves to ``VectorStoreParam()``.
+
+        The card records the author's declaration; the settings live one step
+        later, in what the normaliser produces from it.
+        """
         tool = KnowledgeGraphTool()
-        assert isinstance(tool.collection, CollectionConfig)
-        assert tool.collection == CollectionConfig()
+        assert tool.vector_store is True
+
+        param = resolve_store_param(tool.vector_store)
+        assert param == VectorStoreParam()
         # Default values explicitly (guards against AC-11 regressions).
-        assert tool.collection.dimension == 1536
-        assert tool.collection.backend == "inmemory"
-        assert tool.collection.tenant is None
+        assert param is not None
+        assert param.dimension == 1536
+        assert param.backend == "inmemory"
+        assert param.tenant is None
 
     def test_collection_field_present_in_model_fields(self) -> None:
-        assert "collection" in KnowledgeGraphTool.model_fields
+        assert "vector_store" in KnowledgeGraphTool.model_fields
 
     def test_collection_appears_in_model_dump(self) -> None:
         dump = KnowledgeGraphTool().model_dump()
-        assert "collection" in dump
+        assert "vector_store" in dump
 
     def test_custom_collection_stored_on_instance(self) -> None:
-        custom = CollectionConfig(backend="weaviate", tenant="team-42")
-        tool = KnowledgeGraphTool(collection=custom)
-        assert tool.collection is custom
-        assert tool.collection.backend == "weaviate"
-        assert tool.collection.tenant == "team-42"
+        custom = VectorStoreParam(backend="weaviate", tenant="team-42")
+        tool = KnowledgeGraphTool(vector_store=custom)
+        assert tool.vector_store is custom
+        assert tool.vector_store.backend == "weaviate"
+        assert tool.vector_store.tenant == "team-42"
 
     def test_collection_roundtrip_default(self) -> None:
         tool = KnowledgeGraphTool()
         reloaded = KnowledgeGraphTool.model_validate(tool.model_dump())
-        assert reloaded.collection == CollectionConfig()
+        assert reloaded.vector_store is True
+        assert resolve_store_param(reloaded.vector_store) == VectorStoreParam()
 
     def test_collection_roundtrip_custom(self) -> None:
         tool = KnowledgeGraphTool(
-            collection=CollectionConfig(backend="weaviate", tenant="team-123")
+            vector_store=VectorStoreParam(backend="weaviate", tenant="team-123")
         )
         reloaded = KnowledgeGraphTool.model_validate(tool.model_dump())
-        assert reloaded.collection.backend == "weaviate"
-        assert reloaded.collection.tenant == "team-123"
-        # Non-touched fields preserved at CollectionConfig defaults.
-        assert reloaded.collection.dimension == 1536
+        assert reloaded.vector_store.backend == "weaviate"
+        assert reloaded.vector_store.tenant == "team-123"
+        # Non-touched fields preserved at VectorStoreParam defaults.
+        assert reloaded.vector_store.dimension == 1536
 
-    def test_independent_tools_do_not_alias_collection(self) -> None:
-        """`default_factory=CollectionConfig` gives each instance a fresh object."""
+    def test_independent_tools_do_not_share_a_mutable_param(self) -> None:
+        """Two default cards can never mutate one another's store settings.
+
+        The default is now the immutable ``True`` rather than a shared object, so
+        the aliasing this spec guards against moved one step later: it is
+        ``resolve_store_param`` that must hand each caller its own param.
+        """
         a = KnowledgeGraphTool()
         b = KnowledgeGraphTool()
-        assert a.collection is not b.collection
+        assert a.vector_store is True
+        assert b.vector_store is True
+        assert resolve_store_param(a.vector_store) is not resolve_store_param(b.vector_store)
 
 
 class TestKnowledgeGraphToolObserverCollection:
@@ -828,8 +872,10 @@ class TestKnowledgeGraphToolObserverCollection:
         mock_proxy = MagicMock()
 
         def capture(actor_cls: type, config: object = None) -> MagicMock:
-            assert isinstance(config, KnowledgeGraphConfig)
-            captured.append(config)
+            # The card creates the store actor first when its backend needs one,
+            # so only the consumer's own config is captured here.
+            if isinstance(config, KnowledgeGraphConfig):
+                captured.append(config)
             return MagicMock()
 
         mock_proxy.getChildrenOrCreate.side_effect = capture
@@ -842,45 +888,43 @@ class TestKnowledgeGraphToolObserverCollection:
     def test_observer_propagates_custom_collection_identity(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The exact CollectionConfig object on the ToolCard reaches the config."""
+        """The exact VectorStoreParam object on the ToolCard reaches the config."""
         monkeypatch.setenv(WEAVIATE_URL_ENV, "http://localhost:8080")
-        custom = CollectionConfig(backend="weaviate", tenant="t1")
-        tool = KnowledgeGraphTool(collection=custom)
+        custom = VectorStoreParam(backend="weaviate", tenant="t1")
+        tool = KnowledgeGraphTool(vector_store=custom)
 
         captured = self._run_observer(tool)
 
         assert len(captured) == 1
         # Identity match — same object, no copy/reconstruction.
-        assert captured[0].collection is custom
-        # And vector_store (10-9 invariant) still propagates.
-        assert captured[0].vector_store is True
+        assert captured[0].vector_store is custom
 
     def test_observer_propagates_default_collection_structurally_equal(self) -> None:
-        """Default ``KnowledgeGraphTool()`` propagates a CollectionConfig() to the config.
+        """Default ``KnowledgeGraphTool()`` propagates a VectorStoreParam() to the config.
 
         Verifies the AC-11 backward-compatibility guarantee: the value reaching
-        ``_acquire_vs_proxy`` via ``self.config.collection`` is structurally
-        identical to the historical hardcoded ``CollectionConfig()``.
+        ``_acquire_vs_proxy`` via ``self.config.vector_store`` is structurally
+        identical to the historical hardcoded ``VectorStoreParam()``.
         """
         tool = KnowledgeGraphTool()  # default collection
 
         captured = self._run_observer(tool)
 
         assert len(captured) == 1
-        assert captured[0].collection == CollectionConfig()
+        assert captured[0].vector_store == VectorStoreParam()
 
     def test_observer_does_not_mutate_tool_collection(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """observer() passes collection through without mutating the ToolCard."""
         monkeypatch.setenv(WEAVIATE_URL_ENV, "http://localhost:8080")
-        custom = CollectionConfig(backend="weaviate", tenant="zz")
-        tool = KnowledgeGraphTool(collection=custom)
-        before_dump = tool.collection.model_dump()
+        custom = VectorStoreParam(backend="weaviate", tenant="zz")
+        tool = KnowledgeGraphTool(vector_store=custom)
+        before_dump = tool.vector_store.model_dump()
 
         self._run_observer(tool)
 
-        assert tool.collection.model_dump() == before_dump
+        assert tool.vector_store.model_dump() == before_dump
 
 
 # ---------------------------------------------------------------------------
@@ -888,21 +932,22 @@ class TestKnowledgeGraphToolObserverCollection:
 # ---------------------------------------------------------------------------
 
 
-class TestKnowledgeGraphToolDependsOnProperty:
-    """AC-3, AC-8: depends_on is a conditional @property, not serialised."""
+class TestKnowledgeGraphToolDeclaresNoDependency:
+    """The card owns its store, so it names no prerequisite card."""
 
-    def test_default_depends_on_vector_store_tool(self) -> None:
-        """Default (vector_store=True) depends on VectorStoreTool."""
-        assert KnowledgeGraphTool().depends_on == ["VectorStoreTool"]
+    def test_depends_on_is_the_base_property(self) -> None:
+        from akgentic.tool.core import ToolCard
 
-    def test_vector_store_true_depends_on_vector_store_tool(self) -> None:
-        assert KnowledgeGraphTool(vector_store=True).depends_on == ["VectorStoreTool"]
+        assert KnowledgeGraphTool.depends_on is ToolCard.depends_on
+        assert KnowledgeGraphTool().depends_on == []
 
-    def test_vector_store_str_depends_on_vector_store_tool(self) -> None:
-        assert KnowledgeGraphTool(vector_store="#VectorStore-RAG").depends_on == ["VectorStoreTool"]
-
-    def test_vector_store_false_no_dependency(self) -> None:
-        assert KnowledgeGraphTool(vector_store=False).depends_on == []
+    def test_depends_on_is_empty_whatever_the_backend(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(WEAVIATE_URL_ENV, "http://localhost:8080")
+        for backend in ("inmemory", "weaviate"):
+            card = KnowledgeGraphTool(vector_store=VectorStoreParam(backend=backend))
+            assert card.depends_on == []
 
     def test_depends_on_not_in_model_fields(self) -> None:
         """depends_on is a @property, not a Pydantic field."""
@@ -910,25 +955,15 @@ class TestKnowledgeGraphToolDependsOnProperty:
 
     def test_depends_on_not_in_model_dump(self) -> None:
         """depends_on never appears in serialised output."""
-        tool_false = KnowledgeGraphTool(vector_store=False)
-        tool_true = KnowledgeGraphTool(vector_store=True)
-        assert "depends_on" not in tool_false.model_dump()
-        assert "depends_on" not in tool_true.model_dump()
-        assert "depends_on" not in tool_false.model_dump(mode="json")
-        assert "depends_on" not in tool_true.model_dump(mode="json")
+        tool = KnowledgeGraphTool()
+        assert "depends_on" not in tool.model_dump()
+        assert "depends_on" not in tool.model_dump(mode="json")
 
-    def test_round_trip_preserves_depends_on_semantics(self) -> None:
-        """Round-trip via model_validate reconstructs conditional depends_on."""
-        tool = KnowledgeGraphTool(vector_store=False)
-        dump = tool.model_dump()
-        reconstructed = KnowledgeGraphTool.model_validate(dump)
+    def test_round_trip_preserves_the_param_and_the_empty_edge(self) -> None:
+        tool = KnowledgeGraphTool(vector_store=VectorStoreParam(tenant="kg-tenant"))
+        reconstructed = KnowledgeGraphTool.model_validate(tool.model_dump())
         assert reconstructed.depends_on == []
-        assert reconstructed.vector_store is False
-
-        tool_true = KnowledgeGraphTool(vector_store=True)
-        dump_true = tool_true.model_dump()
-        reconstructed_true = KnowledgeGraphTool.model_validate(dump_true)
-        assert reconstructed_true.depends_on == ["VectorStoreTool"]
+        assert reconstructed.vector_store.tenant == "kg-tenant"
 
 
 # ===========================================================================
@@ -996,8 +1031,10 @@ class TestKnowledgeGraphToolObserverSearchFields:
         mock_proxy = MagicMock()
 
         def capture(actor_cls: type, config: object = None) -> MagicMock:
-            assert isinstance(config, KnowledgeGraphConfig)
-            captured.append(config)
+            # The card creates the store actor first when its backend needs one,
+            # so only the consumer's own config is captured here.
+            if isinstance(config, KnowledgeGraphConfig):
+                captured.append(config)
             return MagicMock()
 
         mock_proxy.getChildrenOrCreate.side_effect = capture
@@ -1029,3 +1066,73 @@ class TestKnowledgeGraphToolObserverSearchFields:
         """Without this the knob is unreachable from a catalog YAML."""
         captured = self._run_observer(KnowledgeGraphTool(hybrid_alpha=0.2))
         assert captured[0].hybrid_alpha == 0.2
+
+
+class TestTheSearchClosureAnswersADeclinedStore:
+    """``mode="vector"`` on a store-less card answers a sentence, not nothing.
+
+    The sentence lives on the card rather than in the actor because
+    ``KnowledgeGraphActor.search`` returns a ``SearchResult``, which has no
+    channel for one, and ``_format_search_result`` renders an empty result as
+    "No results found." — an assertion about the graph rather than about the
+    configuration.
+
+    Every negative below is paired: the disabled card's closure is checked
+    against an enabled card's closure over the same double, so "it did not ask
+    the actor" cannot pass by the closure never being reachable.
+    """
+
+    @staticmethod
+    def _search_callable(tool: KnowledgeGraphTool) -> tuple[Any, MagicMock]:
+        """Wire *tool* to a recording actor proxy and return its search closure."""
+        from akgentic.tool.knowledge_graph.models import SearchResult
+
+        proxy = MagicMock()
+        proxy.search.return_value = SearchResult(hits=[])
+
+        observer = MockActorToolObserver()
+        observer._kg_actor = proxy  # type: ignore[assignment]
+        tool.observer(observer)
+
+        search_fn = next(t for t in tool.get_tools() if t.__name__ == "search_graph")
+        return search_fn, proxy
+
+    def test_a_disabled_card_answers_the_sentence_without_asking_the_actor(self) -> None:
+        from akgentic.tool.vector_store.protocol import SEMANTIC_DISABLED
+
+        search_fn, proxy = self._search_callable(KnowledgeGraphTool(vector_store=False))
+
+        assert search_fn(SearchQuery(query="Alice", mode="vector")) == SEMANTIC_DISABLED
+        assert proxy.search.call_count == 0
+
+    def test_an_enabled_card_asks_the_actor_for_the_same_query(self) -> None:
+        """The positive half: the closure is reachable and does ask."""
+        from akgentic.tool.vector_store.protocol import SEMANTIC_DISABLED
+
+        search_fn, proxy = self._search_callable(KnowledgeGraphTool(vector_store=True))
+
+        result = search_fn(SearchQuery(query="Alice", mode="vector"))
+        assert proxy.search.call_count == 1
+        assert result != SEMANTIC_DISABLED
+
+    @pytest.mark.parametrize("mode", ["keyword", "hybrid"])
+    def test_a_disabled_card_still_asks_the_actor_for_the_other_two_modes(
+        self, mode: str
+    ) -> None:
+        """Only ``mode="vector"`` is short-circuited; the tool is not unregistered."""
+        from akgentic.tool.vector_store.protocol import SEMANTIC_DISABLED
+
+        search_fn, proxy = self._search_callable(KnowledgeGraphTool(vector_store=False))
+
+        result = search_fn(SearchQuery(query="Alice", mode=mode))
+        assert proxy.search.call_count == 1
+        assert result != SEMANTIC_DISABLED
+
+    def test_the_capability_stays_registered_when_disabled(self) -> None:
+        """Keyword and hybrid are fully functional, so nothing is unregistered."""
+        tool = KnowledgeGraphTool(vector_store=False)
+        observer = MockActorToolObserver()
+        observer.setup_kg_actor()
+        tool.observer(observer)
+
+        assert "search_graph" in [t.__name__ for t in tool.get_tools()]

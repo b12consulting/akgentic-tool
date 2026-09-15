@@ -1,0 +1,463 @@
+"""``#index-``: the off-thread half of indexing one file (ADR-045 §5).
+
+The workspace actor owns the tree, the write gate and the extraction cache on a
+single thread. Extracting an 800-page PDF and splitting it takes seconds, so
+neither may ever happen on that thread — every mutation in the team queues behind
+it. This module is where they happen instead: one short-lived actor per file,
+which reads, extracts, splits, composes the chunk texts, reports once and stops
+itself.
+
+**It is not merged with**
+:class:`~akgentic.tool.vector_store.embedding_actor.EmbeddingWorker`, and the
+ruling is recorded here because this is the module a reader asking the question
+lands in. Three reasons, each checked against the code rather than against a
+planning document:
+
+- **The cardinality is not 1:1.** This worker is one child per **file**;
+  ``EmbeddingWorker`` is one child per **batch of** :data:`EMBED_BATCH_SIZE`
+  **chunks**. An 800-page document is ~1,900 chunks and therefore ~30 embedding
+  children. "One child per file" would turn thirty requests of which one can fail
+  into one request that fails whole — the exact arithmetic
+  :data:`EMBED_BATCH_SIZE`'s own docstring exists to state — and would hold every
+  batch's vectors in one worker instead of landing each on its own mailbox turn.
+- **This worker cannot hold them.** It stops itself the instant it reports (see
+  below), so it could neither hold the embedding workers it would have to spawn
+  nor take their reports; and the actor is the only place that can hold
+  ``batches_expected`` consistently with the row it counts for.
+- **``EmbeddingWorker`` is not this package's to absorb.** It lives in
+  ``vector_store/``, is in ``akgentic.tool.vector_store.__all__``, and its module
+  is the home of ``build_embedding_service`` — the single place the worker
+  timeout budget is chosen.
+
+**One correction to the reason usually given for the third point.** It is said
+that ``EmbeddingWorker`` is shared with the knowledge-graph and planning paths.
+Measured: ``knowledge_graph/kg_actor.py`` and ``planning/planning_actor.py``
+import **``build_embedding_service``**, not the worker, and the only site that
+spawns an ``EmbeddingWorker`` anywhere in ``src/`` is
+``DocumentsMixin._spawn_embedding``. The sharing that survives is the *module and
+the timeout budget*, not the spawn — still decisive, and that is the form to
+carry forward.
+
+**It is a plain :class:`~akgentic.core.agent.Akgent`, not a ``DeferredWorker``.**
+The trap either way is the **report channel**, not the base class:
+``DeferredWorker`` reports through ``parent.deliver(key, value)`` /
+``parent.fail(key, error)``, and on ``WorkspaceActor`` those belong to a
+``DeferredResultActor[…, str, ExecOutcome]`` — the **exec** result cache. An
+index result delivered that way would evict a running agent's exec outcome and
+mis-type the cache's value.
+:class:`~akgentic.tool.vector_store.embedding_actor.EmbeddingWorker` takes the
+other exit: it inherits ``DeferredWorker`` for the budget contract, the role and
+the single-shot lifecycle, and overrides ``receiveMsg_DeferredPayload`` so the
+report goes to the consumer's own handlers instead. This worker is deliberately
+left as it is — converting it is hygiene with no behaviour change and belongs in
+its own story.
+
+**The worker extracts and splits; the actor batches, embeds and adds.** ADR §5's
+literal wording puts the ``add()`` calls here, and it cannot be here: this worker
+stops itself the instant it reports, so it could neither hold the embedding
+workers it would have to spawn nor take their reports. The actor is also the only
+place that can hold ``batches_expected`` consistently with the row it counts for.
+
+**The three payloads are ``SerializableBaseModel`` and never ``Message``.**
+``Akgent.on_receive`` emits the ``ReceivedMessage`` / ``ProcessedMessage``
+telemetry sandwich only for ``Message`` instances, and consumers derive "who is
+working" from exactly those two — so a ``Message`` payload would surface every
+transient worker as a busy team member.
+
+**The cycle this module used to be kept out of a façade for is gone.** It needs
+:class:`~akgentic.tool.workspace.rag.params.WorkspaceRagIndex` at runtime, because
+that class is a Pydantic *field type* here and a string annotation cannot serve.
+While that class lived in ``card/params.py`` the import executed
+``card/__init__.py``, which imports ``workspace.actor``, which imports this
+capability's ``rag/actor.py``, which imports ``documents/`` — so ``documents/__init__.py``
+could not re-export this module without closing the cycle at import time. The
+parameter is a sibling now and no cycle exists: ``rag/__init__.py`` is free to
+name this module and ``documents/`` no longer knows it at all.
+
+**No import in this module is function-level, and that is the second thing the
+move changed.** :meth:`IndexWorker._report` used to import ``WorkspaceActor``
+inside the method to hand it to ``proxy_tell``, which ignores it; the actor is
+named under ``TYPE_CHECKING`` and ``cast`` instead, and :meth:`IndexWorker._report`
+records what that cost while it executed.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+from pathlib import Path
+from typing import TYPE_CHECKING, cast
+
+from akgentic.core.agent import Akgent
+from akgentic.core.agent_config import BaseConfig
+from akgentic.core.agent_state import BaseState
+from akgentic.core.utils.serializer import SerializableBaseModel
+from akgentic.tool.workspace.documents.models import RagChunk, chunk_id
+from akgentic.tool.workspace.rag.params import WorkspaceRagIndex
+from akgentic.tool.workspace.rag.splitter import BlockSplitter, TextSplitter
+from akgentic.tool.workspace.readers import DocumentReader
+from akgentic.tool.workspace.workspace import get_workspace
+
+if TYPE_CHECKING:
+    from akgentic.tool.workspace.actor import WorkspaceActor
+
+__all__ = [
+    "EMBED_BATCH_SIZE",
+    "INDEX_WORKER_NAME_PREFIX",
+    "MAX_CONCURRENT_INDEX_WORKERS",
+    "IndexFailure",
+    "IndexRequest",
+    "IndexResult",
+    "IndexWorker",
+    "compose_chunk_text",
+    "index_worker_name",
+]
+
+logger = logging.getLogger(__name__)
+
+EMBED_BATCH_SIZE = 64
+"""How many chunks one ``#embed-`` worker carries, and therefore one ``add()``.
+
+**Not a card parameter**: it is a provider limit, not a corpus property.
+``EmbeddingService.embed`` sends every text it is given in **one**
+``client.embeddings.create(input=texts)`` call, and the workspace spawns one
+``EmbeddingWorker`` per batch. An 800-page document is ~1,900 chunks; one request
+of that size fails whole. Batching is what turns that into thirty requests of
+which one can fail.
+"""
+
+MAX_CONCURRENT_INDEX_WORKERS = 4
+"""How many files may have a live worker at once.
+
+Derived, not taken from the ADR, which caps nothing. ``workspace_rag_index("")``
+over a tree of 500 candidates would otherwise spawn 500 actors in one mailbox
+turn — every one of which appears in ``Orchestrator.get_team()`` and every one of
+which holds the workspace actor's teardown open. Files past the cap stay
+:attr:`~akgentic.tool.workspace.documents.models.RagStatus.PENDING`, which is
+what ``PENDING`` means and what ``workspace_rag_list`` renders, and the next one
+is spawned when a result or an error settles.
+"""
+
+INDEX_WORKER_NAME_PREFIX = "#index-"
+"""Prefix of every index worker's actor name.
+
+**Only the leading ``#`` is load-bearing** — it is what classifies the actor as a
+tool actor during the orchestrator's two-phase stop. The rest is a readability
+aid, mirroring
+:data:`~akgentic.tool.vector_store.embedding_actor.EMBED_WORKER_NAME_PREFIX`.
+Deliberately not ``WORKER_NAME_PREFIX``, which belongs to the cache actor's own
+spawns.
+"""
+
+_NAME_DIGEST_CHARS = 12
+"""How much of the path digest rides in the worker name — readability only."""
+
+
+def index_worker_name(scope: str, path: str) -> str:
+    """Return the actor name of the worker indexing *path* in *scope*.
+
+    The path is digested rather than embedded: a workspace path may contain
+    anything a filesystem allows, and an actor name is looked up by string.
+
+    Args:
+        scope: The workspace the file belongs to.
+        path: Workspace-relative path of the file.
+
+    Returns:
+        ``#index-<scope>-<12 hex characters of the path digest>``.
+    """
+    digest = hashlib.sha256(path.encode("utf-8")).hexdigest()[:_NAME_DIGEST_CHARS]
+    return f"{INDEX_WORKER_NAME_PREFIX}{scope}-{digest}"
+
+
+def _delimiter_row(header: str) -> str:
+    """Build the GFM delimiter line for a table whose header row is *header*.
+
+    A cut table's continuation piece carries its header row so it stays
+    independently readable — but the delimiter line (``|---|---|``) is not a table
+    row, so it falls outside the header's offsets and the composed text would be a
+    header plus body rows, which is **not a parseable table**. It is derivable
+    from the header's column count, so it needs no new field on
+    :class:`~akgentic.tool.workspace.documents.models.RagChunk`, and it costs one
+    generated line.
+
+    The count is ``header.count("|") - 1``, which is exact for the pipe-delimited
+    form MarkItDown emits (``| a | b |`` — three pipes, two columns). A header
+    written without its outer pipes would be undercounted by one; the floor of one
+    keeps the result a table rather than a crash, and a wrong column count still
+    re-parses.
+
+    Args:
+        header: The table's header row, verbatim.
+
+    Returns:
+        A delimiter row with one ``---`` cell per column.
+    """
+    columns = max(1, header.strip().count("|") - 1)
+    return "| " + " | ".join(["---"] * columns) + " |"
+
+
+def compose_chunk_text(markdown: str, chunk: RagChunk, prepend_heading_path: bool) -> str:
+    """Build the text that is embedded for *chunk*, from *markdown* and nothing else.
+
+    Composition is what keeps a stored chunk a pair of offsets rather than a copy
+    of the document: the heading prefix and a cut table's header are re-derived
+    here, at embed time, and never written back into
+    :class:`~akgentic.tool.workspace.documents.models.RagChunk`.
+
+    The order is heading prefix, header row, generated delimiter, slice. The blank
+    line after the prefix is load-bearing rather than cosmetic — a table cannot
+    interrupt a paragraph in GFM, so a prefix on the line immediately above would
+    absorb the whole table into a paragraph and the piece would stop being a table
+    at all.
+
+    Args:
+        markdown: The document the chunk's offsets index into.
+        chunk: The chunk to compose.
+        prepend_heading_path: Whether to lead with the enclosing headings.
+
+    Returns:
+        The composed text.
+    """
+    body = markdown[chunk.start : chunk.end]
+    if chunk.header_start is not None and chunk.header_end is not None:
+        header = markdown[chunk.header_start : chunk.header_end]
+        body = f"{header}\n{_delimiter_row(header)}\n{body}"
+    if prepend_heading_path and chunk.heading_path:
+        return " > ".join(chunk.heading_path) + "\n\n" + body
+    return body
+
+
+class IndexRequest(SerializableBaseModel):
+    """One file handed to an :class:`IndexWorker`.
+
+    Attributes:
+        path: Workspace-relative path of the source file.
+        scope: The workspace name. It is called ``scope`` because that is what it
+            becomes — in every :func:`~akgentic.tool.workspace.documents.models.chunk_id`
+            and in every ``VectorEntry.scope``.
+        source_sha: Digest of the source bytes this run is indexing. Echoed back
+            so the actor can drop a report for a file that has since moved.
+        markdown: The actor's cached extraction when it had one. ``None`` means
+            the worker extracts — including when the body was evicted under the
+            character cap, which is an ordinary state and never a failure.
+        params: The chunking configuration, already validated.
+        reader: The extraction configuration. It travels with the request because
+            it lives on the **card**, not on the actor: the card that created the
+            actor for a workspace is routinely one with no retrieval capability.
+    """
+
+    path: str
+    scope: str
+    source_sha: str
+    markdown: str | None
+    params: WorkspaceRagIndex
+    reader: DocumentReader
+
+
+class IndexResult(SerializableBaseModel):
+    """What an :class:`IndexWorker` reports when it succeeded.
+
+    Attributes:
+        path: Workspace-relative path of the source file.
+        scope: The workspace name, as it was requested.
+        source_sha: The digest this run indexed, for attribution.
+        markdown: The body the chunks index into — returned so the actor can fill
+            its extraction cache when the worker was the one that extracted.
+        extracted: ``False`` when the actor supplied the body, so the actor knows
+            whether the cache would learn anything from filling it.
+        chunks: The chunks, in document order, already carrying their ids.
+        texts: The composed chunk texts, index-aligned with :attr:`chunks`.
+    """
+
+    path: str
+    scope: str
+    source_sha: str
+    markdown: str
+    extracted: bool
+    chunks: list[RagChunk]
+    texts: list[str]
+
+
+class IndexFailure(SerializableBaseModel):
+    """What an :class:`IndexWorker` reports when it could not produce chunks.
+
+    Deliberately not an exception: it mirrors ``EmbeddingError``, the payload the
+    vector store's worker reports failure with. **Named ``…Failure`` rather than
+    ``…Error`` because ``IndexError`` is a builtin**, and a payload by that name
+    would shadow it from its definition to the end of this module and throughout
+    ``rag/actor.py``, which imports it — so a later ``except IndexError:``
+    beside an ordinal lookup would raise ``TypeError`` instead of catching, with
+    no complaint from mypy. ``EmbeddingError``, the model this mirrors, shadows
+    nothing; the mirror is in the shape, not in the letter of the name.
+
+    Attributes:
+        path: Workspace-relative path of the source file.
+        scope: The workspace name, as it was requested.
+        source_sha: The digest this run was indexing, for attribution.
+        reason: What went wrong, in the words the index row will carry.
+    """
+
+    path: str
+    scope: str
+    source_sha: str
+    reason: str
+
+
+class IndexWorker(Akgent[BaseConfig, BaseState]):
+    """Reads, extracts, splits and composes one file, then stops itself.
+
+    **It makes no ask and holds no proxy but the one it reports through**, so
+    there is no I/O client here to hand a budget to. The one call that can be
+    slow without bound is the optional LLM pass inside
+    :meth:`~akgentic.tool.workspace.readers.DocumentReader.extract_text`, whose
+    client is built inside that class and takes no budget today; a timeout field
+    on :class:`IndexRequest` would reach nothing, and a timeout that does not
+    reach the I/O client is decoration.
+    """
+
+    def on_start(self) -> None:
+        """Initialise the empty state this worker never writes to."""
+        self.state = BaseState()
+        self.state.observer(self)
+
+    def receiveMsg_IndexRequest(self, msg: IndexRequest) -> None:  # noqa: N802
+        """Produce *msg*'s chunks and report exactly once, then stop.
+
+        Every failure — a path that escaped, a file that vanished, an extractor
+        that raised, bytes that are not UTF-8 — becomes an :class:`IndexFailure`
+        rather than an exception out of this actor. The workspace actor is the
+        only party that can record it against the file, and it must be told.
+
+        Args:
+            msg: The file to index.
+        """
+        try:
+            markdown, extracted = self._body(msg)
+            chunks, texts = self._chunks(markdown, msg)
+            self._report(
+                IndexResult(
+                    path=msg.path,
+                    scope=msg.scope,
+                    source_sha=msg.source_sha,
+                    markdown=markdown,
+                    extracted=extracted,
+                    chunks=chunks,
+                    texts=texts,
+                )
+            )
+        except Exception as exc:
+            self._report(
+                IndexFailure(
+                    path=msg.path,
+                    scope=msg.scope,
+                    source_sha=msg.source_sha,
+                    reason=f"{type(exc).__name__}: {exc}",
+                )
+            )
+        finally:
+            self.stop()
+
+    def _body(self, msg: IndexRequest) -> tuple[str, bool]:
+        """Return the Markdown to split, and whether this worker produced it.
+
+        Reads **through** :class:`~akgentic.tool.workspace.workspace.Filesystem`,
+        never by joining onto its private root: every read there goes through the
+        path validation, and re-implementing the join is how a traversal gets
+        back in.
+
+        Args:
+            msg: The request being served.
+
+        Returns:
+            The body and ``True`` when it was extracted here, ``False`` when the
+            actor supplied it from its cache.
+        """
+        if msg.markdown is not None:
+            return msg.markdown, False
+        data = get_workspace(msg.scope).read(msg.path)
+        if Path(msg.path).suffix.lower() in DocumentReader.extensions:
+            return msg.reader.extract_text(data, msg.path), True
+        return data.decode("utf-8"), True
+
+    @staticmethod
+    def _chunks(markdown: str, msg: IndexRequest) -> tuple[list[RagChunk], list[str]]:
+        """Split *markdown* and compose one text per chunk.
+
+        Args:
+            markdown: The body to split.
+            msg: The request, for the scope, path, digest and chunking parameters.
+
+        Returns:
+            The chunks and their composed texts, index-aligned.
+        """
+        # Annotated, and annotated **here**: this is the package's only
+        # ``TextSplitter`` annotation site inside ``src/``, and CI runs mypy over
+        # ``src/`` alone. The same assignment in a test file is never evaluated by
+        # the run that gates a merge, so a ``split`` that drifts from the Protocol
+        # would ship green — ``isinstance`` against a Protocol checks member
+        # presence, not signatures (splitter.py's own note). Do not narrow this
+        # back to ``BlockSplitter``. What it catches, verified by mutation: a
+        # changed arity, parameter type or return type. What it does not: a
+        # renamed parameter, which mypy ignores for protocol compatibility — so
+        # that one is still on the reader.
+
+        splitter: TextSplitter = BlockSplitter()
+        spans = splitter.split(markdown, msg.params)
+        chunks = [
+            RagChunk(
+                chunk_id=chunk_id(msg.scope, msg.path, msg.source_sha, ordinal),
+                ordinal=ordinal,
+                start=span.start,
+                end=span.end,
+                heading_path=span.heading_path,
+                header_start=span.header_start,
+                header_end=span.header_end,
+            )
+            for ordinal, span in enumerate(spans)
+        ]
+        texts = [
+            compose_chunk_text(markdown, chunk, msg.params.prepend_heading_path) for chunk in chunks
+        ]
+        return chunks, texts
+
+    def _report(self, payload: IndexResult | IndexFailure) -> None:
+        """Tell the parent what happened — fire and forget, and never raising.
+
+        A parent that has stopped between the spawn and this line must not turn a
+        finished extraction into a traceback: there is nobody left to record it
+        against, and this worker is about to stop either way.
+
+        **The actor is named under ``TYPE_CHECKING`` and never imported at
+        runtime**, and that is the one line of this module the move changed. It
+        used to pass ``WorkspaceActor`` to ``proxy_tell``, whose second argument
+        core's own docstring calls a "type hint for return typing (not used at
+        runtime)" — ``ProxyWrapper`` is built from the address alone. So the
+        import bought nothing at runtime and cost this capability an executed
+        edge into ``actor/__init__.py``, and through it into ``journal/``,
+        ``lock/`` and the exec machinery: seven modules in the closure guard's
+        allow-list, every one of them reached only to pass an ignored argument.
+        The ``cast`` keeps mypy's view of the proxy exactly as it was. It is the
+        pattern ``rag/actor.py`` and ``rag/__init__.py`` already use to name a
+        type without taking on an executed edge to it.
+
+        Args:
+            payload: The result or the failure.
+        """
+        parent = self._parent
+        if parent is None:
+            logger.warning("[%s] no parent address — the index report is dropped", self.config.name)
+            return
+        try:
+            proxy = cast("WorkspaceActor", self.proxy_tell(parent))
+            if isinstance(payload, IndexResult):
+                proxy.receiveMsg_IndexResult(payload)
+            else:
+                proxy.receiveMsg_IndexFailure(payload)
+        except Exception:
+            logger.warning(
+                "[%s] could not report the index outcome for %s",
+                self.config.name,
+                payload.path,
+                exc_info=True,
+            )

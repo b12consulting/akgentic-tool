@@ -1,0 +1,431 @@
+"""The metadata directory is a sibling of the tree, and nothing in the tree can name it.
+
+Guards for :func:`meta_dir_for` (ADR-051 Decision 9). The placement is the whole
+subject: ``Filesystem.resolve_path`` refuses every path that does not resolve
+*inside* the root, so a directory **beside** the tree is one no read capability
+can name and no sandboxed run can delete. Inside the tree it would be listable,
+globbable, greppable, readable — and removable by an ``rm -rf`` from the very run
+whose exec lock it holds.
+
+Two habits run through every spec here:
+
+- the resolver **creates nothing**, so a guard about reaching the directory has
+  to create it first. A path that cannot be reached because nothing is there
+  would prove nothing at all;
+- the workspaces root is never spelled twice. What a test compares against is
+  what :func:`get_workspace` itself resolved, because two derivations that drift
+  give two metadata directories over one tree — and a test carrying the second
+  one would agree with the defect.
+"""
+
+from __future__ import annotations
+
+import os
+from collections.abc import Callable
+from pathlib import Path
+
+import pytest
+
+from akgentic.tool.errors import RetriableError
+from akgentic.tool.workspace.journal import git_dir_for
+from akgentic.tool.workspace.models import GIT_DIR_SUFFIX, META_DIR_SUFFIX
+from akgentic.tool.workspace.workspace import (
+    PathEscapeError,
+    get_workspace,
+    leaf_segment,
+    meta_dir_for,
+    user_segment,
+)
+from tests.workspace.conftest import (
+    WORKSPACE_NAME,
+    WORKSPACE_PATH,
+    FakeOrchestratorProxy,
+    card_for,
+    tool_named,
+    workspace_root_for,
+)
+from tests.workspace.test_workspace_path_resolution import SIX_CELLS, Cell, bind_cell
+
+WORKSPACES_ROOT_VAR = "AKGENTIC_WORKSPACES_ROOT"
+"""The one variable the placement reads — the one the trees themselves hang off."""
+
+LOCK_NAME = "exec.lock"
+"""A stand-in for what 52-2 will put in the directory. Any name would do."""
+
+META_LEAF = f"{WORKSPACE_NAME}{META_DIR_SUFFIX}"
+"""The metadata directory's own leaf, beside ``WORKSPACE_NAME`` in one scope."""
+
+
+def _tree_root(workspace_path: str = WORKSPACE_PATH) -> Path:
+    """The tree :func:`get_workspace` opens, read from the backend it returns.
+
+    Every assertion in this module is about where the metadata directory sits
+    **relative to that exact path**. A second derivation spelled out in the test
+    would be a second rule to keep in step — which is the defect one resolver
+    exists to remove.
+    """
+    return get_workspace(workspace_path).root
+
+
+def _seeded_meta(workspace_path: str = WORKSPACE_PATH) -> Path:
+    """Create the directory the resolver names and put a file in it.
+
+    Always the test's own doing: production creates nothing here until 52-2.
+    """
+    meta = meta_dir_for(workspace_path)
+    meta.mkdir(parents=True, exist_ok=True)
+    (meta / LOCK_NAME).write_text("held", encoding="utf-8")
+    return meta
+
+
+def _escape_forms(meta: Path, root: Path) -> list[str]:
+    """Every shape an agent could write to name *meta* from inside *root*.
+
+    The traversal form is spelled literally because that is what an agent types;
+    the ``relpath`` form is the same thing computed, which keeps the list correct
+    for any tree whatever its depth. The absolute form is the one an agent
+    reaches for when the relative ones are refused.
+    """
+    return [
+        f"../{META_LEAF}",
+        f"../{META_LEAF}/{LOCK_NAME}",
+        os.path.relpath(meta, root),
+        os.path.relpath(meta / LOCK_NAME, root),
+        str(meta),
+        str(meta / LOCK_NAME),
+    ]
+
+
+def _hands_back_nothing(closure: Callable[..., object], *args: str) -> bool:
+    """Whether a read closure gives the agent nothing naming the metadata directory.
+
+    A refusal counts, and so does an empty result: from the agent's side they are
+    one answer — the directory is not reachable — and which of the two a given
+    path produces depends only on whether it escapes the root or merely matches
+    nothing inside it.
+    """
+    try:
+        answer = str(closure(*args))
+    except RetriableError:
+        return True
+    return META_DIR_SUFFIX not in answer and LOCK_NAME not in answer
+
+
+##
+## AC 2 and AC 3 — one resolver, it is a sibling, and it writes nothing
+##
+
+
+class TestTheResolverPlacesItBesideTheTree:
+    """``meta_dir_for`` derives ``<root>.index``, and derives it only."""
+
+    def test_it_is_a_sibling_of_the_tree(self, workspaces_root: Path) -> None:
+        """Same parent, the tree's name plus the suffix — and outside the tree.
+
+        The third assertion is made **directly** rather than inferred from the
+        first two: those hold for a path that is spelled correctly and still
+        resolves inside the root through a symlink, and it is the containment
+        property, not the spelling, that keeps the exec lock out of the sandbox.
+        """
+        root = _tree_root()
+        meta = meta_dir_for(WORKSPACE_PATH)
+
+        assert meta.parent == root.parent
+        assert meta.name == f"{root.name}{META_DIR_SUFFIX}"
+        assert not meta.is_relative_to(root)
+
+    def test_it_is_absolute(self, workspaces_root: Path) -> None:
+        """A relative answer would resolve against whatever the caller's cwd is."""
+        assert meta_dir_for(WORKSPACE_PATH).is_absolute()
+
+    def test_the_same_path_resolves_the_same_directory(self, workspaces_root: Path) -> None:
+        """One derivation. Two that drifted would give one tree two metadata directories."""
+        assert meta_dir_for(WORKSPACE_PATH) == meta_dir_for(WORKSPACE_PATH)
+
+    def test_it_creates_nothing(self, workspaces_root: Path) -> None:
+        """No ``mkdir``, no touch, no side effect — creation belongs to a later story."""
+        meta = meta_dir_for(WORKSPACE_PATH)
+
+        assert not meta.exists()
+        assert not list(workspaces_root.rglob(f"*{META_DIR_SUFFIX}"))
+
+    def test_it_still_creates_nothing_once_the_tree_exists(self, workspace_tree: Path) -> None:
+        """The tree being there is what makes an accidental ``exist_ok=True`` invisible."""
+        meta = meta_dir_for(WORKSPACE_PATH)
+
+        assert not meta.exists()
+
+    def test_two_workspaces_get_two_directories(self, workspaces_root: Path) -> None:
+        """The suffix hangs off the leaf, so neither can name the other's."""
+        first = meta_dir_for(WORKSPACE_PATH)
+        second = meta_dir_for(f"u-bob/{WORKSPACE_NAME}")
+
+        assert first != second
+        assert not first.is_relative_to(second)
+        assert not second.is_relative_to(first)
+
+
+##
+## AC 4 — no read capability can reach it
+##
+
+
+class TestNoReadCapabilityCanReachIt:
+    """The backend refuses every path that names it, and no listing mentions it."""
+
+    def test_the_backend_refuses_every_path_that_names_it(self, workspaces_root: Path) -> None:
+        """``read``, ``list`` and ``exists`` all validate first, so all three refuse.
+
+        ``PathEscapeError`` rather than a bare ``PermissionError``: the agent has
+        to be told the path escaped rather than that the file was not writable,
+        or it rewrites a correct path for ever.
+        """
+        workspace = get_workspace(WORKSPACE_PATH)
+        meta = _seeded_meta()
+        root = _tree_root()
+
+        for path in _escape_forms(meta, root):
+            for call in (workspace.read, workspace.list, workspace.exists):
+                with pytest.raises(PathEscapeError):
+                    call(path)
+
+    def test_listing_the_tree_never_mentions_it(self, workspaces_root: Path) -> None:
+        """It is a sibling, so it is not a child — asserted as the whole listing."""
+        workspace = get_workspace(WORKSPACE_PATH)
+        _seeded_meta()
+        workspace.write("notes.md", b"hello")
+
+        assert [entry.name for entry in workspace.list("")] == ["notes.md"]
+
+    def test_no_read_closure_of_a_wired_card_names_it(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """What an agent actually calls: the card's own ``list`` and ``glob``.
+
+        The backend's refusal above is the mechanism; this is the surface. A
+        recursive glob is the pattern an agent writes when it is looking around,
+        and the two targeted ones are what it writes once it knows the name.
+        """
+        card, _observer = card_for(orchestrator_proxy, "alice")
+        _seeded_meta()
+        (workspace_tree / "notes.md").write_text("hello", encoding="utf-8")
+
+        listing = str(tool_named(card, "workspace_list")(""))
+        assert "notes.md" in listing
+        assert META_DIR_SUFFIX not in listing
+
+        recursive = str(tool_named(card, "workspace_glob")("**/*"))
+        assert "notes.md" in recursive
+        assert META_DIR_SUFFIX not in recursive
+
+        glob = tool_named(card, "workspace_glob")
+        assert _hands_back_nothing(glob, f"*{META_DIR_SUFFIX}/*")
+        assert _hands_back_nothing(glob, f"{META_LEAF}/**/*")
+        assert _hands_back_nothing(glob, "*", f"../{META_LEAF}")
+        assert _hands_back_nothing(tool_named(card, "workspace_list"), f"../{META_LEAF}")
+
+    def test_a_traversal_pattern_reaches_it_through_glob(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """The read closure that named something outside the root — until story 55-1.
+
+        ``workspace_glob("../<leaf>.index/*")`` handed the agent back
+        ``../<leaf>.index/exec.lock``: the closure resolved its ``path``
+        argument against the root and refused an escape, but fed ``pattern``
+        straight to ``Path.glob``, and ``Path.relative_to`` is lexical, so a
+        match above the root rendered as a ``../`` path rather than raising.
+
+        Written correctly and marked ``xfail(strict=True)`` when story 52-1 found
+        it — ``workspace/card/`` was out of that story's scope — so that the day
+        the closure obeyed the rule, ``strict`` would force the marker's removal.
+        That day is this one: ``pattern`` now goes through the same containment
+        rule as ``path``, and every match is filtered through
+        ``Filesystem.contains``. The marker is gone and the spec stands unmarked.
+        """
+        card, _observer = card_for(orchestrator_proxy, "alice")
+        _seeded_meta()
+
+        assert _hands_back_nothing(tool_named(card, "workspace_glob"), f"../{META_LEAF}/*")
+
+
+##
+## AC 1 and AC 2 — the parent is the workspaces root, derived once
+##
+
+
+class TestTheParentIsTheWorkspacesRoot:
+    """``<meta>`` hangs off ``AKGENTIC_WORKSPACES_ROOT``, and off nothing else."""
+
+    def test_the_parent_is_the_workspaces_root(self, workspaces_root: Path) -> None:
+        """With ``AKGENTIC_WORKSPACES_ROOT`` set, ``<meta>`` lands beside the tree."""
+        meta = meta_dir_for(WORKSPACE_PATH)
+
+        assert meta == workspace_root_for(workspaces_root, META_LEAF).resolve()
+        assert meta.parent == _tree_root().parent
+
+    def test_the_parent_is_the_one_get_workspace_uses(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Compared against ``get_workspace``'s own root, never a second literal.
+
+        A ``"./workspaces"`` spelled here would agree with a resolver that had
+        drifted from :func:`get_workspace`, which is precisely the failure the
+        shared ``_workspaces_root`` exists to prevent. It is also what a **second
+        derivation** goes red against, whatever that second derivation is spelled
+        as: the answer has to be this tree's own parent, not a directory that
+        merely looks plausible.
+
+        ``chdir`` is not decoration: with the variable unset the default is
+        relative to the working directory, and ``get_workspace`` **creates** the
+        tree it resolves — without this the spec would write into the developer's
+        own checkout.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv(WORKSPACES_ROOT_VAR, raising=False)
+
+        root = _tree_root()
+        meta = meta_dir_for(WORKSPACE_PATH)
+
+        assert meta.parent == root.parent
+        assert meta.name == f"{root.name}{META_DIR_SUFFIX}"
+        assert not meta.is_relative_to(root)
+
+
+##
+## AC 8 — a leaf may not end in the new suffix
+##
+
+
+class TestALeafMayNotEndInTheMetadataSuffix:
+    """``workspace_id="notes.index"`` would root a tree on another workspace's metadata."""
+
+    def test_a_leaf_ending_in_the_suffix_is_refused(self) -> None:
+        """This story is what creates the collision, so this story closes it.
+
+        Once ``<leaf>.index`` is a real sibling directory, a second card
+        declaring it as a ``workspace_id`` roots its **tree** there and reads,
+        writes and deletes another workspace's exec lock, document cache and
+        index as ordinary in-tree activity. Nothing raises: ``resolve_path``
+        refuses only what resolves outside the root, and that root is a real
+        directory.
+        """
+        with pytest.raises(ValueError, match="metadata directory"):
+            leaf_segment(f"notes{META_DIR_SUFFIX}")
+
+    @pytest.mark.parametrize(
+        "spelling",
+        [
+            f"notes{META_DIR_SUFFIX.upper()}",  # notes.INDEX
+            f"notes{META_DIR_SUFFIX.title()}",  # notes.Index
+            f"notes{META_DIR_SUFFIX.title().swapcase()}",  # notes.iNDEX
+        ],
+    )
+    def test_the_match_is_case_insensitive(self, spelling: str) -> None:
+        """macOS and Windows are case-insensitive by default, so these are one directory.
+
+        Spelled from the constant, so a renamed suffix is still tested in the
+        cases it can actually take, and never in the lower case the plain
+        refusal above already covers.
+        """
+        assert spelling != f"notes{META_DIR_SUFFIX}"
+        with pytest.raises(ValueError, match="metadata directory"):
+            leaf_segment(spelling)
+
+    def test_the_message_names_the_collision_and_the_value(self) -> None:
+        """The admin who caused it has to see which name to change, and to what end."""
+        with pytest.raises(ValueError) as excinfo:
+            leaf_segment(f"notes{META_DIR_SUFFIX}")
+
+        assert META_DIR_SUFFIX in str(excinfo.value)
+        assert f"notes{META_DIR_SUFFIX}" in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        "accepted",
+        [
+            META_DIR_SUFFIX.lstrip("."),  # the suffix's letters, in the wrong place
+            f"{META_DIR_SUFFIX.lstrip('.')}-notes",
+            f"notes{META_DIR_SUFFIX}.md",  # the suffix mid-name, which names no directory
+            f"notes{META_DIR_SUFFIX[:-1]}",  # a shorter ending that merely leads the same way
+            f"notes{META_DIR_SUFFIX}x",
+        ],
+    )
+    def test_only_the_suffix_is_refused_never_the_substring(self, accepted: str) -> None:
+        """Over-refusing costs a real workspace its name, which is not a safer failure.
+
+        Spelled from the constant: literal near-misses of an old suffix would go
+        on passing after a rename while testing nothing near the new one.
+        """
+        assert leaf_segment(accepted) == accepted
+
+    def test_the_rule_is_spelled_once_against_the_resolvers_own_constant(self) -> None:
+        """``meta_dir_for`` builds the directory from the constant; this guard refuses it.
+
+        A second ``".index"`` literal in the guard is a rule that has to agree
+        with another one, and the two drift silently.
+        """
+        assert leaf_segment(f"notes{META_DIR_SUFFIX}x") == f"notes{META_DIR_SUFFIX}x"
+        with pytest.raises(ValueError):
+            leaf_segment(f"x{META_DIR_SUFFIX}")
+
+    def test_a_principal_may_still_end_in_the_suffix(self) -> None:
+        """``user_segment`` is unchanged: the collision is between siblings in one scope.
+
+        There is no metadata directory beside a *scope* — the suffix hangs off
+        the leaf — so refusing a principal here would turn a containment guard
+        into a rejected login at team creation.
+        """
+        assert user_segment(f"alice{META_DIR_SUFFIX}") == f"alice{META_DIR_SUFFIX}"
+
+    def test_the_two_suffixes_are_refused_with_different_reasons(self) -> None:
+        """One shared guard, two collisions — and the admin is told which one they hit.
+
+        The suffixes are checked by one loop over the two derivations' own
+        constants. A loop that collapsed the messages would leave somebody
+        renaming a workspace without knowing what it collided with.
+        """
+        with pytest.raises(ValueError, match="journal directory"):
+            leaf_segment(f"notes{GIT_DIR_SUFFIX}")
+        with pytest.raises(ValueError, match="metadata directory"):
+            leaf_segment(f"notes{META_DIR_SUFFIX}")
+
+
+##
+## Epic 54, story 54-1 AC 9 — both siblings land beside every one of the six cells
+##
+
+
+def _cell_ids(cell: Cell) -> str:
+    return cell.name
+
+
+class TestBothSiblingsLandBesideEveryCell:
+    """``<leaf>.index`` and ``<leaf>.git`` are children of ``<root>/<scope>/<kind>/``.
+
+    Neither ``meta_dir_for`` nor ``git_dir_for`` changed when the kind segment
+    arrived: both are "sibling of the resolved tree", and a three-segment tree
+    gives them the kind directory as a parent with no code change. These specs
+    pin that for every cell **as the card binds it**, against literal paths —
+    so a "fix" that dropped the kind, or a card deriving its metadata directory
+    some other way, goes red here.
+    """
+
+    @pytest.mark.parametrize("cell", SIX_CELLS, ids=_cell_ids)
+    def test_the_metadata_and_journal_siblings_share_the_trees_parent(
+        self,
+        cell: Cell,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspaces_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        card, expected, _observer = bind_cell(cell, orchestrator_proxy, monkeypatch)
+        base = workspaces_root.resolve()
+        scope, kind, _leaf = expected.split("/")
+
+        meta = meta_dir_for(card._workspace_path)
+        git_dir = git_dir_for(card.workspace._root)
+
+        assert meta == Path(f"{base}/{expected}.index")
+        assert card._meta_dir == meta
+        assert git_dir == Path(f"{base}/{expected}.git")
+        assert meta.parent == git_dir.parent == card.workspace._root.parent
+        assert meta.parent == base / scope / kind

@@ -7,37 +7,53 @@ while the call site ignores it is precisely the failure this file exists to catc
 
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 from typing import Any
 
 import pytest
+from akgentic.core.agent_config import BaseConfig
+from akgentic.core.utils import deserialize_object, import_class, serialize
+
 from akgentic.tool.core import COMMAND, LLM_CONTEXT, TOOL_CALL
-from akgentic.tool.vector_store.protocol import CollectionConfig
+from akgentic.tool.vector_store import registry
+from akgentic.tool.vector_store.protocol import VectorStoreParam
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
-from akgentic.tool.workspace.card.params import (
-    WorkspaceRagIndex,
-    WorkspaceRagList,
-    WorkspaceRagSearch,
-    WorkspaceRead,
-)
-from akgentic.tool.workspace.card.rag import RagFactories
 from akgentic.tool.workspace.documents.models import (
     DEFAULT_MAX_DOCUMENT_CHARS,
     DEFAULT_MAX_DOCUMENTS,
-    IN_MEMORY_MAX_DOCUMENT_CHARS,
-    IN_MEMORY_MAX_DOCUMENTS,
     RagFile,
     RagStatus,
+    derived_document_caps,
 )
 from akgentic.tool.workspace.models import WorkspaceConfig
+from akgentic.tool.workspace.rag import (
+    IN_ACTOR_BACKEND,
+    WORKSPACE_LOCAL_BACKEND,
+    RagFactories,
+    workspace_backend,
+)
+from akgentic.tool.workspace.rag.params import (
+    WorkspaceRagIndex,
+    WorkspaceRagList,
+    WorkspaceRagSearch,
+)
+
+# From where it is **defined**, not through ``card/params.py``'s re-export of it.
+# That re-export exists for one purpose — keeping the module path stored
+# ``__model__`` markers name resolving — and ``test_read_capability.py`` is its
+# only guard. An importer here would turn deleting it into a collection error
+# that interrupts the run before that guard ever executes.
+from akgentic.tool.workspace.read.params import WorkspaceRead
 from akgentic.tool.workspace.readers import DocumentReader
 from akgentic.tool.workspace.tool import WorkspaceTool
-
 from tests.workspace.conftest import (
     WORKSPACE_NAME,
     WORKSPACE_PATH,
     FakeActorToolObserver,
     FakeOrchestratorProxy,
+    factory_for,
+    seed_row,
 )
 
 
@@ -47,7 +63,21 @@ def workspace_config_of(orchestrator_proxy: FakeOrchestratorProxy) -> WorkspaceC
         if actor_class is WorkspaceActor:
             assert isinstance(config, WorkspaceConfig)
             return config
-    raise AssertionError("the card never created a workspace actor")
+    raise AssertionError("the card never bound a workspace actor")
+
+
+def document_caps_of(card: WorkspaceTool) -> tuple[int, int]:
+    """The two caps this card derived, read off the cache it built.
+
+    They travelled on ``WorkspaceConfig`` until story 55-8, which is exactly the
+    defect: get-or-create ignores ``config`` on a hit, so the first card of a team
+    to bind fixed both for every later card of that team. They are on the
+    announced :class:`~akgentic.tool.workspace.documents.cache.DocumentCache` now,
+    which is last-writer-wins — and which a card with no actor also has.
+    """
+    cache = card._document_cache
+    assert cache is not None, "the card built no document cache"
+    return cache.max_documents, cache.max_document_chars
 
 
 def bind(
@@ -67,18 +97,24 @@ class RecordingTell:
 
     def __init__(self) -> None:
         self.enable_calls: list[tuple[Any, ...]] = []
+        self.calls: list[str] = []
+        """Every announcement's name, in the order the bind made it."""
 
     def enable_rag(
         self,
         agent_id: str,
         params: WorkspaceRagIndex,
         reader: DocumentReader,
-        collection: CollectionConfig,
+        collection: VectorStoreParam,
     ) -> None:
+        self.calls.append("enable_rag")
         self.enable_calls.append((agent_id, params, reader, collection))
 
     def __getattr__(self, name: str) -> Any:
-        return lambda *args, **kwargs: None
+        def announced(*args: Any, **kwargs: Any) -> None:
+            self.calls.append(name)
+
+        return announced
 
 
 class TestTheCardsRetrievalFields:
@@ -100,7 +136,7 @@ class TestTheCardsRetrievalFields:
 
     def test_the_collection_field_is_named_for_the_workspace(self) -> None:
         """A bare ``collection`` reads as the workspace's collection of files."""
-        assert "rag_collection" in WorkspaceTool.model_fields
+        assert "vector_store" in WorkspaceTool.model_fields
         assert "collection" not in WorkspaceTool.model_fields
 
     def test_a_payload_carrying_the_new_fields_round_trips(self) -> None:
@@ -108,7 +144,7 @@ class TestTheCardsRetrievalFields:
         payload = {
             "workspace_rag_index": {"chunk_chars": 800},
             "workspace_rag_list": {"max_pending_shown": 5},
-            "rag_collection": {"backend": "inmemory", "dimension": 512},
+            "vector_store": {"backend": "inmemory", "dimension": 512},
             "max_documents": 99,
         }
         card = WorkspaceTool.model_validate(payload)
@@ -175,17 +211,19 @@ class TestTheSearchCapability:
         [(_, announced, _, _)] = tell.enable_calls
         assert announced == WorkspaceRagIndex()
 
-    def test_a_search_only_card_also_derives_the_small_caps(
+    def test_a_search_only_card_also_derives_from_the_resolved_backend(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
-        """The second of the three sites that read the predicate."""
-        bind(
-            orchestrator_proxy,
-            workspace_rag_search=True,
-            rag_collection=CollectionConfig(backend="inmemory"),
-        )
+        """The second of the three sites that read the predicate.
 
-        assert workspace_config_of(orchestrator_proxy).max_documents == IN_MEMORY_MAX_DOCUMENTS
+        The card names no backend, so its declaration is the in-actor one and its
+        **resolved** backend is ``local`` — which is what the caps follow since
+        story 55-5. Naming the in-actor backend explicitly is refused at bind (see
+        ``TestAWorkspaceMayNotRunOnTheInActorBackend``).
+        """
+        card, _observer = bind(orchestrator_proxy, workspace_rag_search=True)
+
+        assert document_caps_of(card)[0] == DEFAULT_MAX_DOCUMENTS
 
     def test_a_search_only_card_naming_weaviate_with_no_cluster_fails_at_wiring(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
@@ -195,8 +233,27 @@ class TestTheSearchCapability:
             bind(
                 orchestrator_proxy,
                 workspace_rag_search=True,
-                rag_collection=CollectionConfig(backend="weaviate"),
+                vector_store=VectorStoreParam(backend="weaviate"),
             )
+
+    def test_a_retrieval_card_with_a_mismatched_dimension_fails_at_wiring(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """Same severity as the Weaviate check three lines above it."""
+        with pytest.raises(ValueError, match="WorkspaceTool.*dimension=3072"):
+            bind(
+                orchestrator_proxy,
+                workspace_rag_index=True,
+                vector_store=VectorStoreParam(dimension=3072),
+            )
+
+    def test_a_card_with_retrieval_off_never_inherits_the_dimension_rule(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """Most cards never create the collection and must not be constrained by it."""
+        card, _ = bind(orchestrator_proxy, vector_store=VectorStoreParam(dimension=3072))
+
+        assert card.vector_store.dimension == 3072
 
     def test_a_payload_carrying_the_search_capability_round_trips(self) -> None:
         """Compare the models, never two dumps — ``expose`` is a ``set``."""
@@ -208,20 +265,32 @@ class TestTheSearchCapability:
 
 
 class TestTheSearchCallable:
-    """A thin ask, and the card's configured values travel with it."""
+    """The card runs the whole search; no actor is handed anything (story 57-1)."""
 
-    def test_it_forwards_the_cards_knobs_to_the_actor(
-        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    def test_it_forwards_the_cards_knobs_to_the_search(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The whole search runs on the actor; the card supplies configuration."""
+        """What reaches the search, by equality — so a sixth argument reddens it.
+
+        **Re-pointed in story 57-1, from the actor to the moved function.** It
+        recorded what crossed a mailbox; nothing crosses one now, so it records
+        what the closure hands
+        :func:`~akgentic.tool.workspace.rag.search.search_documents` instead. The
+        knobs and their values are unchanged, and ``score_threshold`` has joined
+        them: it bounds the vector leg, which used to be spent in the closure
+        itself and is now spent one call further in.
+        """
         seen: list[dict[str, Any]] = []
 
-        class Recording:
-            def rag_search(self, query: str, **kwargs: Any) -> str:
-                seen.append({"query": query, **kwargs})
-                return "ok"
+        def recording(cache: Any, store: Any, resolved: Any, query: str, **kwargs: Any) -> str:
+            seen.append({"query": query, **kwargs})
+            return "ok"
 
-        observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=Recording())
+        monkeypatch.setattr("akgentic.tool.workspace.rag.search_documents", recording)
+        observer = FakeActorToolObserver(orchestrator_proxy)
         card = WorkspaceTool(
             workspace_id=WORKSPACE_NAME,
             workspace_rag_search=WorkspaceRagSearch(top_k=3, alpha=0.4, score_threshold=0.2),
@@ -233,6 +302,7 @@ class TestTheSearchCallable:
             {
                 "query": "terms",
                 "top_k": 3,
+                "scope": WORKSPACE_PATH,
                 "path_prefix": "docs/",
                 "alpha": 0.4,
                 "score_threshold": 0.2,
@@ -240,17 +310,20 @@ class TestTheSearchCallable:
         ]
 
     def test_the_callables_own_top_k_overrides_the_cards(
-        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The budget is the one knob the model may set per call."""
         seen: list[int] = []
 
-        class Recording:
-            def rag_search(self, query: str, **kwargs: Any) -> str:
-                seen.append(int(kwargs["top_k"]))
-                return "ok"
+        def recording(cache: Any, store: Any, resolved: Any, query: str, **kwargs: Any) -> str:
+            seen.append(int(kwargs["top_k"]))
+            return "ok"
 
-        observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=Recording())
+        monkeypatch.setattr("akgentic.tool.workspace.rag.search_documents", recording)
+        observer = FakeActorToolObserver(orchestrator_proxy)
         card = WorkspaceTool(
             workspace_id=WORKSPACE_NAME, workspace_rag_search=WorkspaceRagSearch(top_k=3)
         )
@@ -260,16 +333,19 @@ class TestTheSearchCallable:
 
         assert seen == [9]
 
-    def test_it_degrades_to_a_sentence_when_the_actor_raises(
-        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    def test_it_degrades_to_a_sentence_when_the_search_raises(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """It is an LLM-facing callable; a traceback is not an answer it can use."""
 
-        class Gone:
-            def rag_search(self, query: str, **kwargs: Any) -> str:
-                raise RuntimeError("actor is dead")
+        def explodes(cache: Any, store: Any, resolved: Any, query: str, **kwargs: Any) -> str:
+            raise RuntimeError("the records could not be read")
 
-        observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=Gone())
+        monkeypatch.setattr("akgentic.tool.workspace.rag.search_documents", explodes)
+        observer = FakeActorToolObserver(orchestrator_proxy)
         card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_rag_search=True)
         card.observer(observer)
 
@@ -278,7 +354,7 @@ class TestTheSearchCallable:
         )
 
     def test_an_unbound_card_answers_the_sentence_rather_than_raising(self) -> None:
-        """A harness that wires a bare observer binds no proxy at all."""
+        """A harness that wires a bare observer builds no cache at all."""
         card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_rag_search=True)
 
         assert card._rag_search_factory(WorkspaceRagSearch())("terms") == (
@@ -303,19 +379,37 @@ class TestTheSearchCallable:
 class TestTheDerivedCaps:
     """AC10: all three outcomes and the override, at the one construction site."""
 
-    def test_in_memory_with_retrieval_on_shrinks_the_cache(
+    def test_the_caps_come_from_the_backend_the_card_actually_indexes_into(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
-        bind(
-            orchestrator_proxy,
-            workspace_rag_index=True,
-            rag_collection=CollectionConfig(backend="inmemory"),
-        )
+        """Story 55-5 AC 6. The loose end this class used to record is now closed.
 
-        config = workspace_config_of(orchestrator_proxy)
-        assert (config.max_documents, config.max_document_chars) == (
-            IN_MEMORY_MAX_DOCUMENTS,
-            IN_MEMORY_MAX_DOCUMENT_CHARS,
+        ``VectorStoreParam.backend`` defaults to ``default_backend()``, which is
+        the in-actor one wherever no cluster is provisioned, and
+        :func:`workspace_backend` substitutes ``local`` for an **undeclared** one.
+        So deriving from the author's declaration held every default retrieval
+        card in a community or development deployment to the small pair while it
+        indexed into ``local`` — an index on disk, which is not the ~44 MB
+        re-serialisation those constants exist for (ADR-045 §7).
+
+        **The ordinary case, not an exotic one.** The audit's example was a card
+        *declaring* the in-actor backend, which ``require_workspace_backend``
+        refuses before the caps are ever built; this is the configuration nobody
+        has to write down.
+        """
+        card, _observer = bind(orchestrator_proxy, workspace_rag_index=True)
+
+        # Non-vacuity first: the declared and the resolved backend must actually
+        # differ here, or this spec would pass whichever one the derivation read.
+        assert card.vector_store.backend == IN_ACTOR_BACKEND
+        assert workspace_backend(card.vector_store) == WORKSPACE_LOCAL_BACKEND
+
+        assert document_caps_of(card) == derived_document_caps(
+            workspace_backend(card.vector_store), True
+        )
+        assert document_caps_of(card) == (
+            DEFAULT_MAX_DOCUMENTS,
+            DEFAULT_MAX_DOCUMENT_CHARS,
         )
 
     def test_weaviate_with_retrieval_on_keeps_the_large_cache(
@@ -327,14 +421,13 @@ class TestTheDerivedCaps:
         # A card naming Weaviate with no cluster fails at wiring, which is its own
         # spec below; here the cluster exists so the caps are what is under test.
         monkeypatch.setenv("AKGENTIC_WEAVIATE_URL", "https://cluster.example")
-        bind(
+        card, _observer = bind(
             orchestrator_proxy,
             workspace_rag_index=True,
-            rag_collection=CollectionConfig(backend="weaviate"),
+            vector_store=VectorStoreParam(backend="weaviate"),
         )
 
-        config = workspace_config_of(orchestrator_proxy)
-        assert (config.max_documents, config.max_document_chars) == (
+        assert document_caps_of(card) == (
             DEFAULT_MAX_DOCUMENTS,
             DEFAULT_MAX_DOCUMENT_CHARS,
         )
@@ -342,11 +435,17 @@ class TestTheDerivedCaps:
     def test_retrieval_off_keeps_the_large_cache_on_an_in_memory_backend(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
-        """No vectors exist, so nothing is derived from the document cap."""
-        bind(orchestrator_proxy, rag_collection=CollectionConfig(backend="inmemory"))
+        """No vectors exist, so nothing is derived from the document cap.
 
-        config = workspace_config_of(orchestrator_proxy)
-        assert (config.max_documents, config.max_document_chars) == (
+        A retrieval-off card may still *declare* the in-actor backend: the refusal
+        is inside the same ``_rag_enabled()`` guard as the two ``require_*`` calls,
+        because a card that will never open a store owes it no obligation.
+        """
+        card, _observer = bind(
+            orchestrator_proxy, vector_store=VectorStoreParam(backend="inmemory")
+        )
+
+        assert document_caps_of(card) == (
             DEFAULT_MAX_DOCUMENTS,
             DEFAULT_MAX_DOCUMENT_CHARS,
         )
@@ -355,33 +454,60 @@ class TestTheDerivedCaps:
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         """ "An explicit catalog value always wins" is what the two fields are for."""
-        bind(
+        card, _observer = bind(
             orchestrator_proxy,
             workspace_rag_index=True,
-            rag_collection=CollectionConfig(backend="inmemory"),
             max_documents=99,
             max_document_chars=12345,
         )
 
-        config = workspace_config_of(orchestrator_proxy)
-        assert (config.max_documents, config.max_document_chars) == (99, 12345)
+        assert document_caps_of(card) == (99, 12345)
 
-    def test_the_list_capability_alone_also_derives_the_small_caps(
+    def test_the_list_capability_alone_also_derives_from_the_resolved_backend(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         """Either capability turns retrieval on, and the caps follow retrieval."""
-        bind(
-            orchestrator_proxy,
-            workspace_rag_list=True,
-            rag_collection=CollectionConfig(backend="inmemory"),
-        )
+        card, _observer = bind(orchestrator_proxy, workspace_rag_list=True)
 
-        config = workspace_config_of(orchestrator_proxy)
-        assert config.max_documents == IN_MEMORY_MAX_DOCUMENTS
+        assert document_caps_of(card)[0] == DEFAULT_MAX_DOCUMENTS
 
 
 class TestTheWeaviateCheck:
-    """It is imposed on the cards that asked for Weaviate, and on no others."""
+    """It is imposed on the cards that asked for a cluster, and on no others."""
+
+    def test_a_retrieval_card_naming_qdrant_with_no_cluster_fails_at_wiring(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The guard is backend-agnostic now, so qdrant fails the build like weaviate.
+
+        Before this it only tested ``backend == "weaviate"``, so a qdrant card with
+        no URL passed the check and degraded silently at ``enable_rag``.
+        """
+        monkeypatch.delenv("AKGENTIC_QDRANT_URL", raising=False)
+
+        with pytest.raises(ValueError, match="AKGENTIC_QDRANT_URL") as excinfo:
+            bind(
+                orchestrator_proxy,
+                workspace_rag_search=True,
+                vector_store=VectorStoreParam(backend="qdrant"),
+            )
+        assert "WorkspaceTool" in str(excinfo.value)
+
+    def test_a_retrieval_off_card_naming_qdrant_does_not_raise(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A retrieval-off card inherits no collection constraint at all."""
+        monkeypatch.delenv("AKGENTIC_QDRANT_URL", raising=False)
+
+        card, _ = bind(orchestrator_proxy, vector_store=VectorStoreParam(backend="qdrant"))
+
+        assert card.vector_store.backend == "qdrant"
 
     def test_a_retrieval_card_naming_weaviate_with_no_cluster_fails_at_wiring(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
@@ -391,16 +517,16 @@ class TestTheWeaviateCheck:
             bind(
                 orchestrator_proxy,
                 workspace_rag_index=True,
-                rag_collection=CollectionConfig(backend="weaviate"),
+                vector_store=VectorStoreParam(backend="weaviate"),
             )
 
     def test_a_card_with_retrieval_off_is_untouched_by_the_check(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         """The overwhelming majority of ``WorkspaceTool()`` instances never enable it."""
-        card, _ = bind(orchestrator_proxy, rag_collection=CollectionConfig(backend="weaviate"))
+        card, _ = bind(orchestrator_proxy, vector_store=VectorStoreParam(backend="weaviate"))
 
-        assert card.rag_collection.backend == "weaviate"
+        assert card.vector_store.backend == "weaviate"
 
     def test_a_plain_card_binds_with_no_collection_configuration_at_all(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
@@ -408,11 +534,63 @@ class TestTheWeaviateCheck:
         """``id_workspace.yaml`` ships ``payload: {}``; defaults must suffice."""
         card, _ = bind(orchestrator_proxy)
 
-        assert card.rag_collection.backend == "inmemory"
+        assert card.vector_store.backend == "inmemory"
+
+
+class TestTheCardCreatesNoStoreActor:
+    """**Premise reversed for the actor-backed case** — see the class below.
+
+    Story 51-1 moved the store to the workspace actor's own child, which is what
+    a *hosted* actor required (core ADR-022 Decision 3). Nothing is hosted after
+    epic 52, and Decision 2 records that the prohibition was always on the actor:
+    "a card keeps talking to its orchestrator". So a backend that needs an actor
+    is bound by the card again, through the team's one ``#VectorStore``.
+
+    What survives unchanged is the **cluster** case: there is nothing for an actor
+    to hold, so no store actor is created for one — and the retrieval-off case,
+    which creates nothing at all.
+    """
+
+    def test_a_cluster_retrieval_card_creates_no_store_actor(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from akgentic.tool.vector_store.actor import VectorStoreActor
+
+        monkeypatch.setenv("AKGENTIC_WEAVIATE_URL", "http://localhost:8080")
+        bind(
+            orchestrator_proxy,
+            workspace_rag_index=True,
+            vector_store=VectorStoreParam(backend="weaviate"),
+        )
+
+        # Kept as a positive with a negative beside it: the bind happened, and
+        # nothing it did named a store actor on the child path. There is no host
+        # path to name one on: the core this package ships against has none.
+        created = [cls for cls, _config in orchestrator_proxy.create_calls]
+        assert created == [WorkspaceActor]
+        assert VectorStoreActor not in created
+
+    def test_a_retrieval_off_card_creates_no_store_actor(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        from akgentic.tool.vector_store.actor import VectorStoreActor
+
+        bind(orchestrator_proxy, vector_store=VectorStoreParam(backend="inmemory"))
+
+        # **Nothing at all is created.** The store actor was never this card's to
+        # create with retrieval off; the workspace actor stopped being created
+        # too in story 55-8, because a card enabling neither exec nor retrieval
+        # dispatches nothing.
+        created = [cls for cls, _config in orchestrator_proxy.create_calls]
+        assert created == []
+        assert VectorStoreActor not in created
 
 
 class TestTheBindTimeAnnouncement:
-    """``getChildrenOrCreate`` fixes the config; a capable card announces itself."""
+    """The first bind fixes the config; a capable card announces itself."""
 
     def test_a_retrieval_card_announces_itself(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
@@ -424,7 +602,7 @@ class TestTheBindTimeAnnouncement:
             orchestrator_proxy,
             tell_proxy=tell,
             workspace_rag_index=params,
-            rag_collection=CollectionConfig(backend="inmemory", tenant="acme"),
+            vector_store=VectorStoreParam(tenant="acme"),
         )
 
         [(agent_id, announced, reader, collection)] = tell.enable_calls
@@ -432,6 +610,25 @@ class TestTheBindTimeAnnouncement:
         assert announced == params
         assert isinstance(reader, DocumentReader)
         assert collection.tenant == "acme"
+
+    def test_the_document_store_is_announced_before_retrieval_is_enabled(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """The actor may never enable retrieval under a store it has not been given.
+
+        Story 52-3's ordering clause, and the reason ``_announce_document_store``
+        sits between the bind and ``_announce_rag`` rather than after it: the
+        moment retrieval is on, the actor reads and writes index rows, and a
+        window where it does that with no store is a window where the index looks
+        empty and every row it writes is dropped.
+        """
+        tell = RecordingTell()
+
+        bind(orchestrator_proxy, tell_proxy=tell, workspace_rag_index=True)
+
+        assert "configure_document_cache" in tell.calls
+        assert "enable_rag" in tell.calls
+        assert tell.calls.index("configure_document_cache") < tell.calls.index("enable_rag")
 
     def test_a_card_with_retrieval_off_announces_nothing(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
@@ -586,11 +783,15 @@ class TestTheProvider:
 
         card, _ = bind(orchestrator_proxy, workspace_rag_list=True)
         actor = self._actor(orchestrator_proxy)
-        actor.state.rag_index["notes.md"] = RagFile(
-            path="notes.md",
-            status=RagStatus.EMBEDDED,
-            chunk_count=4,
-            updated_at=datetime.now(UTC),
+        seed_row(
+            actor,
+            "notes.md",
+            RagFile(
+                path="notes.md",
+                status=RagStatus.EMBEDDED,
+                chunk_count=4,
+                updated_at=datetime.now(UTC),
+            ),
         )
 
         [provider] = card.get_context_states()
@@ -611,16 +812,25 @@ class TestTheProvider:
         assert state is not None
         assert state.render_full() == "No workspace files are indexed for retrieval."
 
-    def test_it_returns_none_when_the_actor_is_unreachable(
-        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    def test_it_returns_none_when_the_render_raises(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The ``ContextState`` contract: never raise, answer ``None`` instead."""
+        """The ``ContextState`` contract: never raise, answer ``None`` instead.
 
-        class Gone:
-            def rag_snapshot(self, max_pending_shown: int) -> Any:
-                raise RuntimeError("actor is dead")
+        Re-pointed in story 57-1: the failure it stood for was an actor that had
+        died, and the provider reaches no actor now. What can still fail is the
+        render itself — an unreadable record directory — and the contract is the
+        same.
+        """
 
-        observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=Gone())
+        def explodes(cache: Any, max_pending_shown: int) -> Any:
+            raise RuntimeError("the records could not be read")
+
+        monkeypatch.setattr("akgentic.tool.workspace.rag.render_index_state", explodes)
+        observer = FakeActorToolObserver(orchestrator_proxy)
         card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_rag_list=True)
         card.observer(observer)
 
@@ -629,17 +839,20 @@ class TestTheProvider:
         assert provider() is None
 
     def test_the_card_cap_reaches_the_snapshot(
-        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """``max_pending_shown`` is captured at ``get_context_states`` time."""
         seen: list[int] = []
 
-        class Recording:
-            def rag_snapshot(self, max_pending_shown: int) -> Any:
-                seen.append(max_pending_shown)
-                return None
+        def recording(cache: Any, max_pending_shown: int) -> Any:
+            seen.append(max_pending_shown)
+            return None
 
-        observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=Recording())
+        monkeypatch.setattr("akgentic.tool.workspace.rag.render_index_state", recording)
+        observer = FakeActorToolObserver(orchestrator_proxy)
         card = WorkspaceTool(
             workspace_id=WORKSPACE_NAME,
             workspace_rag_list=WorkspaceRagList(max_pending_shown=7),
@@ -661,9 +874,9 @@ class TestTheMixinRules:
 
     def test_no_two_card_mixins_define_the_same_name(self) -> None:
         """A real definition on two bases lets the MRO pick a winner in silence."""
-        from akgentic.tool.workspace.card.execution import ExecFactories
-        from akgentic.tool.workspace.card.read import ReadFactories
-        from akgentic.tool.workspace.card.write import WriteFactories
+        from akgentic.tool.workspace.execution.card import ExecFactories
+        from akgentic.tool.workspace.read import ReadFactories
+        from akgentic.tool.workspace.write import WriteFactories
 
         owners: dict[str, str] = {}
         for mixin in (ReadFactories, WriteFactories, ExecFactories, RagFactories):
@@ -696,6 +909,9 @@ class TestTheCallablesThemselves:
         """The counts are the answer, which is why this leg is an ask."""
 
         class Counting:
+            def attach(self, agent: Any, agent_name: str) -> None:
+                """The bind-time holder registration — the actor was alive then."""
+
             def index_paths(self, path: str, force: bool) -> str:
                 return f"queued {path!r} force={force}"
 
@@ -711,6 +927,9 @@ class TestTheCallablesThemselves:
         """It is an LLM-facing callable; a traceback is not an answer it can use."""
 
         class Gone:
+            def attach(self, agent: Any, agent_name: str) -> None:
+                """The bind-time holder registration — the actor was alive then."""
+
             def index_paths(self, path: str, force: bool) -> str:
                 raise RuntimeError("actor is dead")
 
@@ -731,11 +950,15 @@ class TestTheCallablesThemselves:
         card, _ = bind(orchestrator_proxy, workspace_rag_list=True)
         _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
-        actor.state.rag_index["notes.md"] = RagFile(
-            path="notes.md",
-            status=RagStatus.EMBEDDED,
-            chunk_count=4,
-            updated_at=datetime.now(UTC),
+        seed_row(
+            actor,
+            "notes.md",
+            RagFile(
+                path="notes.md",
+                status=RagStatus.EMBEDDED,
+                chunk_count=4,
+                updated_at=datetime.now(UTC),
+            ),
         )
 
         rendered = card.get_commands()[WorkspaceRagList]()
@@ -743,14 +966,19 @@ class TestTheCallablesThemselves:
         assert "notes.md" in rendered
         assert "4 chunk(s)" in rendered
 
-    def test_the_list_command_degrades_when_the_actor_raises(
-        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    def test_the_list_command_degrades_when_the_render_raises(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        class Gone:
-            def rag_snapshot(self, max_pending_shown: int) -> Any:
-                raise RuntimeError("actor is dead")
+        """Re-pointed in story 57-1: no actor is reached, but a read can still fail."""
 
-        observer = FakeActorToolObserver(orchestrator_proxy, workspace_proxy=Gone())
+        def explodes(cache: Any, max_pending_shown: int) -> Any:
+            raise RuntimeError("the records could not be read")
+
+        monkeypatch.setattr("akgentic.tool.workspace.rag.render_index_state", explodes)
+        observer = FakeActorToolObserver(orchestrator_proxy)
         card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_rag_list=True)
         card.observer(observer)
 
@@ -775,3 +1003,563 @@ class TestTheCallablesThemselves:
         card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_rag_index=True)
 
         card._announce_rag()  # must not raise
+
+
+##
+## Story 52-4 — the card resolves the team's store again
+##
+
+
+def store_configs_of(orchestrator_proxy: FakeOrchestratorProxy) -> list[BaseConfig]:
+    """Every ``VectorStoreActor`` config the card asked the orchestrator to create."""
+    from akgentic.tool.vector_store.actor import VectorStoreActor
+
+    return [
+        config
+        for actor_class, config in orchestrator_proxy.create_calls
+        if actor_class is VectorStoreActor
+    ]
+
+
+class TestTheCardBindsTheTeamsStore:
+    """AC 7. Exactly one ``#VectorStore``, created here and looked up by name."""
+
+    def test_a_retrieval_card_creates_the_teams_store_and_resolves_a_proxy_to_it(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VS_ACTOR_ROLE
+
+        card, _ = bind(orchestrator_proxy, workspace_rag_index=True)
+
+        [config] = store_configs_of(orchestrator_proxy)
+        assert (config.name, config.role) == (VS_ACTOR_NAME, VS_ACTOR_ROLE)
+        assert orchestrator_proxy.member_lookups == [VS_ACTOR_NAME]
+        # The card holds the object the lookup returned, never one it built.
+        assert card._vector_store is orchestrator_proxy.children[VS_ACTOR_NAME][1]
+
+    def test_two_retrieval_cards_in_one_team_share_the_one_store(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """``getChildrenOrCreate`` is idempotent, so a team holds one store however
+        many cards ask for one — which is the whole point of going back to it."""
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME, VectorStoreActor
+
+        first, _ = bind(orchestrator_proxy, workspace_rag_index=True)
+        second, _ = bind(orchestrator_proxy, workspace_rag_search=True)
+
+        created = [cls for cls, _config in orchestrator_proxy.create_calls]
+        assert created.count(VectorStoreActor) == 2  # asked twice
+        assert len(store_configs_of(orchestrator_proxy)) == 2
+        # Created once, and the workspace beside it once: two cards on one tree
+        # in one team share both actors, which is what get-or-create buys.
+        assert created.count(VectorStoreActor) == 2
+        assert set(orchestrator_proxy.children) == {
+            VS_ACTOR_NAME,
+            workspace_actor_name(WORKSPACE_PATH),
+        }
+        assert first._vector_store is second._vector_store
+
+    def test_a_plain_card_creates_no_store_resolves_nothing_and_announces_nothing(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """AC 7's second half, and the one most likely to pass vacuously.
+
+        Asserted on the **absence of the calls**, never on ``_vector_store`` being
+        ``None``: a card that made every call and then failed to keep the result
+        would leave the slot ``None`` too, and the whole point is that a bare
+        ``WorkspaceTool()`` — the overwhelming majority of them — costs nothing.
+        """
+        from akgentic.tool.vector_store.actor import VectorStoreActor
+
+        tell = RecordingTell()
+
+        card, _ = bind(orchestrator_proxy, tell_proxy=tell)
+
+        # **Nothing is created at all.** The workspace's own bind was on this
+        # list from 52-5 until 55-8 gated it on a capability that dispatches; a
+        # bare ``WorkspaceTool()`` enables none, so the equality is the empty one.
+        created = [cls for cls, _config in orchestrator_proxy.create_calls]
+        assert created == []
+        assert VectorStoreActor not in created
+        assert orchestrator_proxy.member_lookups == []
+        assert "configure_vector_store" not in tell.calls
+        assert card._vector_store is None
+        assert card._resolved_store is None
+
+    def test_the_card_passes_its_real_team_and_nothing_passes_none(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Story 51-4 neutralised the team; the row identity carries it no more.
+
+        The cluster branch is where the team is visible, because that is the one
+        that builds a backend directly from a ``BackendContext``.
+        """
+        from akgentic.tool.vector_store.protocol import VectorStoreService
+
+        contexts: list[Any] = []
+
+        class _Client:
+            def create_collection(self, name: str, config: VectorStoreParam) -> None: ...
+            def add(self, collection: str, entries: list[Any]) -> None: ...
+            def remove(self, collection: str, ref_ids: list[str], **kwargs: Any) -> None: ...
+            def search(self, *args: Any, **kwargs: Any) -> Any: ...
+
+        def _factory(context: Any) -> VectorStoreService:
+            contexts.append(context)
+            return _Client()
+
+        monkeypatch.setenv("AKGENTIC_WEAVIATE_URL", "https://cluster.example")
+        with factory_for("weaviate", _factory):
+            _card, observer = bind(
+                orchestrator_proxy,
+                workspace_rag_index=True,
+                vector_store=VectorStoreParam(backend="weaviate"),
+            )
+
+        assert [context.team_id for context in contexts] == [str(observer.team_id)]
+        assert None not in [context.team_id for context in contexts]
+
+
+class TestTheStoreIsAnnouncedBeforeRetrievalIsEnabled:
+    """AC 8. The ordering, pinned — moving the announcement later must break this."""
+
+    def test_the_store_announcement_precedes_enable_rag(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        tell = RecordingTell()
+
+        bind(orchestrator_proxy, tell_proxy=tell, workspace_rag_index=True)
+
+        assert "configure_vector_store" in tell.calls
+        assert tell.calls.index("configure_vector_store") < tell.calls.index("enable_rag")
+
+    def test_the_actor_is_handed_the_object_the_card_resolved(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """Not an equivalent one it built itself: identity, on the announced object."""
+        announced: list[Any] = []
+
+        class _Watching(RecordingTell):
+            def configure_vector_store(self, store: Any) -> None:
+                self.calls.append("configure_vector_store")
+                announced.append(store)
+
+        tell = _Watching()
+        card, _ = bind(orchestrator_proxy, tell_proxy=tell, workspace_rag_index=True)
+
+        assert announced == [card._vector_store]
+
+    def test_a_lost_announcement_does_not_fail_the_bind(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """It degrades: the actor answers its unavailable sentence and rebinding fixes it."""
+
+        class _Broken(RecordingTell):
+            def configure_vector_store(self, store: Any) -> None:
+                raise RuntimeError("the actor died between the bind and this line")
+
+        card, _ = bind(orchestrator_proxy, tell_proxy=_Broken(), workspace_rag_index=True)
+
+        assert card._vector_store is not None
+
+
+class TestTheResolvedParamIsDerivedNotDeclared:
+    """AC 9, 11 and 12: what the card sends, and what it leaves the author's field."""
+
+    def test_a_card_naming_no_backend_indexes_into_the_file_backed_one(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        tell = RecordingTell()
+
+        card, _ = bind(orchestrator_proxy, tell_proxy=tell, workspace_rag_index=True)
+
+        [(_, _, _, collection)] = tell.enable_calls
+        assert collection.backend == "local"
+        # The author's declaration is untouched by the bind.
+        assert card.vector_store.backend == "inmemory"
+        assert card.vector_store.root is None
+
+    def test_the_root_is_this_trees_metadata_directory(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        from akgentic.tool.workspace.workspace import meta_dir_for
+
+        tell = RecordingTell()
+
+        bind(orchestrator_proxy, tell_proxy=tell, workspace_rag_index=True)
+
+        [(_, _, _, collection)] = tell.enable_calls
+        assert collection.root == str(meta_dir_for(WORKSPACE_PATH))
+
+    def test_an_explicitly_named_backend_is_untouched(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Nothing about the cluster path changes: same backend, same collection."""
+        tell = RecordingTell()
+
+        monkeypatch.setenv("AKGENTIC_WEAVIATE_URL", "https://cluster.example")
+        with factory_for("weaviate", lambda _ctx: object()):
+            card, _ = bind(
+                orchestrator_proxy,
+                tell_proxy=tell,
+                workspace_rag_index=True,
+                vector_store=VectorStoreParam(
+                    backend="weaviate",
+                    dimension=3072,
+                    embedding_model="text-embedding-3-large",
+                ),
+            )
+
+        [(_, _, _, collection)] = tell.enable_calls
+        assert (collection.backend, collection.dimension) == ("weaviate", 3072)
+        assert card.vector_store.backend == "weaviate"
+
+    def test_a_root_declared_in_a_catalog_is_inert(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """AC 12. Nothing an author writes can point one tree's index at another's."""
+        from akgentic.tool.workspace.workspace import meta_dir_for
+
+        tell = RecordingTell()
+
+        card, _ = bind(
+            orchestrator_proxy,
+            tell_proxy=tell,
+            workspace_rag_index=True,
+            vector_store=VectorStoreParam(root="/somebody/elses/tree"),
+        )
+
+        [(_, _, _, collection)] = tell.enable_calls
+        assert collection.root == str(meta_dir_for(WORKSPACE_PATH))
+        assert collection.root != "/somebody/elses/tree"
+        # And the author's own record still says what they wrote.
+        assert card.vector_store.root == "/somebody/elses/tree"
+
+    def test_the_derived_param_is_copied_never_rebuilt(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """Golden Rule 12, in the only formulation that works.
+
+        A whole-model comparison passes green against a rebuild that names every
+        field existing today — which is the failure this rule is about, since the
+        field added tomorrow is the one that disappears. So the param carries a
+        field the write path has never heard of, and the assertion is that the
+        subclass **and its sentinel** come out the other side.
+        """
+
+        class _VectorStoreParamWithExtraField(VectorStoreParam):
+            extra_field: str = "sentinel"
+
+        tell = RecordingTell()
+
+        bind(
+            orchestrator_proxy,
+            tell_proxy=tell,
+            workspace_rag_index=True,
+            vector_store=_VectorStoreParamWithExtraField(),
+        )
+
+        [(_, _, _, collection)] = tell.enable_calls
+        assert isinstance(collection, _VectorStoreParamWithExtraField)
+        assert collection.extra_field == "sentinel"
+
+
+class TestAWorkspaceMayNotRunOnTheInActorBackend:
+    """Ruling E. An index that dies with the process, under rows that do not."""
+
+    def test_a_retrieval_card_declaring_the_in_actor_backend_fails_the_bind(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """It fails at wiring, in front of the admin who wrote it, and names the fix."""
+        with pytest.raises(ValueError) as excinfo:
+            bind(
+                orchestrator_proxy,
+                workspace_rag_index=True,
+                vector_store=VectorStoreParam(backend="inmemory"),
+            )
+
+        message = str(excinfo.value)
+        assert "WorkspaceTool" in message
+        assert "local" in message
+        assert orchestrator_proxy.create_calls == []
+
+    def test_a_stored_payload_declaring_it_is_refused_the_same_way(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """A catalog is where this is most likely to be written, so it is checked there."""
+        observer = FakeActorToolObserver(orchestrator_proxy)
+        card = WorkspaceTool.model_validate(
+            {
+                "workspace_id": WORKSPACE_NAME,
+                "workspace_rag_index": True,
+                "vector_store": {"backend": "inmemory"},
+            }
+        )
+
+        with pytest.raises(ValueError, match="not a workspace backend"):
+            card.observer(observer)
+
+    def test_a_card_that_named_nothing_still_binds_after_a_serialisation_round_trip(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """The refusal must not fire on a value the author never wrote.
+
+        ``SerializableBaseModel`` declares a whole-model serializer that emits
+        **every** field, so one ``model_dump()`` / ``model_validate()`` round trip
+        makes every field look explicitly set — and the agent-card store performs
+        exactly that round trip on every team resume. Discriminating on
+        ``model_fields_set`` therefore turned a card that named no backend into one
+        that had "declared" the in-actor backend, and refused it at the next bind
+        with a message blaming its author. The record is a field now, so the trip
+        is invisible.
+        """
+        tell = RecordingTell()
+        stored = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_rag_index=True).model_dump()
+        card = WorkspaceTool.model_validate(stored)
+
+        # The trip really did inflate the naive discriminator — without this the
+        # spec could pass while proving nothing.
+        assert "backend" in card.vector_store.model_fields_set
+        assert card.vector_store.backend_declared is False
+
+        card.observer(FakeActorToolObserver(orchestrator_proxy, workspace_tell_proxy=tell))
+
+        [(_, _, _, collection)] = tell.enable_calls
+        assert collection.backend == "local"
+
+    def test_a_declaration_survives_the_round_trip_and_is_still_refused(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """The other half: the trip must not launder a declaration away either."""
+        stored = WorkspaceTool(
+            workspace_id=WORKSPACE_NAME,
+            workspace_rag_index=True,
+            vector_store=VectorStoreParam(backend="inmemory"),
+        ).model_dump()
+        card = WorkspaceTool.model_validate(stored)
+
+        assert card.vector_store.backend_declared is True
+        with pytest.raises(ValueError, match="not a workspace backend"):
+            card.observer(FakeActorToolObserver(orchestrator_proxy))
+
+    def test_a_retrieval_card_naming_a_backend_nobody_registered_fails_the_bind(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """At the bind, not merely in the resolver — the gap story 52-3 shipped.
+
+        ``require_backend_configured`` looks the name up in the registry, so an
+        unregistered one raises before anything is created. Asserting it on the
+        resolver alone would leave the card free to stop calling it.
+        """
+        with pytest.raises((ValueError, KeyError)):
+            bind(
+                orchestrator_proxy,
+                workspace_rag_index=True,
+                vector_store=VectorStoreParam(backend="no-such-backend"),
+            )
+
+        assert orchestrator_proxy.create_calls == []
+
+    def test_a_retrieval_off_card_declaring_it_binds_normally(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """The refusal is inside the same guard as the two ``require_*`` calls."""
+        card, _ = bind(orchestrator_proxy, vector_store=VectorStoreParam(backend="inmemory"))
+
+        assert card.vector_store.backend == "inmemory"
+
+    def test_the_knowledge_graph_and_the_plan_still_get_the_in_actor_backend(self) -> None:
+        """AC 14. They keep their rows in actor state beside the index, so it fits.
+
+        The mismatch this rule exists for is a *persisted* row over an empty
+        engine; a consumer whose rows live in the same actor state as its index
+        loses and restores both together and never had one.
+        """
+        from akgentic.tool.vector_store.protocol import needs_store_actor
+
+        assert needs_store_actor(VectorStoreParam(backend="inmemory")) is True
+        assert registry.get_backend_spec("inmemory").persists_in_actor_state is True
+
+
+class TestTheStoreResolutionDegradesRatherThanFailingTheBind:
+    """A retrieval capability is one of twenty on a card whose others are file ops."""
+
+    def test_a_store_the_team_does_not_hold_after_creation_degrades(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """The lookup answering ``None`` is a real answer — core's, for a miss.
+
+        It should not happen after ``ensure_store_actor`` returns, which is why it
+        is a WARNING and not a raise: the bind carries on and the workspace's
+        other capabilities are unaffected.
+        """
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
+
+        tell = RecordingTell()
+        orchestrator_proxy.get_team_member = lambda _name: None  # type: ignore[method-assign]
+
+        card, _ = bind(orchestrator_proxy, tell_proxy=tell, workspace_rag_index=True)
+
+        assert card._vector_store is None
+        assert "configure_vector_store" not in tell.calls
+        assert card.workspace is not None  # the rest of the bind completed
+        assert VS_ACTOR_NAME
+
+    def test_a_factory_that_cannot_reach_its_cluster_degrades(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """One WARNING naming the backend, no store, and the bind still returns."""
+        import logging
+
+        def _factory(_context: Any) -> Any:
+            raise ValueError("cluster unreachable")
+
+        monkeypatch.setenv("AKGENTIC_WEAVIATE_URL", "https://cluster.example")
+        with (
+            factory_for("weaviate", _factory),
+            caplog.at_level(logging.WARNING, logger="akgentic.tool.workspace.card"),
+        ):
+            card, _ = bind(
+                orchestrator_proxy,
+                workspace_rag_index=True,
+                vector_store=VectorStoreParam(backend="weaviate"),
+            )
+
+        assert card._vector_store is None
+        warnings = [
+            record
+            for record in caplog.records
+            if record.levelno == logging.WARNING and record.name == "akgentic.tool.workspace.card"
+        ]
+        assert len(warnings) == 1
+        assert "weaviate" in warnings[0].getMessage()
+        assert "cluster unreachable" in warnings[0].getMessage()
+
+
+##
+## A card a deployment already persisted with a retrieval parameter still loads
+##
+
+STORED_MARKER_MODULE = "akgentic.tool.workspace.card.params"
+"""The module path a deployment's stored retrieval parameters carry in ``__model__``.
+
+**Captured by serializing a configured card on the working tree, not transcribed
+from a design document** — the discipline ``test_read_capability.py`` and
+``test_write_capability.py`` already follow for their own six.
+
+``serialize_base_model`` stamps ``f"{cls.__module__}.{cls.__name__}"`` on every
+:class:`~akgentic.core.utils.SerializableBaseModel`, and ``BaseToolParam`` is one,
+so every card written since the card decomposition with a retrieval parameter set
+explicitly carries this literal string. Reading one back is ``import_module`` plus
+``getattr`` on exactly it
+(:func:`akgentic.core.utils.deserializer.import_class`); a path that has gone
+raises ``UnresolvableClassError``, which turns a stored team's tool card into a bad
+record rather than a card.
+
+So the three retrieval parameters keep resolving *here* whatever module actually
+defines them — and the specs below are written so that the same source asserts the
+same thing before and after they move into ``rag/params.py``.
+"""
+
+RETRIEVAL_PARAM_NAMES = ["WorkspaceRagIndex", "WorkspaceRagList", "WorkspaceRagSearch"]
+"""The three parameters of the retrieval capability, by the name a marker can carry."""
+
+
+@pytest.fixture
+def explicitly_configured_card() -> WorkspaceTool:
+    """A card carrying two retrieval parameters the author set by hand.
+
+    Two rather than one, and two *different* capabilities of the three: a marker is
+    stamped per nested model, so a single one could be preserved by an accident
+    that a second would expose.
+    """
+    return WorkspaceTool(
+        workspace_id=WORKSPACE_NAME,
+        workspace_rag_index=WorkspaceRagIndex(chunk_chars=800),
+        workspace_rag_search=WorkspaceRagSearch(top_k=3),
+    )
+
+
+class TestStoredRetrievalParamsStillResolve:
+    """The persisted ``__model__`` markers, end to end through core's own path."""
+
+    def test_every_retrieval_param_resolves_through_the_stored_module_path(self) -> None:
+        """``import_module`` + ``getattr``, exactly as ``import_class`` does it.
+
+        ``hasattr`` on the package would not catch this: the mechanism that keeps
+        these three resolving once they are defined elsewhere is a **re-export**,
+        which only an import of this precise module path exercises.
+        """
+        module = importlib.import_module(STORED_MARKER_MODULE)
+        for name in RETRIEVAL_PARAM_NAMES:
+            assert getattr(module, name, None) is not None, (
+                f"{STORED_MARKER_MODULE}.{name} no longer resolves — every card "
+                f"persisted with that parameter set explicitly carries that literal string"
+            )
+
+    def test_the_stored_path_serves_the_same_classes_the_card_uses(self) -> None:
+        """A second definition would deserialise into a class nothing else uses.
+
+        A re-export satisfies this; a copy of the class body, which is the tempting
+        way to "keep the path working", does not.
+        """
+        stored = importlib.import_module(STORED_MARKER_MODULE)
+        facade = importlib.import_module("akgentic.tool.workspace")
+        for name in RETRIEVAL_PARAM_NAMES:
+            assert getattr(stored, name) is getattr(facade, name)
+
+    def test_a_freshly_dumped_card_carries_markers_that_resolve(
+        self, explicitly_configured_card: WorkspaceTool
+    ) -> None:
+        """Whatever module a parameter lives in, the path a dump stamps must import back.
+
+        This is the row that legitimately *changes* with the move — a dump names
+        wherever the class is defined — so it is written as the invariant rather
+        than as a literal: the stamped path resolves, and to the very class the card
+        is holding.
+        """
+        dumped = serialize(explicitly_configured_card)
+        assert isinstance(dumped, dict)
+
+        for field in ("workspace_rag_index", "workspace_rag_search"):
+            marker = dumped[field]["__model__"]
+            assert import_class(marker) is type(getattr(explicitly_configured_card, field))
+
+    def test_a_record_written_before_the_move_still_validates_into_an_equal_card(
+        self, explicitly_configured_card: WorkspaceTool
+    ) -> None:
+        """The end-to-end property, on the literal a deployment's database holds.
+
+        The markers are rewritten to :data:`STORED_MARKER_MODULE` rather than left
+        as the dump produced them, so this spec asserts the **same thing before and
+        after** the parameters move: on the un-moved tree the rewrite is a no-op and
+        the record is exactly what a deployment stored; afterwards it is the
+        pre-move record, which is the one that has to keep loading.
+
+        Its non-vacuity is the two specs above: they prove the path is real.
+
+        **The comparison is the two cards, not their two dumps.** ``expose`` is a
+        ``set``, so a dump renders it as a list in *set-iteration* order and whether
+        two such lists agree depends on ``PYTHONHASHSEED``; pydantic's own equality
+        compares field values, where two equal sets are equal whatever order they
+        iterate in.
+        """
+        stored = serialize(explicitly_configured_card)
+        assert isinstance(stored, dict)
+        stored["workspace_rag_index"]["__model__"] = f"{STORED_MARKER_MODULE}.WorkspaceRagIndex"
+        stored["workspace_rag_search"]["__model__"] = f"{STORED_MARKER_MODULE}.WorkspaceRagSearch"
+
+        restored = deserialize_object(stored)
+
+        assert isinstance(restored, WorkspaceTool)
+        assert restored == explicitly_configured_card

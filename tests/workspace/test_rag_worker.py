@@ -18,12 +18,13 @@ from typing import Any
 import pytest
 from akgentic.core.agent import Akgent
 from akgentic.core.agent_config import BaseConfig
+
 from akgentic.tool.core.deferred import DeferredWorker
 from akgentic.tool.workspace.actor import WorkspaceActor
-from akgentic.tool.workspace.card.params import WorkspaceRagIndex
 from akgentic.tool.workspace.documents.models import RagChunk, chunk_id
-from akgentic.tool.workspace.documents.splitter import _parser
-from akgentic.tool.workspace.documents.worker import (
+from akgentic.tool.workspace.rag.params import WorkspaceRagIndex
+from akgentic.tool.workspace.rag.splitter import _parser
+from akgentic.tool.workspace.rag.worker import (
     INDEX_WORKER_NAME_PREFIX,
     IndexFailure,
     IndexRequest,
@@ -33,8 +34,7 @@ from akgentic.tool.workspace.documents.worker import (
     index_worker_name,
 )
 from akgentic.tool.workspace.readers import DocumentReader
-
-from tests.workspace.conftest import DeadAddress, WORKSPACE_PATH
+from tests.workspace.conftest import WORKSPACE_PATH, DeadAddress
 
 _TABLE_PARAMS = WorkspaceRagIndex(
     chunk_chars=60, max_chunk_chars=120, min_chunk_chars=1, chunk_overlap_chars=0
@@ -142,14 +142,14 @@ class TestWhatTheWorkerIs:
 
         A module-level ``IndexError`` hides the builtin from its definition to the
         end of the module and everywhere it is imported — including
-        ``actor/documents.py``, whose ``_chunk_at`` is an ordinal lookup. A later
+        ``rag/actor.py``, whose ``_chunk_at`` is an ordinal lookup. A later
         ``except IndexError:`` there would raise ``TypeError`` at runtime instead
         of catching, and mypy would not complain. Ruff's ``A`` rules are not
         selected in this package, so this spec is the gate.
         """
         import builtins
 
-        from akgentic.tool.workspace.documents import worker
+        from akgentic.tool.workspace.rag import worker
 
         shadowed = [name for name in worker.__all__ if hasattr(builtins, name)]
         assert shadowed == []

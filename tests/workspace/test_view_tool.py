@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import akgentic.tool.workspace.card.read as _tool_mod
+import akgentic.tool.workspace.read as _tool_mod
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.tool import WorkspaceTool, WorkspaceView
 from akgentic.tool.workspace.workspace import Filesystem
@@ -409,7 +409,10 @@ class TestWorkspaceViewPillowAbsent:
 
         with (
             patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}),
-            patch.object(logging.getLogger("akgentic.tool.workspace.card.read"), "warning") as mock_warn,
+            # The logger is named for the module, so it moved with it. That is an
+            # operational surface: a deployment configuring this logger by name has
+            # to follow the rename.
+            patch.object(logging.getLogger("akgentic.tool.workspace.read"), "warning") as mock_warn,
         ):
             fn("image.png")
             fn("image.png")  # second call — warning must NOT be repeated

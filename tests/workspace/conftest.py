@@ -2,11 +2,19 @@
 
 The doubles here reach the actor only through the public surface a card uses —
 ``getChildrenOrCreate`` on a fake orchestrator, then ``proxy_ask``. The fake
-orchestrator holds the real actor instances, which is what lets the singleton
-test prove that an observation recorded through one card is visible through
-another. A handful of assertions do read a card's or an actor's private
-attribute where there is no public equivalent — which tree an actor took, which
-proxy a card bound — and they say so where they do it.
+orchestrator holds the real actor instances, which is what lets a spec prove that
+two cards of one team over one tree reach one actor. A handful of assertions do
+read a card's or an actor's private attribute where there is no public
+equivalent — which tree an actor took, which proxy a card bound — and they say
+so where they do it.
+
+**The child-process harness lives here too**, moved out of
+``test_gate_locks.py`` when a second and third module needed it. Cross-process
+properties need real second interpreters — a ``threading.Lock``, the GIL and one
+mailbox all provide exclusion inside one interpreter, so a single-process spec
+passes whether or not the file lock exists — and there is exactly one runner for
+them. Importing helpers out of another *test module* is not on offer, and neither
+is a second copy of the child runner.
 
 Shaped after ``tests/notification/conftest.py``; deliberately a copy rather than
 an import, because a test package is not a library for other test packages.
@@ -17,32 +25,55 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
+import textwrap
 import threading
+import time
 import uuid
-from collections.abc import Generator
-from dataclasses import dataclass, field
+from collections.abc import Callable, Generator, Iterator
+from concurrent import futures
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
-from pykka import ActorDeadError
-
+from akgentic.core import ActorRegistry
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.actor_address_impl import ActorAddressImpl
 from akgentic.core.agent import Akgent, AkgentType
 from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
-from akgentic.tool.core import ToolState
-from akgentic.tool.sandbox.actor import ExecRequest, ExecResult, SandboxActor
-from akgentic.tool.sandbox.tool import SANDBOX_ACTOR_CLASSES
-from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
-from akgentic.tool.workspace.execution import DEFAULT_EXEC_TIMEOUT_S
-from akgentic.tool.workspace.journal import git_dir_for
-from akgentic.tool.workspace.models import MutationOutcome, Observation
-from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
+from pykka import ActorDeadError
 
+from akgentic.tool.core import ToolState
+from akgentic.tool.sandbox import SANDBOX_BACKEND_CLASSES
+from akgentic.tool.sandbox.backend import ExecResult, validate_command
+from akgentic.tool.workspace.actor import (
+    WORKSPACE_ACTOR_ROLE,
+    WorkspaceActor,
+    workspace_actor_name,
+)
+from akgentic.tool.workspace.documents.cache import DocumentCache
+from akgentic.tool.workspace.documents.models import (
+    DEFAULT_MAX_DOCUMENT_CHARS,
+    DEFAULT_MAX_DOCUMENTS,
+    DocumentExtract,
+    RagFile,
+)
+from akgentic.tool.workspace.documents.store import DocumentEntry, YamlDocumentStore
+from akgentic.tool.workspace.execution import DEFAULT_EXEC_TIMEOUT_S, RunningExec
+from akgentic.tool.workspace.journal import git_dir_for
+from akgentic.tool.workspace.models import MutationOutcome, Observation, WorkspaceConfig
+from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
+from akgentic.tool.workspace.workspace import ID_KIND
 from tests.conftest import MockActorAddress
+
+if TYPE_CHECKING:
+    from akgentic.tool.vector_store.protocol import VectorStoreService
+    from akgentic.tool.vector_store.registry import BackendContext, BackendFactory
 
 WORKSPACE_NAME = "test-workspace"
 """The ``workspace_id`` the wired cards below share."""
@@ -50,30 +81,44 @@ WORKSPACE_NAME = "test-workspace"
 DEFAULT_TEST_PRINCIPAL = "u-alice"
 """The ``user_id`` the fake observer carries unless a test names another.
 
-Every workspace now resolves under its owner, so the trees the suite writes to
-live at ``<root>/u-alice/<leaf>``. :func:`workspace_root_for` builds that path so
-no test has to spell the layout out twice.
+Every workspace now resolves under its owner and its kind, so the trees the
+suite writes to live at ``<root>/u-alice/<kind>/<leaf>``. :func:`workspace_root_for`
+builds that path so no test has to spell the layout out twice.
 """
 
 
-WORKSPACE_PATH = f"{DEFAULT_TEST_PRINCIPAL}/{WORKSPACE_NAME}"
-"""What ``WORKSPACE_NAME`` **resolves** to — the two-segment path, not the leaf.
+WORKSPACE_PATH = f"{DEFAULT_TEST_PRINCIPAL}/{ID_KIND}/{WORKSPACE_NAME}"
+"""What ``WORKSPACE_NAME`` **resolves** to — the three-segment path, not the leaf.
 
-The distinction is the whole of ADR-048 in one line: ``WORKSPACE_NAME`` is what
-a card declares, and this is the directory and the actor-name suffix it reaches.
-Assertions about a tree or an actor name use this one; assertions about what an
-author wrote use the other.
+The distinction is the whole of the layout in one line: ``WORKSPACE_NAME`` is a
+``workspace_id`` a card declares, and this is the directory and the actor-name
+suffix it reaches. Assertions about a tree or an actor name use this one;
+assertions about what an author wrote use the other.
+
+These helpers are a convenience, not the specification: the six-cell literal
+table in ``test_workspace_path_resolution.py`` pins the layout independently of
+them, which is exactly why it does not use them.
 """
 
 
-def workspace_path_for(leaf: str, user_id: str = DEFAULT_TEST_PRINCIPAL) -> str:
-    """The two-segment path *leaf* resolves to for *user_id*."""
-    return f"{user_id}/{leaf}"
+def workspace_path_for(
+    leaf: str, user_id: str = DEFAULT_TEST_PRINCIPAL, kind: str = ID_KIND
+) -> str:
+    """The three-segment path *leaf* of *kind* resolves to for *user_id*.
+
+    *kind* defaults to ``ID_KIND`` because *leaf* is almost always a
+    ``workspace_id``; a caller resolving a **default** card — whose leaf is the
+    team id — passes ``TEAM_KIND`` explicitly.
+    """
+    return f"{user_id}/{kind}/{leaf}"
 
 
-def workspace_root_for(base: Path, leaf: str, user_id: str = DEFAULT_TEST_PRINCIPAL) -> Path:
-    """The on-disk root of the workspace *leaf* belonging to *user_id*."""
-    return base / user_id / leaf
+def workspace_root_for(
+    base: Path, leaf: str, user_id: str = DEFAULT_TEST_PRINCIPAL, kind: str = ID_KIND
+) -> Path:
+    """The on-disk root of the workspace *leaf* of *kind* belonging to *user_id*."""
+    return base / user_id / kind / leaf
+
 
 HANDSHAKE_TIMEOUT_S = 5.0
 """Upper bound on a thread handshake — never a delay, only a failure budget."""
@@ -88,6 +133,107 @@ would leak into every other test that shells out.
 """
 
 requires_git = pytest.mark.skipif(not GIT_ON_PATH, reason="git is not on PATH")
+
+
+##
+## The child-process harness — one runner, for every cross-process spec
+##
+CHILD_TIMEOUT_S = 180.0
+"""Upper bound on a child — a failure budget, never a delay."""
+
+_PACKAGE_ROOT = str(Path(__file__).resolve().parents[2])
+"""The package root, so a child can import ``tests.workspace.conftest``."""
+
+CHILD_PRELUDE = f"""
+import os, sys, time
+sys.path.insert(0, {_PACKAGE_ROOT!r})
+from pathlib import Path
+from akgentic.tool.workspace.tool import WorkspaceTool
+from akgentic.tool.errors import RetriableError
+from tests.workspace.conftest import FakeActorToolObserver, FakeOrchestratorProxy
+
+
+def bind(name, **kwargs):
+    proxy = FakeOrchestratorProxy()
+    card = WorkspaceTool(workspace_id={WORKSPACE_NAME!r}, **kwargs)
+    card.observer(FakeActorToolObserver(proxy, name=name))
+    return card
+
+
+def barrier(meta, tag, count):
+    ready = Path(meta) / ("ready-" + tag)
+    ready.parent.mkdir(parents=True, exist_ok=True)
+    ready.write_text("x")
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if len(list(Path(meta).glob("ready-*"))) >= count:
+            return
+        time.sleep(0.005)
+    raise SystemExit("the barrier never completed")
+"""
+"""What every child script starts with — ``bind`` drives the **real card**.
+
+A child that constructed a ``WorkspaceTool`` and poked its private attributes
+would be testing the test file, so the prelude gives it the shipped bind and
+nothing else.
+"""
+
+
+@dataclass
+class ChildReport:
+    """One child's exit code and what it printed."""
+
+    code: int
+    out: str
+    err: str
+
+
+def run_child(script: Path, workspaces_root: Path, *args: str) -> ChildReport:
+    """Run *script* in a fresh interpreter, with this suite's workspaces root."""
+    done = subprocess.run(
+        [sys.executable, str(script), *args],
+        capture_output=True,
+        text=True,
+        timeout=CHILD_TIMEOUT_S,
+        env=_child_env(workspaces_root),
+        check=False,
+    )
+    return ChildReport(done.returncode, done.stdout.strip(), done.stderr.strip())
+
+
+def start_child(script: Path, workspaces_root: Path, *args: str) -> subprocess.Popen[str]:
+    """Start *script* in a fresh interpreter without waiting for it."""
+    return subprocess.Popen(
+        [sys.executable, str(script), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=_child_env(workspaces_root),
+    )
+
+
+def _child_env(workspaces_root: Path) -> dict[str, str]:
+    """This process's environment, pointed at the test's workspaces root.
+
+    The workspaces root is the **only** thing a child is told about where the
+    tree's metadata lives, because it is the only thing there is: ``<meta>`` is
+    derived from it and from nothing else. That is what makes the cross-process
+    specs prove a property rather than a harness convention — parent and child
+    reach one ``<meta>`` with nothing configurable between them.
+
+    Args:
+        workspaces_root: The base every tree in this test hangs off.
+    """
+    env = dict(os.environ)
+    env["AKGENTIC_WORKSPACES_ROOT"] = str(workspaces_root)
+    return env
+
+
+def write_script(tmp_path: Path, name: str, body: str) -> Path:
+    """Write a child script made of the shared prelude plus *body*."""
+    script = tmp_path / name
+    script.write_text(CHILD_PRELUDE + textwrap.dedent(body), encoding="utf-8")
+    return script
 
 
 @dataclass
@@ -195,8 +341,61 @@ class SilentAgent(Akgent[BaseConfig, BaseState]):
     """A do-nothing agent, used to mint a real (serializable) ``ActorAddress``."""
 
 
+def _start_actor(
+    actor_class: type[Akgent[Any, Any]], config: BaseConfig, live: bool, refs: list[Any]
+) -> tuple[ActorAddress, Any]:
+    """Create one actor with no orchestrator and no parent — live on a thread, or inert.
+
+    The second element is a live actor instance in the inert mode and a Pykka
+    proxy over one in the live mode — both answer the same calls.
+    """
+    if live:
+        ref = actor_class.start(config=config)
+        refs.append(ref)
+        return ActorAddressImpl(ref), ref.proxy()
+    actor = actor_class(config=config)
+    actor.on_start()
+    return MockActorAddress(config.name, config.role), actor
+
+
+def _stop_actors(refs: list[Any], entries: list[tuple[ActorAddress, Any]], live: bool) -> None:
+    """Stop every created actor **and its children** — live on its thread, inert in place.
+
+    The real orchestrator stops a member through ``Akgent.stop``, which runs
+    ``stop_children`` first; a bare ``ActorRef.stop()`` runs ``on_stop`` only.
+    Since the in-memory vector store became the workspace actor's own child,
+    the difference is a real thread: an inert actor whose ``enable_rag`` ran
+    has started one through ``createActor``, and stopping the parent any other
+    way leaves it alive until the interpreter refuses to exit.
+    """
+    for ref in refs:
+        if ref.is_alive():
+            try:
+                ref.proxy().stop().get(timeout=HANDSHAKE_TIMEOUT_S)
+            except ActorDeadError:
+                pass
+        ref.stop()
+    refs.clear()
+    if not live:
+        for _, actor in entries:
+            actor.stop_children()
+            actor.on_stop()
+
+
 class FakeOrchestratorProxy:
-    """Get-or-create singletons by config name, exactly as the orchestrator does.
+    """The orchestrator's get-or-create, exactly as core implements it.
+
+    ``getChildrenOrCreate`` is what a workspace card binds through, and what
+    :attr:`create_calls` records.
+
+    Story 52-6 kept a ``getResourceOrCreate`` here as a trap against a host
+    forward coming back; story 54-5 removed it, because no published core ever
+    had that method. What guards the negative now is the strict type check
+    against the shipped core, and the :attr:`create_calls` positives beside it.
+    The check sees every call made on a proxy typed ``Orchestrator`` — which is
+    how the card builds every one it holds — swallowed or not, and not only on
+    the paths a spec drives. A forward that reached this fake unswallowed would
+    raise ``AttributeError``.
 
     With *live* set, the actors it creates are genuinely started on their own
     thread and handed out behind a real ``ActorAddressImpl``. That is what lets a
@@ -205,19 +404,12 @@ class FakeOrchestratorProxy:
     """
 
     def __init__(self, live: bool = False) -> None:
-        # The second element is a live actor instance in the inert mode and a
-        # Pykka proxy over one in the live mode — both answer the same calls.
         self.children: dict[str, tuple[ActorAddress, Any]] = {}
         self.create_calls: list[tuple[type[Akgent[Any, Any]], BaseConfig]] = []
+        self.emitted: list[object] = []
+        """Every event this orchestrator emitted for a successful bind, in order."""
         self.live = live
         self._refs: list[Any] = []
-        self.sandbox_sink: Any = None
-        """Where a :class:`SandboxAddress` hands the requests it is told.
-
-        Set by :class:`SandboxHarness` when it installs itself, and ``None``
-        otherwise — the wiring suites resolve sandbox actors without ever
-        sending them anything.
-        """
         self.metadata: Any = None
         """What :meth:`get_metadata` answers — the team's metadata, or ``None``.
 
@@ -226,14 +418,12 @@ class FakeOrchestratorProxy:
         gained no bind-time round trip: :attr:`metadata_calls` stays at zero.
         """
         self.metadata_calls = 0
+        self.member_lookups: list[str] = []
+        """Every name :meth:`get_team_member` was asked for, in order.
 
-        self.sandbox_born_dead = False
-        """Hand out sandbox addresses that are already dead.
-
-        The one way to reach "the sandbox is gone at the moment the request is
-        sent": flipping an *existing* address dead does not do it, because the
-        next resolve skips a dead child and creates a live replacement — which
-        is the production behaviour and the point of the skip.
+        A retrieval card looks the team's ``#VectorStore`` up here after creating
+        it; a card with retrieval off must leave this list empty, which is the
+        negative that "retrieval off costs nothing" is asserted on.
         """
 
     def getChildrenOrCreate(  # noqa: N802 — mirrors the orchestrator's method name
@@ -242,26 +432,22 @@ class FakeOrchestratorProxy:
         self.create_calls.append((actor_class, config))
         existing = self.children.get(config.name)
         # A child that is no longer alive is skipped and replaced, exactly as
-        # the real orchestrator does — which is what makes "the next admission
-        # recreates the sandbox" observable through ``create_calls``.
+        # the real orchestrator does.
         if existing is not None and existing[0].is_alive():
             return existing[0]
-        if self.live:
-            ref = actor_class.start(config=config)
-            self._refs.append(ref)
-            address: ActorAddress = ActorAddressImpl(ref)
-            self.children[config.name] = (address, ref.proxy())
-            return address
-        actor = actor_class(config=config)
-        actor.on_start()
-        if issubclass(actor_class, SandboxActor):
-            sandbox_address = SandboxAddress(config.name, config.role, self)
-            sandbox_address.alive = not self.sandbox_born_dead
-            address = sandbox_address
-        else:
-            address = MockActorAddress(config.name, config.role)
+        address, actor = _start_actor(actor_class, config, self.live, self._refs)
         self.children[config.name] = (address, actor)
         return address
+
+    def get_team_member(self, name: str) -> ActorAddress | None:  # noqa: N802 — mirrors core
+        """Return the address registered under *name*, or ``None`` — core's own answer.
+
+        ``None`` for a miss is what the real orchestrator answers and what every
+        caller branches on.
+        """
+        self.member_lookups.append(name)
+        existing = self.children.get(name)
+        return existing[0] if existing is not None else None
 
     def get_metadata(self) -> Any:
         """Return the team's metadata, exactly as the orchestrator does."""
@@ -269,20 +455,15 @@ class FakeOrchestratorProxy:
         return self.metadata
 
     def actor_for(self, address: ActorAddress) -> Any:
-        """Return the actor behind *address*, or ``None`` when it is unknown."""
+        """Return the child actor behind *address*, or ``None`` when it is unknown."""
         for known_address, actor in self.children.values():
             if known_address is address:
                 return actor
         return None
 
     def stop_all(self) -> None:
-        """Stop every created actor — a live one on its thread, an inert one in place."""
-        for ref in self._refs:
-            ref.stop()
-        self._refs.clear()
-        if not self.live:
-            for _, actor in self.children.values():
-                actor.on_stop()
+        """Stop every child, each with its own children."""
+        _stop_actors(self._refs, list(self.children.values()), self.live)
         self.children.clear()
 
 
@@ -395,10 +576,17 @@ class CountingProxy:
 
 
 class FailingProxy:
-    """Raises on every recording call — a dead actor or an unreachable proxy."""
+    """Raises on every recording call — an actor that died after the bind.
+
+    ``attach`` succeeds: the card sends it on the ask proxy at bind, unguarded,
+    so a stand-in for "the actor was alive at bind" must accept it.
+    """
 
     def __init__(self) -> None:
         self.calls = 0
+
+    def attach(self, agent: ActorAddress, agent_name: str) -> None:
+        """The bind-time holder registration — the actor was alive then."""
 
     def record_observation(self, agent_id: str, path: str, observation: Observation) -> None:
         self.calls += 1
@@ -456,6 +644,9 @@ class BusyProxy:
         self.queued = threading.Event()
         self.release = threading.Event()
         self.calls: list[str] = []
+
+    def attach(self, agent: ActorAddress, agent_name: str) -> None:
+        """The bind-time holder registration — the actor was alive then."""
 
     def occupy(self) -> None:
         with self._lock:
@@ -525,11 +716,32 @@ def wired_card(
 
 
 @pytest.fixture
+def dispatching_card(
+    observer: FakeActorToolObserver,
+    workspace_tree: Path,
+) -> WorkspaceTool:
+    """A card that creates an actor — the plain one does not, since story 55-8.
+
+    **Its own fixture rather than a widened :func:`wired_card`.** ``wired_card``
+    is a plain read/write card used at some four hundred call sites, and it is
+    what asserts that the ordinary shape creates no actor; giving it exec would
+    make every one of those specs bind a sandbox they never asked for.
+
+    ``workspace_exec`` rather than retrieval, because it is the cheaper of the
+    two dispatching capabilities: retrieval resolves a vector backend and looks
+    the team's ``#VectorStore`` up.
+    """
+    card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_exec=True)
+    card.observer(observer)
+    return card
+
+
+@pytest.fixture
 def workspace_actor(
     orchestrator_proxy: FakeOrchestratorProxy,
-    wired_card: WorkspaceTool,
+    dispatching_card: WorkspaceTool,
 ) -> WorkspaceActor:
-    """The live singleton actor behind :func:`wired_card`."""
+    """The live actor behind :func:`dispatching_card`, read from the team's children."""
     _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
     assert isinstance(actor, WorkspaceActor)
     return actor
@@ -548,6 +760,7 @@ def card_for(
     name: str,
     workspace_id: str = WORKSPACE_NAME,
     git_journal: bool = False,
+    workspace_exec: bool = False,
 ) -> tuple[WorkspaceTool, FakeActorToolObserver]:
     """Wire a second (or third) agent's card onto the same workspace.
 
@@ -556,12 +769,65 @@ def card_for(
 
     ``git_journal`` mirrors the card's own default, which is off. A test about
     the journal opts in explicitly, so the suite never depends on a default it
-    is not asserting.
+    is not asserting. ``workspace_exec`` is the same shape and exists for the
+    same reason: since story 55-8 it is what decides whether the bind creates an
+    actor at all, so a spec about the actor asks for it in as many words.
     """
     observer = FakeActorToolObserver(orchestrator_proxy, name=name)
-    card = WorkspaceTool(workspace_id=workspace_id, git_journal=git_journal)
+    card = WorkspaceTool(
+        workspace_id=workspace_id, git_journal=git_journal, workspace_exec=workspace_exec
+    )
     card.observer(observer)
     return card, observer
+
+
+def workspace_config(workspace_path: str, **overrides: Any) -> WorkspaceConfig:
+    """A ``WorkspaceConfig`` for *workspace_path*, named and rolled as a card would.
+
+    The successor to 51-3's ``fast_config``, which existed only to give a tree a
+    sweep interval and a reap grace short enough for a spec to watch. Story 52-6
+    deleted both fields with the liveness sweep, so what is left is the naming
+    every spec that creates an actor ahead of a card needs anyway.
+    """
+    fields: dict[str, Any] = {
+        "name": workspace_actor_name(workspace_path),
+        "role": WORKSPACE_ACTOR_ROLE,
+        "workspace_path": workspace_path,
+    }
+    fields.update(overrides)
+    return WorkspaceConfig(**fields)
+
+
+def wait_until(predicate: Callable[[], bool], timeout: float = HANDSHAKE_TIMEOUT_S) -> bool:
+    """Poll *predicate* every 10 ms until it holds or *timeout* elapses — a budget, not a delay."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def live_workspace_actors() -> list[ActorAddress]:
+    """Every live ``WorkspaceActor`` in this process, as addresses."""
+    return [
+        ActorAddressImpl(ref)
+        for ref in ActorRegistry.get_by_class(WorkspaceActor)
+        if ref.is_alive()
+    ]
+
+
+def attached(actor: WorkspaceActor, name: str) -> str:
+    """Attach a fresh agent called *name* to *actor* and return the id its maps key on.
+
+    The id is ``str(address.agent_id)`` — the string a card sends on every
+    mutation and passes as a run's ``agent`` — so a spec that attaches through
+    this and then acts under the returned id exercises exactly the production
+    keying.
+    """
+    address = MockActorAddress(name)
+    actor.attach(address, name)
+    return str(address.agent_id)
 
 
 def tool_named(card: WorkspaceTool, name: str) -> Any:
@@ -582,18 +848,33 @@ def mutate(card: WorkspaceTool, name: str, *args: Any, **kwargs: Any) -> str:
     return str(tool_named(card, name)(*args, **kwargs))
 
 
-def outcome_of(actor: WorkspaceActor, method: str, *args: Any) -> MutationOutcome:
-    """Call one of the actor's ``apply_*`` methods directly, for status assertions."""
-    result = getattr(actor, method)(*args)
+def outcome_of(card: WorkspaceTool, method: str, *args: Any) -> MutationOutcome:
+    """Call one of the **card's** ``apply_*`` methods directly, for status assertions.
+
+    The gate is the card's since story 52-5, so these go through the card rather
+    than the actor — and they carry no ``agent_id``, because card-side there is
+    exactly one agent and it is the card's own.
+    """
+    result = getattr(card, method)(*args)
     assert isinstance(result, MutationOutcome)
     return result
 
 
 ##
-## Exec (29-5) — a fake backend at the ``local`` key, and a worker on a real
+## Exec — a fake **backend** at the ``local`` key, and the actor's own worker
 ## thread.  No docker, no bwrap, no sandbox-exec, and no wall-clock sleeps: a run
 ## is held open by an event and released by the test, so every concurrency
 ## assertion is a handshake with a failure budget rather than a wait.
+##
+## **The injection window is** ``SANDBOX_BACKEND_CLASSES``, the one registry.
+## ``#Workspace`` builds its own backend in ``configure_exec`` and runs it on its
+## own single-worker executor; there is no sandbox actor to resolve, and when
+## there still was one a fake installed at its registry key was installed and
+## never reached — every spec below went green while testing nothing.
+## Injecting the *backend* keeps the whole production path live:
+## ``configure_exec`` → ``resolve_mode`` → the registry → ``ExecRunner`` → the
+## real executor → ``perform``.  Only the four lines that would touch a real
+## process are the fake's.
 ##
 
 
@@ -622,8 +903,34 @@ class SandboxScript:
             output" cannot be asserted at all. A command absent from the map
             falls back to :attr:`stdout`, so every existing test is unaffected.
         raise_with: Raised instead of returning, for the failure path.
+        start_raises: Raised by :meth:`FakeBackend.start` instead of
+            provisioning, for the cold-start failure path. Cleared by a test
+            that wants the retry to succeed.
         timeouts: Every budget the backend was handed, in order.
         commands: Every ``(cmd, cwd)`` it was handed, in order.
+        starts: Every ``workspace_path`` ``start()`` was called with, in order.
+            Its **length** is the whole of the "started once, lazily" assertion.
+        kills: How many times ``kill()`` was called.
+        stops: How many times ``stop()`` was called.
+        kill_raises: Raised by ``kill()`` instead of ending the run, for the
+            "a failing step must not skip the ones after it" path.
+        kill_releases: Whether ``kill()`` ends the blocked run, as a real
+            backend's does. Turned **off** to reproduce the child that ignores
+            the kill, which is what the bounded drain exists for.
+        exec_tail_s: Wall clock ``exec`` spends *after* it is released, before
+            it returns. Zero everywhere except the one spec that asserts a
+            teardown ordering across two threads, where it is what makes the
+            order observable rather than a race.
+        threads: ``("start" | "exec", thread ident)`` for every call, in order.
+            The whole of "no backend call happens on the actor's thread": the
+            identity of the thread is the property, and a name would only be a
+            proxy for it.
+        events: One shared ordered record of everything the backend was asked to
+            do — ``("start", path)``, ``("exec-enter", cmd)``,
+            ``("exec-return", cmd)``, ``("kill",)``, ``("stop",)``. Teardown
+            order is a property of *positions* in this list; the separate
+            counters above answer "how many", which is a different question and
+            cannot express an order at all.
     """
 
     started: threading.Event = field(default_factory=threading.Event)
@@ -635,49 +942,99 @@ class SandboxScript:
     exit_code: int = 0
     stdout_by_cmd: dict[str, str] = field(default_factory=dict)
     raise_with: BaseException | None = None
+    start_raises: BaseException | None = None
     timeouts: list[float | None] = field(default_factory=list)
     commands: list[tuple[str, str]] = field(default_factory=list)
+    starts: list[str] = field(default_factory=list)
+    kills: int = 0
+    stops: int = 0
+    kill_raises: BaseException | None = None
+    kill_releases: bool = True
+    exec_tail_s: float = 0.0
+    threads: list[tuple[str, int]] = field(default_factory=list)
+    events: list[tuple[str, ...]] = field(default_factory=list)
 
 
-class FakeSandboxActor(SandboxActor):
+class FakeBackend:
     """A backend that writes what a test asks for and blocks when a test asks it to.
 
-    Injected into ``SANDBOX_ACTOR_CLASSES`` at the ``local`` key, which the
-    module documents as a mutable injection window. It is a real
-    :class:`SandboxActor` subclass, so it goes through the same
-    ``getChildrenOrCreate`` the production path uses and honours the same
-    allowlist — what it does not do is start a process.
+    Installed at ``SANDBOX_BACKEND_CLASSES["local"]``, which the registry
+    documents as a mutable injection window. It **exposes the four Protocol
+    names** — which is all ``@runtime_checkable`` would check anyway — and
+    honours the same allowlist the four shipped backends do, by calling
+    ``validate_command`` in ``exec`` exactly as they each do. What it does not do
+    is start a process.
+
+    The script is a class attribute rather than a constructor argument because
+    ``resolve_mode`` constructs the backend itself, from the registry, with no
+    arguments at all — which is the production path and the reason this fake is
+    reached at all.
     """
 
     script: ClassVar[SandboxScript] = SandboxScript()
 
-    def _start_sandbox(self) -> None:
+    def __init__(self) -> None:
+        self.workspace_path: Path | None = None
+
+    def start(self, workspace_path: str) -> None:
         # Joins the path it was handed and derives nothing, exactly as the four
         # shipped backends do — a fake that still resolved would hide the very
         # thing the shipped ones stopped doing.
-        base = os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
-        root = Path(base) / self.config.workspace_path
-        root.mkdir(parents=True, exist_ok=True)
-        self.state.workspace_path = root.resolve()
-
-    def _stop_sandbox(self) -> None:
-        pass
-
-    def _exec(self, cmd: str, cwd: str, timeout: float | None = None) -> ExecResult:
         script = type(self).script
+        script.starts.append(workspace_path)
+        script.threads.append(("start", threading.get_ident()))
+        script.events.append(("start", workspace_path))
+        if script.start_raises is not None:
+            raise script.start_raises
+        base = os.environ.get("AKGENTIC_WORKSPACES_ROOT", "./workspaces")
+        root = Path(base) / workspace_path
+        root.mkdir(parents=True, exist_ok=True)
+        self.workspace_path = root.resolve()
+
+    def exec(self, cmd: str, cwd: str = "", timeout: float | None = None) -> ExecResult:
+        script = type(self).script
+        # Ahead of every recording, so a refused command leaves no trace of
+        # having reached the backend — the same order the four shipped backends
+        # produce by validating while they build their argv.
+        validate_command(cmd)
         script.commands.append((cmd, cwd))
         script.timeouts.append(timeout)
+        script.threads.append(("exec", threading.get_ident()))
+        script.events.append(("exec-enter", cmd))
         script.started.set()
-        assert script.gate.wait(timeout=HANDSHAKE_TIMEOUT_S), "the run was never released"
-        assert self.state.workspace_path is not None
-        for relative, body in script.files_by_cmd.get(cmd, script.files):
-            target = self.state.workspace_path / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(body, encoding="utf-8")
-        if script.raise_with is not None:
-            raise script.raise_with
-        stdout = script.stdout_by_cmd.get(cmd, script.stdout)
-        return ExecResult(stdout=stdout, stderr=script.stderr, exit_code=script.exit_code)
+        try:
+            assert script.gate.wait(timeout=HANDSHAKE_TIMEOUT_S), "the run was never released"
+            if script.exec_tail_s:
+                time.sleep(script.exec_tail_s)
+            assert self.workspace_path is not None
+            for relative, body in script.files_by_cmd.get(cmd, script.files):
+                target = self.workspace_path / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(body, encoding="utf-8")
+            if script.raise_with is not None:
+                raise script.raise_with
+            stdout = script.stdout_by_cmd.get(cmd, script.stdout)
+            return ExecResult(stdout=stdout, stderr=script.stderr, exit_code=script.exit_code)
+        finally:
+            # In a ``finally`` because "the worker left ``exec``" is the event
+            # teardown ordering is asserted against, and a raise leaves it too.
+            script.events.append(("exec-return", cmd))
+
+    def kill(self) -> None:
+        script = type(self).script
+        script.kills += 1
+        script.events.append(("kill",))
+        if script.kill_raises is not None:
+            raise script.kill_raises
+        if script.kill_releases:
+            # A real backend's kill ends the blocked command. Turning this off
+            # is how the child that ignores the kill is reproduced.
+            script.gate.set()
+
+    def stop(self) -> None:
+        script = type(self).script
+        script.stops += 1
+        script.events.append(("stop",))
 
 
 class DeadAddress(MockActorAddress):
@@ -694,152 +1051,180 @@ class DeadAddress(MockActorAddress):
         return False
 
 
-class SandboxAddress(MockActorAddress):
-    """The address ``#Workspace`` resolves for a sandbox, and tells its requests to.
+class MortalAddress(MockActorAddress):
+    """A holder's address whose actor a spec can stop, by setting :attr:`dead`.
 
-    Two things a stand-in has to get right, because the actor now decides on
-    both:
-
-    - ``is_alive()`` follows a flag a test flips. ``exec_status`` consults it to
-      notice a sandbox that died mid-run, so an address that always claimed to be
-      alive would make that path untestable and one that always claimed to be
-      dead would make every other path untestable.
-    - ``tell()`` **raises** ``ActorDeadError`` when the flag is down, exactly as
-      ``ActorAddressImpl.tell`` does. That is the whole reason ``_start_run``
-      sends through the address rather than a tell proxy, so a stand-in that
-      swallowed it would guard nothing.
-
-    A live tell hands the request to the harness, which runs the **real**
-    base-class handler against the fake backend on its own thread.
+    ``DeadAddress`` is dead from the start; a holder that must be live when it
+    attaches and stopped by the next sweep needs the flag.
     """
 
-    def __init__(self, name: str, role: str, proxy: FakeOrchestratorProxy) -> None:
-        super().__init__(name, role)
-        self.alive = True
-        self._proxy = proxy
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.dead = False
 
     def is_alive(self) -> bool:
-        return self.alive
-
-    def tell(self, message: Any) -> None:
-        if not self.alive:
-            raise ActorDeadError(f"{self.name} not found")
-        sink = self._proxy.sandbox_sink
-        if sink is None:
-            raise RuntimeError(f"{self.name} was told {message!r} with no harness installed")
-        sink(self, message)
+        return not self.dead
 
 
 class WorkspaceAddress(MockActorAddress):
-    """``#Workspace``'s own address, as the sandbox sees it — the reply stand-in.
+    """``#Workspace``'s own address, as its worker sees it — the reply stand-in.
 
     The actor under test is inert: the suite calls its methods directly, so its
     real ``myAddress`` names an inbox nobody drains and a report told to it would
     simply vanish (a never-started Pykka actor even reports ``is_alive()`` as
     ``True``). So the harness rewrites ``reply_to`` to this, which calls the
-    handler directly — on the sandbox's thread, exactly where the worker's
-    ``deliver`` and ``fail`` used to land.
+    handler directly — on the worker's thread, exactly where production's mailbox
+    hand-off lands the work.
 
     Do not "fix" this by starting the workspace actor for real: the point of the
-    inert actor is that a test can read ``_running`` and ``_queue`` while a run
-    is held open.
+    inert actor is that a test can read ``_running`` — and the marker the run
+    holds on disk — while a run is held open.
     """
 
     def __init__(self, name: str, role: str, actor: WorkspaceActor) -> None:
         super().__init__(name, role)
         self._actor = actor
+        self.dead = False
+        """When set, :meth:`tell` raises, exactly as a stopping actor's does."""
 
     def tell(self, message: Any) -> None:
+        if self.dead:
+            raise ActorDeadError(f"{self.name} not found")
         self._actor.receiveMsg_ExecReport(message)
 
 
-class SandboxHarness:
-    """Runs the sandbox's real tell handler on a real thread, with no actor system.
+@dataclass
+class SubmittedRun:
+    """One call the actor made to ``executor.submit``, as it made it.
+
+    The five values plus the reply address are what ``_start_run`` hands the
+    worker, so recording them here is recording the whole of what crosses the
+    thread boundary — the successor to the request model the retired sandbox
+    actor used to receive.
+    """
+
+    run_id: str
+    cmd: str
+    cwd: str
+    timeout_s: float
+    reply_to: ActorAddress
+
+
+class RecordingExecutor:
+    """Stands in for ``#Workspace``'s own executor, and delegates to a real one.
+
+    Three jobs, and it is deliberately not a mock for any of them:
+
+    - it **records** what the actor submitted, which is the only place the run
+      id and the reply address are observable now that no request model crosses
+      the boundary;
+    - it **redirects** ``reply_to`` to the inert actor's stand-in, exactly as the
+      old harness rewrote it on the request it intercepted;
+    - it **runs the real callable on a real single worker thread**, so the
+      command genuinely runs elsewhere. That is the only way the tree's hold can
+      be observed *while it is held*, and it is what makes "call ``perform``
+      inline instead of submitting" an observable mutation rather than an
+      invisible one.
+
+    ``submit_raises`` is the reachable failure of the submit itself: production
+    raises ``RuntimeError`` here when the executor has already been shut down.
+    """
+
+    def __init__(self, workspace_address: WorkspaceAddress, actor: WorkspaceActor) -> None:
+        self._inner = ThreadPoolExecutor(max_workers=1)
+        self._workspace_address = workspace_address
+        self._actor = actor
+        self.runs: list[SubmittedRun] = []
+        self.futures: list[Future[None]] = []
+        self.holds: list[RunningExec | None] = []
+        """``actor._running`` as it stood at each submit, in order.
+
+        Read between the hold being taken and the work being handed over, which
+        is the only window in which the value is observable: a run released by an
+        already-set gate can report and clear ``_running`` before the call that
+        took it has even returned.
+        """
+        self.submit_raises: BaseException | None = None
+
+    def submit(self, fn: Any, **kwargs: Any) -> Future[None]:
+        self.holds.append(self._actor._running)
+        self.runs.append(SubmittedRun(**kwargs))
+        if self.submit_raises is not None:
+            raise self.submit_raises
+        future = self._inner.submit(fn, **{**kwargs, "reply_to": self._workspace_address})
+        self.futures.append(future)
+        return future
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        self._inner.shutdown(wait=wait, cancel_futures=cancel_futures)
+
+
+class ExecHarness:
+    """Gives the inert actor a recording executor and an address to report to.
 
     The workspace actor stays inert — the tests call its methods directly,
-    exactly as the other workspace suites do — but the command genuinely runs
-    elsewhere, which is the only way the tree's hold can be observed *while it is
-    held*.
+    exactly as the other workspace suites do — but the command genuinely runs on
+    a worker thread, which is the only way the tree's hold can be observed *while
+    it is held*.
 
-    Nothing about the actor's exec path is stubbed: it resolves the sandbox
-    through the fake orchestrator exactly as production resolves it through the
-    real one, and it sends the request with ``ActorAddress.tell``. What the
-    harness supplies is the two ends — an orchestrator to ask and an address to
-    reply to.
+    Nothing about the actor's exec path is stubbed: it builds its backend through
+    ``configure_exec`` and ``resolve_mode`` exactly as production does, and it
+    submits the real ``ExecRunner.perform``. What the harness supplies is the two
+    ends — an executor whose worker it can wait on, and an address to reply to.
     """
 
     def __init__(self, actor: WorkspaceActor, orchestrator_proxy: FakeOrchestratorProxy) -> None:
         self.actor = actor
         self.orchestrator_proxy = orchestrator_proxy
-        self.threads: list[threading.Thread] = []
-        self.requests: list[ExecRequest] = []
-        """Every request the actor told a sandbox, in order — one per started run."""
-        self.ask_timeouts: list[int | None] = []
-        """Every timeout the actor's asks carried, in order.
-
-        The sandbox resolve is an ask on the team singleton's own thread, so an
-        untimed one parks every read, mutation and poll behind it. Recorded here
-        so that property is asserted rather than assumed.
-        """
         self.workspace_address = WorkspaceAddress("#Workspace", "ToolActor", actor)
+        self.executor = RecordingExecutor(self.workspace_address, actor)
         self._orchestrator = DeadAddress("orchestrator")
 
     @property
-    def sandbox_addresses(self) -> list[SandboxAddress]:
-        """Every sandbox address handed out so far, in creation order."""
-        return [
-            address
-            for address, _actor in self.orchestrator_proxy.children.values()
-            if isinstance(address, SandboxAddress)
-        ]
+    def runs(self) -> list[SubmittedRun]:
+        """Every run the actor submitted, in order — one per started run."""
+        return self.executor.runs
+
+    @property
+    def holds(self) -> list[RunningExec | None]:
+        """``actor._running`` as it stood at each submit, in order."""
+        return self.executor.holds
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Give the actor an orchestrator to resolve through, and a reply address."""
+        """Put the recording executor on the actor, and give it an orchestrator."""
         monkeypatch.setattr(self.actor, "_orchestrator", self._orchestrator)
         monkeypatch.setattr(self.actor, "proxy_ask", self._proxy_ask)
-        monkeypatch.setattr(self.orchestrator_proxy, "sandbox_sink", self._deliver)
+        monkeypatch.setattr(self.actor, "_executor", self.executor)
 
     def _proxy_ask(
         self, target: ActorAddress, actor_type: Any = None, timeout: int | None = None
     ) -> Any:
-        self.ask_timeouts.append(timeout)
         if target is self._orchestrator:
             return self.orchestrator_proxy
         return self.orchestrator_proxy.actor_for(target)
 
-    def _deliver(self, address: SandboxAddress, request: ExecRequest) -> None:
-        """Run the real ``receiveMsg_ExecRequest`` for *request*, off this thread."""
-        self.requests.append(request)
-        sandbox = self.orchestrator_proxy.actor_for(address)
-        assert isinstance(sandbox, SandboxActor)
-        # The actor's own ``myAddress`` names an inbox nobody drains, so the
-        # reply is redirected here. model_copy(update=...) rather than a
-        # rebuild: a field added to ExecRequest later must survive the rewrite
-        # (Golden Rule #12).
-        routed = request.model_copy(update={"reply_to": self.workspace_address})
-        thread = threading.Thread(
-            target=sandbox.receiveMsg_ExecRequest, args=(routed,), daemon=True
-        )
-        self.threads.append(thread)
-        thread.start()
-
     def join(self) -> None:
-        """Wait for every started run, bounded — a hang is a failure, not a wait."""
-        for thread in self.threads:
-            thread.join(timeout=HANDSHAKE_TIMEOUT_S)
-            assert not thread.is_alive(), "a sandbox run never finished"
-        self.threads.clear()
+        """Wait for every submitted run, bounded — a hang is a failure, not a wait."""
+        for future in self.executor.futures:
+            futures.wait([future], timeout=HANDSHAKE_TIMEOUT_S)
+            assert future.done(), "a sandbox run never finished"
+            future.result()  # a callable that raised would otherwise be silent
+        self.executor.futures.clear()
+
+    def close(self) -> None:
+        """Release the worker thread. Never leaves one behind a failed assertion."""
+        self.executor.shutdown(wait=False, cancel_futures=True)
 
 
 @pytest.fixture
 def sandbox_script() -> Generator[SandboxScript, None, None]:
-    """Install :class:`FakeSandboxActor` at the ``local`` key for one test."""
+    """Install :class:`FakeBackend` at the ``local`` key for one test."""
     script = SandboxScript()
-    FakeSandboxActor.script = script
-    previous = SANDBOX_ACTOR_CLASSES["local"]
-    SANDBOX_ACTOR_CLASSES["local"] = FakeSandboxActor
+    FakeBackend.script = script
+    previous = SANDBOX_BACKEND_CLASSES["local"]
+    SANDBOX_BACKEND_CLASSES["local"] = FakeBackend
     yield script
-    SANDBOX_ACTOR_CLASSES["local"] = previous
+    SANDBOX_BACKEND_CLASSES["local"] = previous
     script.gate.set()  # never leave a worker blocked behind a failed assertion
 
 
@@ -875,3 +1260,243 @@ def exec_card_for(
     )
     card.observer(observer)
     return card, observer
+
+
+@contextmanager
+def factory_for(backend: str, factory: BackendFactory) -> Iterator[list[BackendContext]]:
+    """Swap one registered backend's factory for the duration of a spec, yielding its contexts.
+
+    ``BackendSpec`` is a frozen dataclass, so the seam is a re-registration rather
+    than an attribute patch — the shape ``tests/vector_store/test_registry.py``
+    already uses. Every ``BackendContext`` the factory receives is appended to the
+    yielded list, which is how a spec reads the team a consumer handed its backend.
+    """
+    from akgentic.tool.vector_store import registry
+
+    contexts: list[BackendContext] = []
+    original = registry.get_backend_spec(backend)
+
+    def _recording(context: BackendContext) -> VectorStoreService:
+        contexts.append(context)
+        return factory(context)
+
+    registry.register_backend(replace(original, factory=_recording), replace=True)
+    try:
+        yield contexts
+    finally:
+        registry.register_backend(original, replace=True)
+
+
+##
+## The document store — reading an actor's records back off the disk
+##
+# Every helper below reads or writes through a **fresh** ``YamlDocumentStore``,
+# never the object the actor under test holds. That is deliberate and it is what
+# makes these assertions worth more than the two in-memory maps they replace: a
+# spec that reads back through a second object proves the record reached the
+# disk, where one that inspected ``actor.state`` could only prove it reached
+# memory. It is also exactly the shape story 52-3's AC 13 asks for.
+
+
+def attach_store(
+    actor: WorkspaceActor,
+    max_documents: int = DEFAULT_MAX_DOCUMENTS,
+    max_document_chars: int = DEFAULT_MAX_DOCUMENT_CHARS,
+) -> WorkspaceActor:
+    """Announce a document cache to *actor*, exactly as a bound card does.
+
+    A directly constructed actor gets none — ``on_start`` leaves the slot
+    ``None``, because building one is the card's job and an actor that built its
+    own would be reading configuration nobody handed it. Every fixture that
+    builds an actor by hand therefore stands in for the card here.
+
+    **The two caps arrive with the cache, not in the config.** They were
+    ``WorkspaceConfig`` fields until story 55-8 moved the extraction cache
+    card-side; a spec that wants a small cap passes it here.
+    """
+    actor.configure_document_cache(
+        DocumentCache(
+            YamlDocumentStore(),
+            actor.config.workspace_path,
+            max_documents,
+            max_document_chars,
+        )
+    )
+    return actor
+
+
+def cache_of(actor: WorkspaceActor) -> DocumentCache:
+    """The cache *actor* was announced — where a spec reaches its records.
+
+    ``mark_paths_stale`` and the extraction cache are this object's since story
+    55-8; the actor holds one rather than being one.
+    """
+    cache = actor._document_cache
+    assert cache is not None, "the actor was never announced a document cache"
+    return cache
+
+
+def store_of(target: WorkspaceActor | DocumentCache) -> YamlDocumentStore:
+    """A second store object over *target*'s tree — never the one it was given."""
+    return YamlDocumentStore()
+
+
+def tree_key_of(target: WorkspaceActor | DocumentCache) -> str:
+    """The three-segment path *target* addresses records by.
+
+    Both shapes are accepted because both are legitimate subjects since story
+    55-8: a spec about the retrieval pipeline holds an actor, and one about the
+    extraction cache holds the card's cache and no actor at all.
+    """
+    return target.tree_key if isinstance(target, DocumentCache) else target.config.workspace_path
+
+
+def stored_entries(target: WorkspaceActor | DocumentCache) -> dict[str, DocumentEntry]:
+    """Every record on disk for *target*'s tree, keyed by path."""
+    return {
+        entry.path: entry for entry in store_of(target).list_documents(tree_key_of(target))
+    }
+
+
+def stored_rows(target: WorkspaceActor | DocumentCache) -> dict[str, RagFile]:
+    """The retrieval index as the disk holds it — the former ``state.rag_index``."""
+    return {
+        path: entry.row for path, entry in stored_entries(target).items() if entry.row is not None
+    }
+
+
+def stored_docs(target: WorkspaceActor | DocumentCache) -> dict[str, DocumentExtract]:
+    """The extraction cache as the disk holds it — the former ``state.documents``."""
+    return {
+        path: entry.extract
+        for path, entry in stored_entries(target).items()
+        if entry.extract is not None
+    }
+
+
+def seed_row(actor: WorkspaceActor, path: str, row: RagFile) -> None:
+    """Put *row* on disk for *path*, keeping whatever extraction is already stored."""
+    store = store_of(actor)
+    key = actor.config.workspace_path
+    existing = store.get_document(key, path) or DocumentEntry(path=path)
+    store.put_document(key, existing.model_copy(update={"row": row}))
+
+
+def seed_extract(actor: WorkspaceActor, path: str, extract: DocumentExtract) -> None:
+    """Put *extract* on disk for *path*, keeping whatever row is already stored."""
+    store = store_of(actor)
+    key = actor.config.workspace_path
+    existing = store.get_document(key, path) or DocumentEntry(path=path)
+    store.put_document(key, existing.model_copy(update={"extract": extract}))
+
+
+def drop_row(actor: WorkspaceActor, path: str) -> None:
+    """Remove *path*'s index row, keeping its extraction — the former ``rag_index.pop``."""
+    store = store_of(actor)
+    key = actor.config.workspace_path
+    existing = store.get_document(key, path)
+    if existing is not None:
+        store.put_document(key, existing.model_copy(update={"row": None}))
+
+
+def drop_extract(actor: WorkspaceActor, path: str) -> None:
+    """Remove *path*'s extraction, keeping its row — the former ``documents.pop``."""
+    store = store_of(actor)
+    key = actor.config.workspace_path
+    existing = store.get_document(key, path)
+    if existing is not None:
+        store.put_document(key, existing.model_copy(update={"extract": None}))
+
+
+class RecordingDocumentStore:
+    """A real :class:`YamlDocumentStore` that also records what was asked of it.
+
+    The successor to ``delta_recorder``: where that counted the deltas a persist
+    point sent, this counts the **writes** a turn performed. It is the same
+    question one layer down, and a stronger one — a delta could be counted
+    without anything reaching a disk, and a put here cannot.
+
+    It delegates rather than faking, so a spec that reads back through
+    :func:`stored_rows` sees exactly what the actor wrote.
+
+    **Both new methods are written by hand, never inherited.**
+    ``@runtime_checkable`` checks method *names* only, so a fake missing one still
+    passes ``isinstance`` and fails at the call; and delegating by ``__getattr__``
+    would record nothing, which is the whole point of the class.
+
+    Attributes:
+        puts: ``(tree_key, path)`` for every ``put_document``, in order.
+        evicted: ``(tree_key, path)`` for every ``evict``, in order.
+        gets: ``(tree_key, path)`` for every ``get_document``, in order.
+        listings: ``tree_key`` for every ``list_documents``, in order.
+        pending_calls: ``(tree_key, exclude)`` for every ``next_pending``, in
+            order. What "the drain performs no full listing" is asserted on,
+            beside an empty :attr:`listings`.
+        holds: ``("enter" | "exit", path)`` for every hold, in order. A pair of
+            *positions*, so a spec can say a write happened **inside** one — which
+            a count cannot express at all.
+    """
+
+    def __init__(self) -> None:
+        self._inner = YamlDocumentStore()
+        self.puts: list[tuple[str, str]] = []
+        self.evicted: list[tuple[str, str]] = []
+        self.gets: list[tuple[str, str]] = []
+        self.listings: list[str] = []
+        self.pending_calls: list[tuple[str, frozenset[str]]] = []
+        self.holds: list[tuple[str, str]] = []
+
+    @property
+    def written(self) -> list[str]:
+        """The paths written, in order — what most specs actually assert on."""
+        return [path for _, path in self.puts]
+
+    def get_document(self, tree_key: str, path: str) -> DocumentEntry | None:
+        self.gets.append((tree_key, path))
+        return self._inner.get_document(tree_key, path)
+
+    def put_document(self, tree_key: str, entry: DocumentEntry) -> None:
+        self.puts.append((tree_key, entry.path))
+        self._inner.put_document(tree_key, entry)
+
+    def evict(self, tree_key: str, path: str) -> None:
+        self.evicted.append((tree_key, path))
+        self._inner.evict(tree_key, path)
+
+    def list_documents(self, tree_key: str) -> list[DocumentEntry]:
+        self.listings.append(tree_key)
+        return self._inner.list_documents(tree_key)
+
+    def next_pending(self, tree_key: str, exclude: frozenset[str]) -> DocumentEntry | None:
+        self.pending_calls.append((tree_key, exclude))
+        return self._inner.next_pending(tree_key, exclude)
+
+    @contextmanager
+    def hold(self, tree_key: str, path: str) -> Iterator[None]:
+        self.holds.append(("enter", path))
+        try:
+            with self._inner.hold(tree_key, path):
+                yield
+        finally:
+            self.holds.append(("exit", path))
+
+
+def watch_store(actor: WorkspaceActor) -> RecordingDocumentStore:
+    """Give *actor* a recording store and hand the recorder back.
+
+    Announced through ``configure_document_cache`` rather than assigned, so the
+    spec exercises the same tell path a card uses. The caps it is announced under
+    are whatever *actor* already holds, so swapping the store in mid-spec does not
+    silently reset a cap the spec set.
+    """
+    recorder = RecordingDocumentStore()
+    current = actor._document_cache
+    actor.configure_document_cache(
+        DocumentCache(
+            recorder,
+            actor.config.workspace_path,
+            current.max_documents if current is not None else DEFAULT_MAX_DOCUMENTS,
+            current.max_document_chars if current is not None else DEFAULT_MAX_DOCUMENT_CHARS,
+        )
+    )
+    return recorder

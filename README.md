@@ -28,7 +28,7 @@ commands.
   - [WorkspaceTool](#workspacetool)
   - [PlanningTool](#planningtool)
   - [KnowledgeGraphTool](#knowledgegraphtool)
-  - [VectorStoreTool](#vectorstoretool)
+  - [The vector store](#the-vector-store)
   - [SearchTool](#searchtool)
   - [TeamTool](#teamtool)
   - [MetadataTool](#metadatatool)
@@ -37,7 +37,6 @@ commands.
   - [MailboxTool](#mailboxtool)
   - [ModelTool](#modeltool)
   - [MCPTool](#mcptool)
-  - [ExecTool — deprecated](#exectool--deprecated-use-workspacetoolworkspace_exec)
   - [Deprecating a card](#deprecating-a-card--not-the-same-as-moving-an-import-path)
 - [Error Handling](#error-handling)
 - [Optional Extras](#optional-extras)
@@ -67,9 +66,7 @@ running inside it. It provides:
   sandboxed shell execution**, task planning, knowledge graph, web search, team management, the
   team's business context, on-demand skill guidance, the agent's own mailbox and run-cancellation
   surface, runtime model switching, vector-store configuration, MCP server integration, and
-  self-scheduled notifications. A thirteenth card, `ExecTool`, still ships as a deprecated shim over
-  `WorkspaceTool(workspace_exec=…)` and is not counted — it advertises no capability the workspace
-  card does not
+  self-scheduled notifications
 
 ```
 ToolCard(s)
@@ -473,6 +470,15 @@ a sibling package imports `CommandsAnnouncedEvent` from the old path.
 | `akgentic.tool.event.TeamManagementToolObserver` | `akgentic.tool` (root) or `akgentic.tool.team.observer` |
 | `akgentic.tool.vector.EmbeddingService` | `akgentic.tool` (root) or `akgentic.tool.vector_store.vector` |
 | `akgentic.tool.vector.VectorIndex` | `akgentic.tool` (root) or `akgentic.tool.vector_store.vector` |
+| `akgentic.tool.sandbox.ExecTool`, `akgentic.tool.ExecTool` | `WorkspaceTool(workspace_exec=…)` from `akgentic.tool` — **removed**, not moved: the card was deprecated in 1.7.0, shipped its warning through 1.8.0, and is absent from every release after |
+
+`ExecTool` is the one row here that is a *card* rather than a path, so it is governed by
+[Deprecating a card](#deprecating-a-card--not-the-same-as-moving-an-import-path) rather than by the
+tiers below. Unlike the other withdrawn entries the failure is not a bare "cannot import name":
+both paths raise an `ImportError` naming `WorkspaceTool(workspace_exec=…)`, because a stored
+catalog row naming the class has nothing else to tell it where the capability went. When migrating
+such a row, turn every other `WorkspaceTool` capability off explicitly — they default to `True`,
+and a bare `model_type` swap grants file access to an agent that previously had only a shell.
 
 The observers are Stable-tier **symbols** — but the promise attaches to the package root,
 their supported surface, not to every path they historically resolved from. Their `event.py`
@@ -711,18 +717,39 @@ few are not. A plan, a knowledge graph and a vector index are **shared, mutable 
 any single tool call**, and the framework gives that state a home — a **tool actor**, one per team,
 that every agent carrying the card talks to.
 
-Seven ship in this package today: `#VectorStore`, `#PlanningTool`, `#KnowledgeGraphTool`,
-`#SandboxActor-<scope>/<leaf>`, `#TeamActivity`, `#NotificationTool` and
-`#Workspace-<scope>/<leaf>`.
+Six ship in this package today: `#VectorStore`, `#PlanningTool`, `#KnowledgeGraphTool`,
+`#TeamActivity`, `#NotificationTool` and `#Workspace-<scope>/<kind>/<leaf>`. The sandbox actor that
+used to sit beside the workspace actor is retired: `#Workspace` owns the tree's exec backend and
+runs commands on its own worker thread, so an exec-enabled tree runs one actor, not two.
 
-**Note the two names that carry a suffix.** Five of the seven are one per *team*, and their name is
-a constant. The workspace actor and the sandbox actor are one per *workspace tree*, so their names
-are **built** from the workspace's resolved two-segment path — slash included — rather than being
-literals. Two of them can coexist in one team, each owning its own directory, and two *principals*
-whose cards both say `workspace_id="notes"` get two actors over two trees because the name carries
-the scope as well as the leaf. `getChildrenOrCreate` keys on the name, so this is not
-cosmetic: a fixed name would collapse two trees onto one actor, silently. The unicity domain of an
-actor must equal the resource it owns.
+**`#Workspace` is one per team like the other five, and one per *tree* within a team.** Epic 51 made
+it a hosted singleton so that one actor per tree could hold the exec lease, the document cache, the
+retrieval index and the write gate; epic 52 moved every one of those onto the tree itself — a marker
+file, YAML records under a metadata sibling, an `fcntl.flock` — so the actor holds **no shared
+state**, and the hosting was removed with the state that motivated it. What it still owns is
+dispatch: exec runs on its own worker thread, and the retrieval indexing pipeline whose workers
+report to its mailbox. **Two teams over one tree therefore get two actors, and that is correct** —
+the tree orders them, across two processes as well as two teams, which a mailbox never did. See the
+[workspace README](src/akgentic/tool/workspace/README.md#lifetime).
+
+**`#VectorStore` is the exception among them: it exists only for a backend that keeps its data in
+actor state.** Today that means the in-memory backend. On a cluster the rows live in the cluster,
+so there is nothing for an actor to own and none is created — each consumer holds its own backend
+object and calls it directly. Whether the actor exists at all is the backend's answer, read from the
+`persists_in_actor_state` flag on its registered spec, not a card's. The workspace's in-memory store
+is the team's `#VectorStore`: since epic 52 the workspace card binds the team's store rather than
+creating a child of its own, so two trees in one team share one store and one workspace stopping
+cannot take the other's index down.
+
+**Note the one name that carries a suffix.** Five of the six are one per *team*, and their name is
+a constant. The workspace actor is one per *workspace tree*, so its name is **built** from the
+workspace's resolved three-segment path — slashes included — rather than being a literal. Two of
+them can coexist in one team, each owning its own directory, and two *principals* whose cards both
+say `workspace_id="notes"` get two actors over two trees because the name carries the scope and the
+kind as well as the leaf. Get-or-create keys on the name, so this is not cosmetic: a fixed name
+would collapse two trees onto one actor, silently. The unicity domain of an actor must equal the
+resource it owns — and the exec backend, which serves exactly that tree, is held by the workspace
+actor rather than named and created as an actor of its own.
 
 ### One per team, and what that buys
 
@@ -742,10 +769,13 @@ anything you write, which is why a tool actor's methods can read-modify-write wi
 same one-thread property is why the next section exists: it also means a slow method blocks
 everyone queued behind it.
 
-**State that persists itself.** A tool actor's state reaches the team's event store without the
-tool arranging it — the actor calls `notify_state_change()`, and the framework snapshots the state
-and restores it when the team resumes. Persistence here is a property of being an actor, not
-something a tool implements.
+**State that persists itself.** A one-per-team tool actor's state reaches the team's event store
+without the tool arranging it — the actor calls `notify_state_change()`, and the framework
+snapshots the state and restores it when the team resumes. Persistence here is a property of being
+an actor, not something a tool implements. `#Workspace` is the exception, and in the other
+direction: it persists **nothing** through its actor, because what it knows about a tree belongs to
+the tree — one YAML record per source document under the tree's metadata sibling, which a second
+actor, or a second process over the same mount, reads back with no handoff at all.
 
 ### Binding one: `getChildrenOrCreate`, never check-then-create
 
@@ -999,19 +1029,11 @@ the `ToolCard` definition, every field and every nested capability parameter, an
 configuration surface — environment, extras, actor wiring and failure modes. The entries below
 are the index; the detail lives beside the module it documents.
 
-`ExecTool` has a row below and is **not** one of the twelve: it is a deprecated shim over
-`WorkspaceTool(workspace_exec=…)`, kept working and kept listed so a reader who arrives looking for
-it is told where the capability went. A shim is not a distinct usable capability, so it does not
-count towards what the package advertises. See
-[Deprecating a card](#deprecating-a-card--not-the-same-as-moving-an-import-path) for what that
-status commits us to.
-
 | Tool | Module | What it does | Reference |
 |---|---|---|---|
 | `WorkspaceTool` | `akgentic.tool.workspace` | Team-scoped filesystem behind a write gate, with a git journal and sandboxed shell execution | [README](src/akgentic/tool/workspace/README.md) |
 | `PlanningTool` | `akgentic.tool.planning` | Shared task board backed by the `#PlanningTool` actor | [README](src/akgentic/tool/planning/README.md) |
 | `KnowledgeGraphTool` | `akgentic.tool.knowledge_graph` | Entities and relations with hybrid keyword + semantic search | [README](src/akgentic/tool/knowledge_graph/README.md) |
-| `VectorStoreTool` | `akgentic.tool.vector_store` | Configuration-only card owning the shared embedding store | [README](src/akgentic/tool/vector_store/README.md) |
 | `SearchTool` | `akgentic.tool.search` | Web search, fetch and crawl via Tavily | [README](src/akgentic/tool/search/README.md) |
 | `TeamTool` | `akgentic.tool.team` | Hire, fire, roster, role profiles, and who is busy right now | [README](src/akgentic/tool/team/README.md) |
 | `MetadataTool` | `akgentic.tool.metadata` | The team's business context, rendered once into every agent's prefix | [README](src/akgentic/tool/metadata/README.md) |
@@ -1020,7 +1042,11 @@ status commits us to.
 | `MailboxTool` | `akgentic.tool.mailbox` | A signal naming one message in the agent's own mailbox, and the `/stop` cancel surface | [README](src/akgentic/tool/mailbox/README.md) |
 | `ModelTool` | `akgentic.tool.model` | The model roster listed, the switch between its entries, and the resulting selection persisted | [README](src/akgentic/tool/model/README.md) |
 | `MCPTool` | `akgentic.tool.mcp` | External MCP servers as pydantic-ai toolsets | [README](src/akgentic/tool/mcp/README.md) |
-| ~~`ExecTool`~~ | `akgentic.tool.sandbox` | **Deprecated** — use `WorkspaceTool(workspace_exec=…)`. The sandbox *backend* it wired is not deprecated and is documented in the same place | [README](src/akgentic/tool/sandbox/README.md) |
+
+The sandbox *backend* `WorkspaceTool.workspace_exec` runs on — the four isolation backends, the
+allowlist, the Docker image and the registry a deployment injects its own backend into — has its
+own reference beside the code: [`src/akgentic/tool/sandbox/README.md`](src/akgentic/tool/sandbox/README.md).
+It is not a card.
 
 ### WorkspaceTool
 
@@ -1029,13 +1055,21 @@ Read/write access to a shared team filesystem — `workspace_read`, `workspace_l
 `workspace_edit`, `workspace_multi_edit`, `workspace_patch`, `workspace_delete`,
 `workspace_mkdir` and (opt-in) `workspace_exec` / `workspace_exec_result` on the write side. One
 class covers both modes via a `read_only: bool` gate. All paths are anchored to
-`<AKGENTIC_WORKSPACES_ROOT>/<scope>/<leaf>` — a workspace is a two-segment path, scoped to its owner:
-`<user_id>/<team_id>` by default, `<user_id>/<workspace_id>` for a named one, and `_meta/<joined
-keys>` for the metadata-shared layout. Traversal out of that root is rejected.
+`<AKGENTIC_WORKSPACES_ROOT>/<scope>/<kind>/<leaf>` — a workspace is a three-segment path. The
+`<kind>` says how the leaf was derived: `_team/<team_id>` by default, `_id/<workspace_id>` for a
+named one, and `_meta/<joined keys>` for a metadata-keyed one. A `workspace_id` is 1 to 128
+characters of `[A-Za-z0-9._-]`, not a kind name and not ending in `.git` or `.index`; anything else
+is refused when the card is constructed — catalog save, team creation, resume — never at bind. The `<scope>` is the owning principal
+for all three, unless the card declares `workspace_sharable=True` **and** the platform permits that
+kind through `AKGENTIC_WORKSPACE_SHARED_KINDS`, which puts the tree under the reserved `_shared`
+scope. A shared request the platform does not permit fails the bind rather than falling back. See
+the [workspace README](src/akgentic/tool/workspace/README.md#where-the-files-live) for the six
+cells and the permission. Traversal out of that root is rejected.
 
-**A `#Workspace-<scope>/<leaf>` singleton owns the tree, and every mutation is refused unless the file
-is still what the writing agent last read.** Reads stay on the agent's own thread and are never
-serialized. A refusal is a `RetriableError`, so it lands in the model's next turn carrying a diff of
+**Every mutation is refused unless the file is still what the writing agent last read**, and the
+check and the write happen together under an `fcntl.flock` held on the path — on the *tree*, so two
+teams and two processes over one mounted volume are ordered by the same thing. Reads stay on the
+agent's own thread and are never serialized. A refusal is a `RetriableError`, so it lands in the model's next turn carrying a diff of
 what the write would have destroyed — the agent re-reads and redoes without anyone writing recovery
 logic. No digest, `expected` or `force` appears in any tool signature: the precondition is derived
 server-side from what the agent was observed to read, and there is deliberately no bypass. Accepted
@@ -1047,8 +1081,9 @@ from akgentic.tool import WorkspaceTool
 
 WorkspaceTool()                                      # full access (default), journal off, exec off
 WorkspaceTool(read_only=True)                        # read tools only
-WorkspaceTool(workspace_id="scratch")                # a second tree of YOUR OWN: <user_id>/scratch
-WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])  # shared across teams AND users
+WorkspaceTool(workspace_id="scratch")                # a second tree of YOUR OWN: alice/_id/scratch
+WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])  # alice/_meta/…: still per-principal
+WorkspaceTool(workspace_id="notes", workspace_sharable=True)       # _shared/_id/notes, if "id" is permitted
 WorkspaceTool(workspace_exec=True)                   # + sandboxed shell over the same tree
 WorkspaceTool(git_journal=True)                      # + git history; the gate is unaffected either way
 WorkspaceTool(read_only=True, workspace_glob=False)  # fine-grained capability control
@@ -1103,15 +1138,14 @@ from akgentic.tool.planning import GetPlanning, PlanningTool
 
 PlanningTool()                                                  # default config
 PlanningTool(get_planning=GetPlanning(filter_by_agent=False))   # show all tasks
-PlanningTool(vector_store=False)                                # keyword-only search
 ```
 
-Semantic search needs `akgentic-tool[vector_search]` and a `VectorStoreTool` in the team; without
-either it degrades to keyword-only.
+Semantic search needs `akgentic-tool[vector_search]`; without it the card degrades to keyword-only.
+The store itself needs no second card — `PlanningTool` carries its own `vector_store:
+VectorStoreParam` and creates whatever that backend needs.
 
 **[Full reference → `src/akgentic/tool/planning/README.md`](src/akgentic/tool/planning/README.md)** —
-task model constraints, the four capabilities and their channels, collection configuration and
-the `depends_on` contract.
+task model constraints, the four capabilities and their channels, and collection configuration.
 
 ### KnowledgeGraphTool
 
@@ -1128,32 +1162,34 @@ KnowledgeGraphTool()
 KnowledgeGraphTool(read_only=True)
 ```
 
-Requires `akgentic-tool[vector_search]` — the dependency is checked at wiring time even when
-`vector_store=False`.
+Requires `akgentic-tool[vector_search]` — the dependency is checked at wiring time.
 
 **[Full reference → `src/akgentic/tool/knowledge_graph/README.md`](src/akgentic/tool/knowledge_graph/README.md)** —
 the mutation and query models, search modes and expansion flags, scoring, and the state-delta
 events.
 
-### VectorStoreTool
+### The vector store
 
-Configuration-only companion card for the `VectorStoreActor` singleton — it exposes **no LLM
-tools, system prompts, or commands** (`get_tools()` returns `[]`). Its sole runtime job is to
-ensure the singleton exists when the observer attaches. Consumer cards (`PlanningTool`,
-`KnowledgeGraphTool`) never create the actor themselves: they look it up by name and declare a
-conditional `depends_on: ["VectorStoreTool"]`, so `ToolFactory`'s topological sort wires this card
-first.
+**There is no configuration card.** Each consumer — `PlanningTool`, `KnowledgeGraphTool`,
+`WorkspaceTool` — carries its own `vector_store: VectorStoreParam` and resolves its own storage
+engine, so a store's settings live on the card that uses it and no card declares a `depends_on`
+edge.
+
+Whether an actor exists at all is the backend's answer, not a card's. In memory the
+`VectorStoreActor`'s state *is* the database, so the consumer's `observer()` creates it (through
+`ensure_store_actor`) before the actor that will look it up. On a cluster the data is elsewhere and
+an actor would hold nothing but a socket, so none is created and the consumer calls the shared
+client directly.
 
 ```python
-from akgentic.tool.vector_store import VectorStoreTool
+from akgentic.tool.vector_store import VectorStoreParam
 
-VectorStoreTool()                                  # "#VectorStore", OpenAI embeddings
-VectorStoreTool(vector_store_name="#VectorStore-RAG", embedding_provider="azure")
+PlanningTool()                                                          # in memory: an actor
+KnowledgeGraphTool(vector_store=VectorStoreParam(backend="weaviate"))   # a cluster: none
 ```
 
-Collections are configured on the *consumer* card (`collection: CollectionConfig`), and Weaviate
-connection settings are deliberately not fields on any card — they are infrastructure. The card
-reads them from the environment when the observer attaches:
+Weaviate connection settings are deliberately not fields on any card — they are infrastructure,
+read from the environment:
 
 ```bash
 export AKGENTIC_WEAVIATE_URL="https://your-cluster.weaviate.network"
@@ -1161,7 +1197,7 @@ export AKGENTIC_WEAVIATE_API_KEY="..."          # omit for an unauthenticated cl
 ```
 
 **Exporting the URL is what turns the Weaviate backend on**, and it also picks the *default*:
-`CollectionConfig.backend` resolves to `weaviate` when a cluster is configured and `inmemory`
+`VectorStoreParam.backend` resolves to `weaviate` when a cluster is configured and `inmemory`
 otherwise, so a card that names no backend lands wherever the deployment actually is. An exported
 but empty variable counts as unset. Requires `akgentic-tool[weaviate]`.
 
@@ -1169,7 +1205,7 @@ Naming `backend="weaviate"` with no URL exported **raises at team creation** rat
 to memory — a card asking for durable, shared storage should not be silently handed a process-local
 index that everything downstream assumes is persisted.
 
-This card is also where **hybrid search** lives. `akgentic.tool.vector_store.hybrid` owns the one
+This package is also where **hybrid search** lives. `akgentic.tool.vector_store.hybrid` owns the one
 rule that fuses keyword and vector hits, shared by `PlanningTool` and `KnowledgeGraphTool` so both
 rank identically: Weaviate's `relativeScoreFusion`, `alpha * norm(cosine) + (1 - alpha) * keyword`,
 at the client's default `alpha = 0.7`. The backends themselves answer pure similarity queries and
@@ -1180,11 +1216,22 @@ strong semantic hit.
 Every object `WeaviateBackend` writes is stamped with the owning team's id (`team_id`, taken from
 the actor, never from a card), so `delete_by_team()` and `list_collections()` give a deployment the
 two primitives it needs to reap the vectors of a deleted team — otherwise unreachable, since
-nothing else on a Weaviate object says who produced it.
+nothing else on a Weaviate object says who produced it. **The exception is the shared workspace
+collection, `workspace_chunks`**: a workspace row carries `""` for its team — deliberately, so that
+a row's identity does not move when the actor that wrote it is replaced — is bounded by the
+mandatory `scope` instead, and is never reaped by team. Every object's id is
+derived from its team, tenant and `ref_id` — the derivation Qdrant's point ids use — so a re-added
+row replaces the object instead of doubling it.
+
+Every consumer in a process reaches a cluster through **one shared client**, keyed on the backend and
+the connection it names (host, port, scheme, API key) and obtained with `get_client(key, connect)`
+from `akgentic.tool.vector_store`; a cluster backend takes that client and never opens or closes one
+of its own. `close_all()` closes every cached client and runs by itself at process exit — an embedder
+or a script that wants its connections released earlier calls it once no consumer is live.
 
 **[Full reference → `src/akgentic/tool/vector_store/README.md`](src/akgentic/tool/vector_store/README.md)** —
-`CollectionConfig` in full, the service protocol, asynchronous embedding, team-scoped cleanup, and
-multi-store setups.
+`VectorStoreParam` in full, the service protocol, per-collection team scoping, team-scoped cleanup,
+and multi-store setups.
 
 ### SearchTool
 
@@ -1498,38 +1545,12 @@ be requested explicitly.
 both connection models field by field, the SSE timeout subtlety, tool prefixing, diagnostics and
 the OAuth helpers.
 
-### ExecTool — deprecated, use `WorkspaceTool(workspace_exec=…)`
-
-**The card moved; the backend did not.** Sandboxed execution is a capability of `WorkspaceTool`,
-because exec and the write gate share one resource — the tree — and two cards over one tree means
-two mailboxes that interleave. `SANDBOX_ACTOR_CLASSES`, the four backends and the bundled Docker
-image are unchanged, are not deprecated, and are what `workspace_exec` resolves through.
-
-```python
-# Before
-ToolFactory([WorkspaceTool(workspace_id="proj-42"), ExecTool(workspace_id="proj-42")], observer=agent)
-
-# After
-ToolFactory([WorkspaceTool(workspace_id="proj-42", workspace_exec=True)], observer=agent)
-```
-
-`ExecTool` still resolves and `exec_command` still behaves identically — same lease, same worker,
-same discovery, same commit — because it is a shim over `workspace_exec` rather than a second
-implementation. It emits a `DeprecationWarning` when the card is **wired**, not at import. What it
-cannot express is `git_journal`: its three fields are frozen, so an `ExecTool`-only agent always
-gets the journal's default, which is off.
-
-**[Full reference → `src/akgentic/tool/sandbox/README.md`](src/akgentic/tool/sandbox/README.md)** —
-the migration table, the four backends compared (isolation, timeouts, rlimits, network), the
-allowlist and why it is not the boundary, the Docker image lifecycle, and how to register a backend
-of your own.
-
 ### Deprecating a card — not the same as moving an import path
 
 [§Migration](#migration-moved-import-paths) governs **import paths** and their Stable/Internal
 tiers: a symbol that moves modules gets a shim, and the tier says whether the old path was ever a
 promise. A deprecated **card** is a different thing — no module moved, and the class keeps working.
-The policy, stated once because `ExecTool` is the first to need it:
+The policy, stated once because `ExecTool` was the first to need it:
 
 - **It keeps working, identically**, for as long as it ships. A shim that behaves differently from
   its replacement is worse than no shim.
@@ -1538,7 +1559,21 @@ The policy, stated once because `ExecTool` is the first to need it:
   change.
 - **It leaves the Tool Catalog for a migration pointer** and stops counting towards the number of
   tools the package advertises.
-- **It is removed no earlier than the minor release after** the one that deprecated it.
+- **It is removed no earlier than the minor release after the first *published* release that
+  warns.** The clock counts published releases, not commits: a warning that exists only on a branch
+  has warned nobody. A card whose deprecated form has **never been published** is therefore removed
+  outright rather than shimmed — a shim's only purpose is to give an already-released consumer one
+  warned upgrade, and an audience that never received the card being deprecated has nothing to be
+  warned about.
+- **When it is removed, the break stays legible**: the module answers the old name with an
+  `ImportError` naming the replacement, and the row moves to [§Migration](#migration-moved-import-paths).
+
+`ExecTool` is the case that produced the last two rules, and it is worth recording how. The
+removal was drafted on the finding that the shim had never been published — PyPI held 1.6.10, in
+which `ExecTool` was the only exec card and carried no warning — which would have made removing it
+outright the right call. By the time the removal landed, 1.7.0 and 1.8.0 had both shipped the
+warning, so it also satisfies the window as originally written. Either way the policy now says what
+its clock counts, so that the next card does not have to re-derive it.
 
 ## Error Handling
 
@@ -1673,17 +1708,22 @@ src/akgentic/tool/
     vector.py                 # Compatibility façade only — moved to
     │                         #   vector_store/vector.py. See the migration table
     vector_store/
-    │   README.md           # VectorStoreTool reference — fields, CollectionConfig, backends
+    │   README.md           # Vector store reference — VectorStoreParam, backends, the client cache
     │   vector.py             # VectorEntry, EmbeddingService, VectorIndex
     │   │                     #   [optional: vector_search extra]
     │   protocol.py           # VectorStore Protocol, VectorStoreConfig, data models
-    │   inmemory.py           # InMemory backend
-    │   weaviate.py           # Weaviate backend [optional: weaviate extra]
-    │   actor.py              # VectorStoreActor singleton
-    │   embedding_actor.py    # EmbeddingActor (non-blocking embedding); spawned as
-    │                         #   "#embed-<collection>-<request_id>" (teardown
-    │                         #   invariant — see Deferred Results)
-    │   └── tool.py           # VectorStoreTool ToolCard
+    │   backends/             # The built-in backends; each self-registers on import.
+    │   │                     #   Import the classes from vector_store, not here
+    │   │   inmemory.py       # InMemory backend
+    │   │   weaviate.py       # Weaviate backend + its environment helpers
+    │   │                     #   [optional: weaviate extra]
+    │   │   └── qdrant.py     # Qdrant backend [optional: qdrant extra]
+    │   client.py             # One client per cluster per process, keyed and closed
+    │   registry.py           # Pluggable backend registry — BackendSpec, register_backend
+    │   actor.py              # VectorStoreActor singleton + ensure_store_actor
+    │   embedding_actor.py    # EmbeddingWorker (a DeferredWorker), spawned by the
+    │                         #   CONSUMER as "#embed-<collection>-<request_id>"
+    │   └──                   #   (teardown invariant — see Deferred Results)
     planning/
     │   README.md           # PlanningTool reference — capabilities, task models, wiring
     │   planning_actor.py     # Task models, PlanConfig, PlanActor
@@ -1752,34 +1792,33 @@ src/akgentic/tool/
         workspace.py          # Workspace Protocol, Filesystem (atomic write / write_many),
         │                     #   PathEscapeError, WriteEntry, get_workspace(), is_staging_name,
         │                     #   resolve_workspace_path() / user_segment() / leaf_segment() —
-        │                     #   the one place a two-segment workspace path is derived
-        migrate.py            # Operator script: move a pre-two-segment workspaces root under
-        │                     #   its owners. Not exported; run as a module, never imported
-        actor.py              # WorkspaceActor "#Workspace-<scope>/<leaf>" — the six gated
-        │                     #   mutations, the live-hash check, the lease, the staging sweep
+        │                     #   the one place a three-segment workspace path is derived —
+        │                     #   and permitted_shared_kinds(), the platform's sharing permission
+        actor/                # WorkspaceActor "#Workspace-<scope>/<kind>/<leaf>" — a team child
+        │                     #   owning one tree's dispatch: exec's worker, the RAG pipeline
         models.py             # Observation, MutationOutcome, LastWrite, WorkspaceConfig,
         │                     #   content_sha, the refusal texts and every cap
         journal.py            # GitJournal, Identity — linear history, out-of-band commits,
         │                     #   the seeded .gitignore, graceful absence
-        execution.py          # workspace_exec's models, budgets, ExecWorker and the one
-        │                     #   formatter both exec surfaces render through
+        execution.py          # workspace_exec's models, budgets, and the one formatter
+        │                     #   a finished run renders through
         edit.py               # EditMatcher (7-strategy), FilePatch, parse_patch,
         │                     #   render_file_patch (hunk-context verified), HunkContextError
         readers.py            # DocumentReader (Pydantic BaseModel), TEXT_EXTENSIONS
         └── tool.py           # WorkspaceTool ToolCard
     sandbox/
-        README.md           # The exec backend — backends compared, allowlist, image;
-        │                     #   and ExecTool's migration pointer
-        __init__.py           # Public exports: ExecTool, SandboxActor subclasses, models
-        actor.py              # SandboxActor (abstract), SandboxConfig, ALLOWED_COMMANDS,
-        │                     #   sandbox_actor_name() — the name carries the workspace
-        local.py              # LocalSandboxActor (subprocess, resource limits)
-        docker.py             # DockerSandboxActor (persistent container per team)
-        seatbelt.py           # SeatbeltSandboxActor (macOS Apple Seatbelt)
-        bwrap.py              # BwrapSandboxActor (Linux bubblewrap)
-        tool.py               # ExecTool ToolCard (deprecated shim over workspace_exec),
-        │                     #   SANDBOX_ACTOR_CLASSES registry, auto-mode probing
-        └── sandbox.Dockerfile # Bundled image definition for akgentic-sandbox:latest
+        README.md           # The exec backend — backends compared, allowlist, image,
+        │                     #   registering a backend; the ExecTool and sandbox-actor migrations
+        __init__.py           # Public exports: the four backends, the Protocol, the registry;
+        │                     #   refuses `ExecTool` by name with a pointer to workspace_exec
+        backend.py            # SandboxBackend (Protocol), ProcessBackend (the Popen dance, once),
+        │                     #   ExecResult, ExecReport, ALLOWED_COMMANDS, validate_command()
+        local.py              # LocalBackend (subprocess, resource limits, process group)
+        docker.py             # DockerBackend (ephemeral read-only container per workspace tree)
+        seatbelt.py           # SeatbeltBackend (macOS Apple Seatbelt)
+        bwrap.py              # BwrapBackend (Linux bubblewrap)
+        registry.py           # SANDBOX_BACKEND_CLASSES registry, auto-mode probing
+        └── sandbox.Dockerfile # Bundled image definition for akgentic-sandbox:v2
 tests/                        # Tests organised by domain
 ```
 

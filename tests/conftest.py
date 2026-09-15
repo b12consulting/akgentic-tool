@@ -2,20 +2,54 @@
 
 from __future__ import annotations
 
+import os
 import uuid
+from collections.abc import Iterator
+from unittest.mock import patch
 
 import pytest
 from akgentic.core.actor_address import ActorAddress
 
-from akgentic.tool.vector_store.protocol import WEAVIATE_API_KEY_ENV, WEAVIATE_URL_ENV
-from akgentic.tool.vector_store.qdrant import QDRANT_API_KEY_ENV, QDRANT_URL_ENV
+from akgentic.tool.vector_store.backends.qdrant import QDRANT_API_KEY_ENV, QDRANT_URL_ENV
+from akgentic.tool.vector_store.backends.weaviate import WEAVIATE_API_KEY_ENV, WEAVIATE_URL_ENV
+from akgentic.tool.workspace.workspace import SHARED_KINDS_ENV
+
+#: The pid every ``popen_mock`` helper in this suite stamps on its fake process.
+MOCK_CHILD_PID = 4242
+
+
+@pytest.fixture(autouse=True)
+def _no_group_kill_on_the_mock_pid() -> Iterator[None]:
+    """Refuse a real ``os.killpg`` aimed at the fake process's pid.
+
+    ``local`` and ``bwrap`` spawn under ``process_group=True``, so a spec that
+    mocks ``Popen`` and then reaches the timeout or ``kill()`` path without
+    patching ``os.killpg`` would send ``SIGKILL`` to whatever real process group
+    happens to own pid 4242 on this host. Every such spec patches ``killpg``
+    today; this turns a forgotten patch into a red test rather than a dead
+    process. A spec that runs a real child goes through to the real call, and a
+    spec's own ``patch`` of the same target still wins, since it nests inside.
+    """
+    real_killpg = os.killpg
+
+    def guarded(pgid: int, sig: int) -> None:
+        if pgid == MOCK_CHILD_PID:
+            raise AssertionError(
+                f"os.killpg reached with the mock pid {MOCK_CHILD_PID}: this spec mocks "
+                "Popen on a group-kill path and must patch "
+                "akgentic.tool.sandbox.backend.os.killpg"
+            )
+        real_killpg(pgid, sig)
+
+    with patch("akgentic.tool.sandbox.backend.os.killpg", guarded):
+        yield
 
 
 @pytest.fixture(autouse=True)
 def _no_ambient_weaviate_cluster(monkeypatch: pytest.MonkeyPatch) -> None:
     """Hide a developer's exported cluster from every test in the package.
 
-    ``CollectionConfig.backend`` resolves from the backends' environment
+    ``VectorStoreParam.backend`` resolves from the backends' environment
     variables at instantiation, so without this the suite means different things
     depending on whose shell it runs in: green on a CI runner that exports
     nothing, red for the developer running the local cluster the feature exists
@@ -27,6 +61,30 @@ def _no_ambient_weaviate_cluster(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv(WEAVIATE_API_KEY_ENV, raising=False)
     monkeypatch.delenv(QDRANT_URL_ENV, raising=False)
     monkeypatch.delenv(QDRANT_API_KEY_ENV, raising=False)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _no_ambient_shared_kinds() -> Iterator[None]:
+    """Hide a developer's or runner's exported shared-kind permission from every test.
+
+    ``WorkspaceTool.observer`` reads ``AKGENTIC_WORKSPACE_SHARED_KINDS`` at every
+    bind, so without this the suite means different things depending on whose
+    shell it runs in: an exported ``team,id,meta`` turns every "unset refuses"
+    spec red and makes every "permitted binds" spec vacuous, since it would bind
+    whether or not the spec granted anything.
+
+    Here rather than in ``tests/workspace/conftest.py`` because a
+    ``WorkspaceTool`` is bound outside that directory too. **Session-scoped**
+    because a function-scoped fixture is set up only after every wider-scoped
+    one: the read-cost smoke's module-scoped harness bound its team with the
+    shell's value still in place, and an exported malformed value errored all
+    five of its specs. The variable is ambient for the whole session, so it is
+    hidden for the whole session. Tests that want a permission grant it with
+    ``monkeypatch``, whose undo restores this fixture's "unset".
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        patch.delenv(SHARED_KINDS_ENV, raising=False)
+        yield
 
 
 class MockActorAddress(ActorAddress):

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -274,43 +274,30 @@ class TestFieldLengthConstraints:
 # ---------------------------------------------------------------------------
 
 
-class TestPlanConfigVectorStoreField:
-    """AC-3: PlanConfig carries a fully-serialisable vector_store field."""
+class TestPlanConfigRefusesTheOldBinding:
+    """The lookup field is gone: the old catalog shapes fail loudly, not silently."""
 
-    def test_vector_store_default_true(self) -> None:
+    def test_a_boolean_binding_is_a_validation_error(self) -> None:
+        from pydantic import ValidationError
+
         from akgentic.tool.planning.planning_actor import PlanConfig
 
-        cfg = PlanConfig(name="#PlanningTool", role="ToolActor")
-        assert cfg.vector_store is True
+        for value in (True, False):
+            with pytest.raises(ValidationError):
+                PlanConfig(name="#PlanningTool", role="ToolActor", vector_store=value)
 
-    def test_vector_store_accepts_false(self) -> None:
+    def test_a_named_actor_string_is_a_validation_error(self) -> None:
+        from pydantic import ValidationError
+
         from akgentic.tool.planning.planning_actor import PlanConfig
 
-        cfg = PlanConfig(name="#PlanningTool", role="ToolActor", vector_store=False)
-        assert cfg.vector_store is False
-
-    def test_vector_store_accepts_string(self) -> None:
-        from akgentic.tool.planning.planning_actor import PlanConfig
-
-        cfg = PlanConfig(
-            name="#PlanningTool", role="ToolActor", vector_store="#VectorStore-RAG"
-        )
-        assert cfg.vector_store == "#VectorStore-RAG"
-
-    def test_vector_store_roundtrip(self) -> None:
-        from akgentic.tool.planning.planning_actor import PlanConfig
-
-        for value in (True, False, "#VectorStore-RAG"):
-            cfg = PlanConfig(
-                name="#PlanningTool", role="ToolActor", vector_store=value
+        with pytest.raises(ValidationError):
+            PlanConfig(
+                name="#PlanningTool", role="ToolActor", vector_store="#VectorStore-RAG"
             )
-            reloaded = PlanConfig.model_validate(cfg.model_dump())
-            assert reloaded.vector_store == value
 
 
-def _plan_actor_with_orchestrator(
-    vector_store_value: object = True,
-) -> tuple[PlanActor, MagicMock, MockActorAddress]:
+def _plan_actor_with_orchestrator() -> tuple[PlanActor, MagicMock, MockActorAddress]:
     """Build a PlanActor with a stubbed orchestrator + proxy_ask recorder.
 
     Does NOT call on_start (which would run _acquire_vs_proxy). Caller
@@ -319,14 +306,11 @@ def _plan_actor_with_orchestrator(
     from akgentic.tool.planning.planning_actor import PlanConfig, PlanManagerState
 
     actor = PlanActor()
-    actor.config = PlanConfig(
-        name="#PlanningTool",
-        role="ToolActor",
-        vector_store=vector_store_value,  # type: ignore[arg-type]
-    )
+    actor.config = PlanConfig(name="#PlanningTool", role="ToolActor")
     actor.state = PlanManagerState()
     actor.state.observer(actor)
     actor._vs_proxy = None
+    actor._embedder = None
 
     orch_addr = MockActorAddress("orchestrator", "Orchestrator")
     actor._orchestrator = orch_addr  # type: ignore[assignment]
@@ -349,7 +333,7 @@ class TestPlanActorAcquireVsProxy:
     def test_uses_get_team_member_not_get_children_or_create(self) -> None:
         from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
 
-        actor, orch_proxy, _ = _plan_actor_with_orchestrator(vector_store_value=True)
+        actor, orch_proxy, _ = _plan_actor_with_orchestrator()
         orch_proxy.get_team_member.return_value = MockActorAddress(VS_ACTOR_NAME, "ToolActor")
 
         actor._acquire_vs_proxy()
@@ -358,29 +342,72 @@ class TestPlanActorAcquireVsProxy:
         orch_proxy.getChildrenOrCreate.assert_not_called()
         assert actor._vs_proxy is not None
 
-    def test_named_instance(self) -> None:
-        named = "#VectorStore-RAG"
-        actor, orch_proxy, _ = _plan_actor_with_orchestrator(vector_store_value=named)
-        orch_proxy.get_team_member.return_value = MockActorAddress(named, "ToolActor")
+    def test_the_embedder_is_built_from_this_actors_own_param(self) -> None:
+        """AC 18: the store embeds nothing, so this actor's param is what embeds."""
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
+        from akgentic.tool.vector_store.embedding_actor import EmbeddingWorker
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
+
+        actor, orch_proxy, _ = _plan_actor_with_orchestrator()
+        actor.config = actor.config.model_copy(
+            update={
+                "vector_store": VectorStoreParam(
+                    embedding_model="custom-model", embedding_provider="azure"
+                )
+            }
+        )
+        orch_proxy.get_team_member.return_value = MockActorAddress(VS_ACTOR_NAME, "ToolActor")
+
+        with patch("akgentic.tool.vector_store.vector.EmbeddingService") as service_cls:
+            actor._acquire_vs_proxy()
+
+        service_cls.assert_called_once_with(
+            model="custom-model",
+            provider="azure",
+            timeout_s=EmbeddingWorker.timeout_s,
+        )
+        assert actor._embedder is service_cls.return_value
+
+    def test_a_task_is_embedded_by_the_embedder_and_written_by_the_proxy(self) -> None:
+        """AC 18: ``proxy.embed`` is never called, and ``add`` takes two arguments."""
+        from akgentic.tool.planning.planning_actor import PLAN_COLLECTION
+
+        actor = PlanActor()
+        actor.on_start()
+        proxy = MagicMock()
+        embedder = MagicMock()
+        embedder.embed.return_value = [[0.1, 0.2, 0.3]]
+        actor._vs_proxy = proxy
+        actor._embedder = embedder
+
+        actor._create_task(
+            TaskCreate(id=1, status="pending", description="write the report", owner="alice"),
+            MockActorAddress("alice", "Agent"),
+        )
+
+        embedder.embed.assert_called_once_with(["write the report"])
+        assert proxy.embed.call_count == 0
+        collection, entries = proxy.add.call_args.args
+        assert collection == PLAN_COLLECTION
+        assert proxy.add.call_args.kwargs == {}
+        assert entries[0].vector == [0.1, 0.2, 0.3]
+
+    def test_the_store_actor_is_looked_up_under_its_one_name(self) -> None:
+        """A named-instance binding is gone: there is one store actor name."""
+        from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
+
+        actor, orch_proxy, _ = _plan_actor_with_orchestrator()
+        orch_proxy.get_team_member.return_value = MockActorAddress(VS_ACTOR_NAME, "ToolActor")
 
         actor._acquire_vs_proxy()
 
-        orch_proxy.get_team_member.assert_called_once_with(named)
+        orch_proxy.get_team_member.assert_called_once_with(VS_ACTOR_NAME)
         assert actor._vs_proxy is not None
-
-    def test_false_skips_all_wiring(self) -> None:
-        actor, orch_proxy, _ = _plan_actor_with_orchestrator(vector_store_value=False)
-
-        actor._acquire_vs_proxy()
-
-        assert actor._vs_proxy is None
-        orch_proxy.get_team_member.assert_not_called()
-        orch_proxy.getChildrenOrCreate.assert_not_called()
 
     def test_missing_raises_runtime_error(self) -> None:
         from akgentic.tool.vector_store.actor import VS_ACTOR_NAME
 
-        actor, orch_proxy, _ = _plan_actor_with_orchestrator(vector_store_value=True)
+        actor, orch_proxy, _ = _plan_actor_with_orchestrator()
         orch_proxy.get_team_member.return_value = None
 
         with pytest.raises(RuntimeError) as exc_info:
@@ -389,46 +416,36 @@ class TestPlanActorAcquireVsProxy:
         msg = str(exc_info.value)
         assert "#PlanningTool" in msg
         assert VS_ACTOR_NAME in msg
-        assert "VectorStoreTool" in msg
+        assert "VectorStoreTool" not in msg
         assert actor._vs_proxy is None
 
     def test_no_orchestrator_degraded_mode(self) -> None:
         from akgentic.tool.planning.planning_actor import PlanConfig, PlanManagerState
 
         actor = PlanActor()
-        actor.config = PlanConfig(
-            name="#PlanningTool", role="ToolActor", vector_store=True
-        )
+        actor.config = PlanConfig(name="#PlanningTool", role="ToolActor")
         actor.state = PlanManagerState()
         actor.state.observer(actor)
         actor._vs_proxy = None
+        actor._embedder = None
         actor._orchestrator = None  # type: ignore[assignment]
 
         actor._acquire_vs_proxy()
 
         assert actor._vs_proxy is None
 
-    def test_vector_store_false_short_circuits_acquire(self) -> None:
-        """vector_store=False short-circuits _acquire_vs_proxy in on_start.
-
-        When ``vector_store=False`` the ``on_start`` guard must prevent
-        ``_acquire_vs_proxy`` from running, so no orchestrator lookup occurs.
-        """
+    def test_no_orchestrator_leaves_the_slot_empty_without_raising(self) -> None:
+        """There is no opt-out field any more; a harness with no orchestrator degrades."""
         from akgentic.tool.planning.planning_actor import PlanConfig
 
         actor = PlanActor()
-        actor.config = PlanConfig(
-            name="#PlanningTool",
-            role="ToolActor",
-            vector_store=False,
-        )
+        actor.config = PlanConfig(name="#PlanningTool", role="ToolActor")
         actor.on_start()
-        # _acquire_vs_proxy not invoked → _vs_proxy stays None, no RuntimeError
         assert actor._vs_proxy is None
 
 
 # ---------------------------------------------------------------------------
-# Story 10-10 — PlanConfig.collection + PlanActor._acquire_vs_proxy identity
+# Story 10-10 — PlanConfig.vector_store + PlanActor._acquire_vs_proxy identity
 # ---------------------------------------------------------------------------
 
 
@@ -437,48 +454,48 @@ class TestPlanConfigCollectionField:
 
     def test_collection_default_is_default_collection_config(self) -> None:
         from akgentic.tool.planning.planning_actor import PlanConfig
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
         cfg = PlanConfig(name="#PlanningTool", role="ToolActor")
-        assert cfg.collection == CollectionConfig()
+        assert cfg.vector_store == VectorStoreParam()
         # Structural defaults — AC-11 backward-compat guard.
-        assert cfg.collection.dimension == 1536
-        assert cfg.collection.backend == "inmemory"
-        assert cfg.collection.tenant is None
+        assert cfg.vector_store.dimension == 1536
+        assert cfg.vector_store.backend == "inmemory"
+        assert cfg.vector_store.tenant is None
 
     def test_collection_accepts_custom_value(self) -> None:
         from akgentic.tool.planning.planning_actor import PlanConfig
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
         cfg = PlanConfig(
             name="#PlanningTool",
             role="ToolActor",
-            collection=CollectionConfig(backend="inmemory", tenant="plan-tenant"),
+            vector_store=VectorStoreParam(backend="inmemory", tenant="plan-tenant"),
         )
-        assert cfg.collection.backend == "inmemory"
-        assert cfg.collection.tenant == "plan-tenant"
+        assert cfg.vector_store.backend == "inmemory"
+        assert cfg.vector_store.tenant == "plan-tenant"
 
     def test_collection_roundtrip_default(self) -> None:
         from akgentic.tool.planning.planning_actor import PlanConfig
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
         cfg = PlanConfig(name="#PlanningTool", role="ToolActor")
         reloaded = PlanConfig.model_validate(cfg.model_dump())
-        assert reloaded.collection == CollectionConfig()
+        assert reloaded.vector_store == VectorStoreParam()
 
     def test_collection_roundtrip_custom(self) -> None:
         from akgentic.tool.planning.planning_actor import PlanConfig
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
         cfg = PlanConfig(
             name="#PlanningTool",
             role="ToolActor",
-            collection=CollectionConfig(backend="inmemory", tenant="plan-tenant"),
+            vector_store=VectorStoreParam(backend="inmemory", tenant="plan-tenant"),
         )
         reloaded = PlanConfig.model_validate(cfg.model_dump())
-        assert reloaded.collection.backend == "inmemory"
-        assert reloaded.collection.tenant == "plan-tenant"
-        assert reloaded.collection.dimension == 1536  # default preserved
+        assert reloaded.vector_store.backend == "inmemory"
+        assert reloaded.vector_store.tenant == "plan-tenant"
+        assert reloaded.vector_store.dimension == 1536  # default preserved
 
     def test_base_config_coercion_yields_default_collection(self) -> None:
         """AC-8: BaseConfig → PlanConfig coercion keeps default collection + vector_store."""
@@ -489,7 +506,7 @@ class TestPlanConfigCollectionField:
             PlanConfig,
             PlanManagerState,
         )
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
         actor = PlanActor()
         actor.config = BaseConfig(  # type: ignore[assignment]
@@ -498,6 +515,7 @@ class TestPlanConfigCollectionField:
         actor.state = PlanManagerState()
         actor.state.observer(actor)
         actor._vs_proxy = None
+        actor._embedder = None
         actor._orchestrator = None  # type: ignore[assignment]
 
         # Exercise the coercion block from on_start.
@@ -507,14 +525,10 @@ class TestPlanConfigCollectionField:
                 role=actor.config.role,
             )
         assert isinstance(actor.config, PlanConfig)
-        assert actor.config.collection == CollectionConfig()
-        assert actor.config.vector_store is True  # 10-9 invariant
+        assert actor.config.vector_store == VectorStoreParam()
 
 
-def _plan_actor_with_vs_proxy(
-    collection: object,
-    vector_store_value: object = True,
-) -> tuple[PlanActor, MagicMock]:
+def _plan_actor_with_vs_proxy(vector_store: object) -> tuple[PlanActor, MagicMock]:
     """Build a PlanActor wired so _acquire_vs_proxy can reach create_collection.
 
     Returns (actor, vs_proxy_mock). Does NOT call on_start.
@@ -526,12 +540,12 @@ def _plan_actor_with_vs_proxy(
     actor.config = PlanConfig(
         name="#PlanningTool",
         role="ToolActor",
-        vector_store=vector_store_value,  # type: ignore[arg-type]
-        collection=collection,  # type: ignore[arg-type]
+        vector_store=vector_store,  # type: ignore[arg-type]
     )
     actor.state = PlanManagerState()
     actor.state.observer(actor)
     actor._vs_proxy = None
+    actor._embedder = None
 
     orch_addr = MockActorAddress("orchestrator", "Orchestrator")
     actor._orchestrator = orch_addr  # type: ignore[assignment]
@@ -555,53 +569,50 @@ def _plan_actor_with_vs_proxy(
 
 
 class TestPlanActorAcquireVsProxyCollectionPropagation:
-    """AC-7 / AC-11: _acquire_vs_proxy forwards config.collection to create_collection."""
+    """AC-7 / AC-11: _acquire_vs_proxy forwards config.vector_store to create_collection."""
 
     def test_create_collection_receives_same_instance_as_config_collection(self) -> None:
-        """AC-7: the CollectionConfig passed to create_collection is the config's instance."""
+        """AC-7: the VectorStoreParam passed to create_collection is the config's instance."""
         from akgentic.tool.planning.planning_actor import PLAN_COLLECTION
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        custom = CollectionConfig(backend="inmemory", tenant="plan-tenant")
-        actor, vs_proxy = _plan_actor_with_vs_proxy(collection=custom)
+        custom = VectorStoreParam(backend="inmemory", tenant="plan-tenant")
+        actor, vs_proxy = _plan_actor_with_vs_proxy(vector_store=custom)
 
         actor._acquire_vs_proxy()
 
         vs_proxy.create_collection.assert_called_once()
         args, _ = vs_proxy.create_collection.call_args
         assert args[0] == PLAN_COLLECTION
-        # Identity assertion — proves no fresh CollectionConfig is constructed.
-        assert args[1] is actor.config.collection
+        # Identity assertion — proves no fresh VectorStoreParam is constructed.
+        assert args[1] is actor.config.vector_store
         assert args[1] is custom
 
     def test_default_config_collection_is_structurally_default(self) -> None:
-        """AC-11 regression guard: default config gets a default ``CollectionConfig()``."""
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        """AC-11 regression guard: default config gets a default ``VectorStoreParam()``."""
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        default_collection = CollectionConfig()
-        actor, vs_proxy = _plan_actor_with_vs_proxy(collection=default_collection)
+        default_collection = VectorStoreParam()
+        actor, vs_proxy = _plan_actor_with_vs_proxy(vector_store=default_collection)
 
         actor._acquire_vs_proxy()
 
         args, _ = vs_proxy.create_collection.call_args
-        assert args[1] == CollectionConfig()
+        assert args[1] == VectorStoreParam()
         assert args[1].dimension == 1536
         assert args[1].backend == "inmemory"
         assert args[1].tenant is None
 
-    def test_vector_store_false_short_circuits_before_collection_examined(self) -> None:
-        """vector_store=False → _acquire_vs_proxy never runs, even with custom coll."""
+    def test_an_actor_state_param_with_no_orchestrator_degrades(self) -> None:
+        """No opt-out field remains; a harness with no orchestrator stays degraded."""
         from akgentic.tool.planning.planning_actor import PlanConfig
-        from akgentic.tool.vector_store.protocol import CollectionConfig
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
 
-        # Non-default collection, orchestrator absent (would otherwise warn+return).
-        # vector_store=False must short-circuit in on_start before we touch it.
         actor = PlanActor()
         actor.config = PlanConfig(
             name="#PlanningTool",
             role="ToolActor",
-            vector_store=False,
-            collection=CollectionConfig(backend="weaviate", tenant="t1"),
+            vector_store=VectorStoreParam(backend="inmemory", tenant="t1"),
         )
         actor.on_start()
         assert actor._vs_proxy is None

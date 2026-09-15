@@ -4,10 +4,11 @@
 and :class:`RagChunk`, chosen now on purpose.** ``serialize()`` stamps
 ``__model__ = "<module>.<name>"`` into every nested ``SerializableBaseModel``,
 and the deserializer resolves that literal string with ``import_module`` plus
-``getattr``. An extract — or an index row — persisted inside a
-``WorkspaceState`` snapshot therefore pins this module path in deployments this
-repository cannot see — the failure mode that forced ``workspace/tool.py`` to
-stay on disk as a shim. Nothing here moves afterwards.
+``getattr``. An extract — or an index row — persisted in a tree's metadata
+directory therefore pins this module path in deployments this repository cannot
+see, and a mounted tree written by an older release outlives every process that
+wrote it — the failure mode that forced ``workspace/tool.py`` to stay on disk as
+a shim. Nothing here moves afterwards.
 
 **This module adds no digest.** ``content_sha`` in
 :mod:`akgentic.tool.workspace.models` is the one definition of the digest in the
@@ -63,11 +64,12 @@ extractor *produces* from unchanged source bytes.
 """
 
 DEFAULT_MAX_DOCUMENTS = 32
-"""Bound on the number of rows in ``WorkspaceState.documents``.
+"""Bound on the number of cached extractions one tree's document store holds.
 
-Answers the **metadata** dimension: ~200 bytes per row, re-serialised in full by
-``model_dump_json()`` on every notify, growing for the life of the team. An
-uncapped map on a team singleton leaks exactly that way — the same reasoning
+Answers the **metadata** dimension: ~200 bytes per record, kept as a file under
+the tree's sibling metadata directory, which outlives every team on the tree and
+every process that ever bound it. Nothing sweeps that directory but this cap, so
+an uncapped cache grows there for as long as the tree exists — the same reasoning
 :data:`~akgentic.tool.workspace.models.DEFAULT_MAX_TRACKED_WRITERS` records.
 
 This is the Weaviate / RAG-off default. A backend-derived override belongs at
@@ -123,14 +125,17 @@ literal.
 EMBEDDING_STALE_AFTER_S = 600.0
 """How long a file may sit at :attr:`RagStatus.EMBEDDING` before it is reaped.
 
-Not a card parameter. ``VectorStoreActor`` keeps the map from an open request to
-its requester in a **private** attribute — correctly, because an ``ActorAddress``
-inside a ``BaseState`` breaks ``notify_state_change()``
-(``b12consulting/akgentic-core#131``) — so after a resume the store's own pending
-requests are gone too and its derived status truthfully reads ``READY``. Nothing
-in the store will ever tell a file left at ``EMBEDDING`` that its signal is not
-coming. The reaper is the only thing that will, and reverting to
-:attr:`RagStatus.PENDING` costs one re-index and never a wrong answer.
+Not a card parameter. The workspace spawns one ``#embed-`` worker per batch and
+counts the reports; a worker that **dies without reporting** — killed with the
+process, or lost across a resume — leaves its file waiting for a signal that is
+never coming, and no message will ever arrive to say so. The reaper is the only
+thing that frees it, and reverting to :attr:`RagStatus.PENDING` costs one
+re-index and never a wrong answer.
+
+Every other failure is a message and needs no bound: a worker that could not embed
+tells ``EmbeddingError``, and a write that could not land raises on the turn the
+workspace attempts it. The value is therefore generous relative to the worker's own
+20 s budget; shortening it is defensible once the new shape has run.
 """
 
 
@@ -141,6 +146,16 @@ def derived_document_caps(backend: str, rag_enabled: bool) -> tuple[int, int]:
     otherwise. **Retrieval off yields the larger pair whatever the backend is**
     (ADR-045 §7): no vectors exist, so nothing is derived from the document cap,
     and lowering it would shrink a cache for a cost that is not being paid.
+
+    **The in-memory pair is currently unreachable through the workspace**, and
+    that is a consequence worth stating rather than a defect to act on here. The
+    workspace derives these from its *resolved* backend
+    (``WorkspaceTool._caps_backend``), ``workspace_backend`` substitutes ``local``
+    for an undeclared ``inmemory``, and ``require_workspace_backend`` refuses a
+    declared one — so every retrieval card on a tree gets 32 / 2,000,000 unless
+    its author declares otherwise. This function is generic and has other callers'
+    shapes to keep, and :data:`IN_MEMORY_MAX_DOCUMENTS` documents arithmetic worth
+    keeping, so neither is deleted or "simplified".
 
     Args:
         backend: The collection's configured backend — ``"inmemory"`` or
@@ -218,9 +233,9 @@ class RagChunk(SerializableBaseModel):
     A chunk is a pair of offsets into the file's extracted Markdown and nothing
     else. There is no ``text`` field, no ``prefix`` field and no body of any
     kind: storing the text would duplicate the document inside the actor's state,
-    which is re-serialised on every notify, and would let the copy drift from the
-    extraction it claims to describe. The composed text is built at embed time
-    and handed straight to the vector store.
+    whose row is re-sent whole in every delta that names it, and would let the
+    copy drift from the extraction it claims to describe. The composed text is
+    built at embed time and handed straight to the vector store.
 
     Attributes:
         chunk_id: The chunk's identity, from :func:`chunk_id`. It is also the
@@ -382,8 +397,9 @@ def evict_document_bodies(
 
     Pure: it takes a dict and two ints, and touches no actor, no ``self`` and no
     chunk structure. *documents* is mutated in place and iterated in insertion
-    order, which is the whole of the LRU — the fill site re-inserts on every
-    write and the lookup moves an entry to the end on every hit.
+    order, so **the caller owns the recency order** and this function only obeys
+    it. The caller builds the mapping sorted by ``extracted_at``, which is the
+    only stamp there is: a hit records nothing, because a read may not write.
 
     **Two caps, two different remedies**, because they answer two different
     pressures:
@@ -405,7 +421,9 @@ def evict_document_bodies(
     **A dropped body must not de-index its file.** Nothing anywhere may infer
     that a file is indexed, searchable, or absent from the index from the
     presence, the absence, or the body-state of an entry in this map. Index
-    membership lives in its own map and is keyed off that alone.
+    membership is the other half of the stored record and is read off that alone
+    — which is why the caller clears the extraction half rather than removing
+    the record whenever a row is left in it.
 
     Args:
         documents: The cache, mutated in place.

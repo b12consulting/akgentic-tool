@@ -10,7 +10,7 @@ that it is *short*, and keyed on the path.
 from __future__ import annotations
 
 from akgentic.tool.core import ContextState
-from akgentic.tool.workspace.documents.context import RagFileRow, RagIndexState
+from akgentic.tool.workspace.rag.context import RagFileRow, RagIndexState
 
 
 def row(path: str, status: str = "embedded", chunk_count: int = 3, reason: str = "") -> RagFileRow:

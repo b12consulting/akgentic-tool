@@ -1,108 +1,118 @@
-"""``#Workspace-<workspace_name>``: the team singleton that owns one workspace tree.
+"""``#Workspace-<workspace_name>``: the team child that owns one workspace tree's dispatch.
 
-29-2 wired an actor that knew what everyone had read and decided nothing. This
-module is where it decides: every mutation now runs **here**, on the actor's own
-tree handle, and only after the live file still matches what the writing agent
-observed (ADR-036 §3).
+**This actor is dispatch, and nothing else** (ADR-053 Decision 6). It is created
+only when a capability that dispatches is enabled — ``workspace_exec``, or one of
+the three retrieval fields. A read-only or read/write card, which is the
+overwhelming majority of them, creates no actor at all and loses nothing: what a
+mailbox is genuinely needed for is a sandbox run whose report has to land
+somewhere, and the ``#index-`` / ``#embed-`` children a Pydantic card cannot
+parent.
 
-**The check and the write are one mailbox turn.** Returning a verdict and letting
-the agent write would reopen the window the gate exists to close — between the
-answer and the write, a third agent can land a mutation. That is why the
-mutation helpers moved into :mod:`akgentic.tool.workspace.edit` and why this
-actor performs real file I/O rather than adjudicating from a distance.
+**Mutations do not run here.** 29-2 wired an actor that knew what everyone had
+read, and 29-3 made it decide; since story 52-5 the gate, the six mutation bodies
+and the observation map are all **card-side**, in
+:mod:`akgentic.tool.workspace.write.gate`. The lock that makes a check and a
+write one unit is an ``fcntl.flock`` on the path — a lock on the *tree*, which is
+what two workers over one mounted volume share, where a mailbox is only what one
+process has. Reads do not come here either: a read runs on the calling agent's
+own thread against its own ``Filesystem``, and records what it saw in the card's
+own map.
 
-**The hash is read from disk on every check, never cached.** A
-``{path -> current_sha}`` map would pass almost every test written against this
-module and fail exactly one: the file written behind the actor's back. That case
-is not exotic — it is the frontend upload, resource seeding, a sandbox run, and a
-second team sharing a ``workspace_id``. Four writers that never call this actor,
-all caught for free, because the check consults the *file* rather than a record
-of who wrote it. Do not optimise this into a cache.
+**The hash is read from disk on every check, never cached** — a rule that is
+still load-bearing and is now the **gate's**, stated where the gate lives. A
+``{path -> current_sha}`` map would pass almost every test written against it and
+fail exactly one: the file written behind its back. That case is not exotic — it
+is the frontend upload, resource seeding, a sandbox run, and a second team
+sharing a ``workspace_id``.
 
-**Reads never come here for content.** They report what they saw through a
-fire-and-forget ``tell`` and go straight to the agent's own ``Filesystem``. From
-this story the ask path hashes files, so a reader that waited on it would queue
-behind another agent's mutation hashing a large file — and an ask carries no
-timeout.
+**The actor is an ordinary team child, and it holds no shared state** (ADR-051).
+Its card creates it through ``getChildrenOrCreate``, so it belongs to exactly one
+team and that team's teardown is the only thing that stops it. Two teams over one
+tree therefore get two actors, which is correct rather than a regression: the
+exec hold is a lock file, the document records are files under ``<meta>``, and the
+write gate is an ``fcntl.flock`` — every shared thing is on the tree, where the
+filesystem serialises it across processes as well as teams. What is left here is
+**dispatch** over per-process resources: the sandbox backend and its worker
+thread, the document reader, and the RAG indexing pipeline whose ``IndexWorker``
+and ``EmbeddingWorker`` children need a mailbox to report to. That is the
+finished shape, not a leftover.
 
-**The name carries the workspace, and that is load-bearing.**
-``getChildrenOrCreate`` keys on the actor *name*, so a fixed ``#Workspace`` would
-collapse two cards carrying different ``workspace_id`` values onto one actor
-owning one of the two trees — silently, in a team where
-``WorkspaceTool(workspace_id="shared")`` is a documented configuration. The
-unicity domain of an actor must equal the resource it owns, and the resource is a
-tree. The ``#`` prefix stays: it is the orchestrator's two-phase-stop invariant.
-
-**Every accepted mutation is one commit, and the journal sits at the one place
-they converge.** :meth:`~akgentic.tool.workspace.actor.gate.GateMixin._journalled`
-wraps all six ``apply_*`` bodies, so the out-of-band commit happens before any of
-them touches disk and the agent's own commit happens after exactly one of them
-succeeds. A seventh mutation added later cannot forget it, because there is
-nowhere else to put one.
+**The name carries the workspace, and that is load-bearing.** Get-or-create keys
+on the actor *name*, so a fixed ``#Workspace`` would collapse two cards of one
+team carrying different ``workspace_id`` values onto one actor owning one of the
+two trees — silently. **The unicity domain is ``(team, tree)``, and that is
+correct**: one actor per team over a shared tree carries no correctness meaning,
+because nothing shared is held here. Do not read the name rule as a claim that
+two actors over one tree is a bug. It is the design.
 
 **Exec is fenced, not gated, and that is the whole difference.** Every other
-writer here says what it is about to do, so the gate can check a precondition
-against the file it names. A shell command cannot, so ``workspace_exec`` takes an
+writer says what it is about to do, so the gate can check a precondition against
+the file it names. A shell command cannot, so ``workspace_exec`` takes an
 exclusive lease over the tree instead, and its write set is *discovered*
 afterwards from ``git status --porcelain -uall`` (ADR-036 §5). A mutation
 arriving under that lease is refused immediately, naming the holder; reads are
 untouched and keep working throughout.
 
 The deferred-result mechanism (ADR-033) is **engaged** from story 29-5, and its
-seven rules apply in full: the blocking sandbox call happens in a ``#defer-``
-worker, never on this thread. Everything the ask path still does is bounded — one
-file read, one write, a few short-lived ``git`` forks under an explicit timeout —
-and never external.
+seven rules apply in full. The blocking sandbox call is off this thread — on
+``ExecRunner``'s own single worker since story 47-2, not in a ``#defer-`` worker.
+Everything the ask path still does is bounded — one file read, one write, a few
+short-lived ``git`` forks under an explicit timeout — and never external. The last
+exception was ``rag_search``, which embedded a query and then searched a store
+that may be a cluster client. **There is no ``rag_search`` here at all now**: a
+search reads the document records, which is not dispatch, so the whole of it —
+both legs, the fusion and the render — is the card's, in ``rag/search.py``, and
+the snapshot render is in ``rag/context.py`` beside the models it builds.
+``tests/workspace/test_rag_search_off_the_mailbox.py`` is what holds the sentence
+to its word rather than leaving it a claim.
 
-**The class is assembled from four per-concern mixins** (ADR-045 §1): the
-extraction cache in :mod:`~akgentic.tool.workspace.actor.documents`, the
-observation and last-writer maps in :mod:`~akgentic.tool.workspace.actor.observation`,
-the gate and the six mutations in :mod:`~akgentic.tool.workspace.actor.gate`, and
-the lease and the deferred surface in :mod:`~akgentic.tool.workspace.actor.execution`.
-Each body is the same code with the same ``self``; what stays here is the class
-itself, ``on_start``, ``init_state``, ``worker_class`` and the startup sweep
-``on_start`` calls.
+**The class is assembled from two per-concern mixins, and each one lives under
+its own capability** (ADR-053 Decision 1): the retrieval pipeline in
+:mod:`~akgentic.tool.workspace.rag.actor`, the lease and the deferred surface in
+:mod:`~akgentic.tool.workspace.execution.actor`. Each body is the same code with
+the same ``self``; what stays here is the class itself, ``on_start``,
+``worker_class``, and the agent-name map that gives a commit and a busy refusal a
+name to print. **This package therefore holds exactly one module**, and that is
+the finished shape of the epic rather than a way-station: importing a mixin from
+the capability that owns it is the assembly point doing its job, which is why
+either capability's directory can still be deleted without touching the other.
 """
 
 from __future__ import annotations
 
-import contextlib
 import logging
-import time
-from collections import OrderedDict, deque
-from pathlib import Path
+from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
+from akgentic.core.agent import Akgent
+from akgentic.core.agent_state import BaseState
 from akgentic.tool.core.deferred import DeferredResultActor, DeferredWorker
-from akgentic.tool.workspace.actor.documents import DocumentsMixin
-from akgentic.tool.workspace.actor.execution import EXEC_CAPABILITY, ExecMixin
-from akgentic.tool.workspace.actor.gate import GateMixin
-from akgentic.tool.workspace.actor.observation import ObservationMixin
-from akgentic.tool.workspace.edit import EditMatcher
+from akgentic.tool.workspace.documents.cache import DocumentCache
 from akgentic.tool.workspace.execution import (
     ExecConfig,
     ExecOutcome,
-    QueuedExec,
+    ExecRunner,
     RunningExec,
 )
-from akgentic.tool.workspace.journal import GitJournal
+from akgentic.tool.workspace.execution.actor import EXEC_CAPABILITY, ExecMixin
+from akgentic.tool.workspace.lock import LockBackend
 from akgentic.tool.workspace.models import (
-    STAGING_SWEEP_GRACE_S,
-    LastWrite,
-    Observation,
+    DEFAULT_MAX_TRACKED_WRITERS,
+    Identity,
     WorkspaceConfig,
-    WorkspaceState,
 )
-from akgentic.tool.workspace.workspace import Filesystem, get_workspace, is_staging_name
+from akgentic.tool.workspace.rag.actor import DocumentsMixin
+from akgentic.tool.workspace.workspace import Filesystem, get_workspace
 
 if TYPE_CHECKING:
+    from akgentic.core.actor_address import ActorAddress
+
     # Runtime slots the retrieval pipeline fills. Under ``TYPE_CHECKING`` because
-    # the vector store lives behind an optional extra and ``card.params`` closes
-    # an import cycle through this very module — neither is needed to annotate a
+    # the vector store lives behind an optional extra — not needed to annotate a
     # ``None`` at start.
-    from akgentic.tool.vector_store.actor import VectorStoreActor
-    from akgentic.tool.vector_store.protocol import CollectionConfig
-    from akgentic.tool.workspace.card.params import WorkspaceRagIndex
+    from akgentic.tool.vector_store.protocol import VectorStoreParam, VectorStoreService
+    from akgentic.tool.workspace.rag.params import WorkspaceRagIndex
     from akgentic.tool.workspace.readers import DocumentReader
 
 __all__ = [
@@ -118,8 +128,9 @@ logger = logging.getLogger(__name__)
 WORKSPACE_ACTOR_NAME = "#Workspace"
 """Base actor name. The live name appends the workspace — see :func:`workspace_actor_name`.
 
-The ``#`` prefix is the orchestrator's teardown invariant: it is what classifies
-the actor as a tool actor during the two-phase stop.
+The ``#`` prefix marks a tool actor for its team's teardown, and the full name is
+the get-or-create key: two cards of one team on one tree get one actor, and two
+cards on different trees get two.
 """
 
 WORKSPACE_ACTOR_ROLE = "ToolActor"
@@ -129,8 +140,8 @@ def workspace_actor_name(workspace_name: str) -> str:
     """Return the singleton actor name owning *workspace_name*.
 
     Args:
-        workspace_name: The **resolved** two-segment workspace path, exactly as
-            the card derived it and as ``Filesystem`` receives it. Its slash is
+        workspace_name: The **resolved** three-segment workspace path, exactly as
+            the card derived it and as ``Filesystem`` receives it. Its slashes are
             carried verbatim — nothing parses an actor name, and the path is
             injective by construction.
 
@@ -140,46 +151,66 @@ def workspace_actor_name(workspace_name: str) -> str:
     return f"{WORKSPACE_ACTOR_NAME}-{workspace_name}"
 
 
-def _is_sweepable_orphan(entry: Path, cutoff: float) -> bool:
-    """Whether *entry* is a staging file old enough to have been abandoned.
-
-    Args:
-        entry: A path found under the workspace root.
-        cutoff: The mtime below which a staging file counts as orphaned.
-
-    Returns:
-        True only for a regular file carrying the full staging shape and last
-        modified before *cutoff*. A failed ``stat`` answers False: an entry this
-        process cannot inspect is one it must not delete.
-    """
-    if not is_staging_name(entry.name):
-        return False
-    try:
-        return entry.is_file() and entry.stat().st_mtime < cutoff
-    except OSError:
-        return False
-
-
 class WorkspaceActor(
     DocumentsMixin,
     ExecMixin,
-    GateMixin,
-    ObservationMixin,
-    DeferredResultActor[WorkspaceConfig, WorkspaceState, str, ExecOutcome],
+    DeferredResultActor[WorkspaceConfig, BaseState, str, ExecOutcome],
+    # Redundant for the MRO — ``DeferredResultActor`` already is an ``Akgent`` —
+    # but not for what core reads off the class. ``AgentCard`` coerces a dict
+    # ``config`` to the agent class's config type, found by walking the MRO's
+    # ``__orig_bases__`` for a concrete ``Akgent[Config, State]`` binding; the one
+    # inherited through ``DeferredResultActor`` carries type variables, so without
+    # this line the answer is ``None`` and the config stays a plain ``BaseConfig``.
+    Akgent[WorkspaceConfig, BaseState],
 ):
-    """Team singleton owning one tree, the extraction cache, the observations, the gate.
+    """Team child owning one tree's exec dispatch and its RAG indexing pipeline.
+
+    **A per-team dispatch context that exists only when something dispatches.** It
+    owns a sandbox run whose report must land somewhere, and the index/embed
+    children a Pydantic card cannot parent. It holds the agent-name map those two
+    print, and the deferred result cache the exec half keys on. Nothing else. Its
+    unicity domain is ``(team, tree)``, and two actors over one tree is the design.
+
+    That sentence is the end of a five-story arc and the file tree now agrees with
+    it: every capability's actor-side code sits under the capability, and this
+    package holds the class and nothing more.
+
+    **Created only when the card enables exec or retrieval** (ADR-053 Decision
+    6), and not otherwise: a read-only or read/write card binds a tree, seeds it,
+    sweeps it, opens its journal and gates every mutation without one of these
+    existing at all. One per resolved path per team where it does exist, created
+    by its card through ``getChildrenOrCreate``.
+
+    **Get-or-create still ignores ``config`` on a hit, and there is no longer
+    anything in the config for that to decide.** It held the document caps, then
+    ``git_journal``, ``git_timeout_s`` and ``max_tracked_writers``, and every one
+    of them made the *first* card of a team to bind a tree settle the question
+    for every later card of that team, silently. What is left is
+    ``workspace_path``, which the actor's own name is derived from — so two cards
+    that disagreed about it would not hit one actor at all; they would get two.
+    Everything a later card can legitimately differ on now arrives by
+    announcement, where the last writer wins and a rebind is the remedy.
+
+    **Its team owns its lifetime, and nothing else does.** It is in exactly one
+    team's roster, so that team's two-phase teardown stops it like any other tool
+    actor — through ``Akgent.stop``, whose ``stop_children`` takes any live
+    ``#index-`` / ``#embed-`` worker down with it. There is no timer, no liveness
+    sweep and no self-stop: the arrangement those existed for was an actor that
+    sat outside every team's teardown, and this one does not.
+
+    **It carries no state two instances could disagree about**, which is why two
+    teams over one tree may each have one. ``state`` is a bare
+    :class:`~akgentic.core.agent_state.BaseState` with no fields: the extraction
+    cache and the retrieval index are one file per source document under the
+    tree's sibling metadata directory (ADR-051 Decision 6), so a second actor —
+    or a second *process* over the same mount — reads the same records with no
+    shared memory. What the actor does keep in memory is the agent-name map, the
+    exec run bookkeeping and the deferred result cache, all of them about runs it
+    is dispatching itself.
 
     ``DocumentsMixin`` sits ahead of ``ExecMixin`` in the MRO, so anything it
     named ``deliver`` or ``fail`` would silently take over the deferred delivery
     path. It defines neither, and the public-API guard asserts that.
-
-    Neither observation map is a state field: recording is not persisted state,
-    while the extraction cache is (see :class:`WorkspaceState`). The observation
-    map is keyed
-    ``agent_id -> path -> Observation`` and each inner map is an
-    :class:`~collections.OrderedDict`, which is the whole of the LRU — recording
-    moves an entry to the end, eviction pops from the front. The last-writer map
-    is keyed by path across all agents and is capped independently.
 
     From story 29-5 it is also a :class:`~akgentic.tool.core.deferred.DeferredResultActor`
     keyed by run id. The base supplies ``_slots`` and ``_in_flight``; do not
@@ -189,7 +220,7 @@ class WorkspaceActor(
     either** — ``cache_capacity`` is a class attribute with a default, so a mixin
     defining one would resize the LRU with no error and no log line.
 
-    :meth:`~akgentic.tool.workspace.actor.execution.ExecMixin.exec_status`
+    :meth:`~akgentic.tool.workspace.execution.actor.ExecMixin.exec_status`
     **does** read ``_in_flight``, and that is deliberate: a run is running iff it
     is in flight, and the earlier prohibition forced the question onto a map with
     a different capacity, which answered ``RUNNING`` for settled runs. Reading an
@@ -198,10 +229,7 @@ class WorkspaceActor(
     """
 
     def on_start(self) -> None:
-        """Initialise state, take the tree handle, sweep staging files, open the journal.
-
-        **The order is load-bearing and there is only one correct one**, and two
-        different orderings are being satisfied at once.
+        """Initialise state and take the tree handle. Nothing here is resolved.
 
         ``self.state`` is assigned *before* ``super().on_start()`` because
         ``DeferredResultActor.on_start`` touches ``self.state`` on its first
@@ -210,73 +238,113 @@ class WorkspaceActor(
         rather than a guarantee, and it is why this comment exists rather than
         silence.
 
-        Everything after it keeps 29-4's order: sweeping *after* the initial
-        commit would commit orphaned staging files and then delete them, and
-        seeding ``.gitignore`` after that commit would leave the sidecars inside
-        it.
+        **Every duty has left this method**, because none of them was dispatch
+        and this actor is only created when something dispatches (ADR-053
+        Decision 6). The staging sweep is
+        :func:`~akgentic.tool.workspace.workspace.sweep_staging_files`, called
+        from the card's ``observer()``; seeding ``.gitignore`` and making the
+        initial out-of-band commit are the card's ``_open_journal``. A card with
+        neither exec nor retrieval enabled has no actor to run them, and every
+        one of them still has to happen — an orphaned staging file that nothing
+        removes survives for ever, and 29-4's ordering argument (sweep before any
+        write, seed before the first commit) is now satisfied inside
+        ``observer()`` rather than here.
+
+        **The journal was the last of them, and it is gone rather than gated.**
+        This method used to construct a *second*
+        :class:`~akgentic.tool.workspace.journal.GitJournal` over the repository
+        the card had already opened — same root, same ``<meta>``, same timeout —
+        and ``initialise()`` it, so one bind of one card forked ``git init``
+        twice for one tree. The card announces its own object through
+        :meth:`~akgentic.tool.workspace.execution.actor.ExecMixin.configure_journal`
+        now, which is also what lets a later card of the same team turn the
+        journal off: get-or-create ignores ``config`` on a hit, so anything
+        reaching this actor through :class:`WorkspaceConfig` is fixed by
+        whichever card bound first.
+
+        What is left is assignment. Every slot below is either a container this
+        actor owns or a ``None`` waiting for an announcement.
         """
-        self.state = WorkspaceState()
+        self.state = BaseState()
         super().on_start()
-        self._observations: dict[str, OrderedDict[str, Observation]] = {}
-        self._last_writers: OrderedDict[str, LastWrite] = OrderedDict()
         self._agent_names: OrderedDict[str, str] = OrderedDict()
-        self._touched: list[str] = []
-        self._matcher = EditMatcher()
         self._exec_config: ExecConfig | None = None
+        self._runner: ExecRunner | None = None
+        # One worker, unconditionally, for every workspace whether or not exec is
+        # enabled. ``ThreadPoolExecutor`` spawns no thread until the first
+        # ``submit``, so a workspace that never runs a command pays for the object
+        # and nothing else — which is what makes the branch-free version correct
+        # rather than merely tidy. One worker per tree is also what preserves the
+        # serialisation the lease already guarantees: the tree admits one run at a
+        # time, so a second worker could only ever idle.
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"exec-{self.config.workspace_path}"
+        )
+        self._pending: Future[None] | None = None
         self._running: RunningExec | None = None
-        self._queue: deque[QueuedExec] = deque()
+        # Announced by the card at bind time, exactly as ``_exec_config`` is.
+        # Until then ``request_exec`` refuses as unconfigured: a run admitted
+        # under no hold is a run two workers could both admit.
+        self._lock: LockBackend | None = None
         self._run_errors: OrderedDict[str, str] = OrderedDict()
         self._recent_runs: dict[str, OrderedDict[str, str]] = {}
+        # The seven retrieval slots below are annotated on ``DocumentsMixin``, in
+        # ``rag/actor.py``, and assigned here — which is exactly what ``ExecMixin``
+        # does with its own eight. **The assignments stay in this method
+        # deliberately**: moving them would mean giving a mixin an ``on_start`` and
+        # inserting it into the chain, against the ordering ``self.state`` before
+        # ``super().on_start()`` above states explicitly, and for no measured gain.
+        # The actor is the assembly point — the role ``card/__init__.py`` plays for
+        # the factory mixins — and an assembly point naming what it assembles is
+        # not a capability leak.
         self._rag_params: WorkspaceRagIndex | None = None
         self._rag_reader: DocumentReader | None = None
-        self._rag_collection: CollectionConfig | None = None
-        self._vs_proxy: VectorStoreActor | None = None
-        self._vs_tell: VectorStoreActor | None = None
-        self._index_active: set[str] = set()
+        self._rag_collection: VectorStoreParam | None = None
+        # Announced by the card at bind time, exactly as ``_lock`` is, and always
+        # before ``enable_rag``: this actor resolves no store of its own, so
+        # until the announcement lands there is nothing to enable retrieval over.
+        self._vector_store: VectorStoreService | None = None
+        self._vs_proxy: VectorStoreService | None = None
+        # How many ``#index-`` workers **this process** is running, and nothing
+        # else. Not the set it replaced: "is this path being worked on?" and "is
+        # this path exempt from the reaper?" are questions about the *tree*, which
+        # another process can answer differently, and both are now answered from
+        # the row under its record hold. This is a resource bound on this process,
+        # never a de-duplicator.
+        self._index_workers: int = 0
+        # Announced by the card at bind time, exactly as ``_lock`` is. Until
+        # then the document cache misses and the index looks empty: an ordinary,
+        # visible degradation, never a raise (ADR-051 Decision 6).
+        self._document_cache: DocumentCache | None = None
         self._workspace: Filesystem = get_workspace(self.config.workspace_path)
-        self._sweep_staging_files()
-        self._journal = GitJournal(
-            self._workspace._root,
-            enabled=self.config.git_journal,
-            timeout_s=self.config.git_timeout_s,
-        )
-        if self._journal.initialise():
-            self._journal.seed_gitignore(self._workspace.write)
-            self._journal.commit_out_of_band()
-
-    def init_state(self, state: WorkspaceState) -> None:
-        """Take a restored snapshot, then free anything left mid-embed (ADR-045 §7).
-
-        **This is the resume hook, and ``on_start`` is not.** Story 45-7's
-        acceptance criterion says the ``EMBEDDING`` reaper runs "on ``on_start``
-        (resume)", and against this core it would run on an empty index: the first
-        line of ``on_start`` assigns a fresh :class:`WorkspaceState`, and a
-        restored snapshot arrives *afterwards* through this method — the one
-        ``akgentic-team``'s restorer calls. Reaping in ``on_start`` is therefore
-        provably a no-op, and the criterion's intent lands here instead.
-
-        What it frees is a file whose ``EMBEDDING`` signal is never coming.
-        ``VectorStoreActor`` keeps the map from an open request to its requester in
-        a private attribute — correctly, because an ``ActorAddress`` inside a
-        ``BaseState`` breaks ``notify_state_change()`` — so a restart drops the
-        pending requests with it and the store's own status truthfully reads
-        ``READY``. Nothing there knows a workspace file is still waiting. Reverting
-        it to ``PENDING`` costs one re-index and never a wrong answer.
-
-        Args:
-            state: The snapshot to adopt.
-        """
-        super().init_state(state)
-        self.reap_stale_embedding()
+        # Announced by the card at bind time, exactly as ``_lock`` is, and always
+        # before the sandbox bind that makes a run admissible: this actor opens
+        # no repository of its own, so until the announcement lands there is
+        # nothing for a discovered commit to go into.
+        self._journal = None
 
     def worker_class(self) -> type[DeferredWorker]:
-        """Never called: ``#Workspace`` spawns nothing.
+        """Never called: nothing here is spawned through ``request()``.
 
         The base declares this abstract because its worker half spawns one actor
-        per key, and ``core/deferred.py`` is shared with ``TeamTool``, which uses
-        that half in full. This actor uses only the cache half — the sandbox
-        performs the run and tells the report back — so ``request()`` is never
-        called and there is nothing for this to return.
+        per key through :meth:`~akgentic.tool.core.deferred.DeferredResultActor.request`,
+        and ``core/deferred.py`` is shared with ``TeamTool``, which uses that half
+        in full. This actor uses only the cache half — the sandbox performs the run
+        and tells the report back — so ``request()`` is never called and there is
+        nothing for this to return.
+
+        **It does spawn actors directly, and that is not a contradiction.**
+        ``DocumentsMixin`` creates an ``EmbeddingWorker`` per batch with
+        ``createActor`` and hands it its payload directly, because that worker
+        reports through this actor's ``receiveMsg_EmbeddingResult`` /
+        ``receiveMsg_EmbeddingError`` rather than through ``deliver`` / ``fail`` —
+        which here are the **exec** result cache. Routing it through ``request()``
+        would put a batch of vectors into that cache and evict a running agent's
+        exec outcome. **It is the only actor spawned outside ``request()``**: the
+        team's ``#VectorStore`` is not this actor's child and never was — the card
+        creates it so that a planning or knowledge-graph card of the same team
+        shares it, and ``_resolve_store`` says outright that this actor receives a
+        store and creates no child.
 
         Raising rather than returning a never-spawned stub: a stub would be dead
         code carrying a ``produce`` nobody runs, and the next reader would have to
@@ -286,73 +354,90 @@ class WorkspaceActor(
             NotImplementedError: Always.
         """
         raise NotImplementedError(
-            "#Workspace spawns no deferred worker — the sandbox runs the command "
-            "and reports back, so request() is never called."
+            "#Workspace routes nothing through request() — the sandbox runs the "
+            "command and reports back, and an embedding worker is spawned directly "
+            "because it reports outside the deferred cache."
         )
 
     def on_stop(self) -> None:
-        """Drop everything still waiting for the tree, then chain to the base.
+        """Take exec down in its stated order, then chain to the base.
 
-        A queued entry never ran, was never sent anywhere and produced nothing,
-        so there is nothing to report and nothing to wait for — dropping it is
-        free. The running head is a different matter and is deliberately left
-        alone: it is on the sandbox, and the sandbox is the only thing that can
-        hold teardown open — for one run's budget, because the budget reaches the
-        subprocess. That is what bounds stop no matter how deep the queue got —
-        three queued fifteen-second runs are forty-five seconds of work but never
-        more than one run's worth of it.
+        The four exec steps and the reasoning behind their order live in
+        :meth:`~akgentic.tool.workspace.execution.actor.ExecMixin._teardown_exec`,
+        beside the exec code they tear down: cancel the queued runs, kill the
+        running subprocess, drain the worker under a bound, release the backend.
+
+        **A run in flight is no longer left alone.** It used to be, because it
+        was on a second actor and its own budget was the only thing that could
+        end it. It is now on this actor's own worker, and the tree it is writing
+        to is this actor's, so a team that stops must not leave a command running
+        in it. What bounds teardown is therefore the kill plus
+        :data:`~akgentic.tool.workspace.execution.EXEC_SHUTDOWN_GRACE_S`, rather
+        than one run's full budget.
+
+        It runs on two paths — its team's teardown, which is the ordinary one,
+        and ``ActorSystem.shutdown`` through ``ActorRegistry.stop_all()``.
 
         Nothing here may raise past ``super()``: leaving a Pykka actor part-way
-        stopped is worse than any error this could report, which is why the clear
-        is wrapped exactly as ``SandboxActor.on_stop`` wraps its own teardown.
+        stopped is worse than any error a step could report, which is why every
+        step is wrapped individually.
         """
-        try:
-            self._queue.clear()
-        except Exception:
-            logger.warning(
-                "Workspace %s: clearing the exec queue raised during on_stop — swallowing",
-                self.config.workspace_path,
-                exc_info=True,
-            )
+        self._teardown_exec()
         super().on_stop()
 
     ##
-    ## Startup housekeeping
+    ## Agent names — reached through the card's **ask** proxy, once, at bind time
     ##
-    def _sweep_staging_files(self) -> None:
-        """Delete staging files an interrupted write left behind, anywhere in the tree.
+    def attach(self, agent: ActorAddress, agent_name: str) -> None:
+        """Record the name to print for *agent*, keyed by its id.
 
-        ``Filesystem.write`` publishes by rename from ``.<name>.<32 hex>.tmp`` in
-        the target's own directory. A process killed between the two steps leaves
-        one behind for good, and nothing else ever removes it.
+        Sent once per card, at bind, right after the get-or-create returns this
+        actor's address — O(1), never on the mutation path. The map is keyed by
+        ``str(agent.agent_id)``, the same string the card sends with every exec
+        request.
 
-        The sweep runs **at actor start only** — never on a timer, never per
-        mutation — and matches the full staging shape, so a user's own
-        ``.notes.tmp`` survives. Every failure is suppressed: a directory this
-        process cannot clean must not stop the team's workspace from starting.
+        **The name is what a commit author and a refusal print, and that is the
+        whole of what this call is for now.** The card can capture ``agent_id``
+        without an edge back to the agent (ADR-030), but an id is a UUID: a
+        refusal reading *"agent '3f2a…'"* tells a model nothing it can act on,
+        and a journal entry authored by one names nobody a reader recognises.
+        :meth:`_name_of` falls back to the id, so losing a name degrades the two
+        messages rather than breaking either.
 
-        **A staging file younger than the grace window is left alone**, because
-        it is being written *now* and — with a ``workspace_id`` shared between
-        two teams, which is a supported configuration — by somebody who may not
-        be us. A tool actor's unicity domain is the team, so two teams over one
-        tree means two actors each sweeping the whole tree at start; unlinking
-        the other's staged file in the window between ``os.open`` and
-        ``os.replace`` turns their healthy write into a refusal. An orphan is
-        minutes or a restart old, so no realistic window confuses the two.
+        It **is** capped, at :data:`~akgentic.tool.workspace.models.DEFAULT_MAX_TRACKED_WRITERS`,
+        because it is the one map here that grows with every agent that ever
+        bound rather than with the runs in flight. Recording refreshes recency;
+        the least recently recorded name is dropped over the cap.
+
+        The cap is the constant rather than a config field. It was one, and no
+        production caller ever set it: the single ``WorkspaceConfig`` the card
+        builds never passed it, so every tree ran on the default — while
+        get-or-create's ignored ``config`` meant a card that *did* set it would
+        have been obeyed or ignored depending on whether it bound first.
+
+        It still takes the whole address rather than the id alone: the id is
+        derived here so that one caller cannot key the map differently from
+        another, which is exactly how the exec refusal once printed a name for
+        an agent and an id for the same agent one call later.
+
+        **An ask, not a tell**, so a failure is seen by the card and fails the
+        bind rather than leaving an agent bound to an actor that never heard of
+        it.
+
+        Args:
+            agent: The binding agent's address.
+            agent_name: Its configured, human-readable name.
         """
-        root = self._workspace._root
-        cutoff = time.time() - STAGING_SWEEP_GRACE_S
-        staged: list[Path] = []
-        with contextlib.suppress(OSError):
-            staged = [entry for entry in root.rglob("*") if _is_sweepable_orphan(entry, cutoff)]
-        removed = 0
-        for entry in staged:
-            with contextlib.suppress(OSError):
-                entry.unlink()
-                removed += 1
-        if removed:
-            logger.info(
-                "Workspace %s: swept %d orphaned staging file(s) at start",
-                self.config.workspace_path,
-                removed,
-            )
+        agent_id = str(agent.agent_id)
+        self._agent_names[agent_id] = agent_name
+        self._agent_names.move_to_end(agent_id)
+        while len(self._agent_names) > DEFAULT_MAX_TRACKED_WRITERS:
+            self._agent_names.popitem(last=False)
+
+    def _name_of(self, agent_id: str) -> str:
+        """Return *agent_id*'s registered name, falling back to the id itself."""
+        return self._agent_names.get(agent_id) or agent_id
+
+    def _identity(self, agent_id: str) -> Identity:
+        """Compose the git identity for *agent_id*: name to read, id to distinguish."""
+        return Identity(self._name_of(agent_id), agent_id)

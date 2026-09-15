@@ -67,11 +67,11 @@ def _make_observer() -> Mock:
 def _build_registry(observer: Mock) -> object:
     """Wire TeamTool + PlanningTool through the public ToolFactory and build the registry.
 
-    ``PlanningTool(vector_store=False)`` runs in degraded mode so it declares no
-    ``VectorStoreTool`` dependency — the command wiring under test (and the weak
-    observer edge) is independent of the VectorStoreActor lookup.
+    No card declares a dependency any more, so a plain ``PlanningTool()`` is a
+    complete team on its own — the command wiring under test (and the weak
+    observer edge) is independent of how the store is resolved.
     """
-    factory = ToolFactory([TeamTool(), PlanningTool(vector_store=False)], observer=observer)
+    factory = ToolFactory([TeamTool(), PlanningTool()], observer=observer)
     return factory.get_command_registry()
 
 
@@ -99,7 +99,7 @@ def test_update_planning_in_life_calls_proxy() -> None:
     # AC7 alive path: while the agent is alive, update_planning performs the same
     # planning_proxy.update_planning(update, observer.myAddress) call as before.
     observer = _make_observer()
-    tool = PlanningTool(vector_store=False)
+    tool = PlanningTool()
     tool.observer(observer)
 
     # Replace the wired PlanActor proxy with a dedicated mock to assert the call.
@@ -119,7 +119,7 @@ def test_update_planning_raises_after_stop() -> None:
     # AC3 gone path: once the agent is collected, update_planning raises
     # RetriableError (not AttributeError / ToolObserverGone).
     observer = _make_observer()
-    tool = PlanningTool(vector_store=False)
+    tool = PlanningTool()
     tool.observer(observer)
     update_planning = tool._update_planning_factory(UpdatePlanning())
 

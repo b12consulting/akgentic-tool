@@ -19,8 +19,8 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Generator
-from typing import Any
-from unittest.mock import MagicMock, patch
+from typing import Any, NoReturn
+from unittest.mock import patch
 
 import pytest
 from akgentic.core import ActorRegistry
@@ -31,14 +31,19 @@ from akgentic.core.agent_state import BaseState
 from akgentic.core.orchestrator import Orchestrator
 
 from akgentic.tool.core.deferred import (
+    WORKER_ROLE,
     DeferredPayload,
     DeferredResultActor,
     DeferredWorker,
     poll_deferred,
 )
-from akgentic.tool.vector_store.actor import VectorStoreActor
-from akgentic.tool.vector_store.embedding_actor import EmbeddingActor
-from akgentic.tool.vector_store.protocol import VectorStoreConfig
+from akgentic.tool.vector_store.embedding_actor import (
+    EmbeddingError,
+    EmbeddingRequest,
+    EmbeddingResult,
+    EmbeddingWorker,
+    embedding_worker_name,
+)
 from akgentic.tool.vector_store.vector import VectorEntry
 
 # How long the deliberately slow production takes. Everything else is measured
@@ -145,6 +150,7 @@ def test_second_request_while_in_flight_spawns_no_second_worker() -> None:
 # AC9 — team teardown with a worker in flight
 # ---------------------------------------------------------------------------
 
+
 _embed_entered = threading.Event()
 _embed_left = threading.Event()
 _idle_tool_stopped = threading.Event()
@@ -170,30 +176,64 @@ class _IdleTool(Akgent):
         super().on_stop()
 
 
-def _slow_embedding_service(self: EmbeddingActor, model: str, provider: str) -> None:
-    """Stand-in for the embedding call: slow, then reports the service as absent.
+class _Requester(Akgent):
+    """The minimal consumer: it spawns one embedding worker and takes its report.
 
-    Returning ``None`` sends the worker down its ``EmbeddingError`` path, so the
-    test needs neither credentials nor the ``[vector_search]`` extras.
+    Stands in for ``#Workspace``, ``#PlanActor`` and ``#KnowledgeGraph`` — the
+    three actors that own a ``VectorStoreParam`` and therefore own the embedding
+    call after story 49-3. The two handlers are no-ops because this test is about
+    teardown, not about what a consumer does with a batch.
+    """
+
+    def receiveMsg_EmbeddingResult(self, msg: EmbeddingResult) -> None:  # noqa: N802
+        """Take one embedded batch. Nothing here is under test."""
+
+    def receiveMsg_EmbeddingError(self, msg: EmbeddingError) -> None:  # noqa: N802
+        """Take one failed batch. Nothing here is under test."""
+
+    def start_embedding(self) -> None:
+        """Spawn one worker and hand it a batch, exactly as a consumer does."""
+        address = self.createActor(
+            EmbeddingWorker,
+            config=BaseConfig(
+                name=embedding_worker_name("col1", "req-00000000"), role=WORKER_ROLE
+            ),
+        )
+        self.proxy_tell(address, EmbeddingWorker).receiveMsg_DeferredPayload(
+            EmbeddingRequest(
+                deferred_key="req-00000000",
+                collection="col1",
+                entries=[
+                    VectorEntry(ref_type="entity", ref_id="e1", text="hello", vector=[])
+                ],
+                request_ref="docs/a.md",
+            )
+        )
+
+
+def _slow_embedding_service(model: str, provider: str) -> NoReturn:
+    """Stand-in for the embedding call: slow, then fails.
+
+    Raising sends the worker down its ``EmbeddingError`` path, so the test needs
+    neither credentials nor the ``[vector_search]`` extras.
     """
     _embed_entered.set()
     time.sleep(EMBED_SLEEP_S)
     _embed_left.set()
-    return None
+    raise RuntimeError("no embedding service in this test")
 
 
-def _build_vector_store_team(system: ActorSystem) -> tuple[Any, Any]:
-    """Start an orchestrator with two tool children: a vector store and an idle tool."""
+def _build_requester_team(system: ActorSystem) -> tuple[Any, Any]:
+    """Start an orchestrator with two tool children: a requester and an idle tool."""
     orch_addr = system.createActor(
         Orchestrator, config=BaseConfig(name="@Orchestrator", role="Orchestrator")
     )
     orch_proxy = system.proxy_ask(orch_addr, Orchestrator)
-    vs_addr = orch_proxy.createActor(
-        VectorStoreActor,
-        config=VectorStoreConfig(name="#VectorStore", role="ToolActor"),
+    requester_addr = orch_proxy.createActor(
+        _Requester, config=BaseConfig(name="#Requester", role="ToolActor")
     )
     orch_proxy.createActor(_IdleTool, config=BaseConfig(name="#IdleTool", role="ToolActor"))
-    return orch_addr, vs_addr
+    return orch_addr, requester_addr
 
 
 def test_team_stop_with_an_embedding_worker_in_flight_does_not_ride_the_backstop() -> None:
@@ -204,14 +244,13 @@ def test_team_stop_with_an_embedding_worker_in_flight_does_not_ride_the_backstop
     whole teardown would serialise behind an unrelated slow call.
     """
     system = ActorSystem()
-    with (
-        patch.object(EmbeddingActor, "_get_or_create_embedding_svc", _slow_embedding_service),
-        patch.object(VectorStoreActor, "_get_backend_for_collection", return_value=MagicMock()),
+    with patch(
+        "akgentic.tool.vector_store.embedding_actor.build_embedding_service",
+        _slow_embedding_service,
     ):
         try:
-            orch_addr, vs_addr = _build_vector_store_team(system)
-            entry = VectorEntry(ref_type="entity", ref_id="e1", text="hello", vector=[])
-            system.proxy_tell(vs_addr, VectorStoreActor).add("col1", [entry])
+            orch_addr, requester_addr = _build_requester_team(system)
+            system.proxy_tell(requester_addr, _Requester).start_embedding()
             assert _embed_entered.wait(timeout=10.0), "embedding worker never started"
 
             stopped: threading.Event = system.proxy_ask(orch_addr, Orchestrator).stop(GRACE_S)

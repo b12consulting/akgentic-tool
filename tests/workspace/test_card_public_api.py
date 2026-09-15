@@ -28,10 +28,12 @@ import akgentic.tool
 import akgentic.tool.workspace as ws
 
 # Captured verbatim from ``akgentic/tool/workspace/__init__.py``'s ``__all__``
-# before the move: 102 names, plus the four story 45-3 added and the six the
-# workspace path resolver adds (ADR-048 Decision 5). The package ships
-# on PyPI, so every one of them is a public import path somebody may already
-# depend on.
+# before the move: 102 names. It has grown since, one deliberate addition at a
+# time — among them the four story 45-3 added, the six the workspace path
+# resolver adds (ADR-048 Decision 5), the shared-kind permission's parser story
+# 54-2 adds, and the ``workspace_id`` grammar story 54-6 adds — to 149 names.
+# The package ships on PyPI, so every one of them is a public import path
+# somebody may already depend on.
 _WORKSPACE_ALL: frozenset[str] = frozenset(
     {
         "ANONYMOUS",
@@ -44,9 +46,13 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "DEFAULT_MAX_DOCUMENT_CHARS",
         "DEFAULT_MAX_OBSERVATIONS_PER_AGENT",
         "DEFAULT_MAX_TRACKED_WRITERS",
+        "DOCUMENT_STORE_CLASSES",
+        "DocumentEntry",
         "DocumentExtract",
         "DocumentReader",
+        "DocumentStore",
         "EMBEDDING_STALE_AFTER_S",
+        "EXEC_LOCK_FILENAME",
         "EXEC_REPORT_MARGIN_S",
         "EXTRACTOR_VERSION",
         "EditItem",
@@ -58,6 +64,7 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "ExecStatus",
         "ExpandMediaRefs",
         "FileEntry",
+        "FileLockBackend",
         "FilePatch",
         "FileTypeReader",
         "Filesystem",
@@ -72,12 +79,15 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "IN_MEMORY_MAX_DOCUMENT_CHARS",
         "Identity",
         "LEASE_GRACE_S",
-        "LastWrite",
+        "LockBackend",
+        "LockGrant",
+        "LockMarker",
+        "LockTicket",
         "MAX_COMMIT_BODY_CHARS",
         "MAX_EXEC_BUDGET_S",
-        "MAX_QUEUED_RUNS",
         "MAX_REJECTION_DIFF_LINES",
         "MAX_TRACKED_RUNS",
+        "META_DIR_SUFFIX",
         "MatchResult",
         "MediaContent",
         "MutationOutcome",
@@ -89,7 +99,6 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "PUBLISH_LOST_MSG",
         "PathEscapeError",
         "Precondition",
-        "QueuedExec",
         "RAG_COLLECTION",
         "RUN_ID_CHARS",
         "RagChunk",
@@ -100,7 +109,6 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "Resource",
         "ResourceType",
         "RunningExec",
-        "SANDBOX_RESOLVE_TIMEOUT_S",
         "STAGING_SWEEP_GRACE_S",
         "Span",
         "TEXT_EXTENSIONS",
@@ -111,6 +119,7 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "WRITE_DENIED_MSG",
         "Workspace",
         "WorkspaceActor",
+        "WorkspaceAttached",
         "WorkspaceConfig",
         "WorkspaceDelete",
         "WorkspaceEdit",
@@ -125,25 +134,34 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "WorkspaceRagList",
         "WorkspaceRagSearch",
         "WorkspaceRead",
-        "WorkspaceState",
         "WorkspaceTool",
         "WorkspaceView",
         "WorkspaceWrite",
         "WriteEntry",
+        "YamlDocumentStore",
         "apply_file_patch",
         "content_sha",
         "deleted_paths",
         "derived_document_caps",
         "detect_line_ending",
         "effective_budget",
+        "exec_busy",
         "format_outcome",
         "format_status",
-        "METADATA_SCOPE",
+        "ID_KIND",
+        "METADATA_KIND",
+        "RESERVED_KINDS",
         "RESERVED_SCOPES",
+        "SHARED_SCOPE",
+        "TEAM_KIND",
         "get_workspace",
         "leaf_segment",
+        "lock_unavailable",
+        "meta_dir_for",
+        "permitted_shared_kinds",
         "resolve_workspace_path",
         "user_segment",
+        "validate_workspace_id",
         "git_dir_for",
         "gitignore_seed",
         "hunk_header",
@@ -155,18 +173,16 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "parse_patch",
         "patch_label",
         "poll_attempts_within",
-        "queue_full",
-        "queued",
         "render_file_patch",
+        "resolve_document_store",
+        "resolve_lock_backend",
         "resolve_mode",
-        "sandbox_config",
         "sanitise_command",
         "sanitise_email_local",
         "sanitise_name",
         "substitute_edit",
         "timed_out",
         "unified",
-        "wait_out_the_turn",
         "workspace_actor_name",
         "write_and_diff",
     }
@@ -204,6 +220,7 @@ _WORKSPACE_TOOL_FIELDS: frozenset[str] = frozenset(
     {
         "workspace_id",
         "workspace_metadata_keys",
+        "workspace_sharable",
         "workspace_read",
         "workspace_view",
         "workspace_list",
@@ -227,12 +244,18 @@ _WORKSPACE_TOOL_FIELDS: frozenset[str] = frozenset(
         # so it can never grow.
         "workspace_rag_index",
         "workspace_rag_list",
-        "rag_collection",
+        "vector_store",
         "max_documents",
         "max_document_chars",
         # Added by story 45-8, deliberately: the search capability. Twenty-two
         # names became twenty-three.
         "workspace_rag_search",
+        # Added by story 52-5, deliberately: the observation map moved onto the
+        # card, so the cap that bounds it did too. It was a ``WorkspaceConfig``
+        # field the card never set — unreachable from a catalog, because the
+        # first bind fixed the tree's configuration for everyone — and it is a
+        # declared field here. Twenty-three names became twenty-four.
+        "max_observations_per_agent",
     }
 )
 

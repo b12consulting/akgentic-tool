@@ -1,36 +1,45 @@
-"""The workspace's extracted-document cache, its splitter, and its retrieval index.
+"""The workspace's extracted-document cache: what one entry holds, and what bounds it.
 
-The two maps themselves are fields on
-:class:`~akgentic.tool.workspace.models.WorkspaceState`; what lives here is what
-describes one entry of each and what bounds them. The actor-side lookup, fill and
-indexing pipeline are in :mod:`akgentic.tool.workspace.actor.documents`.
-:class:`~akgentic.tool.workspace.documents.splitter.BlockSplitter` turns a cached
-body into spans, and story 45-7's index turns those spans into identified,
-persisted chunks.
+The records themselves are files under the tree's sibling metadata directory,
+one per source document, written through a
+:class:`~akgentic.tool.workspace.documents.store.DocumentStore`; what lives here
+is what describes one entry of each, what bounds them, and — in
+:mod:`akgentic.tool.workspace.documents.cache` — the one read-modify-write both
+sides go through. The indexing **pipeline** is in
+:mod:`akgentic.tool.workspace.rag.actor`, under the capability that owns it; the
+lookup and the fill are not, and have not been since the actor became dispatch
+(ADR-053 Decision 6).
 
-Several names here are deliberately **not** re-exported, in three groups:
+**This package is shared by two capabilities, which is why it is not one.** The
+extraction cache is filled and read on the **read** path — ``card/__init__.py``
+resolves the store unconditionally at bind, builds a
+:class:`~akgentic.tool.workspace.documents.cache.DocumentCache` over it and calls
+that object directly, whether or not this card ever creates an actor — while the
+chunk records and the collection name serve retrieval, and ``workspace/models.py``
+takes two cap constants from :mod:`akgentic.tool.workspace.documents.models`. Code
+genuinely shared by two capabilities stays shared (ADR-053 Decision 1), so it
+stays here rather than being forced under one owner.
+
+**The retrieval-only halves have left.** The splitter, the retrieval context
+state and the index worker are the retrieval capability's and live in
+:mod:`akgentic.tool.workspace.rag` — which also dissolved the cycle that used to
+keep the worker out of this façade: it needed
+:class:`~akgentic.tool.workspace.rag.params.WorkspaceRagIndex` as a Pydantic field
+type, and while that class lived under ``card/`` importing it from here would
+have closed a cycle back through the actor. The parameter is a capability sibling
+now, and nothing in this package names it at all.
+
+A handful of names here are deliberately **not** re-exported, in two groups:
 
 - **Internal helpers**, reached by their full module path:
-  :func:`~akgentic.tool.workspace.documents.models.evict_document_bodies`, and the
-  splitter's two phases
-  :func:`~akgentic.tool.workspace.documents.splitter.parse_blocks` and
-  :func:`~akgentic.tool.workspace.documents.splitter.pack_blocks`.
+  :func:`~akgentic.tool.workspace.documents.models.evict_document_bodies`.
 - **The chunk-id machinery** —
   :data:`~akgentic.tool.workspace.documents.models.CHUNK_ID_NAMESPACE` and
   :func:`~akgentic.tool.workspace.documents.models.chunk_id`. They are the
-  package's own minting rule, called from the worker and from nowhere outside;
-  the ids themselves travel as ``RagChunk.chunk_id``.
-- **The whole of :mod:`akgentic.tool.workspace.documents.worker`**, and that one is
-  structural rather than editorial. It imports
-  :class:`~akgentic.tool.workspace.card.params.WorkspaceRagIndex` at runtime,
-  because that class is a Pydantic field type there; importing ``card.params``
-  executes ``card/__init__.py``, which imports ``workspace.actor``, which imports
-  ``actor/documents.py``, which imports this package. A re-export here would close
-  that cycle at import time. Its module docstring says the same from the other
-  side.
+  package's own minting rule, called from the index worker and from nowhere
+  outside; the ids themselves travel as ``RagChunk.chunk_id``.
 """
 
-from akgentic.tool.workspace.documents.context import RagFileRow, RagIndexState
 from akgentic.tool.workspace.documents.models import (
     DEFAULT_MAX_DOCUMENT_CHARS,
     DEFAULT_MAX_DOCUMENTS,
@@ -46,7 +55,6 @@ from akgentic.tool.workspace.documents.models import (
     RagStatus,
     derived_document_caps,
 )
-from akgentic.tool.workspace.documents.splitter import BlockSplitter, Span, TextSplitter
 
 __all__ = [
     "DEFAULT_MAX_DOCUMENTS",
@@ -56,15 +64,10 @@ __all__ = [
     "IN_MEMORY_MAX_DOCUMENTS",
     "IN_MEMORY_MAX_DOCUMENT_CHARS",
     "RAG_COLLECTION",
-    "BlockSplitter",
     "DocumentExtract",
     "NewFileMessage",
     "RagChunk",
     "RagFile",
-    "RagFileRow",
-    "RagIndexState",
     "RagStatus",
-    "Span",
-    "TextSplitter",
     "derived_document_caps",
 ]

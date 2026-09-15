@@ -609,7 +609,7 @@ def test_topological_sort_duplicate_class_allowed() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Story 10-9 — end-to-end VectorStoreTool + consumer ToolCards
+# Epic 49 — a consumer card creates its own store, and declares no dependency
 # ---------------------------------------------------------------------------
 
 
@@ -635,123 +635,91 @@ def _build_recording_observer() -> tuple[Any, list[tuple[str, Any]]]:
     return observer, calls
 
 
-def test_factory_wires_vector_store_tool_before_consumers() -> None:
-    """AC-9: VectorStoreTool runs first; consumers never create VectorStoreActor."""
+def test_factory_consumers_each_create_the_store_before_their_own_actor() -> None:
+    """Each in-memory consumer creates the store, before the actor that looks it up.
+
+    The ordering the deleted dependency edge existed to enforce is now intra-card,
+    so it holds per consumer rather than across the whole card list.
+    """
     from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
     from akgentic.tool.planning.planning import PlanningTool
-    from akgentic.tool.vector_store.tool import VectorStoreTool
+    from akgentic.tool.vector_store.protocol import VectorStoreParam
 
     observer, calls = _build_recording_observer()
-
-    # Deliberately mis-order input: KG + Planning first, VS last.
+    param = VectorStoreParam(backend="inmemory")
     ToolFactory(
-        tool_cards=[KnowledgeGraphTool(), PlanningTool(), VectorStoreTool()],
+        tool_cards=[
+            KnowledgeGraphTool(vector_store=param),
+            PlanningTool(vector_store=param),
+        ],
         observer=observer,
     )
 
-    # Every actor-class name recorded, in creation order.
     names = [n for n, _ in calls]
-    # Expect exactly one VectorStoreActor creation, one KnowledgeGraphActor, one PlanActor.
-    assert names.count("VectorStoreActor") == 1
+    # Two consumers, two calls: getChildrenOrCreate is idempotent per ADR-025,
+    # so the helper keeps no bookkeeping of its own.
+    assert names.count("VectorStoreActor") == 2
+    assert names.count("KnowledgeGraphActor") == 1
+    assert names.count("PlanActor") == 1
+    assert names.index("VectorStoreActor") < names.index("KnowledgeGraphActor")
+    assert names[names.index("PlanActor") - 1] == "VectorStoreActor"
+
+
+def test_factory_cluster_consumers_create_no_store_actor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cluster backend gets no actor: only the two consumer actors are created."""
+    from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
+    from akgentic.tool.planning.planning import PlanningTool
+    from akgentic.tool.vector_store.protocol import VectorStoreParam
+
+    monkeypatch.setenv("AKGENTIC_WEAVIATE_URL", "http://localhost:8080")
+    observer, calls = _build_recording_observer()
+    param = VectorStoreParam(backend="weaviate")
+    ToolFactory(
+        tool_cards=[
+            KnowledgeGraphTool(vector_store=param),
+            PlanningTool(vector_store=param),
+        ],
+        observer=observer,
+    )
+
+    names = [n for n, _ in calls]
+    assert "VectorStoreActor" not in names
     assert names.count("KnowledgeGraphActor") == 1
     assert names.count("PlanActor") == 1
 
-    # Order: VS before both consumers.
-    vs_idx = names.index("VectorStoreActor")
-    kg_idx = names.index("KnowledgeGraphActor")
-    plan_idx = names.index("PlanActor")
-    assert vs_idx < kg_idx
-    assert vs_idx < plan_idx
 
-
-def test_factory_consumers_do_not_create_vector_store_actor() -> None:
-    """AC-9: consumer observers never call getChildrenOrCreate(VectorStoreActor, ...).
-
-    We verify that *after* VectorStoreTool runs (first creation), subsequent
-    creations are all consumer-owned actors — NOT VectorStoreActor.
-    """
+def test_factory_accepts_a_lone_consumer_with_no_second_card() -> None:
+    """No card declares a dependency, so a consumer alone is a complete team."""
     from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
     from akgentic.tool.planning.planning import PlanningTool
-    from akgentic.tool.vector_store.tool import VectorStoreTool
 
-    observer, calls = _build_recording_observer()
-    ToolFactory(
-        tool_cards=[KnowledgeGraphTool(), PlanningTool(), VectorStoreTool()],
-        observer=observer,
-    )
-
-    names = [n for n, _ in calls]
-    vs_idx = names.index("VectorStoreActor")
-    # No further VectorStoreActor creation after the first one.
-    assert "VectorStoreActor" not in names[vs_idx + 1 :]
+    for card in (PlanningTool(), KnowledgeGraphTool()):
+        factory = ToolFactory(tool_cards=[card])
+        assert factory.tool_cards == [card]
+        assert card.depends_on == []
 
 
-def test_factory_consumer_configs_propagate_vector_store_true() -> None:
-    """AC-9: KnowledgeGraphConfig and PlanConfig both carry vector_store=True."""
-    from akgentic.tool.knowledge_graph.kg_actor import KnowledgeGraphConfig
-    from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
-    from akgentic.tool.planning.planning import PlanningTool
-    from akgentic.tool.planning.planning_actor import PlanConfig
-    from akgentic.tool.vector_store.tool import VectorStoreTool
-
-    observer, calls = _build_recording_observer()
-    ToolFactory(
-        tool_cards=[KnowledgeGraphTool(), PlanningTool(), VectorStoreTool()],
-        observer=observer,
-    )
-
-    configs_by_class = {name: cfg for name, cfg in calls}
-    kg_cfg = configs_by_class["KnowledgeGraphActor"]
-    plan_cfg = configs_by_class["PlanActor"]
-    assert isinstance(kg_cfg, KnowledgeGraphConfig)
-    assert isinstance(plan_cfg, PlanConfig)
-    assert kg_cfg.vector_store is True
-    assert plan_cfg.vector_store is True
-
-
-def test_factory_missing_vector_store_tool_raises_missing_dependency_error() -> None:
-    """AC-9 (negative path): a consumer without its VectorStoreTool fails at factory-init."""
-    from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
-
-    with pytest.raises(ValueError) as exc:
-        ToolFactory(tool_cards=[KnowledgeGraphTool()])
-    msg = str(exc.value)
-    assert "KnowledgeGraphTool" in msg
-    assert "VectorStoreTool" in msg
-
-
-# ---------------------------------------------------------------------------
-# Story 10-10 — per-consumer CollectionConfig propagation through ToolFactory
-# ---------------------------------------------------------------------------
-
-
-def test_factory_propagates_per_consumer_collection_config(
+def test_factory_propagates_per_consumer_vector_store_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC-10: KG and Planning each get their own CollectionConfig through the factory.
-
-    Constructs KnowledgeGraphTool and PlanningTool with distinct non-default
-    CollectionConfig values and verifies the factory's topological-sort + observer
-    loop threads each consumer's collection into its actor config. Also verifies
-    10-9 invariants (vector_store=True) continue to propagate.
-    """
+    """KG and Planning each get their own VectorStoreParam through the factory."""
     from akgentic.tool.knowledge_graph.kg_actor import KnowledgeGraphConfig
     from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
     from akgentic.tool.planning.planning import PlanningTool
     from akgentic.tool.planning.planning_actor import PlanConfig
-    from akgentic.tool.vector_store.protocol import CollectionConfig
-    from akgentic.tool.vector_store.tool import VectorStoreTool
+    from akgentic.tool.vector_store.protocol import VectorStoreParam
 
     monkeypatch.setenv("AKGENTIC_WEAVIATE_URL", "http://localhost:8080")
-    kg_collection = CollectionConfig(backend="weaviate", tenant="team-42")
-    plan_collection = CollectionConfig(backend="inmemory", tenant="plan-tenant")
+    kg_param = VectorStoreParam(backend="weaviate", tenant="team-42")
+    plan_param = VectorStoreParam(backend="inmemory", tenant="plan-tenant")
 
     observer, calls = _build_recording_observer()
     ToolFactory(
         tool_cards=[
-            KnowledgeGraphTool(collection=kg_collection),
-            PlanningTool(collection=plan_collection),
-            VectorStoreTool(),
+            KnowledgeGraphTool(vector_store=kg_param),
+            PlanningTool(vector_store=plan_param),
         ],
         observer=observer,
     )
@@ -762,115 +730,32 @@ def test_factory_propagates_per_consumer_collection_config(
     assert isinstance(kg_cfg, KnowledgeGraphConfig)
     assert isinstance(plan_cfg, PlanConfig)
 
-    # Each consumer received ITS OWN CollectionConfig (not aliased).
-    assert kg_cfg.collection is kg_collection
-    assert plan_cfg.collection is plan_collection
-    assert kg_cfg.collection.backend == "weaviate"
-    assert kg_cfg.collection.tenant == "team-42"
-    assert plan_cfg.collection.backend == "inmemory"
-    assert plan_cfg.collection.tenant == "plan-tenant"
-
-    # The two collections are distinct — per-consumer backend divergence.
-    assert kg_cfg.collection != plan_cfg.collection
-
-    # 10-9 invariant: vector_store=True still propagates.
-    assert kg_cfg.vector_store is True
-    assert plan_cfg.vector_store is True
+    # Each consumer received ITS OWN VectorStoreParam (not aliased).
+    assert kg_cfg.vector_store is kg_param
+    assert plan_cfg.vector_store is plan_param
+    assert kg_cfg.vector_store.backend == "weaviate"
+    assert kg_cfg.vector_store.tenant == "team-42"
+    assert plan_cfg.vector_store.backend == "inmemory"
+    assert plan_cfg.vector_store.tenant == "plan-tenant"
+    assert kg_cfg.vector_store != plan_cfg.vector_store
 
 
-def test_factory_default_tools_propagate_default_collection() -> None:
-    """AC-11 regression guard at the factory level.
-
-    With no explicit ``collection`` argument, both consumers should propagate a
-    ``CollectionConfig()`` structurally equal to the historical hardcoded value.
-    """
+def test_factory_default_tools_propagate_default_vector_store() -> None:
+    """With no explicit param, both consumers propagate a default VectorStoreParam."""
     from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
     from akgentic.tool.planning.planning import PlanningTool
-    from akgentic.tool.vector_store.protocol import CollectionConfig
-    from akgentic.tool.vector_store.tool import VectorStoreTool
+    from akgentic.tool.vector_store.protocol import VectorStoreParam
 
     observer, calls = _build_recording_observer()
     ToolFactory(
-        tool_cards=[KnowledgeGraphTool(), PlanningTool(), VectorStoreTool()],
+        tool_cards=[KnowledgeGraphTool(), PlanningTool()],
         observer=observer,
     )
 
     configs_by_class = {name: cfg for name, cfg in calls}
     kg_cfg = configs_by_class["KnowledgeGraphActor"]
     plan_cfg = configs_by_class["PlanActor"]
-    assert kg_cfg.collection == CollectionConfig()
-    assert plan_cfg.collection == CollectionConfig()
+    assert kg_cfg.vector_store == VectorStoreParam()
+    assert plan_cfg.vector_store == VectorStoreParam()
     # Fresh per-instance — no aliasing between siblings.
-    assert kg_cfg.collection is not plan_cfg.collection
-
-
-# ---------------------------------------------------------------------------
-# Story 10-11 — conditional depends_on for vector_store opt-out
-# ---------------------------------------------------------------------------
-
-
-class TestConditionalDependsOn:
-    """AC-5, AC-6, AC-7: factory accepts opted-out consumers, rejects opted-in without VS."""
-
-    def test_planning_tool_vector_store_false_constructs_successfully(self) -> None:
-        """AC-5: PlanningTool(vector_store=False) alone succeeds."""
-        from akgentic.tool.planning.planning import PlanningTool
-
-        card = PlanningTool(vector_store=False)
-        factory = ToolFactory(tool_cards=[card])
-        assert len(factory.tool_cards) == 1
-        assert factory.tool_cards[0] is card
-
-    def test_planning_tool_vector_store_true_raises_missing_dep(self) -> None:
-        """AC-6: PlanningTool(vector_store=True) alone raises ValueError."""
-        from akgentic.tool.planning.planning import PlanningTool
-
-        with pytest.raises(ValueError) as exc:
-            ToolFactory(tool_cards=[PlanningTool(vector_store=True)])
-        msg = str(exc.value)
-        assert "PlanningTool depends on VectorStoreTool but it was not found in the tool list" in msg
-
-    def test_planning_tool_vector_store_str_raises_missing_dep(self) -> None:
-        """AC-6: PlanningTool(vector_store=str) alone raises ValueError."""
-        from akgentic.tool.planning.planning import PlanningTool
-
-        with pytest.raises(ValueError) as exc:
-            ToolFactory(tool_cards=[PlanningTool(vector_store="#VectorStore-RAG")])
-        msg = str(exc.value)
-        assert "PlanningTool depends on VectorStoreTool but it was not found in the tool list" in msg
-
-    def test_kg_tool_vector_store_false_constructs_successfully(self) -> None:
-        """AC-7: KnowledgeGraphTool(vector_store=False) alone succeeds."""
-        from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
-
-        card = KnowledgeGraphTool(vector_store=False)
-        factory = ToolFactory(tool_cards=[card])
-        assert len(factory.tool_cards) == 1
-        assert factory.tool_cards[0] is card
-
-    def test_kg_tool_vector_store_true_raises_missing_dep(self) -> None:
-        """AC-7: KnowledgeGraphTool(vector_store=True) alone raises ValueError."""
-        from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
-
-        with pytest.raises(ValueError) as exc:
-            ToolFactory(tool_cards=[KnowledgeGraphTool(vector_store=True)])
-        msg = str(exc.value)
-        assert (
-            "KnowledgeGraphTool depends on VectorStoreTool but it was not found in the tool list"
-            in msg
-        )
-
-    def test_mixed_opted_out_and_opted_in_raises_for_opted_in(self) -> None:
-        """Mixed: Planning opts out (False), KG opts in (True) with no VS -> KG error."""
-        from akgentic.tool.knowledge_graph.kg_tool import KnowledgeGraphTool
-        from akgentic.tool.planning.planning import PlanningTool
-
-        with pytest.raises(ValueError) as exc:
-            ToolFactory(
-                tool_cards=[
-                    PlanningTool(vector_store=False),
-                    KnowledgeGraphTool(vector_store=True),
-                ]
-            )
-        msg = str(exc.value)
-        assert "KnowledgeGraphTool depends on VectorStoreTool" in msg
+    assert kg_cfg.vector_store is not plan_cfg.vector_store

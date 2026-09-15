@@ -27,6 +27,8 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from akgentic.core.agent_config import BaseConfig
+
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.actor import (
     WORKSPACE_ACTOR_ROLE,
@@ -34,40 +36,41 @@ from akgentic.tool.workspace.actor import (
     workspace_actor_name,
 )
 from akgentic.tool.workspace.edit import EditItem
-from akgentic.tool.workspace.journal import (
+from akgentic.tool.workspace.journal import GitJournal, git_dir_for
+from akgentic.tool.workspace.models import (
+    DEFAULT_GIT_TIMEOUT_S,
+    GITIGNORE_NAME,
     IDENTITY_DOMAIN,
     IDENTITY_FALLBACK,
-    GitJournal,
-    Identity,
-    git_dir_for,
-)
-from akgentic.tool.workspace.models import (
-    GITIGNORE_NAME,
     OUT_OF_BAND_AUTHOR,
-    MutationStatus,
+    Identity,
     WorkspaceConfig,
+    sanitise_email_local,
 )
 from akgentic.tool.workspace.readers import DocumentReader
 from akgentic.tool.workspace.tool import WorkspaceRead, WorkspaceTool, WorkspaceView
-
+from akgentic.tool.workspace.workspace import ID_KIND, meta_dir_for
 from tests.workspace.conftest import (
-    WORKSPACE_NAME,
     DEFAULT_TEST_PRINCIPAL,
+    WORKSPACE_NAME,
     WORKSPACE_PATH,
-    workspace_path_for,
+    ExecHarness,
     FakeActorToolObserver,
     FakeOrchestratorProxy,
+    SandboxScript,
     card_for,
+    exec_card_for,
     git_show,
     journal_branches,
     journal_log,
     mutate,
-    outcome_of,
     read,
     requires_git,
     tool_named,
     working_tree_is_clean,
+    workspace_path_for,
 )
+from tests.workspace.test_exec import finish_run, start_run
 from tests.workspace.test_workspace_actor import staging_name
 
 pytestmark = requires_git
@@ -129,7 +132,7 @@ class TestTheRepository:
     def test_it_is_a_sibling_of_the_tree_and_never_inside_it(
         self, wired_card: WorkspaceTool, workspace_tree: Path
     ) -> None:
-        # Structural, not filtered: Filesystem._validate_path refuses anything
+        # Structural, not filtered: Filesystem.resolve_path refuses anything
         # that is not relative to the root, so a repository placed here simply
         # does not resolve from inside the workspace.
         git_dir = git_dir_for(workspace_tree)
@@ -151,20 +154,28 @@ class TestTheRepository:
         mutate(wired_card, "workspace_write", "fresh.md", "body\n")
         assert [commit.subject for commit in journal_log(workspace_tree)][-1] == ("write: fresh.md")
 
-    def test_restarting_over_an_existing_tree_keeps_the_history(
+    def test_reopening_an_existing_tree_keeps_the_history(
         self, wired_card: WorkspaceTool, workspace_tree: Path
     ) -> None:
+        """A second journal over a tree that already has one preserves its history.
+
+        **Re-homed onto a second ``GitJournal``, from a second ``WorkspaceActor``.**
+        The property has always belonged to ``GitJournal.initialise`` — nothing
+        it asserts is the actor's — and since story 57-3 the actor opens no
+        journal at all, so driving it through one would assert that a method
+        which now does nothing breaks nothing. Constructing the journal the way
+        the card does is what keeps the row about ``initialise``.
+        """
         mutate(wired_card, "workspace_write", "fresh.md", "body\n")
         before = [commit.sha for commit in journal_log(workspace_tree)]
 
-        second = WorkspaceActor(
-            config=WorkspaceConfig(
-                name=workspace_actor_name(WORKSPACE_PATH),
-                role=WORKSPACE_ACTOR_ROLE,
-                workspace_path=WORKSPACE_PATH,
-            )
+        second = GitJournal(
+            workspace_tree,
+            enabled=True,
+            timeout_s=DEFAULT_GIT_TIMEOUT_S,
+            meta_dir=meta_dir_for(WORKSPACE_PATH),
         )
-        second.on_start()
+        assert second.initialise()
 
         after = [commit.sha for commit in journal_log(workspace_tree)]
         assert after[: len(before)] == before
@@ -185,6 +196,16 @@ class TestTheRepository:
         The two guards are complementary and neither makes the other redundant.
         Deleting this one as "now covered upstream" would reopen the hole from
         the side the resolver never sees.
+
+        **The journal is constructed directly here, and must NOT be routed
+        through a card.** ``leaf_segment`` refuses a ``.git`` leaf at bind, so a
+        card-driven version of this row could never reach the branch it guards —
+        it would assert nothing at all while reading, at review, as a surviving
+        guard. Story 57-3 moved the construction off the actor and onto the card;
+        this row keeps a hand-built journal for the same reason it kept a
+        hand-built actor before, which is that the layer it stands in for
+        (``akgentic-infra``, through ``get_workspace``) never passes through
+        resolution either.
         """
         path = workspace_path_for("shared.git")
         tree = workspaces_root / path
@@ -192,26 +213,24 @@ class TestTheRepository:
         tree.mkdir()
         (tree / "unseen.md").write_text("someone else's\n", encoding="utf-8")
 
-        actor = WorkspaceActor(
-            config=WorkspaceConfig(
-                name=workspace_actor_name(path),
-                role=WORKSPACE_ACTOR_ROLE,
-                workspace_path=path,
-                git_journal=True,
-            )
+        journal = GitJournal(
+            tree,
+            enabled=True,
+            timeout_s=DEFAULT_GIT_TIMEOUT_S,
+            meta_dir=meta_dir_for(path),
         )
-        actor.on_start()
+        assert not journal.initialise()
 
-        # The journal is off — no second repository, no seeded ignore file …
-        assert not actor._journal.enabled
+        # The journal is off — no second repository, no seeded ignore file.
+        assert not journal.enabled
         assert not (workspaces_root / workspace_path_for("shared.git.git")).exists()
         assert not (tree / GITIGNORE_NAME).exists()
-        # … and the gate is untouched: creates land, unread overwrites do not.
-        created = outcome_of(actor, "apply_write", "solo", "fresh.md", "body\n")
-        assert created.status is MutationStatus.ACCEPTED
-        refused = outcome_of(actor, "apply_write", "solo", "unseen.md", "mine\n")
-        assert refused.status is MutationStatus.REJECTED
-        assert "read it before overwriting" in refused.message
+        # The "and the gate is untouched" half used to be asserted here, through
+        # the actor's own ``apply_write``. The gate is card-side since 52-5 and
+        # this tree is unreachable from a card by construction (``leaf_segment``
+        # refuses a ``.git`` leaf), so that half moved to
+        # ``TestTheGateSurvivesWithoutGit``, which drives both whole tables with
+        # ``git_journal=False`` through a real card.
 
     def test_a_journal_never_initialises_inside_another_workspaces_tree(
         self, workspaces_root: Path, orchestrator_proxy: FakeOrchestratorProxy
@@ -250,23 +269,24 @@ class TestTheRepository:
     def test_a_real_repository_is_reused_rather_than_refused(
         self, wired_card: WorkspaceTool, workspace_tree: Path
     ) -> None:
-        # The guard above keys on "exists but has no HEAD". A repository this
-        # actor already created has one, so a restart must still reuse it —
-        # otherwise the guard would disable the journal on every second start.
+        # The guard above keys on "exists but has no HEAD". A repository a card
+        # already created has one, so a second journal over the same tree must
+        # still reuse it — otherwise that guard would turn the journal off on
+        # every rebind. Re-homed onto a second ``GitJournal`` with story 57-3,
+        # which took the construction off the actor: the property is
+        # ``initialise``'s and never was the actor's.
         mutate(wired_card, "workspace_write", "fresh.md", "body\n")
         assert (git_dir_for(workspace_tree) / "HEAD").is_file()
 
-        second = WorkspaceActor(
-            config=WorkspaceConfig(
-                name=workspace_actor_name(WORKSPACE_PATH),
-                role=WORKSPACE_ACTOR_ROLE,
-                workspace_path=WORKSPACE_PATH,
-                git_journal=True,
-            )
+        second = GitJournal(
+            workspace_tree,
+            enabled=True,
+            timeout_s=DEFAULT_GIT_TIMEOUT_S,
+            meta_dir=meta_dir_for(WORKSPACE_PATH),
         )
-        second.on_start()
 
-        assert second._journal.enabled
+        assert second.initialise()
+        assert second.enabled
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +393,6 @@ class TestOneMutationOneCommit:
         workspace_tree: Path,
         notes: Path,
         monkeypatch: pytest.MonkeyPatch,
-        workspace_actor: WorkspaceActor,
     ) -> None:
         """AC2b — staging is by explicit pathspec, never a bare ``git add -A``.
 
@@ -381,9 +400,13 @@ class TestOneMutationOneCommit:
         otherwise be swept into that agent's commit and attributed to it. A gated
         mutation knows exactly which paths it wrote, which is precisely the
         difference from exec (29-5), which has to discover its write set.
+
+        The journal patched is the **card's**: the gate commits through that one,
+        and this card creates no actor to have a second.
         """
         read(wired_card, "notes.md")
-        journal = workspace_actor._journal
+        journal = wired_card._journal
+        assert journal is not None
         original = journal.commit_paths
 
         def intrude(paths: Any, identity: Any, capability: str) -> None:
@@ -410,7 +433,6 @@ class TestARefusalIsNotRecorded:
         self,
         wired_card: WorkspaceTool,
         notes: Path,
-        workspace_actor: WorkspaceActor,
         workspace_tree: Path,
     ) -> str:
         """The tip once the fixture's own file has been absorbed as ``out-of-band``.
@@ -418,7 +440,8 @@ class TestARefusalIsNotRecorded:
         Settling first is what makes "HEAD did not move" mean *the refusal added
         nothing*, rather than *the tree happened to be clean*.
         """
-        workspace_actor._journal.commit_out_of_band()
+        assert wired_card._journal is not None
+        wired_card._journal.commit_out_of_band()
         return journal_log(workspace_tree)[-1].sha
 
     def test_an_unread_whole_file_write(
@@ -570,7 +593,6 @@ class TestAPartPublishedBatchIsNeverCommitted:
     def test_a_staging_failure_on_the_second_file_leaves_the_first_and_the_log_alone(
         self,
         wired_card: WorkspaceTool,
-        workspace_actor: WorkspaceActor,
         workspace_tree: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -584,10 +606,12 @@ class TestAPartPublishedBatchIsNeverCommitted:
         for name, body in (("a.py", "x = 1\n"), ("b.py", "y = 2\n")):
             (workspace_tree / name).write_text(body, encoding="utf-8")
             read(wired_card, name)
-        workspace_actor._journal.commit_out_of_band()
+        assert wired_card._journal is not None
+        wired_card._journal.commit_out_of_band()
         head = journal_log(workspace_tree)[-1].sha
 
-        tree = workspace_actor._workspace
+        tree = wired_card._workspace
+        assert tree is not None
         real_stage = tree._stage
         calls: list[int] = []
 
@@ -632,8 +656,340 @@ class _StubDocumentReader(DocumentReader):
         return "# extracted\n" + "body text " * 20
 
 
+class TestTheActorBuildsNoJournalAtAll:
+    """The actor never builds a ``GitJournal``, gated or otherwise.
+
+    **Story 55-8 gated the actor's construction; story 57-3 removed it.** The
+    subject of this class used to be *"an actor that **is** created builds none
+    when the card said no"*, and with it the non-vacuity argument the docstring
+    spelled out: the card had to create an actor, because otherwise restoring an
+    unconditional construction would redden nothing. That argument collapses once
+    there is no construction to restore. What is left — a dispatching
+    ``git_journal=False`` card leaves ``actor._journal is None`` and logs no
+    journal warning — is carried between
+    :class:`TestTwoCardsOfOneTeamThatDisagree`'s first row, which proves an
+    announced ``None`` reaches the slot, and
+    :class:`TestTheActorsJournalIsTheCardsOwnObject`, which proves a live journal
+    in that slot is the card's own object and not one the actor resolved.
+
+    The rows below are kept because the *warning* half is not asserted anywhere
+    else: the actor's ``initialise()`` on a disabled journal is exactly what made
+    a read-only bind log one WARNING, and "no warning" is the cheapest evidence
+    that no second ``initialise`` runs.
+    ``test_a_read_only_bind_is_silent_for_the_other_reason`` stays untouched —
+    it is about the creation rule, which this story did not touch.
+    """
+
+    @staticmethod
+    def _journal_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+        return [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "akgentic.tool.workspace.journal"
+        ]
+
+    def test_a_dispatching_card_with_the_journal_off_builds_none_and_warns_not_at_all(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger="akgentic.tool.workspace.journal"):
+            card = WorkspaceTool(
+                workspace_id=WORKSPACE_NAME, git_journal=False, workspace_exec=True
+            )
+            card.observer(FakeActorToolObserver(orchestrator_proxy, name="alice"))
+
+        # Non-vacuity: this card really does create the actor whose journal is
+        # under test. Without it the two assertions below are about nothing.
+        [(_cls, config)] = orchestrator_proxy.create_calls
+        assert config.name == workspace_actor_name(WORKSPACE_PATH)
+        _address, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
+        assert isinstance(actor, WorkspaceActor)
+
+        assert actor._journal is None
+        assert self._journal_warnings(caplog) == []
+        assert not git_dir_for(workspace_tree).exists()
+
+    def test_a_read_only_bind_is_silent_for_the_other_reason(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The half that proves the row above is not vacuous.
+
+        This bind is silent because it creates **no actor at all**, not because
+        the actor's journal is gated — so it stays green under the mutation that
+        reddens the row above, and reddens under the creation rule's own.
+        """
+        with caplog.at_level(logging.WARNING, logger="akgentic.tool.workspace.journal"):
+            card = WorkspaceTool(workspace_id=WORKSPACE_NAME, git_journal=False)
+            card.observer(FakeActorToolObserver(orchestrator_proxy, name="alice"))
+
+        assert orchestrator_proxy.create_calls == []
+        assert self._journal_warnings(caplog) == []
+
+
+def _init_invocations(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """Record every ``git init`` fork, by argv, and return the growing list.
+
+    Counted at the **subprocess** level rather than on ``GitJournal.initialise``
+    or ``_create_repository``: ``initialise`` has four branches that return
+    before forking anything, so "initialise was called twice" and "``git init``
+    ran twice" are two different claims and only the second is the one story
+    57-3 is about. ``_git_command`` keeps every non-git fork out of the count.
+
+    The subcommand is read by skipping the invariant prefix ``GitJournal._base``
+    composes — ``--git-dir <p> --work-tree <p> -c <k>=<v>`` — rather than by
+    indexing a fixed position, so a prefix that gains a flag does not silently
+    stop this from seeing an ``init``.
+    """
+    real_run = subprocess.run
+    seen: list[list[str]] = []
+    flags_with_values = {"--git-dir", "--work-tree", "-c"}
+
+    def subcommand_of(cmd: Any) -> str | None:
+        skip = False
+        for token in [str(item) for item in cmd][1:]:
+            if skip:
+                skip = False
+                continue
+            if token in flags_with_values:
+                skip = True
+                continue
+            if token.startswith("-"):
+                continue
+            return token
+        return None
+
+    def recording(cmd: Any, *args: Any, **kwargs: Any) -> Any:
+        if _git_command(cmd) and subcommand_of(cmd) == "init":
+            seen.append([str(item) for item in cmd])
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", recording)
+    return seen
+
+
+def _actor_behind(orchestrator_proxy: FakeOrchestratorProxy) -> WorkspaceActor:
+    """The live actor the suite's cards bind, read out of the team's children."""
+    _address, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
+    assert isinstance(actor, WorkspaceActor)
+    return actor
+
+
+class TestOneGitInitPerTree:
+    """AC 9 — a bind runs ``git init`` once for its tree, never twice.
+
+    The actor used to build a **second** ``GitJournal`` over the repository the
+    card had already opened, with the same root, the same ``<meta>`` and the same
+    timeout, and call ``initialise()`` on it. The duplication was invisible
+    because ``git init`` is idempotent: two forks, one repository, and nothing to
+    fail. It is now the card's object that the actor receives.
+    """
+
+    def test_a_dispatching_journal_card_forks_git_init_exactly_once(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        inits = _init_invocations(monkeypatch)
+
+        card_for(orchestrator_proxy, "alice", git_journal=True, workspace_exec=True)
+
+        assert len(inits) == 1, inits
+
+    def test_a_journal_card_that_dispatches_nothing_forks_it_once_too(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The half that was already one, kept so the pair names where the two came from.
+
+        A card with no dispatching capability creates no actor at all since story
+        55-8, so only the card's own journal ever forked here. Asserting both
+        shapes is what says the fix removed a duplicate rather than a journal.
+        """
+        inits = _init_invocations(monkeypatch)
+
+        card_for(orchestrator_proxy, "alice", git_journal=True)
+
+        assert len(inits) == 1, inits
+
+
+class TestTheActorsJournalIsTheCardsOwnObject:
+    """AC 10 — identity, which is the strongest form of "the actor resolves nothing".
+
+    An actor that built its own equal-but-distinct journal over the same root
+    would pass every ``.enabled`` assertion in this file and fail this one. It is
+    also what makes :class:`TestOneGitInitPerTree` structural rather than
+    incidental: one object cannot fork ``init`` twice.
+    """
+
+    def test_the_actor_holds_the_very_object_the_card_opened(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        card, _observer = card_for(
+            orchestrator_proxy, "alice", git_journal=True, workspace_exec=True
+        )
+        actor = _actor_behind(orchestrator_proxy)
+
+        assert card._journal is not None
+        assert actor._journal is card._journal
+
+    def test_a_card_with_the_journal_off_announces_none_rather_than_nothing(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """AC 5 — the announcement is unconditional on the journal.
+
+        The other four ``_announce_*`` methods return early when their object is
+        ``None``. This one returns early only when there is no actor to tell, and
+        that difference is the whole of AC 8's first row: an *off* that never
+        leaves the card cannot turn a sibling card's journal off.
+
+        The tell itself is asserted in ``test_observation_recording.py``, through
+        the ``_TellRecorder`` that already watches ``configure_lock``.
+        """
+        card, _observer = card_for(
+            orchestrator_proxy, "alice", git_journal=False, workspace_exec=True
+        )
+        actor = _actor_behind(orchestrator_proxy)
+
+        assert card._journal is None
+        assert actor._journal is None
+
+
+class TestTwoCardsOfOneTeamThatDisagree:
+    """AC 8 — the guard this story exists for: the LAST card to bind decides.
+
+    Get-or-create ignores ``config`` on a hit, so ``git_journal`` travelling on
+    :class:`WorkspaceConfig` meant the **first** card of a team to bind a tree
+    fixed the actor's journal for every later card of that team, silently. That
+    is the same hazard ``models.py`` records as fixed for the two document caps
+    and left standing here. The journal now travels on an announcement, which is
+    last-writer-wins like every other one.
+
+    **Both orders, because only one of them catches the near-miss.** An
+    announcement copied from the shape of the other four — returning early when
+    the object is ``None`` — leaves the ``True``-then-``False`` row failing while
+    the ``False``-then-``True`` row goes green, which is first-card-wins
+    preserved under a new mechanism.
+
+    Each row asserts the actor's state **and** an observable: a run dispatched
+    after the second bind either records a discovered commit or does not.
+    """
+
+    @staticmethod
+    def _run_and_join(
+        actor: WorkspaceActor,
+        script: SandboxScript,
+        harness: ExecHarness,
+    ) -> None:
+        """Dispatch one run that writes a file, and wait for its report."""
+        script.files = [("built.txt", "out\n")]
+        start_run(actor, script, cmd="make build")
+        finish_run(script, harness)
+
+    def test_a_journal_off_card_binding_second_turns_the_actors_journal_off(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        sandbox_script: SandboxScript,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        exec_card_for(orchestrator_proxy, name="alice", git_journal=True)
+        actor = _actor_behind(orchestrator_proxy)
+        assert actor._journal is not None, "the first card's journal never arrived"
+
+        exec_card_for(orchestrator_proxy, name="bert", git_journal=False)
+
+        assert actor._journal is None
+        # … and the observable: the run's write set goes unrecorded.
+        harness = ExecHarness(actor, orchestrator_proxy)
+        harness.install(monkeypatch)
+        before = [commit.sha for commit in journal_log(workspace_tree)]
+        self._run_and_join(actor, sandbox_script, harness)
+        assert [commit.sha for commit in journal_log(workspace_tree)] == before
+
+    def test_a_journal_on_card_binding_second_turns_the_actors_journal_on(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        sandbox_script: SandboxScript,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        exec_card_for(orchestrator_proxy, name="alice", git_journal=False)
+        actor = _actor_behind(orchestrator_proxy)
+        assert actor._journal is None, "a card that asked for no journal announced one"
+
+        second, _observer = exec_card_for(orchestrator_proxy, name="bert", git_journal=True)
+
+        assert second._journal is not None
+        assert actor._journal is second._journal
+        # … and the observable: the run's write set is recorded.
+        harness = ExecHarness(actor, orchestrator_proxy)
+        harness.install(monkeypatch)
+        self._run_and_join(actor, sandbox_script, harness)
+        assert journal_log(workspace_tree)[-1].subject == "exec: built.txt"
+
+
+class TestAJournalWithNoActor:
+    """Story 55-8: a journal card that dispatches nothing still gets the whole journal.
+
+    ``wired_card`` here enables ``git_journal`` and nothing else, so since 55-8 it
+    creates **no actor at all** — and the repository, the seeded ``.gitignore``,
+    the initial out-of-band commit and the commit author were all reached through
+    one before. Every one of them is the card's now.
+    """
+
+    def test_the_bind_creates_no_actor(
+        self, wired_card: WorkspaceTool, orchestrator_proxy: FakeOrchestratorProxy
+    ) -> None:
+        """Non-vacuity for the two rows below, and an equality over the empty list.
+
+        Without it, both would keep passing on a bind that quietly created an
+        actor again and had it do the work — which is precisely what they are
+        meant to prove has stopped.
+        """
+        assert orchestrator_proxy.create_calls == []
+
+    def test_a_commit_is_authored_by_the_agents_name_not_an_empty_identity(
+        self, wired_card: WorkspaceTool, workspace_tree: Path, notes: Path
+    ) -> None:
+        """AC 5, read out of ``git log`` rather than off a private attribute.
+
+        ``_agent_id`` and ``_agent_name`` were captured **inside** the actor bind;
+        leaving them there would author every commit of a card like this one as
+        ``Identity("", "")`` — silently, because an empty author is a valid commit.
+        """
+        read(wired_card, "notes.md")
+        mutate(wired_card, "workspace_write", "notes.md", "alice's version\n")
+
+        mine = commits_by(workspace_tree, "alice")
+        assert [commit.files for commit in mine] == [["notes.md"]]
+        assert mine[0].author_email == alice_email(wired_card)
+        assert wired_card._agent_name == "alice"
+
+    def test_the_repository_the_gitignore_and_the_first_commit_are_all_there(
+        self, wired_card: WorkspaceTool, workspace_tree: Path
+    ) -> None:
+        """AC 13. ``seed_gitignore`` and the initial ``commit_out_of_band`` had
+        exactly one production caller — the actor's ``on_start`` — so a card like
+        this one got a repository and neither of the other two."""
+        assert (git_dir_for(workspace_tree) / "HEAD").is_file()
+        assert (workspace_tree / GITIGNORE_NAME).exists()
+        assert journal_log(workspace_tree), "the initial out-of-band commit is missing"
+
+
 class TestTheSeededIgnoreFile:
     def test_it_is_written_at_init(self, wired_card: WorkspaceTool, workspace_tree: Path) -> None:
+        """**Green for a different reason since story 55-8**: the card seeds it.
+
+        It was the actor's ``on_start``, and this card creates no actor.
+        """
         assert (workspace_tree / GITIGNORE_NAME).exists()
 
     def test_an_existing_one_is_never_overwritten(
@@ -782,29 +1138,55 @@ class TestIdentity:
         assert commit.author_name == "alice"
         assert commit.author_email == alice_email(wired_card)
 
-    def test_an_unregistered_agent_falls_back_to_its_id(
-        self, workspace_actor: WorkspaceActor, workspace_tree: Path
+    def test_the_identity_comes_from_the_binding_agent_and_nowhere_else(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
-        outcome_of(workspace_actor, "apply_write", "never-registered", "fresh.md", "body\n")
+        """**Premise reversed by decision**: there is no registration to miss.
+
+        This used to assert a fallback to the id for an agent the actor's name
+        map had never been told about — a real case while the map was the
+        actor's and a card had to ``attach`` before its name was known. The card
+        captures its own agent's name and id at bind, so the two halves of the
+        identity are the two halves of one address and there is no third state
+        for a fallback to cover. The guard for the new invariant is that both
+        halves come from that address: the **name** authors the commit, the
+        **id** distinguishes two agents that share one.
+        """
+        card, observer = card_for(orchestrator_proxy, "alice", git_journal=True)
+
+        mutate(card, "workspace_write", "fresh.md", "body\n")
+
         commit = journal_log(workspace_tree)[-1]
-        assert commit.author_name == "never-registered"
-        assert commit.author_email == f"never-registered@{IDENTITY_DOMAIN}"
+        assert commit.author_name == str(observer.myAddress.name)
+        assert commit.author_email == (
+            f"{sanitise_email_local(str(observer.myAddress.agent_id))}@{IDENTITY_DOMAIN}"
+        )
 
     def test_a_hostile_name_still_commits_sanitised(
-        self, workspace_actor: WorkspaceActor, workspace_tree: Path
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         # Angle brackets would open the email field and a newline would end the
-        # identity line — either lets an agent id say something other than a name.
-        workspace_actor.register_agent("hostile-id", "Ali<ce>\nGIT_AUTHOR_NAME=root\x07")
+        # identity line — either lets an agent name say something other than a
+        # name. The name now travels from the agent's own address, so the
+        # sanitisation has to survive that route.
+        card, observer = card_for(
+            orchestrator_proxy,
+            "Ali<ce>\nGIT_AUTHOR_NAME=root\x07",
+            git_journal=True,
+        )
 
-        outcome_of(workspace_actor, "apply_write", "hostile-id", "fresh.md", "body\n")
+        mutate(card, "workspace_write", "fresh.md", "body\n")
 
         commit = journal_log(workspace_tree)[-1]
         assert "<" not in commit.author_name
         assert ">" not in commit.author_name
         assert "\n" not in commit.author_name
         assert "\x07" not in commit.author_name
-        assert commit.author_email == f"hostile-id@{IDENTITY_DOMAIN}"
+        # The email is built from the **id**, which is a UUID and carries none of
+        # this — so the hostile half is contained in the name field alone.
+        assert commit.author_email == (
+            f"{sanitise_email_local(str(observer.myAddress.agent_id))}@{IDENTITY_DOMAIN}"
+        )
 
     def test_an_identity_that_sanitises_to_nothing_is_never_empty(self) -> None:
         identity = Identity("\x00\x01", "<<<")
@@ -1044,7 +1426,12 @@ class TestNoJournalFailureFailsAMutation:
             return real_run(cmd, *args, **kwargs)
 
         monkeypatch.setattr(subprocess, "run", record)
-        journal = GitJournal(workspace_tree, enabled=True, timeout_s=7.5)
+        journal = GitJournal(
+            workspace_tree,
+            enabled=True,
+            timeout_s=7.5,
+            meta_dir=meta_dir_for(WORKSPACE_PATH),
+        )
         assert journal.initialise()
         journal.commit_paths(["nothing.md"], Identity.out_of_band(), "write")
         journal.is_dirty()
@@ -1085,24 +1472,64 @@ class TestTheCardField:
         assert restored.git_journal is False
         assert restored == card
 
-    def test_the_actor_config_round_trips_with_the_field(self) -> None:
-        config = WorkspaceConfig(
-            name=workspace_actor_name(WORKSPACE_PATH),
-            role=WORKSPACE_ACTOR_ROLE,
-            workspace_path=WORKSPACE_PATH,
-            git_journal=False,
-        )
-        assert WorkspaceConfig.model_validate(config.model_dump()).git_journal is False
+    def test_a_stored_actor_config_still_carrying_the_field_loads_unchanged(self) -> None:
+        """The compatibility claim ``WorkspaceConfig``'s own docstring makes, asserted.
 
-    def test_it_reaches_the_actor_config(
+        Re-homed from ``test_the_actor_config_round_trips_with_the_field``, which
+        round-tripped a ``git_journal`` the config no longer has. The property
+        that outlived the field is the one the docstring states in prose and
+        nothing checked: a record persisted before story 57-3 loads, because an
+        unknown key is ignored rather than rejected. Asserted for all three
+        removed fields at once — a config that rejected any of them would strand
+        every catalog entry written before this story.
+        """
+        stored = {
+            "name": workspace_actor_name(WORKSPACE_PATH),
+            "role": WORKSPACE_ACTOR_ROLE,
+            "workspace_path": WORKSPACE_PATH,
+            "git_journal": True,
+            "git_timeout_s": 99.0,
+            "max_tracked_writers": 7,
+        }
+
+        loaded = WorkspaceConfig.model_validate(stored)
+
+        assert loaded.workspace_path == WORKSPACE_PATH
+        assert not hasattr(loaded, "git_journal")
+        assert not hasattr(loaded, "git_timeout_s")
+        assert not hasattr(loaded, "max_tracked_writers")
+
+    def test_it_reaches_the_actor_by_announcement_and_never_through_the_config(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
+        """Re-homed from ``test_it_reaches_the_actor_config``: it no longer does.
+
+        The field used to travel on :class:`WorkspaceConfig`, and this row
+        asserted exactly that. It is now announced, which is what lets a later
+        card of the same team disagree — get-or-create ignores ``config`` on a
+        hit, so anything reaching the actor that way is fixed by whichever card
+        bound first.
+
+        The negative is the half worth keeping, and it is asserted here rather
+        than left to the model: everything ``WorkspaceConfig`` adds to
+        ``BaseConfig`` is the tree's path, which the actor's own name is derived
+        from — so there is nothing left for get-or-create to fix on a hit.
+        Subtracting the base's fields rather than listing the dump's keys keeps
+        the row about **this** model; a field added to ``BaseConfig`` is not this
+        story's to notice. ``workspace_exec`` is what gives this card an actor at
+        all since story 55-8, and is what keeps the row from asserting over an
+        empty list of creations.
+        """
         observer = FakeActorToolObserver(orchestrator_proxy, name="alice")
-        card = WorkspaceTool(workspace_id=WORKSPACE_NAME, git_journal=False)
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME, git_journal=True, workspace_exec=True)
         card.observer(observer)
-        _actor_class, config = orchestrator_proxy.create_calls[-1]
+
+        config = orchestrator_proxy.create_calls[-1][1]
         assert isinstance(config, WorkspaceConfig)
-        assert config.git_journal is False
+        own = set(WorkspaceConfig.model_fields) - set(BaseConfig.model_fields)
+        assert own == {"workspace_path"}
+        # … and the journal arrived anyway, by the route that replaced it.
+        assert _actor_behind(orchestrator_proxy)._journal is card._journal
 
 
 # ---------------------------------------------------------------------------
@@ -1170,7 +1597,7 @@ class TestTheGateSurvivesWithoutGit:
         assert mutate(journal_off, "workspace_write", "fresh.md", "body\n") == "Written: fresh.md"
 
     @pytest.mark.parametrize("mode", ["git-absent", "card-disabled"])
-    def test_exactly_one_warning_is_logged_not_one_per_mutation(
+    def test_the_warnings_are_per_journal_not_per_mutation(
         self,
         mode: str,
         orchestrator_proxy: FakeOrchestratorProxy,
@@ -1187,6 +1614,16 @@ class TestTheGateSurvivesWithoutGit:
                 "which",
                 lambda cmd, *a, **k: None if cmd == "git" else real_which(cmd, *a, **k),
             )
+
+        def journal_warnings() -> int:
+            return len(
+                [
+                    record
+                    for record in caplog.records
+                    if record.name == "akgentic.tool.workspace.journal"
+                ]
+            )
+
         with caplog.at_level(logging.WARNING, logger="akgentic.tool.workspace.journal"):
             observer = FakeActorToolObserver(orchestrator_proxy, name="alice")
             card = WorkspaceTool(
@@ -1194,13 +1631,22 @@ class TestTheGateSurvivesWithoutGit:
                 git_journal=mode != "card-disabled",
             )
             card.observer(observer)
+            after_bind = journal_warnings()
             for index in range(5):
                 mutate(card, "workspace_write", f"file{index}.md", "body\n")
+            after_mutations = journal_warnings()
 
-        journal_warnings = [
-            record for record in caplog.records if record.name == "akgentic.tool.workspace.journal"
-        ]
-        assert len(journal_warnings) == 1
+        # **The property AC8 asks for is per *mutation*, and it is unchanged:
+        # five writes add nothing.** What changed is the denominator, twice.
+        # 55-4 stopped the *card* building a journal it would not use; 55-8
+        # stopped the *actor* being created at all for a card like this one, and
+        # gated the journal it used to build unconditionally. So
+        # ``card-disabled`` is now **silent**: there is no journal object
+        # anywhere to warn, which is the whole of what "off costs nothing" means.
+        # ``git-absent`` still has exactly the card's one, from ``initialise``
+        # finding no ``git``.
+        assert after_mutations == after_bind
+        assert after_bind == (0 if mode == "card-disabled" else 1)
 
     def test_the_whole_file_table_is_unchanged(
         self, journal_off: WorkspaceTool, off_notes: Path
@@ -1275,9 +1721,23 @@ class TestTheGateSurvivesWithoutGit:
         assert result == "[ERROR] old_string not found in b.py"
         assert (workspace_tree / "a.py").read_text(encoding="utf-8") == "x = 1\n"
 
-    def test_a_refusal_still_names_the_other_writer_by_name(
+    def test_a_refusal_without_a_journal_names_nobody_and_claims_nothing(
         self, journal_off: WorkspaceTool, orchestrator_proxy: FakeOrchestratorProxy, off_notes: Path
     ) -> None:
+        """**Premise reversed by decision** (ADR-051 Decision 4, AC 13).
+
+        The old spec asserted that a card *without* a journal still named the
+        other writer, which it could because the attribution came from a map the
+        shared actor held. That map is gone: it was one process's memory, and
+        two workers over one mount held two of them that never agreed. What is
+        left is the journal, and a card that has none has no history to read —
+        so it names **nobody** rather than guessing, because without a history a
+        teammate's write and an upload are indistinguishable and claiming either
+        is a guess stated as a fact.
+
+        The actionable half is what every configuration still gets, and that is
+        asserted here alongside the silence.
+        """
         bob, _observer = card_for(orchestrator_proxy, "bob", git_journal=True)
         read(journal_off, "notes.md")
         read(bob, "notes.md")
@@ -1285,7 +1745,12 @@ class TestTheGateSurvivesWithoutGit:
 
         with pytest.raises(RetriableError) as refusal:
             mutate(journal_off, "workspace_write", "notes.md", "alice's version\n")
-        assert "last written by agent 'bob'" in str(refusal.value)
+
+        message = str(refusal.value)
+        assert "last written by agent" not in message
+        assert "came from outside" not in message
+        assert message.startswith("Refused to modify notes.md: it changed since you read it.")
+        assert "Read the file again" in message
 
 
 def test_a_stale_actor_state_never_leaks_a_repository_outside_the_tmp_tree(
@@ -1298,10 +1763,10 @@ def test_a_stale_actor_state_never_leaks_a_repository_outside_the_tmp_tree(
     would otherwise have the actor run ``git init`` in the developer's own
     directory — which would look like nothing at all until it did.
     """
-    # The journal is the tree's sibling, which under the two-segment layout puts
-    # it inside the owning principal's directory rather than at the root — still
-    # a sibling, still outside the tree every path is anchored to.
-    scope = workspaces_root / DEFAULT_TEST_PRINCIPAL
+    # The journal is the tree's sibling, which under the three-segment layout
+    # puts it inside the owning principal's kind directory rather than at the
+    # root — still a sibling, still outside the tree every path is anchored to.
+    scope = workspaces_root / DEFAULT_TEST_PRINCIPAL / ID_KIND
     assert git_dir_for(workspaces_root / WORKSPACE_PATH).parent == scope
     assert list(scope.glob("*.git"))
     for candidate in scope.glob("*.git"):
@@ -1310,7 +1775,9 @@ def test_a_stale_actor_state_never_leaks_a_repository_outside_the_tmp_tree(
 
 def test_the_journal_is_a_no_op_before_it_is_initialised(workspace_tree: Path) -> None:
     # Every method is guarded so the actor never has to ask whether git is there.
-    journal = GitJournal(workspace_tree, enabled=False, timeout_s=1.0)
+    journal = GitJournal(
+        workspace_tree, enabled=False, timeout_s=1.0, meta_dir=meta_dir_for(WORKSPACE_PATH)
+    )
     assert not journal.enabled
     assert not journal.is_dirty()
     journal.commit_out_of_band()

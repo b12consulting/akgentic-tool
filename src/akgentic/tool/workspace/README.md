@@ -1,8 +1,8 @@
 # WorkspaceTool
 
-Team-scoped filesystem access for LLM agents: read, list, glob, grep, view images, write, edit,
-patch, delete, mkdir and run shell commands — every path anchored to one workspace root that
-nothing can escape.
+Filesystem access for LLM agents, one tree per resolved workspace path: read, list, glob, grep,
+view images, write, edit, patch, delete, mkdir and run shell commands — every path anchored to one
+workspace root that nothing can escape.
 
 ```python
 from akgentic.tool import WorkspaceTool
@@ -11,10 +11,10 @@ from akgentic.tool import WorkspaceTool
 | | |
 |---|---|
 | Module | `akgentic.tool.workspace.tool` |
-| Actor | `#Workspace-<scope>/<leaf>` — the **resolved two-segment path**, slash included, so two principals' `notes` are two actors over two trees. One singleton per **tree**, not per team. Plus `#SandboxActor-<scope>/<leaf>` when `workspace_exec` is on |
+| Actor | `#Workspace-<scope>/<kind>/<leaf>` — the **resolved three-segment path**, slashes included, so two principals' `notes` are two actors over two trees. **Created only when the card enables a capability that dispatches** — `workspace_exec`, or one of the three `workspace_rag_*` fields; a read-only or read/write card creates none at all. Where one does exist it is an ordinary **team child**: made by its card through `getChildrenOrCreate`, in exactly one team's roster, stopped by that team's teardown. It owns **dispatch and no shared state** — with `workspace_exec` on, the tree's sandbox backend and the single worker thread that runs commands on it, plus the retrieval indexing pipeline. Two teams over one tree get two actors, and the tree orders them — see *Lifetime* below |
 | Channels used | `TOOL_CALL` (11 callables, 13 with `workspace_exec`), `COMMAND` (`expand_media_refs`) |
 | Optional extras | `[docs]` for binary reads, `[vision]` for image resizing |
-| Environment | `AKGENTIC_WORKSPACES_ROOT` (default `./workspaces`) |
+| Environment | `AKGENTIC_WORKSPACES_ROOT` (default `./workspaces`) · `AKGENTIC_WORKSPACE_SHARED_KINDS` (default unset, which permits **no** shared tree — see *Sharing a tree across principals*) · `AKGENTIC_LOCK_BACKEND` (default `file`) · `AKGENTIC_DOCUMENT_STORE` (default `yaml`). The last three are read on every bind, and a value they cannot use fails that bind |
 | External tools | `git` (optional — the journal, see below), `rg` (optional — accelerates `workspace_grep`) |
 
 ---
@@ -35,9 +35,15 @@ The workspace does **not** need `git`. It does not need a sandbox backend. It do
 vector store. With none of them, the gate still refuses every stale write, because the gate hashes
 the file rather than consulting a record of who wrote it.
 
-Retrieval degrades further **within** itself: with the capability on and no `#VectorStore` reachable,
-every retrieval callable answers one sentence rather than raising, and a search whose embedding call
-fails falls back to its keyword leg. That is deliberate rather than defensive — this actor owns the
+Retrieval degrades further **within** itself: with the capability on and no store reachable, every
+retrieval callable answers one sentence rather than raising, and a search whose embedding call fails
+falls back to its keyword leg. ("No store reachable" means the backend this card's `vector_store`
+names could not be built — on the `local` backend that is the **team's** `#VectorStore`,
+which files the index under the tree's sibling metadata directory, and on a cluster backend there is
+no actor at all, only a client that failed to connect. The in-memory backend is not a workspace
+backend: a card that names it explicitly is refused at bind, and a card that names no backend gets
+whichever one the environment provisions, with `local` standing in wherever that would have been
+the in-memory fallback.) That is deliberate rather than defensive — this actor owns the
 write gate, and a misconfigured vector store must not be a way to take the gate down with it.
 
 ---
@@ -46,9 +52,11 @@ write gate, and a misconfigured vector store must not be a way to take the gate 
 
 ```python
 class WorkspaceTool(ToolCard):
-    # Where the files live — two mutually exclusive ways to name the <leaf>
-    workspace_id: str | None = None
+    # Where the files live — two mutually exclusive ways to name the <leaf> (each selects
+    # its <kind>), plus one orthogonal flag that chooses the <scope>
+    workspace_id: str | None = None             # [A-Za-z0-9._-]{1,128}, refused at construction
     workspace_metadata_keys: list[str] = []
+    workspace_sharable: bool = False
 
     # Read-side capabilities
     workspace_read: WorkspaceRead | bool = True
@@ -92,9 +100,12 @@ the **write** side: a command mutates the tree whatever it happens to be, so
 
 **The backend and the actor are both bound in `observer()`, not in `__init__`.** `observer()` makes
 **one** call to `resolve_workspace_path(...)` — the single place a workspace directory is derived —
-and hands the result down as an already-resolved value: a `Filesystem` rooted at
-`<AKGENTIC_WORKSPACES_ROOT>/<scope>/<leaf>`, the `#Workspace-<scope>/<leaf>` singleton that owns the
-tree, and — only if exec is enabled — the sandbox backend. Nothing below re-derives it, which is what
+and passes the result through the **sharing gate** before anything with a side effect: a shared
+path whose kind this process does not permit raises there, before `get_workspace` creates the tree
+(see *Sharing a tree across principals*). It then hands the result down as an already-resolved
+value: a `Filesystem` rooted at `<AKGENTIC_WORKSPACES_ROOT>/<scope>/<kind>/<leaf>`, the
+`#Workspace-<scope>/<kind>/<leaf>` actor that dispatches for the tree — only if exec or retrieval is
+enabled, because nothing else needs a mailbox — and, only if exec is enabled, the sandbox backend. Nothing below re-derives it, which is what
 makes it impossible for a backend to open a different directory from the one the gate and the journal
 are guarding. `resources` are seeded in between. Reading `card.workspace` before that raises
 `RuntimeError`; calling a mutation before it raises `RuntimeError` too, because there is deliberately
@@ -107,15 +118,46 @@ majority of `WorkspaceTool()` instances gain no round trip at wiring time.
 
 **The actor's name carries the resolved path, and that is load-bearing.** Two cards with different
 `workspace_id` values in one team get **two** actors, each owning its own tree — and so do two
-*principals* whose cards both say `workspace_id="notes"`, because the name carries the scope as well
-as the leaf. A fixed name would collapse them onto one actor owning one of the trees, silently. The
-same rule names the sandbox actor `#SandboxActor-<scope>/<leaf>`.
+*principals* whose cards both say `workspace_id="notes"`, because the name carries the scope and the
+kind as well as the leaf. A fixed name would collapse them onto one actor owning one of the trees, silently. The
+sandbox backend needs no name of its own: it is held by the workspace actor whose tree it serves.
 
-**Two teams of the same principal sharing one `workspace_id` get two actors over one tree**, and
-their writes are therefore *not* ordered. They are still *checked*: the gate hashes the live file, so
-the collision is detected and refused rather than lost. This is a stated limit, not an oversight.
-Two teams of **different** principals do not share a tree at all: `notes` resolves under each owner's
-own scope. Sharing across principals is `workspace_metadata_keys`, and nothing else.
+**Two teams of the same principal sharing one `workspace_id` reach one tree and two actors**, one
+per team — and their writes are still ordered, because the ordering is on the **tree**: an
+`fcntl.flock` held on the path for the whole check-and-write, and an `O_EXCL` marker for the whole of
+a run. That holds across two *processes* as well, which a mailbox never did. The first bind of a team
+fixes that team's actor's configuration. Two teams of **different** principals do not share a tree
+unless the card asks: `notes` resolves under each owner's own scope, `alice/_id/notes` and
+`bob/_id/notes`. Sharing across principals is `workspace_sharable=True`, valid with any of the three
+kinds and honoured only where the platform permits that kind — never `workspace_metadata_keys`,
+which is per-principal like the other two. See *Sharing a tree across principals*.
+
+### Lifetime
+
+- **A team child, created by its card — when its card dispatches.** `observer()` calls
+  `getChildrenOrCreate` on its own team's orchestrator only when `_enabled_exec()` or
+  `_rag_enabled()` says something needs a mailbox; a read-only or read/write card binds, seeds,
+  sweeps, opens its journal and gates every mutation with no actor at all. **`WorkspaceAttached` is
+  emitted on that team's stream by every successful bind either way** — it names the agent that
+  bound the tree, not the actor, so it left the actor branch when the creation became conditional.
+  Where an actor exists it is in exactly
+  one team's roster, and **that team's two-phase teardown is the only thing that stops it** — no
+  timer, no liveness sweep, no reap grace, no self-stop. Epic 51 needed all four because a hosted
+  actor sat outside every team's teardown; a team child has an owner.
+- **`attach` records the agent's name, and nothing else.** It is the only source for the name the
+  git journal authors a commit with and the name an exec busy refusal prints — an id is a UUID, and
+  *"agent '3f2a…'"* is something a model can read and nothing it can act on. Losing a name degrades
+  to printing the id; it never breaks either message.
+- **Read back from the tree, never handed over.** The extraction cache and the retrieval index are
+  **files under the tree's sibling metadata directory** — one YAML record per source document under
+  `<meta>/rag/`, written on the turn that changes it (ADR-051 Decision 6). A later actor, or a second
+  process over the same mount, simply reads the same files; nothing is registered anywhere, nothing
+  is handed to it, and there is no state to restore.
+- **Nothing is restored, so nothing can be lost by a cold deployment.** A row that a worker was
+  carrying when its process died is queued again by `reap_abandoned_rows`, which covers a crash in
+  this process and one in another with a single rule: an in-flight row older than the staleness
+  bound. The bound is what does the whole job — a row at `embedding` may belong to a worker that is
+  alive in another process, and only its age tells the two apart.
 
 ---
 
@@ -192,18 +234,18 @@ way around the gate.
 - **A paginated read does not license a whole-file write.** `workspace_read(path, offset=…)` records
   that a *page* was seen. The way through is `workspace_edit` on a still-matching anchor, not a
   bigger `limit`.
-- **Observations do not survive a team resume.** They are actor instance state, not persisted. After
-  a resume the first write to any path is refused until it is re-read. That is the safe direction and
-  it is deliberate.
+- **Observations do not survive a process restart.** They are the card's own in-memory map, not
+  persisted. After a restart the first write to any path is refused until it is re-read. That is the
+  safe direction and it is deliberate.
 
 ### What the gate catches that a registry would not
 
 The hash is read from disk on **every** check and never cached. That is what makes the gate correct
 against writers that never pass through the card at all: a frontend upload, a sandboxed command,
-ADR-026 resource seeding, and a second team of the same principal sharing the same `workspace_id`.
-None of the four announces itself; all four are caught, because the check consults the file. The
-narrowing of the fourth is a fact about the *layout*, not about the gate: the gate never knew which
-team wrote, and does not need to.
+ADR-026 resource seeding, and another team bound to the same tree — a team of the same principal on
+a per-principal tree, or a team of **any** principal on a `_shared` tree. None of the four announces
+itself; all four are caught, because the check consults the file. Who the fourth can be is a fact
+about the *layout*, not about the gate: the gate never knew which team wrote, and does not need to.
 
 ---
 
@@ -213,7 +255,7 @@ When `git` is available and `git_journal` is on, **every accepted mutation is on
 authored by the agent that made it.
 
 ```
-$ git --git-dir workspaces/$SCOPE/proj-42.git --work-tree workspaces/$SCOPE/proj-42 log --oneline
+$ git --git-dir workspaces/$SCOPE/_id/proj-42.git --work-tree workspaces/$SCOPE/_id/proj-42 log --oneline
 9c1f0aa exec: 3 files          (builder)
 41b0d3e out-of-band: changes from outside the tools   (out-of-band)
 a77e214 edit: src/main.py      (reviewer)
@@ -246,7 +288,7 @@ in these situations:
 
 | Condition | Deliberate? |
 |---|---|
-| `git_journal=False` on the card that created the actor | yes |
+| `git_journal=False` on the card — and, for a tree's shared exec runs, on the card that bound **last** | yes |
 | `git` is not on `PATH` | yes — an environment fact |
 | The workspace is itself named `<name>.git`, colliding with workspace `<name>`'s journal | no — an operator mistake |
 | A sibling `<name>.git` exists and is **not** a repository (it is another workspace's tree) | no — refusing here costs one workspace's history; not refusing scatters git internals through another team's tree |
@@ -262,8 +304,15 @@ care about the last three, check the logs when a workspace is created. **The gat
 every one of the five cases** — no failure in the journal can fail a mutation, because the bytes are
 already on disk by the time a commit is attempted.
 
-Note also that the **first** card to create the actor for a workspace decides its configuration. A
-second card arriving with `git_journal=False` does not turn off a journal that is already running.
+Note also that among the cards of one team on one tree, the **last** one to bind decides what that
+team's shared exec runs are recorded in. Each card keeps its own journal, so its own mutations follow
+its own `git_journal`; what the last bind settles is only the actor's, which is what an `exec` run's
+discovered commit goes into. A second card arriving with `git_journal=False` therefore *does* turn
+the actor's journal off, and rebinding the card that wants one turns it back on.
+
+That is deliberate, and it replaced the opposite rule. The flag used to travel on the actor's
+configuration, which get-or-create ignores on a hit — so whichever card bound first decided for every
+later card of the team, silently and with no way to correct it short of tearing the team down.
 
 ---
 
@@ -290,71 +339,85 @@ the duration of a run the tree is held **exclusively** by that run:
   nothing to react to, whereas a refusal naming the holder lets it read a file or answer the user;
 - every **read** keeps working, throughout. The price of that is honest: a read during a run may see
   a half-written build artefact;
-- a second `workspace_exec` is **queued, never refused**. It is handed a run id of its own and takes
-  the tree when the head releases it.
+- a second `workspace_exec` is **refused**, with a message naming nobody, and its caller retries.
 
-**Commands never refuse each other, and that is the whole of the queue.** A model emits several
-`workspace_exec` calls in one response and pydantic-ai runs them **concurrently**, so they race for
-the tree. Refusing the losers threw the work away and — worse — published the *winner's* run id in
-the refusal, which the model could then collect: an answer to a question it never asked, and one
-that was byte-indistinguishable from its own. So admission has a third answer:
+**The hold is a file, not a queue in one actor's memory.** A run takes an `O_EXCL` marker at
+`<meta>/exec.lock` — a *sibling* of the tree, so no read capability can name it and a sandboxed
+`rm -rf` cannot delete the lock guarding its own run. That placement is what makes it work where an
+actor cannot: pykka has no remote addressing and a workspace singleton is one instance per process,
+so two teams on two workers attached to one tree get two unsynchronised actors — while every
+multi-worker deployment mounts **one** volume into all of them. `O_EXCL` on that volume is exclusive
+exactly where the actor is not.
 
 | At `request_exec` | Answer | What exists for it |
 |---|---|---|
-| tree free | run id, `RUNNING` | the hold, and one request sent to the sandbox |
-| tree held | run id, `QUEUED` | **nothing** — the entry is inert bookkeeping |
-| queue full (`MAX_QUEUED_RUNS`) | a refusal naming **nobody** | — |
+| tree free | run id, `RUNNING` | the marker, the in-memory record, one command submitted to the worker |
+| tree held | a refusal naming **nobody** | — |
+| the lock could not be taken at all | a refusal naming **nobody**, and saying so | — |
 
 Three properties hold this together and none of them is optional:
 
-- **The run id is issued at enqueue time, in every branch.** A caller leaves `request_exec` holding
-  a handle to its *own* work whether or not the tree was free, so no message on this path can name
-  another agent's run.
-- **The hold and the clock are taken at dequeue.** A request handed to the sandbox at enqueue would
-  run out of order in the sandbox's own mailbox, and a clock started at enqueue would measure the
-  wait rather than the run. `#Workspace` sends the sandbox one command at a time, because only it
-  knows when the tree has been committed — a second run started before the first run's write set is
-  committed would sweep the first run's files into its own discovery.
-- **Only the head is on the sandbox**, which is what bounds teardown **on the actor side**: three
-  queued 15 s runs are 45 s of work but never more than one run's worth of liveness, comfortably
-  inside the orchestrator's 30 s stop backstop. `WorkspaceActor.on_stop` drops every queued entry —
-  they never ran and produced nothing to report. It says nothing about the **caller's** thread,
-  which waits out its turn on the agent's side of the boundary; see the accepted costs below.
+- **The run id comes from the grant**, so the id the agent holds and the id in the marker on disk are
+  one value by construction rather than by agreement. A caller leaves `request_exec` holding a handle
+  to its *own* work or holding nothing at all, so no message on this path can name another agent's
+  run.
+- **The refusal names no run and no agent.** A refusal that quoted the holder's id is precisely the
+  defect ADR-047 removed: a model emits several `workspace_exec` calls in one response, pydantic-ai
+  runs them **concurrently**, and a loser would read the winner's id out of its refusal and collect
+  it — an answer to a question it never asked, byte-indistinguishable from its own. A refused exec
+  caller has no id of its own to be given instead, so it is given nobody's. The backend rendering the
+  message has no access to the actor's display-name map either, so it could not do otherwise.
+- **One run at a time reaches the worker**, which is what bounds teardown on the actor side: never
+  more than one run's worth of liveness, comfortably inside the orchestrator's 30 s stop backstop.
+  `WorkspaceActor.on_stop` releases the marker for the run it was holding, so a team that stops
+  mid-run does not leave the tree locked for the next process to wait out.
+
+**There is no FIFO ordering any more, and that is a deliberate behaviour change.** Among several
+refused callers the first to **retry** wins, not the first to ask. The queue this replaced lived in
+one process's memory and could not have ordered waiters across workers without becoming a
+distributed scheduler. The cost is real and was taken knowingly: a refused `workspace_exec` raises
+`RetriableError`, which `akgentic-agent` turns into pydantic-ai's `ModelRetry`, so a parallel batch
+costs one LLM round trip per collision. "Restore the queue" is not the answer to a refusal seen in
+the wild — the retry is.
 
 **Every ordinary exit reports, so releasing the tree is ordinarily not a decision at all.** The
-sandbox's tell handler reports in a `finally`: a command that ran, one the budget killed, a backend
-that raised, a binary the allowlist refused — all four arrive as a report, and the report hands the
-tree on. Two cases have no report to wait for, and each releases the tree and **starts the queue
-head**:
+worker reports in a `finally`: a command that ran, one the budget killed, a backend that raised, a
+binary the allowlist refused — all four arrive as a report, and the report releases the marker.
+**The release happens after the discovered commit, never before.** The next acquirer may be in
+another process, so an early release hands an uncommitted tree to a discovery this process cannot
+see coming, and the finished run's files would land in somebody else's commit.
+
+Two cases have no report to wait for, and each releases the tree:
 
 | No report because | Noticed by | What happens |
 |---|---|---|
 | the **sandbox stopped** mid-run — no send primitive can see this, the request was delivered to an actor that was alive at the time | `workspace_exec_result`'s liveness check, the one place `is_alive` is consulted | the run is recorded `FAILED` naming the sandbox, **nothing is committed as its agent**, and the next admission resolves a *new* sandbox — the orchestrator skips a child that is no longer alive |
-| the **child ignored the kill** and is still running past `budget + LEASE_GRACE_S` | the next mutation or poll, against the run's own clock | the tree is handed on with one WARNING; the late report that may follow commits nothing and clears nothing, though its owner can still collect the outcome |
+| the **child ignored the kill** and is still running past `budget + LEASE_GRACE_S` | the next mutation, poll or exec request, against the run's own clock | the tree is given back — the in-memory record **and** the marker — with one WARNING; the late report that may follow commits nothing and clears nothing, though its owner can still collect the outcome |
 
-**A release drains the queue, and nothing overtakes it.** In both rows the queue **head** is started
-— not whichever request happened to notice. Only an empty queue lets the arriving request run
-immediately. Without that, the entries would sit with nothing scheduled to run them, and the next
-request to arrive would find the tree free and start itself, breaking FIFO on exactly the path the
-release created.
+**Two clocks describe that wedge, and they agree by construction.** The actor measures
+`started_at + budget + LEASE_GRACE_S` on the monotonic clock; a marker is stale at
+`mtime + budget + LEASE_GRACE_S` on the wall clock, and a stale marker is taken over by the next
+acquirer. They agree because **nothing refreshes the marker mid-run** — it is written once, at
+acquire, so its mtime *is* the run's start. Do not add a heartbeat: a refreshed mtime turns a
+bounded takeover into an unbounded one, and a child that ignores the kill is exactly the case that
+would never refresh. The wall clock is forced rather than chosen (an mtime is not comparable with
+`time.monotonic()`), so an NTP step or skew between two workers makes a takeover early or late by
+the skew — never a lost hold.
 
-Because the actor is passive — nothing releases on a timer — both checks also run on
-`workspace_exec_result`'s read path. That is the one message guaranteed to arrive, since every
-queued caller is polling its own run by construction; without it a head that will never report
-strands the work behind it until some unrelated request happens along. It costs one clock read and
-one flag read.
+Because the actor is passive — nothing releases on a timer — the wedge check also runs on
+`workspace_exec_result`'s read path and at the head of `request_exec`. Without it a run that will
+never report keeps refusing mutations until some unrelated request happens along. It costs one clock
+read and one flag read.
 
-The queue is FIFO and nothing else. No priorities, no fairness weighting: a team singleton's queue
-that needs a scheduling policy is a design smell, not a feature. A queued entry belonging to an
-agent that has since stopped still **runs** — the actor holds no liveness signal it could ask, and
-guessing from an evicted display name would discard live work. Its output is simply never
-collected, which costs one command and loses nothing.
+A run belonging to an agent that has since stopped completes on its own budget and gives the tree
+back when it reports; its output is simply never collected. There is no sweep that notices the agent
+went — the agent and the actor belong to one team, so a teardown takes both.
 
 **A run belongs to the agent that started it.** `workspace_exec_result` answers only the asking
 agent's runs: an id from somebody else comes back as the existing recoverable `UNKNOWN`, carrying
 the *asker's* own recent ids. No new state was introduced for it — "exists but is not yours" is a
-distinction a model cannot act on differently. This is defence in depth rather than the fix: with
-the queue in place nothing publishes a foreign id any more. Ownership is read from a map capped at
+distinction a model cannot act on differently. This is defence in depth rather than the fix: no exec
+refusal publishes a foreign id any more. Ownership is read from a map capped at
 `MAX_TRACKED_RUNS = 32` **per agent**, so an agent past its 33rd run can no longer collect its
 oldest; the answer is a recoverable `UNKNOWN`, and the alternative — a second map keyed by run —
 would leak for the life of the team.
@@ -367,18 +430,18 @@ exit_code: 0 (OK)
 stdout: acf1942f5389dd…
 ```
 
-The provenance line is added by `format_status`, not by `format_outcome`: the outcome body is
-shared with the deprecated `exec_command` shim, and the caller that knows the run is the one that
-names it.
+The provenance line is added by `format_status`, not by `format_outcome`: the outcome body is one
+shared rendering, and the caller that knows the run is the one that names it.
 
 **Mutations still refuse while a run holds the tree, and that asymmetry is deliberate.** `workspace_write`,
 `_edit`, `_patch`, `_delete` and `_mkdir` are *gated*, not fenced: they declare their write set, so
 a refusal is a precondition failure that costs nothing to re-issue and that the agent can act on
 immediately (read the file, answer the user, ask the holder). Exec is the only operation whose write
 set is discovered after the fact, which is why it is the only one whose work would be *lost* by a
-refusal and therefore the only one worth a slot in a queue. Queuing mutations would buy nothing and
-would put a stale precondition in a deque. The busy refusal still names the holder's run id, which
-is safe precisely because that id is now uncollectable by anyone but its owner.
+refusal — but both are refusals now, and the two messages differ in one respect: **the mutation
+refusal names the holder's run id and agent, and the exec refusal names nobody.** Naming the id in a
+mutation refusal is safe precisely because that id is uncollectable by anyone but its owner, and it
+is what lets a human reading the transcript see who is holding the tree.
 
 Afterwards the write set is **discovered** — `git status --porcelain -uall` — and committed as one
 commit attributed to the requesting agent, with the command in the body. That is where multi-file
@@ -395,35 +458,26 @@ change, and ends by telling the model to come back on a next turn it does not ha
 held for the run's duration either way, so the *team* waits identically; only the requesting
 agent's turn count differs.
 
-**Under the default the wait covers your turn as well as your run**, so a command that had to queue
-still returns its own output on the call that asked for it — a batch behaves as if it had been
-issued one command at a time. That makes the poll **deadline-driven** rather than attempt-driven: a
-run at queue position `p` has at most `p + 1` run budgets left to wait, so that is the deadline, and
-it **re-arms on every queued look**, so a caller that is still advancing up the queue is never
-abandoned mid-climb — a run ahead costs its budget *plus* the grace and the sandbox resolve, so a
-deadline pinned to the position first seen gives a caller less time than its wait honestly takes.
-What bounds it is a separate **ceiling fixed on entry and never re-armed**,
-`(MAX_QUEUED_RUNS + 1) × run_budget + margin`: without it, a position that stopped decreasing would
-re-start the clock for ever. The `+ 1` is the caller's own run, the same arithmetic as the 1-based
-position — at the deepest legal slot you wait for the 16 ahead of you *and then for yourself*.
+**Under the default the wait covers the run**, resolved once at wiring time into the attempt count
+whose last look falls as late as it still can inside the effective run budget **plus** a report
+margin (~1 s). There is no turn to wait out any more: an admitted run starts immediately, and a
+command that was refused never got an id to wait on.
 
 The thread parked by that wait is the **caller's own tool thread**, never the actor's, and the
 mailbox goes on draining — so reads, mutations and other agents' polls are unaffected. On the
-ordinary path a poll costs **one clock read and one flag read**: the sandbox is alive, and the run
-is inside `budget + LEASE_GRACE_S`. It is not unconditionally O(1), and the difference is worth
-stating rather than glossing — a poll *can* fork git and send the queue head to the sandbox, but
-only on the two no-report paths above. That is the anomaly path, not the poll path, and the work is
-what the tree needs done by whoever arrives first: nothing releases on a timer, so the queued
-caller's own poll is the message guaranteed to arrive. Two costs come with it and are accepted: latency is serial (three 15 s commands mean the
-third result lands ~45 s in, which is the point), and a parked thread can outlive the orchestrator's
-30 s stop backstop during teardown — the same exposure one long run already has, not a new one.
+ordinary path a poll costs **one clock read and one flag read**: the run is inside
+`budget + LEASE_GRACE_S`. It is not unconditionally O(1), and the difference is worth stating rather
+than glossing — a poll *can* release a wedged run's hold, on the no-report path above. That is the
+anomaly path, not the poll path, and the work is what the tree needs done by whoever arrives first:
+nothing releases on a timer, so a caller's own poll is the message guaranteed to arrive. One cost
+comes with it and is accepted: a parked thread can outlive the orchestrator's 30 s stop backstop
+during teardown — the same exposure one long run already has, not a new one.
 
-A run that outlives even that deadline comes back saying it passed its budget and naming its id, and
-`workspace_exec_result('<id>')` collects the output whenever it does land; a run still queued at the
-deadline says so instead. That degraded path stops being the normal outcome but does not disappear —
-it is what answers a head that hangs past its budget. An id nothing was issued under, or one
-belonging to another agent, does not raise — it comes back with that agent's own recent run ids, so
-a mistyped one is correctable.
+A run that outlives that deadline comes back saying it passed its budget and naming its id, and
+`workspace_exec_result('<id>')` collects the output whenever it does land. That degraded path is not
+the normal outcome but does not disappear — it is what answers a run that hangs past its budget. An
+id nothing was issued under, or one belonging to another agent, does not raise — it comes back with
+that agent's own recent run ids, so a mistyped one is correctable.
 
 A **positive** `poll_attempts` is unchanged: it asked for an explicitly bounded look and still gets
 a run id when the count runs out.
@@ -432,7 +486,7 @@ a run id when the count runs out.
 
 | Setting | Meaning | Bounded by |
 |---|---|---|
-| `-1` (default) | wait out your **turn and** your run | a deadline, not a count: the effective run budget **plus** a report margin (~1 s), re-armed to `(p + 1)` budgets on every look while queued at position `p`, and clamped by a ceiling of `(MAX_QUEUED_RUNS + 1) × run_budget + margin` fixed on entry. So a command killed at its budget still arrives as a readable `exit_code: 124`, and one that had to queue still returns its own output |
+| `-1` (default) | wait out your run | the effective run budget **plus** a report margin (~1 s), resolved once at wiring into an attempt count. So a command killed at its budget still arrives as a readable `exit_code: 124` rather than as a timeout message |
 | a positive count | a bounded look, then a run id | the effective run budget alone — no margin |
 | `0` | no polling; the run id comes back immediately | — |
 
@@ -462,10 +516,11 @@ cannot argue with.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `workspace_id` | `str \| None` | `None` | The `<leaf>` — a directory name **under the caller's own principal**, not under the workspaces root, and the second half of the actor's name. `None` ⇒ the team id, so each team gets its own tree. A fixed string names a **second tree of your own**: two agents in one team can hold two separate trees, and two teams of the *same* principal reach one tree (checked by the gate, not ordered by an actor). It does **not** share across principals — two users declaring `notes` get `<alice>/notes` and `<bob>/notes`. For sharing that actually shares, use `workspace_metadata_keys`. |
-| `workspace_metadata_keys` | `list[str]` | `[]` | The `<leaf>` derived from the team's own metadata, under the reserved `_meta` scope: `["customer_id", "case_id"]` over `ACME` and `42` resolves to `_meta/customer_id-ACME__case_id-42`. This is the layout that is **shared across teams and across users** — which is why it sits under a reserved scope rather than under anybody's principal. Keys are a **sequence**: joined in declaration order, so the list reads as a refinement path from the coarsest scope down and `ls _meta/` groups a customer's trees together — the trade being that two cards naming the same keys in different orders address different workspaces, which is visible in the directory name rather than silent. Values are percent-encoded, which is what keeps the join unforgeable. The declared list also travels on the wire as `WorkspaceConfig.metadata_keys`, so a client attributes an agent to a workspace by plain list equality against this field, with nothing to normalise on either side. **Mutually exclusive with `workspace_id`** — declaring both is a `ValidationError` at card construction, not a precedence rule. Every failure is a hard error at bind time, never a fallback to a user path: no metadata on the team, a key that is not a field of the metadata model, a value that is `None` or empty, or a joined leaf over 255 bytes. |
+| `workspace_id` | `str \| None` | `None` | The `<leaf>` of the `_id` kind — a directory name **under the caller's own principal** by default, not under the workspaces root, and the tail of the actor's name. `None` ⇒ the `_team` kind, whose leaf is the team id, so each team gets its own tree. A fixed string names a **second tree of your own**: two agents in one team can hold two separate trees, and two teams of the *same* principal reach one tree (checked by the gate, not ordered by an actor). It does **not** share across principals on its own — two users declaring `notes` get `alice/_id/notes` and `bob/_id/notes`. For sharing that actually shares, add `workspace_sharable=True`, which the platform must permit for `id`. **One grammar** (`validate_workspace_id`): 1 to 128 characters, each an ASCII letter, a digit, `.`, `_` or `-`, and not a kind name (`_team`, `_id`, `_meta`) or a name ending in `.git` or `.index`, in any letter case. **Refused at card construction (catalog save, team creation, resume), never at bind**, so a name the workspace routes cannot serve never gets a tree: `"Customer Notes"` is a `ValidationError` naming the value and the rule. |
+| `workspace_metadata_keys` | `list[str]` | `[]` | The `<leaf>` derived from the team's own metadata, under the `_meta` kind: `["customer_id", "case_id"]` over `ACME` and `42` resolves to `alice/_meta/customer_id-ACME__case_id-42` for principal `alice`. **Per-principal by default, like the other two kinds**: every team of one principal carrying the same values reaches one tree, and another principal's teams reach another. It is shared across principals only with `workspace_sharable=True` (`_shared/_meta/…`), where the platform permits `meta` — the inverse of the old layout, which shared every metadata tree across principals implicitly. Keys are a **sequence**: joined in declaration order, so the list reads as a refinement path from the coarsest scope down and `ls <scope>/_meta/` groups a customer's trees together — the trade being that two cards naming the same keys in different orders address different workspaces, which is visible in the directory name rather than silent. Values are percent-encoded, which is what keeps the join unforgeable. Only the resolver reads this field: a client learns which tree an agent bound from the `WorkspaceAttached` event the bind emits, whose `workspace_path` is the full three-segment path, never from a key list. **Mutually exclusive with `workspace_id`** — declaring both is a `ValidationError` at card construction, not a precedence rule. Every failure is a hard error at bind time, never a fallback to a user path: no metadata on the team, a key that is not a field of the metadata model, a value that is `None` or empty, or a joined leaf over 255 bytes. |
+| `workspace_sharable` | `bool` | `False` | Whether the tree lives under the reserved shared scope, `_shared/<kind>/<leaf>`, instead of under the owning principal. Orthogonal to both layout fields and valid with all three kinds; not part of the mutual-exclusivity check. **A request, not a grant**: the bind fails unless `AKGENTIC_WORKSPACE_SHARED_KINDS` on the binding process permits the kind, and a refused request is never downgraded to the per-principal tree. A plain `bool`, so the value survives every catalog round trip. See *Sharing a tree across principals*. |
 | `read_only` | `bool` | `False` | `True` removes every write-side callable from the tool list, `workspace_exec` included. The read side is unaffected. |
-| `git_journal` | `bool` | `False` | Whether accepted mutations are recorded in the git journal. **Off by default**, because nothing in the system consumes the record: the gate re-hashes live and never consults it, and an agent's exec result carries only `exit_code`/`stdout`/`stderr`, so the journal is a human-facing audit trail you opt into. A plain field, not a capability param: it exposes no tool and nothing about it is expressible by a model. Turning it off loses history, attribution and out-of-band detection — it does **not** loosen the gate by one row. Read by the **first** card to create the actor for a workspace. |
+| `git_journal` | `bool` | `False` | Whether accepted mutations are recorded in the git journal. **Off by default**, because nothing in the system consumes the record: the gate re-hashes live and never consults it, and an agent's exec result carries only `exit_code`/`stdout`/`stderr`, so the journal is a human-facing audit trail you opt into. A plain field, not a capability param: it exposes no tool and nothing about it is expressible by a model. Turning it off loses history, attribution and out-of-band detection — it does **not** loosen the gate by one row. Each card keeps its own journal; for the exec runs a team's cards share, the **last** card to bind decides. |
 | `resources` | `list[Resource]` | `[]` | Files written into the workspace at `observer()` time, before the agent's first turn. Seeding is **idempotent**: a resource whose `file_name` already exists is skipped, so restoring a team never clobbers a file the agent has since edited. |
 | `workspace_read` | `WorkspaceRead \| bool` | `True` | Read a file with line-number pagination. |
 | `workspace_view` | `WorkspaceView \| bool` | `True` | Return an image as `BinaryContent` for the model's vision endpoint. |
@@ -483,7 +538,7 @@ cannot argue with.
 | `workspace_rag_index` | `WorkspaceRagIndex \| bool` | **`False`** | Queue workspace files for retrieval indexing. On the **read** side of `read_only`: indexing derives from the tree and writes nothing into it. |
 | `workspace_rag_list` | `WorkspaceRagList \| bool` | **`False`** | Where every file stands in the index. `COMMAND` + `LLM_CONTEXT`, never `TOOL_CALL` — it is pushed into the context tail as a per-turn delta, so a tool call for it would be a round trip for what the model already has. |
 | `workspace_rag_search` | `WorkspaceRagSearch \| bool` | **`False`** | Hybrid search over the indexed chunks. `TOOL_CALL` only — a search is something the model *does*, not something it is *shown*. Read side, like its two siblings. |
-| `rag_collection` | `CollectionConfig` | `CollectionConfig()` | Backend, dimension and tenant of the one `workspace_chunks` collection. Named `rag_collection` rather than the house's bare `collection`: on a card whose other twenty fields are workspace operations, a bare `collection` reads as "the workspace's collection of files". |
+| `vector_store` | `VectorStoreParam` | `VectorStoreParam()` | Backend, dimension, tenant, embedding model and provider of the one `workspace_chunks` collection. The house name, shared with `PlanningTool` and `KnowledgeGraphTool`. It was once `rag_collection`, because a bare `collection` reads as "the workspace's collection of files" on a card whose other twenty fields are file operations — `vector_store` answers that objection rather than working around it. The backend it names also decides whether a store actor is created at all, and it is what the backend-configuration check reads. All of that only when a retrieval capability is on. |
 | `max_documents` | `int \| None` | `None` | Row cap on the extraction cache. `None` is **not** zero and not "use the default" — it means *derive it* from the vector backend and whether retrieval is on. An explicit value always wins. |
 | `max_document_chars` | `int \| None` | `None` | Character cap on the bodies the cache holds. Same three-way meaning. |
 
@@ -522,19 +577,28 @@ truncated. A missing path or a path escaping the root surfaces as `RetriableErro
 can correct itself.
 
 **Binary reads** (`.pdf`, `.docx`, `.xlsx`, `.xls`, `.pptx`, `.msg`, `.epub`, and image
-extensions) go through the `DocumentReader`, and the extracted Markdown is cached **in
-`#Workspace`'s state** — not in a file beside the source (ADR-045 §3). The sidecar it replaced is
-gone, and so is the read-path rule that used to return a dotfile ending in `.md` as plain text.
+extensions) go through the `DocumentReader`, and the extracted Markdown is cached in the tree's
+**sibling metadata directory** — never in a file beside the source (ADR-045 §3, ADR-051 Decision 6).
+The sidecar it replaced is gone, and so is the read-path rule that used to return a dotfile ending
+in `.md` as plain text. No read capability can name a cache file, because `<meta>` is beside the
+tree rather than inside it.
 
 The cache is keyed by path and hits only when the entry was produced from *these* source bytes by
 *this* extractor version, so it can never serve a stale body: a changed file misses and re-extracts.
-It is bounded on two dimensions — a row count and a character total — because it is re-serialised
-into the team's event store on every fill. Over the character cap the least-recently-used entry
-keeps its metadata and **drops its body**; over the row cap the entry goes entirely. Every byte is
-regenerable from the tree, so an eviction costs one re-extraction and never a wrong answer.
+Each fill writes one YAML record, temp-then-`replace()`, so a torn write leaves the previous record
+intact. It is bounded on two dimensions, a row count and a character total, so the metadata
+directory stays bounded however many documents are read. Over the character cap the entry whose body
+was **least recently extracted** keeps its metadata and drops its body; over the row cap that entry
+loses its extraction outright. Every byte is regenerable from the tree, so an eviction costs one
+re-extraction and never a wrong answer.
 
-An evicted body does **not** de-index its file: index membership lives in its own map and is never
-inferred from this one.
+**Recency is `extracted_at`, stamped at the fill.** A cache *hit* refreshes nothing and writes
+nothing: a read must never write, which is the rule the whole design rests on, and the price is at
+most one extra re-extraction of a file that was read but not re-extracted.
+
+An eviction does **not** de-index its file. Both halves of a document live in one record, so the row
+cap clears the extraction half and leaves the index row exactly where it was; the record is removed
+outright only when there is no row left in it.
 
 #### `DocumentReader`
 
@@ -638,12 +702,12 @@ WorkspaceTool(
 | `expose` | `set[Channels]` | `{TOOL_CALL}` | Taking exec off this channel withholds both callables **and** skips the wiring entirely — no host probe, no sandbox actor. |
 | `mode` | `"local" \| "bwrap" \| "seatbelt" \| "docker" \| "auto"` | `"auto"` | The isolation backend. `"auto"` probes the host at wiring time (`bwrap` → `seatbelt` → `docker` → `local`) and warns when it falls through to `local`. A mode naming no registered backend raises `KeyError` at wiring time, deliberately. |
 | `timeout_s` | `float` | `15.0` | Budget for the **subprocess**, handed to the backend. Capped at `MAX_EXEC_BUDGET_S` (20 s), which sits below the orchestrator's 30 s stop backstop. |
-| `poll_attempts` | `int` | `-1` | How many times the agent's own thread looks for a result. `-1` is the sentinel for "wait out my turn **and** my run" — a deadline of the effective run budget plus a report margin, re-armed from the queue position on every look and clamped by a ceiling fixed on entry, so a queued command still returns its own output; a positive count is a bounded look clamped to that budget without the margin, and is unaffected by the queue; `0` opts out of polling and takes the run id immediately. Below `-1` is a validation error. |
+| `poll_attempts` | `int` | `-1` | How many times the agent's own thread looks for a result. `-1` is the sentinel for "wait out my run" — resolved at wiring into the count whose last look falls as late as it still can inside the effective run budget plus a report margin, so an ordinary command returns its own output and the model never sees a run id; a positive count is a bounded look clamped to that budget without the margin; `0` opts out of polling and takes the run id immediately. Below `-1` is a validation error. |
 | `poll_delay_seconds` | `float` | `0.5` | Seconds between those looks — the granularity of the wait, not its length. The length comes from `poll_attempts` resolved against the run budget, and can never outlast the run it waits for: past that point there is nothing left to wait for. |
 
 None of these reaches an LLM-facing signature: nothing lets a model name a mode, a timeout, or a
-git argument. See the [`ExecTool` reference](../sandbox/README.md) for what each backend actually
-isolates, the bundled Docker image, and how to register a backend of your own.
+git argument. See the [sandbox backend reference](../sandbox/README.md) for what each backend
+actually isolates, the bundled Docker image, and how to register a backend of your own.
 
 ---
 
@@ -694,8 +758,23 @@ loss. `stale` means the tree changed underneath an indexed file.
 
 Two legs, combined by the fusion rule the whole package shares: a scoped similarity search against
 `workspace_chunks`, and a case-insensitive term match over the extraction bodies the actor already
-holds. Each hit renders its path, its heading path, a score label — `(hybrid: 0.90)`,
-`(semantic: 0.85)` or `(keyword match)` — and the chunk's text.
+holds.
+
+**`workspace_chunks` is shared across teams, and the `scope` is what bounds it.** The collection's
+rows belong to a *filesystem tree*, not to a team, so on a cluster two teams pointed at one tree read
+the same rows — which is the point, since it is the same file in the same tree. `planning` and
+`knowledge_graph` keep their per-team predicate; this one does not have it, and instead the store
+**requires** a `scope` on every search and every removal against it. This actor always passes its
+resolved `workspace_path`, so the requirement is invisible here; it exists so that a caller written
+later cannot omit the collection's only remaining boundary.
+
+One consequence to weigh deliberately rather than meet as a surprise: two teams indexing one tree
+produce identical chunk ids for identical content, so team A re-indexing a file removes the rows team
+B also reads. That is correct — it is the same file in the same tree — but it means a re-index is
+visible across teams.
+
+Each hit renders its path, its heading path, a score label — `(hybrid: 0.90)`, `(semantic: 0.85)` or
+`(keyword match)` — and the chunk's text.
 
 **A hit's text comes from the vector store, not from the cache**, which is what keeps a file whose
 extraction body was evicted both searchable and renderable. That file loses only its lexical leg:
@@ -787,48 +866,103 @@ now returns only the failure — nothing was applied, so there is nothing to rep
 
 ### Where the files live
 
-**A workspace is a relative path of exactly two segments** — `<scope>/<leaf>`. `<scope>` answers
-*whose is this*, `<leaf>` answers *which of theirs*, and the leaf is always a discriminator unique to
-one workspace: a team id, a `workspace_id`, or a joined metadata key, never a category. There are
-three layouts and no fourth:
-
-| Card | Resolved path |
-|---|---|
-| `WorkspaceTool()` | `<user_id>/<team_id>` |
-| `WorkspaceTool(workspace_id="notes")` | `<user_id>/notes` |
-| `WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])` | `_meta/customer_id-ACME__case_id-42` |
+**A workspace is a relative path of exactly three segments**, joined to the workspaces root:
 
 ```
-$AKGENTIC_WORKSPACES_ROOT/                # default ./workspaces
-├── <user_id>/
-│   ├── <team_id>/                        # the root every path is anchored to
-│   ├── <team_id>.git/                    # the journal — a SIBLING, never inside the root
-│   ├── notes/                            # a named workspace: a second tree of your OWN
-│   └── notes.git/
-└── _meta/                                # reserved: the shared, metadata-keyed layout
-    ├── customer_id-ACME__case_id-42/
-    └── customer_id-ACME__case_id-42.git/
+<AKGENTIC_WORKSPACES_ROOT>/<scope>/<kind>/<leaf>
 ```
 
-**Depth is fixed at two, and what that buys is that no workspace path is a prefix of another.**
-`Filesystem._validate_path` rejects only paths resolving *outside* the root, so a workspace at
-`ACME/` would read and write everything under `ACME/42/` as ordinary in-tree activity, with the
-per-path write gate none the wiser. That is containment rather than a name collision, and it is
-worse. At depth two with a unique leaf the property holds by construction.
+- `<scope>` answers *who may reach this*: the owning principal's user id, or the reserved `_shared`.
+- `<kind>` answers *how the leaf was derived*: exactly one of `_team`, `_id` and `_meta`, chosen by
+  which layout field the card set.
+- `<leaf>` answers *which one*: the team id, the `workspace_id`, or the joined metadata key. It is
+  always a discriminator unique to one workspace of that kind, never a category.
+
+Two fields choose the kind and one flag chooses the scope, so there are six cells. For principal
+`alice`:
+
+| Card | `workspace_sharable=False` (default) | `workspace_sharable=True` |
+|---|---|---|
+| `WorkspaceTool()` | `alice/_team/<team_id>` | `_shared/_team/<team_id>` |
+| `WorkspaceTool(workspace_id="notes")` | `alice/_id/notes` | `_shared/_id/notes` |
+| `WorkspaceTool(workspace_metadata_keys=["customer_id"])` | `alice/_meta/customer_id-ACME` | `_shared/_meta/customer_id-ACME` |
+
+Per-principal is the default for **every** kind, metadata included. A shared cell exists only where
+the platform permits its kind (see *Sharing a tree across principals*, below), and the resolver never
+consults the principal for one.
+
+```
+$AKGENTIC_WORKSPACES_ROOT/                      # default ./workspaces
+├── alice/                                      # a principal's scope
+│   ├── _team/
+│   │   ├── <team_id>/                          # the root every path is anchored to
+│   │   ├── <team_id>.git/                      # the journal — a SIBLING, never inside the root
+│   │   └── <team_id>.index/                 # <meta> — a sibling too
+│   ├── _id/
+│   │   ├── notes/                              # a named workspace: a second tree of alice's OWN
+│   │   ├── notes.git/
+│   │   └── notes.index/
+│   └── _meta/
+│       ├── customer_id-ACME__case_id-42/       # metadata-keyed, and still alice's own
+│       ├── customer_id-ACME__case_id-42.git/
+│       └── customer_id-ACME__case_id-42.index/
+└── _shared/                                    # reserved: trees no principal owns
+    └── _meta/
+        ├── customer_id-ACME/                   # workspace_sharable=True, permitted for `meta`
+        ├── customer_id-ACME.git/
+        └── customer_id-ACME.index/
+```
+
+**Depth is fixed at three, and what that buys is that no workspace path is a proper prefix of
+another.** The invariant is load-bearing because violating it is **containment**, not a name
+collision: `Filesystem.resolve_path` rejects only paths resolving *outside* the root, so a
+workspace anchored at a parent would read and write everything under a child's tree as ordinary
+in-tree activity, with the per-path write gate none the wiser. **Fixed depth is what buys the
+property.** No path of exactly three segments can be a proper prefix of another, because a proper
+prefix has strictly fewer segments. The previous layout's depth was never load-bearing, only fixed.
+The kind segment adds one thing more: it separates a user id from a workspace name, so
+`notes/_id/x` (a principal called `notes`) and `alice/_id/notes` (a workspace called `notes`) cannot
+meet.
+
+**The reserved names are refused on both sides, or two cells collapse into one tree.**
+`user_segment` refuses a principal named `_shared` or any of the three kind names: a principal called
+`_shared` would *be* the shared cell. `leaf_segment` refuses the three kind names, and any leaf ending
+in `.git` or `.index`, which would root one tree at another workspace's journal or metadata
+directory. Both match **exactly**, never as a `_` prefix (an Azure AD `sub` is base64url, whose
+alphabet includes `_`), and **case-insensitively**, because macOS and Windows filesystems are —
+case-folded, so `_ſhared` (with a long s) is refused as well as `_SHARED`.
+`_shared` is a legal **leaf**: at the third position it collides with nothing.
+The suffix rule has an author-facing consequence: a `workspace_id` such as `search.index` is
+refused, because it is the index and metadata directory of workspace `search`, and the refusal says
+so — *workspace leaf may not end in '.index': 'search.index' would collide with the index and
+metadata directory that the workspace named 'search' keeps beside its tree.*
+
+**Two sibling directories sit beside every tree, never inside it**, in the same `<scope>/<kind>/`
+directory: `<leaf>.git`, the journal, and `<leaf>.index`, the tree's metadata directory
+(`<meta>`), which holds the exec lock, the `rag/` document records, the local vector backend's
+`index/` and the `locks/`. Being beside the tree is what keeps both out of every read capability and
+out of every sandbox mount: **neither is ever mounted**.
+**Whatever removes a tree must remove both siblings too.** `<leaf>.index/rag/*.yaml` holds the
+**extracted text** of every document the tree indexed, and `akgentic-infra`'s team deletion does not
+yet remove the siblings.
+
+Layouts written by `akgentic-tool` 1.8.0 (two segments) or earlier (flat) are not read by this
+resolver: **no migration is provided**, and such trees are removed by hand.
 
 **Where there is no principal there is no isolation, by construction.** A team created through the
 SDK carries `user_id="cli"` and an HTTP deployment with no authentication configured carries
 `anonymous`, so every such team on one host shares that one scope. Team trees stay distinct anyway —
-`cli/<team_id>`, and a team id is unique — but a **named** workspace does not: `cli/notes` is one
-tree for every SDK-created team on that host. On a developer machine that is the desired behaviour;
-on a shared host reached without authentication it is the old flat namespace again, narrowed to one
-scope. Supplying a principal is the deployment's job.
+`cli/_team/<team_id>`, and a team id is unique — but a **named** workspace does not: `cli/_id/notes`
+is one tree for every SDK-created team on that host. On a developer machine that is the desired
+behaviour; on a shared host reached without authentication it is one namespace for everybody,
+narrowed to one scope. Supplying a principal is the deployment's job.
 
-The `<scope>` never reaches a client. The frontend sends and labels the **leaf** it read from the
-tool row — `notes`, a team id, or the joined metadata key — and the server recomputes the scope from
-the team's own card.
+**What the tool tells a client is the whole path.** Each bind emits
+`WorkspaceAttached(agent_id, workspace_path)` on the team's stream, and `workspace_path` is the full
+three-segment path, scope included: `alice/_meta/customer_id-ACME__case_id-42`. What a client does
+with it is the client's business.
 
-`Filesystem._validate_path` resolves each path against that root and rejects anything landing
+`Filesystem.resolve_path` resolves each path against that root and rejects anything landing
 outside it with `PermissionError`, which the tools surface as `RetriableError`. The check is
 component-level (`Path.is_relative_to`), so a sibling workspace whose name shares a prefix —
 `team-1` vs `team-11` — cannot be reached. Symlinks are resolved before the check, so a symlink
@@ -841,108 +975,77 @@ complete previous file or the complete new one, never to a prefix. Same-director
 load-bearing — `os.replace` is atomic only within one filesystem. Permission bits are preserved;
 ownership, extended attributes and hardlinks are not, because publishing by rename replaces the
 inode. That matters where the workspace is bind-mounted into a container running as another uid.
-Orphaned staging files left by a hard kill are swept once, at actor start.
+Orphaned staging files left by a hard kill are swept once per card bind, in `observer()` — before
+anything writes into the tree, and whether or not that card creates an actor. It was the actor's
+`on_start` until the actor became dispatch-only, which would have left the commonest card shape
+sweeping nothing; a staging file younger than the grace window is left alone, because it belongs to
+a write that is still in flight.
 
-### Migrating a pre-48 workspaces root
+### Sharing a tree across principals
 
-A root written before the two-segment layout holds every workspace at the top level. Every one of
-them moves:
+**The card requests, the platform permits.** `workspace_sharable=True` on a card is a *request* to
+put its tree under `_shared`. `AKGENTIC_WORKSPACE_SHARED_KINDS` is the platform's *permission*: it
+names the kinds that may live there. Neither is enough alone. A card cannot make a tree shared on its
+own authority, and a platform that permits a kind shares nothing until a card asks.
 
-| Before | After |
+The variable takes comma-separated **bare** kind names: `team`, `id`, `meta`. Each token is stripped
+of surrounding whitespace and compared case-insensitively, and empty tokens are skipped. **Unset or
+empty means none**, so a deployment that has never heard of sharing cannot be given it by a card.
+
+| Value | Permits |
 |---|---|
-| `workspaces/<team_id>/` | `workspaces/<user_id>/<team_id>/` |
-| `workspaces/<team_id>.git/` | `workspaces/<user_id>/<team_id>.git/` |
-| `workspaces/<name>/` | `workspaces/<user_id>/<name>/`, **manually**, once per owning principal |
-| `workspaces/<name>.git/` | `workspaces/<user_id>/<name>.git/`, with its tree |
+| unset, `""`, `"  "`, `","` | nothing |
+| `meta` | `_meta` |
+| `id,meta`, `" id , META "` | `_id`, `_meta` |
+| `team,id,meta` | all three |
+| `metadata`, `_meta`, `all`, `*`, `id meta`, `meta,metadata` | **`ValueError`**: the whole value is refused |
 
-**The journal moves with its tree — both directories or neither.** The repository is the sibling
-`<name>.git` in the same directory as the tree, so a move that relocates only the tree loses that
-workspace's history *silently*: nothing raises, and the actor initialises an empty repository at the
-new sibling on next start.
+One unknown token refuses the **whole** value, so `meta,metadata` permits nothing rather than
+`meta`: a typo that silently permitted half a value would look like a working configuration. The
+separator is `,` and nothing else, so `id meta` is one unknown token. The value is parsed on
+**every** bind, so a malformed one fails **every** bind, per-principal ones included:
 
-#### Team workspaces — the script
-
-```bash
-# Dry run is the default: it prints the plan and changes nothing.
-python -m akgentic.tool.workspace.migrate --root ./workspaces --owners owners.json
-
-# Then apply it.
-python -m akgentic.tool.workspace.migrate --root ./workspaces --owners owners.json --apply
+```
+AKGENTIC_WORKSPACE_SHARED_KINDS names 'metadata', which is not a workspace kind; accepted, comma-separated: 'id', 'meta', 'team'
 ```
 
-`owners.json` is a flat object mapping team id to the owning user id:
+**It is read by the process that binds agents**: the worker in a department or enterprise
+deployment, the single process in community. It is read at every bind and **never cached**. The API
+server never reads it: the server calls the resolver on catalog writes, and a card must not be judged
+there against an allow-list that does not decide. That is also why the resolver itself reads no
+environment.
 
-```json
-{
-  "3f2b1c8e-0a4d-4c9a-9f3e-2b6d7c8a1e55": "2R0bQV8j9zX8CEsBl6APi7MXgAn4_laOa8vd9ZoIHIQ",
-  "b7c4e2a1-55d9-4f30-8a1b-9c0e6d4f2a77": "geoffroy.piroux@example.com"
-}
+**A request the process does not permit fails the bind, and is never downgraded.**
+`WorkspaceTool.observer()` checks the resolved path immediately after resolving it and before
+`get_workspace`, which creates the tree eagerly. So a refused bind creates no directory, no
+`#Workspace` actor and no `WorkspaceAttached` event, and the team fails to start in front of the admin
+who configured it:
+
+```
+WorkspaceTool requests a shared 'id' workspace (_shared/_id/notes), but AKGENTIC_WORKSPACE_SHARED_KINDS permits only 'meta' on this process. Add 'id' to it on the process that binds agents, or declare workspace_sharable=False.
 ```
 
-For a deployment with one principal for the whole root — the community and CLI tiers, where every
-team carries `cli` or `anonymous` — `--owner <user_id>` covers it in one flag and no file is needed:
+With nothing permitted, the middle of that message reads
+`permits none (it is unset or empty) on this process`. There is no fallback to the per-principal
+tree, because a card that asked for a shared tree and quietly got a private one would have had its
+meaning changed without being told.
 
-```bash
-python -m akgentic.tool.workspace.migrate --root ./workspaces --owner anonymous --apply
-```
+**The metadata default inverted.** A metadata tree used to be shared across principals implicitly,
+as a side effect of choosing `workspace_metadata_keys`. It is now per-principal (`alice/_meta/…`),
+like every other kind. A deployment that wants a metadata tree shared sets
+`AKGENTIC_WORKSPACE_SHARED_KINDS=meta` **and** marks those cards `workspace_sharable=True`. Both are
+needed, deliberately.
 
-**Where the mapping comes from.** Each team's owner is the `user_id` stored on that team's team
-record — one owner per team, no judgement involved. The script does **not** read those records:
-`akgentic-tool` may not import `akgentic-team`, so the lookup happens outside this package and its
-result is handed in. On an `akgentic-infra` server, `GET /teams` returns `team_id` and `user_id` for
-each team, but only for **the calling user's own** teams — so a root with several principals is
-built from the deployment's team store directly, one entry per team, rather than from one call.
+Two limits to know before permitting anything:
 
-**An unmapped team id is refused, never guessed.** The run reports it and exits non-zero without
-moving it. Defaulting to `anonymous` would file one user's tree under the shared anonymous scope,
-which is exactly the exposure the two-segment layout exists to close.
-
-What the plan says about each directory:
-
-| Verdict | Meaning |
-|---|---|
-| `MOVE` | a team id in the mapping — tree and journal move together |
-| `ALREADY_MIGRATED` | the source is gone and the destination is there: a previous run did it. Not a conflict, and it does not fail the run. If the tree moved but its journal is still at the root — a hand-migration, or a run killed between the two moves — the row says so, and that journal must be moved beside its tree by hand |
-| `CONFLICT` | the destination already exists. **The whole plan refuses**: nothing moves and the exit code is non-zero |
-| `UNMAPPED` | a team id absent from the mapping. Never moved; the run exits non-zero |
-| `MANUAL` | a named workspace, or a `.git` the mapping did not account for. Never touched — see below. The row distinguishes the two: a journal whose tree is beside it moves **with** that tree, while one standing alone cannot be placed at all |
-| `SKIPPED` | already a scope directory, not a workspace |
-
-The whole plan is validated before anything moves, so a collision is found while the root is still
-untouched rather than halfway through. Running the script twice over the same root is a clean no-op
-the second time.
-
-#### Named workspaces — the manual path
-
-The script never touches them, and that is deliberate: the mapping from a *name* to a principal
-exists nowhere on disk, and a wrong guess hands one user's files to another.
-
-For each named workspace, decide who owns it and move both directories:
-
-```bash
-mkdir -p workspaces/<user_id>
-mv workspaces/<name>      workspaces/<user_id>/<name>
-mv workspaces/<name>.git  workspaces/<user_id>/<name>.git   # if it exists
-```
-
-`<user_id>` is literally the value on that user's teams' records. Where a tree really was being
-shared by several principals, **copy** it once per principal — and treat that as a signal: a tree
-that genuinely needs sharing should move to `workspace_metadata_keys` instead of being copied,
-because copies diverge from the moment they are made. Replace
-`WorkspaceTool(workspace_id="acme-case-42")` with
-`WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])` on a team whose metadata carries
-those fields, and put the directory at `workspaces/_meta/customer_id-ACME__case_id-42`. The sharing
-is then declared rather than implied by everyone happening to type the same string.
-
-#### The RAG index must be rebuilt, and there is no script for it
-
-The retrieval index is scoped by the workspace path, so a moved workspace's chunks are still filed
-under the old scope. Re-index the tree after the move — `workspace_rag_index(force=True)` — and the
-old scope's chunks stay where they are until a scope-wide purge primitive exists.
-
-That costs re-embedding and no information: the index is derived data, and every chunk is recoverable
-from the tree. The stranded chunks are inert rather than cross-readable — no query ever issues a
-bare-leaf scope any more — so they leak storage and nothing else.
+- **Forwarding.** The department and enterprise tiers do not forward
+  `AKGENTIC_WORKSPACE_SHARED_KINDS` to their workers today. Leaving it unforwarded is **safe**,
+  because unset means none. A deployment that adopts sharing must forward it to the processes that
+  bind agents.
+- **Entitlement.** Nothing yet decides whether a principal may claim a given metadata value. Any team
+  carrying `{customer_id: ACME}` whose card declares a shared metadata tree reaches that tree. Until
+  an entitlement policy exists (ADR-052 Decision 5, owned by `akgentic-infra-auth`), leaving the
+  variable unset is the safe posture.
 
 ### Seeding files
 
@@ -964,17 +1067,24 @@ Both fields are primitives, so a seeded resource round-trips through a catalog e
 ### Recipes
 
 ```python
-WorkspaceTool()                                   # <user_id>/<team_id>: this team's own tree
+WorkspaceTool()                                   # alice/_team/<team_id>: this team's own tree
 WorkspaceTool(read_only=True)                     # analyst: reads only
-WorkspaceTool(workspace_id="scratch")             # <user_id>/scratch: a second tree of YOUR OWN,
+WorkspaceTool(workspace_id="scratch")             # alice/_id/scratch: a second tree of YOUR OWN,
                                                   # not a tree shared with other principals
 WorkspaceTool(read_only=True, workspace_glob=False)  # drop one capability
 
-# Shared across teams AND across users, because the sharing is DECLARED: the leaf
-# is derived from the team's own metadata and lands under the reserved _meta scope,
-# e.g. _meta/customer_id-ACME__case_id-42 — declaration order, so `ls _meta/` groups
-# a customer's trees. Mutually exclusive with workspace_id.
+# Keyed by the team's own metadata, and still per-principal: every one of alice's
+# teams carrying the same values reaches alice/_meta/customer_id-ACME__case_id-42.
+# Declaration order, so `ls alice/_meta/` groups a customer's trees. Mutually
+# exclusive with workspace_id.
 WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"])
+
+# Shared across principals, because the card REQUESTS it and the platform PERMITS
+# it: _shared/_meta/customer_id-ACME__case_id-42, reached by every principal whose
+# team carries those values. Needs AKGENTIC_WORKSPACE_SHARED_KINDS=meta on the
+# process that binds agents; without it the bind fails rather than handing the card
+# a private tree.
+WorkspaceTool(workspace_metadata_keys=["customer_id", "case_id"], workspace_sharable=True)
 
 # A coding agent: file tools and a shell over ONE tree, ONE gate, ONE history.
 # Exec used to be a second card sharing a workspace_id; it is a capability now,
@@ -984,8 +1094,8 @@ WorkspaceTool(workspace_id="proj-42", workspace_exec=True)
 # Two agents, two trees, one team — two actors, each owning its own directory
 WorkspaceTool(workspace_id="proj-42"), WorkspaceTool(workspace_id="scratch")
 
-# No history: the gate still refuses every stale write
-WorkspaceTool(git_journal=True)
+# No history (the default, written out): the gate still refuses every stale write
+WorkspaceTool(git_journal=False)
 
 # Documents without the LLM fallback (no OpenAI credentials needed)
 WorkspaceTool(workspace_read=WorkspaceRead(document_reader=DocumentReader(llm_client=None)))
@@ -993,9 +1103,11 @@ WorkspaceTool(workspace_read=WorkspaceRead(document_reader=DocumentReader(llm_cl
 # Ship full-resolution images to the model
 WorkspaceTool(workspace_view=WorkspaceView(max_dimension=0))
 
-# Retrieval over a document corpus at <user_id>/corpus — reachable by this
-# principal's other teams, and by nobody else's. Needs a #VectorStore on the team;
-# without one every retrieval callable answers a sentence and nothing raises.
+# Retrieval over a document corpus at alice/_id/corpus — reachable by this
+# principal's other teams, and by nobody else's. The card's own vector_store
+# decides where the chunks live and whether a store actor is created at all;
+# if that store cannot be built, every retrieval callable answers a sentence
+# and nothing raises.
 WorkspaceTool(
     workspace_id="corpus",
     read_only=True,
@@ -1007,15 +1119,15 @@ WorkspaceTool(
 # Search only — the model queries an index another card of the SAME principal
 # fills. Enabling any one of the three still turns retrieval on for the tree, so
 # this creates the collection and shrinks the extraction cache exactly as the
-# indexer would. Use workspace_metadata_keys instead to index a corpus that
-# several principals must share.
+# indexer would. To index a corpus several principals must share, add
+# workspace_sharable=True, which AKGENTIC_WORKSPACE_SHARED_KINDS must permit: id.
 WorkspaceTool(workspace_id="corpus", workspace_rag_search=True)
 
 # A durable shared index. Fails at wiring time if AKGENTIC_WEAVIATE_URL is unset,
 # rather than silently giving a card that asked for a cluster a local index.
 WorkspaceTool(
     workspace_rag_index=True,
-    rag_collection=CollectionConfig(backend="weaviate", tenant="acme"),
+    vector_store=VectorStoreParam(backend="weaviate", tenant="acme"),
 )
 ```
 
@@ -1027,19 +1139,21 @@ WorkspaceTool(
 | `[vision]` (Pillow) | `workspace_view` logs one warning and returns unresized bytes. Nothing fails. |
 | `git` off `PATH` | The journal degrades off with one warning. The gate is unaffected. |
 | No isolation backend | `mode="auto"` falls through to `local` with a `DeprecationWarning`: commands run as a plain subprocess with no filesystem isolation. |
-| No `#VectorStore` on the team | Every retrieval callable answers *"Retrieval indexing is not available for this workspace."* — one warning at bind time, nothing raised. Add `VectorStoreTool` to the team configuration. |
+| The store cannot be resolved | Every retrieval callable answers *"Retrieval indexing is not available for this workspace."* — one warning at bind time, nothing raised. The card creates its own store when the backend needs one, so this is an unreachable cluster or a collection that could not be created, not a missing card. |
 | `[vector_search]` (numpy) | The in-memory vector backend cannot be built. Retrieval degrades as above; nothing else on the card changes. |
 
 ### What it costs
 
 Retrieval adds three things worth knowing before you turn it on. **Indexing spends embedding credits
 per file**, which is why all three capabilities are opt-in. **The in-memory vector backend keeps
-every vector inside the store's own state**, re-serialised on every notify, which is why enabling
-retrieval on that backend shrinks the extraction cache from 32 documents / 2 MB to 8 / 200 KB —
-2 MB of Markdown is roughly 1,900 chunks, and 1536 floats rendered as JSON is about 23 KB each.
-Weaviate keeps the vectors in the cluster and keeps the large caps. And **`workspace_rag_search`
-makes one embedding round trip on the mailbox turn of the actor that owns the write gate**: bounded
-to a single call, fully degrading, but it is the one external call this card puts on that thread.
+every vector in the workspace actor's own store child**, which is not persisted: its vectors are
+lost with the actor, while the index rows describing them are on disk and are not. Re-index the tree
+after a process restart on that backend — `workspace_rag_index(force=True)` — until the local vector
+backend lands. Enabling retrieval on that backend shrinks the extraction cache from 32
+documents / 2 MB to 8 / 200 KB. A cluster backend keeps the vectors in the cluster and keeps the
+large caps. And **`workspace_rag_search` makes one embedding round trip and one store call per
+query**, both on the calling agent's own thread — bounded, fully degrading, and off the mailbox of
+the actor that owns the write gate, which is where they used to be.
 
 Measured on ten concurrent agents against a 27 MB tree (Apple M3 Max, Python 3.12):
 

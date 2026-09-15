@@ -79,11 +79,21 @@ class EmbeddingService:
     Args:
         model: Embedding model identifier (e.g. ``"text-embedding-3-small"``).
         provider: Which OpenAI SDK variant to use — ``"openai"`` or ``"azure"``.
+        timeout_s: Per-request budget in seconds, handed to the OpenAI SDK on the
+            one call :meth:`embed` makes. ``None`` sends no ``timeout=`` at all and
+            leaves the SDK's own default in force, which is what every caller that
+            is not on a worker thread wants.
     """
 
-    def __init__(self, model: str, provider: Literal["openai", "azure"]) -> None:
+    def __init__(
+        self,
+        model: str,
+        provider: Literal["openai", "azure"],
+        timeout_s: float | None = None,
+    ) -> None:
         self._model = model
         self._provider = provider
+        self._timeout_s = timeout_s
         self._client: _openai_typing.OpenAI | _openai_typing.AzureOpenAI | None = None
 
     # --- Internal ---
@@ -108,6 +118,10 @@ class EmbeddingService:
     def embed(self, texts: list[str]) -> list[list[float]]:
         """Embed a batch of texts and return one vector per input.
 
+        A configured ``timeout_s`` reaches the HTTP call itself, as the SDK's
+        per-request keyword; it is not passed at all when there is none, so a
+        caller that wants the SDK default gets exactly the call it always made.
+
         Args:
             texts: List of strings to embed.
 
@@ -115,7 +129,12 @@ class EmbeddingService:
             List of float vectors — one per input text, in the same order.
         """
         client = self._get_client()
-        response = client.embeddings.create(input=texts, model=self._model)
+        if self._timeout_s is None:
+            response = client.embeddings.create(input=texts, model=self._model)
+        else:
+            response = client.embeddings.create(
+                input=texts, model=self._model, timeout=self._timeout_s
+            )
         return [item.embedding for item in response.data]
 
 
