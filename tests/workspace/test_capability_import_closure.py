@@ -88,7 +88,7 @@ SPINE = frozenset(
         # root rather than under one of them — and its *absence* is measured:
         # removing it from this set reddens **both** assertions below for ``read``
         # and ``rag``, with
-        # ``read/ names ['akgentic.tool.workspace.lines']``, and neither one for
+        # ``read/ reaches ['akgentic.tool.workspace.lines']``, and neither one for
         # ``write``, ``journal`` or ``execution``.
         #
         # It is the entry whose alternative was the defect: ``read/`` importing
