@@ -343,6 +343,10 @@ class SearchHarness:
                 path=path,
                 status=RagStatus.EMBEDDED,
                 indexed_sha=sha,
+                # Stamped, so every keyword spec below exercises the *matching*
+                # branch of the extractor guard rather than passing for ever
+                # through the ``None`` escape hatch a legacy row takes.
+                indexed_extractor_version=EXTRACTOR_VERSION,
                 chunks=chunks,
                 chunk_count=len(chunks),
                 updated_at=datetime.now(UTC),
@@ -731,6 +735,89 @@ class TestTheKeywordLeg:
         search.embedder.embed_error = RuntimeError("vector leg off")
 
         assert search.run("payment") == _NO_HITS
+
+    def test_a_body_cut_by_another_extractor_is_skipped(self, search: SearchHarness) -> None:
+        """The second half of an extraction's identity, and the reason for the clause.
+
+        An ``EXTRACTOR_VERSION`` bump leaves the source bytes alone, so
+        ``indexed_sha`` still matches — and every cached body becomes a miss and
+        is re-extracted. Without this guard the leg slices a **new** extraction
+        with **old** offsets, which quotes text that belongs to neither.
+
+        The same shape as the digest spec above, for the other half of the pair.
+        """
+        search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
+        current = stored_docs(search.actor)["invoice.md"]
+        seed_extract(
+            search.actor,
+            "invoice.md",
+            current.model_copy(update={"extractor_version": EXTRACTOR_VERSION + 1}),
+        )
+        search.embedder.embed_error = RuntimeError("vector leg off")
+
+        assert search.run("payment") == _NO_HITS
+
+    def test_the_vector_leg_is_unaffected_by_an_extractor_bump(
+        self, search: SearchHarness
+    ) -> None:
+        """"Degrades to vector-only" — without this, the spec above only proves a loss.
+
+        The store holds its own copy of each chunk's text, which no offset of the
+        row's is used to produce. The file keeps rendering from it.
+        """
+        search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
+        current = stored_docs(search.actor)["invoice.md"]
+        seed_extract(
+            search.actor,
+            "invoice.md",
+            current.model_copy(update={"extractor_version": EXTRACTOR_VERSION + 1}),
+        )
+
+        answer = search.run("payment")
+
+        assert "invoice.md" in answer
+        assert "Payment terms are net thirty." in answer
+        assert "semantic:" in answer
+
+    def test_an_extractor_bump_does_not_mark_the_row_stale(self, search: SearchHarness) -> None:
+        """A bump is not a mutation of the tree, so no path may write a status off it.
+
+        ``mark_paths_stale`` fires on writes; the row here was never written to.
+        It stays ``EMBEDDED`` with its chunks intact and simply loses its lexical
+        leg, which is the degradation ADR-045 §4 already promises.
+        """
+        search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
+        current = stored_docs(search.actor)["invoice.md"]
+        seed_extract(
+            search.actor,
+            "invoice.md",
+            current.model_copy(update={"extractor_version": EXTRACTOR_VERSION + 1}),
+        )
+        search.embedder.embed_error = RuntimeError("vector leg off")
+
+        assert search.run("payment") == _NO_HITS
+
+        row = stored_rows(search.actor)["invoice.md"]
+        assert row.status is RagStatus.EMBEDDED
+        assert row.chunk_count == 2
+
+    def test_a_row_that_predates_the_field_still_matches(self, search: SearchHarness) -> None:
+        """``None`` is "written before this field", not "unknown, refuse".
+
+        A required field — or a ``None`` treated as a mismatch — would drop the
+        keyword leg for every row already on disk, which is a silent de-index of
+        every tree in the field on the day this ships.
+        """
+        search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
+        legacy = stored_rows(search.actor)["invoice.md"]
+        seed_row(
+            search.actor,
+            "invoice.md",
+            legacy.model_copy(update={"indexed_extractor_version": None}),
+        )
+        search.embedder.embed_error = RuntimeError("vector leg off")
+
+        assert "invoice.md" in search.run("payment")
 
     def test_a_cached_path_absent_from_the_index_is_skipped_rather_than_raising(
         self, search: SearchHarness

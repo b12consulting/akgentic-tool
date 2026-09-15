@@ -28,6 +28,7 @@ from akgentic.tool.workspace.documents.models import (
     DEFAULT_MAX_DOCUMENT_CHARS,
     DEFAULT_MAX_DOCUMENTS,
     EMBEDDING_STALE_AFTER_S,
+    EXTRACTOR_VERSION,
     IN_MEMORY_MAX_DOCUMENT_CHARS,
     IN_MEMORY_MAX_DOCUMENTS,
     RAG_COLLECTION,
@@ -124,6 +125,8 @@ class TestChunksAreOffsets:
             "heading_path",
             "header_start",
             "header_end",
+            "start_line",
+            "end_line",
         }
 
     def test_every_field_survives_a_json_round_trip(self) -> None:
@@ -138,7 +141,14 @@ class TestChunksAreOffsets:
         the next process over the same mount.
         """
         chunk = RagChunk(
-            chunk_id="c1", ordinal=3, start=10, end=40, heading_path=["A", "B"], header_start=1
+            chunk_id="c1",
+            ordinal=3,
+            start=10,
+            end=40,
+            heading_path=["A", "B"],
+            header_start=1,
+            start_line=2,
+            end_line=4,
         )
         assert RagChunk.model_validate_json(chunk.model_dump_json()) == chunk
 
@@ -148,11 +158,59 @@ class TestChunksAreOffsets:
             path="a.md",
             status=RagStatus.EMBEDDED,
             indexed_sha="abc",
-            chunks=[RagChunk(chunk_id="c1", ordinal=0, start=0, end=5, heading_path=["A"])],
+            indexed_extractor_version=EXTRACTOR_VERSION,
+            chunks=[
+                RagChunk(
+                    chunk_id="c1",
+                    ordinal=0,
+                    start=0,
+                    end=5,
+                    heading_path=["A"],
+                    start_line=1,
+                    end_line=1,
+                )
+            ],
             chunk_count=1,
             updated_at=datetime.now(UTC),
         )
         assert RagFile.model_validate(original.model_dump()) == original
+
+
+class TestARowWrittenBeforeThisStoryStillValidates:
+    """No migration, and no de-indexing in the field — asserted, not inferred.
+
+    The three new fields are optional *because* a required one would fail
+    validation on every record already under a tree's metadata directory and
+    silently drop the whole corpus. That is a property of the models against a
+    mapping carrying none of the new keys, not a property of the defaults read
+    back off a model this process built.
+    """
+
+    def test_a_chunk_mapping_without_the_line_range_validates_with_nulls(self) -> None:
+        """``None`` means "no range was recorded", never "refuse"."""
+        chunk = RagChunk.model_validate(
+            {"chunk_id": "c1", "ordinal": 0, "start": 0, "end": 5, "heading_path": ["A"]}
+        )
+
+        assert chunk.start_line is None
+        assert chunk.end_line is None
+
+    def test_a_file_mapping_without_the_extractor_version_validates_with_null(self) -> None:
+        """``None`` means "this row predates the field", which matches any version."""
+        row = RagFile.model_validate(
+            {
+                "path": "a.md",
+                "status": "embedded",
+                "indexed_sha": "abc",
+                "chunks": [{"chunk_id": "c1", "ordinal": 0, "start": 0, "end": 5}],
+                "chunk_count": 1,
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+        )
+
+        assert row.indexed_extractor_version is None
+        assert row.chunks[0].start_line is None
+        assert row.status is RagStatus.EMBEDDED
 
 
 class TestTheCollectionIsOnePerDeployment:
@@ -225,6 +283,38 @@ class TestEveryTransitionIsACopy:
 
         result = stored_rows(actor)["a.md"]
         assert result.status is RagStatus.PENDING
+        assert isinstance(result, _RagFileWithExtraField)
+        assert result.extra_field == "sentinel"
+
+    def test_re_queueing_a_path_preserves_an_unknown_field(self, workspace_tree: object) -> None:
+        """The transition this story edits, and the widest of the three.
+
+        ``_enqueue``'s re-queue branch moves nine fields, which is exactly the
+        shape that invites a hand-enumerated rebuild: every field is named
+        anyway, so naming the last two looks like no extra cost. It is, and the
+        cost falls on the field added after it — here, on ``extra_field``, which
+        no write path has ever heard of.
+
+        The new stamp is asserted beside the survival, so the case pins both
+        halves of what this branch now does.
+        """
+        actor = _actor()
+        seed_row(actor, "a.md", _RagFileWithExtraField(
+            path="a.md",
+            status=RagStatus.EMBEDDED,
+            indexed_sha="old-bytes",
+            chunks=[RagChunk(chunk_id="c1", ordinal=0, start=0, end=5)],
+            chunk_count=1,
+            updated_at=datetime.now(UTC),
+        ))
+
+        actor._enqueue("a.md", "new-bytes")
+
+        result = stored_rows(actor)["a.md"]
+        assert result.status is RagStatus.PENDING
+        assert result.indexed_sha == "new-bytes"
+        assert result.indexed_extractor_version == EXTRACTOR_VERSION
+        assert result.superseded_chunk_ids == ["c1"]
         assert isinstance(result, _RagFileWithExtraField)
         assert result.extra_field == "sentinel"
 

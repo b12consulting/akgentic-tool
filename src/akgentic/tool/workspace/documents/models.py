@@ -250,6 +250,23 @@ class RagChunk(SerializableBaseModel):
             piece of a table cut at the ceiling. ``None`` on every other chunk.
         header_end: Exclusive end of that header row. Set exactly when
             ``header_start`` is.
+        start_line: The 1-indexed line of the extracted Markdown that ``start``
+            falls on.
+        end_line: The 1-indexed line the chunk's **last character** falls on —
+            inclusive on both ends, so ``offset=start_line,
+            limit=end_line - start_line + 1`` is the ``workspace_read`` call that
+            expands this chunk, with no arithmetic a caller can get wrong.
+
+            **The text that was embedded is not the slice this range names.**
+            ``compose_chunk_text`` prepends the heading path and re-synthesises a
+            cut table's header row, so the embedded text is longer than the range
+            and contains lines present in no document. Both statements are true
+            and they are not reconciled: the range locates the chunk *in its
+            document*, and the composition is what the embedding model was shown.
+
+            ``None`` on a chunk written before this field existed, and on one a
+            :class:`~akgentic.tool.workspace.rag.splitter.TextSplitter` left
+            unfilled. It means *no range was recorded*, never *refuse*.
     """
 
     chunk_id: str
@@ -259,6 +276,8 @@ class RagChunk(SerializableBaseModel):
     heading_path: list[str] = []
     header_start: int | None = None
     header_end: int | None = None
+    start_line: int | None = None
+    end_line: int | None = None
 
 
 class RagFile(SerializableBaseModel):
@@ -280,6 +299,19 @@ class RagFile(SerializableBaseModel):
             embedding batch has to be attributable to the run that issued it: a
             batch whose file has since been re-indexed at other bytes is dropped
             on this comparison.
+        indexed_extractor_version: The :data:`EXTRACTOR_VERSION` in force when
+            indexing started — the **other half** of an extraction's identity,
+            which :meth:`~akgentic.tool.workspace.documents.cache.DocumentCache.lookup`
+            has always required and this row has never carried. Set beside
+            :attr:`indexed_sha` and for the same reason: an extractor bump leaves
+            the source bytes untouched, so ``indexed_sha`` still matches while the
+            body the chunk offsets were cut from no longer exists.
+
+            ``None`` means **this row predates the field**, and it compares equal
+            to any version. Requiring it instead would fail validation on every
+            row already on disk and de-index every tree in the field; a re-index
+            fills it. It is not a status: an extractor bump does not mark the row
+            ``STALE``, because it is not a mutation of the tree.
         chunks: The chunk set the row currently describes. During a re-index it
             holds the **new** set from the moment the worker reports, which is
             what lets a landing batch be attributed.
@@ -300,6 +332,7 @@ class RagFile(SerializableBaseModel):
     path: str
     status: RagStatus
     indexed_sha: str | None = None
+    indexed_extractor_version: int | None = None
     chunks: list[RagChunk] = []
     chunk_count: int = 0
     batches_expected: int = 0

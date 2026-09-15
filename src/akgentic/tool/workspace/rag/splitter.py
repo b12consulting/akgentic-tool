@@ -42,6 +42,7 @@ modules stay leaves.
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from markdown_it import MarkdownIt
@@ -105,6 +106,19 @@ class Span(SerializableBaseModel):
             thing in a composed chunk that is not contiguous with ``[start:end)``.
         header_end: Exclusive end of that header row. Set exactly when
             ``header_start`` is.
+        start_line: The 1-indexed line of the document that ``start`` falls on,
+            counted by :func:`~akgentic.tool.workspace.lines.line_starts` — the
+            same definition ``workspace_read``'s gutter prints.
+        end_line: The 1-indexed line that the span's **last character** falls on,
+            so the range is inclusive on both ends and
+            ``offset=start_line, limit=end_line - start_line + 1`` is the
+            expansion read, with no arithmetic a caller can get wrong.
+
+            Both are ``None`` on a block from :func:`parse_blocks` and on a span
+            any other :class:`TextSplitter` built: a block is not a chunk, and a
+            pair stamped before the packer has re-cut it would name the block on
+            a piece that is one sentence of it. :func:`pack_blocks` fills them
+            once, from the bounds it finally kept.
     """
 
     start: int
@@ -112,6 +126,8 @@ class Span(SerializableBaseModel):
     heading_path: list[str] = []
     header_start: int | None = None
     header_end: int | None = None
+    start_line: int | None = None
+    end_line: int | None = None
 
 
 @runtime_checkable
@@ -567,6 +583,41 @@ def _merge_short_chunks(chunks: list[Span], markdown: str, params: WorkspaceRagI
     return merged
 
 
+def _locate(chunks: list[Span], markdown: str) -> list[Span]:
+    """Stamp every chunk's line range, from the bounds it finally kept.
+
+    **The last pass of :func:`pack_blocks`, and the only site that writes the
+    pair.** Every cutting, packing and merging helper above moves ``start`` or
+    ``end`` by ``model_copy``, and a line pair stamped before them survives each
+    copy *unchanged* — Golden Rule #12's mechanism working against the value it
+    preserves. An oversized paragraph cut into four pieces would give four chunks
+    the same whole-paragraph range: right for one of them and silently wide for
+    three. Deriving here cannot drift from the bounds it describes.
+
+    ``bisect_right(starts, offset)`` is the 1-indexed line containing *offset*,
+    with no ``+ 1`` and no clamp: :func:`~akgentic.tool.workspace.lines.line_starts`
+    opens at ``0`` and ends at ``len(markdown)``.
+
+    **``end`` is decremented and that is not cosmetic.** The bounds are half-open,
+    so a chunk ending flush at a break — ``end`` on the first character of the
+    next line — would otherwise be named by the line it does not touch at all.
+    Every span :func:`_trimmed` produces is non-empty, so ``end - 1`` is always a
+    real character of the chunk.
+
+    ``line_starts`` is computed **once** for the document, not once per chunk.
+    """
+    starts = line_starts(markdown)
+    return [
+        chunk.model_copy(
+            update={
+                "start_line": bisect_right(starts, chunk.start),
+                "end_line": bisect_right(starts, chunk.end - 1),
+            }
+        )
+        for chunk in chunks
+    ]
+
+
 def pack_blocks(blocks: list[Span], markdown: str, params: WorkspaceRagIndex) -> list[Span]:
     """Phase 2 — pack *blocks* into chunks under the four rules.
 
@@ -576,7 +627,8 @@ def pack_blocks(blocks: list[Span], markdown: str, params: WorkspaceRagIndex) ->
     Three passes, one per concern, so no rule is buried inside another's loop:
     every block is first cut if and only if it passes the ceiling, the result is
     grouped by section and packed with overlap, and chunks still under the
-    minimum merge forward into their own section.
+    minimum merge forward into their own section. A fourth and final pass locates
+    what came out — see :func:`_locate` for why it is last rather than first.
 
     Args:
         blocks: The output of :func:`parse_blocks`, in document order.
@@ -585,8 +637,9 @@ def pack_blocks(blocks: list[Span], markdown: str, params: WorkspaceRagIndex) ->
 
     Returns:
         The chunks, in document order, with strictly increasing ``start``
-        offsets. Every non-whitespace offset inside a block is covered by the
-        union of the chunks; overlap means an offset may be covered twice.
+        offsets, each carrying its line range. Every non-whitespace offset inside
+        a block is covered by the union of the chunks; overlap means an offset
+        may be covered twice.
     """
     units: list[Span] = []
     for block in blocks:
@@ -594,7 +647,7 @@ def pack_blocks(blocks: list[Span], markdown: str, params: WorkspaceRagIndex) ->
     chunks: list[Span] = []
     for group in _heading_groups(units, markdown):
         chunks.extend(_pack_group(group, params))
-    return _merge_short_chunks(chunks, markdown, params)
+    return _locate(_merge_short_chunks(chunks, markdown, params), markdown)
 
 
 class BlockSplitter:

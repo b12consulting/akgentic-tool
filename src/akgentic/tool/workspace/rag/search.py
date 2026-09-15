@@ -261,6 +261,17 @@ def _keyword_leg(cache: DocumentCache, query: str, path_prefix: str) -> dict[str
     neither. The offsets of such a row are provenance, exactly as an evicted
     file's are.
 
+    **An extraction is identified by two things, and the second is the
+    extractor.** Bumping ``EXTRACTOR_VERSION`` leaves the source bytes untouched,
+    so ``indexed_sha`` still matches while every cached body is a miss and is
+    re-extracted — and this leg would then slice a *new* extraction with *old*
+    offsets. The two conditions are checked as two statements rather than one
+    conjunction because they are two different staleness stories and a reader has
+    to be able to see which of them fired. A row whose
+    ``indexed_extractor_version`` is ``None`` predates the field and matches any
+    version; a mismatch costs the file its lexical leg and nothing else — the row
+    stays ``EMBEDDED`` and its vector hits still render.
+
     The keys are ``chunk_id``s — the key space ``fuse`` combines on, and what
     ``SearchHit.ref_id`` carries. It is an **indicator** and not a score: a flat
     substring match is equally good everywhere, which is why ``fuse`` does not
@@ -285,6 +296,8 @@ def _keyword_leg(cache: DocumentCache, query: str, path_prefix: str) -> dict[str
         if path_prefix and not entry.path.startswith(path_prefix):
             continue
         if row is None or row.indexed_sha != extract.source_sha:
+            continue
+        if row.indexed_extractor_version not in (None, extract.extractor_version):
             continue
         body = extract.markdown
         lowered = body.lower()

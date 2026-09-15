@@ -413,6 +413,8 @@ class IndexWorker(Akgent[BaseConfig, BaseState]):
                 heading_path=span.heading_path,
                 header_start=span.header_start,
                 header_end=span.header_end,
+                start_line=span.start_line,
+                end_line=span.end_line,
             )
             for ordinal, span in enumerate(spans)
         ]
