@@ -3,7 +3,7 @@
 Chunking parameters and the two document caps were per-actor state governing a
 tree two teams share. Two teams get two actors, one ``<meta>/index/`` and one
 ``scope=``, and ``chunk_id(scope, path, source_sha, ordinal)`` carries no team —
-so both chunkings minted rows into one collection and ``_render_hit``'s
+so both chunkings minted rows into one collection and the search's
 ``chunks[ordinal]`` lookup resolved a hit minted under one chunking against
 offsets stored under the other. ADR-051 Decision 1 and the workspace shard both
 claimed the actor "carries no state two instances could disagree about"; this is

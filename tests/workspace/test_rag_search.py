@@ -1,4 +1,4 @@
-"""``workspace_rag_search``: two legs, fusion, the render, degradation.
+"""``workspace_rag_search``: two legs, fusion, the result model, degradation.
 
 The vector store double here wraps a **real** :class:`InMemoryBackend` rather than
 returning a canned hit list, and that is what makes the scope-isolation spec worth
@@ -12,7 +12,7 @@ ordering is deterministic and a spec can say which hit comes first.
 
 **Both legs run in one place now, so every spec is driven through one callable.**
 ``tool_named(card, "workspace_rag_search")`` is what an agent holds, and it is
-what these specs call. Story 57-1 took the keyword leg, the fusion and the render
+what these specs call. Story 57-1 took the keyword leg, the fusion and the answer
 off ``#Workspace`` — they read the document records, which the card's own
 :class:`~akgentic.tool.workspace.documents.cache.DocumentCache` reaches without a
 mailbox — so there is no ``actor.rag_search`` left to drive and no split to
@@ -32,10 +32,16 @@ its factory is swapped through the registry's own seam.
 **Where a spec calls a moved function directly, that is deliberate and says so**:
 the fusion module's own default for ``alpha`` is reachable from no production
 caller, because the closure always sends a float.
+
+**Nothing here asserts on ``str()`` of the answer.** A search answers a
+:class:`RagSearchResult` since story 58-3, and ``str()`` of a Pydantic model is
+its repr — which carries the chunk text, so a substring assertion over it would
+stay green while testing nothing. Every assertion below reads a field.
 """
 
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -45,7 +51,11 @@ from akgentic.core.agent_state import BaseState
 
 from akgentic.tool.vector_store.backends.inmemory import InMemoryBackend
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA, OVERFETCH
-from akgentic.tool.vector_store.protocol import SearchResult, VectorStoreParam
+from akgentic.tool.vector_store.protocol import (
+    PATH_PREFIX_REJECTED,
+    SearchResult,
+    VectorStoreParam,
+)
 from akgentic.tool.vector_store.vector import VectorEntry
 from akgentic.tool.workspace.actor import (
     WORKSPACE_ACTOR_ROLE,
@@ -64,7 +74,12 @@ from akgentic.tool.workspace.documents.models import (
 from akgentic.tool.workspace.documents.store import DocumentEntry, YamlDocumentStore
 from akgentic.tool.workspace.models import WorkspaceConfig, content_sha
 from akgentic.tool.workspace.rag.params import WorkspaceRagIndex, WorkspaceRagSearch
-from akgentic.tool.workspace.rag.search import search_documents
+from akgentic.tool.workspace.rag.search import (
+    MatchKind,
+    RagSearchHit,
+    RagSearchResult,
+    search_documents,
+)
 from akgentic.tool.workspace.readers import DocumentReader
 from akgentic.tool.workspace.tool import WorkspaceTool
 from tests.conftest import MockActorAddress
@@ -90,6 +105,8 @@ _NO_HITS = (
     "Nothing in the retrieval index matched that query. "
     "Use workspace_rag_list to see which files are indexed."
 )
+_REJECTED_PREFIX = PATH_PREFIX_REJECTED
+"""Imported rather than copied: the closure returns the protocol's own constant."""
 
 _VOCABULARY = ("invoice", "payment", "holiday", "refund")
 """The whole of the embedding model, so a cosine ordering is a fact of the test."""
@@ -280,12 +297,19 @@ class SearchHarness:
         self._workspace_id = workspace_id
         return card
 
-    def run(self, query: str, **kwargs: Any) -> str:
-        """Search through the card's own callable — both legs, production path."""
-        assert self.card is not None, "bind_card first"
-        return str(tool_named(self.card, "workspace_rag_search")(query, **kwargs))
+    def run(self, query: str, **kwargs: Any) -> RagSearchResult:
+        """Search through the card's own callable — both legs, production path.
 
-    def run_with(self, query: str, **search_params: Any) -> str:
+        The model is returned as the callable answers it. **Never ``str()``-ed**:
+        the repr of a hit contains its text, so a substring assertion over it
+        would pass on a result that had lost every field this epic added.
+        """
+        assert self.card is not None, "bind_card first"
+        answer = tool_named(self.card, "workspace_rag_search")(query, **kwargs)
+        assert isinstance(answer, RagSearchResult)
+        return answer
+
+    def run_with(self, query: str, **search_params: Any) -> RagSearchResult:
         """Search through a card configured with *search_params*.
 
         The two knobs a caller cannot pass per call — ``alpha`` and
@@ -296,7 +320,9 @@ class SearchHarness:
         card = self.bind_card(
             self._orchestrator_proxy, self._monkeypatch, self._workspace_id, **search_params
         )
-        return str(tool_named(card, "workspace_rag_search")(query))
+        answer = tool_named(card, "workspace_rag_search")(query)
+        assert isinstance(answer, RagSearchResult)
+        return answer
 
     def index(
         self,
@@ -307,6 +333,7 @@ class SearchHarness:
         scope: str | None = None,
         cache: bool = True,
         embedded: bool = True,
+        lines: list[tuple[int, int] | None] | None = None,
     ) -> str:
         """Index *path* into both actor maps and into the collection.
 
@@ -318,6 +345,15 @@ class SearchHarness:
             cache: Whether the extraction body is held — ``False`` stands in for
                 an evicted body.
             embedded: Whether the chunks reach the vector store at all.
+            lines: ``(start_line, end_line)`` per chunk, positional by ordinal,
+                or ``None`` for a chunk that records no range. Defaults to
+                **all-None**, so every spec that does not ask for coordinates
+                keeps exercising the row-predates-58-2 path.
+
+                The pairs are **literal and hand-chosen**, never re-derived here
+                from ``body``: the derivation is pinned by ``test_splitter.py``'s
+                ``TestTheLineRange``, and a harness that re-derived would make a
+                coordinate spec assert its own arithmetic instead of transport.
 
         Returns:
             The digest both maps agree on.
@@ -327,6 +363,7 @@ class SearchHarness:
         chunks: list[RagChunk] = []
         for ordinal, (start, end, heading) in enumerate(spans):
             identity = chunk_id(owner, path, sha, ordinal)
+            pair = lines[ordinal] if lines is not None and ordinal < len(lines) else None
             chunks.append(
                 RagChunk(
                     chunk_id=identity,
@@ -334,6 +371,8 @@ class SearchHarness:
                     start=start,
                     end=end,
                     heading_path=heading,
+                    start_line=None if pair is None else pair[0],
+                    end_line=None if pair is None else pair[1],
                 )
             )
             if embedded:
@@ -421,18 +460,25 @@ _FIRST = (0, _SPLIT, ["Invoice", "Payment terms"])
 _SECOND = (_SPLIT, len(_INVOICE), ["Invoice", "Refunds"])
 
 
-def hit_count(answer: str) -> int:
-    """How many hits a rendered answer carries.
+def paths(result: RagSearchResult) -> list[str]:
+    """The path of every hit, in order — the shape most specs here assert on.
 
-    Counted by their score labels rather than by splitting on the blank line
-    between blocks: a chunk's own text routinely contains blank lines, so the
-    obvious split over-counts and the spec would be measuring the document.
+    ``hit_count`` stood here until story 58-3 and counted score labels, because a
+    chunk's own text routinely contains blank lines and splitting the rendered
+    answer on them measured the document rather than the search. There is no
+    string to split any more: a count is ``len(result.hits)`` and the hazard the
+    helper existed for is gone with the render.
     """
-    return sum(answer.count(label) for label in ("(hybrid: ", "(semantic: ", "(keyword match)"))
+    return [hit.path for hit in result.hits]
 
 
 class TestDegradation:
-    """Every failure mode answers a sentence and none of them raises."""
+    """Every failure mode answers a ``note`` and none of them raises.
+
+    The wording of all three sentences is unchanged by story 58-3; what changed
+    is that they arrive as ``RagSearchResult.note`` with an empty ``hits`` list
+    rather than as the bare return value.
+    """
 
     def test_a_card_that_resolved_no_engine_answers_the_sentence(
         self, search: SearchHarness
@@ -453,7 +499,8 @@ class TestDegradation:
         search.card._vector_store = None
 
         assert search.card._retrieval_bound() is False
-        assert search.run("payment") == _UNAVAILABLE
+        answer = search.run("payment")
+        assert (answer.note, answer.hits) == (_UNAVAILABLE, [])
 
     def test_a_card_with_an_engine_but_no_collection_param_answers_the_sentence(
         self, search: SearchHarness
@@ -470,7 +517,8 @@ class TestDegradation:
         search.card._resolved_store = None
 
         assert search.card._retrieval_bound() is False
-        assert search.run("payment") == _UNAVAILABLE
+        answer = search.run("payment")
+        assert (answer.note, answer.hits) == (_UNAVAILABLE, [])
 
     def test_a_card_that_never_bound_a_tree_answers_the_sentence(self) -> None:
         """The first gate, in the position the ``None`` proxy used to hold.
@@ -482,7 +530,7 @@ class TestDegradation:
         card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_rag_search=True)
 
         assert card._document_cache is None
-        assert card._rag_search_factory(WorkspaceRagSearch())("payment") == _UNAVAILABLE
+        assert card._rag_search_factory(WorkspaceRagSearch())("payment").note == _UNAVAILABLE
 
     def test_an_embed_that_raises_falls_back_to_the_keyword_leg(
         self, search: SearchHarness
@@ -493,8 +541,8 @@ class TestDegradation:
 
         answer = search.run("payment")
 
-        assert "invoice.md" in answer
-        assert "keyword match" in answer
+        assert paths(answer) == ["invoice.md"]
+        assert answer.hits[0].match is MatchKind.KEYWORD
 
     def test_an_embed_that_returns_nothing_falls_back_to_the_keyword_leg(
         self, search: SearchHarness
@@ -504,7 +552,7 @@ class TestDegradation:
 
         answer = search.run("payment")
 
-        assert "keyword match" in answer
+        assert [hit.match for hit in answer.hits] == [MatchKind.KEYWORD]
         assert search.store.searches == []
 
     def test_a_search_that_raises_falls_back_to_the_keyword_leg(
@@ -515,7 +563,7 @@ class TestDegradation:
 
         answer = search.run("payment")
 
-        assert "keyword match" in answer
+        assert [hit.match for hit in answer.hits] == [MatchKind.KEYWORD]
 
     def test_a_failing_vector_leg_never_raises_out_of_the_search(
         self, search: SearchHarness
@@ -546,7 +594,7 @@ class TestDegradation:
 
         answer = search.run("payment")  # must not raise
 
-        assert "keyword match" in answer
+        assert [hit.match for hit in answer.hits] == [MatchKind.KEYWORD]
         assert search.store.searches == []
 
     def test_a_card_that_resolved_no_store_spends_nothing_before_the_sentence(
@@ -585,7 +633,7 @@ class TestDegradation:
 
         answer = search.run("payment")
 
-        assert answer == _UNAVAILABLE
+        assert (answer.note, answer.hits) == (_UNAVAILABLE, [])
         assert search.store.searches == []
         assert search.embedder.embeds == []
 
@@ -600,6 +648,12 @@ class TestDegradation:
         is a silent change of meaning with nothing else in the suite to catch it:
         every other prefix spec runs against a tree that is **not** degraded, and
         every other degradation spec passes no prefix.
+
+        **Both halves are asserted on ``note``, deliberately.** ``note is not
+        None`` — or ``not hits`` — would pass under the very swap this row exists
+        to catch, because both notes are set and both answers are hitless. The
+        two sentences being *different strings* is what makes the spec work, and
+        that is what the second assertion says.
         """
         assert search.card is not None
         search.card._vector_store = None
@@ -607,8 +661,8 @@ class TestDegradation:
 
         answer = search.run("payment", path_prefix="report*")
 
-        assert "cannot contain" in answer
-        assert answer != _UNAVAILABLE
+        assert answer.note == _REJECTED_PREFIX
+        assert answer.note != _UNAVAILABLE
 
     def test_no_hits_is_a_sentence_that_is_not_the_unavailable_one(
         self, search: SearchHarness
@@ -618,9 +672,10 @@ class TestDegradation:
 
         answer = search.run("bicycles")
 
-        assert answer == _NO_HITS
-        assert answer != _UNAVAILABLE
-        assert "workspace_rag_list" in answer
+        assert answer.hits == []
+        assert answer.note == _NO_HITS
+        assert answer.note != _UNAVAILABLE
+        assert "workspace_rag_list" in (answer.note or "")
 
 
 class TestTheVectorLeg:
@@ -682,8 +737,8 @@ class TestTheVectorLeg:
         kept = search.run_with("holiday", score_threshold=0.0)
         dropped = search.run_with("holiday", score_threshold=1.5)
 
-        assert "holiday.md" in kept
-        assert dropped == _NO_HITS
+        assert paths(kept) == ["holiday.md"]
+        assert (dropped.hits, dropped.note) == ([], _NO_HITS)
 
 
 class TestTheKeywordLeg:
@@ -693,7 +748,7 @@ class TestTheKeywordLeg:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
         search.embedder.embed_error = RuntimeError("vector leg off")
 
-        assert "invoice.md" in search.run("PAYMENT")
+        assert paths(search.run("PAYMENT")) == ["invoice.md"]
 
     def test_an_evicted_body_contributes_nothing_and_is_never_sliced(
         self, search: SearchHarness
@@ -709,9 +764,9 @@ class TestTheKeywordLeg:
 
         answer = search.run("payment")  # must not raise
 
-        assert answer == _NO_HITS
+        assert (answer.hits, answer.note) == ([], _NO_HITS)
 
-    def test_an_evicted_body_still_renders_through_the_vector_leg(
+    def test_an_evicted_body_still_answers_through_the_vector_leg(
         self, search: SearchHarness
     ) -> None:
         """This is what keeps ``max_documents`` a bound on state, not on the corpus."""
@@ -719,9 +774,9 @@ class TestTheKeywordLeg:
 
         answer = search.run("payment")
 
-        assert "invoice.md" in answer
-        assert "Payment terms are net thirty." in answer
-        assert "semantic:" in answer
+        assert set(paths(answer)) == {"invoice.md"}
+        assert {hit.match for hit in answer.hits} == {MatchKind.SEMANTIC}
+        assert any("Payment terms are net thirty." in hit.text for hit in answer.hits)
 
     def test_a_body_whose_digest_no_longer_matches_the_row_is_skipped(
         self, search: SearchHarness
@@ -734,7 +789,7 @@ class TestTheKeywordLeg:
         )
         search.embedder.embed_error = RuntimeError("vector leg off")
 
-        assert search.run("payment") == _NO_HITS
+        assert search.run("payment").note == _NO_HITS
 
     def test_a_body_cut_by_another_extractor_is_skipped(self, search: SearchHarness) -> None:
         """The second half of an extraction's identity, and the reason for the clause.
@@ -755,7 +810,7 @@ class TestTheKeywordLeg:
         )
         search.embedder.embed_error = RuntimeError("vector leg off")
 
-        assert search.run("payment") == _NO_HITS
+        assert search.run("payment").note == _NO_HITS
 
     def test_the_vector_leg_is_unaffected_by_an_extractor_bump(
         self, search: SearchHarness
@@ -775,9 +830,9 @@ class TestTheKeywordLeg:
 
         answer = search.run("payment")
 
-        assert "invoice.md" in answer
-        assert "Payment terms are net thirty." in answer
-        assert "semantic:" in answer
+        assert set(paths(answer)) == {"invoice.md"}
+        assert {hit.match for hit in answer.hits} == {MatchKind.SEMANTIC}
+        assert any("Payment terms are net thirty." in hit.text for hit in answer.hits)
 
     def test_an_extractor_bump_does_not_mark_the_row_stale(self, search: SearchHarness) -> None:
         """A bump is not a mutation of the tree, so no path may write a status off it.
@@ -795,7 +850,7 @@ class TestTheKeywordLeg:
         )
         search.embedder.embed_error = RuntimeError("vector leg off")
 
-        assert search.run("payment") == _NO_HITS
+        assert search.run("payment").note == _NO_HITS
 
         row = stored_rows(search.actor)["invoice.md"]
         assert row.status is RagStatus.EMBEDDED
@@ -817,7 +872,7 @@ class TestTheKeywordLeg:
         )
         search.embedder.embed_error = RuntimeError("vector leg off")
 
-        assert "invoice.md" in search.run("payment")
+        assert paths(search.run("payment")) == ["invoice.md"]
 
     def test_a_cached_path_absent_from_the_index_is_skipped_rather_than_raising(
         self, search: SearchHarness
@@ -833,7 +888,7 @@ class TestTheKeywordLeg:
         ))
         search.embedder.embed_error = RuntimeError("vector leg off")
 
-        assert search.run("payment") == _NO_HITS
+        assert search.run("payment").note == _NO_HITS
 
     def test_only_the_chunk_whose_own_slice_carries_the_term_is_hit(
         self, search: SearchHarness
@@ -844,8 +899,7 @@ class TestTheKeywordLeg:
 
         answer = search.run("refund")
 
-        assert "Refunds" in answer
-        assert "Payment terms" not in answer
+        assert [hit.heading_path for hit in answer.hits] == [["Invoice", "Refunds"]]
 
     def test_the_prefix_filters_the_keyword_leg_too(self, search: SearchHarness) -> None:
         """The backend filters its own leg; nothing else would filter this one."""
@@ -855,50 +909,73 @@ class TestTheKeywordLeg:
 
         answer = search.run("payment", path_prefix="reports/")
 
-        assert "reports/invoice.md" in answer
-        assert "notes/invoice.md" not in answer
+        assert paths(answer) == ["reports/invoice.md"]
 
     def test_an_empty_query_hits_nothing_on_the_keyword_leg(self, search: SearchHarness) -> None:
         """A blank query must not match every chunk in the workspace."""
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
         search.embedder.embed_error = RuntimeError("vector leg off")
 
-        assert search.run("   ") == _NO_HITS
+        assert search.run("   ").note == _NO_HITS
 
 
-class TestTheRender:
-    """Path, heading path, score label, and the chunk's text."""
+class TestTheHit:
+    """What one hit carries: where it is, which leg found it, and its text."""
 
-    def test_a_hit_renders_its_path_and_heading_path(self, search: SearchHarness) -> None:
+    def test_a_hit_carries_its_path_and_heading_path(self, search: SearchHarness) -> None:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
 
-        answer = search.run("payment", top_k=1)
+        [hit] = search.run("payment", top_k=1).hits
 
-        assert answer.startswith("invoice.md > Invoice > Payment terms (")
+        assert (hit.path, hit.heading_path) == ("invoice.md", ["Invoice", "Payment terms"])
 
-    def test_a_keyword_only_hit_is_labelled_as_one(self, search: SearchHarness) -> None:
+    def test_a_keyword_only_hit_says_which_leg_found_it(self, search: SearchHarness) -> None:
         search.index("invoice.md", _INVOICE, [_FIRST], embedded=False)
 
-        assert "(keyword match)" in search.run("payment")
+        [hit] = search.run("payment").hits
 
-    def test_a_vector_only_hit_is_labelled_semantic_with_its_raw_cosine(
-        self, search: SearchHarness
-    ) -> None:
+        assert hit.match is MatchKind.KEYWORD
+
+    def test_a_keyword_only_hit_has_no_score_at_all(self, search: SearchHarness) -> None:
+        """``None``, never ``0.0`` — "was not scored" is not "matched, badly".
+
+        ``fuse`` does not normalise the keyword leg, which is an indicator rather
+        than a score, so there is no number to report. ``0.0`` would be a number,
+        and an agent comparing it against another hit's cosine would read it as
+        the worst possible match instead of as an absence.
+        """
+        search.index("invoice.md", _INVOICE, [_FIRST], embedded=False)
+
+        [hit] = search.run("payment").hits
+
+        assert hit.score is None
+
+    def test_a_vector_only_hit_carries_its_raw_cosine(self, search: SearchHarness) -> None:
         """The raw cosine, because a fused score means nothing outside its own set.
 
-        ``0.71`` is the arithmetic and not a recorded observation: the chunk's own
+        The number is arithmetic and not a recorded observation: the chunk's own
         text carries "invoice" and "payment", so its bag-of-words vector is
         ``[1, 1, 0, 0]`` against the query's ``[0, 1, 0, 0]`` — a cosine of
         ``1 / sqrt(2)``. A **fused** score at this alpha would be ``0.70``.
+
+        **This is the claim the old spec was hiding.** It asserted the string
+        ``"(semantic: 0.71)"`` — a *formatted* number at two decimals, which
+        agrees with anything between ``0.705`` and ``0.715``. The field carries
+        the cosine itself.
         """
         search.index("invoice.md", _INVOICE, [_FIRST], cache=False)
 
-        assert "(semantic: 0.71)" in search.run("payment")
+        [hit] = search.run("payment").hits
 
-    def test_a_hit_confirmed_by_both_legs_is_labelled_hybrid(self, search: SearchHarness) -> None:
+        assert hit.match is MatchKind.SEMANTIC
+        assert hit.score == pytest.approx(1 / math.sqrt(2))
+
+    def test_a_hit_confirmed_by_both_legs_says_hybrid(self, search: SearchHarness) -> None:
         search.index("invoice.md", _INVOICE, [_FIRST])
 
-        assert "(hybrid: " in search.run("payment", top_k=1)
+        [hit] = search.run("payment", top_k=1).hits
+
+        assert hit.match is MatchKind.HYBRID
 
     def test_the_text_of_a_hit_comes_from_the_store_and_not_from_the_cache(
         self, search: SearchHarness
@@ -912,80 +989,339 @@ class TestTheRender:
             held.model_copy(update={"markdown": _INVOICE.replace("net thirty", "REPLACED")}),
         )
 
-        answer = search.run("payment", top_k=1)
+        [hit] = search.run("payment", top_k=1).hits
 
-        assert "net thirty" in answer
-        assert "REPLACED" not in answer
+        assert "net thirty" in hit.text
+        assert "REPLACED" not in hit.text
 
-    def test_a_hit_with_no_resolvable_ordinal_renders_without_a_heading_path(
+    def test_the_text_is_carried_as_the_leg_supplied_it_and_is_not_stripped(
         self, search: SearchHarness
     ) -> None:
-        """The chunk text is still the answer, so a hit is never dropped for this."""
+        """A behaviour change, stated: the render's ``.strip()`` is gone with it.
+
+        The strip existed to make joined blocks read cleanly. There are no blocks,
+        and a caller that wants the passage's own leading and trailing whitespace
+        — to line it up against the file it came from — now gets it.
+        """
+        search.index("invoice.md", _INVOICE, [_FIRST], cache=False)
+
+        [hit] = search.run("payment").hits
+
+        assert hit.text == _INVOICE[_FIRST[0] : _FIRST[1]]
+        assert hit.text.endswith("\n\n")
+
+    def test_a_hit_whose_row_will_not_resolve_is_returned_with_null_coordinates(
+        self, search: SearchHarness
+    ) -> None:
+        """The chunk text is still the answer, so a hit is never dropped for this.
+
+        **Three claims where the old spec made one weak one.** It asserted
+        ``answer.startswith("invoice.md (semantic:")`` and inferred "no heading
+        path" from the *absence* of a ``>`` in a prefix — which a changed
+        separator would also satisfy. Each coordinate is now named.
+
+        ``ordinal`` is the exception and is deliberate: it falls back to what the
+        vector store itself reported. It is the one coordinate still known, and
+        discarding it would leave the caller with nothing at all.
+        """
         search.index("invoice.md", _INVOICE, [_FIRST], cache=False)
         drop_row(search.actor, "invoice.md")
 
-        answer = search.run("payment")
+        [hit] = search.run("payment").hits
 
-        assert answer.startswith("invoice.md (semantic:")
+        assert hit.path == "invoice.md"
+        assert hit.heading_path == []
+        assert hit.chunk_count is None
+        assert hit.start_line is None
+        assert hit.end_line is None
+        assert hit.ordinal == 0
+        assert hit.match is MatchKind.SEMANTIC
+        assert "Payment terms are net thirty." in hit.text
 
-    def test_a_multi_hit_answer_renders_character_for_character(
+    def test_two_hits_come_back_in_fused_order_each_with_its_own_fields(
         self, search: SearchHarness
     ) -> None:
-        """The whole answer as one string, so a drifted ordering is a diff.
+        """The whole list as one comparison, so a drifted ordering is a diff.
 
-        **Story 57-1's shape guard.** Every other spec in this class asserts a
-        substring or a count, and a relocation can satisfy all of them while
-        reordering the blocks, changing the separator, or re-deriving a score
-        label. This pins the bytes.
+        **The successor to story 57-1's byte-for-byte shape guard.** Its subject —
+        one composed string — no longer exists, so what it guarded is asserted at
+        the new boundary: the *order* of the two hits, and the fields attached to
+        each. It must not degrade into "two hits came back".
 
         The two scores are arithmetic rather than recorded observations. The
         query ``payment refund`` is ``[0, 1, 0, 1]`` over the four-word
         vocabulary. The first chunk carries "invoice" and "payment", so it is
         ``[1, 1, 0, 0]`` — a cosine of ``1 / (sqrt(2) * sqrt(2)) = 0.50``. The
         second carries "refund" alone, so it is ``[0, 0, 0, 1]`` — a cosine of
-        ``1 / sqrt(2) = 0.71``. The second therefore ranks first, and both labels
-        are ``hybrid`` because the keyword leg hits both. The text of each block
-        is ``SearchHit.text`` — the store's copy — stripped.
+        ``1 / sqrt(2) = 0.71``. The second therefore ranks first, and both are
+        ``HYBRID`` because the keyword leg hits both. The text of each is
+        ``SearchHit.text`` — the store's copy — **unstripped**.
         """
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
 
         answer = search.run("payment refund", top_k=2)
 
-        assert answer == (
-            "invoice.md > Invoice > Refunds (hybrid: 0.71)\n"
-            "A refund is issued on request.\n"
-            "\n"
-            "invoice.md > Invoice > Payment terms (hybrid: 0.50)\n"
-            "# Invoice\n"
-            "\n"
-            "Payment terms are net thirty."
-        )
+        assert [
+            (hit.path, hit.ordinal, hit.chunk_count, hit.heading_path, hit.match, hit.text)
+            for hit in answer.hits
+        ] == [
+            (
+                "invoice.md",
+                1,
+                2,
+                ["Invoice", "Refunds"],
+                MatchKind.HYBRID,
+                "A refund is issued on request.\n",
+            ),
+            (
+                "invoice.md",
+                0,
+                2,
+                ["Invoice", "Payment terms"],
+                MatchKind.HYBRID,
+                "# Invoice\n\nPayment terms are net thirty.\n\n",
+            ),
+        ]
+        assert [hit.score for hit in answer.hits] == [
+            pytest.approx(1 / math.sqrt(2)),
+            pytest.approx(0.5),
+        ]
 
-    def test_hits_are_separated_by_a_blank_line(self, search: SearchHarness) -> None:
+    def test_two_hits_are_two_entries_rather_than_one_run_together(
+        self, search: SearchHarness
+    ) -> None:
+        """What the blank-line separator used to buy, now structural.
+
+        A chunk's own text routinely contains blank lines, so "hits are separated
+        by a blank line" could never be read back reliably — which is why
+        ``hit_count`` counted score labels instead. A list needs no separator.
+        """
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
 
         answer = search.run("payment refund", top_k=2)
 
-        assert hit_count(answer) == 2
-        assert "\n\n" in answer
+        assert len(answer.hits) == 2
+        assert answer.hits[0].text != answer.hits[1].text
+        assert answer.note is None
+
+
+class TestTheCoordinates:
+    """Where a hit is: its ordinal out of how many, and its line range."""
+
+    def test_a_hit_carries_the_line_range_its_record_holds(self, search: SearchHarness) -> None:
+        """Transport, and only transport — the numbers are literals, not arithmetic.
+
+        Re-deriving the pair here with ``line_starts`` would make the spec assert
+        the harness's own arithmetic. The derivation is pinned by 58-2's
+        ``TestTheLineRange``; what 58-3 owes is that what the record holds is what
+        the hit carries, and a hand-chosen pair proves that and nothing else.
+        """
+        search.index(
+            "invoice.md", _INVOICE, [_FIRST, _SECOND], cache=False, lines=[(1, 3), (5, 5)]
+        )
+
+        answer = search.run("payment refund", top_k=2)
+
+        assert [(hit.ordinal, hit.start_line, hit.end_line) for hit in answer.hits] == [
+            (1, 5, 5),
+            (0, 1, 3),
+        ]
+
+    def test_a_keyword_only_hit_carries_the_range_too(self, search: SearchHarness) -> None:
+        """The leg that never reaches the row still answers the coordinates.
+
+        ``_KeywordMatch`` holds the chunk itself, so the range rides along with no
+        lookup at all — and a keyword-only hit is the degraded mode this whole
+        design turns on.
+        """
+        search.index("invoice.md", _INVOICE, [_FIRST], embedded=False, lines=[(1, 3)])
+
+        [hit] = search.run("payment").hits
+
+        assert (hit.match, hit.start_line, hit.end_line) == (MatchKind.KEYWORD, 1, 3)
+
+    def test_a_hit_says_which_chunk_of_how_many_it_is(self, search: SearchHarness) -> None:
+        """``chunk_count`` is the row's, so "chunk 2 of 3" is answerable."""
+        search.index("invoice.md", _INVOICE, [_FIRST, _SECOND], cache=False)
+
+        [hit] = search.run("refund", top_k=1).hits
+
+        assert (hit.ordinal, hit.chunk_count) == (1, 2)
+
+    def test_a_chunk_whose_row_predates_the_line_range_answers_nulls_and_its_text(
+        self, search: SearchHarness
+    ) -> None:
+        """No migration and no de-indexing in the field, at the boundary.
+
+        Asserted directly rather than inferred from the model's defaults: a row
+        written before 58-2 carries ``start_line=None`` / ``end_line=None``, and
+        every other field of the hit is populated as usual.
+        """
+        search.index("invoice.md", _INVOICE, [_FIRST], cache=False)
+
+        [hit] = search.run("payment").hits
+
+        assert (hit.start_line, hit.end_line) == (None, None)
+        assert hit.ordinal == 0
+        assert hit.chunk_count == 1
+        assert hit.heading_path == ["Invoice", "Payment terms"]
+        assert "Payment terms are net thirty." in hit.text
+
+    def test_a_hit_the_store_reported_no_ordinal_for_is_returned_with_null_coordinates(
+        self, search: SearchHarness
+    ) -> None:
+        """The other way a hit locates nowhere: the store itself carried no ordinal.
+
+        Story 45-6 put ``ordinal`` on ``SearchHit``, and an entry written before
+        it — or by a producer that does not partition — has none. There is then
+        nothing to look the row up by, and the chunk text is still the answer.
+        """
+        search.store.backend.add(
+            RAG_COLLECTION,
+            [
+                VectorEntry(
+                    ref_type="workspace_chunk",
+                    ref_id="an-entry-with-no-ordinal",
+                    text="A payment note with no ordinal.",
+                    vector=vector_for("payment"),
+                    scope=WORKSPACE_PATH,
+                    path="invoice.md",
+                    ordinal=None,
+                )
+            ],
+        )
+
+        [hit] = search.run("payment").hits
+
+        assert hit.path == "invoice.md"
+        assert (hit.ordinal, hit.chunk_count, hit.start_line, hit.end_line) == (
+            None,
+            None,
+            None,
+            None,
+        )
+        assert hit.heading_path == []
+        assert hit.text == "A payment note with no ordinal."
+
+    def test_a_fused_key_that_resolves_to_neither_leg_spends_no_result_slot(
+        self, search: SearchHarness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The skip the budget is spent **after**, pinned where it cannot arise alone.
+
+        Every key ``fuse`` returns comes from one of the two mappings handed to
+        it, so no production input reaches this branch — which is exactly why it
+        needs a spec rather than an argument. A phantom key is fused in ahead of
+        both real ones; it must contribute no hit **and** cost neither of them
+        its slot, which is what "the budget is spent after filtering" means.
+        """
+        from akgentic.tool.vector_store import hybrid  # noqa: PLC0415 — patched per spec
+
+        search.index("invoice.md", _INVOICE, [_FIRST, _SECOND], cache=False)
+        real = hybrid.fuse
+
+        def phantom(
+            keyword_keys: Any, vector_scores: Any, *, alpha: float = DEFAULT_ALPHA
+        ) -> dict[str, float]:
+            return {"a-key-neither-leg-has": 99.0, **real(keyword_keys, vector_scores, alpha=alpha)}
+
+        monkeypatch.setattr(hybrid, "fuse", phantom)
+
+        answer = search.run("payment refund", top_k=2)
+
+        assert len(answer.hits) == 2
+        assert set(paths(answer)) == {"invoice.md"}
+
+    def test_the_coordinates_cost_one_record_read_per_vector_hit(
+        self, search: SearchHarness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``cache.entry(path)`` is a YAML file opened and parsed, once per hit.
+
+        ``DocumentCache.entry`` → ``DocumentStore.get_document`` → ``_read`` of a
+        file. ``chunk_count`` is a field of the same row the chunk comes from, so
+        resolving it through a **second** ``entry()`` call would double a search's
+        disk reads for one integer. The bodies are evicted here so the keyword leg
+        contributes nothing and every hit takes the lookup path.
+        """
+        search.index("invoice.md", _INVOICE, [_FIRST, _SECOND], cache=False)
+        assert search.card is not None
+        cache = search.card._document_cache
+        assert cache is not None
+        reads: list[str] = []
+        original = cache.entry
+
+        def counting(path: str) -> Any:
+            reads.append(path)
+            return original(path)
+
+        monkeypatch.setattr(cache, "entry", counting)
+
+        answer = search.run("payment refund", top_k=2)
+
+        assert len(answer.hits) == 2
+        assert reads == ["invoice.md", "invoice.md"]
+
+
+class TestTheResultIsAModelAndNotAString:
+    """ADR-054 Decision 1: a plain ``BaseModel``, and what its dump carries."""
+
+    def test_the_result_dumps_exactly_two_keys(self) -> None:
+        assert set(RagSearchResult(note="x").model_dump()) == {"hits", "note"}
+
+    def test_a_hit_dumps_exactly_its_nine_fields(self) -> None:
+        hit = RagSearchHit(path="a.md", match=MatchKind.KEYWORD, text="t")
+
+        assert set(hit.model_dump()) == {
+            "path",
+            "ordinal",
+            "chunk_count",
+            "start_line",
+            "end_line",
+            "heading_path",
+            "score",
+            "match",
+            "text",
+        }
+
+    def test_no_model_path_discriminator_reaches_the_payload(self) -> None:
+        """Why these are plain ``BaseModel`` and not ``SerializableBaseModel``.
+
+        That base declares a ``@model_serializer`` which appends
+        ``__model__ = <module path>`` to every dump. A search result is
+        serialised into a prompt and consumed, never reconstructed, so the
+        discriminator would buy nothing and would put this module's own import
+        path in front of the model once per hit — pinning where ``rag/search.py``
+        happens to live into the agent-visible wire format.
+        """
+        dumped = RagSearchResult(
+            hits=[RagSearchHit(path="a.md", match=MatchKind.SEMANTIC, text="t", score=0.5)]
+        ).model_dump()
+
+        assert "__model__" not in dumped
+        assert "__model__" not in dumped["hits"][0]
+
+    def test_the_match_kind_dumps_as_its_bare_value(self) -> None:
+        """A ``StrEnum`` serialises to the string, so no call site restates it."""
+        hit = RagSearchHit(path="a.md", match=MatchKind.HYBRID, text="t")
+
+        assert hit.model_dump()["match"] == "hybrid"
 
 
 class TestTopK:
     """Honoured after filtering, and never under-filled by another scope."""
 
-    def test_the_render_is_cut_to_top_k(self, search: SearchHarness) -> None:
+    def test_the_hit_list_is_cut_to_top_k(self, search: SearchHarness) -> None:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
 
         answer = search.run("payment refund", top_k=1)
 
-        assert hit_count(answer) == 1
+        assert len(answer.hits) == 1
 
     def test_a_larger_budget_returns_both(self, search: SearchHarness) -> None:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
 
         answer = search.run("payment refund", top_k=5)
 
-        assert hit_count(answer) == 2
+        assert len(answer.hits) == 2
 
     def test_a_zero_budget_is_clamped_rather_than_over_fetching_nothing(
         self, search: SearchHarness
@@ -995,7 +1331,7 @@ class TestTopK:
 
         answer = search.run("payment", top_k=0)
 
-        assert "invoice.md" in answer
+        assert paths(answer) == ["invoice.md"]
         assert search.store.searches[0][1] == OVERFETCH
 
 
@@ -1025,8 +1361,7 @@ class TestScopeIsolation:
 
         answer = search.run("payment", top_k=5)
 
-        assert "theirs.md" not in answer
-        assert "mine.md" in answer
+        assert set(paths(answer)) == {"mine.md"}
 
     def test_the_other_workspace_sees_only_its_own(
         self,
@@ -1056,8 +1391,7 @@ class TestScopeIsolation:
 
         answer = theirs.run("payment", top_k=5)
 
-        assert "theirs.md" in answer
-        assert "mine.md" not in answer
+        assert set(paths(answer)) == {"theirs.md"}
 
     def test_the_two_workspaces_mint_distinct_ids_for_the_same_file(
         self, search: SearchHarness
@@ -1086,8 +1420,8 @@ class TestThePathPrefixDecision:
     ) -> None:
         answer = search.run("payment", path_prefix=prefix)
 
-        assert "cannot contain" in answer
-        assert answer != _UNAVAILABLE
+        assert answer.note == _REJECTED_PREFIX
+        assert answer.note != _UNAVAILABLE
 
     @pytest.mark.parametrize("backend", ["local", "inmemory", "weaviate"])
     def test_the_same_sentence_comes_back_whatever_the_backend(
@@ -1112,8 +1446,8 @@ class TestThePathPrefixDecision:
 
         answer = search.run("payment", path_prefix="report?.md")
 
-        assert "cannot contain" in answer
-        assert answer != _UNAVAILABLE
+        assert answer.note == _REJECTED_PREFIX
+        assert answer.note != _UNAVAILABLE
 
     def test_a_refused_prefix_never_reaches_the_backend(self, search: SearchHarness) -> None:
         """No embed is spent either — the refusal is the first thing that happens."""
@@ -1142,7 +1476,7 @@ class TestThePathPrefixDecision:
 
         answer = search.run("payment", path_prefix="reports/")
 
-        assert "reports/invoice.md" in answer
+        assert paths(answer) == ["reports/invoice.md"]
 
 
 class TestTheFusionKnobs:
@@ -1178,7 +1512,7 @@ class TestTheFusionKnobs:
         """``alpha=0.0`` is pure keyword, and a vector-only hit then scores zero."""
         search.index("invoice.md", _INVOICE, [_FIRST])
 
-        assert "invoice.md" in search.run_with("payment", alpha=0.0)
+        assert paths(search.run_with("payment", alpha=0.0)) == ["invoice.md"]
 
 
 class TestTheStateItNeverTouches:
@@ -1189,7 +1523,7 @@ class TestTheStateItNeverTouches:
         search.index("invoice.md", _INVOICE, [_FIRST, _SECOND])
         writes = watch_store(search.actor)
 
-        assert "invoice.md" in search.run("payment")
+        assert set(paths(search.run("payment"))) == {"invoice.md"}
 
         assert writes.puts == []
         assert writes.evicted == []

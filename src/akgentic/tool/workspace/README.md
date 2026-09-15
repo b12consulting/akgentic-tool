@@ -747,12 +747,12 @@ A file moves `pending` → `extraction` or `splitting` → `embedding` → `embe
 previously indexed file stays searchable at its previous content — a failure is a degradation, not a
 loss. `stale` means the tree changed underneath an indexed file.
 
-### `WorkspaceRagSearch` — `workspace_rag_search(query, top_k=…, path_prefix="")`
+### `WorkspaceRagSearch` — `workspace_rag_search(query, top_k=…, path_prefix="") -> RagSearchResult`
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `expose` | `set[Channels]` | `{TOOL_CALL}` | |
-| `top_k` | `int` | `5` | How many passages to render. Applied **after** filtering — the scope and prefix predicates go to the backend, so the budget is never spent on another workspace's chunks. |
+| `top_k` | `int` | `5` | How many passages to return. Applied **after** filtering — the scope and prefix predicates go to the backend, so the budget is never spent on another workspace's chunks. |
 | `alpha` | `float` | `0.7` | Weight of the vector leg; the keyword leg gets `1 - alpha`. `1.0` is pure vector, `0.0` pure keyword. Mirrors the value `weaviate-client` sends for `hybrid(alpha=…)`. |
 | `score_threshold` | `float` | `0.0` | Minimum **raw** cosine for a vector hit, applied before normalisation so the number keeps its absolute meaning. |
 
@@ -773,11 +773,21 @@ produce identical chunk ids for identical content, so team A re-indexing a file 
 B also reads. That is correct — it is the same file in the same tree — but it means a re-index is
 visible across teams.
 
-Each hit renders its path, its heading path, a score label — `(hybrid: 0.90)`, `(semantic: 0.85)` or
-`(keyword match)` — and the chunk's text.
+The answer is a `RagSearchResult` — a `hits` list, best first, or an empty one and a `note` saying
+why there is nothing. Each `RagSearchHit` carries its `path`, its `ordinal` out of the file's
+`chunk_count`, the 1-indexed inclusive `start_line` / `end_line` it spans, its `heading_path`, its
+raw cosine `score` (`None` on a keyword-only hit), a `match` of `semantic` / `hybrid` / `keyword`,
+and the chunk's `text`. The line range is what makes a hit expandable:
+`workspace_read(path, offset=start_line, limit=end_line - start_line + 1)` reads exactly the passage,
+and widening from there reads its neighbourhood. `start_line` / `end_line` are `None` on a file
+indexed before ranges were recorded; `workspace_rag_index(path, force=True)` fills them.
+
+**`text` is what was matched, not the slice the range names.** `compose_chunk_text` prepends the
+heading path and re-synthesises a cut table's header row, so a read of `[start_line, end_line]` will
+not contain those lines. Both are true and they are not reconciled.
 
 **A hit's text comes from the vector store, not from the cache**, which is what keeps a file whose
-extraction body was evicted both searchable and renderable. That file loses only its lexical leg:
+extraction body was evicted both searchable and readable. That file loses only its lexical leg:
 the keyword search skips an evicted body rather than slicing it, and its stored offsets degrade to
 provenance. The consequence is worth stating plainly — `max_documents` bounds the size of the
 actor's state, **not** the size of the searchable corpus.
@@ -838,7 +848,7 @@ Seven properties, each of them load-bearing:
 | `workspace_exec` | `(cmd, cwd="")` | only when `workspace_exec` is on; takes the tree for the run |
 | `workspace_exec_result` | `(run_id)` | only when `workspace_exec` is on; collects a run started earlier |
 | `workspace_rag_index` | `(path="", force=False)` | returns immediately with counts; extraction, splitting and embedding happen in `#index-` workers |
-| `workspace_rag_search` | `(query, top_k=…, path_prefix="")` | hybrid over the indexed chunks; degrades to keyword-only, never raises |
+| `workspace_rag_search` | `(query, top_k=…, path_prefix="")` | hybrid over the indexed chunks; answers a `RagSearchResult`; degrades to keyword-only, never raises |
 | `workspace_rag_list` | `()` | `COMMAND` only — the full table. The per-turn delta is a `ContextState`, not a callable |
 
 The read side runs on the calling agent's own thread against its own `Filesystem`, exactly as it
