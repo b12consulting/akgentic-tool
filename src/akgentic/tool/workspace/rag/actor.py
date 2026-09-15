@@ -567,12 +567,24 @@ class DocumentsMixin(_DocumentsBase):
         ``chunks`` is cleared, because re-index is add-then-remove and the old ids
         have to survive somewhere for the duration. Ids left over from a removal
         that previously failed are kept, so a later re-index retries them.
+
+        ``indexed_extractor_version`` is stamped here beside ``indexed_sha``, in
+        both branches and for the same reason: the two together identify the
+        extraction this row's offsets were cut from, and indexing is what starts
+        producing them.
         """
         now = datetime.now(UTC)
         row = self._entry(path).row
         if row is None:
             self._put_row(
-                path, RagFile(path=path, status=RagStatus.PENDING, indexed_sha=sha, updated_at=now)
+                path,
+                RagFile(
+                    path=path,
+                    status=RagStatus.PENDING,
+                    indexed_sha=sha,
+                    indexed_extractor_version=EXTRACTOR_VERSION,
+                    updated_at=now,
+                ),
             )
             return
         superseded = list(row.superseded_chunk_ids)
@@ -589,6 +601,7 @@ class DocumentsMixin(_DocumentsBase):
                 update={
                     "status": RagStatus.PENDING,
                     "indexed_sha": sha,
+                    "indexed_extractor_version": EXTRACTOR_VERSION,
                     "chunks": [],
                     "chunk_count": 0,
                     "batches_expected": 0,

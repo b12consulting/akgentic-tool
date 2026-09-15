@@ -163,7 +163,7 @@ from akgentic.tool.workspace.rag.params import (
     WorkspaceRagList,
     WorkspaceRagSearch,
 )
-from akgentic.tool.workspace.rag.search import search_documents
+from akgentic.tool.workspace.rag.search import RagSearchResult, search_documents
 from akgentic.tool.workspace.read.params import WorkspaceRead
 from akgentic.tool.workspace.readers import DocumentReader
 from akgentic.tool.workspace.workspace import meta_dir_for
@@ -185,6 +185,10 @@ vector store is wired" apart from "this card never bound a tree" or "the actor i
 gone", because its next step is the same in all three. ``rag/actor.py`` returns
 the identical sentence from ``index_paths``, which is the one callable still
 behind a mailbox.
+
+``workspace_rag_index`` answers it **bare**, as this string; ``workspace_rag_search``
+answers a :class:`~akgentic.tool.workspace.rag.search.RagSearchResult` and carries
+the same sentence as that result's ``note``.
 """
 
 _REJECTED_PREFIX = PATH_PREFIX_REJECTED
@@ -799,32 +803,47 @@ class RagFactories:
         available = self._retrieval_bound()
         top_k, alpha, threshold = params.top_k, params.alpha, params.score_threshold
 
-        def workspace_rag_search(query: str, top_k: int = top_k, path_prefix: str = "") -> str:
+        def workspace_rag_search(
+            query: str, top_k: int = top_k, path_prefix: str = ""
+        ) -> RagSearchResult:
             """Search the indexed workspace documents for passages about *query*.
 
-            Combines meaning-based and word-based matching over the files that
-            ``workspace_rag_index`` has indexed. Use it to find *where* something
-            is said before reading a whole document.
+            Finds *where* something is said, so you can read that part rather
+            than a whole document.
 
             Args:
                 query: What to look for, in natural language.
-                path_prefix: Restrict the search to paths starting with this, e.g.
-                    "reports/". Wildcards are not accepted. Defaults to the whole
-                    workspace.
+                path_prefix: Restrict to paths starting with this, e.g.
+                    "reports/". No wildcards. Defaults to the whole workspace.
                 top_k: How many passages to return.
 
             Returns:
-                The matching passages with their file, heading path and score, or
-                a sentence saying that nothing matched.
+                `hits`, best first: `path`, `ordinal` of `chunk_count`, and
+                `start_line`/`end_line` (1-indexed, inclusive). Empty with a
+                `note` when nothing matched or retrieval is unavailable.
+
+                Read around a hit with `workspace_read(path, offset=start_line,
+                limit=end_line - start_line + 1)`, then widen. A `None` range
+                means that file predates line recording;
+                `workspace_rag_index(path, force=True)` fills it in.
+
+                `text` is what matched, not those lines — the indexer prepends
+                the heading path and re-adds a cut table's header. The
+                difference is not evidence you read the wrong place.
+
+                `score` is raw semantic similarity, `None` for a keyword-only
+                hit, and not comparable across searches; `match` is "semantic",
+                "keyword" or "hybrid".
             """
             if cache is None:
-                return _UNAVAILABLE  # harness shapes that wire a bare observer never bind one
+                # harness shapes that wire a bare observer never bind one
+                return RagSearchResult(note=_UNAVAILABLE)
             # Ahead of the embed and the search, so a refused prefix costs
             # nothing at all — no round trip and no embedding credit.
             if any(character in path_prefix for character in PATH_PREFIX_WILDCARDS):
-                return _REJECTED_PREFIX
+                return RagSearchResult(note=_REJECTED_PREFIX)
             if not available:
-                return _UNAVAILABLE
+                return RagSearchResult(note=_UNAVAILABLE)
             try:
                 return search_documents(
                     cache,
@@ -839,7 +858,7 @@ class RagFactories:
                 )
             except Exception:
                 logger.debug("Could not search the retrieval index", exc_info=True)
-                return _UNAVAILABLE
+                return RagSearchResult(note=_UNAVAILABLE)
 
         workspace_rag_search.__doc__ = params.format_docstring(workspace_rag_search.__doc__)
         return workspace_rag_search

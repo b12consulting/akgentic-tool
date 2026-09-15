@@ -63,7 +63,7 @@ from akgentic.tool.workspace.models import (
     content_sha,
 )
 from akgentic.tool.workspace.rag.context import render_index_state
-from akgentic.tool.workspace.rag.search import search_documents
+from akgentic.tool.workspace.rag.search import RagSearchResult, search_documents
 from akgentic.tool.workspace.rag.worker import (
     EMBED_BATCH_SIZE,
     MAX_CONCURRENT_INDEX_WORKERS,
@@ -1263,7 +1263,12 @@ def _drive_every_write_site_degraded(harness: RagHarness, tree: Path) -> None:
     # The read path over the same degraded cache: it must answer, not raise, and
     # write nothing. Card-side since story 57-1, so it is driven the way the
     # search closure drives it rather than through the actor.
-    assert search_documents(degraded, None, None, "body", top_k=5, scope=WORKSPACE_PATH) == (
-        "Nothing in the retrieval index matched that query. "
-        "Use workspace_rag_list to see which files are indexed."
+    assert search_documents(
+        degraded, None, None, "body", top_k=5, scope=WORKSPACE_PATH
+    ) == RagSearchResult(
+        hits=[],
+        note=(
+            "Nothing in the retrieval index matched that query. "
+            "Use workspace_rag_list to see which files are indexed."
+        ),
     )

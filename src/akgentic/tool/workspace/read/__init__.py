@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic_ai.messages import BinaryContent
 
 from akgentic.tool.errors import RetriableError
+from akgentic.tool.workspace.lines import split_lines
 from akgentic.tool.workspace.models import PERM_ERR_MSG, content_sha
 from akgentic.tool.workspace.read.params import (
     WorkspaceGlob,
@@ -162,13 +163,21 @@ def _maybe_resize(data: bytes, suffix: str, max_dim: int, root: Path, path: str)
 def _paginate(raw: str, offset: int, limit: int) -> tuple[str, bool]:
     """Number *raw*'s lines within the requested window.
 
+    Lines are the spine's — :func:`~akgentic.tool.workspace.lines.split_lines`,
+    breaking on ``\\r\\n``, ``\\r`` and ``\\n`` — rather than
+    :meth:`str.splitlines`, which starts a line at eight further characters the
+    retrieval splitter does not. A body carrying one of those, and an extracted
+    deck carries several, was numbered one way here and another way there, so the
+    gutter an agent read and the line a chunk was minted against named different
+    regions of one file.
+
     Returns:
         The numbered text — with a truncation notice when the window stops short
         — and whether the window covered the **whole** file. The flag is derived
         from the same clamped bounds the text is, so what a read records about
         itself can never disagree with what the agent was shown.
     """
-    lines = raw.splitlines()
+    lines = split_lines(raw)
     total = len(lines)
     start = max(0, offset - 1)
     end = min(start + limit, total)

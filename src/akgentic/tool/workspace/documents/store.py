@@ -9,7 +9,8 @@ the same mount reads the same cache with **no shared memory** (ADR-051 Decision
 **The two halves live in one file, deliberately.** ``documents`` and ``rag_index``
 were keyed identically — the workspace-relative path — and every settle point
 touched both: an index result caches the extraction *and* writes the row, and the
-keyword search leg joins them on ``source_sha == indexed_sha``. Two files per
+keyword search leg joins them on ``source_sha == indexed_sha`` and on the
+extractor version beside it. Two files per
 document would double every write and reintroduce the possibility of the halves
 disagreeing about which bytes they describe. One file, two optional halves,
 written whole.

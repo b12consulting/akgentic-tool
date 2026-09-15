@@ -81,6 +81,21 @@ SPINE = frozenset(
         # for ``read`` or ``execution``. Adding it reddens nothing, because an
         # extra permitted entry never reddens a subset test.
         f"{PACKAGE}.locks",
+        # The one definition of a line break and the two functions over it, shared
+        # by the two capabilities that number a document's lines since story 58-1
+        # and importing nothing but ``re``. It earns ``SPINE`` on the same evidence
+        # ``locks.py`` did — consumers in more than one capability, at the package
+        # root rather than under one of them — and its *absence* is measured:
+        # removing it from this set reddens **both** assertions below for ``read``
+        # and ``rag``, with
+        # ``read/ reaches ['akgentic.tool.workspace.lines']``, and neither one for
+        # ``write``, ``journal`` or ``execution``.
+        #
+        # It is the entry whose alternative was the defect: ``read/`` importing
+        # ``rag/splitter``'s private helper, or ``rag/`` importing ``read/``'s, is
+        # the peer edge ADR-053 forbids — which is why the definition went to the
+        # root instead of to either capability.
+        f"{PACKAGE}.lines",
         f"{PACKAGE}.models",
         f"{PACKAGE}.readers",
         f"{PACKAGE}.workspace",
@@ -315,7 +330,23 @@ CAPABILITY_SPINE_REACH: dict[str, frozenset[str]] = {
     # takes no ``flock`` at all, so adding it here goes red immediately — this is
     # an ``EXPECTED <= closure`` assertion, which reports a row claiming a reach
     # the capability does not have.
-    "read": frozenset({f"{PACKAGE}.workspace", f"{PACKAGE}.models", f"{PACKAGE}.readers"}),
+    #
+    # ``lines`` joins the three since story 58-1: ``_paginate`` numbers the
+    # gutter with ``split_lines``, so this capability genuinely reaches it.
+    # Measured, one mutation at a time: **removing** this entry reddens nothing
+    # — a subset assertion cannot report a reach a row stops claiming, which is
+    # why the ``SPINE`` row above carries the observable instead — while putting
+    # it on a row that does *not* reach it reddens
+    # ``test_the_closure_is_not_empty_and_reaches_the_spine`` at once, checked
+    # against ``journal/``.
+    "read": frozenset(
+        {
+            f"{PACKAGE}.lines",
+            f"{PACKAGE}.models",
+            f"{PACKAGE}.readers",
+            f"{PACKAGE}.workspace",
+        }
+    ),
     # ``locks`` joins the three here: ``CardGate._hold`` calls it on every gated
     # mutation. Removing this entry reddens nothing (a subset assertion), which is
     # why the closure row above carries the observable instead.
@@ -346,12 +377,22 @@ CAPABILITY_SPINE_REACH: dict[str, frozenset[str]] = {
     # ``documents.cache`` with it, and this table exists to report a graph that
     # silently narrows: listing every module the row actually reaches is what
     # makes a later narrowing visible, where a shorter row would absorb it.
+    #
+    # ``lines`` joins them in story 58-1, and it is the **second** row to claim
+    # it: ``splitter.py`` indexes ``markdown-it``'s token maps through
+    # ``line_starts``, and ``read/`` numbers its gutter through ``split_lines``.
+    # Two capabilities on one definition is the whole argument for the module
+    # sitting in the spine rather than inside either of them. Measured the same
+    # way as ``read/``'s: removing it reddens nothing, claiming it on a row that
+    # does not reach it reddens
+    # ``test_the_closure_is_not_empty_and_reaches_the_spine`` immediately.
     "rag": frozenset(
         {
             f"{PACKAGE}.documents",
             f"{PACKAGE}.documents.cache",
             f"{PACKAGE}.documents.models",
             f"{PACKAGE}.documents.store",
+            f"{PACKAGE}.lines",
             f"{PACKAGE}.locks",
             f"{PACKAGE}.models",
             f"{PACKAGE}.readers",
@@ -404,7 +445,7 @@ assert nothing at all about that capability.
 MINIMUM_MODULES_PARSED = 20
 """Below this the sweep is looking at the wrong directory, not at a clean package.
 
-Calibrated for **this package**, which holds 33 modules — counted from the sweep
+Calibrated for **this package**, which holds 34 modules — counted from the sweep
 itself rather than by adding one to the number that was here. The previous figure
 said 31 while 32 were on disk, so incrementing it would have published an
 inherited off-by-one as a fact; a count nobody measures is how a number stops
@@ -415,9 +456,9 @@ opposite of what a sentinel is for.
 
 **The floor does not move when the package grows.** It is deliberately below the
 smallest correct sweep, not a number chosen to pass: story 55-6 took the count
-from 27 to 29, story 55-8 to 31 and story 57-2 to 33, and this stayed at 20
-throughout, which is the whole point of a floor. Story 55-9 moved a module
-without changing the count, which is what a move does.
+from 27 to 29, story 55-8 to 31, story 57-2 to 33 and story 58-1 to 34, and this
+stayed at 20 throughout, which is the whole point of a floor. Story 55-9 moved a
+module without changing the count, which is what a move does.
 """
 
 
