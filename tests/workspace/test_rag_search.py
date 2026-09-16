@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 from akgentic.core.agent_state import BaseState
 
 from akgentic.tool.vector_store.backends.inmemory import InMemoryBackend
@@ -1300,10 +1301,106 @@ class TestTheResultIsAModelAndNotAString:
         assert "__model__" not in dumped["hits"][0]
 
     def test_the_match_kind_dumps_as_its_bare_value(self) -> None:
-        """A ``StrEnum`` serialises to the string, so no call site restates it."""
+        """The dumped value is a plain ``str``, not the member that equals one.
+
+        **This spec changed meaning in 58-4.** It asserted
+        ``model_dump()["match"] == "hybrid"`` and its docstring claimed a
+        ``StrEnum`` "serialises to the string". Neither held: a plain
+        ``model_dump()`` left the *member* in the dict, and
+        ``MatchKind.HYBRID == "hybrid"`` is ``True``, so the assertion agreed
+        with the broken code as readily as with the fixed one. The type is the
+        only claim that tells the two apart.
+        """
         hit = RagSearchHit(path="a.md", match=MatchKind.HYBRID, text="t")
 
-        assert hit.model_dump()["match"] == "hybrid"
+        assert type(hit.model_dump()["match"]) is str
+
+    @pytest.mark.parametrize("kind", list(MatchKind))
+    def test_a_fully_populated_result_survives_an_unsafe_dump_and_a_safe_load(
+        self, kind: MatchKind
+    ) -> None:
+        """The writer/reader pair that empties an event log in the field.
+
+        ``akgentic-team`` persists the LLM history with an **unsafe** YAML dumper
+        and reads it back with ``yaml.safe_load_all``. An enum member that
+        survives ``model_dump()`` is written as
+        ``!!python/object/apply:...MatchKind`` — a tag the safe loader refuses,
+        so the read yields **zero** events for the whole log and resume fails
+        with a misleading "No Orchestrator StartMessage found".
+
+        Three properties of this row are load bearing and each is one keystroke
+        from being useless:
+
+        - **plain** ``model_dump()``, never ``mode="json"`` — that mode converts
+          the enum itself, so the row would be green before *and* after the fix.
+          It is why this package's other ``StrEnum`` (``RagFile.status``) was
+          never affected: both of the tool's own write sites dump in JSON mode.
+        - ``yaml.dump``, never ``yaml.safe_dump`` — the safe dumper *raises* on
+          an unrepresentable value instead of emitting a tag, which is a
+          different failure from the silent one being reproduced here.
+        - the assertion is on the **emitted text**. ``isinstance(match, str)`` is
+          vacuous for a ``StrEnum``, and ``== "semantic"`` agrees with the broken
+          code.
+
+        Every field carries a non-default value, so this is also the executable
+        form of the field audit: a field added later whose value is not
+        YAML-plain reddens here with nobody remembering this story.
+        """
+        result = RagSearchResult(
+            hits=[
+                RagSearchHit(
+                    path="invoice.md",
+                    ordinal=2,
+                    chunk_count=7,
+                    start_line=11,
+                    end_line=19,
+                    heading_path=["Invoice", "Payment terms"],
+                    score=0.71,
+                    match=kind,
+                    text="Payment terms are net thirty.",
+                )
+            ],
+            note="carried so both fields of the parent hold a value too",
+        )
+
+        dumped = yaml.dump(result.model_dump(), default_flow_style=False)
+
+        assert "!!python/" not in dumped
+        assert yaml.safe_load(dumped) == result.model_dump()
+
+    def test_a_result_from_the_production_builder_round_trips_the_same_way(
+        self, search: SearchHarness
+    ) -> None:
+        """The same round trip over the path the defect actually travelled.
+
+        A hand-built instance proves the model; only the builder proves the
+        answer an agent's tool call returns.
+        """
+        search.index("invoice.md", _INVOICE, [_FIRST])
+
+        result = search.run("payment", top_k=1)
+        dumped = yaml.dump(result.model_dump(), default_flow_style=False)
+
+        assert result.hits
+        assert "!!python/" not in dumped
+        assert yaml.safe_load(dumped) == result.model_dump()
+
+    def test_the_safe_loaded_match_re_validates_as_its_kind(self) -> None:
+        """What makes the stored string a *value* and not a lossy rendering.
+
+        The attribute stays a real ``MatchKind`` — the serializer acts at dump
+        time, not at validation time — so identity still holds on the way back
+        in, and the member compares equal to the string that was stored.
+        """
+        result = RagSearchResult(
+            hits=[RagSearchHit(path="a.md", match=MatchKind.SEMANTIC, text="t")]
+        )
+
+        reloaded = yaml.safe_load(yaml.dump(result.model_dump(), default_flow_style=False))
+
+        assert reloaded["hits"][0]["match"] == "semantic"
+        assert RagSearchHit.model_validate(reloaded["hits"][0]).match is MatchKind.SEMANTIC
+        assert MatchKind.SEMANTIC == "semantic"
 
 
 class TestTopK:

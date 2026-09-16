@@ -43,7 +43,7 @@ import logging
 from enum import StrEnum
 from typing import TYPE_CHECKING, NamedTuple
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_serializer
 
 from akgentic.tool.workspace.documents.models import RAG_COLLECTION, RagChunk
 
@@ -97,6 +97,15 @@ class RagSearchHit(BaseModel):
     discriminator that serializer stamps on every dump would buy nothing and
     would put this module's own import path in front of the model once per hit.
 
+    **The** ``match`` **field is dumped as its bare value, and that is load
+    bearing.** A plain ``model_dump()`` leaves an enum member as an instance, and
+    this model rides into a persisted LLM history whose writer is an unsafe YAML
+    dumper and whose reader is a safe loader — so a surviving ``MatchKind``
+    instance is emitted as a ``!!python/object/apply:`` tag that the reader then
+    refuses, taking the whole log with it. The serializer states that contract
+    where it applies, leaving the attribute itself a real :class:`MatchKind` so
+    ``hit.match is MatchKind.SEMANTIC`` keeps meaning something.
+
     Attributes:
         path: Workspace-relative path of the file the chunk is in.
         ordinal: Position of the chunk within its document, from zero. ``None``
@@ -141,6 +150,11 @@ class RagSearchHit(BaseModel):
     score: float | None = None
     match: MatchKind
     text: str
+
+    @field_serializer("match")
+    def _dump_match_as_its_value(self, match: MatchKind) -> str:
+        """Emit the string, never the member — see the class docstring."""
+        return match.value
 
 
 class RagSearchResult(BaseModel):
