@@ -1,8 +1,12 @@
 """Markdown to embeddable chunks, in two phases: parse to blocks, pack blocks.
 
 **Phase 1 — :func:`parse_blocks`.** ``markdown-it-py`` gives every block token a
-``.map`` of ``[start_line, end_line]``; a line-start index turns that into
-character offsets. What comes back is one :class:`Span` per structural block,
+``.map`` of ``[start_line, end_line]``;
+:func:`~akgentic.tool.workspace.lines.line_starts` turns that into character
+offsets. That index is the spine's rather than this module's, and deliberately:
+the read path numbers the same document's lines for the agent's gutter, and while
+the two counted breaks differently a line number minted here named a different
+region there. What comes back is one :class:`Span` per structural block,
 with a table and a fenced block each arriving as **one atomic block** — the
 property no character-recursive splitter can have.
 
@@ -38,11 +42,13 @@ modules stay leaves.
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from markdown_it import MarkdownIt
 
 from akgentic.core.utils.serializer import SerializableBaseModel
+from akgentic.tool.workspace.lines import line_starts
 
 if TYPE_CHECKING:
     from markdown_it.token import Token
@@ -58,20 +64,6 @@ dependency to get it — a missed boundary costs one slightly worse cut, because
 the whitespace fallback catches everything this misses."""
 
 _WHITESPACE = re.compile(r"\s+")
-
-_LINE_BREAK = re.compile(r"\r\n?|\n")
-"""A line break **as the parser counts them** — its own ``NEWLINES_RE``.
-
-Deliberately not ``str.splitlines``, which is the wider definition: it also
-breaks on ``\\v``, ``\\f``, ``\\x1c``-``\\x1e``, ``\\x85``, ``\\u2028`` and
-``\\u2029``, none of which start a line for ``markdown-it``. One of those in the
-document and the two disagree about how many lines there are, so every token map
-past it indexes the wrong line and every offset after it is silently wrong.
-
-It is not a theoretical hazard: ``python-pptx`` renders a soft line break
-(``<a:br>``) as a vertical tab, so every extracted deck with a wrapped title
-carries several.
-"""
 
 _NON_BLOCK_TYPES = frozenset({"heading_open", "hr"})
 """Level-0 mapped tokens that are **not** blocks.
@@ -114,6 +106,19 @@ class Span(SerializableBaseModel):
             thing in a composed chunk that is not contiguous with ``[start:end)``.
         header_end: Exclusive end of that header row. Set exactly when
             ``header_start`` is.
+        start_line: The 1-indexed line of the document that ``start`` falls on,
+            counted by :func:`~akgentic.tool.workspace.lines.line_starts` — the
+            same definition ``workspace_read``'s gutter prints.
+        end_line: The 1-indexed line that the span's **last character** falls on,
+            so the range is inclusive on both ends and
+            ``offset=start_line, limit=end_line - start_line + 1`` is the
+            expansion read, with no arithmetic a caller can get wrong.
+
+            Both are ``None`` on a block from :func:`parse_blocks` and on a span
+            any other :class:`TextSplitter` built: a block is not a chunk, and a
+            pair stamped before the packer has re-cut it would name the block on
+            a piece that is one sentence of it. :func:`pack_blocks` fills them
+            once, from the bounds it finally kept.
     """
 
     start: int
@@ -121,6 +126,8 @@ class Span(SerializableBaseModel):
     heading_path: list[str] = []
     header_start: int | None = None
     header_end: int | None = None
+    start_line: int | None = None
+    end_line: int | None = None
 
 
 @runtime_checkable
@@ -152,26 +159,6 @@ def _parser() -> MarkdownIt:
     produces our input, so the dialect is ours to fix rather than guess.
     """
     return MarkdownIt("commonmark").enable("table")
-
-
-def _line_starts(text: str) -> list[int]:
-    """Character offset of the start of every line, plus ``len(text)``.
-
-    Lines are counted with :data:`_LINE_BREAK` — the parser's own definition —
-    because this list is indexed by *the parser's* line numbers. Any wider
-    definition puts the two out of step and every offset after the first extra
-    break is wrong; see :data:`_LINE_BREAK` for which characters do that and
-    where they come from.
-
-    The result ends at ``len(text)``, so a token's exclusive ``map[1]`` always
-    indexes in range — including for a document with no trailing newline. No
-    clamp, which would hide a real indexing bug.
-    """
-    starts = [0]
-    starts.extend(match.end() for match in _LINE_BREAK.finditer(text))
-    if starts[-1] != len(text):
-        starts.append(len(text))
-    return starts
 
 
 def _trimmed(start: int, end: int, markdown: str) -> tuple[int, int] | None:
@@ -282,7 +269,7 @@ def parse_blocks(markdown: str) -> list[Span]:
         One span per block, in document order. Heading lines are covered by no
         span, and neither are the blank lines between blocks.
     """
-    starts = _line_starts(markdown)
+    starts = line_starts(markdown)
     blocks: list[Span] = []
     path: list[str] = []
     depths: list[int] = []
@@ -324,7 +311,7 @@ def _structure(span: Span, markdown: str) -> tuple[str, list[int], tuple[int, in
     if markdown[origin : span.start].strip():
         origin = span.start
     text = markdown[origin : span.end]
-    starts = _line_starts(text)
+    starts = line_starts(text)
     tokens = _parser().parse(text)
     kind = next((t.type for t in tokens if t.level == 0 and t.map is not None), "")
     rows = [t.map for t in tokens if t.type == "tr_open" and t.map is not None]
@@ -596,6 +583,49 @@ def _merge_short_chunks(chunks: list[Span], markdown: str, params: WorkspaceRagI
     return merged
 
 
+def _locate(chunks: list[Span], markdown: str) -> list[Span]:
+    """Stamp every chunk's line range, from the bounds it finally kept.
+
+    **The last pass of :func:`pack_blocks`, and the only site that writes the
+    pair.** Every cutting, packing and merging helper above moves ``start`` or
+    ``end`` by ``model_copy``, and a line pair stamped before them survives each
+    copy *unchanged* — Golden Rule #12's mechanism working against the value it
+    preserves. An oversized paragraph cut into four pieces would give four chunks
+    the same whole-paragraph range: right for one of them and silently wide for
+    three. Deriving here cannot drift from the bounds it describes.
+
+    ``bisect_right(starts, offset)`` is the 1-indexed line containing *offset*,
+    with no ``+ 1`` and no clamp: :func:`~akgentic.tool.workspace.lines.line_starts`
+    opens at ``0`` and ends at ``len(markdown)``.
+
+    **``end`` is decremented and that is not cosmetic.** The bounds are half-open,
+    so ``end`` is one past the chunk's last character, and the reachable way that
+    names the wrong line is a document with **no trailing break**: ``line_starts``
+    ends at ``len(markdown)``, so the last chunk's ``end`` *is* an entry of
+    ``starts`` and ``bisect_right(starts, end)`` answers one line past the last
+    one the document has. Measured rather than predicted — that mutation reddens
+    seven rows of ``TestTheLineRange`` and only on the unterminated fixture.
+
+    A chunk ending *flush at a break* — the case this reads as at first glance —
+    cannot occur at all: :func:`_trimmed` never leaves a span ending on
+    whitespace, and every chunk's ``end`` comes through it, whether by
+    :func:`_piece`, by :func:`_join`'s last unit or by :func:`_merge_short_chunks`.
+    That is also why ``end - 1`` is always a real character of the chunk.
+
+    ``line_starts`` is computed **once** for the document, not once per chunk.
+    """
+    starts = line_starts(markdown)
+    return [
+        chunk.model_copy(
+            update={
+                "start_line": bisect_right(starts, chunk.start),
+                "end_line": bisect_right(starts, chunk.end - 1),
+            }
+        )
+        for chunk in chunks
+    ]
+
+
 def pack_blocks(blocks: list[Span], markdown: str, params: WorkspaceRagIndex) -> list[Span]:
     """Phase 2 — pack *blocks* into chunks under the four rules.
 
@@ -605,7 +635,8 @@ def pack_blocks(blocks: list[Span], markdown: str, params: WorkspaceRagIndex) ->
     Three passes, one per concern, so no rule is buried inside another's loop:
     every block is first cut if and only if it passes the ceiling, the result is
     grouped by section and packed with overlap, and chunks still under the
-    minimum merge forward into their own section.
+    minimum merge forward into their own section. A fourth and final pass locates
+    what came out — see :func:`_locate` for why it is last rather than first.
 
     Args:
         blocks: The output of :func:`parse_blocks`, in document order.
@@ -614,8 +645,9 @@ def pack_blocks(blocks: list[Span], markdown: str, params: WorkspaceRagIndex) ->
 
     Returns:
         The chunks, in document order, with strictly increasing ``start``
-        offsets. Every non-whitespace offset inside a block is covered by the
-        union of the chunks; overlap means an offset may be covered twice.
+        offsets, each carrying its line range. Every non-whitespace offset inside
+        a block is covered by the union of the chunks; overlap means an offset
+        may be covered twice.
     """
     units: list[Span] = []
     for block in blocks:
@@ -623,7 +655,7 @@ def pack_blocks(blocks: list[Span], markdown: str, params: WorkspaceRagIndex) ->
     chunks: list[Span] = []
     for group in _heading_groups(units, markdown):
         chunks.extend(_pack_group(group, params))
-    return _merge_short_chunks(chunks, markdown, params)
+    return _locate(_merge_short_chunks(chunks, markdown, params), markdown)
 
 
 class BlockSplitter:

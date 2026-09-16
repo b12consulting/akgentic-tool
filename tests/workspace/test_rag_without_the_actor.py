@@ -39,6 +39,7 @@ from akgentic.tool.workspace.documents.models import (
 from akgentic.tool.workspace.documents.store import DocumentEntry, YamlDocumentStore
 from akgentic.tool.workspace.models import content_sha
 from akgentic.tool.workspace.rag.params import WorkspaceRagList
+from akgentic.tool.workspace.rag.search import MatchKind
 from akgentic.tool.workspace.tool import WorkspaceTool
 from tests.workspace.conftest import (
     WORKSPACE_NAME,
@@ -209,10 +210,10 @@ class TestTheSearchRunsWithNoActor:
         assert card._retrieval_bound(), "this bind resolved nothing — the gate would answer first"
         card._workspace_proxy = _RaisingProxy()
 
-        answer = str(tool_named(card, "workspace_rag_search")("payment"))
+        answer = tool_named(card, "workspace_rag_search")("payment")
 
-        assert "invoice.md" in answer
-        assert "keyword match" in answer
+        assert [hit.path for hit in answer.hits] == ["invoice.md"]
+        assert answer.hits[0].match is MatchKind.KEYWORD
 
     def test_a_card_whose_proxy_is_none_still_returns_its_hits(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
@@ -226,7 +227,7 @@ class TestTheSearchRunsWithNoActor:
         card = _bind(orchestrator_proxy, workspace_rag_search=True)
         card._workspace_proxy = None
 
-        answer = str(tool_named(card, "workspace_rag_search")("payment"))
+        answer = tool_named(card, "workspace_rag_search")("payment")
 
-        assert "invoice.md" in answer
-        assert "keyword match" in answer
+        assert [hit.path for hit in answer.hits] == ["invoice.md"]
+        assert answer.hits[0].match is MatchKind.KEYWORD

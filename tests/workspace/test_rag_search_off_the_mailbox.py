@@ -104,6 +104,7 @@ from akgentic.tool.workspace.documents.store import (
     YamlDocumentStore,
 )
 from akgentic.tool.workspace.models import content_sha
+from akgentic.tool.workspace.rag.search import RagSearchResult
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
 from tests.workspace.conftest import (
     HANDSHAKE_TIMEOUT_S,
@@ -334,12 +335,18 @@ class _Wired:
         self.actor = actor
         """The live actor's Pykka proxy — how a message is put on its mailbox."""
 
-    def search_on_its_own_thread(self) -> tuple[threading.Thread, list[str]]:
-        """Call the card's real ``workspace_rag_search`` on a thread, capturing its answer."""
-        answers: list[str] = []
+    def search_on_its_own_thread(self) -> tuple[threading.Thread, list[RagSearchResult]]:
+        """Call the card's real ``workspace_rag_search`` on a thread, capturing its answer.
+
+        **The model is captured, never ``str()``-ed.** The assertions below used
+        to read ``_HIT_TEXT in str(...)``, and ``str()`` of a Pydantic model is
+        its repr — which contains the chunk text. Under a model return those
+        assertions would have stayed green while testing nothing at all.
+        """
+        answers: list[RagSearchResult] = []
 
         def run() -> None:
-            answers.append(str(tool_named(self.card, "workspace_rag_search")("payment")))
+            answers.append(tool_named(self.card, "workspace_rag_search")("payment"))
 
         thread = threading.Thread(target=run, name="rag-search", daemon=True)
         thread.start()
@@ -469,7 +476,10 @@ class TestTheMailboxAnswersWhileASearchIsInFlight:
 
         search_thread.join(timeout=HANDSHAKE_TIMEOUT_S)
         assert not search_thread.is_alive()
-        assert _HIT_TEXT in answers[0], "the search did not render the hits it was handed"
+        assert answers[0].hits, "the search answered no hits at all"
+        assert any(_HIT_TEXT in hit.text for hit in answers[0].hits), (
+            "the search did not answer with the hits it was handed"
+        )
 
     def test_the_stand_in_was_actually_reached(
         self, wired: _Wired, stalls: dict[str, _Stall], seam: str
@@ -533,7 +543,8 @@ class TestASearchAnswersWhileTheActorIsIndexing:
             "the search did not answer while #Workspace was indexing — its keyword "
             "leg is queued behind the held mailbox again"
         )
-        assert _HIT_TEXT in answers[0], "the search answered, but rendered no hits"
+        assert answers[0].hits, "the search answered, but carried no hits"
+        assert any(_HIT_TEXT in hit.text for hit in answers[0].hits)
 
     def test_the_add_stand_in_was_actually_reached(
         self, wired: _Wired, stalls: dict[str, _Stall]
@@ -568,7 +579,7 @@ class TestASearchAnswersWhileTheActorIsIndexing:
         search_thread.join(timeout=PROBE_JOIN_S)
 
         assert not search_thread.is_alive()
-        assert _HIT_TEXT in answers[0]
+        assert any(_HIT_TEXT in hit.text for hit in answers[0].hits)
         assert wired.store.adds == [RAG_COLLECTION], "the search itself wrote to the store"
 
 
@@ -700,11 +711,11 @@ class TestTwoCardsOfOneTeamSearchAtOnce:
     ) -> None:
         """The count reaching two is the property; one mailbox cannot reach it."""
         crowd.armed = True
-        answers: list[list[str]] = [[], []]
+        answers: list[list[RagSearchResult]] = [[], []]
         threads = [
             threading.Thread(
                 target=lambda index=index: answers[index].append(  # type: ignore[misc]
-                    str(tool_named(cards[index], "workspace_rag_search")("payment"))
+                    tool_named(cards[index], "workspace_rag_search")("payment")
                 ),
                 name=f"rag-search-{index}",
                 daemon=True,
@@ -726,7 +737,9 @@ class TestTwoCardsOfOneTeamSearchAtOnce:
         )
         assert crowd.arrivals == 2
         assert all(not thread.is_alive() for thread in threads)
-        assert all(_HIT_TEXT in answer[0] for answer in answers)
+        assert all(
+            any(_HIT_TEXT in hit.text for hit in answer[0].hits) for answer in answers
+        )
 
     def test_with_the_seam_unarmed_both_searches_answer(
         self, cards: list[WorkspaceTool], crowd: _Crowd
@@ -734,7 +747,7 @@ class TestTwoCardsOfOneTeamSearchAtOnce:
         """The positive control: two searches that never worked would pass the row above."""
         assert crowd.armed is False
 
-        answers = [str(tool_named(card, "workspace_rag_search")("payment")) for card in cards]
+        answers = [tool_named(card, "workspace_rag_search")("payment") for card in cards]
 
-        assert all(_HIT_TEXT in answer for answer in answers)
+        assert all(any(_HIT_TEXT in hit.text for hit in answer.hits) for answer in answers)
         assert crowd.arrivals == 0

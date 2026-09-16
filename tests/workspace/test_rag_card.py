@@ -38,6 +38,7 @@ from akgentic.tool.workspace.rag.params import (
     WorkspaceRagList,
     WorkspaceRagSearch,
 )
+from akgentic.tool.workspace.rag.search import MatchKind, RagSearchHit, RagSearchResult
 
 # From where it is **defined**, not through ``card/params.py``'s re-export of it.
 # That re-export exists for one purpose — keeping the module path stored
@@ -55,6 +56,11 @@ from tests.workspace.conftest import (
     factory_for,
     seed_row,
 )
+
+
+def _hit(path: str) -> RagSearchHit:
+    """One hit for a recording double to answer with, so the return type is real."""
+    return RagSearchHit(path=path, match=MatchKind.KEYWORD, text="a passage")
 
 
 def workspace_config_of(orchestrator_proxy: FakeOrchestratorProxy) -> WorkspaceConfig:
@@ -284,10 +290,13 @@ class TestTheSearchCallable:
         itself and is now spent one call further in.
         """
         seen: list[dict[str, Any]] = []
+        answered = RagSearchResult(hits=[_hit("ok.md")])
 
-        def recording(cache: Any, store: Any, resolved: Any, query: str, **kwargs: Any) -> str:
+        def recording(
+            cache: Any, store: Any, resolved: Any, query: str, **kwargs: Any
+        ) -> RagSearchResult:
             seen.append({"query": query, **kwargs})
-            return "ok"
+            return answered
 
         monkeypatch.setattr("akgentic.tool.workspace.rag.search_documents", recording)
         observer = FakeActorToolObserver(orchestrator_proxy)
@@ -297,7 +306,7 @@ class TestTheSearchCallable:
         )
         card.observer(observer)
 
-        assert self._tool(card, "workspace_rag_search")("terms", path_prefix="docs/") == "ok"
+        assert self._tool(card, "workspace_rag_search")("terms", path_prefix="docs/") == answered
         assert seen == [
             {
                 "query": "terms",
@@ -318,9 +327,11 @@ class TestTheSearchCallable:
         """The budget is the one knob the model may set per call."""
         seen: list[int] = []
 
-        def recording(cache: Any, store: Any, resolved: Any, query: str, **kwargs: Any) -> str:
+        def recording(
+            cache: Any, store: Any, resolved: Any, query: str, **kwargs: Any
+        ) -> RagSearchResult:
             seen.append(int(kwargs["top_k"]))
-            return "ok"
+            return RagSearchResult(hits=[_hit("ok.md")])
 
         monkeypatch.setattr("akgentic.tool.workspace.rag.search_documents", recording)
         observer = FakeActorToolObserver(orchestrator_proxy)
@@ -341,7 +352,9 @@ class TestTheSearchCallable:
     ) -> None:
         """It is an LLM-facing callable; a traceback is not an answer it can use."""
 
-        def explodes(cache: Any, store: Any, resolved: Any, query: str, **kwargs: Any) -> str:
+        def explodes(
+            cache: Any, store: Any, resolved: Any, query: str, **kwargs: Any
+        ) -> RagSearchResult:
             raise RuntimeError("the records could not be read")
 
         monkeypatch.setattr("akgentic.tool.workspace.rag.search_documents", explodes)
@@ -349,17 +362,19 @@ class TestTheSearchCallable:
         card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_rag_search=True)
         card.observer(observer)
 
-        assert self._tool(card, "workspace_rag_search")("terms") == (
-            "Retrieval indexing is not available for this workspace."
-        )
+        answer = self._tool(card, "workspace_rag_search")("terms")
+
+        assert answer.hits == []
+        assert answer.note == "Retrieval indexing is not available for this workspace."
 
     def test_an_unbound_card_answers_the_sentence_rather_than_raising(self) -> None:
         """A harness that wires a bare observer builds no cache at all."""
         card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_rag_search=True)
 
-        assert card._rag_search_factory(WorkspaceRagSearch())("terms") == (
-            "Retrieval indexing is not available for this workspace."
-        )
+        answer = card._rag_search_factory(WorkspaceRagSearch())("terms")
+
+        assert answer.hits == []
+        assert answer.note == "Retrieval indexing is not available for this workspace."
 
     def test_the_docstring_carries_the_cards_extra_instructions(self) -> None:
         """``format_docstring`` is what puts a team's configuration in front of the model."""
@@ -367,6 +382,25 @@ class TestTheSearchCallable:
         params = WorkspaceRagSearch(instructions="Prefer the reports/ directory.")
 
         assert "Prefer the reports/ directory." in (card._rag_search_factory(params).__doc__ or "")
+
+    def test_the_docstring_carries_the_expansion_recipe(self) -> None:
+        """The docstring **is** the wire format this capability hands the model.
+
+        Field descriptions on a return model do not reach the LLM; only the
+        docstring does. Without the recipe, the line ranges story 58-2 recorded
+        and story 58-3 surfaced are invisible to the agent they were built for —
+        the feature ships and nothing uses it.
+
+        Deliberately weak and deliberately present: it cannot prove the prose is
+        good, and it does catch the recipe being dropped by a later edit.
+        """
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME)
+
+        doc = card._rag_search_factory(WorkspaceRagSearch()).__doc__ or ""
+
+        assert "workspace_read" in doc
+        assert "start_line" in doc
+        assert "end_line" in doc
 
     @staticmethod
     def _tool(card: WorkspaceTool, name: str) -> Any:

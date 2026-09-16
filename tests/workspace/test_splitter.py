@@ -17,6 +17,7 @@ import pytest
 
 from akgentic.tool.core import COMMAND, TOOL_CALL
 from akgentic.tool.workspace import BlockSplitter, Span, TextSplitter, WorkspaceRagIndex
+from akgentic.tool.workspace.lines import split_lines
 from akgentic.tool.workspace.rag.splitter import pack_blocks, parse_blocks
 
 # --------------------------------------------------------------------------- #
@@ -200,6 +201,30 @@ SLIDES = (
 # not. The vertical tab is the one that arrives in practice; the rest fail the
 # same way and cost nothing to pin.
 LONE_PYTHON_BREAKS = ["\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]
+
+# A document with **no trailing break**, which is the reachable shape of the
+# off-by-one the line range has to avoid. ``line_starts`` ends at ``len(text)``,
+# so the last chunk's exclusive ``end`` *is* an entry of ``starts`` \u2014 and
+# ``bisect_right(starts, end)`` then names a line the document does not have.
+# Every other candidate is unreachable: ``_trimmed`` never leaves a span ending
+# on whitespace, so no chunk's ``end`` sits on a break's own end.
+UNTERMINATED = "# A\n\nAlpha paragraph under A.\n\n## B\n\nBeta paragraph, unterminated."
+
+# The same structure over ``\r\n``, so the range is asserted on a document whose
+# breaks are two characters wide. ``str.splitlines`` and ``_LINE_BREAK`` agree on
+# how many lines this has; they disagree about where each one *starts*, which is
+# what a character-offset derivation is sensitive to.
+CRLF = NESTED.replace("\n", "\r\n")
+
+# The fixtures the line range is asserted over: a multi-heading LF document, the
+# unterminated one, a ``\r\n`` one, and the deck \u2014 whose vertical tabs are lines
+# to ``str.splitlines`` and are not lines to the parser or to ``workspace_read``.
+LOCATED_FIXTURES: dict[str, str] = {
+    "NESTED": NESTED,
+    "UNTERMINATED": UNTERMINATED,
+    "CRLF": CRLF,
+    "SLIDES": SLIDES,
+}
 
 EMPTY = ""
 
@@ -926,3 +951,133 @@ class TestPhasesCompose:
         assert BlockSplitter().split(markdown, SMALL) == pack_blocks(
             parse_blocks(markdown), markdown, SMALL
         )
+
+
+class TestTheLineRange:
+    """Every chunk says which lines of its document it is — in the read path's units.
+
+    The range is derived from the **final** character bounds, after every cut,
+    pack and merge, so the assertions here are about ``split``'s output and never
+    about a block's. A block carries no range at all, which is the other half of
+    the same decision and is pinned below.
+    """
+
+    @pytest.mark.parametrize("name", sorted(LOCATED_FIXTURES))
+    @pytest.mark.parametrize("params_name", sorted(ALL_PARAMS))
+    def test_every_chunk_carries_a_range_inside_the_document(
+        self, name: str, params_name: str
+    ) -> None:
+        """``1 <= start_line <= end_line <= len(split_lines(markdown))``, always."""
+        markdown = LOCATED_FIXTURES[name]
+        lines = split_lines(markdown)
+        chunks = BlockSplitter().split(markdown, ALL_PARAMS[params_name])
+        assert chunks, f"{name}: the fixture produced no chunks to locate"
+        for chunk in chunks:
+            assert chunk.start_line is not None, f"{name}: {chunk.start}:{chunk.end} has no range"
+            assert chunk.end_line is not None
+            assert 1 <= chunk.start_line <= chunk.end_line <= len(lines), (
+                f"{name}: {chunk.start_line}-{chunk.end_line} is outside {len(lines)} lines"
+            )
+
+    @pytest.mark.parametrize("name", sorted(LOCATED_FIXTURES))
+    @pytest.mark.parametrize("params_name", sorted(ALL_PARAMS))
+    def test_the_lines_the_range_names_are_the_lines_the_chunk_lies_on(
+        self, name: str, params_name: str
+    ) -> None:
+        """Asserted break-agnostically, so it holds on ``\\r\\n`` and on a deck's ``\\v``.
+
+        A chunk's first line of text is part of the document line ``start_line``
+        names, and its last is part of the one ``end_line`` names. Stated as
+        containment rather than equality because a chunk may begin and end
+        mid-line — the range rounds outward, which is what an expansion read
+        wants.
+        """
+        markdown = LOCATED_FIXTURES[name]
+        lines = split_lines(markdown)
+        for chunk in BlockSplitter().split(markdown, ALL_PARAMS[params_name]):
+            assert chunk.start_line is not None and chunk.end_line is not None
+            own = split_lines(markdown[chunk.start : chunk.end])
+            assert own[0] in lines[chunk.start_line - 1], (
+                f"{name}: {own[0]!r} is not on line {chunk.start_line}"
+            )
+            assert own[-1] in lines[chunk.end_line - 1], (
+                f"{name}: {own[-1]!r} is not on line {chunk.end_line}"
+            )
+
+    @pytest.mark.parametrize("params_name", sorted(ALL_PARAMS))
+    def test_the_window_the_range_names_contains_the_whole_chunk(self, params_name: str) -> None:
+        """The stronger form, on the one fixture whose breaks are a single ``\\n``.
+
+        Rejoining the named lines with ``"\\n"`` reproduces the source exactly
+        there, so the chunk's own slice has to appear inside it verbatim — which
+        is the property an agent relies on when it calls
+        ``workspace_read(path, offset=start_line, limit=end_line - start_line + 1)``.
+        """
+        lines = split_lines(NESTED)
+        for chunk in BlockSplitter().split(NESTED, ALL_PARAMS[params_name]):
+            assert chunk.start_line is not None and chunk.end_line is not None
+            window = "\n".join(lines[chunk.start_line - 1 : chunk.end_line])
+            assert NESTED[chunk.start : chunk.end] in window
+
+    def test_a_chunk_ending_at_the_end_of_an_unterminated_document_stays_in_range(self) -> None:
+        """The whole of why ``end_line`` derives from ``end - 1``.
+
+        ``line_starts`` ends at ``len(text)``, so the last chunk of a document
+        with no trailing break has an exclusive ``end`` that **is** an entry of
+        ``starts``. ``bisect_right(starts, end)`` therefore answers one past the
+        last line — a number the document has no line for — while
+        ``bisect_right(starts, end - 1)`` answers the line the chunk really ends
+        on. A hand-check of the arithmetic passes either way; only a fixture of
+        this shape separates them.
+        """
+        lines = split_lines(UNTERMINATED)
+        assert not UNTERMINATED.endswith("\n")
+
+        last = BlockSplitter().split(UNTERMINATED, SMALL)[-1]
+
+        assert last.end == len(UNTERMINATED)
+        assert last.end_line == len(lines)
+        assert lines[last.end_line - 1] == "Beta paragraph, unterminated."
+
+    def test_the_deck_is_numbered_by_the_parsers_definition_of_a_line(self) -> None:
+        """A ``str.splitlines`` derivation disagrees with the gutter on this body.
+
+        ``python-pptx`` renders a soft break as a vertical tab, which
+        ``str.splitlines`` counts as a line and neither ``markdown-it`` nor
+        ``workspace_read`` does. Numbering by the wider definition would push
+        every range after the first tab past the end of the document.
+        """
+        assert SLIDES.count("\v") == 2
+        assert len(SLIDES.splitlines()) == len(split_lines(SLIDES)) + 2
+
+        chunks = BlockSplitter().split(SLIDES, SMALL)
+
+        assert chunks
+        for chunk in chunks:
+            assert chunk.end_line is not None
+            assert chunk.end_line <= len(split_lines(SLIDES))
+
+    @pytest.mark.parametrize("name", sorted(FIXTURES))
+    def test_a_parsed_block_carries_no_range(self, name: str) -> None:
+        """A block is not a chunk, and a stamped block is the carried-through bug.
+
+        Every packing helper moves ``start`` or ``end`` by ``model_copy``, which
+        preserves an upstream pair untouched — so a range stamped at parse time
+        would name the block on a piece that is one sentence of it.
+        """
+        for block in parse_blocks(FIXTURES[name]):
+            assert block.start_line is None
+            assert block.end_line is None
+
+    def test_a_splitter_that_fills_neither_field_still_works(self) -> None:
+        """The Protocol is unchanged: nothing in the pipeline requires the pair."""
+        chunks = _WholeDocumentSplitter().split(NESTED, SMALL)
+
+        assert chunks
+        assert all(chunk.start_line is None and chunk.end_line is None for chunk in chunks)
+
+    def test_the_range_defaults_to_none_on_a_bare_span(self) -> None:
+        """``None`` is "no range was recorded", and it is the default."""
+        span = Span(start=0, end=1)
+        assert span.start_line is None
+        assert span.end_line is None
