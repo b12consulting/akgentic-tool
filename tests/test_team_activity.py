@@ -402,9 +402,11 @@ class TestReportModels:
 class TestCardShape:
     """AC2: configuration on the param models, runtime handles in PrivateAttr."""
 
-    def test_the_capability_is_on_by_default_without_a_summarizer(self) -> None:
-        """Default ``True`` resolves to a summarizer-less ``GetTeamActivity``."""
-        assert TeamTool().get_team_activity is True
+    def test_the_capability_is_off_by_default(self) -> None:
+        """The report is opt-in: a default card exposes no ``team_activity``."""
+        assert TeamTool().get_team_activity is False
+        harness = _Harness([], get_team_activity=False)
+        assert "team_activity" not in [c.__name__ for c in harness.tool.get_tools()]
 
     def test_configuration_defaults(self) -> None:
         params = GetTeamActivity()
@@ -620,12 +622,12 @@ class TestSignatureFollowsConfiguration:
 
 
 class TestBackwardCompatibility:
-    """AC2c/AC4: old payloads still validate; the new default costs no actor.
+    """AC2c/AC4: old payloads still validate; the default costs no actor.
 
-    The default flipped to ``True`` (2026-08-17 revision), so a payload that
-    predates the field now *gains* the truncate-only capability — deliberately.
-    What must not change: an explicit persisted value survives, hire/fire and the
-    prompts are untouched, and no actor is ever created without a summarizer.
+    The default is ``False`` again, so a payload that predates the field keeps
+    exactly the surface it had — the capability is opt-in. What must not change:
+    an explicit persisted value survives, hire/fire and the prompts are
+    untouched, and no actor is ever created without a summarizer.
     """
 
     def _bound_default_tool(self) -> tuple[TeamTool, _FakeOrchestrator, _FakeObserver]:
@@ -635,31 +637,29 @@ class TestBackwardCompatibility:
         tool.observer(observer)
         return tool, orchestrator, observer
 
-    def test_a_payload_without_the_field_validates_to_the_new_default(self) -> None:
+    def test_a_payload_without_the_field_validates_to_the_default(self) -> None:
         payload = TeamTool().model_dump()
         del payload["get_team_activity"]
         restored = TeamTool.model_validate(payload)
-        assert restored.get_team_activity is True
-
-    def test_a_persisted_explicit_false_survives_the_default_flip(self) -> None:
-        payload = TeamTool(get_team_activity=False).model_dump()
-        restored = TeamTool.model_validate(payload)
         assert restored.get_team_activity is False
 
-    def test_the_default_dispatch_surface_gains_only_team_activity(self) -> None:
+    def test_a_persisted_explicit_true_survives(self) -> None:
+        payload = TeamTool(get_team_activity=True).model_dump()
+        restored = TeamTool.model_validate(payload)
+        assert restored.get_team_activity is True
+
+    def test_the_default_dispatch_surface_is_unchanged(self) -> None:
         tool, _, _ = self._bound_default_tool()
 
         assert [callable_.__name__ for callable_ in tool.get_tools()] == [
             "hire_members",
             "fire_members",
-            "team_activity",
         ]
         assert set(tool.get_commands()) == {
             HireTeamMember,
             FireTeamMember,
             GetTeamRoster,
             GetRoleProfiles,
-            GetTeamActivity,
         }
         assert len(tool.get_system_prompts()) == 0
         assert [provider.__name__ for provider in tool.get_context_states()] == [
@@ -681,7 +681,6 @@ class TestBackwardCompatibility:
         assert [callable_.__name__ for callable_ in restored.get_tools()] == [
             "hire_members",
             "fire_members",
-            "team_activity",
         ]
         assert orchestrator.children_created == []
 

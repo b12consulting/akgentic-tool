@@ -311,7 +311,7 @@ class TeamTool(ToolCard):
     Provides:
     - hire_members(roles: list[str]) -> str: Hire team members
     - fire_members(names: list[str]) -> str: Fire team members
-    - team_activity() -> TeamActivityReport: Who is mid-handler (on by default, no summarizer)
+    - team_activity() -> TeamActivityReport: Who is mid-handler (opt-in, no summarizer)
     - Team roster context state: Current team composition, delivered as deltas
     - Role catalog context state: Every role and description, each marked hireable
       or not, delivered as deltas
@@ -333,7 +333,7 @@ class TeamTool(ToolCard):
     )
     get_team_activity: GetTeamActivity | bool = Field(
         default=False,
-        description="Enable the team_activity report (default: True, no summarizer)",
+        description="Enable the team_activity report (default: False, opt-in)",
     )
 
     # Runtime handle: an actor proxy is not serializable and never a field.

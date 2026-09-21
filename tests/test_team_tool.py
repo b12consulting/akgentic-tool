@@ -79,15 +79,27 @@ def test_team_tool_observer_requires_orchestrator():
 
 
 def test_team_tool_get_tools_default():
-    """TeamTool.get_tools() returns hire + fire + team_activity by default."""
+    """TeamTool.get_tools() returns hire + fire by default; team_activity is opt-in."""
     tool = TeamTool()
     tool.observer(mock_observer())
 
     tools = tool.get_tools()
-    assert len(tools) == 3
+    assert len(tools) == 2
     assert tools[0].__name__ == "hire_members"
     assert tools[1].__name__ == "fire_members"
-    assert tools[2].__name__ == "team_activity"
+
+
+def test_team_tool_get_tools_with_team_activity_enabled():
+    """Opting in adds team_activity to the dispatch surface."""
+    tool = TeamTool(get_team_activity=True)
+    tool.observer(mock_observer())
+
+    tools = tool.get_tools()
+    assert [callable_.__name__ for callable_ in tools] == [
+        "hire_members",
+        "fire_members",
+        "team_activity",
+    ]
 
 
 def test_team_tool_get_tools_disabled():
@@ -554,18 +566,36 @@ def test_fire_members_batch_partial_success():
 
 
 def test_team_tool_get_commands_default():
-    """TeamTool.get_commands() returns dict keyed by param class with 5 commands."""
+    """TeamTool.get_commands() returns dict keyed by param class with 4 commands.
+
+    ``GetTeamActivity`` is off by default, so it is absent until opted in.
+    """
     tool = TeamTool()
     tool.observer(mock_observer())
 
     commands = tool.get_commands()
-    assert len(commands) == 5
+    assert len(commands) == 4
     assert HireTeamMember in commands
     assert FireTeamMember in commands
     assert GetTeamRoster in commands
     assert GetRoleProfiles in commands
-    assert GetTeamActivity in commands
+    assert GetTeamActivity not in commands
     assert all(callable(c) for c in commands.values())
+
+
+def test_team_tool_get_commands_with_team_activity_enabled():
+    """Opting in registers the team_activity command alongside the defaults."""
+    tool = TeamTool(get_team_activity=True)
+    tool.observer(mock_observer())
+
+    commands = tool.get_commands()
+    assert set(commands) == {
+        HireTeamMember,
+        FireTeamMember,
+        GetTeamRoster,
+        GetRoleProfiles,
+        GetTeamActivity,
+    }
 
 
 def test_team_tool_get_commands_disabled():

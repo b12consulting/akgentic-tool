@@ -25,7 +25,7 @@ class TeamTool(ToolCard):
     fire_team_members: FireTeamMember | bool = True
     get_role_profiles: GetRoleProfiles | bool = True
     get_team_roster: GetTeamRoster | bool = True
-    get_team_activity: GetTeamActivity | bool = True
+    get_team_activity: GetTeamActivity | bool = False
 
     _activity_proxy: TeamActivityActor | None = PrivateAttr(default=None)
 ```
@@ -52,7 +52,7 @@ know about.
 | `fire_team_members` | `FireTeamMember \| bool` | `True` | `fire_members(names)` on `TOOL_CALL`, `fire_member(name)` on `COMMAND`. |
 | `get_team_roster` | `GetTeamRoster \| bool` | `True` | The current roster as structured context state on `LLM_CONTEXT`, delivered as per-turn deltas. |
 | `get_role_profiles` | `GetRoleProfiles \| bool` | `True` | The role catalog as structured context state on `LLM_CONTEXT`, delivered as per-turn deltas. |
-| `get_team_activity` | `GetTeamActivity \| bool` | `True` | `team_activity()` — who is mid-handler. Free by default. |
+| `get_team_activity` | `GetTeamActivity \| bool` | `False` | `team_activity()` — who is mid-handler. Opt-in; free once enabled. |
 
 ---
 
@@ -210,13 +210,13 @@ Two independent gates, and conflating them is the mistake the design exists to p
 
 | Configuration | `team_activity` | `#TeamActivity` actor | model call | `summarize_over` in the schema |
 |---|---|---|---|---|
-| `get_team_activity=False` | not exposed | not created | never | n/a |
-| `get_team_activity=True`, `summarizer=None` *(default)* | exposed, truncates | **not created** | never | **absent** |
+| `get_team_activity=False` *(default)* | not exposed | not created | never | n/a |
+| `get_team_activity=True`, `summarizer=None` | exposed, truncates | **not created** | never | **absent** |
 | `summarizer=ActivitySummarizer(...)` | exposed, summarizes | created | on demand | present |
 
-The default is on because the truncate-only report is derived from telemetry the orchestrator
-already keeps: it costs nothing, so it is safe to enable everywhere. A card persisted with an
-explicit `False` keeps it off.
+The report is off by default so the tool surface stays minimal. The truncate-only form is derived
+from telemetry the orchestrator already keeps, so enabling it costs nothing beyond the extra tool
+in the schema. A card persisted with an explicit `True` keeps it on.
 
 **The signature follows the configuration.** Without a summarizer the callable is
 `team_activity() -> TeamActivityReport` and `summarize_over` is *absent from the tool schema*, not
@@ -260,9 +260,9 @@ derivation keys stay internal: grouping is by `agent_id`, the summary cache is k
 ```python
 from akgentic.tool.team import ActivitySummarizer, GetTeamActivity, GetTeamRoster, TeamTool
 
-TeamTool()                                     # hire/fire/roster/profiles + free team_activity
+TeamTool()                                     # hire/fire/roster/profiles; no team_activity
 
-TeamTool(get_team_activity=False)              # team management only
+TeamTool(get_team_activity=True)               # + the free, truncate-only team_activity
 
 TeamTool(                                      # summaries on demand; #TeamActivity is created
     get_team_activity=GetTeamActivity(
