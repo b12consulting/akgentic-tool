@@ -222,6 +222,18 @@ def test_read_mailbox_docstring_carries_the_absorption_contract() -> None:
     assert "as its own turn" in doc
 
 
+def test_read_mailbox_docstring_restricts_use_to_a_mid_run_arrival_notice() -> None:
+    # Without this, models read the message that STARTED their run as "a message
+    # waiting in your mailbox" and spend a whole request calling read_mailbox on
+    # it — nothing to absorb, full context re-sent (issue #410).
+    card, observer = _wired_card()
+    doc = (card.get_tools()[0].__doc__ or "").lower()
+
+    assert "middle of your run" in doc
+    assert "only in answer to an arrival notice" in doc
+    assert "new message arrived" in doc  # the notice's shape, so the model can recognise it
+
+
 def test_read_mailbox_docstring_documents_message_id_and_promises_no_content() -> None:
     # pydantic-ai derives the tool schema from the signature plus this docstring,
     # so the Args: block is functional surface. And the return must not be sold

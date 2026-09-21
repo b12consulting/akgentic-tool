@@ -112,7 +112,13 @@ class MailboxTool(ToolCard):
         observer_or_none = self._observer_or_none  # bound method -> weak edge to agent
 
         def read_mailbox(message_id: str) -> str:
-            """Take on a message waiting in your mailbox, by its id.
+            """Take on a message that arrived in the MIDDLE of your run, by its id.
+
+            Call this ONLY in answer to an arrival notice — a block that appears
+            while you are already working, shaped like this:
+
+                1 new message arrived:
+                - @Human (request): Add a contributor (id: 6dc0f066-cd1f-4b69-b77b-59b8a691ed02)
 
             Naming a message here ABSORBS it: you take it on in THIS run and it
             will NOT be delivered to you again as its own turn. Deal with it

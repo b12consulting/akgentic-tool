@@ -74,6 +74,12 @@ model is expected to deal with it now. Anything left unnamed stays queued and ar
 turn later. That contract lives in the docstring the model reads, which is the only place it can
 be taught.
 
+**The docstring also says when the tool applies: only in answer to a mid-run arrival notice.** It
+quotes the notice's shape so the model can recognise one. Without
+that, models read their own triggering message as "a message waiting in your mailbox" and spend a
+whole request — full context re-sent — naming a message there is nothing to absorb from. Measured
+on a coordinator agent, that was 5 of its 41 requests in one session (#410).
+
 **What makes the acknowledgement true is `MailboxCapability`, in this package.** It reads the id
 back off the completed tool call through `after_tool_execute`, consumes that one message, and
 injects its content into the run; the message renders itself via `rendering()`. None of that
