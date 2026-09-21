@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 from akgentic.core.messages import Message
+from pydantic import ValidationError
+from pydantic_ai import Tool
 
 from akgentic.tool import ToolFactory
 from akgentic.tool.core import COMMAND, LLM_CONTEXT, ToolCard
@@ -154,7 +156,7 @@ def test_read_mailbox_takes_a_message_id_and_returns_a_non_empty_acknowledgement
     card, observer = _wired_card()
     read_mailbox = card.get_tools()[0]
 
-    acknowledgement = read_mailbox(message_id="0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0")
+    acknowledgement = read_mailbox(message_id=uuid.UUID("0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"))
     assert isinstance(acknowledgement, str)
     assert acknowledgement.strip() != ""
 
@@ -167,12 +169,12 @@ def test_the_parameter_is_named_message_id_and_is_addressable_by_that_name() -> 
     # neither test suite can see it because the halves live in separate repos.
     card, observer = _wired_card()
     # eval_str: the module carries `from __future__ import annotations`, so the
-    # raw annotation is the string "str" — and it is the resolved type that
-    # pydantic-ai turns into the tool schema.
+    # raw annotation is the string "uuid.UUID" — and it is the resolved type
+    # that pydantic-ai turns into the tool schema.
     signature = inspect.signature(card.get_tools()[0], eval_str=True)
 
     assert list(signature.parameters) == ["message_id"]
-    assert signature.parameters["message_id"].annotation is str
+    assert signature.parameters["message_id"].annotation is uuid.UUID
     assert signature.return_annotation is str
 
     # The positive form, not `is not POSITIONAL_ONLY`: the kind must be one the
@@ -192,23 +194,40 @@ def test_read_mailbox_reads_nothing_and_consumes_nothing() -> None:
     card, observer = _wired_card([waiting])
     read_mailbox = card.get_tools()[0]
 
-    read_mailbox(message_id=str(waiting.id))
+    read_mailbox(message_id=waiting.id)
 
     assert observer.calls == []
     assert observer.get_mailbox() == [waiting]
 
 
-@pytest.mark.parametrize(
-    "message_id", ["", "not-a-uuid", "  ", "an id that was never issued", "00000000"]
-)
-def test_read_mailbox_performs_no_lookup_parsing_or_validation_of_the_id(message_id: str) -> None:
-    # No uuid parsing, no membership check: resolving the id is the agent
-    # capability's job, and the card raising here would only teach the model to
-    # retry a call the card cannot answer either way.
+@pytest.mark.parametrize("message_id", [uuid.uuid4(), uuid.UUID(int=0)])
+def test_read_mailbox_performs_no_lookup_of_a_well_formed_id(message_id: uuid.UUID) -> None:
+    # No membership check: resolving the id is the agent capability's job. A
+    # well-formed id that was never issued, or was already consumed, is still
+    # acknowledged — the card raising here would only teach the model to retry a
+    # call the card cannot answer either way.
     card, observer = _wired_card([_user_message("@Alice", "hello")])
 
     assert card.get_tools()[0](message_id=message_id).strip() != ""
     assert observer.calls == []
+
+
+@pytest.mark.parametrize("message_id", ["", "not-a-uuid", "  ", "6dc0f066-...", "00000000"])
+def test_the_tool_schema_rejects_a_malformed_id_before_the_call_runs(message_id: str) -> None:
+    # Format, unlike membership, is checkable without a lookup - so it is checked
+    # at the schema, by pydantic-ai, before the body runs. A malformed id (a
+    # truncated one copied from a notice, a name) comes back to the model as a
+    # retry instead of an acknowledgement for a message nothing will absorb.
+    # Built through pydantic-ai's own Tool, since that is what the agent does.
+    card, observer = _wired_card()
+    schema = Tool(card.get_tools()[0]).function_schema
+
+    assert schema.json_schema["properties"]["message_id"]["format"] == "uuid"
+    with pytest.raises(ValidationError):
+        schema.validator.validate_python({"message_id": message_id})
+    well_formed = "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0"
+    validated = schema.validator.validate_python({"message_id": well_formed})
+    assert validated["message_id"] == uuid.UUID(well_formed)
 
 
 def test_read_mailbox_docstring_carries_the_absorption_contract() -> None:
@@ -256,7 +275,7 @@ def test_read_mailbox_after_observer_collected_raises_tool_observer_gone() -> No
     del observer
     gc.collect()
     with pytest.raises(ToolObserverGone):
-        read_mailbox(message_id="any id at all")
+        read_mailbox(message_id=uuid.uuid4())
 
 
 # ── the deletions (AC 3) ─────────────────────────────────────────────────────

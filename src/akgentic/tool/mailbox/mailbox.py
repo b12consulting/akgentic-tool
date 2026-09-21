@@ -26,6 +26,9 @@ the agent's offer rule now (ADR-010 §7), not a filter here.
 
 from __future__ import annotations
 
+# Runtime import, not TYPE_CHECKING: pydantic-ai resolves read_mailbox's string
+# annotation against this module's globals to build the tool schema.
+import uuid
 from collections.abc import Callable
 from inspect import cleandoc
 from typing import Any
@@ -111,7 +114,7 @@ class MailboxTool(ToolCard):
         """
         observer_or_none = self._observer_or_none  # bound method -> weak edge to agent
 
-        def read_mailbox(message_id: str) -> str:
+        def read_mailbox(message_id: uuid.UUID) -> str:
             """Take on a message that arrived in the MIDDLE of your run, by its id.
 
             Call this ONLY in answer to an arrival notice — a block that appears
@@ -127,8 +130,9 @@ class MailboxTool(ToolCard):
             turn later, so name a message only when you mean to handle it.
 
             Args:
-                message_id: The id of the message to take on, exactly as it was
+                message_id: The UUID of the message to take on, exactly as it was
                     given to you in the notice announcing that message's arrival.
+                    A malformed id is rejected before the call runs.
 
             Returns:
                 A short confirmation that the message is yours for this run. The

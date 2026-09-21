@@ -57,16 +57,27 @@ rule, not a mailbox quirk.
 ### `TOOL_CALL` — `read_mailbox(message_id)`
 
 ```python
-def read_mailbox(message_id: str) -> str: ...
+def read_mailbox(message_id: uuid.UUID) -> str: ...
 ```
 
 **A signal, not a read.** The call takes the id of one message waiting in the agent's mailbox,
 checks the owning agent is still alive, and returns a short acknowledgement. That is the whole
 body: it reads nothing, consumes nothing and renders nothing.
 
-**It deliberately does not validate the id.** There is no useful thing the card could do with a bad
-one — it holds no content to withhold and can offer the model no error it could act on — and
-looking an id up would put `get_mailbox` back into a card that has just stopped calling it.
+**The id's format is checked; its existence is not.** `message_id` is typed `uuid.UUID`, so the tool
+schema declares `"format": "uuid"` and pydantic-ai rejects a malformed id — a truncated one copied
+from a notice, a name — *before* the body runs, handing the model a retry instead of an
+acknowledgement for a message nothing will absorb (#410). Format needs no lookup, so it costs the
+card nothing. Membership is a different matter: the card deliberately does not look the id up. There
+is no useful thing it could do with a well-formed id that was never issued or was already consumed —
+it holds no content to withhold and can offer the model no error it could act on — and a lookup would
+put `get_mailbox` back into a card that has just stopped calling it. Such an id is acknowledged, and
+`MailboxCapability` logs that it absorbed nothing.
+
+The retry is bounded by the agent's tool-retry budget (`retries`, 3 by default in akgentic-llm): a
+model that keeps sending a malformed id past it fails the run, where an untyped `str` never could.
+That trade is taken deliberately — the id comes from an arrival notice that prints it in full, so a
+correct copy is the normal case, and a silent false acknowledgement was the worse failure.
 
 **The absorption contract survives; what changed is the mechanism, not the promise.** Naming a
 message takes it on in the current run: it will not be delivered again as its own turn, so the
@@ -75,10 +86,10 @@ turn later. That contract lives in the docstring the model reads, which is the o
 be taught.
 
 **The docstring also says when the tool applies: only in answer to a mid-run arrival notice.** It
-quotes the notice's shape so the model can recognise one. Without
-that, models read their own triggering message as "a message waiting in your mailbox" and spend a
-whole request — full context re-sent — naming a message there is nothing to absorb from. Measured
-on a coordinator agent, that was 5 of its 41 requests in one session (#410).
+quotes the notice's shape, with a full id, so the model can recognise one. Without that, models read
+their own triggering message as "a message waiting in your mailbox" and spend a whole request — full
+context re-sent — naming a message there is nothing to absorb from. Measured on a coordinator agent,
+that was 5 of its 41 requests in one session (#410).
 
 **What makes the acknowledgement true is `MailboxCapability`, in this package.** It reads the id
 back off the completed tool call through `after_tool_execute`, consumes that one message, and
@@ -93,10 +104,12 @@ fact — the same duplication that got the card's `LLM_CONTEXT` half deleted in 
 
 #### `message_id` is a contract with another repository
 
-The documented signature is `read_mailbox(message_id: str) -> str`, and the parameter name is part
-of the contract: `MailboxCapability` reads the id out of the completed tool call's arguments **by
-name**, through the `MESSAGE_ID_ARG` constant. Rename one side only and the suite stays green while
-in production the model names a message and silently receives nothing — no exception, no log line.
+The documented signature is `read_mailbox(message_id: uuid.UUID) -> str`, and the parameter name is
+part of the contract: `MailboxCapability` reads the id out of the completed tool call's arguments
+**by name**, through the `MESSAGE_ID_ARG` constant. Rename one side only and the suite stays green
+while in production the model names a message and silently receives nothing — no exception, no log
+line. The capability parses whatever it reads with `uuid.UUID(str(raw_id))`, so it accepts the
+argument both as the raw JSON string and as the validated `UUID`.
 
 Both sides now live in this package, so a rename is a local change rather than a coordinated
 two-repository release — but it is still a rename of *two* things, and the type system will not
