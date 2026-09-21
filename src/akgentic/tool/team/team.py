@@ -332,7 +332,7 @@ class TeamTool(ToolCard):
         description="Expose the team roster as structured context state (default: True)",
     )
     get_team_activity: GetTeamActivity | bool = Field(
-        default=True,
+        default=False,
         description="Enable the team_activity report (default: True, no summarizer)",
     )
 
