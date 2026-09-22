@@ -1429,7 +1429,8 @@ loading model, and the failure modes worth knowing.
 ### MailboxTool
 
 The agent's own mailbox as a capability, on two channels: `read_mailbox` on `TOOL_CALL` — a
-**signal** naming one waiting message by id — and the `/stop` cancellation surface on `COMMAND`.
+**signal** naming, by its UUID, one message announced by a mid-run arrival notice — and the `/stop`
+cancellation surface on `COMMAND`.
 The card creates no actor and performs no proxy round trip.
 
 ```python
