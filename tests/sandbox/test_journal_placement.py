@@ -6,11 +6,11 @@ and ``sh`` are on the list, so ``bash -c "git reset --hard"`` walks straight pas
 it. That is asserted here too, so nobody reads the removal as a boundary.
 
 **The boundary is a filesystem fact.** The journal lives at the sibling
-``<root>.git``, and every backend that constructs a mount names the workspace
-root and nothing above or beside it. These tests put a journal directory next to
-the tree and confirm it appears in no constructed argument and no rendered
-policy — a regression guard, so that a later "just mount the parent"
-convenience cannot destroy a team's history silently.
+``<root>.git``, and the Docker container's mount names the workspace root and
+nothing above or beside it. This test puts a journal directory next to the tree
+and confirms it appears in no mount the backend constructs — a regression guard,
+so that a later "just mount the parent" convenience cannot destroy a team's
+history silently.
 
 The placement rule is a property of the **mount**, so every spec here drives a
 backend directly: the argv is built inside the strategy and there is no actor
@@ -26,10 +26,7 @@ from typing import Any
 import pytest
 
 from akgentic.tool.sandbox.backend import ALLOWED_COMMANDS
-from akgentic.tool.sandbox.bwrap import BwrapBackend
 from akgentic.tool.sandbox.docker import DockerBackend
-from akgentic.tool.sandbox.local import LocalBackend
-from akgentic.tool.sandbox.seatbelt import SeatbeltBackend
 from akgentic.tool.workspace.journal import git_dir_for
 
 
@@ -44,48 +41,7 @@ def tree_with_journal(tmp_path: Path) -> Path:
     return root
 
 
-def fake_popen(seen: list[list[str]]) -> Any:
-    """Return a ``Popen`` stand-in that records its argv into *seen*."""
-
-    def spawn(argv: list[str], *args: Any, **kwargs: Any) -> Any:
-        seen.append(list(argv))
-        return SimpleNamespace(
-            communicate=lambda timeout=None: ("", ""),
-            returncode=0,
-            kill=lambda: None,
-            pid=4242,
-        )
-
-    return spawn
-
-
-def captured_argv(
-    backend_class: type[Any], root: Path, monkeypatch: pytest.MonkeyPatch
-) -> list[str]:
-    """Run one command through a *backend_class* rooted at *root* and return its argv."""
-    backend = backend_class()
-    backend.workspace_path = root
-
-    seen: list[list[str]] = []
-
-    # One target for all: the argv is built per backend but spawned in the one
-    # place ``ProcessBackend`` starts a process from.
-    monkeypatch.setattr("akgentic.tool.sandbox.backend.subprocess.Popen", fake_popen(seen))
-    backend.exec("echo hi", "", 1.0)
-    assert len(seen) == 1
-    return seen[0]
-
-
 class TestTheJournalIsOutsideEveryMount:
-    def test_bwrap_binds_the_root_and_nothing_beside_it(
-        self, tree_with_journal: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        argv = captured_argv(BwrapBackend, tree_with_journal, monkeypatch)
-
-        assert argv[argv.index("--bind") + 1] == str(tree_with_journal)
-        assert str(git_dir_for(tree_with_journal)) not in argv
-        assert str(tree_with_journal.parent) not in argv
-
     def test_docker_mounts_the_root_and_nothing_beside_it(
         self, tree_with_journal: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -120,59 +76,6 @@ class TestTheJournalIsOutsideEveryMount:
             assert str(git_dir_for(tree_with_journal)) not in volume
             assert str(tree_with_journal.parent) not in volume.split(":")[0] or volume in workspace
 
-    def test_the_seatbelt_policy_makes_only_the_root_writable(
-        self, tree_with_journal: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        rendered: list[str] = []
-        backend = SeatbeltBackend()
-        backend.workspace_path = tree_with_journal
-
-        import tempfile  # noqa: PLC0415
-
-        real_named = tempfile.NamedTemporaryFile
-
-        def capturing_named(*args: Any, **kwargs: Any) -> Any:
-            handle = real_named(*args, **kwargs)
-            real_write_method = handle.write
-
-            def write(text: str) -> int:
-                rendered.append(text)
-                return real_write_method(text)
-
-            handle.write = write  # type: ignore[method-assign]
-            return handle
-
-        monkeypatch.setattr(
-            "akgentic.tool.sandbox.seatbelt.tempfile.NamedTemporaryFile", capturing_named
-        )
-        monkeypatch.setattr(
-            "akgentic.tool.sandbox.backend.subprocess.Popen",
-            lambda *a, **k: SimpleNamespace(
-                communicate=lambda timeout=None: ("", ""),
-                returncode=0,
-                kill=lambda: None,
-                pid=4242,
-            ),
-        )
-        backend.exec("echo hi", "", 1.0)
-
-        policy = rendered[0]
-        assert f'(allow file-write* (subpath "{tree_with_journal}"))' in policy
-        journal = str(git_dir_for(tree_with_journal))
-        write_rules = [line for line in policy.splitlines() if "file-write" in line]
-        assert not any(journal in rule for rule in write_rules)
-
-    def test_local_provides_no_isolation_and_this_test_says_so(
-        self, tree_with_journal: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # Stated rather than pretended: LocalBackend runs a plain subprocess
-        # with a cwd, so the journal beside the tree is reachable from it
-        # exactly as any other path on the host is. It is a development
-        # convenience, not a boundary, and the class docstring says so.
-        argv = captured_argv(LocalBackend, tree_with_journal, monkeypatch)
-
-        assert argv == ["echo", "hi"]
-
 
 class TestTheAllowlistIsNotTheBoundary:
     def test_git_is_on_the_list_and_the_mount_is_what_protects_the_journal(self) -> None:
@@ -180,7 +83,7 @@ class TestTheAllowlistIsNotTheBoundary:
         # when the allowlist was widened for real work. Nothing was lost, which
         # is the point of this class: the guarantee that holds is asserted by the
         # tests above — the journal lives at the sibling <root>.git, outside
-        # every isolating backend's mount, so a `git reset --hard` from inside
+        # the container's mount, so a `git reset --hard` from inside
         # the sandbox cannot reach it whether or not the binary is reachable.
         assert "git" in ALLOWED_COMMANDS
 

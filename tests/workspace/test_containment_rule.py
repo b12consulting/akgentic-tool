@@ -292,9 +292,9 @@ class TestNothingReachesIntoTheFilesystem:
     def test_no_module_reaches_a_private_attribute_of_the_filesystem(self) -> None:
         """AST, not a text search: a docstring naming ``_root`` is documentation.
 
-        ``GitJournal._root`` and ``LocalBackend._root`` are each that class's own
-        attribute over a different tree, reached as ``self._root`` — which is why
-        the sweep exempts ``self`` rather than exempting a file.
+        ``GitJournal._root`` is that class's own attribute over a different tree,
+        reached as ``self._root`` — which is why the sweep exempts ``self`` rather
+        than exempting a file.
         """
         sources = _tool_sources()
         offenders = [

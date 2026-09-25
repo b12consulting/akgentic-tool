@@ -1,7 +1,12 @@
-"""LocalBackend — subprocess-based sandbox for local filesystem execution.
+"""LocalBackend — a host-process backend that exists for the test suite only.
 
-A plain strategy, built by ``resolve_mode`` and owned by ``#Workspace``'s
-``ExecRunner``; no actor stands between the workspace and the process.
+The shipped sandbox is Docker and nothing else. This backend stays because
+:class:`~akgentic.tool.sandbox.backend.ProcessBackend`'s handle, kill and
+process-group machinery — which ``DockerBackend`` inherits — needs a real
+process to be exercised against, and a spec cannot count on a Docker daemon.
+It runs a plain subprocess rooted at the workspace, with no isolation. It does
+not ship: install it at ``akgentic.tool.sandbox.SANDBOX_BACKEND`` from a spec,
+and restore the slot afterwards.
 """
 
 from __future__ import annotations
@@ -113,8 +118,8 @@ class LocalBackend(ProcessBackend):
     gate and the journal are working on. No Docker daemon required.
 
     This backend does NOT provide filesystem isolation — an allowed command can
-    still read files outside the workspace. It is a development convenience only,
-    not a production security boundary.
+    still read files outside the workspace. It is a test fixture only, not a
+    security boundary.
     """
 
     def __init__(self) -> None:

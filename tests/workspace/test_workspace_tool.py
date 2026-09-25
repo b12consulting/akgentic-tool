@@ -1407,7 +1407,7 @@ class TestTheCardResolvesOnceAndCarriesThePathVerbatim:
             (workspaces_root / "alice" / "_id" / leaf).mkdir(parents=True, exist_ok=True)
             card = WorkspaceTool(
                 workspace_id=leaf,
-                workspace_exec=WorkspaceExec(mode="local", poll_attempts=0),
+                workspace_exec=WorkspaceExec(poll_attempts=0),
             )
             card.observer(
                 FakeActorToolObserver(orchestrator_proxy, name=leaf, user_id="alice")

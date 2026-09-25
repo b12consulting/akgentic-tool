@@ -25,7 +25,7 @@ from akgentic.tool.sandbox.backend import (
     ExecResult,
     validate_command,
 )
-from akgentic.tool.sandbox.local import LocalBackend
+from tests.sandbox._process_backend import LocalBackend
 
 POPEN = "akgentic.tool.sandbox.backend.subprocess.Popen"
 

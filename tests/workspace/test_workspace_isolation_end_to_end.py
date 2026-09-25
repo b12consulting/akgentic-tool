@@ -147,9 +147,7 @@ def _capabilities(config: MemberConfig) -> dict[str, Any]:
         fields["workspace_rag_index"] = True
     if config.exec_local:
         # A tight poll so a completed run is answered in the call that started it.
-        fields["workspace_exec"] = WorkspaceExec(
-            mode="local", poll_attempts=500, poll_delay_seconds=0.01
-        )
+        fields["workspace_exec"] = WorkspaceExec(poll_attempts=500, poll_delay_seconds=0.01)
     return fields
 
 

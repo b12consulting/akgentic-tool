@@ -176,7 +176,6 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "render_file_patch",
         "resolve_document_store",
         "resolve_lock_backend",
-        "resolve_mode",
         "sanitise_command",
         "sanitise_email_local",
         "sanitise_name",

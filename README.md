@@ -760,8 +760,8 @@ cannot both see.
 
 **Centralised processing.** One embedding path, one sandbox, one store, rather than N. The
 expensive machinery is built once, and configuration that must agree — which model embeds, which
-sandbox mode is permitted — is decided in one place instead of being replicated per agent and left
-to drift.
+tree a sandbox mounts — is decided in one place instead of being replicated per agent and left to
+drift.
 
 **No locks.** An actor processes one message at a time, so a tool actor's mutations cannot
 interleave. Two agents updating the graph in the same instant are serialised by the mailbox, not by
@@ -1043,9 +1043,9 @@ are the index; the detail lives beside the module it documents.
 | `ModelTool` | `akgentic.tool.model` | The model roster listed, the switch between its entries, and the resulting selection persisted | [README](src/akgentic/tool/model/README.md) |
 | `MCPTool` | `akgentic.tool.mcp` | External MCP servers as pydantic-ai toolsets | [README](src/akgentic/tool/mcp/README.md) |
 
-The sandbox *backend* `WorkspaceTool.workspace_exec` runs on — the four isolation backends, the
-allowlist, the Docker image and the registry a deployment injects its own backend into — has its
-own reference beside the code: [`src/akgentic/tool/sandbox/README.md`](src/akgentic/tool/sandbox/README.md).
+The sandbox *backend* `WorkspaceTool.workspace_exec` runs on — Docker, with no mode and no
+fallback, the allowlist, the Docker image and the `SANDBOX_BACKEND` slot a deployment assigns its
+own backend to — has its own reference beside the code: [`src/akgentic/tool/sandbox/README.md`](src/akgentic/tool/sandbox/README.md).
 It is not a card.
 
 ### WorkspaceTool
@@ -1808,18 +1808,15 @@ src/akgentic/tool/
         readers.py            # DocumentReader (Pydantic BaseModel), TEXT_EXTENSIONS
         └── tool.py           # WorkspaceTool ToolCard
     sandbox/
-        README.md           # The exec backend — backends compared, allowlist, image,
-        │                     #   registering a backend; the ExecTool and sandbox-actor migrations
-        __init__.py           # Public exports: the four backends, the Protocol, the registry;
-        │                     #   refuses `ExecTool` by name with a pointer to workspace_exec
+        README.md           # The exec backend — Docker only, allowlist, image, replacing
+        │                     #   the backend; the ExecTool, sandbox-actor and Docker-only migrations
+        __init__.py           # Public exports: DockerBackend, the Protocol, the SANDBOX_BACKEND
+        │                     #   slot; refuses `ExecTool` and the removed backends by name
         backend.py            # SandboxBackend (Protocol), ProcessBackend (the Popen dance, once),
         │                     #   ExecResult, ExecReport, ALLOWED_COMMANDS, validate_command()
-        local.py              # LocalBackend (subprocess, resource limits, process group)
         docker.py             # DockerBackend (ephemeral read-only container per workspace tree)
-        seatbelt.py           # SeatbeltBackend (macOS Apple Seatbelt)
-        bwrap.py              # BwrapBackend (Linux bubblewrap)
-        registry.py           # SANDBOX_BACKEND_CLASSES registry, auto-mode probing
-        └── sandbox.Dockerfile # Bundled image definition for akgentic-sandbox:v2
+        registry.py           # SANDBOX_BACKEND — the one backend class, DockerBackend by default
+        └── sandbox.Dockerfile # Bundled image definition for akgentic-sandbox:v3
 tests/                        # Tests organised by domain
 ```
 

@@ -42,6 +42,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 from akgentic.core.agent_state import BaseState
+from akgentic.tool import sandbox
 from akgentic.tool.core.deferred import DeferredResultActor
 from akgentic.tool.sandbox.backend import ExecReport
 from akgentic.tool.workspace.execution import (
@@ -58,7 +59,6 @@ from akgentic.tool.workspace.execution import (
     RunningExec,
     effective_budget,
     lock_unavailable,
-    resolve_mode,
     unconfigured,
 )
 from akgentic.tool.workspace.lock import LEASE_GRACE_S, LockBackend, LockTicket
@@ -187,10 +187,14 @@ class ExecMixin(_ExecBase):
         after its ``attach``.
 
         **This is the one place a backend is built**, and it is here because
-        :class:`ExecConfig` is the one place ``mode``, ``workspace_path`` and
-        ``timeout_s`` all arrive together. Nothing is
-        probed, created or started by the construction: the container is
-        provisioned by the worker thread on the first command.
+        :class:`ExecConfig` is the one place ``workspace_path`` and
+        ``timeout_s`` arrive together. The class is whatever is installed at
+        ``akgentic.tool.sandbox.SANDBOX_BACKEND``, **read through the package
+        now, at call time** — a name bound at import would miss a deployment's
+        later assignment. Nothing is probed, created or started by the
+        construction: the container is provisioned by the worker thread on the
+        first command, and a host without Docker fails that command, not this
+        call.
 
         Last writer wins, and that is correct: two exec-capable cards over one
         tree must agree on the backend anyway. What is new is that overwriting
@@ -211,7 +215,7 @@ class ExecMixin(_ExecBase):
         than a lock nobody can see.
 
         **The old runner is released before the new one exists**, which leaves
-        one window worth naming: a registered backend whose *constructor* raises
+        one window worth naming: an installed backend whose *constructor* raises
         strands this actor holding the runner it has just stopped, under the
         config it has just kept — and the equality check above then short-circuits
         every later announcement, so it holds it for good. It is left this way
@@ -220,12 +224,12 @@ class ExecMixin(_ExecBase):
         reports the stopped backend's error, which is an answer its caller reads.
 
         Args:
-            config: The resolved backend, the tree, and the run budget.
+            config: The tree and the run budget.
         """
         if self._exec_config == config and self._runner is not None:
             return
         self._stop_runner()
-        _mode, backend = resolve_mode(config.mode)
+        backend = sandbox.SANDBOX_BACKEND()
         self._runner = ExecRunner(backend, config.workspace_path)
         self._exec_config = config
 
@@ -803,9 +807,9 @@ class ExecMixin(_ExecBase):
         genuinely wedged in that second drain still stops **this actor** in
         bounded time and still blocks the **process** from exiting. The ordinary
         wedge — a shell's forked command holding the pipes — is closed by the
-        backend's group kill on ``local`` and ``bwrap``; what can still wedge
-        the worker is a process that left the group on its own, or docker's
-        in-container process, which only ``stop()``'s removal ends.
+        group kill of a host-process backend that makes one; what can still
+        wedge the worker is a process that left the group on its own, or
+        docker's in-container process, which only ``stop()``'s removal ends.
         """
         pending = self._pending
         if pending is not None:
