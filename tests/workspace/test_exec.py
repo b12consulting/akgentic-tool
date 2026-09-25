@@ -20,7 +20,7 @@ from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, ClassVar
+from typing import Any, ClassVar, NoReturn
 
 import pykka
 import pytest
@@ -2108,15 +2108,15 @@ class _NoSpawn:
     def __init__(self) -> None:
         self.spawns: list[object] = []
 
-    def Popen(self, *args: Any, **kwargs: Any) -> Any:  # noqa: N802 — mirrors subprocess
+    def Popen(self, *args: Any, **kwargs: Any) -> NoReturn:  # noqa: N802 — mirrors subprocess
         self.spawns.append(args)
         raise AssertionError(f"the sandbox started a process: {args!r}")
 
-    def run(self, *args: Any, **kwargs: Any) -> Any:
+    def run(self, *args: Any, **kwargs: Any) -> NoReturn:
         self.spawns.append(args)
         raise AssertionError(f"the sandbox started a process: {args!r}")
 
-    def __getattr__(self, name: str) -> Any:
+    def __getattr__(self, name: str) -> Any:  # Any: delegates to the whole subprocess module
         return getattr(subprocess, name)
 
 
@@ -3809,10 +3809,13 @@ class TestAStoredModeIsIgnored:
 ##
 
 _EXEC_CHILD = """
+import akgentic.tool.sandbox
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.tool import WorkspaceExec
+from tests.sandbox._process_backend import LocalBackend
 from tests.workspace.conftest import tool_named
 
+akgentic.tool.sandbox.SANDBOX_BACKEND = LocalBackend
 card = bind("child", workspace_exec=WorkspaceExec(poll_attempts=0))
 try:
     print("RAN " + tool_named(card, "workspace_exec")("echo hi"), flush=True)
@@ -3820,6 +3823,10 @@ except RetriableError as exc:
     print("REFUSED " + str(exc), flush=True)
 """
 """A second interpreter that binds the real card and asks to run a command.
+
+The child installs the test ``LocalBackend`` at the slot itself — the parent's
+install does not cross the process boundary — so a regressed hold runs a host
+process and exits at once instead of provisioning a real Docker container.
 
 Driven through ``workspace_exec`` rather than through ``request_exec``, because
 what the guard has to produce is the sentence the **agent** reads: the closure
