@@ -557,10 +557,9 @@ class FileLockBackend:
 LOCK_BACKEND_CLASSES: dict[str, type[LockBackend]] = {"file": FileLockBackend}
 """The registry, with the one entry this story ships.
 
-Shaped like ``SANDBOX_BACKEND_CLASSES``: a mutable dict a deployment assigns its
-own backend into, resolved **at call time** so an entry registered after this
-module was imported is still found. A Redis or Dapr hold is a second entry here
-and nothing else.
+A mutable dict a deployment assigns its own backend into, resolved **at call
+time** so an entry registered after this module was imported is still found. A
+Redis or Dapr hold is a second entry here and nothing else.
 """
 
 
@@ -569,9 +568,8 @@ def resolve_lock_backend() -> LockBackend:
 
     Called at bind time, unconditionally, beside ``get_workspace`` — so a typo
     in the variable fails the bind in front of the admin who set it rather than
-    at the first command, exactly as
-    :func:`~akgentic.tool.workspace.execution.resolve_mode` already fails for an
-    unknown sandbox mode.
+    at the first command: a misspelt backend name is a configuration error, and
+    configuration errors belong at start-up.
 
     An **empty** value falls back rather than being honoured: a compose file
     interpolating an unset variable and a bare ``FOO=`` in an env file both

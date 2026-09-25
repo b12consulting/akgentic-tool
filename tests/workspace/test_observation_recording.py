@@ -694,9 +694,7 @@ def _card_shape(
         return card, f"{DEFAULT_TEST_PRINCIPAL}/_meta/customer_id-ACME__case_id-42"
     if shape == "exec":
         request.getfixturevalue("sandbox_script")
-        card = WorkspaceTool(
-            workspace_id=WORKSPACE_NAME, workspace_exec=WorkspaceExec(mode="local")
-        )
+        card = WorkspaceTool(workspace_id=WORKSPACE_NAME, workspace_exec=WorkspaceExec())
         return card, WORKSPACE_PATH
     assert shape == "rag"
     pytest.importorskip("numpy", reason="the [vector_search] extra is not installed")

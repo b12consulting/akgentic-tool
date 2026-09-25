@@ -94,7 +94,6 @@ from akgentic.tool.workspace.execution import (
     in_progress,
     lock_unavailable,
     poll_attempts_within,
-    resolve_mode,
     timed_out,
 )
 from akgentic.tool.workspace.journal import (
@@ -260,7 +259,6 @@ __all__ = [
     "new_run_id",
     "poll_attempts_within",
     "resolve_lock_backend",
-    "resolve_mode",
     "sanitise_command",
     "timed_out",
     "MutationOutcome",

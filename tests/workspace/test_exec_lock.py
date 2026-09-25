@@ -125,7 +125,7 @@ class TestTheProtocolAndItsModels:
 
     def test_the_backend_takes_no_constructor_arguments(self) -> None:
         # What lets the registry build any entry with no type switch, exactly as
-        # ``SANDBOX_BACKEND_CLASSES[resolved]()`` does.
+        # ``configure_exec`` builds the sandbox backend from its slot.
         assert FileLockBackend() is not None
 
 

@@ -10,6 +10,8 @@ from unittest.mock import patch
 import pytest
 from akgentic.core.actor_address import ActorAddress
 
+import akgentic.tool.sandbox
+from akgentic.tool.sandbox.docker import DockerBackend
 from akgentic.tool.vector_store.backends.qdrant import QDRANT_API_KEY_ENV, QDRANT_URL_ENV
 from akgentic.tool.vector_store.backends.weaviate import WEAVIATE_API_KEY_ENV, WEAVIATE_URL_ENV
 from akgentic.tool.workspace.workspace import SHARED_KINDS_ENV
@@ -18,11 +20,27 @@ from akgentic.tool.workspace.workspace import SHARED_KINDS_ENV
 MOCK_CHILD_PID = 4242
 
 
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item: pytest.Item, nextitem: pytest.Item | None) -> Iterator[None]:
+    """Fail the spec that leaves a class installed at ``SANDBOX_BACKEND``.
+
+    The slot is module state: a fake left behind turns an unrelated spec that
+    runs later — in another order, on another xdist worker — into a test of the
+    fake. A hook rather than an autouse fixture, because it has to look **after
+    every fixture's teardown**, ``monkeypatch``'s undo included, and a fixture
+    cannot promise to be torn down last.
+    """
+    yield
+    assert akgentic.tool.sandbox.SANDBOX_BACKEND is DockerBackend, (
+        f"{item.nodeid} left {akgentic.tool.sandbox.SANDBOX_BACKEND!r} installed at SANDBOX_BACKEND"
+    )
+
+
 @pytest.fixture(autouse=True)
 def _no_group_kill_on_the_mock_pid() -> Iterator[None]:
     """Refuse a real ``os.killpg`` aimed at the fake process's pid.
 
-    ``local`` and ``bwrap`` spawn under ``process_group=True``, so a spec that
+    The test ``LocalBackend`` spawns under ``process_group=True``, so a spec that
     mocks ``Popen`` and then reaches the timeout or ``kill()`` path without
     patching ``os.killpg`` would send ``SIGKILL`` to whatever real process group
     happens to own pid 4242 on this host. Every such spec patches ``killpg``

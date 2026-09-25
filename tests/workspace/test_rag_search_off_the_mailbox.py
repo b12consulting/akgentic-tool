@@ -411,7 +411,7 @@ def wired(
     card = WorkspaceTool(
         workspace_id=WORKSPACE_NAME,
         workspace_rag_search=True,
-        workspace_exec=WorkspaceExec(mode="local", poll_attempts=1, poll_delay_seconds=0.0),
+        workspace_exec=WorkspaceExec(poll_attempts=1, poll_delay_seconds=0.0),
         vector_store=VectorStoreParam(backend="weaviate"),
     )
     with factory_for("weaviate", lambda _context: store):

@@ -1,6 +1,6 @@
 """DockerBackend — an ephemeral Docker container as compute for one tree.
 
-A plain strategy, built by ``resolve_mode`` and owned by ``#Workspace``'s
+A plain strategy, built from the ``SANDBOX_BACKEND`` slot and owned by ``#Workspace``'s
 ``ExecRunner``; no actor stands between the workspace and the container, and
 no container name is persisted anywhere.
 """
@@ -52,7 +52,7 @@ Debian base and installs LibreOffice, the PDF tooling, Node 18 and a Python
 scientific stack, so *minutes* is the honest figure; ten of them is a ceiling
 rather than an expectation. It is deliberately far above any exec budget: the
 run that triggers a build has long since handed its caller a run id, and the
-alternative to waiting is a deployment where docker mode never works at all.
+alternative to waiting is a deployment where Docker never works at all.
 
 **A bound is owed because the build is on the worker thread.** It used to run
 inside the sandbox actor's ``on_start`` where an unbounded 78-second build was

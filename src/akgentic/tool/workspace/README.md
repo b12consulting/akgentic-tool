@@ -319,13 +319,16 @@ later card of the team, silently and with no way to correct it short of tearing 
 ## Sandboxed execution — `workspace_exec`
 
 Off by default, and that is a security decision rather than a style one: `True` would give every
-`WorkspaceTool()` in existence sandboxed shell execution through a dependency bump, probe the host
-for docker at wiring time, and bring up a sandbox actor in teams that never asked for one.
+`WorkspaceTool()` in existence sandboxed shell execution through a dependency bump, and a Docker
+container on the first command, in teams that never asked for one.
 
 ```python
-WorkspaceTool(workspace_exec=True)                          # auto backend, 15 s commands
-WorkspaceTool(workspace_exec=WorkspaceExec(mode="docker"))  # deterministic toolchain
+WorkspaceTool(workspace_exec=True)                          # Docker, 15 s commands
+WorkspaceTool(workspace_exec=WorkspaceExec(timeout_s=8.0))  # tighter command budget
 ```
+
+The sandbox is Docker and has no mode: there is nothing to choose on the card, and a host without
+Docker fails the first `workspace_exec` run rather than the bind.
 
 Enabling it registers **two** callables — `workspace_exec` and `workspace_exec_result` — from one
 field. They go together deliberately: a result collector with nothing to collect is a foot-gun.
@@ -699,15 +702,15 @@ WorkspaceTool(
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `expose` | `set[Channels]` | `{TOOL_CALL}` | Taking exec off this channel withholds both callables **and** skips the wiring entirely — no host probe, no sandbox actor. |
-| `mode` | `"local" \| "bwrap" \| "seatbelt" \| "docker" \| "auto"` | `"auto"` | The isolation backend. `"auto"` probes the host at wiring time (`bwrap` → `seatbelt` → `docker` → `local`) and warns when it falls through to `local`. A mode naming no registered backend raises `KeyError` at wiring time, deliberately. |
+| `expose` | `set[Channels]` | `{TOOL_CALL}` | Taking exec off this channel withholds both callables **and** skips the wiring entirely — no backend is built and no actor is created. |
 | `timeout_s` | `float` | `15.0` | Budget for the **subprocess**, handed to the backend. Capped at `MAX_EXEC_BUDGET_S` (20 s), which sits below the orchestrator's 30 s stop backstop. |
 | `poll_attempts` | `int` | `-1` | How many times the agent's own thread looks for a result. `-1` is the sentinel for "wait out my run" — resolved at wiring into the count whose last look falls as late as it still can inside the effective run budget plus a report margin, so an ordinary command returns its own output and the model never sees a run id; a positive count is a bounded look clamped to that budget without the margin; `0` opts out of polling and takes the run id immediately. Below `-1` is a validation error. |
 | `poll_delay_seconds` | `float` | `0.5` | Seconds between those looks — the granularity of the wait, not its length. The length comes from `poll_attempts` resolved against the run budget, and can never outlast the run it waits for: past that point there is nothing left to wait for. |
 
-None of these reaches an LLM-facing signature: nothing lets a model name a mode, a timeout, or a
-git argument. See the [sandbox backend reference](../sandbox/README.md) for what each backend
-actually isolates, the bundled Docker image, and how to register a backend of your own.
+None of these reaches an LLM-facing signature: nothing lets a model name a timeout or a git
+argument. There is no `mode` field any more — a stored card that still carries one loads and ignores
+it. See the [sandbox backend reference](../sandbox/README.md) for what the Docker backend isolates,
+the bundled image, and how a deployment replaces the backend with one of its own.
 
 ---
 
@@ -1148,7 +1151,7 @@ WorkspaceTool(
 | `[docs]` (markitdown) | `workspace_read` on a binary extension raises `ImportError` with the install command. Text files are unaffected. |
 | `[vision]` (Pillow) | `workspace_view` logs one warning and returns unresized bytes. Nothing fails. |
 | `git` off `PATH` | The journal degrades off with one warning. The gate is unaffected. |
-| No isolation backend | `mode="auto"` falls through to `local` with a `DeprecationWarning`: commands run as a plain subprocess with no filesystem isolation. |
+| No Docker on the host | The first `workspace_exec` run fails with *docker CLI not found on PATH*; binding is unaffected. Nothing falls back to an unisolated subprocess. |
 | The store cannot be resolved | Every retrieval callable answers *"Retrieval indexing is not available for this workspace."* — one warning at bind time, nothing raised. The card creates its own store when the backend needs one, so this is an unreachable cluster or a collection that could not be created, not a missing card. |
 | `[vector_search]` (numpy) | The in-memory vector backend cannot be built. Retrieval degrades as above; nothing else on the card changes. |
 

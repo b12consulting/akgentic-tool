@@ -3,8 +3,9 @@
 A backend is a plain strategy: no actor, no mailbox, no lifecycle beyond
 ``start`` / ``exec`` / ``kill`` / ``stop``. :class:`SandboxBackend` is the whole
 of what a caller may rely on, and :class:`ProcessBackend` is the one place the
-``Popen`` dance is written — four hand-rolled copies of it is precisely where
-four backends would drift apart.
+``Popen`` dance is written, so a backend a deployment adds beside
+:class:`~akgentic.tool.sandbox.docker.DockerBackend` inherits it rather than
+hand-rolling a copy that drifts.
 
 **``kill`` is a new obligation, not a rename.** Every backend used to run
 ``subprocess.run(timeout=)``, which owns the child for the duration of the call
@@ -13,15 +14,15 @@ caller could end. A backend now keeps the handle of the run in flight, so a
 caller that no longer wants a run can stop it.
 
 **A kill reaches the child's whole process group where one was made for it.**
-``local`` and ``bwrap`` start the child under a ``preexec_fn`` that calls
-``os.setpgrp()``, and the group exists precisely so that a timeout or a kill can
-end the subtree rather than the shell at its root — ``sh -c '…'`` on Linux forks
-the command as a grandchild, which used to survive a direct-child kill and hold
-the pipes open for the rest of its life. A backend says so when it spawns —
-``_run(..., process_group=True)`` beside the ``preexec_fn`` that creates the
-group — and :meth:`ProcessBackend._signal` ends the group where it was told one
-exists and the direct child everywhere else. Docker (one host process, the
-``docker exec`` client) and seatbelt (no ``preexec_fn``) take the second path.
+A backend that runs its command as a host process can start the child under a
+``preexec_fn`` that calls ``os.setpgrp()``, and the group exists precisely so
+that a timeout or a kill can end the subtree rather than the shell at its root —
+``sh -c '…'`` on Linux forks the command as a grandchild, which would survive a
+direct-child kill and hold the pipes open for the rest of its life. A backend
+says so when it spawns — ``_run(..., process_group=True)`` beside the
+``preexec_fn`` that creates the group — and :meth:`ProcessBackend._signal` ends
+the group where it was told one exists and the direct child everywhere else.
+Docker (one host process, the ``docker exec`` client) takes the second path.
 
 This module imports nothing else from ``akgentic.tool``. (It does reach
 ``akgentic.core`` for the serializer base, which is a package below this one and
@@ -41,7 +42,7 @@ import signal
 import subprocess
 import threading
 from collections.abc import Callable
-from typing import Literal, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, model_validator
 
@@ -52,17 +53,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Module-level constants
 # ---------------------------------------------------------------------------
-
-SandboxMode = Literal["local", "bwrap", "seatbelt", "docker"]
-"""A backend that has been resolved. ``"auto"`` is not one of these."""
-
-CardMode = Literal["local", "bwrap", "seatbelt", "docker", "auto"]
-"""What a card may ask for, which includes ``"auto"``: probe the host and pick.
-
-Both aliases live here, in the module with no dependencies of its own, because
-both sides of the exec merge need them and a second definition in either would
-be a second place to add a backend to.
-"""
 
 DEFAULT_BACKEND_TIMEOUT_S: float = 30.0
 """What a backend gives a command when the caller names no budget.
@@ -84,10 +74,8 @@ Callers that own a tighter budget pass it to :meth:`SandboxBackend.exec`.
 ## --hard`` from destroying the workspace journal — but the bypass above meant
 ## that stopped nobody, while costing an agent the use of git in a directory
 ## that *is* a git repository.  The real guarantee is a filesystem fact: the
-## journal lives at the sibling ``<root>.git``, outside the mount of every
-## backend that constructs one, so it is not there to be reached.  Note that
-## ``LocalBackend`` constructs no mount, so that guarantee does not cover
-## it — use an isolating backend where it matters.
+## journal lives at the sibling ``<root>.git``, outside the container's mount,
+## so it is not there to be reached.
 ##
 ALLOWED_COMMANDS: frozenset[str] = frozenset(
     {
@@ -282,11 +270,11 @@ class SandboxBackend(Protocol):
     the slightest — every object has one — and mypy ignores ``__init__``
     entirely when deciding whether a class *implements* a Protocol.
 
-    **What ``__init__`` is declared for is the other direction**: the registry
-    holds ``type[SandboxBackend]`` and ``resolve_mode`` constructs from it, so
-    "constructible with no arguments" is part of what registering a backend
-    commits to, and a Protocol that did not say so would leave the one call site
-    that builds one unable to be type-checked at all.
+    **What ``__init__`` is declared for is the other direction**: the
+    ``SANDBOX_BACKEND`` slot holds ``type[SandboxBackend]`` and ``#Workspace``
+    constructs from it, so "constructible with no arguments" is part of what
+    installing a backend commits to, and a Protocol that did not say so would
+    leave the one call site that builds one unable to be type-checked at all.
     """
 
     def __init__(self) -> None:
@@ -316,7 +304,7 @@ class SandboxBackend(Protocol):
 
 
 class ProcessBackend:
-    """The ``Popen`` dance, written once for the four backends that share it.
+    """The ``Popen`` dance, written once for every backend that shares it.
 
     A subclass builds its own argv and hands it to :meth:`_run`; everything about
     keeping the handle, reproducing ``subprocess.run``'s timeout semantics and
@@ -325,8 +313,8 @@ class ProcessBackend:
     which is the whole of what distinguishes one backend from another.
 
     **Every backend is constructed with no arguments**, so the caller building
-    one from the registry has one uniform constructor to call and never a type
-    switch on the mode it just resolved. The tree a backend runs in arrives
+    one from the ``SANDBOX_BACKEND`` slot has one uniform constructor to call,
+    whatever class a deployment installed there. The tree a backend runs in arrives
     through ``start(workspace_path)``; nothing about the team that asked does,
     because a hosted tree is shared by several teams and no backend depends on
     which one asked.
@@ -360,9 +348,8 @@ class ProcessBackend:
             cwd: Working directory for the child, or ``None`` for this process's.
             timeout: The run's budget in seconds.
             env: The child's environment, or ``None`` to inherit.
-            preexec_fn: Run in the child before ``exec``; ``local`` and ``bwrap``
-                pass ``_make_preexec()``, which sets resource limits and calls
-                ``os.setpgrp()``.
+            preexec_fn: Run in the child before ``exec``; a host-process backend
+                passes one that sets resource limits and calls ``os.setpgrp()``.
             process_group: ``True`` when *preexec_fn* makes the child the leader
                 of a new process group, so that a kill or a timeout can end the
                 whole subtree. **Pass it only beside a ``preexec_fn`` that calls
@@ -426,11 +413,11 @@ class ProcessBackend:
     def _signal(proc: subprocess.Popen[str], process_group: bool) -> None:
         """``SIGKILL`` *proc* — its whole process group where *process_group* says it leads one.
 
-        A child started under ``_make_preexec`` called ``os.setpgrp()`` and is
+        A child started under a ``preexec_fn`` that called ``os.setpgrp()`` is
         the **leader** of a group whose id is its own pid; the group is the
         subtree, and ``os.killpg(proc.pid, …)`` is what ends it — the shell and
         whatever the shell forked, together. A child that leads no group
-        (docker's ``docker exec`` client, seatbelt's ``sandbox-exec``) shares
+        (docker's ``docker exec`` client) shares
         this process's group and gets ``Popen.kill`` alone: ``killpg`` on *that*
         group would take the caller down with it, which is why nothing here
         guesses and the backend has to say so.
@@ -461,14 +448,14 @@ class ProcessBackend:
         ``ProcessLookupError`` is swallowed rather than raised at a caller who
         asked for exactly that outcome.
 
-        **The whole subtree, where the backend made one.** ``local`` and
-        ``bwrap`` put the child in a new process group, and the group — the
-        shell *and* what the shell forked — is what :meth:`_signal` ends. That
-        is the promise ``_make_preexec``'s docstring has always made, and on
-        Linux, where ``sh -c '…'`` forks its command rather than exec'ing it in
-        place, it is the difference between a kill that lands and one that
-        leaves a grandchild holding the pipes. Docker and seatbelt create no
-        group and are signalled as the direct child they are.
+        **The whole subtree, where the backend made one.** A host-process
+        backend that passed ``process_group=True`` put the child in a new
+        process group, and the group — the shell *and* what the shell forked —
+        is what :meth:`_signal` ends. On Linux, where ``sh -c '…'`` forks its
+        command rather than exec'ing it in place, that is the difference
+        between a kill that lands and one that leaves a grandchild holding the
+        pipes. Docker creates no group and is signalled as the direct child it
+        is.
         """
         with self._lock:
             proc = self._running
@@ -489,7 +476,7 @@ class ProcessBackend:
     def _release(self) -> None:
         """Release whatever this backend provisioned in ``start()``.
 
-        A no-op here because three of the four backends provision nothing that
+        A no-op here because a host-process backend provisions nothing that
         outlives a run. :class:`~akgentic.tool.sandbox.docker.DockerBackend`
         overrides it to stop its container.
         """

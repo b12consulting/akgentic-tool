@@ -18,7 +18,6 @@ from __future__ import annotations
 from pydantic import Field
 
 from akgentic.tool.core import TOOL_CALL, BaseToolParam, Channels
-from akgentic.tool.sandbox.backend import CardMode
 from akgentic.tool.workspace.execution import (
     DEFAULT_EXEC_POLL_ATTEMPTS,
     DEFAULT_EXEC_POLL_DELAY_S,
@@ -64,7 +63,6 @@ class WorkspaceExec(BaseToolParam):
     """
 
     expose: set[Channels] = {TOOL_CALL}
-    mode: CardMode = "auto"
     timeout_s: float = DEFAULT_EXEC_TIMEOUT_S
     poll_attempts: int = Field(default=DEFAULT_EXEC_POLL_ATTEMPTS, ge=-1)
     poll_delay_seconds: float = DEFAULT_EXEC_POLL_DELAY_S

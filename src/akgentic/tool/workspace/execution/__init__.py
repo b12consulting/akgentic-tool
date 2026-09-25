@@ -61,23 +61,14 @@ from pydantic import model_validator
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.sandbox.backend import (
-    CardMode,
     ExecReport,
     ExecResult,
     SandboxBackend,
-    SandboxMode,
     validate_command,
 )
 from akgentic.tool.workspace.lock import _BUSY_PREFIX
 
 logger = logging.getLogger(__name__)
-
-##
-## ``SandboxMode`` and ``CardMode`` are defined in ``sandbox.backend`` and used
-## here as they are: a resolved backend and a card's request are the same two
-## vocabularies on both sides of the merge, and a second definition would be a
-## second place to register a backend in.
-##
 
 DEFAULT_EXEC_TIMEOUT_S = 15.0
 """Wall-clock budget for the sandboxed command itself.
@@ -191,10 +182,11 @@ EXEC_SHUTDOWN_GRACE_S = 3.0
 ``shutdown(wait=True)`` can wait for ever and the case is reachable:
 ``ProcessBackend._run``'s timeout path drains with a second ``communicate()``,
 which reads both pipes to EOF, and a process that inherited them and outlived
-the kill holds that call open. ``kill()`` now signals the child's whole process
-group on ``local`` and ``bwrap``, which closes the ordinary case — a shell's
-forked command — but a process that left the group of its own accord is still
-out of reach, and docker's ``kill()`` never reaches inside the container at all.
+the kill holds that call open. ``kill()`` signals the child's whole process
+group on a host-process backend that makes one, which closes the ordinary case —
+a shell's forked command — but a process that left the group of its own accord
+is still out of reach, and docker's ``kill()`` never reaches inside the
+container at all.
 The wait is therefore on the submitted ``Future``, and the shutdown that follows
 it does not wait at all.
 
@@ -374,8 +366,12 @@ class ExecConfig(SerializableBaseModel):
     ``configure_exec`` replaces the runner on an unequal config — one agent
     binding would tear down another's run mid-flight.
 
+    **It carries no backend either.** There is one, installed at
+    ``akgentic.tool.sandbox.SANDBOX_BACKEND``, and a field that could hold only
+    that value would tell the actor nothing. A stored config still carrying a
+    ``mode`` loads and drops it.
+
     Attributes:
-        mode: The resolved backend.
         workspace_path: The card's **already-resolved** three-segment path, the
             only thing a backend needs to open the right tree. It replaces the
             raw ``workspace_id`` this model used to forward: a backend that
@@ -384,7 +380,6 @@ class ExecConfig(SerializableBaseModel):
         timeout_s: The run budget this card asks for, before clamping.
     """
 
-    mode: SandboxMode
     workspace_path: str
     timeout_s: float = DEFAULT_EXEC_TIMEOUT_S
 
@@ -447,63 +442,6 @@ def poll_attempts_within(attempts: int, delay: float, run_budget: float) -> int:
     if attempts * delay <= run_budget:
         return attempts
     return max(1, int(run_budget // delay))
-
-
-def resolve_mode(mode: CardMode) -> tuple[SandboxMode, SandboxBackend]:
-    """Turn a card's requested mode into a backend, warning where the host has none.
-
-    Every wiring goes through this rather than probing for itself — a second
-    copy of the probe is a second place for the warning to stop firing.
-
-    **Both halves of the answer have a consumer, and they are different callers.**
-
-    - ``_bind_sandbox`` calls it with the card's mode and uses only the
-      **resolved mode**. It runs no commands, so it drops the instance. What it
-      needs from here is the ``"auto"`` probe and its ``DeprecationWarning``,
-      which must fire at wiring time, in front of the admin who configured the
-      card.
-    - ``#Workspace.configure_exec`` calls it with the already-resolved
-      ``ExecConfig.mode`` and uses the **instance**, which becomes the backend
-      its worker thread runs on. Because that mode is concrete, the probe
-      short-circuits and no second warning fires for one card.
-
-    Constructing a backend is inert — nothing is probed, created or started until
-    ``start()`` — so building one at wiring time and discarding it costs nothing.
-
-    Every registered backend is constructed with **no arguments** — the one
-    uniform constructor that lets this function build any of them from the
-    registry with no type switch on the mode it has just resolved. Everything a
-    backend needs arrives later, through ``start(workspace_path)``.
-
-    Args:
-        mode: What the card asked for, possibly ``"auto"``.
-
-    Returns:
-        The resolved mode and a fresh, unstarted backend for it.
-
-    Raises:
-        KeyError: If *mode* names no registered backend. Deliberately at wiring
-            time rather than at the first command: a typo in a card is a
-            configuration error, and configuration errors belong at start-up.
-    """
-    import warnings  # noqa: PLC0415 — only on the wiring path
-
-    # Resolved at call time through the package, so a backend registered — or a
-    # probe replaced — after this module was imported is what gets consulted.
-    from akgentic.tool.sandbox import (  # noqa: PLC0415
-        SANDBOX_BACKEND_CLASSES,
-        _resolve_auto_mode,
-    )
-
-    resolved: SandboxMode = _resolve_auto_mode() if mode == "auto" else mode
-    if mode == "auto" and resolved == "local":
-        warnings.warn(
-            "sandbox mode='auto': no isolation backend found (bwrap, sandbox-exec, "
-            "docker). Falling back to LocalBackend — no filesystem isolation.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
-    return resolved, SANDBOX_BACKEND_CLASSES[resolved]()
 
 
 class ExecRunner:
@@ -646,9 +584,9 @@ class ExecRunner:
 
         Best-effort and idempotent, because the backend's is: with no run in
         flight there is nothing to signal, and a child that has already exited
-        is what the caller wanted anyway. On ``local`` and ``bwrap`` the signal
-        reaches the child's whole process group, so a shell's forked command
-        dies with the shell.
+        is what the caller wanted anyway. On a host-process backend that makes a
+        process group the signal reaches the whole group, so a shell's forked
+        command dies with the shell.
         """
         self.backend.kill()
 
@@ -661,7 +599,7 @@ class ExecRunner:
         is the only thing that ends the process inside it** — ``kill()`` reaches
         the local ``docker exec`` client and no further — so a bounded drain that
         gave up must still be followed by this, and the container going away is
-        what bounds the abandoned process's life. For the three local backends
+        what bounds the abandoned process's life. For a host-process backend
         ``_release()`` is a no-op, so the case does not arise.
         """
         self.backend.stop()

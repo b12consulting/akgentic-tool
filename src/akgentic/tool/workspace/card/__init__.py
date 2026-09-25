@@ -94,7 +94,6 @@ from akgentic.tool.workspace.execution import (
     DEFAULT_EXEC_TIMEOUT_S,
     ExecConfig,
     effective_budget,
-    resolve_mode,
 )
 from akgentic.tool.workspace.execution.card import ExecFactories
 from akgentic.tool.workspace.execution.params import WorkspaceExec
@@ -982,11 +981,11 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         return params
 
     def _bind_sandbox(self, observer: ActorToolObserver, workspace_path: str) -> None:
-        """Resolve the mode and tell ``#Workspace`` which backend to run on.
+        """Tell ``#Workspace`` the tree and the run budget the exec capability runs with.
 
-        **Nothing happens here when the capability is off** — no host probe, no
-        message. That is the whole of what ``workspace_exec=False`` buys, and it
-        is why the check is at the top rather than inside.
+        **Nothing happens here when the capability is off** — no message. That
+        is the whole of what ``workspace_exec=False`` buys, and it is why the
+        check is at the top rather than inside.
 
         **No actor is created here.** ``#Workspace`` owns its own backend and its
         own worker thread; the sandbox actor that used to be created at this
@@ -999,35 +998,26 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         after ``attach``, so the actor can already name this agent in a refusal
         the first run causes.
 
-        **``resolve_mode``'s instance is still dropped here, and that is
-        correct**: this card does not run commands. What it needs from that call
-        is the resolved mode and the ``"auto"`` probe's ``DeprecationWarning``,
-        which must fire at wiring time in front of the admin who configured the
-        card. ``#Workspace.configure_exec`` makes the same call with the concrete
-        mode — so the probe short-circuits, no second warning fires — and keeps
-        the instance.
+        **The card builds no backend and probes nothing.** There is one backend,
+        installed at ``akgentic.tool.sandbox.SANDBOX_BACKEND``, and
+        ``#Workspace.configure_exec`` constructs it. A host without Docker fails
+        the first command, not this bind, so a team that never runs a command
+        still starts there.
 
         Args:
             observer: The owning agent, live at bind time.
             workspace_path: The already-resolved three-segment path this card is
                 anchored to. Passed down rather than re-derived, so the backend
                 cannot open a directory other than the one being gated.
-
-        Raises:
-            KeyError: If the configured mode names no registered backend —
-                fail-fast at wiring time rather than at the first command.
         """
         params = self._enabled_exec()
         if params is None:
             return
-        mode, _backend = resolve_mode(params.mode)
         # Before the exec config, deliberately: the actor refuses every run
         # until it has both, so announcing the hold first means it can never
         # admit a run under a backend it has not been given.
         self._announce_lock()
-        self._announce_exec(
-            ExecConfig(mode=mode, workspace_path=workspace_path, timeout_s=params.timeout_s)
-        )
+        self._announce_exec(ExecConfig(workspace_path=workspace_path, timeout_s=params.timeout_s))
 
     def _announce_lock(self) -> None:
         """Tell the actor what the tree's exclusive hold is taken on — fire and forget.

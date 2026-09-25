@@ -1,4 +1,4 @@
-"""The strategy contract: the Protocol, the filter, ``kill``, ``stop``, the registry.
+"""The strategy contract: the Protocol, the filter, ``kill``, ``stop``, the slot.
 
 ``kill`` is the centre of this file and the one piece of genuinely new behaviour.
 The obvious spec for it is inert:
@@ -34,7 +34,6 @@ import signal
 import subprocess
 import threading
 import time
-import warnings
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -42,7 +41,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 from akgentic.core.agent import Akgent
 
-from akgentic.tool.sandbox import SANDBOX_BACKEND_CLASSES
+import akgentic.tool.sandbox
+import akgentic.tool.sandbox.registry
 from akgentic.tool.sandbox.backend import (
     CommandNotAllowedError,
     CommandParseError,
@@ -50,11 +50,8 @@ from akgentic.tool.sandbox.backend import (
     ProcessBackend,
     SandboxBackend,
 )
-from akgentic.tool.sandbox.bwrap import BwrapBackend
 from akgentic.tool.sandbox.docker import DockerBackend
-from akgentic.tool.sandbox.local import LocalBackend
-from akgentic.tool.sandbox.seatbelt import SeatbeltBackend
-from akgentic.tool.workspace.execution import resolve_mode
+from tests.sandbox._process_backend import LocalBackend
 
 POPEN = "akgentic.tool.sandbox.backend.subprocess.Popen"
 KILLPG = "akgentic.tool.sandbox.backend.os.killpg"
@@ -73,9 +70,10 @@ WORKSPACE = "u-alice/notes"
 def backend(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> LocalBackend:
     """A started :class:`LocalBackend` rooted at *tmp_path*.
 
-    ``LocalBackend`` carries the ``kill`` specs because it is the one backend that
-    runs everywhere: bwrap and seatbelt are platform-gated and docker needs a
-    daemon.
+    ``LocalBackend`` carries the ``kill`` specs because it runs everywhere and
+    docker needs a daemon. It is a test fixture, not a shipped backend: what the
+    specs exercise is :class:`ProcessBackend`'s machinery, which ``DockerBackend``
+    inherits.
     """
     monkeypatch.setenv("AKGENTIC_WORKSPACES_ROOT", str(tmp_path))
     started = LocalBackend()
@@ -482,14 +480,12 @@ def test_the_handle_is_released_after_a_raise(backend: LocalBackend) -> None:
 
 
 # ---------------------------------------------------------------------------
-# AC 1 / AC 4 — the four classes, and what runtime_checkable does not check
+# AC 1 / AC 4 — the classes, and what runtime_checkable does not check
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "backend_class", [LocalBackend, BwrapBackend, SeatbeltBackend, DockerBackend]
-)
-def test_the_four_classes_expose_the_four_names(backend_class: type[Any]) -> None:
+@pytest.mark.parametrize("backend_class", [DockerBackend, LocalBackend])
+def test_the_backend_classes_expose_the_four_names(backend_class: type[Any]) -> None:
     """AC1: ``isinstance`` against the Protocol — which checks names, and only names.
 
     ``@runtime_checkable`` verifies that four attributes exist and no more: not a
@@ -504,10 +500,8 @@ def test_the_four_classes_expose_the_four_names(backend_class: type[Any]) -> Non
         assert callable(getattr(instance, name))
 
 
-@pytest.mark.parametrize(
-    "backend_class", [LocalBackend, BwrapBackend, SeatbeltBackend, DockerBackend]
-)
-def test_the_four_classes_are_plain_classes(backend_class: type[Any]) -> None:
+@pytest.mark.parametrize("backend_class", [DockerBackend, LocalBackend])
+def test_the_backend_classes_are_plain_classes(backend_class: type[Any]) -> None:
     """AC4: not actors and not abstract — a strategy has no mailbox and no lifecycle."""
     assert not issubclass(backend_class, Akgent)
     assert not getattr(backend_class, "__abstractmethods__", frozenset())
@@ -557,75 +551,26 @@ def test_a_permitted_binary_reaches_the_process(backend: LocalBackend) -> None:
 
 
 # ---------------------------------------------------------------------------
-# AC 12 — the one registry
+# AC 12 — the one slot
 # ---------------------------------------------------------------------------
 
 
-def test_the_backend_registry_maps_the_four_modes_to_the_four_strategies() -> None:
-    """AC12: the shipped mapping, pinned entry by entry."""
-    assert SANDBOX_BACKEND_CLASSES == {
-        "local": LocalBackend,
-        "bwrap": BwrapBackend,
-        "seatbelt": SeatbeltBackend,
-        "docker": DockerBackend,
-    }
+def test_the_shipped_slot_is_docker() -> None:
+    """The one backend there is, installed at the package slot by default."""
+    assert akgentic.tool.sandbox.SANDBOX_BACKEND is DockerBackend
+    assert akgentic.tool.sandbox.registry.SANDBOX_BACKEND is DockerBackend
 
 
-# ---------------------------------------------------------------------------
-# AC 13 — resolve_mode returns a live strategy
-# ---------------------------------------------------------------------------
-
-
-def test_resolve_mode_returns_a_live_backend_instance() -> None:
-    """AC13: an instance, not a class — inert until something calls ``start()``."""
-    mode, resolved = resolve_mode("local")
-
-    assert mode == "local"
-    assert isinstance(resolved, LocalBackend)
-    assert resolved.workspace_path is None
-
-
-def test_resolve_mode_hands_out_a_fresh_instance_each_time() -> None:
-    """AC13: a shared instance would give two cards one process handle."""
-    _, first = resolve_mode("local")
-    _, second = resolve_mode("local")
+def test_the_slot_hands_out_a_fresh_instance_each_time() -> None:
+    """A shared instance would give two trees one process handle."""
+    first = akgentic.tool.sandbox.SANDBOX_BACKEND()
+    second = akgentic.tool.sandbox.SANDBOX_BACKEND()
 
     assert first is not second
 
 
-def test_auto_still_warns_when_it_degrades_to_local(monkeypatch: pytest.MonkeyPatch) -> None:
-    """AC13: the warning is the whole reason every wiring goes through here."""
-    monkeypatch.setattr("akgentic.tool.sandbox._resolve_auto_mode", lambda: "local")
-
-    with pytest.warns(DeprecationWarning, match="no isolation backend found"):
-        mode, resolved = resolve_mode("auto")
-
-    assert mode == "local"
-    assert isinstance(resolved, LocalBackend)
-
-
-def test_auto_resolving_to_an_isolating_backend_does_not_warn(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """AC13: the warning fires on the degradation, not on ``auto`` itself."""
-    monkeypatch.setattr("akgentic.tool.sandbox._resolve_auto_mode", lambda: "docker")
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", DeprecationWarning)
-        mode, resolved = resolve_mode("auto")
-
-    assert mode == "docker"
-    assert isinstance(resolved, DockerBackend)
-
-
-def test_an_unregistered_mode_raises_at_wiring_time() -> None:
-    """AC13: a typo in a card is a configuration error, and those belong at start-up."""
-    with pytest.raises(KeyError):
-        resolve_mode("e2b")  # type: ignore[arg-type]
-
-
 # ---------------------------------------------------------------------------
-# AC 17 — an injected backend is what the resolution path hands out
+# AC 17 — an injected backend is what the slot hands out
 # ---------------------------------------------------------------------------
 
 
@@ -642,24 +587,23 @@ class _StubBackend:
     def stop(self) -> None: ...
 
 
-def test_an_injected_backend_is_what_resolve_mode_hands_out(
+def test_an_injected_backend_is_what_the_slot_hands_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC17: the registry is the injection point, and the swap is total.
+    """AC17: the package slot is the injection point, and the swap is total.
 
     ``echo hi`` really would print ``hi`` and exit 0. Getting the stub's answer
-    from the instance ``resolve_mode`` built is the proof that resolution reads
-    the registry at call time and that nothing between the registry and the
-    caller keeps an execution path of its own. The end-to-end form — the same
-    injection reaching ``#Workspace``'s worker — is ``InjectedBackend`` in
+    from the instance built the way ``configure_exec`` builds one — the package
+    attribute, read and called now — is the proof that nothing between the slot
+    and the caller keeps an execution path of its own. The end-to-end form — the
+    same injection reaching ``#Workspace``'s worker — is ``InjectedBackend`` in
     ``tests/workspace/test_exec.py``.
     """
-    monkeypatch.setitem(SANDBOX_BACKEND_CLASSES, "local", _StubBackend)
+    monkeypatch.setattr("akgentic.tool.sandbox.SANDBOX_BACKEND", _StubBackend)
 
-    mode, backend = resolve_mode("local")
+    backend = akgentic.tool.sandbox.SANDBOX_BACKEND()
     result = backend.exec("echo hi", "", None)
 
-    assert mode == "local"
     assert isinstance(backend, _StubBackend)
     assert result.stdout == "from the stub"
     assert result.exit_code == 7
@@ -671,16 +615,14 @@ def test_an_injected_backend_is_what_resolve_mode_hands_out(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "backend_class", [LocalBackend, BwrapBackend, SeatbeltBackend, DockerBackend]
-)
+@pytest.mark.parametrize("backend_class", [DockerBackend, LocalBackend])
 def test_every_backend_is_constructed_with_no_arguments_and_takes_no_team(
     backend_class: type[Any],
 ) -> None:
-    """All four build from nothing, so the caller needs no type switch — and no team.
+    """A backend builds from nothing, so the caller needs no type switch — and no team.
 
-    The registry holds classes and ``resolve_mode`` constructs from it, so the
-    constructor is part of what registering a backend commits to. A hosted tree
+    The slot holds a class and ``configure_exec`` constructs from it, so the
+    constructor is part of what installing a backend commits to. A hosted tree
     is shared by several teams, and no backend depends on which one asked, so
     the team id the constructor used to take is gone: passing one is a
     ``TypeError``, and a backend carries no attribute for it.
@@ -694,18 +636,8 @@ def test_every_backend_is_constructed_with_no_arguments_and_takes_no_team(
 
 
 def test_the_protocol_declares_a_constructor_with_no_arguments() -> None:
-    """What a deployment-registered backend must accept is nothing at all."""
+    """What a deployment-installed backend must accept is nothing at all."""
     assert list(inspect.signature(SandboxBackend.__init__).parameters) == ["self"]
-
-
-def test_resolve_mode_builds_the_backend_with_no_team() -> None:
-    """The wiring path passes no team, and has no keyword to pass one through."""
-    _mode, backend = resolve_mode("docker")
-
-    assert isinstance(backend, DockerBackend)
-    assert not hasattr(backend, "team_id")
-    with pytest.raises(TypeError):
-        resolve_mode("docker", team_id="team-42")  # type: ignore[call-arg]
 
 
 def test_an_unstarted_docker_release_returns_instead_of_raising() -> None:

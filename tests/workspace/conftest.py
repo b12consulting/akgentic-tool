@@ -48,8 +48,8 @@ from akgentic.core.agent_config import BaseConfig
 from akgentic.core.agent_state import BaseState
 from pykka import ActorDeadError
 
+from akgentic.tool import sandbox
 from akgentic.tool.core import ToolState
-from akgentic.tool.sandbox import SANDBOX_BACKEND_CLASSES
 from akgentic.tool.sandbox.backend import ExecResult, validate_command
 from akgentic.tool.workspace.actor import (
     WORKSPACE_ACTOR_ROLE,
@@ -861,19 +861,19 @@ def outcome_of(card: WorkspaceTool, method: str, *args: Any) -> MutationOutcome:
 
 
 ##
-## Exec — a fake **backend** at the ``local`` key, and the actor's own worker
-## thread.  No docker, no bwrap, no sandbox-exec, and no wall-clock sleeps: a run
-## is held open by an event and released by the test, so every concurrency
-## assertion is a handshake with a failure budget rather than a wait.
+## Exec — a fake **backend** at the ``SANDBOX_BACKEND`` slot, and the actor's own
+## worker thread.  No docker and no wall-clock sleeps: a run is held open by an
+## event and released by the test, so every concurrency assertion is a handshake
+## with a failure budget rather than a wait.
 ##
-## **The injection window is** ``SANDBOX_BACKEND_CLASSES``, the one registry.
-## ``#Workspace`` builds its own backend in ``configure_exec`` and runs it on its
-## own single-worker executor; there is no sandbox actor to resolve, and when
-## there still was one a fake installed at its registry key was installed and
-## never reached — every spec below went green while testing nothing.
-## Injecting the *backend* keeps the whole production path live:
-## ``configure_exec`` → ``resolve_mode`` → the registry → ``ExecRunner`` → the
-## real executor → ``perform``.  Only the four lines that would touch a real
+## **The injection window is** ``akgentic.tool.sandbox.SANDBOX_BACKEND``, the
+## one slot.  ``#Workspace`` builds its own backend in ``configure_exec`` and
+## runs it on its own single-worker executor; there is no sandbox actor to
+## resolve, and when there still was one a fake installed at its registry key
+## was installed and never reached — every spec below went green while testing
+## nothing.  Injecting the *backend* keeps the whole production path live:
+## ``configure_exec`` → the slot, read through the package → ``ExecRunner`` →
+## the real executor → ``perform``.  Only the four lines that would touch a real
 ## process are the fake's.
 ##
 
@@ -958,15 +958,14 @@ class SandboxScript:
 class FakeBackend:
     """A backend that writes what a test asks for and blocks when a test asks it to.
 
-    Installed at ``SANDBOX_BACKEND_CLASSES["local"]``, which the registry
-    documents as a mutable injection window. It **exposes the four Protocol
-    names** — which is all ``@runtime_checkable`` would check anyway — and
-    honours the same allowlist the four shipped backends do, by calling
-    ``validate_command`` in ``exec`` exactly as they each do. What it does not do
-    is start a process.
+    Installed at ``akgentic.tool.sandbox.SANDBOX_BACKEND``, the slot a deployment
+    assigns its own executor to. It **exposes the four Protocol names** — which
+    is all ``@runtime_checkable`` would check anyway — and honours the same
+    allowlist the shipped backend does, by calling ``validate_command`` in
+    ``exec`` exactly as it does. What it does not do is start a process.
 
     The script is a class attribute rather than a constructor argument because
-    ``resolve_mode`` constructs the backend itself, from the registry, with no
+    ``configure_exec`` constructs the backend itself, from the slot, with no
     arguments at all — which is the production path and the reason this fake is
     reached at all.
     """
@@ -1168,7 +1167,8 @@ class ExecHarness:
     it is held*.
 
     Nothing about the actor's exec path is stubbed: it builds its backend through
-    ``configure_exec`` and ``resolve_mode`` exactly as production does, and it
+    ``configure_exec`` from the ``SANDBOX_BACKEND`` slot exactly as production
+    does, and it
     submits the real ``ExecRunner.perform``. What the harness supplies is the two
     ends — an executor whose worker it can wait on, and an address to reply to.
     """
@@ -1217,15 +1217,28 @@ class ExecHarness:
 
 
 @pytest.fixture
-def sandbox_script() -> Generator[SandboxScript, None, None]:
-    """Install :class:`FakeBackend` at the ``local`` key for one test."""
+def sandbox_script(monkeypatch: pytest.MonkeyPatch) -> Generator[SandboxScript, None, None]:
+    """Install :class:`FakeBackend` at the ``SANDBOX_BACKEND`` slot for one test.
+
+    The slot is module state, so the previous class is restored on teardown,
+    failed assertion included: a fake left installed would redden an unrelated
+    spec that runs later on the same worker.
+
+    **Through the spec's own ``monkeypatch``, not a hand-rolled save/restore.**
+    A spec that installs a class of its own on top — ``InjectedBackend`` — does
+    it through ``monkeypatch`` too, and ``monkeypatch`` is set up before this
+    fixture (an autouse one requests it), so it is torn down *after* it. A
+    ``finally`` here would restore the shipped class first and the spec's undo
+    would then put the fake back, leaving it installed for good. One undo stack
+    unwinds both in the right order.
+    """
     script = SandboxScript()
     FakeBackend.script = script
-    previous = SANDBOX_BACKEND_CLASSES["local"]
-    SANDBOX_BACKEND_CLASSES["local"] = FakeBackend
-    yield script
-    SANDBOX_BACKEND_CLASSES["local"] = previous
-    script.gate.set()  # never leave a worker blocked behind a failed assertion
+    monkeypatch.setattr(sandbox, "SANDBOX_BACKEND", FakeBackend)
+    try:
+        yield script
+    finally:
+        script.gate.set()  # never leave a worker blocked behind a failed assertion
 
 
 def exec_card_for(
@@ -1251,7 +1264,6 @@ def exec_card_for(
     card = WorkspaceTool(
         workspace_id=workspace_id,
         workspace_exec=WorkspaceExec(
-            mode="local",
             poll_attempts=poll_attempts,
             poll_delay_seconds=poll_delay_seconds,
             timeout_s=timeout_s,

@@ -4,13 +4,14 @@ Story 29-5. Every concurrency assertion here is an event handshake with an upper
 bound that is a *failure budget*, never a delay: the fake backend blocks on an
 event the test sets, so a run is held open for exactly as long as the test wants
 and not one millisecond of wall clock more. Nothing in this file starts docker,
-bubblewrap or ``sandbox-exec``, and nothing sleeps for seconds.
+and nothing sleeps for seconds.
 """
 
 from __future__ import annotations
 
 import importlib
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -29,17 +30,16 @@ from akgentic.core.agent_state import BaseState
 from akgentic.core.utils import deserialize_object, import_class, serialize
 from pydantic import ValidationError
 
+import akgentic.tool.sandbox
+import akgentic.tool.sandbox.registry
 from akgentic.tool.errors import RetriableError
-from akgentic.tool.sandbox import SANDBOX_BACKEND_CLASSES
 from akgentic.tool.sandbox.backend import (
     DEFAULT_BACKEND_TIMEOUT_S,
     ExecReport,
     ExecResult,
+    ProcessBackend,
 )
-from akgentic.tool.sandbox.bwrap import BwrapBackend
 from akgentic.tool.sandbox.docker import DockerBackend
-from akgentic.tool.sandbox.local import LocalBackend
-from akgentic.tool.sandbox.seatbelt import SeatbeltBackend
 from akgentic.tool.workspace.actor import WorkspaceActor, workspace_actor_name
 from akgentic.tool.workspace.edit import EditItem
 from akgentic.tool.workspace.execution import (
@@ -76,6 +76,7 @@ from akgentic.tool.workspace.lock import (
 from akgentic.tool.workspace.models import MAX_COMMIT_BODY_CHARS
 from akgentic.tool.workspace.tool import WorkspaceExec, WorkspaceTool
 from akgentic.tool.workspace.workspace import meta_dir_for
+from tests.sandbox._process_backend import LocalBackend
 from tests.workspace.conftest import (
     HANDSHAKE_TIMEOUT_S,
     WORKSPACE_NAME,
@@ -113,15 +114,24 @@ no "somebody else". Every ownership and queue spec below uses at least two.
 
 REAL_STRATEGIES: dict[str, type[Any]] = {
     "local": LocalBackend,
-    "bwrap": BwrapBackend,
-    "seatbelt": SeatbeltBackend,
     "docker": DockerBackend,
 }
-"""The four real backends, named directly rather than read from the registry.
+"""The real backends, named directly rather than read from the slot.
 
-``SANDBOX_BACKEND_CLASSES`` is the injection window this suite writes a fake
-into, so a budget test that read the registry would be asserting about the fake.
+``DockerBackend`` is the one that ships; the test ``LocalBackend`` is here for
+the :class:`~akgentic.tool.sandbox.backend.ProcessBackend` path it shares with
+it. ``akgentic.tool.sandbox.SANDBOX_BACKEND`` is the injection window this suite
+writes a fake into, so a budget test that read the slot would be asserting about
+the fake.
 """
+
+
+class _ExplodingBackend:
+    """A backend whose construction is the failure: a card that builds one has built one."""
+
+    def __init__(self) -> None:
+        raise AssertionError("a card with exec off constructed a sandbox backend")
+
 
 # ---------------------------------------------------------------------------
 # Fixtures — an exec-capable card, its actor, and a worker that really threads
@@ -286,7 +296,7 @@ class TestTheCapability:
         workspace_tree: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # The whole of what the default buys: no host probe at wiring time and
+        # The whole of what the default buys: no backend built at wiring time and
         # **no actor at all** in a team that never asked for exec — since story
         # 55-8 the workspace's own is created only by a card that dispatches.
         # Asserted as an equality over the created list rather than as the
@@ -294,10 +304,7 @@ class TestTheCapability:
         # an absence assertion would pass over it whatever the bind did. A
         # forward to a resource host is the strict type check's to catch: the
         # core this package ships against has none.
-        def explode() -> str:
-            raise AssertionError("a card with exec off probed the host for a backend")
-
-        monkeypatch.setattr("akgentic.tool.sandbox._resolve_auto_mode", explode)
+        monkeypatch.setattr("akgentic.tool.sandbox.SANDBOX_BACKEND", _ExplodingBackend)
         card = WorkspaceTool(workspace_id=workspace_tree.name)
         card.observer(FakeActorToolObserver(orchestrator_proxy))
 
@@ -395,7 +402,7 @@ class TestTheCapability:
         assert second_observer.team_id != first_observer.team_id
         second_card = WorkspaceTool(
             workspace_id=first_card.workspace_id,
-            workspace_exec=WorkspaceExec(mode="local", poll_attempts=1),
+            workspace_exec=WorkspaceExec(poll_attempts=1),
         )
         second_card.observer(second_observer)
 
@@ -404,30 +411,29 @@ class TestTheCapability:
         assert actor._runner.backend is first.backend
         assert sandbox_script.stops == 0
 
-    def test_the_actor_builds_the_backend_from_the_registry_with_the_cards_config(
+    def test_the_actor_builds_the_backend_from_the_slot_with_the_cards_config(
         self,
         orchestrator_proxy: FakeOrchestratorProxy,
         workspace_tree: Path,
         sandbox_script: SandboxScript,
     ) -> None:
-        # ``resolve_mode`` hands back a strategy instance, and this is the caller
-        # that keeps it. The class has to come from ``SANDBOX_BACKEND_CLASSES``
-        # at call time — that is the injection window a deployment writes into —
-        # and every value the backend needs has to arrive on the card's own
-        # ``ExecConfig``. A backend built from anything else could open a
-        # directory other than the one this #Workspace gates.
+        # ``configure_exec`` constructs the strategy instance and keeps it. The
+        # class has to come from ``akgentic.tool.sandbox.SANDBOX_BACKEND`` at
+        # call time — that is the slot a deployment assigns — and every value the
+        # backend needs has to arrive on the card's own ``ExecConfig``. A backend
+        # built from anything else could open a directory other than the one
+        # this #Workspace gates.
         exec_card_for(orchestrator_proxy)
         _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
         assert isinstance(actor, WorkspaceActor)
 
         assert actor._exec_config == ExecConfig(
-            mode="local",
             workspace_path=WORKSPACE_PATH,
             timeout_s=DEFAULT_EXEC_TIMEOUT_S,
         )
         runner = actor._runner
         assert runner is not None
-        assert type(runner.backend) is SANDBOX_BACKEND_CLASSES["local"]
+        assert type(runner.backend) is akgentic.tool.sandbox.SANDBOX_BACKEND
         assert isinstance(runner.backend, FakeBackend)
         assert runner.workspace_path == WORKSPACE_PATH
 
@@ -455,7 +461,7 @@ class TestTheCapability:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # A configuration error belongs at start-up, in front of the admin who
-        # set the variable — exactly as an unknown sandbox mode already fails.
+        # set the variable.
         # Deferred to the first command it would surface as an unexplained
         # refusal, to an agent, hours later.
         monkeypatch.setenv("AKGENTIC_LOCK_BACKEND", "nope")
@@ -517,12 +523,9 @@ class TestTheCapability:
     ) -> None:
         # The two halves of the capability have to agree on what "on" means. A
         # card that takes exec off the tool channel registers no callable, so it
-        # must not resolve a backend, warn about the fallback, or create an actor
-        # at all — the second half of Trap 2b's row, reached by the other door.
-        def explode() -> str:
-            raise AssertionError("a card with exec off the tool channel probed the host")
-
-        monkeypatch.setattr("akgentic.tool.sandbox._resolve_auto_mode", explode)
+        # must not build a backend or create an actor at all — the second half
+        # of Trap 2b's row, reached by the other door.
+        monkeypatch.setattr("akgentic.tool.sandbox.SANDBOX_BACKEND", _ExplodingBackend)
         card = WorkspaceTool(
             workspace_id=workspace_tree.name,
             workspace_exec=WorkspaceExec(expose=set()),
@@ -554,23 +557,14 @@ class TestTheCapability:
 
         assert "workspace_exec" in {tool.__name__ for tool in card.get_tools()}
 
-    def test_an_unknown_mode_fails_at_wiring_time(
-        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
-    ) -> None:
-        # A typo in a card is a configuration error, and configuration errors
-        # belong at start-up rather than at the first command.
-        card = WorkspaceTool(workspace_id=workspace_tree.name, workspace_exec=WorkspaceExec())
-        object.__setattr__(card.workspace_exec, "mode", "e2b")
-
-        with pytest.raises(KeyError):
-            card.observer(FakeActorToolObserver(orchestrator_proxy))
-
     def test_the_card_round_trips_with_the_field_intact(self) -> None:
-        card = WorkspaceTool(workspace_exec=WorkspaceExec(mode="docker", timeout_s=9.0))
-        restored = WorkspaceTool.model_validate(card.model_dump())
+        card = WorkspaceTool(workspace_exec=WorkspaceExec(timeout_s=9.0))
+        dumped = card.model_dump()
+        restored = WorkspaceTool.model_validate(dumped)
         assert isinstance(restored.workspace_exec, WorkspaceExec)
-        assert restored.workspace_exec.mode == "docker"
         assert restored.workspace_exec.timeout_s == 9.0
+        assert "mode" not in dumped["workspace_exec"]
+        assert "mode" not in WorkspaceExec.model_fields
 
     def test_every_model_crossing_the_boundary_round_trips(self) -> None:
         # The behavioural half of "no arbitrary_types_allowed is introduced": a
@@ -1247,8 +1241,8 @@ class TestCollectingARun:
 def started_strategy(mode: str, workspace_path: Path) -> Any:
     """The backend of *mode*, as ``start()`` would have left it.
 
-    Assembled rather than started: no bwrap, no sandbox-exec and no docker daemon
-    has to be present for a budget to be asserted.
+    Assembled rather than started: no docker daemon has to be present for a
+    budget to be asserted.
     """
     backend = REAL_STRATEGIES[mode]()
     backend.workspace_path = workspace_path
@@ -1259,7 +1253,7 @@ def started_strategy(mode: str, workspace_path: Path) -> Any:
 def capture_budget(monkeypatch: pytest.MonkeyPatch) -> list[float | None]:
     """Record the budget each backend hands the process, and return the list.
 
-    One patch target for all four: the budget is now an argument to
+    One patch target for every backend: the budget is now an argument to
     ``communicate()`` inside ``ProcessBackend._run``, which is the single place a
     process is started from. Captured rather than measured — nothing slow runs.
     """
@@ -1288,13 +1282,13 @@ class TestTheBudgets:
 
         assert sandbox_script.timeouts == [DEFAULT_EXEC_TIMEOUT_S]
 
-    @pytest.mark.parametrize("mode", ["local", "bwrap", "seatbelt", "docker"])
+    @pytest.mark.parametrize("mode", ["local", "docker"])
     def test_every_backend_hands_its_budget_to_the_subprocess(
         self, mode: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         # Captured rather than measured: nothing slow is run and no backend
         # binary has to be present. A budget that stops at the caller is
-        # decoration, so this asserts it reaches the process in all four.
+        # decoration, so this asserts it reaches the process on every backend.
         backend = started_strategy(mode, tmp_path)
 
         captured = capture_budget(monkeypatch)
@@ -1302,7 +1296,7 @@ class TestTheBudgets:
 
         assert captured == [3.25]
 
-    @pytest.mark.parametrize("mode", ["local", "bwrap", "seatbelt", "docker"])
+    @pytest.mark.parametrize("mode", ["local", "docker"])
     def test_no_budget_falls_back_to_the_backends_own(
         self, mode: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -1327,9 +1321,7 @@ class TestTheBudgets:
         assert isinstance(actor, WorkspaceActor)
         harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
-        actor.configure_exec(
-            ExecConfig(mode="local", workspace_path=WORKSPACE_PATH, timeout_s=999.0)
-        )
+        actor.configure_exec(ExecConfig(workspace_path=WORKSPACE_PATH, timeout_s=999.0))
 
         start_run(actor, sandbox_script)
         finish_run(sandbox_script, harness)
@@ -2042,45 +2034,39 @@ class TestTwoCardsOverOneTree:
 
 
 class InjectedBackend(FakeBackend):
-    """A backend registered from outside the package, as a deployment would.
+    """A backend installed from outside the package, as a deployment would.
 
     A subclass rather than the fixture's fake itself, so the assertion below is
-    on *this* class having been resolved — the fixture already sits at the
-    ``local`` key, and a test that resolved it would prove nothing about the
-    registration it made.
+    on *this* class having been constructed — the fixture already sits in the
+    slot, and a test that found it there would prove nothing about the
+    assignment it made.
     """
 
 
-class TestARegisteredBackendIsReached:
-    """``SANDBOX_BACKEND_CLASSES`` is the live extension point, and this is its contract.
+class TestAnInstalledBackendIsReached:
+    """``akgentic.tool.sandbox.SANDBOX_BACKEND`` is the live extension point.
 
-    A deployment assigns its own backend into the registry before any card is
-    constructed. What matters is not the spelling of the import but that
-    ``workspace_exec`` — the wiring *and* the run — resolves through the registry
-    at call time and therefore reaches the injected class.
-
-    **This spec moved from the actor registry to the backend registry**, because
-    that is where the extension point moved — and the actor registry is now
-    gone with the actor. A spec written against a registry nothing reads would
-    install a class nothing reaches and pass without executing a line of it —
-    the exact shape of vacuity this suite is written against. The backend
-    registry's own shape is asserted in ``tests/sandbox/test_registry.py`` and
-    its mapping in ``tests/sandbox/test_backend_kill.py``.
+    A deployment assigns its own backend class to the package attribute before
+    any card binds. What matters is that ``#Workspace.configure_exec`` reads the
+    attribute **through the package, at call time**, and therefore reaches a
+    class assigned after every module was imported. A reader that bound the name
+    at import would keep ``DockerBackend`` for good and go red here.
     """
 
-    def test_a_backend_assigned_into_the_registry_runs_the_command(
+    def test_a_backend_assigned_to_the_slot_runs_the_command(
         self,
         orchestrator_proxy: FakeOrchestratorProxy,
         workspace_tree: Path,
         sandbox_script: SandboxScript,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Registered under a key a card may name, before the card exists —
-        # exactly the sequence the sandbox README documents.
-        monkeypatch.setitem(SANDBOX_BACKEND_CLASSES, "docker", InjectedBackend)
+        # Every module is already imported by now; the assignment comes after,
+        # and before the card binds — exactly the sequence the sandbox README
+        # documents.
+        monkeypatch.setattr("akgentic.tool.sandbox.SANDBOX_BACKEND", InjectedBackend)
         card = WorkspaceTool(
             workspace_id=workspace_tree.name,
-            workspace_exec=WorkspaceExec(mode="docker", poll_attempts=50, poll_delay_seconds=0.01),
+            workspace_exec=WorkspaceExec(poll_attempts=50, poll_delay_seconds=0.01),
         )
         card.observer(FakeActorToolObserver(orchestrator_proxy))
         _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
@@ -2088,7 +2074,7 @@ class TestARegisteredBackendIsReached:
         harness = ExecHarness(actor, orchestrator_proxy)
         harness.install(monkeypatch)
 
-        # The wiring resolved the injected class, not the shipped docker backend.
+        # The wiring built the injected class, not the shipped docker backend.
         assert actor._runner is not None
         assert type(actor._runner.backend) is InjectedBackend
 
@@ -2100,6 +2086,121 @@ class TestARegisteredBackendIsReached:
 
         assert "ran in the injected backend" in answer
         assert sandbox_script.commands == [("make build", "")]
+
+    def test_the_shipped_default_is_docker(self) -> None:
+        """With nothing installed, the package slot and its definition agree on docker."""
+        assert (
+            akgentic.tool.sandbox.SANDBOX_BACKEND
+            is DockerBackend
+            is akgentic.tool.sandbox.registry.SANDBOX_BACKEND
+        )
+
+
+class _NoSpawn:
+    """A ``subprocess`` stand-in whose two spawning calls are the failure.
+
+    Installed as the ``subprocess`` name of the docker and backend modules only,
+    so a process started from either is an ``AssertionError`` while every other
+    attribute — ``PIPE``, ``TimeoutExpired`` — and every other module's
+    ``subprocess`` stay real.
+    """
+
+    def __init__(self) -> None:
+        self.spawns: list[object] = []
+
+    def Popen(self, *args: Any, **kwargs: Any) -> Any:  # noqa: N802 — mirrors subprocess
+        self.spawns.append(args)
+        raise AssertionError(f"the sandbox started a process: {args!r}")
+
+    def run(self, *args: Any, **kwargs: Any) -> Any:
+        self.spawns.append(args)
+        raise AssertionError(f"the sandbox started a process: {args!r}")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(subprocess, name)
+
+
+class TestTheSandboxFailsClosed:
+    """No Docker on the host: the bind succeeds, and the first command fails.
+
+    Docker is removed rather than a failure faked. The **real** ``DockerBackend``
+    is installed at the slot, ``docker`` is taken off ``PATH`` for the one lookup
+    the backend makes, and every process the sandbox could start is an
+    ``AssertionError``. A fake backend that raised would only prove that
+    exceptions propagate; this proves that nothing picks a weaker backend.
+    """
+
+    def test_the_first_command_fails_naming_docker_and_nothing_else_is_built(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        real_which = shutil.which
+
+        def no_docker(cmd: str, *args: Any, **kwargs: Any) -> str | None:
+            if cmd == "docker":
+                return None
+            return real_which(cmd, *args, **kwargs)
+
+        no_spawn = _NoSpawn()
+        constructed: list[type[Any]] = []
+        real_init = ProcessBackend.__init__
+
+        def counting_init(self: ProcessBackend) -> None:
+            constructed.append(type(self))
+            real_init(self)
+
+        monkeypatch.setattr("akgentic.tool.sandbox.SANDBOX_BACKEND", DockerBackend)
+        monkeypatch.setattr("akgentic.tool.sandbox.docker.shutil.which", no_docker)
+        monkeypatch.setattr("akgentic.tool.sandbox.docker.subprocess", no_spawn)
+        monkeypatch.setattr("akgentic.tool.sandbox.backend.subprocess", no_spawn)
+        monkeypatch.setattr(ProcessBackend, "__init__", counting_init)
+
+        card, _observer = exec_card_for(orchestrator_proxy)  # the bind raises nothing
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
+        assert isinstance(actor, WorkspaceActor)
+        harness = ExecHarness(actor, orchestrator_proxy)
+        harness.install(monkeypatch)
+        assert actor._runner is not None
+        assert type(actor._runner.backend) is DockerBackend
+
+        start = actor.request_exec(card._agent_id, "echo hi")
+        assert start.run_id, start.refusal
+        harness.join()
+        harness.close()
+
+        status = actor.exec_status(card._agent_id, start.run_id)
+        assert status.state is ExecState.FAILED
+        assert "docker CLI not found on PATH" in status.reason
+        assert constructed == [DockerBackend], "a second backend was built as a fallback"
+        assert no_spawn.spawns == []
+
+    def test_binding_an_exec_card_does_not_probe_the_host(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The failure belongs to the first command, so wiring looks for nothing:
+        # a team that never runs a command starts on a host without Docker.
+        real_which = shutil.which
+        looked_up: list[str] = []
+
+        def spy(cmd: str, *args: Any, **kwargs: Any) -> str | None:
+            looked_up.append(cmd)
+            return real_which(cmd, *args, **kwargs)
+
+        monkeypatch.setattr("akgentic.tool.sandbox.SANDBOX_BACKEND", DockerBackend)
+        monkeypatch.setattr("akgentic.tool.sandbox.docker.shutil.which", spy)
+
+        exec_card_for(orchestrator_proxy)
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
+        assert isinstance(actor, WorkspaceActor)
+
+        assert actor._runner is not None
+        assert type(actor._runner.backend) is DockerBackend
+        assert looked_up.count("docker") == 0
 
 
 # ---------------------------------------------------------------------------
@@ -2443,18 +2544,25 @@ def live_exec(
 ) -> Generator[tuple[WorkspaceTool, WorkspaceActor], None, None]:
     """An exec-capable card over a **real** ``LocalBackend`` and the real executor.
 
-    No ``sandbox_script``, so nothing is injected into the registry and the
-    command genuinely runs; no harness, so the actor keeps the
-    ``ThreadPoolExecutor`` its own ``on_start`` built. This is the only setup in
-    which "the child is dead, and it was killed" is a statement about a process.
+    No ``sandbox_script``: the test ``LocalBackend`` is installed at the
+    ``SANDBOX_BACKEND`` slot **before** the card binds, so the command genuinely
+    runs as a host process — and not in a Docker container, which the slot would
+    otherwise build. No harness, so the actor keeps the ``ThreadPoolExecutor``
+    its own ``on_start`` built. This is the only setup in which "the child is
+    dead, and it was killed" is a statement about a process.
     """
-    card, _observer = exec_card_for(
-        orchestrator_proxy, poll_attempts=0, timeout_s=MAX_EXEC_BUDGET_S
-    )
-    _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
-    assert isinstance(actor, WorkspaceActor)
-    yield card, actor
-    actor._executor.shutdown(wait=False, cancel_futures=True)
+    previous = akgentic.tool.sandbox.SANDBOX_BACKEND
+    akgentic.tool.sandbox.SANDBOX_BACKEND = LocalBackend
+    try:
+        card, _observer = exec_card_for(
+            orchestrator_proxy, poll_attempts=0, timeout_s=MAX_EXEC_BUDGET_S
+        )
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
+        assert isinstance(actor, WorkspaceActor)
+        yield card, actor
+        actor._executor.shutdown(wait=False, cancel_futures=True)
+    finally:
+        akgentic.tool.sandbox.SANDBOX_BACKEND = previous
 
 
 def await_child(actor: WorkspaceActor) -> subprocess.Popen[str]:
@@ -2582,8 +2690,9 @@ class TestTheBackendFakeIsReallyReached:
 
     ``#Workspace`` resolves no sandbox actor, so a fake left at the retired
     actor registry's ``local`` key was installed, restored, and never called —
-    and every spec in this file went green while exercising the real
-    ``LocalBackend`` or nothing at all. This is the sentinel that says otherwise.
+    and every spec in this file went green while exercising a real backend or
+    nothing at all. The fake now sits at the ``SANDBOX_BACKEND`` slot, and this
+    is the sentinel that says it is reached.
     """
 
     def test_the_answer_could_only_have_come_from_the_fake(
@@ -2591,8 +2700,8 @@ class TestTheBackendFakeIsReallyReached:
         exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness],
         sandbox_script: SandboxScript,
     ) -> None:
-        # The discriminator is the OUTPUT, not the absence of an error: the real
-        # LocalBackend answers "hi" to ``echo hi`` and cannot answer this, and
+        # The discriminator is the OUTPUT, not the absence of an error: a real
+        # backend answers "hi" to ``echo hi`` and cannot answer this, and
         # exit code 7 is not something ``echo`` produces either.
         card, actor, harness = exec_setup
         sandbox_script.stdout = "<<<only-the-fake-backend-says-this>>>"
@@ -2609,14 +2718,14 @@ class TestTheBackendFakeIsReallyReached:
     def test_the_runner_holds_the_injected_backend_and_not_the_shipped_one(
         self, exec_setup: tuple[WorkspaceTool, WorkspaceActor, ExecHarness]
     ) -> None:
-        # The other half: the object itself, resolved through the registry the
-        # fixture writes into.
+        # The other half: the object itself, built from the slot the fixture
+        # assigns.
         _card, actor, _harness = exec_setup
 
         runner = actor._runner
         assert runner is not None
         assert isinstance(runner.backend, FakeBackend)
-        assert not isinstance(runner.backend, LocalBackend)
+        assert not isinstance(runner.backend, DockerBackend)
 
 
 class TestReplacingTheConfiguration:
@@ -2650,17 +2759,17 @@ class TestReplacingTheConfiguration:
         with the same settings announce configs ``configure_exec`` cannot tell
         apart.
         """
-        assert set(ExecConfig.model_fields) == {"mode", "workspace_path", "timeout_s"}
-        first_team = ExecConfig(mode="local", workspace_path=WORKSPACE_PATH, timeout_s=5.0)
-        second_team = ExecConfig(mode="local", workspace_path=WORKSPACE_PATH, timeout_s=5.0)
+        assert set(ExecConfig.model_fields) == {"workspace_path", "timeout_s"}
+        first_team = ExecConfig(workspace_path=WORKSPACE_PATH, timeout_s=5.0)
+        second_team = ExecConfig(workspace_path=WORKSPACE_PATH, timeout_s=5.0)
         assert first_team == second_team
 
-    def test_a_config_record_still_carrying_a_team_loads_without_it(self) -> None:
-        """A record written before the team id was deleted must load, and drop it.
+    def test_a_config_record_still_carrying_a_team_or_a_mode_loads_without_them(self) -> None:
+        """A record written before the team id and the mode were deleted loads, and drops both.
 
         ``ExecConfig`` travels by tell and is not persisted today, so this pins
         the unknown-key rule rather than a stored stream: a later
-        ``extra="forbid"`` would turn every caller still passing the old key
+        ``extra="forbid"`` would turn every caller still passing an old key
         into a crash at bind, and this goes red first.
         """
         stored = {
@@ -2672,8 +2781,9 @@ class TestReplacingTheConfiguration:
 
         restored = ExecConfig.model_validate(stored)
 
-        assert restored == ExecConfig(mode="local", workspace_path=WORKSPACE_PATH, timeout_s=5.0)
+        assert restored == ExecConfig(workspace_path=WORKSPACE_PATH, timeout_s=5.0)
         assert "team_id" not in restored.model_dump()
+        assert "mode" not in restored.model_dump()
 
     def test_a_second_exec_card_keeps_the_runner_with_a_run_in_flight(
         self,
@@ -3567,7 +3677,7 @@ def explicitly_configured_exec_card() -> WorkspaceTool:
     """
     return WorkspaceTool(
         workspace_id=WORKSPACE_NAME,
-        workspace_exec=WorkspaceExec(mode="local", timeout_s=7.0),
+        workspace_exec=WorkspaceExec(timeout_s=7.0),
     )
 
 
@@ -3639,6 +3749,61 @@ class TestStoredExecParamsStillResolve:
         assert restored.model_dump() == explicitly_configured_exec_card.model_dump()
 
 
+STORED_MODE_PARAMS: dict[str, Any] = {
+    "mode": "local",
+    "poll_attempts": 50,
+    "poll_delay_seconds": 0.01,
+}
+"""An exec parameter as a card stored before the mode was removed persists it."""
+
+
+class TestAStoredModeIsIgnored:
+    """A card persisted with ``mode:`` loads, drops it, and runs on the installed slot.
+
+    Built with ``model_validate`` from a payload **dict**, never from keyword
+    arguments: the dict is the persisted shape, and it is the shape a stored
+    catalog entry reaches the card in. A later ``extra="forbid"`` on the
+    parameter turns every such card into a load failure, and this goes red first.
+    """
+
+    @pytest.mark.parametrize("shape", ["param", "card"])
+    def test_the_stored_mode_is_dropped_and_the_command_runs_on_the_slot(
+        self,
+        shape: str,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        sandbox_script: SandboxScript,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        if shape == "param":
+            params = WorkspaceExec.model_validate(dict(STORED_MODE_PARAMS))
+            card = WorkspaceTool(workspace_id=workspace_tree.name, workspace_exec=params)
+        else:
+            card = WorkspaceTool.model_validate(
+                {"workspace_id": workspace_tree.name, "workspace_exec": dict(STORED_MODE_PARAMS)}
+            )
+        params = card.workspace_exec
+        assert isinstance(params, WorkspaceExec)
+        assert "mode" not in params.model_dump()
+
+        card.observer(FakeActorToolObserver(orchestrator_proxy))
+        _, actor = orchestrator_proxy.children[workspace_actor_name(WORKSPACE_PATH)]
+        assert isinstance(actor, WorkspaceActor)
+        harness = ExecHarness(actor, orchestrator_proxy)
+        harness.install(monkeypatch)
+        assert actor._runner is not None
+        assert type(actor._runner.backend) is FakeBackend
+
+        sandbox_script.gate.set()
+        sandbox_script.stdout = "ran on the installed slot"
+        answer = tool_named(card, "workspace_exec")(cmd="echo hi")
+        harness.join()
+        harness.close()
+
+        assert "ran on the installed slot" in answer
+        assert sandbox_script.commands == [("echo hi", "")]
+
+
 ##
 ## Guard 1, the exec half — two processes, one tree, nothing configurable between them
 ##
@@ -3648,7 +3813,7 @@ from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.tool import WorkspaceExec
 from tests.workspace.conftest import tool_named
 
-card = bind("child", workspace_exec=WorkspaceExec(mode="local", poll_attempts=0))
+card = bind("child", workspace_exec=WorkspaceExec(poll_attempts=0))
 try:
     print("RAN " + tool_named(card, "workspace_exec")("echo hi"), flush=True)
 except RetriableError as exc:
