@@ -481,13 +481,22 @@ class TestAPolicyThatDoesNotParseRefusesTheBind:
     def test_a_non_utf8_file_meets_the_same_refusal(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
-        """Story 5.13: ``UnicodeDecodeError`` is not an ``OSError``, and used to escape raw."""
+        """Story 5.13: ``UnicodeDecodeError`` is not an ``OSError``, and used to escape raw.
+
+        It **is** a ``ValueError``, so ``pytest.raises(ValueError)`` on its own
+        passes on the raw escape too. What proves the wrap is the composed text.
+        """
         record = policy_file_for(WORKSPACE_PATH)
         record.parent.mkdir(parents=True, exist_ok=True)
         record.write_bytes(b"\xd5 not utf-8")
 
-        with pytest.raises(ValueError, match=POLICY_FILE_NAME):
+        with pytest.raises(ValueError) as refusal:
             bind(orchestrator_proxy)
+
+        prefix = WORKSPACE_POLICY_UNREADABLE.split("{reason}")[0].format(
+            card="WorkspaceTool", path=WORKSPACE_PATH, file=record
+        )
+        assert str(refusal.value).startswith(prefix)
 
 
 ##
