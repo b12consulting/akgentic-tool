@@ -478,6 +478,17 @@ class TestAPolicyThatDoesNotParseRefusesTheBind:
         the three specs above pass while breaking every first bind there is."""
         assert read_tree_policy(WORKSPACE_PATH, "WorkspaceTool") is None
 
+    def test_a_non_utf8_file_meets_the_same_refusal(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """Story 5.13: ``UnicodeDecodeError`` is not an ``OSError``, and used to escape raw."""
+        record = policy_file_for(WORKSPACE_PATH)
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_bytes(b"\xd5 not utf-8")
+
+        with pytest.raises(ValueError, match=POLICY_FILE_NAME):
+            bind(orchestrator_proxy)
+
 
 ##
 ## AC 4 — the publish is a read-modify-write under the lock

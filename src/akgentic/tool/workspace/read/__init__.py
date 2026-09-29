@@ -42,7 +42,7 @@ from pydantic_ai.messages import BinaryContent
 
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.lines import split_lines
-from akgentic.tool.workspace.models import PERM_ERR_MSG, content_sha
+from akgentic.tool.workspace.models import PERM_ERR_MSG, content_sha, not_utf8_text
 from akgentic.tool.workspace.read.params import (
     WorkspaceGlob,
     WorkspaceGrep,
@@ -261,13 +261,15 @@ def _grep_rg(
         cmd += ["--glob", include_glob]
     cmd += [pattern, str(root)]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        result = subprocess.run(cmd, capture_output=True, timeout=15)
     except (subprocess.TimeoutExpired, OSError):
         return None
     if result.returncode not in (0, 1):
         return None
     matches: list[tuple[Path, int, str]] = []
-    for line in result.stdout.splitlines():
+    # Decoded here, lossily, rather than with ``text=True``: a match line in a
+    # non-UTF-8 file must not raise. Same policy as the Python fallback above.
+    for line in result.stdout.decode("utf-8", errors="replace").splitlines():
         parts = line.split(":", 2)
         if len(parts) == 3:
             try:
@@ -275,6 +277,41 @@ def _grep_rg(
             except ValueError:
                 continue
     return matches
+
+
+def _extract_document(
+    backend: Filesystem,
+    document_reader: DocumentReader,
+    lookup: Callable[[str, str], str | None],
+    remember: Callable[[str, str, str], None],
+    path: str,
+    force_regeneration: bool,
+) -> str:
+    """Return the Markdown extraction of the document at *path*, through the cache.
+
+    The cache is keyed on the source **bytes**, so the source is read on a hit
+    as well. That read is milliseconds against an extraction measured in
+    seconds, and it is what makes a replaced file read as the replacement.
+
+    Args:
+        backend: The workspace to read the source bytes from.
+        document_reader: The configured extractor.
+        lookup: The card's cache lookup, ``(path, source_sha) -> markdown | None``.
+        remember: The card's cache fill, ``(path, source_sha, markdown)``.
+        path: Workspace-relative path of the document.
+        force_regeneration: Bypass a valid cached extraction and re-extract.
+
+    Returns:
+        The extracted Markdown, from the cache or freshly produced.
+    """
+    content_bytes = backend.read(path)
+    source_sha = content_sha(content_bytes)
+    cached = None if force_regeneration else lookup(path, source_sha)
+    if cached is not None:
+        return cached
+    raw = document_reader.extract_text(content_bytes, path)
+    remember(path, source_sha, raw)
+    return raw
 
 
 _BRACE_RE = _re.compile(r"\{([^{}]+)\}")
@@ -533,8 +570,8 @@ class ReadFactories:
                 Truncated files include a trailing notice.
 
             Raises:
-                RetriableError: If the path does not exist or escapes the
-                    workspace root.
+                RetriableError: If the path does not exist, escapes the
+                    workspace root, or is not UTF-8 text.
                 ValueError: If the file is a binary format and
                     ``document_reader`` is not configured.
             """
@@ -554,18 +591,14 @@ class ReadFactories:
                 # — the cache's own digest below is a different thing entirely.
                 observed: bytes | None = None
                 if document_reader is not None and ext in document_reader.extensions:
-                    # Document path: the cache is keyed on the source bytes, so the
-                    # source is read on a hit as well. That read is milliseconds
-                    # against an extraction measured in seconds, and it is what
-                    # makes a replaced file read as the replacement.
-                    content_bytes = backend.read(path)
-                    source_sha = content_sha(content_bytes)
-                    cached = None if force_document_regeneration else lookup(path, source_sha)
-                    if cached is not None:
-                        raw = cached
-                    else:
-                        raw = document_reader.extract_text(content_bytes, path)
-                        remember(path, source_sha, raw)
+                    raw = _extract_document(
+                        backend,
+                        document_reader,
+                        lookup,
+                        remember,
+                        path,
+                        force_document_regeneration,
+                    )
                 else:
                     # Text path (existing logic)
                     observed = backend.read(path)
@@ -580,6 +613,10 @@ class ReadFactories:
                 raise RetriableError(f"File not found: {path}")
             except PermissionError:
                 raise RetriableError(_PERM_ERR_MSG)
+            except UnicodeDecodeError as exc:
+                # A refusal, not a crash: nothing was recorded, so the write gate
+                # still treats the file as unread and the agent decides what next.
+                raise RetriableError(not_utf8_text(path, exc)) from exc
 
         workspace_read.__doc__ = params.format_docstring(workspace_read.__doc__)
         return workspace_read

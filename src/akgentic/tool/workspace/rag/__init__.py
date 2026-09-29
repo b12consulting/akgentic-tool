@@ -332,7 +332,7 @@ def read_tree_policy(workspace_path: str, card_name: str) -> TreePolicy | None:
         raw = file.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         raise ValueError(_unreadable(card_name, workspace_path, file, exc)) from exc
     try:
         return TreePolicy.model_validate(yaml.safe_load(raw))

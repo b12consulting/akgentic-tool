@@ -127,9 +127,7 @@ class TestObserverWiring:
             assert tool.workspace is fs
             assert result is tool
 
-    def test_observer_nests_an_explicit_workspace_id_under_its_owner(
-        self, tmp_path: Path
-    ) -> None:
+    def test_observer_nests_an_explicit_workspace_id_under_its_owner(self, tmp_path: Path) -> None:
         """A named workspace is one of *this* principal's trees, not a global key.
 
         ``explicit-ws`` alone is what every user used to share; the scope segment
@@ -240,6 +238,45 @@ class TestWorkspaceRead:
         assert "1     alpha" in result
         assert "2     beta" in result
         assert "3     gamma" in result
+
+
+class TestANonUtf8FileIsARefusal:
+    """Story 5.13: a file the agent cannot decode is a tool result, not a dead run.
+
+    ``UnicodeDecodeError`` is not a :class:`RetriableError`, so before this it
+    escaped the tool and stopped the agent. The refusal names the file, the
+    byte and the offset, and records **no** observation — the write gate keeps
+    treating the file as unread, which is what
+    ``test_write_over_an_unread_non_utf8_file_is_refused`` relies on.
+    """
+
+    LATIN1 = b"caf\xe9 au lait\n" + b"x" * 20 + b"\xd5 curly\n"
+
+    def test_the_refusal_names_the_byte_and_the_offset(self, tmp_path: Path) -> None:
+        tool = make_tool(tmp_path)
+        (tool.workspace._root / "legacy.txt").write_bytes(self.LATIN1)
+        fn = tool.get_tools()[0]  # workspace_read
+        with pytest.raises(RetriableError, match="legacy.txt") as refusal:
+            fn("legacy.txt")
+        message = str(refusal.value)
+        assert "byte 0xe9 at offset 3" in message
+        assert "not valid UTF-8" in message
+        assert "Skip it" in message
+
+    def test_nothing_is_recorded_for_a_file_that_did_not_decode(self, tmp_path: Path) -> None:
+        tool = make_tool(tmp_path)
+        (tool.workspace._root / "legacy.txt").write_bytes(self.LATIN1)
+        fn = tool.get_tools()[0]  # workspace_read
+        with pytest.raises(RetriableError):
+            fn("legacy.txt")
+        assert tool.observation_for("legacy.txt") is None
+
+    def test_a_utf8_file_with_the_same_characters_still_reads(self, tmp_path: Path) -> None:
+        """The negative control: the refusal is about bytes, not about accents."""
+        tool = make_tool(tmp_path)
+        (tool.workspace._root / "fine.txt").write_text("café Õ\n", encoding="utf-8")
+        fn = tool.get_tools()[0]  # workspace_read
+        assert "café Õ" in fn("fine.txt")
 
 
 # ---------------------------------------------------------------------------
@@ -467,7 +504,7 @@ class TestGrepRg:
         fake_file.write_bytes(b"")
         mock_result = MagicMock()
         mock_result.returncode = 0
-        mock_result.stdout = f"{fake_file}:3:import os\n"
+        mock_result.stdout = f"{fake_file}:3:import os\n".encode()
         with (
             patch("shutil.which", return_value="/usr/bin/rg"),
             patch("subprocess.run", return_value=mock_result),
@@ -478,6 +515,28 @@ class TestGrepRg:
         path, lineno, line = result[0]
         assert lineno == 3
         assert line == "import os"
+
+    def test_a_non_utf8_match_line_is_returned_lossily_not_raised(self, tmp_path: Path) -> None:
+        """Story 5.13: ``rg`` hands back raw bytes; a Latin-1 hit must not kill the search.
+
+        ``text=True`` decoded strictly, so one accented byte in a matching line
+        raised out of the closure. Search is the one place a lossy decode is
+        right — the same ``errors="replace"`` the Python fallback has always used.
+        """
+        fake_file = tmp_path / "legacy.txt"
+        fake_file.write_bytes(b"")
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = str(fake_file).encode() + b":1:caf\xe9 import\n"
+        with (
+            patch("shutil.which", return_value="/usr/bin/rg"),
+            patch("subprocess.run", return_value=mock_result),
+        ):
+            result = _grep_rg(tmp_path, "import", "", 100)
+        assert result is not None
+        _path, lineno, line = result[0]
+        assert lineno == 1
+        assert line == "caf� import"
 
 
 # ---------------------------------------------------------------------------

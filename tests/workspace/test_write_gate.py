@@ -1162,6 +1162,65 @@ class TestMkdirIsRoutedNotGated:
 # ---------------------------------------------------------------------------
 
 
+class TestANonUtf8FileIsARefusalNotACrash:
+    """Story 5.13: the anchored table decodes the live file, and the decode can fail.
+
+    An *unread* non-UTF-8 file never gets this far — the observation check
+    refuses it first, and ``workspace_read`` records nothing for a file it could
+    not decode. The reachable case is a file that was UTF-8 when the agent read
+    it and is not any more: another writer, an upload, a sandbox run. The decode
+    used to raise ``UnicodeDecodeError`` out of the gate, which is not a
+    :class:`RetriableError`, so the agent's run died instead of being told.
+    """
+
+    REPLACED = b"\xd5 replaced by someone else\n"
+
+    @pytest.fixture
+    def swapped(self, wired_card: WorkspaceTool, notes: Path) -> Path:
+        read(wired_card, "notes.md")
+        notes.write_bytes(self.REPLACED)
+        return notes
+
+    def test_an_edit_is_refused_and_the_file_is_untouched(
+        self, wired_card: WorkspaceTool, swapped: Path
+    ) -> None:
+        with pytest.raises(RetriableError, match="byte 0xd5 at offset 0"):
+            mutate(wired_card, "workspace_edit", "notes.md", "bravo", "BRAVO")
+        assert swapped.read_bytes() == self.REPLACED
+
+    def test_a_multi_edit_is_refused_before_anything_is_written(
+        self, wired_card: WorkspaceTool, swapped: Path, workspace_tree: Path
+    ) -> None:
+        (workspace_tree / "other.md").write_text("keep\n", encoding="utf-8")
+        read(wired_card, "other.md")
+        with pytest.raises(RetriableError, match="notes.md as text"):
+            mutate(
+                wired_card,
+                "workspace_multi_edit",
+                [
+                    EditItem(path="other.md", old_string="keep", new_string="KEEP"),
+                    EditItem(path="notes.md", old_string="bravo", new_string="BRAVO"),
+                ],
+            )
+        assert (workspace_tree / "other.md").read_text(encoding="utf-8") == "keep\n"
+        assert swapped.read_bytes() == self.REPLACED
+
+    def test_a_patch_is_refused_and_the_file_is_untouched(
+        self, wired_card: WorkspaceTool, swapped: Path
+    ) -> None:
+        patch_text = "--- a/notes.md\n+++ b/notes.md\n@@ -1,2 +1,2 @@\n alpha\n-bravo\n+BRAVO\n"
+        with pytest.raises(RetriableError, match="not valid UTF-8"):
+            mutate(wired_card, "workspace_patch", patch_text)
+        assert swapped.read_bytes() == self.REPLACED
+
+    def test_the_outcome_is_rejected_not_failed(
+        self, wired_card: WorkspaceTool, swapped: Path
+    ) -> None:
+        """A refusal, on the error contract: the agent's next step is to skip or re-read."""
+        outcome = outcome_of(wired_card, "apply_edit", "notes.md", "bravo", "BRAVO", False)
+        assert outcome.status is MutationStatus.REJECTED
+
+
 class TestTheErrorContract:
     def test_an_accepted_outcome_carries_the_unchanged_confirmation(
         self, wired_card: WorkspaceTool, workspace_tree: Path
