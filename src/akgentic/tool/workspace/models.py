@@ -62,6 +62,26 @@ Shared by the read closures and the actor's mutation methods so the two cannot
 drift; agents see one wording whichever side rejects them.
 """
 
+NOT_UTF8_MSG = (
+    "Cannot read {path} as text: byte 0x{byte:02x} at offset {offset} is not valid UTF-8. "
+    "The file is either binary or text in another encoding (Latin-1, Windows-1252, ...). "
+    "Skip it and carry on, or ask the user which encoding it uses."
+)
+"""Refusal text for a file whose bytes do not decode as UTF-8.
+
+Shared by ``workspace_read`` and the anchored mutations so an agent meets one
+wording whether the file was undecodable when it read it or became so since.
+The refusal is what keeps the run alive: the raw ``UnicodeDecodeError`` is not
+a :class:`~akgentic.tool.errors.RetriableError`, so it escaped the tool and
+stopped the agent instead of letting it decide to skip the file.
+"""
+
+
+def not_utf8_text(path: str, exc: UnicodeDecodeError) -> str:
+    """Compose :data:`NOT_UTF8_MSG` for *path* from the decode failure."""
+    return NOT_UTF8_MSG.format(path=path, byte=exc.object[exc.start], offset=exc.start)
+
+
 WRITE_DENIED_MSG = (
     "The change was not published: the operating system refused this process permission to "
     "replace the file. The path is correct and inside the workspace — it did not escape it. "

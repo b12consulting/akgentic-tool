@@ -77,6 +77,7 @@ from akgentic.tool.workspace.models import (
     Observation,
     Precondition,
     content_sha,
+    not_utf8_text,
 )
 from akgentic.tool.workspace.workspace import (
     Filesystem,
@@ -748,6 +749,10 @@ class CardGate:
             return _denied(exc)
         except FileNotFoundError:
             return _rejected(PUBLISH_LOST_MSG)
+        except UnicodeDecodeError as exc:
+            # Reachable only on a file replaced by non-UTF-8 bytes since the read:
+            # an unread one is refused by the observation check above.
+            return _rejected(not_utf8_text(path, exc))
         self._accept(path, data)
         return _accepted(diff or f"(no change) {path}")
 
@@ -1063,7 +1068,11 @@ class CardGate:
                 return _rejected(refusal)
             if live is None:
                 return _rejected(f"File not found: {item.path}")
-            entry = _Staged(live=live, text=live.decode("utf-8"), exact_only=exact_only)
+            try:
+                text = live.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                return _rejected(not_utf8_text(item.path, exc))
+            entry = _Staged(live=live, text=text, exact_only=exact_only)
             staged[item.path] = entry
         edited = substitute_edit(_MATCHER, entry.text, item, exact_only=entry.exact_only)
         if edited is None:
@@ -1168,7 +1177,10 @@ class CardGate:
         )
         if refusal is not None:
             return _rejected(refusal)
-        raw = None if live is None else live.decode("utf-8")
+        try:
+            raw = None if live is None else live.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            return _rejected(not_utf8_text(file_patch.path, exc))
         try:
             # raw is None only for a create; an update patch raises FileNotFoundError
             # here, which the caller turns into the [ERROR] line it always was.
