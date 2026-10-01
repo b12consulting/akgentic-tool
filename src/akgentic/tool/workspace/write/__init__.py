@@ -160,9 +160,10 @@ class WriteFactories:
         def workspace_delete(path: str) -> str:
             """Delete a file from the team workspace.
 
-            Refused unless you have read the whole file and it has not changed
-            since — deleting a file someone else has just rewritten destroys
-            work you never saw.
+            No prior read is required. If you have read the file, the delete
+            is refused when it changed or was deleted since you read it, or
+            when you read only part of it — deleting a file someone else has
+            just rewritten destroys work you never saw.
 
             Args:
                 path: Relative path from workspace root (e.g. "src/old.py").

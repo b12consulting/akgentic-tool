@@ -163,9 +163,12 @@ which is per-principal like the other two. See *Sharing a tree across principals
 
 ## The write gate
 
-**Every mutation is refused unless the file is still what the writing agent last read.** That is
-the whole rule. It is a precondition, not a lock: nothing is held while the agent thinks, and the
-check happens at the moment of the write.
+**A mutation is refused unless the file is still what the writing agent last read.** That is the
+whole rule. It is a precondition, not a lock: nothing is held while the agent thinks, and the check
+happens at the moment of the write. One mutation needs no read to begin with: `workspace_delete`
+replaces nothing, so an agent that never read the file holds no view the gate could protect — a
+binary upload, which no read can record, is deletable at all because of this. A delete of a file
+the agent *did* read is held to the rule like every other mutation.
 
 ### What an agent sees
 
@@ -202,8 +205,8 @@ Three ingredients, in order of value to the agent: **what to do next**, **who el
 
 | Situation | `write` / `delete` | `edit` / `multi_edit` / `patch` |
 |---|---|---|
-| You have not read the file, and it does not exist | ✅ creates it | ⛔ read it before editing |
-| You have not read the file, and it exists | ⛔ read it before overwriting | ⛔ read it before editing |
+| You have not read the file, and it does not exist | `write` ✅ creates it · `delete` ⛔ `File not found` | ⛔ read it before editing |
+| You have not read the file, and it exists | `write` ⛔ read it before overwriting · `delete` ✅ — no view to protect | ⛔ read it before editing |
 | You read it whole, and it has not changed | ✅ | ✅ full 7-strategy match cascade |
 | You read only a **page** of it, and it has not changed | ⛔ a page is not a licence to replace the file | ✅ — the anchor is the precondition |
 | It **changed** since you read it | ⛔ refused, with the diff | ✅ admitted, but matching drops to **exact only** |
