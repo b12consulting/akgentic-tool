@@ -580,6 +580,14 @@ class TestASearchAnswersWhileTheActorIsIndexing:
 
         assert not search_thread.is_alive()
         assert any(_HIT_TEXT in hit.text for hit in answers[0].hits)
+        # The batch was put on the mailbox and not waited for, and with the seam
+        # unarmed nothing above orders its ``add`` before this line — the two rows
+        # beside this one wait on ``entered``, which an unarmed stall never sets.
+        # On a loaded runner the search answers first and ``adds`` is still empty
+        # at compare time. One round trip on the same mailbox is what proves the
+        # batch's turn has run: the fixture's own idiom, and a wait on a message
+        # rather than on a clock.
+        wired.actor.state.get(timeout=HANDSHAKE_TIMEOUT_S)
         assert wired.store.adds == [RAG_COLLECTION], "the search itself wrote to the store"
 
 
