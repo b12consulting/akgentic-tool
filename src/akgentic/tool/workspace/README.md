@@ -69,9 +69,6 @@ class WorkspaceTool(ToolCard):
     # The read-only gate
     read_only: bool = False
 
-    # The journal
-    git_journal: bool = False
-
     # Write-side capabilities
     workspace_write: WorkspaceWrite | bool = True
     workspace_delete: WorkspaceDelete | bool = True
@@ -80,16 +77,29 @@ class WorkspaceTool(ToolCard):
     workspace_patch: WorkspacePatch | bool = True
     workspace_mkdir: WorkspaceMkdir | bool = True
 
+    # The journal
+    git_journal: bool = False
+
     workspace_exec: WorkspaceExec | bool = False        # off unless asked for
 
     # Files seeded at wiring time
     resources: list[Resource] = []
 
-    _workspace: Filesystem | None = PrivateAttr(default=None)
-    _workspace_proxy: WorkspaceActor | None = PrivateAttr(default=None)   # mutations — ask
-    _workspace_tell: WorkspaceActor | None = PrivateAttr(default=None)    # observations — tell
-    _agent_id: str = PrivateAttr(default="")
+    # Retrieval — read-side, all off unless asked for; any one turns retrieval on
+    workspace_rag_index: WorkspaceRagIndex | bool = False
+    workspace_rag_list: WorkspaceRagList | bool = False
+    workspace_rag_search: WorkspaceRagSearch | bool = False
+    vector_store: VectorStoreParam = VectorStoreParam()  # read only when retrieval is on
+
+    # Caps
+    max_observations_per_agent: int = 256
+    max_documents: int | None = None                    # None ⇒ derived, not zero
+    max_document_chars: int | None = None
 ```
+
+Runtime state — the bound `Filesystem`, the actor proxies, the journal, the caches — lives in
+`PrivateAttr`s and is deliberately not listed: none of it is configuration, none of it serializes,
+and all of it is bound in `observer()` (next paragraph).
 
 **One card, two modes.** There is no separate read-only class. `read_only` is a gate applied in
 `get_tools()`: read-side callables are always built (subject to their own field), write-side ones
@@ -109,7 +119,7 @@ enabled, because nothing else needs a mailbox — and, only if exec is enabled, 
 makes it impossible for a backend to open a different directory from the one the gate and the journal
 are guarding. `resources` are seeded in between. Reading `card.workspace` before that raises
 `RuntimeError`; calling a mutation before it raises `RuntimeError` too, because there is deliberately
-no ungated path to fall back to. Every runtime handle lives in a `PrivateAttr`, so none appears in
+no ungated path to fall back to. Because every runtime handle is a `PrivateAttr`, none appears in
 `model_dump()` and the card stays catalog-serializable.
 
 **A card declaring `workspace_metadata_keys` makes one bind-time `get_metadata()` ask; a bare card
@@ -545,6 +555,7 @@ cannot argue with.
 | `workspace_rag_list` | `WorkspaceRagList \| bool` | **`False`** | Where every file stands in the index. `COMMAND` + `LLM_CONTEXT`, never `TOOL_CALL` — it is pushed into the context tail as a per-turn delta, so a tool call for it would be a round trip for what the model already has. |
 | `workspace_rag_search` | `WorkspaceRagSearch \| bool` | **`False`** | Hybrid search over the indexed chunks. `TOOL_CALL` only — a search is something the model *does*, not something it is *shown*. Read side, like its two siblings. |
 | `vector_store` | `VectorStoreParam` | `VectorStoreParam()` | Backend, dimension, tenant, embedding model and provider of the one `workspace_chunks` collection. The house name, shared with `PlanningTool` and `KnowledgeGraphTool`. It was once `rag_collection`, because a bare `collection` reads as "the workspace's collection of files" on a card whose other twenty fields are file operations — `vector_store` answers that objection rather than working around it. The backend it names also decides whether a store actor is created at all, and it is what the backend-configuration check reads. All of that only when a retrieval capability is on. |
+| `max_observations_per_agent` | `int` | `256` | Cap on the paths this agent's observation map remembers, LRU-evicted over the cap. A card field because the map is the card's: one card is one agent, so the path dimension is the only one. Eviction costs a *refused* write rather than a stale accepted one, which is what makes an LRU safe here. |
 | `max_documents` | `int \| None` | `None` | Row cap on the extraction cache. `None` is **not** zero and not "use the default" — it means *derive it* from the vector backend and whether retrieval is on. An explicit value always wins. |
 | `max_document_chars` | `int \| None` | `None` | Character cap on the bodies the cache holds. Same three-way meaning. |
 
