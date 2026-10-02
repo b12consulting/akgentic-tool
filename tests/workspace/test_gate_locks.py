@@ -401,6 +401,17 @@ if mode == "unlocked":
         yield
     GitJournal._holding = _no_lock
 
+# Widen the add-to-commit gap in BOTH modes, so the lock is the only variable.
+_real_run = GitJournal._run
+
+def _slow_run(self, args, env=None):
+    result = _real_run(self, args, env)
+    if args and args[0] == "add":
+        time.sleep(ADD_TO_COMMIT_GAP_S)
+    return result
+
+GitJournal._run = _slow_run
+
 journal = GitJournal(root, enabled=True, timeout_s=60.0, meta_dir=meta)
 if not journal.initialise():
     print("INIT-FAILED", flush=True)
@@ -421,7 +432,19 @@ print("enabled=" + str(journal.enabled), flush=True)
 """
 
 _JOURNAL_ROUNDS = 25
-"""Commits per child. Two children at this depth collided on the first attempt."""
+"""Commits per child."""
+
+_ADD_TO_COMMIT_GAP_S = 0.02
+"""How long each child waits between its ``add`` and its ``commit``, in both modes.
+
+The hazard is the *pair* not being atomic, and the window between the two
+invocations is where it bites. Left to the scheduler that window is a few
+milliseconds wide, and on a loaded two-vCPU runner two children happily take
+turns without ever landing inside it — which turned the unlocked control green
+on one CI event and red on the next for the same commit. Holding the window
+open makes the collision a property of the code rather than of the runner.
+Applied in both modes so the two runs differ in exactly one thing: the lock.
+"""
 
 
 def _drive_journal_race(
@@ -439,7 +462,9 @@ def _drive_journal_race(
     meta.mkdir(parents=True, exist_ok=True)
     script = tmp_path / f"journal_{mode}.py"
     script.write_text(
-        "import sys, time\nfrom pathlib import Path\n" + textwrap.dedent(_JOURNAL_CHILD),
+        "import sys, time\nfrom pathlib import Path\n"
+        + f"ADD_TO_COMMIT_GAP_S = {_ADD_TO_COMMIT_GAP_S!r}\n"
+        + textwrap.dedent(_JOURNAL_CHILD),
         encoding="utf-8",
     )
 
@@ -479,8 +504,12 @@ class TestTheJournalSurvivesTwoProcesses:
     journal **stays enabled** and simply loses the commit. Nothing is disabled,
     nothing raises, and the only trace is one warning nobody reads.
 
-    Measured, twice, on this machine: unlocked, 10 of 50 commits landed and 40
-    vanished; locked, 50 of 50 landed with both journals still enabled.
+    Both runs hold the add-to-commit gap open for :data:`_ADD_TO_COMMIT_GAP_S`,
+    so the collision does not depend on the runner's scheduler — see that
+    constant for the CI event that made this necessary. Unlocked, one child's
+    ``add`` lands in the other's gap on every round, the other's commit swallows
+    the file and the first has nothing left to commit; locked, every commit
+    lands with both journals still enabled.
     """
 
     def test_two_processes_committing_at_once_lose_no_commit(
