@@ -3,8 +3,10 @@
 Two tables govern, and they differ deliberately (ADR-036 §3):
 
 - **Whole-file** mutations — ``write``, ``delete`` — replace or remove everything,
-  so they demand that the agent has read the whole file and that it has not
-  moved since.
+  so they demand that a file the agent has read was read whole and has not moved
+  since. ``write`` over an unread existing file is refused outright; ``delete``
+  needs no prior read, because there is no view to protect — the held
+  observation, when there is one, is what is enforced.
 - **Anchored** mutations — ``edit``, ``multi_edit``, ``patch`` — are governed by
   their anchor, which is itself a precondition. They are *admitted* on a file
   that changed, with the 7-strategy cascade degraded to exact matching.
@@ -38,6 +40,7 @@ from akgentic.tool.workspace.models import (
     MAX_REJECTION_DIFF_LINES,
     MutationStatus,
 )
+from akgentic.tool.workspace.readers import DocumentReader
 from akgentic.tool.workspace.tool import WorkspaceTool
 from akgentic.tool.workspace.workspace import Filesystem
 from tests.workspace.conftest import (
@@ -299,12 +302,19 @@ class TestWholeFileTableForWrite:
 
 
 class TestWholeFileTableForDelete:
-    def test_an_unread_existing_file_is_refused(
+    """The one row of the whole-file table that differs between ``write`` and ``delete``.
+
+    An agent that has not read a file holds no view of it, so there is nothing
+    for the gate to protect: ``delete`` proceeds where ``write`` is refused. The
+    other rows are identical for both — a held observation is enforced exactly
+    as it always was, changed, gone and partial alike.
+    """
+
+    def test_an_unread_existing_file_is_deleted(
         self, wired_card: WorkspaceTool, notes: Path
     ) -> None:
-        with pytest.raises(RetriableError, match="read it before overwriting"):
-            mutate(wired_card, "workspace_delete", "notes.md")
-        assert notes.exists()
+        assert mutate(wired_card, "workspace_delete", "notes.md") == "Deleted: notes.md"
+        assert not notes.exists()
 
     def test_a_fully_read_unchanged_file_is_deleted(
         self, wired_card: WorkspaceTool, notes: Path
@@ -335,6 +345,76 @@ class TestWholeFileTableForDelete:
         with pytest.raises(RetriableError, match="you read only part of it"):
             mutate(wired_card, "workspace_delete", "notes.md")
         assert notes.exists()
+
+    def test_an_unread_non_utf8_file_is_deleted(
+        self, wired_card: WorkspaceTool, workspace_tree: Path
+    ) -> None:
+        # The incident, end to end: a read of undecodable bytes is refused and
+        # records nothing, so the delete is admitted by the no-observation row
+        # and by nothing else. For every binary the old precondition was
+        # unsatisfiable — the agent could not read what it was told to read.
+        legacy = workspace_tree / "legacy.bin"
+        legacy.write_bytes(b"\xd5 legacy bytes nobody can decode\n")
+
+        with pytest.raises(RetriableError, match="not valid UTF-8"):
+            read(wired_card, "legacy.bin")
+        assert wired_card.observation_for("legacy.bin") is None
+
+        assert mutate(wired_card, "workspace_delete", "legacy.bin") == "Deleted: legacy.bin"
+        assert not legacy.exists()
+
+    def test_a_document_the_agent_read_is_deleted(
+        self, wired_card: WorkspaceTool, workspace_tree: Path
+    ) -> None:
+        # A document read shows derived Markdown and records no observation by
+        # design — a digest of bytes the agent never saw would be a false one.
+        # The same gate row admits it by a second road.
+        report = workspace_tree / "report.pdf"
+        report.write_bytes(b"%PDF fake content")
+
+        with patch.object(DocumentReader, "extract_text", return_value="# Report\n"):
+            assert "# Report" in read(wired_card, "report.pdf")
+        assert wired_card.observation_for("report.pdf") is None
+
+        assert mutate(wired_card, "workspace_delete", "report.pdf") == "Deleted: report.pdf"
+        assert not report.exists()
+
+    @pytest.mark.parametrize("writer", ["a teammate's card", "the disk behind the gate"])
+    def test_a_whole_read_then_a_rewrite_is_still_refused(
+        self,
+        writer: str,
+        wired_card: WorkspaceTool,
+        bob: tuple[WorkspaceTool, FakeActorToolObserver],
+        notes: Path,
+    ) -> None:
+        # The half that carries information is kept whole: an agent that did
+        # read the file holds a digest, and the digest is enforced whoever
+        # rewrote the file — a teammate through the tools, or an upload that
+        # never passed through them.
+        bob_card, _ = bob
+        read(wired_card, "notes.md")
+        if writer == "a teammate's card":
+            read(bob_card, "notes.md")
+            mutate(bob_card, "workspace_write", "notes.md", "one\ntwo\n")
+        else:
+            notes.write_text("one\ntwo\n", encoding="utf-8")
+
+        with pytest.raises(RetriableError) as refusal:
+            mutate(wired_card, "workspace_delete", "notes.md")
+
+        message = str(refusal.value)
+        assert "changed since you read it" in message
+        assert "The live file has 2 line(s)" in message
+        assert "--- live/" not in message
+        assert notes.exists()
+
+    def test_an_unread_missing_file_is_still_not_found(
+        self, wired_card: WorkspaceTool, workspace_tree: Path
+    ) -> None:
+        # No observation and no file is a not-found, not an acceptance of
+        # nothing: the row that changed is the one where the file exists.
+        with pytest.raises(RetriableError, match="File not found: missing.md"):
+            mutate(wired_card, "workspace_delete", "missing.md")
 
 
 # ---------------------------------------------------------------------------
@@ -719,13 +799,27 @@ class TestPatchIsGated:
             mutate(wired_card, "workspace_patch", patch_text)
         assert notes.read_text(encoding="utf-8") == BODY
 
-    def test_a_delete_over_an_unread_file_is_refused(
+    def test_a_delete_over_an_unread_file_is_accepted(
         self, wired_card: WorkspaceTool, notes: Path
     ) -> None:
+        # A removal section follows the same row as workspace_delete: no view to
+        # protect, so no prior read is required.
         patch_text = "--- a/notes.md\n+++ /dev/null\n@@ -1 +0,0 @@\n-alpha\n"
-        with pytest.raises(RetriableError, match="read it before overwriting"):
+        assert mutate(wired_card, "workspace_patch", patch_text) == "deleted: notes.md"
+        assert not notes.exists()
+
+    def test_a_delete_over_a_whole_read_file_rewritten_behind_the_gate_is_refused(
+        self, wired_card: WorkspaceTool, notes: Path
+    ) -> None:
+        # And a held observation is enforced on the removal path exactly as on
+        # workspace_delete: the file moved under the agent, so the file survives.
+        read(wired_card, "notes.md")
+        notes.write_text("rewritten by an upload\n", encoding="utf-8")
+        patch_text = "--- a/notes.md\n+++ /dev/null\n@@ -1 +0,0 @@\n-alpha\n"
+
+        with pytest.raises(RetriableError, match="changed since you read it"):
             mutate(wired_card, "workspace_patch", patch_text)
-        assert notes.exists()
+        assert notes.read_text(encoding="utf-8") == "rewritten by an upload\n"
 
     def test_a_read_file_patches_and_refreshes_the_writers_observation(
         self, wired_card: WorkspaceTool, notes: Path
@@ -1569,6 +1663,7 @@ class TestBothTablesAreIdenticalWithoutAJournal:
     ROWS: list[tuple[str, str]] = [
         ("unread create", "create"),
         ("unread overwrite", "read it before overwriting"),
+        ("unread delete", "accept"),
         ("whole-read overwrite", "accept"),
         ("changed since read", "it changed since you read it"),
         ("paginated overwrite", "a page is not a licence"),
@@ -1596,15 +1691,17 @@ class TestBothTablesAreIdenticalWithoutAJournal:
         if row == "mkdir":
             return self._told(lambda: mutate(card, "workspace_mkdir", "sub"))
         notes.write_text(BODY, encoding="utf-8")
-        if row in ("unread overwrite", "unread edit", "paginated overwrite"):
+        if row in ("unread overwrite", "unread delete", "unread edit", "paginated overwrite"):
             return self._unread_row(card, row)
         read(card, "notes.md")
         return self._observed_row(card, row, notes)
 
     def _unread_row(self, card: WorkspaceTool, row: str) -> str:
-        """The three rows whose agent has not read the file whole."""
+        """The four rows whose agent has not read the file whole."""
         if row == "unread overwrite":
             return self._told(lambda: mutate(card, "workspace_write", "notes.md", "mine\n"))
+        if row == "unread delete":
+            return self._told(lambda: mutate(card, "workspace_delete", "notes.md"))
         if row == "unread edit":
             return self._told(lambda: mutate(card, "workspace_edit", "notes.md", "alpha", "A"))
         assert row == "paginated overwrite"

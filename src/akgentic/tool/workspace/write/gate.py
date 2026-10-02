@@ -190,14 +190,18 @@ def _denied(exc: PermissionError) -> MutationOutcome:
 
 
 def _precondition(seen: Observation | None) -> Precondition:
-    """Derive what must hold of a file before *seen*'s agent may replace it.
+    """Derive what must hold of a file before *seen*'s agent may replace or remove it.
 
     Args:
         seen: What the agent last observed of the path, or ``None``.
 
     Returns:
-        The digest the live file must still carry, or ``"absent"`` — an agent
-        that has not read a file may only create it.
+        The digest the live file must still carry, or ``"absent"`` — the agent
+        holds no view of the file. For a ``write`` that means it may only
+        create the file; for a ``delete`` it means there is no view to protect,
+        so the removal proceeds. The value is the same because the *fact* is
+        the same — what differs is what each mutation owes to a view it does
+        not hold, and :meth:`CardGate._check_whole` decides that.
     """
     return "absent" if seen is None else seen.sha
 
@@ -659,7 +663,16 @@ class CardGate:
         return _accepted(f"Written: {path}")
 
     def apply_delete(self, path: str) -> MutationOutcome:
-        """Delete *path*, if this agent has read it whole and it has not moved.
+        """Delete *path*, unless this agent's view of it has gone stale.
+
+        **No prior read is required.** A delete replaces nothing, so an agent
+        that has never read the file holds no view the gate could protect — and
+        for a file the agent *cannot* read (a binary upload, a document whose
+        read shows derived Markdown and records nothing) a read-first rule was
+        a precondition nothing could satisfy. What **is** enforced is the half
+        that carries information: an agent that did read the file is refused if
+        it changed or vanished since, or if it read only a page. Those are the
+        lost-update races the gate exists to catch, and they are unchanged.
 
         Args:
             path: Workspace-relative path.
@@ -675,7 +688,7 @@ class CardGate:
         """Gate and perform one delete — see :meth:`apply_delete`."""
         try:
             live = self._live(path)
-            refusal, _ = self._check(path, whole_file=True, live=live)
+            refusal, _ = self._check(path, whole_file=True, live=live, removal=True)
             if refusal is not None:
                 return _rejected(refusal)
             if live is None:
@@ -899,17 +912,28 @@ class CardGate:
         whole_file: bool,
         live: bytes | None,
         proposed: str | None = None,
+        removal: bool = False,
     ) -> tuple[str | None, bool]:
         """Decide whether this agent may mutate *path*.
 
         Args:
             path: Workspace-relative path.
             whole_file: True for ``write`` and ``delete``, which replace or
-                remove everything; False for the anchored mutations, which are
-                governed by their anchor instead.
+                remove everything and so answer to the whole-file table; False
+                for the anchored mutations, which are governed by their anchor
+                instead.
             live: The file's current bytes, already read by the caller.
             proposed: The whole-file content the agent proposed, when there is
                 one — it is what the refusal diffs the live file against.
+            removal: True when the mutation removes the file rather than
+                replacing it. On the whole-file table this is the one row that
+                differs: an unread existing file is refused for a ``write`` and
+                admitted for a removal, because a removal holds no view the
+                gate could protect. **Named by the caller, never inferred** from
+                ``proposed is None`` — that is true of both removal callers
+                today and false as a contract, and a future whole-file caller
+                with no proposed content would otherwise inherit "no read
+                required" with no spec going red.
 
         Returns:
             The rejection text or ``None`` to proceed, and whether an anchored
@@ -923,13 +947,19 @@ class CardGate:
                 return None, False
             return self._gone(path), False
         if whole_file:
-            return self._check_whole(path, seen, live, proposed), False
+            return self._check_whole(path, seen, live, proposed, removal=removal), False
         if seen is None:
             return self._rejection(path, _REASON_UNREAD_EDIT, live, None), False
         return None, content_sha(live) != seen.sha
 
     def _check_whole(
-        self, path: str, seen: Observation | None, live: bytes, proposed: str | None
+        self,
+        path: str,
+        seen: Observation | None,
+        live: bytes,
+        proposed: str | None,
+        *,
+        removal: bool = False,
     ) -> str | None:
         """Apply the whole-file table to a file that exists.
 
@@ -937,9 +967,18 @@ class CardGate:
         operation on the path was a read*. An operation-order rule admits
         ``read(A) -> write(B) -> write(A)`` and lets A destroy B's work, which is
         the exact lost update the gate exists to prevent.
+
+        **The unread row is the only one that reads *removal*.** With no
+        observation there is no view to protect, so a removal proceeds where a
+        write is refused. Every other row — changed, partial — is about a view
+        the agent *does* hold, and holds it identically for both mutations. The
+        verdict depends on the observation map and the live bytes alone, never
+        on the journal, so it is the same with the journal on and off.
         """
         expected = _precondition(seen)
         if expected == "absent":
+            if removal:
+                return None
             return self._rejection(path, _REASON_UNREAD_WRITE, live, proposed)
         if content_sha(live) != expected:
             return self._rejection(path, _REASON_CHANGED, live, proposed)
@@ -1139,7 +1178,7 @@ class CardGate:
             if path in batch.deletions:
                 continue
             live = self._live(path)
-            refusal, _ = self._check(path, whole_file=True, live=live)
+            refusal, _ = self._check(path, whole_file=True, live=live, removal=True)
             if refusal is not None:
                 return _rejected(refusal)
             if live is None:

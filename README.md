@@ -1066,9 +1066,11 @@ scope. A shared request the platform does not permit fails the bind rather than 
 the [workspace README](src/akgentic/tool/workspace/README.md#where-the-files-live) for the six
 cells and the permission. Traversal out of that root is rejected.
 
-**Every mutation is refused unless the file is still what the writing agent last read**, and the
-check and the write happen together under an `fcntl.flock` held on the path — on the *tree*, so two
-teams and two processes over one mounted volume are ordered by the same thing. Reads stay on the
+**A mutation of a file the agent has read is refused unless the file is still what that agent last
+read**, and the check and the write happen together under an `fcntl.flock` held on the path — on the
+*tree*, so two teams and two processes over one mounted volume are ordered by the same thing. A
+`workspace_write` over an unread existing file is refused too; `workspace_delete` needs no prior
+read, because a delete replaces nothing and so holds no view to protect. Reads stay on the
 agent's own thread and are never serialized. A refusal is a `RetriableError`, so it lands in the model's next turn carrying a diff of
 what the write would have destroyed — the agent re-reads and redoes without anyone writing recovery
 logic. No digest, `expected` or `force` appears in any tool signature: the precondition is derived
