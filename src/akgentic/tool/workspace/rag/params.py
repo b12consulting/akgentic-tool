@@ -34,19 +34,19 @@ Dot-prefixed, so the walk never indexes it and the dot-prefix skip covers it
 without a rule of its own."""
 
 DEFAULT_RAGIGNORE: tuple[str, ...] = (
-    "node_modules/",
-    "build/",
-    "dist/",
     "out/",
-    "target/",
-    "__pycache__/",
+    "dist/",
     "venv/",
-    "site-packages/",
-    "coverage/",
+    "build/",
+    "target/",
     "htmlcov/",
+    "coverage/",
+    "__pycache__/",
+    "node_modules/",
+    "site-packages/",
     "*.log",
-    "package-lock.json",
     "*.min.js",
+    "package-lock.json",
 )
 """What ``.ragignore`` is seeded with, and what is matched when the file is absent.
 
