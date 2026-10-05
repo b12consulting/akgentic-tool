@@ -551,7 +551,7 @@ cannot argue with.
 | `workspace_patch` | `WorkspacePatch \| bool` | `True` | Apply a unified diff. |
 | `workspace_mkdir` | `WorkspaceMkdir \| bool` | `True` | Create a directory tree. |
 | `workspace_exec` | `WorkspaceExec \| bool` | **`False`** | Run a sandboxed shell command. Off by default, and the one field that registers **two** callables. |
-| `workspace_rag_index` | `WorkspaceRagIndex \| bool` | **`False`** | Queue workspace files for retrieval indexing. On the **read** side of `read_only`: indexing derives from the tree and writes nothing into it. |
+| `workspace_rag_index` | `WorkspaceRagIndex \| bool` | **`False`** | Queue workspace files for retrieval indexing. On the **read** side of `read_only`: indexing itself derives from the tree and writes nothing into it. The one exception is the bind, not the index: a retrieval card that is not `read_only` seeds [`.ragignore`](#ragignore--what-indexing-skips) when the tree has none. |
 | `workspace_rag_list` | `WorkspaceRagList \| bool` | **`False`** | Where every file stands in the index. `COMMAND` + `LLM_CONTEXT`, never `TOOL_CALL` — it is pushed into the context tail as a per-turn delta, so a tool call for it would be a round trip for what the model already has. |
 | `workspace_rag_search` | `WorkspaceRagSearch \| bool` | **`False`** | Hybrid search over the indexed chunks. `TOOL_CALL` only — a search is something the model *does*, not something it is *shown*. Read side, like its two siblings. |
 | `vector_store` | `VectorStoreParam` | `VectorStoreParam()` | Backend, dimension, tenant, embedding model and provider of the one `workspace_chunks` collection. The house name, shared with `PlanningTool` and `KnowledgeGraphTool`. It was once `rag_collection`, because a bare `collection` reads as "the workspace's collection of files" on a card whose other twenty fields are file operations — `vector_store` answers that objection rather than working around it. The backend it names also decides whether a store actor is created at all, and it is what the backend-configuration check reads. All of that only when a retrieval capability is on. |
@@ -738,19 +738,75 @@ the bundled image, and how a deployment replaces the backend with one of its own
 | `max_chunk_chars` | `int` | `4000` | **Hard ceiling**, and the only point at which an atomic block — a table, a fenced code block, a list — is ever cut. It is what keeps a chunk inside the embedding model's input limit. |
 | `min_chunk_chars` | `int` | `200` | Below this a chunk merges **forward**, and only under the same heading path. A chunk never crosses a heading boundary, which outranks this. |
 | `prepend_heading_path` | `bool` | `True` | Embed `"Invoice > Payment terms > Late fees"` ahead of the chunk's slice. Read by the **embedder**, never by the splitter: the heading context is composed at embed time and never stored, which is what keeps a stored chunk a pair of offsets rather than a copy of the document. |
+| `ragignore` | `list[str] \| None` | `None` | Gitignore patterns written to `.ragignore` when the tree has none. `None` means `DEFAULT_RAGIGNORE`. A seed, never an override: once the file exists it is the only list read. Not part of the tree's published policy, so two cards with different seeds bind one tree. |
 
 Sizes are in characters rather than tokens so the splitter stays uncoupled from any one model, at
 roughly four characters per token. A configuration the splitter could not honour — a target outside
 its own bounds, or an overlap at or above the target — is a validation error at configuration time
 rather than a surprise at index time.
 
-The callable **returns immediately** with three counts: queued, already current, and unsupported.
+The callable **returns immediately** with five counts:
+`"{queued} file(s) queued, {current} already current, {unsupported} unsupported, {ignored} ignored, {removed} removed"`.
 Everything behind it is bounded work on the actor's thread — a tree walk through the backend, one
 read per candidate to hash it, and up to four worker spawns. No extraction, split or embedding
 happens on the calling agent's thread or on the actor's. Watch `workspace_rag_list` for progress.
 
 `force` re-indexes a file that is already current at its own bytes; without it, a file already
 indexed at its live digest — or one whose run over those same bytes is still in flight — is a no-op.
+
+#### `.ragignore` — what indexing skips
+
+A `.ragignore` file at the **tree root** lists what `workspace_rag_index` skips, in **gitignore
+syntax** (matched by `pathspec.GitIgnoreSpec`, on workspace-relative paths). It is the tree's own
+list: any card that is not `read_only` can edit it with the ordinary write tools, and the next call
+honours the edit, because the file is **re-read on every call** and cached nowhere.
+
+- **Directories are pruned, not filtered.** A matched directory is never listed, so
+  `node_modules/` costs one match and no descent.
+- **The dot-prefix skip stays**, hard-coded and applied before the list: no negation brings back a
+  dot-prefixed name, which guards the package's own staging files. `.ragignore` is dot-prefixed, so
+  it is never indexed itself.
+- **The type filter stays.** The list only subtracts from what is indexable; `!*.png` never makes
+  an image indexable.
+- **Seeding.** A card with retrieval on that is not `read_only` writes `.ragignore` at bind time
+  **only when the tree has none** — its `ragignore` field, or `DEFAULT_RAGIGNORE` (dependency
+  trees, build output, coverage reports, logs, lock files, minified and mapped bundles). An existing
+  file is **never overwritten**, a `read_only` card writes nothing, and a refused bind writes
+  nothing. A seed write that fails logs a WARNING and does not fail the bind.
+- **Fallback.** With no file, the walk matches the list the actor was announced: the first
+  retrieval card's `ragignore`, or `DEFAULT_RAGIGNORE`. A file that cannot be read or does not parse
+  falls back to the same list with one WARNING naming it; the call never raises.
+- **Naming an ignored path opts it in.** When the `path` argument itself matches the list —
+  directly, or because an ancestor directory is ignored — the walk under it ignores the list
+  entirely: `workspace_rag_index("node_modules/some-lib")` indexes that library. Otherwise the list
+  applies under `path` exactly as under `""`. The opt-in lasts until a pass over a wider scope
+  applies the list again, which reconciles the subtree back out.
+
+`ignored` counts indexable files the list excluded **among those the walk actually reached**. A file
+inside a pruned directory is never listed, so it is not counted: the count under-reports by design,
+and is `0` under the opt-in.
+
+#### Reconciliation — what is gone leaves the index
+
+Every pass removes from the index each recorded file **under its scope** that the walk did not
+return: deleted files, newly ignored ones, and files whose type is no longer indexable. The scope is
+`path` matched by whole segments — `""` is the whole tree, `docs` covers `docs/a.md` and never
+`docs2/x.md`, and a single file that no longer exists removes its own record. For each record, its
+chunk ids are removed from the vector store, scoped to the tree, and then the whole record — row
+and cached extraction — is forgotten. `removed` counts those.
+
+- **An in-flight row is skipped** (pending, extracting, splitting, embedding); the next pass gets it.
+- **A failed removal is retried.** The record stays, at `STALE`, with its chunk ids owed in
+  `superseded_chunk_ids`; the next pass tries again. A failed cleanup never fails the pass.
+- **What could not be looked at is left alone.** A record under a sub-directory whose listing
+  failed is kept, and a top-level listing that fails for any reason but absence reconciles nothing,
+  so a transient permission error never wipes an index. A record that only caches an extraction is
+  the extraction cache's business and is not reconciled.
+- **Removal is visible to every team on the tree.** `workspace_chunks` rows belong to the tree, not
+  to a team, exactly as a re-index already is.
+
+Between a deletion and the next pass over its scope, the file is still searchable: the gate marks a
+deleted file `STALE` and does not touch the vector store.
 
 ### `WorkspaceRagList` — `workspace_rag_list()`
 
@@ -864,7 +920,7 @@ Seven properties, each of them load-bearing:
 | `workspace_mkdir` | `(path)` | routed but not gated; creates parents, idempotent |
 | `workspace_exec` | `(cmd, cwd="")` | only when `workspace_exec` is on; takes the tree for the run |
 | `workspace_exec_result` | `(run_id)` | only when `workspace_exec` is on; collects a run started earlier |
-| `workspace_rag_index` | `(path="", force=False)` | returns immediately with counts; extraction, splitting and embedding happen in `#index-` workers |
+| `workspace_rag_index` | `(path="", force=False)` | returns immediately with five counts — queued, already current, unsupported, ignored, removed; skips what `.ragignore` lists; extraction, splitting and embedding happen in `#index-` workers |
 | `workspace_rag_search` | `(query, top_k=…, path_prefix="")` | hybrid over the indexed chunks; answers a `RagSearchResult`; degrades to keyword-only, never raises |
 | `workspace_rag_list` | `()` | `COMMAND` only — the full table. The per-turn delta is a `ContextState`, not a callable |
 

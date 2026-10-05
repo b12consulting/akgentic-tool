@@ -39,6 +39,11 @@ from akgentic.tool.workspace.documents.models import (
     derived_document_caps,
 )
 from akgentic.tool.workspace.models import WorkspaceConfig
+from akgentic.tool.workspace.rag.params import (
+    DEFAULT_RAGIGNORE,
+    RAGIGNORE_FILE,
+    WorkspaceRagIndex,
+)
 from tests.workspace.conftest import (
     WORKSPACE_PATH,
     attach_store,
@@ -219,6 +224,45 @@ class TestTheCollectionIsOnePerDeployment:
     def test_the_collection_name_is_frozen(self) -> None:
         """A class per workspace would be a Weaviate schema mutation per team."""
         assert RAG_COLLECTION == "workspace_chunks"
+
+
+class TestTheRagignoreSeedParameter:
+    """``ragignore`` is a seed list on the card, ``None`` meaning the default."""
+
+    def test_it_defaults_to_none(self) -> None:
+        assert WorkspaceRagIndex().ragignore is None
+
+    def test_it_round_trips_through_serialisation(self) -> None:
+        declared = WorkspaceRagIndex(ragignore=["custom/", "*.tmp"])
+
+        restored = WorkspaceRagIndex.model_validate(declared.model_dump())
+
+        assert restored == declared
+        assert restored.ragignore == ["custom/", "*.tmp"]
+
+    def test_the_default_list_holds_the_sixteen_patterns_in_order(self) -> None:
+        assert DEFAULT_RAGIGNORE == (
+            "node_modules/",
+            "build/",
+            "dist/",
+            "out/",
+            "target/",
+            "__pycache__/",
+            "venv/",
+            "site-packages/",
+            "coverage/",
+            "htmlcov/",
+            "*.log",
+            "*.lock",
+            "package-lock.json",
+            "*.min.js",
+            "*.min.css",
+            "*.map",
+        )
+
+    def test_the_file_is_dot_prefixed_at_the_root(self) -> None:
+        """The walk's dot-prefix skip is what keeps the list out of the corpus."""
+        assert RAGIGNORE_FILE == ".ragignore"
 
 
 class TestDerivedDocumentCaps:

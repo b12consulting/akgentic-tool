@@ -159,6 +159,8 @@ from akgentic.tool.vector_store.protocol import (
 from akgentic.tool.workspace.locks import LOCKS_DIR_NAME, atomic_write, hold
 from akgentic.tool.workspace.rag.context import render_index_state
 from akgentic.tool.workspace.rag.params import (
+    DEFAULT_RAGIGNORE,
+    RAGIGNORE_FILE,
     WorkspaceRagIndex,
     WorkspaceRagList,
     WorkspaceRagSearch,
@@ -174,6 +176,7 @@ if TYPE_CHECKING:
     from akgentic.tool.vector_store.protocol import VectorStoreService
     from akgentic.tool.workspace.actor import WorkspaceActor
     from akgentic.tool.workspace.documents.cache import DocumentCache
+    from akgentic.tool.workspace.workspace import Filesystem
 
 logger = logging.getLogger(__name__)
 
@@ -545,7 +548,9 @@ class RagFactories:
         vector_store: VectorStoreParam
         max_documents: int | None
         max_document_chars: int | None
+        read_only: bool
 
+        _workspace: Filesystem | None
         _workspace_proxy: WorkspaceActor | None
         _workspace_tell: WorkspaceActor | None
         _agent_id: str
@@ -662,9 +667,20 @@ class RagFactories:
         derived cap is a property of this bind — the resolved backend, on this
         host — and publishing it would put a value nobody wrote on the tree, where
         the next host's derivation would then be refused against it.
+
+        **``ragignore`` is published as ``None`` whatever the card declares.** It
+        is a seed for ``.ragignore``, not a chunking parameter: once the file
+        exists it is the only list the walk reads, so two cards declaring
+        different seeds disagree about nothing the tree holds. Clearing that one
+        field by ``model_copy`` keeps every *other* chunking field compared whole,
+        including one added tomorrow (Golden Rule 12).
         """
         return TreePolicy(
-            chunking=self._rag_params() if self._rag_enabled() else None,
+            chunking=(
+                self._rag_params().model_copy(update={"ragignore": None})
+                if self._rag_enabled()
+                else None
+            ),
             max_documents=self.max_documents,
             max_document_chars=self.max_document_chars,
         )
@@ -702,6 +718,41 @@ class RagFactories:
         published = read_tree_policy(workspace_path, card_name)
         if published is not None:
             agreed_tree_policy(published, declared, workspace_path, card_name)
+
+    def _seed_ragignore(self) -> None:
+        """Write ``.ragignore`` at the tree root when the tree has none (ADR-056 §2).
+
+        Only a retrieval card that is not ``read_only`` seeds: a read-only card
+        writes nothing into the tree, and a retrieval-off card has no list to
+        offer. Runs after :meth:`_require_tree_policy` admits the bind, so a
+        refused bind writes nothing, and before :meth:`_announce_rag`.
+
+        **Never an overwrite.** An existing file is the tree's own list, edited by
+        whoever owns the tree, and it is the only list the walk reads — the same
+        exists-then-write idempotence ``_seed_resources`` has. Two binders racing
+        on an absent file both write the same kind of list through an atomic
+        replace, which is benign.
+
+        A write that fails does not fail the bind: indexing falls back to the list
+        the actor was announced, so one WARNING naming the tree is enough.
+        """
+        workspace = self._workspace
+        if workspace is None or not self._rag_enabled() or self.read_only:
+            return
+        patterns = self._rag_params().ragignore
+        lines = list(DEFAULT_RAGIGNORE if patterns is None else patterns)
+        body = "\n".join(["# Paths workspace_rag_index skips, in gitignore syntax.", *lines])
+        try:
+            if workspace.exists(RAGIGNORE_FILE):
+                return
+            workspace.write(RAGIGNORE_FILE, f"{body}\n".encode())
+        except OSError:
+            logger.warning(
+                "Workspace %s: could not seed %s — indexing falls back to the announced list",
+                self._workspace_path,
+                RAGIGNORE_FILE,
+                exc_info=True,
+            )
 
     def _announce_rag(self) -> None:
         """Tell the actor to turn retrieval on for this tree — fire and forget.
@@ -893,8 +944,11 @@ class RagFactories:
                     content. Defaults to False.
 
             Returns:
-                How many files were queued, were already current, and were of a
-                type that cannot be indexed.
+                How many files were queued, were already current, were of a type
+                that cannot be indexed, were skipped by `.ragignore`, and were
+                removed from the index because they are gone or now skipped.
+                `.ragignore` at the workspace root lists what is skipped; naming
+                an ignored path indexes it anyway.
             """
             if proxy is None:
                 return _UNAVAILABLE

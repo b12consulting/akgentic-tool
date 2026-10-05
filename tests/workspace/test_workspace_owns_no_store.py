@@ -92,7 +92,7 @@ class TestAWorkspaceOwnsNoStoreOfItsOwn:
 
         answer = tool_named(card, "workspace_rag_index")("")
 
-        assert answer == "0 file(s) queued, 0 already current, 0 unsupported"
+        assert answer == "0 file(s) queued, 0 already current, 0 unsupported, 0 ignored, 0 removed"
         [store_ref] = pykka.ActorRegistry.get_by_class(VectorStoreActor)
         config = store_ref.proxy().config.get()
         # The team's singleton name, not the per-tree one a child carried.

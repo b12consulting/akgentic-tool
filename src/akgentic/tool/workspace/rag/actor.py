@@ -85,8 +85,10 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum
 from math import ceil
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 from uuid import uuid4
+
+from pathspec import GitIgnoreSpec
 
 from akgentic.core.agent_config import BaseConfig
 from akgentic.tool.workspace.documents.cache import DocumentCache
@@ -100,6 +102,7 @@ from akgentic.tool.workspace.documents.models import (
 )
 from akgentic.tool.workspace.documents.store import DocumentEntry
 from akgentic.tool.workspace.models import WorkspaceConfig, content_sha
+from akgentic.tool.workspace.rag.params import DEFAULT_RAGIGNORE, RAGIGNORE_FILE
 from akgentic.tool.workspace.readers import _MIME_MAP, TEXT_EXTENSIONS, DocumentReader
 from akgentic.tool.workspace.workspace import Filesystem
 
@@ -150,6 +153,44 @@ take the gate down with it.
 
 _CHUNK_REF_TYPE = "workspace_chunk"
 """``VectorEntry.ref_type`` for every chunk this package stores."""
+
+
+class _Walk(NamedTuple):
+    """What one ``index_paths`` walk found — a local of that call, never state."""
+
+    supported: list[str]
+    """Files of an indexable type, workspace-relative."""
+
+    unsupported: int
+    """Files the walk met whose type cannot be indexed."""
+
+    ignored: int
+    """Indexable files ``.ragignore`` excluded, among those the walk reached."""
+
+    unlisted: list[str]
+    """Sub-directories whose listing failed; their records are not reconciled."""
+
+    reconcilable: bool
+    """False when the top-level listing failed for any reason but absence."""
+
+
+def _argument_opts_in(path: str, spec: GitIgnoreSpec) -> bool:
+    """Whether *path* is itself ignored, directly or through an ignored ancestor.
+
+    ``""`` never opts in: the whole tree is not a request for anything ignored.
+    """
+    if not path:
+        return False
+    parts = path.split("/")
+    for depth in range(1, len(parts) + 1):
+        if spec.match_file("/".join(parts[:depth]) + "/"):
+            return True
+    return spec.match_file(path)
+
+
+def _within(path: str, scope: str) -> bool:
+    """Whether *path* is *scope* or lies under it, by whole path segments."""
+    return not scope or path == scope or path.startswith(f"{scope}/")
 
 
 class _Spawn(Enum):
@@ -516,19 +557,26 @@ class DocumentsMixin(_DocumentsBase):
         ``EMBEDDING``: each batch is written on the turn its worker reports, and a
         write that raises settles that file ``FAILED`` there and then.
 
+        **What is skipped is the tree's, read on every call** (ADR-056): the
+        ``.ragignore`` at the root prunes the walk, and a *path* the list itself
+        ignores opts its subtree back in. **What is gone leaves the index on the
+        same pass** — every record under *path* that the walk did not return is
+        reconciled away by :meth:`_reconcile`, before the drain.
+
         Args:
             path: A file, a directory, or ``""`` for the whole tree.
             force: Re-index a file that is already current at these bytes.
 
         Returns:
-            The counts, or the degraded-mode sentence.
+            The five counts, or the degraded-mode sentence.
         """
         if self._vs_proxy is None or self._rag_params is None:
             return _UNAVAILABLE
         self.reap_abandoned_rows()
-        candidates, unsupported = self._candidates(path)
+        walk = self._candidates(path, self._ignore_spec())
+        unsupported = walk.unsupported
         queued = current = 0
-        for candidate in candidates:
+        for candidate in walk.supported:
             sha = self._digest(candidate)
             if sha is None:
                 unsupported += 1
@@ -542,8 +590,12 @@ class DocumentsMixin(_DocumentsBase):
                     continue
                 self._enqueue(candidate, sha)
             queued += 1
+        removed = self._reconcile(path, walk)
         self._drain()
-        return f"{queued} file(s) queued, {current} already current, {unsupported} unsupported"
+        return (
+            f"{queued} file(s) queued, {current} already current, {unsupported} unsupported, "
+            f"{walk.ignored} ignored, {removed} removed"
+        )
 
     def _is_accounted_for(self, path: str, sha: str, force: bool) -> bool:
         """Whether *path* at *sha* needs no new work.
@@ -759,23 +811,74 @@ class DocumentsMixin(_DocumentsBase):
     ##
     ## Candidate discovery — every path through ``Filesystem``, never its root
     ##
-    def _candidates(self, path: str) -> tuple[list[str], int]:
-        """Return the indexable files under *path*, and how many were unsupported.
+    def _ignore_spec(self) -> GitIgnoreSpec:
+        """The tree's ``.ragignore``, compiled — **read on every call, kept nowhere**.
+
+        The file is the tree's and anyone not ``read_only`` may edit it, so the
+        spec is a local of one ``index_paths`` call and is never cached on the
+        actor: a cache would answer an edit with yesterday's list.
+
+        An absent file is ordinary and falls back silently to the list this actor
+        was announced in ``enable_rag`` — the card's ``ragignore``, or
+        :data:`~akgentic.tool.workspace.rag.params.DEFAULT_RAGIGNORE`. A file that
+        cannot be read or does not parse falls back to the same list with one
+        WARNING naming it. Nothing here raises: ``workspace_rag_index`` is
+        reachable from a model.
+        """
+        try:
+            raw = self._workspace.read(RAGIGNORE_FILE)
+            return GitIgnoreSpec.from_lines(raw.decode("utf-8").splitlines())
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as exc:
+            # ``UnicodeDecodeError`` and pathspec's ``GitWildMatchPatternError``
+            # are both ``ValueError``s.
+            logger.warning(
+                "Workspace %s: %s cannot be used (%s) — matching the announced list instead",
+                self.config.workspace_path,
+                RAGIGNORE_FILE,
+                exc,
+            )
+        params = self._rag_params
+        announced = params.ragignore if params is not None else None
+        try:
+            return GitIgnoreSpec.from_lines(DEFAULT_RAGIGNORE if announced is None else announced)
+        except ValueError:
+            logger.warning(
+                "Workspace %s: the announced ragignore list does not parse — matching the default",
+                self.config.workspace_path,
+            )
+            return GitIgnoreSpec.from_lines(DEFAULT_RAGIGNORE)
+
+    def _candidates(self, path: str, spec: GitIgnoreSpec) -> _Walk:
+        """Walk *path* under *spec* and say what was found, skipped and unreachable.
 
         Every path goes through :class:`~akgentic.tool.workspace.workspace.Filesystem`,
         whose every entry point validates internally. Joining onto its private
         root instead is the traversal bypass this package has already had to close
         once.
 
+        **Naming an ignored path opts its subtree back in** (ADR-056 Decision 4):
+        when *path* itself matches, or an ancestor directory of it does, the walk
+        under it ignores the spec entirely. It is a rule about the argument and
+        not per-entry matching, because a gitignore directory pattern also matches
+        every descendant — per-entry matching would still exclude
+        ``node_modules/x.js`` when the caller named ``node_modules``.
+
         A path that escapes, does not exist, or cannot be listed is **skipped with
         a log line**, never an error: ``workspace_rag_index`` is reachable from a
         model, and a raise here would land in the agent's next turn as a failure it
-        cannot act on.
+        cannot act on. Only a path that is **absent** lets the pass reconcile its
+        scope; any other listing failure reconciles nothing, so a transient error
+        never wipes an index.
         """
+        unlisted: list[str] = []
         try:
-            found = self._walk(path)
+            found, ignored = self._walk(
+                path, None if _argument_opts_in(path, spec) else spec, unlisted
+            )
         except NotADirectoryError:
-            found = [path]  # a single file, which is a legal argument
+            found, ignored = [path], 0  # a single file, which is a legal argument
         except OSError as exc:
             logger.info(
                 "Workspace %s: %r is not indexable: %s",
@@ -783,33 +886,164 @@ class DocumentsMixin(_DocumentsBase):
                 path,
                 exc,
             )
-            return [], 0
+            return _Walk([], 0, 0, [], reconcilable=isinstance(exc, FileNotFoundError))
         supported = [
             candidate
             for candidate in found
             if Path(candidate).suffix.lower() in _INDEXABLE_EXTENSIONS
         ]
-        return supported, len(found) - len(supported)
+        return _Walk(supported, len(found) - len(supported), ignored, unlisted, reconcilable=True)
 
-    def _walk(self, root: str) -> list[str]:
-        """List every file under *root*, depth-first, through the backend only.
+    def _walk(
+        self, root: str, spec: GitIgnoreSpec | None, unlisted: list[str]
+    ) -> tuple[list[str], int]:
+        """List every file under *root*, depth-first, and count what *spec* ignored.
 
-        Dot-prefixed names are skipped whole. That covers the atomic-write staging
-        files (``.<name>.<32 hex>.tmp``) and the vestigial extraction sidecars
-        (``.<name>.md``) — indexing either would put a temporary file or a stale
-        copy of a document into the corpus.
+        Dot-prefixed names are skipped whole, **before** the spec is consulted, so
+        no negation in ``.ragignore`` can bring one back. That covers the
+        atomic-write staging files (``.<name>.<32 hex>.tmp``), the vestigial
+        extraction sidecars (``.<name>.md``) and ``.ragignore`` itself.
+
+        **A matched directory is pruned, not filtered**: it is never listed, so
+        ``node_modules/`` costs one match and no descent. The cost of that is the
+        count — a file inside a pruned directory is never met, so it is not in the
+        ignored count, which counts only matched files of an indexable type that
+        the walk actually reached. Matching is on workspace-relative paths, a
+        directory with a trailing ``/``.
+
+        A sub-directory that cannot be listed is recorded in *unlisted* — a local
+        of the caller, never instance state — so reconciliation leaves its records
+        alone.
+
+        Returns:
+            Every file found, and how many indexable files *spec* excluded.
         """
         found: list[str] = []
+        ignored = 0
         for entry in self._workspace.list(root):
             if entry.name.startswith("."):
                 continue
             relative = f"{root}/{entry.name}" if root else entry.name
             if entry.is_dir:
-                with contextlib.suppress(OSError):
-                    found.extend(self._walk(relative))
+                if spec is not None and spec.match_file(f"{relative}/"):
+                    continue
+                try:
+                    below, skipped = self._walk(relative, spec, unlisted)
+                except OSError:
+                    unlisted.append(relative)
+                    continue
+                found.extend(below)
+                ignored += skipped
+            elif spec is not None and spec.match_file(relative):
+                if Path(entry.name).suffix.lower() in _INDEXABLE_EXTENSIONS:
+                    ignored += 1
             else:
                 found.append(relative)
-        return found
+        return found, ignored
+
+    ##
+    ## Reconciliation — what the walk did not return leaves the index
+    ##
+    def _reconcile(self, scope: str, walk: _Walk) -> int:
+        """Remove every record under *scope* the walk did not return, and count them.
+
+        Deleted files, newly ignored ones and files of a type that is no longer
+        indexable all look the same from here: a record with a row and no
+        candidate (ADR-056 Decision 5). Scope matching is segment-aware —
+        ``docs`` covers ``docs/a.md`` and never ``docs2/x.md``.
+
+        Three things are left alone: a record with **no row**, which is the
+        extraction cache's own business; a record under a directory whose listing
+        **failed**; and the whole scope when the top-level listing failed for any
+        reason other than absence. A transient ``EACCES`` must not wipe an index
+        and force every file under it to be embedded again.
+
+        **Removal is visible to every team on the tree**, as re-indexing already
+        is: ``workspace_chunks`` rows belong to the tree, not to a team.
+        """
+        if not walk.reconcilable:
+            return 0
+        kept = set(walk.supported)
+        removed = 0
+        for entry in self._entries():
+            path = entry.path
+            if entry.row is None or path in kept or not _within(path, scope):
+                continue
+            if any(_within(path, directory) for directory in walk.unlisted):
+                continue
+            if self._forget_gone(path):
+                removed += 1
+        return removed
+
+    def _forget_gone(self, path: str) -> bool:
+        """Remove *path*'s chunks, then its record — or keep it ``STALE`` to retry.
+
+        ``_drop_superseded``'s split, for its reason: the two record touches run
+        under the hold and ``proxy.remove`` does not, because a network call inside
+        a cross-process lock is how a lock becomes a bottleneck.
+
+        **An in-flight row is never evicted** — a worker is carrying it, or it is
+        waiting to be claimed, and the next pass gets it. The second hold re-reads
+        before evicting, because the file may have been re-created and re-queued
+        while the ``remove`` was in flight.
+
+        A ``remove`` that fails keeps the record, with its chunk ids owed in
+        ``superseded_chunk_ids`` and its status ``STALE``, so the next pass
+        retries. It never fails the pass.
+
+        Returns:
+            Whether the record was evicted.
+        """
+        with self._hold_record(path):
+            row = self._entry(path).row
+            if row is None or row.status in _IN_FLIGHT:
+                return False
+            owed = list(dict.fromkeys([c.chunk_id for c in row.chunks] + row.superseded_chunk_ids))
+        proxy = self._vs_proxy
+        try:
+            if owed:
+                if proxy is None:
+                    raise RuntimeError("no vector store is bound")
+                proxy.remove(RAG_COLLECTION, owed, scope=self.config.workspace_path)
+        except Exception as exc:
+            logger.warning(
+                "Workspace %s: could not remove %d chunk(s) of %s, which is no longer indexed: "
+                "%s — the record is kept for the next pass to retry",
+                self.config.workspace_path,
+                len(owed),
+                path,
+                exc,
+            )
+            self._keep_owed(path, owed, f"{type(exc).__name__}: {exc}")
+            return False
+        with self._hold_record(path):
+            current = self._entry(path).row
+            if current is not None and current.status in _IN_FLIGHT:
+                return False
+            self._cache().forget_document(path)
+        return True
+
+    def _keep_owed(self, path: str, owed: list[str], reason: str) -> None:
+        """Keep *path*'s record ``STALE``, its chunk ids owed for the next pass."""
+        with self._hold_record(path):
+            row = self._entry(path).row
+            if row is None or row.status in _IN_FLIGHT:
+                return
+            self._put_row(
+                path,
+                row.model_copy(
+                    update={
+                        "status": RagStatus.STALE,
+                        "chunks": [],
+                        "chunk_count": 0,
+                        "superseded_chunk_ids": list(
+                            dict.fromkeys([*row.superseded_chunk_ids, *owed])
+                        ),
+                        "reason": f"could not remove its chunks: {reason}",
+                        "updated_at": datetime.now(UTC),
+                    }
+                ),
+            )
 
     def _digest(self, path: str) -> str | None:
         """Return the digest of *path*'s current bytes, or ``None`` if unreadable."""

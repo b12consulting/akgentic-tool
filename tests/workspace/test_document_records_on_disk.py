@@ -1010,27 +1010,30 @@ def _record_writers(source: str) -> list[str]:
 
 
 class TestOnlyTheKnownFunctionsWriteARecord:
-    """The write inventory is structural: a write outside these five is unaccounted for.
+    """The write inventory is structural: a write outside these six is unaccounted for.
 
     Two of them are the writers proper — ``put_row`` for a row and ``fill`` for an
     extraction. Two more are the eviction pass and the helper it removes through,
     which write only what ``evict_document_bodies`` has already decided. The fifth
-    is ``save`` itself, the one-line wrapper the other four go through: it is here
+    is ``forget_document``, the whole-record eviction an indexing pass calls for a
+    file that is deleted, newly ignored or no longer indexable. The sixth is
+    ``save`` itself, the one-line wrapper the writers go through: it is here
     because the walk sees the call inside its own body, and leaving it out would
     mean a spec that agreed with the code by exception rather than by rule.
     """
 
-    def test_the_record_writers_in_the_cache_are_exactly_five(self) -> None:
+    def test_the_record_writers_in_the_cache_are_exactly_six(self) -> None:
         from akgentic.tool.workspace.documents import cache as cache_module
 
         source = Path(str(cache_module.__file__)).read_text(encoding="utf-8")
 
         assert set(_record_writers(source)) == {
-            "save",  # the one-line wrapper the other four go through
+            "save",  # the one-line wrapper the writers go through
             "put_row",
             "fill",
             "apply_caps",
             "forget_extract",
+            "forget_document",
         }
 
     def test_no_actor_side_module_writes_a_record_of_its_own(self) -> None:
