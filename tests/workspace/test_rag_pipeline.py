@@ -1129,7 +1129,19 @@ class TestRagignore:
             harness.actor.index_paths("")
 
         assert set(harness.rows) == {"top.md"}
-        assert any(RAGIGNORE_FILE in r.getMessage() for r in caplog.records)
+        warnings = [r for r in caplog.records if RAGIGNORE_FILE in r.getMessage()]
+        assert len(warnings) == 1
+
+    def test_a_byte_order_mark_does_not_swallow_the_first_pattern(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        harness.enable()
+        (workspace_tree / RAGIGNORE_FILE).write_bytes(b"\xef\xbb\xbfdraft.md\n")
+        write(workspace_tree, "draft.md")
+        write(workspace_tree, "top.md")
+
+        assert harness.actor.index_paths("") == _answer(queued=1, ignored=1)
+        assert set(harness.rows) == {"top.md"}
 
     def test_with_no_file_the_announced_list_replaces_the_default(
         self, harness: RagHarness, workspace_tree: Path
@@ -1379,6 +1391,69 @@ class TestReconciliation:
 
         assert harness.actor.index_paths("").endswith("0 removed")
         assert "a.md" in harness.rows
+
+    def test_a_record_re_indexed_and_settled_meanwhile_is_kept(
+        self, harness: RagHarness, workspace_tree: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Another process re-created and fully re-indexed the file during ``remove``.
+
+        Its row is settled, not in flight, so a status check alone would evict it
+        and orphan the new chunks. Only the row the first hold read is evicted.
+        """
+        harness.enable()
+        self._settle(harness, workspace_tree, "a.md")
+        (workspace_tree / "a.md").unlink()
+        remove = harness.vs.remove
+        fresh = [RagChunk(chunk_id="fresh-1", ordinal=0, start=0, end=4)]
+
+        def re_indexed_meanwhile(
+            collection: str,
+            ref_ids: list[str],
+            scope: str | None = None,
+            path_prefix: str | None = None,
+        ) -> None:
+            remove(collection, ref_ids, scope=scope)
+            seed_row(
+                harness.actor,
+                "a.md",
+                harness.rows["a.md"].model_copy(
+                    update={"chunks": fresh, "chunk_count": 1, "updated_at": datetime.now(UTC)}
+                ),
+            )
+
+        monkeypatch.setattr(harness.vs, "remove", re_indexed_meanwhile)
+
+        assert harness.actor.index_paths("").endswith("0 removed")
+        assert harness.rows["a.md"].chunks == fresh
+
+    def test_a_failed_remove_does_not_overwrite_a_row_that_moved_on(
+        self, harness: RagHarness, workspace_tree: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Owing a re-indexed row's live chunks would have its next re-index remove them."""
+        harness.enable()
+        self._settle(harness, workspace_tree, "a.md")
+        (workspace_tree / "a.md").unlink()
+        moved_on = harness.rows["a.md"].model_copy(
+            update={
+                "chunks": [RagChunk(chunk_id="fresh-1", ordinal=0, start=0, end=4)],
+                "chunk_count": 1,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+
+        def re_indexed_then_failed(
+            collection: str,
+            ref_ids: list[str],
+            scope: str | None = None,
+            path_prefix: str | None = None,
+        ) -> None:
+            seed_row(harness.actor, "a.md", moved_on)
+            raise RuntimeError("collection is gone")
+
+        monkeypatch.setattr(harness.vs, "remove", re_indexed_then_failed)
+
+        assert harness.actor.index_paths("").endswith("0 removed")
+        assert harness.rows["a.md"] == moved_on
 
     def test_the_whole_record_eviction_degrades_over_no_store(self) -> None:
         DocumentCache(None, WORKSPACE_PATH, 0, 0).forget_document("a.md")

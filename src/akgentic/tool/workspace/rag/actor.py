@@ -827,7 +827,9 @@ class DocumentsMixin(_DocumentsBase):
         """
         try:
             raw = self._workspace.read(RAGIGNORE_FILE)
-            return GitIgnoreSpec.from_lines(raw.decode("utf-8").splitlines())
+            # ``utf-8-sig``: an editor's byte-order mark would otherwise glue
+            # itself to the first pattern, which then silently matches nothing.
+            return GitIgnoreSpec.from_lines(raw.decode("utf-8-sig").splitlines())
         except FileNotFoundError:
             pass
         except (OSError, ValueError) as exc:
@@ -984,8 +986,10 @@ class DocumentsMixin(_DocumentsBase):
 
         **An in-flight row is never evicted** — a worker is carrying it, or it is
         waiting to be claimed, and the next pass gets it. The second hold re-reads
-        before evicting, because the file may have been re-created and re-queued
-        while the ``remove`` was in flight.
+        and evicts only the row the first hold read: the file may have been
+        re-created and re-indexed by another process while the ``remove`` was in
+        flight, and evicting that row would orphan chunks nobody removed. A row
+        that moved on is the next pass's to judge.
 
         A ``remove`` that fails keeps the record, with its chunk ids owed in
         ``superseded_chunk_ids`` and its status ``STALE``, so the next pass
@@ -1014,20 +1018,25 @@ class DocumentsMixin(_DocumentsBase):
                 path,
                 exc,
             )
-            self._keep_owed(path, owed, f"{type(exc).__name__}: {exc}")
+            self._keep_owed(path, row, owed, f"{type(exc).__name__}: {exc}")
             return False
         with self._hold_record(path):
             current = self._entry(path).row
-            if current is not None and current.status in _IN_FLIGHT:
+            if current is not None and current != row:
                 return False
             self._cache().forget_document(path)
         return True
 
-    def _keep_owed(self, path: str, owed: list[str], reason: str) -> None:
-        """Keep *path*'s record ``STALE``, its chunk ids owed for the next pass."""
+    def _keep_owed(self, path: str, read: RagFile, owed: list[str], reason: str) -> None:
+        """Keep *path*'s record ``STALE``, its chunk ids owed for the next pass.
+
+        Only when the row is still the one *read* before the ``remove``: a row
+        re-indexed meanwhile holds its own chunks, and owing those would have the
+        next re-index at the same bytes remove the vectors it has just added.
+        """
         with self._hold_record(path):
             row = self._entry(path).row
-            if row is None or row.status in _IN_FLIGHT:
+            if row is None or row != read:
                 return
             self._put_row(
                 path,
