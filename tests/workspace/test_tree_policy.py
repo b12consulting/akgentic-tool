@@ -20,6 +20,7 @@ prove a filter or a file name would be ceremony.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
@@ -37,9 +38,14 @@ from akgentic.tool.workspace.rag import (
     policy_file_for,
     read_tree_policy,
 )
-from akgentic.tool.workspace.rag.params import WorkspaceRagIndex
+from akgentic.tool.workspace.rag.actor import _INDEXABLE_EXTENSIONS
+from akgentic.tool.workspace.rag.params import (
+    DEFAULT_RAGIGNORE,
+    RAGIGNORE_FILE,
+    WorkspaceRagIndex,
+)
 from akgentic.tool.workspace.tool import WorkspaceTool
-from akgentic.tool.workspace.workspace import meta_dir_for
+from akgentic.tool.workspace.workspace import Filesystem, meta_dir_for
 from tests.workspace.conftest import (
     CHILD_TIMEOUT_S,
     WORKSPACE_NAME,
@@ -62,6 +68,22 @@ def bind(orchestrator_proxy: FakeOrchestratorProxy, **card_kwargs: object) -> Wo
 def policy_on_disk() -> TreePolicy | None:
     """Read the published record back, through the shipped reader."""
     return read_tree_policy(WORKSPACE_PATH, "TestReader")
+
+
+def seeded_lines(tree: Path) -> list[str]:
+    """Every line of the seeded ``.ragignore``."""
+    return (tree / RAGIGNORE_FILE).read_text(encoding="utf-8").splitlines()
+
+
+def seeded_patterns(tree: Path) -> list[str]:
+    """The seeded ``.ragignore`` without its comment header."""
+    return [line for line in seeded_lines(tree) if not line.startswith("#")]
+
+
+class _RagIndexWithExtraField(WorkspaceRagIndex):
+    """A ``WorkspaceRagIndex`` carrying a field no derivation has heard of (Golden Rule 12)."""
+
+    extra_field: str = "sentinel"
 
 
 ##
@@ -130,7 +152,9 @@ class TestTheRecordIsOneFileBesideTheTree:
         bind(orchestrator_proxy, workspace_rag_index=True)
 
         assert not policy_file_for(WORKSPACE_PATH).is_relative_to(workspace_tree.resolve())
-        assert list(workspace_tree.iterdir()) == []
+        # The one file a retrieval bind puts inside the tree is the seeded
+        # exclusion list, which is the tree's to edit — never the policy.
+        assert [entry.name for entry in workspace_tree.iterdir()] == [".ragignore"]
 
 
 ##
@@ -207,6 +231,165 @@ class TestAgreementSectionBySection:
         )
         assert "32" in str(refusal.value)
         assert "8" in str(refusal.value)
+
+
+class TestTheRagignoreSeedIsNotPolicy:
+    """``ragignore`` seeds a file; it is not a chunking value the tree holds.
+
+    Once ``.ragignore`` exists it is the only list the walk reads, so two cards
+    declaring different seeds disagree about nothing. Publishing the field whole
+    would refuse the second of them under the whole-section comparison.
+    """
+
+    def test_two_cards_with_different_seed_lists_both_bind(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        bind(orchestrator_proxy, workspace_rag_index=WorkspaceRagIndex(ragignore=["first/"]))
+
+        bind(orchestrator_proxy, workspace_rag_index=WorkspaceRagIndex(ragignore=["second/"]))
+
+        published = policy_on_disk()
+        assert published is not None
+        assert published.chunking == WorkspaceRagIndex()
+
+    def test_clearing_the_seed_keeps_every_other_chunking_field(self) -> None:
+        """A copy, not a rebuild: an enumerated ``WorkspaceRagIndex(...)`` drops the subclass."""
+        card = WorkspaceTool(
+            workspace_id=WORKSPACE_NAME,
+            workspace_rag_index=_RagIndexWithExtraField(ragignore=["mine/"]),
+        )
+
+        chunking = card._declared_policy().chunking
+
+        assert isinstance(chunking, _RagIndexWithExtraField)
+        assert chunking.extra_field == "sentinel"
+        assert chunking.ragignore is None
+
+    def test_a_policy_file_written_with_no_ragignore_key_admits_a_seed(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """Raw YAML, as a tree published before the field existed holds it."""
+        record = policy_file_for(WORKSPACE_PATH)
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(
+            "chunking:\n"
+            "  chunk_chars: 1200\n"
+            "  chunk_overlap_chars: 150\n"
+            "  max_chunk_chars: 4000\n"
+            "  min_chunk_chars: 200\n"
+            "  prepend_heading_path: true\n"
+            "max_documents: null\n"
+            "max_document_chars: null\n",
+            encoding="utf-8",
+        )
+
+        bind(orchestrator_proxy, workspace_rag_index=WorkspaceRagIndex(ragignore=["foo/"]))
+
+        published = policy_on_disk()
+        assert published is not None
+        assert published.chunking is not None
+        assert published.chunking.ragignore is None
+
+
+class TestARetrievalBindSeedsTheExclusionList:
+    """``.ragignore`` is written once, by a retrieval card that may write the tree."""
+
+    def test_the_default_list_is_seeded_one_pattern_per_line(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        bind(orchestrator_proxy, workspace_rag_index=True)
+
+        assert seeded_lines(workspace_tree)[0].startswith("#")
+        assert tuple(seeded_patterns(workspace_tree)) == DEFAULT_RAGIGNORE
+
+    def test_the_header_explains_the_file_and_the_negation_idiom(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        bind(orchestrator_proxy, workspace_rag_index=True)
+
+        header = "\n".join(line for line in seeded_lines(workspace_tree) if line.startswith("#"))
+        assert "This file wins over the card's list." in header
+        assert "never add a type" in header
+        assert "node_modules/*  then  !node_modules/lib/" in header
+        assert all(len(line) <= 100 for line in seeded_lines(workspace_tree))
+
+    def test_the_header_lists_exactly_the_indexable_extensions(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """Generated from the allowlist at write time, so the two cannot drift."""
+        bind(orchestrator_proxy, workspace_rag_index=True)
+
+        listed = [
+            token
+            for line in seeded_lines(workspace_tree)
+            if line.startswith("#   ")
+            for token in line[1:].split()
+        ]
+        assert listed == sorted(_INDEXABLE_EXTENSIONS)
+
+    def test_the_cards_own_list_is_seeded_instead_when_it_declares_one(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        bind(orchestrator_proxy, workspace_rag_index=WorkspaceRagIndex(ragignore=["custom/"]))
+
+        assert seeded_patterns(workspace_tree) == ["custom/"]
+
+    def test_an_existing_file_is_never_overwritten(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        existing = b"# mine\nvendor/\n"
+        (workspace_tree / RAGIGNORE_FILE).write_bytes(existing)
+
+        bind(orchestrator_proxy, workspace_rag_index=True)
+
+        assert (workspace_tree / RAGIGNORE_FILE).read_bytes() == existing
+
+    def test_a_read_only_card_writes_nothing(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        bind(orchestrator_proxy, read_only=True, workspace_rag_index=True)
+
+        assert not (workspace_tree / RAGIGNORE_FILE).exists()
+
+    def test_a_retrieval_off_card_writes_nothing(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        bind(orchestrator_proxy)
+
+        assert not (workspace_tree / RAGIGNORE_FILE).exists()
+
+    def test_a_refused_bind_writes_nothing(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        record = policy_file_for(WORKSPACE_PATH)
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text("chunking:\n  chunk_chars: 777\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="chunking"):
+            bind(orchestrator_proxy, workspace_rag_index=True)
+
+        assert not (workspace_tree / RAGIGNORE_FILE).exists()
+
+    def test_a_seed_that_cannot_be_written_warns_and_still_binds(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        def refuse(self: Filesystem, path: str, data: bytes) -> None:
+            raise PermissionError(path)
+
+        monkeypatch.setattr(Filesystem, "write", refuse)
+
+        with caplog.at_level(logging.WARNING, logger="akgentic.tool.workspace.rag"):
+            card = bind(orchestrator_proxy, workspace_rag_index=True)
+
+        assert card.workspace is not None
+        warnings = [r for r in caplog.records if RAGIGNORE_FILE in r.getMessage()]
+        assert len(warnings) == 1
+        assert WORKSPACE_PATH in warnings[0].getMessage()
+        assert not (workspace_tree / RAGIGNORE_FILE).exists()
 
 
 class TestASecondProcessIsHeldToWhatTheFirstPublished:

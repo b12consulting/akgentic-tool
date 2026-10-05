@@ -41,6 +41,7 @@ from akgentic.tool.workspace.actor import (
     WorkspaceActor,
     workspace_actor_name,
 )
+from akgentic.tool.workspace.documents.cache import DocumentCache
 from akgentic.tool.workspace.documents.models import (
     EMBEDDING_STALE_AFTER_S,
     EXTRACTOR_VERSION,
@@ -53,7 +54,7 @@ from akgentic.tool.workspace.documents.models import (
 )
 from akgentic.tool.workspace.models import WorkspaceConfig, content_sha
 from akgentic.tool.workspace.rag.context import render_index_state
-from akgentic.tool.workspace.rag.params import WorkspaceRagIndex
+from akgentic.tool.workspace.rag.params import RAGIGNORE_FILE, WorkspaceRagIndex
 from akgentic.tool.workspace.rag.worker import (
     EMBED_BATCH_SIZE,
     MAX_CONCURRENT_INDEX_WORKERS,
@@ -63,6 +64,7 @@ from akgentic.tool.workspace.rag.worker import (
     IndexWorker,
 )
 from akgentic.tool.workspace.readers import DocumentReader
+from akgentic.tool.workspace.workspace import FileEntry
 from tests.conftest import MockActorAddress
 from tests.workspace.conftest import (
     WORKSPACE_PATH,
@@ -73,6 +75,7 @@ from tests.workspace.conftest import (
     seed_extract,
     seed_row,
     stored_docs,
+    stored_entries,
     stored_rows,
     watch_store,
 )
@@ -653,7 +656,7 @@ class TestTheStoreArrivesByAnnouncement:
 
         assert harness.actor._vs_proxy is harness.vs
         assert harness.actor.index_paths("") == (
-            "1 file(s) queued, 0 already current, 0 unsupported"
+            "1 file(s) queued, 0 already current, 0 unsupported, 0 ignored, 0 removed"
         )
         assert len(harness.worker_names) == 1
         harness.report("a.md")
@@ -815,7 +818,7 @@ class TestTheEmbeddedReMarkIsDeleted:
         assert harness.worker_names == []
         assert harness.requests == []
         assert harness.actor.index_paths("") == (
-            "0 file(s) queued, 1 already current, 0 unsupported"
+            "0 file(s) queued, 1 already current, 0 unsupported, 0 ignored, 0 removed"
         )
         assert harness.worker_names == []
 
@@ -876,7 +879,7 @@ class TestCandidateDiscovery:
 
         answer = harness.actor.index_paths("")
 
-        assert answer == "2 file(s) queued, 0 already current, 2 unsupported"
+        assert answer == "2 file(s) queued, 0 already current, 2 unsupported, 0 ignored, 0 removed"
         assert set(harness.rows) == {"notes.md", "data.csv"}
 
     def test_images_are_excluded_even_though_the_reader_claims_them(
@@ -886,7 +889,9 @@ class TestCandidateDiscovery:
         harness.enable()
         (workspace_tree / "scan.jpg").write_bytes(b"\xff\xd8\xff")
 
-        assert harness.actor.index_paths("") == "0 file(s) queued, 0 already current, 1 unsupported"
+        assert harness.actor.index_paths("") == (
+            "0 file(s) queued, 0 already current, 1 unsupported, 0 ignored, 0 removed"
+        )
 
     def test_subdirectories_are_walked(self, harness: RagHarness, workspace_tree: Path) -> None:
         """The whole tree, through ``Filesystem.list`` and nothing else."""
@@ -936,13 +941,17 @@ class TestCandidateDiscovery:
     def test_a_path_that_escapes_the_root_is_skipped_not_raised(
         self, harness: RagHarness, workspace_tree: Path
     ) -> None:
-        """``workspace_rag_index`` is reachable from a model; it must never raise."""
+        """``workspace_rag_index`` is reachable from a model; it must never raise.
+
+        It reconciles nothing either: a refused listing is not an absent one, so a
+        record the walk never got to look for is left in place."""
         harness.enable()
+        seed_row(harness.actor, "a.md", _settled_row("a.md"))
 
         assert harness.actor.index_paths("../..") == (
-            "0 file(s) queued, 0 already current, 0 unsupported"
+            "0 file(s) queued, 0 already current, 0 unsupported, 0 ignored, 0 removed"
         )
-        assert harness.rows == {}
+        assert set(harness.rows) == {"a.md"}
 
     def test_a_missing_path_is_skipped_not_raised(
         self, harness: RagHarness, workspace_tree: Path
@@ -950,7 +959,7 @@ class TestCandidateDiscovery:
         harness.enable()
 
         assert harness.actor.index_paths("nowhere") == (
-            "0 file(s) queued, 0 already current, 0 unsupported"
+            "0 file(s) queued, 0 already current, 0 unsupported, 0 ignored, 0 removed"
         )
 
 
@@ -968,7 +977,7 @@ class TestIdempotence:
         assert harness.rows["notes.md"].status is RagStatus.EMBEDDED
 
         assert harness.actor.index_paths("") == (
-            "0 file(s) queued, 1 already current, 0 unsupported"
+            "0 file(s) queued, 1 already current, 0 unsupported, 0 ignored, 0 removed"
         )
 
     def test_force_re_indexes_a_current_file(
@@ -983,7 +992,7 @@ class TestIdempotence:
 
         answer = harness.actor.index_paths("", force=True)
 
-        assert answer == "1 file(s) queued, 0 already current, 0 unsupported"
+        assert answer == "1 file(s) queued, 0 already current, 0 unsupported, 0 ignored, 0 removed"
 
     def test_changed_bytes_are_queued_again_without_force(
         self, harness: RagHarness, workspace_tree: Path
@@ -997,7 +1006,7 @@ class TestIdempotence:
         write(workspace_tree, "notes.md", "# Replaced\n\nOther text.\n")
 
         assert harness.actor.index_paths("") == (
-            "1 file(s) queued, 0 already current, 0 unsupported"
+            "1 file(s) queued, 0 already current, 0 unsupported, 0 ignored, 0 removed"
         )
 
     def test_a_run_already_in_flight_over_the_same_bytes_is_not_restarted(
@@ -1010,9 +1019,516 @@ class TestIdempotence:
         spawned = len(harness.requests)
 
         assert harness.actor.index_paths("") == (
-            "0 file(s) queued, 1 already current, 0 unsupported"
+            "0 file(s) queued, 1 already current, 0 unsupported, 0 ignored, 0 removed"
         )
         assert len(harness.requests) == spawned
+
+
+class _ListSpy:
+    """Wraps ``Filesystem.list``: records every path asked for, refuses the named ones."""
+
+    def __init__(self, harness: RagHarness, refuse: frozenset[str] = frozenset()) -> None:
+        self.asked: list[str] = []
+        self._list = harness.actor._workspace.list
+        self._refuse = refuse
+
+    def __call__(self, path: str = "") -> list[FileEntry]:
+        self.asked.append(path)
+        if path in self._refuse:
+            raise PermissionError(path)
+        return self._list(path)
+
+
+def _answer(
+    queued: int = 0, current: int = 0, unsupported: int = 0, ignored: int = 0, removed: int = 0
+) -> str:
+    """The reply ``index_paths`` gives, composed from its five counts."""
+    return (
+        f"{queued} file(s) queued, {current} already current, {unsupported} unsupported, "
+        f"{ignored} ignored, {removed} removed"
+    )
+
+
+def _settled_row(path: str) -> RagFile:
+    """A settled row with no chunks — what a reconciled record looks like at rest."""
+    return RagFile(
+        path=path,
+        status=RagStatus.EMBEDDED,
+        indexed_sha=content_sha(path.encode()),
+        updated_at=datetime.now(UTC),
+    )
+
+
+class TestRagignore:
+    """``.ragignore`` at the root decides what the walk skips, read on every call."""
+
+    def test_an_edit_to_the_file_is_honoured_on_the_next_call(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        harness.enable()
+        (workspace_tree / RAGIGNORE_FILE).write_text("# nothing yet\n", encoding="utf-8")
+        write(workspace_tree, "keep.md")
+        write(workspace_tree, "draft.md")
+
+        assert harness.actor.index_paths("") == _answer(queued=2)
+
+        (workspace_tree / RAGIGNORE_FILE).write_text("draft.md\n", encoding="utf-8")
+
+        assert harness.actor.index_paths("") == _answer(current=1, ignored=1, removed=0)
+
+    def test_an_ignored_directory_is_never_listed(
+        self, harness: RagHarness, workspace_tree: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pruned, not filtered — a queued count alone could not tell the two apart."""
+        harness.enable()
+        write(workspace_tree, "node_modules/a.js", "export {}\n")
+        write(workspace_tree, "top.md")
+        spy = _ListSpy(harness)
+        monkeypatch.setattr(harness.actor._workspace, "list", spy)
+
+        harness.actor.index_paths("")
+
+        assert "node_modules" not in spy.asked
+        assert set(harness.rows) == {"top.md"}
+
+    def test_with_no_file_the_default_list_applies(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        harness.enable()
+        write(workspace_tree, "node_modules/a.js", "export {}\n")
+        write(workspace_tree, "top.md")
+
+        harness.actor.index_paths("")
+
+        assert set(harness.rows) == {"top.md"}
+
+    def test_an_unreadable_file_falls_back_to_the_list_with_one_warning(
+        self, harness: RagHarness, workspace_tree: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        harness.enable()
+        (workspace_tree / RAGIGNORE_FILE).write_bytes(b"\xff\xfe not utf-8\n")
+        write(workspace_tree, "node_modules/a.js", "export {}\n")
+        write(workspace_tree, "top.md")
+
+        with caplog.at_level(logging.WARNING, logger=_DOCUMENTS_LOGGER):
+            harness.actor.index_paths("")
+
+        assert set(harness.rows) == {"top.md"}
+        warnings = [r for r in caplog.records if RAGIGNORE_FILE in r.getMessage()]
+        assert len(warnings) == 1
+
+    def test_an_unparsable_file_falls_back_too(
+        self, harness: RagHarness, workspace_tree: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        harness.enable()
+        (workspace_tree / RAGIGNORE_FILE).write_text("!\n", encoding="utf-8")
+        write(workspace_tree, "node_modules/a.js", "export {}\n")
+        write(workspace_tree, "top.md")
+
+        with caplog.at_level(logging.WARNING, logger=_DOCUMENTS_LOGGER):
+            harness.actor.index_paths("")
+
+        assert set(harness.rows) == {"top.md"}
+        warnings = [r for r in caplog.records if RAGIGNORE_FILE in r.getMessage()]
+        assert len(warnings) == 1
+
+    def test_a_byte_order_mark_does_not_swallow_the_first_pattern(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        harness.enable()
+        (workspace_tree / RAGIGNORE_FILE).write_bytes(b"\xef\xbb\xbfdraft.md\n")
+        write(workspace_tree, "draft.md")
+        write(workspace_tree, "top.md")
+
+        assert harness.actor.index_paths("") == _answer(queued=1, ignored=1)
+        assert set(harness.rows) == {"top.md"}
+
+    def test_with_no_file_the_announced_list_replaces_the_default(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        harness.enable(params=WorkspaceRagIndex(ragignore=["custom/"]))
+        write(workspace_tree, "custom/a.md")
+        write(workspace_tree, "node_modules/b.md")
+
+        harness.actor.index_paths("")
+
+        assert set(harness.rows) == {"node_modules/b.md"}
+
+    def test_an_announced_list_that_does_not_parse_falls_back_to_the_default(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        harness.enable(params=WorkspaceRagIndex(ragignore=["!"]))
+        write(workspace_tree, "node_modules/a.js", "export {}\n")
+        write(workspace_tree, "top.md")
+
+        harness.actor.index_paths("")
+
+        assert set(harness.rows) == {"top.md"}
+
+    def test_no_negation_brings_back_a_dot_prefixed_name(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        """The dot skip runs first and guards the package's own staging files."""
+        harness.enable()
+        (workspace_tree / RAGIGNORE_FILE).write_text("!.*\n!.report.pdf.md\n", encoding="utf-8")
+        write(workspace_tree, "real.md")
+        write(workspace_tree, ".report.pdf.md", "# leftover\n")
+        write(workspace_tree, ".x.tmp", "staging\n")
+
+        harness.actor.index_paths("")
+
+        assert set(harness.rows) == {"real.md"}
+
+    def test_no_negation_makes_an_unsupported_type_indexable(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        harness.enable()
+        (workspace_tree / RAGIGNORE_FILE).write_text("!*.png\n", encoding="utf-8")
+        (workspace_tree / "photo.png").write_bytes(b"\x89PNG")
+
+        assert harness.actor.index_paths("") == _answer(unsupported=1)
+        assert harness.rows == {}
+
+    def test_ignoring_a_directorys_contents_lets_a_negation_re_include_part_of_it(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        """``node_modules/`` would prune the directory, so its ``!`` line is never read.
+
+        ``node_modules/*`` matches the children and not the directory, so the walk
+        descends and ``!node_modules/lib/`` applies — exactly as in git.
+        """
+        harness.enable()
+        (workspace_tree / RAGIGNORE_FILE).write_text(
+            "node_modules/*\n!node_modules/lib/\n", encoding="utf-8"
+        )
+        write(workspace_tree, "node_modules/lib/a.js", "export {}\n")
+        write(workspace_tree, "node_modules/other/b.js", "export {}\n")
+
+        harness.actor.index_paths("")
+
+        assert set(harness.rows) == {"node_modules/lib/a.js"}
+
+    def test_only_an_indexable_file_counts_as_ignored(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        """The count says what the list saved, and an archive was never indexable."""
+        harness.enable()
+        (workspace_tree / RAGIGNORE_FILE).write_text("*.zip\nold.md\n", encoding="utf-8")
+        (workspace_tree / "archive.zip").write_bytes(b"PK\x03\x04")
+        write(workspace_tree, "old.md")
+
+        assert harness.actor.index_paths("") == _answer(ignored=1)
+
+
+class TestNamingAnIgnoredPathOptsItIn:
+    """The argument outranks the list: naming an ignored subtree indexes it."""
+
+    def test_naming_an_ignored_directory_indexes_what_is_under_it(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        harness.enable()
+        write(workspace_tree, "node_modules/a.js", "export {}\n")
+
+        harness.actor.index_paths("")
+        assert "node_modules/a.js" not in harness.rows
+
+        assert harness.actor.index_paths("node_modules") == _answer(queued=1)
+        assert "node_modules/a.js" in harness.rows
+
+        # The opt-in does not persist: the next pass that applies the list removes it.
+        harness.report("node_modules/a.js", chunks=1)
+        harness.result("node_modules/a.js")
+        assert harness.actor.index_paths("") == _answer(removed=1)
+        assert "node_modules/a.js" not in harness.rows
+
+    def test_a_path_under_an_ignored_ancestor_is_opted_in_too(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        harness.enable()
+        write(workspace_tree, "node_modules/some-lib/x.js", "export {}\n")
+
+        harness.actor.index_paths("node_modules/some-lib")
+
+        assert set(harness.rows) == {"node_modules/some-lib/x.js"}
+
+    def test_naming_a_directory_that_is_not_ignored_still_applies_the_list(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        harness.enable()
+        write(workspace_tree, "src/main.md")
+        write(workspace_tree, "src/build/out.md")
+
+        harness.actor.index_paths("src")
+
+        assert set(harness.rows) == {"src/main.md"}
+
+
+class TestReconciliation:
+    """A pass removes every record under its scope that the walk did not return."""
+
+    def _settle(self, harness: RagHarness, tree: Path, name: str) -> list[str]:
+        """Index *name* through the real pipeline and return its chunk ids."""
+        write(tree, name)
+        harness.actor.index_paths(name)
+        harness.report(name, chunks=2)
+        harness.result(name)
+        row = harness.rows[name]
+        assert row.status is RagStatus.EMBEDDED
+        return [chunk.chunk_id for chunk in row.chunks]
+
+    def test_a_deleted_file_named_alone_is_evicted_and_its_chunks_removed(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        harness.enable()
+        ids = self._settle(harness, workspace_tree, "a.md")
+        (workspace_tree / "a.md").unlink()
+        harness.vs.calls.clear()
+
+        assert harness.actor.index_paths("a.md") == _answer(removed=1)
+
+        assert "a.md" not in stored_entries(harness.actor)
+        assert harness.vs.of("remove") == [(RAG_COLLECTION, ids, WORKSPACE_PATH)]
+
+    def test_scope_matching_is_by_whole_path_segments(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        harness.enable()
+        write(workspace_tree, "docs/keep.md")
+        for path in ("docs/a.md", "docs2/x.md", "docsearch.md"):
+            seed_row(harness.actor, path, _settled_row(path))
+
+        assert harness.actor.index_paths("docs") == _answer(queued=1, removed=1)
+
+        assert set(harness.rows) == {"docs/keep.md", "docs2/x.md", "docsearch.md"}
+
+    def test_a_newly_ignored_file_leaves_the_index(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        harness.enable()
+        self._settle(harness, workspace_tree, "draft.md")
+        (workspace_tree / RAGIGNORE_FILE).write_text("draft.md\n", encoding="utf-8")
+
+        assert harness.actor.index_paths("") == _answer(ignored=1, removed=1)
+        assert "draft.md" not in harness.rows
+
+    def test_an_in_flight_row_is_never_evicted(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        harness.enable()
+        now = datetime.now(UTC)
+        seed_row(
+            harness.actor,
+            "ghost.md",
+            RagFile(
+                path="ghost.md",
+                status=RagStatus.EMBEDDING,
+                indexed_sha="abc",
+                chunks=[RagChunk(chunk_id="c-1", ordinal=0, start=0, end=4)],
+                chunk_count=1,
+                updated_at=now,
+            ),
+        )
+        seed_row(
+            harness.actor,
+            "waiting.md",
+            RagFile(path="waiting.md", status=RagStatus.PENDING, indexed_sha="def", updated_at=now),
+        )
+
+        assert harness.actor.index_paths("").endswith("0 removed")
+
+        assert {"ghost.md", "waiting.md"} <= set(harness.rows)
+        assert harness.vs.of("remove") == []
+
+    def test_a_failed_remove_keeps_the_record_stale_and_the_next_pass_retries(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        harness.enable()
+        ids = self._settle(harness, workspace_tree, "a.md")
+        (workspace_tree / "a.md").unlink()
+        harness.vs.remove_error = RuntimeError("collection is gone")
+
+        assert harness.actor.index_paths("") == _answer()
+
+        row = harness.rows["a.md"]
+        assert row.status is RagStatus.STALE
+        assert set(ids) <= set(row.superseded_chunk_ids)
+        assert row.chunks == []
+
+        harness.vs.remove_error = None
+        harness.vs.calls.clear()
+
+        assert harness.actor.index_paths("") == _answer(removed=1)
+        assert "a.md" not in harness.rows
+        assert harness.vs.of("remove") == [(RAG_COLLECTION, ids, WORKSPACE_PATH)]
+
+    def test_a_record_whose_eviction_raises_does_not_fail_the_pass(
+        self, harness: RagHarness, workspace_tree: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed cleanup never fails the pass — not only a failed ``remove``."""
+        harness.enable()
+        for path in ("bad.md", "good.md"):
+            seed_row(harness.actor, path, _settled_row(path))
+        write(workspace_tree, "new.md")
+        cache = harness.actor._cache()
+        forget = cache.forget_document
+
+        def refuse_one(path: str) -> None:
+            if path == "bad.md":
+                raise OSError("disk went away")
+            forget(path)
+
+        monkeypatch.setattr(cache, "forget_document", refuse_one)
+
+        assert harness.actor.index_paths("") == _answer(queued=1, removed=1)
+
+        assert "bad.md" in harness.rows
+        assert "good.md" not in harness.rows
+        assert [request.path for request in harness.requests] == ["new.md"]
+
+    def test_records_under_a_directory_that_could_not_be_listed_survive(
+        self, harness: RagHarness, workspace_tree: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A transient ``EACCES`` must not wipe a subtree's index."""
+        harness.enable()
+        write(workspace_tree, "locked/one.md")
+        write(workspace_tree, "locked/two.md")
+        for path in ("locked/one.md", "locked/two.md"):
+            seed_row(harness.actor, path, _settled_row(path))
+        monkeypatch.setattr(
+            harness.actor._workspace, "list", _ListSpy(harness, frozenset({"locked"}))
+        )
+
+        assert harness.actor.index_paths("").endswith("0 removed")
+
+        assert {"locked/one.md", "locked/two.md"} <= set(harness.rows)
+
+    def test_a_top_level_listing_failure_reconciles_nothing(
+        self, harness: RagHarness, workspace_tree: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        harness.enable()
+        write(workspace_tree, "docs/one.md")
+        seed_row(harness.actor, "docs/gone.md", _settled_row("docs/gone.md"))
+        monkeypatch.setattr(
+            harness.actor._workspace, "list", _ListSpy(harness, frozenset({"docs"}))
+        )
+
+        assert harness.actor.index_paths("docs") == _answer()
+
+        assert "docs/gone.md" in harness.rows
+
+    def test_a_record_re_queued_while_its_chunks_were_removed_is_kept(
+        self, harness: RagHarness, workspace_tree: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The second hold re-reads: a file re-created meanwhile is not evicted."""
+        harness.enable()
+        self._settle(harness, workspace_tree, "a.md")
+        (workspace_tree / "a.md").unlink()
+        remove = harness.vs.remove
+
+        def requeue_meanwhile(
+            collection: str,
+            ref_ids: list[str],
+            scope: str | None = None,
+            path_prefix: str | None = None,
+        ) -> None:
+            remove(collection, ref_ids, scope=scope)
+            seed_row(
+                harness.actor,
+                "a.md",
+                harness.rows["a.md"].model_copy(update={"status": RagStatus.PENDING}),
+            )
+
+        monkeypatch.setattr(harness.vs, "remove", requeue_meanwhile)
+
+        assert harness.actor.index_paths("").endswith("0 removed")
+        assert "a.md" in harness.rows
+
+    def test_a_record_re_indexed_and_settled_meanwhile_is_kept(
+        self, harness: RagHarness, workspace_tree: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Another process re-created and fully re-indexed the file during ``remove``.
+
+        Its row is settled, not in flight, so a status check alone would evict it
+        and orphan the new chunks. Only the row the first hold read is evicted.
+        """
+        harness.enable()
+        self._settle(harness, workspace_tree, "a.md")
+        (workspace_tree / "a.md").unlink()
+        remove = harness.vs.remove
+        fresh = [RagChunk(chunk_id="fresh-1", ordinal=0, start=0, end=4)]
+
+        def re_indexed_meanwhile(
+            collection: str,
+            ref_ids: list[str],
+            scope: str | None = None,
+            path_prefix: str | None = None,
+        ) -> None:
+            remove(collection, ref_ids, scope=scope)
+            seed_row(
+                harness.actor,
+                "a.md",
+                harness.rows["a.md"].model_copy(
+                    update={"chunks": fresh, "chunk_count": 1, "updated_at": datetime.now(UTC)}
+                ),
+            )
+
+        monkeypatch.setattr(harness.vs, "remove", re_indexed_meanwhile)
+
+        assert harness.actor.index_paths("").endswith("0 removed")
+        assert harness.rows["a.md"].chunks == fresh
+
+    def test_a_failed_remove_does_not_overwrite_a_row_that_moved_on(
+        self, harness: RagHarness, workspace_tree: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Owing a re-indexed row's live chunks would have its next re-index remove them."""
+        harness.enable()
+        self._settle(harness, workspace_tree, "a.md")
+        (workspace_tree / "a.md").unlink()
+        moved_on = harness.rows["a.md"].model_copy(
+            update={
+                "chunks": [RagChunk(chunk_id="fresh-1", ordinal=0, start=0, end=4)],
+                "chunk_count": 1,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+
+        def re_indexed_then_failed(
+            collection: str,
+            ref_ids: list[str],
+            scope: str | None = None,
+            path_prefix: str | None = None,
+        ) -> None:
+            seed_row(harness.actor, "a.md", moved_on)
+            raise RuntimeError("collection is gone")
+
+        monkeypatch.setattr(harness.vs, "remove", re_indexed_then_failed)
+
+        assert harness.actor.index_paths("").endswith("0 removed")
+        assert harness.rows["a.md"] == moved_on
+
+    def test_the_whole_record_eviction_degrades_over_no_store(self) -> None:
+        DocumentCache(None, WORKSPACE_PATH, 0, 0).forget_document("a.md")
+
+    def test_an_extraction_only_record_is_left_to_the_cache(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        harness.enable()
+        seed_extract(
+            harness.actor,
+            "read.md",
+            DocumentExtract(
+                path="read.md",
+                source_sha="abc",
+                extractor_version=EXTRACTOR_VERSION,
+                markdown="# body",
+                char_count=6,
+                extracted_at=datetime.now(UTC),
+            ),
+        )
+
+        assert harness.actor.index_paths("").endswith("0 removed")
+
+        assert "read.md" in harness.docs
 
 
 class TestTheSpawnSide:

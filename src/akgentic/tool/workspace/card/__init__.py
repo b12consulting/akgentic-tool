@@ -652,6 +652,9 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         # where get-or-create fixed them for a team at whichever card bound first.
         self._document_cache = self._build_document_cache()
         self._seed_resources()
+        # Beside the resources and for their reason: after the policy admits the
+        # bind, before the journal's first commit, and before ``_announce_rag``.
+        self._seed_ragignore()
         self._bind_workspace_actor(observer, observer.orchestrator, ws_path)
         # **One event per successful bind, actor or no actor.** It used to be
         # emitted inside the bind above, which now runs for some cards and not

@@ -43,6 +43,11 @@ dependencies = [
     # extra: pure Python, no transitive dependencies, and already in the workspace
     # through akgentic-team's event store. No ceiling, per Golden Rule #13.
     "pyyaml>=6.0",
+    # `.ragignore` at a workspace root is gitignore syntax, matched by
+    # `pathspec.GitIgnoreSpec` (`rag/actor.py`). Base, not an extra: pure Python,
+    # no transitive dependencies, and already in the workspace through mypy. No
+    # ceiling, per Golden Rule #13.
+    "pathspec>=0.12",
 ]
 
 [project.optional-dependencies]

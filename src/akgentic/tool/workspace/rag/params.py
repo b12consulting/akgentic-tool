@@ -27,6 +27,36 @@ from pydantic import model_validator
 
 from akgentic.tool.core import COMMAND, LLM_CONTEXT, TOOL_CALL, BaseToolParam, Channels
 
+RAGIGNORE_FILE = ".ragignore"
+"""The tree's exclusion list for indexing, at the workspace root (ADR-056).
+
+Dot-prefixed, so the walk never indexes it and the dot-prefix skip covers it
+without a rule of its own."""
+
+DEFAULT_RAGIGNORE: tuple[str, ...] = (
+    "out/",
+    "dist/",
+    "venv/",
+    "build/",
+    "target/",
+    "htmlcov/",
+    "coverage/",
+    "__pycache__/",
+    "node_modules/",
+    "site-packages/",
+    "*.log",
+    "*.min.js",
+    "package-lock.json",
+)
+"""What ``.ragignore`` is seeded with, and what is matched when the file is absent.
+
+Build output, dependency trees, coverage reports, logs, the npm lock file and
+minified bundles: text the type filter would accept and nobody asks a question
+of. Only types the extension allowlist admits are worth listing — ``.ragignore``
+only subtracts, so a pattern for a type that is never indexed (``*.lock``,
+``*.map``, ``*.min.css``) would be noise. A tuple, so no caller can mutate the
+default every card shares."""
+
 
 class WorkspaceRagIndex(BaseToolParam):
     """Chunking configuration for indexing a workspace document for retrieval.
@@ -88,6 +118,15 @@ class WorkspaceRagIndex(BaseToolParam):
     never stored, which is what keeps a stored chunk a pair of offsets rather
     than a copy of the document. Nothing branches on this field inside
     ``rag/splitter.py``, and a reader should not read it as dangling."""
+
+    ragignore: list[str] | None = None
+    """Gitignore patterns written to ``.ragignore`` when the tree has none.
+    ``None`` means ``DEFAULT_RAGIGNORE``. A seed, never an override: once the file
+    exists it is the only list read.
+
+    Not part of the tree's published chunking policy: two cards seeding different
+    lists bind one tree without a refusal, because the file, not either card, is
+    what the walk reads."""
 
     @model_validator(mode="after")
     def _check_chunk_bounds(self) -> WorkspaceRagIndex:

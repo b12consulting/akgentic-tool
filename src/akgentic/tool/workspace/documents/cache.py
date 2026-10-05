@@ -272,6 +272,26 @@ class DocumentCache:
             return
         self.save(entry.model_copy(update={"extract": None}))
 
+    def forget_document(self, path: str) -> None:
+        """Remove *path*'s whole record — the index row **and** the extraction.
+
+        The one eviction that takes both halves, for a file an indexing pass found
+        deleted, newly ignored or no longer of an indexable type (ADR-056
+        Decision 5). An extraction cached for such a file has no reader worth
+        keeping; a later read simply refills it. :meth:`forget_extract` is the
+        other eviction and keeps the row, because the caps bound the extraction
+        cache and must never de-index a file.
+
+        Degrades to a no-op over no store, like every other path here.
+
+        Args:
+            path: Workspace-relative path of the source file.
+        """
+        store = self.store
+        if store is None:
+            return
+        store.evict(self.tree_key, path)
+
     def apply_caps(self, filled: str) -> None:
         """Bring the cache back under both caps, least recently extracted first.
 
