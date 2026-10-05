@@ -545,7 +545,7 @@ def _ragignore_header() -> list[str]:
     """
     extensions = textwrap.wrap(
         " ".join(sorted(_INDEXABLE_EXTENSIONS)),
-        width=100,
+        width=60,
         initial_indent="#   ",
         subsequent_indent="#   ",
         break_long_words=False,
