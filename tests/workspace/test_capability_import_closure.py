@@ -220,11 +220,10 @@ CAPABILITY_CLOSURES: dict[str, frozenset[str]] = {
         f"{PACKAGE}.documents.store",
         f"{PACKAGE}.rag",
         # Measured, story 55-9: the mixin's own module. It is a **closure root**,
-        # so removing it reddens ``test_the_closure_is_inside_the_allow_list``;
-        # it reddens the direct-edge spec **not at all**, because no sibling under
-        # ``rag/`` imports it — ``actor/__init__.py`` does, and the actor is the
-        # assembly point rather than a capability. That asymmetry is the
-        # allow-list rule read off this row rather than inherited from another.
+        # so removing it reddens ``test_the_closure_is_inside_the_allow_list``.
+        # Since story 60-1 ``rag/__init__.py`` imports ``_INDEXABLE_EXTENSIONS``
+        # from it for the ``.ragignore`` header, so it is also a sibling edge;
+        # ``actor/__init__.py`` imports it too, as the assembly point.
         f"{PACKAGE}.rag.actor",
         f"{PACKAGE}.rag.context",
         f"{PACKAGE}.rag.params",
@@ -233,9 +232,7 @@ CAPABILITY_CLOSURES: dict[str, frozenset[str]] = {
         # **both** ``test_the_closure_is_inside_the_allow_list`` (it is one of this
         # capability's own modules, so it is a closure root) **and**
         # ``test_it_names_no_other_capability_even_in_an_annotation``
-        # (``rag/__init__.py`` imports it at module scope). That is the asymmetry
-        # with ``rag.actor`` one row up, which reddens only the first because no
-        # sibling under ``rag/`` imports it — the assembly point does.
+        # (``rag/__init__.py`` imports it at module scope).
         f"{PACKAGE}.rag.search",
         f"{PACKAGE}.rag.splitter",
         f"{PACKAGE}.rag.worker",

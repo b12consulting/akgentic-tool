@@ -762,17 +762,28 @@ list: any card that is not `read_only` can edit it with the ordinary write tools
 honours the edit, because the file is **re-read on every call** and cached nowhere.
 
 - **Directories are pruned, not filtered.** A matched directory is never listed, so
-  `node_modules/` costs one match and no descent.
+  `node_modules/` costs one match and no descent. The cost is the same as in git: a `!` line can
+  never re-include anything under a pruned directory, so `node_modules/` followed by
+  `!node_modules/lib/` keeps `lib` out. To keep part of an ignored directory, ignore its
+  **contents** instead of the directory — `node_modules/*` then `!node_modules/lib/`.
+  `node_modules/*` does not match the directory itself, so the walk descends and the negation
+  applies.
 - **The dot-prefix skip stays**, hard-coded and applied before the list: no negation brings back a
   dot-prefixed name, which guards the package's own staging files. `.ragignore` is dot-prefixed, so
   it is never indexed itself.
-- **The type filter stays.** The list only subtracts from what is indexable; `!*.png` never makes
-  an image indexable.
+- **The type filter stays.** The extension allowlist decides what is indexable and the list only
+  subtracts from it. A `!` line re-includes a path, never a type: `!*.png` is a silent no-op, with
+  no warning, and never makes an image indexable.
 - **Seeding.** A card with retrieval on that is not `read_only` writes `.ragignore` at bind time
-  **only when the tree has none** — its `ragignore` field, or `DEFAULT_RAGIGNORE` (dependency
-  trees, build output, coverage reports, logs, lock files, minified and mapped bundles). An existing
+  **only when the tree has none** — its `ragignore` field, or `DEFAULT_RAGIGNORE`'s 13 patterns
+  (dependency trees, build output, coverage reports, logs, `package-lock.json`, minified scripts).
+  Types the allowlist never indexes — `*.lock`, `*.map`, `*.min.css` — are not listed. An existing
   file is **never overwritten**, a `read_only` card writes nothing, and a refused bind writes
   nothing. A seed write that fails logs a WARNING and does not fail the bind.
+- **The seeded header.** The patterns follow a comment block that says what the file is and that it
+  wins over the card's list, lists the indexable extensions — generated from the allowlist when the
+  file is written, so it is a snapshot of that moment — and states the two rules above: a `!` line
+  never adds a type, and the `dir/*` + `!dir/sub/` idiom for keeping part of an ignored directory.
 - **Fallback.** With no file, the walk matches the list the actor was announced: the first
   retrieval card's `ragignore`, or `DEFAULT_RAGIGNORE`. A file that cannot be read or does not parse
   falls back to the same list with one WARNING naming it; the call never raises.
@@ -780,7 +791,8 @@ honours the edit, because the file is **re-read on every call** and cached nowhe
   directly, or because an ancestor directory is ignored — the walk under it ignores the list
   entirely: `workspace_rag_index("node_modules/some-lib")` indexes that library. Otherwise the list
   applies under `path` exactly as under `""`. The opt-in lasts until a pass over a wider scope
-  applies the list again, which reconciles the subtree back out.
+  applies the list again, which reconciles the subtree back out. To keep such a subtree for good,
+  change the list: replace `node_modules/` with `node_modules/*` and add `!node_modules/some-lib/`.
 
 `ignored` counts indexable files the list excluded **among those the walk actually reached**. A file
 inside a pruned directory is never listed, so it is not counted: the count under-reports by design,
@@ -797,7 +809,9 @@ and cached extraction — is forgotten. `removed` counts those.
 
 - **An in-flight row is skipped** (pending, extracting, splitting, embedding); the next pass gets it.
 - **A failed removal is retried.** The record stays, at `STALE`, with its chunk ids owed in
-  `superseded_chunk_ids`; the next pass tries again. A failed cleanup never fails the pass.
+  `superseded_chunk_ids`; the next pass tries again. A failed cleanup never fails the pass: a
+  record whose eviction itself raises is logged, left in place and not counted, and the pass still
+  reconciles the rest and still drains what it queued.
 - **What could not be looked at is left alone.** A record under a sub-directory whose listing
   failed is kept, and a top-level listing that fails for any reason but absence reconciles nothing,
   so a transient permission error never wipes an index. A record that only caches an extraction is

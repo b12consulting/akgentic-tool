@@ -306,11 +306,11 @@ class DocumentsMixin(_DocumentsBase):
     def _entries(self) -> list[DocumentEntry]:
         """Every stored record for this tree, in no guaranteed order.
 
-        **One caller here since story 57-1** — :meth:`reap_abandoned_rows`, whose
-        question is about every row on the tree at once. The render and the
-        keyword leg were the other two, and both read the same listing card-side
-        now, through the same cache: one file carries both halves of a document,
-        so one listing still serves every reader of either half.
+        **Two callers here** — :meth:`reap_abandoned_rows` and :meth:`_reconcile`,
+        whose questions are both about every row on the tree at once. The render
+        and the keyword leg read the same listing card-side, through the same
+        cache: one file carries both halves of a document, so one listing still
+        serves every reader of either half.
 
         Callers that need an order sort for themselves: a directory glob's order
         is the file system's, and leaning on it is how a render stops being stable
@@ -385,8 +385,10 @@ class DocumentsMixin(_DocumentsBase):
         **The arbitration is gone; the keep-first that remains is defensive.**
         Deciding which chunking a tree uses is the *tree's* now, published at
         ``<meta>/policy.yaml`` and enforced at bind: a card carrying different
-        parameters is refused there, naming both values, so no second card
-        carrying different parameters can reach this method through a bind at all
+        chunking is refused there, naming both values. **A second card whose
+        parameters differ only in ``ragignore`` legitimately passes that gate** —
+        the seed is not policy — and arrives here; it keeps the first card's list,
+        which matters only while ``.ragignore`` is absent
         (:class:`~akgentic.tool.workspace.rag.TreePolicy`).
 
         The branch is kept rather than deleted, and narrowly. This actor **must
@@ -395,7 +397,8 @@ class DocumentsMixin(_DocumentsBase):
         ``enable_rag`` in a spec, a worker resolving a different ``<meta>`` root)
         would otherwise silently re-chunk a tree mid-flight. So the assignment
         stays idempotent, and what would have been an arbitration is one DEBUG
-        line saying where the decision actually lives.
+        line saying where the decision actually lives — logged only for a
+        difference in chunking, never for a different seed list.
 
         This is also where the collection is created — **lazily, and never in
         ``on_start``**: a workspace with retrieval off must never create one. It
@@ -417,7 +420,9 @@ class DocumentsMixin(_DocumentsBase):
         """
         try:
             if self._rag_params is not None:
-                if self._rag_params != params:
+                if self._rag_params.model_copy(update={"ragignore": None}) != params.model_copy(
+                    update={"ragignore": None}
+                ):
                     logger.debug(
                         "Workspace %s: the tree's published policy record is the authority "
                         "on chunking and this actor is already carrying it; agent %s "
@@ -962,6 +967,11 @@ class DocumentsMixin(_DocumentsBase):
 
         **Removal is visible to every team on the tree**, as re-indexing already
         is: ``workspace_chunks`` rows belong to the tree, not to a team.
+
+        **A failed cleanup never fails the pass.** A record whose eviction, hold
+        or ``STALE`` write raises is logged, counted as not removed and left for
+        the next pass; the remaining records are still reconciled and the caller
+        still drains.
         """
         if not walk.reconcilable:
             return 0
@@ -973,7 +983,18 @@ class DocumentsMixin(_DocumentsBase):
                 continue
             if any(_within(path, directory) for directory in walk.unlisted):
                 continue
-            if self._forget_gone(path):
+            try:
+                forgotten = self._forget_gone(path)
+            except Exception:
+                logger.warning(
+                    "Workspace %s: could not reconcile %s, which is no longer indexed — "
+                    "the next pass retries",
+                    self.config.workspace_path,
+                    path,
+                    exc_info=True,
+                )
+                continue
+            if forgotten:
                 removed += 1
         return removed
 

@@ -45,17 +45,17 @@ DEFAULT_RAGIGNORE: tuple[str, ...] = (
     "coverage/",
     "htmlcov/",
     "*.log",
-    "*.lock",
     "package-lock.json",
     "*.min.js",
-    "*.min.css",
-    "*.map",
 )
 """What ``.ragignore`` is seeded with, and what is matched when the file is absent.
 
-Build output, dependency trees, coverage reports, logs, lock files and minified
-or mapped bundles: text the type filter would accept and nobody asks a question
-of. A tuple, so no caller can mutate the default every card shares."""
+Build output, dependency trees, coverage reports, logs, the npm lock file and
+minified bundles: text the type filter would accept and nobody asks a question
+of. Only types the extension allowlist admits are worth listing — ``.ragignore``
+only subtracts, so a pattern for a type that is never indexed (``*.lock``,
+``*.map``, ``*.min.css``) would be noise. A tuple, so no caller can mutate the
+default every card shares."""
 
 
 class WorkspaceRagIndex(BaseToolParam):

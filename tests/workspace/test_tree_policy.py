@@ -38,6 +38,7 @@ from akgentic.tool.workspace.rag import (
     policy_file_for,
     read_tree_policy,
 )
+from akgentic.tool.workspace.rag.actor import _INDEXABLE_EXTENSIONS
 from akgentic.tool.workspace.rag.params import (
     DEFAULT_RAGIGNORE,
     RAGIGNORE_FILE,
@@ -67,6 +68,22 @@ def bind(orchestrator_proxy: FakeOrchestratorProxy, **card_kwargs: object) -> Wo
 def policy_on_disk() -> TreePolicy | None:
     """Read the published record back, through the shipped reader."""
     return read_tree_policy(WORKSPACE_PATH, "TestReader")
+
+
+def seeded_lines(tree: Path) -> list[str]:
+    """Every line of the seeded ``.ragignore``."""
+    return (tree / RAGIGNORE_FILE).read_text(encoding="utf-8").splitlines()
+
+
+def seeded_patterns(tree: Path) -> list[str]:
+    """The seeded ``.ragignore`` without its comment header."""
+    return [line for line in seeded_lines(tree) if not line.startswith("#")]
+
+
+class _RagIndexWithExtraField(WorkspaceRagIndex):
+    """A ``WorkspaceRagIndex`` carrying a field no derivation has heard of (Golden Rule 12)."""
+
+    extra_field: str = "sentinel"
 
 
 ##
@@ -235,6 +252,19 @@ class TestTheRagignoreSeedIsNotPolicy:
         assert published is not None
         assert published.chunking == WorkspaceRagIndex()
 
+    def test_clearing_the_seed_keeps_every_other_chunking_field(self) -> None:
+        """A copy, not a rebuild: an enumerated ``WorkspaceRagIndex(...)`` drops the subclass."""
+        card = WorkspaceTool(
+            workspace_id=WORKSPACE_NAME,
+            workspace_rag_index=_RagIndexWithExtraField(ragignore=["mine/"]),
+        )
+
+        chunking = card._declared_policy().chunking
+
+        assert isinstance(chunking, _RagIndexWithExtraField)
+        assert chunking.extra_field == "sentinel"
+        assert chunking.ragignore is None
+
     def test_a_policy_file_written_with_no_ragignore_key_admits_a_seed(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
@@ -269,17 +299,40 @@ class TestARetrievalBindSeedsTheExclusionList:
     ) -> None:
         bind(orchestrator_proxy, workspace_rag_index=True)
 
-        lines = (workspace_tree / RAGIGNORE_FILE).read_text(encoding="utf-8").splitlines()
-        assert lines[0].startswith("#")
-        assert tuple(lines[1:]) == DEFAULT_RAGIGNORE
+        assert seeded_lines(workspace_tree)[0].startswith("#")
+        assert tuple(seeded_patterns(workspace_tree)) == DEFAULT_RAGIGNORE
+
+    def test_the_header_explains_the_file_and_the_negation_idiom(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        bind(orchestrator_proxy, workspace_rag_index=True)
+
+        header = "\n".join(line for line in seeded_lines(workspace_tree) if line.startswith("#"))
+        assert "This file wins over the card's list." in header
+        assert "never add a type" in header
+        assert "node_modules/*  then  !node_modules/lib/" in header
+        assert all(len(line) <= 100 for line in seeded_lines(workspace_tree))
+
+    def test_the_header_lists_exactly_the_indexable_extensions(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """Generated from the allowlist at write time, so the two cannot drift."""
+        bind(orchestrator_proxy, workspace_rag_index=True)
+
+        listed = [
+            token
+            for line in seeded_lines(workspace_tree)
+            if line.startswith("#   ")
+            for token in line[1:].split()
+        ]
+        assert listed == sorted(_INDEXABLE_EXTENSIONS)
 
     def test_the_cards_own_list_is_seeded_instead_when_it_declares_one(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
         bind(orchestrator_proxy, workspace_rag_index=WorkspaceRagIndex(ragignore=["custom/"]))
 
-        lines = (workspace_tree / RAGIGNORE_FILE).read_text(encoding="utf-8").splitlines()
-        assert lines[1:] == ["custom/"]
+        assert seeded_patterns(workspace_tree) == ["custom/"]
 
     def test_an_existing_file_is_never_overwritten(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path

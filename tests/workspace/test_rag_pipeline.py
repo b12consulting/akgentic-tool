@@ -1189,6 +1189,25 @@ class TestRagignore:
         assert harness.actor.index_paths("") == _answer(unsupported=1)
         assert harness.rows == {}
 
+    def test_ignoring_a_directorys_contents_lets_a_negation_re_include_part_of_it(
+        self, harness: RagHarness, workspace_tree: Path
+    ) -> None:
+        """``node_modules/`` would prune the directory, so its ``!`` line is never read.
+
+        ``node_modules/*`` matches the children and not the directory, so the walk
+        descends and ``!node_modules/lib/`` applies — exactly as in git.
+        """
+        harness.enable()
+        (workspace_tree / RAGIGNORE_FILE).write_text(
+            "node_modules/*\n!node_modules/lib/\n", encoding="utf-8"
+        )
+        write(workspace_tree, "node_modules/lib/a.js", "export {}\n")
+        write(workspace_tree, "node_modules/other/b.js", "export {}\n")
+
+        harness.actor.index_paths("")
+
+        assert set(harness.rows) == {"node_modules/lib/a.js"}
+
     def test_only_an_indexable_file_counts_as_ignored(
         self, harness: RagHarness, workspace_tree: Path
     ) -> None:
@@ -1215,6 +1234,12 @@ class TestNamingAnIgnoredPathOptsItIn:
 
         assert harness.actor.index_paths("node_modules") == _answer(queued=1)
         assert "node_modules/a.js" in harness.rows
+
+        # The opt-in does not persist: the next pass that applies the list removes it.
+        harness.report("node_modules/a.js", chunks=1)
+        harness.result("node_modules/a.js")
+        assert harness.actor.index_paths("") == _answer(removed=1)
+        assert "node_modules/a.js" not in harness.rows
 
     def test_a_path_under_an_ignored_ancestor_is_opted_in_too(
         self, harness: RagHarness, workspace_tree: Path
@@ -1330,9 +1355,35 @@ class TestReconciliation:
         assert row.chunks == []
 
         harness.vs.remove_error = None
+        harness.vs.calls.clear()
 
         assert harness.actor.index_paths("") == _answer(removed=1)
         assert "a.md" not in harness.rows
+        assert harness.vs.of("remove") == [(RAG_COLLECTION, ids, WORKSPACE_PATH)]
+
+    def test_a_record_whose_eviction_raises_does_not_fail_the_pass(
+        self, harness: RagHarness, workspace_tree: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed cleanup never fails the pass — not only a failed ``remove``."""
+        harness.enable()
+        for path in ("bad.md", "good.md"):
+            seed_row(harness.actor, path, _settled_row(path))
+        write(workspace_tree, "new.md")
+        cache = harness.actor._cache()
+        forget = cache.forget_document
+
+        def refuse_one(path: str) -> None:
+            if path == "bad.md":
+                raise OSError("disk went away")
+            forget(path)
+
+        monkeypatch.setattr(cache, "forget_document", refuse_one)
+
+        assert harness.actor.index_paths("") == _answer(queued=1, removed=1)
+
+        assert "bad.md" in harness.rows
+        assert "good.md" not in harness.rows
+        assert [request.path for request in harness.requests] == ["new.md"]
 
     def test_records_under_a_directory_that_could_not_be_listed_survive(
         self, harness: RagHarness, workspace_tree: Path, monkeypatch: pytest.MonkeyPatch

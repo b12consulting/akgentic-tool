@@ -240,7 +240,7 @@ class TestTheRagignoreSeedParameter:
         assert restored == declared
         assert restored.ragignore == ["custom/", "*.tmp"]
 
-    def test_the_default_list_holds_the_sixteen_patterns_in_order(self) -> None:
+    def test_the_default_list_holds_the_thirteen_patterns_in_order(self) -> None:
         assert DEFAULT_RAGIGNORE == (
             "node_modules/",
             "build/",
@@ -253,11 +253,8 @@ class TestTheRagignoreSeedParameter:
             "coverage/",
             "htmlcov/",
             "*.log",
-            "*.lock",
             "package-lock.json",
             "*.min.js",
-            "*.min.css",
-            "*.map",
         )
 
     def test_the_file_is_dot_prefixed_at_the_root(self) -> None:
@@ -300,9 +297,13 @@ class TestEveryTransitionIsACopy:
     def test_marking_stale_preserves_an_unknown_field(self, workspace_tree: object) -> None:
         """``mark_paths_stale`` is a status bump, and one of seven per indexed file."""
         actor = _actor()
-        seed_row(actor, "a.md", _RagFileWithExtraField(
-            path="a.md", status=RagStatus.EMBEDDED, updated_at=datetime.now(UTC)
-        ))
+        seed_row(
+            actor,
+            "a.md",
+            _RagFileWithExtraField(
+                path="a.md", status=RagStatus.EMBEDDED, updated_at=datetime.now(UTC)
+            ),
+        )
 
         cache_of(actor).mark_paths_stale(["a.md"])
 
@@ -315,13 +316,17 @@ class TestEveryTransitionIsACopy:
         """A second, structurally different transition — it moves four fields, not one."""
         actor = _actor()
         stale = datetime.now(UTC) - timedelta(seconds=EMBEDDING_STALE_AFTER_S + 1)
-        seed_row(actor, "a.md", _RagFileWithExtraField(
-            path="a.md",
-            status=RagStatus.EMBEDDING,
-            batches_expected=3,
-            batches_landed=1,
-            updated_at=stale,
-        ))
+        seed_row(
+            actor,
+            "a.md",
+            _RagFileWithExtraField(
+                path="a.md",
+                status=RagStatus.EMBEDDING,
+                batches_expected=3,
+                batches_landed=1,
+                updated_at=stale,
+            ),
+        )
 
         assert actor.reap_abandoned_rows() is True
 
@@ -343,14 +348,18 @@ class TestEveryTransitionIsACopy:
         halves of what this branch now does.
         """
         actor = _actor()
-        seed_row(actor, "a.md", _RagFileWithExtraField(
-            path="a.md",
-            status=RagStatus.EMBEDDED,
-            indexed_sha="old-bytes",
-            chunks=[RagChunk(chunk_id="c1", ordinal=0, start=0, end=5)],
-            chunk_count=1,
-            updated_at=datetime.now(UTC),
-        ))
+        seed_row(
+            actor,
+            "a.md",
+            _RagFileWithExtraField(
+                path="a.md",
+                status=RagStatus.EMBEDDED,
+                indexed_sha="old-bytes",
+                chunks=[RagChunk(chunk_id="c1", ordinal=0, start=0, end=5)],
+                chunk_count=1,
+                updated_at=datetime.now(UTC),
+            ),
+        )
 
         actor._enqueue("a.md", "new-bytes")
 
@@ -358,6 +367,37 @@ class TestEveryTransitionIsACopy:
         assert result.status is RagStatus.PENDING
         assert result.indexed_sha == "new-bytes"
         assert result.indexed_extractor_version == EXTRACTOR_VERSION
+        assert result.superseded_chunk_ids == ["c1"]
+        assert isinstance(result, _RagFileWithExtraField)
+        assert result.extra_field == "sentinel"
+
+    def test_a_failed_reconcile_removal_preserves_an_unknown_field(
+        self, workspace_tree: object
+    ) -> None:
+        """``_keep_owed``'s ``STALE`` transition: the record kept for the next pass.
+
+        The ``remove`` fails because no vector store is bound, which is the same
+        branch a store that raises takes.
+        """
+        actor = _actor()
+        actor._vs_proxy = None
+        seed_row(
+            actor,
+            "gone.md",
+            _RagFileWithExtraField(
+                path="gone.md",
+                status=RagStatus.EMBEDDED,
+                indexed_sha="abc",
+                chunks=[RagChunk(chunk_id="c1", ordinal=0, start=0, end=5)],
+                chunk_count=1,
+                updated_at=datetime.now(UTC),
+            ),
+        )
+
+        assert actor._forget_gone("gone.md") is False
+
+        result = stored_rows(actor)["gone.md"]
+        assert result.status is RagStatus.STALE
         assert result.superseded_chunk_ids == ["c1"]
         assert isinstance(result, _RagFileWithExtraField)
         assert result.extra_field == "sentinel"
@@ -374,13 +414,17 @@ class TestTheEmbeddingBound:
     def test_a_file_past_the_bound_is_queued_again(self, workspace_tree: object) -> None:
         """After a resume the vector store's requester map is gone with the request."""
         actor = _actor()
-        seed_row(actor, "a.md", RagFile(
-            path="a.md",
-            status=RagStatus.EMBEDDING,
-            batches_expected=2,
-            batches_landed=1,
-            updated_at=datetime.now(UTC) - timedelta(seconds=EMBEDDING_STALE_AFTER_S + 1),
-        ))
+        seed_row(
+            actor,
+            "a.md",
+            RagFile(
+                path="a.md",
+                status=RagStatus.EMBEDDING,
+                batches_expected=2,
+                batches_landed=1,
+                updated_at=datetime.now(UTC) - timedelta(seconds=EMBEDDING_STALE_AFTER_S + 1),
+            ),
+        )
 
         assert actor.reap_abandoned_rows() is True
 
@@ -391,11 +435,15 @@ class TestTheEmbeddingBound:
     def test_a_file_just_inside_the_bound_does_not_move(self, workspace_tree: object) -> None:
         """A live embed must not be restarted underneath itself."""
         actor = _actor()
-        seed_row(actor, "a.md", RagFile(
-            path="a.md",
-            status=RagStatus.EMBEDDING,
-            updated_at=datetime.now(UTC) - timedelta(seconds=EMBEDDING_STALE_AFTER_S - 5),
-        ))
+        seed_row(
+            actor,
+            "a.md",
+            RagFile(
+                path="a.md",
+                status=RagStatus.EMBEDDING,
+                updated_at=datetime.now(UTC) - timedelta(seconds=EMBEDDING_STALE_AFTER_S - 5),
+            ),
+        )
 
         assert actor.reap_abandoned_rows() is False
         assert stored_rows(actor)["a.md"].status is RagStatus.EMBEDDING
@@ -404,9 +452,11 @@ class TestTheEmbeddingBound:
         """The bound is about a signal that is not coming, not about age."""
         actor = _actor()
         old = datetime.now(UTC) - timedelta(days=7)
-        seed_row(actor, "a.md", RagFile(
-            path="a.md", status=RagStatus.FAILED, reason="boom", updated_at=old
-        ))
+        seed_row(
+            actor,
+            "a.md",
+            RagFile(path="a.md", status=RagStatus.FAILED, reason="boom", updated_at=old),
+        )
 
         assert actor.reap_abandoned_rows() is False
         assert stored_rows(actor)["a.md"].status is RagStatus.FAILED
