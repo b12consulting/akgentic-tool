@@ -242,19 +242,19 @@ class TestTheRagignoreSeedParameter:
 
     def test_the_default_list_holds_the_thirteen_patterns_in_order(self) -> None:
         assert DEFAULT_RAGIGNORE == (
-            "node_modules/",
-            "build/",
-            "dist/",
             "out/",
-            "target/",
-            "__pycache__/",
+            "dist/",
             "venv/",
-            "site-packages/",
-            "coverage/",
+            "build/",
+            "target/",
             "htmlcov/",
+            "coverage/",
+            "__pycache__/",
+            "node_modules/",
+            "site-packages/",
             "*.log",
-            "package-lock.json",
             "*.min.js",
+            "package-lock.json",
         )
 
     def test_the_file_is_dot_prefixed_at_the_root(self) -> None:
