@@ -621,16 +621,24 @@ outright only when there is no row left in it.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `llm_client` | `Literal["openai"] \| None` | `"openai"` | Enables the Pass-2 vision fallback. `None` disables it: extraction is Pass 1 only. |
-| `llm_model` | `str` | `"gpt-5.4-mini"` | Model used for the Pass-2 fallback. |
+| `llm_client` | `Literal["openai", "azure"] \| None` | `"openai"`, or `AKGENTIC_DOCUMENT_READER_PROVIDER` | Enables the Pass-2 vision fallback and picks its client: `OpenAI()` or `AzureOpenAI()`. `None` disables it: extraction is Pass 1 only. |
+| `llm_model` | `str` | `"gpt-6-luna"`, or `AKGENTIC_DOCUMENT_READER_MODEL` | Model used for the Pass-2 fallback — on Azure, the deployment name. |
 | `extensions` | `ClassVar[frozenset[str]]` | see above | The extension set treated as binary. A `ClassVar`, not a field — not configurable per instance. |
 
 Two passes: MarkItDown alone first; if the result holds fewer than 50 non-whitespace characters
-**and** `llm_client` is set, an `OpenAI()` client is constructed lazily and MarkItDown retried with
-vision. If both passes come up short the reader returns `<!-- markitdown: no text extracted -->`.
+**and** `llm_client` is set, an `OpenAI()` (or `AzureOpenAI()`) client is constructed lazily and
+MarkItDown retried with vision. If both passes come up short the reader returns `<!-- markitdown: no text extracted -->`.
 The client is only built when Pass 1 falls short, so a successful text extraction never requires
 credentials. Requires `akgentic-tool[docs]`; without it `extract_text` raises `ImportError` with
 the install command.
+
+**Defaults a host can override.** The tool keeps its own defaults (`openai`, `gpt-6-luna`). A
+deployment overrides them for every reader built without explicit values by exporting
+`AKGENTIC_DOCUMENT_READER_PROVIDER` and `AKGENTIC_DOCUMENT_READER_MODEL` (akgentic-infra's
+worker settings read the same two names). The provider takes an `akgentic.llm` provider id:
+`openai` / `openai-chat` select `OpenAI()`, `azure` / `azure-chat` select `AzureOpenAI()` (which
+reads `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `OPENAI_API_VERSION`). Any other id logs a
+WARNING and keeps the default; an empty value counts as unset; an explicit field value always wins.
 
 ### `WorkspaceView` — `workspace_view(path) -> BinaryContent`
 

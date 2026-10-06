@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol
 
-from pydantic import BaseModel, PrivateAttr
+from pydantic import BaseModel, Field, PrivateAttr
 
 if TYPE_CHECKING:
     from openai import OpenAI
@@ -31,6 +32,58 @@ class MediaContent(BaseModel):
 
     data: bytes
     media_type: str
+
+
+logger = logging.getLogger(__name__)
+
+LlmClient = Literal["openai", "azure"]
+"""The OpenAI-compatible clients this reader can build. MarkItDown only calls
+``client.chat.completions.create``, which both ``OpenAI`` and ``AzureOpenAI`` serve."""
+
+_DEFAULT_LLM_CLIENT: LlmClient = "openai"
+_DEFAULT_LLM_MODEL = "gpt-6-luna"
+LLM_CLIENT_ENV = "AKGENTIC_DOCUMENT_READER_PROVIDER"
+LLM_MODEL_ENV = "AKGENTIC_DOCUMENT_READER_MODEL"
+"""Environment variables a deployment sets to override the reader's defaults.
+
+The tool keeps its own defaults; a deployment sets these names to override them
+(akgentic-infra's worker settings read the same two), and an empty value counts
+as unset."""
+
+_CLIENT_FOR_PROVIDER: dict[str, LlmClient] = {
+    "openai": "openai",
+    "openai-chat": "openai",
+    "azure": "azure",
+    "azure-chat": "azure",
+}
+"""``akgentic.llm.ModelConfig`` provider ids mapped to the client that serves them, so
+one provider setting can drive both an agent model and this reader."""
+
+
+def _default_llm_client() -> LlmClient:
+    """``AKGENTIC_DOCUMENT_READER_PROVIDER`` mapped to a client, else the tool default.
+
+    A provider this reader cannot serve (``anthropic``, ``google-gla``…) is logged
+    and ignored rather than failing every read.
+    """
+    value = os.environ.get(LLM_CLIENT_ENV)
+    if not value:
+        return _DEFAULT_LLM_CLIENT
+    client = _CLIENT_FOR_PROVIDER.get(value)
+    if client is None:
+        logger.warning(
+            "%s=%r is not a provider the document reader supports; using %r",
+            LLM_CLIENT_ENV,
+            value,
+            _DEFAULT_LLM_CLIENT,
+        )
+        return _DEFAULT_LLM_CLIENT
+    return client
+
+
+def _default_llm_model() -> str:
+    """``AKGENTIC_DOCUMENT_READER_MODEL`` when set, else the tool default."""
+    return os.environ.get(LLM_MODEL_ENV) or _DEFAULT_LLM_MODEL
 
 
 TEXT_EXTENSIONS: frozenset[str] = frozenset(
@@ -78,7 +131,8 @@ class DocumentReader(BaseModel):
 
     Pass 1: Extract text via ``MarkItDown()`` (no LLM).
     Pass 2 (optional): If Pass 1 yields fewer than 50 non-whitespace characters
-    and ``llm_client="openai"`` is set, lazily constructs ``OpenAI()`` and retries.
+    and ``llm_client`` is set, lazily constructs ``OpenAI()`` (or ``AzureOpenAI()``)
+    and retries.
     If both passes yield fewer than 50 non-whitespace characters, returns a
     placeholder comment.
     """
@@ -101,22 +155,30 @@ class DocumentReader(BaseModel):
         }
     )
 
-    llm_client: Literal["openai"] | None = "openai"
-    llm_model: str = "gpt-5.4-mini"
+    llm_client: LlmClient | None = Field(default_factory=_default_llm_client)
+    llm_model: str = Field(default_factory=_default_llm_model)
 
     _openai_client: OpenAI | None = PrivateAttr(default=None)
 
     def _get_openai_client(self) -> OpenAI | None:
-        """Lazily create and cache an OpenAI client.
+        """Lazily create and cache the client ``llm_client`` names.
 
-        Returns None if ``llm_client`` is not set.
+        ``azure`` builds ``AzureOpenAI()``, which reads ``AZURE_OPENAI_ENDPOINT``,
+        ``AZURE_OPENAI_API_KEY`` and ``OPENAI_API_VERSION`` — the variables
+        akgentic-llm's ``azure`` provider already uses; ``llm_model`` is then the
+        Azure deployment name. Returns None if ``llm_client`` is not set.
         """
         if self.llm_client is None:
             return None
         if self._openai_client is None:
-            from openai import OpenAI as _OpenAI  # noqa: PLC0415
+            if self.llm_client == "azure":
+                from openai import AzureOpenAI  # noqa: PLC0415
 
-            self._openai_client = _OpenAI()
+                self._openai_client = AzureOpenAI()
+            else:
+                from openai import OpenAI as _OpenAI  # noqa: PLC0415
+
+                self._openai_client = _OpenAI()
         return self._openai_client
 
     @staticmethod

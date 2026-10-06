@@ -1296,15 +1296,75 @@ class TestDocumentReaderSerialization:
         """Default DocumentReader dumps to expected dict."""
         assert DocumentReader().model_dump() == {
             "llm_client": "openai",
-            "llm_model": "gpt-5.4-mini",
+            "llm_model": "gpt-6-luna",
         }
 
     def test_model_dump_with_openai(self) -> None:
         """DocumentReader with llm_client='openai' dumps correctly."""
         assert DocumentReader(llm_client="openai").model_dump() == {
             "llm_client": "openai",
-            "llm_model": "gpt-5.4-mini",
+            "llm_model": "gpt-6-luna",
         }
+
+    def test_environment_overrides_the_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AKGENTIC_DOCUMENT_READER_* replace the tool defaults when set."""
+        monkeypatch.setenv("AKGENTIC_DOCUMENT_READER_PROVIDER", "azure")
+        monkeypatch.setenv("AKGENTIC_DOCUMENT_READER_MODEL", "my-deployment")
+        assert DocumentReader().model_dump() == {
+            "llm_client": "azure",
+            "llm_model": "my-deployment",
+        }
+
+    @pytest.mark.parametrize(
+        ("provider", "client"),
+        [
+            ("openai", "openai"),
+            ("openai-chat", "openai"),
+            ("azure", "azure"),
+            ("azure-chat", "azure"),
+        ],
+    )
+    def test_a_model_config_provider_id_maps_to_its_client(
+        self, monkeypatch: pytest.MonkeyPatch, provider: str, client: str
+    ) -> None:
+        monkeypatch.setenv("AKGENTIC_DOCUMENT_READER_PROVIDER", provider)
+        assert DocumentReader().llm_client == client
+
+    def test_an_unsupported_provider_keeps_the_default(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("AKGENTIC_DOCUMENT_READER_PROVIDER", "anthropic")
+        with caplog.at_level("WARNING"):
+            assert DocumentReader().llm_client == "openai"
+        assert "AKGENTIC_DOCUMENT_READER_PROVIDER" in caplog.text
+
+    def test_an_empty_environment_value_keeps_the_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AKGENTIC_DOCUMENT_READER_PROVIDER", "")
+        monkeypatch.setenv("AKGENTIC_DOCUMENT_READER_MODEL", "")
+        assert DocumentReader().model_dump() == {"llm_client": "openai", "llm_model": "gpt-6-luna"}
+
+    def test_an_explicit_value_beats_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("AKGENTIC_DOCUMENT_READER_MODEL", "host-model")
+        assert DocumentReader(llm_model="chosen").llm_model == "chosen"
+
+    def test_azure_builds_an_azure_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import openai
+
+        monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://example.openai.azure.com")
+        monkeypatch.setenv("AZURE_OPENAI_API_KEY", "test-key")
+        monkeypatch.setenv("OPENAI_API_VERSION", "2024-10-21")
+        client = DocumentReader(llm_client="azure")._get_openai_client()
+        assert isinstance(client, openai.AzureOpenAI)
+
+    def test_openai_builds_a_plain_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import openai
+
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        client = DocumentReader(llm_client="openai")._get_openai_client()
+        assert isinstance(client, openai.OpenAI)
+        assert not isinstance(client, openai.AzureOpenAI)
 
     def test_no_openai_client_in_dump(self) -> None:
         """Private _openai_client must not appear in model_dump()."""
@@ -1326,7 +1386,7 @@ class TestDocumentReaderSerialization:
         original = DocumentReader(llm_client="openai")
         restored = DocumentReader.model_validate(original.model_dump())
         assert restored.llm_client == "openai"
-        assert restored.llm_model == "gpt-5.4-mini"
+        assert restored.llm_model == "gpt-6-luna"
 
 
 class TestWorkspaceToolSerialization:
@@ -1355,7 +1415,7 @@ class TestWorkspaceToolSerialization:
         )
         assert tool.model_dump()["workspace_read"]["document_reader"] == {
             "llm_client": "openai",
-            "llm_model": "gpt-5.4-mini",
+            "llm_model": "gpt-6-luna",
         }
 
     def test_model_validate_roundtrip_with_document_reader(self) -> None:
