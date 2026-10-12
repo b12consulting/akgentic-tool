@@ -2,6 +2,8 @@
 
 from typing import TypeVar
 
+from pydantic import field_serializer
+
 from akgentic.core.utils import SerializableBaseModel
 
 from .channels import TOOL_CALL, Channels
@@ -80,6 +82,17 @@ class BaseToolParam(SerializableBaseModel):
     Use ``Channels`` enum members or module-level aliases: ``TOOL_CALL``, ``SYSTEM_PROMPT``,
     ``LLM_CONTEXT``, ``COMMAND``.
     """
+
+    @field_serializer("expose")
+    def _serialize_expose(self, expose: set[Channels]) -> list[Channels]:
+        """Dump ``expose`` sorted, so one set always dumps to one list.
+
+        A set's iteration order depends on string hashing and on its insertion
+        history, so a two-channel set dumped as-is can come back from a round
+        trip as the same set in a different list order — and a stored record
+        compared as data then differs from itself.
+        """
+        return sorted(expose)
 
     def format_docstring(self, original: str | None) -> str | None:
         """Format the tool docstring with optional additional instructions.
