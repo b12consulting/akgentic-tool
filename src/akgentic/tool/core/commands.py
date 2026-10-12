@@ -176,10 +176,16 @@ class CommandRegistry:
     def dispatch(self, text: str) -> str | None:
         """Parse a ``/``-prefixed command, invoke it, and return its result surface.
 
-        Strips the leading ``/``, ``shlex.split``s the remainder, resolves the
-        first token to a command, classifies the remaining tokens as positional or
+        Strips the leading ``/``, resolves the first **whitespace** token to a
+        command, ``shlex.split``s the rest, classifies those tokens as positional or
         ``name=value`` keyword arguments, coerces and merges them, invokes the
         command, and renders the result.
+
+        **The name is not taken from ``shlex``**, because ``shlex`` raises on a
+        broken quote and the name decides which of the two failure contracts
+        applies. A text naming a registered command whose arguments will not
+        tokenise is that command's failure, returned as a result string like any
+        other; a text naming no command still raises ``CommandNotRecognized``.
 
         A command returning ``None`` dispatches to ``None`` — it handled itself
         and has nothing to report, and the caller says nothing rather than
@@ -202,28 +208,28 @@ class CommandRegistry:
         string — ``CommandNotRecognized`` is never raised once a command has been
         identified.
         """
-        tokens = shlex.split(text[1:] if text.startswith("/") else text)
-        if not tokens:
+        head = (text[1:] if text.startswith("/") else text).split(maxsplit=1)
+        if not head:
             raise CommandNotRecognized(text)
-        name, args = tokens[0], tokens[1:]
+        name = head[0]
         if name not in self._entries:
             raise CommandNotRecognized(name)
-        return self._invoke(name, args)
+        return self._invoke(name, head[1] if len(head) > 1 else "")
 
-    def _invoke(self, name: str, args: list[str]) -> str | None:
-        """Classify, merge, coerce *args* for command *name* and invoke it.
+    def _invoke(self, name: str, rest: str) -> str | None:
+        """Tokenise *rest*, then classify, merge, coerce for command *name* and invoke it.
 
         A ``None`` result is propagated unchanged; every other result is
         string-rendered, so commands returning a non-``str`` value still reach
         the caller as text.
 
-        Any failure (positional-after-keyword, too many/missing args, unknown
-        keyword, duplicate binding, coercion error, or the command body raising) is
-        caught and returned as a result string.
+        Any failure (a quote that does not close, positional-after-keyword, too
+        many/missing args, unknown keyword, duplicate binding, coercion error, or the
+        command body raising) is caught and returned as a result string.
         """
         entry = self._entries[name]
         try:
-            positional, keyword = self._classify_tokens(entry, args)
+            positional, keyword = self._classify_tokens(entry, shlex.split(rest))
             bound = self._bind(entry, positional, keyword)
             result = entry.fn(**bound)
             return None if result is None else str(result)
