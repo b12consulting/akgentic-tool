@@ -76,6 +76,7 @@ class WorkspaceTool(ToolCard):
     workspace_multi_edit: WorkspaceMultiEdit | bool = True
     workspace_patch: WorkspacePatch | bool = True
     workspace_mkdir: WorkspaceMkdir | bool = True
+    workspace_rmdir: WorkspaceRmdir | bool = True
 
     # The journal
     git_journal: bool = False
@@ -224,6 +225,17 @@ Three ingredients, in order of value to the agent: **what to do next**, **who el
 
 `workspace_mkdir` is routed through the actor but **not gated**: a directory has no content to
 clobber, and directory creation is idempotent by design.
+
+`workspace_rmdir` **is** gated, as the delete column generalised to a tree: a recursive removal
+behaves like a `workspace_delete` of every file under the directory. It is **all-or-nothing** — one
+stale view anywhere under it refuses the whole call before a single file is removed — and it locks
+only the paths this agent holds a view of, never one per file. It never reaches the sandbox, so it
+works where exec does not and does not take the exec hold. Without `recursive=true` only an empty
+directory goes; `force=true` (which requires `recursive=true`) skips the view check and nothing
+else. The docstring tells the model to set either **only when the user has explicitly asked** —
+the tool cannot see the user's words, so that is a docstring rule rather than something the code
+checks. The workspace root, a file, a missing path, a path outside the root and a path that is
+itself a symlink are refused; links *inside* the tree are unlinked, never followed.
 
 `workspace_patch` sits on the anchored column because its hunks' context is verified before they
 are spliced. A patch whose context still matches applies on a changed file; one whose context
@@ -450,7 +462,7 @@ The provenance line is added by `format_status`, not by `format_outcome`: the ou
 shared rendering, and the caller that knows the run is the one that names it.
 
 **Mutations still refuse while a run holds the tree, and that asymmetry is deliberate.** `workspace_write`,
-`_edit`, `_patch`, `_delete` and `_mkdir` are *gated*, not fenced: they declare their write set, so
+`_edit`, `_patch`, `_delete`, `_mkdir` and `_rmdir` are *gated*, not fenced: they declare their write set, so
 a refusal is a precondition failure that costs nothing to re-issue and that the agent can act on
 immediately (read the file, answer the user, ask the holder). Exec is the only operation whose write
 set is discovered after the fact, which is why it is the only one whose work would be *lost* by a
@@ -550,6 +562,7 @@ cannot argue with.
 | `workspace_multi_edit` | `WorkspaceMultiEdit \| bool` | `True` | Ordered sequence of find-and-replace edits. |
 | `workspace_patch` | `WorkspacePatch \| bool` | `True` | Apply a unified diff. |
 | `workspace_mkdir` | `WorkspaceMkdir \| bool` | `True` | Create a directory tree. |
+| `workspace_rmdir` | `WorkspaceRmdir \| bool` | `True` | Remove a directory — empty, or with everything under it on request. `WorkspaceRmdir.allow_recursive=False` limits it to empty directories and drops `recursive` and `force` from the schema. |
 | `workspace_exec` | `WorkspaceExec \| bool` | **`False`** | Run a sandboxed shell command. Off by default, and the one field that registers **two** callables. |
 | `workspace_rag_index` | `WorkspaceRagIndex \| bool` | **`False`** | Queue workspace files for retrieval indexing. On the **read** side of `read_only`: indexing itself derives from the tree and writes nothing into it. The one exception is the bind, not the index: a retrieval card that is not `read_only` seeds [`.ragignore`](#ragignore--what-indexing-skips) when the tree has none. |
 | `workspace_rag_list` | `WorkspaceRagList \| bool` | **`False`** | Where every file stands in the index. `COMMAND` + `LLM_CONTEXT`, never `TOOL_CALL` — it is pushed into the context tail as a per-turn delta, so a tool call for it would be a round trip for what the model already has. |
@@ -707,7 +720,9 @@ whenever the field resolves to anything other than `False`.
 ### Write-side params
 
 `WorkspaceWrite`, `WorkspaceDelete`, `WorkspaceEdit`, `WorkspaceMultiEdit`, `WorkspacePatch` and
-`WorkspaceMkdir` add **no fields of their own**. Each carries only the inherited `expose`
+`WorkspaceMkdir` add **no fields of their own**. `WorkspaceRmdir` adds one, `allow_recursive: bool =
+True` — a deployment setting: `False` exposes `workspace_rmdir(path)` with neither `recursive` nor
+`force` in its schema, so only an empty directory can be removed. Each carries only the inherited `expose`
 (`{TOOL_CALL}`) and `instructions`. They exist so a deployment can disable one operation, move it
 to another channel, or attach policy text to its description:
 
@@ -940,6 +955,7 @@ Seven properties, each of them load-bearing:
 | `workspace_patch` | `(patch_text)` | gated; GNU unified diff, add / update / delete; **all-or-nothing** |
 | `workspace_delete` | `(path)` | gated |
 | `workspace_mkdir` | `(path)` | routed but not gated; creates parents, idempotent |
+| `workspace_rmdir` | `(path, recursive=False, force=False)` | gated; **all-or-nothing** over the subtree; `(path)` alone when `allow_recursive=False` |
 | `workspace_exec` | `(cmd, cwd="")` | only when `workspace_exec` is on; takes the tree for the run |
 | `workspace_exec_result` | `(run_id)` | only when `workspace_exec` is on; collects a run started earlier |
 | `workspace_rag_index` | `(path="", force=False)` | returns immediately with five counts — queued, already current, unsupported, ignored, removed; skips what `.ragignore` lists; extraction, splitting and embedding happen in `#index-` workers |

@@ -5,7 +5,7 @@ Pass ``read_only=True`` to restrict to read-side callables only (``workspace_rea
 ``workspace_list``, ``workspace_glob``, ``workspace_grep``, ``workspace_view``).
 The default ``read_only=False`` also includes write-side callables (``workspace_write``,
 ``workspace_delete``, ``workspace_edit``, ``workspace_multi_edit``, ``workspace_patch``,
-``workspace_mkdir``).
+``workspace_mkdir``, ``workspace_rmdir``).
 
 **Reads and mutations both run here now.** A read runs on the calling agent's own
 thread against its own :class:`~akgentic.tool.workspace.workspace.Filesystem` and
@@ -15,10 +15,11 @@ held on the path (ADR-051 Decision 3) — a lock on the *tree*, which is what tw
 workers over one mounted volume share, rather than a mailbox, which is what one
 process has.
 
-Nothing about the gate is visible in an LLM-facing signature: the six mutation
+Nothing about the gate is visible in an LLM-facing signature: the mutation
 callables take exactly what they always took, and the precondition is derived
-from what this agent observed. There is no digest, no ``expected``, and no
-``force``.
+from what this agent observed. There is no digest and no ``expected``. The one
+``force`` is ``workspace_rmdir``'s, which skips the view check only when the user
+has explicitly asked to discard changes — and its docstring says so.
 
 **A workspace binds, gates and mutates in a process that hosts nothing.** There
 is no resource host in this package any more and nothing here forwards to one:
@@ -144,6 +145,7 @@ from akgentic.tool.workspace.write.params import (
     WorkspaceMkdir,
     WorkspaceMultiEdit,
     WorkspacePatch,
+    WorkspaceRmdir,
     WorkspaceWrite,
 )
 
@@ -169,6 +171,7 @@ __all__ = [
     "WorkspaceRagList",
     "WorkspaceRagSearch",
     "WorkspaceRead",
+    "WorkspaceRmdir",
     "WorkspaceTool",
     "WorkspaceView",
     "WorkspaceWrite",
@@ -180,7 +183,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
 
     Pass ``read_only=True`` to restrict to read-side tools only.  The default
     ``read_only=False`` also exposes write-side tools (write, delete, edit,
-    multi_edit, patch, mkdir).
+    multi_edit, patch, mkdir, rmdir).
 
     Binary-extraction config lives on the nested :class:`WorkspaceRead` capability
     (``workspace_read=WorkspaceRead(document_reader=...)``), co-located with the read
@@ -281,6 +284,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
     workspace_multi_edit: WorkspaceMultiEdit | bool = True
     workspace_patch: WorkspacePatch | bool = True
     workspace_mkdir: WorkspaceMkdir | bool = True
+    workspace_rmdir: WorkspaceRmdir | bool = True
 
     git_journal: bool = False
     """Whether accepted mutations are recorded in a git journal.
@@ -1445,6 +1449,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
             ),
             self._tool_if_enabled(self.workspace_patch, WorkspacePatch, self._patch_factory),
             self._tool_if_enabled(self.workspace_mkdir, WorkspaceMkdir, self._mkdir_factory),
+            self._tool_if_enabled(self.workspace_rmdir, WorkspaceRmdir, self._rmdir_factory),
         ]
         tools = [tool for tool in candidates if tool is not None]
         return tools + self._exec_tools()

@@ -204,6 +204,8 @@ class Workspace(Protocol):
 
     def mkdir(self, path: str) -> None: ...
 
+    def rmdir(self, path: str, recursive: bool = False) -> None: ...
+
     def exists(self, path: str) -> bool: ...
 
 
@@ -472,6 +474,30 @@ class Filesystem:
         """
         resolved = self.resolve_path(path)
         resolved.mkdir(parents=True, exist_ok=True)
+
+    def rmdir(self, path: str, recursive: bool = False) -> None:
+        """Remove the directory *path* — empty only, or with everything under it.
+
+        The directory is removed **as named**, never through a symlink: *path* is
+        validated through :meth:`resolve_path`, then the unresolved
+        ``<root>/<path>`` is what is removed. ``Path.rmdir`` refuses a symlink
+        with ``NotADirectoryError`` and ``shutil.rmtree`` refuses one with
+        ``OSError``, so a link is never followed to its target — and
+        ``shutil.rmtree`` unlinks the links *inside* the tree rather than
+        descending into them.
+
+        Raises:
+            FileNotFoundError: if the directory does not exist.
+            NotADirectoryError: if *path* is not a directory.
+            OSError: if *recursive* is False and the directory is not empty.
+            PermissionError: if *path* escapes the workspace root.
+        """
+        self.resolve_path(path)
+        target = self._root / path
+        if recursive:
+            shutil.rmtree(target)
+        else:
+            target.rmdir()
 
     def exists(self, path: str) -> bool:
         """Return ``True`` if *path* exists inside the workspace.

@@ -1,6 +1,6 @@
-"""The write capability of :class:`WorkspaceTool` — write, delete, edit, patch, mkdir.
+"""The write capability of :class:`WorkspaceTool` — write, delete, edit, patch, mkdir, rmdir.
 
-It holds one capability whole: the six LLM-facing closures here, the mutation
+It holds one capability whole: the seven LLM-facing closures here, the mutation
 gate in ``write/gate.py`` — with the observation map and the refusal vocabulary
 that belong to it — and the capability's own parameters in ``write/params.py``.
 It may import the package **spine** — ``workspace.py``, ``models.py``,
@@ -15,7 +15,7 @@ become capabilities of their own later are on that allow-list with their reasons
 the gate's docstring says what each is for.
 
 **The two modules are two because the grouping reads well** (ADR-053 Decision 1):
-the six closures are what an LLM sees, and the gate is what they converge on.
+the seven closures are what an LLM sees, and the gate is what they converge on.
 Merging them would make one 1500-line module out of a split that already tells a
 reader which question they are asking.
 
@@ -58,6 +58,7 @@ from akgentic.tool.workspace.write.params import (
     WorkspaceMkdir,
     WorkspaceMultiEdit,
     WorkspacePatch,
+    WorkspaceRmdir,
     WorkspaceWrite,
 )
 
@@ -110,6 +111,15 @@ class WriteFactories:
         def apply_patch(self, patch_text: str) -> MutationOutcome: ...
 
         def apply_mkdir(self, path: str) -> MutationOutcome: ...
+
+        def apply_rmdir(
+            self,
+            path: str,
+            recursive: bool = False,
+            force: bool = False,
+            *,
+            empty_only: bool = False,
+        ) -> MutationOutcome: ...
 
     def _write_factory(self, params: WorkspaceWrite) -> Callable[..., Any]:
         """Create the ``workspace_write`` tool callable.
@@ -316,3 +326,72 @@ class WriteFactories:
 
         workspace_mkdir.__doc__ = params.format_docstring(workspace_mkdir.__doc__)
         return workspace_mkdir
+
+    def _rmdir_factory(self, params: WorkspaceRmdir) -> Callable[..., Any]:
+        """Create the ``workspace_rmdir`` tool callable.
+
+        **Two closures, one returned**, chosen by ``allow_recursive``. pydantic-ai
+        builds the schema from the signature, so a conditional default would
+        still put ``recursive`` and ``force`` in front of the model on a
+        deployment that has turned them off.
+
+        Args:
+            params: Rmdir capability configuration.
+
+        Returns:
+            Callable that removes a directory from the workspace, through the gate.
+        """
+        card = self
+
+        def workspace_rmdir(path: str, recursive: bool = False, force: bool = False) -> str:
+            """Remove a directory from the team workspace.
+
+            Without recursive, only an empty directory is removed. Set
+            recursive=true ONLY when the user has explicitly asked to remove the
+            directory together with its contents.
+
+            Refused if a file you have read under the directory changed since
+            you read it — no file is removed. Set force=true ONLY when the user
+            has explicitly asked to discard changes made since your last read.
+            Never set it to get past a refusal on your own initiative.
+
+            Args:
+                path: Relative directory path from workspace root (e.g. "build").
+                recursive: Remove the directory and everything under it.
+                force: Remove it even if files under it changed since you read
+                    them. Requires recursive=true.
+
+            Returns:
+                Confirmation string "Removed: <path>".
+
+            Raises:
+                RetriableError: If the removal is refused, the path is not a
+                    directory, does not exist, or escapes the workspace root.
+            """
+            return _resolve_outcome(card.apply_rmdir(path, recursive, force))
+
+        def workspace_rmdir_empty_only(path: str) -> str:
+            """Remove an empty directory from the team workspace.
+
+            A directory that still contains anything is refused.
+
+            Args:
+                path: Relative directory path from workspace root (e.g. "build").
+
+            Returns:
+                Confirmation string "Removed: <path>".
+
+            Raises:
+                RetriableError: If the removal is refused, the path is not an
+                    empty directory, does not exist, or escapes the workspace root.
+            """
+            return _resolve_outcome(card.apply_rmdir(path, empty_only=True))
+
+        chosen: Callable[..., str]
+        if params.allow_recursive:
+            chosen = workspace_rmdir
+        else:
+            chosen = workspace_rmdir_empty_only
+            chosen.__name__ = chosen.__qualname__ = "workspace_rmdir"
+        chosen.__doc__ = params.format_docstring(chosen.__doc__)
+        return chosen

@@ -67,16 +67,17 @@ from akgentic.tool.workspace.write.params import (
     WorkspaceMkdir,
     WorkspaceMultiEdit,
     WorkspacePatch,
+    WorkspaceRmdir,
     WorkspaceWrite,
 )
 
-# mypy strict implies ``no_implicit_reexport``, so the sixteen re-exported names
+# mypy strict implies ``no_implicit_reexport``, so the seventeen re-exported names
 # need an explicit export to keep serving the module path stored records name.
-# ``__all__`` does it in sixteen lines where ``X as X`` aliases would cost an
+# ``__all__`` does it in seventeen lines where ``X as X`` aliases would cost an
 # import statement each — the spelling ``workspace/tool.py`` already uses, and for
 # the same reason.
 #
-# **Nothing in this package imports the sixteen from here.** ``card/__init__.py``
+# **Nothing in this package imports the seventeen from here.** ``card/__init__.py``
 # and every capability module take them from ``read/params.py``,
 # ``write/params.py``, ``rag/params.py`` and ``execution/params.py``, where they
 # are defined, so this re-export exists for exactly one purpose — the stored
@@ -102,6 +103,7 @@ __all__ = [
     "WorkspaceRagList",
     "WorkspaceRagSearch",
     "WorkspaceRead",
+    "WorkspaceRmdir",
     "WorkspaceView",
     "WorkspaceWrite",
 ]

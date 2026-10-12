@@ -1413,7 +1413,7 @@ class TestEveryMutationConvergesOnOnePoint:
             if name.startswith("apply_") and callable(getattr(WorkspaceTool, name))
         )
 
-    def test_the_enumeration_finds_the_six_that_exist_today(self) -> None:
+    def test_the_enumeration_finds_the_seven_that_exist_today(self) -> None:
         """The sweep is floored: one that found nothing would pass every check below."""
         assert self._mutations() == [
             "apply_delete",
@@ -1421,6 +1421,7 @@ class TestEveryMutationConvergesOnOnePoint:
             "apply_mkdir",
             "apply_multi_edit",
             "apply_patch",
+            "apply_rmdir",
             "apply_write",
         ]
 
@@ -1438,9 +1439,11 @@ class TestEveryMutationConvergesOnOnePoint:
         seen: list[str] = []
         real = WorkspaceTool._gated
 
-        def watched(card: WorkspaceTool, capability: str, paths: Any, run: Any) -> Any:
+        def watched(
+            card: WorkspaceTool, capability: str, paths: Any, run: Any, **kwargs: Any
+        ) -> Any:
             seen.append(capability)
-            return real(card, capability, paths, run)
+            return real(card, capability, paths, run, **kwargs)
 
         monkeypatch.setattr(WorkspaceTool, "_gated", watched)
         arguments: dict[str, tuple[Any, ...]] = {
@@ -1452,6 +1455,7 @@ class TestEveryMutationConvergesOnOnePoint:
                 "--- a/notes.md\n+++ b/notes.md\n@@ -1,2 +1,2 @@\n-alpha\n+A\n bravo\n",
             ),
             "apply_mkdir": ("sub",),
+            "apply_rmdir": ("sub",),
         }
         assert set(arguments) == set(self._mutations()), (
             "a mutation was added without a case here — add one rather than "
@@ -1461,7 +1465,9 @@ class TestEveryMutationConvergesOnOnePoint:
         for name in self._mutations():
             getattr(wired_card, name)(*arguments[name])
 
-        assert sorted(seen) == sorted(["write", "delete", "edit", "multi_edit", "patch", "mkdir"])
+        assert sorted(seen) == sorted(
+            ["write", "delete", "edit", "multi_edit", "patch", "mkdir", "rmdir"]
+        )
         assert len(seen) == len(self._mutations())
 
     def test_the_convergence_point_is_one_method_and_it_holds_all_five_duties(self) -> None:
@@ -1482,7 +1488,10 @@ class TestEveryMutationConvergesOnOnePoint:
         for name in self._mutations():
             source = inspect.getsource(getattr(gate_module.CardGate, name))
             assert "_busy_refusal" not in source
-            assert "commit_" not in source
+            # ``.commit_`` — a call on the journal — rather than ``commit_``,
+            # which ``apply_rmdir``'s ``commit_scope=`` keyword to ``_gated``
+            # would match without performing any commit at all.
+            assert ".commit_" not in source
             assert "_hold(" not in source
 
 

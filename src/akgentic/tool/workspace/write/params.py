@@ -1,4 +1,4 @@
-"""The write capability's parameters — write, delete, edit, multi-edit, patch, mkdir.
+"""The write capability's parameters — write, delete, edit, multi-edit, patch, mkdir, rmdir.
 
 Configuration only. Every class here is a :class:`~akgentic.tool.core.BaseToolParam`
 subclass carrying what a capability is configured *with*, never what its callable
@@ -12,7 +12,7 @@ vector-store registry and the actor. A capability module that took its parameter
 from there would depend on every other capability by construction, and the
 property this package's capability modules exist to have would be unobtainable.
 
-``card/params.py`` keeps **re-exporting** these six names, and that is not
+``card/params.py`` keeps **re-exporting** these seven names, and that is not
 tidiness either: :class:`~akgentic.tool.core.BaseToolParam` is a
 :class:`~akgentic.core.utils.SerializableBaseModel`, so a card a deployment
 persisted with one of them set explicitly carries
@@ -23,7 +23,7 @@ tool card into a bad record rather than a card.
 
 from __future__ import annotations
 
-from akgentic.tool.core import TOOL_CALL, BaseToolParam, Channels
+from akgentic.tool.core import COMMAND, TOOL_CALL, BaseToolParam, Channels
 
 
 class WorkspaceWrite(BaseToolParam):
@@ -60,3 +60,15 @@ class WorkspaceMkdir(BaseToolParam):
     """Create a directory (and parents) in the team workspace."""
 
     expose: set[Channels] = {TOOL_CALL}
+
+
+class WorkspaceRmdir(BaseToolParam):
+    """Remove a directory from the team workspace — empty, or with everything under it."""
+
+    expose: set[Channels] = {TOOL_CALL, COMMAND}
+    allow_recursive: bool = True
+    """Whether a non-empty directory may be removed at all — a deployment setting.
+
+    ``False`` exposes ``workspace_rmdir(path)`` with **neither** ``recursive`` nor
+    ``force`` in its schema, so it also disables ``force``, and it makes
+    ``/workspace_rmdir`` remove empty directories only."""
