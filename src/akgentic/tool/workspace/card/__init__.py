@@ -1524,13 +1524,13 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
     def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
         """Return COMMAND-channel capabilities for this tool.
 
-        The read-side pair is served whatever ``read_only`` says; the write-side
-        file commands and the exec pair only when the card is not ``read_only``,
-        exactly as their tools are.
+        The read side — read, list, glob, grep and the retrieval search — is served
+        whatever ``read_only`` says; the write-side file commands and the exec pair
+        only when the card is not ``read_only``, exactly as their tools are.
 
         Returns:
             Dict mapping each enabled COMMAND capability to its callable —
-            ``ExpandMediaRefs``, the two retrieval capabilities, and the
+            ``ExpandMediaRefs``, the retrieval index and list, and the
             workspace's own slash commands.
         """
         commands: dict[type[BaseToolParam], Callable[..., Any]] = {}
@@ -1543,7 +1543,15 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         listing = _resolve(self.workspace_rag_list, WorkspaceRagList)
         if listing is not None and COMMAND in listing.expose:
             commands[WorkspaceRagList] = self._rag_list_factory(listing)
-        rows: list[_CommandRow] = [
+        rows = self._read_command_rows()
+        if not self.read_only:
+            rows += self._write_command_rows()
+        commands.update({key: command for key, command in rows if command is not None})
+        return commands
+
+    def _read_command_rows(self) -> list[_CommandRow]:
+        """The read-side slash commands, keyed for :meth:`get_commands` — ``read_only`` too."""
+        return [
             (
                 WorkspaceRead,
                 self._command_if_enabled(
@@ -1556,11 +1564,25 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
                     self.workspace_list, WorkspaceList, self._list_command_factory
                 ),
             ),
+            (
+                WorkspaceGlob,
+                self._command_if_enabled(
+                    self.workspace_glob, WorkspaceGlob, self._glob_command_factory
+                ),
+            ),
+            (
+                WorkspaceGrep,
+                self._command_if_enabled(
+                    self.workspace_grep, WorkspaceGrep, self._grep_command_factory
+                ),
+            ),
+            (
+                WorkspaceRagSearch,
+                self._command_if_enabled(
+                    self.workspace_rag_search, WorkspaceRagSearch, self._rag_search_command_factory
+                ),
+            ),
         ]
-        if not self.read_only:
-            rows += self._write_command_rows()
-        commands.update({key: command for key, command in rows if command is not None})
-        return commands
 
     def _write_command_rows(self) -> list[_CommandRow]:
         """The write-side slash commands, keyed for :meth:`get_commands` — never ``read_only``."""

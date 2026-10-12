@@ -60,7 +60,7 @@ WRITE_COMMANDS = {
     "workspace_mkdir",
     "workspace_rmdir",
 }
-READ_COMMANDS = {"workspace_read", "workspace_list"}
+READ_COMMANDS = {"workspace_read", "workspace_list", "workspace_glob", "workspace_grep"}
 EXEC_COMMANDS = {"workspace_exec", "workspace_exec_result"}
 
 

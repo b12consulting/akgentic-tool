@@ -167,9 +167,13 @@ class TestTheSearchCapability:
         """It reaches the vector store and spends an embedding call per query."""
         assert WorkspaceTool().workspace_rag_search is False
 
-    def test_it_is_a_tool_call_and_nothing_else(self) -> None:
-        """ADR-045 §5 gives the three capabilities three different channel sets."""
-        assert WorkspaceRagSearch().expose == {TOOL_CALL}
+    def test_it_is_a_tool_call_and_a_command_and_never_context(self) -> None:
+        """ADR-045 §5 gives the three capabilities three different channel sets.
+
+        ``COMMAND`` is the human's channel (story 62-3); no search result is ever
+        pushed into the model's context.
+        """
+        assert WorkspaceRagSearch().expose == {TOOL_CALL, COMMAND}
 
     def test_it_is_a_read_side_tool_and_survives_read_only(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
@@ -186,13 +190,17 @@ class TestTheSearchCapability:
 
         assert "workspace_rag_search" not in {tool.__name__ for tool in card.get_tools()}
 
-    def test_it_reaches_no_other_channel(
+    def test_it_reaches_the_human_but_never_the_models_context(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
     ) -> None:
-        """A search is something the model does, not something it is shown."""
+        """A search is something the model does, not something it is shown.
+
+        The human's ``/workspace_rag_search`` is served (story 62-3); no context
+        provider is.
+        """
         card, _ = bind(orchestrator_proxy, workspace_rag_search=True)
 
-        assert WorkspaceRagSearch not in card.get_commands()
+        assert WorkspaceRagSearch in card.get_commands()
         assert card.get_context_states() == []
 
     def test_a_search_only_card_still_enables_retrieval_on_the_actor(

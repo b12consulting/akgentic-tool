@@ -999,12 +999,31 @@ to the agent's context as a **user action**.
 | `/workspace_write` | `(filepath, content: RestOfLine)` | write | `workspace_write` on `COMMAND` |
 | `/workspace_read` | `(filepath)` | read | `workspace_read` on `COMMAND` |
 | `/workspace_list` | `(path="", depth=<WorkspaceList.max_depth>)` | read | `workspace_list` on `COMMAND` |
+| `/workspace_glob` | `(pattern, path="")` | read | `workspace_glob` on `COMMAND` |
+| `/workspace_grep` | `(pattern, path="", include="")` | read | `workspace_grep` on `COMMAND` |
+| `/workspace_rag_search` | `(query: RestOfLine)` | read | `workspace_rag_search` on `COMMAND` |
 | `/workspace_exec` | `(cmd: RestOfLine)` | write | `workspace_exec` enabled and on `COMMAND` |
 | `/workspace_exec_result` | `(run_id)` | write | as `/workspace_exec` — the pair is served together or not at all |
 
 `COMMAND` is on by default for every one of them, and `read_only` covers commands exactly as it
-covers tools: a read-only card serves `/workspace_read` and `/workspace_list` and none of the
-write side. A field set to `False` serves neither its tool nor its command; exec stays opt-in.
+covers tools: a read-only card serves the read side — `/workspace_read`, `/workspace_list`,
+`/workspace_glob`, `/workspace_grep` and `/workspace_rag_search` — and none of the write side. A
+field set to `False` serves neither its tool nor its command; exec stays opt-in, and so does
+retrieval (`workspace_rag_search` is `False` on a default card).
+
+**Glob, grep and search answer what their tools answer.** `/workspace_glob` and `/workspace_grep`
+return the tool's exact text through one shared render, with the same `max_results` and line caps;
+where the tool raises (an escaping path, pattern or `include`, an invalid regex) the command returns
+the same sentence as text. `/workspace_rag_search` runs the tool's own search with the param's
+`top_k`, `alpha` and `score_threshold` and no path prefix, and renders the hits as text for the
+human — one header per hit (`1. docs/a.md:3-9 (hybrid, score 0.83)`) over its text cut to 300
+characters. The **tool** still answers the model a `RagSearchResult`; that text rendering is the
+command's alone. A search spends one query embedding, which is the point of typing it.
+
+**Quote a regex in single quotes.** The leading arguments are split like a shell line (POSIX
+`shlex`), so outside quotes and inside double quotes a backslash is an escape and is dropped:
+`/workspace_grep \d+` searches for `d+`. Single quotes keep it literal —
+`/workspace_grep 'def \w+_factory' src`.
 
 **`RestOfLine` takes the line verbatim.** `/workspace_write notes.md it's a "quoted" word` writes
 exactly `it's a "quoted" word`; multi-line chat content after the path is written with its

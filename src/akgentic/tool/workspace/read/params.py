@@ -59,14 +59,14 @@ class WorkspaceList(BaseToolParam):
 class WorkspaceGlob(BaseToolParam):
     """Find files matching a glob pattern in the team workspace."""
 
-    expose: set[Channels] = {TOOL_CALL}
+    expose: set[Channels] = {TOOL_CALL, COMMAND}
     max_results: int = 100
 
 
 class WorkspaceGrep(BaseToolParam):
     """Search file contents by regex in the team workspace."""
 
-    expose: set[Channels] = {TOOL_CALL}
+    expose: set[Channels] = {TOOL_CALL, COMMAND}
     max_results: int = 100
     max_line_length: int = 2000
 

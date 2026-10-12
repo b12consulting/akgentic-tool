@@ -405,6 +405,89 @@ def _render_listing(backend: Filesystem, path: str, depth: int) -> str:
         raise RetriableError(_PERM_ERR_MSG)
 
 
+def _render_glob(backend: Filesystem, pattern: str, path: str, max_results: int) -> str:
+    """Render what *pattern* matches — the one rendering ``workspace_glob`` and its command share.
+
+    Raises:
+        RetriableError: If *path* or *pattern* escapes the workspace root.
+    """
+    try:
+        search_root = backend.resolve_path(path) if path else backend.root
+        seen: set[Path] = set()
+        raw_matches: list[Path] = []
+        for expanded_pattern in _expand_braces(pattern):
+            safe_pattern = _normalize_glob_pattern(expanded_pattern)
+            # After both rewrites, never before: ``{..,src}/*`` is a legal
+            # shape until ``_expand_braces`` has turned it into ``../*``.
+            if _pattern_escapes(safe_pattern):
+                raise PathEscapeError(f"Pattern '{safe_pattern}' escapes workspace root")
+            for m in search_root.glob(safe_pattern, case_sensitive=False):
+                if m.is_file() and m not in seen and backend.contains(m):
+                    seen.add(m)
+                    raw_matches.append(m)
+        all_matches = sorted(
+            raw_matches,
+            key=lambda match: match.stat().st_mtime,
+            reverse=True,
+        )
+        truncated = len(all_matches) > max_results
+        shown = [str(m.relative_to(backend.root)) for m in all_matches[:max_results]]
+        if not shown:
+            return "No files found."
+        result = "\n".join(shown)
+        if truncated:
+            result += (
+                f"\n[... truncated: {len(all_matches)} total, showing first {max_results} ...]"
+            )
+        return result
+    except PermissionError:
+        raise RetriableError(_PERM_ERR_MSG)
+
+
+def _render_grep(
+    backend: Filesystem,
+    pattern: str,
+    path: str,
+    include: str,
+    max_results: int,
+    max_line_len: int,
+) -> str:
+    """Render the lines *pattern* hits — the one rendering ``workspace_grep`` and its command share.
+
+    Raises:
+        RetriableError: If *pattern* is not a valid regex, or *path* or *include*
+            escapes the workspace root.
+    """
+    try:
+        search_root = backend.resolve_path(path) if path else backend.root
+        # ``include`` reaches ``Path.rglob`` and then ``read_text`` on every
+        # candidate, so an unvalidated one leaks file *contents* rather than
+        # names.  Checked here, above both engines, because ``rg`` refuses a
+        # ``..`` glob of its own accord and the Python fallback does not —
+        # containment that depended on which binary is installed would be no
+        # containment at all.
+        if include and _pattern_escapes(include):
+            raise PathEscapeError(f"Pattern '{include}' escapes workspace root")
+
+        raw_matches = _grep_rg(search_root, pattern, include, max_results)
+        if raw_matches is None:
+            raw_matches = _grep_python(search_root, pattern, include, max_results, max_line_len)
+        raw_matches = [match for match in raw_matches if backend.contains(match[0])]
+
+        if not raw_matches:
+            return "No matches found."
+
+        result_lines = [
+            f"{fpath.relative_to(backend.root)}:{lineno}: {line}"
+            for fpath, lineno, line in raw_matches
+        ]
+        return "\n".join(result_lines)
+    except PermissionError:
+        raise RetriableError(_PERM_ERR_MSG)
+    except _re.error as e:
+        raise RetriableError(f"Invalid regex pattern: {e}")
+
+
 def _build_tree(
     root: Path,
     prefix: str = "",
@@ -789,40 +872,35 @@ class ReadFactories:
             Raises:
                 RetriableError: If the path or the pattern escapes the workspace root.
             """
-            try:
-                search_root = backend.resolve_path(path) if path else backend.root
-                seen: set[Path] = set()
-                raw_matches: list[Path] = []
-                for expanded_pattern in _expand_braces(pattern):
-                    safe_pattern = _normalize_glob_pattern(expanded_pattern)
-                    # After both rewrites, never before: ``{..,src}/*`` is a legal
-                    # shape until ``_expand_braces`` has turned it into ``../*``.
-                    if _pattern_escapes(safe_pattern):
-                        raise PathEscapeError(f"Pattern '{safe_pattern}' escapes workspace root")
-                    for m in search_root.glob(safe_pattern, case_sensitive=False):
-                        if m.is_file() and m not in seen and backend.contains(m):
-                            seen.add(m)
-                            raw_matches.append(m)
-                all_matches = sorted(
-                    raw_matches,
-                    key=lambda match: match.stat().st_mtime,
-                    reverse=True,
-                )
-                truncated = len(all_matches) > max_results
-                shown = [str(m.relative_to(backend.root)) for m in all_matches[:max_results]]
-                if not shown:
-                    return "No files found."
-                result = "\n".join(shown)
-                if truncated:
-                    result += (
-                        f"\n[... truncated: {len(all_matches)} total,"
-                        f" showing first {max_results} ...]"
-                    )
-                return result
-            except PermissionError:
-                raise RetriableError(_PERM_ERR_MSG)
+            return _render_glob(backend, pattern, path, max_results)
 
         workspace_glob.__doc__ = params.format_docstring(workspace_glob.__doc__)
+        return workspace_glob
+
+    def _glob_command_factory(self, params: WorkspaceGlob) -> Callable[..., Any]:
+        """Create the ``/workspace_glob`` command — the tool's rendering, for the human.
+
+        Args:
+            params: Glob capability configuration; ``max_results`` caps the list.
+
+        Returns:
+            Callable named ``workspace_glob`` that lists the matching files.
+        """
+        backend = self.workspace
+        max_results = params.max_results
+
+        def workspace_glob(pattern: str, path: str = "") -> str:
+            """Find files of the team workspace by glob pattern, newest first.
+
+            Give a directory after the pattern to search only under it.
+
+            Example: /workspace_glob '**/*.md' docs
+            """
+            try:
+                return _render_glob(backend, pattern, path, max_results)
+            except RetriableError as refusal:
+                return str(refusal)
+
         return workspace_glob
 
     def _grep_factory(self, params: WorkspaceGrep) -> Callable[..., Any]:
@@ -854,38 +932,38 @@ class ReadFactories:
                 RetriableError: If pattern is not a valid regex, or the path or the
                     include glob escapes the workspace root.
             """
-            try:
-                search_root = backend.resolve_path(path) if path else backend.root
-                # ``include`` reaches ``Path.rglob`` and then ``read_text`` on every
-                # candidate, so an unvalidated one leaks file *contents* rather than
-                # names.  Checked here, above both engines, because ``rg`` refuses a
-                # ``..`` glob of its own accord and the Python fallback does not —
-                # containment that depended on which binary is installed would be no
-                # containment at all.
-                if include and _pattern_escapes(include):
-                    raise PathEscapeError(f"Pattern '{include}' escapes workspace root")
-
-                raw_matches = _grep_rg(search_root, pattern, include, max_results)
-                if raw_matches is None:
-                    raw_matches = _grep_python(
-                        search_root, pattern, include, max_results, max_line_len
-                    )
-                raw_matches = [match for match in raw_matches if backend.contains(match[0])]
-
-                if not raw_matches:
-                    return "No matches found."
-
-                result_lines = [
-                    f"{fpath.relative_to(backend.root)}:{lineno}: {line}"
-                    for fpath, lineno, line in raw_matches
-                ]
-                return "\n".join(result_lines)
-            except PermissionError:
-                raise RetriableError(_PERM_ERR_MSG)
-            except _re.error as e:
-                raise RetriableError(f"Invalid regex pattern: {e}")
+            return _render_grep(backend, pattern, path, include, max_results, max_line_len)
 
         workspace_grep.__doc__ = params.format_docstring(workspace_grep.__doc__)
+        return workspace_grep
+
+    def _grep_command_factory(self, params: WorkspaceGrep) -> Callable[..., Any]:
+        """Create the ``/workspace_grep`` command — the tool's rendering, for the human.
+
+        Args:
+            params: Grep capability configuration; the same result and line caps.
+
+        Returns:
+            Callable named ``workspace_grep`` that lists the matching lines.
+        """
+        backend = self.workspace
+        max_results = params.max_results
+        max_line_len = params.max_line_length
+
+        def workspace_grep(pattern: str, path: str = "", include: str = "") -> str:
+            """Search the team workspace's files by regex — under PATH, in files matching INCLUDE.
+
+            Quote the regex in single quotes: the command line is split like a
+            shell's, so outside single quotes a backslash is an escape and is
+            dropped — an unquoted \\d arrives as d.
+
+            Example: /workspace_grep 'def \\w+_factory' src
+            """
+            try:
+                return _render_grep(backend, pattern, path, include, max_results, max_line_len)
+            except RetriableError as refusal:
+                return str(refusal)
+
         return workspace_grep
 
     def _view_factory(self, params: WorkspaceView) -> Callable[..., Any]:

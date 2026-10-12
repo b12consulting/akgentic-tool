@@ -54,6 +54,7 @@ from akgentic.tool.workspace.journal import git_dir_for
 from akgentic.tool.workspace.read.params import (
     ExpandMediaRefs,
     WorkspaceGlob,
+    WorkspaceGrep,
     WorkspaceList,
     WorkspaceRead,
 )
@@ -147,14 +148,16 @@ class TestEnablingNothingCostsNothing:
     ) -> None:
         """The two retrieval capabilities are off, so neither reaches COMMAND.
 
-        ``/workspace_read`` and ``/workspace_list`` do, since story 62-2: they are
-        the read side, so ``read_only`` keeps them, and none of the write-side
-        commands.
+        ``/workspace_read`` and ``/workspace_list`` do, since story 62-2, and
+        ``/workspace_glob`` and ``/workspace_grep`` since 62-3: they are the read
+        side, so ``read_only`` keeps them, and none of the write-side commands.
         """
         assert set(read_only_card.get_commands()) == {
             ExpandMediaRefs,
             WorkspaceRead,
             WorkspaceList,
+            WorkspaceGlob,
+            WorkspaceGrep,
         }
 
     def test_it_contributes_no_context_state(self, read_only_card: WorkspaceTool) -> None:

@@ -196,14 +196,18 @@ class WorkspaceRagSearch(BaseToolParam):
     budget and the path filter are arguments of the callable, never fields here
     (ADR-020).
 
-    **``TOOL_CALL`` only, and deliberately.** The three retrieval capabilities
+    **Never ``LLM_CONTEXT``, and deliberately.** The three retrieval capabilities
     carry three different channel sets (ADR-045 §5): indexing is
     ``{TOOL_CALL, COMMAND}``, listing is ``{COMMAND, LLM_CONTEXT}``, and search is
-    ``{TOOL_CALL}`` alone. A search is something the model *does* with a question
-    it has just formed, not something it is *shown* on every turn.
+    ``{TOOL_CALL, COMMAND}``. A search is something the model *does* with a
+    question it has just formed, not something it is *shown* on every turn, so no
+    result is ever pushed into the model's context. ``COMMAND`` is the human's
+    channel: ``/workspace_rag_search`` runs the same search for a person who typed
+    the question, and its text rendering is for that person only — the tool still
+    answers the model a :class:`~akgentic.tool.workspace.rag.search.RagSearchResult`.
     """
 
-    expose: set[Channels] = {TOOL_CALL}
+    expose: set[Channels] = {TOOL_CALL, COMMAND}
 
     top_k: int = 5
     """How many fused hits the render may carry.

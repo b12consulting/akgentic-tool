@@ -152,6 +152,11 @@ from pydantic import ValidationError
 
 from akgentic.core.utils.serializer import SerializableBaseModel
 from akgentic.tool.core import ContextState, _resolve
+
+# Runtime import, not a ``TYPE_CHECKING`` one: the command registry resolves the
+# ``/workspace_rag_search`` closure's annotations with ``get_type_hints`` against
+# this module's globals, and ``RestOfLine`` is what it reads there.
+from akgentic.tool.core.commands import RestOfLine
 from akgentic.tool.vector_store.protocol import (
     PATH_PREFIX_REJECTED,
     PATH_PREFIX_WILDCARDS,
@@ -562,6 +567,40 @@ def _ragignore_header() -> list[str]:
     ]
 
 
+_HUMAN_TEXT_CAP = 300
+"""How many characters of a hit's text :func:`_render_hits_for_human` shows."""
+
+
+def _render_hits_for_human(result: RagSearchResult) -> str:
+    """Render a search result as text for the human who typed ``/workspace_rag_search``.
+
+    **For the command only.** The model is answered the structured result, and the
+    text rendering it once had was deleted on purpose (story 58-3); this one must
+    stay unreachable from the tool.
+
+    Each hit is a header — ``<i>. <path>:<start>-<end> (<match>, score <s>)``, the
+    range replaced by ``(chunk <n>/<count>)`` when the file has none and the score
+    left out when the hit has none — over its text on one line, cut to
+    :data:`_HUMAN_TEXT_CAP` characters.
+    """
+    if not result.hits:
+        return result.note or "No passages found."
+    blocks: list[str] = []
+    for index, hit in enumerate(result.hits, start=1):
+        if hit.start_line is not None and hit.end_line is not None:
+            where = f"{hit.path}:{hit.start_line}-{hit.end_line}"
+        else:
+            ordinal = "?" if hit.ordinal is None else hit.ordinal + 1
+            count = "?" if hit.chunk_count is None else hit.chunk_count
+            where = f"{hit.path} (chunk {ordinal}/{count})"
+        how = hit.match.value if hit.score is None else f"{hit.match.value}, score {hit.score:.2f}"
+        text = " ".join(hit.text.split())
+        if len(text) > _HUMAN_TEXT_CAP:
+            text = text[:_HUMAN_TEXT_CAP] + "…"
+        blocks.append(f"{index}. {where} ({how})\n   {text}")
+    return "\n".join(blocks)
+
+
 class RagFactories:
     """The three retrieval factories and their binding.
 
@@ -851,26 +890,8 @@ class RagFactories:
         Two agents of one team searching concurrently now genuinely search
         concurrently, instead of serialising on one mailbox.
 
-        **The order of the three gates below is load-bearing and is pinned by a
-        spec.** A ``None`` cache is "this card never bound a tree", which is the
-        position the ``None`` proxy held before — ``_build_document_cache`` runs in
-        ``observer()``, so an unbound card has neither. The wildcard check comes
-        next, so a refused prefix costs nothing at all whatever the tree's state.
-        The availability gate comes last of the three, and it now sits **ahead of
-        the vector leg** where the actor's sat behind it. That changes no answer,
-        and it saves the keyword leg's directory scan and parse on a degraded
-        tree — but it saves **no round trip**, and a claim that it did stood here
-        until review measured it: the gate's two terms are exactly what
-        :func:`~akgentic.tool.workspace.rag.search._vector_hits` already
-        short-circuits on, for free. The spend that docstring recorded as
-        unclosable belongs to the *other* degraded state — ``create_collection``
-        raised — which this gate does not cover and which still pays it; see
-        :meth:`_retrieval_bound`. Swapping the middle two gates would silently
-        flip what a degraded tree answers to a wildcard prefix.
-
-        The values are read **at ``get_tools()`` time**, which is after
-        ``observer()`` has run, so the cache, the engine, the collection param and
-        the workspace path are all populated by the time the closure captures them.
+        The guards and the search itself are :meth:`_rag_searcher`'s, which the
+        ``/workspace_rag_search`` command calls too.
 
         Args:
             params: The result budget and the two fusion knobs, captured here so
@@ -879,12 +900,8 @@ class RagFactories:
         Returns:
             The callable, which never raises.
         """
-        cache = self._document_cache
-        store = self._vector_store
-        resolved = self._resolved_store
-        scope = self._workspace_path
-        available = self._retrieval_bound()
-        top_k, alpha, threshold = params.top_k, params.alpha, params.score_threshold
+        search = self._rag_searcher(params)
+        top_k = params.top_k
 
         def workspace_rag_search(
             query: str, top_k: int = top_k, path_prefix: str = ""
@@ -918,6 +935,76 @@ class RagFactories:
                 hit, and not comparable across searches; `match` is "semantic",
                 "keyword" or "hybrid".
             """
+            return search(query, top_k, path_prefix)
+
+        workspace_rag_search.__doc__ = params.format_docstring(workspace_rag_search.__doc__)
+        return workspace_rag_search
+
+    def _rag_search_command_factory(self, params: WorkspaceRagSearch) -> Callable[..., Any]:
+        """Create the ``/workspace_rag_search`` command — the tool's search, rendered for a human.
+
+        The same :meth:`_rag_searcher` the tool calls, with the param's budget and
+        no prefix. The result is rendered by :func:`_render_hits_for_human`, which
+        the tool never reaches: the model keeps receiving the structured result.
+
+        Args:
+            params: The result budget and the two fusion knobs.
+
+        Returns:
+            Callable named ``workspace_rag_search`` that answers text.
+        """
+        search = self._rag_searcher(params)
+        top_k = params.top_k
+
+        def workspace_rag_search(query: RestOfLine) -> str:
+            """Search the indexed workspace documents — the whole rest of the line is the query.
+
+            Example: /workspace_rag_search how is the gate refused?
+            """
+            return _render_hits_for_human(search(query, top_k, ""))
+
+        return workspace_rag_search
+
+    def _rag_searcher(
+        self, params: WorkspaceRagSearch
+    ) -> Callable[[str, int, str], RagSearchResult]:
+        """The guard-and-search sequence both ``workspace_rag_search`` callables run.
+
+        **The order of the three gates below is load-bearing and is pinned by a
+        spec.** A ``None`` cache is "this card never bound a tree", which is the
+        position the ``None`` proxy held before — ``_build_document_cache`` runs in
+        ``observer()``, so an unbound card has neither. The wildcard check comes
+        next, so a refused prefix costs nothing at all whatever the tree's state.
+        The availability gate comes last of the three, and it now sits **ahead of
+        the vector leg** where the actor's sat behind it. That changes no answer,
+        and it saves the keyword leg's directory scan and parse on a degraded
+        tree — but it saves **no round trip**, and a claim that it did stood here
+        until review measured it: the gate's two terms are exactly what
+        :func:`~akgentic.tool.workspace.rag.search._vector_hits` already
+        short-circuits on, for free. The spend that docstring recorded as
+        unclosable belongs to the *other* degraded state — ``create_collection``
+        raised — which this gate does not cover and which still pays it; see
+        :meth:`_retrieval_bound`. Swapping the middle two gates would silently
+        flip what a degraded tree answers to a wildcard prefix.
+
+        The values are read **at ``get_tools()`` time**, which is after
+        ``observer()`` has run, so the cache, the engine, the collection param and
+        the workspace path are all populated by the time the closure captures them.
+
+        Args:
+            params: The two fusion knobs; the budget is the caller's argument.
+
+        Returns:
+            ``search(query, top_k, path_prefix)``, which never raises.
+        """
+        cache = self._document_cache
+        store = self._vector_store
+        resolved = self._resolved_store
+        scope = self._workspace_path
+        available = self._retrieval_bound()
+        alpha, threshold = params.alpha, params.score_threshold
+
+        def search(query: str, top_k: int, path_prefix: str) -> RagSearchResult:
             if cache is None:
                 # harness shapes that wire a bare observer never bind one
                 return RagSearchResult(note=_UNAVAILABLE)
@@ -943,8 +1030,7 @@ class RagFactories:
                 logger.debug("Could not search the retrieval index", exc_info=True)
                 return RagSearchResult(note=_UNAVAILABLE)
 
-        workspace_rag_search.__doc__ = params.format_docstring(workspace_rag_search.__doc__)
-        return workspace_rag_search
+        return search
 
     def _rag_index_factory(self, params: WorkspaceRagIndex) -> Callable[..., Any]:
         """Create the ``workspace_rag_index`` callable.
