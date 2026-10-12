@@ -103,7 +103,7 @@ ALLOWED_COMMANDS: frozenset[str] = frozenset(
         "rmdir",
         "mkdir",
         "find",
-        "grep", 
+        "grep",
         "sed",
         "awk",
         "jq",
