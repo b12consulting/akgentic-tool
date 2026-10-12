@@ -155,6 +155,9 @@ GITIGNORE_NAME = ".gitignore"
 OUT_OF_BAND_AUTHOR = "out-of-band"
 """Author of every commit no agent in this team is responsible for."""
 
+HUMAN_AUTHOR = "human"
+"""Author of every commit a human's slash command made — name and id alike."""
+
 MAX_COMMIT_BODY_CHARS = 500
 """Cap on the agent-supplied text a commit body may carry.
 
@@ -298,6 +301,16 @@ class Identity:
     def out_of_band(cls) -> Identity:
         """The identity for changes no agent in this team made."""
         return cls(OUT_OF_BAND_AUTHOR, OUT_OF_BAND_AUTHOR)
+
+    @classmethod
+    def human(cls) -> Identity:
+        """The identity for changes the human made through a slash command.
+
+        Not the agent's: ``_dispatch_command`` runs the command on the agent's own
+        card, and a commit attributed to the agent would claim it wrote bytes it
+        has never seen.
+        """
+        return cls(HUMAN_AUTHOR, HUMAN_AUTHOR)
 
 
 Precondition = str | Literal["absent"]

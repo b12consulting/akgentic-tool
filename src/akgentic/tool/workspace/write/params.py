@@ -29,13 +29,13 @@ from akgentic.tool.core import COMMAND, TOOL_CALL, BaseToolParam, Channels
 class WorkspaceWrite(BaseToolParam):
     """Write content to a file in the team workspace."""
 
-    expose: set[Channels] = {TOOL_CALL}
+    expose: set[Channels] = {TOOL_CALL, COMMAND}
 
 
 class WorkspaceDelete(BaseToolParam):
     """Delete a file from the team workspace."""
 
-    expose: set[Channels] = {TOOL_CALL}
+    expose: set[Channels] = {TOOL_CALL, COMMAND}
 
 
 class WorkspaceEdit(BaseToolParam):
@@ -59,7 +59,7 @@ class WorkspacePatch(BaseToolParam):
 class WorkspaceMkdir(BaseToolParam):
     """Create a directory (and parents) in the team workspace."""
 
-    expose: set[Channels] = {TOOL_CALL}
+    expose: set[Channels] = {TOOL_CALL, COMMAND}
 
 
 class WorkspaceRmdir(BaseToolParam):

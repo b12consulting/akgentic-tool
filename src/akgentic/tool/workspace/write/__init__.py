@@ -44,6 +44,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+# Runtime import, not a ``TYPE_CHECKING`` one, for the same reason as ``EditItem``
+# below: the command registry resolves ``/workspace_write``'s annotations with
+# ``get_type_hints`` against this module's globals.
+from akgentic.tool.core.commands import RestOfLine
 from akgentic.tool.errors import RetriableError
 
 # Runtime import, not a ``TYPE_CHECKING`` one: ``EditItem`` appears in the
@@ -120,6 +124,14 @@ class WriteFactories:
             *,
             empty_only: bool = False,
         ) -> MutationOutcome: ...
+
+        def human_write(self, path: str, content: str) -> MutationOutcome: ...
+
+        def human_delete(self, path: str) -> MutationOutcome: ...
+
+        def human_mkdir(self, path: str) -> MutationOutcome: ...
+
+        def human_rmdir(self, path: str, recursive: bool) -> MutationOutcome: ...
 
     def _write_factory(self, params: WorkspaceWrite) -> Callable[..., Any]:
         """Create the ``workspace_write`` tool callable.
@@ -395,3 +407,101 @@ class WriteFactories:
             chosen.__name__ = chosen.__qualname__ = "workspace_rmdir"
         chosen.__doc__ = params.format_docstring(chosen.__doc__)
         return chosen
+
+    ##
+    ## The slash commands — the human's hand on the tree. Each closure is named
+    ## exactly after its command, because the registry keys on ``__name__``, and
+    ## each goes through the gate's human mode: no view check, no observation
+    ## recorded, the commit attributed to ``human``. A refusal is returned as the
+    ## result text rather than raised — the human reads it, and so does the agent.
+    ##
+    def _write_command_factory(self, params: WorkspaceWrite) -> Callable[..., Any]:
+        """Create the ``/workspace_write`` command.
+
+        Args:
+            params: Write capability configuration.
+
+        Returns:
+            Callable named ``workspace_write`` that writes the rest of the line.
+        """
+        card = self
+
+        def workspace_write(filepath: str, content: RestOfLine) -> str:
+            """Create or overwrite a file with everything after its path, as UTF-8.
+
+            The text is written exactly as typed, quotes and line breaks included,
+            and any extension is accepted. Missing directories are created.
+
+            Example: /workspace_write notes.md Remember to call the supplier.
+            """
+            return card.human_write(filepath, content).message
+
+        return workspace_write
+
+    def _delete_command_factory(self, params: WorkspaceDelete) -> Callable[..., Any]:
+        """Create the ``/workspace_delete`` command.
+
+        Args:
+            params: Delete capability configuration.
+
+        Returns:
+            Callable named ``workspace_delete`` that deletes one file.
+        """
+        card = self
+
+        def workspace_delete(filepath: str) -> str:
+            """Delete one file from the team workspace.
+
+            Example: /workspace_delete drafts/old.md
+            """
+            return card.human_delete(filepath).message
+
+        return workspace_delete
+
+    def _mkdir_command_factory(self, params: WorkspaceMkdir) -> Callable[..., Any]:
+        """Create the ``/workspace_mkdir`` command.
+
+        Args:
+            params: Mkdir capability configuration.
+
+        Returns:
+            Callable named ``workspace_mkdir`` that creates a directory.
+        """
+        card = self
+
+        def workspace_mkdir(path: str) -> str:
+            """Create a directory, and any missing parents, in the team workspace.
+
+            Example: /workspace_mkdir reports/2026
+            """
+            return card.human_mkdir(path).message
+
+        return workspace_mkdir
+
+    def _rmdir_command_factory(self, params: WorkspaceRmdir) -> Callable[..., Any]:
+        """Create the ``/workspace_rmdir`` command.
+
+        The human typing it is the explicit request the tool's docstring asks the
+        model to wait for, so it removes the whole tree whenever the deployment
+        allows recursive removal, and empty directories only when it does not.
+
+        Args:
+            params: Rmdir capability configuration.
+
+        Returns:
+            Callable named ``workspace_rmdir`` that removes a directory.
+        """
+        card = self
+        recursive = params.allow_recursive
+
+        def workspace_rmdir(path: str) -> str:
+            """Remove a directory and everything under it from the team workspace.
+
+            Where the workspace removes empty directories only, a directory that
+            still holds anything is refused.
+
+            Example: /workspace_rmdir build
+            """
+            return card.human_rmdir(path, recursive).message
+
+        return workspace_rmdir

@@ -1097,6 +1097,111 @@ class CardGate:
         return removed
 
     ##
+    ## Human mode — the slash commands. The human holds no view, so nothing is
+    ## checked against one, and nothing the human does becomes this agent's view.
+    ##
+    def human_write(self, path: str, content: str) -> MutationOutcome:
+        """Create or overwrite *path* with *content* as the human, through ``/workspace_write``.
+
+        **No ``_check`` and no ``_accept``.** The human has no view to be stale
+        against, and recording one for this agent would be an observation of
+        bytes the agent has never read: its next blind overwrite of the human's
+        content would then be admitted, which is exactly the lost update the
+        gate exists to refuse. The human's change is treated like an upload —
+        live bytes the agent has not seen — and the commit is the human's.
+
+        Args:
+            path: Workspace-relative path.
+            content: Text, written as UTF-8.
+
+        Returns:
+            ``Written: <path> (<n> bytes)``, or a refusal.
+        """
+        return self._gated(
+            "write", [path], lambda: self._human_write(path, content), identity=Identity.human()
+        )
+
+    def _human_write(self, path: str, content: str) -> MutationOutcome:
+        """Write as the human — see :meth:`human_write`."""
+        data = content.encode("utf-8")
+        try:
+            self._tree().write(path, data)
+        except PermissionError as exc:
+            return _denied(exc)
+        except IsADirectoryError:
+            return _rejected(f"Is a directory: {path}")
+        except FileNotFoundError:
+            return _rejected(PUBLISH_LOST_MSG)
+        self._touched.append(path)
+        return _accepted(f"Written: {path} ({len(data)} bytes)")
+
+    def human_delete(self, path: str) -> MutationOutcome:
+        """Delete one file as the human, through ``/workspace_delete`` — no view check.
+
+        Returns:
+            ``Deleted: <path>``, or a refusal for a directory, a missing file or
+            a path outside the root.
+        """
+        return self._gated(
+            "delete", [path], lambda: self._human_delete(path), identity=Identity.human()
+        )
+
+    def _human_delete(self, path: str) -> MutationOutcome:
+        """Delete as the human — see :meth:`human_delete`."""
+        try:
+            tree = self._tree()
+            if tree.resolve_path(path).is_dir():
+                return _rejected(f"Is a directory: {path} — use /workspace_rmdir")
+            tree.delete(path)
+        except PermissionError as exc:
+            return _denied(exc)
+        except FileNotFoundError:
+            return _rejected(f"File not found: {path}")
+        self._touched.append(path)
+        return _accepted(f"Deleted: {path}")
+
+    def human_mkdir(self, path: str) -> MutationOutcome:
+        """Create *path* and its parents as the human — exactly :meth:`apply_mkdir`."""
+        return self._gated("mkdir", [], lambda: self._mkdir(path), identity=Identity.human())
+
+    def human_rmdir(self, path: str, recursive: bool) -> MutationOutcome:
+        """Remove the directory *path* as the human, through ``/workspace_rmdir``.
+
+        The human typing the command is the explicit request the tool's
+        docstring tells the model to wait for, so there is no view check and no
+        ``force``. *recursive* is the deployment's ``allow_recursive``: off, only
+        an empty directory is removed. No path lock is taken, and this agent's
+        observations under the directory are left alone — its next mutation of
+        one of those paths is refused as gone, which is the truth.
+
+        Returns:
+            ``Removed: <path> (<k> files)`` when recursive, ``Removed: <path>``
+            otherwise, or a refusal.
+        """
+        return self._gated(
+            "rmdir",
+            [],
+            lambda: self._human_rmdir(path, recursive),
+            commit_scope=[_normalised(path)],
+            identity=Identity.human(),
+        )
+
+    def _human_rmdir(self, path: str, recursive: bool) -> MutationOutcome:
+        """Remove as the human — see :meth:`human_rmdir`."""
+        try:
+            target = self._removable_dir(path, "/workspace_delete")
+            if isinstance(target, MutationOutcome):
+                return target
+            refusal = _not_empty(path, target, recursive, empty_only=not recursive)
+            if refusal is not None:
+                return refusal
+            removed = self._remove_tree(path, target, recursive)
+        except PermissionError as exc:
+            return _denied(exc)
+        self._touched.extend(removed)
+        return _accepted(_removed(path, removed, recursive, force=False))
+
+    ##
     ## The gate
     ##
     def _live(self, path: str) -> bytes | None:

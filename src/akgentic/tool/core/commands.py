@@ -4,12 +4,38 @@ import inspect
 import shlex
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, get_type_hints
+from io import StringIO
+from typing import Annotated, Any, get_args, get_origin, get_type_hints
 
 from pydantic import TypeAdapter
 
 from akgentic.tool.core.event import CommandArg, CommandDescriptor
 from akgentic.tool.errors import CommandNotRecognized
+
+
+class _RestOfLineMarker:
+    """The ``Annotated`` metadata that makes a command's last parameter rest-of-line."""
+
+    def __repr__(self) -> str:
+        return "RestOfLine"
+
+
+_REST_OF_LINE = _RestOfLineMarker()
+
+RestOfLine = Annotated[str, _REST_OF_LINE]
+"""A command's last, required parameter that receives the raw rest of the line.
+
+The parameters before it are tokenised with ``shlex`` as usual; this one gets
+whatever text follows them **verbatim** — leading whitespace stripped, inner and
+trailing whitespace, newlines and quotes kept — so ``/workspace_write notes.md
+it's a "quoted" word`` writes exactly ``it's a "quoted" word``. It is never bound
+as ``name=value``: ``content=x`` in the rest of the line is part of the content.
+"""
+
+
+def _is_rest_of_line(annotation: Any) -> bool:
+    """Whether *annotation* carries the :data:`RestOfLine` marker."""
+    return get_origin(annotation) is Annotated and _REST_OF_LINE in get_args(annotation)[1:]
 
 
 @dataclass(frozen=True)
@@ -40,6 +66,8 @@ class _CommandEntry:
     fn: Callable[..., Any]
     args: tuple[_CommandArgSpec, ...]
     tool_card: str
+    rest_of_line: bool = False
+    """Whether the last argument receives the raw rest of the line (:data:`RestOfLine`)."""
 
     @property
     def required_count(self) -> int:
@@ -70,14 +98,19 @@ def _build_command_entry(fn: Callable[..., Any], tool_card: str) -> _CommandEntr
     or an un-annotated parameter), and build a :class:`TypeAdapter` over the
     ordered positional parameter types for later coercion.
 
+    The hints are read with ``include_extras=True``: without it ``Annotated``
+    metadata is stripped and a :data:`RestOfLine` parameter is indistinguishable
+    from a plain ``str``.
+
     Raises:
         ValueError: If the signature has a ``VAR_POSITIONAL`` (``*args``),
-            ``VAR_KEYWORD`` (``**kwargs``), or un-annotated parameter. The message
-            names the command and the offending parameter.
+            ``VAR_KEYWORD`` (``**kwargs``), or un-annotated parameter, or a
+            :data:`RestOfLine` parameter that is not the last or not required. The
+            message names the command and the offending parameter.
     """
     sig = inspect.signature(fn)
     try:
-        hints = get_type_hints(fn)
+        hints = get_type_hints(fn, include_extras=True)
     except Exception:
         hints = {}
 
@@ -100,6 +133,9 @@ def _build_command_entry(fn: Callable[..., Any], tool_card: str) -> _CommandEntr
                 "has no type annotation."
             )
         required = param.default is inspect.Parameter.empty
+        if _is_rest_of_line(annotation):
+            _check_rest_of_line(fn, pname, required, last=pname == list(sig.parameters)[-1])
+            annotation = str
         specs.append(
             _CommandArgSpec(
                 name=pname,
@@ -109,7 +145,56 @@ def _build_command_entry(fn: Callable[..., Any], tool_card: str) -> _CommandEntr
             )
         )
 
-    return _CommandEntry(name=fn.__name__, fn=fn, args=tuple(specs), tool_card=tool_card)
+    rest_of_line = bool(specs) and _is_rest_of_line(hints.get(specs[-1].name))
+    return _CommandEntry(
+        name=fn.__name__,
+        fn=fn,
+        args=tuple(specs),
+        tool_card=tool_card,
+        rest_of_line=rest_of_line,
+    )
+
+
+def _check_rest_of_line(fn: Callable[..., Any], pname: str, required: bool, last: bool) -> None:
+    """Refuse a :data:`RestOfLine` parameter anywhere but last, or with a default.
+
+    Raises:
+        ValueError: Naming the command and the parameter.
+    """
+    if not last:
+        raise ValueError(
+            f"Command '{fn.__name__}' cannot be registered: RestOfLine parameter "
+            f"'{pname}' must be the last parameter."
+        )
+    if not required:
+        raise ValueError(
+            f"Command '{fn.__name__}' cannot be registered: RestOfLine parameter "
+            f"'{pname}' must be required."
+        )
+
+
+def _split_leading(rest: str, count: int) -> tuple[list[str], str]:
+    """Tokenise the first *count* arguments of *rest* and return the raw remainder.
+
+    The lexer is configured exactly as ``shlex.split`` configures its own —
+    POSIX, whitespace-split, no comment characters — so the leading arguments
+    tokenise as they always have. It stops after *count* tokens, and whatever it
+    has not consumed is the remainder, verbatim but for leading whitespace.
+
+    Raises:
+        ValueError: When a leading argument's quote does not close.
+    """
+    stream = StringIO(rest)
+    lexer = shlex.shlex(stream, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    tokens: list[str] = []
+    while len(tokens) < count:
+        token = lexer.get_token()
+        if token is None:
+            return tokens, ""
+        tokens.append(token)
+    return tokens, stream.read().lstrip()
 
 
 class CommandRegistry:
@@ -229,16 +314,34 @@ class CommandRegistry:
         """
         entry = self._entries[name]
         try:
-            positional, keyword = self._classify_tokens(entry, shlex.split(rest))
+            positional, keyword = self._tokenise(entry, rest)
             bound = self._bind(entry, positional, keyword)
             result = entry.fn(**bound)
             return None if result is None else str(result)
         except Exception as exc:  # noqa: BLE001 — failures become result strings (ADR-028 §4)
             return f"Command '{name}' failed: {exc}"
 
+    @classmethod
+    def _tokenise(cls, entry: _CommandEntry, rest: str) -> tuple[list[str], dict[str, str]]:
+        """Split *rest* into ``(positional, keyword)`` for *entry*.
+
+        A plain command ``shlex.split``s it whole. A :data:`RestOfLine` command
+        tokenises only the arguments before the last, and binds the raw remainder
+        to the last by name — so it can never be supplied as ``name=value``, and
+        an empty remainder leaves it unbound, which :meth:`_bind` reports as a
+        missing argument.
+        """
+        if not entry.rest_of_line:
+            return cls._classify_tokens(entry, shlex.split(rest))
+        leading, remainder = _split_leading(rest, len(entry.args) - 1)
+        positional, keyword = cls._classify_tokens(entry, leading, rest_of_line=True)
+        if remainder:
+            keyword[entry.args[-1].name] = remainder
+        return positional, keyword
+
     @staticmethod
     def _classify_tokens(
-        entry: _CommandEntry, args: list[str]
+        entry: _CommandEntry, args: list[str], rest_of_line: bool = False
     ) -> tuple[list[str], dict[str, str]]:
         """Partition *args* into ``(positional, keyword)`` for *entry*.
 
@@ -247,11 +350,15 @@ class CommandRegistry:
         remainder after that first ``=``. All other tokens are positional. A
         positional token appearing after any keyword token is rejected.
 
+        With *rest_of_line*, the last parameter is not a keyword candidate: its
+        value is the raw remainder, bound by :meth:`_tokenise`.
+
         Raises:
             ValueError: If a positional token follows a keyword token (names the
                 offending positional value).
         """
-        names = {spec.name for spec in entry.args}
+        specs = entry.args[:-1] if rest_of_line else entry.args
+        names = {spec.name for spec in specs}
         positional: list[str] = []
         keyword: dict[str, str] = {}
         for token in args:

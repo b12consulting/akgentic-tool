@@ -360,6 +360,51 @@ def _expand_braces(pattern: str) -> list[str]:
     return expanded
 
 
+def _capped_text(text: str, limit: int) -> str:
+    """*text* cut to its first *limit* lines, saying so when it was cut.
+
+    Lines are the spine's (:func:`~akgentic.tool.workspace.lines.split_lines`),
+    the same lines ``workspace_read`` numbers.
+    """
+    lines = split_lines(text)
+    if len(lines) <= limit:
+        return text
+    shown = "\n".join(lines[:limit])
+    return f"{shown}\n… ({len(lines)} lines; showing 1–{limit})"
+
+
+def _render_listing(backend: Filesystem, path: str, depth: int) -> str:
+    """Render *path* flat or as a tree — the one rendering ``workspace_list`` and its command share.
+
+    Raises:
+        RetriableError: If the directory does not exist, *path* is a file, or it
+            escapes the workspace root.
+    """
+    try:
+        resolved = backend.resolve_path(path) if path else backend.root
+
+        entries = backend.list(path)
+        if not entries:
+            return "Empty directory."
+
+        if depth == 1:
+            # Flat list — no tree connectors
+            lines: list[str] = []
+            for entry in entries:
+                if entry.is_dir:
+                    lines.append(f"{entry.name}/")
+                else:
+                    lines.append(f"{entry.name} ({entry.size} bytes)")
+            return "\n".join(lines)
+        # ASCII tree — depth=0 means unlimited, depth>1 means N levels
+        tree_lines = _build_tree(resolved, max_depth=depth)
+        return ".\n" + "\n".join(tree_lines) if tree_lines else "Empty directory."
+    except (FileNotFoundError, NotADirectoryError):
+        raise RetriableError(f"Directory not found: {path}")
+    except PermissionError:
+        raise RetriableError(_PERM_ERR_MSG)
+
+
 def _build_tree(
     root: Path,
     prefix: str = "",
@@ -649,32 +694,73 @@ class ReadFactories:
                     a file rather than a directory, or the path escapes the
                     workspace root.
             """
-            try:
-                resolved = backend.resolve_path(path) if path else backend.root
-
-                entries = backend.list(path)
-                if not entries:
-                    return "Empty directory."
-
-                if depth == 1:
-                    # Flat list — no tree connectors
-                    lines: list[str] = []
-                    for entry in entries:
-                        if entry.is_dir:
-                            lines.append(f"{entry.name}/")
-                        else:
-                            lines.append(f"{entry.name} ({entry.size} bytes)")
-                    return "\n".join(lines)
-                else:
-                    # ASCII tree — depth=0 means unlimited, depth>1 means N levels
-                    tree_lines = _build_tree(resolved, max_depth=depth)
-                    return ".\n" + "\n".join(tree_lines) if tree_lines else "Empty directory."
-            except (FileNotFoundError, NotADirectoryError):
-                raise RetriableError(f"Directory not found: {path}")
-            except PermissionError:
-                raise RetriableError(_PERM_ERR_MSG)
+            return _render_listing(backend, path, depth)
 
         workspace_list.__doc__ = params.format_docstring(workspace_list.__doc__)
+        return workspace_list
+
+    def _read_command_factory(self, params: WorkspaceRead) -> Callable[..., Any]:
+        """Create the ``/workspace_read`` command — the human's look at a text file.
+
+        **It records no observation.** The text reaches the agent's context as a
+        user action, never as something the agent read, so the agent's next write
+        to the file is still judged on a read of its own. It never invokes the
+        document reader either: a human command must not spend LLM credits.
+
+        Args:
+            params: Read capability configuration; ``default_limit`` caps the lines.
+
+        Returns:
+            Callable named ``workspace_read`` that returns the file's text.
+        """
+        backend = self.workspace
+        limit = params.default_limit
+
+        def workspace_read(filepath: str) -> str:
+            """Show a text file from the team workspace.
+
+            Long files are cut at the configured line limit, with a note saying how
+            many lines there are.
+
+            Example: /workspace_read docs/notes.md
+            """
+            try:
+                text = backend.read(filepath).decode("utf-8")
+            except FileNotFoundError:
+                return f"File not found: {filepath}"
+            except IsADirectoryError:
+                return f"Is a directory: {filepath} — use /workspace_list"
+            except PermissionError:
+                return _PERM_ERR_MSG
+            except UnicodeDecodeError:
+                return f"Not a text file: {filepath}"
+            return _capped_text(text, limit)
+
+        return workspace_read
+
+    def _list_command_factory(self, params: WorkspaceList) -> Callable[..., Any]:
+        """Create the ``/workspace_list`` command — the tool's rendering, for the human.
+
+        Args:
+            params: List capability configuration; ``max_depth`` is the default depth.
+
+        Returns:
+            Callable named ``workspace_list`` that renders a directory.
+        """
+        backend = self.workspace
+
+        def workspace_list(path: str = "", depth: int = params.max_depth) -> str:
+            """List a directory of the team workspace — flat, or as a tree DEPTH levels deep.
+
+            Depth 1 is a flat list and 0 is the whole tree.
+
+            Example: /workspace_list docs 2
+            """
+            try:
+                return _render_listing(backend, path, depth)
+            except RetriableError as refusal:
+                return str(refusal)
+
         return workspace_list
 
     def _glob_factory(self, params: WorkspaceGlob) -> Callable[..., Any]:

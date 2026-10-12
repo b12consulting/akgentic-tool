@@ -597,7 +597,7 @@ docstring the model sees) and `expose: set[Channels]` from `BaseToolParam`.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `expose` | `set[Channels]` | `{TOOL_CALL}` | Channels the capability reaches. |
+| `expose` | `set[Channels]` | `{TOOL_CALL, COMMAND}` | Channels the capability reaches. `COMMAND` serves `/workspace_read`. |
 | `default_limit` | `int` | `2000` | Maximum lines returned per call. Becomes the **default value of the `limit` argument in the tool signature**, so the model can still ask for fewer or more; it is a budget, not a hard cap. |
 | `force_document_regeneration` | `bool` | `False` | Default for the same-named argument: **ignore a valid cache entry** and re-extract. The meaning is new in ADR-045 — it used to mean "ignore a file that happens to sit beside the source", which no notion of validity governed at all. A cache entry knows whether it describes the current bytes, so forcing now means overriding a *correct* answer: coherent, and rarely needed. A forced read still fills the cache with what it extracted. |
 | `document_reader` | `DocumentReader \| bool` | `True` | Binary extraction policy. `True` ⇒ a default `DocumentReader()` (MarkItDown, Pass 1, no LLM). `False` ⇒ reading a binary extension raises `ValueError` with an install hint. An instance ⇒ custom extraction, including the LLM fallback. |
@@ -670,7 +670,7 @@ Use `workspace_view` to *look at* an image and `workspace_read` to *extract text
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `expose` | `set[Channels]` | `{TOOL_CALL}` | |
+| `expose` | `set[Channels]` | `{TOOL_CALL, COMMAND}` | `COMMAND` serves `/workspace_list`. |
 | `max_depth` | `int` | `1` | Default for the `depth` argument. `1` ⇒ flat list of immediate children; `0` ⇒ unlimited recursive tree; `N > 1` ⇒ tree N levels deep. Despite the name it is a default, not a ceiling — the model may pass any depth. |
 
 Directories render as `name/`, files as `name (N bytes)`. An empty directory returns
@@ -720,11 +720,13 @@ whenever the field resolves to anything other than `False`.
 ### Write-side params
 
 `WorkspaceWrite`, `WorkspaceDelete`, `WorkspaceEdit`, `WorkspaceMultiEdit`, `WorkspacePatch` and
-`WorkspaceMkdir` add **no fields of their own**. `WorkspaceRmdir` adds one, `allow_recursive: bool =
-True` — a deployment setting: `False` exposes `workspace_rmdir(path)` with neither `recursive` nor
-`force` in its schema, so only an empty directory can be removed. Each carries only the inherited `expose`
-(`{TOOL_CALL}`) and `instructions`. They exist so a deployment can disable one operation, move it
-to another channel, or attach policy text to its description:
+`WorkspaceMkdir` add **no fields of their own**: each carries only the inherited `expose` and
+`instructions`. `expose` is `{TOOL_CALL, COMMAND}` for write, delete and mkdir, which also serve a
+[slash command](#slash-commands), and `{TOOL_CALL}` for the three edits. `WorkspaceRmdir`
+(`{TOOL_CALL, COMMAND}`) adds one field, `allow_recursive: bool = True` — a deployment setting:
+`False` exposes `workspace_rmdir(path)` with neither `recursive` nor `force` in its schema, and
+`/workspace_rmdir` then removes empty directories only. They exist so a deployment can disable one
+operation, move it to another channel, or attach policy text to its description:
 
 ```python
 WorkspaceTool(
@@ -739,7 +741,7 @@ WorkspaceTool(
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `expose` | `set[Channels]` | `{TOOL_CALL}` | Taking exec off this channel withholds both callables **and** skips the wiring entirely — no backend is built and no actor is created. |
+| `expose` | `set[Channels]` | `{TOOL_CALL, COMMAND}` | `TOOL_CALL` serves the two callables, `COMMAND` the `/workspace_exec` pair. Taking exec off **both** channels skips the wiring entirely — no backend is built and no actor is created. |
 | `timeout_s` | `float` | `15.0` | Budget for the **subprocess**, handed to the backend. Capped at `MAX_EXEC_BUDGET_S` (20 s), which sits below the orchestrator's 30 s stop backstop. |
 | `poll_attempts` | `int` | `-1` | How many times the agent's own thread looks for a result. `-1` is the sentinel for "wait out my run" — resolved at wiring into the count whose last look falls as late as it still can inside the effective run budget plus a report margin, so an ordinary command returns its own output and the model never sees a run id; a positive count is a bounded look clamped to that budget without the margin; `0` opts out of polling and takes the run id immediately. Below `-1` is a validation error. |
 | `poll_delay_seconds` | `float` | `0.5` | Seconds between those looks — the granularity of the wait, not its length. The length comes from `poll_attempts` resolved against the run budget, and can never outlast the run it waits for: past that point there is nothing left to wait for. |
@@ -980,6 +982,51 @@ missing anchor anywhere leaves every file in the batch untouched on disk. Later 
 still see the result of earlier ones. One consequence is visible in the return value: where a
 partial patch used to return the summary lines it had managed plus the failing file's `[ERROR]`, it
 now returns only the failure — nothing was applied, so there is nothing to report.
+
+---
+
+## Slash commands
+
+The human runs the workspace from the chat. Each command is a `COMMAND`-channel callable named after
+itself, dispatched by the agent's `CommandRegistry`; its result is shown to the human and appended
+to the agent's context as a **user action**.
+
+| Command | Signature | Side | Served when |
+|---|---|---|---|
+| `/workspace_mkdir` | `(path)` | write | `workspace_mkdir` on `COMMAND` |
+| `/workspace_rmdir` | `(path)` | write | `workspace_rmdir` on `COMMAND` |
+| `/workspace_delete` | `(filepath)` | write | `workspace_delete` on `COMMAND` |
+| `/workspace_write` | `(filepath, content: RestOfLine)` | write | `workspace_write` on `COMMAND` |
+| `/workspace_read` | `(filepath)` | read | `workspace_read` on `COMMAND` |
+| `/workspace_list` | `(path="", depth=<WorkspaceList.max_depth>)` | read | `workspace_list` on `COMMAND` |
+| `/workspace_exec` | `(cmd: RestOfLine)` | write | `workspace_exec` enabled and on `COMMAND` |
+| `/workspace_exec_result` | `(run_id)` | write | as `/workspace_exec` — the pair is served together or not at all |
+
+`COMMAND` is on by default for every one of them, and `read_only` covers commands exactly as it
+covers tools: a read-only card serves `/workspace_read` and `/workspace_list` and none of the
+write side. A field set to `False` serves neither its tool nor its command; exec stays opt-in.
+
+**`RestOfLine` takes the line verbatim.** `/workspace_write notes.md it's a "quoted" word` writes
+exactly `it's a "quoted" word`; multi-line chat content after the path is written with its
+newlines, and any extension is accepted. `/workspace_exec` runs the raw rest of the line as
+`bash -c <line>`, so pipes, `&&` and redirects work — on the same sandbox, budget and allow-list as
+the tool (`bash` must stay on it). A quote that does not close in the leading arguments is the
+command's failure, returned as text, never a crash.
+
+**The human's change is never the agent's view.** The commands run on the agent's own card, but a
+write-side command records no observation, so the agent's next write to a file the human changed is
+refused as *changed since you read it*, and a file the human created is still *not read*.
+`/workspace_read` records nothing either, and never invokes the document reader — a human command
+must not spend LLM credits. What is **not** skipped is the tree's guard: every write-side command
+goes through `_gated`, so it is refused while an exec run holds the tree, takes the path lock of the
+file it writes or deletes (none for mkdir and rmdir), commits as `human` — `Identity.human()`, name
+and id alike, which is also who a `/workspace_exec` run's discovered changes are attributed to —
+and marks the touched files stale. `/workspace_rmdir` needs no `force`: the human typing it is the
+explicit request, so it removes the whole tree unless `allow_recursive=False`.
+
+**Two `WorkspaceTool`s on one agent collide.** The registry keys commands by name and refuses a
+duplicate at wiring time; `/expand_media_refs` already collided before these commands existed. Give
+an agent one workspace card.
 
 ---
 

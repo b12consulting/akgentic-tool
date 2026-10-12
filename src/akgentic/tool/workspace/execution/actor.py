@@ -254,7 +254,9 @@ class ExecMixin(_ExecBase):
                 exc_info=True,
             )
 
-    def request_exec(self, agent_id: str, cmd: str, cwd: str = "") -> ExecStart:
+    def request_exec(
+        self, agent_id: str, cmd: str, cwd: str = "", *, as_human: bool = False
+    ) -> ExecStart:
         """Take the tree and start the run, or refuse — in one mailbox turn.
 
         Admission has two answers now: the run id of the caller's **own** run, or
@@ -290,6 +292,11 @@ class ExecMixin(_ExecBase):
             agent_id: Identity of the requesting agent, as a string.
             cmd: The command string.
             cwd: Working directory below the workspace root.
+            as_human: The human ran it, through ``/workspace_exec`` on this
+                agent's card. The run is still keyed by *agent_id*, so
+                ``/workspace_exec_result`` and ``workspace_exec_result`` collect
+                from one namespace, but its discovered changes are committed as
+                ``Identity.human()`` rather than as the agent.
 
         Returns:
             The issued run id, or the refusal — which names no run and no agent.
@@ -323,11 +330,18 @@ class ExecMixin(_ExecBase):
         if not grant.run_id:
             return ExecStart(refusal=grant.refusal)
         self._track_run(agent_id, grant.run_id, cmd)
-        self._start_run(grant.run_id, agent_id, cmd, cwd, config)
+        self._start_run(grant.run_id, agent_id, cmd, cwd, config, as_human=as_human)
         return ExecStart(run_id=grant.run_id)
 
     def _start_run(
-        self, run_id: str, agent_id: str, cmd: str, cwd: str, config: ExecConfig
+        self,
+        run_id: str,
+        agent_id: str,
+        cmd: str,
+        cwd: str,
+        config: ExecConfig,
+        *,
+        as_human: bool = False,
     ) -> None:
         """Record the granted run and submit it to the worker — the one accept path.
 
@@ -365,6 +379,7 @@ class ExecMixin(_ExecBase):
             cmd: The command string, exactly as the agent gave it.
             cwd: Working directory below the workspace root.
             config: The budget to start it under.
+            as_human: Commit what it discovers as the human, not the agent.
         """
         if self._journal is not None:
             self._journal.commit_out_of_band()
@@ -373,6 +388,7 @@ class ExecMixin(_ExecBase):
             agent_id=agent_id,
             cmd=cmd,
             started_at=time.monotonic(),
+            as_human=as_human,
         )
         # What ``request()`` used to do, and ``exec_status`` still answers
         # RUNNING from it. The base's deliver/fail clear it, unchanged.
@@ -604,9 +620,8 @@ class ExecMixin(_ExecBase):
             return
         self._running = None
         if self._journal is not None:
-            self._journal.commit_discovered(
-                self._identity(running.agent_id), EXEC_CAPABILITY, detail=running.cmd
-            )
+            author = Identity.human() if running.as_human else self._identity(running.agent_id)
+            self._journal.commit_discovered(author, EXEC_CAPABILITY, detail=running.cmd)
         self._release_lock(run_id)
 
     def _release_lock(self, run_id: str) -> None:

@@ -8,7 +8,7 @@ Defines the core contracts:
 
 from .card import ToolCard
 from .channels import COMMAND, LLM_CONTEXT, SYSTEM_PROMPT, TOOL_CALL, Channels
-from .commands import CommandRegistry
+from .commands import CommandRegistry, RestOfLine
 from .context_state import ContextState
 from .context_update import ContextUpdater
 
@@ -32,6 +32,7 @@ __all__ = [
     "CommandRegistry",
     "ContextState",
     "ContextUpdater",
+    "RestOfLine",
     "ToolCard",
     "ToolFactory",
     "ToolState",
