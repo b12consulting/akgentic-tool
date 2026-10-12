@@ -115,6 +115,7 @@ def test_allowed_commands_exact_set() -> None:
             "cp",
             "mv",
             "rm",
+            "rmdir",
             "mkdir",
             "find",
             "grep",
@@ -133,7 +134,7 @@ def test_allowed_commands_exact_set() -> None:
         }
     )
     assert ALLOWED_COMMANDS == expected
-    assert len(ALLOWED_COMMANDS) == 32
+    assert len(ALLOWED_COMMANDS) == 33
 
 
 def test_git_is_allowed_and_the_journal_is_protected_by_the_mount() -> None:
