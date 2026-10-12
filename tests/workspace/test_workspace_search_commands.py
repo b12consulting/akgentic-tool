@@ -276,6 +276,17 @@ class TestGrep:
         assert run(wired_card, "/workspace_grep TODO") == expected
         assert expected == "src/a.txt:1: TODO one\nsrc/a.txt:3: TODO two"
 
+    def test_the_command_carries_the_params_result_cap(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        # A command built from the class defaults instead of the param would
+        # answer both lines here; the tool and the command must answer one.
+        populate(workspace_tree, {"src/a.txt": "TODO one\nnope\nTODO two\n"})
+        card = _bind(orchestrator_proxy, workspace_grep=WorkspaceGrep(max_results=1))
+        expected = tool_named(card, "workspace_grep")("TODO")
+        assert run(card, "/workspace_grep TODO") == expected
+        assert expected == "src/a.txt:1: TODO one"
+
     def test_a_single_quoted_backslash_survives_the_registrys_shlex(
         self, wired_card: WorkspaceTool, workspace_tree: Path
     ) -> None:

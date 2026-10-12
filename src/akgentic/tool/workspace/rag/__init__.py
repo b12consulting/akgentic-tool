@@ -987,9 +987,10 @@ class RagFactories:
         :meth:`_retrieval_bound`. Swapping the middle two gates would silently
         flip what a degraded tree answers to a wildcard prefix.
 
-        The values are read **at ``get_tools()`` time**, which is after
-        ``observer()`` has run, so the cache, the engine, the collection param and
-        the workspace path are all populated by the time the closure captures them.
+        The values are read **at ``get_tools()`` or ``get_commands()`` time**, which
+        is after ``observer()`` has run, so the cache, the engine, the collection
+        param and the workspace path are all populated by the time the closure
+        captures them.
 
         Args:
             params: The two fusion knobs; the budget is the caller's argument.
