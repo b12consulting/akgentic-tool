@@ -138,8 +138,8 @@ class WriteFactories:
                 Confirmation string "Written: <path>".
 
             Raises:
-                RetriableError: If the write is refused, or the path escapes the
-                    workspace root.
+                RetriableError: If the write is refused, the path is a directory
+                    or runs through a file, or it escapes the workspace root.
             """
             return _resolve_outcome(card.apply_write(path, content))
 
