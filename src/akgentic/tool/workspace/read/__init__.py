@@ -360,17 +360,23 @@ def _expand_braces(pattern: str) -> list[str]:
     return expanded
 
 
-def _capped_text(text: str, limit: int) -> str:
+def _capped_text(text: str, limit: int) -> tuple[str, bool]:
     """*text* cut to its first *limit* lines, saying so when it was cut.
 
     Lines are the spine's (:func:`~akgentic.tool.workspace.lines.split_lines`),
     the same lines ``workspace_read`` numbers.
+
+    Returns:
+        The text to show, and whether it is the **whole** file. As with
+        :func:`_paginate`, the flag comes from the same comparison that decides
+        the cut, so what the command records can never disagree with what it
+        showed.
     """
     lines = split_lines(text)
     if len(lines) <= limit:
-        return text
+        return text, True
     shown = "\n".join(lines[:limit])
-    return f"{shown}\n… ({len(lines)} lines; showing 1–{limit})"
+    return f"{shown}\n… ({len(lines)} lines; showing 1–{limit})", False
 
 
 def _render_listing(backend: Filesystem, path: str, depth: int) -> str:
@@ -830,10 +836,11 @@ class ReadFactories:
                 return _PERM_ERR_MSG
             except UnicodeDecodeError:
                 return f"Not a text file: {filepath}"
-            # Shown in full only when nothing was cut — see the factory docstring
-            # for why recording here at all depends on how the command was called.
-            record(filepath, observed, len(split_lines(text)) <= limit)
-            return _capped_text(text, limit)
+            # Recorded only on the text path, never on a refusal — see the factory
+            # docstring for why recording here at all depends on how it was called.
+            shown, full = _capped_text(text, limit)
+            record(filepath, observed, full)
+            return shown
 
         return workspace_read
 

@@ -1037,10 +1037,11 @@ command's failure, returned as text, never a crash.
 a user action — so the agent has seen what the command did, and the observations move as if it had
 made the call itself: `/workspace_write` records a full read of the bytes written (they are the
 verbatim rest of the line), `/workspace_read` a full read, or a partial one when it was capped,
-`/workspace_delete` and `/workspace_rmdir` drop the views of what they removed. `/workspace_exec`,
-`/workspace_mkdir`, `/workspace_list` and the search commands record nothing — none of them shows a
-file's bytes. `/workspace_read` never invokes the document reader: a human command must not spend LLM
-credits.
+`/workspace_delete` and `/workspace_rmdir` drop the views of what they removed. `/workspace_mkdir`,
+`/workspace_list` and the search commands record nothing — none of them shows a whole file's bytes;
+`/workspace_exec` records nothing either, because its output is whatever the command printed, never
+a verified copy of the files the run changed. `/workspace_read` never invokes the document reader: a
+human command must not spend LLM credits.
 
 > **Assumption — every command arrives through `_dispatch_command`.** A caller that reaches these
 > commands any other way — `CommandRegistry.callable(name)` from code, or a channel adapter that does
@@ -1049,8 +1050,9 @@ credits.
 > needs a variant that records nothing. The contract is restated on the gate's human mode
 > (`write/gate.py`) and on the `/workspace_read` factory.
 
-What is **not** skipped is the tree's guard: every write-side command
-goes through `_gated`, so it is refused while an exec run holds the tree, takes the path lock of the
+The human holds no view, so no command is checked against one. What is **not** skipped is the
+tree's guard: every write-side command goes through `_gated`, so it is refused while an exec run
+holds the tree, takes the path lock of the
 file it writes or deletes (none for mkdir and rmdir), commits as `human` — `Identity.human()`, name
 and id alike, which is also who a `/workspace_exec` run's discovered changes are attributed to —
 and marks the touched files stale. `/workspace_rmdir` needs no `force`: the human typing it is the

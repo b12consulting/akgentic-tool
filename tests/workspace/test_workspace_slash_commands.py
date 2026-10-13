@@ -393,6 +393,63 @@ class TestWhatTheCommandShowsBecomesTheAgentsView:
         observation = card.observation_for("a.md")
         assert observation is not None and not observation.full
 
+    @pytest.mark.parametrize(
+        ("body", "expected_full"),
+        [
+            ("one\ntwo\n", True),  # exactly the limit, trailing break
+            ("one\ntwo", True),  # exactly the limit, no trailing break
+            ("one\ntwo\nthree\n", False),
+            ("one\n\n", True),  # a genuine empty second line
+            ("one\n\n\n", False),
+            ("", True),
+        ],
+    )
+    def test_the_read_command_decides_full_as_the_tool_does(
+        self,
+        observer: FakeActorToolObserver,
+        workspace_tree: Path,
+        body: str,
+        expected_full: bool,
+    ) -> None:
+        """The command's ``full`` agrees with the tool's own read at the cut boundary."""
+        card = _wired(observer, workspace_read=WorkspaceRead(default_limit=2))
+        populate(workspace_tree, {"a.md": body})
+
+        read(card, "a.md")
+        by_the_tool = card.observation_for("a.md")
+        card._observations.clear()
+        run(card, "/workspace_read a.md")
+        by_the_command = card.observation_for("a.md")
+
+        assert by_the_tool is not None and by_the_command is not None
+        assert by_the_command == by_the_tool
+        assert by_the_command.full is expected_full
+
+    @pytest.mark.parametrize("target", ["nowhere.md", "docs", "blob.bin"])
+    def test_a_refused_read_records_nothing(
+        self, wired_card: WorkspaceTool, workspace_tree: Path, target: str
+    ) -> None:
+        populate(workspace_tree, {"docs/d.md": "d\n"})
+        (workspace_tree / "blob.bin").write_bytes(b"\xff\xfe\x00binary")
+
+        run(wired_card, f"/workspace_read {target}")
+
+        assert wired_card.observation_for(target) is None
+
+    def test_a_human_rmdir_drops_a_view_of_a_file_already_gone(
+        self, wired_card: WorkspaceTool, workspace_tree: Path
+    ) -> None:
+        """A view under the directory is dropped even when the file was not among those removed."""
+        populate(workspace_tree, {"docs/gone.md": "g\n", "docs/kept.md": "k\n"})
+        read(wired_card, "docs/gone.md")
+        (workspace_tree / "docs" / "gone.md").unlink()
+
+        assert run(wired_card, "/workspace_rmdir docs") == "Removed: docs (1 files)"
+
+        assert wired_card.observation_for("docs/gone.md") is None
+        mutate(wired_card, "workspace_write", "docs/gone.md", "recreated\n")
+        assert (workspace_tree / "docs" / "gone.md").read_text(encoding="utf-8") == "recreated\n"
+
     @pytest.mark.parametrize("text", ["/workspace_mkdir fresh", "/workspace_list"])
     def test_a_command_that_shows_no_file_touches_no_view(
         self, wired_card: WorkspaceTool, workspace_tree: Path, text: str

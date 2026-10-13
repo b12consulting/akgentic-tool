@@ -1033,11 +1033,22 @@ class CardGate:
             removed = self._remove_tree(path, target, recursive)
         except PermissionError as exc:
             return _denied(exc)
+        self._forget_tree(path, removed)
+        return _accepted(_removed(path, removed, recursive, force))
+
+    def _forget_tree(self, path: str, removed: list[str]) -> None:
+        """Drop what an accepted rmdir of *path* invalidated — the agent's and the human's alike.
+
+        Every removed file is forgotten, which also puts it in the write set. Then
+        every remaining view under the directory goes too: an observation of a
+        file that had already vanished out of band is in no ``removed`` list, but
+        it names a path the agent now knows is gone, so its next write there is a
+        create rather than a refusal.
+        """
         for removed_path in removed:
             self._forget(removed_path)
         for observed in self._observed_under(path):
             self._observations.pop(observed, None)
-        return _accepted(_removed(path, removed, recursive, force))
 
     def _observed_under(self, path: str) -> list[str]:
         """This agent's observed paths at or under the directory *path*, matched by segment.
@@ -1221,10 +1232,7 @@ class CardGate:
             removed = self._remove_tree(path, target, recursive)
         except PermissionError as exc:
             return _denied(exc)
-        for removed_path in removed:
-            self._forget(removed_path)
-        for observed in self._observed_under(path):
-            self._observations.pop(observed, None)
+        self._forget_tree(path, removed)
         return _accepted(_removed(path, removed, recursive, force=False))
 
     ##

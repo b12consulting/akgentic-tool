@@ -411,9 +411,13 @@ class WriteFactories:
     ##
     ## The slash commands — the human's hand on the tree. Each closure is named
     ## exactly after its command, because the registry keys on ``__name__``, and
-    ## each goes through the gate's human mode: no view check, no observation
-    ## recorded, the commit attributed to ``human``. A refusal is returned as the
-    ## result text rather than raised — the human reads it, and so does the agent.
+    ## each goes through the gate's human mode: no view check, the commit
+    ## attributed to ``human``, and the agent's observations moved as if it had
+    ## made the call — it sees the command and its result in its own context. That
+    ## holds only through ``BaseAgent._dispatch_command``; see the *ASSUMPTION*
+    ## block on the gate's human mode (``gate.py``) for what a bypass admits. A
+    ## refusal is returned as the result text rather than raised — the human reads
+    ## it, and so does the agent.
     ##
     def _write_command_factory(self, params: WorkspaceWrite) -> Callable[..., Any]:
         """Create the ``/workspace_write`` command.
