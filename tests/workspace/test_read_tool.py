@@ -242,6 +242,71 @@ class TestWorkspaceRead:
         assert "3     gamma" in result
 
 
+class TestADirectoryReadIsARefusal:
+    """Story 62-5: a directory handed to ``workspace_read`` is a refusal, not a lost turn.
+
+    ``IsADirectoryError`` is not a :class:`RetriableError`, so it used to escape
+    the tool and end the agent's turn. The commonest trigger is ``path=""`` on a
+    new team's still-empty workspace, which resolves to the root.
+    """
+
+    @pytest.mark.parametrize("path", ["", "docs", "docs/"])
+    def test_a_directory_is_refused_with_a_pointer_to_workspace_list(
+        self, tmp_path: Path, path: str
+    ) -> None:
+        tool = make_tool(tmp_path)
+        (tool.workspace._root / "docs").mkdir()
+        read_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_read")
+        with pytest.raises(RetriableError) as refusal:
+            read_fn(path)
+        assert str(refusal.value) == (
+            f"'{path}' is a directory; use workspace_list to see its files."
+        )
+
+    def test_the_root_of_an_empty_workspace_is_refused(self, tmp_path: Path) -> None:
+        tool = make_tool(tmp_path)
+        assert list(tool.workspace._root.iterdir()) == []
+        read_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_read")
+        with pytest.raises(RetriableError, match="'' is a directory; use workspace_list"):
+            read_fn("")
+
+    def test_a_file_used_as_a_directory_is_a_missing_file(self, tmp_path: Path) -> None:
+        tool = make_tool(tmp_path)
+        (tool.workspace._root / "notes.md").write_text("alpha\n", encoding="utf-8")
+        read_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_read")
+        with pytest.raises(RetriableError) as refusal:
+            read_fn("notes.md/x")
+        assert str(refusal.value) == "File not found: notes.md/x"
+
+    @pytest.mark.parametrize("path", ["", "docs", "notes.md/x"])
+    def test_nothing_is_recorded_for_a_refused_read(self, tmp_path: Path, path: str) -> None:
+        tool = make_tool(tmp_path)
+        (tool.workspace._root / "docs").mkdir()
+        (tool.workspace._root / "notes.md").write_text("alpha\n", encoding="utf-8")
+        read_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_read")
+        with pytest.raises(RetriableError):
+            read_fn(path)
+        assert tool.observation_for(path) is None
+        assert tool.observation_for("notes.md") is None
+
+    def test_the_next_write_is_unaffected_by_a_refused_read(
+        self, wired_card: WorkspaceTool, workspace_tree: Path
+    ) -> None:
+        """The refusal records nothing, so a write after it is judged as if no read happened."""
+        (workspace_tree / "docs").mkdir()
+        (workspace_tree / "notes.md").write_text("alpha\n", encoding="utf-8")
+        read_fn = next(t for t in wired_card.get_tools() if t.__name__ == "workspace_read")
+        write_fn = next(t for t in wired_card.get_tools() if t.__name__ == "workspace_write")
+        for path in ("docs", "notes.md/x"):
+            with pytest.raises(RetriableError):
+                read_fn(path)
+        # A create under the directory is accepted, exactly as without the read.
+        assert write_fn("docs/new.md", "body\n") == "Written: docs/new.md"
+        # And the unread file is still unread: the whole-file table still refuses it.
+        with pytest.raises(RetriableError):
+            write_fn("notes.md", "mine\n")
+
+
 # ---------------------------------------------------------------------------
 # Task 3: workspace_list (AC 6)
 # ---------------------------------------------------------------------------
@@ -793,6 +858,22 @@ def cache_the_extract(cache: DocumentCache, tree: Path, path: str, body: str) ->
 
 class TestBinaryFileReading:
     """Document dispatch in ``workspace_read``, against the state cache (45-4)."""
+
+    def test_a_directory_with_a_document_extension_is_refused(
+        self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path
+    ) -> None:
+        """Story 62-5: ``report.pdf/`` takes the document branch and still refuses."""
+        tool, fs, cache = make_wired_tool(orchestrator_proxy, workspace_tree, DocumentReader())
+        (fs._root / "report.pdf").mkdir()
+        read_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_read")
+        with patch.object(DocumentReader, "extract_text") as mock_extract:
+            with pytest.raises(RetriableError) as refusal:
+                read_fn("report.pdf")
+        assert str(refusal.value) == (
+            "'report.pdf' is a directory; use workspace_list to see its files."
+        )
+        mock_extract.assert_not_called()
+        assert "report.pdf" not in stored_docs(cache)
 
     def test_document_reader_none_raises_value_error(
         self, orchestrator_proxy: FakeOrchestratorProxy, workspace_tree: Path

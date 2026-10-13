@@ -163,6 +163,35 @@ class TestWorkspaceViewTool:
         with pytest.raises(RetriableError):
             fn("../../secret.png")  # type: ignore[assignment]
 
+    @pytest.mark.parametrize("path", ["", "shots", "shots/", "shots.png"])
+    def test_a_directory_is_refused_like_workspace_read(self, tmp_path: Path, path: str) -> None:
+        """Story 62-5: the same refusal, same wording, as ``workspace_read``."""
+        tool, fs = make_wired_read_tool(tmp_path)
+        (fs._root / "shots").mkdir()
+        (fs._root / "shots.png").mkdir()
+        fn = self._view_fn(tool)
+        with pytest.raises(RetriableError) as refusal:
+            fn(path)  # type: ignore[operator]
+        assert str(refusal.value) == (
+            f"'{path}' is a directory; use workspace_list to see its files."
+        )
+
+    def test_the_root_of_an_empty_workspace_is_refused(self, tmp_path: Path) -> None:
+        tool, fs = make_wired_read_tool(tmp_path)
+        assert list(fs._root.iterdir()) == []
+        fn = self._view_fn(tool)
+        with pytest.raises(RetriableError, match="'' is a directory; use workspace_list"):
+            fn("")  # type: ignore[operator]
+
+    def test_a_file_used_as_a_directory_is_a_missing_file(self, tmp_path: Path) -> None:
+        """Story 62-5: ``shot.png/x`` is a path that does not exist."""
+        tool, fs = make_wired_read_tool(tmp_path)
+        (fs._root / "shot.png").write_bytes(b"fake-png-bytes")
+        fn = self._view_fn(tool)
+        with pytest.raises(RetriableError) as refusal:
+            fn("shot.png/x.png")  # type: ignore[operator]
+        assert str(refusal.value) == "File not found: shot.png/x.png"
+
     def test_workspace_view_false_not_in_tools(self, tmp_path: Path) -> None:
         """workspace_view=False → workspace_view not in get_tools() (AC: 11)."""
         tid = uuid.uuid4()

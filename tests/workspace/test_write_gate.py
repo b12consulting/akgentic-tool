@@ -1636,3 +1636,46 @@ class TestBothTablesAreIdenticalWithoutAJournal:
         in full.
         """
         assert wired_card._journal is None
+
+
+# ---------------------------------------------------------------------------
+# Story 62-5: a directory handed to a single-file mutation is a refusal
+# ---------------------------------------------------------------------------
+
+
+class TestADirectoryIsNeverARawOSError:
+    """Every agent-facing tool that takes one file by path refuses a directory.
+
+    ``IsADirectoryError`` and its kin are not :class:`RetriableError`, so one that
+    escapes a tool ends the agent's turn. Each tool answers on its own error
+    contract: a :class:`RetriableError`, or the ``[ERROR] ...`` string an
+    anchored tool documents — never the raw ``OSError``.
+    """
+
+    PATCH = "--- a/docs\n+++ b/docs\n@@ -1,1 +1,1 @@\n-alpha\n+ALPHA\n"
+
+    @pytest.mark.parametrize(
+        ("name", "args"),
+        [
+            ("workspace_edit", ("docs", "alpha", "ALPHA")),
+            ("workspace_multi_edit", ([EditItem(path="docs", old_string="a", new_string="b")],)),
+            ("workspace_patch", (PATCH,)),
+            ("workspace_delete", ("docs",)),
+        ],
+    )
+    def test_a_directory_is_refused(
+        self,
+        wired_card: WorkspaceTool,
+        workspace_tree: Path,
+        name: str,
+        args: tuple[Any, ...],
+    ) -> None:
+        (workspace_tree / "docs").mkdir()
+        (workspace_tree / "docs" / "kept.md").write_text("kept\n", encoding="utf-8")
+        try:
+            answer = mutate(wired_card, name, *args)
+        except RetriableError:
+            pass
+        else:
+            assert answer.startswith("[ERROR]"), answer
+        assert (workspace_tree / "docs" / "kept.md").read_text(encoding="utf-8") == "kept\n"
