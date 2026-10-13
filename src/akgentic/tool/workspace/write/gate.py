@@ -771,6 +771,8 @@ class CardGate:
             self._tree().delete(path)
         except PermissionError as exc:
             return _denied(exc)
+        except IsADirectoryError:
+            return _rejected(f"Is a directory: {path} — use workspace_rmdir")
         except FileNotFoundError:
             return _rejected(PUBLISH_LOST_MSG)
         self._forget(path)
@@ -835,6 +837,8 @@ class CardGate:
             data, diff = write_and_diff(self._tree(), path, raw, edited)
         except PermissionError as exc:
             return _denied(exc)
+        except IsADirectoryError:
+            return _rejected(f"Is a directory: {path}")
         except FileNotFoundError:
             return _rejected(PUBLISH_LOST_MSG)
         except UnicodeDecodeError as exc:
@@ -1449,7 +1453,10 @@ class CardGate:
         """Gate and apply one edit in memory; return an outcome only on failure."""
         entry = staged.get(item.path)
         if entry is None:
-            live = self._live(item.path)
+            try:
+                live = self._live(item.path)
+            except IsADirectoryError:
+                return _rejected(f"Is a directory: {item.path}")
             refusal, exact_only = self._check(item.path, whole_file=False, live=live)
             if refusal is not None:
                 return _rejected(refusal)
