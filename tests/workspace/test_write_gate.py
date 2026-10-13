@@ -1815,17 +1815,28 @@ class TestADirectoryIsNeverARawOSError:
     escapes a tool ends the agent's turn. Each tool answers on its own error
     contract: a :class:`RetriableError`, or the ``[ERROR] ...`` string an
     anchored tool documents — never the raw ``OSError``.
+
+    The same holds for a path that runs through a file (``notes.md/x``), which
+    raises ``NotADirectoryError``: the gate's tools read it as a path that does
+    not exist, as ``workspace_read`` does, and a write refuses to create under a file.
     """
 
     PATCH = "--- a/docs\n+++ b/docs\n@@ -1,1 +1,1 @@\n-alpha\n+ALPHA\n"
+    THROUGH_PATCH = "--- a/notes.md/x\n+++ b/notes.md/x\n@@ -1,1 +1,1 @@\n-alpha\n+ALPHA\n"
+    THROUGH_ADD = "--- /dev/null\n+++ b/notes.md/x\n@@ -0,0 +1,1 @@\n+alpha\n"
 
     @pytest.mark.parametrize(
-        ("name", "args"),
+        ("name", "args", "refusal"),
         [
-            ("workspace_edit", ("docs", "alpha", "ALPHA")),
-            ("workspace_multi_edit", ([EditItem(path="docs", old_string="a", new_string="b")],)),
-            ("workspace_patch", (PATCH,)),
-            ("workspace_delete", ("docs",)),
+            ("workspace_write", ("docs", "body\n"), "Is a directory: docs"),
+            ("workspace_edit", ("docs", "alpha", "ALPHA"), "Is a directory: docs"),
+            (
+                "workspace_multi_edit",
+                ([EditItem(path="docs", old_string="a", new_string="b")],),
+                "Is a directory: docs",
+            ),
+            ("workspace_patch", (PATCH,), None),
+            ("workspace_delete", ("docs",), "Is a directory: docs — use workspace_rmdir"),
         ],
     )
     def test_a_directory_is_refused(
@@ -1834,13 +1845,59 @@ class TestADirectoryIsNeverARawOSError:
         workspace_tree: Path,
         name: str,
         args: tuple[Any, ...],
+        refusal: str | None,
     ) -> None:
         (workspace_tree / "docs").mkdir()
         (workspace_tree / "docs" / "kept.md").write_text("kept\n", encoding="utf-8")
-        try:
-            answer = mutate(wired_card, name, *args)
-        except RetriableError:
-            pass
-        else:
-            assert answer.startswith("[ERROR]"), answer
+        self._assert_refused(wired_card, name, args, refusal)
+        assert (workspace_tree / "docs").is_dir()
         assert (workspace_tree / "docs" / "kept.md").read_text(encoding="utf-8") == "kept\n"
+
+    @pytest.mark.parametrize(
+        ("name", "args", "refusal"),
+        [
+            (
+                "workspace_write",
+                ("notes.md/x", "body\n"),
+                "Not a directory: a parent of notes.md/x is a file",
+            ),
+            (
+                "workspace_write",
+                ("notes.md/a/b", "body\n"),
+                "Not a directory: a parent of notes.md/a/b is a file",
+            ),
+            ("workspace_edit", ("notes.md/x", "alpha", "ALPHA"), "File not found: notes.md/x"),
+            (
+                "workspace_multi_edit",
+                ([EditItem(path="notes.md/x", old_string="a", new_string="b")],),
+                "File not found: notes.md/x",
+            ),
+            ("workspace_patch", (THROUGH_PATCH,), None),
+            ("workspace_patch", (THROUGH_ADD,), None),
+            ("workspace_delete", ("notes.md/x",), "File not found: notes.md/x"),
+        ],
+    )
+    def test_a_path_through_a_file_is_refused(
+        self,
+        wired_card: WorkspaceTool,
+        workspace_tree: Path,
+        name: str,
+        args: tuple[Any, ...],
+        refusal: str | None,
+    ) -> None:
+        (workspace_tree / "notes.md").write_text("alpha\n", encoding="utf-8")
+        self._assert_refused(wired_card, name, args, refusal)
+        assert (workspace_tree / "notes.md").read_text(encoding="utf-8") == "alpha\n"
+
+    @staticmethod
+    def _assert_refused(
+        card: WorkspaceTool, name: str, args: tuple[Any, ...], refusal: str | None
+    ) -> None:
+        """A gate refusal raises *refusal* verbatim; ``None`` means the ``[ERROR]`` line."""
+        if refusal is None:
+            answer = mutate(card, name, *args)
+            assert answer.startswith("[ERROR]"), answer
+            return
+        with pytest.raises(RetriableError) as raised:
+            mutate(card, name, *args)
+        assert str(raised.value) == refusal
