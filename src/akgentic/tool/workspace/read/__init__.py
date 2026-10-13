@@ -785,10 +785,21 @@ class ReadFactories:
     def _read_command_factory(self, params: WorkspaceRead) -> Callable[..., Any]:
         """Create the ``/workspace_read`` command — the human's look at a text file.
 
-        **It records no observation.** The text reaches the agent's context as a
-        user action, never as something the agent read, so the agent's next write
-        to the file is still judged on a read of its own. It never invokes the
-        document reader either: a human command must not spend LLM credits.
+        **It records what it showed as this agent's observation** — full when the
+        whole file fit under ``default_limit``, partial when it was cut, exactly as
+        the tool's own read does. That rests on an assumption: the command arrives
+        through ``BaseAgent._dispatch_command`` (akgentic-agent), which appends the
+        result to the agent's LLM context, so the agent has seen these bytes. A
+        caller that runs it any other way — ``CommandRegistry.callable(name)``
+        from code, or an adapter that does not write the result into the agent's
+        context — would leave the agent holding an observation of text it never
+        saw, and the write gate would then admit a blind overwrite of the file.
+        Such a caller must not record. See the *ASSUMPTION* block on the write
+        gate's human mode (``write/gate.py``), which carries the same contract.
+
+        It never invokes the document reader: a human command must not spend LLM
+        credits, and a document read shows derived Markdown, which would be a
+        false observation of the source bytes anyway.
 
         Args:
             params: Read capability configuration; ``default_limit`` caps the lines.
@@ -798,6 +809,7 @@ class ReadFactories:
         """
         backend = self.workspace
         limit = params.default_limit
+        record = self._observation_recorder()
 
         def workspace_read(filepath: str) -> str:
             """Show a text file from the team workspace.
@@ -808,7 +820,8 @@ class ReadFactories:
             Example: /workspace_read docs/notes.md
             """
             try:
-                text = backend.read(filepath).decode("utf-8")
+                observed = backend.read(filepath)
+                text = observed.decode("utf-8")
             except FileNotFoundError:
                 return f"File not found: {filepath}"
             except IsADirectoryError:
@@ -817,6 +830,9 @@ class ReadFactories:
                 return _PERM_ERR_MSG
             except UnicodeDecodeError:
                 return f"Not a text file: {filepath}"
+            # Shown in full only when nothing was cut — see the factory docstring
+            # for why recording here at all depends on how the command was called.
+            record(filepath, observed, len(split_lines(text)) <= limit)
             return _capped_text(text, limit)
 
         return workspace_read

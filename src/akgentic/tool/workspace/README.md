@@ -1032,11 +1032,24 @@ newlines, and any extension is accepted. `/workspace_exec` runs the raw rest of 
 the tool (`bash` must stay on it). A quote that does not close in the leading arguments is the
 command's failure, returned as text, never a crash.
 
-**The human's change is never the agent's view.** The commands run on the agent's own card, but a
-write-side command records no observation, so the agent's next write to a file the human changed is
-refused as *changed since you read it*, and a file the human created is still *not read*.
-`/workspace_read` records nothing either, and never invokes the document reader — a human command
-must not spend LLM credits. What is **not** skipped is the tree's guard: every write-side command
+**What a command shows the agent becomes its view.** The commands run on the agent's own card, and
+`BaseAgent._dispatch_command` writes the command line and its result into the agent's LLM context as
+a user action — so the agent has seen what the command did, and the observations move as if it had
+made the call itself: `/workspace_write` records a full read of the bytes written (they are the
+verbatim rest of the line), `/workspace_read` a full read, or a partial one when it was capped,
+`/workspace_delete` and `/workspace_rmdir` drop the views of what they removed. `/workspace_exec`,
+`/workspace_mkdir`, `/workspace_list` and the search commands record nothing — none of them shows a
+file's bytes. `/workspace_read` never invokes the document reader: a human command must not spend LLM
+credits.
+
+> **Assumption — every command arrives through `_dispatch_command`.** A caller that reaches these
+> commands any other way — `CommandRegistry.callable(name)` from code, or a channel adapter that does
+> not write the result into the agent's context — leaves the agent holding an observation of bytes it
+> never saw, and the gate then **admits** its next blind overwrite of that content. Such a caller
+> needs a variant that records nothing. The contract is restated on the gate's human mode
+> (`write/gate.py`) and on the `/workspace_read` factory.
+
+What is **not** skipped is the tree's guard: every write-side command
 goes through `_gated`, so it is refused while an exec run holds the tree, takes the path lock of the
 file it writes or deletes (none for mkdir and rmdir), commits as `human` — `Identity.human()`, name
 and id alike, which is also who a `/workspace_exec` run's discovered changes are attributed to —

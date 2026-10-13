@@ -4,9 +4,10 @@
 ``/workspace_write``, ``/workspace_read``, ``/workspace_list``, ``/workspace_exec``
 and ``/workspace_exec_result`` are served on the ``COMMAND`` channel and dispatched
 by the agent's ``CommandRegistry``. The commands run on the agent's own card, so
-the property that matters most is the negative one: **the human's change is never
-the agent's view.** Each write-side command goes through the gate's human mode —
-no view check, no observation recorded, the commit attributed to ``human``.
+what a command shows the agent becomes its view: ``_dispatch_command`` writes the
+command line and its result into the agent's LLM context, so the observations move
+as if the agent had made the call. Each write-side command goes through the gate's
+human mode — no view check, the commit attributed to ``human``.
 """
 
 from __future__ import annotations
@@ -306,41 +307,94 @@ class TestWorkspaceWrite:
 
 
 # ---------------------------------------------------------------------------
-# B6 — the human's change is not the agent's view
+# B6 — what a command shows the agent becomes its view
+#
+# The rule rests on an assumption the gate documents: every command arrives
+# through ``BaseAgent._dispatch_command``, which writes the command line and its
+# result into the agent's LLM context. The agent has seen what the command did,
+# so the observations move exactly as if the agent had made the call itself.
 # ---------------------------------------------------------------------------
 
 
-class TestTheHumansChangeIsNotTheAgentsView:
-    def test_a_human_overwrite_refuses_the_agents_next_blind_write(
+class TestWhatTheCommandShowsBecomesTheAgentsView:
+    def test_a_human_overwrite_admits_the_agents_next_write(
         self, wired_card: WorkspaceTool, workspace_tree: Path
     ) -> None:
         populate(workspace_tree, {"a.md": "old\n"})
         read(wired_card, "a.md")
         run(wired_card, "/workspace_write a.md new")
 
-        with pytest.raises(RetriableError, match="it changed since you read it"):
-            mutate(wired_card, "workspace_write", "a.md", "agent's version\n")
-        assert (workspace_tree / "a.md").read_text(encoding="utf-8") == "new"
+        mutate(wired_card, "workspace_write", "a.md", "agent's version\n")
+        assert (workspace_tree / "a.md").read_text(encoding="utf-8") == "agent's version\n"
 
-    def test_a_human_create_is_not_a_read(
+    def test_a_human_create_counts_as_a_full_read(
         self, wired_card: WorkspaceTool, workspace_tree: Path
     ) -> None:
         run(wired_card, "/workspace_write b.md x")
-        with pytest.raises(RetriableError, match="you have not read it"):
-            mutate(wired_card, "workspace_edit", "b.md", "x", "y")
+        observation = wired_card.observation_for("b.md")
+        assert observation is not None and observation.full
 
-    @pytest.mark.parametrize(
-        "text",
-        [
-            "/workspace_write a.md new",
-            "/workspace_delete a.md",
-            "/workspace_mkdir fresh",
-            "/workspace_rmdir docs",
-            "/workspace_read a.md",
-            "/workspace_list",
-        ],
-    )
-    def test_no_command_touches_the_observation_map(
+        mutate(wired_card, "workspace_edit", "b.md", "x", "y")
+        assert (workspace_tree / "b.md").read_text(encoding="utf-8") == "y"
+
+    def test_a_human_write_still_refuses_an_agent_that_never_saw_it_change(
+        self, wired_card: WorkspaceTool, workspace_tree: Path
+    ) -> None:
+        """The human's write refreshes the view; a later out-of-band change still refuses."""
+        populate(workspace_tree, {"a.md": "old\n"})
+        run(wired_card, "/workspace_write a.md new")
+        (workspace_tree / "a.md").write_text("changed by someone else\n", encoding="utf-8")
+
+        with pytest.raises(RetriableError, match="it changed since you read it"):
+            mutate(wired_card, "workspace_write", "a.md", "agent's version\n")
+
+    def test_a_human_delete_drops_the_agents_view(
+        self, wired_card: WorkspaceTool, workspace_tree: Path
+    ) -> None:
+        populate(workspace_tree, {"a.md": "old\n"})
+        read(wired_card, "a.md")
+        run(wired_card, "/workspace_delete a.md")
+
+        assert wired_card.observation_for("a.md") is None
+        mutate(wired_card, "workspace_write", "a.md", "recreated\n")
+        assert (workspace_tree / "a.md").read_text(encoding="utf-8") == "recreated\n"
+
+    def test_a_human_rmdir_drops_every_view_under_it(
+        self, wired_card: WorkspaceTool, workspace_tree: Path
+    ) -> None:
+        populate(workspace_tree, {"a.md": "a\n", "docs/d.md": "d\n", "docs/sub/e.md": "e\n"})
+        read(wired_card, "a.md")
+        read(wired_card, "docs/d.md")
+        read(wired_card, "docs/sub/e.md")
+
+        run(wired_card, "/workspace_rmdir docs")
+
+        assert wired_card.observation_for("docs/d.md") is None
+        assert wired_card.observation_for("docs/sub/e.md") is None
+        assert wired_card.observation_for("a.md") is not None
+
+    def test_a_human_read_records_a_full_view(
+        self, wired_card: WorkspaceTool, workspace_tree: Path
+    ) -> None:
+        populate(workspace_tree, {"a.md": "alpha\n"})
+        run(wired_card, "/workspace_read a.md")
+        observation = wired_card.observation_for("a.md")
+        assert observation is not None and observation.full
+
+        mutate(wired_card, "workspace_edit", "a.md", "alpha", "bravo")
+        assert (workspace_tree / "a.md").read_text(encoding="utf-8") == "bravo\n"
+
+    def test_a_capped_human_read_records_a_partial_view(
+        self, observer: FakeActorToolObserver, workspace_tree: Path
+    ) -> None:
+        card = _wired(observer, workspace_read=WorkspaceRead(default_limit=2))
+        populate(workspace_tree, {"a.md": "one\ntwo\nthree\nfour\n"})
+        run(card, "/workspace_read a.md")
+        observation = card.observation_for("a.md")
+        assert observation is not None and not observation.full
+
+    @pytest.mark.parametrize("text", ["/workspace_mkdir fresh", "/workspace_list"])
+    def test_a_command_that_shows_no_file_touches_no_view(
         self, wired_card: WorkspaceTool, workspace_tree: Path, text: str
     ) -> None:
         populate(workspace_tree, {"a.md": "old\n", "docs/d.md": "d\n"})
@@ -524,12 +578,9 @@ class TestDeleteRmdirMkdir:
 
 
 class TestReadAndList:
-    def test_read_returns_the_text_and_records_nothing(
-        self, wired_card: WorkspaceTool, workspace_tree: Path
-    ) -> None:
+    def test_read_returns_the_text(self, wired_card: WorkspaceTool, workspace_tree: Path) -> None:
         populate(workspace_tree, {"a.md": "alpha\nbravo\n"})
         assert run(wired_card, "/workspace_read a.md") == "alpha\nbravo\n"
-        assert wired_card.observation_for("a.md") is None
 
     def test_read_is_capped_at_the_default_limit(
         self, observer: FakeActorToolObserver, workspace_tree: Path

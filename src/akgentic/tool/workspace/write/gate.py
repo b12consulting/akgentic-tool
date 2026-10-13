@@ -1098,17 +1098,36 @@ class CardGate:
 
     ##
     ## Human mode — the slash commands. The human holds no view, so nothing is
-    ## checked against one, and nothing the human does becomes this agent's view.
+    ## checked against one; what the command shows the agent becomes its view.
+    ##
+    ## ASSUMPTION — every call arrives through ``BaseAgent._dispatch_command``
+    ## (akgentic-agent), which appends the command line and its result to this
+    ## agent's LLM context as a user action. The agent has therefore seen exactly
+    ## what a ``/workspace_write`` wrote (its content is the verbatim rest of the
+    ## line) and that a ``/workspace_delete`` / ``/workspace_rmdir`` removed what it
+    ## removed, so the methods below update the observations as if the agent had
+    ## made the call itself.
+    ##
+    ## A caller that reaches these commands any other way — notably
+    ## ``CommandRegistry.callable(name)`` from code, or a future channel adapter
+    ## that does not write the result into the agent's context — breaks the
+    ## assumption: the agent then holds an observation of bytes it never saw, and
+    ## its next blind overwrite of that content is ADMITTED. That is the lost
+    ## update this gate exists to refuse. Such a caller needs a variant that skips
+    ## ``_accept`` / ``_forget`` (the human's change then reads like an upload),
+    ## or the observation must move to the point where the context entry is
+    ## actually written.
     ##
     def human_write(self, path: str, content: str) -> MutationOutcome:
         """Create or overwrite *path* with *content* as the human, through ``/workspace_write``.
 
-        **No ``_check`` and no ``_accept``.** The human has no view to be stale
-        against, and recording one for this agent would be an observation of
-        bytes the agent has never read: its next blind overwrite of the human's
-        content would then be admitted, which is exactly the lost update the
-        gate exists to refuse. The human's change is treated like an upload —
-        live bytes the agent has not seen — and the commit is the human's.
+        **No ``_check``, but ``_accept``.** The human has no view to be stale
+        against, so nothing is checked. The written bytes do become this agent's
+        full observation, because ``_dispatch_command`` puts the command line —
+        content included, verbatim — into the agent's context: it has seen them.
+        See the *ASSUMPTION* block above: that is only true while every caller
+        goes through ``_dispatch_command``. The commit is still the human's;
+        attribution is a fact about who acted, not about who saw it.
 
         Args:
             path: Workspace-relative path.
@@ -1132,11 +1151,14 @@ class CardGate:
             return _rejected(f"Is a directory: {path}")
         except FileNotFoundError:
             return _rejected(PUBLISH_LOST_MSG)
-        self._touched.append(path)
+        self._accept(path, data)
         return _accepted(f"Written: {path} ({len(data)} bytes)")
 
     def human_delete(self, path: str) -> MutationOutcome:
         """Delete one file as the human, through ``/workspace_delete`` — no view check.
+
+        This agent's observation of *path* is dropped, as for its own delete: it
+        was shown the removal. Valid only under the *ASSUMPTION* above.
 
         Returns:
             ``Deleted: <path>``, or a refusal for a directory, a missing file or
@@ -1157,7 +1179,7 @@ class CardGate:
             return _denied(exc)
         except FileNotFoundError:
             return _rejected(f"File not found: {path}")
-        self._touched.append(path)
+        self._forget(path)
         return _accepted(f"Deleted: {path}")
 
     def human_mkdir(self, path: str) -> MutationOutcome:
@@ -1170,9 +1192,10 @@ class CardGate:
         The human typing the command is the explicit request the tool's
         docstring tells the model to wait for, so there is no view check and no
         ``force``. *recursive* is the deployment's ``allow_recursive``: off, only
-        an empty directory is removed. No path lock is taken, and this agent's
-        observations under the directory are left alone — its next mutation of
-        one of those paths is refused as gone, which is the truth.
+        an empty directory is removed. No path lock is taken. This agent's
+        observations under the directory are dropped, as for its own rmdir: it was
+        shown the removal, so its next write there is a create. Valid only under
+        the *ASSUMPTION* above.
 
         Returns:
             ``Removed: <path> (<k> files)`` when recursive, ``Removed: <path>``
@@ -1198,7 +1221,10 @@ class CardGate:
             removed = self._remove_tree(path, target, recursive)
         except PermissionError as exc:
             return _denied(exc)
-        self._touched.extend(removed)
+        for removed_path in removed:
+            self._forget(removed_path)
+        for observed in self._observed_under(path):
+            self._observations.pop(observed, None)
         return _accepted(_removed(path, removed, recursive, force=False))
 
     ##
