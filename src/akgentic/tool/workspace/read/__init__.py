@@ -57,6 +57,9 @@ if TYPE_CHECKING:
     from akgentic.tool.workspace.workspace import Filesystem
 
 _PERM_ERR_MSG = PERM_ERR_MSG
+# One refusal for a directory handed to a single-file read, shared by
+# ``workspace_read`` and ``workspace_view``: it names the tool that does take one.
+_IS_A_DIRECTORY_MSG = "'{path}' is a directory; use workspace_list to see its files."
 _REF_RE = _re.compile(r'!!"([^"]+)"|!!(\S+)')
 
 # The two refusals a media-ref token can be answered with, both in the family of
@@ -542,12 +545,9 @@ class ReadFactories:
         lookup = self._extract_lookup()
         remember = self._extract_recorder()
         _dr_cfg = params.document_reader
-        if _dr_cfg is True:
-            document_reader: DocumentReader | None = DocumentReader()
-        elif _dr_cfg is False:
-            document_reader = None
-        else:
-            document_reader = _dr_cfg
+        document_reader: DocumentReader | None = (
+            DocumentReader() if _dr_cfg is True else _dr_cfg or None
+        )
 
         def workspace_read(
             path: str,
@@ -570,8 +570,8 @@ class ReadFactories:
                 Truncated files include a trailing notice.
 
             Raises:
-                RetriableError: If the path does not exist, escapes the
-                    workspace root, or is not UTF-8 text.
+                RetriableError: If the path does not exist, is a directory,
+                    escapes the workspace root, or is not UTF-8 text.
                 ValueError: If the file is a binary format and
                     ``document_reader`` is not configured.
             """
@@ -609,8 +609,11 @@ class ReadFactories:
                     # One recording call per invocation, whatever the file's size.
                     record(path, observed, full)
                 return numbered
-            except FileNotFoundError:
+            except (FileNotFoundError, NotADirectoryError):
+                # ``notes.md/x``: a file used as a directory is a path that does not exist.
                 raise RetriableError(f"File not found: {path}")
+            except IsADirectoryError:
+                raise RetriableError(_IS_A_DIRECTORY_MSG.format(path=path))
             except PermissionError:
                 raise RetriableError(_PERM_ERR_MSG)
             except UnicodeDecodeError as exc:
@@ -829,13 +832,15 @@ class ReadFactories:
                 BinaryContent with the image bytes and MIME type.
 
             Raises:
-                RetriableError: If the path does not exist, escapes the workspace root,
-                    or the file extension is not a supported image format.
+                RetriableError: If the path does not exist, is a directory, escapes the
+                    workspace root, or the file extension is not a supported image format.
             """
             try:
                 data = backend.read_bytes(path)
-            except FileNotFoundError:
+            except (FileNotFoundError, NotADirectoryError):
                 raise RetriableError(f"File not found: {path}")
+            except IsADirectoryError:
+                raise RetriableError(_IS_A_DIRECTORY_MSG.format(path=path))
             except PermissionError:
                 raise RetriableError(_PERM_ERR_MSG)
             try:
