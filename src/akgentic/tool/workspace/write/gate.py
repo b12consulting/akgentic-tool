@@ -652,6 +652,11 @@ class CardGate:
             self._tree().write(path, data)
         except PermissionError as exc:
             return _denied(exc)
+        except IsADirectoryError:
+            return _rejected(f"Is a directory: {path}")
+        except NotADirectoryError:
+            # ``notes.md/x``: ``_live`` reads through a file, so nothing is created under it.
+            return _rejected(f"Not a directory: a parent of {path} is a file")
         except FileNotFoundError:
             return _rejected(PUBLISH_LOST_MSG)
         self._accept(path, data)
@@ -684,6 +689,9 @@ class CardGate:
             return _denied(exc)
         except IsADirectoryError:
             return _rejected(f"Is a directory: {path} — use workspace_rmdir")
+        except NotADirectoryError:
+            # ``notes.md/x``: a file used as a directory is a path that does not exist.
+            return _rejected(f"File not found: {path}")
         except FileNotFoundError:
             return _rejected(PUBLISH_LOST_MSG)
         self._forget(path)
@@ -750,6 +758,8 @@ class CardGate:
             return _denied(exc)
         except IsADirectoryError:
             return _rejected(f"Is a directory: {path}")
+        except NotADirectoryError:
+            return _rejected(f"File not found: {path}")
         except FileNotFoundError:
             return _rejected(PUBLISH_LOST_MSG)
         self._accept(path, data)
@@ -1065,6 +1075,8 @@ class CardGate:
                 live = self._live(item.path)
             except IsADirectoryError:
                 return _rejected(f"Is a directory: {item.path}")
+            except NotADirectoryError:
+                return _rejected(f"File not found: {item.path}")
             refusal, exact_only = self._check(item.path, whole_file=False, live=live)
             if refusal is not None:
                 return _rejected(refusal)
