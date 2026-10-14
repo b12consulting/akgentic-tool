@@ -15,7 +15,8 @@ from datetime import timedelta
 from typing import Any
 
 import pytest
-from pydantic_ai.mcp import MCPToolset, SSETransport, StdioTransport, StreamableHttpTransport
+from fastmcp.client.transports import SSETransport, StdioTransport, StreamableHttpTransport
+from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.toolsets.prefixed import PrefixedToolset
 
 from akgentic.tool.mcp.mcp import (
@@ -134,23 +135,30 @@ def test_loaders_return_the_v2_symbols() -> None:
     assert _load_mcp_transport_classes() == (StdioTransport, SSETransport, StreamableHttpTransport)
 
 
-@pytest.mark.parametrize("loader", [_load_mcp_toolset_class, _load_mcp_transport_classes])
+@pytest.mark.parametrize(
+    ("loader", "source_module"),
+    [
+        (_load_mcp_toolset_class, "pydantic_ai.mcp"),
+        (_load_mcp_transport_classes, "fastmcp.client.transports"),
+    ],
+)
 def test_import_failure_surfaces_its_real_cause_not_installation_advice(
     loader: Any,
+    source_module: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A real ImportError must propagate unrewritten.
 
-    `mcp` ships unconditionally with pydantic-ai v2, so the old "install
+    Both sources are declared dependencies of this package, so the old "install
     pydantic-ai-slim[mcp]" guidance misdiagnosed a removed symbol as a missing package.
     """
-    monkeypatch.setitem(sys.modules, "pydantic_ai.mcp", None)
+    monkeypatch.setitem(sys.modules, source_module, None)
 
     with pytest.raises(ImportError) as excinfo:
         loader()
 
     message = str(excinfo.value)
-    assert "pydantic_ai.mcp" in message
+    assert source_module in message
     assert "pydantic-ai-slim[mcp]" not in message
     assert "extras" not in message
 
