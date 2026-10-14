@@ -5,7 +5,7 @@ Pass ``read_only=True`` to restrict to read-side callables only (``workspace_rea
 ``workspace_list``, ``workspace_glob``, ``workspace_grep``, ``workspace_view``).
 The default ``read_only=False`` also includes write-side callables (``workspace_write``,
 ``workspace_delete``, ``workspace_edit``, ``workspace_multi_edit``, ``workspace_patch``,
-``workspace_mkdir``).
+``workspace_mkdir``, ``workspace_rmdir``).
 
 **Reads and mutations both run here now.** A read runs on the calling agent's own
 thread against its own :class:`~akgentic.tool.workspace.workspace.Filesystem` and
@@ -15,10 +15,11 @@ held on the path (ADR-051 Decision 3) — a lock on the *tree*, which is what tw
 workers over one mounted volume share, rather than a mailbox, which is what one
 process has.
 
-Nothing about the gate is visible in an LLM-facing signature: the six mutation
+Nothing about the gate is visible in an LLM-facing signature: the mutation
 callables take exactly what they always took, and the precondition is derived
-from what this agent observed. There is no digest, no ``expected``, and no
-``force``.
+from what this agent observed. There is no digest and no ``expected``. The one
+``force`` is ``workspace_rmdir``'s, which skips the view check only when the user
+has explicitly asked to discard changes — and its docstring says so.
 
 **A workspace binds, gates and mutates in a process that hosts nothing.** There
 is no resource host in this package any more and nothing here forwards to one:
@@ -144,6 +145,7 @@ from akgentic.tool.workspace.write.params import (
     WorkspaceMkdir,
     WorkspaceMultiEdit,
     WorkspacePatch,
+    WorkspaceRmdir,
     WorkspaceWrite,
 )
 
@@ -151,6 +153,21 @@ logger = logging.getLogger(__name__)
 
 # Binds a capability's configuration field to the factory that consumes it.
 _ParamT = TypeVar("_ParamT", bound=BaseToolParam)
+
+
+_CommandRow = tuple[type[BaseToolParam], Callable[..., Any] | None]
+"""One ``get_commands`` entry before the ``None`` rows are dropped."""
+
+
+class _ExecResultCommand(WorkspaceExec):
+    """The ``get_commands`` key of ``/workspace_exec_result`` — a key, never a field.
+
+    ``get_commands`` maps one parameter class to one callable, and the exec
+    capability is the one field that yields two. ``/workspace_exec`` takes the
+    ``WorkspaceExec`` key; its collector needs a key of its own, and nothing but
+    the dict ever sees this class — the registry keys commands by ``__name__``.
+    """
+
 
 __all__ = [
     "ExpandMediaRefs",
@@ -169,6 +186,7 @@ __all__ = [
     "WorkspaceRagList",
     "WorkspaceRagSearch",
     "WorkspaceRead",
+    "WorkspaceRmdir",
     "WorkspaceTool",
     "WorkspaceView",
     "WorkspaceWrite",
@@ -180,7 +198,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
 
     Pass ``read_only=True`` to restrict to read-side tools only.  The default
     ``read_only=False`` also exposes write-side tools (write, delete, edit,
-    multi_edit, patch, mkdir).
+    multi_edit, patch, mkdir, rmdir).
 
     Binary-extraction config lives on the nested :class:`WorkspaceRead` capability
     (``workspace_read=WorkspaceRead(document_reader=...)``), co-located with the read
@@ -281,6 +299,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
     workspace_multi_edit: WorkspaceMultiEdit | bool = True
     workspace_patch: WorkspacePatch | bool = True
     workspace_mkdir: WorkspaceMkdir | bool = True
+    workspace_rmdir: WorkspaceRmdir | bool = True
 
     git_journal: bool = False
     """Whether accepted mutations are recorded in a git journal.
@@ -975,11 +994,15 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         sandbox actor still existed — still brought one up (a running container,
         on the docker backend) to serve two callables it then never registered.
 
+        **Either channel turns it on**, because ``/workspace_exec`` needs the same
+        actor and backend the tool does. Which callables each channel then gets is
+        :meth:`_exec_tools`' and :meth:`_write_command_rows`' business.
+
         Returns:
             The parameters, or ``None`` when nothing exec-related should happen.
         """
         params = _resolve(self.workspace_exec, WorkspaceExec)
-        if params is None or self.read_only or TOOL_CALL not in params.expose:
+        if params is None or self.read_only or not params.expose & {TOOL_CALL, COMMAND}:
             return None
         return params
 
@@ -1445,6 +1468,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
             ),
             self._tool_if_enabled(self.workspace_patch, WorkspacePatch, self._patch_factory),
             self._tool_if_enabled(self.workspace_mkdir, WorkspaceMkdir, self._mkdir_factory),
+            self._tool_if_enabled(self.workspace_rmdir, WorkspaceRmdir, self._rmdir_factory),
         ]
         tools = [tool for tool in candidates if tool is not None]
         return tools + self._exec_tools()
@@ -1461,7 +1485,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         actor they need can never disagree about whether the capability is on.
         """
         params = self._enabled_exec()
-        if params is None:
+        if params is None or TOOL_CALL not in params.expose:
             return []
         return [self._exec_factory(params), self._exec_result_factory(params)]
 
@@ -1481,12 +1505,33 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
             return None
         return factory(params)
 
+    @staticmethod
+    def _command_if_enabled(
+        value: _ParamT | bool,
+        param_cls: type[_ParamT],
+        factory: Callable[[_ParamT], Callable[..., Any]],
+    ) -> Callable[..., Any] | None:
+        """Build a capability's slash command, or ``None`` when it is off the COMMAND channel.
+
+        The mirror of :meth:`_tool_if_enabled` on the other channel, so a field set
+        to ``False`` serves neither its tool nor its command.
+        """
+        params = _resolve(value, param_cls)
+        if params is None or COMMAND not in params.expose:
+            return None
+        return factory(params)
+
     def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
         """Return COMMAND-channel capabilities for this tool.
 
+        The read side — read, list, glob, grep and the retrieval search — is served
+        whatever ``read_only`` says; the write-side file commands and the exec pair
+        only when the card is not ``read_only``, exactly as their tools are.
+
         Returns:
             Dict mapping each enabled COMMAND capability to its callable —
-            ``ExpandMediaRefs``, and the two retrieval capabilities.
+            ``ExpandMediaRefs``, the retrieval index and list, and the
+            workspace's own slash commands.
         """
         commands: dict[type[BaseToolParam], Callable[..., Any]] = {}
         pr = _resolve(self.expand_media_refs, ExpandMediaRefs)
@@ -1498,7 +1543,82 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         listing = _resolve(self.workspace_rag_list, WorkspaceRagList)
         if listing is not None and COMMAND in listing.expose:
             commands[WorkspaceRagList] = self._rag_list_factory(listing)
+        rows = self._read_command_rows()
+        if not self.read_only:
+            rows += self._write_command_rows()
+        commands.update({key: command for key, command in rows if command is not None})
         return commands
+
+    def _read_command_rows(self) -> list[_CommandRow]:
+        """The read-side slash commands, keyed for :meth:`get_commands` — ``read_only`` too."""
+        return [
+            (
+                WorkspaceRead,
+                self._command_if_enabled(
+                    self.workspace_read, WorkspaceRead, self._read_command_factory
+                ),
+            ),
+            (
+                WorkspaceList,
+                self._command_if_enabled(
+                    self.workspace_list, WorkspaceList, self._list_command_factory
+                ),
+            ),
+            (
+                WorkspaceGlob,
+                self._command_if_enabled(
+                    self.workspace_glob, WorkspaceGlob, self._glob_command_factory
+                ),
+            ),
+            (
+                WorkspaceGrep,
+                self._command_if_enabled(
+                    self.workspace_grep, WorkspaceGrep, self._grep_command_factory
+                ),
+            ),
+            (
+                WorkspaceRagSearch,
+                self._command_if_enabled(
+                    self.workspace_rag_search, WorkspaceRagSearch, self._rag_search_command_factory
+                ),
+            ),
+        ]
+
+    def _write_command_rows(self) -> list[_CommandRow]:
+        """The write-side slash commands, keyed for :meth:`get_commands` — never ``read_only``."""
+        rows: list[_CommandRow] = [
+            (
+                WorkspaceWrite,
+                self._command_if_enabled(
+                    self.workspace_write, WorkspaceWrite, self._write_command_factory
+                ),
+            ),
+            (
+                WorkspaceDelete,
+                self._command_if_enabled(
+                    self.workspace_delete, WorkspaceDelete, self._delete_command_factory
+                ),
+            ),
+            (
+                WorkspaceMkdir,
+                self._command_if_enabled(
+                    self.workspace_mkdir, WorkspaceMkdir, self._mkdir_command_factory
+                ),
+            ),
+            (
+                WorkspaceRmdir,
+                self._command_if_enabled(
+                    self.workspace_rmdir, WorkspaceRmdir, self._rmdir_command_factory
+                ),
+            ),
+        ]
+        params = self._enabled_exec()
+        if params is not None and COMMAND in params.expose:
+            rows += [
+                (WorkspaceExec, self._exec_command_factory(params)),
+                (_ExecResultCommand, self._exec_result_command_factory(params)),
+            ]
+        return rows
 
     def get_context_states(self) -> list[Callable[[], ContextState | None]]:
         """Return the retrieval-index provider, or nothing.

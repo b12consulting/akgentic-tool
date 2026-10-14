@@ -57,6 +57,9 @@ if TYPE_CHECKING:
     from akgentic.tool.workspace.workspace import Filesystem
 
 _PERM_ERR_MSG = PERM_ERR_MSG
+# One refusal for a directory handed to a single-file read, shared by
+# ``workspace_read`` and ``workspace_view``: it names the tool that does take one.
+_IS_A_DIRECTORY_MSG = "'{path}' is a directory; use workspace_list to see its files."
 _REF_RE = _re.compile(r'!!"([^"]+)"|!!(\S+)')
 
 # The two refusals a media-ref token can be answered with, both in the family of
@@ -360,6 +363,140 @@ def _expand_braces(pattern: str) -> list[str]:
     return expanded
 
 
+def _capped_text(text: str, limit: int) -> tuple[str, bool]:
+    """*text* cut to its first *limit* lines, saying so when it was cut.
+
+    Lines are the spine's (:func:`~akgentic.tool.workspace.lines.split_lines`),
+    the same lines ``workspace_read`` numbers.
+
+    Returns:
+        The text to show, and whether it is the **whole** file. As with
+        :func:`_paginate`, the flag comes from the same comparison that decides
+        the cut, so what the command records can never disagree with what it
+        showed.
+    """
+    lines = split_lines(text)
+    if len(lines) <= limit:
+        return text, True
+    shown = "\n".join(lines[:limit])
+    return f"{shown}\n… ({len(lines)} lines; showing 1–{limit})", False
+
+
+def _render_listing(backend: Filesystem, path: str, depth: int) -> str:
+    """Render *path* flat or as a tree — the one rendering ``workspace_list`` and its command share.
+
+    Raises:
+        RetriableError: If the directory does not exist, *path* is a file, or it
+            escapes the workspace root.
+    """
+    try:
+        resolved = backend.resolve_path(path) if path else backend.root
+
+        entries = backend.list(path)
+        if not entries:
+            return "Empty directory."
+
+        if depth == 1:
+            # Flat list — no tree connectors
+            lines: list[str] = []
+            for entry in entries:
+                if entry.is_dir:
+                    lines.append(f"{entry.name}/")
+                else:
+                    lines.append(f"{entry.name} ({entry.size} bytes)")
+            return "\n".join(lines)
+        # ASCII tree — depth=0 means unlimited, depth>1 means N levels
+        tree_lines = _build_tree(resolved, max_depth=depth)
+        return ".\n" + "\n".join(tree_lines) if tree_lines else "Empty directory."
+    except (FileNotFoundError, NotADirectoryError):
+        raise RetriableError(f"Directory not found: {path}")
+    except PermissionError:
+        raise RetriableError(_PERM_ERR_MSG)
+
+
+def _render_glob(backend: Filesystem, pattern: str, path: str, max_results: int) -> str:
+    """Render what *pattern* matches — the one rendering ``workspace_glob`` and its command share.
+
+    Raises:
+        RetriableError: If *path* or *pattern* escapes the workspace root.
+    """
+    try:
+        search_root = backend.resolve_path(path) if path else backend.root
+        seen: set[Path] = set()
+        raw_matches: list[Path] = []
+        for expanded_pattern in _expand_braces(pattern):
+            safe_pattern = _normalize_glob_pattern(expanded_pattern)
+            # After both rewrites, never before: ``{..,src}/*`` is a legal
+            # shape until ``_expand_braces`` has turned it into ``../*``.
+            if _pattern_escapes(safe_pattern):
+                raise PathEscapeError(f"Pattern '{safe_pattern}' escapes workspace root")
+            for m in search_root.glob(safe_pattern, case_sensitive=False):
+                if m.is_file() and m not in seen and backend.contains(m):
+                    seen.add(m)
+                    raw_matches.append(m)
+        all_matches = sorted(
+            raw_matches,
+            key=lambda match: match.stat().st_mtime,
+            reverse=True,
+        )
+        truncated = len(all_matches) > max_results
+        shown = [str(m.relative_to(backend.root)) for m in all_matches[:max_results]]
+        if not shown:
+            return "No files found."
+        result = "\n".join(shown)
+        if truncated:
+            result += (
+                f"\n[... truncated: {len(all_matches)} total, showing first {max_results} ...]"
+            )
+        return result
+    except PermissionError:
+        raise RetriableError(_PERM_ERR_MSG)
+
+
+def _render_grep(
+    backend: Filesystem,
+    pattern: str,
+    path: str,
+    include: str,
+    max_results: int,
+    max_line_len: int,
+) -> str:
+    """Render the lines *pattern* hits — the one rendering ``workspace_grep`` and its command share.
+
+    Raises:
+        RetriableError: If *pattern* is not a valid regex, or *path* or *include*
+            escapes the workspace root.
+    """
+    try:
+        search_root = backend.resolve_path(path) if path else backend.root
+        # ``include`` reaches ``Path.rglob`` and then ``read_text`` on every
+        # candidate, so an unvalidated one leaks file *contents* rather than
+        # names.  Checked here, above both engines, because ``rg`` refuses a
+        # ``..`` glob of its own accord and the Python fallback does not —
+        # containment that depended on which binary is installed would be no
+        # containment at all.
+        if include and _pattern_escapes(include):
+            raise PathEscapeError(f"Pattern '{include}' escapes workspace root")
+
+        raw_matches = _grep_rg(search_root, pattern, include, max_results)
+        if raw_matches is None:
+            raw_matches = _grep_python(search_root, pattern, include, max_results, max_line_len)
+        raw_matches = [match for match in raw_matches if backend.contains(match[0])]
+
+        if not raw_matches:
+            return "No matches found."
+
+        result_lines = [
+            f"{fpath.relative_to(backend.root)}:{lineno}: {line}"
+            for fpath, lineno, line in raw_matches
+        ]
+        return "\n".join(result_lines)
+    except PermissionError:
+        raise RetriableError(_PERM_ERR_MSG)
+    except _re.error as e:
+        raise RetriableError(f"Invalid regex pattern: {e}")
+
+
 def _build_tree(
     root: Path,
     prefix: str = "",
@@ -542,12 +679,9 @@ class ReadFactories:
         lookup = self._extract_lookup()
         remember = self._extract_recorder()
         _dr_cfg = params.document_reader
-        if _dr_cfg is True:
-            document_reader: DocumentReader | None = DocumentReader()
-        elif _dr_cfg is False:
-            document_reader = None
-        else:
-            document_reader = _dr_cfg
+        document_reader: DocumentReader | None = (
+            DocumentReader() if _dr_cfg is True else _dr_cfg or None
+        )
 
         def workspace_read(
             path: str,
@@ -570,8 +704,8 @@ class ReadFactories:
                 Truncated files include a trailing notice.
 
             Raises:
-                RetriableError: If the path does not exist, escapes the
-                    workspace root, or is not UTF-8 text.
+                RetriableError: If the path does not exist, is a directory,
+                    escapes the workspace root, or is not UTF-8 text.
                 ValueError: If the file is a binary format and
                     ``document_reader`` is not configured.
             """
@@ -609,8 +743,11 @@ class ReadFactories:
                     # One recording call per invocation, whatever the file's size.
                     record(path, observed, full)
                 return numbered
-            except FileNotFoundError:
+            except (FileNotFoundError, NotADirectoryError):
+                # ``notes.md/x``: a file used as a directory is a path that does not exist.
                 raise RetriableError(f"File not found: {path}")
+            except IsADirectoryError:
+                raise RetriableError(_IS_A_DIRECTORY_MSG.format(path=path))
             except PermissionError:
                 raise RetriableError(_PERM_ERR_MSG)
             except UnicodeDecodeError as exc:
@@ -649,32 +786,90 @@ class ReadFactories:
                     a file rather than a directory, or the path escapes the
                     workspace root.
             """
-            try:
-                resolved = backend.resolve_path(path) if path else backend.root
-
-                entries = backend.list(path)
-                if not entries:
-                    return "Empty directory."
-
-                if depth == 1:
-                    # Flat list — no tree connectors
-                    lines: list[str] = []
-                    for entry in entries:
-                        if entry.is_dir:
-                            lines.append(f"{entry.name}/")
-                        else:
-                            lines.append(f"{entry.name} ({entry.size} bytes)")
-                    return "\n".join(lines)
-                else:
-                    # ASCII tree — depth=0 means unlimited, depth>1 means N levels
-                    tree_lines = _build_tree(resolved, max_depth=depth)
-                    return ".\n" + "\n".join(tree_lines) if tree_lines else "Empty directory."
-            except (FileNotFoundError, NotADirectoryError):
-                raise RetriableError(f"Directory not found: {path}")
-            except PermissionError:
-                raise RetriableError(_PERM_ERR_MSG)
+            return _render_listing(backend, path, depth)
 
         workspace_list.__doc__ = params.format_docstring(workspace_list.__doc__)
+        return workspace_list
+
+    def _read_command_factory(self, params: WorkspaceRead) -> Callable[..., Any]:
+        """Create the ``/workspace_read`` command — the human's look at a text file.
+
+        **It records what it showed as this agent's observation** — full when the
+        whole file fit under ``default_limit``, partial when it was cut, exactly as
+        the tool's own read does. That rests on an assumption: the command arrives
+        through ``BaseAgent._dispatch_command`` (akgentic-agent), which appends the
+        result to the agent's LLM context, so the agent has seen these bytes. A
+        caller that runs it any other way — ``CommandRegistry.callable(name)``
+        from code, or an adapter that does not write the result into the agent's
+        context — would leave the agent holding an observation of text it never
+        saw, and the write gate would then admit a blind overwrite of the file.
+        Such a caller must not record. See the *ASSUMPTION* block on the write
+        gate's human mode (``write/gate.py``), which carries the same contract.
+
+        It never invokes the document reader: a human command must not spend LLM
+        credits, and a document read shows derived Markdown, which would be a
+        false observation of the source bytes anyway.
+
+        Args:
+            params: Read capability configuration; ``default_limit`` caps the lines.
+
+        Returns:
+            Callable named ``workspace_read`` that returns the file's text.
+        """
+        backend = self.workspace
+        limit = params.default_limit
+        record = self._observation_recorder()
+
+        def workspace_read(filepath: str) -> str:
+            """Show a text file from the team workspace.
+
+            Long files are cut at the configured line limit, with a note saying how
+            many lines there are.
+
+            Example: /workspace_read docs/notes.md
+            """
+            try:
+                observed = backend.read(filepath)
+                text = observed.decode("utf-8")
+            except FileNotFoundError:
+                return f"File not found: {filepath}"
+            except IsADirectoryError:
+                return f"Is a directory: {filepath} — use /workspace_list"
+            except PermissionError:
+                return _PERM_ERR_MSG
+            except UnicodeDecodeError:
+                return f"Not a text file: {filepath}"
+            # Recorded only on the text path, never on a refusal — see the factory
+            # docstring for why recording here at all depends on how it was called.
+            shown, full = _capped_text(text, limit)
+            record(filepath, observed, full)
+            return shown
+
+        return workspace_read
+
+    def _list_command_factory(self, params: WorkspaceList) -> Callable[..., Any]:
+        """Create the ``/workspace_list`` command — the tool's rendering, for the human.
+
+        Args:
+            params: List capability configuration; ``max_depth`` is the default depth.
+
+        Returns:
+            Callable named ``workspace_list`` that renders a directory.
+        """
+        backend = self.workspace
+
+        def workspace_list(path: str = "", depth: int = params.max_depth) -> str:
+            """List a directory of the team workspace — flat, or as a tree DEPTH levels deep.
+
+            Depth 1 is a flat list and 0 is the whole tree.
+
+            Example: /workspace_list docs 2
+            """
+            try:
+                return _render_listing(backend, path, depth)
+            except RetriableError as refusal:
+                return str(refusal)
+
         return workspace_list
 
     def _glob_factory(self, params: WorkspaceGlob) -> Callable[..., Any]:
@@ -703,40 +898,35 @@ class ReadFactories:
             Raises:
                 RetriableError: If the path or the pattern escapes the workspace root.
             """
-            try:
-                search_root = backend.resolve_path(path) if path else backend.root
-                seen: set[Path] = set()
-                raw_matches: list[Path] = []
-                for expanded_pattern in _expand_braces(pattern):
-                    safe_pattern = _normalize_glob_pattern(expanded_pattern)
-                    # After both rewrites, never before: ``{..,src}/*`` is a legal
-                    # shape until ``_expand_braces`` has turned it into ``../*``.
-                    if _pattern_escapes(safe_pattern):
-                        raise PathEscapeError(f"Pattern '{safe_pattern}' escapes workspace root")
-                    for m in search_root.glob(safe_pattern, case_sensitive=False):
-                        if m.is_file() and m not in seen and backend.contains(m):
-                            seen.add(m)
-                            raw_matches.append(m)
-                all_matches = sorted(
-                    raw_matches,
-                    key=lambda match: match.stat().st_mtime,
-                    reverse=True,
-                )
-                truncated = len(all_matches) > max_results
-                shown = [str(m.relative_to(backend.root)) for m in all_matches[:max_results]]
-                if not shown:
-                    return "No files found."
-                result = "\n".join(shown)
-                if truncated:
-                    result += (
-                        f"\n[... truncated: {len(all_matches)} total,"
-                        f" showing first {max_results} ...]"
-                    )
-                return result
-            except PermissionError:
-                raise RetriableError(_PERM_ERR_MSG)
+            return _render_glob(backend, pattern, path, max_results)
 
         workspace_glob.__doc__ = params.format_docstring(workspace_glob.__doc__)
+        return workspace_glob
+
+    def _glob_command_factory(self, params: WorkspaceGlob) -> Callable[..., Any]:
+        """Create the ``/workspace_glob`` command — the tool's rendering, for the human.
+
+        Args:
+            params: Glob capability configuration; ``max_results`` caps the list.
+
+        Returns:
+            Callable named ``workspace_glob`` that lists the matching files.
+        """
+        backend = self.workspace
+        max_results = params.max_results
+
+        def workspace_glob(pattern: str, path: str = "") -> str:
+            """Find files of the team workspace by glob pattern, newest first.
+
+            Give a directory after the pattern to search only under it.
+
+            Example: /workspace_glob '**/*.md' docs
+            """
+            try:
+                return _render_glob(backend, pattern, path, max_results)
+            except RetriableError as refusal:
+                return str(refusal)
+
         return workspace_glob
 
     def _grep_factory(self, params: WorkspaceGrep) -> Callable[..., Any]:
@@ -768,38 +958,38 @@ class ReadFactories:
                 RetriableError: If pattern is not a valid regex, or the path or the
                     include glob escapes the workspace root.
             """
-            try:
-                search_root = backend.resolve_path(path) if path else backend.root
-                # ``include`` reaches ``Path.rglob`` and then ``read_text`` on every
-                # candidate, so an unvalidated one leaks file *contents* rather than
-                # names.  Checked here, above both engines, because ``rg`` refuses a
-                # ``..`` glob of its own accord and the Python fallback does not —
-                # containment that depended on which binary is installed would be no
-                # containment at all.
-                if include and _pattern_escapes(include):
-                    raise PathEscapeError(f"Pattern '{include}' escapes workspace root")
-
-                raw_matches = _grep_rg(search_root, pattern, include, max_results)
-                if raw_matches is None:
-                    raw_matches = _grep_python(
-                        search_root, pattern, include, max_results, max_line_len
-                    )
-                raw_matches = [match for match in raw_matches if backend.contains(match[0])]
-
-                if not raw_matches:
-                    return "No matches found."
-
-                result_lines = [
-                    f"{fpath.relative_to(backend.root)}:{lineno}: {line}"
-                    for fpath, lineno, line in raw_matches
-                ]
-                return "\n".join(result_lines)
-            except PermissionError:
-                raise RetriableError(_PERM_ERR_MSG)
-            except _re.error as e:
-                raise RetriableError(f"Invalid regex pattern: {e}")
+            return _render_grep(backend, pattern, path, include, max_results, max_line_len)
 
         workspace_grep.__doc__ = params.format_docstring(workspace_grep.__doc__)
+        return workspace_grep
+
+    def _grep_command_factory(self, params: WorkspaceGrep) -> Callable[..., Any]:
+        """Create the ``/workspace_grep`` command — the tool's rendering, for the human.
+
+        Args:
+            params: Grep capability configuration; the same result and line caps.
+
+        Returns:
+            Callable named ``workspace_grep`` that lists the matching lines.
+        """
+        backend = self.workspace
+        max_results = params.max_results
+        max_line_len = params.max_line_length
+
+        def workspace_grep(pattern: str, path: str = "", include: str = "") -> str:
+            """Search the team workspace's files by regex — under PATH, in files matching INCLUDE.
+
+            Quote the regex in single quotes: the command line is split like a
+            shell's, so outside single quotes a backslash is an escape and is
+            dropped — an unquoted \\d arrives as d.
+
+            Example: /workspace_grep 'def \\w+_factory' src
+            """
+            try:
+                return _render_grep(backend, pattern, path, include, max_results, max_line_len)
+            except RetriableError as refusal:
+                return str(refusal)
+
         return workspace_grep
 
     def _view_factory(self, params: WorkspaceView) -> Callable[..., Any]:
@@ -829,13 +1019,15 @@ class ReadFactories:
                 BinaryContent with the image bytes and MIME type.
 
             Raises:
-                RetriableError: If the path does not exist, escapes the workspace root,
-                    or the file extension is not a supported image format.
+                RetriableError: If the path does not exist, is a directory, escapes the
+                    workspace root, or the file extension is not a supported image format.
             """
             try:
                 data = backend.read_bytes(path)
-            except FileNotFoundError:
+            except (FileNotFoundError, NotADirectoryError):
                 raise RetriableError(f"File not found: {path}")
+            except IsADirectoryError:
+                raise RetriableError(_IS_A_DIRECTORY_MSG.format(path=path))
             except PermissionError:
                 raise RetriableError(_PERM_ERR_MSG)
             try:

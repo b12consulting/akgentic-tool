@@ -30,7 +30,7 @@ from akgentic.tool.workspace.readers import DocumentReader
 class WorkspaceRead(BaseToolParam):
     """Read a file from the team workspace with pagination support."""
 
-    expose: set[Channels] = {TOOL_CALL}
+    expose: set[Channels] = {TOOL_CALL, COMMAND}
     default_limit: int = 2000
 
     force_document_regeneration: bool = False
@@ -52,21 +52,21 @@ class WorkspaceRead(BaseToolParam):
 class WorkspaceList(BaseToolParam):
     """List immediate children of a directory in the team workspace."""
 
-    expose: set[Channels] = {TOOL_CALL}
+    expose: set[Channels] = {TOOL_CALL, COMMAND}
     max_depth: int = 1  # 1 = flat list (default), 0 = unlimited, N = N levels deep
 
 
 class WorkspaceGlob(BaseToolParam):
     """Find files matching a glob pattern in the team workspace."""
 
-    expose: set[Channels] = {TOOL_CALL}
+    expose: set[Channels] = {TOOL_CALL, COMMAND}
     max_results: int = 100
 
 
 class WorkspaceGrep(BaseToolParam):
     """Search file contents by regex in the team workspace."""
 
-    expose: set[Channels] = {TOOL_CALL}
+    expose: set[Channels] = {TOOL_CALL, COMMAND}
     max_results: int = 100
     max_line_length: int = 2000
 

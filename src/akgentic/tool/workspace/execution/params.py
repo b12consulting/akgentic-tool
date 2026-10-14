@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from pydantic import Field
 
-from akgentic.tool.core import TOOL_CALL, BaseToolParam, Channels
+from akgentic.tool.core import COMMAND, TOOL_CALL, BaseToolParam, Channels
 from akgentic.tool.workspace.execution import (
     DEFAULT_EXEC_POLL_ATTEMPTS,
     DEFAULT_EXEC_POLL_DELAY_S,
@@ -62,7 +62,7 @@ class WorkspaceExec(BaseToolParam):
     never outlives ``timeout_s``.
     """
 
-    expose: set[Channels] = {TOOL_CALL}
+    expose: set[Channels] = {TOOL_CALL, COMMAND}
     timeout_s: float = DEFAULT_EXEC_TIMEOUT_S
     poll_attempts: int = Field(default=DEFAULT_EXEC_POLL_ATTEMPTS, ge=-1)
     poll_delay_seconds: float = DEFAULT_EXEC_POLL_DELAY_S

@@ -134,6 +134,7 @@ _WORKSPACE_ALL: frozenset[str] = frozenset(
         "WorkspaceRagList",
         "WorkspaceRagSearch",
         "WorkspaceRead",
+        "WorkspaceRmdir",
         "WorkspaceTool",
         "WorkspaceView",
         "WorkspaceWrite",
@@ -206,6 +207,7 @@ _SHIM_NAMES: frozenset[str] = frozenset(
         "WorkspaceMultiEdit",
         "WorkspacePatch",
         "WorkspaceRead",
+        "WorkspaceRmdir",
         "WorkspaceTool",
         "WorkspaceView",
         "WorkspaceWrite",
@@ -255,6 +257,9 @@ _WORKSPACE_TOOL_FIELDS: frozenset[str] = frozenset(
         # first bind fixed the tree's configuration for everyone — and it is a
         # declared field here. Twenty-three names became twenty-four.
         "max_observations_per_agent",
+        # Added by story 62-2, deliberately: the directory-removal capability.
+        # Twenty-four names became twenty-five.
+        "workspace_rmdir",
     }
 )
 

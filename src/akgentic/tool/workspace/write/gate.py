@@ -1,4 +1,4 @@
-"""The six mutations, the live-hash gate, the observation map and the refusal vocabulary.
+"""The seven mutations, the live-hash gate, the observation map and the refusal vocabulary.
 
 Every mutation the card accepts runs **here**, on the card's own tree handle, and
 only after the live file still matches what this agent observed (ADR-036 §3).
@@ -21,8 +21,8 @@ orders the writers that come *through* here; the hash is what catches everyone
 else — an upload, a sandbox run, another team, a human with an editor. Do not
 optimise :meth:`CardGate._live` into a cache.
 
-:meth:`CardGate._gated` is the one point all six mutations converge on, so a
-seventh added later cannot forget the busy check, the out-of-band commit, the
+:meth:`CardGate._gated` is the one point all seven mutations converge on, so an
+eighth added later cannot forget the busy check, the out-of-band commit, the
 lock, the agent's own commit or the stale-mark.
 
 **The observation map is this agent's and this agent's only**, an
@@ -41,10 +41,12 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import logging
+import os
+import posixpath
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 from akgentic.tool.workspace.edit import (
@@ -116,7 +118,7 @@ _UNBOUND_MSG = (
 )
 
 ##
-## Refusal wording.  One builder composes every rejection from these, so the six
+## Refusal wording.  One builder composes every rejection from these, so the seven
 ## mutation methods cannot drift apart — and the LLM reads them, so they say what
 ## to do next before they say what went wrong.
 ##
@@ -153,6 +155,16 @@ _OUT_OF_BAND = (
     "workspace tools (an upload, a sandbox run, or another team)."
 )
 _NEXT_STEP = "Read the file again, reconsider your change against what is there now, then retry."
+
+_REASON_FORCE_NEEDS_RECURSIVE = "force requires recursive=true"
+_RMDIR_ASK_FIRST = (
+    "pass recursive=true only if the user explicitly asked to remove it and everything under it"
+)
+_RMDIR_EMPTY_ONLY = "this workspace removes empty directories only"
+_RMDIR_STALE_NEXT_STEP = (
+    "— re-read the files, or pass force=true only if the user explicitly asked to discard "
+    "those changes"
+)
 
 
 def _accepted(message: str) -> MutationOutcome:
@@ -251,6 +263,52 @@ def _preserve_endings(content: str, live: bytes | None) -> str:
     return normalise_endings(content, detect_line_ending(existing))
 
 
+def _normalised(path: str) -> str:
+    """*path* as one spelling — ``""``, ``"."``, ``"./"`` and ``"a/.."`` are all ``"."``."""
+    return posixpath.normpath(path) if path else "."
+
+
+def _is_under(path: str, directory: str) -> bool:
+    """Whether *path* is *directory* or below it — by segment, never by string prefix."""
+    candidate = _normalised(path)
+    return candidate == directory or candidate.startswith(directory + "/")
+
+
+def _not_empty(
+    path: str, target: Path, recursive: bool, empty_only: bool
+) -> MutationOutcome | None:
+    """Refuse a non-empty directory unless *recursive*, saying which rule refused it."""
+    entries = sum(1 for _ in target.iterdir())
+    if not entries or recursive:
+        return None
+    tail = _RMDIR_EMPTY_ONLY if empty_only else _RMDIR_ASK_FIRST
+    return _rejected(f"Directory not empty: {path} ({entries} entries) — {tail}")
+
+
+def _files_under(target: Path, directory: str) -> list[str]:
+    """Every file under *target*, workspace-relative, without following a link.
+
+    ``os.walk`` lists a link to a directory among the directories and does not
+    descend into it, so it is collected here as the file it is.
+    """
+    files: list[str] = []
+    for current, dirnames, filenames in os.walk(target):
+        here = Path(current)
+        base = PurePosixPath(directory) / here.relative_to(target).as_posix()
+        links = [name for name in dirnames if (here / name).is_symlink()]
+        files.extend((base / name).as_posix() for name in sorted([*filenames, *links]))
+    return files
+
+
+def _removed(path: str, files: list[str], recursive: bool, force: bool) -> str:
+    """The acceptance text of a directory removal."""
+    if force:
+        return f"Removed: {path} ({len(files)} files, forced)"
+    if recursive:
+        return f"Removed: {path} ({len(files)} files)"
+    return f"Removed: {path}"
+
+
 def lock_file_for(meta_dir: Path, path: str) -> Path:
     """The lock file writers of *path* contend on, under *meta_dir*.
 
@@ -314,7 +372,7 @@ class _PatchBatch:
 
 
 class CardGate:
-    """The six mutations, the live-hash check, the observation map, the refusal.
+    """The seven mutations, the live-hash check, the observation map, the refusal.
 
     Declares **no Pydantic field**: the annotations below are inside
     ``if TYPE_CHECKING:``, so they are never executed and never reach
@@ -402,7 +460,7 @@ class CardGate:
 
         This is also where the mutation's write set is collected, for the commit
         :meth:`_gated` makes once the body returns. The list is plain state
-        rather than a return value because the alternative is widening six
+        rather than a return value because the alternative is widening seven
         signatures.
         """
         self._touched.append(path)
@@ -502,10 +560,16 @@ class CardGate:
             yield
 
     ##
-    ## The six mutations — each one thin, all six through one point
+    ## The seven mutations — each one thin, all seven through one point
     ##
     def _gated(
-        self, capability: str, paths: Sequence[str], run: Callable[[], MutationOutcome]
+        self,
+        capability: str,
+        paths: Sequence[str],
+        run: Callable[[], MutationOutcome],
+        *,
+        commit_scope: Sequence[str] | None = None,
+        identity: Identity | None = None,
     ) -> MutationOutcome:
         """Run one mutation between the busy check, the lock, and the two commits.
 
@@ -514,8 +578,8 @@ class CardGate:
         the mutation's own paths and commit them as this agent → tell the index
         what went stale.
 
-        **The busy check is first, and it is here rather than in six places.**
-        This is the one point all six mutations converge on, so a seventh added
+        **The busy check is first, and it is here rather than in seven places.**
+        This is the one point all seven mutations converge on, so an eighth added
         later cannot forget it — nor the lock, which is the reason this method
         still exists now that the mailbox does not serialise anything. A
         forgotten ``flock`` fails silently, under load, on a shared mount.
@@ -550,6 +614,13 @@ class CardGate:
             paths: Every path this mutation may write, for the lock. Empty for
                 ``mkdir``.
             run: The mutation body.
+            commit_scope: The pathspec the journal stages, when it is not the
+                write set itself. ``rmdir`` passes the directory: a pathspec of
+                every removed file overflows ``ARG_MAX`` on a large tree, and the
+                journal swallows that failure as a warning, losing the
+                attribution. The index is still told every touched file.
+            identity: Who the commit is attributed to, when it is not this
+                agent — the human, for a slash command.
 
         Returns:
             Whatever the body returned, untouched. No journal or index failure
@@ -568,7 +639,11 @@ class CardGate:
         if outcome.status is not MutationStatus.ACCEPTED or not touched:
             return outcome
         if journal is not None:
-            journal.commit_paths(touched, Identity(self._agent_name, self._agent_id), capability)
+            journal.commit_paths(
+                touched if commit_scope is None else commit_scope,
+                identity or Identity(self._agent_name, self._agent_id),
+                capability,
+            )
         self._mark_stale(touched)
         return outcome
 
@@ -657,6 +732,11 @@ class CardGate:
             self._tree().write(path, data)
         except PermissionError as exc:
             return _denied(exc)
+        except IsADirectoryError:
+            return _rejected(f"Is a directory: {path}")
+        except NotADirectoryError:
+            # ``notes.md/x``: ``_live`` reads through a file, so nothing is created under it.
+            return _rejected(f"Not a directory: a parent of {path} is a file")
         except FileNotFoundError:
             return _rejected(PUBLISH_LOST_MSG)
         self._accept(path, data)
@@ -696,6 +776,11 @@ class CardGate:
             self._tree().delete(path)
         except PermissionError as exc:
             return _denied(exc)
+        except IsADirectoryError:
+            return _rejected(f"Is a directory: {path} — use workspace_rmdir")
+        except NotADirectoryError:
+            # ``notes.md/x``: a file used as a directory is a path that does not exist.
+            return _rejected(f"File not found: {path}")
         except FileNotFoundError:
             return _rejected(PUBLISH_LOST_MSG)
         self._forget(path)
@@ -760,6 +845,10 @@ class CardGate:
             data, diff = write_and_diff(self._tree(), path, raw, edited)
         except PermissionError as exc:
             return _denied(exc)
+        except IsADirectoryError:
+            return _rejected(f"Is a directory: {path}")
+        except NotADirectoryError:
+            return _rejected(f"File not found: {path}")
         except FileNotFoundError:
             return _rejected(PUBLISH_LOST_MSG)
         except UnicodeDecodeError as exc:
@@ -886,6 +975,279 @@ class CardGate:
         except PermissionError as exc:
             return _denied(exc)
         return _accepted(f"Created: {path}")
+
+    def apply_rmdir(
+        self,
+        path: str,
+        recursive: bool = False,
+        force: bool = False,
+        *,
+        empty_only: bool = False,
+    ) -> MutationOutcome:
+        """Remove the directory *path* — the delete strategy, generalised to a tree.
+
+        ``workspace_rmdir(d, recursive=True)`` behaves like a ``workspace_delete``
+        of every file under ``d``, with two exceptions:
+
+        - **All or nothing.** One stale view anywhere under ``d`` refuses the
+          whole call, before a single file is removed.
+        - **It locks only the paths a view exists for.** Those are the only
+          paths the gate can refuse on, and locks under ``<meta>/locks/`` are
+          never unlinked — a lock per file would leave tens of thousands behind
+          after a recursive delete of ``node_modules``.
+
+        **It never reaches the sandbox.** It runs here, on the card's thread,
+        inside :meth:`_gated`, so the busy check, the out-of-band commit, the
+        agent's own commit and the stale-mark reach it like every other
+        mutation. The journal pathspec is the directory (``commit_scope``),
+        never the file list.
+
+        ``force`` skips the view check, and so takes no path lock: there is no
+        check whose window a lock could close. Everything else still applies.
+
+        Args:
+            path: Workspace-relative directory path.
+            recursive: Remove a non-empty directory and everything under it.
+            force: Skip the view check. Requires *recursive*.
+            empty_only: The deployment allows empty directories only — what a
+                non-empty directory's refusal says instead of the hint to ask.
+
+        Returns:
+            ``Removed: <path>``, ``Removed: <path> (<k> files)`` or
+            ``Removed: <path> (<k> files, forced)``, or a refusal.
+        """
+        observed = [] if force else self._observed_under(path)
+        return self._gated(
+            "rmdir",
+            observed,
+            lambda: self._rmdir(path, recursive, force, empty_only),
+            commit_scope=[_normalised(path)],
+        )
+
+    def _rmdir(self, path: str, recursive: bool, force: bool, empty_only: bool) -> MutationOutcome:
+        """Gate and perform one directory removal — see :meth:`apply_rmdir`.
+
+        The order is the contract: ``force`` without ``recursive`` first, then
+        what the path is, then the emptiness rule, then every view under the
+        directory — and only then is anything removed.
+        """
+        if force and not recursive:
+            return _rejected(_REASON_FORCE_NEEDS_RECURSIVE)
+        try:
+            target = self._removable_dir(path, "workspace_delete")
+            if isinstance(target, MutationOutcome):
+                return target
+            refusal = _not_empty(path, target, recursive, empty_only)
+            if refusal is not None:
+                return refusal
+            if not force:
+                stale = self._stale_view_under(path)
+                if stale is not None:
+                    return stale
+            removed = self._remove_tree(path, target, recursive)
+        except PermissionError as exc:
+            return _denied(exc)
+        self._forget_tree(path, removed)
+        return _accepted(_removed(path, removed, recursive, force))
+
+    def _forget_tree(self, path: str, removed: list[str]) -> None:
+        """Drop what an accepted rmdir of *path* invalidated — the agent's and the human's alike.
+
+        Every removed file is forgotten, which also puts it in the write set. Then
+        every remaining view under the directory goes too: an observation of a
+        file that had already vanished out of band is in no ``removed`` list, but
+        it names a path the agent now knows is gone, so its next write there is a
+        create rather than a refusal.
+        """
+        for removed_path in removed:
+            self._forget(removed_path)
+        for observed in self._observed_under(path):
+            self._observations.pop(observed, None)
+
+    def _observed_under(self, path: str) -> list[str]:
+        """This agent's observed paths at or under the directory *path*, matched by segment.
+
+        ``build`` does not contain ``build2/x``: the match is the directory
+        itself or a path continuing with ``/``, never a bare string prefix.
+        """
+        directory = _normalised(path)
+        return [key for key in self._observations if _is_under(key, directory)]
+
+    def _stale_view_under(self, path: str) -> MutationOutcome | None:
+        """The first refusal ``apply_delete`` would give for an observed path under *path*.
+
+        Every observed path is checked before anything is removed, so one stale
+        view refuses the whole call and no file is deleted.
+        """
+        for observed in self._observed_under(path):
+            refusal, _ = self._check(
+                observed, whole_file=True, live=self._live(observed), removal=True
+            )
+            if refusal is not None:
+                return _rejected(f"{refusal}\n{_RMDIR_STALE_NEXT_STEP}")
+        return None
+
+    def _removable_dir(self, path: str, delete_hint: str) -> Path | MutationOutcome:
+        """The directory *path* names, unresolved, or the refusal for what it is instead.
+
+        The symlink test is **lexical**, on ``<root>/<path>`` before resolving:
+        resolved, a link to a directory is that directory, and removing it would
+        remove the target rather than the link.
+
+        Raises:
+            PathEscapeError: When *path* escapes the workspace root.
+        """
+        directory = _normalised(path)
+        tree = self._tree()
+        if tree.resolve_path(directory) == tree.root:
+            return _rejected(f"Refused to remove {path!r}: it is the workspace root.")
+        target = tree.root / directory
+        if target.is_symlink():
+            return _rejected(f"{path} is a symlink — use {delete_hint}")
+        if not target.exists():
+            return _rejected(f"Directory not found: {path}")
+        if not target.is_dir():
+            return _rejected(f"Not a directory: {path} — use {delete_hint}")
+        return target
+
+    def _remove_tree(self, path: str, target: Path, recursive: bool) -> list[str]:
+        """Enumerate the files under *target* without following links, then remove it.
+
+        Returns:
+            Every removed file, workspace-relative — a link counts as a file,
+            because a link is what is unlinked.
+        """
+        removed = _files_under(target, _normalised(path))
+        self._tree().rmdir(_normalised(path), recursive=recursive)
+        return removed
+
+    ##
+    ## Human mode — the slash commands. The human holds no view, so nothing is
+    ## checked against one; what the command shows the agent becomes its view.
+    ##
+    ## ASSUMPTION — every call arrives through ``BaseAgent._dispatch_command``
+    ## (akgentic-agent), which appends the command line and its result to this
+    ## agent's LLM context as a user action. The agent has therefore seen exactly
+    ## what a ``/workspace_write`` wrote (its content is the verbatim rest of the
+    ## line) and that a ``/workspace_delete`` / ``/workspace_rmdir`` removed what it
+    ## removed, so the methods below update the observations as if the agent had
+    ## made the call itself.
+    ##
+    ## A caller that reaches these commands any other way — notably
+    ## ``CommandRegistry.callable(name)`` from code, or a future channel adapter
+    ## that does not write the result into the agent's context — breaks the
+    ## assumption: the agent then holds an observation of bytes it never saw, and
+    ## its next blind overwrite of that content is ADMITTED. That is the lost
+    ## update this gate exists to refuse. Such a caller needs a variant that skips
+    ## ``_accept`` / ``_forget`` (the human's change then reads like an upload),
+    ## or the observation must move to the point where the context entry is
+    ## actually written.
+    ##
+    def human_write(self, path: str, content: str) -> MutationOutcome:
+        """Create or overwrite *path* with *content* as the human, through ``/workspace_write``.
+
+        **No ``_check``, but ``_accept``.** The human has no view to be stale
+        against, so nothing is checked. The written bytes do become this agent's
+        full observation, because ``_dispatch_command`` puts the command line —
+        content included, verbatim — into the agent's context: it has seen them.
+        See the *ASSUMPTION* block above: that is only true while every caller
+        goes through ``_dispatch_command``. The commit is still the human's;
+        attribution is a fact about who acted, not about who saw it.
+
+        Args:
+            path: Workspace-relative path.
+            content: Text, written as UTF-8.
+
+        Returns:
+            ``Written: <path> (<n> bytes)``, or a refusal.
+        """
+        return self._gated(
+            "write", [path], lambda: self._human_write(path, content), identity=Identity.human()
+        )
+
+    def _human_write(self, path: str, content: str) -> MutationOutcome:
+        """Write as the human — see :meth:`human_write`."""
+        data = content.encode("utf-8")
+        try:
+            self._tree().write(path, data)
+        except PermissionError as exc:
+            return _denied(exc)
+        except IsADirectoryError:
+            return _rejected(f"Is a directory: {path}")
+        except FileNotFoundError:
+            return _rejected(PUBLISH_LOST_MSG)
+        self._accept(path, data)
+        return _accepted(f"Written: {path} ({len(data)} bytes)")
+
+    def human_delete(self, path: str) -> MutationOutcome:
+        """Delete one file as the human, through ``/workspace_delete`` — no view check.
+
+        This agent's observation of *path* is dropped, as for its own delete: it
+        was shown the removal. Valid only under the *ASSUMPTION* above.
+
+        Returns:
+            ``Deleted: <path>``, or a refusal for a directory, a missing file or
+            a path outside the root.
+        """
+        return self._gated(
+            "delete", [path], lambda: self._human_delete(path), identity=Identity.human()
+        )
+
+    def _human_delete(self, path: str) -> MutationOutcome:
+        """Delete as the human — see :meth:`human_delete`."""
+        try:
+            tree = self._tree()
+            if tree.resolve_path(path).is_dir():
+                return _rejected(f"Is a directory: {path} — use /workspace_rmdir")
+            tree.delete(path)
+        except PermissionError as exc:
+            return _denied(exc)
+        except FileNotFoundError:
+            return _rejected(f"File not found: {path}")
+        self._forget(path)
+        return _accepted(f"Deleted: {path}")
+
+    def human_mkdir(self, path: str) -> MutationOutcome:
+        """Create *path* and its parents as the human — exactly :meth:`apply_mkdir`."""
+        return self._gated("mkdir", [], lambda: self._mkdir(path), identity=Identity.human())
+
+    def human_rmdir(self, path: str, recursive: bool) -> MutationOutcome:
+        """Remove the directory *path* as the human, through ``/workspace_rmdir``.
+
+        The human typing the command is the explicit request the tool's
+        docstring tells the model to wait for, so there is no view check and no
+        ``force``. *recursive* is the deployment's ``allow_recursive``: off, only
+        an empty directory is removed. No path lock is taken. This agent's
+        observations under the directory are dropped, as for its own rmdir: it was
+        shown the removal, so its next write there is a create. Valid only under
+        the *ASSUMPTION* above.
+
+        Returns:
+            ``Removed: <path> (<k> files)`` when recursive, ``Removed: <path>``
+            otherwise, or a refusal.
+        """
+        return self._gated(
+            "rmdir",
+            [],
+            lambda: self._human_rmdir(path, recursive),
+            commit_scope=[_normalised(path)],
+            identity=Identity.human(),
+        )
+
+    def _human_rmdir(self, path: str, recursive: bool) -> MutationOutcome:
+        """Remove as the human — see :meth:`human_rmdir`."""
+        try:
+            target = self._removable_dir(path, "/workspace_delete")
+            if isinstance(target, MutationOutcome):
+                return target
+            refusal = _not_empty(path, target, recursive, empty_only=not recursive)
+            if refusal is not None:
+                return refusal
+            removed = self._remove_tree(path, target, recursive)
+        except PermissionError as exc:
+            return _denied(exc)
+        self._forget_tree(path, removed)
+        return _accepted(_removed(path, removed, recursive, force=False))
 
     ##
     ## The gate
@@ -1101,7 +1463,12 @@ class CardGate:
         """Gate and apply one edit in memory; return an outcome only on failure."""
         entry = staged.get(item.path)
         if entry is None:
-            live = self._live(item.path)
+            try:
+                live = self._live(item.path)
+            except IsADirectoryError:
+                return _rejected(f"Is a directory: {item.path}")
+            except NotADirectoryError:
+                return _rejected(f"File not found: {item.path}")
             refusal, exact_only = self._check(item.path, whole_file=False, live=live)
             if refusal is not None:
                 return _rejected(refusal)

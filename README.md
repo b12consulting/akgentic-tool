@@ -1053,7 +1053,11 @@ It is not a card.
 Read/write access to a shared team filesystem — `workspace_read`, `workspace_list`,
 `workspace_glob`, `workspace_grep`, `workspace_view` on the read side; `workspace_write`,
 `workspace_edit`, `workspace_multi_edit`, `workspace_patch`, `workspace_delete`,
-`workspace_mkdir` and (opt-in) `workspace_exec` / `workspace_exec_result` on the write side. One
+`workspace_mkdir`, `workspace_rmdir` and (opt-in) `workspace_exec` / `workspace_exec_result` on the
+write side. The human gets the same workspace as slash commands — `/workspace_read`,
+`/workspace_list`, `/workspace_write`, `/workspace_delete`, `/workspace_mkdir`, `/workspace_rmdir`
+and `/workspace_exec` — committed as `human` and never counted as the agent's view of a file (see
+the [workspace README](src/akgentic/tool/workspace/README.md#slash-commands)). One
 class covers both modes via a `read_only: bool` gate. All paths are anchored to
 `<AKGENTIC_WORKSPACES_ROOT>/<scope>/<kind>/<leaf>` — a workspace is a three-segment path. The
 `<kind>` says how the leaf was derived: `_team/<team_id>` by default, `_id/<workspace_id>` for a

@@ -2245,6 +2245,11 @@ class TestTheToolSurface:
         card, _actor, _harness = exec_setup
         for tool in card.get_tools():
             forbidden = {"mode", "timeout", "timeout_s", "force", "digest", "expected"}
+            if tool.__name__ == "workspace_rmdir":
+                # The one deliberate ``force``: it skips the view check on a
+                # directory removal the user explicitly asked to discard, and the
+                # docstring tells the model so. Every other tool stays without one.
+                forbidden -= {"force"}
             assert not (set(inspect.signature(tool).parameters) & forbidden)
 
 

@@ -255,6 +255,8 @@ class RunningExec(SerializableBaseModel):
         agent_id: Who requested the run. Named in every mutation refusal it
             causes, and who the discovered commit is attributed to.
         cmd: The command, kept for the discovered commit's body.
+        as_human: The human ran it through ``/workspace_exec``, so the
+            discovered commit is attributed to ``Identity.human()``.
         started_at: Monotonic clock at the moment the work was submitted. The
             budget and the grace are both measured from here, and nothing
             re-bases it: a submit onto an idle single-worker executor is O(1), so
@@ -266,6 +268,7 @@ class RunningExec(SerializableBaseModel):
     agent_id: str
     cmd: str
     started_at: float
+    as_human: bool = False
 
 
 class ExecStart(SerializableBaseModel):

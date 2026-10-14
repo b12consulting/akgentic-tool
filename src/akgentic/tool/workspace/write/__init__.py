@@ -1,6 +1,6 @@
-"""The write capability of :class:`WorkspaceTool` — write, delete, edit, patch, mkdir.
+"""The write capability of :class:`WorkspaceTool` — write, delete, edit, patch, mkdir, rmdir.
 
-It holds one capability whole: the six LLM-facing closures here, the mutation
+It holds one capability whole: the seven LLM-facing closures here, the mutation
 gate in ``write/gate.py`` — with the observation map and the refusal vocabulary
 that belong to it — and the capability's own parameters in ``write/params.py``.
 It may import the package **spine** — ``workspace.py``, ``models.py``,
@@ -15,7 +15,7 @@ become capabilities of their own later are on that allow-list with their reasons
 the gate's docstring says what each is for.
 
 **The two modules are two because the grouping reads well** (ADR-053 Decision 1):
-the six closures are what an LLM sees, and the gate is what they converge on.
+the seven closures are what an LLM sees, and the gate is what they converge on.
 Merging them would make one 1500-line module out of a split that already tells a
 reader which question they are asking.
 
@@ -44,6 +44,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+# Runtime import, not a ``TYPE_CHECKING`` one, for the same reason as ``EditItem``
+# below: the command registry resolves ``/workspace_write``'s annotations with
+# ``get_type_hints`` against this module's globals.
+from akgentic.tool.core.commands import RestOfLine
 from akgentic.tool.errors import RetriableError
 
 # Runtime import, not a ``TYPE_CHECKING`` one: ``EditItem`` appears in the
@@ -58,6 +62,7 @@ from akgentic.tool.workspace.write.params import (
     WorkspaceMkdir,
     WorkspaceMultiEdit,
     WorkspacePatch,
+    WorkspaceRmdir,
     WorkspaceWrite,
 )
 
@@ -111,6 +116,23 @@ class WriteFactories:
 
         def apply_mkdir(self, path: str) -> MutationOutcome: ...
 
+        def apply_rmdir(
+            self,
+            path: str,
+            recursive: bool = False,
+            force: bool = False,
+            *,
+            empty_only: bool = False,
+        ) -> MutationOutcome: ...
+
+        def human_write(self, path: str, content: str) -> MutationOutcome: ...
+
+        def human_delete(self, path: str) -> MutationOutcome: ...
+
+        def human_mkdir(self, path: str) -> MutationOutcome: ...
+
+        def human_rmdir(self, path: str, recursive: bool) -> MutationOutcome: ...
+
     def _write_factory(self, params: WorkspaceWrite) -> Callable[..., Any]:
         """Create the ``workspace_write`` tool callable.
 
@@ -138,8 +160,8 @@ class WriteFactories:
                 Confirmation string "Written: <path>".
 
             Raises:
-                RetriableError: If the write is refused, or the path escapes the
-                    workspace root.
+                RetriableError: If the write is refused, the path is a directory
+                    or runs through a file, or it escapes the workspace root.
             """
             return _resolve_outcome(card.apply_write(path, content))
 
@@ -316,3 +338,174 @@ class WriteFactories:
 
         workspace_mkdir.__doc__ = params.format_docstring(workspace_mkdir.__doc__)
         return workspace_mkdir
+
+    def _rmdir_factory(self, params: WorkspaceRmdir) -> Callable[..., Any]:
+        """Create the ``workspace_rmdir`` tool callable.
+
+        **Two closures, one returned**, chosen by ``allow_recursive``. pydantic-ai
+        builds the schema from the signature, so a conditional default would
+        still put ``recursive`` and ``force`` in front of the model on a
+        deployment that has turned them off.
+
+        Args:
+            params: Rmdir capability configuration.
+
+        Returns:
+            Callable that removes a directory from the workspace, through the gate.
+        """
+        card = self
+
+        def workspace_rmdir(path: str, recursive: bool = False, force: bool = False) -> str:
+            """Remove a directory from the team workspace.
+
+            Without recursive, only an empty directory is removed. Set
+            recursive=true ONLY when the user has explicitly asked to remove the
+            directory together with its contents.
+
+            Refused if a file you have read under the directory changed since
+            you read it — no file is removed. Set force=true ONLY when the user
+            has explicitly asked to discard changes made since your last read.
+            Never set it to get past a refusal on your own initiative.
+
+            Args:
+                path: Relative directory path from workspace root (e.g. "build").
+                recursive: Remove the directory and everything under it.
+                force: Remove it even if files under it changed since you read
+                    them. Requires recursive=true.
+
+            Returns:
+                Confirmation string "Removed: <path>".
+
+            Raises:
+                RetriableError: If the removal is refused, the path is not a
+                    directory, does not exist, or escapes the workspace root.
+            """
+            return _resolve_outcome(card.apply_rmdir(path, recursive, force))
+
+        def workspace_rmdir_empty_only(path: str) -> str:
+            """Remove an empty directory from the team workspace.
+
+            A directory that still contains anything is refused.
+
+            Args:
+                path: Relative directory path from workspace root (e.g. "build").
+
+            Returns:
+                Confirmation string "Removed: <path>".
+
+            Raises:
+                RetriableError: If the removal is refused, the path is not an
+                    empty directory, does not exist, or escapes the workspace root.
+            """
+            return _resolve_outcome(card.apply_rmdir(path, empty_only=True))
+
+        chosen: Callable[..., str]
+        if params.allow_recursive:
+            chosen = workspace_rmdir
+        else:
+            chosen = workspace_rmdir_empty_only
+            chosen.__name__ = chosen.__qualname__ = "workspace_rmdir"
+        chosen.__doc__ = params.format_docstring(chosen.__doc__)
+        return chosen
+
+    ##
+    ## The slash commands — the human's hand on the tree. Each closure is named
+    ## exactly after its command, because the registry keys on ``__name__``, and
+    ## each goes through the gate's human mode: no view check, the commit
+    ## attributed to ``human``, and the agent's observations moved as if it had
+    ## made the call — it sees the command and its result in its own context. That
+    ## holds only through ``BaseAgent._dispatch_command``; see the *ASSUMPTION*
+    ## block on the gate's human mode (``gate.py``) for what a bypass admits. A
+    ## refusal is returned as the result text rather than raised — the human reads
+    ## it, and so does the agent.
+    ##
+    def _write_command_factory(self, params: WorkspaceWrite) -> Callable[..., Any]:
+        """Create the ``/workspace_write`` command.
+
+        Args:
+            params: Write capability configuration.
+
+        Returns:
+            Callable named ``workspace_write`` that writes the rest of the line.
+        """
+        card = self
+
+        def workspace_write(filepath: str, content: RestOfLine) -> str:
+            """Create or overwrite a file with everything after its path, as UTF-8.
+
+            The text is written exactly as typed, quotes and line breaks included,
+            and any extension is accepted. Missing directories are created.
+
+            Example: /workspace_write notes.md Remember to call the supplier.
+            """
+            return card.human_write(filepath, content).message
+
+        return workspace_write
+
+    def _delete_command_factory(self, params: WorkspaceDelete) -> Callable[..., Any]:
+        """Create the ``/workspace_delete`` command.
+
+        Args:
+            params: Delete capability configuration.
+
+        Returns:
+            Callable named ``workspace_delete`` that deletes one file.
+        """
+        card = self
+
+        def workspace_delete(filepath: str) -> str:
+            """Delete one file from the team workspace.
+
+            Example: /workspace_delete drafts/old.md
+            """
+            return card.human_delete(filepath).message
+
+        return workspace_delete
+
+    def _mkdir_command_factory(self, params: WorkspaceMkdir) -> Callable[..., Any]:
+        """Create the ``/workspace_mkdir`` command.
+
+        Args:
+            params: Mkdir capability configuration.
+
+        Returns:
+            Callable named ``workspace_mkdir`` that creates a directory.
+        """
+        card = self
+
+        def workspace_mkdir(path: str) -> str:
+            """Create a directory, and any missing parents, in the team workspace.
+
+            Example: /workspace_mkdir reports/2026
+            """
+            return card.human_mkdir(path).message
+
+        return workspace_mkdir
+
+    def _rmdir_command_factory(self, params: WorkspaceRmdir) -> Callable[..., Any]:
+        """Create the ``/workspace_rmdir`` command.
+
+        The human typing it is the explicit request the tool's docstring asks the
+        model to wait for, so it removes the whole tree whenever the deployment
+        allows recursive removal, and empty directories only when it does not.
+
+        Args:
+            params: Rmdir capability configuration.
+
+        Returns:
+            Callable named ``workspace_rmdir`` that removes a directory.
+        """
+        card = self
+        recursive = params.allow_recursive
+
+        def workspace_rmdir(path: str) -> str:
+            """Remove a directory and everything under it from the team workspace.
+
+            Where the workspace removes empty directories only, a directory that
+            still holds anything is refused.
+
+            Example: /workspace_rmdir build
+            """
+            return card.human_rmdir(path, recursive).message
+
+        return workspace_rmdir

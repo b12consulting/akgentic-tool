@@ -37,9 +37,14 @@ they reach mypy without ever reaching Pydantic's field collection (ADR-045 §1).
 
 from __future__ import annotations
 
+import shlex
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+# Runtime import, not a ``TYPE_CHECKING`` one: the command registry resolves the
+# ``/workspace_exec`` closure's annotations with ``get_type_hints`` against this
+# module's globals, and ``RestOfLine`` is what it reads there.
+from akgentic.tool.core.commands import RestOfLine
 from akgentic.tool.core.deferred import poll_deferred
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.workspace.execution import (
@@ -98,14 +103,20 @@ class ExecFactories:
         _agent_id: str
         _workspace_proxy: WorkspaceActor | None
 
-    def _exec_factory(self, params: WorkspaceExec) -> Callable[..., Any]:
-        """Create the ``workspace_exec`` tool callable.
+    def _exec_runner(self, params: WorkspaceExec) -> Callable[[str, str, bool], str]:
+        """Admit one run and wait for it — shared by ``workspace_exec`` and ``/workspace_exec``.
+
+        One body, so the tool and the command run on the same sandbox with the
+        same budget, the same poll settings and the same answer text: a command
+        that copied this would be the second place for the two to drift apart.
 
         Args:
             params: Exec capability configuration.
 
         Returns:
-            Callable that runs a sandboxed command, through the actor.
+            ``run(cmd, cwd, as_human)``, answering with ``format_status`` text or
+            a run id, and raising :class:`RetriableError` with the refusal when
+            the tree is already held.
         """
         proxy = self._workspace_proxy
         agent_id = self._agent_id
@@ -121,6 +132,43 @@ class ExecFactories:
         # and it is a property of the card, not of the run — so it is computed
         # here rather than re-derived on every call.
         waits_out_the_run = params.poll_attempts < 0
+
+        def run(cmd: str, cwd: str, as_human: bool) -> str:
+            start = _bound(proxy).request_exec(agent_id, cmd, cwd, as_human=as_human)
+            if not start.run_id:
+                raise RetriableError(start.refusal)
+            run_id = start.run_id
+
+            def fetch() -> ExecStatus:
+                return _bound(proxy).exec_status(agent_id, run_id)
+
+            settled = poll_deferred(
+                lambda: _settled_status(fetch()), attempts=attempts, delay=delay
+            )
+            if settled is not None:
+                return format_status(settled)
+            # Every admitted run starts at once now, so there is one thing an
+            # exhausted poll can mean and no second ask is needed to tell which:
+            # the run is in flight. Which message is honest still depends on the
+            # budget that was in force — the sentinel waited out the whole run
+            # and then some, so a run still going has overrun; a bounded look
+            # asked for a run id after N attempts and gets one.
+            if waits_out_the_run:
+                return timed_out(run_id, run_budget)
+            return in_progress(run_id)
+
+        return run
+
+    def _exec_factory(self, params: WorkspaceExec) -> Callable[..., Any]:
+        """Create the ``workspace_exec`` tool callable.
+
+        Args:
+            params: Exec capability configuration.
+
+        Returns:
+            Callable that runs a sandboxed command, through the actor.
+        """
+        run = self._exec_runner(params)
 
         def workspace_exec(cmd: str, cwd: str = "") -> str:
             """Run ONE binary in the team workspace sandbox. There is NO shell: `&&` fails.
@@ -148,28 +196,7 @@ class ExecFactories:
             Raises:
                 RetriableError: If another command already holds this workspace.
             """
-            start = _bound(proxy).request_exec(agent_id, cmd, cwd)
-            if not start.run_id:
-                raise RetriableError(start.refusal)
-            run_id = start.run_id
-
-            def fetch() -> ExecStatus:
-                return _bound(proxy).exec_status(agent_id, run_id)
-
-            settled = poll_deferred(
-                lambda: _settled_status(fetch()), attempts=attempts, delay=delay
-            )
-            if settled is not None:
-                return format_status(settled)
-            # Every admitted run starts at once now, so there is one thing an
-            # exhausted poll can mean and no second ask is needed to tell which:
-            # the run is in flight. Which message is honest still depends on the
-            # budget that was in force — the sentinel waited out the whole run
-            # and then some, so a run still going has overrun; a bounded look
-            # asked for a run id after N attempts and gets one.
-            if waits_out_the_run:
-                return timed_out(run_id, run_budget)
-            return in_progress(run_id)
+            return run(cmd, cwd, False)
 
         workspace_exec.__doc__ = params.format_docstring(workspace_exec.__doc__)
         return workspace_exec
@@ -200,4 +227,53 @@ class ExecFactories:
             return format_status(_bound(proxy).exec_status(agent_id, run_id))
 
         workspace_exec_result.__doc__ = params.format_docstring(workspace_exec_result.__doc__)
+        return workspace_exec_result
+
+    def _exec_command_factory(self, params: WorkspaceExec) -> Callable[..., Any]:
+        """Create the ``/workspace_exec`` command — the human's bash command line.
+
+        Args:
+            params: Exec capability configuration.
+
+        Returns:
+            Callable named ``workspace_exec`` that runs ``bash -c <line>`` as the human.
+        """
+        run = self._exec_runner(params)
+
+        def workspace_exec(cmd: RestOfLine) -> str:
+            """Run a bash command line in the team workspace sandbox, as you.
+
+            Everything after the command name is run as `bash -c <line>`, so pipes,
+            `&&` and redirects work. The run holds the workspace like an agent's,
+            and its changes are recorded as yours. A long run hands back a run id
+            for /workspace_exec_result.
+
+            Example: /workspace_exec ls -la | wc -l
+            """
+            try:
+                return run(shlex.join(["bash", "-c", cmd]), "", True)
+            except RetriableError as refusal:
+                return str(refusal)
+
+        return workspace_exec
+
+    def _exec_result_command_factory(self, params: WorkspaceExec) -> Callable[..., Any]:
+        """Create the ``/workspace_exec_result`` command.
+
+        Args:
+            params: Exec capability configuration.
+
+        Returns:
+            Callable named ``workspace_exec_result`` that collects a run's output.
+        """
+        proxy = self._workspace_proxy
+        agent_id = self._agent_id
+
+        def workspace_exec_result(run_id: str) -> str:
+            """Collect the output of a run /workspace_exec handed back a run id for.
+
+            Example: /workspace_exec_result 3f2a9c
+            """
+            return format_status(_bound(proxy).exec_status(agent_id, run_id))
+
         return workspace_exec_result
