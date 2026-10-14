@@ -143,17 +143,18 @@ def _load_mcp_toolset_class() -> type[Any]:
 
 
 def _load_mcp_transport_classes() -> tuple[type[Any], type[Any], type[Any]]:
-    """Lazy-load the fastmcp transport classes re-exported by pydantic-ai.
+    """Lazy-load the fastmcp transport classes that `MCPToolset` accepts.
 
-    These are module-level names in `pydantic_ai.mcp` (they are not listed in its
-    `__all__`). They are imported from there rather than from `fastmcp` directly:
-    fastmcp arrives transitively via pydantic-ai and is not a declared dependency
-    of this package.
+    They are imported from `fastmcp.client.transports`, which lists them in its
+    `__all__`, and not from `pydantic_ai.mcp`: pydantic-ai imports them too but omits
+    them from its `__all__`, so that re-export is private and may disappear. This
+    package declares `fastmcp-slim[client]` itself, so, as for `MCPToolset`, a genuine
+    ImportError surfaces with its real cause.
 
     Returns:
         Tuple of (StdioTransport, SSETransport, StreamableHttpTransport) classes.
     """
-    from pydantic_ai.mcp import (  # noqa: PLC0415
+    from fastmcp.client.transports import (  # noqa: PLC0415
         SSETransport,
         StdioTransport,
         StreamableHttpTransport,

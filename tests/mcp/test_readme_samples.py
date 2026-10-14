@@ -21,8 +21,9 @@ Python; asserting on markdown content would test the document instead of the beh
 from __future__ import annotations
 
 import pytest
+from fastmcp.client.transports import SSETransport, StdioTransport, StreamableHttpTransport
 from pydantic import ValidationError
-from pydantic_ai.mcp import MCPToolset, SSETransport, StdioTransport, StreamableHttpTransport
+from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.toolsets.prefixed import PrefixedToolset
 
 from .test_mcp_toolset import (
