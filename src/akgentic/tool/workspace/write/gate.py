@@ -688,7 +688,7 @@ class CardGate:
         except PermissionError as exc:
             return _denied(exc)
         except IsADirectoryError:
-            return _rejected(f"Is a directory: {path} — use workspace_rmdir")
+            return _rejected(f"Is a directory: {path}")
         except NotADirectoryError:
             # ``notes.md/x``: a file used as a directory is a path that does not exist.
             return _rejected(f"File not found: {path}")

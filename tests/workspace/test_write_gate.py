@@ -1671,7 +1671,7 @@ class TestADirectoryIsNeverARawOSError:
                 "Is a directory: docs",
             ),
             ("workspace_patch", (PATCH,), None),
-            ("workspace_delete", ("docs",), "Is a directory: docs — use workspace_rmdir"),
+            ("workspace_delete", ("docs",), "Is a directory: docs"),
         ],
     )
     def test_a_directory_is_refused(
