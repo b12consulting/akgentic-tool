@@ -606,6 +606,7 @@ outright only when there is no row left in it.
 |---|---|---|---|
 | `llm_client` | `Literal["openai", "azure"] \| None` | `"openai"`, or `AKGENTIC_DOCUMENT_READER_PROVIDER` | Enables the Pass-2 vision fallback and picks its client: `OpenAI()` or `AzureOpenAI()`. `None` disables it: extraction is Pass 1 only. |
 | `llm_model` | `str` | `"gpt-6-luna"`, or `AKGENTIC_DOCUMENT_READER_MODEL` | Model used for the Pass-2 fallback — on Azure, the deployment name. |
+| `docintel_endpoint` | `str \| None` | `None`, or `AKGENTIC_DOCUMENT_READER_DOCINTEL_ENDPOINT` | Azure Document Intelligence endpoint for Pass 2. Set it to OCR scanned PDFs, which the LLM fallback cannot read. |
 | `extensions` | `ClassVar[frozenset[str]]` | see above | The extension set treated as binary. A `ClassVar`, not a field — not configurable per instance. |
 
 Two passes: MarkItDown alone first; if the result holds fewer than 50 non-whitespace characters
@@ -614,6 +615,14 @@ MarkItDown retried with vision. If both passes come up short the reader returns 
 The client is only built when Pass 1 falls short, so a successful text extraction never requires
 credentials. Requires `akgentic-tool[docs]`; without it `extract_text` raises `ImportError` with
 the install command.
+
+**Scanned PDFs need Document Intelligence.** MarkItDown hands the LLM client only to its image
+and PowerPoint converters, so a PDF without a text layer stays empty after an LLM-only Pass 2.
+With `docintel_endpoint` set, Pass 2 also registers MarkItDown's Document Intelligence converter,
+which takes precedence over the LLM for every type it supports (PDF, images, Office). It
+authenticates with `AKGENTIC_DOCUMENT_READER_DOCINTEL_KEY`, read at call time and never stored on
+the reader, or with `DefaultAzureCredential` (managed identity) when that is unset. The credential
+is passed explicitly because MarkItDown would otherwise pick up `AZURE_API_KEY`.
 
 **Defaults a host can override.** The tool keeps its own defaults (`openai`, `gpt-6-luna`). A
 deployment overrides them for every reader built without explicit values by exporting

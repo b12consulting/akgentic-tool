@@ -52,7 +52,7 @@ vector_search = [
 ]
 weaviate = ["weaviate-client>=4.9.0"]
 qdrant = ["qdrant-client>=1.10.0"]
-docs = ["markitdown[pdf,docx,xlsx,xls,pptx,outlook]>=0.1"]
+docs = ["markitdown[pdf,docx,xlsx,xls,pptx,outlook,az-doc-intel]>=0.1"]
 vision = ["Pillow>=10.0"]
 dev = [
     "pytest>=8.0.0",

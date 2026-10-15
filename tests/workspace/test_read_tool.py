@@ -1165,6 +1165,29 @@ class TestDocumentReaderExtractText:
         assert result == "# OCR\n" + "z" * 60
         assert call_count == 2
 
+    def test_pass1_empty_pass2_with_docintel(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Pass 1 empty + Document Intelligence -> Pass 2 gets the endpoint and an explicit key."""
+        from azure.core.credentials import AzureKeyCredential
+
+        monkeypatch.setenv("AKGENTIC_DOCUMENT_READER_DOCINTEL_KEY", "di-key")
+        reader = DocumentReader(llm_client=None, docintel_endpoint="https://di.example.com")
+        mock_md_module = self._make_mock_markitdown_module()
+        empty_result, ocr_result = MagicMock(), MagicMock()
+        empty_result.text_content = ""
+        ocr_result.text_content = "# Scan\n" + "s" * 60
+        mock_md_module.MarkItDown.return_value.convert.side_effect = [empty_result, ocr_result]
+
+        import sys
+
+        with patch.dict(sys.modules, {"markitdown": mock_md_module}):
+            result = reader.extract_text(b"%PDF scan", "scan.pdf")
+
+        assert result == "# Scan\n" + "s" * 60
+        kwargs = mock_md_module.MarkItDown.call_args.kwargs
+        assert kwargs["docintel_endpoint"] == "https://di.example.com"
+        assert isinstance(kwargs["docintel_credential"], AzureKeyCredential)
+        assert kwargs["docintel_credential"].key == "di-key"
+
     def test_both_passes_empty_returns_placeholder(self) -> None:
         """Both passes empty -> placeholder."""
         reader = DocumentReader(llm_client="openai")
@@ -1319,6 +1342,7 @@ class TestDocumentReaderSerialization:
         assert DocumentReader().model_dump() == {
             "llm_client": "openai",
             "llm_model": "gpt-6-luna",
+            "docintel_endpoint": None,
         }
 
     def test_model_dump_with_openai(self) -> None:
@@ -1326,15 +1350,18 @@ class TestDocumentReaderSerialization:
         assert DocumentReader(llm_client="openai").model_dump() == {
             "llm_client": "openai",
             "llm_model": "gpt-6-luna",
+            "docintel_endpoint": None,
         }
 
     def test_environment_overrides_the_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """AKGENTIC_DOCUMENT_READER_* replace the tool defaults when set."""
         monkeypatch.setenv("AKGENTIC_DOCUMENT_READER_PROVIDER", "azure")
         monkeypatch.setenv("AKGENTIC_DOCUMENT_READER_MODEL", "my-deployment")
+        monkeypatch.setenv("AKGENTIC_DOCUMENT_READER_DOCINTEL_ENDPOINT", "https://di.example.com")
         assert DocumentReader().model_dump() == {
             "llm_client": "azure",
             "llm_model": "my-deployment",
+            "docintel_endpoint": "https://di.example.com",
         }
 
     @pytest.mark.parametrize(
@@ -1365,7 +1392,11 @@ class TestDocumentReaderSerialization:
     ) -> None:
         monkeypatch.setenv("AKGENTIC_DOCUMENT_READER_PROVIDER", "")
         monkeypatch.setenv("AKGENTIC_DOCUMENT_READER_MODEL", "")
-        assert DocumentReader().model_dump() == {"llm_client": "openai", "llm_model": "gpt-6-luna"}
+        assert DocumentReader().model_dump() == {
+            "llm_client": "openai",
+            "llm_model": "gpt-6-luna",
+            "docintel_endpoint": None,
+        }
 
     def test_an_explicit_value_beats_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("AKGENTIC_DOCUMENT_READER_MODEL", "host-model")
@@ -1438,6 +1469,7 @@ class TestWorkspaceToolSerialization:
         assert tool.model_dump()["workspace_read"]["document_reader"] == {
             "llm_client": "openai",
             "llm_model": "gpt-6-luna",
+            "docintel_endpoint": None,
         }
 
     def test_model_validate_roundtrip_with_document_reader(self) -> None:
