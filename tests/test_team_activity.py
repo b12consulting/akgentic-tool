@@ -44,6 +44,7 @@ from akgentic.tool.team import (
     GetRoleProfiles,
     GetTeamActivity,
     GetTeamRoster,
+    HireableRoles,
     HireTeamMember,
     TeamActivityReport,
     TeamTool,
@@ -657,6 +658,7 @@ class TestBackwardCompatibility:
         ]
         assert set(tool.get_commands()) == {
             HireTeamMember,
+            HireableRoles,
             FireTeamMember,
             GetTeamRoster,
             GetRoleProfiles,
