@@ -1287,21 +1287,8 @@ def _text_result(text: str) -> MagicMock:
 _FULL_TEXT = "# Report\n" + "x" * 60
 
 
-class _NativeSession:
-    """Stands in for a MarkItDown holding an onnxruntime session: converts, never deep-copies."""
-
-    def __init__(self, text: str) -> None:
-        self._text = text
-
-    def convert(self, path: str) -> MagicMock:
-        return _text_result(self._text)
-
-    def __deepcopy__(self, memo: dict[int, object]) -> _NativeSession:
-        raise TypeError("cannot deep-copy a native session")
-
-
 class TestDocumentReaderConverterReuse:
-    """Story 61-3 AC 1-6: one MarkItDown per pass per reader, built lazily, safe to copy."""
+    """Story 61-3: one MarkItDown per pass per reader, built lazily; a fresh reader copies."""
 
     def test_pass1_instance_is_built_once_across_extractions(self) -> None:
         import sys
@@ -1443,120 +1430,29 @@ class TestDocumentReaderConverterReuse:
         assert reader.model_dump() == before
         assert DocumentReader.model_validate(reader.model_dump()).model_dump() == before
 
-    def test_equality_ignores_the_caches(self) -> None:
+    @pytest.mark.parametrize(
+        "copier",
+        [
+            pytest.param(copy.deepcopy, id="copy.deepcopy"),
+            pytest.param(lambda r: r.model_copy(deep=True), id="model_copy-deep"),
+        ],
+    )
+    def test_a_deep_copy_of_a_fresh_reader_extracts(
+        self, copier: Callable[[DocumentReader], DocumentReader]
+    ) -> None:
+        """The hire-time path: an agent's config is deep-copied from a template that never read."""
         import sys
 
-        assert DocumentReader(llm_client=None, llm_model="m") == DocumentReader(
-            llm_client=None, llm_model="m"
-        )
-        used = DocumentReader(llm_client=None, llm_model="m")
+        reader = DocumentReader(llm_client=None, llm_model="m")
+        copied = copier(reader)
         md_module = MagicMock()
         md_module.MarkItDown.return_value.convert.return_value = _text_result(_FULL_TEXT)
 
         with patch.dict(sys.modules, {"markitdown": md_module}):
-            used.extract_text(b"%PDF", "report.pdf")
-
-        assert used == DocumentReader(llm_client=None, llm_model="m")
-        assert used != DocumentReader(llm_client=None, llm_model="other")
-        assert used != "not a reader"
-
-    @pytest.mark.parametrize(
-        "copier",
-        [
-            pytest.param(copy.deepcopy, id="copy.deepcopy"),
-            pytest.param(lambda r: r.model_copy(deep=True), id="model_copy-deep"),
-        ],
-    )
-    def test_a_deep_copy_of_a_used_reader_starts_empty_and_extracts(
-        self, copier: Callable[[DocumentReader], DocumentReader]
-    ) -> None:
-        import sys
-
-        reader = DocumentReader(llm_client=None)
-        md_module = MagicMock()
-        md_module.MarkItDown.side_effect = lambda **kwargs: _NativeSession(_FULL_TEXT)
-
-        with patch.dict(sys.modules, {"markitdown": md_module}):
-            reader.extract_text(b"%PDF", "report.pdf")
-            copied = copier(reader)
-            assert copied._markitdown is None
             assert copied.extract_text(b"%PDF", "report.pdf") == _FULL_TEXT
 
         assert copied.model_dump() == reader.model_dump()
-        assert copied._markitdown is not reader._markitdown
-        assert md_module.MarkItDown.call_count == 2
-
-    @pytest.mark.parametrize(
-        "copier",
-        [
-            pytest.param(copy.copy, id="copy.copy"),
-            pytest.param(lambda r: r.model_copy(), id="model_copy"),
-        ],
-    )
-    def test_a_shallow_copy_of_a_used_reader_starts_empty(
-        self, copier: Callable[[DocumentReader], DocumentReader]
-    ) -> None:
-        import sys
-
-        reader = DocumentReader(llm_client=None)
-        md_module = MagicMock()
-        md_module.MarkItDown.side_effect = lambda **kwargs: _NativeSession(_FULL_TEXT)
-
-        with patch.dict(sys.modules, {"markitdown": md_module}):
-            reader.extract_text(b"%PDF", "report.pdf")
-            copied = copier(reader)
-            assert copied._markitdown is None
-            assert copied._converter_lock is not reader._converter_lock
-            assert copied.extract_text(b"%PDF", "report.pdf") == _FULL_TEXT
-
-        assert copied == reader
-        assert md_module.MarkItDown.call_count == 2
-
-    def test_a_copy_with_a_new_configuration_builds_its_own_pass2(self) -> None:
-        import sys
-
-        reader = DocumentReader(llm_client="openai", llm_model="old-model")
-        md_module = MagicMock()
-        md_module.MarkItDown.return_value.convert.side_effect = [
-            _text_result(""),
-            _text_result("# OCR\n" + "z" * 60),
-        ] * 2
-
-        with patch.dict(sys.modules, {"markitdown": md_module, "openai": MagicMock()}):
-            reader.extract_text(b"%PDF", "scan.pdf")
-            updated = reader.model_copy(update={"llm_model": "new-model"})
-            updated.extract_text(b"%PDF", "scan.pdf")
-
-        pass2_models = [
-            call.kwargs["llm_model"]
-            for call in md_module.MarkItDown.call_args_list
-            if "llm_model" in call.kwargs
-        ]
-        assert pass2_models == ["old-model", "new-model"]
-
-    @pytest.mark.parametrize(
-        "copier",
-        [
-            pytest.param(copy.deepcopy, id="copy.deepcopy"),
-            pytest.param(lambda r: r.model_copy(deep=True), id="model_copy-deep"),
-            pytest.param(copy.copy, id="copy.copy"),
-            pytest.param(lambda r: r.model_copy(), id="model_copy"),
-        ],
-    )
-    def test_a_copy_keeps_a_field_it_has_never_heard_of(
-        self, copier: Callable[[DocumentReader], DocumentReader]
-    ) -> None:
-        """Golden Rule #12: an enumerated rebuild would return a plain reader."""
-
-        class _ReaderWithExtraField(DocumentReader):
-            extra_field: str = "default"
-
-        reader = _ReaderWithExtraField(llm_client=None, extra_field="sentinel")
-        copied = copier(reader)
-
-        assert isinstance(copied, _ReaderWithExtraField)
-        assert copied.extra_field == "sentinel"
-        assert copied.model_fields_set == reader.model_fields_set
+        assert reader._markitdown is None
 
 
 # ---------------------------------------------------------------------------

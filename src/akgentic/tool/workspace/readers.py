@@ -6,9 +6,8 @@ import logging
 import os
 import tempfile
 import threading
-from copy import deepcopy
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, Self
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol
 
 from pydantic import BaseModel, Field, PrivateAttr
 
@@ -193,37 +192,11 @@ class DocumentReader(BaseModel):
     _openai_client: OpenAI | None = PrivateAttr(default=None)
     _markitdown: MarkItDown | None = PrivateAttr(default=None)
     _markitdown_pass2: MarkItDown | None = PrivateAttr(default=None)
-    _converter_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
+    _converter_lock: ClassVar[threading.Lock] = threading.Lock()
+    """Guards converter construction only, shared by every reader; ``convert()`` runs outside it.
 
-    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:  # BaseModel's signature
-        """Copy the configuration; the copy starts with empty caches and builds its own.
-
-        The cached clients and converters hold native sessions, and the lock cannot be
-        copied at all, so the default deep copy of private attributes would fail.
-        ``model_construct`` gives every private attribute its default.
-        """
-        return self.model_construct(
-            _fields_set=set(self.model_fields_set), **deepcopy(self.__dict__, memo)
-        )
-
-    def __copy__(self) -> Self:
-        """Copy the configuration shallowly; the copy, too, starts with empty caches.
-
-        ``model_copy(update=...)`` copies through here and then changes fields, so a copy
-        that kept the source's converters would go on using the configuration they were
-        built from.
-        """
-        return self.model_construct(_fields_set=set(self.model_fields_set), **self.__dict__)
-
-    def __eq__(self, other: object) -> bool:
-        """Readers are equal when their configuration is; the caches and lock do not count.
-
-        ``BaseModel`` also compares private attributes, which would make two fresh readers
-        differ by their locks and a used reader differ from its own configuration.
-        """
-        if not isinstance(other, BaseModel):
-            return NotImplemented
-        return type(self) is type(other) and self.__dict__ == other.__dict__
+    A class-level lock keeps a fresh reader deep-copyable, which an agent's hire-time
+    config copy relies on."""
 
     def _get_markitdown(self) -> MarkItDown:
         """The Pass 1 converter (no LLM), built once under the lock."""
