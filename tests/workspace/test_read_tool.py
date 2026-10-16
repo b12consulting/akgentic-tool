@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1247,6 +1249,28 @@ class TestDocumentReaderExtractText:
         assert isinstance(kwargs["docintel_credential"], AzureKeyCredential)
         assert kwargs["docintel_credential"].key == "di-key"
 
+    def test_pass2_without_a_key_authenticates_with_managed_identity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No DOCINTEL_KEY -> DefaultAzureCredential, never MarkItDown's ``AZURE_API_KEY``."""
+        from azure.identity import DefaultAzureCredential
+
+        monkeypatch.delenv("AKGENTIC_DOCUMENT_READER_DOCINTEL_KEY", raising=False)
+        reader = DocumentReader(llm_client=None, docintel_endpoint="https://di.example.com")
+        mock_md_module = self._make_mock_markitdown_module()
+        mock_md_module.MarkItDown.return_value.convert.side_effect = [
+            _text_result(""),
+            _text_result("# Scan\n" + "s" * 60),
+        ]
+
+        import sys
+
+        with patch.dict(sys.modules, {"markitdown": mock_md_module}):
+            reader.extract_text(b"%PDF scan", "scan.pdf")
+
+        kwargs = mock_md_module.MarkItDown.call_args.kwargs
+        assert isinstance(kwargs["docintel_credential"], DefaultAzureCredential)
+
     def test_both_passes_empty_returns_placeholder(self) -> None:
         """Both passes empty -> placeholder."""
         reader = DocumentReader(llm_client="openai")
@@ -1274,6 +1298,235 @@ class TestDocumentReaderExtractText:
         with patch.dict(sys.modules, {"markitdown": None}):
             with pytest.raises(ImportError, match='pip install "akgentic-tool\\[docs\\]"'):
                 reader.extract_text(b"fake", "file.pdf")
+
+    def test_docintel_sdk_not_installed_names_the_extra(self) -> None:
+        """A thin PDF with an endpoint but no Azure SDK says which extra to install."""
+        import sys
+
+        reader = DocumentReader(llm_client=None, docintel_endpoint="https://di.example.com")
+        md_module = self._make_mock_markitdown_module()
+        md_module.MarkItDown.return_value.convert.return_value = _text_result("")
+
+        with patch.dict(sys.modules, {"markitdown": md_module, "azure.identity": None}):
+            with pytest.raises(ImportError, match='pip install "akgentic-tool\\[docs\\]"'):
+                reader.extract_text(b"%PDF scan", "scan.pdf")
+
+
+def _text_result(text: str) -> MagicMock:
+    result = MagicMock()
+    result.text_content = text
+    return result
+
+
+_FULL_TEXT = "# Report\n" + "x" * 60
+
+
+class TestDocumentReaderConverterReuse:
+    """Story 61-3: one MarkItDown per pass per reader, built lazily; a fresh reader copies."""
+
+    def test_pass1_instance_is_built_once_across_extractions(self) -> None:
+        import sys
+
+        reader = DocumentReader()
+        md_module = MagicMock()
+        md_module.MarkItDown.return_value.convert.return_value = _text_result(_FULL_TEXT)
+        openai_module = MagicMock()
+
+        with patch.dict(sys.modules, {"markitdown": md_module, "openai": openai_module}):
+            for _ in range(3):
+                assert reader.extract_text(b"%PDF", "report.pdf") == _FULL_TEXT
+
+        assert md_module.MarkItDown.call_count == 1
+        assert md_module.MarkItDown.call_args.kwargs == {}
+
+    def test_a_reader_whose_pass1_succeeds_never_builds_pass2(self) -> None:
+        import sys
+
+        reader = DocumentReader(llm_client="openai", docintel_endpoint="https://di.example.com")
+        md_module = MagicMock()
+        md_module.MarkItDown.return_value.convert.return_value = _text_result(_FULL_TEXT)
+        openai_module = MagicMock()
+
+        with patch.dict(sys.modules, {"markitdown": md_module, "openai": openai_module}):
+            for _ in range(3):
+                reader.extract_text(b"%PDF", "report.pdf")
+
+        assert reader._markitdown_pass2 is None
+        assert reader._openai_client is None
+        openai_module.OpenAI.assert_not_called()
+
+    def test_pass2_instance_is_built_once_across_thin_documents(self) -> None:
+        import sys
+
+        reader = DocumentReader(llm_client="openai", llm_model="gpt-4o")
+        md_module = MagicMock()
+        md_module.MarkItDown.return_value.convert.side_effect = [
+            _text_result(""),
+            _text_result("# OCR\n" + "z" * 60),
+        ] * 3
+        openai_module = MagicMock()
+
+        with patch.dict(sys.modules, {"markitdown": md_module, "openai": openai_module}):
+            for _ in range(3):
+                assert reader.extract_text(b"%PDF", "scan.pdf") == "# OCR\n" + "z" * 60
+
+        assert md_module.MarkItDown.call_count == 2
+        first, second = md_module.MarkItDown.call_args_list
+        assert first.kwargs == {}
+        assert second.kwargs["llm_model"] == "gpt-4o"
+        assert second.kwargs["llm_client"] is openai_module.OpenAI.return_value
+        assert openai_module.OpenAI.call_count == 1
+
+    def test_a_reader_that_never_extracted_builds_nothing(self) -> None:
+        import sys
+
+        md_module = MagicMock()
+        with patch.dict(sys.modules, {"markitdown": md_module}):
+            reader = DocumentReader(llm_client="openai")
+
+        md_module.MarkItDown.assert_not_called()
+        assert reader._markitdown is None
+        assert reader._markitdown_pass2 is None
+
+    def test_concurrent_first_use_builds_one_instance(self) -> None:
+        import sys
+        import threading
+
+        reader = DocumentReader(llm_client=None)
+        md_module = MagicMock()
+
+        def slow_markitdown(**kwargs: object) -> MagicMock:
+            time.sleep(0.05)  # widens the check-then-build window a missing lock would lose
+            instance = MagicMock()
+            instance.convert.return_value = _text_result(_FULL_TEXT)
+            return instance
+
+        md_module.MarkItDown.side_effect = slow_markitdown
+        start = threading.Barrier(2)
+        results: list[str] = []
+
+        def read() -> None:
+            start.wait()
+            results.append(reader.extract_text(b"%PDF", "report.pdf"))
+
+        with patch.dict(sys.modules, {"markitdown": md_module}):
+            threads = [threading.Thread(target=read) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        assert results == [_FULL_TEXT, _FULL_TEXT]
+        assert md_module.MarkItDown.call_count == 1
+
+    def test_convert_runs_concurrently_on_the_shared_instance(self) -> None:
+        import sys
+        import threading
+
+        reader = DocumentReader(llm_client=None)
+        both_converting = threading.Barrier(2, timeout=2)
+
+        def convert(path: str) -> MagicMock:
+            both_converting.wait()  # breaks if convert() were serialised
+            return _text_result(_FULL_TEXT)
+
+        md_module = MagicMock()
+        md_module.MarkItDown.return_value.convert.side_effect = convert
+        results: list[str] = []
+
+        def read() -> None:
+            results.append(reader.extract_text(b"%PDF", "report.pdf"))
+
+        with patch.dict(sys.modules, {"markitdown": md_module}):
+            threads = [threading.Thread(target=read) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        assert results == [_FULL_TEXT, _FULL_TEXT]
+
+    def test_concurrent_first_thin_documents_build_one_pass2(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sys
+        import threading
+
+        monkeypatch.setenv("AKGENTIC_DOCUMENT_READER_DOCINTEL_KEY", "di-key")
+        reader = DocumentReader(llm_client=None, docintel_endpoint="https://di.example.com")
+        pass2_builds: list[MagicMock] = []
+
+        def markitdown(**kwargs: object) -> MagicMock:
+            instance = MagicMock()
+            if not kwargs:
+                instance.convert.return_value = _text_result("")
+                return instance
+            time.sleep(0.05)  # widens the check-then-build window a missing lock would lose
+            instance.convert.return_value = _text_result(_FULL_TEXT)
+            pass2_builds.append(instance)
+            return instance
+
+        md_module = MagicMock()
+        md_module.MarkItDown.side_effect = markitdown
+        start = threading.Barrier(2)
+        results: list[str] = []
+
+        def read() -> None:
+            start.wait()
+            results.append(reader.extract_text(b"%PDF", "scan.pdf"))
+
+        with patch.dict(sys.modules, {"markitdown": md_module}):
+            reader._get_markitdown()  # Pass 1 is built up front so only Pass 2 races
+            threads = [threading.Thread(target=read) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        assert results == [_FULL_TEXT, _FULL_TEXT]
+        assert len(pass2_builds) == 1
+
+    def test_dump_and_round_trip_are_unchanged_by_an_extraction(self) -> None:
+        import sys
+
+        reader = DocumentReader(llm_client="openai", docintel_endpoint="https://di.example.com")
+        before = reader.model_dump()
+        md_module = MagicMock()
+        md_module.MarkItDown.return_value.convert.side_effect = [
+            _text_result(""),
+            _text_result("# OCR\n" + "z" * 60),
+        ]
+
+        with patch.dict(sys.modules, {"markitdown": md_module, "openai": MagicMock()}):
+            reader.extract_text(b"%PDF", "scan.pdf")
+
+        assert reader._markitdown_pass2 is not None
+        assert reader.model_dump() == before
+        assert DocumentReader.model_validate(reader.model_dump()).model_dump() == before
+
+    @pytest.mark.parametrize(
+        "copier",
+        [
+            pytest.param(copy.deepcopy, id="copy.deepcopy"),
+            pytest.param(lambda r: r.model_copy(deep=True), id="model_copy-deep"),
+        ],
+    )
+    def test_a_deep_copy_of_a_fresh_reader_extracts(
+        self, copier: Callable[[DocumentReader], DocumentReader]
+    ) -> None:
+        """The hire-time path: an agent's config is deep-copied from a template that never read."""
+        import sys
+
+        reader = DocumentReader(llm_client=None, llm_model="m")
+        copied = copier(reader)
+        md_module = MagicMock()
+        md_module.MarkItDown.return_value.convert.return_value = _text_result(_FULL_TEXT)
+
+        with patch.dict(sys.modules, {"markitdown": md_module}):
+            assert copied.extract_text(b"%PDF", "report.pdf") == _FULL_TEXT
+
+        assert copied.model_dump() == reader.model_dump()
+        assert reader._markitdown is None
 
 
 # ---------------------------------------------------------------------------
@@ -1460,6 +1713,41 @@ class TestDocumentReaderSerialization:
     def test_an_explicit_value_beats_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("AKGENTIC_DOCUMENT_READER_MODEL", "host-model")
         assert DocumentReader(llm_model="chosen").llm_model == "chosen"
+
+    def test_an_empty_docintel_endpoint_is_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("AKGENTIC_DOCUMENT_READER_DOCINTEL_ENDPOINT", "")
+        assert DocumentReader().docintel_endpoint is None
+
+    def test_explicit_client_and_endpoint_beat_the_environment_when_pass2_is_built(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The values given to the reader, not the host's, reach Pass 2."""
+        import sys
+
+        import openai
+
+        monkeypatch.setenv("AKGENTIC_DOCUMENT_READER_PROVIDER", "azure")
+        monkeypatch.setenv("AKGENTIC_DOCUMENT_READER_DOCINTEL_ENDPOINT", "https://host.example.com")
+        monkeypatch.setenv("AKGENTIC_DOCUMENT_READER_DOCINTEL_KEY", "di-key")
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://example.openai.azure.com")
+        monkeypatch.setenv("AZURE_OPENAI_API_KEY", "test-key")
+        monkeypatch.setenv("OPENAI_API_VERSION", "2024-10-21")
+        reader = DocumentReader(llm_client="openai", docintel_endpoint="https://chosen.example.com")
+        assert reader.llm_client == "openai"
+        assert reader.docintel_endpoint == "https://chosen.example.com"
+
+        md_module = MagicMock()
+        md_module.MarkItDown.return_value.convert.side_effect = [
+            _text_result(""),
+            _text_result(_FULL_TEXT),
+        ]
+        with patch.dict(sys.modules, {"markitdown": md_module}):
+            reader.extract_text(b"%PDF scan", "scan.pdf")
+
+        kwargs = md_module.MarkItDown.call_args.kwargs
+        assert kwargs["docintel_endpoint"] == "https://chosen.example.com"
+        assert not isinstance(kwargs["llm_client"], openai.AzureOpenAI)
 
     def test_azure_builds_an_azure_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import openai

@@ -1627,7 +1627,7 @@ what must not happen when the point is that the write does not land.
 | `vector_search` | `openai>=1.0.0`, `numpy>=1.26.0` | Semantic search in `PlanningTool` and `KnowledgeGraphTool` |
 | `weaviate` | `weaviate-client>=4.9.0` | Weaviate backend for the vector store |
 | `qdrant` | `qdrant-client>=1.10.0` | Qdrant backend for the vector store |
-| `docs` | `markitdown[pdf,docx,xlsx,xls,pptx,outlook]>=0.1` | Binary file reading in `workspace_read` |
+| `docs` | `markitdown[pdf,docx,xlsx,xls,pptx,outlook,az-doc-intel]>=0.1` | Binary file reading in `workspace_read`, including Document Intelligence OCR |
 | `vision` | `Pillow>=10.0` | Image resizing + sidecar cache in `workspace_view` |
 
 No extra is required at import time. When one is absent the affected feature either falls

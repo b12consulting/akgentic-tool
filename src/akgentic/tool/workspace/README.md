@@ -600,7 +600,7 @@ docstring the model sees) and `expose: set[Channels]` from `BaseToolParam`.
 | `expose` | `set[Channels]` | `{TOOL_CALL, COMMAND}` | Channels the capability reaches. `COMMAND` serves `/workspace_read`. |
 | `default_limit` | `int` | `2000` | Maximum lines returned per call. Becomes the **default value of the `limit` argument in the tool signature**, so the model can still ask for fewer or more; it is a budget, not a hard cap. |
 | `force_document_regeneration` | `bool` | `False` | Default for the same-named argument: **ignore a valid cache entry** and re-extract. The meaning is new in ADR-045 — it used to mean "ignore a file that happens to sit beside the source", which no notion of validity governed at all. A cache entry knows whether it describes the current bytes, so forcing now means overriding a *correct* answer: coherent, and rarely needed. A forced read still fills the cache with what it extracted. |
-| `document_reader` | `DocumentReader \| bool` | `True` | Binary extraction policy. `True` ⇒ a default `DocumentReader()` (MarkItDown, Pass 1, no LLM). `False` ⇒ reading a binary extension raises `ValueError` with an install hint. An instance ⇒ custom extraction, including the LLM fallback. |
+| `document_reader` | `DocumentReader \| bool` | `True` | Binary extraction policy. `True` ⇒ a default `DocumentReader()`, configured by the `AKGENTIC_DOCUMENT_READER_*` environment (out of the box: Pass 1, then the `openai` fallback when Pass 1 comes up short). `False` ⇒ reading a binary extension raises `ValueError` with an install hint. An instance ⇒ custom extraction, including the LLM fallback. |
 
 The callable returns file contents with 1-indexed line numbers prefixed and a trailing notice when
 truncated. A missing path or a path escaping the root surfaces as `RetriableError`, so the model
@@ -634,30 +634,35 @@ outright only when there is no row left in it.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `llm_client` | `Literal["openai", "azure"] \| None` | `"openai"`, or `AKGENTIC_DOCUMENT_READER_PROVIDER` | Enables the Pass-2 vision fallback and picks its client: `OpenAI()` or `AzureOpenAI()`. `None` disables it: extraction is Pass 1 only. |
+| `llm_client` | `Literal["openai", "azure"] \| None` | `"openai"`, or `AKGENTIC_DOCUMENT_READER_PROVIDER` | Enables the Pass-2 vision fallback and picks its client: `OpenAI()` or `AzureOpenAI()`. `None` disables the LLM; Pass 2 then runs only if `docintel_endpoint` is set. |
 | `llm_model` | `str` | `"gpt-6-luna"`, or `AKGENTIC_DOCUMENT_READER_MODEL` | Model used for the Pass-2 fallback — on Azure, the deployment name. |
 | `docintel_endpoint` | `str \| None` | `None`, or `AKGENTIC_DOCUMENT_READER_DOCINTEL_ENDPOINT` | Azure Document Intelligence endpoint for Pass 2. Set it to OCR scanned PDFs, which the LLM fallback cannot read. |
 | `extensions` | `ClassVar[frozenset[str]]` | see above | The extension set treated as binary. A `ClassVar`, not a field — not configurable per instance. |
 
 Two passes: MarkItDown alone first; if the result holds fewer than 50 non-whitespace characters
-**and** `llm_client` is set, an `OpenAI()` (or `AzureOpenAI()`) client is constructed lazily and
-MarkItDown retried with vision. If both passes come up short the reader returns `<!-- markitdown: no text extracted -->`.
-The client is only built when Pass 1 falls short, so a successful text extraction never requires
+**and** `llm_client` or `docintel_endpoint` is set, MarkItDown is retried with an `OpenAI()` (or
+`AzureOpenAI()`) client built lazily and/or Document Intelligence. If both passes come up short
+the reader returns `<!-- markitdown: no text extracted -->`.
+Pass 2 is only built when Pass 1 falls short, so a successful text extraction never requires
 credentials. Requires `akgentic-tool[docs]`; without it `extract_text` raises `ImportError` with
-the install command.
+the install command, and a reader with `docintel_endpoint` set but no Azure SDK raises the same
+hint. A reader builds each pass's `MarkItDown` converter on first use and keeps it (each
+construction loads an ONNX model into native memory). The Document Intelligence key is read when
+Pass 2 is first built, so a rotated key reaches only a new reader.
 
 **Scanned PDFs need Document Intelligence.** MarkItDown hands the LLM client only to its image
 and PowerPoint converters, so a PDF without a text layer stays empty after an LLM-only Pass 2.
 With `docintel_endpoint` set, Pass 2 also registers MarkItDown's Document Intelligence converter,
 which takes precedence over the LLM for every type it supports (PDF, images, Office). It
-authenticates with `AKGENTIC_DOCUMENT_READER_DOCINTEL_KEY`, read at call time and never stored on
-the reader, or with `DefaultAzureCredential` (managed identity) when that is unset. The credential
-is passed explicitly because MarkItDown would otherwise pick up `AZURE_API_KEY`.
+authenticates with `AKGENTIC_DOCUMENT_READER_DOCINTEL_KEY`, read when Pass 2 is first built and
+never serialised with the reader, or with `DefaultAzureCredential` (managed identity) when that is
+unset. The credential is passed explicitly because MarkItDown would otherwise pick up
+`AZURE_API_KEY`.
 
 **Defaults a host can override.** The tool keeps its own defaults (`openai`, `gpt-6-luna`). A
 deployment overrides them for every reader built without explicit values by exporting
-`AKGENTIC_DOCUMENT_READER_PROVIDER` and `AKGENTIC_DOCUMENT_READER_MODEL` (akgentic-infra's
-worker settings read the same two names). The provider takes an `akgentic.llm` provider id:
+`AKGENTIC_DOCUMENT_READER_PROVIDER` and `AKGENTIC_DOCUMENT_READER_MODEL`; the tool is the only
+reader of these names. The provider takes an `akgentic.llm` provider id:
 `openai` / `openai-chat` select `OpenAI()`, `azure` / `azure-chat` select `AzureOpenAI()` (which
 reads `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `OPENAI_API_VERSION`). Any other id logs a
 WARNING and keeps the default; an empty value counts as unset; an explicit field value always wins.
