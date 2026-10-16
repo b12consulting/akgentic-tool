@@ -646,15 +646,17 @@ The client is only built when Pass 1 falls short, so a successful text extractio
 credentials. Requires `akgentic-tool[docs]`; without it `extract_text` raises `ImportError` with
 the install command. Each pass's `MarkItDown` converter is built on first use and reused for the
 reader's lifetime (each construction loads an ONNX model into native memory), so Pass 2's
-credentials are captured when it is first built and a rotated key reaches only a new reader.
+credentials are captured when it is first built and a rotated key reaches only a new reader. A
+copy of a reader, shallow or deep, starts with empty caches and builds its own.
 
 **Scanned PDFs need Document Intelligence.** MarkItDown hands the LLM client only to its image
 and PowerPoint converters, so a PDF without a text layer stays empty after an LLM-only Pass 2.
 With `docintel_endpoint` set, Pass 2 also registers MarkItDown's Document Intelligence converter,
 which takes precedence over the LLM for every type it supports (PDF, images, Office). It
 authenticates with `AKGENTIC_DOCUMENT_READER_DOCINTEL_KEY`, read when Pass 2 is first built and
-never serialised with the reader, or with `DefaultAzureCredential` (managed identity) when that is unset. The credential
-is passed explicitly because MarkItDown would otherwise pick up `AZURE_API_KEY`.
+never serialised with the reader, or with `DefaultAzureCredential` (managed identity) when that is
+unset. The credential is passed explicitly because MarkItDown would otherwise pick up
+`AZURE_API_KEY`.
 
 **Defaults a host can override.** The tool keeps its own defaults (`openai`, `gpt-6-luna`). A
 deployment overrides them for every reader built without explicit values by exporting

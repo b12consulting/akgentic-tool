@@ -1486,6 +1486,78 @@ class TestDocumentReaderConverterReuse:
         assert copied._markitdown is not reader._markitdown
         assert md_module.MarkItDown.call_count == 2
 
+    @pytest.mark.parametrize(
+        "copier",
+        [
+            pytest.param(copy.copy, id="copy.copy"),
+            pytest.param(lambda r: r.model_copy(), id="model_copy"),
+        ],
+    )
+    def test_a_shallow_copy_of_a_used_reader_starts_empty(
+        self, copier: Callable[[DocumentReader], DocumentReader]
+    ) -> None:
+        import sys
+
+        reader = DocumentReader(llm_client=None)
+        md_module = MagicMock()
+        md_module.MarkItDown.side_effect = lambda **kwargs: _NativeSession(_FULL_TEXT)
+
+        with patch.dict(sys.modules, {"markitdown": md_module}):
+            reader.extract_text(b"%PDF", "report.pdf")
+            copied = copier(reader)
+            assert copied._markitdown is None
+            assert copied._converter_lock is not reader._converter_lock
+            assert copied.extract_text(b"%PDF", "report.pdf") == _FULL_TEXT
+
+        assert copied == reader
+        assert md_module.MarkItDown.call_count == 2
+
+    def test_a_copy_with_a_new_configuration_builds_its_own_pass2(self) -> None:
+        import sys
+
+        reader = DocumentReader(llm_client="openai", llm_model="old-model")
+        md_module = MagicMock()
+        md_module.MarkItDown.return_value.convert.side_effect = [
+            _text_result(""),
+            _text_result("# OCR\n" + "z" * 60),
+        ] * 2
+
+        with patch.dict(sys.modules, {"markitdown": md_module, "openai": MagicMock()}):
+            reader.extract_text(b"%PDF", "scan.pdf")
+            updated = reader.model_copy(update={"llm_model": "new-model"})
+            updated.extract_text(b"%PDF", "scan.pdf")
+
+        pass2_models = [
+            call.kwargs["llm_model"]
+            for call in md_module.MarkItDown.call_args_list
+            if "llm_model" in call.kwargs
+        ]
+        assert pass2_models == ["old-model", "new-model"]
+
+    @pytest.mark.parametrize(
+        "copier",
+        [
+            pytest.param(copy.deepcopy, id="copy.deepcopy"),
+            pytest.param(lambda r: r.model_copy(deep=True), id="model_copy-deep"),
+            pytest.param(copy.copy, id="copy.copy"),
+            pytest.param(lambda r: r.model_copy(), id="model_copy"),
+        ],
+    )
+    def test_a_copy_keeps_a_field_it_has_never_heard_of(
+        self, copier: Callable[[DocumentReader], DocumentReader]
+    ) -> None:
+        """Golden Rule #12: an enumerated rebuild would return a plain reader."""
+
+        class _ReaderWithExtraField(DocumentReader):
+            extra_field: str = "default"
+
+        reader = _ReaderWithExtraField(llm_client=None, extra_field="sentinel")
+        copied = copier(reader)
+
+        assert isinstance(copied, _ReaderWithExtraField)
+        assert copied.extra_field == "sentinel"
+        assert copied.model_fields_set == reader.model_fields_set
+
 
 # ---------------------------------------------------------------------------
 # Story 5.9: _expand_braces unit tests

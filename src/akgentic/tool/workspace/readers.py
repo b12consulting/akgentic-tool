@@ -206,6 +206,15 @@ class DocumentReader(BaseModel):
             _fields_set=set(self.model_fields_set), **deepcopy(self.__dict__, memo)
         )
 
+    def __copy__(self) -> Self:
+        """Copy the configuration shallowly; the copy, too, starts with empty caches.
+
+        ``model_copy(update=...)`` copies through here and then changes fields, so a copy
+        that kept the source's converters would go on using the configuration they were
+        built from.
+        """
+        return self.model_construct(_fields_set=set(self.model_fields_set), **self.__dict__)
+
     def __eq__(self, other: object) -> bool:
         """Readers are equal when their configuration is; the caches and lock do not count.
 
