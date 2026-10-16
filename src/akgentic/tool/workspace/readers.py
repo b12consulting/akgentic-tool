@@ -86,6 +86,13 @@ def _default_llm_model() -> str:
     return os.environ.get(LLM_MODEL_ENV) or _DEFAULT_LLM_MODEL
 
 
+DOCINTEL_ENDPOINT_ENV = "AKGENTIC_DOCUMENT_READER_DOCINTEL_ENDPOINT"
+DOCINTEL_KEY_ENV = "AKGENTIC_DOCUMENT_READER_DOCINTEL_KEY"
+"""Azure Document Intelligence for Pass 2, which OCRs scanned PDFs (MarkItDown's PDF converter
+ignores the LLM client). The key is read at call time and never stored on the reader; without it
+the reader authenticates with ``DefaultAzureCredential`` (managed identity)."""
+
+
 TEXT_EXTENSIONS: frozenset[str] = frozenset(
     {
         ".txt",
@@ -131,8 +138,8 @@ class DocumentReader(BaseModel):
 
     Pass 1: Extract text via ``MarkItDown()`` (no LLM).
     Pass 2 (optional): If Pass 1 yields fewer than 50 non-whitespace characters
-    and ``llm_client`` is set, lazily constructs ``OpenAI()`` (or ``AzureOpenAI()``)
-    and retries.
+    and ``llm_client`` or ``docintel_endpoint`` is set, retries with a lazily
+    constructed ``OpenAI()`` (or ``AzureOpenAI()``) and/or Azure Document Intelligence.
     If both passes yield fewer than 50 non-whitespace characters, returns a
     placeholder comment.
     """
@@ -157,6 +164,9 @@ class DocumentReader(BaseModel):
 
     llm_client: LlmClient | None = Field(default_factory=_default_llm_client)
     llm_model: str = Field(default_factory=_default_llm_model)
+    docintel_endpoint: str | None = Field(
+        default_factory=lambda: os.environ.get(DOCINTEL_ENDPOINT_ENV) or None
+    )
 
     _openai_client: OpenAI | None = PrivateAttr(default=None)
 
@@ -180,6 +190,23 @@ class DocumentReader(BaseModel):
 
                 self._openai_client = _OpenAI()
         return self._openai_client
+
+    def _docintel_kwargs(self) -> dict[str, Any]:
+        """MarkItDown's Document Intelligence arguments, empty when no endpoint is set.
+
+        The credential is explicit because MarkItDown otherwise takes ``AZURE_API_KEY``, a name
+        hosts already use for Azure OpenAI.
+        """
+        if not self.docintel_endpoint:
+            return {}
+        from azure.core.credentials import AzureKeyCredential  # noqa: PLC0415
+        from azure.identity import DefaultAzureCredential  # noqa: PLC0415
+
+        key = os.environ.get(DOCINTEL_KEY_ENV)
+        return {
+            "docintel_endpoint": self.docintel_endpoint,
+            "docintel_credential": AzureKeyCredential(key) if key else DefaultAzureCredential(),
+        }
 
     @staticmethod
     def _convert_via_tempfile(md: Any, content: bytes, suffix: str) -> str:
@@ -237,8 +264,10 @@ class DocumentReader(BaseModel):
         # a successful Pass 1 would needlessly require credentials it never uses.
         if len("".join(text.split())) < 50:
             openai_client = self._get_openai_client()
-            if openai_client is not None:
-                md_vision = MarkItDown(llm_client=openai_client, llm_model=self.llm_model)
+            if openai_client is not None or self.docintel_endpoint:
+                md_vision = MarkItDown(
+                    llm_client=openai_client, llm_model=self.llm_model, **self._docintel_kwargs()
+                )
                 text = self._convert_via_tempfile(md_vision, content, suffix)
 
         if len("".join(text.split())) < 50:

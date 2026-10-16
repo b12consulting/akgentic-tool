@@ -1519,3 +1519,5 @@ def _isolate_document_reader_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep a host's ``AKGENTIC_DOCUMENT_READER_*`` exports out of the reader's defaults."""
     monkeypatch.delenv("AKGENTIC_DOCUMENT_READER_PROVIDER", raising=False)
     monkeypatch.delenv("AKGENTIC_DOCUMENT_READER_MODEL", raising=False)
+    monkeypatch.delenv("AKGENTIC_DOCUMENT_READER_DOCINTEL_ENDPOINT", raising=False)
+    monkeypatch.delenv("AKGENTIC_DOCUMENT_READER_DOCINTEL_KEY", raising=False)
