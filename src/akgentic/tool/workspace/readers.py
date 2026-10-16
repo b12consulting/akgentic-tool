@@ -246,16 +246,26 @@ class DocumentReader(BaseModel):
                 self._openai_client = _OpenAI()
         return self._openai_client
 
+    # Any: these are splatted into MarkItDown's open ``**kwargs`` constructor signature.
     def _docintel_kwargs(self) -> dict[str, Any]:
         """MarkItDown's Document Intelligence arguments, empty when no endpoint is set.
 
         The credential is explicit because MarkItDown otherwise takes ``AZURE_API_KEY``, a name
         hosts already use for Azure OpenAI.
+
+        Raises:
+            ImportError: If the Azure SDK (``az-doc-intel``, in the ``docs`` extra) is missing.
         """
         if not self.docintel_endpoint:
             return {}
-        from azure.core.credentials import AzureKeyCredential  # noqa: PLC0415
-        from azure.identity import DefaultAzureCredential  # noqa: PLC0415
+        try:
+            from azure.core.credentials import AzureKeyCredential  # noqa: PLC0415
+            from azure.identity import DefaultAzureCredential  # noqa: PLC0415
+        except ImportError as exc:
+            raise ImportError(
+                "Azure Document Intelligence SDK not installed. "
+                'Run: pip install "akgentic-tool[docs]"'
+            ) from exc
 
         key = os.environ.get(DOCINTEL_KEY_ENV)
         return {

@@ -1277,6 +1277,18 @@ class TestDocumentReaderExtractText:
             with pytest.raises(ImportError, match='pip install "akgentic-tool\\[docs\\]"'):
                 reader.extract_text(b"fake", "file.pdf")
 
+    def test_docintel_sdk_not_installed_names_the_extra(self) -> None:
+        """A thin PDF with an endpoint but no Azure SDK says which extra to install."""
+        import sys
+
+        reader = DocumentReader(llm_client=None, docintel_endpoint="https://di.example.com")
+        md_module = self._make_mock_markitdown_module()
+        md_module.MarkItDown.return_value.convert.return_value = _text_result("")
+
+        with patch.dict(sys.modules, {"markitdown": md_module, "azure.identity": None}):
+            with pytest.raises(ImportError, match='pip install "akgentic-tool\\[docs\\]"'):
+                reader.extract_text(b"%PDF scan", "scan.pdf")
+
 
 def _text_result(text: str) -> MagicMock:
     result = MagicMock()
