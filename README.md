@@ -1035,7 +1035,7 @@ are the index; the detail lives beside the module it documents.
 | `PlanningTool` | `akgentic.tool.planning` | Shared task board backed by the `#PlanningTool` actor | [README](src/akgentic/tool/planning/README.md) |
 | `KnowledgeGraphTool` | `akgentic.tool.knowledge_graph` | Entities and relations with hybrid keyword + semantic search | [README](src/akgentic/tool/knowledge_graph/README.md) |
 | `SearchTool` | `akgentic.tool.search` | Web search, fetch and crawl via Tavily | [README](src/akgentic/tool/search/README.md) |
-| `TeamTool` | `akgentic.tool.team` | Hire, fire, roster, role profiles, and who is busy right now | [README](src/akgentic/tool/team/README.md) |
+| `TeamTool` | `akgentic.tool.team` | Hire, fire, roster, role profiles, which roles a hire would accept, and who is busy right now | [README](src/akgentic/tool/team/README.md) |
 | `MetadataTool` | `akgentic.tool.metadata` | The team's business context, rendered once into every agent's prefix | [README](src/akgentic/tool/metadata/README.md) |
 | `NotificationTool` | `akgentic.tool.notification` | Delayed messages an agent schedules to itself | [README](src/akgentic/tool/notification/README.md) |
 | `SkillTool` | `akgentic.tool.skill` | A library of skills: the menu in the prefix, the bodies on demand | [README](src/akgentic/tool/skill/README.md) |
@@ -1274,7 +1274,9 @@ answers *who is working right now, and on what*. The roster and the role catalog
 each marked hireable or not — are exposed as structured context state on `LLM_CONTEXT`, delivered
 into the context tail as deltas.
 Used by `BaseAgent` in `akgentic-agent` to let orchestrator-level agents extend the team at
-runtime. Requires a `TeamManagementToolObserver`.
+runtime, and to ask — through the read-only `hireable_roles` command, registered alongside
+`hire_member` — which roles a hire would accept before routing a message to one. Requires a
+`TeamManagementToolObserver`.
 
 ```python
 from akgentic.tool.team import ActivitySummarizer, GetTeamActivity, TeamTool
@@ -1293,8 +1295,8 @@ when a summarizer is configured, and the callable's signature follows the config
 `summarize_over` is absent from the schema when nothing could produce a summary.
 
 **[Full reference → `src/akgentic/tool/team/README.md`](src/akgentic/tool/team/README.md)** —
-the hire/fire channel split, partial-success reporting, the two activity gates, and how "busy" is
-derived from telemetry.
+the hire/fire channel split, the `hireable_roles` command, partial-success reporting, the two
+activity gates, and how "busy" is derived from telemetry.
 
 ### MetadataTool
 

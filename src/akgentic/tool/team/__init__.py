@@ -17,6 +17,7 @@ from .team import (
     FireTeamMember,
     GetRoleProfiles,
     GetTeamRoster,
+    HireableRoles,
     HireTeamMember,
     TeamTool,
 )
@@ -25,6 +26,7 @@ __all__ = [
     "TeamTool",
     "TeamManagementToolObserver",
     "HireTeamMember",
+    "HireableRoles",
     "FireTeamMember",
     "GetTeamRoster",
     "GetRoleProfiles",

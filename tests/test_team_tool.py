@@ -21,6 +21,7 @@ from akgentic.tool.team import (
     GetRoleProfiles,
     GetTeamActivity,
     GetTeamRoster,
+    HireableRoles,
     HireTeamMember,
     TeamTool,
 )
@@ -566,7 +567,7 @@ def test_fire_members_batch_partial_success():
 
 
 def test_team_tool_get_commands_default():
-    """TeamTool.get_commands() returns dict keyed by param class with 4 commands.
+    """TeamTool.get_commands() returns dict keyed by param class with 5 commands.
 
     ``GetTeamActivity`` is off by default, so it is absent until opted in.
     """
@@ -574,8 +575,9 @@ def test_team_tool_get_commands_default():
     tool.observer(mock_observer())
 
     commands = tool.get_commands()
-    assert len(commands) == 4
+    assert len(commands) == 5
     assert HireTeamMember in commands
+    assert HireableRoles in commands
     assert FireTeamMember in commands
     assert GetTeamRoster in commands
     assert GetRoleProfiles in commands
@@ -591,6 +593,7 @@ def test_team_tool_get_commands_with_team_activity_enabled():
     commands = tool.get_commands()
     assert set(commands) == {
         HireTeamMember,
+        HireableRoles,
         FireTeamMember,
         GetTeamRoster,
         GetRoleProfiles,
@@ -626,6 +629,7 @@ def test_team_tool_get_commands_partial():
     # hire excluded (no command in expose), fire + roster + profiles = 3
     assert len(commands) == 3
     assert HireTeamMember not in commands
+    assert HireableRoles not in commands  # comes and goes with hire_member
     assert FireTeamMember in commands
 
 
@@ -1108,3 +1112,66 @@ def test_hire_member_command_rejects_an_already_taken_name():
         hire_member("Developer", "@Taken")
 
     observer_mock.createActor.assert_not_called()
+
+
+# --- hireable_roles: the read-only half of the hire guard ------------------------------
+
+
+def test_hireable_roles_lists_only_hireable_roles_sorted():
+    """The command answers with the roles hire_member would accept, and hires nobody."""
+    catalog = [
+        hireable_card("Tester", can_be_hired=True),
+        hireable_card("Manager", can_be_hired=False),
+        hireable_card("Developer", can_be_hired=True),
+    ]
+    observer_mock = hire_guard_observer(catalog)
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    hireable_roles = tool.get_commands()[HireableRoles]
+
+    assert hireable_roles() == ["Developer", "Tester"]
+    observer_mock.createActor.assert_not_called()
+
+
+def test_hireable_roles_is_empty_when_no_role_is_hireable():
+    observer_mock = hire_guard_observer([hireable_card("Manager", can_be_hired=False)])
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+
+    assert tool.get_commands()[HireableRoles]() == []
+
+
+def test_hireable_roles_agrees_with_the_hire_guard():
+    """A role it lists is hired; a role it leaves out is refused."""
+    catalog = [
+        hireable_card("Developer", can_be_hired=True),
+        hireable_card("Manager", can_be_hired=False),
+    ]
+    observer_mock = hire_guard_observer(catalog)
+
+    tool = TeamTool()
+    tool.observer(observer_mock)
+    commands = tool.get_commands()
+    hire_member = commands[HireTeamMember]
+
+    assert commands[HireableRoles]() == ["Developer"]
+    hire_member("Developer")
+    with pytest.raises(RoleNotHireableError):
+        hire_member("Manager")
+
+
+def test_hireable_roles_is_absent_when_hiring_is_off():
+    tool = TeamTool(hire_team_members=False)
+    tool.observer(mock_observer())
+
+    assert HireableRoles not in tool.get_commands()
+
+
+def test_hireable_roles_is_registered_under_its_name():
+    """The registry keys commands by __name__; callers look it up as "hireable_roles"."""
+    tool = TeamTool()
+    tool.observer(mock_observer())
+
+    assert tool.get_commands()[HireableRoles].__name__ == "hireable_roles"
