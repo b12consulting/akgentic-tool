@@ -48,9 +48,8 @@ LLM_CLIENT_ENV = "AKGENTIC_DOCUMENT_READER_PROVIDER"
 LLM_MODEL_ENV = "AKGENTIC_DOCUMENT_READER_MODEL"
 """Environment variables a deployment sets to override the reader's defaults.
 
-The tool keeps its own defaults; a deployment sets these names to override them
-(akgentic-infra's worker settings read the same two), and an empty value counts
-as unset."""
+The tool keeps its own defaults and is the only reader of these names; a deployment sets
+them to override the defaults, and an empty value counts as unset."""
 
 _CLIENT_FOR_PROVIDER: dict[str, LlmClient] = {
     "openai": "openai",
@@ -160,7 +159,7 @@ class DocumentReader(BaseModel):
     If both passes yield fewer than 50 non-whitespace characters, returns a
     placeholder comment.
 
-    Each pass's ``MarkItDown`` is built on first use and reused for the reader's
+    Each pass's ``MarkItDown`` is built on first use and kept for the reader's
     lifetime: construction loads a Magika ONNX model into native memory the process
     does not give back, so building one per extraction grows a worker without bound.
     """

@@ -203,7 +203,7 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
     Binary-extraction config lives on the nested :class:`WorkspaceRead` capability
     (``workspace_read=WorkspaceRead(document_reader=...)``), co-located with the read
     capability that uses it. ``WorkspaceRead.document_reader`` controls extraction:
-    - ``True`` (default): uses a default ``DocumentReader()`` (Pass 1 only, no LLM).
+    - ``True`` (default): uses a default ``DocumentReader()`` (environment defaults).
     - ``False``: binary reads raise ``ValueError`` with install hint.
     - ``DocumentReader(...)`` instance: custom extraction config (e.g. with LLM).
 
