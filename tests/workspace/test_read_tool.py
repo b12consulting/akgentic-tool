@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1274,6 +1276,215 @@ class TestDocumentReaderExtractText:
         with patch.dict(sys.modules, {"markitdown": None}):
             with pytest.raises(ImportError, match='pip install "akgentic-tool\\[docs\\]"'):
                 reader.extract_text(b"fake", "file.pdf")
+
+
+def _text_result(text: str) -> MagicMock:
+    result = MagicMock()
+    result.text_content = text
+    return result
+
+
+_FULL_TEXT = "# Report\n" + "x" * 60
+
+
+class _NativeSession:
+    """Stands in for a MarkItDown holding an onnxruntime session: converts, never deep-copies."""
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    def convert(self, path: str) -> MagicMock:
+        return _text_result(self._text)
+
+    def __deepcopy__(self, memo: dict[int, object]) -> _NativeSession:
+        raise TypeError("cannot deep-copy a native session")
+
+
+class TestDocumentReaderConverterReuse:
+    """Story 61-3 AC 1-6: one MarkItDown per pass per reader, built lazily, safe to copy."""
+
+    def test_pass1_instance_is_built_once_across_extractions(self) -> None:
+        import sys
+
+        reader = DocumentReader()
+        md_module = MagicMock()
+        md_module.MarkItDown.return_value.convert.return_value = _text_result(_FULL_TEXT)
+        openai_module = MagicMock()
+
+        with patch.dict(sys.modules, {"markitdown": md_module, "openai": openai_module}):
+            for _ in range(3):
+                assert reader.extract_text(b"%PDF", "report.pdf") == _FULL_TEXT
+
+        assert md_module.MarkItDown.call_count == 1
+        assert md_module.MarkItDown.call_args.kwargs == {}
+
+    def test_a_reader_whose_pass1_succeeds_never_builds_pass2(self) -> None:
+        import sys
+
+        reader = DocumentReader(llm_client="openai", docintel_endpoint="https://di.example.com")
+        md_module = MagicMock()
+        md_module.MarkItDown.return_value.convert.return_value = _text_result(_FULL_TEXT)
+        openai_module = MagicMock()
+
+        with patch.dict(sys.modules, {"markitdown": md_module, "openai": openai_module}):
+            for _ in range(3):
+                reader.extract_text(b"%PDF", "report.pdf")
+
+        assert reader._markitdown_pass2 is None
+        assert reader._openai_client is None
+        openai_module.OpenAI.assert_not_called()
+
+    def test_pass2_instance_is_built_once_across_thin_documents(self) -> None:
+        import sys
+
+        reader = DocumentReader(llm_client="openai", llm_model="gpt-4o")
+        md_module = MagicMock()
+        md_module.MarkItDown.return_value.convert.side_effect = [
+            _text_result(""),
+            _text_result("# OCR\n" + "z" * 60),
+        ] * 3
+        openai_module = MagicMock()
+
+        with patch.dict(sys.modules, {"markitdown": md_module, "openai": openai_module}):
+            for _ in range(3):
+                assert reader.extract_text(b"%PDF", "scan.pdf") == "# OCR\n" + "z" * 60
+
+        assert md_module.MarkItDown.call_count == 2
+        first, second = md_module.MarkItDown.call_args_list
+        assert first.kwargs == {}
+        assert second.kwargs["llm_model"] == "gpt-4o"
+        assert second.kwargs["llm_client"] is openai_module.OpenAI.return_value
+        assert openai_module.OpenAI.call_count == 1
+
+    def test_a_reader_that_never_extracted_builds_nothing(self) -> None:
+        import sys
+
+        md_module = MagicMock()
+        with patch.dict(sys.modules, {"markitdown": md_module}):
+            reader = DocumentReader(llm_client="openai")
+
+        md_module.MarkItDown.assert_not_called()
+        assert reader._markitdown is None
+        assert reader._markitdown_pass2 is None
+
+    def test_concurrent_first_use_builds_one_instance(self) -> None:
+        import sys
+        import threading
+
+        reader = DocumentReader(llm_client=None)
+        md_module = MagicMock()
+
+        def slow_markitdown(**kwargs: object) -> MagicMock:
+            time.sleep(0.05)  # widens the check-then-build window a missing lock would lose
+            instance = MagicMock()
+            instance.convert.return_value = _text_result(_FULL_TEXT)
+            return instance
+
+        md_module.MarkItDown.side_effect = slow_markitdown
+        start = threading.Barrier(2)
+        results: list[str] = []
+
+        def read() -> None:
+            start.wait()
+            results.append(reader.extract_text(b"%PDF", "report.pdf"))
+
+        with patch.dict(sys.modules, {"markitdown": md_module}):
+            threads = [threading.Thread(target=read) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        assert results == [_FULL_TEXT, _FULL_TEXT]
+        assert md_module.MarkItDown.call_count == 1
+
+    def test_convert_runs_concurrently_on_the_shared_instance(self) -> None:
+        import sys
+        import threading
+
+        reader = DocumentReader(llm_client=None)
+        both_converting = threading.Barrier(2, timeout=2)
+
+        def convert(path: str) -> MagicMock:
+            both_converting.wait()  # breaks if convert() were serialised
+            return _text_result(_FULL_TEXT)
+
+        md_module = MagicMock()
+        md_module.MarkItDown.return_value.convert.side_effect = convert
+        results: list[str] = []
+
+        def read() -> None:
+            results.append(reader.extract_text(b"%PDF", "report.pdf"))
+
+        with patch.dict(sys.modules, {"markitdown": md_module}):
+            threads = [threading.Thread(target=read) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        assert results == [_FULL_TEXT, _FULL_TEXT]
+
+    def test_dump_and_round_trip_are_unchanged_by_an_extraction(self) -> None:
+        import sys
+
+        reader = DocumentReader(llm_client="openai", docintel_endpoint="https://di.example.com")
+        before = reader.model_dump()
+        md_module = MagicMock()
+        md_module.MarkItDown.return_value.convert.side_effect = [
+            _text_result(""),
+            _text_result("# OCR\n" + "z" * 60),
+        ]
+
+        with patch.dict(sys.modules, {"markitdown": md_module, "openai": MagicMock()}):
+            reader.extract_text(b"%PDF", "scan.pdf")
+
+        assert reader._markitdown_pass2 is not None
+        assert reader.model_dump() == before
+        assert DocumentReader.model_validate(reader.model_dump()).model_dump() == before
+
+    def test_equality_ignores_the_caches(self) -> None:
+        import sys
+
+        assert DocumentReader(llm_client=None, llm_model="m") == DocumentReader(
+            llm_client=None, llm_model="m"
+        )
+        used = DocumentReader(llm_client=None, llm_model="m")
+        md_module = MagicMock()
+        md_module.MarkItDown.return_value.convert.return_value = _text_result(_FULL_TEXT)
+
+        with patch.dict(sys.modules, {"markitdown": md_module}):
+            used.extract_text(b"%PDF", "report.pdf")
+
+        assert used == DocumentReader(llm_client=None, llm_model="m")
+        assert used != DocumentReader(llm_client=None, llm_model="other")
+        assert used != "not a reader"
+
+    @pytest.mark.parametrize(
+        "copier",
+        [
+            pytest.param(copy.deepcopy, id="copy.deepcopy"),
+            pytest.param(lambda r: r.model_copy(deep=True), id="model_copy-deep"),
+        ],
+    )
+    def test_a_deep_copy_of_a_used_reader_starts_empty_and_extracts(
+        self, copier: Callable[[DocumentReader], DocumentReader]
+    ) -> None:
+        import sys
+
+        reader = DocumentReader(llm_client=None)
+        md_module = MagicMock()
+        md_module.MarkItDown.side_effect = lambda **kwargs: _NativeSession(_FULL_TEXT)
+
+        with patch.dict(sys.modules, {"markitdown": md_module}):
+            reader.extract_text(b"%PDF", "report.pdf")
+            copied = copier(reader)
+            assert copied._markitdown is None
+            assert copied.extract_text(b"%PDF", "report.pdf") == _FULL_TEXT
+
+        assert copied.model_dump() == reader.model_dump()
+        assert copied._markitdown is not reader._markitdown
+        assert md_module.MarkItDown.call_count == 2
 
 
 # ---------------------------------------------------------------------------

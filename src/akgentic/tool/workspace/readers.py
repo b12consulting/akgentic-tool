@@ -5,12 +5,15 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import threading
+from copy import deepcopy
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, Self
 
 from pydantic import BaseModel, Field, PrivateAttr
 
 if TYPE_CHECKING:
+    from markitdown import MarkItDown
     from openai import OpenAI
 
 _MIME_MAP: dict[str, str] = {
@@ -89,8 +92,23 @@ def _default_llm_model() -> str:
 DOCINTEL_ENDPOINT_ENV = "AKGENTIC_DOCUMENT_READER_DOCINTEL_ENDPOINT"
 DOCINTEL_KEY_ENV = "AKGENTIC_DOCUMENT_READER_DOCINTEL_KEY"
 """Azure Document Intelligence for Pass 2, which OCRs scanned PDFs (MarkItDown's PDF converter
-ignores the LLM client). The key is read at call time and never stored on the reader; without it
-the reader authenticates with ``DefaultAzureCredential`` (managed identity)."""
+ignores the LLM client). The key is read when Pass 2 is first built and never serialised; without
+it the reader authenticates with ``DefaultAzureCredential`` (managed identity)."""
+
+
+def _markitdown_class() -> type[MarkItDown]:
+    """Import ``MarkItDown`` on first use; ``markitdown`` is an optional extra.
+
+    Raises:
+        ImportError: If ``markitdown`` is not installed.
+    """
+    try:
+        from markitdown import MarkItDown as _MarkItDown  # noqa: PLC0415
+    except ImportError as exc:
+        raise ImportError(
+            'markitdown not installed. Run: pip install "akgentic-tool[docs]"'
+        ) from exc
+    return _MarkItDown
 
 
 TEXT_EXTENSIONS: frozenset[str] = frozenset(
@@ -142,6 +160,10 @@ class DocumentReader(BaseModel):
     constructed ``OpenAI()`` (or ``AzureOpenAI()``) and/or Azure Document Intelligence.
     If both passes yield fewer than 50 non-whitespace characters, returns a
     placeholder comment.
+
+    Each pass's ``MarkItDown`` is built on first use and reused for the reader's
+    lifetime: construction loads a Magika ONNX model into native memory the process
+    does not give back, so building one per extraction grows a worker without bound.
     """
 
     extensions: ClassVar[frozenset[str]] = frozenset(
@@ -169,6 +191,57 @@ class DocumentReader(BaseModel):
     )
 
     _openai_client: OpenAI | None = PrivateAttr(default=None)
+    _markitdown: MarkItDown | None = PrivateAttr(default=None)
+    _markitdown_pass2: MarkItDown | None = PrivateAttr(default=None)
+    _converter_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
+
+    def __deepcopy__(self, memo: dict[int, Any] | None = None) -> Self:  # BaseModel's signature
+        """Copy the configuration; the copy starts with empty caches and builds its own.
+
+        The cached clients and converters hold native sessions, and the lock cannot be
+        copied at all, so the default deep copy of private attributes would fail.
+        ``model_construct`` gives every private attribute its default.
+        """
+        return self.model_construct(
+            _fields_set=set(self.model_fields_set), **deepcopy(self.__dict__, memo)
+        )
+
+    def __eq__(self, other: object) -> bool:
+        """Readers are equal when their configuration is; the caches and lock do not count.
+
+        ``BaseModel`` also compares private attributes, which would make two fresh readers
+        differ by their locks and a used reader differ from its own configuration.
+        """
+        if not isinstance(other, BaseModel):
+            return NotImplemented
+        return type(self) is type(other) and self.__dict__ == other.__dict__
+
+    def _get_markitdown(self) -> MarkItDown:
+        """The Pass 1 converter (no LLM), built once under the lock."""
+        if self._markitdown is None:
+            with self._converter_lock:
+                if self._markitdown is None:
+                    self._markitdown = _markitdown_class()()
+        return self._markitdown
+
+    def _get_markitdown_pass2(self) -> MarkItDown | None:
+        """The Pass 2 converter, built once under the lock; None when Pass 2 is not configured.
+
+        Its credentials are captured at construction, so a rotated
+        ``AKGENTIC_DOCUMENT_READER_DOCINTEL_KEY`` reaches only a new reader.
+        """
+        if self._markitdown_pass2 is None:
+            with self._converter_lock:
+                if self._markitdown_pass2 is None:
+                    openai_client = self._get_openai_client()
+                    if openai_client is None and not self.docintel_endpoint:
+                        return None
+                    self._markitdown_pass2 = _markitdown_class()(
+                        llm_client=openai_client,
+                        llm_model=self.llm_model,
+                        **self._docintel_kwargs(),
+                    )
+        return self._markitdown_pass2
 
     def _get_openai_client(self) -> OpenAI | None:
         """Lazily create and cache the client ``llm_client`` names.
@@ -209,7 +282,7 @@ class DocumentReader(BaseModel):
         }
 
     @staticmethod
-    def _convert_via_tempfile(md: Any, content: bytes, suffix: str) -> str:
+    def _convert_via_tempfile(md: MarkItDown, content: bytes, suffix: str) -> str:
         """Write content to a temp file, convert via MarkItDown, and clean up.
 
         Uses ``delete=False`` to avoid Windows file-locking issues when
@@ -247,27 +320,17 @@ class DocumentReader(BaseModel):
         Raises:
             ImportError: If ``markitdown`` is not installed.
         """
-        try:
-            from markitdown import MarkItDown
-        except ImportError as exc:
-            raise ImportError(
-                'markitdown not installed. Run: pip install "akgentic-tool[docs]"'
-            ) from exc
-
         suffix = Path(path).suffix or ".bin"
 
         # Pass 1: plain MarkItDown (no LLM)
-        text = self._convert_via_tempfile(MarkItDown(), content, suffix)
+        text = self._convert_via_tempfile(self._get_markitdown(), content, suffix)
 
         # Pass 2: LLM vision fallback if Pass 1 yielded insufficient content.
-        # Only construct the OpenAI client when Pass 1 came up short — otherwise
+        # Only build the Pass 2 converter when Pass 1 came up short — otherwise
         # a successful Pass 1 would needlessly require credentials it never uses.
         if len("".join(text.split())) < 50:
-            openai_client = self._get_openai_client()
-            if openai_client is not None or self.docintel_endpoint:
-                md_vision = MarkItDown(
-                    llm_client=openai_client, llm_model=self.llm_model, **self._docintel_kwargs()
-                )
+            md_vision = self._get_markitdown_pass2()
+            if md_vision is not None:
                 text = self._convert_via_tempfile(md_vision, content, suffix)
 
         if len("".join(text.split())) < 50:
