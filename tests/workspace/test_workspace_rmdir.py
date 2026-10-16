@@ -499,18 +499,19 @@ class TestForce:
 
 
 class TestTheDocstringTellsTheModelToAsk:
+    # Compared with whitespace collapsed: Python 3.13+ dedents docstrings at compile time.
     RECURSIVE_RULE = (
-        "Set\n            recursive=true ONLY when the user has explicitly asked to remove the\n"
-        "            directory together with its contents."
+        "Set recursive=true ONLY when the user has explicitly asked to remove the"
+        " directory together with its contents."
     )
     FORCE_RULE = (
-        "Set force=true ONLY when the user\n"
-        "            has explicitly asked to discard changes made since your last read.\n"
-        "            Never set it to get past a refusal on your own initiative."
+        "Set force=true ONLY when the user"
+        " has explicitly asked to discard changes made since your last read."
+        " Never set it to get past a refusal on your own initiative."
     )
 
     def test_allowed_the_docstring_carries_both_rules(self, wired_card: WorkspaceTool) -> None:
-        doc = tool_named(wired_card, "workspace_rmdir").__doc__
+        doc = " ".join(tool_named(wired_card, "workspace_rmdir").__doc__.split())
         assert self.RECURSIVE_RULE in doc
         assert self.FORCE_RULE in doc
 
