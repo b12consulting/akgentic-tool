@@ -48,7 +48,7 @@ know about.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `hire_team_members` | `HireTeamMember \| bool` | `True` | `hire_members(roles)` on `TOOL_CALL`; `hire_member(role, name=None)` and the read-only `hireable_roles()` on `COMMAND`. |
+| `hire_team_members` | `HireTeamMember \| bool` | `True` | `hire_members(roles)` on `TOOL_CALL`, `hire_member(role, name=None)` on `COMMAND`. |
 | `fire_team_members` | `FireTeamMember \| bool` | `True` | `fire_members(names)` on `TOOL_CALL`, `fire_member(name)` on `COMMAND`. |
 | `get_team_roster` | `GetTeamRoster \| bool` | `True` | The current roster as structured context state on `LLM_CONTEXT`, delivered as per-turn deltas. |
 | `get_role_profiles` | `GetRoleProfiles \| bool` | `True` | The role catalog as structured context state on `LLM_CONTEXT`, delivered as per-turn deltas. |
@@ -67,7 +67,7 @@ know about.
 | Channel | Hire | Fire |
 |---|---|---|
 | `TOOL_CALL` | `hire_members(roles: list[str]) -> str` — batch, auto-named | `fire_members(names: list[str]) -> str` — batch |
-| `COMMAND` | `hire_member(role: str, name: str \| None = None) -> ActorAddress`, and `hireable_roles() -> list[str]` | `fire_member(name: str) -> str` |
+| `COMMAND` | `hire_member(role: str, name: str \| None = None) -> ActorAddress` | `fire_member(name: str) -> str` |
 
 The batch variants are what the LLM sees; the singular variants exist for programmatic
 orchestration and for the human `/`-command surface, where naming the new member matters.
@@ -93,23 +93,6 @@ tell the caller a genuine miss was a policy decision.
 
 Both tool docstrings carry an explicit note that these should only be used when the user asks —
 hiring is the one capability in the package with an unbounded blast radius.
-
-#### `hireable_roles` — asking before hiring
-
-`hireable_roles() -> list[str]` answers *which roles would a hire accept?* without hiring anybody.
-It returns `_hireable_roles(catalog)` — the same sorted list every hire failure advertises — so a
-role it lists is hired and a role it leaves out is refused. A caller that must validate a recipient
-before routing to it (the recipient check in `akgentic-agent`) asks this command instead of
-attempting the hire, which would create an actor, or restating the guard, which would drift.
-
-**It comes and goes with `hire_member`, not with `hire_team_members`.** It is registered under its
-own `HireableRoles` param class, in the same branch as `hire_member` — whenever `HireTeamMember`
-exposes `COMMAND`, and only then. `hire_team_members=False` has neither command, and
-`HireTeamMember(expose={TOOL_CALL})` — hiring offered to the LLM only — has the hire tool but
-neither command, because routing could not hire there either.
-
-Being a `COMMAND`, it is also the `/hireable_roles` slash command and is listed in
-`CommandsAnnouncedEvent`. It is read-only: it reads the orchestrator's catalog and nothing else.
 
 #### Hire and fire are not symmetric
 
@@ -294,12 +277,8 @@ TeamTool(                                      # awareness without authority
 )
 
 TeamTool(                                      # hiring only via the human /-command surface
-    hire_team_members=HireTeamMember(expose={COMMAND}),  # hire_member + hireable_roles
+    hire_team_members=HireTeamMember(expose={COMMAND}),
     fire_team_members=FireTeamMember(expose={COMMAND}),
-)
-
-TeamTool(                                      # the LLM may hire; routing and humans may not
-    hire_team_members=HireTeamMember(expose={TOOL_CALL}),  # no hire_member, no hireable_roles
 )
 
 TeamTool(get_team_roster=False)                # drop the roster from the context
@@ -320,7 +299,7 @@ TeamTool(get_team_roster=False)                # drop the roster from the contex
 ```python
 from akgentic.tool.team import (
     TeamTool, TeamManagementToolObserver,
-    HireTeamMember, HireableRoles, FireTeamMember, GetTeamRoster, GetRoleProfiles,
+    HireTeamMember, FireTeamMember, GetTeamRoster, GetRoleProfiles,
     GetTeamActivity, ActivitySummarizer, AgentActivity, TeamActivityReport,
 )
 ```

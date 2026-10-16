@@ -58,17 +58,6 @@ class HireTeamMember(BaseToolParam):
     expose: set[Channels] = {TOOL_CALL, COMMAND}
 
 
-class HireableRoles(BaseToolParam):
-    """List the roles a hire would accept.
-
-    Not a configuration field of its own: it is registered alongside the
-    ``hire_member`` command and only then, so the command that answers "could this
-    role be hired?" exists exactly when the command that hires does.
-    """
-
-    expose: set[Channels] = {COMMAND}
-
-
 class FireTeamMember(BaseToolParam):
     """Fire existing team members by name."""
 
@@ -321,8 +310,6 @@ class TeamTool(ToolCard):
 
     Provides:
     - hire_members(roles: list[str]) -> str: Hire team members
-    - hireable_roles() -> list[str]: The roles a hire would accept (command only,
-      registered with hire_member)
     - fire_members(names: list[str]) -> str: Fire team members
     - team_activity() -> TeamActivityReport: Who is mid-handler (opt-in, no summarizer)
     - Team roster context state: Current team composition, delivered as deltas
@@ -476,7 +463,6 @@ class TeamTool(ToolCard):
         htm = _resolve(self.hire_team_members, HireTeamMember)
         if htm and COMMAND in htm.expose:
             commands[HireTeamMember] = self._hire_member_command_factory(htm)
-            commands[HireableRoles] = self._hireable_roles_command_factory()
 
         ftm = _resolve(self.fire_team_members, FireTeamMember)
         if ftm and COMMAND in ftm.expose:
@@ -605,28 +591,6 @@ class TeamTool(ToolCard):
             return _hire_single_member(orchestrator_proxy, observer, role, name, existing_names)
 
         return hire_member
-
-    def _hireable_roles_command_factory(self) -> Callable[..., Any]:
-        """Create the hireable_roles command callable.
-
-        Returns:
-            Callable that lists the roles ``hire_member`` would accept
-        """
-        orchestrator_proxy = self._orchestrator_proxy
-
-        def hireable_roles() -> list[str]:
-            """List the roles a hire would accept, sorted.
-
-            The same list every hire failure advertises: roles whose card the team
-            marks hireable. Read-only — nothing is hired, and a caller can ask before
-            routing a message to a role rather than finding out from a failed hire.
-
-            Returns:
-                Sorted role names that ``hire_member`` would accept.
-            """
-            return _hireable_roles(orchestrator_proxy.get_agent_catalog())
-
-        return hireable_roles
 
     def _fire_members_factory(self, params: FireTeamMember) -> Callable[..., Any]:
         """Create fire_members tool callable.
