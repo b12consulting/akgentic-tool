@@ -854,76 +854,52 @@ def _compaction_row(
 
 
 @pytest.mark.parametrize("active", [False, True])
-def test_a_reported_threshold_renders_both_counts(active: bool) -> None:
+def test_a_reported_threshold_renders_the_threshold(active: bool) -> None:
     row = _compaction_row(262_144, ModelCompaction(threshold=223_000), active)
 
     assert _render_model_row(row) == (
-        "openai:gpt-5.2 (context: 262k tokens, compaction threshold: 223k tokens)"
-        + (" [ACTIVE]" if active else "")
+        "openai:gpt-5.2 (compaction threshold: 223k)" + (" [ACTIVE]" if active else "")
     )
 
 
 @pytest.mark.parametrize("active", [False, True])
-def test_compaction_off_without_a_context_length_says_why(active: bool) -> None:
-    row = _compaction_row(None, ModelCompaction(threshold=None), active)
-
-    assert _render_model_row(row) == (
-        "openai:gpt-5.2 (compaction disabled: no context length declared)"
-        + (" [ACTIVE]" if active else "")
-    )
-
-
-@pytest.mark.parametrize("active", [False, True])
-def test_compaction_off_with_a_context_length_says_disabled(active: bool) -> None:
+def test_compaction_reported_off_says_no_compaction_activated(active: bool) -> None:
     row = _compaction_row(262_144, ModelCompaction(threshold=None), active)
 
     assert _render_model_row(row) == (
-        "openai:gpt-5.2 (context: 262k tokens, compaction disabled)"
-        + (" [ACTIVE]" if active else "")
+        "openai:gpt-5.2 (no compaction activated)" + (" [ACTIVE]" if active else "")
     )
+
+
+@pytest.mark.parametrize(
+    "compaction", [None, ModelCompaction(threshold=None), ModelCompaction(threshold=223_000)]
+)
+def test_no_context_length_says_no_compaction_activated_whatever_is_reported(
+    compaction: ModelCompaction | None,
+) -> None:
+    """No context length means no budget to trigger on, whatever the agent reports."""
+    row = _compaction_row(None, compaction, True)
+
+    assert _render_model_row(row) == "openai:gpt-5.2 (no compaction activated) [ACTIVE]"
 
 
 @pytest.mark.parametrize("active", [False, True])
 def test_compaction_not_reported_renders_the_context_alone(active: bool) -> None:
+    """Until the agent reports the column, the tool cannot tell whether the trigger is armed."""
     row = _compaction_row(400_000, None, active)
 
     assert _render_model_row(row) == (
-        "openai:gpt-5.2 (context: 400k tokens)" + (" [ACTIVE]" if active else "")
+        "openai:gpt-5.2 (context: 400k)" + (" [ACTIVE]" if active else "")
     )
 
 
-@pytest.mark.parametrize("active", [False, True])
-def test_compaction_not_reported_and_no_context_length_says_undeclared(active: bool) -> None:
-    row = _compaction_row(None, None, active)
-
-    assert _render_model_row(row) == (
-        "openai:gpt-5.2 (context: undeclared)" + (" [ACTIVE]" if active else "")
-    )
-
-
-def test_a_count_below_a_thousand_renders_raw_never_as_zero_k() -> None:
-    row = _compaction_row(512, ModelCompaction(threshold=None), False)
-
-    assert _render_model_row(row) == "openai:gpt-5.2 (context: 512 tokens, compaction disabled)"
-
-
-@pytest.mark.parametrize(("threshold", "rendered"), [(999, "999 tokens"), (1_000, "1k tokens")])
-def test_the_threshold_switches_to_thousands_at_one_thousand(threshold: int, rendered: str) -> None:
+@pytest.mark.parametrize(("threshold", "rendered"), [(512, "512"), (999, "999"), (1_000, "1k")])
+def test_a_count_below_a_thousand_renders_raw_never_as_zero_k(
+    threshold: int, rendered: str
+) -> None:
     row = _compaction_row(262_144, ModelCompaction(threshold=threshold), False)
 
-    assert _render_model_row(row) == (
-        f"openai:gpt-5.2 (context: 262k tokens, compaction threshold: {rendered})"
-    )
-
-
-def test_a_threshold_without_a_context_length_still_renders() -> None:
-    """No line is decided for this case; the renderer must only not crash."""
-    row = _compaction_row(None, ModelCompaction(threshold=223_000), False)
-
-    line = _render_model_row(row)
-
-    assert line.startswith("openai:gpt-5.2 (")
-    assert "223k tokens" in line
+    assert _render_model_row(row) == f"openai:gpt-5.2 (compaction threshold: {rendered})"
 
 
 def test_both_surfaces_show_the_compaction_column() -> None:
@@ -934,7 +910,7 @@ def test_both_surfaces_show_the_compaction_column() -> None:
     card.observer(observer)
     registry = ToolFactory([ModelTool()], observer=observer).get_command_registry()
 
-    expected = "openai:gpt-5.2 (context: 262k tokens, compaction threshold: 223k tokens) [ACTIVE]"
+    expected = "openai:gpt-5.2 (compaction threshold: 223k) [ACTIVE]"
     assert _list_callable(card)() == expected
     assert registry.dispatch("/models") == expected
 

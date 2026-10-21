@@ -85,14 +85,16 @@ from the row's `compaction` column (see [`ModelCompaction`](#modelcompaction--wh
 
 | Case | Line |
 |---|---|
-| threshold reported | `key (context: 262k tokens, compaction threshold: 223k tokens)` |
-| off, no context length | `key (compaction disabled: no context length declared)` |
-| off, context declared | `key (context: 262k tokens, compaction disabled)` |
-| not reported, context declared | `key (context: 262k tokens)` |
-| not reported, no context length | `key (context: undeclared)` |
+| threshold reported | `key (compaction threshold: 223k)` |
+| reported off, or no context length | `key (no compaction activated)` |
+| not reported, context declared | `key (context: 262k)` |
 
-Token counts render in thousands, rounded (`262_144` → `262k tokens`); a count below a thousand
-renders raw (`512 tokens`), never `0k`. The entry currently in force ends with a space and a literal
+Without a context length there is no budget to trigger on, so the line says no compaction is
+activated even when the agent does not report the column. A declared window the agent has not
+classified shows its size instead: the tool alone cannot tell whether the trigger is armed.
+
+Token counts render in thousands, rounded (`262_144` → `262k`); a count below a thousand renders
+raw (`512`), never `0k`. The entry currently in force ends with a space and a literal
 `[ACTIVE]`, after the parenthesis, in every case. Nothing turn-varying enters the text, so two calls
 against an unchanged roster are byte-identical.
 

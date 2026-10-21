@@ -72,33 +72,38 @@ class ActiveModel(BaseToolParam):
     expose: set[Channels] = {LLM_CONTEXT}
 
 
+_NO_COMPACTION = "no compaction activated"
+
+
 def _tokens(count: int) -> str:
     """A token count in thousands, rounded — raw below a thousand, never ``0k``."""
     if count < 1000:
-        return f"{count} tokens"
-    return f"{round(count / 1000)}k tokens"
+        return str(count)
+    return f"{round(count / 1000)}k"
 
 
-def _describe_window(row: ModelRow) -> str:
-    """The parenthesised part of a roster line: the window, then its compaction."""
-    compaction = row.compaction
+def _describe_compaction(row: ModelRow) -> str:
+    """The parenthesised part of a roster line: when compaction fires, or that it never does.
+
+    Without a context length there is no budget to trigger on, so compaction is
+    off whatever the agent reports — the one case the tool can state alone. A
+    declared window the agent has not classified shows as ``context: 262k``: the
+    tool cannot tell whether the trigger is armed, and must not say it is not.
+    """
     if row.context_length is None:
-        if compaction is not None and compaction.threshold is None:
-            return "compaction disabled: no context length declared"
-        context = "context: undeclared"
-    else:
-        context = f"context: {_tokens(row.context_length)}"
+        return _NO_COMPACTION
+    compaction = row.compaction
     if compaction is None:
-        return context
+        return f"context: {_tokens(row.context_length)}"
     if compaction.threshold is None:
-        return f"{context}, compaction disabled"
-    return f"{context}, compaction threshold: {_tokens(compaction.threshold)}"
+        return _NO_COMPACTION
+    return f"compaction threshold: {_tokens(compaction.threshold)}"
 
 
 def _render_model_row(row: ModelRow) -> str:
     """One roster entry on one line, key first, the entry in force marked last."""
     marker = " [ACTIVE]" if row.active else ""
-    return f"{row.key} ({_describe_window(row)}){marker}"
+    return f"{row.key} ({_describe_compaction(row)}){marker}"
 
 
 def _render_model_rows(rows: list[ModelRow]) -> str:
