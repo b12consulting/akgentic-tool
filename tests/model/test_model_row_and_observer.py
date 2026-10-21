@@ -26,17 +26,20 @@ from typing import Any
 import pytest
 from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import AkgentType
+from pydantic import ValidationError
 
 import akgentic.tool as tool_package
 import akgentic.tool.model as model_package
+from akgentic.tool import ModelCompaction as RootModelCompaction
 from akgentic.tool import ModelRow as RootModelRow
 from akgentic.tool import ModelSwitchToolObserver as RootModelSwitchToolObserver
 from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.core.state import ToolState
+from akgentic.tool.model import ModelCompaction as PackageModelCompaction
 from akgentic.tool.model import ModelRow as PackageModelRow
 from akgentic.tool.model import ModelSwitchToolObserver as PackageModelSwitchToolObserver
 from akgentic.tool.model.observer import ModelSwitchToolObserver
-from akgentic.tool.model.state import ModelRow
+from akgentic.tool.model.state import ModelCompaction, ModelRow
 
 # ---------------------------------------------------------------------------
 # AC 2 — ModelRow is a serializable projection
@@ -88,7 +91,61 @@ def test_model_row_declares_its_fields_in_the_decided_order() -> None:
         "model",
         "active",
         "context_length",
+        "compaction",
     ]
+
+
+def test_a_row_built_without_compaction_validates_as_not_reported() -> None:
+    """The agent's constructor predates the field; ``None`` means "not reported"."""
+    row = ModelRow(
+        key="openai:gpt-5.2",
+        provider="openai",
+        model="gpt-5.2",
+        active=True,
+        context_length=400_000,
+    )
+
+    assert row.compaction is None
+
+
+def test_model_row_round_trips_a_reported_compaction() -> None:
+    row = ModelRow(
+        key="openai:gpt-5.2",
+        provider="openai",
+        model="gpt-5.2",
+        active=True,
+        context_length=262_144,
+        compaction=ModelCompaction(threshold=223_000),
+    )
+
+    restored = ModelRow.model_validate(row.model_dump())
+
+    assert restored == row
+    assert restored.compaction == ModelCompaction(threshold=223_000)
+
+
+# ---------------------------------------------------------------------------
+# Story 21.8 — ModelCompaction: the agent states the threshold, or that it is off
+# ---------------------------------------------------------------------------
+
+
+def test_model_compaction_declares_one_field() -> None:
+    assert list(ModelCompaction.model_fields) == ["threshold"]
+
+
+def test_model_compaction_has_no_default_so_off_is_stated_explicitly() -> None:
+    with pytest.raises(ValidationError):
+        ModelCompaction.model_validate({})
+
+
+@pytest.mark.parametrize("threshold", [223_000, None])
+def test_model_compaction_round_trips(threshold: int | None) -> None:
+    compaction = ModelCompaction(threshold=threshold)
+
+    restored = ModelCompaction.model_validate(compaction.model_dump())
+
+    assert restored == compaction
+    assert restored.threshold == threshold
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +256,8 @@ def test_both_symbols_are_exported_by_identity() -> None:
     assert RootModelRow is ModelRow
     assert PackageModelSwitchToolObserver is ModelSwitchToolObserver
     assert RootModelSwitchToolObserver is ModelSwitchToolObserver
+    assert PackageModelCompaction is ModelCompaction
+    assert RootModelCompaction is ModelCompaction
 
 
 def test_both_symbols_are_named_in_both_all_lists() -> None:
@@ -207,6 +266,8 @@ def test_both_symbols_are_named_in_both_all_lists() -> None:
     assert "ModelSwitchToolObserver" in model_package.__all__
     assert "ModelRow" in tool_package.__all__
     assert "ModelSwitchToolObserver" in tool_package.__all__
+    assert "ModelCompaction" in model_package.__all__
+    assert "ModelCompaction" in tool_package.__all__
 
 
 # ---------------------------------------------------------------------------

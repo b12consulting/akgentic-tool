@@ -44,15 +44,17 @@ card (`TeamTool`'s roster and role-catalog params take it the same way), so it i
 than rejected. Put guidance for the model in the agent's own instructions instead.
 
 Two of the three share their channels, which is what distinguishes this card's shape from
-`MailboxTool`'s one-capability-per-channel layout: `list_models` and `switch_model` are each served
-on both `TOOL_CALL` and `COMMAND`, because the same act is meaningful pulled by the model and pushed
-by a human.
+`MailboxTool`'s one-capability-per-channel layout: the listing and the switch are each served on
+both `TOOL_CALL` and `COMMAND`, because the same act is meaningful pulled by the model and pushed by
+a human. The two forms are not identical, though. Each command is its own closure that delegates to
+the tool's: the listing is the tool `list_models` and the command `/models`, and the switch's
+`model` argument is `str` on the tool and typed by the roster on the command.
 
 ## ToolCard fields
 
 | Field | Type | Default | Channel default | Meaning |
 |---|---|---|---|---|
-| `list_models` | `ListModels \| bool` | `True` | `{TOOL_CALL, COMMAND}` | The roster listing — what this agent may switch within. |
+| `list_models` | `ListModels \| bool` | `True` | `{TOOL_CALL, COMMAND}` | The roster listing — what this agent may switch within. The tool `list_models` on `TOOL_CALL`, the command `/models` on `COMMAND`. |
 | `switch_model` | `SwitchModel \| bool` | `True` | `{TOOL_CALL, COMMAND}` | The switch itself, and the only writer of `ToolState.active_model`. |
 | `active_model` | `ActiveModel \| bool` | `True` | `{LLM_CONTEXT}` | The `active_model_state` provider publishing the model in force. Its inherited `instructions` is a silent no-op — see above. |
 
@@ -65,25 +67,34 @@ serve is dropped silently — the package-wide rule, not a model-switch quirk.
 
 ## The three channels
 
-### `TOOL_CALL` and `COMMAND` — `list_models()`
+### `TOOL_CALL` — `list_models()`, and `COMMAND` — `/models`
 
 ```python
-def list_models() -> str: ...
+def list_models() -> str: ...   # the tool
+def models() -> str: ...        # the command, delegating to the tool
 ```
 
-Zero arguments. Renders one line per roster entry, **in the roster's own order** — the order is the
+Zero arguments. **The command is named `/models`; the tool and the card field stay `list_models`**
+— the tool's name is the one `switch_model`'s docstring tells the model to call, and the field is
+the catalog payload. The command delegates to the tool closure, so both render the same text.
+
+The listing renders one line per roster entry, **in the roster's own order** — the order is the
 roster's decision, and re-sorting here would make the listing disagree with every other view of the
-same configuration. The line grammar is fixed:
+same configuration. Each line says what the entry means for this conversation's auto-compaction,
+from the row's `compaction` column (see [`ModelCompaction`](#modelcompaction--what-a-row-means-for-compaction)):
 
-```
-{key} (context: {context_length|undeclared})
-{key} (context: {context_length|undeclared}) [ACTIVE]
-```
+| Case | Line |
+|---|---|
+| threshold reported | `key (context: 262k tokens, compaction threshold: 223k tokens)` |
+| off, no context length | `key (compaction disabled: no context length declared)` |
+| off, context declared | `key (context: 262k tokens, compaction disabled)` |
+| not reported, context declared | `key (context: 262k tokens)` |
+| not reported, no context length | `key (context: undeclared)` |
 
-The second form is the entry currently in force: the marker is a space followed by a literal
-`[ACTIVE]`, appended to the same line and nothing else. `undeclared` stands in for an entry whose
-`context_length` is `None`. Nothing turn-varying enters the text, so two calls against an unchanged
-roster are byte-identical.
+Token counts render in thousands, rounded (`262_144` → `262k tokens`); a count below a thousand
+renders raw (`512 tokens`), never `0k`. The entry currently in force ends with a space and a literal
+`[ACTIVE]`, after the parenthesis, in every case. Nothing turn-varying enters the text, so two calls
+against an unchanged roster are byte-identical.
 
 **An empty roster is not an error.** It renders a fixed sentinel —
 `"This agent has no model roster, so there is nothing to switch within."` — rather than an empty
@@ -92,12 +103,30 @@ string or a raise, so a model that called the listing gets an answer it can act 
 ### `TOOL_CALL` and `COMMAND` — `switch_model(model)`
 
 ```python
-def switch_model(model: str) -> str: ...
+def switch_model(model: str) -> str: ...                    # the tool
+def switch_model(model: Literal[<roster keys>]) -> str: ...  # the command, delegating to the tool
 ```
 
-One argument, the roster key exactly as `list_models` prints it. The call asks the observer to make
+One argument, the roster key exactly as the listing prints it. The call asks the observer to make
 that entry the model in force, and — **only if that succeeds** — records the key in
 `ToolState.active_model`, where a restart finds it.
+
+**The command form is typed by the roster; the tool form stays `model: str`.** A command whose shape
+differs from its tool gets its own closure (the Story 21.5 rule), and this one delegates to the tool
+closure, so the refusal handling and the single live-slot write exist once.
+
+- **Its `choices` are the roster keys, in roster order**, read **once**, when the agent builds its
+  command registry. The announced `CommandDescriptor` carries them, so a frontend can offer them.
+  There is no refresh path: a roster edit rebuilds the agent, and with it the registry and the
+  announcement.
+- **An unknown key is refused by the registry, at coercion**, before the observer is reached. The
+  result string names every valid key.
+- **It falls back to `model: str`, with no choices**, in three cases: an empty roster and a missing
+  observer, silently; and a roster that cannot be read when the registry is built, with one warning
+  naming the card and the reason. In the fallback an unknown key reaches the observer and is
+  refused there, as on the tool. The unreadable case is real: an agent that builds its command
+  registry before its model runtime exists hits it on every start, and the card works under either
+  order because tool and agent release independently.
 
 #### The parameter is `model` on this side and `key` on the observer's
 
@@ -108,20 +137,21 @@ contracts, two names. The command registry derives its schema from the **callabl
 ```
 /switch_model openai:gpt-5.2              # binds — positional
 /switch_model model=openai:gpt-5.2        # binds — keyword, the advertised name
-/switch_model key=openai:gpt-5.2          # binds the WHOLE token positionally, then fails downstream
+/switch_model key=openai:gpt-5.2          # binds the WHOLE token positionally, then is refused
 ```
 
 The positional form works because the colon survives `shlex` and the split-on-first-`=` keyword
 rule, so `openai:gpt-5.2` arrives as one token.
 
-**The third form is not caught by the registry, which is the part worth knowing.** A token counts as
-a keyword only when the text before its first `=` is a known parameter name — deliberately, so a
+**The third form is not an unknown-keyword error, which is the part worth knowing.** A token counts
+as a keyword only when the text before its first `=` is a known parameter name — deliberately, so a
 value containing `=` is never silently swallowed. `key` is the observer's name, not the card's, so
 it is not a parameter here: the whole token `key=openai:gpt-5.2` is classified **positional** and
-binds to `model`, reaching the observer verbatim and being rejected downstream as an unknown roster
-key. Don't write it — but if you are writing a frontend or a script, expect the refusal to come back
-from the roster rather than as an unknown-keyword error, and read the parameter name off the
-announced `CommandDescriptor` rather than off the observer protocol.
+binds to `model`, where the roster `Literal` refuses it at coercion as an unknown key, naming the
+valid ones; the observer is never called. (In the `str` fallback it reaches the observer verbatim
+and is refused there instead.) Don't write it — but if you are writing a frontend or a script,
+expect the refusal to come back as an unknown key rather than as an unknown-keyword error, and read
+the parameter name off the announced `CommandDescriptor` rather than off the observer protocol.
 
 ### `LLM_CONTEXT` — the `active_model_state` provider
 
@@ -153,6 +183,7 @@ class ModelRow(SerializableBaseModel):
     model: str
     active: bool
     context_length: int | None
+    compaction: ModelCompaction | None = None
 ```
 
 | Field | Type | Meaning |
@@ -162,6 +193,7 @@ class ModelRow(SerializableBaseModel):
 | `model` | `str` | The provider-side model name. |
 | `active` | `bool` | Whether this entry is the one currently in force. |
 | `context_length` | `int \| None` | The entry's declared context window, or `None` when it declares none. |
+| `compaction` | `ModelCompaction \| None` | What the entry means for auto-compaction, or `None` when the agent did not report it. |
 
 **A row is rebuilt from the roster on every call and never stored.** The only thing this feature
 persists is `ToolState.active_model`, a single key.
@@ -173,8 +205,29 @@ field is a construction bug and should fail loudly rather than silently read as 
 persisted before the field existed must still restore. The asymmetry is the rule, not an
 inconsistency: **defaults protect stored payloads, and a projection has none.**
 
+`compaction` is the one column that **does** default, and for a different reason: the row is built
+by `akgentic-agent`, which releases independently of this package, so an agent built before the
+column existed must still produce a valid row. `None` there reads as "not reported" and renders as
+the context alone.
+
 `ModelRow` is deliberately **not** a `ContextState`. A row is not diffable state; the `LLM_CONTEXT`
 state describing the model in force belongs to the card and is `ActiveModelState`.
+
+### `ModelCompaction` — what a row means for compaction
+
+```python
+class ModelCompaction(SerializableBaseModel):
+    threshold: int | None
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `threshold` | `int \| None` | The token count at which auto-compaction fires for this model, or `None` when auto-compaction is off for it. |
+
+**No default**, so the agent states "off" explicitly rather than leaving it implied. **The card never
+computes the threshold**: the rule lives in `akgentic-llm`, which this package may not import, so the
+agent fills the column and the card only renders it — see the line table under
+[`list_models()`](#tool_call--list_models-and-command--models).
 
 ### `ActiveModelState` — the key, and nothing else
 
@@ -315,26 +368,27 @@ behaviour belongs to `akgentic-llm`, which owns the run loop; this card makes no
 ## Import paths
 
 ```python
-# All seven symbols live here.
+# All eight symbols live here.
 from akgentic.tool.model import (
     ActiveModel,
     ActiveModelState,
     ListModels,
+    ModelCompaction,
     ModelRow,
     ModelSwitchToolObserver,
     ModelTool,
     SwitchModel,
 )
 
-# Three of the seven are re-exported from the package root as well.
-from akgentic.tool import ModelRow, ModelSwitchToolObserver, ModelTool
+# Four of the eight are re-exported from the package root as well.
+from akgentic.tool import ModelCompaction, ModelRow, ModelSwitchToolObserver, ModelTool
 ```
 
-`akgentic.tool.model` carries the whole surface. The package root re-exports **three** of it:
-`ModelTool` — the import a deployment writes — plus `ModelRow` and `ModelSwitchToolObserver`, the
-two contract symbols `akgentic-agent` needs to implement the protocol and project the roster. That
-is the same placement `TeamManagementToolObserver` has, and it is asserted rather than incidental:
-both are named in both `__all__` lists.
+`akgentic.tool.model` carries the whole surface. The package root re-exports **four** of it:
+`ModelTool` — the import a deployment writes — plus `ModelRow`, `ModelCompaction` and
+`ModelSwitchToolObserver`, the contract symbols `akgentic-agent` needs to implement the protocol and
+project the roster. That is the same placement `TeamManagementToolObserver` has, and it is asserted
+rather than incidental: each is named in both `__all__` lists.
 
 The three capability params and `ActiveModelState` are **not** at the root — a
 `from akgentic.tool import ListModels` or `ActiveModelState` will not resolve. Reach for those

@@ -68,6 +68,7 @@ _EXPECTED_ROOT_ALL: list[str] = [
     "ToolStateEvent",
     "KnowledgeGraphStateEvent",
     "ModelRow",  # epic 36: the roster projection that contract speaks in
+    "ModelCompaction",  # epic 21: the compaction column the agent fills on each row
     "CommandArg",
     "CommandDescriptor",
     "CommandsAnnouncedEvent",

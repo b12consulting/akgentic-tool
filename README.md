@@ -1480,10 +1480,12 @@ observer protocol, and the enforcement that stays `akgentic-agent`'s.
 
 ### ModelTool
 
-Runtime model switching, on three channels. `list_models` and `switch_model` are each served on
+Runtime model switching, on three channels. The listing and the switch are each served on
 **both** `TOOL_CALL` and `COMMAND` — the model can escalate itself mid-run and a human can move it
 back with the same act — while `active_model` publishes the model in force as `LLM_CONTEXT` state,
-never as a re-rendered system prefix. The card creates no actor and performs no proxy round trip.
+never as a re-rendered system prefix. The listing is the tool `list_models` and the command
+`/models`; each line says when auto-compaction fires for that model, or that it is off. The card
+creates no actor and performs no proxy round trip.
 
 ```python
 from akgentic.tool import ModelTool
@@ -1495,13 +1497,15 @@ ModelTool(switch_model=False)                          # read-only: the roster, 
 ModelTool(switch_model=SwitchModel(expose={COMMAND}))  # humans may switch, the model may not
 ```
 
-**The command grammar, exactly.** `/list_models` takes no argument. `/switch_model` takes the roster
-key, and the advertised parameter name is `model`:
+**The command grammar, exactly.** `/models` takes no argument. `/switch_model` takes the roster
+key, and the advertised parameter name is `model`. The command types it by the roster: the
+announced descriptor carries the keys as `choices`, read once when the agent builds its registry,
+and falls back to a plain string (with a warning) when the roster cannot be read then:
 
 ```
 /switch_model openai:gpt-5.2              # binds — positional
 /switch_model model=openai:gpt-5.2        # binds — keyword
-/switch_model key=openai:gpt-5.2          # binds the WHOLE token positionally — then fails downstream
+/switch_model key=openai:gpt-5.2          # binds the WHOLE token positionally — then is refused
 ```
 
 `key` is the *observer's* parameter name (`ModelSwitchToolObserver.switch_model(key)`); the card's
@@ -1511,9 +1515,9 @@ callable. Two contracts, two names, deliberately.
 **The third line is not rejected as an unknown keyword.** A token counts as a keyword only when the
 text before its first `=` is a known parameter name — deliberately, so a value containing `=` is
 never silently swallowed. `key` is not a parameter of the callable, so the whole token
-`key=openai:gpt-5.2` is classified positional and binds to `model`, reaching the observer verbatim
-and being refused there as an unknown roster key. Don't write it — but expect the failure to arrive
-from the roster, not from the command registry.
+`key=openai:gpt-5.2` is classified positional and binds to `model`, where the registry refuses it
+at coercion as an unknown roster key, naming the valid ones. Don't write it — but expect the failure
+to arrive as an unknown key, not as an unknown keyword.
 
 **The card is opt-in and never auto-injected.** `BaseAgent` auto-adds `TeamTool` and `MailboxTool`;
 it does not add this one. Granting every agent the standing power to change its own model is a cost

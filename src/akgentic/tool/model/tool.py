@@ -2,9 +2,15 @@
 
 One card, three capabilities. ``list_models`` and ``switch_model`` are served on
 both ``TOOL_CALL`` and ``COMMAND`` — the model can escalate itself mid-run, and a
-human can type ``/switch_model openai:gpt-5.2`` at the same agent — while
-``active_model`` publishes the model in force as an ``LLM_CONTEXT`` delta block
-rather than re-rendering it into the frozen system prefix.
+human can type ``/models`` then ``/switch_model openai:gpt-5.2`` at the same
+agent — while ``active_model`` publishes the model in force as an
+``LLM_CONTEXT`` delta block rather than re-rendering it into the frozen system
+prefix.
+
+Each command has its own closure, delegating to the tool's: ``/models`` differs
+from the ``list_models`` tool in name, and ``/switch_model`` from its tool in
+type — its ``model`` is a ``Literal`` over the roster, so a frontend can offer the
+keys and the registry refuses a typo.
 
 The card creates no actor and makes no proxy call: it does not override
 ``observer()``. Everything it needs is two methods on the observer, plus the
@@ -26,7 +32,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from inspect import cleandoc
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from akgentic.tool.core import (
     COMMAND,
@@ -66,11 +72,33 @@ class ActiveModel(BaseToolParam):
     expose: set[Channels] = {LLM_CONTEXT}
 
 
+def _tokens(count: int) -> str:
+    """A token count in thousands, rounded — raw below a thousand, never ``0k``."""
+    if count < 1000:
+        return f"{count} tokens"
+    return f"{round(count / 1000)}k tokens"
+
+
+def _describe_window(row: ModelRow) -> str:
+    """The parenthesised part of a roster line: the window, then its compaction."""
+    compaction = row.compaction
+    if row.context_length is None:
+        if compaction is not None and compaction.threshold is None:
+            return "compaction disabled: no context length declared"
+        context = "context: undeclared"
+    else:
+        context = f"context: {_tokens(row.context_length)}"
+    if compaction is None:
+        return context
+    if compaction.threshold is None:
+        return f"{context}, compaction disabled"
+    return f"{context}, compaction threshold: {_tokens(compaction.threshold)}"
+
+
 def _render_model_row(row: ModelRow) -> str:
-    """One roster entry on one line, key first, the entry in force marked."""
-    context = str(row.context_length) if row.context_length is not None else "undeclared"
+    """One roster entry on one line, key first, the entry in force marked last."""
     marker = " [ACTIVE]" if row.active else ""
-    return f"{row.key} (context: {context}){marker}"
+    return f"{row.key} ({_describe_window(row)}){marker}"
 
 
 def _render_model_rows(rows: list[ModelRow]) -> str:
@@ -91,9 +119,12 @@ class ModelTool(ToolCard):
 
     Three channels, three capabilities:
 
-    - ``list_models`` — ``TOOL_CALL`` and ``COMMAND``. Renders the roster.
+    - ``list_models`` — ``TOOL_CALL`` (the ``list_models`` tool) and ``COMMAND``
+      (``/models``). Renders the roster, with what each entry means for
+      compaction.
     - ``switch_model`` — ``TOOL_CALL`` and ``COMMAND``. Makes one entry current
       and records its key in ``ToolState.active_model``, where a restart finds it.
+      The command's ``model`` is typed by the roster; the tool's is ``str``.
     - ``active_model`` — ``LLM_CONTEXT``. Publishes the model in force as an
       :class:`ActiveModelState` delta block.
 
@@ -141,19 +172,19 @@ class ModelTool(ToolCard):
         return tools
 
     def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
-        """Return the capabilities that serve ``COMMAND``.
+        """Return the capabilities that serve ``COMMAND``: ``/models``, ``/switch_model``.
 
-        ``list_models`` is inserted first: the registry preserves this dict's
+        ``/models`` is inserted first: the registry preserves this dict's
         insertion order, and that order is what ``descriptors()`` announces to
         every frontend's command palette.
         """
         commands: dict[type[BaseToolParam], Callable[..., Any]] = {}
 
         if lm := _resolve(self.list_models, ListModels, COMMAND):
-            commands[ListModels] = self._list_models_factory(lm)
+            commands[ListModels] = self._models_command_factory(lm)
 
         if sm := _resolve(self.switch_model, SwitchModel, COMMAND):
-            commands[SwitchModel] = self._switch_model_factory(sm)
+            commands[SwitchModel] = self._switch_model_command_factory(sm)
 
         return commands
 
@@ -192,13 +223,42 @@ class ModelTool(ToolCard):
         list_models.__doc__ = params.format_docstring(cleandoc(list_models.__doc__ or ""))
         return list_models
 
+    def _models_command_factory(self, params: ListModels) -> Callable[..., Any]:
+        """Create the ``/models`` command.
+
+        Its own closure because the command and the tool differ in name: a human
+        types ``/models``, while the tool stays ``list_models`` — the name
+        ``switch_model``'s tool docstring tells the model to call. It delegates
+        to the tool closure, so both surfaces render the same lines.
+
+        Args:
+            params: Configuration for the listing capability.
+
+        Returns:
+            A zero-argument callable named ``models``.
+        """
+        list_models: Callable[[], str] = self._list_models_factory(params)
+
+        def models() -> str:
+            """List the models this agent can switch to, and when each one compacts.
+
+            Example: /models
+            """
+            return list_models()
+
+        models.__doc__ = params.format_docstring(cleandoc(models.__doc__ or ""))
+        return models
+
     def _switch_model_factory(self, params: SwitchModel) -> Callable[..., Any]:
-        """Create the ``switch_model`` callable.
+        """Create the ``switch_model`` LLM tool.
 
         The parameter is named ``model`` because ADR-018 §5 declares the card
         surface as ``switch_model(model: str) -> str``; the observer's own
-        parameter is ``key``, from §6. Two contracts, two names, deliberately —
-        the command descriptor advertises ``model``.
+        parameter is ``key``, from §6. Two contracts, two names, deliberately.
+
+        The ``/switch_model`` command is a different closure, built by
+        :meth:`_switch_model_command_factory`, which delegates here — so the
+        refusal handling and the single live-slot write exist once.
 
         Args:
             params: Configuration for the switch capability.
@@ -241,6 +301,73 @@ class ModelTool(ToolCard):
 
         switch_model.__doc__ = params.format_docstring(cleandoc(switch_model.__doc__ or ""))
         return switch_model
+
+    def _switch_model_command_factory(self, params: SwitchModel) -> Callable[..., Any]:
+        """Create the ``/switch_model`` command, its ``model`` typed by the roster.
+
+        The roster keys are read **once, here**, when the registry is built, and
+        become a ``Literal`` in roster order: the descriptor announces them as
+        ``choices``, and the registry refuses any other key at coercion, naming
+        the valid ones, before the observer is reached. There is no refresh path —
+        a roster edit rebuilds the agent, and with it the registry and its
+        announcement.
+
+        Three fallbacks give ``model: str`` with no choices, where the observer
+        refuses an unknown key as before: an empty roster and a missing observer,
+        silently, and a roster read that raises, with one warning (see
+        :meth:`_roster_keys`).
+
+        The command delegates to the tool closure, so the refusal handling and
+        the single live-slot write exist once.
+
+        Args:
+            params: Configuration for the switch capability.
+
+        Returns:
+            A one-argument callable named ``switch_model``.
+        """
+        switch: Callable[[str], str] = self._switch_model_factory(params)
+        keys = self._roster_keys()
+
+        def switch_model(model: str) -> str:
+            """Switch this agent to another model for the rest of the conversation.
+
+            Example: /switch_model openai:gpt-5.2
+
+            Args:
+                model: The key of the model to switch to, as /models lists it.
+            """
+            return switch(model)
+
+        switch_model.__doc__ = params.format_docstring(cleandoc(switch_model.__doc__ or ""))
+        if keys:  # never ``Literal[()]``
+            # Annotations are strings in this module, and the registry resolves
+            # them against the module globals, where no factory-local ``Literal``
+            # can be named — it would fall back to ``str`` silently. A type object
+            # is passed through as is.
+            switch_model.__annotations__["model"] = Literal.__getitem__(keys)
+        return switch_model
+
+    def _roster_keys(self) -> tuple[str, ...]:
+        """The roster keys in roster order, or ``()`` when they cannot be offered.
+
+        ``()`` without a word when there is no observer or the roster is empty —
+        both legitimate states. ``()`` with one warning when the read raises: the
+        agent may build its command registry before its model runtime exists, and
+        the card must work under either order.
+        """
+        observer = self._model_observer_or_none()
+        if observer is None:
+            return ()
+        try:
+            return tuple(row.key for row in observer.list_model_rows())
+        except Exception as exc:
+            logger.warning(
+                "%s: the model roster could not be read, so /switch_model offers no choices: %s",
+                type(self).__name__,
+                exc,
+            )
+            return ()
 
     def _active_model_state_factory(
         self, params: ActiveModel

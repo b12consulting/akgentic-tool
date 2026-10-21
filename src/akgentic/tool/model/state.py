@@ -6,16 +6,33 @@ package must never name. ``akgentic-agent`` maps one onto the other — it may
 import both packages, so the mapping has a legal home and neither package gains
 an import edge.
 
-Two models, one subject and two roles: ``ModelRow`` is a projection the observer
-rebuilds per call and nobody stores, while ``ActiveModelState`` is the diffable
-``LLM_CONTEXT`` state ``ModelTool`` publishes and the context updater persists as
-a baseline.
+Three models, one subject and two roles: ``ModelRow`` is a projection the observer
+rebuilds per call and nobody stores — ``ModelCompaction`` is one of its columns —
+while ``ActiveModelState`` is the diffable ``LLM_CONTEXT`` state ``ModelTool``
+publishes and the context updater persists as a baseline.
 """
 
 from typing import Self
 
 from akgentic.core.utils import SerializableBaseModel
 from akgentic.tool.core import ContextState
+
+
+class ModelCompaction(SerializableBaseModel):
+    """What one roster entry means for this conversation's auto-compaction.
+
+    The agent states it; this package only renders it. The threshold is derived
+    from configuration ``akgentic-llm`` owns, a package this one may not import,
+    so the tool never computes it.
+
+    No default: the agent must say "off" explicitly rather than leave it implied.
+
+    Attributes:
+        threshold: The token count at which auto-compaction fires for this model,
+            or ``None`` when auto-compaction is off for it.
+    """
+
+    threshold: int | None
 
 
 class ModelRow(SerializableBaseModel):
@@ -36,6 +53,8 @@ class ModelRow(SerializableBaseModel):
         active: Whether this entry is the one currently in force.
         context_length: The entry's declared context window, or ``None`` when it
             declares none.
+        compaction: What the entry means for auto-compaction, or ``None`` when
+            the agent did not report it.
     """
 
     key: str
@@ -43,6 +62,7 @@ class ModelRow(SerializableBaseModel):
     model: str
     active: bool
     context_length: int | None
+    compaction: ModelCompaction | None = None
 
 
 class ActiveModelState(ContextState):

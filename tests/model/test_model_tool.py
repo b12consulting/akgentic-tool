@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import gc
 import inspect
+import logging
 import uuid
+from inspect import cleandoc
 from types import SimpleNamespace
 from typing import Any
 
@@ -20,10 +22,17 @@ from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import AkgentType
 
 from akgentic.tool.core import COMMAND, LLM_CONTEXT, TOOL_CALL, ToolCard, ToolFactory, ToolState
-from akgentic.tool.errors import RetriableError, ToolObserverGone
+from akgentic.tool.errors import CommandNotRecognized, RetriableError, ToolObserverGone
 from akgentic.tool.model import ModelSwitchToolObserver
-from akgentic.tool.model.state import ActiveModelState, ModelRow
-from akgentic.tool.model.tool import ActiveModel, ListModels, ModelTool, SwitchModel
+from akgentic.tool.model.state import ActiveModelState, ModelCompaction, ModelRow
+from akgentic.tool.model.tool import (
+    ActiveModel,
+    ListModels,
+    ModelTool,
+    SwitchModel,
+    _render_model_row,
+    _render_model_rows,
+)
 
 # ---------------------------------------------------------------------------
 # The fake observer — recording and controllable
@@ -112,6 +121,10 @@ def _roster() -> list[ModelRow]:
         _row("anthropic:claude-opus-5"),
         _row("mistral:medium-3", context_length=None),
     ]
+
+
+# ``_roster()``'s keys, in its order — what the command announces as ``choices``.
+_ROSTER_KEYS = ["openai:gpt-5.2", "anthropic:claude-opus-5", "mistral:medium-3"]
 
 
 def _wired_card(rows: list[ModelRow] | None = None, **fields: object) -> tuple[
@@ -341,10 +354,11 @@ def test_the_factory_yields_exactly_one_provider_named_active_model_state() -> N
 
 
 def test_the_registry_names_exactly_the_two_commands_in_order() -> None:
+    """The listing is ``/models`` and stays first — the palette order."""
     observer = _FakeObserver(_roster())
     registry = ToolFactory([ModelTool()], observer=observer).get_command_registry()
 
-    assert [d.name for d in registry.descriptors()] == ["list_models", "switch_model"]
+    assert [d.name for d in registry.descriptors()] == ["models", "switch_model"]
 
 
 def test_the_switch_model_descriptor_carries_one_required_string_argument() -> None:
@@ -358,11 +372,11 @@ def test_the_switch_model_descriptor_carries_one_required_string_argument() -> N
     ]
 
 
-def test_list_models_dispatches_to_the_rendered_listing() -> None:
+def test_models_dispatches_to_the_rendered_listing() -> None:
     observer = _FakeObserver(_roster())
     registry = ToolFactory([ModelTool()], observer=observer).get_command_registry()
 
-    dispatched = registry.dispatch("/list_models")
+    dispatched = registry.dispatch("/models")
 
     assert dispatched == observer_free_render(observer)
 
@@ -394,23 +408,27 @@ def test_switch_model_binds_by_the_declared_parameter_name() -> None:
     assert observer.switch_calls == ["openai:gpt-5.2"]
 
 
-def test_an_unrecognised_keyword_token_binds_positionally_and_reaches_the_observer() -> None:
+def test_an_unrecognised_keyword_token_binds_positionally_and_is_refused() -> None:
     """``key=…`` is NOT rejected as a keyword — the whole token binds to ``model``.
 
     ``_classify_tokens`` counts a token as a keyword only when the text before its
     first ``=`` is a known parameter name, so a value containing ``=`` is never
     silently swallowed. ``key`` is the *observer's* name, not the callable's, so
-    the entire token is classified positional and arrives at the observer verbatim,
-    to be refused downstream as an unknown roster key. The registry's own
-    ``unknown keyword argument`` branch is unreachable from ``dispatch`` for it.
+    the entire token is classified positional and binds to ``model`` — where the
+    roster ``Literal`` refuses it at coercion, before the observer is reached. The
+    registry's own ``unknown keyword argument`` branch is unreachable from
+    ``dispatch`` for it.
     """
     observer = _FakeObserver(_roster())
     registry = ToolFactory([ModelTool()], observer=observer).get_command_registry()
 
     dispatched = registry.dispatch("/switch_model key=openai:gpt-5.2")
 
-    assert observer.switch_calls == ["key=openai:gpt-5.2"]
+    assert dispatched is not None
+    assert observer.switch_calls == []
     assert "unknown keyword" not in dispatched
+    for key in _ROSTER_KEYS:
+        assert key in dispatched
 
 
 def test_the_switch_model_callable_declares_model_as_its_only_parameter() -> None:
@@ -421,6 +439,195 @@ def test_the_switch_model_callable_declares_model_as_its_only_parameter() -> Non
 
     assert list(signature.parameters) == ["model"]
     assert signature.parameters["model"].annotation is str
+
+
+# ---------------------------------------------------------------------------
+# Story 21.8 FR15 — the /switch_model command is typed by the roster
+# ---------------------------------------------------------------------------
+
+# The two LLM tool docstrings, byte for byte: the command closures are new, the
+# tools are not, and the model reads these.
+_LIST_MODELS_TOOL_DOC = cleandoc(
+    """List the models you can switch to, one per line.
+
+    Each line starts with the model's roster KEY — that key, exactly as
+    written, is what ``switch_model`` takes. The model you are running on
+    now is marked. The listing is the roster's own order, not a ranking.
+    """
+)
+
+_SWITCH_MODEL_TOOL_DOC = cleandoc(
+    """Switch to a different model for the rest of this conversation.
+
+    Args:
+        model: The roster KEY of the model to switch to, exactly as
+            ``list_models`` prints it (for example
+            ``openai:gpt-5.2``). Call ``list_models`` first if you are
+            not sure what is available.
+
+    Returns:
+        A short confirmation of the outcome.
+    """
+)
+
+
+def _switch_arg(registry: Any) -> Any:
+    """The one ``CommandArg`` the ``switch_model`` descriptor carries."""
+    descriptor = next(d for d in registry.descriptors() if d.name == "switch_model")
+    assert len(descriptor.args) == 1
+    return descriptor.args[0]
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [record for record in caplog.records if record.levelno >= logging.WARNING]
+
+
+def test_the_command_and_the_tool_are_different_closures() -> None:
+    card, observer = _wired_card(_roster())
+
+    command = card.get_commands()[SwitchModel]
+    tool = _switch_callable(card)
+
+    assert command is not tool
+    assert command.__name__ == tool.__name__ == "switch_model"
+    assert tool.__doc__ == _SWITCH_MODEL_TOOL_DOC
+
+
+def test_the_switch_model_descriptor_carries_the_roster_keys_as_choices_in_order() -> None:
+    """``_roster()`` is deliberately not alphabetical: the choices are not sorted."""
+    observer = _FakeObserver(_roster())
+    registry = ToolFactory([ModelTool()], observer=observer).get_command_registry()
+
+    arg = _switch_arg(registry)
+
+    assert arg.name == "model"
+    assert arg.type == "string"
+    assert arg.required is True
+    assert arg.keyword_only is False
+    assert arg.rest_of_line is False
+    assert arg.choices == _ROSTER_KEYS
+    assert arg.description is not None
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["/switch_model anthropic:claude-opus-5", "/switch_model model=anthropic:claude-opus-5"],
+)
+def test_a_roster_key_dispatches_through_the_tool_closure(text: str) -> None:
+    """The live-slot write is the tool closure's, so reaching it proves the delegation."""
+    observer = _FakeObserver(_roster())
+    registry = ToolFactory([ModelTool()], observer=observer).get_command_registry()
+
+    result = registry.dispatch(text)
+
+    assert result == "Now using anthropic:claude-opus-5."
+    assert observer.switch_calls == ["anthropic:claude-opus-5"]
+    assert observer.state.tool_state.active_model == "anthropic:claude-opus-5"
+
+
+def test_an_unknown_key_is_refused_at_coercion_naming_every_valid_key() -> None:
+    observer = _FakeObserver(_roster())
+    registry = ToolFactory([ModelTool()], observer=observer).get_command_registry()
+
+    result = registry.dispatch("/switch_model openai:nope")
+
+    assert result is not None
+    assert result.startswith("Command 'switch_model' failed:")
+    for key in _ROSTER_KEYS:
+        assert key in result
+    assert observer.switch_calls == []
+    assert observer.state.tool_state.active_model is None
+
+
+def test_an_empty_roster_falls_back_to_a_plain_string_silently(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    observer = _FakeObserver([])
+
+    with caplog.at_level(logging.WARNING):
+        registry = ToolFactory([ModelTool()], observer=observer).get_command_registry()
+
+    arg = _switch_arg(registry)
+    assert arg.choices is None
+    assert arg.type == "string"
+    assert _warnings(caplog) == []
+
+    registry.dispatch("/switch_model anything")
+
+    assert observer.switch_calls == ["anything"]
+
+
+def test_no_observer_falls_back_to_a_plain_string_silently(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING):
+        assert set(ModelTool().get_commands()) == {ListModels, SwitchModel}
+        registry = ToolFactory([ModelTool()]).get_command_registry()
+
+    assert _switch_arg(registry).choices is None
+    assert _warnings(caplog) == []
+
+
+def test_an_unreadable_roster_falls_back_to_a_plain_string_with_one_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The production path until the agent builds its registry after its model runtime."""
+    observer = _FakeObserver(_roster())
+    observer.raise_on_list = RuntimeError("roster unavailable")
+
+    with caplog.at_level(logging.WARNING):
+        registry = ToolFactory([ModelTool()], observer=observer).get_command_registry()
+
+    assert _switch_arg(registry).choices is None
+    warnings = _warnings(caplog)
+    assert len(warnings) == 1
+    assert warnings[0].name == "akgentic.tool.model.tool"
+    assert "ModelTool" in warnings[0].getMessage()
+    assert "roster unavailable" in warnings[0].getMessage()
+
+    observer.raise_on_list = None
+    registry.dispatch("/switch_model openai:gpt-5.2")
+
+    assert observer.switch_calls == ["openai:gpt-5.2"]
+
+
+# ---------------------------------------------------------------------------
+# Story 21.8 FR16 — the /list_models command becomes /models
+# ---------------------------------------------------------------------------
+
+
+def test_the_listing_command_is_models_and_list_models_is_not_a_command() -> None:
+    observer = _FakeObserver(_roster())
+    registry = ToolFactory([ModelTool()], observer=observer).get_command_registry()
+
+    assert registry.has("models") is True
+    assert registry.has("list_models") is False
+    assert registry.dispatch("/models") == _render_model_rows(observer.list_model_rows())
+    with pytest.raises(CommandNotRecognized):
+        registry.dispatch("/list_models")
+
+
+def test_the_llm_tool_is_still_list_models_with_its_docstring_unchanged() -> None:
+    card, observer = _wired_card(_roster())
+
+    tools = card.get_tools()
+
+    assert [tool.__name__ for tool in tools] == ["list_models", "switch_model"]
+    assert _list_callable(card).__doc__ == _LIST_MODELS_TOOL_DOC
+    assert "Call ``list_models`` first" in (_switch_callable(card).__doc__ or "")
+
+
+def test_disabling_list_models_registers_no_models_command() -> None:
+    card, observer = _wired_card(_roster(), list_models=False)
+
+    assert [fn.__name__ for fn in card.get_commands().values()] == ["switch_model"]
+
+
+def test_list_models_narrowed_to_command_registers_models_and_no_list_models_tool() -> None:
+    card, observer = _wired_card(_roster(), list_models=ListModels(expose={COMMAND}))
+
+    assert [fn.__name__ for fn in card.get_commands().values()] == ["models", "switch_model"]
+    assert [tool.__name__ for tool in card.get_tools()] == ["switch_model"]
 
 
 # ---------------------------------------------------------------------------
@@ -556,16 +763,21 @@ def test_dispatching_a_refused_switch_returns_the_failure_string() -> None:
     ``CommandRegistry._invoke`` turns any exception into a plain result string, so
     a ``pytest.raises`` around ``dispatch`` could never fire — the refusal is
     asserted on the callable above, and the string here.
+
+    A **roster** key is dispatched: a key outside the roster is refused at
+    coercion and would never reach ``raise_on_switch``, so it would pass here for
+    the wrong reason.
     """
     observer = _FakeObserver(_roster())
     observer.raise_on_switch = ValueError("unknown roster key")
     registry = ToolFactory([ModelTool()], observer=observer).get_command_registry()
 
-    result = registry.dispatch("/switch_model openai:nope")
+    result = registry.dispatch("/switch_model mistral:medium-3")
 
     assert result is not None
     assert result.startswith("Command 'switch_model' failed:")
-    assert "openai:nope" in result
+    assert "mistral:medium-3" in result
+    assert "unknown roster key" in result
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +833,101 @@ def test_list_models_renders_one_line_per_row() -> None:
     card, observer = _wired_card(_roster())
 
     assert len(_list_callable(card)().splitlines()) == 3
+
+
+# ---------------------------------------------------------------------------
+# Story 21.8 FR17 — each row says what the model means for compaction
+# ---------------------------------------------------------------------------
+
+
+def _compaction_row(
+    context_length: int | None, compaction: ModelCompaction | None, active: bool
+) -> ModelRow:
+    return ModelRow(
+        key="openai:gpt-5.2",
+        provider="openai",
+        model="gpt-5.2",
+        active=active,
+        context_length=context_length,
+        compaction=compaction,
+    )
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_a_reported_threshold_renders_both_counts(active: bool) -> None:
+    row = _compaction_row(262_144, ModelCompaction(threshold=223_000), active)
+
+    assert _render_model_row(row) == (
+        "openai:gpt-5.2 (context: 262k tokens, compaction threshold: 223k tokens)"
+        + (" [ACTIVE]" if active else "")
+    )
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_compaction_off_without_a_context_length_says_why(active: bool) -> None:
+    row = _compaction_row(None, ModelCompaction(threshold=None), active)
+
+    assert _render_model_row(row) == (
+        "openai:gpt-5.2 (compaction disabled: no context length declared)"
+        + (" [ACTIVE]" if active else "")
+    )
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_compaction_off_with_a_context_length_says_disabled(active: bool) -> None:
+    row = _compaction_row(262_144, ModelCompaction(threshold=None), active)
+
+    assert _render_model_row(row) == (
+        "openai:gpt-5.2 (context: 262k tokens, compaction disabled)"
+        + (" [ACTIVE]" if active else "")
+    )
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_compaction_not_reported_renders_the_context_alone(active: bool) -> None:
+    row = _compaction_row(400_000, None, active)
+
+    assert _render_model_row(row) == (
+        "openai:gpt-5.2 (context: 400k tokens)" + (" [ACTIVE]" if active else "")
+    )
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_compaction_not_reported_and_no_context_length_says_undeclared(active: bool) -> None:
+    row = _compaction_row(None, None, active)
+
+    assert _render_model_row(row) == (
+        "openai:gpt-5.2 (context: undeclared)" + (" [ACTIVE]" if active else "")
+    )
+
+
+def test_a_count_below_a_thousand_renders_raw_never_as_zero_k() -> None:
+    row = _compaction_row(512, ModelCompaction(threshold=None), False)
+
+    assert _render_model_row(row) == "openai:gpt-5.2 (context: 512 tokens, compaction disabled)"
+
+
+def test_a_threshold_without_a_context_length_still_renders() -> None:
+    """No line is decided for this case; the renderer must only not crash."""
+    row = _compaction_row(None, ModelCompaction(threshold=223_000), False)
+
+    line = _render_model_row(row)
+
+    assert line.startswith("openai:gpt-5.2 (")
+    assert "223k tokens" in line
+
+
+def test_both_surfaces_show_the_compaction_column() -> None:
+    """``/models`` delegates to the ``list_models`` tool, so one renderer serves both."""
+    rows = [_compaction_row(262_144, ModelCompaction(threshold=223_000), True)]
+    observer = _FakeObserver(rows)
+    card = ModelTool()
+    card.observer(observer)
+    registry = ToolFactory([ModelTool()], observer=observer).get_command_registry()
+
+    expected = "openai:gpt-5.2 (context: 262k tokens, compaction threshold: 223k tokens) [ACTIVE]"
+    assert _list_callable(card)() == expected
+    assert registry.dispatch("/models") == expected
 
 
 # ---------------------------------------------------------------------------
