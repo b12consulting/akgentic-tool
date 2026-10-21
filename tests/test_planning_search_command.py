@@ -19,11 +19,17 @@ from akgentic.tool.vector_store.protocol import SEMANTIC_DISABLED
 from tests.conftest import MockActorAddress
 
 
+# A card holds its observer weakly, so the module keeps every observer it wires alive:
+# otherwise a garbage collection between wiring and use raises ToolObserverGone.
+_OBSERVERS: list[MagicMock] = []
+
+
 def _wire(proxy: Any) -> PlanningTool:
     """A ``PlanningTool`` whose planning proxy is *proxy*."""
     tool = PlanningTool()
     observer = MagicMock()
     observer.myAddress = MockActorAddress()
+    _OBSERVERS.append(observer)
     tool._observer = observer
     tool._planning_proxy = proxy
     return tool
