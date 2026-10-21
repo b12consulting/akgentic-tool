@@ -1509,8 +1509,8 @@ and falls back to a plain string (with a warning) when the roster cannot be read
 ```
 
 `key` is the *observer's* parameter name (`ModelSwitchToolObserver.switch_model(key)`); the card's
-callable is `switch_model(model: str) -> str`, and the command registry derives its schema from the
-callable. Two contracts, two names, deliberately.
+callables take `model` — `str` on the tool, the roster `Literal` on the command — and the command
+registry derives its schema from the command's callable. Two contracts, two names, deliberately.
 
 **The third line is not rejected as an unknown keyword.** A token counts as a keyword only when the
 text before its first `=` is a known parameter name — deliberately, so a value containing `=` is

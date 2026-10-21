@@ -907,6 +907,15 @@ def test_a_count_below_a_thousand_renders_raw_never_as_zero_k() -> None:
     assert _render_model_row(row) == "openai:gpt-5.2 (context: 512 tokens, compaction disabled)"
 
 
+@pytest.mark.parametrize(("threshold", "rendered"), [(999, "999 tokens"), (1_000, "1k tokens")])
+def test_the_threshold_switches_to_thousands_at_one_thousand(threshold: int, rendered: str) -> None:
+    row = _compaction_row(262_144, ModelCompaction(threshold=threshold), False)
+
+    assert _render_model_row(row) == (
+        f"openai:gpt-5.2 (context: 262k tokens, compaction threshold: {rendered})"
+    )
+
+
 def test_a_threshold_without_a_context_length_still_renders() -> None:
     """No line is decided for this case; the renderer must only not crash."""
     row = _compaction_row(None, ModelCompaction(threshold=223_000), False)
