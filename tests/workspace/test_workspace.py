@@ -302,6 +302,22 @@ class TestFilesystemWriteAtomicity:
         assert stat.S_IMODE(target.stat().st_mode) == 0o640
         assert target.read_bytes() == b"second"
 
+    def test_overwrite_succeeds_where_chmod_is_refused(self, tmp_path: Path) -> None:
+        """An SMB share mounted with ``uid=``/``file_mode=`` refuses chmod to a non-owner."""
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        fs.write("smb.txt", b"first")
+        fs.write_many([WriteEntry(path="many.txt", data=b"first")])
+        refused = PermissionError(1, "Operation not permitted")
+
+        with patch("akgentic.tool.workspace.workspace.shutil.copymode", side_effect=refused):
+            fs.write("smb.txt", b"second")
+            fs.write_many([WriteEntry(path="many.txt", data=b"second")])
+
+        root = tmp_path / "team-1"
+        assert (root / "smb.txt").read_bytes() == b"second"
+        assert (root / "many.txt").read_bytes() == b"second"
+        assert sorted(child.name for child in root.iterdir()) == ["many.txt", "smb.txt"]
+
     def test_new_file_mode_matches_a_plain_write(self, tmp_path: Path) -> None:
         """Parity with today's behaviour: whatever the umask would have produced."""
         fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")

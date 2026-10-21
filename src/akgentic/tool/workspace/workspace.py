@@ -424,7 +424,10 @@ class Filesystem:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(data)
             if resolved.exists():
-                shutil.copymode(resolved, staged)
+                # A mount that fixes the mode refuses chmod to a non-owner (SMB
+                # with uid=/file_mode=), and its files all have that mode anyway.
+                with contextlib.suppress(PermissionError):
+                    shutil.copymode(resolved, staged)
         except BaseException:
             with contextlib.suppress(OSError):
                 staged.unlink(missing_ok=True)
