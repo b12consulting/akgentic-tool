@@ -162,22 +162,19 @@ class SkillTool(ToolCard):
 
     def get_system_prompts(self) -> list[Callable[..., Any]]:
         """Return the menu callable when the prompt channel is exposed."""
-        params = _resolve(self.param, Skills)
-        if params and SYSTEM_PROMPT in params.expose:
+        if params := _resolve(self.param, Skills, SYSTEM_PROMPT):
             return [self._menu_factory(params)]
         return []
 
     def get_tools(self) -> list[Callable[..., Any]]:
         """Return ``use_skill`` when the tool channel is exposed."""
-        params = _resolve(self.param, Skills)
-        if params and TOOL_CALL in params.expose:
+        if params := _resolve(self.param, Skills, TOOL_CALL):
             return [self._use_skill_factory(params)]
         return []
 
     def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
         """Return ``skills`` when the command channel is exposed."""
-        params = _resolve(self.param, Skills)
-        if params and COMMAND in params.expose:
+        if params := _resolve(self.param, Skills, COMMAND):
             return {Skills: self._menu_factory(params)}
         return {}
 

@@ -11,22 +11,26 @@ from .channels import TOOL_CALL, Channels
 T = TypeVar("T", bound="BaseToolParam")
 
 
-def _resolve(value: "T | bool", cls: "type[T]") -> "T | None":
+def _resolve(value: "T | bool", cls: "type[T]", channel: Channels | None = None) -> "T | None":
     """Resolve a ``ParamModel | bool`` field to a ``ParamModel`` or ``None``.
 
     Args:
         value: ``True`` (enable with defaults), ``False`` (disable), or a
             ``BaseToolParam`` instance (enable with custom parameters).
         cls: The param model class to instantiate when *value* is ``True``.
+        channel: When given, the capability also counts as disabled unless the
+            resolved param's ``expose`` contains it.
 
     Returns:
-        A param model instance, or ``None`` if the capability is disabled.
+        A param model instance, or ``None`` if the capability is disabled or,
+        with *channel*, not exposed on that channel.
     """
-    if value is True:
-        return cls()
     if value is False:
         return None
-    return value  # already a ParamModel instance
+    params = cls() if value is True else value  # else already a ParamModel instance
+    if channel is not None and channel not in params.expose:
+        return None
+    return params
 
 
 def normalize_system_prompt_to_llm_context(expose: set[Channels]) -> set[Channels]:

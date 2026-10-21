@@ -320,8 +320,7 @@ class KnowledgeGraphTool(ToolCard):
             List with the graph-summary provider, or empty when disabled or
             not exposed on ``LLM_CONTEXT``.
         """
-        gp = _resolve(self.get_graph, GetGraph)
-        if gp and LLM_CONTEXT in gp.expose:
+        if gp := _resolve(self.get_graph, GetGraph, LLM_CONTEXT):
             return [self._kg_summary_state_factory(gp)]
         return []
 
@@ -357,17 +356,14 @@ class KnowledgeGraphTool(ToolCard):
         """Return callable tool functions for LLM agents."""
         tools: list[Callable[..., Any]] = []
 
-        gp = _resolve(self.get_graph, GetGraph)
-        if gp and TOOL_CALL in gp.expose:
+        if gp := _resolve(self.get_graph, GetGraph, TOOL_CALL):
             tools.append(self._get_graph_factory(gp))
 
         if not self.read_only:
-            up = _resolve(self.update_graph, UpdateGraph)
-            if up and TOOL_CALL in up.expose:
+            if up := _resolve(self.update_graph, UpdateGraph, TOOL_CALL):
                 tools.append(self._update_graph_factory(up))
 
-        sp = _resolve(self.search, SearchGraph)
-        if sp and TOOL_CALL in sp.expose:
+        if sp := _resolve(self.search, SearchGraph, TOOL_CALL):
             tools.append(self._search_factory(sp))
 
         return tools
@@ -380,12 +376,10 @@ class KnowledgeGraphTool(ToolCard):
         """Return command mappings for inter-agent orchestration."""
         commands: dict[type[BaseToolParam], Callable[..., Any]] = {}
 
-        gp = _resolve(self.get_graph, GetGraph)
-        if gp and COMMAND in gp.expose:
+        if gp := _resolve(self.get_graph, GetGraph, COMMAND):
             commands[GetGraph] = self._get_graph_factory(gp)
 
-        sp = _resolve(self.search, SearchGraph)
-        if sp and COMMAND in sp.expose:
+        if sp := _resolve(self.search, SearchGraph, COMMAND):
             commands[SearchGraph] = self._search_command_factory(sp)
 
         return commands

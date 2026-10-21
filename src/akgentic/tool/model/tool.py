@@ -132,12 +132,10 @@ class ModelTool(ToolCard):
         """Return the capabilities that serve ``TOOL_CALL``."""
         tools: list[Callable[..., Any]] = []
 
-        lm = _resolve(self.list_models, ListModels)
-        if lm and TOOL_CALL in lm.expose:
+        if lm := _resolve(self.list_models, ListModels, TOOL_CALL):
             tools.append(self._list_models_factory(lm))
 
-        sm = _resolve(self.switch_model, SwitchModel)
-        if sm and TOOL_CALL in sm.expose:
+        if sm := _resolve(self.switch_model, SwitchModel, TOOL_CALL):
             tools.append(self._switch_model_factory(sm))
 
         return tools
@@ -151,20 +149,17 @@ class ModelTool(ToolCard):
         """
         commands: dict[type[BaseToolParam], Callable[..., Any]] = {}
 
-        lm = _resolve(self.list_models, ListModels)
-        if lm and COMMAND in lm.expose:
+        if lm := _resolve(self.list_models, ListModels, COMMAND):
             commands[ListModels] = self._list_models_factory(lm)
 
-        sm = _resolve(self.switch_model, SwitchModel)
-        if sm and COMMAND in sm.expose:
+        if sm := _resolve(self.switch_model, SwitchModel, COMMAND):
             commands[SwitchModel] = self._switch_model_factory(sm)
 
         return commands
 
     def get_context_states(self) -> list[Callable[[], ContextState | None]]:
         """Return the ``active_model_state`` provider when it serves ``LLM_CONTEXT``."""
-        am = _resolve(self.active_model, ActiveModel)
-        if am and LLM_CONTEXT in am.expose:
+        if am := _resolve(self.active_model, ActiveModel, LLM_CONTEXT):
             return [self._active_model_state_factory(am)]
         return []
 

@@ -78,6 +78,27 @@ def test_resolve_instance() -> None:
     assert result.value == "custom"
 
 
+def test_resolve_channel_exposed_returns_the_instance() -> None:
+    param = _DummyParam(expose={COMMAND})
+    assert _resolve(param, _DummyParam, COMMAND) is param
+
+
+def test_resolve_channel_not_exposed_returns_none() -> None:
+    param = _DummyParam(expose={TOOL_CALL})
+    assert _resolve(param, _DummyParam, COMMAND) is None
+
+
+def test_resolve_channel_false_returns_none() -> None:
+    assert _resolve(False, _DummyParam, TOOL_CALL) is None
+
+
+def test_resolve_channel_true_follows_the_default_expose() -> None:
+    result = _resolve(True, _DummyParam, TOOL_CALL)
+    assert isinstance(result, _DummyParam)
+    assert result.value == "default"
+    assert _resolve(True, _DummyParam, COMMAND) is None
+
+
 def test_base_tool_param_defaults() -> None:
     """BaseToolParam defaults: expose={TOOL_CALL}, instructions=None."""
     p = BaseToolParam()

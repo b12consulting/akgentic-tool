@@ -261,28 +261,23 @@ class PlanningTool(ToolCard):
             List with the planning-state provider, or empty when disabled or
             not exposed on ``LLM_CONTEXT``.
         """
-        gp = _resolve(self.get_planning, GetPlanning)
-        if gp and LLM_CONTEXT in gp.expose:
+        if gp := _resolve(self.get_planning, GetPlanning, LLM_CONTEXT):
             return [self._planning_state_factory(gp)]
         return []
 
     def get_tools(self) -> list[Callable[..., Any]]:
         tools: list[Callable[..., Any]] = []
 
-        gp = _resolve(self.get_planning, GetPlanning)
-        if gp and TOOL_CALL in gp.expose:
+        if gp := _resolve(self.get_planning, GetPlanning, TOOL_CALL):
             tools.append(self._planning_prompt_factory(gp))
 
-        gpi = _resolve(self.get_planning_task, GetPlanningTask)
-        if gpi and TOOL_CALL in gpi.expose:
+        if gpi := _resolve(self.get_planning_task, GetPlanningTask, TOOL_CALL):
             tools.append(self._get_planning_task_factory(gpi))
 
-        up = _resolve(self.update_planning, UpdatePlanning)
-        if up and TOOL_CALL in up.expose:
+        if up := _resolve(self.update_planning, UpdatePlanning, TOOL_CALL):
             tools.append(self._update_planning_factory(up))
 
-        sp = _resolve(self.search_planning, SearchPlanning)
-        if sp and TOOL_CALL in sp.expose:
+        if sp := _resolve(self.search_planning, SearchPlanning, TOOL_CALL):
             tools.append(self._search_planning_factory(sp))
 
         return tools
@@ -290,16 +285,13 @@ class PlanningTool(ToolCard):
     def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
         commands: dict[type[BaseToolParam], Callable[..., Any]] = {}
 
-        gp = _resolve(self.get_planning, GetPlanning)
-        if gp and COMMAND in gp.expose:
+        if gp := _resolve(self.get_planning, GetPlanning, COMMAND):
             commands[GetPlanning] = self._planning_prompt_factory(gp)
 
-        gpi = _resolve(self.get_planning_task, GetPlanningTask)
-        if gpi and COMMAND in gpi.expose:
+        if gpi := _resolve(self.get_planning_task, GetPlanningTask, COMMAND):
             commands[GetPlanningTask] = self._get_planning_task_factory(gpi)
 
-        sp = _resolve(self.search_planning, SearchPlanning)
-        if sp and COMMAND in sp.expose:
+        if sp := _resolve(self.search_planning, SearchPlanning, COMMAND):
             commands[SearchPlanning] = self._search_planning_factory(sp)
 
         return commands

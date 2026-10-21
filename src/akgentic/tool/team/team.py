@@ -420,12 +420,10 @@ class TeamTool(ToolCard):
         """
         providers: list[Callable[[], ContextState | None]] = []
 
-        gtr = _resolve(self.get_team_roster, GetTeamRoster)
-        if gtr and LLM_CONTEXT in gtr.expose:
+        if gtr := _resolve(self.get_team_roster, GetTeamRoster, LLM_CONTEXT):
             providers.append(self._team_roster_state_factory(gtr))
 
-        grp = _resolve(self.get_role_profiles, GetRoleProfiles)
-        if grp and LLM_CONTEXT in grp.expose:
+        if grp := _resolve(self.get_role_profiles, GetRoleProfiles, LLM_CONTEXT):
             providers.append(self._role_catalog_state_factory(grp))
 
         return providers
@@ -438,16 +436,13 @@ class TeamTool(ToolCard):
         """
         tools: list[Callable[..., Any]] = []
 
-        htm = _resolve(self.hire_team_members, HireTeamMember)
-        if htm and TOOL_CALL in htm.expose:
+        if htm := _resolve(self.hire_team_members, HireTeamMember, TOOL_CALL):
             tools.append(self._hire_members_factory(htm))
 
-        ftm = _resolve(self.fire_team_members, FireTeamMember)
-        if ftm and TOOL_CALL in ftm.expose:
+        if ftm := _resolve(self.fire_team_members, FireTeamMember, TOOL_CALL):
             tools.append(self._fire_members_factory(ftm))
 
-        gta = _resolve(self.get_team_activity, GetTeamActivity)
-        if gta and TOOL_CALL in gta.expose:
+        if gta := _resolve(self.get_team_activity, GetTeamActivity, TOOL_CALL):
             tools.append(self._team_activity(gta))
 
         return tools
@@ -460,24 +455,19 @@ class TeamTool(ToolCard):
         """
         commands: dict[type[BaseToolParam], Callable[..., Any]] = {}
 
-        htm = _resolve(self.hire_team_members, HireTeamMember)
-        if htm and COMMAND in htm.expose:
+        if htm := _resolve(self.hire_team_members, HireTeamMember, COMMAND):
             commands[HireTeamMember] = self._hire_member_command_factory(htm)
 
-        ftm = _resolve(self.fire_team_members, FireTeamMember)
-        if ftm and COMMAND in ftm.expose:
+        if ftm := _resolve(self.fire_team_members, FireTeamMember, COMMAND):
             commands[FireTeamMember] = self._fire_member_command_factory(ftm)
 
-        gtr = _resolve(self.get_team_roster, GetTeamRoster)
-        if gtr and COMMAND in gtr.expose:
+        if gtr := _resolve(self.get_team_roster, GetTeamRoster, COMMAND):
             commands[GetTeamRoster] = self._team_roster_command_factory(gtr)
 
-        grp = _resolve(self.get_role_profiles, GetRoleProfiles)
-        if grp and COMMAND in grp.expose:
+        if grp := _resolve(self.get_role_profiles, GetRoleProfiles, COMMAND):
             commands[GetRoleProfiles] = self._role_profiles_command_factory(grp)
 
-        gta = _resolve(self.get_team_activity, GetTeamActivity)
-        if gta and COMMAND in gta.expose:
+        if gta := _resolve(self.get_team_activity, GetTeamActivity, COMMAND):
             commands[GetTeamActivity] = self._team_activity(gta)
 
         return commands

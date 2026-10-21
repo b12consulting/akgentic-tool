@@ -115,14 +115,11 @@ class SearchTool(ToolCard):
     def get_tools(self) -> list[Callable[..., Any]]:
         _check_tavily_api_key()
         tools: list[Callable[..., Any]] = []
-        ws = _resolve(self.web_search, WebSearch)
-        if ws and TOOL_CALL in ws.expose:
+        if ws := _resolve(self.web_search, WebSearch, TOOL_CALL):
             tools.append(self._web_search_factory(ws))
-        wc = _resolve(self.web_crawl, WebCrawl)
-        if wc and TOOL_CALL in wc.expose:
+        if wc := _resolve(self.web_crawl, WebCrawl, TOOL_CALL):
             tools.append(self._web_crawl_factory(wc))
-        wf = _resolve(self.web_fetch, WebFetch)
-        if wf and TOOL_CALL in wf.expose:
+        if wf := _resolve(self.web_fetch, WebFetch, TOOL_CALL):
             tools.append(self._web_fetch_factory(wf))
         return tools
 
