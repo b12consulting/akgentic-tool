@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import typing
 import uuid
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -1154,22 +1155,27 @@ class TestTheSearchClosureAnswersADeclinedStore:
 class TestTheSearchGraphCommandTakesText:
     """``/search_graph <free text>`` searches the graph — always through the registry.
 
-    Every spec here goes through ``registry.dispatch(...)``. A call to the closure
+    Every command spec here goes through ``registry.dispatch(...)``. A call to the closure
     from ``get_commands()`` bypasses tokenising and coercion, and that is exactly
     the shape that let a model-typed command ship: the closure accepted a
     ``SearchQuery`` while no human could type one.
     """
 
     @staticmethod
-    def _registry(tool: KnowledgeGraphTool) -> tuple[CommandRegistry, MagicMock]:
-        """Wire *tool* to a recording actor proxy and build its command registry."""
+    def _wire(tool: KnowledgeGraphTool) -> MagicMock:
+        """Wire *tool* to a recording actor proxy and return the proxy."""
         proxy = MagicMock()
         proxy.search.return_value = SearchResult(hits=[])
 
         observer = MockActorToolObserver()
         observer._kg_actor = proxy  # type: ignore[assignment]
         tool.observer(observer)
+        return proxy
 
+    @classmethod
+    def _registry(cls, tool: KnowledgeGraphTool) -> tuple[CommandRegistry, MagicMock]:
+        """Wire *tool* to a recording actor proxy and build its command registry."""
+        proxy = cls._wire(tool)
         return ToolFactory(tool_cards=[tool]).get_command_registry(), proxy
 
     def test_the_command_takes_one_free_text_query(self) -> None:
@@ -1244,10 +1250,31 @@ class TestTheSearchGraphCommandTakesText:
         assert proxy.search.call_count == 2
         assert proxy.search.call_args_list[0] == proxy.search.call_args_list[1]
 
-    def test_both_channels_share_one_guarded_searcher(self) -> None:
-        """The semantic-disabled verdict lives in one place both closures call."""
+    def test_both_channels_run_one_guarded_searcher(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Both closures route through ``_graph_searcher`` — neither re-implements it."""
+        seen: list[SearchQuery] = []
+
+        def recording_searcher(self: KnowledgeGraphTool) -> Callable[[SearchQuery], str]:
+            def search(query: SearchQuery) -> str:
+                seen.append(query)
+                return "recorded"
+
+            return search
+
+        monkeypatch.setattr(KnowledgeGraphTool, "_graph_searcher", recording_searcher)
+        tool = KnowledgeGraphTool()
+        registry, proxy = self._registry(tool)
+        search_tool = next(t for t in tool.get_tools() if t.__name__ == "search_graph")
+
+        assert registry.dispatch("/search_graph mailing list") == "recorded"
+        assert search_tool(SearchQuery(query="Alice", mode="vector")) == "recorded"
+        assert [q.query for q in seen] == ["mailing list", "Alice"]
+        assert proxy.search.call_count == 0
+
+    def test_the_guarded_searcher_answers_vector_mode_on_a_store_less_card(self) -> None:
+        """The semantic-disabled verdict is answered before the actor is asked."""
         tool = KnowledgeGraphTool(vector_store=False)
-        _, proxy = self._registry(tool)
+        proxy = self._wire(tool)
 
         search = tool._graph_searcher()
 
@@ -1259,7 +1286,7 @@ class TestTheSearchGraphCommandTakesText:
     def test_the_tool_keeps_its_structured_signature(self) -> None:
         """The LLM keeps ``SearchQuery``; only the command takes text."""
         tool = KnowledgeGraphTool(search=SearchGraph(instructions="Prefer hybrid."))
-        self._registry(tool)
+        self._wire(tool)
 
         search_tool = next(t for t in tool.get_tools() if t.__name__ == "search_graph")
 
