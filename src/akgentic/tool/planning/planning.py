@@ -442,8 +442,9 @@ class PlanningTool(ToolCard):
                 status: Filter by status.
                 owner: Filter by owner.
                 creator: Filter by creator.
-                top_k: Max semantic hits (default 10).
-                score_threshold: Min cosine similarity (default 0.5).
+                top_k: Max semantic hits; the card's configured default when omitted.
+                score_threshold: Min cosine similarity; the card's configured default
+                    when omitted.
                 query: Search text for keyword and/or semantic matching; omit it,
                     and every filter, to list all tasks.
             """

@@ -1031,10 +1031,10 @@ where the tool raises (an escaping path, pattern or `include`, an invalid regex)
 the same sentence as text. `/workspace_rag_search` runs the tool's own search with the param's
 `alpha` and `score_threshold` — and its `top_k` and no path prefix unless the `top_k=` /
 `path_prefix=` options say otherwise (`/workspace_rag_search top_k=3 path_prefix=reports/ gate
-refusal`) — and renders the hits as text for the
-human — one header per hit (`1. docs/a.md:3-9 (hybrid, score 0.83)`) over its text cut to 300
-characters. The **tool** still answers the model a `RagSearchResult`; that text rendering is the
-command's alone. A search spends one query embedding, which is the point of typing it.
+refusal`) — and renders the hits as text for the human — one header per hit
+(`1. docs/a.md:3-9 (hybrid, score 0.83)`) over its text cut to 300 characters. The **tool** still
+answers the model a `RagSearchResult`; that text rendering is the command's alone. A search spends
+one query embedding, which is the point of typing it.
 
 **Quote a regex in single quotes.** The leading arguments are split like a shell line (POSIX
 `shlex`), so outside quotes and inside double quotes a backslash is an escape and is dropped:

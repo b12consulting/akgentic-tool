@@ -455,13 +455,13 @@ class KnowledgeGraphTool(ToolCard):
             Args:
                 mode: "hybrid" (default) = keyword + vector,
                     "keyword" = substring only, "vector" = semantic only.
-                top_k: Max hits; the card's default (10) when omitted.
+                top_k: Max hits; the card's configured default when omitted.
                 include_neighbors: Add 1-hop neighbors of entity hits.
                 include_edges: Add relations connected to entity hits.
                 find_paths: BFS shortest paths between the top 5 entity hits
                     (max 10 pairs).
-                score_threshold: Min cosine similarity; the card's default (0.3)
-                    when omitted.
+                score_threshold: Min cosine similarity; the card's configured
+                    default when omitted.
                 query: What to search for.
             """
             return search(

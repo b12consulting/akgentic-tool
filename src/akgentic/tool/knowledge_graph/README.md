@@ -201,10 +201,10 @@ The command takes every other `SearchQuery` field as a `name=value` option with 
 own default — hybrid mode, the card's `search_top_k` / `search_score_threshold`, no expansion
 flags — and renders the hits for a human. An option is never bound positionally:
 `/search_graph mailing list` searches for `mailing list`, and anything after the first word of the
-text is text, `mode=vector` included. A `SearchQuery` cannot be typed as a command argument — the registry refuses any command
-parameter that is or contains a Pydantic model — so the command takes text and the model keeps
-its schema. Both callables run the same guarded search, so a store-less card's `mode="vector"`
-sentence is answered in one place.
+text is text, `mode=vector` included. A `SearchQuery` cannot be typed as a command argument —
+the registry refuses any command parameter that is or contains a Pydantic model — so the command
+takes text and the model keeps its schema. Both callables run the same guarded search, so a
+store-less card's `mode="vector"` sentence is answered in one place.
 
 ```python
 class SearchQuery(SerializableBaseModel):

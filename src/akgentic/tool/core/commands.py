@@ -428,7 +428,7 @@ class CommandRegistry:
         """Parse a ``/``-prefixed command, invoke it, and return its result surface.
 
         Strips the leading ``/``, resolves the first **whitespace** token to a
-        command, ``shlex.split``s the rest, classifies those tokens as positional or
+        command, ``shlex``-tokenises the rest, classifies those tokens as positional or
         ``name=value`` keyword arguments, coerces and merges them, invokes the
         command, and renders the result.
 
