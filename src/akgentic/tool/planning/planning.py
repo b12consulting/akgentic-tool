@@ -7,6 +7,10 @@ from typing import Any, Literal, cast
 from pydantic import Field, field_validator
 
 from akgentic.core.orchestrator import Orchestrator
+
+# ``RestOfLine`` is a runtime import, not a ``TYPE_CHECKING`` one: the command
+# registry resolves the ``/search_planning`` closure's annotations with
+# ``get_type_hints`` against this module's globals, and reads ``RestOfLine`` there.
 from akgentic.tool.core import (
     COMMAND,
     LLM_CONTEXT,
@@ -14,6 +18,7 @@ from akgentic.tool.core import (
     BaseToolParam,
     Channels,
     ContextState,
+    RestOfLine,
     ToolCard,
     _resolve,
     normalize_system_prompt_to_llm_context,
@@ -292,7 +297,7 @@ class PlanningTool(ToolCard):
             commands[GetPlanningTask] = self._get_planning_task_factory(gpi)
 
         if sp := _resolve(self.search_planning, SearchPlanning, COMMAND):
-            commands[SearchPlanning] = self._search_planning_factory(sp)
+            commands[SearchPlanning] = self._search_planning_command_factory(sp)
 
         return commands
 
@@ -403,6 +408,55 @@ class PlanningTool(ToolCard):
                 top_k=top_k,
                 score_threshold=score_threshold,
             )
+
+        search_planning.__doc__ = params.format_docstring(search_planning.__doc__)
+        return search_planning
+
+    def _search_planning_command_factory(self, params: SearchPlanning) -> Callable[..., Any]:
+        """Return the ``/search_planning`` command closure: options, then free text.
+
+        The tool closure takes ``query`` first, so a human typing
+        ``/search_planning mailing list`` would bind ``list`` to ``mode``. The
+        command gets its own closure, whose filters are ``name=value`` options and
+        whose rest of the line is the query, and which renders the lines for a
+        human rather than answering a Python list.
+        """
+        planning_proxy = self._planning_proxy
+
+        def search_planning(
+            mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
+            status: TaskStatus | None = None,
+            owner: str | None = None,
+            creator: str | None = None,
+            top_k: int | None = None,
+            score_threshold: float | None = None,
+            query: RestOfLine = "",
+        ) -> str:
+            """Search tasks — options first, then the rest of the line is the query.
+
+            Example: /search_planning status=pending deploy the service
+
+            Args:
+                mode: "hybrid" (default) = keyword + semantic,
+                    "keyword" = substring only, "vector" = semantic only.
+                status: Filter by status.
+                owner: Filter by owner.
+                creator: Filter by creator.
+                top_k: Max semantic hits (default 10).
+                score_threshold: Min cosine similarity (default 0.5).
+                query: Search text for keyword and/or semantic matching; omit it,
+                    and every filter, to list all tasks.
+            """
+            lines = planning_proxy.search_planning(
+                status=status,
+                owner=owner,
+                creator=creator,
+                query=query or None,
+                mode=mode,
+                top_k=top_k,
+                score_threshold=score_threshold,
+            )
+            return "\n".join(lines) if lines else "No tasks found."
 
         search_planning.__doc__ = params.format_docstring(search_planning.__doc__)
         return search_planning

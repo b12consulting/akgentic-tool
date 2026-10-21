@@ -3,10 +3,11 @@
 import inspect
 import shlex
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import StringIO
 from typing import Annotated, Any, get_args, get_origin, get_type_hints
 
+from griffe import Docstring, DocstringSectionParameters, GoogleOptions
 from pydantic import BaseModel, TypeAdapter
 
 from akgentic.tool.core.event import CommandArg, CommandDescriptor
@@ -23,13 +24,21 @@ class _RestOfLineMarker:
 _REST_OF_LINE = _RestOfLineMarker()
 
 RestOfLine = Annotated[str, _REST_OF_LINE]
-"""A command's last, required parameter that receives the raw rest of the line.
+"""A command's last parameter, which receives the raw rest of the line — its *text*.
 
-The parameters before it are tokenised with ``shlex`` as usual; this one gets
-whatever text follows them **verbatim** — leading whitespace stripped, inner and
-trailing whitespace, newlines and quotes kept — so ``/workspace_write notes.md
-it's a "quoted" word`` writes exactly ``it's a "quoted" word``. It is never bound
-as ``name=value``: ``content=x`` in the rest of the line is part of the content.
+A rest-of-line command reads ``/cmd [positional …] [name=value …] <text…>``. The
+parameters before the text are tokenised with ``shlex``: those without a default
+are positional (and may still be named), those with a default are *options* —
+keyword-only, written ``name=value``, never bound positionally. The text starts
+at the first token that is not a known option once every positional is bound,
+and runs **verbatim** to the end of the line — leading whitespace stripped, inner
+and trailing whitespace, newlines and quotes kept — so ``/workspace_write notes.md
+it's a "quoted" word`` writes exactly ``it's a "quoted" word``, and
+``/search_graph mailing mode=vector`` searches for ``mailing mode=vector``. The
+text is never bound as ``name=value``: ``content=x`` in it is part of the content.
+
+It may have a default, which an empty text leaves in place; without one, an
+empty text is a missing argument.
 """
 
 
@@ -50,6 +59,10 @@ class _CommandArgSpec:
     name: str
     required: bool
     adapter: TypeAdapter[Any]
+    keyword_only: bool = False
+    """Whether this is an option of a rest-of-line command (``name=value`` only)."""
+    rest_of_line: bool = False
+    """Whether this is a rest-of-line command's text (:data:`RestOfLine`)."""
 
 
 @dataclass(frozen=True)
@@ -85,6 +98,50 @@ def _json_type_name(adapter: TypeAdapter[Any]) -> str:
     return type_name if isinstance(type_name, str) else "string"
 
 
+def _choices(adapter: TypeAdapter[Any]) -> list[str] | None:
+    """Return the closed set of values a parameter's coercion adapter accepts.
+
+    Read from the JSON schema: the top-level ``enum``, or the ``enum`` of the one
+    non-``null`` branch of an ``anyOf`` (``Literal[...] | None``), following a
+    ``$ref`` into ``$defs`` in either position (``MyEnum | None``). A ``boolean``
+    is the closed set ``["true", "false"]``. ``None`` when the set is open, and
+    when the schema cannot be generated at all.
+    """
+    try:
+        schema = adapter.json_schema()
+    except Exception:
+        return None
+    branches = [b for b in schema.get("anyOf", [schema]) if b.get("type") != "null"]
+    if len(branches) != 1:
+        return None
+    branch = branches[0]
+    if "$ref" in branch:
+        branch = schema.get("$defs", {}).get(branch["$ref"].removeprefix("#/$defs/"), {})
+    if "enum" in branch:
+        return [str(value) for value in branch["enum"]]
+    return ["true", "false"] if branch.get("type") == "boolean" else None
+
+
+def _arg_descriptions(fn: Callable[..., Any]) -> dict[str, str]:
+    """Map each parameter documented in *fn*'s Google-style ``Args:`` section to its text.
+
+    Parsed with griffe, the parser pydantic-ai reads tool docstrings with.
+    ``warnings=False`` because no ``parent`` is given, so griffe cannot find the
+    parameters' annotations and would log about each one.
+    """
+    if not fn.__doc__:
+        return {}
+    docstring = Docstring(
+        fn.__doc__, parser="google", parser_options=GoogleOptions(warnings=False)
+    )
+    return {
+        param.name: param.description
+        for section in docstring.parse()
+        if isinstance(section, DocstringSectionParameters)
+        for param in section.value
+    }
+
+
 def _build_command_entry(fn: Callable[..., Any], tool_card: str) -> _CommandEntry:
     """Derive a per-command arg model + ordered metadata from a callable signature.
 
@@ -102,9 +159,10 @@ def _build_command_entry(fn: Callable[..., Any], tool_card: str) -> _CommandEntr
         ValueError: If the signature has a ``VAR_POSITIONAL`` (``*args``),
             ``VAR_KEYWORD`` (``**kwargs``), or un-annotated parameter, a parameter
             typed as — or containing — a Pydantic model (bare, or inside
-            ``Optional`` / a union / a container), or a :data:`RestOfLine`
-            parameter that is not the last or not required. The message names the
-            command and the offending parameter.
+            ``Optional`` / a union / a container), a :data:`RestOfLine` parameter
+            that is not the last, or — in a rest-of-line command — a positional
+            parameter after an option. The message names the command and the
+            offending parameter.
     """
     sig = inspect.signature(fn)
     try:
@@ -133,7 +191,7 @@ def _build_command_entry(fn: Callable[..., Any], tool_card: str) -> _CommandEntr
         _check_producible_from_text(fn, pname, annotation)
         required = param.default is inspect.Parameter.empty
         if _is_rest_of_line(annotation):
-            _check_rest_of_line(fn, pname, required, last=pname == list(sig.parameters)[-1])
+            _check_rest_of_line(fn, pname, last=pname == list(sig.parameters)[-1])
             annotation = str
         specs.append(
             _CommandArgSpec(
@@ -147,10 +205,35 @@ def _build_command_entry(fn: Callable[..., Any], tool_card: str) -> _CommandEntr
     return _CommandEntry(
         name=fn.__name__,
         fn=fn,
-        args=tuple(specs),
+        args=_mark_options(fn, specs) if rest_of_line else tuple(specs),
         tool_card=tool_card,
         rest_of_line=rest_of_line,
     )
+
+
+def _mark_options(
+    fn: Callable[..., Any], specs: list[_CommandArgSpec]
+) -> tuple[_CommandArgSpec, ...]:
+    """Mark a rest-of-line command's options and its text parameter.
+
+    A parameter before the text that has a default is an option. One without a
+    default after an option is refused: the splitter binds positionals first and
+    then options, so it could only ever be reached by name. Python allows that
+    shape only as a keyword-only parameter (``mode="a", *, path: str, ...``).
+
+    Raises:
+        ValueError: Naming the command and the positional parameter.
+    """
+    *leading, text = specs
+    marked: list[_CommandArgSpec] = []
+    for spec in leading:
+        if spec.required and any(option.keyword_only for option in marked):
+            raise ValueError(
+                f"Command '{fn.__name__}' cannot be registered: positional parameter "
+                f"'{spec.name}' follows an option (a parameter with a default)."
+            )
+        marked.append(replace(spec, keyword_only=not spec.required))
+    return (*marked, replace(text, rest_of_line=True))
 
 
 def _contains_model(annotation: Any) -> bool:
@@ -184,8 +267,8 @@ def _check_producible_from_text(fn: Callable[..., Any], pname: str, annotation: 
         )
 
 
-def _check_rest_of_line(fn: Callable[..., Any], pname: str, required: bool, last: bool) -> None:
-    """Refuse a :data:`RestOfLine` parameter anywhere but last, or with a default.
+def _check_rest_of_line(fn: Callable[..., Any], pname: str, last: bool) -> None:
+    """Refuse a :data:`RestOfLine` parameter anywhere but last.
 
     Raises:
         ValueError: Naming the command and the parameter.
@@ -195,35 +278,84 @@ def _check_rest_of_line(fn: Callable[..., Any], pname: str, required: bool, last
             f"Command '{fn.__name__}' cannot be registered: RestOfLine parameter "
             f"'{pname}' must be the last parameter."
         )
-    if not required:
-        raise ValueError(
-            f"Command '{fn.__name__}' cannot be registered: RestOfLine parameter "
-            f"'{pname}' must be required."
-        )
 
 
-def _split_leading(rest: str, count: int) -> tuple[list[str], str]:
-    """Tokenise the first *count* arguments of *rest* and return the raw remainder.
+def _split_leading(rest: str, entry: _CommandEntry) -> tuple[list[str], str]:
+    """Tokenise the positionals and options of a rest-of-line command; return the text.
 
     The lexer is configured exactly as ``shlex.split`` configures its own —
     POSIX, whitespace-split, no comment characters — so the leading arguments
-    tokenise as they always have. It stops after *count* tokens, and whatever it
-    has not consumed is the remainder, verbatim but for leading whitespace.
+    tokenise as they always have. Every token is consumed while a positional is
+    unbound; after that only ``name=value`` tokens naming an option are, and the
+    text starts at the first other token. Whatever has not been consumed is the
+    text, verbatim but for leading whitespace.
 
     Raises:
-        ValueError: When a leading argument's quote does not close.
+        ValueError: When a quote does not close before every positional is bound.
+            After that, a token that cannot be lexed is the start of the text.
     """
     stream = StringIO(rest)
     lexer = shlex.shlex(stream, posix=True)
     lexer.whitespace_split = True
     lexer.commenters = ""
+    leading = entry.args[:-1]
+    tokens, bound = _take_positionals(lexer, leading)
+    if not bound:  # the line ended first
+        return tokens, ""
+    options = {spec.name for spec in leading if spec.keyword_only}
+    if not options:  # nothing more to consume: never lex the text
+        return tokens, stream.read().lstrip()
+    return _take_options(lexer, stream, options, tokens)
+
+
+def _take_positionals(
+    lexer: shlex.shlex, leading: tuple[_CommandArgSpec, ...]
+) -> tuple[list[str], bool]:
+    """Consume tokens until every positional of *leading* is bound, by position or name.
+
+    Returns:
+        The tokens consumed, and whether every positional was bound before the
+        line ended.
+    """
+    names = {spec.name for spec in leading}
+    unbound = [spec.name for spec in leading if not spec.keyword_only]
     tokens: list[str] = []
-    while len(tokens) < count:
+    while unbound:
         token = lexer.get_token()
         if token is None:
-            return tokens, ""
+            return tokens, False
         tokens.append(token)
-    return tokens, stream.read().lstrip()
+        key, sep, _ = token.partition("=")
+        if sep and key in names:
+            if key in unbound:
+                unbound.remove(key)
+        else:
+            unbound.pop(0)
+    return tokens, True
+
+
+def _take_options(
+    lexer: shlex.shlex, stream: StringIO, options: set[str], tokens: list[str]
+) -> tuple[list[str], str]:
+    """Consume ``name=value`` option tokens; the text starts at the first other token.
+
+    ``mark`` is taken before every read and the stream is sought back to it when
+    the text starts, so the text is the raw source — quotes and escapes kept — and
+    not the lexed token. A token that cannot be lexed starts the text too.
+    """
+    while True:
+        mark = stream.tell()
+        try:
+            token = lexer.get_token()
+        except ValueError:  # a broken quote: text, not a failure
+            token = ""
+        if token is None:
+            return tokens, ""
+        key, sep, _ = token.partition("=")
+        if not (sep and key in options):
+            stream.seek(mark)
+            return tokens, stream.read().lstrip()
+        tokens.append(token)
 
 
 class CommandRegistry:
@@ -268,11 +400,16 @@ class CommandRegistry:
         """Return serializable discovery metadata, one entry per command."""
         result: list[CommandDescriptor] = []
         for entry in self._entries.values():
+            documented = _arg_descriptions(entry.fn)
             args = [
                 CommandArg(
                     name=spec.name,
                     type=_json_type_name(spec.adapter),
                     required=spec.required,
+                    description=documented.get(spec.name) or None,
+                    keyword_only=spec.keyword_only,
+                    rest_of_line=spec.rest_of_line,
+                    choices=_choices(spec.adapter),
                 )
                 for spec in entry.args
             ]
@@ -310,6 +447,8 @@ class CommandRegistry:
         real parameter name on the command; otherwise it is positional (so values
         containing ``=`` are never silently swallowed). Positionals must precede
         keywords. ``key=value`` is opt-in — purely-positional dispatch is unchanged.
+        A command whose last parameter is :data:`RestOfLine` reads positionals,
+        then ``name=value`` options, then free text (see :data:`RestOfLine`).
 
         Raises:
             CommandNotRecognized: If the first token does not name a known command
@@ -355,14 +494,14 @@ class CommandRegistry:
         """Split *rest* into ``(positional, keyword)`` for *entry*.
 
         A plain command ``shlex.split``s it whole. A :data:`RestOfLine` command
-        tokenises only the arguments before the last, and binds the raw remainder
-        to the last by name — so it can never be supplied as ``name=value``, and
-        an empty remainder leaves it unbound, which :meth:`_bind` reports as a
-        missing argument.
+        tokenises only its positionals and options (:func:`_split_leading`), and
+        binds the raw remainder to the last by name — so it can never be supplied
+        as ``name=value``, and an empty remainder leaves it unbound: its default
+        applies, or :meth:`_bind` reports it as a missing argument.
         """
         if not entry.rest_of_line:
             return cls._classify_tokens(entry, shlex.split(rest))
-        leading, remainder = _split_leading(rest, len(entry.args) - 1)
+        leading, remainder = _split_leading(rest, entry)
         positional, keyword = cls._classify_tokens(entry, leading, rest_of_line=True)
         if remainder:
             keyword[entry.args[-1].name] = remainder
@@ -377,14 +516,15 @@ class CommandRegistry:
         A token is a keyword iff it contains ``=`` AND the substring before the
         **first** ``=`` is a known parameter name on *entry*; the value is the
         remainder after that first ``=``. All other tokens are positional. A
-        positional token appearing after any keyword token is rejected.
+        positional token appearing after any keyword token is rejected, and so is
+        a keyword given twice.
 
         With *rest_of_line*, the last parameter is not a keyword candidate: its
         value is the raw remainder, bound by :meth:`_tokenise`.
 
         Raises:
             ValueError: If a positional token follows a keyword token (names the
-                offending positional value).
+                offending positional value), or a keyword repeats (names it).
         """
         specs = entry.args[:-1] if rest_of_line else entry.args
         names = {spec.name for spec in specs}
@@ -393,6 +533,8 @@ class CommandRegistry:
         for token in args:
             key, sep, value = token.partition("=")
             if sep and key in names:
+                if key in keyword:
+                    raise ValueError(f"got multiple values for argument '{key}'")
                 keyword[key] = value
             elif keyword:
                 raise ValueError(

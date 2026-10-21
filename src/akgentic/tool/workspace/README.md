@@ -1015,7 +1015,7 @@ to the agent's context as a **user action**.
 | `/workspace_list` | `(path="", depth=<WorkspaceList.max_depth>)` | read | `workspace_list` on `COMMAND` |
 | `/workspace_glob` | `(pattern, path="")` | read | `workspace_glob` on `COMMAND` |
 | `/workspace_grep` | `(pattern, path="", include="")` | read | `workspace_grep` on `COMMAND` |
-| `/workspace_rag_search` | `(query: RestOfLine)` | read | `workspace_rag_search` on `COMMAND` |
+| `/workspace_rag_search` | `(top_k=<WorkspaceRagSearch.top_k>, path_prefix="", *, query: RestOfLine)` | read | `workspace_rag_search` on `COMMAND` |
 | `/workspace_exec` | `(cmd: RestOfLine)` | write | `workspace_exec` enabled and on `COMMAND` |
 | `/workspace_exec_result` | `(run_id)` | write | as `/workspace_exec` — the pair is served together or not at all |
 
@@ -1029,7 +1029,9 @@ retrieval (`workspace_rag_search` is `False` on a default card).
 return the tool's exact text through one shared render, with the same `max_results` and line caps;
 where the tool raises (an escaping path, pattern or `include`, an invalid regex) the command returns
 the same sentence as text. `/workspace_rag_search` runs the tool's own search with the param's
-`top_k`, `alpha` and `score_threshold` and no path prefix, and renders the hits as text for the
+`alpha` and `score_threshold` — and its `top_k` and no path prefix unless the `top_k=` /
+`path_prefix=` options say otherwise (`/workspace_rag_search top_k=3 path_prefix=reports/ gate
+refusal`) — and renders the hits as text for the
 human — one header per hit (`1. docs/a.md:3-9 (hybrid, score 0.83)`) over its text cut to 300
 characters. The **tool** still answers the model a `RagSearchResult`; that text rendering is the
 command's alone. A search spends one query embedding, which is the point of typing it.
@@ -1045,6 +1047,17 @@ newlines, and any extension is accepted. `/workspace_exec` runs the raw rest of 
 `bash -c <line>`, so pipes, `&&` and redirects work — on the same sandbox, budget and allow-list as
 the tool (`bash` must stay on it). A quote that does not close in the leading arguments is the
 command's failure, returned as text, never a crash.
+
+**Options, then text.** A `RestOfLine` command reads `/cmd [positional …] [name=value …] <text…>`.
+A parameter before the text **without** a default is positional (and may still be named, as
+`filepath=notes.md`); one **with** a default is an *option* — keyword-only, written `name=value`,
+never bound positionally. Options are split like the leading arguments (`owner="Alice Smith"` is
+one value). The text starts at the first token that is not a known option, once every positional
+is bound, and runs verbatim to the end of the line: `/workspace_rag_search mailing top_k=3`
+searches for `mailing top_k=3`. A quote that does not close after the positionals is the start of
+the text, not a failure. `RestOfLine` may have a default, which an empty text leaves in place;
+without one, an empty text is a missing argument. `/workspace_write` and `/workspace_exec` have
+no options, so their text is never lexed at all.
 
 **What a command shows the agent becomes its view.** The commands run on the agent's own card, and
 `BaseAgent._dispatch_command` writes the command line and its result into the agent's LLM context as

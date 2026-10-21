@@ -214,6 +214,26 @@ for more than that, because fusion and the field filters both drop candidates.
 `mode="keyword"` performs **no embedding call at all**, which is the mode to use when the query is
 a known substring and you do not want to pay for an embedding.
 
+The two channels carry **different callables**. `TOOL_CALL` is the signature above. `COMMAND` is a
+dedicated closure that takes the filters as `name=value` options first and the rest of the line as
+the query, and renders the lines for a human (`No tasks found.` when nothing matches):
+
+```python
+search_planning(
+    mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
+    status: TaskStatus | None = None,
+    owner: str | None = None,
+    creator: str | None = None,
+    top_k: int | None = None,
+    score_threshold: float | None = None,
+    query: RestOfLine = "",               # "" -> None: no query
+) -> str
+```
+
+`/search_planning status=pending deploy the service` filters on `pending` and searches for
+`deploy the service`; `/search_planning mailing list` searches for `mailing list` — an option is
+never bound positionally — and `/search_planning` alone lists every task.
+
 ---
 
 ## Configuration
