@@ -10,7 +10,6 @@ assertion checks for an ADR-reference string (Golden Rule #8 / NFR3).
 from __future__ import annotations
 
 import uuid
-import warnings
 from enum import StrEnum
 from typing import Annotated, Any, Callable, Literal, Optional
 
@@ -429,20 +428,6 @@ def test_descriptor_int_arg_type() -> None:
     desc = registry.descriptors()[0]
     assert desc.args[0].name == "task_id"
     assert desc.args[0].type == "integer"
-
-
-# ---------------------------------------------------------------------------
-# AC 11 — Deprecated get_commands() alias retained
-# ---------------------------------------------------------------------------
-
-
-def test_get_commands_still_returns_legacy_dict_and_warns() -> None:
-    factory = ToolFactory(tool_cards=[_HireCard()])
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        commands = factory.get_commands()
-    assert _HireParam in commands  # legacy param-class keying preserved
-    assert any(issubclass(w.category, DeprecationWarning) for w in caught)
 
 
 # ---------------------------------------------------------------------------

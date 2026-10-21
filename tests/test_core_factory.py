@@ -92,8 +92,8 @@ def test_base_tool_param_subclass_defaults() -> None:
     assert p.expose == {TOOL_CALL}
 
 
-def test_tool_factory_get_commands() -> None:
-    """ToolFactory.get_commands() aggregates from all tool cards."""
+def test_tool_factory_command_registry() -> None:
+    """ToolFactory.get_command_registry() registers card commands by name."""
 
     class _CommandParam(BaseToolParam):
         expose: set[str] = {COMMAND}
@@ -118,18 +118,18 @@ def test_tool_factory_get_commands() -> None:
 
     card = _CommandTool()
     factory = ToolFactory(tool_cards=[card])
-    commands = factory.get_commands()
-    assert len(commands) == 1
-    assert _CommandParam in commands
-    assert commands[_CommandParam]() == "cmd-result"
+    registry = factory.get_command_registry()
+    assert registry.has("my_cmd")
+    assert registry.dispatch("/my_cmd") == "cmd-result"
 
 
-def test_tool_factory_get_commands_empty() -> None:
-    """ToolFactory.get_commands() returns empty dict when no cards have commands."""
+def test_tool_factory_command_registry_empty() -> None:
+    """ToolFactory.get_command_registry() is empty when no cards have commands."""
     card = _DummyTool()
     factory = ToolFactory(tool_cards=[card])
-    commands = factory.get_commands()
-    assert commands == {}
+    registry = factory.get_command_registry()
+    assert registry.descriptors() == []
+    assert not hasattr(factory, "get_commands")  # the registry is the only command surface
 
 
 def test_tool_factory_with_null_observer() -> None:

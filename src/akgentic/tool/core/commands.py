@@ -48,7 +48,6 @@ class _CommandArgSpec:
     """
 
     name: str
-    annotation: Any
     required: bool
     adapter: TypeAdapter[Any]
 
@@ -69,21 +68,17 @@ class _CommandEntry:
     rest_of_line: bool = False
     """Whether the last argument receives the raw rest of the line (:data:`RestOfLine`)."""
 
-    @property
-    def required_count(self) -> int:
-        """Number of leading required (no-default) parameters."""
-        return sum(1 for spec in self.args if spec.required)
 
-
-def _json_type_name(annotation: Any) -> str:
-    """Return the JSON-schema type name for a parameter annotation.
+def _json_type_name(adapter: TypeAdapter[Any]) -> str:
+    """Return the JSON-schema type name of a parameter's coercion adapter.
 
     Falls back to ``"string"`` when the schema has no top-level ``type`` (e.g.
     a union like ``str | None`` produces ``anyOf``), matching how the human help
-    surface renders un-typed-or-optional args.
+    surface renders un-typed-or-optional args, and when the schema cannot be
+    generated at all.
     """
     try:
-        schema = TypeAdapter(annotation).json_schema()
+        schema = adapter.json_schema()
     except Exception:
         return "string"
     type_name = schema.get("type", "string")
@@ -143,7 +138,6 @@ def _build_command_entry(fn: Callable[..., Any], tool_card: str) -> _CommandEntr
         specs.append(
             _CommandArgSpec(
                 name=pname,
-                annotation=annotation,
                 required=required,
                 adapter=TypeAdapter(annotation),
             )
@@ -162,17 +156,15 @@ def _build_command_entry(fn: Callable[..., Any], tool_card: str) -> _CommandEntr
 def _contains_model(annotation: Any) -> bool:
     """Whether *annotation* is, or has among its type arguments, a Pydantic model.
 
-    Recurses through ``get_args`` so ``Model | None``, ``Optional[Model]``,
-    ``list[Model]`` and ``dict[str, Model]`` are all seen. ``Annotated`` recurses
-    into its first argument only — the rest is metadata, not a type. Anything
-    that is not a class (``Literal`` values, ``Ellipsis``) is not a model.
+    Recurses through every ``get_args`` entry, so ``Model | None``,
+    ``Optional[Model]``, ``list[Model]``, ``dict[str, Model]`` and
+    ``Annotated[Model, ...]`` are all seen. Anything that is not a class
+    (``Annotated`` metadata such as the :data:`RestOfLine` marker, ``Literal``
+    values, ``Ellipsis``) is not a model.
     """
     if inspect.isclass(annotation) and issubclass(annotation, BaseModel):
         return True
-    args = get_args(annotation)
-    if get_origin(annotation) is Annotated:
-        args = args[:1]
-    return any(_contains_model(arg) for arg in args)
+    return any(_contains_model(arg) for arg in get_args(annotation))
 
 
 def _check_producible_from_text(fn: Callable[..., Any], pname: str, annotation: Any) -> None:
@@ -279,7 +271,7 @@ class CommandRegistry:
             args = [
                 CommandArg(
                     name=spec.name,
-                    type=_json_type_name(spec.annotation),
+                    type=_json_type_name(spec.adapter),
                     required=spec.required,
                 )
                 for spec in entry.args
@@ -418,8 +410,9 @@ class CommandRegistry:
 
         Maps positionals onto the leading parameters in signature order, then binds
         keywords by name, detecting unknown names and duplicate bindings. Validates
-        arity (at least ``required_count``, at most ``len(args)``) over the merged
-        set, then coerces every bound value through its per-arg :class:`TypeAdapter`.
+        arity over the merged set (every required parameter bound, at most
+        ``len(args)`` positionals), then coerces every bound value through its
+        per-arg :class:`TypeAdapter`.
         Unbound trailing optionals are omitted so the callable applies its defaults.
 
         Raises:

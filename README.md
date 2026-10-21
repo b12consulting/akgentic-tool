@@ -182,7 +182,7 @@ factory = ToolFactory(
 tools = factory.get_tools()            # LLM-callable functions
 prompts = factory.get_system_prompts() # static prompt injections
 states = factory.get_context_states()  # structured context state, delivered as deltas
-commands = factory.get_commands()      # programmatic calls from orchestrator
+registry = factory.get_command_registry()  # name-keyed commands: /-dispatch or call by name
 ```
 
 Grant read-only workspace access to a reviewer agent:

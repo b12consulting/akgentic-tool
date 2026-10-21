@@ -1,7 +1,6 @@
 """The ``ToolFactory``: resolves tool cards into callable tools, prompts, and toolsets."""
 
 import functools
-import warnings
 from collections.abc import Callable
 from typing import Any
 
@@ -13,7 +12,6 @@ from .commands import CommandRegistry, _build_command_entry, _CommandEntry
 from .context_state import ContextState
 from .context_update import ContextUpdater
 from .dependencies import _topological_sort
-from .params import BaseToolParam
 
 
 class ToolFactory:
@@ -37,8 +35,8 @@ class ToolFactory:
             tool_cards: Tool cards to resolve into callable tools. The caller's
                 list is not mutated; a new dependency-ordered list is stored on
                 ``self.tool_cards``. Aggregators (``get_tools``,
-                ``get_system_prompts``, ``get_commands``, ``get_toolsets``)
-                iterate in this dependency order.
+                ``get_system_prompts``, ``get_command_registry``,
+                ``get_toolsets``) iterate in this dependency order.
             observer: Optional observer notified by tool implementations during
                 tool calls.
             retry_exception: Optional exception class to raise when a tool raises
@@ -138,30 +136,6 @@ class ToolFactory:
             )
         return ContextUpdater(self.observer, self.get_context_states())
 
-    def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
-        """Return command callables aggregated from all tool cards.
-
-        Deprecated:
-            Use :meth:`get_command_registry` instead. This param-class-keyed dict
-            is retained for one migration cycle. The registry keys by canonical
-            command name and adds signature-derived dispatch + discovery metadata.
-
-        Returns:
-            Dict mapping param class to callable, merged from all tool cards.
-        """
-        warnings.warn(
-            "ToolFactory.get_commands() is deprecated; use get_command_registry() instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        commands: dict[type[BaseToolParam], Callable[..., Any]] = {}
-        for card in self.tool_cards:
-            commands.update(card.get_commands())
-
-        if self._retry_exception is not None:
-            commands = {k: self._wrap_with_retry(v) for k, v in commands.items()}
-        return commands
-
     def get_command_registry(
         self, extra_commands: list[Callable[..., Any]] | None = None
     ) -> CommandRegistry:
@@ -173,7 +147,7 @@ class ToolFactory:
         an un-derivable signature (``*args``/``**kwargs``/un-annotated param) fails
         loudly here. When ``retry_exception`` is configured, each command is
         wrapped via :meth:`_wrap_with_retry` (``functools.wraps`` preserves
-        ``__name__``/``__doc__``), matching :meth:`get_commands` behavior.
+        ``__name__``/``__doc__``).
 
         Args:
             extra_commands: Optional agent-owned plain callables (e.g. ``/compact``,
