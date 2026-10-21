@@ -32,7 +32,7 @@ from pydantic import ValidationError
 
 import akgentic.tool
 import akgentic.tool.metadata
-from akgentic.tool.core import COMMAND, SYSTEM_PROMPT, ToolCard
+from akgentic.tool.core import COMMAND, SYSTEM_PROMPT, ToolCard, ToolFactory
 from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.metadata import MetadataTool, RenderMetadata
 
@@ -513,6 +513,11 @@ class TestChannels:
     def test_instructions_reach_the_command_docstring(self) -> None:
         card, _ = _wire(_TeamContext(), instructions="Quote it verbatim.")
         assert "Quote it verbatim." in (card.get_commands()[RenderMetadata].__doc__ or "")
+
+    def test_the_command_registry_builds(self) -> None:
+        card, _ = _wire(_TeamContext())
+        registry = ToolFactory(tool_cards=[card]).get_command_registry()
+        assert registry.has("team_metadata")
 
     def test_command_only_exposure_contributes_no_prompt(self) -> None:
         card, _ = _wire(_TeamContext(), expose={COMMAND})

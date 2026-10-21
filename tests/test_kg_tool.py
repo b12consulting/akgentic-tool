@@ -11,7 +11,9 @@ Covers:
 
 from __future__ import annotations
 
+import typing
 import uuid
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -21,7 +23,17 @@ from akgentic.core.actor_address import ActorAddress
 from akgentic.core.agent import AkgentType
 from akgentic.core.orchestrator import Orchestrator
 
-from akgentic.tool.core import COMMAND, LLM_CONTEXT, TOOL_CALL, BaseToolParam, ToolState, _resolve
+from akgentic.tool.core import (
+    COMMAND,
+    LLM_CONTEXT,
+    TOOL_CALL,
+    BaseToolParam,
+    CommandRegistry,
+    ToolFactory,
+    ToolState,
+    _resolve,
+)
+from akgentic.tool.core.event import CommandArg
 from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.knowledge_graph.kg_actor import (
     KG_ACTOR_NAME,
@@ -41,11 +53,13 @@ from akgentic.tool.knowledge_graph.models import (
     ManageGraph,
     RelationCreate,
     SearchQuery,
+    SearchResult,
 )
 from akgentic.tool.vector_store.actor import VectorStoreActor
 from akgentic.tool.vector_store.backends.weaviate import WEAVIATE_URL_ENV
 from akgentic.tool.vector_store.hybrid import DEFAULT_ALPHA
 from akgentic.tool.vector_store.protocol import (
+    SEMANTIC_DISABLED,
     VectorStoreParam,
     resolve_store_param,
 )
@@ -1136,3 +1150,146 @@ class TestTheSearchClosureAnswersADeclinedStore:
         tool.observer(observer)
 
         assert "search_graph" in [t.__name__ for t in tool.get_tools()]
+
+
+class TestTheSearchGraphCommandTakesText:
+    """``/search_graph <free text>`` searches the graph — always through the registry.
+
+    Every command spec here goes through ``registry.dispatch(...)``. A call to the closure
+    from ``get_commands()`` bypasses tokenising and coercion, and that is exactly
+    the shape that let a model-typed command ship: the closure accepted a
+    ``SearchQuery`` while no human could type one.
+    """
+
+    @staticmethod
+    def _wire(tool: KnowledgeGraphTool) -> MagicMock:
+        """Wire *tool* to a recording actor proxy and return the proxy."""
+        proxy = MagicMock()
+        proxy.search.return_value = SearchResult(hits=[])
+
+        observer = MockActorToolObserver()
+        observer._kg_actor = proxy  # type: ignore[assignment]
+        tool.observer(observer)
+        return proxy
+
+    @classmethod
+    def _registry(cls, tool: KnowledgeGraphTool) -> tuple[CommandRegistry, MagicMock]:
+        """Wire *tool* to a recording actor proxy and build its command registry."""
+        proxy = cls._wire(tool)
+        return ToolFactory(tool_cards=[tool]).get_command_registry(), proxy
+
+    def test_the_command_takes_one_free_text_query(self) -> None:
+        registry, _ = self._registry(KnowledgeGraphTool())
+
+        descriptor = next(d for d in registry.descriptors() if d.name == "search_graph")
+        assert descriptor.args == [CommandArg(name="query", type="string", required=True)]
+        assert descriptor.tool_card == "KnowledgeGraphTool"
+        assert "/search_graph " in descriptor.description
+
+    def test_the_free_text_reaches_the_actor_as_the_query(self) -> None:
+        registry, proxy = self._registry(KnowledgeGraphTool())
+
+        result = registry.dispatch("/search_graph mailing list")
+
+        assert result == "No results found."
+        proxy.search.assert_called_once()
+        (query,) = proxy.search.call_args.args
+        assert isinstance(query, SearchQuery)
+        assert query.query == "mailing list"
+        assert query.mode == "hybrid"
+        # ``None`` lets the actor apply the card's own defaults.
+        assert query.top_k is None
+        assert query.score_threshold is None
+        assert (query.include_neighbors, query.include_edges, query.find_paths) == (
+            False,
+            False,
+            False,
+        )
+
+    def test_the_hits_are_rendered_for_a_human(self) -> None:
+        tool = KnowledgeGraphTool()
+        observer = MockActorToolObserver()
+        actor = observer.setup_kg_actor()
+        actor.update_graph(
+            ManageGraph(
+                create_entities=[
+                    EntityCreate(name="Alice", entity_type="Person", description="Engineer"),
+                ]
+            )
+        )
+        tool.observer(observer)
+        registry = ToolFactory(tool_cards=[tool]).get_command_registry()
+
+        result = registry.dispatch("/search_graph Alice")
+
+        assert result is not None
+        assert result.startswith("Search Results:")
+        assert "Alice" in result
+
+    def test_an_empty_query_is_a_usage_result_not_a_fallback(self) -> None:
+        registry, proxy = self._registry(KnowledgeGraphTool())
+
+        result = registry.dispatch("/search_graph")
+
+        assert result is not None
+        assert "missing required argument" in result
+        assert "query" in result
+        assert proxy.search.call_count == 0
+
+    def test_a_store_less_card_still_serves_the_command_hybrid_results(self) -> None:
+        """The command answers exactly what the tool closure answers for hybrid."""
+        tool = KnowledgeGraphTool(vector_store=False)
+        registry, proxy = self._registry(tool)
+        search_tool = next(t for t in tool.get_tools() if t.__name__ == "search_graph")
+
+        from_command = registry.dispatch("/search_graph Alice")
+        from_tool = search_tool(SearchQuery(query="Alice", mode="hybrid"))
+
+        assert from_command != SEMANTIC_DISABLED
+        assert from_command == from_tool
+        assert proxy.search.call_count == 2
+        assert proxy.search.call_args_list[0] == proxy.search.call_args_list[1]
+
+    def test_both_channels_run_one_guarded_searcher(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Both closures route through ``_graph_searcher`` — neither re-implements it."""
+        seen: list[SearchQuery] = []
+
+        def recording_searcher(self: KnowledgeGraphTool) -> Callable[[SearchQuery], str]:
+            def search(query: SearchQuery) -> str:
+                seen.append(query)
+                return "recorded"
+
+            return search
+
+        monkeypatch.setattr(KnowledgeGraphTool, "_graph_searcher", recording_searcher)
+        tool = KnowledgeGraphTool()
+        registry, proxy = self._registry(tool)
+        search_tool = next(t for t in tool.get_tools() if t.__name__ == "search_graph")
+
+        assert registry.dispatch("/search_graph mailing list") == "recorded"
+        assert search_tool(SearchQuery(query="Alice", mode="vector")) == "recorded"
+        assert [q.query for q in seen] == ["mailing list", "Alice"]
+        assert proxy.search.call_count == 0
+
+    def test_the_guarded_searcher_answers_vector_mode_on_a_store_less_card(self) -> None:
+        """The semantic-disabled verdict is answered before the actor is asked."""
+        tool = KnowledgeGraphTool(vector_store=False)
+        proxy = self._wire(tool)
+
+        search = tool._graph_searcher()
+
+        assert search(SearchQuery(query="Alice", mode="vector")) == SEMANTIC_DISABLED
+        assert proxy.search.call_count == 0
+        assert search(SearchQuery(query="Alice", mode="hybrid")) == "No results found."
+        assert proxy.search.call_count == 1
+
+    def test_the_tool_keeps_its_structured_signature(self) -> None:
+        """The LLM keeps ``SearchQuery``; only the command takes text."""
+        tool = KnowledgeGraphTool(search=SearchGraph(instructions="Prefer hybrid."))
+        self._wire(tool)
+
+        search_tool = next(t for t in tool.get_tools() if t.__name__ == "search_graph")
+
+        hints = typing.get_type_hints(search_tool)
+        assert hints == {"query": SearchQuery, "return": str}
+        assert "Prefer hybrid." in (search_tool.__doc__ or "")

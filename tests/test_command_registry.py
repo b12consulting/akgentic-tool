@@ -9,15 +9,19 @@ assertion checks for an ADR-reference string (Golden Rule #8 / NFR3).
 
 from __future__ import annotations
 
+import uuid
 import warnings
-from typing import Callable, Literal
+from enum import StrEnum
+from typing import Annotated, Any, Callable, Literal, Optional
 
 import pytest
+from pydantic import BaseModel
 
 from akgentic.tool.core import (
     COMMAND,
     BaseToolParam,
     CommandRegistry,
+    RestOfLine,
     ToolCard,
     ToolFactory,
 )
@@ -838,3 +842,203 @@ def test_unknown_command_raises_with_and_without_extra_commands() -> None:
         reg_plain.dispatch("/nope")
     with pytest.raises(CommandNotRecognized):
         reg_extra.dispatch("/nope")
+
+
+# ===========================================================================
+# Story 21.5 — a command parameter must be producible from text
+#
+# Every command below is declared at module scope on purpose: this file has
+# ``from __future__ import annotations``, so the registry resolves each
+# annotation with ``get_type_hints`` against the module's globals. A model
+# defined inside a test function would leave the annotation a bare string, the
+# refusal would never see a model, and the spec would go red for the wrong
+# reason.
+# ===========================================================================
+
+
+class _Query(BaseModel):
+    """A stand-in for ``SearchQuery``: a model no single text token can produce."""
+
+    query: str
+
+
+class _Colour(StrEnum):
+    RED = "red"
+    BLUE = "blue"
+
+
+def _one_command_card(fn: Callable[..., Any]) -> ToolCard:
+    """A card whose only command is *fn*."""
+
+    class _OneCommandCard(ToolCard):
+        name: str = "one-command"
+        description: str = "one command"
+
+        def get_tools(self) -> list[Callable]:
+            return []
+
+        def get_commands(self) -> dict[type[BaseToolParam], Callable]:
+            return {_HireParam: fn}
+
+    return _OneCommandCard()
+
+
+def search_graph(query: _Query) -> str:
+    """The shape ``/search_graph`` shipped with: the tool closure, model-typed."""
+    return query.query
+
+
+def maybe_pipe(maybe_query: _Query | None = None) -> str:
+    """A model behind ``X | None``."""
+    return "x"
+
+
+def maybe_typing(maybe_query: Optional[_Query] = None) -> str:  # noqa: UP045
+    """A model behind ``Optional[X]`` — how a developer would actually write it."""
+    return "x"
+
+
+def many(queries: list[_Query]) -> str:
+    """A model inside a list."""
+    return "x"
+
+
+def either(text_or_query: str | _Query) -> str:
+    """A model as one arm of a union with a text-producible type."""
+    return "x"
+
+
+def keyed(queries_by_name: dict[str, _Query]) -> str:
+    """A model as a mapping's value type."""
+    return "x"
+
+
+def annotated(annotated_query: Annotated[_Query, "metadata"]) -> str:
+    """A model behind ``Annotated`` — its metadata is not a type, its first arg is."""
+    return "x"
+
+
+# --- AC1: the bare model parameter is refused at construction ---------------
+
+
+def test_a_bare_model_parameter_is_refused_at_construction() -> None:
+    factory = ToolFactory(tool_cards=[_one_command_card(search_graph)])
+    with pytest.raises(ValueError) as exc:
+        factory.get_command_registry()
+    assert "Command 'search_graph' cannot be registered: parameter 'query'" in str(exc.value)
+
+
+# --- AC2: a model nested in Optional / a union / a container is refused ------
+
+
+@pytest.mark.parametrize(
+    ("fn", "pname"),
+    [
+        (maybe_pipe, "maybe_query"),
+        (maybe_typing, "maybe_query"),
+        (many, "queries"),
+        (either, "text_or_query"),
+        (keyed, "queries_by_name"),
+        (annotated, "annotated_query"),
+    ],
+    ids=["pipe-none", "optional", "list", "union", "dict", "annotated"],
+)
+def test_a_nested_model_parameter_is_refused_at_construction(
+    fn: Callable[..., Any], pname: str
+) -> None:
+    factory = ToolFactory(tool_cards=[_one_command_card(fn)])
+    with pytest.raises(ValueError) as exc:
+        factory.get_command_registry()
+    message = str(exc.value)
+    assert f"Command '{fn.__name__}' cannot be registered: parameter '{pname}'" in message
+
+
+def test_the_refusal_reaches_an_agent_owned_extra_command_too() -> None:
+    factory = ToolFactory(tool_cards=[])
+    with pytest.raises(ValueError, match="parameter 'maybe_query'"):
+        factory.get_command_registry(extra_commands=[maybe_typing])
+
+
+# --- AC3: text-producible types still register ------------------------------
+
+
+def as_str(value: str) -> str:
+    """str."""
+    return value
+
+
+def as_int(value: int) -> str:
+    """int."""
+    return str(value)
+
+
+def as_float(value: float) -> str:
+    """float."""
+    return str(value)
+
+
+def as_bool(value: bool) -> str:
+    """bool."""
+    return str(value)
+
+
+def as_uuid(value: uuid.UUID) -> str:
+    """uuid.UUID."""
+    return str(value)
+
+
+def as_enum(value: _Colour) -> str:
+    """StrEnum."""
+    return str(value)
+
+
+def as_literal(value: Literal["a", "b"]) -> str:
+    """Literal."""
+    return value
+
+
+def as_optional_str(value: str | None = None) -> str:
+    """str | None."""
+    return str(value)
+
+
+def as_str_list(value: list[str]) -> str:
+    """list[str]."""
+    return str(value)
+
+
+def as_int_list(value: list[int]) -> str:
+    """list[int]."""
+    return str(value)
+
+
+def as_rest_of_line(value: RestOfLine) -> str:
+    """RestOfLine."""
+    return value
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [
+        as_str,
+        as_int,
+        as_float,
+        as_bool,
+        as_uuid,
+        as_enum,
+        as_literal,
+        as_optional_str,
+        as_str_list,
+        as_int_list,
+        as_rest_of_line,
+    ],
+    ids=lambda fn: fn.__name__,
+)
+def test_a_text_producible_parameter_still_registers(fn: Callable[..., Any]) -> None:
+    registry = _registry(_one_command_card(fn))
+    assert registry.has(fn.__name__)
+
+
+def test_a_rest_of_line_command_still_takes_the_whole_line() -> None:
+    registry = _registry(_one_command_card(as_rest_of_line))
+    assert registry.dispatch("/as_rest_of_line mailing list") == "mailing list"

@@ -27,7 +27,7 @@ from pydantic import ValidationError
 
 import akgentic.tool
 import akgentic.tool.skill
-from akgentic.tool.core import COMMAND, SYSTEM_PROMPT, TOOL_CALL, ToolCard
+from akgentic.tool.core import COMMAND, SYSTEM_PROMPT, TOOL_CALL, ToolCard, ToolFactory
 from akgentic.tool.core.observer import ActorToolObserver
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.skill import SkillEntry, Skills, SkillTool
@@ -265,6 +265,10 @@ class TestCommand:
     def test_instructions_reach_the_command_docstring(self) -> None:
         card = _card(instructions="Quote the menu verbatim.")
         assert "Quote the menu verbatim." in (card.get_commands()[Skills].__doc__ or "")
+
+    def test_the_command_registry_builds(self) -> None:
+        registry = ToolFactory(tool_cards=[_card()]).get_command_registry()
+        assert registry.has("skills")
 
 
 # ── AC8: the three channels are independent ───────────────────────────────────

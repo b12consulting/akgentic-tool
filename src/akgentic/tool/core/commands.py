@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from io import StringIO
 from typing import Annotated, Any, get_args, get_origin, get_type_hints
 
-from pydantic import TypeAdapter
+from pydantic import BaseModel, TypeAdapter
 
 from akgentic.tool.core.event import CommandArg, CommandDescriptor
 from akgentic.tool.errors import CommandNotRecognized
@@ -95,8 +95,9 @@ def _build_command_entry(fn: Callable[..., Any], tool_card: str) -> _CommandEntr
 
     Mirrors how pydantic-ai derives a tool schema from a function signature:
     inspect the parameters, reject anything un-derivable (``*args``, ``**kwargs``,
-    or an un-annotated parameter), and build a :class:`TypeAdapter` over the
-    ordered positional parameter types for later coercion.
+    an un-annotated parameter, or one no text token can produce), and build a
+    :class:`TypeAdapter` over the ordered positional parameter types for later
+    coercion.
 
     The hints are read with ``include_extras=True``: without it ``Annotated``
     metadata is stripped and a :data:`RestOfLine` parameter is indistinguishable
@@ -104,9 +105,11 @@ def _build_command_entry(fn: Callable[..., Any], tool_card: str) -> _CommandEntr
 
     Raises:
         ValueError: If the signature has a ``VAR_POSITIONAL`` (``*args``),
-            ``VAR_KEYWORD`` (``**kwargs``), or un-annotated parameter, or a
-            :data:`RestOfLine` parameter that is not the last or not required. The
-            message names the command and the offending parameter.
+            ``VAR_KEYWORD`` (``**kwargs``), or un-annotated parameter, a parameter
+            typed as — or containing — a Pydantic model (bare, or inside
+            ``Optional`` / a union / a container), or a :data:`RestOfLine`
+            parameter that is not the last or not required. The message names the
+            command and the offending parameter.
     """
     sig = inspect.signature(fn)
     try:
@@ -132,6 +135,7 @@ def _build_command_entry(fn: Callable[..., Any], tool_card: str) -> _CommandEntr
                 f"Command '{fn.__name__}' cannot be registered: parameter '{pname}' "
                 "has no type annotation."
             )
+        _check_producible_from_text(fn, pname, annotation)
         required = param.default is inspect.Parameter.empty
         if _is_rest_of_line(annotation):
             _check_rest_of_line(fn, pname, required, last=pname == list(sig.parameters)[-1])
@@ -153,6 +157,39 @@ def _build_command_entry(fn: Callable[..., Any], tool_card: str) -> _CommandEntr
         tool_card=tool_card,
         rest_of_line=rest_of_line,
     )
+
+
+def _contains_model(annotation: Any) -> bool:
+    """Whether *annotation* is, or has among its type arguments, a Pydantic model.
+
+    Recurses through ``get_args`` so ``Model | None``, ``Optional[Model]``,
+    ``list[Model]`` and ``dict[str, Model]`` are all seen. ``Annotated`` recurses
+    into its first argument only — the rest is metadata, not a type. Anything
+    that is not a class (``Literal`` values, ``Ellipsis``) is not a model.
+    """
+    if inspect.isclass(annotation) and issubclass(annotation, BaseModel):
+        return True
+    args = get_args(annotation)
+    if get_origin(annotation) is Annotated:
+        args = args[:1]
+    return any(_contains_model(arg) for arg in args)
+
+
+def _check_producible_from_text(fn: Callable[..., Any], pname: str, annotation: Any) -> None:
+    """Refuse a parameter no text token can produce: one that is or contains a model.
+
+    A dispatched token is coerced through the parameter's :class:`TypeAdapter`,
+    and a string never validates as a model — so such a command could only ever
+    answer a validation error. Refusing it here makes that a wiring failure.
+
+    Raises:
+        ValueError: Naming the command and the parameter.
+    """
+    if _contains_model(annotation):
+        raise ValueError(
+            f"Command '{fn.__name__}' cannot be registered: parameter '{pname}' is typed "
+            f"{annotation!r}, which a text token cannot produce."
+        )
 
 
 def _check_rest_of_line(fn: Callable[..., Any], pname: str, required: bool, last: bool) -> None:
