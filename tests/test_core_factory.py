@@ -150,7 +150,12 @@ def test_tool_factory_command_registry_empty() -> None:
     factory = ToolFactory(tool_cards=[card])
     registry = factory.get_command_registry()
     assert registry.descriptors() == []
-    assert not hasattr(factory, "get_commands")  # the registry is the only command surface
+
+
+def test_tool_factory_has_no_get_commands_alias() -> None:
+    """The registry is the factory's only command surface; the card-level hook stays."""
+    assert not hasattr(ToolFactory, "get_commands")
+    assert hasattr(ToolCard, "get_commands")
 
 
 def test_tool_factory_with_null_observer() -> None:

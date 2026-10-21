@@ -430,6 +430,15 @@ def test_descriptor_int_arg_type() -> None:
     assert desc.args[0].type == "integer"
 
 
+def test_descriptor_type_falls_back_to_string_when_no_json_schema() -> None:
+    def run(job: Callable[[], int]) -> str:
+        """Run a job."""
+        return str(job())
+
+    registry = _registry(_one_command_card(run))  # registers: a callable is not a model
+    assert registry.descriptors()[0].args[0].type == "string"
+
+
 # ---------------------------------------------------------------------------
 # retry_exception wrapping preserves name and translates RetriableError
 # ---------------------------------------------------------------------------
