@@ -16,6 +16,10 @@ from typing import Any
 from pydantic import Field, field_validator
 
 from akgentic.core.orchestrator import Orchestrator
+
+# ``RestOfLine`` is a runtime import, not a ``TYPE_CHECKING`` one: the command
+# registry resolves the ``/search_graph`` closure's annotations with
+# ``get_type_hints`` against this module's globals, and reads ``RestOfLine`` there.
 from akgentic.tool.core import (
     COMMAND,
     LLM_CONTEXT,
@@ -23,6 +27,7 @@ from akgentic.tool.core import (
     BaseToolParam,
     Channels,
     ContextState,
+    RestOfLine,
     ToolCard,
     _resolve,
     normalize_system_prompt_to_llm_context,
@@ -381,7 +386,7 @@ class KnowledgeGraphTool(ToolCard):
 
         sp = _resolve(self.search, SearchGraph)
         if sp and COMMAND in sp.expose:
-            commands[SearchGraph] = self._search_factory(sp)
+            commands[SearchGraph] = self._search_command_factory(sp)
 
         return commands
 
@@ -417,7 +422,39 @@ class KnowledgeGraphTool(ToolCard):
         return update_graph
 
     def _search_factory(self, params: SearchGraph) -> Callable[..., Any]:
-        """Return a closure that searches the graph.
+        """Return the ``search_graph`` tool closure, which takes a ``SearchQuery``."""
+        search = self._graph_searcher()
+
+        def search_graph(query: SearchQuery) -> str:
+            """Search the knowledge graph by keyword, vector, or hybrid mode."""
+            return search(query)
+
+        search_graph.__doc__ = params.format_docstring(search_graph.__doc__)
+        return search_graph
+
+    def _search_command_factory(self, params: SearchGraph) -> Callable[..., Any]:
+        """Return the ``/search_graph`` command closure, which takes free text.
+
+        The tool's ``SearchQuery`` is a model no text token can produce, so the
+        command gets its own closure: the whole rest of the line becomes the
+        query, and every other ``SearchQuery`` field keeps its default — hybrid
+        mode, and ``None`` budgets the actor resolves from the card's settings.
+        Both closures run the same :meth:`_graph_searcher`.
+        """
+        search = self._graph_searcher()
+
+        def search_graph(query: RestOfLine) -> str:
+            """Search the knowledge graph — the whole rest of the line is the query.
+
+            Example: /search_graph mailing list
+            """
+            return search(SearchQuery(query=query))
+
+        search_graph.__doc__ = params.format_docstring(search_graph.__doc__)
+        return search_graph
+
+    def _graph_searcher(self) -> Callable[[SearchQuery], str]:
+        """The guard-and-search sequence both ``search_graph`` callables run.
 
         **The semantic-disabled sentence is answered here, on the card, and not in
         the actor** — the opposite of where ``PlanActor`` answers it, for a
@@ -434,12 +471,10 @@ class KnowledgeGraphTool(ToolCard):
         format_result = self._format_search_result
         semantic_disabled = resolve_store_param(self.vector_store) is None
 
-        def search_graph(query: SearchQuery) -> str:
-            """Search the knowledge graph by keyword, vector, or hybrid mode."""
+        def search(query: SearchQuery) -> str:
             if semantic_disabled and query.mode == "vector":
                 return SEMANTIC_DISABLED
             result = kg_proxy.search(query)
             return format_result(result)
 
-        search_graph.__doc__ = params.format_docstring(search_graph.__doc__)
-        return search_graph
+        return search

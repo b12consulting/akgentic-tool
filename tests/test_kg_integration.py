@@ -304,7 +304,7 @@ class TestEndToEndUpdateGetSearch:
 
         commands = tool.get_commands()
         search_cmd = commands[SearchGraph]
-        result = search_cmd(SearchQuery(query="TypeScript"))
+        result = search_cmd("TypeScript")
         assert "TypeScript" in result
 
     def test_get_graph_with_tool_call_channel(self) -> None:

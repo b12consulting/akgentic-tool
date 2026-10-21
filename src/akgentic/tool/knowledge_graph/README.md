@@ -186,11 +186,23 @@ call therefore works.
 used by the vector index. Entities are addressed by **name** in the API and by **UUID** in the
 index; deleting an entity cascades to every relation touching it.
 
-### `SearchGraph` — `search_graph(query: SearchQuery)`
+### `SearchGraph` — `search_graph`
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `expose` | `set[Channels]` | `{TOOL_CALL, COMMAND}` | |
+| `expose` | `set[Channels]` | `{TOOL_CALL, COMMAND}` | The two channels carry **different callables**, not the same one twice. |
+
+| Channel | Callable |
+|---|---|
+| `TOOL_CALL` | `search_graph(query: SearchQuery) -> str` — the structured query below |
+| `COMMAND` | `search_graph(query: RestOfLine) -> str` — `/search_graph mailing list`: the whole rest of the line is the query, no quotes needed |
+
+The command builds `SearchQuery(query=<text>)` and nothing else: hybrid mode, the card's
+`search_top_k` / `search_score_threshold`, no expansion flags, and the hits rendered for a human.
+A `SearchQuery` cannot be typed as a command argument — the registry refuses any command
+parameter that is or contains a Pydantic model — so the command takes text and the model keeps
+its schema. Both callables run the same guarded search, so a store-less card's `mode="vector"`
+sentence is answered in one place.
 
 ```python
 class SearchQuery(SerializableBaseModel):
