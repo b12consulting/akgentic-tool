@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field, field_validator
 
@@ -320,8 +320,7 @@ class KnowledgeGraphTool(ToolCard):
             List with the graph-summary provider, or empty when disabled or
             not exposed on ``LLM_CONTEXT``.
         """
-        gp = _resolve(self.get_graph, GetGraph)
-        if gp and LLM_CONTEXT in gp.expose:
+        if gp := _resolve(self.get_graph, GetGraph, LLM_CONTEXT):
             return [self._kg_summary_state_factory(gp)]
         return []
 
@@ -357,17 +356,14 @@ class KnowledgeGraphTool(ToolCard):
         """Return callable tool functions for LLM agents."""
         tools: list[Callable[..., Any]] = []
 
-        gp = _resolve(self.get_graph, GetGraph)
-        if gp and TOOL_CALL in gp.expose:
+        if gp := _resolve(self.get_graph, GetGraph, TOOL_CALL):
             tools.append(self._get_graph_factory(gp))
 
         if not self.read_only:
-            up = _resolve(self.update_graph, UpdateGraph)
-            if up and TOOL_CALL in up.expose:
+            if up := _resolve(self.update_graph, UpdateGraph, TOOL_CALL):
                 tools.append(self._update_graph_factory(up))
 
-        sp = _resolve(self.search, SearchGraph)
-        if sp and TOOL_CALL in sp.expose:
+        if sp := _resolve(self.search, SearchGraph, TOOL_CALL):
             tools.append(self._search_factory(sp))
 
         return tools
@@ -380,12 +376,10 @@ class KnowledgeGraphTool(ToolCard):
         """Return command mappings for inter-agent orchestration."""
         commands: dict[type[BaseToolParam], Callable[..., Any]] = {}
 
-        gp = _resolve(self.get_graph, GetGraph)
-        if gp and COMMAND in gp.expose:
+        if gp := _resolve(self.get_graph, GetGraph, COMMAND):
             commands[GetGraph] = self._get_graph_factory(gp)
 
-        sp = _resolve(self.search, SearchGraph)
-        if sp and COMMAND in sp.expose:
+        if sp := _resolve(self.search, SearchGraph, COMMAND):
             commands[SearchGraph] = self._search_command_factory(sp)
 
         return commands
@@ -433,22 +427,54 @@ class KnowledgeGraphTool(ToolCard):
         return search_graph
 
     def _search_command_factory(self, params: SearchGraph) -> Callable[..., Any]:
-        """Return the ``/search_graph`` command closure, which takes free text.
+        """Return the ``/search_graph`` command closure: options, then free text.
 
         The tool's ``SearchQuery`` is a model no text token can produce, so the
-        command gets its own closure: the whole rest of the line becomes the
-        query, and every other ``SearchQuery`` field keeps its default — hybrid
-        mode, and ``None`` budgets the actor resolves from the card's settings.
-        Both closures run the same :meth:`_graph_searcher`.
+        command gets its own closure: every other ``SearchQuery`` field is a
+        ``name=value`` option with ``SearchQuery``'s own default — hybrid mode,
+        and ``None`` budgets the actor resolves from the card's settings — and the
+        rest of the line becomes the query. Both closures run the same
+        :meth:`_graph_searcher`.
         """
         search = self._graph_searcher()
 
-        def search_graph(query: RestOfLine) -> str:
-            """Search the knowledge graph — the whole rest of the line is the query.
+        def search_graph(
+            mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
+            top_k: int | None = None,
+            include_neighbors: bool = False,
+            include_edges: bool = False,
+            find_paths: bool = False,
+            score_threshold: float | None = None,
+            *,
+            query: RestOfLine,
+        ) -> str:
+            """Search the knowledge graph — options, then the rest of the line is the query.
 
             Example: /search_graph mailing list
+
+            Args:
+                mode: "hybrid" (default) = keyword + vector,
+                    "keyword" = substring only, "vector" = semantic only.
+                top_k: Max hits; the card's configured default when omitted.
+                include_neighbors: Add 1-hop neighbors of entity hits.
+                include_edges: Add relations connected to entity hits.
+                find_paths: BFS shortest paths between the top 5 entity hits
+                    (max 10 pairs).
+                score_threshold: Min cosine similarity; the card's configured
+                    default when omitted.
+                query: What to search for.
             """
-            return search(SearchQuery(query=query))
+            return search(
+                SearchQuery(
+                    query=query,
+                    mode=mode,
+                    top_k=top_k,
+                    include_neighbors=include_neighbors,
+                    include_edges=include_edges,
+                    find_paths=find_paths,
+                    score_threshold=score_threshold,
+                )
+            )
 
         search_graph.__doc__ = params.format_docstring(search_graph.__doc__)
         return search_graph

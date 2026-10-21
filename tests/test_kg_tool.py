@@ -1178,11 +1178,23 @@ class TestTheSearchGraphCommandTakesText:
         proxy = cls._wire(tool)
         return ToolFactory(tool_cards=[tool]).get_command_registry(), proxy
 
-    def test_the_command_takes_one_free_text_query(self) -> None:
+    def test_the_command_takes_options_then_a_free_text_query(self) -> None:
         registry, _ = self._registry(KnowledgeGraphTool())
 
         descriptor = next(d for d in registry.descriptors() if d.name == "search_graph")
-        assert descriptor.args == [CommandArg(name="query", type="string", required=True)]
+        assert [
+            (a.name, a.type, a.keyword_only, a.rest_of_line, a.required, a.choices)
+            for a in descriptor.args
+        ] == [
+            ("mode", "string", True, False, False, ["hybrid", "vector", "keyword"]),
+            ("top_k", "string", True, False, False, None),
+            ("include_neighbors", "boolean", True, False, False, ["true", "false"]),
+            ("include_edges", "boolean", True, False, False, ["true", "false"]),
+            ("find_paths", "boolean", True, False, False, ["true", "false"]),
+            ("score_threshold", "string", True, False, False, None),
+            ("query", "string", False, True, True, None),
+        ]
+        assert all(isinstance(a, CommandArg) and a.description for a in descriptor.args)
         assert descriptor.tool_card == "KnowledgeGraphTool"
         assert "/search_graph " in descriptor.description
 
@@ -1205,6 +1217,48 @@ class TestTheSearchGraphCommandTakesText:
             False,
             False,
         )
+
+    def _query(self, text: str) -> SearchQuery:
+        """Dispatch *text* and return the ``SearchQuery`` the actor received."""
+        registry, proxy = self._registry(KnowledgeGraphTool())
+        registry.dispatch(text)
+        (query,) = proxy.search.call_args.args
+        return query
+
+    def test_a_plain_first_word_is_the_query_not_the_mode(self) -> None:
+        query = self._query("/search_graph mailing list")
+        assert (query.query, query.mode) == ("mailing list", "hybrid")
+
+    def test_the_options_reach_the_actor(self) -> None:
+        query = self._query("/search_graph top_k=3 include_edges=true find_paths=1 foo")
+        assert (query.top_k, query.include_edges, query.find_paths) == (3, True, True)
+        assert (query.include_neighbors, query.query) == (False, "foo")
+
+    def test_a_quoted_first_word_of_the_text_is_kept_verbatim(self) -> None:
+        query = self._query('/search_graph mode=keyword "exact" phrase')
+        assert (query.query, query.mode) == ('"exact" phrase', "keyword")
+
+    def test_option_like_text_after_the_first_word_is_text(self) -> None:
+        query = self._query("/search_graph mailing mode=vector")
+        assert (query.query, query.mode) == ("mailing mode=vector", "hybrid")
+
+    def test_a_broken_quote_is_the_query(self) -> None:
+        assert self._query('/search_graph "mailing list').query == '"mailing list'
+
+    def test_a_bad_mode_is_the_commands_failure_and_the_actor_is_not_asked(self) -> None:
+        registry, proxy = self._registry(KnowledgeGraphTool())
+
+        result = registry.dispatch("/search_graph mode=x mailing")
+
+        assert result is not None
+        assert result.startswith("Command 'search_graph' failed:")
+        assert proxy.search.call_count == 0
+
+    def test_vector_mode_on_a_store_less_card_is_the_sentence(self) -> None:
+        registry, proxy = self._registry(KnowledgeGraphTool(vector_store=False))
+
+        assert registry.dispatch("/search_graph mode=vector Alice") == SEMANTIC_DISABLED
+        assert proxy.search.call_count == 0
 
     def test_the_hits_are_rendered_for_a_human(self) -> None:
         tool = KnowledgeGraphTool()

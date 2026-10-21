@@ -113,12 +113,13 @@ class ToolCard(SerializableBaseModel, ABC):
         return []
 
     def get_commands(self) -> dict[type["BaseToolParam"], Callable[..., Any]]:
-        """Return callable commands for programmatic invocation.
+        """Return the callables this card exposes on the ``COMMAND`` channel.
 
-        Commands are methods exposed for inter-agent orchestration
-        (e.g., ``hire_member``, ``fire_member``). Unlike tools (invoked by
-        the LLM), commands are called programmatically by other agents
-        or system components via ``proxy_call`` or similar mechanisms.
+        Unlike tools (invoked by the LLM), commands are either ``/``-dispatched
+        by a human or called by name from code (e.g., ``hire_member``), both
+        through the :class:`CommandRegistry` that
+        ``ToolFactory.get_command_registry()`` builds, keyed by each callable's
+        ``__name__``.
 
         Returns:
             Dict mapping param class (e.g., ``HireTeamMember``) to callable.

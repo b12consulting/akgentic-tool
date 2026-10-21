@@ -211,16 +211,13 @@ class NotificationTool(ToolCard):
         """Return the enabled capabilities that reach the ``TOOL_CALL`` channel."""
         tools: list[Callable[..., Any]] = []
 
-        rn = _resolve(self.register_notification, RegisterNotification)
-        if rn and TOOL_CALL in rn.expose:
+        if rn := _resolve(self.register_notification, RegisterNotification, TOOL_CALL):
             tools.append(self._register_factory(rn))
 
-        pn = _resolve(self.pending_notification, PendingNotifications)
-        if pn and TOOL_CALL in pn.expose:
+        if pn := _resolve(self.pending_notification, PendingNotifications, TOOL_CALL):
             tools.append(self._pending_factory(pn))
 
-        cn = _resolve(self.cancel_notification, CancelNotification)
-        if cn and TOOL_CALL in cn.expose:
+        if cn := _resolve(self.cancel_notification, CancelNotification, TOOL_CALL):
             tools.append(self._cancel_factory(cn))
 
         return tools
@@ -229,16 +226,13 @@ class NotificationTool(ToolCard):
         """Return the enabled capabilities that reach the ``COMMAND`` channel."""
         commands: dict[type[BaseToolParam], Callable[..., Any]] = {}
 
-        rn = _resolve(self.register_notification, RegisterNotification)
-        if rn and COMMAND in rn.expose:
+        if rn := _resolve(self.register_notification, RegisterNotification, COMMAND):
             commands[RegisterNotification] = self._register_factory(rn)
 
-        pn = _resolve(self.pending_notification, PendingNotifications)
-        if pn and COMMAND in pn.expose:
+        if pn := _resolve(self.pending_notification, PendingNotifications, COMMAND):
             commands[PendingNotifications] = self._pending_factory(pn)
 
-        cn = _resolve(self.cancel_notification, CancelNotification)
-        if cn and COMMAND in cn.expose:
+        if cn := _resolve(self.cancel_notification, CancelNotification, COMMAND):
             commands[CancelNotification] = self._cancel_factory(cn)
 
         return commands

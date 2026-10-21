@@ -195,14 +195,16 @@ index; deleting an entity cascades to every relation touching it.
 | Channel | Callable |
 |---|---|
 | `TOOL_CALL` | `search_graph(query: SearchQuery) -> str` — the structured query below |
-| `COMMAND` | `search_graph(query: RestOfLine) -> str` — `/search_graph mailing list`: the whole rest of the line is the query, no quotes needed |
+| `COMMAND` | `search_graph(mode="hybrid", top_k=None, include_neighbors=False, include_edges=False, find_paths=False, score_threshold=None, *, query: RestOfLine) -> str` — `/search_graph mode=keyword mailing list`: `name=value` options first, then the rest of the line is the query, no quotes needed |
 
-The command builds `SearchQuery(query=<text>)` and nothing else: hybrid mode, the card's
-`search_top_k` / `search_score_threshold`, no expansion flags, and the hits rendered for a human.
-A `SearchQuery` cannot be typed as a command argument — the registry refuses any command
-parameter that is or contains a Pydantic model — so the command takes text and the model keeps
-its schema. Both callables run the same guarded search, so a store-less card's `mode="vector"`
-sentence is answered in one place.
+The command takes every other `SearchQuery` field as a `name=value` option with `SearchQuery`'s
+own default — hybrid mode, the card's `search_top_k` / `search_score_threshold`, no expansion
+flags — and renders the hits for a human. An option is never bound positionally:
+`/search_graph mailing list` searches for `mailing list`, and anything after the first word of the
+text is text, `mode=vector` included. A `SearchQuery` cannot be typed as a command argument —
+the registry refuses any command parameter that is or contains a Pydantic model — so the command
+takes text and the model keeps its schema. Both callables run the same guarded search, so a
+store-less card's `mode="vector"` sentence is answered in one place.
 
 ```python
 class SearchQuery(SerializableBaseModel):

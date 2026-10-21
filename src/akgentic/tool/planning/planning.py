@@ -7,6 +7,10 @@ from typing import Any, Literal, cast
 from pydantic import Field, field_validator
 
 from akgentic.core.orchestrator import Orchestrator
+
+# ``RestOfLine`` is a runtime import, not a ``TYPE_CHECKING`` one: the command
+# registry resolves the ``/search_planning`` closure's annotations with
+# ``get_type_hints`` against this module's globals, and reads ``RestOfLine`` there.
 from akgentic.tool.core import (
     COMMAND,
     LLM_CONTEXT,
@@ -14,6 +18,7 @@ from akgentic.tool.core import (
     BaseToolParam,
     Channels,
     ContextState,
+    RestOfLine,
     ToolCard,
     _resolve,
     normalize_system_prompt_to_llm_context,
@@ -261,28 +266,23 @@ class PlanningTool(ToolCard):
             List with the planning-state provider, or empty when disabled or
             not exposed on ``LLM_CONTEXT``.
         """
-        gp = _resolve(self.get_planning, GetPlanning)
-        if gp and LLM_CONTEXT in gp.expose:
+        if gp := _resolve(self.get_planning, GetPlanning, LLM_CONTEXT):
             return [self._planning_state_factory(gp)]
         return []
 
     def get_tools(self) -> list[Callable[..., Any]]:
         tools: list[Callable[..., Any]] = []
 
-        gp = _resolve(self.get_planning, GetPlanning)
-        if gp and TOOL_CALL in gp.expose:
+        if gp := _resolve(self.get_planning, GetPlanning, TOOL_CALL):
             tools.append(self._planning_prompt_factory(gp))
 
-        gpi = _resolve(self.get_planning_task, GetPlanningTask)
-        if gpi and TOOL_CALL in gpi.expose:
+        if gpi := _resolve(self.get_planning_task, GetPlanningTask, TOOL_CALL):
             tools.append(self._get_planning_task_factory(gpi))
 
-        up = _resolve(self.update_planning, UpdatePlanning)
-        if up and TOOL_CALL in up.expose:
+        if up := _resolve(self.update_planning, UpdatePlanning, TOOL_CALL):
             tools.append(self._update_planning_factory(up))
 
-        sp = _resolve(self.search_planning, SearchPlanning)
-        if sp and TOOL_CALL in sp.expose:
+        if sp := _resolve(self.search_planning, SearchPlanning, TOOL_CALL):
             tools.append(self._search_planning_factory(sp))
 
         return tools
@@ -290,17 +290,14 @@ class PlanningTool(ToolCard):
     def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
         commands: dict[type[BaseToolParam], Callable[..., Any]] = {}
 
-        gp = _resolve(self.get_planning, GetPlanning)
-        if gp and COMMAND in gp.expose:
+        if gp := _resolve(self.get_planning, GetPlanning, COMMAND):
             commands[GetPlanning] = self._planning_prompt_factory(gp)
 
-        gpi = _resolve(self.get_planning_task, GetPlanningTask)
-        if gpi and COMMAND in gpi.expose:
+        if gpi := _resolve(self.get_planning_task, GetPlanningTask, COMMAND):
             commands[GetPlanningTask] = self._get_planning_task_factory(gpi)
 
-        sp = _resolve(self.search_planning, SearchPlanning)
-        if sp and COMMAND in sp.expose:
-            commands[SearchPlanning] = self._search_planning_factory(sp)
+        if sp := _resolve(self.search_planning, SearchPlanning, COMMAND):
+            commands[SearchPlanning] = self._search_planning_command_factory(sp)
 
         return commands
 
@@ -411,6 +408,56 @@ class PlanningTool(ToolCard):
                 top_k=top_k,
                 score_threshold=score_threshold,
             )
+
+        search_planning.__doc__ = params.format_docstring(search_planning.__doc__)
+        return search_planning
+
+    def _search_planning_command_factory(self, params: SearchPlanning) -> Callable[..., Any]:
+        """Return the ``/search_planning`` command closure: options, then free text.
+
+        The tool closure takes ``query`` first, so a human typing
+        ``/search_planning mailing list`` would bind ``list`` to ``mode``. The
+        command gets its own closure, whose filters are ``name=value`` options and
+        whose rest of the line is the query, and which renders the lines for a
+        human rather than answering a Python list.
+        """
+        planning_proxy = self._planning_proxy
+
+        def search_planning(
+            mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
+            status: TaskStatus | None = None,
+            owner: str | None = None,
+            creator: str | None = None,
+            top_k: int | None = None,
+            score_threshold: float | None = None,
+            query: RestOfLine = "",
+        ) -> str:
+            """Search tasks — options first, then the rest of the line is the query.
+
+            Example: /search_planning status=pending deploy the service
+
+            Args:
+                mode: "hybrid" (default) = keyword + semantic,
+                    "keyword" = substring only, "vector" = semantic only.
+                status: Filter by status.
+                owner: Filter by owner.
+                creator: Filter by creator.
+                top_k: Max semantic hits; the card's configured default when omitted.
+                score_threshold: Min cosine similarity; the card's configured default
+                    when omitted.
+                query: Search text for keyword and/or semantic matching; omit it,
+                    and every filter, to list all tasks.
+            """
+            lines = planning_proxy.search_planning(
+                status=status,
+                owner=owner,
+                creator=creator,
+                query=query or None,
+                mode=mode,
+                top_k=top_k,
+                score_threshold=score_threshold,
+            )
+            return "\n".join(lines) if lines else "No tasks found."
 
         search_planning.__doc__ = params.format_docstring(search_planning.__doc__)
         return search_planning

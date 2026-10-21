@@ -943,9 +943,11 @@ class RagFactories:
     def _rag_search_command_factory(self, params: WorkspaceRagSearch) -> Callable[..., Any]:
         """Create the ``/workspace_rag_search`` command — the tool's search, rendered for a human.
 
-        The same :meth:`_rag_searcher` the tool calls, with the param's budget and
-        no prefix. The result is rendered by :func:`_render_hits_for_human`, which
-        the tool never reaches: the model keeps receiving the structured result.
+        The same :meth:`_rag_searcher` the tool calls. ``top_k`` and
+        ``path_prefix`` are ``name=value`` options defaulting to the param's budget
+        and no prefix; the rest of the line is the query. The result is rendered by
+        :func:`_render_hits_for_human`, which the tool never reaches: the model
+        keeps receiving the structured result.
 
         Args:
             params: The result budget and the two fusion knobs.
@@ -954,14 +956,22 @@ class RagFactories:
             Callable named ``workspace_rag_search`` that answers text.
         """
         search = self._rag_searcher(params)
-        top_k = params.top_k
+        default_top_k = params.top_k
 
-        def workspace_rag_search(query: RestOfLine) -> str:
-            """Search the indexed workspace documents — the whole rest of the line is the query.
+        def workspace_rag_search(
+            top_k: int = default_top_k, path_prefix: str = "", *, query: RestOfLine
+        ) -> str:
+            """Search the indexed workspace documents — options, then the query.
 
             Example: /workspace_rag_search how is the gate refused?
+
+            Args:
+                top_k: How many passages to return.
+                path_prefix: Restrict to paths starting with this, e.g.
+                    "reports/". No wildcards. Defaults to the whole workspace.
+                query: What to look for, in natural language — the rest of the line.
             """
-            return _render_hits_for_human(search(query, top_k, ""))
+            return _render_hits_for_human(search(query, top_k, path_prefix))
 
         return workspace_rag_search
 

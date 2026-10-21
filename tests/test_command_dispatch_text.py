@@ -9,7 +9,7 @@ A ``RestOfLine`` last parameter receives the raw remainder instead.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 
@@ -147,8 +147,8 @@ class TestRestOfLine:
         ]
 
 
-class TestRestOfLineIsOnlyLastAndRequired:
-    def _build(self, fn: Callable[..., Any]) -> None:
+class TestRestOfLineIsOnlyLast:
+    def _build(self, fn: Callable[..., Any]) -> CommandRegistry:
         class _Card(ToolCard):
             name: str = "bad"
             description: str = "bad"
@@ -159,7 +159,7 @@ class TestRestOfLineIsOnlyLastAndRequired:
             def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
                 return {_WriteParam: fn}
 
-        ToolFactory(tool_cards=[_Card()]).get_command_registry()
+        return ToolFactory(tool_cards=[_Card()]).get_command_registry()
 
     def test_not_last_is_refused_naming_the_command(self) -> None:
         def misplaced(content: RestOfLine, filepath: str) -> str:
@@ -169,10 +169,181 @@ class TestRestOfLineIsOnlyLastAndRequired:
         with pytest.raises(ValueError, match="'misplaced'.*must be the last"):
             self._build(misplaced)
 
-    def test_optional_is_refused_naming_the_command(self) -> None:
-        def optional(filepath: str, content: RestOfLine = "") -> str:
-            """Bad."""
+    def test_optional_registers_and_an_empty_remainder_keeps_its_default(self) -> None:
+        def optional(filepath: str, content: RestOfLine = "<default>") -> str:
+            """Optional text."""
             return content
 
-        with pytest.raises(ValueError, match="'optional'.*must be required"):
-            self._build(optional)
+        registry = self._build(optional)
+
+        assert registry.dispatch("/optional a.md") == "<default>"
+        assert registry.dispatch("/optional a.md hi") == "hi"
+
+    def test_a_positional_after_an_option_is_refused_naming_the_command_and_parameter(
+        self,
+    ) -> None:
+        def bad(mode: str = "a", *, path: str, text: RestOfLine) -> str:
+            """Bad."""
+            return text
+
+        with pytest.raises(ValueError, match="'bad'.*'path'"):
+            self._build(bad)
+
+    def test_the_same_shape_without_rest_of_line_still_registers(self) -> None:
+        """The refusal is a rest-of-line rule; a plain command keeps the 21.4 grammar."""
+
+        def fine(mode: str = "a", *, path: str) -> str:
+            """Fine."""
+            return f"{mode}|{path}"
+
+        assert self._build(fine).dispatch("/fine path=x") == "a|x"
+
+
+# ---------------------------------------------------------------------------
+# Options, then text — a defaulted parameter before RestOfLine is name=value only
+# ---------------------------------------------------------------------------
+
+
+class _FindParam(BaseToolParam):
+    expose: set[str] = {COMMAND}
+
+
+class _ListParam(BaseToolParam):
+    expose: set[str] = {COMMAND}
+
+
+class _PutParam(BaseToolParam):
+    expose: set[str] = {COMMAND}
+
+
+class _OptionsCard(ToolCard):
+    """Card exposing options-then-text commands that echo what they were given."""
+
+    name: str = "options-card"
+    description: str = "options card"
+
+    def get_tools(self) -> list[Callable[..., Any]]:
+        return []
+
+    def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
+        def find(
+            mode: Literal["hybrid", "vector", "keyword"] = "hybrid",
+            top_k: int | None = None,
+            include_edges: bool = False,
+            *,
+            text: RestOfLine,
+        ) -> str:
+            """Find with a required text."""
+            return repr((mode, top_k, include_edges, text))
+
+        def listing(
+            status: Literal["pending", "started"] | None = None,
+            owner: str | None = None,
+            text: RestOfLine = "",
+        ) -> str:
+            """List with an optional text."""
+            return repr((status, owner, text))
+
+        def put(
+            filepath: str, mode: Literal["a", "b"] = "a", *, text: RestOfLine
+        ) -> str:
+            """A positional, an option, then text."""
+            return repr((filepath, mode, text))
+
+        return {_FindParam: find, _ListParam: listing, _PutParam: put}
+
+
+def _options_registry() -> CommandRegistry:
+    return ToolFactory(tool_cards=[_OptionsCard()]).get_command_registry()
+
+
+class TestAnOptionIsNeverBoundPositionally:
+    def test_a_plain_first_word_is_text_not_the_first_option(self) -> None:
+        result = _options_registry().dispatch("/find mailing list")
+        assert result == repr(("hybrid", None, False, "mailing list"))
+
+    def test_options_then_text(self) -> None:
+        result = _options_registry().dispatch("/find mode=keyword top_k=2 mailing list")
+        assert result == repr(("keyword", 2, False, "mailing list"))
+
+    def test_a_positional_is_still_bound_before_the_options(self) -> None:
+        result = _options_registry().dispatch("/put notes.md mode=b hello there")
+        assert result == repr(("notes.md", "b", "hello there"))
+
+    def test_a_positional_may_still_be_named(self) -> None:
+        result = _options_registry().dispatch("/put filepath=notes.md hello")
+        assert result == repr(("notes.md", "a", "hello"))
+
+    def test_a_line_ending_before_the_positionals_is_the_missing_argument_result(self) -> None:
+        result = _options_registry().dispatch("/put")
+        assert result == "Command 'put' failed: missing required argument(s): filepath, text"
+
+    def test_an_option_before_a_positional_is_the_ordering_failure(self) -> None:
+        result = _options_registry().dispatch("/put mode=b notes.md hello")
+        assert result == (
+            "Command 'put' failed: positional argument 'notes.md' cannot follow a keyword argument"
+        )
+
+
+class TestTheTextStartsAtTheFirstNonOption:
+    def test_a_quoted_first_word_is_kept_verbatim(self) -> None:
+        result = _options_registry().dispatch('/find mode=keyword "exact" phrase')
+        assert result == repr(("keyword", None, False, '"exact" phrase'))
+
+    def test_option_like_text_after_the_first_text_word_is_text(self) -> None:
+        result = _options_registry().dispatch("/find mailing mode=vector")
+        assert result == repr(("hybrid", None, False, "mailing mode=vector"))
+
+    def test_name_value_naming_no_option_is_text(self) -> None:
+        assert _options_registry().dispatch("/find a=b c") == repr(
+            ("hybrid", None, False, "a=b c")
+        )
+
+    def test_inner_whitespace_and_newlines_are_kept_leading_is_stripped(self) -> None:
+        result = _options_registry().dispatch("/find mode=keyword   two  spaces\n next line")
+        assert result == repr(("keyword", None, False, "two  spaces\n next line"))
+
+    def test_option_values_are_shlex_tokenised(self) -> None:
+        result = _options_registry().dispatch('/listing owner="Alice Smith" deploy')
+        assert result == repr((None, "Alice Smith", "deploy"))
+
+    def test_a_broken_quote_in_the_text_is_text(self) -> None:
+        result = _options_registry().dispatch('/find "mailing list')
+        assert result == repr(("hybrid", None, False, '"mailing list'))
+
+    def test_a_broken_quote_after_an_option_is_text(self) -> None:
+        result = _options_registry().dispatch('/find mode=vector "mailing list')
+        assert result == repr(("vector", None, False, '"mailing list'))
+
+    def test_a_broken_quote_before_the_positionals_are_bound_is_a_result(self) -> None:
+        result = _options_registry().dispatch('/put "notes.md hello')
+        assert result == "Command 'put' failed: No closing quotation"
+
+
+class TestOptionValuesAreCoerced:
+    def test_a_bad_option_value_is_the_commands_failure(self) -> None:
+        result = _options_registry().dispatch("/find mode=x mailing")
+        assert result is not None
+        assert result.startswith("Command 'find' failed:")
+
+    def test_int_and_bool_options_are_coerced(self) -> None:
+        result = _options_registry().dispatch("/find top_k=3 include_edges=true foo")
+        assert result == repr(("hybrid", 3, True, "foo"))
+
+    def test_a_repeated_option_is_a_duplicate_binding_failure(self) -> None:
+        result = _options_registry().dispatch("/find mode=keyword mode=vector foo")
+        assert result == "Command 'find' failed: got multiple values for argument 'mode'"
+
+
+class TestADefaultedTextMayBeEmpty:
+    def test_options_alone_leave_the_text_at_its_default(self) -> None:
+        assert _options_registry().dispatch("/listing status=pending") == repr(
+            ("pending", None, "")
+        )
+
+    def test_the_bare_command_applies_every_default(self) -> None:
+        assert _options_registry().dispatch("/listing") == repr((None, None, ""))
+
+    def test_a_required_text_left_empty_is_the_missing_argument_result(self) -> None:
+        result = _options_registry().dispatch("/find mode=keyword   ")
+        assert result == "Command 'find' failed: missing required argument(s): text"

@@ -137,7 +137,7 @@ class TestTheSearchCommandSurface:
     EXPECTED = {
         "workspace_glob": [("pattern", True), ("path", False)],
         "workspace_grep": [("pattern", True), ("path", False), ("include", False)],
-        "workspace_rag_search": [("query", True)],
+        "workspace_rag_search": [("top_k", False), ("path_prefix", False), ("query", True)],
     }
 
     def test_the_descriptors_name_each_command_and_its_arguments(
@@ -366,6 +366,40 @@ class TestRagSearchCommand:
         assert kwargs["alpha"] == 0.4
         assert kwargs["score_threshold"] == 0.2
         assert kwargs["path_prefix"] == ""
+
+    def test_the_options_come_first_and_reach_the_search(
+        self,
+        orchestrator_proxy: FakeOrchestratorProxy,
+        workspace_tree: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        seen: list[tuple[str, dict[str, Any]]] = []
+
+        def capture(*args: Any, **kwargs: Any) -> RagSearchResult:
+            seen.append((args[3], kwargs))
+            return RagSearchResult(note="captured")
+
+        monkeypatch.setattr("akgentic.tool.workspace.rag.search_documents", capture)
+        card = _bind(orchestrator_proxy, workspace_rag_search=WorkspaceRagSearch(top_k=3))
+
+        assert run(card, "/workspace_rag_search top_k=1 path_prefix=reports/ gate") == "captured"
+
+        [(query, kwargs)] = seen
+        assert query == "gate"
+        assert (kwargs["top_k"], kwargs["path_prefix"]) == (1, "reports/")
+
+    def test_the_descriptor_flags_the_options_and_the_text(
+        self, search_card: WorkspaceTool
+    ) -> None:
+        descriptor = next(
+            d for d in registry(search_card).descriptors() if d.name == "workspace_rag_search"
+        )
+        assert [(a.name, a.keyword_only, a.rest_of_line) for a in descriptor.args] == [
+            ("top_k", True, False),
+            ("path_prefix", True, False),
+            ("query", False, True),
+        ]
+        assert all(a.description for a in descriptor.args), descriptor.args
 
     def test_the_hits_are_rendered_for_the_human(
         self, search_card: WorkspaceTool, workspace_tree: Path

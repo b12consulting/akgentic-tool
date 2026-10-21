@@ -77,16 +77,14 @@ class MailboxTool(ToolCard):
     def get_tools(self) -> list[Callable[..., Any]]:
         """Return ``read_mailbox`` when its capability serves ``TOOL_CALL``."""
         tools: list[Callable[..., Any]] = []
-        read = _resolve(self.read_mailbox, ReadMailbox)
-        if read and TOOL_CALL in read.expose:
+        if read := _resolve(self.read_mailbox, ReadMailbox, TOOL_CALL):
             tools.append(self._read_mailbox_factory(read))
         return tools
 
     def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
         """Return ``stop`` when its capability serves ``COMMAND``."""
         commands: dict[type[BaseToolParam], Callable[..., Any]] = {}
-        stop = _resolve(self.stop, Stop)
-        if stop and COMMAND in stop.expose:
+        if stop := _resolve(self.stop, Stop, COMMAND):
             commands[Stop] = self._stop_factory(stop)
         return commands
 

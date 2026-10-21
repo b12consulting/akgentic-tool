@@ -78,6 +78,27 @@ def test_resolve_instance() -> None:
     assert result.value == "custom"
 
 
+def test_resolve_channel_exposed_returns_the_instance() -> None:
+    param = _DummyParam(expose={COMMAND})
+    assert _resolve(param, _DummyParam, COMMAND) is param
+
+
+def test_resolve_channel_not_exposed_returns_none() -> None:
+    param = _DummyParam(expose={TOOL_CALL})
+    assert _resolve(param, _DummyParam, COMMAND) is None
+
+
+def test_resolve_channel_false_returns_none() -> None:
+    assert _resolve(False, _DummyParam, TOOL_CALL) is None
+
+
+def test_resolve_channel_true_follows_the_default_expose() -> None:
+    result = _resolve(True, _DummyParam, TOOL_CALL)
+    assert isinstance(result, _DummyParam)
+    assert result.value == "default"
+    assert _resolve(True, _DummyParam, COMMAND) is None
+
+
 def test_base_tool_param_defaults() -> None:
     """BaseToolParam defaults: expose={TOOL_CALL}, instructions=None."""
     p = BaseToolParam()
@@ -92,8 +113,8 @@ def test_base_tool_param_subclass_defaults() -> None:
     assert p.expose == {TOOL_CALL}
 
 
-def test_tool_factory_get_commands() -> None:
-    """ToolFactory.get_commands() aggregates from all tool cards."""
+def test_tool_factory_command_registry() -> None:
+    """ToolFactory.get_command_registry() registers card commands by name."""
 
     class _CommandParam(BaseToolParam):
         expose: set[str] = {COMMAND}
@@ -118,18 +139,23 @@ def test_tool_factory_get_commands() -> None:
 
     card = _CommandTool()
     factory = ToolFactory(tool_cards=[card])
-    commands = factory.get_commands()
-    assert len(commands) == 1
-    assert _CommandParam in commands
-    assert commands[_CommandParam]() == "cmd-result"
+    registry = factory.get_command_registry()
+    assert registry.has("my_cmd")
+    assert registry.dispatch("/my_cmd") == "cmd-result"
 
 
-def test_tool_factory_get_commands_empty() -> None:
-    """ToolFactory.get_commands() returns empty dict when no cards have commands."""
+def test_tool_factory_command_registry_empty() -> None:
+    """ToolFactory.get_command_registry() is empty when no cards have commands."""
     card = _DummyTool()
     factory = ToolFactory(tool_cards=[card])
-    commands = factory.get_commands()
-    assert commands == {}
+    registry = factory.get_command_registry()
+    assert registry.descriptors() == []
+
+
+def test_tool_factory_has_no_get_commands_alias() -> None:
+    """The registry is the factory's only command surface; the card-level hook stays."""
+    assert not hasattr(ToolFactory, "get_commands")
+    assert hasattr(ToolCard, "get_commands")
 
 
 def test_tool_factory_with_null_observer() -> None:

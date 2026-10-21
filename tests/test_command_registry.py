@@ -10,7 +10,6 @@ assertion checks for an ADR-reference string (Golden Rule #8 / NFR3).
 from __future__ import annotations
 
 import uuid
-import warnings
 from enum import StrEnum
 from typing import Annotated, Any, Callable, Literal, Optional
 
@@ -431,18 +430,13 @@ def test_descriptor_int_arg_type() -> None:
     assert desc.args[0].type == "integer"
 
 
-# ---------------------------------------------------------------------------
-# AC 11 — Deprecated get_commands() alias retained
-# ---------------------------------------------------------------------------
+def test_descriptor_type_falls_back_to_string_when_no_json_schema() -> None:
+    def run(job: Callable[[], int]) -> str:
+        """Run a job."""
+        return str(job())
 
-
-def test_get_commands_still_returns_legacy_dict_and_warns() -> None:
-    factory = ToolFactory(tool_cards=[_HireCard()])
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        commands = factory.get_commands()
-    assert _HireParam in commands  # legacy param-class keying preserved
-    assert any(issubclass(w.category, DeprecationWarning) for w in caught)
+    registry = _registry(_one_command_card(run))  # registers: a callable is not a model
+    assert registry.descriptors()[0].args[0].type == "string"
 
 
 # ---------------------------------------------------------------------------
@@ -644,8 +638,10 @@ def test_kw_duplicate_same_keyword_twice_is_result_string() -> None:
     registry = _registry(_SearchCard())
     # shlex keeps both tokens; first-= classification yields a repeated keyword.
     result = registry.dispatch("/search_planning status=pending status=started")
-    assert isinstance(result, str)
-    assert "status" in result
+    # The success output (the bound dict) also names "status": pin the failure itself.
+    assert result == (
+        "Command 'search_planning' failed: got multiple values for argument 'status'"
+    )
 
 
 # --- AC8: arity / required checks over the merged binding -------------------
@@ -1042,3 +1038,155 @@ def test_a_text_producible_parameter_still_registers(fn: Callable[..., Any]) -> 
 def test_a_rest_of_line_command_still_takes_the_whole_line() -> None:
     registry = _registry(_one_command_card(as_rest_of_line))
     assert registry.dispatch("/as_rest_of_line mailing list") == "mailing list"
+
+
+# ===========================================================================
+# Story 21.7 — discovery says which args are options, which is the text, what
+# each one means and which values it accepts
+# ===========================================================================
+
+
+def documented(
+    colour: _Colour | None = None,
+    flag: bool = False,
+    count: int | None = None,
+    *,
+    text: RestOfLine,
+) -> str:
+    """Say something in a colour.
+
+    Example: /documented colour=red hello
+
+    Args:
+        colour: The colour to say it in.
+        flag: Whether to flag it.
+        text: What to say,
+            over two lines.
+
+    Additional Instructions:
+    Appended by ``format_docstring``; not part of ``Args:``.
+    """
+    return text
+
+
+def blank(value: str) -> str:
+    """A documented section with an empty entry.
+
+    Args:
+        value:
+    """
+    return value
+
+
+def undocumented(value: str) -> str:
+    return value
+
+
+def either_scalar(value: int | str) -> str:
+    """Two open branches: no single closed set."""
+    return str(value)
+
+
+def _args_by_name(fn: Callable[..., Any]) -> dict[str, Any]:
+    (descriptor,) = _registry(_one_command_card(fn)).descriptors()
+    return {arg.name: arg for arg in descriptor.args}
+
+
+def test_an_arg_description_comes_from_the_docstring_args_section() -> None:
+    args = _args_by_name(documented)
+    assert args["colour"].description == "The colour to say it in."
+    assert args["flag"].description == "Whether to flag it."
+    assert args["text"].description == "What to say,\nover two lines."
+
+
+def test_an_undocumented_arg_has_no_description() -> None:
+    assert _args_by_name(documented)["count"].description is None
+    assert _args_by_name(undocumented)["value"].description is None
+    assert _args_by_name(blank)["value"].description is None
+
+
+def test_the_command_description_is_still_the_whole_docstring() -> None:
+    (descriptor,) = _registry(_one_command_card(documented)).descriptors()
+    assert descriptor.description.startswith("Say something in a colour.")
+    assert "Additional Instructions:" in descriptor.description
+
+
+def test_options_and_the_text_are_flagged() -> None:
+    args = _args_by_name(documented)
+    assert [(a.name, a.keyword_only, a.rest_of_line) for a in args.values()] == [
+        ("colour", True, False),
+        ("flag", True, False),
+        ("count", True, False),
+        ("text", False, True),
+    ]
+
+
+def test_a_positional_before_the_text_is_not_an_option() -> None:
+    (descriptor,) = _registry(_one_command_card(as_rest_of_line)).descriptors()
+    assert [(a.keyword_only, a.rest_of_line) for a in descriptor.args] == [(False, True)]
+
+
+def test_no_arg_of_a_plain_command_is_an_option_or_the_text() -> None:
+    (descriptor,) = _registry(_SearchCard()).descriptors()
+    assert all(not a.keyword_only and not a.rest_of_line for a in descriptor.args)
+
+
+def test_an_enum_or_none_arg_resolves_its_ref() -> None:
+    assert _args_by_name(documented)["colour"].choices == ["red", "blue"]
+
+
+def test_a_literal_or_none_arg_carries_its_values() -> None:
+    (descriptor,) = _registry(_SearchCard()).descriptors()
+    choices = {a.name: a.choices for a in descriptor.args}
+    assert choices["status"] == ["pending", "started", "completed", "abort"]
+    assert choices["owner"] is None
+
+
+@pytest.mark.parametrize(
+    ("fn", "expected"),
+    [
+        (as_literal, ["a", "b"]),
+        (as_enum, ["red", "blue"]),
+        (as_bool, ["true", "false"]),
+        (as_str, None),
+        (as_int, None),
+        (as_optional_str, None),
+        (as_str_list, None),
+        (as_rest_of_line, None),
+        (either_scalar, None),
+    ],
+)
+def test_the_closed_value_set_of_each_shape(fn: Callable[..., Any], expected: Any) -> None:
+    (descriptor,) = _registry(_one_command_card(fn)).descriptors()
+    assert descriptor.args[0].choices == expected
+
+
+def test_a_bool_option_offers_true_and_false() -> None:
+    assert _args_by_name(documented)["flag"].choices == ["true", "false"]
+    assert _args_by_name(documented)["count"].choices is None
+
+
+def test_choices_fall_back_to_none_when_no_json_schema() -> None:
+    def run(job: Callable[[], int]) -> str:
+        """Run a job."""
+        return str(job())
+
+    (descriptor,) = _registry(_one_command_card(run)).descriptors()
+    assert descriptor.args[0].choices is None
+
+
+def test_the_type_name_is_unchanged_by_the_new_fields() -> None:
+    args = _args_by_name(documented)
+    assert [(a.name, a.type) for a in args.values()] == [
+        ("colour", "string"),
+        ("flag", "boolean"),
+        ("count", "string"),
+        ("text", "string"),
+    ]
+
+
+def test_the_new_fields_round_trip_under_their_wire_names() -> None:
+    (descriptor,) = _registry(_one_command_card(documented)).descriptors()
+    dumped = descriptor.model_dump()
+    assert {"description", "keyword_only", "rest_of_line", "choices"} <= set(dumped["args"][0])
+    assert CommandDescriptor.model_validate(dumped) == descriptor

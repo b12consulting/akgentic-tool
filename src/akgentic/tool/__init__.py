@@ -40,7 +40,7 @@ from .errors import (  # noqa: F401
 from .mailbox.mailbox import MailboxTool  # noqa: F401
 from .metadata.tool import MetadataTool  # noqa: F401
 from .model.observer import ModelSwitchToolObserver  # noqa: F401
-from .model.state import ModelRow  # noqa: F401
+from .model.state import ModelCompaction, ModelRow  # noqa: F401
 from .model.tool import ModelTool  # noqa: F401
 from .notification.tool import NotificationTool  # noqa: F401
 from .skill.tool import SkillTool  # noqa: F401
@@ -84,6 +84,7 @@ __all__ = [
     "ToolStateEvent",
     "KnowledgeGraphStateEvent",
     # Domain models
+    "ModelCompaction",
     "ModelRow",
     # Command discovery models
     "CommandArg",

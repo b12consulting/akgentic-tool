@@ -254,15 +254,13 @@ class MetadataTool(ToolCard):
 
     def get_system_prompts(self) -> list[Callable[..., Any]]:
         """Return the metadata block callable when the prompt channel is exposed."""
-        params = _resolve(self.render_metadata, RenderMetadata)
-        if params and SYSTEM_PROMPT in params.expose:
+        if params := _resolve(self.render_metadata, RenderMetadata, SYSTEM_PROMPT):
             return [self._team_metadata_factory(params)]
         return []
 
     def get_commands(self) -> dict[type[BaseToolParam], Callable[..., Any]]:
         """Return ``team_metadata`` when the command channel is exposed."""
-        params = _resolve(self.render_metadata, RenderMetadata)
-        if params and COMMAND in params.expose:
+        if params := _resolve(self.render_metadata, RenderMetadata, COMMAND):
             return {RenderMetadata: self._team_metadata_factory(params)}
         return {}
 

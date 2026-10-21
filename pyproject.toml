@@ -49,6 +49,10 @@ dependencies = [
     # no transitive dependencies, and already in the workspace through mypy. No
     # ceiling, per Golden Rule #13.
     "pathspec>=0.12",
+    # Command descriptors read each arg's description from the closure's `Args:`
+    # section with griffe (`core/commands.py`). Distribution `griffelib`, import
+    # `griffe`; already in the workspace through pydantic-ai-slim. No ceiling.
+    "griffelib>=2.0",
 ]
 
 [project.optional-dependencies]

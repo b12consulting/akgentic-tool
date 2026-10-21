@@ -50,13 +50,23 @@ class CommandArg(SerializableBaseModel):
         name: Argument name as it appears in the callable signature.
         type: JSON-schema type name (e.g. ``"string"``, ``"integer"``, ``"boolean"``).
         required: Whether the argument must be supplied (no default).
-        description: Optional human-readable description; ``None`` when absent.
+        description: The arg's entry in the command docstring's ``Args:`` section;
+            ``None`` when the docstring does not document it.
+        keyword_only: Whether the arg is an *option* of a rest-of-line command —
+            written ``name=value`` before the text, never bound positionally.
+        rest_of_line: Whether the arg receives the raw rest of the line.
+        choices: The closed set of values the arg accepts — a ``Literal``'s or an
+            ``Enum``'s values, ``["true", "false"]`` for a ``bool`` — rendered as
+            strings; ``None`` when the set is open.
     """
 
     name: str
     type: str
     required: bool
     description: str | None = None
+    keyword_only: bool = False
+    rest_of_line: bool = False
+    choices: list[str] | None = None
 
 
 class CommandDescriptor(SerializableBaseModel):
