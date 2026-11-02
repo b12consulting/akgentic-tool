@@ -12,6 +12,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from akgentic.tool.workspace.workspace import (
+    EXTENSIONS_ENV,
+    ExtensionNotAllowedError,
     FileEntry,
     Filesystem,
     Workspace,
@@ -194,10 +196,10 @@ class TestFilesystemWriteAtomicity:
         final byte; against write-temp-then-rename that window does not exist.
         """
         fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
-        target = tmp_path / "team-1" / "big.bin"
+        target = tmp_path / "team-1" / "big.txt"
         payload_a = b"a" * _PAYLOAD_SIZE
         payload_b = b"b" * _PAYLOAD_SIZE
-        fs.write("big.bin", payload_a)
+        fs.write("big.txt", payload_a)
 
         finished = threading.Event()
         writer_error: list[BaseException] = []
@@ -205,7 +207,7 @@ class TestFilesystemWriteAtomicity:
         def writer() -> None:
             try:
                 for i in range(_WRITER_ITERATIONS):
-                    fs.write("big.bin", payload_b if i % 2 else payload_a)
+                    fs.write("big.txt", payload_b if i % 2 else payload_a)
             except BaseException as exc:  # pragma: no cover - surfaced via assertion
                 writer_error.append(exc)
             finally:
@@ -463,11 +465,11 @@ class TestFilesystemWriteMany:
 
     def test_it_preserves_an_existing_files_mode(self, tmp_path: Path) -> None:
         fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
-        target = tmp_path / "team-1" / "script.sh"
+        target = tmp_path / "team-1" / "script.py"
         target.write_bytes(b"old")
         target.chmod(0o750)
 
-        fs.write_many([WriteEntry(path="script.sh", data=b"new")])
+        fs.write_many([WriteEntry(path="script.py", data=b"new")])
 
         assert stat.S_IMODE(target.stat().st_mode) == 0o750
 
@@ -668,3 +670,26 @@ class TestGetWorkspace:
             mock_fs_cls.assert_called_once_with(
                 base_path="./workspaces", workspace_name="my-special-team"
             )
+
+
+class TestExtensionAllowlist:
+    def test_a_refused_extension_writes_nothing(self, tmp_path: Path) -> None:
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        with pytest.raises(ExtensionNotAllowedError, match="'.exe' files are not accepted"):
+            fs.write("tool.exe", b"MZ")
+        assert list((tmp_path / "team-1").iterdir()) == []
+
+    def test_a_name_without_extension_is_accepted(self, tmp_path: Path) -> None:
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        fs.write(".ragignore", b"*.log\n")
+        assert fs.read(".ragignore") == b"*.log\n"
+
+    def test_the_environment_replaces_the_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(EXTENSIONS_ENV, "exe, .CSV")
+        fs = Filesystem(base_path=str(tmp_path), workspace_name="team-1")
+        fs.write("tool.EXE", b"MZ")
+        fs.write("data.csv", b"a,b")
+        with pytest.raises(ExtensionNotAllowedError):
+            fs.write("notes.md", b"x")
