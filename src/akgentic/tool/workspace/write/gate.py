@@ -82,6 +82,7 @@ from akgentic.tool.workspace.models import (
     not_utf8_text,
 )
 from akgentic.tool.workspace.workspace import (
+    ExtensionNotAllowedError,
     Filesystem,
     PathEscapeError,
     WriteEntry,
@@ -198,6 +199,8 @@ def _denied(exc: PermissionError) -> MutationOutcome:
         The matching refusal. Both are retriable — the second because the file's
         owner may change, or the agent may pick another path knowing why.
     """
+    if isinstance(exc, ExtensionNotAllowedError):
+        return _rejected(str(exc))
     return _rejected(PERM_ERR_MSG if isinstance(exc, PathEscapeError) else WRITE_DENIED_MSG)
 
 
