@@ -387,14 +387,14 @@ store is an authoritative index of the graph rather than a lossy projection of i
 ## Collection configuration (on the consumer card)
 
 ```python
-PlanningTool(vector_store=VectorStoreParam(backend="weaviate", tenant="team-42"))
+PlanningTool(vector_store=VectorStoreParam(backend="weaviate", tenant="acme"))  # one tenant per cluster
 ```
 
 | `VectorStoreParam` field | Type | Default | Meaning |
 |---|---|---|---|
 | `dimension` | `int` (≥1) | `1536` | Embedding vector dimensionality. Must be the native width of a known `embedding_model`; a mismatch is refused when the card binds. |
 | `backend` | `str` | **follows the environment** | A registered backend name (`inmemory` / `weaviate` / `qdrant` / any third-party). Defaults via `default_backend()`: the highest-priority provisioned store, else `inmemory`. External backends require their extra (e.g. `akgentic-tool[qdrant]`). See [Pluggable backends](#pluggable-backends). |
-| `tenant` | `str \| None` | `None` | Weaviate tenant id for multi-tenancy — normally the workspace or team id. A class's tenancy mode is fixed by whichever card creates it first: a later card that disagrees (a tenant on a plain class, or none on a multi-tenant one) is refused when it binds, and its consumer degrades with one WARNING. Every card that writes a class must agree on `tenant`. |
+| `tenant` | `str \| None` | `None` | Weaviate tenant id: one value per cluster, shared by every card that writes a class. A class's tenancy mode is fixed by whichever card creates it first: a later card that disagrees (a tenant on a plain class, or none on a multi-tenant one) is refused when it binds, and its consumer degrades with one WARNING. Team isolation is the `team_id` filter, not the tenant; a catalog card cannot carry a per-team id. |
 | `embedding_model` | `str` | `"text-embedding-3-small"` | The model that produces this collection's vectors. Known models (`text-embedding-3-small` 1536, `text-embedding-3-large` 3072, `text-embedding-ada-002` 1536) pin `dimension`; an unknown name — an Azure deployment — is accepted at any dimension. |
 | `embedding_provider` | `Literal["openai", "azure"]` | `"openai"` | The embedding API provider. |
 
