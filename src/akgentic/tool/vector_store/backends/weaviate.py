@@ -47,6 +47,9 @@ WEAVIATE_MISSING_MESSAGE: Final[str] = (
 )
 """The ``ImportError`` text raised when ``weaviate-client`` is not installed."""
 
+DEFAULT_TENANT: Final[str] = "default"
+"""The tenant a card that names no ``tenant`` binds under; every class is multi-tenant."""
+
 
 def _check_weaviate_dependencies() -> None:
     """Validate that ``weaviate-client`` is importable, at call time.
@@ -101,9 +104,8 @@ def _connect_weaviate(key: ClusterKey) -> weaviate.WeaviateClient:
 def _weaviate_client(url: str, api_key: str | None = None) -> weaviate.WeaviateClient:
     """Return the process's shared client for the cluster *url* names.
 
-    The one entry point its callers use — the registered factory and a sweeper
-    built by hand — so the key's shape and the connect keyword set are written
-    once.
+    The one entry point the registered factory uses, so the key's shape and the
+    connect keyword set are written once.
 
     Args:
         url: Cluster URL, e.g. ``http://localhost:8080``.
@@ -120,8 +122,7 @@ TEAM_ID_PROPERTY: str = "team_id"
 
 Stamped on ingest and read back as a predicate on every query this backend
 issues: ``search`` and ``remove`` are restricted to the objects of their own
-team, and ``delete_by_team`` reaps another team's on request. It is never
-surfaced on a ``SearchHit``.
+team. It is never surfaced on a ``SearchHit``.
 
 Collection names are module constants, so every team on a cluster shares the
 same collections — this property is the only thing on a Weaviate object that
@@ -181,122 +182,146 @@ class WeaviateBackend:
     Weaviate client, not a connection of its own. The client is obtained from
     :func:`akgentic.tool.vector_store.client.get_client` — one per cluster per
     process — and closed by ``close_all()`` at process exit, never by a backend.
-    What a backend owns is its scope (``tenant``, ``team_id``) and its own
-    created-collections bookkeeping. It satisfies the ``VectorStoreService``
-    protocol structurally.
+    What a backend owns is its team and its own bookkeeping: the collections it
+    bound, the tenant each was bound under, and their handles. It satisfies the
+    ``VectorStoreService`` protocol structurally.
 
     **The backend is team-scoped by construction.** Every query it issues
     carries a predicate on ``team_id``: ``search`` sees only its own team's
     objects, and ``remove`` deletes only its own team's. The boundary lives
     here rather than on ``VectorStoreService`` precisely so that no caller has
-    to pass a team and no caller can forget one (ADR-046 §D1). The two cleanup
-    primitives — ``delete_by_team`` and ``list_collections`` — cross the
-    boundary deliberately and say so in their signatures.
+    to pass a team and no caller can forget one (ADR-046 §D1).
+
+    **Every class is multi-tenant.** The tenant comes from the card
+    (``VectorStoreParam.tenant``), or is :data:`DEFAULT_TENANT` when the card
+    names none, and is recorded per collection at bind.
 
     Args:
         client: The connected ``weaviate.WeaviateClient`` for the cluster, from
             ``get_client(url, api_key)``. The backend never connects and never
             closes it.
-        tenant: Optional default tenant ID for multi-tenancy.
         team_id: Owning team id. Stamped onto every object written through this
             backend, part of every object's id, and used as the filter on every
             object it reads or removes on a team-scoped collection. **Required to
             query a team-scoped collection:** ``search`` and ``remove`` there
             raise ``ValueError`` without one, rather than inventing an identity
-            for the caller. It is omitted by a consumer with no team of its own —
-            the hosted workspace, whose shared collection is bounded by ``scope``
-            and whose objects stamp ``""`` — and to build an administrative
-            backend for ``list_collections`` and ``delete_by_team``, neither of
-            which needs a team.
+            for the caller. Every consumer passes its real team; only a
+            hand-built backend omits it, and its objects stamp ``""``.
     """
 
-    def __init__(
-        self,
-        client: weaviate.WeaviateClient,
-        tenant: str | None = None,
-        team_id: str | None = None,
-    ) -> None:
+    def __init__(self, client: weaviate.WeaviateClient, team_id: str | None = None) -> None:
         _check_weaviate_dependencies()
 
         self._client: weaviate.WeaviateClient = client
-        self._tenant = tenant
         self._team_id = team_id
-        self._collections_created: set[str] = set()
         self._collection_tenants: dict[str, str] = {}
-        self._collection_handles: dict[tuple[str, str | None], weaviate.collections.Collection] = {}
+        self._collection_handles: dict[str, weaviate.collections.Collection] = {}
 
     # ------------------------------------------------------------------
     # VectorStoreService protocol methods
     # ------------------------------------------------------------------
 
     def create_collection(self, name: str, config: VectorStoreParam) -> None:
-        """Create a named Weaviate collection. No-op if it already exists.
+        """Bind a named Weaviate collection under the card's tenant, creating it if absent.
 
-        When multi-tenancy is enabled (``self._tenant`` or ``config.tenant``
-        is set), the collection is created with multi-tenancy and the tenant
-        is provisioned.
+        The tenant is ``config.tenant``, or :data:`DEFAULT_TENANT` when the card
+        names none. A new class is created multi-tenant and the tenant is
+        provisioned. An existing multi-tenant class is bound under the tenant,
+        which is provisioned if absent. An existing plain class is refused; see
+        :meth:`_bind_existing`.
+
+        A new class gets one self-provided *named* vector, ``default``. A class
+        created before that holds the legacy unnamed vector; :meth:`add` and
+        :meth:`search` name no vector, which both shapes accept.
+
+        The bind fetches one base handle and caches its tenanted handle for
+        :meth:`_get_collection`: every ``collections.get`` or ``with_tenant`` call
+        builds a ``Collection`` whose thread pool is never shut down.
 
         Args:
             name: Unique collection identifier.
             config: Collection configuration.
+
+        Raises:
+            ValueError: When the class already exists and is plain (not
+                multi-tenant). The collection is then left unbound.
         """
         from weaviate.classes.config import Configure, DataType, Property
         from weaviate.classes.tenants import Tenant
 
-        tenant = getattr(config, "tenant", None) or self._tenant
-
+        tenant = config.tenant or DEFAULT_TENANT
         if self._client.collections.exists(name):
-            self._collections_created.add(name)
-            if tenant:
-                self._collection_tenants[name] = tenant
-                try:
-                    collection = self._client.collections.get(name)
-                    collection.tenants.create([Tenant(name=tenant)])
-                except Exception:  # noqa: BLE001
-                    logger.debug(
-                        "Tenant '%s' may already exist on collection '%s'",
-                        tenant,
-                        name,
-                    )
-            return
+            base = self._bind_existing(name, tenant)
+        else:
+            self._client.collections.create(
+                name=name,
+                vector_config=Configure.Vectors.self_provided(),
+                properties=[
+                    Property(name="ref_type", data_type=DataType.TEXT),
+                    Property(name="ref_id", data_type=DataType.TEXT),
+                    Property(name="text", data_type=DataType.TEXT),
+                    Property(name=TEAM_ID_PROPERTY, data_type=DataType.TEXT),
+                    Property(name=SCOPE_PROPERTY, data_type=DataType.TEXT),
+                    Property(name=PATH_PROPERTY, data_type=DataType.TEXT),
+                    Property(name=ORDINAL_PROPERTY, data_type=DataType.INT),
+                ],
+                multi_tenancy_config=Configure.multi_tenancy(enabled=True),
+            )
+            base = self._client.collections.get(name)
+            base.tenants.create([Tenant(name=tenant)])
 
-        properties = [
-            Property(name="ref_type", data_type=DataType.TEXT),
-            Property(name="ref_id", data_type=DataType.TEXT),
-            Property(name="text", data_type=DataType.TEXT),
-            Property(name=TEAM_ID_PROPERTY, data_type=DataType.TEXT),
-            Property(name=SCOPE_PROPERTY, data_type=DataType.TEXT),
-            Property(name=PATH_PROPERTY, data_type=DataType.TEXT),
-            Property(name=ORDINAL_PROPERTY, data_type=DataType.INT),
-        ]
-        mt_config = Configure.multi_tenancy(enabled=True) if tenant else None
+        self._collection_tenants[name] = tenant
+        self._collection_handles[name] = base.with_tenant(tenant)
 
-        self._client.collections.create(
-            name=name,
-            vectorizer_config=Configure.Vectorizer.none(),
-            properties=properties,
-            multi_tenancy_config=mt_config,
-        )
-        self._collections_created.add(name)
+    def _bind_existing(self, name: str, tenant: str) -> weaviate.collections.Collection:
+        """Return an existing class's base handle, refusing a plain class.
 
-        # Create the tenant after multi-tenant collection is created
-        if tenant:
-            self._collection_tenants[name] = tenant
-            collection = self._client.collections.get(name)
-            collection.tenants.create([Tenant(name=tenant)])
+        Weaviate cannot convert a class to multi-tenancy, so a plain class is the
+        one mode this backend does not speak, whatever the card says. The check
+        runs before any bookkeeping write, so a refused collection stays unbound
+        and every later operation on it fails :meth:`_get_collection`. On a
+        multi-tenant class *tenant* is provisioned; a failure there means it
+        already exists, and is logged at DEBUG.
+
+        Args:
+            name: The existing class.
+            tenant: The tenant to bind under.
+
+        Returns:
+            The class's base (untenanted) handle.
+
+        Raises:
+            ValueError: When the class is plain (not multi-tenant).
+        """
+        from weaviate.classes.tenants import Tenant
+
+        base = self._client.collections.get(name)
+        if not base.config.get().multi_tenancy_config.enabled:
+            msg = (
+                f"Weaviate class '{name}' already exists and is plain (not "
+                "multi-tenant), and this backend binds only multi-tenant classes. "
+                "Fix: delete the class so that it is recreated multi-tenant on the "
+                "next bind. Its vectors are derived and are rebuilt as consumers "
+                "re-embed."
+            )
+            raise ValueError(msg)
+        try:
+            base.tenants.create([Tenant(name=tenant)])
+        except Exception:  # noqa: BLE001
+            logger.debug("Tenant '%s' may already exist on collection '%s'", tenant, name)
+        return base
 
     def add(self, collection: str, entries: list[VectorEntry]) -> None:
         """Ingest embedding entries into a Weaviate collection.
 
         Uses batch insertion with pre-populated vectors. Every object is stamped
-        with the backend's ``team_id`` — the handle by which ``search``, ``remove``
-        and ``delete_by_team`` later find it.
+        with the backend's ``team_id`` — the handle by which ``search`` and
+        ``remove`` later find it.
 
         A backend with no ``team_id`` stamps ``""`` rather than omitting the
-        property, so that the schema stays uniform and a sweep never meets an object
-        where it is absent. Writing is therefore still possible without a team where
-        querying is not: the asymmetry is deliberate, since ``""`` is a value a
-        sweeper can find and act on, whereas a *query* filtering on ``""`` would be
+        property, so that the schema stays uniform and every object carries it.
+        Writing is therefore still possible without a team where querying is not:
+        the asymmetry is deliberate, since a *query* filtering on ``""`` would be
         answering as an identity the caller never claimed.
 
         ``scope``, ``path`` and ``ordinal`` follow the opposite rule and are written
@@ -326,16 +351,22 @@ class WeaviateBackend:
         thread-safe, and the client underneath is shared by every consumer in the
         process.
 
+        **A batch that reports failed objects raises.** The client does not raise
+        on a rejected object; it collects it in ``batch.failed_objects``, which
+        ``dynamic()`` resets per call, so the list read after the context exits is
+        this call's alone.
+
         Args:
             collection: Target collection name.
             entries: List of vector entries to store.
 
         Raises:
             ValueError: If the collection has not been created.
+            RuntimeError: If the batch reports one or more failed objects. The
+                message carries the count, the collection and the first failure.
         """
-        self._check_collection(collection)
         col = self._get_collection(collection)
-        tenant = self._effective_tenant(collection)
+        tenant = self._collection_tenants[collection]
 
         with col.batch.dynamic() as batch:
             for entry in entries:
@@ -344,6 +375,14 @@ class WeaviateBackend:
                     vector=entry.vector,
                     uuid=row_object_id(collection, self._team_id, tenant, entry.ref_id),
                 )
+
+        failed = col.batch.failed_objects
+        if failed:
+            msg = (
+                f"{len(failed)} of {len(entries)} object(s) failed to write to "
+                f"collection '{collection}': {failed[0].message}"
+            )
+            raise RuntimeError(msg)
 
     def _object_properties(self, entry: VectorEntry) -> dict[str, str | int]:
         """Build the Weaviate property payload for one entry.
@@ -405,7 +444,6 @@ class WeaviateBackend:
 
         check_path_prefix(path_prefix)
         check_shared_scope(collection, scope)
-        self._check_collection(collection)
         col = self._get_collection(collection)
         col.data.delete_many(
             where=Filter.by_property("ref_id").contains_any(ref_ids)
@@ -455,7 +493,6 @@ class WeaviateBackend:
 
         check_path_prefix(path_prefix)
         check_shared_scope(collection, scope)
-        self._check_collection(collection)
         col = self._get_collection(collection)
 
         result = col.query.near_vector(
@@ -554,91 +591,8 @@ class WeaviateBackend:
         return dict(query.params)
 
     # ------------------------------------------------------------------
-    # Team-scoped cleanup (not part of VectorStoreService)
-    # ------------------------------------------------------------------
-
-    def list_collections(self) -> list[str]:
-        """Return the names of every collection present in the cluster.
-
-        Unlike the protocol methods this reads the cluster rather than the
-        backend's own bookkeeping, so a cleanup process that never created a
-        collection can still enumerate what is there.
-
-        Returns:
-            Collection names, in whatever order the cluster reports them.
-        """
-        return list(self._client.collections.list_all().keys())
-
-    def delete_by_team(self, collection: str, team_id: str) -> int:
-        """Delete every object in *collection* stamped with *team_id*.
-
-        Existence is checked against the cluster, not ``_collections_created``:
-        the caller is typically a sweeper reaping a team that no longer exists,
-        so it never created the collection through this backend.
-
-        The filter is on the **argument** alone. Unlike ``search`` and
-        ``remove`` this method does not add the backend's own team predicate —
-        anding it on would leave a sweeper able to reap only itself, which is
-        the one team that is never being reaped.
-
-        **A collection shared across teams is refused, before any cluster call.**
-        On such a collection ``team_id`` records *who wrote the row* and is read by
-        nothing once the query predicate stops using it, so a sweeper pointed at it
-        would delete rows another live team is still reading, from a tree that still
-        exists. This method has no caller anywhere in ``src/``, which is exactly why
-        it needs a guard rather than a docstring: the first caller will be written
-        by someone reading the signature. The check consults a module-level fact
-        rather than this backend's own bookkeeping, so it still bites on an
-        administrative backend that has created no collection — the only kind a
-        sweeper has.
-
-        Args:
-            collection: Target collection name.
-            team_id: The team whose objects are to be removed.
-
-        Returns:
-            Number of objects deleted, or ``0`` when the cluster reports none.
-
-        Raises:
-            ValueError: If the collection is shared across teams, or does not
-                exist in the cluster.
-        """
-        from weaviate.classes.query import Filter
-
-        if not collection_is_team_scoped(collection):
-            msg = (
-                f"Collection '{collection}' is shared across teams, so deleting one "
-                "team's objects would remove rows another live team is still reading. "
-                "Remove by ref_id with a scope instead."
-            )
-            raise ValueError(msg)
-
-        if not self._client.collections.exists(collection):
-            msg = f"Collection '{collection}' does not exist"
-            raise ValueError(msg)
-
-        col = self._get_collection(collection)
-        result = col.data.delete_many(
-            where=Filter.by_property(TEAM_ID_PROPERTY).equal(team_id),
-        )
-        return int(getattr(result, "successful", 0) or 0)
-
-    # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
-
-    def _check_collection(self, collection: str) -> None:
-        """Raise ``ValueError`` if *collection* was never created via this backend.
-
-        Args:
-            collection: Collection name to validate.
-
-        Raises:
-            ValueError: If the collection has not been created.
-        """
-        if collection not in self._collections_created:
-            msg = f"Collection '{collection}' does not exist"
-            raise ValueError(msg)
 
     def _team_filter(self) -> FilterReturn:
         """Return the predicate restricting a query to this backend's own team.
@@ -669,8 +623,7 @@ class WeaviateBackend:
             msg = (
                 "This backend was built without a team_id, so it cannot search or "
                 "remove — those are scoped to the owning team. Pass team_id to the "
-                "constructor. Cluster administration (list_collections, "
-                "delete_by_team) needs no team and is unaffected."
+                "constructor."
             )
             raise ValueError(msg)
         return Filter.by_property(TEAM_ID_PROPERTY).equal(self._team_id)
@@ -731,29 +684,20 @@ class WeaviateBackend:
             predicate = predicate & leg
         return predicate
 
-    def _effective_tenant(self, name: str) -> str | None:
-        """The tenant every operation on *name* runs under — the collection's, else the default.
-
-        One rule, read by :meth:`_get_collection` to choose the handle and by
-        :meth:`add` to derive each object's id, so the id always names the
-        tenant the object was actually written to.
-        """
-        return self._collection_tenants.get(name) or self._tenant
-
     def _get_collection(self, name: str) -> weaviate.collections.Collection:
-        """Return the Weaviate collection handle, with tenant if applicable.
+        """Return the tenanted handle the bind cached, refusing a collection never bound.
 
-        Resolves the effective tenant from the per-collection mapping first,
-        falling back to the backend-level default tenant.
+        The handle is scoped to the tenant recorded at bind, so the handle,
+        :meth:`add`'s object ids and every query agree on it.
 
-        **The handle is cached per ``(name, tenant)``, and it has to be.**
+        **The handle is cached at bind, and it has to be.**
         ``client.collections.get`` builds a *new* ``Collection`` on every call
         (``weaviate/collections/collections/executor.py:85-91``), and each one
         constructs a ``_BatchCollectionWrapper`` whose ``__init__`` creates a
         ``ThreadPoolExecutor`` (``weaviate/collections/batch/collection.py:127-128``)
         that nothing ever shuts down. Uncached, every ``add()`` leaked one idle
-        pool for the lifetime of the process. ``with_tenant()`` returns a
-        different ``Collection``, so the tenant is part of the key.
+        pool for the lifetime of the process. ``with_tenant()`` returns another
+        ``Collection`` again, which is why the bind caches the tenanted one.
 
         **The invariant that makes a cached handle safe: a backend instance
         belongs to exactly one actor.** The vendor's "not thread-safe" caveat is
@@ -775,17 +719,17 @@ class WeaviateBackend:
             name: Collection name.
 
         Returns:
-            Weaviate collection object (optionally scoped to tenant).
+            The Weaviate collection object, scoped to its tenant.
+
+        Raises:
+            ValueError: If the collection was never bound through this backend,
+                or its bind was refused.
         """
-        tenant = self._effective_tenant(name)
-        cached = self._collection_handles.get((name, tenant))
-        if cached is not None:
-            return cached
-        col = self._client.collections.get(name)
-        if tenant:
-            col = col.with_tenant(tenant)
-        self._collection_handles[(name, tenant)] = col
-        return col
+        handle = self._collection_handles.get(name)
+        if handle is None:
+            msg = f"Collection '{name}' does not exist"
+            raise ValueError(msg)
+        return handle
 
 
 # ---------------------------------------------------------------------------

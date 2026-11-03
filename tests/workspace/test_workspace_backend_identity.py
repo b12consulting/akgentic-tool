@@ -4,16 +4,16 @@
 workspace's cluster backend ``team_id=None``: a hosted actor's team id was
 auto-generated per lifetime, so a team inside the row identity moved every time
 the actor restarted and a re-added chunk minted a second point. Story 52-4 gives
-the backend the team's **real** id — a card builds it now, and a sweep and a
-team-scoped filter both need that id — and moves the rule to where it belongs:
+the backend the team's **real** id — a card builds it now, and a team-scoped
+filter needs that id — and moves the rule to where it belongs:
 :func:`~akgentic.tool.vector_store.protocol.row_object_id` drops the team from
 the identity of a **shared** collection, whoever writes it.
 
 That is the stronger statement, and this file asserts the stronger case. It is no
 longer two lifetimes of one team-less actor; it is **two different teams** binding
 one tree, each with a real and different id, writing one chunk each — and landing
-on one point. The team is still *stamped* on the row, because filtering and
-sweeping read it; only the identity drops it.
+on one point. The team is still *stamped* on the row, because filtering reads
+it; only the identity drops it.
 
 **Every backend here is built through a real ``WorkspaceTool.observer()`` and the
 real registered factory.** Only the network client is a double, handed out where
@@ -139,6 +139,13 @@ def weaviate_client(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     import akgentic.tool.vector_store.backends.weaviate as weaviate_module
 
     client = MagicMock()
+    # The class exists and is multi-tenant, so these tenant-less cards bind under the
+    # default tenant. Its tenant handle is the collection itself, so the batch and the
+    # filters are read off one double; a bare ``failed_objects`` would be truthy.
+    collection = client.collections.get.return_value
+    collection.config.get.return_value.multi_tenancy_config.enabled = True
+    collection.with_tenant.return_value = collection
+    collection.batch.failed_objects = []
     monkeypatch.setenv(weaviate_module.WEAVIATE_URL_ENV, "http://weaviate.test:8080")
     monkeypatch.setattr(weaviate_module, "_weaviate_client", lambda _url, _api_key=None: client)
     return client
@@ -206,7 +213,9 @@ class TestTheSameChunkKeepsItsIdAcrossTwoTeams:
         assert team_ids[0] != team_ids[1], "one team id — the spec could not see a team leak"
         added = _added_objects(weaviate_client)
         assert len(added) == 2
-        assert [call.kwargs["uuid"] for call in added] == [_expected_id("", "", "chunk-1")] * 2
+        assert [call.kwargs["uuid"] for call in added] == [
+            _expected_id("", "default", "chunk-1")
+        ] * 2
         assert [call.kwargs["properties"]["team_id"] for call in added] == [
             str(team_ids[0]),
             str(team_ids[1]),
@@ -219,7 +228,7 @@ class TestTheSameChunkKeepsItsIdAcrossTwoTeams:
 class TestTheWorkspaceBackendCarriesItsRealTeam:
     """Story 51-4 passed ``None`` here. The identity rule replaced that (see the module
     docstring), so the team is free to be what it is — and it has to be, because a
-    row a sweep cannot attribute is a row a deleted team leaves behind."""
+    team-scoped filter finds only the rows stamped with its team."""
 
     @pytest.mark.parametrize("backend", ["weaviate", "qdrant"])
     def test_the_factory_receives_the_binding_teams_id(
@@ -262,10 +271,10 @@ class TestTheWorkspaceBackendCarriesItsRealTeam:
     ) -> None:
         """**Inverted.** A team-less backend was refused one; this one is not.
 
-        The refusal survives — it is what a genuinely administrative backend still
-        meets — but it is no longer what a workspace's backend meets, and a spec
-        that still asserted the raise would be pinning the ``team_id=None`` wiring
-        rather than the rule.
+        The refusal survives — a hand-built backend with no team still meets it —
+        but it is no longer what a workspace's backend meets, and a spec that still
+        asserted the raise would be pinning the ``team_id=None`` wiring rather than
+        the rule.
         """
         weaviate_client.collections.get.return_value.query.near_vector.return_value = MagicMock(
             objects=[]

@@ -89,7 +89,7 @@ above, and every stored card writing `vector_store: false` keeps loading.
 |---|---|---|---|
 | `dimension` | `int` | `1536` | Embedding dimensionality; must be the native width of a known `embedding_model`, refused at bind otherwise. |
 | `backend` | `str` | `default_backend()` | Any **registered** backend name — `inmemory`, `weaviate`, `qdrant`, or one a deployment registers itself. Not a closed union: the set is the registry's, so a name nobody registered fails the build rather than silently taking a branch. The two cluster backends need `akgentic-tool[weaviate]` / `[qdrant]`. |
-| `tenant` | `str \| None` | `None` | Tenant id for multi-tenancy. Native on Weaviate; a payload field on Qdrant. |
+| `tenant` | `str \| None` | `None` | Optional tenant id; native on Weaviate, a payload field with no default on Qdrant. On Weaviate every class is multi-tenant and a card without a tenant writes the `default` tenant; cards with different tenants, or none, share one class and each sees only its own partition. The only refusal is an existing plain (not multi-tenant) class: its consumer degrades with one WARNING at bind until the class is deleted and recreated (see [the `tenant` row](../vector_store/README.md#collection-configuration-on-the-consumer-card)). Team isolation is the `team_id` filter, not the tenant. |
 | `params` | `dict[str, Any]` | `{}` | Backend-native settings passed through untouched. Schemaless by nature, so it is the one place `Any` is the honest type. |
 | `embedding_model` | `str` | `"text-embedding-3-small"` | The model that produces the collection's vectors. |
 | `embedding_provider` | `Literal["openai", "azure"]` | `"openai"` | The embedding API provider. |
@@ -290,8 +290,8 @@ KnowledgeGraphTool(get_graph=GetGraph(                # also fetchable on demand
     expose={LLM_CONTEXT, TOOL_CALL, COMMAND},
 ))
 
-KnowledgeGraphTool(                                   # persistent, tenant-isolated;
-    vector_store=VectorStoreParam(backend="weaviate", tenant="team-42"),
+KnowledgeGraphTool(                                   # persistent, in tenant 'acme';
+    vector_store=VectorStoreParam(backend="weaviate", tenant="acme"),
     search_score_threshold=0.45,                      # no store actor is created for it
     search_top_k=25,
     hybrid_alpha=0.3,                                 # trust exact names over similarity

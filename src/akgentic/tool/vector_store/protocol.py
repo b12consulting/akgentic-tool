@@ -438,16 +438,12 @@ this package — ``planning``, ``knowledge_graph`` — holds rows that belong to
 team and keeps its team predicate.
 
 **The declaration is by name, and it lives here rather than on a model, on a
-constructor or in per-instance state.** Three alternatives were weighed:
+constructor or in per-instance state.** Two alternatives were weighed:
 
 - **A field on ``VectorStoreParam``** is catalog-settable, so an author could write
   ``team_scoped: false`` on ``id_planning`` and silently reproduce the
   cross-tenant destruction that ADR-046 exists to prevent, with no error and no
   log line.
-- **A keyword on ``create_collection``, kept per instance**, is vacuous exactly
-  where it is needed: a sweeper builds an administrative backend that has created
-  no collection, so its per-instance map is empty when
-  :meth:`delete_by_team`'s guard has to bite.
 - **A flag on the backend constructor or ``BackendContext``** puts the declaration
   on the *wiring* rather than on the collection, and one backend instance serves
   several collections through the store actor's per-backend cache.
@@ -460,7 +456,7 @@ collection.
 
 Deliberately a ``frozenset`` and deliberately not extensible at runtime: a
 mutable registry anyone may add to is the catalog hazard in another shape, plus
-an import-order trap for a bare sweeper script that imports no consumer. A
+an import-order trap for a script that imports no consumer. A
 third-party shared collection, if ever needed, wants a ``BackendSpec``-style
 registration with the same fail-loud discipline (ADR-049 open item).
 """
@@ -582,8 +578,8 @@ def row_object_id(collection: str, team_id: str | None, tenant: str | None, ref_
     backends, which is the same reason :data:`SHARED_COLLECTIONS` and
     :func:`check_path_prefix` live here.
 
-    The team is still **stamped** on the object either way: filtering and
-    sweeping need it, and only the identity derivation is affected.
+    The team is still **stamped** on the object either way: filtering needs
+    it, and only the identity derivation is affected.
 
     Args:
         collection: The collection the row is written into.
@@ -720,6 +716,11 @@ class VectorStoreService(Protocol):
         Args:
             name: Unique collection identifier.
             config: Vector store configuration for the collection.
+
+        Raises:
+            ValueError: When the backend cannot bind the collection with this
+                configuration (e.g. an existing collection in a tenancy mode the
+                backend does not speak). Consumers treat it as degraded mode.
         """
         ...
 
@@ -729,6 +730,11 @@ class VectorStoreService(Protocol):
         Args:
             collection: Target collection name.
             entries: List of vector entries to store.
+
+        Raises:
+            ValueError: If the collection has not been created.
+            RuntimeError: A backend may raise it when it reports entries it
+                failed to write.
         """
         ...
 

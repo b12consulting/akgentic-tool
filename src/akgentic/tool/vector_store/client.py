@@ -20,8 +20,8 @@ the concrete constraint exists.
 Sharing one client across actor threads is safe for the calls this package
 makes, and each backend's answer is pinned by a test.
 
-**Weaviate** (``create_collection``, ``add``, ``remove``, ``search``,
-``list_collections``, ``delete_by_team``) is safe under three invariants:
+**Weaviate** (``create_collection``, ``add``, ``remove``, ``search``) is safe
+under three invariants:
 
 1. **A batch context never escapes ``add()``.** ``WeaviateBackend.add`` opens
    ``col.batch.dynamic()`` on a handle fetched in that call and leaves the ``with``
@@ -38,8 +38,8 @@ makes, and each backend's answer is pinned by a test.
    process, and one team stopping must not disconnect the others.
 
 **Qdrant** (``upsert``, ``query_points``, ``scroll``, ``delete``,
-``collection_exists``, ``create_collection``, ``get_collection``,
-``get_collections``) is safe under two more, verified against
+``collection_exists``, ``create_collection``, ``get_collection``) is safe under
+two more, verified against
 ``qdrant-client`` 1.19.0:
 
 4. **The connection is one thread-safe ``httpx.Client``, and the gRPC pool is
