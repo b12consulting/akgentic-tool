@@ -139,6 +139,11 @@ def weaviate_client(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     import akgentic.tool.vector_store.backends.weaviate as weaviate_module
 
     client = MagicMock()
+    # The class exists and is plain, as these tenant-less cards need: a bare MagicMock
+    # ``enabled`` agrees with no caller, and a bare ``failed_objects`` is truthy.
+    collection = client.collections.get.return_value
+    collection.config.get.return_value.multi_tenancy_config.enabled = False
+    collection.batch.failed_objects = []
     monkeypatch.setenv(weaviate_module.WEAVIATE_URL_ENV, "http://weaviate.test:8080")
     monkeypatch.setattr(weaviate_module, "_weaviate_client", lambda _url, _api_key=None: client)
     return client

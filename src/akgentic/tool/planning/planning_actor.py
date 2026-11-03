@@ -366,11 +366,36 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
                     task_update.description is not None
                     and task_update.description != task.description
                 )
-                if description_changed and self._vs_proxy is not None:
-                    self._vs_proxy.remove(PLAN_COLLECTION, [str(task.id)])
+                if description_changed:
+                    self._unindex([str(task.id)])
                     self._embed_task(updated_task)
                 return None
         return f"Update error - no task with ID {task_update.id} found."
+
+    def _unindex(self, ref_ids: list[str]) -> None:
+        """Drop *ref_ids* from the vector index, never letting a failure end the call.
+
+        The task list is authoritative and the index is a derived cache: a ref
+        left behind for a deleted task scores an id no task in the list carries,
+        so search never renders it, and a failed remove costs at most one stale
+        entry. The mutation that called this stands either way. No-op when there
+        is no vector store.
+
+        Args:
+            ref_ids: The ids of the tasks whose embeddings to drop.
+        """
+        if self._vs_proxy is None:
+            return
+        try:
+            self._vs_proxy.remove(PLAN_COLLECTION, ref_ids)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[%s] could not remove %d ref(s) from '%s': %s — the index keeps a stale entry",
+                self.config.name,
+                len(ref_ids),
+                PLAN_COLLECTION,
+                exc,
+            )
 
     ##
     ## Tools to expose to agents:
@@ -563,8 +588,7 @@ class PlanActor(Akgent[PlanConfig, PlanManagerState]):
             if not any(task.id == task_id for task in self.state.task_list):
                 errors.append(f"Delete error - no task with ID {task_id} found.")
             else:
-                if self._vs_proxy is not None:
-                    self._vs_proxy.remove(PLAN_COLLECTION, [str(task_id)])
+                self._unindex([str(task_id)])
                 self.state.task_list = [task for task in self.state.task_list if task.id != task_id]
 
         self.state.notify_state_change()

@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     # Only under TYPE_CHECKING: at runtime the mock ``weaviate`` module must be
     # installed into ``sys.modules`` before this module is imported.
     from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
-    from akgentic.tool.vector_store.protocol import VectorStoreConfig
+    from akgentic.tool.vector_store.protocol import VectorStoreConfig, VectorStoreParam
 
 # ---------------------------------------------------------------------------
 # Recording Filter double
@@ -176,6 +176,16 @@ def _make_entry(
     return entry
 
 
+def _set_class_multi_tenant(mock_client: MagicMock, *, enabled: bool) -> None:
+    """Give the existing class a real ``multi_tenancy_config.enabled`` bool.
+
+    A bare ``MagicMock`` ``.enabled`` is neither ``True`` nor ``False``, so it
+    disagrees with every caller and the bind is refused.
+    """
+    config = mock_client.collections.get.return_value.config.get.return_value
+    config.multi_tenancy_config.enabled = enabled
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -253,12 +263,133 @@ class TestCreateCollection:
         config = VectorStoreParam(dimension=384)
         backend.create_collection("test_col", config)
 
-        # Now simulate exists=True
+        # Now simulate exists=True, on a plain class matching this tenant-less caller
         mock_client.collections.exists.return_value = True
+        _set_class_multi_tenant(mock_client, enabled=False)
         mock_client.collections.create.reset_mock()
         backend.create_collection("test_col", config)
 
         mock_client.collections.create.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Test: an existing class's tenancy mode is checked at bind
+# ---------------------------------------------------------------------------
+
+
+def _existing_class(*, enabled: bool) -> tuple[MagicMock, MagicMock]:
+    """Return (client, collection) for a class that exists with the given tenancy mode."""
+    _mock_weaviate, mock_client = _install_mock_weaviate()
+    mock_client.collections.exists.return_value = True
+    mock_collection = MagicMock()
+    mock_client.collections.get.return_value = mock_collection
+    _set_class_multi_tenant(mock_client, enabled=enabled)
+    return mock_client, mock_collection
+
+
+def _backend_and_param(
+    mock_client: MagicMock, *, source: str, tenant: str | None
+) -> tuple[WeaviateBackend, VectorStoreParam]:
+    """Build a backend and the param to bind it with, the tenant coming from *source*.
+
+    *source* is ``"param"`` (``VectorStoreParam.tenant``) or ``"backend"`` (the
+    constructor's default) — the two halves of the effective-tenant rule.
+    """
+    from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+    from akgentic.tool.vector_store.protocol import VectorStoreParam
+
+    if source == "param":
+        return WeaviateBackend(client=mock_client), VectorStoreParam(tenant=tenant)
+    return WeaviateBackend(client=mock_client, tenant=tenant), VectorStoreParam()
+
+
+def _bind(mock_client: MagicMock, *, source: str, tenant: str | None) -> WeaviateBackend:
+    """Build a backend and bind ``col1``, the tenant coming from *source*."""
+    backend, param = _backend_and_param(mock_client, source=source, tenant=tenant)
+    backend.create_collection("col1", param)
+    return backend
+
+
+def _assert_unbound(backend: WeaviateBackend, mock_collection: MagicMock) -> None:
+    """A refused collection is recorded nowhere, and a write to it never reaches a batch."""
+    assert "col1" not in backend._collections_created
+    assert "col1" not in backend._collection_tenants
+    with pytest.raises(ValueError, match="Collection 'col1' does not exist"):
+        backend.add("col1", [_make_entry()])
+    mock_collection.batch.dynamic.assert_not_called()
+    mock_collection.with_tenant.return_value.batch.dynamic.assert_not_called()
+
+
+class TestExistingClassTenancyIsChecked:
+    """A class's tenancy is fixed by its first creator; a disagreeing bind is refused."""
+
+    @pytest.mark.parametrize("source", ["param", "backend"])
+    def test_a_multi_tenant_class_and_a_tenant_agree(self, source: str) -> None:
+        mock_client, mock_collection = _existing_class(enabled=True)
+
+        backend = _bind(mock_client, source=source, tenant="acme")
+
+        assert "col1" in backend._collections_created
+        assert backend._collection_tenants["col1"] == "acme"
+        mock_collection.tenants.create.assert_called_once_with(["Tenant(acme)"])
+        # One handle for the read and the provisioning, never two.
+        mock_client.collections.get.assert_called_once_with("col1")
+        mock_client.collections.create.assert_not_called()
+
+    def test_a_plain_class_and_no_tenant_agree(self) -> None:
+        mock_client, mock_collection = _existing_class(enabled=False)
+
+        backend = _bind(mock_client, source="param", tenant=None)
+
+        assert "col1" in backend._collections_created
+        assert "col1" not in backend._collection_tenants
+        mock_collection.tenants.create.assert_not_called()
+        mock_client.collections.create.assert_not_called()
+
+    def test_a_multi_tenant_class_refuses_a_caller_without_a_tenant(self) -> None:
+        mock_client, mock_collection = _existing_class(enabled=True)
+        backend, param = _backend_and_param(mock_client, source="param", tenant=None)
+
+        with pytest.raises(ValueError) as refused:
+            backend.create_collection("col1", param)
+
+        message = str(refused.value)
+        assert "'col1'" in message
+        assert "is multi-tenant" in message
+        assert "no tenant" in message
+        assert "set `tenant` on this card's vector_store" in message
+        mock_collection.tenants.create.assert_not_called()
+        _assert_unbound(backend, mock_collection)
+
+    @pytest.mark.parametrize("source", ["param", "backend"])
+    def test_a_plain_class_refuses_a_caller_with_a_tenant(self, source: str) -> None:
+        mock_client, mock_collection = _existing_class(enabled=False)
+        backend, param = _backend_and_param(mock_client, source=source, tenant="acme")
+
+        with pytest.raises(ValueError) as refused:
+            backend.create_collection("col1", param)
+
+        message = str(refused.value)
+        assert "'col1'" in message
+        assert "plain (not multi-tenant)" in message
+        assert "tenant 'acme'" in message
+        assert "remove `tenant` on this card's vector_store" in message
+        # The DEBUG-swallowed provisioning is never reached in this direction.
+        mock_collection.tenants.create.assert_not_called()
+        _assert_unbound(backend, mock_collection)
+
+    def test_a_new_class_makes_no_config_read(self) -> None:
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        mock_collection = MagicMock()
+        mock_client.collections.get.return_value = mock_collection
+
+        backend = _bind(mock_client, source="backend", tenant="acme")
+
+        mock_client.collections.create.assert_called_once()
+        mock_collection.config.get.assert_not_called()
+        assert "col1" in backend._collections_created
+        assert backend._collection_tenants["col1"] == "acme"
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +410,7 @@ class TestAdd:
         mock_batch = MagicMock()
         mock_collection.batch.dynamic.return_value.__enter__ = MagicMock(return_value=mock_batch)
         mock_collection.batch.dynamic.return_value.__exit__ = MagicMock(return_value=False)
+        mock_collection.batch.failed_objects = []
 
         from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
         from akgentic.tool.vector_store.protocol import VectorStoreParam
@@ -307,6 +439,46 @@ class TestAdd:
 
         with pytest.raises(ValueError, match="does not exist"):
             backend.add("nonexistent", [entry])
+
+    def test_add_raises_when_the_batch_reports_failed_objects(self) -> None:
+        """The client collects a rejected object instead of raising; add raises for it."""
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        mock_batch = _batch_for(mock_client)
+        mock_collection = mock_client.collections.get.return_value
+        mock_collection.batch.failed_objects = [
+            MagicMock(message="tenant not found"),
+            MagicMock(message="x"),
+        ]
+
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
+
+        backend = WeaviateBackend(client=mock_client)
+        backend.create_collection("col1", VectorStoreParam())
+
+        with pytest.raises(RuntimeError) as failed:
+            backend.add("col1", [_make_entry(ref_id="r1"), _make_entry(ref_id="r2")])
+
+        message = str(failed.value)
+        assert "2 of 2" in message
+        assert "'col1'" in message
+        assert "tenant not found" in message
+        assert mock_batch.add_object.call_count == 2
+
+    def test_add_returns_when_the_batch_reports_none(self) -> None:
+        _mock_weaviate, mock_client = _install_mock_weaviate()
+        mock_client.collections.exists.return_value = False
+        mock_batch = _batch_for(mock_client)
+
+        from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
+        from akgentic.tool.vector_store.protocol import VectorStoreParam
+
+        backend = WeaviateBackend(client=mock_client)
+        backend.create_collection("col1", VectorStoreParam())
+
+        assert backend.add("col1", [_make_entry(ref_id="r1")]) is None
+        mock_batch.add_object.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +670,7 @@ class TestMultiTenancy:
         mock_batch = MagicMock()
         mock_tenant_col.batch.dynamic.return_value.__enter__ = MagicMock(return_value=mock_batch)
         mock_tenant_col.batch.dynamic.return_value.__exit__ = MagicMock(return_value=False)
+        mock_tenant_col.batch.failed_objects = []
 
         from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
         from akgentic.tool.vector_store.protocol import VectorStoreParam
@@ -543,6 +716,7 @@ class TestMultiTenancy:
         mock_batch = MagicMock()
         mock_tenant_col.batch.dynamic.return_value.__enter__ = MagicMock(return_value=mock_batch)
         mock_tenant_col.batch.dynamic.return_value.__exit__ = MagicMock(return_value=False)
+        mock_tenant_col.batch.failed_objects = []
 
         from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
         from akgentic.tool.vector_store.protocol import VectorStoreParam
@@ -570,6 +744,7 @@ def _batch_for(mock_client: MagicMock) -> MagicMock:
     mock_batch = MagicMock()
     mock_collection.batch.dynamic.return_value.__enter__ = MagicMock(return_value=mock_batch)
     mock_collection.batch.dynamic.return_value.__exit__ = MagicMock(return_value=False)
+    mock_collection.batch.failed_objects = []
     return mock_batch
 
 
@@ -627,6 +802,7 @@ class TestTeamIdMetadata:
         mock_batch = MagicMock()
         mock_tenant_col.batch.dynamic.return_value.__enter__ = MagicMock(return_value=mock_batch)
         mock_tenant_col.batch.dynamic.return_value.__exit__ = MagicMock(return_value=False)
+        mock_tenant_col.batch.failed_objects = []
 
         from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
         from akgentic.tool.vector_store.protocol import VectorStoreParam
@@ -973,6 +1149,7 @@ class TestTwoBackendsShareOneClient:
         mock_client.collections.create.assert_called_once()
 
         mock_client.collections.exists.return_value = True
+        _set_class_multi_tenant(mock_client, enabled=False)
         mock_client.collections.create.reset_mock()
         second.create_collection("col1", VectorStoreParam())
 
@@ -1101,6 +1278,7 @@ def _recording_batch_contexts(
 
     mock_collection = MagicMock()
     mock_collection.batch.dynamic.side_effect = dynamic
+    mock_collection.batch.failed_objects = []
     mock_client.collections.get.return_value = mock_collection
     return mock_collection, contexts
 
@@ -1624,7 +1802,8 @@ class TestCollectionHandleCache:
         """``with_tenant()`` returns a different Collection, so the tenant is in the key."""
         _mock_weaviate, mock_client = _install_mock_weaviate()
         mock_client.collections.exists.return_value = False
-        _recording_batch_contexts(mock_client)
+        mock_collection, _contexts = _recording_batch_contexts(mock_client)
+        mock_collection.with_tenant.return_value.batch.failed_objects = []
 
         backend = _scoped_backend(mock_client)
         mock_client.collections.get.reset_mock()
@@ -1935,6 +2114,7 @@ class TestEveryObjectHasAStableUuid:
         batch = MagicMock()
         collection.batch.dynamic.return_value.__enter__ = MagicMock(return_value=batch)
         collection.batch.dynamic.return_value.__exit__ = MagicMock(return_value=False)
+        collection.batch.failed_objects = []
         return batch
 
     def test_two_teams_writing_one_ref_id_to_planning_pass_two_uuids(self) -> None:

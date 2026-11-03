@@ -477,8 +477,7 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
         """
         if description is None or description == entity.description:
             return False
-        if self._vs_proxy is not None:
-            self._vs_proxy.remove(KG_COLLECTION, [str(entity.id)])
+        self._unindex([str(entity.id)])
         entity.description = description
         self._embed_entity(entity)
         return True
@@ -542,11 +541,8 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
             if r.from_entity not in names_set and r.to_entity not in names_set
         ]
 
-        if self._vs_proxy is not None:
-            ref_ids = [str(eid) for eid in deleted_entity_ids] + [
-                str(rid) for rid in cascaded_rel_ids
-            ]
-            self._vs_proxy.remove(KG_COLLECTION, ref_ids)
+        ref_ids = [str(eid) for eid in deleted_entity_ids] + [str(rid) for rid in cascaded_rel_ids]
+        self._unindex(ref_ids)
 
         return deleted_entity_ids, cascaded_rel_ids, errors
 
@@ -590,10 +586,34 @@ class KnowledgeGraphActor(Akgent[KnowledgeGraphConfig, KnowledgeGraphState]):
                 if (r.from_entity, r.to_entity, r.relation_type) not in triples_to_delete
             ]
 
-            if self._vs_proxy is not None:
-                self._vs_proxy.remove(KG_COLLECTION, [str(rid) for rid in deleted_rel_ids])
+            self._unindex([str(rid) for rid in deleted_rel_ids])
 
         return deleted_rel_ids, errors
+
+    def _unindex(self, ref_ids: list[str]) -> None:
+        """Drop *ref_ids* from the vector index, never letting a failure end the call.
+
+        The graph is authoritative and the index is a derived cache: a ref left
+        behind for a deleted entity or relation is dropped by the read path
+        (``_as_hit`` no longer resolves it), so a failed remove costs at most one
+        stale entry. The mutation that called this has already been made, or is
+        about to be, and stands either way. No-op when there is no vector store.
+
+        Args:
+            ref_ids: The ids of the entities and relations whose embeddings to drop.
+        """
+        if self._vs_proxy is None:
+            return
+        try:
+            self._vs_proxy.remove(KG_COLLECTION, ref_ids)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[%s] could not remove %d ref(s) from '%s': %s — the index keeps a stale entry",
+                self.config.name,
+                len(ref_ids),
+                KG_COLLECTION,
+                exc,
+            )
 
     # ------------------------------------------------------------------
     # Public API

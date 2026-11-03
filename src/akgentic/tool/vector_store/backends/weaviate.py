@@ -236,9 +236,19 @@ class WeaviateBackend:
         is set), the collection is created with multi-tenancy and the tenant
         is provisioned.
 
+        A class's tenancy mode is fixed by whichever caller creates it first. An
+        existing class is bound only when its mode agrees with this caller's
+        effective tenant; see :meth:`_bind_existing`.
+
         Args:
             name: Unique collection identifier.
             config: Collection configuration.
+
+        Raises:
+            ValueError: When the class already exists and its tenancy mode
+                disagrees with the effective tenant, in either direction: a
+                multi-tenant class bound with no tenant, or a plain class bound
+                with one. The collection is then left unbound.
         """
         from weaviate.classes.config import Configure, DataType, Property
         from weaviate.classes.tenants import Tenant
@@ -246,18 +256,7 @@ class WeaviateBackend:
         tenant = getattr(config, "tenant", None) or self._tenant
 
         if self._client.collections.exists(name):
-            self._collections_created.add(name)
-            if tenant:
-                self._collection_tenants[name] = tenant
-                try:
-                    collection = self._client.collections.get(name)
-                    collection.tenants.create([Tenant(name=tenant)])
-                except Exception:  # noqa: BLE001
-                    logger.debug(
-                        "Tenant '%s' may already exist on collection '%s'",
-                        tenant,
-                        name,
-                    )
+            self._bind_existing(name, tenant)
             return
 
         properties = [
@@ -284,6 +283,54 @@ class WeaviateBackend:
             self._collection_tenants[name] = tenant
             collection = self._client.collections.get(name)
             collection.tenants.create([Tenant(name=tenant)])
+
+    def _bind_existing(self, name: str, tenant: str | None) -> None:
+        """Bind to a class that already exists, refusing a tenancy-mode mismatch.
+
+        The class's ``multi_tenancy_config.enabled`` is read once, here, and compared
+        with whether *tenant* is set. Without the check a disagreeing caller was told
+        the bind succeeded, after which every insert it made failed silently and
+        every delete raised. The name is recorded in ``_collections_created`` only
+        after the check, so a refused collection stays unbound and every later
+        operation on it fails ``_check_collection``.
+
+        The one ``Collection`` fetched here is reused for the tenant provisioning:
+        each ``collections.get`` builds a batch wrapper whose thread pool is never
+        shut down (see :meth:`_get_collection`).
+
+        Args:
+            name: The existing class.
+            tenant: The caller's effective tenant, or ``None``.
+
+        Raises:
+            ValueError: When the class's tenancy mode disagrees with *tenant*.
+        """
+        from weaviate.classes.tenants import Tenant
+
+        collection = self._client.collections.get(name)
+        multi_tenant = collection.config.get().multi_tenancy_config.enabled
+        if multi_tenant != bool(tenant):
+            mode = "multi-tenant" if multi_tenant else "plain (not multi-tenant)"
+            requested = f"tenant '{tenant}'" if tenant else "no tenant"
+            fix = "set `tenant`" if multi_tenant else "remove `tenant`"
+            msg = (
+                f"Weaviate class '{name}' already exists and is {mode}, but this "
+                f"backend was asked to bind it with {requested}. Fix: {fix} on this "
+                "card's vector_store to match every other card that writes this class."
+            )
+            raise ValueError(msg)
+
+        self._collections_created.add(name)
+        if tenant:
+            self._collection_tenants[name] = tenant
+            try:
+                collection.tenants.create([Tenant(name=tenant)])
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "Tenant '%s' may already exist on collection '%s'",
+                    tenant,
+                    name,
+                )
 
     def add(self, collection: str, entries: list[VectorEntry]) -> None:
         """Ingest embedding entries into a Weaviate collection.
@@ -326,12 +373,19 @@ class WeaviateBackend:
         thread-safe, and the client underneath is shared by every consumer in the
         process.
 
+        **A batch that reports failed objects raises.** The client does not raise
+        on a rejected object; it collects it in ``batch.failed_objects``, which
+        ``dynamic()`` resets per call, so the list read after the context exits is
+        this call's alone.
+
         Args:
             collection: Target collection name.
             entries: List of vector entries to store.
 
         Raises:
             ValueError: If the collection has not been created.
+            RuntimeError: If the batch reports one or more failed objects. The
+                message carries the count, the collection and the first failure.
         """
         self._check_collection(collection)
         col = self._get_collection(collection)
@@ -344,6 +398,14 @@ class WeaviateBackend:
                     vector=entry.vector,
                     uuid=row_object_id(collection, self._team_id, tenant, entry.ref_id),
                 )
+
+        failed = col.batch.failed_objects
+        if failed:
+            msg = (
+                f"{len(failed)} of {len(entries)} object(s) failed to write to "
+                f"collection '{collection}': {failed[0].message}"
+            )
+            raise RuntimeError(msg)
 
     def _object_properties(self, entry: VectorEntry) -> dict[str, str | int]:
         """Build the Weaviate property payload for one entry.

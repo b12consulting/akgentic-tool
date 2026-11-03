@@ -394,7 +394,7 @@ PlanningTool(vector_store=VectorStoreParam(backend="weaviate", tenant="team-42")
 |---|---|---|---|
 | `dimension` | `int` (≥1) | `1536` | Embedding vector dimensionality. Must be the native width of a known `embedding_model`; a mismatch is refused when the card binds. |
 | `backend` | `str` | **follows the environment** | A registered backend name (`inmemory` / `weaviate` / `qdrant` / any third-party). Defaults via `default_backend()`: the highest-priority provisioned store, else `inmemory`. External backends require their extra (e.g. `akgentic-tool[qdrant]`). See [Pluggable backends](#pluggable-backends). |
-| `tenant` | `str \| None` | `None` | Weaviate tenant id for multi-tenancy — normally the workspace or team id. |
+| `tenant` | `str \| None` | `None` | Weaviate tenant id for multi-tenancy — normally the workspace or team id. A class's tenancy mode is fixed by whichever card creates it first: a later card that disagrees (a tenant on a plain class, or none on a multi-tenant one) is refused when it binds, and its consumer degrades with one WARNING. Every card that writes a class must agree on `tenant`. |
 | `embedding_model` | `str` | `"text-embedding-3-small"` | The model that produces this collection's vectors. Known models (`text-embedding-3-small` 1536, `text-embedding-3-large` 3072, `text-embedding-ada-002` 1536) pin `dimension`; an unknown name — an Azure deployment — is accepted at any dimension. |
 | `embedding_provider` | `Literal["openai", "azure"]` | `"openai"` | The embedding API provider. |
 
@@ -490,6 +490,12 @@ mints a UUIDv4 when none is given, so before this every re-add of a chunk left o
 team-scoped collection the team is inside the id, so two teams writing one `ref_id` stay two
 objects; on the shared collection a team-less writer's id carries `""`, and every lifetime of a tree
 writes the same object.
+
+**A failed write raises; a tenancy mismatch never gets that far.** The client does not raise on a
+rejected object, it collects it in the batch's `failed_objects`; `add` reads that list after the
+batch closes and raises `RuntimeError` with the count, the collection and the first failure's
+message. Binding to an existing class first reads its `multi_tenancy_config` and refuses a card whose
+`tenant` disagrees, so the mismatch shows up once at bind rather than as a stream of failed inserts.
 
 **And read back on every query — but not on every collection.** Collection names are module
 constants, so every team on a cluster shares the same collections and multi-tenancy is off unless a

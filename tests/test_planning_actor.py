@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -616,3 +617,65 @@ class TestPlanActorAcquireVsProxyCollectionPropagation:
         )
         actor.on_start()
         assert actor._vs_proxy is None
+
+
+# ---------------------------------------------------------------------------
+# A failed vector remove never ends the call; the task list stays authoritative
+# ---------------------------------------------------------------------------
+
+
+def _guard_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """The WARNING records the remove guard logged for the injected failure."""
+    return [r for r in caplog.records if r.levelno == logging.WARNING and "boom" in r.getMessage()]
+
+
+def _failing_remove_actor() -> tuple[PlanActor, MagicMock, MockActorAddress]:
+    """Return an actor holding task 1, whose store ``remove`` raises."""
+    actor = PlanActor()
+    actor.on_start()
+    proxy = MagicMock()
+    embedder = MagicMock()
+    embedder.embed.return_value = [[0.1, 0.2, 0.3]]
+    actor._vs_proxy = proxy
+    actor._embedder = embedder
+    address = MockActorAddress("alice", "Agent")
+    actor._create_task(
+        TaskCreate(id=1, status="pending", description="write the report", owner="alice"),
+        address,
+    )
+    proxy.reset_mock()
+    proxy.remove.side_effect = RuntimeError("boom")
+    return actor, proxy, address
+
+
+class TestAFailedRemoveIsContained:
+    """The index is a derived cache: a stale ref costs one dead entry, not the turn."""
+
+    def test_a_task_update_stands_and_is_re_embedded(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        actor, proxy, address = _failing_remove_actor()
+
+        with caplog.at_level(logging.WARNING):
+            result = actor.update_planning(
+                UpdatePlan(update_tasks=[TaskUpdate(id=1, description="publish the report")]),
+                address,
+            )
+
+        assert result == "Done"
+        [task] = actor.get_planning()
+        assert task.description == "publish the report"
+        proxy.remove.assert_called_once()
+        proxy.add.assert_called_once()
+        assert len(_guard_warnings(caplog)) == 1
+
+    def test_a_task_delete_stands(self, caplog: pytest.LogCaptureFixture) -> None:
+        actor, proxy, address = _failing_remove_actor()
+
+        with caplog.at_level(logging.WARNING):
+            result = actor.update_planning(UpdatePlan(delete_tasks=[1]), address)
+
+        assert result == "Done"
+        assert actor.state.task_list == []
+        proxy.remove.assert_called_once()
+        assert len(_guard_warnings(caplog)) == 1
