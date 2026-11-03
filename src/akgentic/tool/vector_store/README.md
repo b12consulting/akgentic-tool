@@ -482,17 +482,23 @@ garbage accumulating in a shared cluster. `team_id` is that handle, and every te
 filters on it.
 
 A backend built without a `team_id` still writes the property, as the empty string, so the schema
-is uniform and every object carries it, an unattributed writer's included. **The workspace is such a writer**: its backend is deliberately built with `team_id=None`, so that
-a chunk's identity is a property of the *tree* rather than of whichever actor indexed it — and every
-`workspace_chunks` row carries `""`. The mandatory `scope` bounds those rows instead.
+is uniform and every object carries it, an unattributed writer's included. Only a hand-built
+backend is such a writer: every consumer, the workspace included, passes its real team. On
+`workspace_chunks` the team is stamped but filtered by nothing; the mandatory `scope` bounds those
+rows instead.
 
 **Every object's id is derived, like Qdrant's point ids.** `add` passes each object a `uuid` from
-`stable_object_id(team_id, tenant, ref_id)` in `protocol.py` — the backend's team, the tenant the
-object is written to (`default` when the card names none), and its `ref_id`. The client replaces an object whose uuid already exists and
-mints a UUIDv4 when none is given, so before this every re-add of a chunk left one more copy. On a
-team-scoped collection the team is inside the id, so two teams writing one `ref_id` stay two
-objects; on the shared collection a team-less writer's id carries `""`, and every lifetime of a tree
-writes the same object.
+`row_object_id(collection, team_id, tenant, ref_id)` in `protocol.py` — the backend's team, the
+tenant the object is written to (`default` when the card names none), and its `ref_id`. The client
+replaces an object whose uuid already exists and mints a UUIDv4 when none is given, so before this
+every re-add of a chunk left one more copy. On a team-scoped collection the team is inside the id,
+so two teams writing one `ref_id` stay two objects; on the shared collection the team is dropped
+from the id whoever writes, so two teams indexing one tree write the same object.
+
+**A new class gets one self-provided named vector, `default`.** A class created before that holds
+the legacy unnamed vector, and a cluster may hold both shapes. `add` passes a bare vector and
+`search` names no target vector, and both shapes accept that; an integration test against a real
+Weaviate (`tests/vector_store/test_weaviate_integration.py`) proves it on each.
 
 **A failed write raises; a plain class never gets that far.** The client does not raise on a
 rejected object, it collects it in the batch's `failed_objects`; `add` reads that list after the
@@ -525,7 +531,7 @@ may add to at runtime is the same hazard in another shape.
 
 | Method | Filter on a team-scoped collection | Filter on a shared collection |
 |---|---|---|
-| `add` | stamps `team_id`; the object's `uuid` includes the team | stamps the backend's `team_id`, and nothing filters on it — for the workspace, whose backend is built with no team, that is `""` |
+| `add` | stamps `team_id`; the object's `uuid` includes the team | stamps the backend's `team_id`, and nothing filters on it; the object's `uuid` leaves the team out |
 | `search` | `team_id == <backend's own>`, plus `scope` / `path` legs, passed to the cluster as `filters=` so it applies **before** `limit` | the `scope` and `path` legs alone; **`scope` is mandatory** |
 | `remove` | `ref_id IN (...)` **AND** `team_id == <backend's own>` | `ref_id IN (...)` **AND** `scope == <argument>`; **`scope` is mandatory** |
 

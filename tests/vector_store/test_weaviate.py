@@ -95,7 +95,7 @@ def _make_mock_weaviate_module() -> MagicMock:
 
     # weaviate.classes.config
     mock_config = MagicMock()
-    mock_config.Configure.Vectorizer.none.return_value = "none_vectorizer"
+    mock_config.Configure.Vectors.self_provided.return_value = "self_provided_vectors"
     mock_config.Configure.multi_tenancy.return_value = "multi_tenancy_config"
     mock_config.DataType.TEXT = "TEXT"
     mock_config.DataType.INT = "INT"
@@ -253,8 +253,8 @@ class TestCreateCollection:
     """AC1, AC3: VectorStoreService compliance and idempotent creation."""
 
     def test_creates_collection_with_correct_config(self) -> None:
-        """Collection created with cosine distance and no vectorizer."""
-        _mock_weaviate, mock_client = _install_mock_weaviate()
+        """Collection created with one self-provided named vector, not the deprecated vectorizer."""
+        mock_weaviate, mock_client = _install_mock_weaviate()
         mock_client.collections.exists.return_value = False
 
         from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend
@@ -265,8 +265,11 @@ class TestCreateCollection:
         backend.create_collection("test_col", config)
 
         mock_client.collections.create.assert_called_once()
-        call_kwargs = mock_client.collections.create.call_args
-        assert call_kwargs[1]["name"] == "test_col" or call_kwargs[0][0] == "test_col"
+        call_kwargs = mock_client.collections.create.call_args.kwargs
+        assert call_kwargs["name"] == "test_col"
+        mock_weaviate.classes.config.Configure.Vectors.self_provided.assert_called_once_with()
+        assert call_kwargs["vector_config"] == "self_provided_vectors"
+        assert "vectorizer_config" not in call_kwargs
 
     def test_idempotent_second_call(self) -> None:
         """Second call with same name is a no-op."""
@@ -325,7 +328,6 @@ def _bind(
 
 def _assert_unbound(backend: WeaviateBackend, mock_collection: MagicMock) -> None:
     """A refused collection is recorded nowhere, and a write to it never reaches a batch."""
-    assert "col1" not in backend._collections_created
     assert "col1" not in backend._collection_tenants
     assert not backend._collection_handles
     with pytest.raises(ValueError, match="Collection 'col1' does not exist"):
@@ -341,7 +343,7 @@ class TestExistingClassTenancyIsChecked:
 
         backend = _bind(mock_client, tenant="acme")
 
-        assert "col1" in backend._collections_created
+        assert backend._collection_handles["col1"] is mock_collection
         assert backend._collection_tenants["col1"] == "acme"
         mock_collection.tenants.create.assert_called_once_with(["Tenant(acme)"])
         # One handle for the read, the provisioning and the cache, never two.
@@ -359,7 +361,7 @@ class TestExistingClassTenancyIsChecked:
 
         backend = _bind(mock_client, tenant=None, team_id="team-42")
 
-        assert "col1" in backend._collections_created
+        assert "col1" in backend._collection_handles
         assert backend._collection_tenants["col1"] == "default"
         mock_collection.tenants.create.assert_called_once_with(["Tenant(default)"])
 
@@ -415,7 +417,7 @@ class TestExistingClassTenancyIsChecked:
 
         mock_client.collections.create.assert_called_once()
         mock_collection.config.get.assert_not_called()
-        assert "col1" in backend._collections_created
+        assert "col1" in backend._collection_handles
         assert backend._collection_tenants["col1"] == "acme"
 
     def test_a_new_class_is_multi_tenant_for_a_tenant_less_card(self) -> None:
@@ -956,10 +958,10 @@ class TestTwoBackendsShareOneClient:
         first, second = _two_backends_for_one_cluster()
         first.create_collection("col1", VectorStoreParam())
 
-        assert first._collections_created is not second._collections_created
+        assert first._collection_handles is not second._collection_handles
         assert first._collection_tenants is not second._collection_tenants
-        assert "col1" in first._collections_created
-        assert "col1" not in second._collections_created
+        assert "col1" in first._collection_handles
+        assert "col1" not in second._collection_handles
         with pytest.raises(ValueError, match="does not exist"):
             second.add("col1", [_make_entry()])
 
@@ -983,7 +985,7 @@ class TestTwoBackendsShareOneClient:
         second.create_collection("col1", VectorStoreParam())
 
         mock_client.collections.create.assert_not_called()
-        assert "col1" in second._collections_created
+        assert "col1" in second._collection_handles
 
 
 # ---------------------------------------------------------------------------
@@ -1595,7 +1597,7 @@ class TestTheDependencyGuard:
 
 
 class TestCollectionHandleCache:
-    """One ``Collection`` per (name, tenant): the vendor mints a new one per call.
+    """One ``Collection`` per bound name: the vendor mints a new one per call.
 
     The bind fetches the handle and caches it, so the counts below run from
     before the bind: a later operation fetches nothing.
@@ -1611,7 +1613,7 @@ class TestCollectionHandleCache:
         backend.add("col1", [_make_entry(ref_id="r2")])
 
         assert mock_client.collections.get.call_count == 1
-        assert set(backend._collection_handles) == {("col1", "default")}
+        assert set(backend._collection_handles) == {"col1"}
 
     def test_an_existing_class_bind_and_its_add_fetch_one_handle(self) -> None:
         mock_client, mock_collection = _existing_class(enabled=True)
@@ -1621,7 +1623,7 @@ class TestCollectionHandleCache:
         backend.add("col1", [_make_entry(ref_id="r1")])
 
         assert mock_client.collections.get.call_count == 1
-        assert set(backend._collection_handles) == {("col1", "default")}
+        assert set(backend._collection_handles) == {"col1"}
 
     def test_a_second_collection_fetches_its_own_handle(self) -> None:
         _mock_weaviate, mock_client = _install_mock_weaviate()
@@ -1636,21 +1638,7 @@ class TestCollectionHandleCache:
         backend.add("col2", [_make_entry(ref_id="r2")])
 
         assert mock_client.collections.get.call_count == 2
-        assert set(backend._collection_handles) == {("col1", "default"), ("col2", "default")}
-
-    def test_the_same_collection_under_a_different_tenant_fetches_again(self) -> None:
-        """``with_tenant()`` returns a different Collection, so the tenant is in the key."""
-        _mock_weaviate, mock_client = _install_mock_weaviate()
-        mock_client.collections.exists.return_value = False
-        _recording_batch_contexts(mock_client)
-
-        backend = _scoped_backend(mock_client)
-        backend.add("col1", [_make_entry(ref_id="r1")])
-        backend._collection_tenants["col1"] = "tenant-b"
-        backend.add("col1", [_make_entry(ref_id="r2")])
-
-        assert mock_client.collections.get.call_count == 2
-        assert set(backend._collection_handles) == {("col1", "default"), ("col1", "tenant-b")}
+        assert set(backend._collection_handles) == {"col1", "col2"}
 
     def test_the_cache_belongs_to_the_instance_not_the_class(self) -> None:
         """One backend instance per actor is the invariant the cache rests on."""

@@ -205,9 +205,8 @@ class WeaviateBackend:
             object it reads or removes on a team-scoped collection. **Required to
             query a team-scoped collection:** ``search`` and ``remove`` there
             raise ``ValueError`` without one, rather than inventing an identity
-            for the caller. It is omitted by a consumer with no team of its own —
-            the hosted workspace, whose shared collection is bounded by ``scope``
-            and whose objects stamp ``""``.
+            for the caller. Every consumer passes its real team; only a
+            hand-built backend omits it, and its objects stamp ``""``.
     """
 
     def __init__(self, client: weaviate.WeaviateClient, team_id: str | None = None) -> None:
@@ -215,9 +214,8 @@ class WeaviateBackend:
 
         self._client: weaviate.WeaviateClient = client
         self._team_id = team_id
-        self._collections_created: set[str] = set()
         self._collection_tenants: dict[str, str] = {}
-        self._collection_handles: dict[tuple[str, str], weaviate.collections.Collection] = {}
+        self._collection_handles: dict[str, weaviate.collections.Collection] = {}
 
     # ------------------------------------------------------------------
     # VectorStoreService protocol methods
@@ -231,6 +229,10 @@ class WeaviateBackend:
         provisioned. An existing multi-tenant class is bound under the tenant,
         which is provisioned if absent. An existing plain class is refused; see
         :meth:`_bind_existing`.
+
+        A new class gets one self-provided *named* vector, ``default``. A class
+        created before that holds the legacy unnamed vector; :meth:`add` and
+        :meth:`search` name no vector, which both shapes accept.
 
         The bind fetches one base handle and caches its tenanted handle for
         :meth:`_get_collection`: every ``collections.get`` or ``with_tenant`` call
@@ -253,7 +255,7 @@ class WeaviateBackend:
         else:
             self._client.collections.create(
                 name=name,
-                vectorizer_config=Configure.Vectorizer.none(),
+                vector_config=Configure.Vectors.self_provided(),
                 properties=[
                     Property(name="ref_type", data_type=DataType.TEXT),
                     Property(name="ref_id", data_type=DataType.TEXT),
@@ -268,9 +270,8 @@ class WeaviateBackend:
             base = self._client.collections.get(name)
             base.tenants.create([Tenant(name=tenant)])
 
-        self._collections_created.add(name)
         self._collection_tenants[name] = tenant
-        self._collection_handles[(name, tenant)] = base.with_tenant(tenant)
+        self._collection_handles[name] = base.with_tenant(tenant)
 
     def _bind_existing(self, name: str, tenant: str) -> weaviate.collections.Collection:
         """Return an existing class's base handle, refusing a plain class.
@@ -278,7 +279,7 @@ class WeaviateBackend:
         Weaviate cannot convert a class to multi-tenancy, so a plain class is the
         one mode this backend does not speak, whatever the card says. The check
         runs before any bookkeeping write, so a refused collection stays unbound
-        and every later operation on it fails ``_check_collection``. On a
+        and every later operation on it fails :meth:`_get_collection`. On a
         multi-tenant class *tenant* is provisioned; a failure there means it
         already exists, and is logged at DEBUG.
 
@@ -364,7 +365,6 @@ class WeaviateBackend:
             RuntimeError: If the batch reports one or more failed objects. The
                 message carries the count, the collection and the first failure.
         """
-        self._check_collection(collection)
         col = self._get_collection(collection)
         tenant = self._collection_tenants[collection]
 
@@ -444,7 +444,6 @@ class WeaviateBackend:
 
         check_path_prefix(path_prefix)
         check_shared_scope(collection, scope)
-        self._check_collection(collection)
         col = self._get_collection(collection)
         col.data.delete_many(
             where=Filter.by_property("ref_id").contains_any(ref_ids)
@@ -494,7 +493,6 @@ class WeaviateBackend:
 
         check_path_prefix(path_prefix)
         check_shared_scope(collection, scope)
-        self._check_collection(collection)
         col = self._get_collection(collection)
 
         result = col.query.near_vector(
@@ -596,19 +594,6 @@ class WeaviateBackend:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _check_collection(self, collection: str) -> None:
-        """Raise ``ValueError`` if *collection* was never created via this backend.
-
-        Args:
-            collection: Collection name to validate.
-
-        Raises:
-            ValueError: If the collection has not been created.
-        """
-        if collection not in self._collections_created:
-            msg = f"Collection '{collection}' does not exist"
-            raise ValueError(msg)
-
     def _team_filter(self) -> FilterReturn:
         """Return the predicate restricting a query to this backend's own team.
 
@@ -700,20 +685,19 @@ class WeaviateBackend:
         return predicate
 
     def _get_collection(self, name: str) -> weaviate.collections.Collection:
-        """Return the collection's handle, scoped to the tenant it was bound under.
+        """Return the tenanted handle the bind cached, refusing a collection never bound.
 
-        The tenant is the one recorded at bind, so the handle, :meth:`add`'s
-        object ids and every query agree on it. A bind caches the handle; a miss
-        here builds it the same way.
+        The handle is scoped to the tenant recorded at bind, so the handle,
+        :meth:`add`'s object ids and every query agree on it.
 
-        **The handle is cached per ``(name, tenant)``, and it has to be.**
+        **The handle is cached at bind, and it has to be.**
         ``client.collections.get`` builds a *new* ``Collection`` on every call
         (``weaviate/collections/collections/executor.py:85-91``), and each one
         constructs a ``_BatchCollectionWrapper`` whose ``__init__`` creates a
         ``ThreadPoolExecutor`` (``weaviate/collections/batch/collection.py:127-128``)
         that nothing ever shuts down. Uncached, every ``add()`` leaked one idle
-        pool for the lifetime of the process. ``with_tenant()`` returns a
-        different ``Collection``, so the tenant is part of the key.
+        pool for the lifetime of the process. ``with_tenant()`` returns another
+        ``Collection`` again, which is why the bind caches the tenanted one.
 
         **The invariant that makes a cached handle safe: a backend instance
         belongs to exactly one actor.** The vendor's "not thread-safe" caveat is
@@ -736,12 +720,15 @@ class WeaviateBackend:
 
         Returns:
             The Weaviate collection object, scoped to its tenant.
+
+        Raises:
+            ValueError: If the collection was never bound through this backend,
+                or its bind was refused.
         """
-        tenant = self._collection_tenants[name]
-        handle = self._collection_handles.get((name, tenant))
+        handle = self._collection_handles.get(name)
         if handle is None:
-            handle = self._client.collections.get(name).with_tenant(tenant)
-            self._collection_handles[(name, tenant)] = handle
+            msg = f"Collection '{name}' does not exist"
+            raise ValueError(msg)
         return handle
 
 
