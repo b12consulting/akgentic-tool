@@ -245,8 +245,8 @@ class QdrantBackend:
         """Ingest embedding entries into a Qdrant collection.
 
         Every point is stamped with the backend's ``team_id`` (empty string when
-        built without one) and optional ``tenant`` so ``delete_by_team`` and the
-        team-scoped query can find it later.
+        built without one) and optional ``tenant`` so the team-scoped query can
+        find it later.
 
         Args:
             collection: Target collection name.
@@ -507,63 +507,6 @@ class QdrantBackend:
         return dict(query.params)
 
     # ------------------------------------------------------------------
-    # Team-scoped cleanup (not part of VectorStoreService)
-    # ------------------------------------------------------------------
-
-    def list_collections(self) -> list[str]:
-        """Return the names of every collection present in the cluster."""
-        return [c.name for c in self._client.get_collections().collections]
-
-    def delete_by_team(self, collection: str, team_id: str) -> None:
-        """Delete every point in *collection* stamped with *team_id*.
-
-        Existence is checked against the cluster, not local bookkeeping: the
-        caller is typically a sweeper reaping a team that no longer exists.
-
-        **A collection shared across teams is refused, before any cluster call.**
-        On such a collection ``team_id`` records *who wrote the point* and is read
-        by nothing once the query predicate stops using it, so a sweeper pointed at
-        it would delete points another live team is still reading, from a tree that
-        still exists. The check consults a module-level fact rather than this
-        backend's own bookkeeping, so it still bites on an administrative backend
-        that has created no collection — the only kind a sweeper has.
-
-        Args:
-            collection: Target collection name.
-            team_id: The team whose points are to be removed.
-
-        Raises:
-            ValueError: If the collection is shared across teams, or does not
-                exist in the cluster.
-        """
-        from qdrant_client import models
-
-        if not collection_is_team_scoped(collection):
-            msg = (
-                f"Collection '{collection}' is shared across teams, so deleting one "
-                "team's points would remove rows another live team is still reading. "
-                "Remove by ref_id with a scope instead."
-            )
-            raise ValueError(msg)
-
-        if not self._client.collection_exists(collection):
-            msg = f"Collection '{collection}' does not exist"
-            raise ValueError(msg)
-
-        self._client.delete(
-            collection_name=collection,
-            points_selector=models.FilterSelector(
-                filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key=TEAM_ID_PAYLOAD, match=models.MatchValue(value=team_id)
-                        )
-                    ]
-                )
-            ),
-        )
-
-    # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
@@ -639,8 +582,7 @@ class QdrantBackend:
             msg = (
                 "This backend was built without a team_id, so it cannot search or "
                 "remove — those are scoped to the owning team. Pass team_id to the "
-                "constructor. Cluster administration (list_collections, "
-                "delete_by_team) needs no team and is unaffected."
+                "constructor."
             )
             raise ValueError(msg)
 

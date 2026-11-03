@@ -2075,9 +2075,21 @@ class TestAFailedGraphStoreIsNotADeclinedOne:
 # ---------------------------------------------------------------------------
 
 
-def _guard_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
-    """The WARNING records the remove guard logged for the injected failure."""
-    return [r for r in caplog.records if r.levelno == logging.WARNING and "boom" in r.getMessage()]
+def _guard_warnings(
+    caplog: pytest.LogCaptureFixture, actor: KnowledgeGraphActor, mock_proxy: MagicMock
+) -> list[logging.LogRecord]:
+    """The WARNING records naming the actor, the collection, the ref count and the failure."""
+    expected = (
+        f"[{actor.config.name}]",
+        f"'{KG_COLLECTION}'",
+        f"{len(mock_proxy.remove.call_args.args[1])} ref(s)",
+        "boom",
+    )
+    return [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and all(part in r.getMessage() for part in expected)
+    ]
 
 
 def _failing_remove_actor(
@@ -2109,7 +2121,7 @@ class TestAFailedRemoveIsContained:
         assert alice.description == "Staff"
         mock_proxy.remove.assert_called_once()
         mock_proxy.add.assert_called_once()
-        assert len(_guard_warnings(caplog)) == 1
+        assert len(_guard_warnings(caplog, actor, mock_proxy)) == 1
 
     def test_an_entity_delete_stands_and_its_delta_is_emitted(
         self, caplog: pytest.LogCaptureFixture
@@ -2132,7 +2144,7 @@ class TestAFailedRemoveIsContained:
         assert isinstance(event, ToolStateEvent)
         assert event.payload.entities_removed == [alice_id]
         assert event.payload.relations_removed == [relation_id]
-        assert len(_guard_warnings(caplog)) == 1
+        assert len(_guard_warnings(caplog, actor, mock_proxy)) == 1
 
     def test_a_relation_delete_stands(self, caplog: pytest.LogCaptureFixture) -> None:
         actor, mock_proxy = _failing_remove_actor(_seed_with_relation)
@@ -2149,4 +2161,4 @@ class TestAFailedRemoveIsContained:
         assert result == "Done"
         assert actor.get_graph().relations == []
         mock_proxy.remove.assert_called_once()
-        assert len(_guard_warnings(caplog)) == 1
+        assert len(_guard_warnings(caplog, actor, mock_proxy)) == 1

@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from akgentic.tool.errors import RetriableError
 from akgentic.tool.planning.planning_actor import (
+    PLAN_COLLECTION,
     PlanActor,
     TaskCreate,
     TaskUpdate,
@@ -624,9 +625,21 @@ class TestPlanActorAcquireVsProxyCollectionPropagation:
 # ---------------------------------------------------------------------------
 
 
-def _guard_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
-    """The WARNING records the remove guard logged for the injected failure."""
-    return [r for r in caplog.records if r.levelno == logging.WARNING and "boom" in r.getMessage()]
+def _guard_warnings(
+    caplog: pytest.LogCaptureFixture, actor: PlanActor, proxy: MagicMock
+) -> list[logging.LogRecord]:
+    """The WARNING records naming the actor, the collection, the ref count and the failure."""
+    expected = (
+        f"[{actor.config.name}]",
+        f"'{PLAN_COLLECTION}'",
+        f"{len(proxy.remove.call_args.args[1])} ref(s)",
+        "boom",
+    )
+    return [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and all(part in r.getMessage() for part in expected)
+    ]
 
 
 def _failing_remove_actor() -> tuple[PlanActor, MagicMock, MockActorAddress]:
@@ -667,7 +680,7 @@ class TestAFailedRemoveIsContained:
         assert task.description == "publish the report"
         proxy.remove.assert_called_once()
         proxy.add.assert_called_once()
-        assert len(_guard_warnings(caplog)) == 1
+        assert len(_guard_warnings(caplog, actor, proxy)) == 1
 
     def test_a_task_delete_stands(self, caplog: pytest.LogCaptureFixture) -> None:
         actor, proxy, address = _failing_remove_actor()
@@ -678,4 +691,4 @@ class TestAFailedRemoveIsContained:
         assert result == "Done"
         assert actor.state.task_list == []
         proxy.remove.assert_called_once()
-        assert len(_guard_warnings(caplog)) == 1
+        assert len(_guard_warnings(caplog, actor, proxy)) == 1

@@ -485,38 +485,6 @@ class TestASharedCollectionRefusesAnUnscopedQuery:
         client.query_points.assert_called_once()
 
 
-class TestDeleteByTeamRefusesASharedCollection:
-    """A sweeper pointed at the workspace collection would reap a live team's points."""
-
-    def test_it_refuses_before_any_cluster_call(self) -> None:
-        backend, client = _make_backend()
-        client.collection_exists.return_value = True
-
-        with pytest.raises(ValueError, match="workspace_chunks"):
-            backend.delete_by_team("workspace_chunks", "team-42")
-
-        client.collection_exists.assert_not_called()
-        client.delete.assert_not_called()
-
-    def test_the_refusal_holds_on_an_administrative_backend(self) -> None:
-        """No team of its own and no collection created here — the only kind a sweeper has."""
-        backend, client = _make_backend(team_id=None)
-        client.collection_exists.return_value = True
-
-        with pytest.raises(ValueError, match="workspace_chunks"):
-            backend.delete_by_team("workspace_chunks", "team-42")
-
-        client.delete.assert_not_called()
-
-    def test_a_team_scoped_collection_is_still_reaped(self) -> None:
-        backend, client = _make_backend(team_id=None)
-        client.collection_exists.return_value = True
-
-        backend.delete_by_team("planning", "team-gone")
-
-        assert _keys(client.delete.call_args[1]["points_selector"].filter) == ["team_id"]
-
-
 class TestThePointIdDerivationIsUnchanged:
     """Every point already on a cluster keeps its id: the derivation moved, it did not change.
 

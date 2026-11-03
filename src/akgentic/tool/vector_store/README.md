@@ -176,7 +176,10 @@ answering on one host:port are two clients and never one; `http://localhost:8080
 **The cache names no vendor.** `get_client(key, connect)` takes the connect callable from the
 backend, which is the only place a client library is constructed, so adding a third cluster backend
 adds no branch there. Both `WeaviateBackend` and `QdrantBackend` take a connected client; neither
-connects and neither closes one. `close_all()` at process exit is the only closer.
+connects and neither closes one: a backend has no `close()`, because it does not own the connection.
+`close_all()` is process-level — it closes every client this process has cached, for every cluster —
+so it belongs at the end of a script or at process shutdown, where it also runs by itself through
+`atexit`, and it must not run while teams are live in the same process.
 
 ### Naming a cluster that is not there is an error
 
@@ -387,14 +390,14 @@ store is an authoritative index of the graph rather than a lossy projection of i
 ## Collection configuration (on the consumer card)
 
 ```python
-PlanningTool(vector_store=VectorStoreParam(backend="weaviate", tenant="acme"))  # one tenant per cluster
+PlanningTool(vector_store=VectorStoreParam(backend="weaviate", tenant="acme"))  # tenant is optional
 ```
 
 | `VectorStoreParam` field | Type | Default | Meaning |
 |---|---|---|---|
 | `dimension` | `int` (≥1) | `1536` | Embedding vector dimensionality. Must be the native width of a known `embedding_model`; a mismatch is refused when the card binds. |
 | `backend` | `str` | **follows the environment** | A registered backend name (`inmemory` / `weaviate` / `qdrant` / any third-party). Defaults via `default_backend()`: the highest-priority provisioned store, else `inmemory`. External backends require their extra (e.g. `akgentic-tool[qdrant]`). See [Pluggable backends](#pluggable-backends). |
-| `tenant` | `str \| None` | `None` | Weaviate tenant id: one value per cluster, shared by every card that writes a class. A class's tenancy mode is fixed by whichever card creates it first: a later card that disagrees (a tenant on a plain class, or none on a multi-tenant one) is refused when it binds, and its consumer degrades with one WARNING. Team isolation is the `team_id` filter, not the tenant; a catalog card cannot carry a per-team id. |
+| `tenant` | `str \| None` | `None` | Optional. On Weaviate every class is multi-tenant, and a card without a tenant writes the `default` tenant. Cards with different tenants, or none, can write one class, and each sees only its own partition; `team_id` isolates teams within a partition. The only refusal is an existing plain (not multi-tenant) class: its consumer degrades with one WARNING at bind, and the remedy is to delete the class so it is recreated multi-tenant — its vectors are derived and are rebuilt. On Qdrant `tenant` is a payload field with no default. A catalog card cannot carry a per-team id. |
 | `embedding_model` | `str` | `"text-embedding-3-small"` | The model that produces this collection's vectors. Known models (`text-embedding-3-small` 1536, `text-embedding-3-large` 3072, `text-embedding-ada-002` 1536) pin `dimension`; an unknown name — an Azure deployment — is accepted at any dimension. |
 | `embedding_provider` | `Literal["openai", "azure"]` | `"openai"` | The embedding API provider. |
 
@@ -475,32 +478,35 @@ WeaviateBackend(client=_weaviate_client(weaviate_url(), weaviate_api_key()), tea
 **Why it is there.** An in-memory collection dies with its actor; a Weaviate collection does not.
 When a team is deleted its vectors stay in the cluster, and until now nothing on the object said
 who had produced them — there was no filter that could find them, so they were unreachable
-garbage accumulating in a shared cluster. `team_id` is the handle a cleanup process needs.
+garbage accumulating in a shared cluster. `team_id` is that handle, and every team-scoped query
+filters on it.
 
 A backend built without a `team_id` still writes the property, as the empty string, so the schema
-is uniform and a sweep never has to reason about objects that predate the field or come from an
-unattributed writer. **The workspace is such a writer**: its backend is deliberately built with `team_id=None`, so that
+is uniform and every object carries it, an unattributed writer's included. **The workspace is such a writer**: its backend is deliberately built with `team_id=None`, so that
 a chunk's identity is a property of the *tree* rather than of whichever actor indexed it — and every
 `workspace_chunks` row carries `""`. The mandatory `scope` bounds those rows instead.
 
 **Every object's id is derived, like Qdrant's point ids.** `add` passes each object a `uuid` from
 `stable_object_id(team_id, tenant, ref_id)` in `protocol.py` — the backend's team, the tenant the
-object is written to, and its `ref_id`. The client replaces an object whose uuid already exists and
+object is written to (`default` when the card names none), and its `ref_id`. The client replaces an object whose uuid already exists and
 mints a UUIDv4 when none is given, so before this every re-add of a chunk left one more copy. On a
 team-scoped collection the team is inside the id, so two teams writing one `ref_id` stay two
 objects; on the shared collection a team-less writer's id carries `""`, and every lifetime of a tree
 writes the same object.
 
-**A failed write raises; a tenancy mismatch never gets that far.** The client does not raise on a
+**A failed write raises; a plain class never gets that far.** The client does not raise on a
 rejected object, it collects it in the batch's `failed_objects`; `add` reads that list after the
 batch closes and raises `RuntimeError` with the count, the collection and the first failure's
-message. Binding to an existing class first reads its `multi_tenancy_config` and refuses a card whose
-`tenant` disagrees, so the mismatch shows up once at bind rather than as a stream of failed inserts.
+message. Every class this backend creates is multi-tenant, and the card's tenant (`default` when it
+names none) is provisioned. Binding to an existing class first reads its `multi_tenancy_config` and
+refuses a plain class whatever the card says, since Weaviate cannot convert a class to
+multi-tenancy: the refusal shows up once at bind rather than as a stream of failed inserts, and the
+remedy is to delete the class so the next bind recreates it.
 
 **And read back on every query — but not on every collection.** Collection names are module
-constants, so every team on a cluster shares the same collections and multi-tenancy is off unless a
-deployment turns it on. Which of them the team predicate applies to is **a property the collection
-declares**, not a backend-wide invariant:
+constants, so every team on a cluster shares the same collections; the tenant partitions storage
+and `team_id` partitions a tenant. Which collections the team predicate applies to is **a property
+the collection declares**, not a backend-wide invariant:
 
 | Collection | Team-scoped? | Why |
 |---|---|---|
@@ -522,8 +528,6 @@ may add to at runtime is the same hazard in another shape.
 | `add` | stamps `team_id`; the object's `uuid` includes the team | stamps the backend's `team_id`, and nothing filters on it — for the workspace, whose backend is built with no team, that is `""` |
 | `search` | `team_id == <backend's own>`, plus `scope` / `path` legs, passed to the cluster as `filters=` so it applies **before** `limit` | the `scope` and `path` legs alone; **`scope` is mandatory** |
 | `remove` | `ref_id IN (...)` **AND** `team_id == <backend's own>` | `ref_id IN (...)` **AND** `scope == <argument>`; **`scope` is mandatory** |
-| `delete_by_team(collection, team_id)` | `team_id == <argument>` — the backend's own is deliberately *not* anded on | **refused**, before any cluster call |
-| `list_collections()` | none; a collection name identifies no team | none |
 
 `remove` needs both legs on a team-scoped collection. `ref_id` alone deletes the matching object of
 every team on the cluster, and reference ids collide across teams by construction — planning ids are
@@ -539,12 +543,6 @@ was added to fix. `search` and `remove` therefore raise `ValueError` for a share
 `scope`, on **all three** backends. The in-memory one has no team predicate to lose and carries the
 guard anyway: one team may hold two `WorkspaceTool` cards on two trees.
 
-**`delete_by_team` refuses a shared collection**, in both cluster backends, before any client call. On
-one, `team_id` records only who wrote the row, so a sweeper pointed at `workspace_chunks` would delete
-rows another live team is still reading, from a tree that still exists. The guard reads a module-level
-fact rather than the backend's own bookkeeping, which is why it still bites on the administrative
-backend a sweeper builds — one that has created no collection at all.
-
 **A backend with no `team_id` cannot query a team-scoped collection** — `search` and `remove` raise
 `ValueError` rather than filtering on something. Filtering on `""` would not be a safe default: `""`
 is a real value in the data, written by `add` for a team-less writer, so a query filtering on it would
@@ -555,8 +553,8 @@ here, so the backend refuses instead of making one. `team_id=""` is refused on t
 weakening it: on a shared collection there is no identity to invent, because the boundary is the
 scope. So a team-less backend can search `workspace_chunks` and still cannot search `planning`.
 
-Writing without a team is still allowed, and the asymmetry is deliberate: `""` on a stored object is
-a value a sweeper can find and act on, whereas `""` in a *query* is an invented identity.
+Writing without a team is still allowed, and the asymmetry is deliberate: `""` on a stored object
+keeps the schema uniform, whereas `""` in a *query* is an invented identity.
 
 In a running deployment the raise is unreachable — `VectorStoreActor` always passes
 `str(self.team_id)`, and an actor's `team_id` is a UUID defaulted at construction. It guards
@@ -564,53 +562,6 @@ hand-built backends.
 
 `SearchHit` still does not expose `team_id`; the boundary is applied in the query, not reported in
 the result.
-
-### Reaping a deleted team
-
-Two methods sit outside the `VectorStoreService` protocol because they are cluster
-administration, not vector storage — the in-memory backend has no equivalent and needs none:
-
-| Method | Purpose |
-|---|---|
-| `list_collections()` | Every collection name in the cluster, read from Weaviate rather than from this backend's own bookkeeping. |
-| `delete_by_team(collection, team_id)` | Delete every object in one collection stamped with `team_id`. Returns the number deleted. Raises `ValueError` if the collection is **shared across teams**, or if the cluster has no such collection. |
-
-Both work on a backend that created nothing — which is the point, since the sweeper runs after
-the team and its actors are gone. **A sweep must skip the shared collections**, and the backend
-enforces that rather than trusting the loop to:
-
-```python
-from akgentic.tool.vector_store import close_all
-from akgentic.tool.vector_store.protocol import collection_is_team_scoped
-from akgentic.tool.vector_store.backends.weaviate import WeaviateBackend, _weaviate_client
-
-backend = WeaviateBackend(client=_weaviate_client(WEAVIATE_URL, WEAVIATE_API_KEY))
-try:
-    for team_id in deleted_team_ids:
-        for collection in backend.list_collections():
-            if not collection_is_team_scoped(collection):
-                continue  # workspace_chunks belongs to a tree, not to a team
-            deleted = backend.delete_by_team(collection, team_id)
-            log.info("reaped %d objects from %s for team %s", deleted, collection, team_id)
-finally:
-    close_all()
-```
-
-The `continue` is a courtesy that keeps the log honest. Dropping it does not cause damage: the call
-raises `ValueError` naming the collection before it reaches the cluster.
-
-A backend has no `close()` of its own: it does not own the connection. `close_all()` is
-process-level — it closes every client this process has cached, for every cluster — so it belongs
-at the end of a script or at process shutdown, where it also runs by itself through `atexit`, and it
-must not run while teams are live in the same process.
-
-On a **multi-tenant** collection the delete is scoped to the backend's tenant, so pass the tenant
-too when the deployment maps one tenant per team — `WeaviateBackend(client=..., tenant=team_id)`.
-`tenant` and `team_id` are independent: the tenant partitions storage, `team_id` is a property on
-the object, and a backend given both stamps its own `team_id` rather than the tenant name.
-
-The sweeper process itself — what decides a team is deleted, and on what schedule — lives in the
-deployment layer, not in this package.
 
 ---
 

@@ -1220,12 +1220,11 @@ are never asked for text — keeping the rule above them is what makes in-memory
 strong semantic hit.
 
 Every object `WeaviateBackend` writes is stamped with the owning team's id (`team_id`, taken from
-the actor, never from a card), so `delete_by_team()` and `list_collections()` give a deployment the
-two primitives it needs to reap the vectors of a deleted team — otherwise unreachable, since
-nothing else on a Weaviate object says who produced it. **The exception is the shared workspace
+the actor, never from a card), and every query on a team-scoped collection filters on it — nothing
+else on a Weaviate object says who produced it. **The exception is the shared workspace
 collection, `workspace_chunks`**: a workspace row carries `""` for its team — deliberately, so that
-a row's identity does not move when the actor that wrote it is replaced — is bounded by the
-mandatory `scope` instead, and is never reaped by team. Every object's id is
+a row's identity does not move when the actor that wrote it is replaced — and is bounded by the
+mandatory `scope` instead. Every object's id is
 derived from its team, tenant and `ref_id` — the derivation Qdrant's point ids use — so a re-added
 row replaces the object instead of doubling it.
 
