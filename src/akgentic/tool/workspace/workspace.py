@@ -36,6 +36,7 @@ from akgentic.tool.workspace.models import (
     META_DIR_SUFFIX,
     STAGING_SWEEP_GRACE_S,
 )
+from akgentic.tool.workspace.readers import TEXT_EXTENSIONS, DocumentReader
 
 logger = logging.getLogger(__name__)
 
@@ -162,6 +163,32 @@ class PathEscapeError(PermissionError):
     a container writes as another uid, and publication by rename means the host
     process must be able to replace that inode on the next write.
     """
+
+
+class ExtensionNotAllowedError(PermissionError):
+    """A write whose file extension the workspace does not accept.
+
+    A ``PermissionError`` for the reason :class:`PathEscapeError` is one: every
+    existing ``except PermissionError`` keeps catching it, and the upload route
+    answers 403 without a change.
+    """
+
+
+EXTENSIONS_ENV = "AKGENTIC_WORKSPACE_EXTENSIONS"
+"""Comma-separated extensions a workspace accepts on write, replacing the default."""
+
+
+def allowed_extensions() -> frozenset[str]:
+    """``AKGENTIC_WORKSPACE_EXTENSIONS`` when set, else every extension the readers read.
+
+    A name without an extension (``.ragignore``, ``Makefile``) is always accepted.
+    """
+    value = os.environ.get(EXTENSIONS_ENV)
+    if not value:
+        return TEXT_EXTENSIONS | DocumentReader.extensions
+    return frozenset(
+        f".{ext.strip().lstrip('.').lower()}" for ext in value.split(",") if ext.strip()
+    )
 
 
 class FileEntry(BaseModel):
@@ -405,8 +432,15 @@ class Filesystem:
 
         Raises:
             PermissionError: if *path* escapes the workspace root.
+            ExtensionNotAllowedError: if *path*'s extension is not accepted.
         """
         resolved = self.resolve_path(path)
+        allowed = allowed_extensions()
+        if resolved.suffix and resolved.suffix.lower() not in allowed:
+            raise ExtensionNotAllowedError(
+                f"'{resolved.suffix}' files are not accepted in the workspace; "
+                f"use one of: {', '.join(sorted(allowed))}"
+            )
         resolved.parent.mkdir(parents=True, exist_ok=True)
         # The ".tmp" suffix is part of the shape three other things match on, and
         # the shape is what makes a staging file recognisable as one: the startup
