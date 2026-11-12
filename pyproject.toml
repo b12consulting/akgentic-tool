@@ -60,7 +60,8 @@ vector_search = [
     "openai>=1.0.0",
     "numpy>=1.26.0",
 ]
-weaviate = ["weaviate-client>=4.9.0"]
+# Floor: `Configure.Vectors.self_provided()` (the named-vector create call), verified in 4.16.2.
+weaviate = ["weaviate-client>=4.16.2"]
 qdrant = ["qdrant-client>=1.10.0"]
 docs = ["markitdown[pdf,docx,xlsx,xls,pptx,outlook,az-doc-intel]>=0.1"]
 vision = ["Pillow>=10.0"]

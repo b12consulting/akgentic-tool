@@ -823,8 +823,8 @@ class WorkspaceTool(ReadFactories, WriteFactories, CardGate, ExecFactories, RagF
         re-add doubled;
         the identity no longer carries the team on a shared collection at all
         (:func:`~akgentic.tool.vector_store.protocol.row_object_id`), so the team
-        is free to be what it is — and it has to be, since it is what a sweep and
-        a team-scoped filter read.
+        is free to be what it is — and it has to be, since it is what a
+        team-scoped filter reads.
 
         Every failure here **degrades**: one WARNING, no store announced, and the
         actor answers its existing unavailable sentence. A retrieval capability is

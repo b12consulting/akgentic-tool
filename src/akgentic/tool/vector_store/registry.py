@@ -56,15 +56,12 @@ class BackendContext:
     ``VectorStoreConfig`` — its name and role, and no connection setting: a
     backend reads its deployment from the environment — and the owning team's
     id, propagated by the actor system and never a card field, so a backend can
-    stamp its objects for later team-scoped cleanup. No built-in factory reads
+    stamp its objects and scope its queries to the team. No built-in factory reads
     ``config``; it stays as the seam a third-party factory may use.
 
-    ``team_id`` is ``None`` for an **administrative** backend — a sweeper built to
-    call ``delete_by_team`` or ``list_collections``, which belongs to no team by
-    construction (ADR-046 §D2). It is the only remaining producer of ``None``:
-    every consumer now passes its real team, and a cluster backend built with
-    none stamps ``""`` and can still query a shared collection, never a
-    team-scoped one.
+    Every consumer passes its real team. A cluster backend built with ``team_id``
+    ``None`` stamps ``""`` and can still query a shared collection, never a
+    team-scoped one (ADR-046 §D2).
 
     ``root`` is the filesystem directory a locally persisting backend hangs its
     index off — the workspace's ``<meta>`` sibling. It is ``None`` for every
