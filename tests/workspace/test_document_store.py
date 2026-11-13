@@ -34,6 +34,7 @@ from akgentic.tool.workspace import (
     meta_dir_for,
     resolve_document_store,
 )
+from akgentic.tool.workspace.documents import store as store_module
 
 TREE_KEY = "scope-a/notes"
 
@@ -367,6 +368,11 @@ class TestEvictionAndUnreadableFiles:
         corrupt.write_text("{ this is not: valid: yaml: at all")
         assert store.get_document(TREE_KEY, "a.md") is None
         assert corrupt.exists()
+
+    @pytest.mark.skipif(not hasattr(yaml, "CSafeLoader"), reason="PyYAML built without libyaml")
+    def test_records_are_parsed_by_libyaml_when_it_is_there(self) -> None:
+        """Every search lists every record: the pure-Python parser makes that slow."""
+        assert store_module.RECORD_LOADER is yaml.CSafeLoader
 
     def test_a_file_the_model_rejects_is_a_miss_and_is_left_in_place(self, roots: Path) -> None:
         """Valid YAML carrying the wrong shape is the same class of problem."""
