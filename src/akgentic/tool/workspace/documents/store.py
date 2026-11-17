@@ -104,6 +104,14 @@ tree, which is how a cache silently stops hitting.
 DOCUMENT_FILE_SUFFIX = ".yaml"
 """Suffix of every file this store writes — and what :meth:`list_documents` globs."""
 
+RECORD_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+"""The YAML loader that parses a record: libyaml's when PyYAML was built with it.
+
+Same result as ``yaml.SafeLoader``, about 27 times faster. It matters because
+:meth:`YamlDocumentStore.list_documents` parses every record of the tree, and the
+keyword leg of every ``workspace_rag_search`` lists them all.
+"""
+
 RECORD_LOCK_PREFIX = "record-"
 """What a document record's lock file is named, before the digest of its path."""
 
@@ -436,7 +444,7 @@ class YamlDocumentStore:
         except OSError:
             return None
         try:
-            return DocumentEntry.model_validate(yaml.safe_load(raw))
+            return DocumentEntry.model_validate(yaml.load(raw, Loader=RECORD_LOADER))
         except (yaml.YAMLError, ValidationError, TypeError):
             logger.warning(
                 "Document record %s does not parse — treating it as a miss and leaving it "
