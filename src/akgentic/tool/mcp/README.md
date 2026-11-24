@@ -56,7 +56,7 @@ alongside the callables from every other card.
 | `stdio_env` | `dict[str, str] \| None` | `None` | Environment for the subprocess. `${VAR}` is resolved in each value (not in keys). |
 | `stdio_cwd` | `str \| None` | `None` | Working directory for the subprocess. |
 | `stdio_token_env_var` | `str \| None` | `None` | When set together with `bearer_token`, the token is injected into the subprocess environment under this name. |
-| `bearer_token` | `str \| None` | `None` | `${VAR}` is resolved. Only reaches the server through `stdio_token_env_var` — there is no header on a stdio transport. |
+| `bearer_token` | `str \| None` | `None` | Only reaches the server through `stdio_token_env_var` — there is no header on a stdio transport. `${VAR}` is resolved only when `stdio_token_env_var` is set; otherwise the token is ignored. |
 | `timeout` | `float` (>0) | `10.0` | Initialization timeout ⇒ `init_timeout`. |
 | `read_timeout` | `float` (>0) | `300.0` | Read timeout. |
 | `tool_prefix` | `str \| None` | `None` | As above. |

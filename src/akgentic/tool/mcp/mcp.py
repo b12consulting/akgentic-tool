@@ -156,20 +156,45 @@ def _resolve_env_placeholders(value: str) -> str:
 
     def substitute(match: re.Match[str]) -> str:
         name = match.group(1)
-        if not name.startswith(MCP_SECRET_PREFIX):
-            raise ValueError(
-                f"MCP connection references environment variable '{name}'; only variables "
-                f"named '{MCP_SECRET_PREFIX}*' can be read by an MCP card"
-            )
-        resolved = os.environ.get(name)
-        if not resolved:
-            raise ValueError(
-                f"MCP connection references environment variable '{name}', "
-                "which is not set on this worker"
-            )
-        return resolved
+        _require_readable(name)
+        return os.environ[name]
 
     return _ENV_PLACEHOLDER.sub(substitute, value)
+
+
+def _require_readable(name: str) -> None:
+    """Refuse a placeholder name that lacks the prefix or whose variable is unset or empty.
+
+    Never binds the variable's value, so a refusal leaves no secret in any frame.
+
+    Raises:
+        ValueError: Naming the variable, never a value.
+    """
+    if not name.startswith(MCP_SECRET_PREFIX):
+        raise ValueError(
+            f"MCP connection references environment variable '{name}'; only variables "
+            f"named '{MCP_SECRET_PREFIX}*' can be read by an MCP card"
+        )
+    if not os.environ.get(name):
+        raise ValueError(
+            f"MCP connection references environment variable '{name}', "
+            "which is not set on this worker"
+        )
+
+
+def _check_placeholders(*values: str | None) -> None:
+    """Validate every placeholder a transport will resolve, before any is resolved.
+
+    A builder resolves several fields in turn. Without this pass, a placeholder that fails
+    late would raise while an earlier field's resolved secret is still a local, where an
+    error reporter that captures frame locals would record it.
+
+    Raises:
+        ValueError: If any placeholder is refused or unset (see `_require_readable`).
+    """
+    for value in values:
+        for name in _ENV_PLACEHOLDER.findall(value or ""):
+            _require_readable(name)
 
 
 def _require_mcp_enabled() -> None:
@@ -268,10 +293,15 @@ def _build_stdio_transport(
     if not connection.stdio_command:
         raise ValueError("stdio_command is required for MCPStdioConnectionConfig")
 
+    # The token reaches a stdio server only through stdio_token_env_var; unused, it is
+    # neither checked nor resolved, so a stale placeholder there cannot fail the build.
+    token = connection.bearer_token if connection.stdio_token_env_var else None
+    _check_placeholders(*(connection.stdio_env or {}).values(), *connection.stdio_args, token)
+
     env = {
         key: _resolve_env_placeholders(value) for key, value in (connection.stdio_env or {}).items()
     }
-    bearer_token = _resolve_optional(connection.bearer_token)
+    bearer_token = _resolve_optional(token)
     if connection.stdio_token_env_var and bearer_token:
         env[connection.stdio_token_env_var] = bearer_token
 
@@ -322,6 +352,7 @@ def _build_mcp_transport(connection: MCPConnectionConfig) -> Any:
     if isinstance(connection, MCPStdioConnectionConfig):
         return _build_stdio_transport(connection, stdio_transport_cls)
 
+    _check_placeholders(connection.url, connection.bearer_token)
     url = _resolve_env_placeholders(connection.url)
     headers = _mcp_auth_headers(_resolve_optional(connection.bearer_token))
     if connection.transport == "sse":

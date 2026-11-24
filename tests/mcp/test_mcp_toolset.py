@@ -970,3 +970,68 @@ def test_the_switch_is_checked_before_any_placeholder_is_read_or_transport_built
 
     assert built == []
     assert recording_toolset.instances == []
+
+
+# --------------------------------------------------------------------------------------
+# No resolved secret survives a failed build, and an unused token is never resolved
+# --------------------------------------------------------------------------------------
+
+MISSING_VAR = MCP_SECRET_PREFIX + "NOT_EXPORTED"
+
+
+def _secret_in_traceback_locals(exc: BaseException) -> bool:
+    """True if any frame on the traceback holds a local whose repr carries the secret.
+
+    Error reporters (Sentry, Logfire, rich tracebacks) record frame locals, so a resolved
+    secret still bound when a later placeholder fails would be shipped with the error.
+    """
+    tb = exc.__traceback__
+    while tb is not None:
+        for local in tb.tb_frame.f_locals.values():
+            if SECRET_VALUE in repr(local):
+                return True
+        tb = tb.tb_next
+    return False
+
+
+@pytest.mark.usefixtures("secret_env")
+@pytest.mark.parametrize(
+    "connection_factory",
+    [
+        lambda: MCPHTTPConnectionConfig(
+            url=ACME_URL + "?k=${" + SECRET_VAR + "}",
+            bearer_token="${" + MISSING_VAR + "}",
+        ),
+        lambda: MCPStdioConnectionConfig(
+            stdio_command="uvx",
+            stdio_env={"CLIENT_SECRET": "${" + SECRET_VAR + "}"},
+            stdio_args=["--key=${" + MISSING_VAR + "}"],
+        ),
+        lambda: MCPStdioConnectionConfig(
+            stdio_command="uvx",
+            stdio_env={"CLIENT_SECRET": "${" + SECRET_VAR + "}"},
+            stdio_token_env_var="ACME_TOKEN",
+            bearer_token="${" + MISSING_VAR + "}",
+        ),
+    ],
+    ids=["http-url-then-token", "stdio-env-then-args", "stdio-env-then-token"],
+)
+def test_a_late_failing_placeholder_leaves_no_resolved_secret_in_any_frame(
+    connection_factory: Callable[[], Any],
+    recording_toolset: type[_RecordingToolset],
+) -> None:
+    with pytest.raises(ValueError, match=f"'{MISSING_VAR}'") as excinfo:
+        MCPTool(connection=connection_factory()).get_toolsets()
+
+    assert not _secret_in_traceback_locals(excinfo.value)
+    assert recording_toolset.instances == []
+
+
+@pytest.mark.parametrize("token", ["${" + MISSING_VAR + "}", "${ACME_DB_PASSWORD}"])
+def test_an_unused_stdio_token_is_neither_checked_nor_resolved(token: str) -> None:
+    """Without `stdio_token_env_var` the token never reaches the server, so it cannot fail."""
+    connection = MCPStdioConnectionConfig(stdio_command="uvx", bearer_token=token)
+
+    transport = _transport_of(_build_mcp_toolset(connection))
+
+    assert transport.env is None
