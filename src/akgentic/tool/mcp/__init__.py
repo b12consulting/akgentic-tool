@@ -1,6 +1,8 @@
 """MCP support for akgentic-tool."""
 
 from .mcp import (
+    MCP_ENABLED_ENV,
+    MCP_SECRET_PREFIX,
     MCPConnectionConfig,
     MCPDiagnosticsConfig,
     MCPHTTPConnectionConfig,
@@ -17,6 +19,8 @@ from .oauth_handler import (
 )
 
 __all__ = [
+    "MCP_ENABLED_ENV",
+    "MCP_SECRET_PREFIX",
     "MCPConnectionConfig",
     "MCPDiagnosticsConfig",
     "MCPHTTPConnectionConfig",
