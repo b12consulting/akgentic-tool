@@ -821,17 +821,55 @@ def test_a_placeholder_outside_the_prefix_is_refused_even_when_set(
     assert recording_toolset.instances == []
 
 
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("ACME_DB_PASSWORD", "contoso-db-password"),
+        ("ACME_" + MCP_SECRET_PREFIX + "DB", "contoso-db-password"),
+        (MCP_SECRET_PREFIX.lower() + "db", "contoso-db-password"),
+        (MCP_ENABLED_ENV, "true"),
+    ],
+    ids=["unrelated", "prefix-not-leading", "prefix-lower-case", "the-switch-itself"],
+)
 def test_a_stdio_placeholder_outside_the_prefix_is_refused(
+    name: str,
+    value: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ACME_DB_PASSWORD", "contoso-db-password")
+    """The prefix must lead the name, in its exact case; the switch is not readable either."""
+    monkeypatch.setenv(name, value)
     connection = MCPStdioConnectionConfig(
         stdio_command="uvx",
-        stdio_env={"PASSWORD": "${ACME_DB_PASSWORD}"},
+        stdio_env={"PASSWORD": "${" + name + "}"},
     )
 
-    with pytest.raises(ValueError, match="'ACME_DB_PASSWORD'"):
+    with pytest.raises(ValueError, match=f"'{name}'") as excinfo:
         _build_mcp_toolset(connection)
+
+    assert MCP_SECRET_PREFIX + "*" in str(excinfo.value)
+    assert value not in str(excinfo.value)
+
+
+@pytest.mark.usefixtures("secret_env")
+def test_names_and_locations_are_never_resolved() -> None:
+    """Only fields that can carry a credential are resolved; the rest stay as written."""
+    placeholder = "${" + SECRET_VAR + "}"
+    connection = MCPStdioConnectionConfig(
+        stdio_command=placeholder,
+        stdio_cwd=placeholder,
+        stdio_env={"ACME_" + placeholder: "plain"},
+        stdio_token_env_var=placeholder,
+        bearer_token="acme-token",
+        tool_prefix=placeholder,
+    )
+
+    (toolset,) = MCPTool(connection=connection).get_toolsets()
+    transport = _transport_of(toolset.wrapped)
+
+    assert transport.command == placeholder
+    assert transport.cwd == placeholder
+    assert transport.env == {"ACME_" + placeholder: "plain", placeholder: "acme-token"}
+    assert toolset.prefix == placeholder
 
 
 # --------------------------------------------------------------------------------------
@@ -891,4 +929,44 @@ async def test_diagnostics_are_refused_when_mcp_is_off(
     with pytest.raises(PermissionError, match=MCP_ENABLED_ENV):
         await probe_mcp_connection(connection)
 
+    assert recording_toolset.instances == []
+
+
+@pytest.mark.parametrize(
+    "connection_factory",
+    [_placeholder_stdio_config, _placeholder_http_config],
+    ids=["stdio", "http"],
+)
+@pytest.mark.parametrize("secret_exported", [True, False], ids=["secret-set", "secret-unset"])
+def test_the_switch_is_checked_before_any_placeholder_is_read_or_transport_built(
+    connection_factory: Callable[[], Any],
+    secret_exported: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    recording_toolset: type[_RecordingToolset],
+) -> None:
+    """Off means nothing is attempted: no card variable is read and no transport is built.
+
+    With the secret unset, resolving before the switch would surface a `ValueError` instead;
+    with it set, the transport constructor would be reached.
+    """
+    import fastmcp.client.transports as transports
+
+    built: list[dict[str, Any]] = []
+
+    def record(**kwargs: Any) -> None:
+        built.append(kwargs)
+
+    for name in ("StdioTransport", "SSETransport", "StreamableHttpTransport"):
+        monkeypatch.setattr(transports, name, record)
+    monkeypatch.delenv(MCP_ENABLED_ENV, raising=False)
+    monkeypatch.setenv(REGION_VAR, REGION_VALUE)
+    if secret_exported:
+        monkeypatch.setenv(SECRET_VAR, SECRET_VALUE)
+    else:
+        monkeypatch.delenv(SECRET_VAR, raising=False)
+
+    with pytest.raises(PermissionError, match=MCP_ENABLED_ENV):
+        MCPTool(connection=connection_factory()).get_toolsets()
+
+    assert built == []
     assert recording_toolset.instances == []

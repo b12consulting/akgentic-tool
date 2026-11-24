@@ -107,6 +107,10 @@ connection:
 - **Why stdio needs `stdio_env`:** the MCP SDK hands a stdio server only `HOME, LOGNAME, PATH,
   SHELL, TERM, USER`. Exporting the secret on the worker is not enough on its own; `stdio_env` is
   the only route into the subprocess.
+- **Prefer `bearer_token` and `stdio_env`.** A secret resolved into `url` travels in the request
+  line: httpx logs request URLs at `INFO`, and its HTTP error messages quote the URL. A secret
+  resolved into `stdio_args` is visible to any user on the host in the process list. Use those
+  two fields only for a value the server accepts nowhere else.
 - There is no escape syntax: a literal `${NAME}` in a resolved field cannot be sent as-is.
 - **What the prefix does not stop:** a card author can still send an `AKGENTIC_MCP_SECRET_*`
   value to a host of their choosing, and a stdio card can still run any command. The switch above,

@@ -263,7 +263,7 @@ def _build_stdio_transport(
         A configured stdio transport.
 
     Raises:
-        ValueError: If stdio_command is missing, or a referenced variable is unset.
+        ValueError: If stdio_command is missing, or a placeholder is refused or unset.
     """
     if not connection.stdio_command:
         raise ValueError("stdio_command is required for MCPStdioConnectionConfig")
@@ -314,8 +314,8 @@ def _build_mcp_transport(connection: MCPConnectionConfig) -> Any:
         A configured fastmcp transport instance.
 
     Raises:
-        ValueError: If stdio_command is missing for stdio transport, or a referenced
-            environment variable is unset.
+        ValueError: If stdio_command is missing for stdio transport, or a placeholder is
+            refused or unset.
     """
     stdio_transport_cls, sse_transport_cls, http_transport_cls = _load_mcp_transport_classes()
 
@@ -419,7 +419,9 @@ async def list_mcp_tools(connection: MCPConnectionConfig) -> list[str]:
         them (i.e. without any configured `tool_prefix` applied).
 
     Raises:
-        ValueError: If stdio_command is missing for stdio transport.
+        PermissionError: If MCP is not enabled on this worker (`MCP_ENABLED_ENV`).
+        ValueError: If stdio_command is missing for stdio transport, or a `${VAR}`
+            placeholder is refused or unset.
         Exception: If connection fails or server is unreachable.
     """
     print("## Creating MCP toolset for diagnostics...")
@@ -447,6 +449,10 @@ async def probe_mcp_connection(
 
     Returns:
         Dictionary with tool_count, tools (list), and feasible (bool).
+
+    Raises:
+        PermissionError: If MCP is not enabled on this worker (`MCP_ENABLED_ENV`).
+        ValueError: If the connection cannot be built (see `list_mcp_tools`).
     """
     tool_names = await list_mcp_tools(connection)
     return {
