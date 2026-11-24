@@ -259,11 +259,19 @@ class TestWorkspaceWriteLineEndingPreservation:
         """
         tool, fs = make_wired_tool(tmp_path)
         # Write a file with non-UTF-8 bytes (Windows-1252 / Latin-1 encoded)
-        fs.write("binary.dat", b"\xff\xfe binary garbage \x80\x81")
+        fs.write("binary.txt", b"\xff\xfe binary garbage \x80\x81")
         write_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_write")
         with pytest.raises(RetriableError, match="read it before overwriting"):
-            write_fn("binary.dat", "replacement\n")
-        assert fs.read("binary.dat") == b"\xff\xfe binary garbage \x80\x81"
+            write_fn("binary.txt", "replacement\n")
+        assert fs.read("binary.txt") == b"\xff\xfe binary garbage \x80\x81"
+
+    def test_write_with_a_refused_extension_is_refused(self, tmp_path: Path) -> None:
+        """The refusal names the accepted extensions, so the agent can pick one."""
+        tool, fs = make_wired_tool(tmp_path)
+        write_fn = next(t for t in tool.get_tools() if t.__name__ == "workspace_write")
+        with pytest.raises(RetriableError, match=r"'\.exe' files are not accepted.*\.md"):
+            write_fn("payload.exe", "MZ\n")
+        assert not fs.exists("payload.exe")
 
     def test_preserve_endings_falls_through_on_non_utf8(self) -> None:
         """Non-UTF-8 live bytes leave the proposed content verbatim, never raising."""

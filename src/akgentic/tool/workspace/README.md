@@ -14,7 +14,7 @@ from akgentic.tool import WorkspaceTool
 | Actor | `#Workspace-<scope>/<kind>/<leaf>` — the **resolved three-segment path**, slashes included, so two principals' `notes` are two actors over two trees. **Created only when the card enables a capability that dispatches** — `workspace_exec`, or one of the three `workspace_rag_*` fields; a read-only or read/write card creates none at all. Where one does exist it is an ordinary **team child**: made by its card through `getChildrenOrCreate`, in exactly one team's roster, stopped by that team's teardown. It owns **dispatch and no shared state** — with `workspace_exec` on, the tree's sandbox backend and the single worker thread that runs commands on it, plus the retrieval indexing pipeline. Two teams over one tree get two actors, and the tree orders them — see *Lifetime* below |
 | Channels used | `TOOL_CALL` (11 callables, 13 with `workspace_exec`), `COMMAND` (`expand_media_refs`) |
 | Optional extras | `[docs]` for binary reads, `[vision]` for image resizing |
-| Environment | `AKGENTIC_WORKSPACES_ROOT` (default `./workspaces`) · `AKGENTIC_WORKSPACE_SHARED_KINDS` (default unset, which permits **no** shared tree — see *Sharing a tree across principals*) · `AKGENTIC_LOCK_BACKEND` (default `file`) · `AKGENTIC_DOCUMENT_STORE` (default `yaml`). The last three are read on every bind, and a value they cannot use fails that bind |
+| Environment | `AKGENTIC_WORKSPACES_ROOT` (default `./workspaces`) · `AKGENTIC_WORKSPACE_SHARED_KINDS` (default unset, which permits **no** shared tree — see *Sharing a tree across principals*) · `AKGENTIC_LOCK_BACKEND` (default `file`) · `AKGENTIC_DOCUMENT_STORE` (default `yaml`) · `AKGENTIC_WORKSPACE_EXTENSIONS` (comma-separated; default unset, which accepts the extensions the readers read — see *Where the files live*). The `SHARED_KINDS`, `LOCK_BACKEND` and `DOCUMENT_STORE` variables are read on every bind, and a value they cannot use fails that bind |
 | External tools | `git` (optional — the journal, see below), `rg` (optional — accelerates `workspace_grep`) |
 
 ---
@@ -1197,6 +1197,13 @@ component-level (`Path.is_relative_to`), so a sibling workspace whose name share
 `team-1` vs `team-11` — cannot be reached. Symlinks are resolved before the check, so a symlink
 pointing out of the tree does not escape either. The journal directory is outside the root by that
 same rule, which is precisely why it is there.
+
+Writes accept only **allowed extensions**: every write — `workspace_write`,
+edits, patches, seeded resources and the server's upload route — goes through `Filesystem._stage`,
+which refuses any other extension with `ExtensionNotAllowedError`, a `PermissionError`. The default is
+`TEXT_EXTENSIONS | DocumentReader.extensions`, the formats the workspace can read back;
+`AKGENTIC_WORKSPACE_EXTENSIONS` replaces it. A name without an extension (`.ragignore`, `Makefile`)
+is accepted. `workspace_exec` writes through the mount, not `Filesystem`, so it is not covered.
 
 Writes are **atomic**: bytes are staged in a `.spec.md.<32 hex>.tmp` file in the target's own
 directory and published with `os.replace`, so a concurrent reader resolves the path to either the
